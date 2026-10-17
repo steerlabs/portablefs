@@ -26,6 +26,10 @@
 	<string>public.app-category.utilities</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PortableFS connects to filesystem authorities on your local network to mount and access your files.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority.</string>
 	<key>NSSystemExtensionUsageDescriptionKey</key>
 	<string>PortableFS mounts remote volumes through its FSKit file system extension.</string>
 	<key>PFSAppGroupIdentifier</key>

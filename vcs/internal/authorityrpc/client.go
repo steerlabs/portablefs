@@ -648,6 +648,10 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	if !ok || !hasFeatures(active.GetFeatures(), required) {
 		return errors.New("authorityrpc: authority omitted required frontend-profile features")
 	}
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
+		!hasFeatures(active.GetFeatures(), []string{fskitDurableMutationsFeature}) {
+		return errors.New("authorityrpc: FSKit authority omitted fskit-durable-mutations-v1")
+	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
 		active.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
 	) {

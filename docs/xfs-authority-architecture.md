@@ -53,6 +53,16 @@ prefix. A run opens the mount root before work and fsyncs that same directory
 handle at completion; loss since open fails the barrier. Stock-FUSE syncfs is
 not this completion surface.
 
+FSKit exposes no fsync callback, so a Mac mutation reply is itself the
+durability point. Before an applied FSKit mutation's reply is sent or retained
+for replay, the authority forces its last storage transaction: full fsync of
+the written, truncated, or attribute-changed inode, of a created file or
+directory, or of the changed parent for symlink, link, unlink, and rename. XFS
+orders its log, so that force also persists the operation's earlier
+transactions. An object with no syncable descriptor, such as one its owner
+cannot read or a symlink, uses syncfs on the volume root. The sync runs after
+storage locks are released; a sync error fences the epoch.
+
 Runtime subscriptions, delegations, connections, locks, handles, and replay
 outcomes are epoch-local. Restart permanently stales old handles; cold
 reattachment permits new opens. The Authority fences prior Linux membership

@@ -299,7 +299,7 @@ func TestStreamedFrameDigestMatchesOneShotReplayFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	decoded := new(authoritypb.Request)
-	release, streamed, err := readRequestFrameRetained(bytes.NewReader(encoded.Bytes()), 2<<20, nil, 0, decoded)
+	release, streamed, err := readRequestFrameRetained(t.Context(), bytes.NewReader(encoded.Bytes()), 2<<20, nil, 0, decoded, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,17 +552,17 @@ func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	total := binary.BigEndian.Uint32(frame.Bytes()[:4]) + binary.BigEndian.Uint32(frame.Bytes()[4:8])
-	budget := newFrameBudget(uint64(total))
+	budget := newFrameBudget(uint64(total), 0)
 	var got authoritypb.Request
 	release, err := readFrameRetained(bytes.NewReader(frame.Bytes()), 8192, budget, time.Second, &got)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := budget.acquire(context.Background(), 1, 20*time.Millisecond); !errors.Is(err, ErrFrameBudget) {
+	if err := budget.acquire(context.Background(), 1, 20*time.Millisecond, true); !errors.Is(err, ErrFrameBudget) {
 		t.Fatalf("budget while handler owns bulk = %v, want ErrFrameBudget", err)
 	}
 	release()
-	if err := budget.acquire(context.Background(), total, time.Second); err != nil {
+	if err := budget.acquire(context.Background(), total, time.Second, true); err != nil {
 		t.Fatalf("budget after handler release = %v", err)
 	}
 	budget.release(total)
@@ -698,7 +698,7 @@ func TestConcurrentRetainedFramesNeverShareAPayload(t *testing.T) {
 		}
 		frames[reader] = frame.Bytes()
 	}
-	budget := newFrameBudget(uint64(readers) * (128 << 10))
+	budget := newFrameBudget(uint64(readers)*(128<<10), 0)
 	var failures sync.WaitGroup
 	errs := make(chan error, readers*rounds)
 	for reader := range readers {
@@ -881,8 +881,8 @@ func TestFrameBudgetBoundsConcurrentAllocation(t *testing.T) {
 	}
 	size := binary.BigEndian.Uint32(frame.Bytes()[:4]) + binary.BigEndian.Uint32(frame.Bytes()[4:8])
 
-	budget := newFrameBudget(uint64(size))
-	if err := budget.acquire(context.Background(), size, time.Second); err != nil {
+	budget := newFrameBudget(uint64(size), 0)
+	if err := budget.acquire(context.Background(), size, time.Second, true); err != nil {
 		t.Fatal(err)
 	}
 	var decoded authoritypb.Request
@@ -937,9 +937,7 @@ func testServeSession(t *testing.T, s *Server, conn net.Conn) chan error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.budget == nil {
-		s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
-	}
+	s.initializeFrameBudget()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -1036,7 +1034,7 @@ func (p activeTestPair) close(t *testing.T) {
 func TestServerMultiplexesRequestIDs(t *testing.T) {
 	s := &Server{
 		Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	pair := startActiveTestPair(t, s)
 	defer pair.close(t)
@@ -1088,7 +1086,7 @@ func TestNilHandlerResponseKeepsTheAuthorityEpoch(t *testing.T) {
 	epoch := bytes.Repeat([]byte{0xA5}, 16)
 	s := &Server{
 		Handler: nilResponseHandler{epoch: epoch}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	pair := startActiveTestPair(t, s)
 	defer pair.close(t)
@@ -1122,14 +1120,14 @@ func (disagreeingHandler) Bounds() TransportBounds {
 func TestServerRefusesToRunWithBoundsItDoesNotEnforce(t *testing.T) {
 	s := &Server{
 		Handler: disagreeingHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	if _, err := s.validate(); err == nil {
 		t.Fatal("server accepted a handler advertising bounds it does not enforce")
 	}
 	agreeing := &Server{
 		Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	if _, err := agreeing.validate(); err != nil {
 		t.Fatalf("agreeing bounds refused: %v", err)

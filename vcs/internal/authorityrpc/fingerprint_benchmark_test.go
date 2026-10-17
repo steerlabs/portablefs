@@ -25,7 +25,7 @@ func BenchmarkReadRequestRetainedBulkFrame1MiB(b *testing.B) {
 	b.SetBytes(1 << 20)
 	for b.Loop() {
 		var got authoritypb.Request
-		release, digest, err := readRequestFrameRetained(bytes.NewReader(wire), 2<<20, nil, 0, &got)
+		release, digest, err := readRequestFrameRetained(b.Context(), bytes.NewReader(wire), 2<<20, nil, 0, &got, true)
 		if err != nil {
 			b.Fatal(err)
 		}

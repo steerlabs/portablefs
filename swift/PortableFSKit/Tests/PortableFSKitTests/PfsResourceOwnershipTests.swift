@@ -45,14 +45,13 @@ private func waitForAcceptedItemCounts(
 }
 
 extension PfsLocalMockDaemonTests {
-@Test func partialEnumerationPrefixPreservesDuplicateHardLinkOccurrences() async throws {
+@Test func metadataOnlyEnumerationPreservesHardLinkFileIDs() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
     // Populate through another frontend so the enumerating VolumeCore begins
     // with no canonical child object. Both names deliberately resolve to the
-    // same item identity: the disposition must count ordered occurrences, not
-    // collapse them into a set of item IDs.
+    // same file ID without transferring ownership of either occurrence.
     let peer = PfsLocalClient(socketPath: daemon.socketPath)
     let peerVolume = try await peer.resolve(attachRef: "mock")
     let source = try await createPeerFile(
@@ -82,27 +81,16 @@ extension PfsLocalMockDaemonTests {
             maxEntries: 2
         )
         #expect(page.entries.count == 2)
-        #expect(
-            page.entries.map(\.attr.item.stableIdentity).allSatisfy {
-                $0 == page.entries[0].attr.item.stableIdentity
-            }
-        )
-
-        let adopted = try await core.adoptEnumeratedItems(page.entries)
-        #expect(adopted.count == 2)
-        #expect(adopted[0] === adopted[1])
-        client.acceptProvisionalItemPrefix(
-            targetRequestID: page.resourceRequestID,
-            count: 1
-        )
+        #expect(page.entries[0].attr.fileID == page.entries[1].attr.fileID)
+        #expect(page.entries.allSatisfy { $0.attr.item == PfsItem() && $0.attr.parent == PfsItem() })
     }
 
-    let stats = try await waitForAcceptedItemCounts(2, daemon: daemon)
-    #expect(stats.resourceAcceptedItemCounts.filter { $0 > 0 } == [1])
-    #expect(await core.testingDebugState().itemCount == 2)
+    let stats = try await waitForAcceptedItemCounts(1, daemon: daemon)
+    #expect(stats.resourceAcceptedItemCounts == [0])
+    #expect(await core.testingDebugState().itemCount == 1)
 }
 
-@Test func multiPageEnumerationSettlesEveryPageDisposition() async throws {
+@Test func multiPageEnumerationHasNoPageDispositions() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
@@ -133,22 +121,15 @@ extension PfsLocalMockDaemonTests {
                 wantAttributes: true,
                 maxEntries: 128
             )
-            let adopted = try await core.adoptEnumeratedItems(page.entries)
-            #expect(adopted.count == page.entries.count)
-            client.acceptProvisionalItemPrefix(
-                targetRequestID: page.resourceRequestID,
-                count: UInt32(clamping: page.entries.count)
-            )
             cookie = page.nextCookie
         } while cookie != 0
     }
 
-    // Resource tickets are independent and may be emitted in dictionary
-    // iteration order. Their exact per-page occurrence counts are the proof;
-    // no ordering between otherwise independent dispositions is required.
-    let stats = try await waitForAcceptedItemCounts(4, daemon: daemon)
+    // Only the retained directory open needs a disposition. Pages transfer
+    // no items, even when the walk crosses several reply boundaries.
+    let stats = try await waitForAcceptedItemCounts(1, daemon: daemon)
     #expect(stats.enumerateRequests == 3)
-    #expect(stats.resourceAcceptedItemCounts.filter { $0 > 0 }.sorted() == [44, 128, 128])
-    #expect(await core.testingDebugState().itemCount == 301)
+    #expect(stats.resourceAcceptedItemCounts == [0])
+    #expect(await core.testingDebugState().itemCount == 1)
 }
 }

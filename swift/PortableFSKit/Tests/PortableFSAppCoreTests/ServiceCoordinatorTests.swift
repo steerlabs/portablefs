@@ -53,7 +53,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
         identitySchema: 1,
         controlProtocol: 1,
         pfslocalMajor: 1,
-        pfslocalMinor: 15
+        pfslocalMinor: 16
     )
     try identity.validate()
     let object = try #require(
@@ -73,7 +73,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
             identitySchema: 1,
             controlProtocol: 1,
             pfslocalMajor: 1,
-            pfslocalMinor: 15
+            pfslocalMinor: 16
         ).validate()
     }
 
@@ -132,67 +132,108 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     }
 }
 
-@Test func anUnreachableDaemonProvesAbsenceInsteadOfWedgingAnEnabledService() throws {
-    // The wedge this covers: BTM reports the agent enabled, but no daemon was
-    // ever bootstrapped into launchd (or the running one no longer matches the
-    // persisted identity). Probing it raises a transport error. If that error
-    // escaped, the enabled service could only ever be repaired by register(),
-    // which reregister is the sole caller of — a deadlock with no user exit.
-    let probed = PortableFSDServiceCoordinator.daemonDepartureProof {
-        throw PfsLocalClientError.system(errno: ENOENT, operation: "connect")
+@Test func daemonOwnershipRequiresTheCanonicalNestedServicePath() throws {
+    let suffix = "/Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd"
+    for app in ["/Applications/PortableFS.app", "/tmp/build/PortableFSKitDev.app"] {
+        #expect(try PortableFSDServiceCoordinator.daemonOwningBundle(
+            executableURL: URL(fileURLWithPath: app + suffix)
+        ).path == app)
     }
-    guard case .unpublished = probed else {
-        Issue.record("an unreachable daemon must fall back to proof of absence")
-        return
+    for path in [
+        "/tmp/portablefsd",
+        "/Applications/PortableFS.app/Contents/MacOS/portablefsd",
+        "/Applications/PortableFS.app/Contents/Library/LaunchAgents/Other.app/Contents/MacOS/portablefsd",
+        "/Applications/PortableFS.app" + suffix + ".other",
+        "/tmp/not-an-app" + suffix,
+    ] {
+        #expect(throws: (any Error).self) {
+            try PortableFSDServiceCoordinator.daemonOwningBundle(
+                executableURL: URL(fileURLWithPath: path)
+            )
+        }
     }
-
-    // Falling back is not the same as assuming absence. `.unpublished` resolves
-    // through the state singleton, so a daemon that is alive but unreachable
-    // still refuses the update.
-    let fileManager = FileManager.default
-    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("pfs-absent-probe-\(UUID().uuidString)", isDirectory: true)
-    try fileManager.createDirectory(
-        at: root,
-        withIntermediateDirectories: false,
-        attributes: [.posixPermissions: 0o700]
-    )
-    defer { try? fileManager.removeItem(at: root) }
-    #expect(try PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
-
-    let lock = root.appendingPathComponent(".portablefsd-state.lock")
-    #expect(fileManager.createFile(
-        atPath: lock.path,
-        contents: Data("owner\n".utf8),
-        attributes: [.posixPermissions: 0o600]
-    ))
-    let descriptor = Darwin.open(lock.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-    #expect(descriptor >= 0)
-    guard descriptor >= 0 else { return }
-    defer { Darwin.close(descriptor) }
-    #expect(serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0)
-    defer { _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN) }
-    #expect(try !PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
+    let networkURL = try #require(URL(string: "https://example.com/PortableFS.app" + suffix))
+    #expect(throws: (any Error).self) {
+        try PortableFSDServiceCoordinator.daemonOwningBundle(executableURL: networkURL)
+    }
 }
 
-@Test func anAuthenticatedPeerStillYieldsTheStrongerProcessProof() throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-    process.arguments = ["30"]
-    try process.run()
-    defer {
-        if process.isRunning { process.terminate() }
-        process.waitUntilExit()
-    }
-
-    let witness = try PortableFSDServiceCoordinator.DaemonProcessWitness(
-        pid: process.processIdentifier,
-        pidVersion: 1
+@Test func serviceOwnershipAdmitsAReleaseUpdateWithinTheSameSignedProduct() throws {
+    let incoming = try PortableFSDServiceCoordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.4.1",
+        buildVersion: "42"
     )
-    let probed = PortableFSDServiceCoordinator.daemonDepartureProof { witness }
-    guard case .process = probed else {
-        Issue.record("a live authenticated peer must yield a process witness")
-        return
+    let running = try PortableFSDServiceCoordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.3.0",
+        buildVersion: "1"
+    )
+    try PortableFSDServiceCoordinator.validateServiceOwner(running, expected: incoming)
+}
+
+@Test func serviceOwnershipRejectsOtherProductsTeamsAndAppGroups() throws {
+    let expected = try PortableFSDServiceCoordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.4.1",
+        buildVersion: "42"
+    )
+    for (product, team, group) in [
+        ("dev.portablefs.Other", "B47U2LLKHW", "B47U2LLKHW.pfsoss"),
+        ("dev.portablefs.oss.KitDev", "OTHERTEAM", "OTHERTEAM.pfsoss"),
+        ("dev.portablefs.oss.KitDev", "B47U2LLKHW", "B47U2LLKHW.other"),
+    ] {
+        let owner = try PortableFSDServiceCoordinator.deriveConfiguration(
+            bundleIdentifier: product,
+            teamIdentifier: team,
+            appGroupIdentifier: group,
+            shortVersion: "0.3.0",
+            buildVersion: "1"
+        )
+        #expect(throws: (any Error).self) {
+            try PortableFSDServiceCoordinator.validateServiceOwner(owner, expected: expected)
+        }
+    }
+}
+
+@Test func authenticatedOutgoingReleaseKeepsItsOwnLocalProtocol() throws {
+    let sealed = PortableFSDReleaseIdentity(
+        codeDirectoryHash: String(repeating: "a", count: 40),
+        executableSHA256: String(repeating: "b", count: 64),
+        daemonVersion: "0.3.0",
+        identitySchema: 1,
+        controlProtocol: 1,
+        pfslocalMajor: 1,
+        pfslocalMinor: 16
+    )
+    let reported = PortableFSDServiceCoordinator.LiveDaemonIdentity(
+        schemaVersion: 1, controlProtocol: 1, daemonVersion: "0.3.0",
+        executableSha256: sealed.executableSHA256, pfslocalMajor: 1, pfslocalMinor: 14
+    )
+    let running = try reported.releaseIdentity(sealed: sealed)
+    #expect(running.codeDirectoryHash == sealed.codeDirectoryHash)
+    #expect(running.pfslocalMinor == 14)
+
+    for (schema, control, version, digest, major) in [
+        (2, 1, "0.3.0", sealed.executableSHA256, UInt32(1)),
+        (1, 2, "0.3.0", sealed.executableSHA256, UInt32(1)),
+        (1, 1, "0.4.1", sealed.executableSHA256, UInt32(1)),
+        (1, 1, "0.3.0", String(repeating: "c", count: 64), UInt32(1)),
+        (1, 1, "0.3.0", sealed.executableSHA256, UInt32(0)),
+    ] {
+        let invalid = PortableFSDServiceCoordinator.LiveDaemonIdentity(
+            schemaVersion: schema, controlProtocol: control, daemonVersion: version,
+            executableSha256: digest, pfslocalMajor: major, pfslocalMinor: 14
+        )
+        #expect(throws: (any Error).self) {
+            try invalid.releaseIdentity(sealed: sealed)
+        }
     }
 }
 

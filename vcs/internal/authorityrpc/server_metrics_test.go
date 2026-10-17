@@ -101,7 +101,7 @@ func TestServerServingObserverTracksTLSAcceptLoop(t *testing.T) {
 	states := make(chan bool, 2)
 	server := &Server{
 		Handler:  &benchmarkDispatchHandler{response: &authoritypb.Response{}},
-		MaxFrame: 1, MaxInFlight: 2, MaxConnections: 2, MaxFrameBytesInFlight: 1,
+		MaxFrame: 1, MaxInFlight: 2, MaxConnections: 2, MaxFrameBytesInFlight: MinimumFrameBytesInFlight(1),
 		HandshakeTimeout: time.Second, IdleTimeout: time.Second, WriteTimeout: time.Second,
 		OnServing: func(up bool) { states <- up },
 	}

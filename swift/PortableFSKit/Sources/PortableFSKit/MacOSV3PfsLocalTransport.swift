@@ -57,7 +57,7 @@ private final class PfsWeakMacOSV3Transport: @unchecked Sendable {
     }
 }
 
-/// The concrete wire adapter between additive pfslocal minor 15 and the
+/// The concrete wire adapter between additive pfslocal minor 16 and the
 /// platform-independent `PfsMacOSCoherenceRunner`.
 ///
 /// portablefsd owns the authority connection. This type owns only the local

@@ -85,6 +85,8 @@ const visibilityCompletionFeature = "foreground-visibility-completion-v1"
 const fskitSyncRepairFeature = "fskit-sync-repair-v1"
 const fskitSourcePublicationFeature = "fskit-source-publication-v1"
 const fskitFragmentedWriteFeature = "fskit-fragmented-write-v1"
+const fskitDirectWriteFeature = "fskit-direct-write-v1"
+const fskitDurableMutationsFeature = "fskit-durable-mutations-v1"
 
 var (
 	requiredCommonHelloFeatures = []string{
@@ -157,6 +159,9 @@ func advertisedActivateFeatures(profile authoritypb.FrontendProfile) ([]string, 
 	features, valid := activateFeatures(profile)
 	if valid && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
 		features = append(features, batchedCloseFeature)
+	}
+	if valid && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		features = append(features, fskitDurableMutationsFeature)
 	}
 	return features, valid
 }
@@ -318,7 +323,7 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 		}
 		switch req.GetBody().(type) {
 		case *authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
-			*authoritypb.Request_FskitWrite:
+			*authoritypb.Request_FskitWrite, *authoritypb.Request_Write:
 			return true
 		default:
 			return common()

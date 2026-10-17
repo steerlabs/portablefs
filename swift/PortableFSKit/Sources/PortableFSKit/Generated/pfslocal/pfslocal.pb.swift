@@ -84,6 +84,13 @@
 // mandatory DATA and CONTROL transports and becomes usable only after its
 // provisional attach is activated. A pre-15 frontend cannot implement these
 // ordering and failure-atomicity rules, so it must fail the minimum-minor gate.
+// Protocol minor 16 separates file identity from item ownership. Attr gains
+// file_id and parent_file_id, the filesystem object numbers FSKit reports;
+// Item stays a daemon-local ownership handle. EnumerateEntriesRequest and
+// EnumerateEntriesReply list a directory as non-owning entry snapshots: no
+// entry carries an Item or transfers item ownership, so listing retains no
+// authority capability. EnumerateRequest/EnumerateReply keep their item-owning
+// meaning and are not served to a minor-16 frontend.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -112,9 +119,10 @@
 // second writer's offset. Without append intent, FSKit's callback remains
 // indistinguishable from an ordinary positional write.
 //
-// Identity model: items are addressed by (item_id, item_generation) — the
-// authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
-// treats them as opaque. attach_ref is an opaque string minted by the daemon's
+// Identity model: items are addressed by (item_id, item_generation), opaque
+// daemon-local ownership handles for authority capabilities. A handle names
+// one retained capability, not a file: after reclaim the same file can return
+// under a new handle. Attr.file_id is the file's identity as FSKit reports it. attach_ref is an opaque string minted by the daemon's
 // control API (EnsureAttach); it carries no secrets and is safe to appear in a
 // mount URL / logs.
 
@@ -636,6 +644,14 @@ public nonisolated struct PfsEnvelope: Sendable {
     set {body = .resourceReplyDisposition(newValue)}
   }
 
+  public var enumerateEntries: PfsEnumerateEntriesRequest {
+    get {
+      if case .enumerateEntries(let v)? = body {return v}
+      return PfsEnumerateEntriesRequest()
+    }
+    set {body = .enumerateEntries(newValue)}
+  }
+
   /// daemon → client (replies)
   public var helloReply: PfsHelloReply {
     get {
@@ -861,6 +877,14 @@ public nonisolated struct PfsEnvelope: Sendable {
     set {body = .v3LivenessReply(newValue)}
   }
 
+  public var enumerateEntriesReply: PfsEnumerateEntriesReply {
+    get {
+      if case .enumerateEntriesReply(let v)? = body {return v}
+      return PfsEnumerateEntriesReply()
+    }
+    set {body = .enumerateEntriesReply(newValue)}
+  }
+
   /// daemon → client (either)
   public var error: PfsErrorReply {
     get {
@@ -913,6 +937,7 @@ public nonisolated struct PfsEnvelope: Sendable {
     case visibilityAck(PfsVisibilityAckRequest)
     case v3Liveness(PfsV3LivenessRequest)
     case resourceReplyDisposition(PfsResourceReplyDisposition)
+    case enumerateEntries(PfsEnumerateEntriesRequest)
     /// daemon → client (replies)
     case helloReply(PfsHelloReply)
     case resolveReply(PfsResolveReply)
@@ -942,6 +967,7 @@ public nonisolated struct PfsEnvelope: Sendable {
     case syncVolumeReply(PfsSyncVolumeReply)
     case visibilityAckReply(PfsVisibilityAckReply)
     case v3LivenessReply(PfsV3LivenessReply)
+    case enumerateEntriesReply(PfsEnumerateEntriesReply)
     /// daemon → client (either)
     case error(PfsErrorReply)
     /// request_id 0: server-initiated
@@ -1367,10 +1393,12 @@ public nonisolated struct PfsAttr: @unchecked Sendable {
     set {_uniqueStorage()._contentVersion = newValue}
   }
 
-  /// Actual frontend identity of one live parent binding. Absent for the root
-  /// and for retained-but-unlinked Items. Hard-linked Items may have multiple
-  /// parents; the daemon returns the parent of the concrete alias used for the
-  /// operation, or a deterministic live alias for identity-only operations.
+  /// Actual frontend identity of one live parent binding. Absent for the root,
+  /// for retained-but-unlinked Items, and whenever no live binding is known,
+  /// such as after the observed alias of a hard-linked Item was removed; the
+  /// daemon never reports a parent it knows to be stale. Hard-linked Items may
+  /// have multiple parents; the daemon returns the parent of the concrete alias
+  /// it last observed.
   public var parent: PfsItem {
     get {_storage._parent ?? PfsItem()}
     set {_uniqueStorage()._parent = newValue}
@@ -1392,6 +1420,23 @@ public nonisolated struct PfsAttr: @unchecked Sendable {
   public var allocSize: UInt64 {
     get {_storage._allocSize}
     set {_uniqueStorage()._allocSize = newValue}
+  }
+
+  /// Filesystem object number, independent of the ownership handle in item.
+  /// The volume root is 1; every other authority-backed object is its XFS inode
+  /// number, in [2, 2^63). Hard-link aliases share it, and it survives reclaim
+  /// and re-lookup of the same inode. It authorizes nothing.
+  public var fileID: UInt64 {
+    get {_storage._fileID}
+    set {_uniqueStorage()._fileID = newValue}
+  }
+
+  /// file_id of the live parent binding described by parent. Zero exactly when
+  /// no live binding is known (see parent). Enumeration entries carry it
+  /// without parent.
+  public var parentFileID: UInt64 {
+    get {_storage._parentFileID}
+    set {_uniqueStorage()._parentFileID = newValue}
   }
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -1532,6 +1577,58 @@ public nonisolated struct PfsEnumerateReply: Sendable {
   public var nextCookie: UInt64 = 0
 
   /// directory coherence version at enumeration time
+  public var dirVersion: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Lists one page of a directory as non-owning entry snapshots. Field meanings
+/// match EnumerateRequest, including the mandatory retained read handle.
+public nonisolated struct PfsEnumerateEntriesRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var dir: PfsItem {
+    get {_dir ?? PfsItem()}
+    set {_dir = newValue}
+  }
+  /// Returns true if `dir` has been explicitly set.
+  public var hasDir: Bool {self._dir != nil}
+  /// Clears the value of `dir`. Subsequent reads from it will return its default value.
+  public mutating func clearDir() {self._dir = nil}
+
+  public var cookie: UInt64 = 0
+
+  public var maxEntries: UInt32 = 0
+
+  public var wantAttrs: Bool = false
+
+  public var handle: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _dir: PfsItem? = nil
+}
+
+/// Every entry's attr has kind and file_id, plus full attributes when
+/// want_attrs; attr.item and attr.parent are always empty and attr.parent_file_id
+/// names the listed directory. The reply transfers no item ownership and
+/// takes no ResourceReplyDisposition. A later lookup of an entry returns the
+/// same file_id under its own ownership handle.
+public nonisolated struct PfsEnumerateEntriesReply: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var entries: [PfsDirEntry] = []
+
+  public var nextCookie: UInt64 = 0
+
   public var dirVersion: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -2755,7 +2852,7 @@ nonisolated extension PfsVisibilityScope: SwiftProtobuf._ProtoNameProviding {
 
 nonisolated extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{3}publication_ack_required\0\u{3}operation_id\0\u{3}publication_retracted\0\u{2}\u{6}hello\0\u{1}resolve\0\u{1}lookup\0\u{1}enumerate\0\u{3}get_attr\0\u{3}set_attr\0\u{1}open\0\u{1}close\0\u{1}read\0\u{1}write\0\u{1}create\0\u{1}mkdir\0\u{1}remove\0\u{1}rename\0\u{1}symlink\0\u{1}readlink\0\u{3}xattr_get\0\u{3}xattr_set\0\u{3}xattr_list\0\u{3}xattr_remove\0\u{1}statfs\0\u{1}fsync\0\u{1}reclaim\0\u{3}subscribe_events\0\u{3}hard_link\0\u{3}sync_volume\0\u{3}publication_ack\0\u{3}visibility_ack\0\u{3}v3_liveness\0\u{3}resource_reply_disposition\0\u{4}\u{15}hello_reply\0\u{3}resolve_reply\0\u{3}lookup_reply\0\u{3}enumerate_reply\0\u{3}get_attr_reply\0\u{3}set_attr_reply\0\u{3}open_reply\0\u{3}close_reply\0\u{3}read_reply\0\u{3}write_reply\0\u{3}create_reply\0\u{3}mkdir_reply\0\u{3}remove_reply\0\u{3}rename_reply\0\u{3}symlink_reply\0\u{3}readlink_reply\0\u{3}xattr_get_reply\0\u{3}xattr_set_reply\0\u{3}xattr_list_reply\0\u{3}xattr_remove_reply\0\u{3}statfs_reply\0\u{3}fsync_reply\0\u{3}reclaim_reply\0\u{3}subscribe_events_reply\0\u{3}hard_link_reply\0\u{3}sync_volume_reply\0\u{3}visibility_ack_reply\0\u{3}v3_liveness_reply\0\u{2}\u{3}error\0\u{1}event\0\u{c}\u{5}\u{1}")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{3}publication_ack_required\0\u{3}operation_id\0\u{3}publication_retracted\0\u{2}\u{6}hello\0\u{1}resolve\0\u{1}lookup\0\u{1}enumerate\0\u{3}get_attr\0\u{3}set_attr\0\u{1}open\0\u{1}close\0\u{1}read\0\u{1}write\0\u{1}create\0\u{1}mkdir\0\u{1}remove\0\u{1}rename\0\u{1}symlink\0\u{1}readlink\0\u{3}xattr_get\0\u{3}xattr_set\0\u{3}xattr_list\0\u{3}xattr_remove\0\u{1}statfs\0\u{1}fsync\0\u{1}reclaim\0\u{3}subscribe_events\0\u{3}hard_link\0\u{3}sync_volume\0\u{3}publication_ack\0\u{3}visibility_ack\0\u{3}v3_liveness\0\u{3}resource_reply_disposition\0\u{3}enumerate_entries\0\u{4}\u{14}hello_reply\0\u{3}resolve_reply\0\u{3}lookup_reply\0\u{3}enumerate_reply\0\u{3}get_attr_reply\0\u{3}set_attr_reply\0\u{3}open_reply\0\u{3}close_reply\0\u{3}read_reply\0\u{3}write_reply\0\u{3}create_reply\0\u{3}mkdir_reply\0\u{3}remove_reply\0\u{3}rename_reply\0\u{3}symlink_reply\0\u{3}readlink_reply\0\u{3}xattr_get_reply\0\u{3}xattr_set_reply\0\u{3}xattr_list_reply\0\u{3}xattr_remove_reply\0\u{3}statfs_reply\0\u{3}fsync_reply\0\u{3}reclaim_reply\0\u{3}subscribe_events_reply\0\u{3}hard_link_reply\0\u{3}sync_volume_reply\0\u{3}visibility_ack_reply\0\u{3}v3_liveness_reply\0\u{3}enumerate_entries_reply\0\u{2}\u{2}error\0\u{1}event\0\u{c}\u{5}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3157,6 +3254,19 @@ nonisolated extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._Message
           self.body = .resourceReplyDisposition(v)
         }
       }()
+      case 40: try {
+        var v: PfsEnumerateEntriesRequest?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .enumerateEntries(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .enumerateEntries(v)
+        }
+      }()
       case 60: try {
         var v: PfsHelloReply?
         var hadOneofValue = false
@@ -3521,6 +3631,19 @@ nonisolated extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._Message
           self.body = .v3LivenessReply(v)
         }
       }()
+      case 88: try {
+        var v: PfsEnumerateEntriesReply?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .enumerateEntriesReply(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .enumerateEntriesReply(v)
+        }
+      }()
       case 90: try {
         var v: PfsErrorReply?
         var hadOneofValue = false
@@ -3690,6 +3813,10 @@ nonisolated extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._Message
       guard case .resourceReplyDisposition(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 39)
     }()
+    case .enumerateEntries?: try {
+      guard case .enumerateEntries(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 40)
+    }()
     case .helloReply?: try {
       guard case .helloReply(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 60)
@@ -3801,6 +3928,10 @@ nonisolated extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._Message
     case .v3LivenessReply?: try {
       guard case .v3LivenessReply(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 87)
+    }()
+    case .enumerateEntriesReply?: try {
+      guard case .enumerateEntriesReply(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 88)
     }()
     case .error?: try {
       guard case .error(let v)? = self.body else { preconditionFailure() }
@@ -4379,7 +4510,7 @@ nonisolated extension PfsItem: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
 
 nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Attr"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}kind\0\u{1}mode\0\u{1}nlink\0\u{1}uid\0\u{1}gid\0\u{1}size\0\u{3}mtime_ms\0\u{3}ctime_ms\0\u{3}atime_ms\0\u{3}birthtime_ms\0\u{3}content_version\0\u{1}parent\0\u{1}flags\0\u{3}alloc_size\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}kind\0\u{1}mode\0\u{1}nlink\0\u{1}uid\0\u{1}gid\0\u{1}size\0\u{3}mtime_ms\0\u{3}ctime_ms\0\u{3}atime_ms\0\u{3}birthtime_ms\0\u{3}content_version\0\u{1}parent\0\u{1}flags\0\u{3}alloc_size\0\u{3}file_id\0\u{3}parent_file_id\0")
 
   fileprivate class _StorageClass {
     var _item: PfsItem? = nil
@@ -4397,6 +4528,8 @@ nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
     var _parent: PfsItem? = nil
     var _flags: UInt32 = 0
     var _allocSize: UInt64 = 0
+    var _fileID: UInt64 = 0
+    var _parentFileID: UInt64 = 0
 
       // This property is used as the initial default value for new instances of the type.
       // The type itself is protecting the reference to its storage via CoW semantics.
@@ -4422,6 +4555,8 @@ nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
       _parent = source._parent
       _flags = source._flags
       _allocSize = source._allocSize
+      _fileID = source._fileID
+      _parentFileID = source._parentFileID
     }
   }
 
@@ -4455,6 +4590,8 @@ nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
         case 13: try { try decoder.decodeSingularMessageField(value: &_storage._parent) }()
         case 14: try { try decoder.decodeSingularUInt32Field(value: &_storage._flags) }()
         case 15: try { try decoder.decodeSingularUInt64Field(value: &_storage._allocSize) }()
+        case 16: try { try decoder.decodeSingularUInt64Field(value: &_storage._fileID) }()
+        case 17: try { try decoder.decodeSingularUInt64Field(value: &_storage._parentFileID) }()
         default: break
         }
       }
@@ -4512,6 +4649,12 @@ nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
       if _storage._allocSize != 0 {
         try visitor.visitSingularUInt64Field(value: _storage._allocSize, fieldNumber: 15)
       }
+      if _storage._fileID != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._fileID, fieldNumber: 16)
+      }
+      if _storage._parentFileID != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._parentFileID, fieldNumber: 17)
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
@@ -4536,6 +4679,8 @@ nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
         if _storage._parent != rhs_storage._parent {return false}
         if _storage._flags != rhs_storage._flags {return false}
         if _storage._allocSize != rhs_storage._allocSize {return false}
+        if _storage._fileID != rhs_storage._fileID {return false}
+        if _storage._parentFileID != rhs_storage._parentFileID {return false}
         return true
       }
       if !storagesAreEqual {return false}
@@ -4783,6 +4928,100 @@ nonisolated extension PfsEnumerateReply: SwiftProtobuf.Message, SwiftProtobuf._M
   }
 
   public static func ==(lhs: PfsEnumerateReply, rhs: PfsEnumerateReply) -> Bool {
+    if lhs.entries != rhs.entries {return false}
+    if lhs.nextCookie != rhs.nextCookie {return false}
+    if lhs.dirVersion != rhs.dirVersion {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension PfsEnumerateEntriesRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".EnumerateEntriesRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}cookie\0\u{3}max_entries\0\u{3}want_attrs\0\u{1}handle\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularMessageField(value: &self._dir) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.cookie) }()
+      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.maxEntries) }()
+      case 4: try { try decoder.decodeSingularBoolField(value: &self.wantAttrs) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.handle) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    try { if let v = self._dir {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+    } }()
+    if self.cookie != 0 {
+      try visitor.visitSingularUInt64Field(value: self.cookie, fieldNumber: 2)
+    }
+    if self.maxEntries != 0 {
+      try visitor.visitSingularUInt32Field(value: self.maxEntries, fieldNumber: 3)
+    }
+    if self.wantAttrs != false {
+      try visitor.visitSingularBoolField(value: self.wantAttrs, fieldNumber: 4)
+    }
+    if self.handle != 0 {
+      try visitor.visitSingularUInt64Field(value: self.handle, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: PfsEnumerateEntriesRequest, rhs: PfsEnumerateEntriesRequest) -> Bool {
+    if lhs._dir != rhs._dir {return false}
+    if lhs.cookie != rhs.cookie {return false}
+    if lhs.maxEntries != rhs.maxEntries {return false}
+    if lhs.wantAttrs != rhs.wantAttrs {return false}
+    if lhs.handle != rhs.handle {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension PfsEnumerateEntriesReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".EnumerateEntriesReply"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}entries\0\u{3}next_cookie\0\u{3}dir_version\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.entries) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.nextCookie) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.dirVersion) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.entries.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.entries, fieldNumber: 1)
+    }
+    if self.nextCookie != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nextCookie, fieldNumber: 2)
+    }
+    if self.dirVersion != 0 {
+      try visitor.visitSingularUInt64Field(value: self.dirVersion, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: PfsEnumerateEntriesReply, rhs: PfsEnumerateEntriesReply) -> Bool {
     if lhs.entries != rhs.entries {return false}
     if lhs.nextCookie != rhs.nextCookie {return false}
     if lhs.dirVersion != rhs.dirVersion {return false}

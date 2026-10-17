@@ -215,6 +215,13 @@ final class PfsOrderedEnvelopeWriter: @unchecked Sendable {
         return receipt
     }
 
+    func testingFailWrites() {
+        let error = PfsLocalClientError.connectionClosed
+        for write in terminate(with: error) {
+            write.receipt.resolve(.failure(error))
+        }
+    }
+
     private func drain() async {
         while true {
             guard let queued = dequeue() else {
@@ -455,12 +462,6 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         lock.unlock()
     }
 
-    func containsResourceReply(targetRequestID: UInt64) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return resources[targetRequestID] != nil
-    }
-
     func snapshot(itemsPublished: Bool) -> PfsBoundaryTickets {
         lock.lock()
         let publications: [PfsPublicationTicket]
@@ -532,13 +533,6 @@ struct PfsResourceReplyLease: @unchecked Sendable {
         collector.acceptResourceReply(targetRequestID: envelope.requestID)
     }
 
-    func acceptItemPrefix(_ count: UInt32) {
-        collector.acceptResourceItemPrefix(
-            targetRequestID: envelope.requestID,
-            count: count
-        )
-    }
-
     func registerItemSettlement(
         _ settle: @escaping @Sendable (UInt32) async -> Void
     ) {
@@ -579,8 +573,8 @@ private final class PfsOneShotResourceCompletion: @unchecked Sendable {
 
 /// Returns nil for an ordinary reply and the provisional item IDs for a
 /// resource-bearing reply. Open has no item ID but still returns an empty list:
-/// its daemon handle needs a final disposition. Empty Enumerate pages likewise
-/// remain resource-bearing because cursor bookkeeping can be request-scoped.
+/// its daemon handle needs a final disposition. Metadata-only enumeration
+/// transfers no resources.
 private func pfsReplyResourceItemIDs(
     _ body: PfsEnvelope.OneOf_Body?
 ) -> [UInt64]? {
@@ -595,15 +589,13 @@ private func pfsReplyResourceItemIDs(
         return [reply.attr.item.itemID]
     case let .symlinkReply(reply):
         return [reply.attr.item.itemID]
-    case let .enumerateReply(reply):
-        return reply.entries.map(\.attr.item.itemID)
     default:
         return nil
     }
 }
 
 /// Whether this successful resource-bearing reply actually conveyed a daemon
-/// handle. Item ownership is independent: Lookup/Enumerate/Mkdir/Symlink never
+/// handle. Item ownership is independent: Lookup/Mkdir/Symlink never
 /// carry handles, and a malformed zero-handle Open/Create must never make the
 /// raw compatibility API send `accept_handles = true`.
 private func pfsReplyHasHandle(_ body: PfsEnvelope.OneOf_Body?) -> Bool {
@@ -626,7 +618,7 @@ private func pfsRequestPublishes(
     _ body: PfsEnvelope.OneOf_Body
 ) -> Bool {
     switch body {
-    case .lookup, .enumerate, .getAttr, .setAttr, .read, .write,
+    case .lookup, .enumerateEntries, .getAttr, .setAttr, .read, .write,
          .create, .mkdir, .remove, .rename, .symlink, .readlink,
          .hardLink, .xattrGet, .xattrSet, .xattrList, .xattrRemove:
         return true
@@ -667,6 +659,12 @@ private func pfsRequestRequiresExactLifecycleOutcome(
     }
 }
 
+/// Only the transport can distinguish a rejected pre-dispatch request from a
+/// failed Reclaim whose daemon ownership may already have been retired.
+struct PfsDispatchedReclaimError: Error {
+    let cause: Error
+}
+
 /// Async pfslocal client for length-prefixed protobuf over a Unix domain socket.
 ///
 /// `PfsLocalClient` multiplexes concurrent requests over one stream by assigning
@@ -702,16 +700,6 @@ public actor PfsLocalClient {
         }
     }
 
-    /// True only while this task still owns the unsettled resource reply. It is
-    /// the guard that prevents metadata returned by direct Enumerate (which
-    /// deliberately abandoned all item capabilities) from being adopted later
-    /// as live canonical items.
-    nonisolated func canAdoptResourceReply(_ requestID: UInt64) -> Bool {
-        PfsPublicationContext.collector?.containsResourceReply(
-            targetRequestID: requestID
-        ) == true
-    }
-
     private let socketPathProvider: @Sendable () async throws -> String
     private let configuration: Configuration
     private let eventSink = PfsEventSink()
@@ -730,6 +718,12 @@ public actor PfsLocalClient {
     private var wantsEvents = false
     private var isShutdown = false
     private var attachIsDetaching = false
+    private var beforeNextResourceSettlement: (@Sendable () async -> Void)?
+
+    /// Only terminal session state permits frontend-only ownership retirement.
+    var isDetachingOrStopped: Bool {
+        attachIsDetaching || isShutdown || strictV3Terminal
+    }
 
     public nonisolated var events: AsyncStream<PfsEvent> {
         eventSink.stream
@@ -1042,39 +1036,6 @@ public actor PfsLocalClient {
             return
         }
         collector.acceptResourceReply(targetRequestID: targetRequestID)
-    }
-
-    public nonisolated func registerResourceItemSettlement(
-        targetRequestID: UInt64,
-        settle: @escaping @Sendable (UInt32) async -> Void
-    ) {
-        guard let collector = PfsPublicationContext.collector else {
-            pfsClientLogger.fault(
-                "resource item settlement escaped its publication boundary"
-            )
-            return
-        }
-        collector.registerLocalItemSettlement(
-            targetRequestID: targetRequestID,
-            settle: settle
-        )
-    }
-
-    /// Accepts exactly the prefix a bounded FSKit directory packer published.
-    public nonisolated func acceptProvisionalItemPrefix(
-        targetRequestID: UInt64,
-        count: UInt32
-    ) {
-        guard let collector = PfsPublicationContext.collector else {
-            pfsClientLogger.fault(
-                "resource prefix acceptance escaped its publication boundary"
-            )
-            return
-        }
-        collector.acceptResourceItemPrefix(
-            targetRequestID: targetRequestID,
-            count: count
-        )
     }
 
     /// Resolves this connection to an attach reference and remembers it for reconnects.
@@ -1412,7 +1373,7 @@ public actor PfsLocalClient {
         // cause is logged here, where it is always known, rather than
         // reconstructed from whichever wrapper a caller happened to observe.
         pfsClientLogger.error(
-            "pfslocal connection closed: \(String(describing: error), privacy: .public); strictV3=\(self.strictV3ConnectionID == connectionID)"
+            "pfslocal connection closed: \(String(describing: error), privacy: .public); strictV3=\(self.strictV3ConnectionID == connectionID) pending=\(self.pending.count)"
         )
         if strictV3ConnectionID == connectionID {
             strictV3Terminal = true
@@ -1478,7 +1439,8 @@ public actor PfsLocalClient {
         // activated only after its mandatory DATA and CONTROL bindings existed;
         // source publication is daemon-gated and every PublicationAck carries
         // an explicit callback semantic-commit verdict.
-        hello.protocolMinor = 15
+        // Minor 16 separates file IDs from ownership and lists non-owning snapshots.
+        hello.protocolMinor = 16
         hello.clientName = configuration.clientName
         hello.clientVersion = configuration.clientVersion
 
@@ -1486,7 +1448,7 @@ public actor PfsLocalClient {
         guard case let .helloReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
-        guard reply.protocolMajor == 1, reply.protocolMinor >= 15 else {
+        guard reply.protocolMajor == 1, reply.protocolMinor >= 16 else {
             throw PfsLocalClientError.protocolMismatch(major: reply.protocolMajor, minor: reply.protocolMinor)
         }
         // ADOPT THE DAEMON'S BOUND, AND NEVER SHORTEN IT.
@@ -1641,70 +1603,76 @@ public actor PfsLocalClient {
         envelope.operationID = operationID
         envelope.body = body
 
-        let replyEnvelope = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let timeoutTask = Task.detached { [
-                    requestID,
-                    deadline = connection.deadlineNanoseconds(
-                        default: configuration.requestDeadlineNanoseconds
-                    ),
-                ] in
-                    do {
-                        try await Task.sleep(nanoseconds: deadline)
-                        await self.timeoutRequest(requestID)
-                    } catch {}
-                }
-                pending[requestID] = PfsPendingRequest(
-                    continuation: continuation,
-                    timeoutTask: timeoutTask,
-                    publicationCollector: PfsPublicationContext.collector,
-                    admissionTicket: admissionTicket,
-                    orderedMutation: orderedMutation,
-                    exactLifecycleOutcome: exactLifecycleOutcome,
-                    connectionID: connection.id
-                )
-                if let admissionTicket, let ordinaryRequestID {
-                    admissionTicket.installOrdinaryRequestCancellation(
-                        ordinaryRequestID
-                    ) { [weak self] in
-                        Task {
-                            await self?.cancelRequest(
-                                requestID,
-                                error: admissionTicket.admissionRefusalError()
-                            )
+        let replyEnvelope: PfsEnvelope
+        do {
+            replyEnvelope = try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    let timeoutTask = Task.detached { [
+                        requestID,
+                        deadline = connection.deadlineNanoseconds(
+                            default: configuration.requestDeadlineNanoseconds
+                        ),
+                    ] in
+                        do {
+                            try await Task.sleep(nanoseconds: deadline)
+                            await self.timeoutRequest(requestID)
+                        } catch {}
+                    }
+                    pending[requestID] = PfsPendingRequest(
+                        continuation: continuation,
+                        timeoutTask: timeoutTask,
+                        publicationCollector: PfsPublicationContext.collector,
+                        admissionTicket: admissionTicket,
+                        orderedMutation: orderedMutation,
+                        exactLifecycleOutcome: exactLifecycleOutcome,
+                        connectionID: connection.id
+                    )
+                    if let admissionTicket, let ordinaryRequestID {
+                        admissionTicket.installOrdinaryRequestCancellation(
+                            ordinaryRequestID
+                        ) { [weak self] in
+                            Task {
+                                await self?.cancelRequest(
+                                    requestID,
+                                    error: admissionTicket.admissionRefusalError()
+                                )
+                            }
+                        }
+                    }
+                    // The write is NOT skipped for an already-cancelled task. A
+                    // publishing request may have just stamped a fresh operation ID
+                    // into the collector, and the boundary will acknowledge that ID
+                    // when the callback ends; an acknowledgement for an operation
+                    // the daemon never saw on a request is a protocol violation
+                    // that costs the whole connection. Writing unconditionally
+                    // keeps the stamp and the daemon's view identical; the caller's
+                    // cancellation is delivered by `onCancel` either way.
+                    let outboundEnvelope = envelope
+                    let writeReceipt = connection.writer.enqueue(
+                        outboundEnvelope,
+                        lane: lane
+                    )
+                    if operationID != 0 {
+                        // The operation's acknowledgement is gated on this frame
+                        // having left the writer; see PfsPublicationTicket.
+                        PfsPublicationContext.collector?.noteStampedWrite(writeReceipt)
+                    }
+                    Task.detached { [connectionID = connection.id, writeReceipt] in
+                        do {
+                            try await writeReceipt.wait()
+                        } catch {
+                            await self.writeFailed(requestID, connectionID: connectionID, error: error)
                         }
                     }
                 }
-                // The write is NOT skipped for an already-cancelled task. A
-                // publishing request may have just stamped a fresh operation ID
-                // into the collector, and the boundary will acknowledge that ID
-                // when the callback ends; an acknowledgement for an operation
-                // the daemon never saw on a request is a protocol violation
-                // that costs the whole connection. Writing unconditionally
-                // keeps the stamp and the daemon's view identical; the caller's
-                // cancellation is delivered by `onCancel` either way.
-                let outboundEnvelope = envelope
-                let writeReceipt = connection.writer.enqueue(
-                    outboundEnvelope,
-                    lane: lane
-                )
-                if operationID != 0 {
-                    // The operation's acknowledgement is gated on this frame
-                    // having left the writer; see PfsPublicationTicket.
-                    PfsPublicationContext.collector?.noteStampedWrite(writeReceipt)
-                }
-                Task.detached { [connectionID = connection.id, writeReceipt] in
-                    do {
-                        try await writeReceipt.wait()
-                    } catch {
-                        await self.writeFailed(requestID, connectionID: connectionID, error: error)
-                    }
+            } onCancel: {
+                Task {
+                    await self.cancelRequest(requestID, error: .cancelled)
                 }
             }
-        } onCancel: {
-            Task {
-                await self.cancelRequest(requestID, error: .cancelled)
-            }
+        } catch {
+            if case .reclaim = body { throw PfsDispatchedReclaimError(cause: error) }
+            throw error
         }
         return replyEnvelope
     }
@@ -1723,8 +1691,7 @@ public actor PfsLocalClient {
     private nonisolated func completeResources(
         _ tickets: [PfsResourceReplyTicket]
     ) async {
-        for ticket in tickets {
-            await ticket.settleLocalItems?(ticket.acceptedItemCount)
+        for (index, ticket) in tickets.enumerated() {
             var disposition = PfsResourceReplyDisposition()
             disposition.targetRequestID = ticket.targetRequestID
             disposition.acceptHandles = ticket.acceptHandles
@@ -1738,12 +1705,19 @@ public actor PfsLocalClient {
             )
             do {
                 try await writeReceipt.wait()
+                // Reclaim may resume from this settlement. Its request must be
+                // ordered after the ownership disposition on the same writer.
+                await beforeResourceSettlement()
+                await ticket.settleLocalItems?(ticket.acceptedItemCount)
             } catch {
                 // A disposition belongs to the connection that delivered the
                 // provisional resource. Replaying it on another epoch could
                 // accept or abandon an unrelated request ID; retire the exact
                 // connection and let daemon disconnect cleanup own the result.
                 await closeResourceConnection(ticket.connection.id, error: error)
+                for unsettled in tickets[index...] {
+                    await unsettled.settleLocalItems?(0)
+                }
                 return
             }
         }
@@ -1894,6 +1868,20 @@ public actor PfsLocalClient {
             request.continuation.resume(throwing: error)
         }
         closeCurrentConnection(connectionID, error: error)
+    }
+
+    func testingBeforeNextResourceSettlement(_ hook: @escaping @Sendable () async -> Void) {
+        beforeNextResourceSettlement = hook
+    }
+
+    private func beforeResourceSettlement() async {
+        let hook = beforeNextResourceSettlement
+        beforeNextResourceSettlement = nil
+        await hook?()
+    }
+
+    func testingFailResourceDispositionWrites() {
+        connection?.writer.testingFailWrites()
     }
 
     public func testingPendingRequestCount() -> Int {

@@ -619,6 +619,8 @@ func (l *v3SourcePublicationLease) markAssigned() error {
 // before reply construction or socket exposure can fail. A callback-level
 // NOT_PUBLISHED verdict is terminal whenever this bit is set, including when a
 // later request in the same logical operation is the one that fails.
+// Terminal withdrawal forbids new leases and assignments; already assigned
+// replies still settle their exact bindings and receipts before teardown.
 func (l *v3SourcePublicationLease) markCommitted() error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: committed source mutation has no publication lease")
@@ -626,8 +628,8 @@ func (l *v3SourcePublicationLease) markCommitted() error {
 	l.gate.mu.Lock()
 	defer l.gate.mu.Unlock()
 	op := l.gate.operations[l.operationID]
-	if l.gate.terminal != nil || l.released || op == nil || op.lease != l ||
-		op.acknowledged || l.assigned == 0 {
+	if l.released || op == nil || op.lease != l ||
+		(op.acknowledged && l.gate.terminal == nil) || l.assigned == 0 {
 		return errors.New("portablefsd: committed source mutation crossed an inactive publication lease")
 	}
 	op.committed = true
@@ -649,7 +651,7 @@ func (l *v3SourcePublicationLease) retainResponseConsumption(consumption authori
 	l.gate.mu.Lock()
 	defer l.gate.mu.Unlock()
 	op := l.gate.operations[l.operationID]
-	if l.gate.terminal != nil || l.released || op == nil || op.lease != l ||
+	if l.released || op == nil || op.lease != l ||
 		!op.committed || l.assigned == 0 {
 		return errors.New("portablefsd: retained authority response crossed an inactive publication lease")
 	}
@@ -673,7 +675,7 @@ func (c *v3SourcePublicationCoordinator) retainFrontendResponseConsumption(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	op := c.operations[operationID]
-	if c.terminal != nil || op == nil || !op.reserved {
+	if op == nil || !op.reserved {
 		return errors.New("portablefsd: retained frontend response crossed an inactive publication operation")
 	}
 	op.responseConsumptions = append(op.responseConsumptions, consumption)
@@ -742,7 +744,7 @@ func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePu
 	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.terminal != nil || l.released {
+	if l.released {
 		return errors.New("portablefsd: definitive source binding reached an inactive publication lease")
 	}
 	if !l.hasNamespaceClaimLocked(namespace, bounds) {
@@ -778,7 +780,7 @@ func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.FskitSourc
 	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.terminal != nil || l.released {
+	if l.released {
 		return errors.New("portablefsd: source namespace resolved after its publication lease ended")
 	}
 	if !l.hasNamespaceClaimLocked(namespace, bounds) {
@@ -801,7 +803,7 @@ func (l *v3SourcePublicationLease) resolveNoBindings(gate *authoritypb.FskitSour
 	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.terminal != nil || l.released {
+	if l.released {
 		return errors.New("portablefsd: source namespaces resolved after their publication lease ended")
 	}
 	for namespace, bounds := range names {

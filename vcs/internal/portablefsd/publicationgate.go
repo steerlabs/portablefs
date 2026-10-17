@@ -632,7 +632,7 @@ func (a *attach) finishFrontendParticipant(participant *frontendOperationPartici
 func frontendRequestPublishes(body any) bool {
 	switch body.(type) {
 	case *pfslocal.LookupRequest,
-		*pfslocal.EnumerateRequest,
+		*pfslocal.EnumerateEntriesRequest,
 		*pfslocal.GetAttrRequest,
 		*pfslocal.SetAttrRequest,
 		*pfslocal.ReadRequest,

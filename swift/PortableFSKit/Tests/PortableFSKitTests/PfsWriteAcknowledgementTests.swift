@@ -4,33 +4,9 @@ import Testing
 import PortableFSKitMockDaemon
 @preconcurrency import Darwin
 
-// ── THE FRONTEND'S HALF OF THE ACKNOWLEDGEMENT CONTRACT ─────────────────────
-//
-// One FSKit write callback becomes SEVERAL daemon write requests (VolumeCore
-// chunks at the volume's preferredIoBytes), and every one of them is separately
-// acknowledged: once the daemon answers a WriteReply, those bytes are in the
-// mount's stream WAL or at the authority, and the next attach will replay them.
-//
-// So the count this layer reports back is a statement about durability, and it
-// has exactly two truthful shapes:
-//
-//   * a count in 0...n, meaning "these bytes are committed, the rest were not
-//     attempted"; the kernel reissues the remainder as a fresh callback, and
-//     whatever is still wrong surfaces there — and at fsync/synchronize/unmount,
-//     which are this mount's drain barriers;
-//   * an error with NOTHING committed.
-//
-// It must never report zero-plus-error over bytes that ARE committed. The
-// daemon states the identical rule on its own side of the same wire
-// (portablefsd/ops.go, attach.write: "The count is committed progress and
-// outranks the error ... reporting zero invites a retry that duplicates an
-// append"), and the two ends of one wire cannot be allowed to disagree about
-// what a partially completed write looks like.
-//
-// WIRE DISCIPLINE: none of this changes pfslocal. No message, field, or errno
-// is added or reinterpreted; what changes is only which of the daemon's
-// existing answers this adapter turns into a throw. The protocol minor is
-// therefore unchanged.
+// Each successful chunk reply represents a durable authority mutation. A
+// later failure may return that exact prefix; its unacknowledged bytes must
+// never contribute to the framework's successful write count.
 
 private func payload(_ count: Int, seed: UInt8) -> Data {
     var data = Data(count: count)
@@ -53,25 +29,13 @@ extension PfsLocalMockDaemonTests {
     let root = try await core.rootItem()
     let file = try await core.createFile(in: root, name: Data("flood.bin".utf8), mode: 0o644)
 
-    // Two chunks commit, the third is refused. This is the fence-mid-callback
-    // shape: by the time the daemon says EIO, 2 MiB is already durable. The
-    // refusal is placed POSITIONALLY at write request 2 so chunks 0 and 1 reach
-    // the mock untouched and really are committed before it fires.
+    // The third request is refused after two independently acknowledged chunks.
     let buffer = payload(3 * chunkBytes, seed: 0x11)
     await daemon.failWrite(atIndex: 2, errno: EIO)
 
     let result = try await core.write(item: file.item, offset: 0, data: buffer)
 
-    #expect(
-        result.written == UInt32(2 * chunkBytes),
-        """
-        A write callback whose third chunk failed reported \(result.written) bytes. \
-        Two chunks (\(2 * chunkBytes) bytes) were acknowledged by the daemon and are \
-        in the mount's WAL. Throwing here tells the kernel that NOTHING was written \
-        about bytes that are on media — the exact disagreement between the two ends \
-        of one wire that turns a retried append into a duplicate.
-        """
-    )
+    #expect(result.written == UInt32(2 * chunkBytes))
 
     // The bytes the count claims must actually be readable back.
     let readBack = try await core.read(item: file.item, offset: 0, length: UInt32(2 * chunkBytes))

@@ -450,18 +450,24 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	}
 	defer use.End()
 	if write := req.GetWrite(); write != nil && write.GetFlushSequence() != 0 {
-		// Only an authenticated owner can retire a sequence with no replay
-		// outcome. Otherwise its already-dispatched successors could park
-		// behind a gap that can never be consumed.
-		defer func() {
-			if response.GetMutation() == nil {
-				if id, err := parseCoherenceDelegationID(write.GetDelegation().GetId()); err == nil {
-					h.Coherence.AbortOrderedFlushes(cred.ID, id, write.GetDelegation().GetGeneration())
+		profile, err := h.sessionFrontendProfile(cred.ID)
+		if err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			// Only an authenticated owner can retire a sequence with no replay
+			// outcome. Otherwise its already-dispatched successors could park
+			// behind a gap that can never be consumed.
+			defer func() {
+				if response.GetMutation() == nil {
+					if id, err := parseCoherenceDelegationID(write.GetDelegation().GetId()); err == nil {
+						h.Coherence.AbortOrderedFlushes(cred.ID, id, write.GetDelegation().GetGeneration())
+					}
 				}
+			}()
+			if entry, ok := transportConnectionFromContext(ctx); !ok || !entry.orderedFlush {
+				return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
 			}
-		}()
-		if entry, ok := transportConnectionFromContext(ctx); !ok || !entry.orderedFlush {
-			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
 		}
 	}
 	// Reauthorization is an ordinary ACTIVE-session operation. Pin the runtime
@@ -870,6 +876,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				modePtr = &mode
 			}
 			var attr xfsstore.Attr
+			applied := false
 			apply := func() error {
 				var applyErr error
 				attr, applyErr = h.Store.SetAttr(item, handle, xfsstore.SetAttrSpec{
@@ -877,18 +884,19 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					ATimeNS: set.AtimeNs, MTimeNS: set.MtimeNs,
 					ATimeNow: set.GetAtimeNow(), MTimeNow: set.GetMtimeNow(),
 				})
+				applied = applyErr == nil || uncertainFailure(applyErr)
 				return applyErr
 			}
 			var err error
 			if h.Restore != nil && h.Restore.Active() && set.Size != nil {
-				err = h.Restore.Truncate(ctx, coordinate.identity, oldSize, set.GetSize(), apply)
+				err = h.truncateRestoring(ctx, coordinate.identity, oldSize, set.GetSize(), apply)
 			} else if h.Restore != nil && h.Restore.Active() && (set.MtimeNs != nil || set.GetMtimeNow()) {
 				err = h.Restore.UserMutation(coordinate.identity, apply)
 			} else {
 				err = apply()
 			}
 			if err != nil {
-				uncertain := uncertainFailure(err)
+				uncertain := applied || uncertainFailure(err)
 				resp := h.errorResponse(0, err, uncertain)
 				if uncertain {
 					resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
@@ -1101,17 +1109,35 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return openErr
 			}
 			if h.Restore != nil && h.Restore.Active() && existed && body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
-				err = h.Restore.Truncate(ctx, existingCoordinate.identity, existingSize, 0, openCreated)
+				err = h.truncateRestoring(ctx, existingCoordinate.identity, existingSize, 0, openCreated)
 			} else {
 				err = openCreated()
 			}
 			if err != nil {
 				targets := createdTargets(item)
+				var post *authoritypb.PostState
+				var durability *xfsstore.DurabilityError
+				if existed && handle != (xfsstore.Capability{}) && errors.As(err, &durability) {
+					// Existing-name CREATE also opens with O_TRUNC. Snapshot both
+					// records before the typed restore failure fences the store.
+					postAttr, postErr := h.Store.Getattr(item)
+					parentAttr, parentErr := h.Store.Getattr(parent)
+					if postErr == nil && parentErr == nil {
+						post = h.mutationPostState(sequence,
+							postStateSnapshot{identity: existingCoordinate.identity, attr: postAttr, roles: postStateRoleTarget, changed: true},
+							postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent},
+						)
+					} else {
+						err = &xfsstore.DurabilityError{Cause: errors.Join(err, postErr, parentErr)}
+					}
+				}
 				if handle != (xfsstore.Capability{}) {
 					h.closeOpen(handle)
 				}
 				h.forgetItem(item)
-				return h.errorResponse(0, err, handle != (xfsstore.Capability{}) || targets != nil), targets
+				resp := h.errorResponse(0, err, handle != (xfsstore.Capability{}) || targets != nil)
+				resp.PostState = post
+				return resp, targets
 			}
 			if err := reservation.commit(
 				[]trackedCapability{{value: item}},
@@ -1588,7 +1614,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			defer reservation.release()
 			handle, err := h.Store.OpenFile(item, openFlags(body.Open.GetFlags()))
 			if err != nil {
-				return h.errorResponse(0, err, false)
+				return h.errorResponse(0, err, uncertainFailure(err))
 			}
 			if err := reservation.commit(nil, []trackedCapability{{value: handle, protected: protected}}); err != nil {
 				h.closeOpen(handle)
@@ -1654,7 +1680,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var resp *authoritypb.Response
 			if h.Restore != nil && h.Restore.Active() {
-				err := h.Restore.Truncate(ctx, coordinate.identity, oldSize, 0, func() error {
+				err := h.truncateRestoring(ctx, coordinate.identity, oldSize, 0, func() error {
 					resp = openApply(item)
 					if resp.GetErrno() != 0 {
 						return syscall.Errno(resp.GetErrno())
@@ -1663,10 +1689,26 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				})
 				if err != nil {
 					if resp != nil && resp.GetErrno() != 0 {
+						if resp.GetUncertain() {
+							return resp, []volumeserver.VisibilityTarget{}
+						}
 						return resp, nil
 					}
+					if resp == nil {
+						return h.errorResponse(0, err, false), nil
+					}
+					// Capture the applied truncate before errorResponse fences the
+					// store; a successful later sync cannot repair a failed map mark.
+					attr, attrErr := h.Store.Getattr(item)
 					cleanupOpenedHandle()
-					return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+					resp = h.errorResponse(0, errors.Join(err, attrErr), true)
+					if attrErr != nil {
+						return resp, []volumeserver.VisibilityTarget{}
+					}
+					resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+						identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true,
+					})
+					return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 				}
 			} else {
 				resp = openApply(item)
@@ -2100,9 +2142,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		resp.Body = &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{BlockSize: stat.BlockSize, Blocks: stat.Blocks, BlocksFree: stat.BlocksFree, BlocksAvailable: stat.BlocksAvailable, Files: stat.Files, FilesFree: stat.FilesFree, NameMax: stat.NameMax}}
 		return resp
 	case *authoritypb.Request_SyncFs:
-		// SyncFS participates in exact replay/mutation order even though it
-		// changes no cache coordinate. That makes it a true volume cut: every
-		// earlier accepted mutation has applied before syncfs(2) runs.
+		// SyncFS is replay-ordered and barriers the captured applied commit cut.
+		// Requests accepted on other replay slots may still be waiting to apply;
+		// callers must establish their prior-work drain before requesting this cut.
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
 			_, durable, err := h.coherenceSyncVolume(cred.ID)
 			if err != nil {
@@ -2357,6 +2399,7 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 		MaxInFlight: uint32(bounds.MaxInFlight), FrontendProfile: hello.GetFrontendProfile(),
 	}}
 	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		resp.GetHello().Features = append(resp.GetHello().Features, fskitDirectWriteFeature)
 		resp.GetHello().MaxFskitWriteBytes = h.MaxFskitWriteBytes
 	}
 	return resp
@@ -3090,17 +3133,23 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 	defer func() { ordered.Abort() }()
 	out, err := h.Runtime.ExecuteMutationAdmitted(ctx, cred, id, func() error {
 		if write := req.GetWrite(); write != nil && write.GetFlushSequence() != 0 {
-			token, tokenErr := h.coherenceToken(cred.ID)
-			if tokenErr != nil {
-				return tokenErr
+			profile, err := h.sessionFrontendProfile(cred.ID)
+			if err != nil {
+				return err
 			}
-			grant, grantErr := parseCoherenceDelegationID(write.GetDelegation().GetId())
-			if grantErr != nil {
-				return volumeserver.ErrDelegationStale
-			}
-			ordered, grantErr = h.Coherence.BeginOrderedFlush(token, grant, write.GetDelegation().GetGeneration(), write.GetFlushSequence(), id)
-			if grantErr != nil {
-				return grantErr
+			if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+				token, tokenErr := h.coherenceToken(cred.ID)
+				if tokenErr != nil {
+					return tokenErr
+				}
+				grant, grantErr := parseCoherenceDelegationID(write.GetDelegation().GetId())
+				if grantErr != nil {
+					return volumeserver.ErrDelegationStale
+				}
+				ordered, grantErr = h.Coherence.BeginOrderedFlush(token, grant, write.GetDelegation().GetGeneration(), write.GetFlushSequence(), id)
+				if grantErr != nil {
+					return grantErr
+				}
 			}
 		}
 		var reserveErr error
@@ -3137,6 +3186,9 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 	})
 	if err != nil {
 		if req.GetWrite() != nil && errors.Is(err, volumeserver.ErrAdmission) {
+			// Unadmitted WRITE: outer errno zero, Error=-ENOMEM, no post-state,
+			// no MutationState. The daemon must recognize this before committing
+			// its source publication lease; the replay slot has not advanced.
 			return stockWriteResponseWithEnvelope(h, req.GetRequestId(), stockWriteRejection(syscall.ENOMEM, false))
 		}
 		// Nothing was recorded for this identity, so the response deliberately
@@ -3802,6 +3854,22 @@ func storageFailure(err error) bool {
 		errors.Is(err, xfsstore.ErrWritePrivilege)
 }
 
+// A successful apply followed by a failed restore sync/map mark is terminal,
+// regardless of errno. A later successful file sync cannot establish the lost
+// map transition. All restore truncate callers share this classification.
+func (h *VolumeHandler) truncateRestoring(ctx context.Context, identity [16]byte, oldSize, newSize int64, apply func() error) error {
+	applied := false
+	err := h.Restore.Truncate(ctx, identity, oldSize, newSize, func() error {
+		err := apply()
+		applied = err == nil
+		return err
+	})
+	if err != nil && applied {
+		return &xfsstore.DurabilityError{Cause: fmt.Errorf("restore truncate: %w", err)}
+	}
+	return err
+}
+
 func uncertainFailure(err error) bool {
 	return fatalStorageErrno(err) || errors.Is(err, xfsstore.ErrOutcomeUncertain)
 }
@@ -3833,9 +3901,9 @@ func (h *VolumeHandler) deferStorageFailure(response *authoritypb.Response, err 
 	h.terminalStorageErr = errors.Join(h.terminalStorageErr, err)
 	h.retainTerminalReceiptFrameLocked(response)
 	h.terminalFailureMu.Unlock()
-	// Close admission before fencing the store. Otherwise a fresh filesystem
-	// request can slip between Fence and terminalDraining and become a hidden
-	// pre-fence operation.
+	// Close handler admission before its store fence. A required-sync failure
+	// can already have fenced storage before releasing coalesced waiters; any
+	// request racing that earlier fence is refused without applying.
 	h.Store.Fence(err)
 	h.terminalFailureMu.Lock()
 	storage, coherence := h.terminalCallbacksLocked()
@@ -3893,6 +3961,10 @@ func terminalReceiptCarriesExactAppliedState(response *authoritypb.Response) boo
 	postSize := uint64(target.GetSize())
 	if reply := response.GetWrite(); reply != nil {
 		return validError(reply.GetError()) && reply.GetPostAttr() != nil && reply.GetPostAttr().GetSize() == int64(postSize)
+	}
+	if reply := response.GetFskitWrite(); reply != nil {
+		return reply.GetFlags() == fskitWriteReplyCommitted|fskitWriteReplyPostApply &&
+			validError(reply.GetError()) && reply.GetVisibilitySequence() > 0 && reply.GetPostSize() == postSize
 	}
 	if reply := response.GetFallocate(); reply != nil {
 		return reply.GetFlags() == rangeReplyApplied|rangeReplyPostApply && reply.GetResultSize() == 0 &&

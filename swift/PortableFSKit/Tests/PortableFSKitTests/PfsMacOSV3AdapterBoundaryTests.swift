@@ -411,7 +411,7 @@ extension PfsLocalMockDaemonTests {
     ] {
         #expect(scratchAttributes.isValid(attribute))
     }
-    #expect(scratchAttributes.parentID == (try PfsFSKitMapping.itemIdentifier(from: harness.root.identity.itemID)))
+    #expect(scratchAttributes.parentID == (try PfsFSKitMapping.itemIdentifier(from: harness.root.fileID)))
     #expect(scratchAttributes.size == 0)
     #expect(scratchAttributes.allocSize == 0)
 
@@ -1050,7 +1050,7 @@ extension PfsLocalMockDaemonTests {
     )
     let portable = try #require(item as? PortableFSItem)
     let identity = try PfsMacOSStableIdentity(portable.identity.stableIdentity)
-    let fileID = try PfsFSKitMapping.itemIdentifier(from: portable.identity.itemID).rawValue
+    let fileID = try PfsFSKitMapping.itemIdentifier(from: portable.fileID).rawValue
     let operand = try authenticator.makeOperand(
         epoch: boundaryEpoch,
         sequence: 2,
@@ -1137,7 +1137,7 @@ extension PfsLocalMockDaemonTests {
     )
     let portable = try #require(item as? PortableFSItem)
     let identity = try PfsMacOSStableIdentity(portable.identity.stableIdentity)
-    let fileID = try PfsFSKitMapping.itemIdentifier(from: portable.identity.itemID).rawValue
+    let fileID = try PfsFSKitMapping.itemIdentifier(from: portable.fileID).rawValue
     let operand = try authenticator.makeOperand(
         epoch: boundaryEpoch,
         sequence: 93,

@@ -147,7 +147,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         itemID: 7,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 7, kind: .file)
 
     // Sixty racing callbacks all name the exact authenticated source. Exactly
     // one may be swallowed; the rest must fail closed, because each extra
@@ -216,12 +216,12 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         itemID: 7,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 7, kind: .file)
     let wrong = PortableFSItem(identity: .init(
         itemID: 8,
         generation: 1,
         stableIdentity: parentIdentity.bytes
-    ))
+    ), fileID: 8, kind: .file)
     #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: parentIdentity.bytes,
         name: Data("victim".utf8),
@@ -346,7 +346,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         itemID: 9,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 9, kind: .file)
 
     // Before the exact source removal there is no data-repair window.
     #expect(await registry.consumeArmedTruncate(
@@ -401,7 +401,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         itemID: 10,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 10, kind: .file)
     #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: parentIdentity.bytes,
         name: Data("data.bin".utf8),
@@ -429,7 +429,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         itemID: 7,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 7, kind: .file)
     // Exact basename and object, wrong directory: never swallowed.
     #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: itemIdentity.bytes,
@@ -452,7 +452,7 @@ private func writeFile(_ url: URL, bytes: Int) throws {
         itemID: 7,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 7, kind: .file)
     #expect(try await registry.consumeArmedSourceRemoval(
         parentIdentity: parentIdentity.bytes,
         name: Data("victim".utf8),
@@ -835,12 +835,12 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         itemID: 1,
         generation: 1,
         stableIdentity: root.bytes
-    ))
+    ), fileID: 1, kind: .directory)
     let directoryItem = PortableFSItem(identity: .init(
         itemID: 2,
         generation: 1,
         stableIdentity: directory.bytes
-    ))
+    ), fileID: 2, kind: .directory)
     let live = PfsMacOSLiveObjectIndex()
     try await live.record(item: rootItem, vfsFileID: 2)
     try await live.record(item: directoryItem, vfsFileID: 3)
@@ -964,7 +964,7 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         itemID: 77,
         generation: 1,
         stableIdentity: file.bytes
-    ))
+    ), fileID: 77, kind: .file)
     try await live.record(
         item: item,
         vfsFileID: 41,
@@ -1125,7 +1125,7 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         itemID: 1,
         generation: 1,
         stableIdentity: root.bytes
-    ))
+    ), fileID: 1, kind: .directory)
     try await live.record(item: rootItem, vfsFileID: 2)
     let planner = PfsMacOSRepairPlanner(index: index, liveObjects: live)
 
@@ -1170,7 +1170,7 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
             itemID: itemID,
             generation: 1,
             stableIdentity: file.bytes
-        ))
+        ), fileID: itemID, kind: .file)
         try await live.record(item: item, vfsFileID: vfsFileID)
         // The last name disappeared, but each mount still has an open FSItem.
         await namespace.forget(parentIdentity: directory, name: Data("open.bin".utf8))
@@ -1240,7 +1240,7 @@ private func makeIndexFixture() async throws -> (PfsMacOSNamespaceIndex, PfsMacO
         itemID: 70,
         generation: 1,
         stableIdentity: itemIdentity.bytes
-    ))
+    ), fileID: 70, kind: .file)
     let complete = try PfsMacOSCoherenceEvent(
         epoch: enforcementEpoch,
         sequence: 1,

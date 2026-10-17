@@ -26,7 +26,7 @@ set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository, and the
 # same image the privileged XFS/FUSE and coherence jobs use.
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c}"
 # The device the authority serves, and the log device that records every write
 # to it. The log must be larger than the target: it holds a copy of every
 # written block plus one metadata block each, and dm-log-writes stops recording
@@ -122,6 +122,13 @@ install_container_dependencies() {
   # losetup, blockdev, findmnt.
   apt-get install -y -qq --no-install-recommends \
     xfsprogs dmsetup kmod fuse3 util-linux procps >/dev/null
+  # The mount pins its exact kernel abort descriptor before serving. Device
+  # access alone cannot prove that boundary; mount the control filesystem in
+  # this container just as the other privileged qualification lanes do.
+  [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
+  mountpoint -q /sys/fs/fuse/connections ||
+    mount -t fusectl none /sys/fs/fuse/connections ||
+    fail "cannot mount FUSE control filesystem" 69
 }
 
 # ensure_loop_nodes pre-creates the loop device nodes.

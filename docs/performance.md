@@ -225,7 +225,11 @@ The shipping FSKit composition was mounted on an 18-core Apple M5 Max MacBook
 Pro with 128 GiB RAM and macOS 26.5. It used protocol 5 over TLS to an XFS
 authority inside the exact Linux 6.12.100 VZ guest. A strict Linux mount was
 attached to the same volume throughout the measurement. Every bulk run verified
-SHA-256, and writes include `fsync` in the reported durable rate.
+SHA-256, and writes include `fsync` in the reported write rate. That `fsync`
+completed at authority application, not storage durability: FSKit delivers no
+fsync callback, and the authority did not then sync Mac mutations. Current
+FSKit mutation replies are storage-durable, so these rows are not a durable
+baseline.
 
 | operation | macOS FSKit median |
 | --- | ---: |
@@ -239,11 +243,11 @@ SHA-256, and writes include `fsync` in the reported durable rate.
 | rename | 16.743 ms |
 | mkdir / rmdir | 6.652 / 12.999 ms |
 | unlink | 16.053 ms |
-| 64 MiB durable write | 128.2 MiB/s |
+| 64 MiB write + fsync (authority-applied) | 128.2 MiB/s |
 | 64 MiB `F_NOCACHE` read | 71.1 MiB/s |
 
-The 4 KiB `write` timing is page-cache acceptance, not authority durability;
-the `fsync` and 64 MiB durable rows are the meaningful completion boundaries.
+The 4 KiB `write` timing is page-cache acceptance; the `fsync` and 64 MiB rows
+measured authority application, the completion boundary of that protocol.
 The final matching-client 64 MiB write runs were 117.8, 128.8, 128.2, 144.1,
 and 29.7 MiB/s; the low run is retained rather than discarded. Five earlier
 uncached reads were 55.6–75.5 MiB/s and all matched the expected digest.

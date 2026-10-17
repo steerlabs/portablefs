@@ -495,7 +495,7 @@ private func objectNativeDataRepair(size: UInt64) -> PfsMacOSCacheRepair {
         itemID: 42,
         generation: 7,
         stableIdentity: testItemIdentity.bytes
-    ))
+    ), fileID: 42, kind: .file)
     return .invalidateDataObject(
         object: PfsMacOSLiveObjectReference(
             item: item,

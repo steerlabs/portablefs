@@ -79,11 +79,10 @@ enum PortableFSDReleaseIdentityError: Error {
 
 public enum PortableFSDServiceCoordinator {
     private static let bundleProgram = "Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd"
-    private static let registeredIdentityDefaultsKey = "PFSRegisteredLaunchAgentIdentity"
     private static let identitySchemaVersion = 1
     private static let controlProtocolVersion = 1
     private static let pfsLocalMajor: UInt32 = 1
-    private static let pfsLocalMinor: UInt32 = 15
+    private static let pfsLocalMinor: UInt32 = 16
     // CS_RUNTIME from Security/CSCommon.h. Swift does not import that C enum
     // case, but SecCode returns the same documented static-signature bitset.
     static let hardenedRuntimeFlag: UInt32 = 0x0001_0000
@@ -99,13 +98,35 @@ public enum PortableFSDServiceCoordinator {
         let buildVersion: String
     }
 
-    private struct LiveDaemonIdentity: Decodable {
+    struct LiveDaemonIdentity: Decodable {
         let schemaVersion: Int
         let controlProtocol: Int
         let daemonVersion: String
         let executableSha256: String
         let pfslocalMajor: UInt32
         let pfslocalMinor: UInt32
+
+        func releaseIdentity(sealed: PortableFSDReleaseIdentity) throws -> PortableFSDReleaseIdentity {
+            guard schemaVersion == identitySchemaVersion,
+                  controlProtocol == controlProtocolVersion,
+                  daemonVersion == sealed.daemonVersion,
+                  executableSha256 == sealed.executableSHA256 else {
+                throw RegistrationError.liveIdentityFailed(
+                    "running daemon does not match its signed owning app"
+                )
+            }
+            // The authenticated outgoing binary declares its local protocol;
+            // the incoming app's compiled protocol cannot describe an older release.
+            return try PortableFSDReleaseIdentity(
+                codeDirectoryHash: sealed.codeDirectoryHash,
+                executableSHA256: sealed.executableSHA256,
+                daemonVersion: sealed.daemonVersion,
+                identitySchema: schemaVersion,
+                controlProtocol: controlProtocol,
+                pfslocalMajor: pfslocalMajor,
+                pfslocalMinor: pfslocalMinor
+            ).validated()
+        }
     }
 
     /// One kernel-pinned execution of the sealed daemon. `pidversion` is part
@@ -237,22 +258,18 @@ public enum PortableFSDServiceCoordinator {
         let service = SMAppService.agent(plistName: configuration.plistName)
         switch service.status {
         case .enabled:
-            let registeredIdentity = loadRegisteredIdentity()
-            if registeredIdentity == nil,
-               liveDaemonMatches(releaseIdentity, bundle: bundle) {
-                try persistRegisteredIdentity(releaseIdentity)
+            let running = try runningDaemon(configuration: configuration)
+            if running?.releaseIdentity == releaseIdentity,
+               running?.bundle.bundleURL.standardizedFileURL == bundle.bundleURL.standardizedFileURL {
                 return .enabled
             }
-            if registeredIdentity != releaseIdentity ||
-                !liveDaemonMatches(releaseIdentity, bundle: bundle) {
-                try reregister(
-                    service: service,
-                    bundle: bundle,
-                    socketDirectory: socketDirectory,
-                    registeredIdentity: registeredIdentity,
-                    releaseIdentity: releaseIdentity
-                )
-            }
+            try reregister(
+                service: service,
+                bundle: bundle,
+                socketDirectory: socketDirectory,
+                running: running,
+                releaseIdentity: releaseIdentity
+            )
             return .enabled
         case .requiresApproval:
             SMAppService.openSystemSettingsLoginItems()
@@ -288,7 +305,6 @@ public enum PortableFSDServiceCoordinator {
                             releaseIdentity,
                             bundle: bundle
                         )
-                        try persistRegisteredIdentity(releaseIdentity)
                     },
                     fence: {
                         try fenceNewRegistration(
@@ -352,18 +368,13 @@ public enum PortableFSDServiceCoordinator {
             bundle: bundle,
             configuration: configuration
         )
-        guard loadRegisteredIdentity() == releaseIdentity else {
-            throw RegistrationError.liveIdentityFailed(
-                "the persisted registered release is not this sealed release"
-            )
-        }
         let service = SMAppService.agent(plistName: configuration.plistName)
         guard service.status == .enabled else {
             throw RegistrationError.registrationDidNotPersist
         }
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
-            registeredIdentity: releaseIdentity
+            runningIdentity: releaseIdentity
         )
         do {
             // Capture the exact current listener only after the mount/attach
@@ -403,7 +414,6 @@ public enum PortableFSDServiceCoordinator {
             configuration: configuration
         )
         guard sealed == expectedRelease,
-              loadRegisteredIdentity() == expectedRelease,
               SMAppService.agent(plistName: configuration.plistName).status == .enabled else {
             throw RegistrationError.liveIdentityFailed(
                 "the completed installer release is not this sealed registered release"
@@ -438,7 +448,6 @@ public enum PortableFSDServiceCoordinator {
                     throw RegistrationError.registrationDidNotPersist
                 }
                 try requireLiveDaemon(sealed, bundle: bundle)
-                try persistRegisteredIdentity(sealed)
             },
             fence: {
                 try fenceNewRegistration(
@@ -509,7 +518,7 @@ public enum PortableFSDServiceCoordinator {
         }
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
-            registeredIdentity: expectedRelease
+            runningIdentity: expectedRelease
         )
         defer { updateGuard.release() }
 
@@ -522,7 +531,6 @@ public enum PortableFSDServiceCoordinator {
             )
         case .enabled:
             try requireLiveDaemon(expectedRelease, bundle: bundle)
-            try persistRegisteredIdentity(expectedRelease)
         case .requiresApproval:
             throw RegistrationError.registrationDidNotPersist
         @unknown default:
@@ -753,57 +761,38 @@ public enum PortableFSDServiceCoordinator {
         ).validated()
     }
 
-    private static func loadRegisteredIdentity() -> PortableFSDReleaseIdentity? {
-        guard let data = UserDefaults.standard.data(
-            forKey: registeredIdentityDefaultsKey
-        ) else {
-            return nil
-        }
-        return try? JSONDecoder().decode(PortableFSDReleaseIdentity.self, from: data)
-    }
-
-    private static func persistRegisteredIdentity(_ identity: PortableFSDReleaseIdentity) throws {
-        let data = try JSONEncoder().encode(identity)
-        UserDefaults.standard.set(data, forKey: registeredIdentityDefaultsKey)
-        guard UserDefaults.standard.data(
-            forKey: registeredIdentityDefaultsKey
-        ) == data else {
-            throw RegistrationError.persistIdentity
-        }
+    private struct RunningDaemon {
+        let bundle: Bundle
+        let releaseIdentity: PortableFSDReleaseIdentity
     }
 
     private static func reregister(
         service: SMAppService,
         bundle: Bundle,
         socketDirectory: URL,
-        registeredIdentity: PortableFSDReleaseIdentity?,
+        running: RunningDaemon?,
         releaseIdentity: PortableFSDReleaseIdentity
     ) throws {
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
-            registeredIdentity: registeredIdentity
+            runningIdentity: running?.releaseIdentity
         )
         defer { updateGuard.release() }
 
-        // An enabled service is updated in place only after the outgoing daemon
-        // is proven gone, by exactly one of two proofs. The preferred proof is a
-        // process witness captured from the authenticated live control peer
-        // after admission is quiesced and before registration mutation. When no
-        // such peer can be authenticated — the daemon was never bootstrapped,
-        // exited, or no longer matches the persisted identity — the fallback is
-        // proof of absence, not an assumption of absence: `.unpublished` makes
-        // `unregisterAndWait` require a nonblocking exclusive flock on the
-        // canonical state singleton, which any live daemon holds. A daemon that
-        // is running but unreachable therefore still fails the update closed,
-        // while a genuinely absent one no longer wedges the enabled service into
-        // a state only `register()` could clear.
-        let processWitness = daemonDepartureProof {
-            guard let registeredIdentity else {
-                throw RegistrationError.liveIdentityFailed(
-                    "an enabled service has no persisted registered identity"
-                )
+        // Reauthenticate after mount admission closes. The outgoing identity
+        // comes from its signed owning bundle and live socket peer, never a
+        // preference or the incoming release's version.
+        let processWitness: DaemonFenceWitness
+        if let running {
+            processWitness = .process(try probeLiveDaemon(
+                running.releaseIdentity,
+                bundle: running.bundle
+            ))
+        } else {
+            guard try stateSingletonIsUnlocked() else {
+                throw RegistrationError.daemonStateSingletonHeld
             }
-            return try probeLiveDaemon(registeredIdentity, bundle: bundle)
+            processWitness = .unpublished
         }
         try unregisterAndWait(
             service: service,
@@ -818,7 +807,6 @@ public enum PortableFSDServiceCoordinator {
                     throw RegistrationError.registrationDidNotPersist
                 }
                 try requireLiveDaemon(releaseIdentity, bundle: bundle)
-                try persistRegisteredIdentity(releaseIdentity)
             },
             fence: {
                 try fenceNewRegistration(
@@ -957,22 +945,6 @@ public enum PortableFSDServiceCoordinator {
         statusNotRegistered && runtimePathsAbsent && processDeparted
     }
 
-    /// Chooses which departure proof an in-place update must satisfy. An
-    /// authenticated live control peer yields the strongest proof — a process
-    /// witness bound to that exact execution. Every other case (no persisted
-    /// identity, no daemon bootstrapped, a daemon whose identity no longer
-    /// matches) yields `.unpublished`, which is a weaker proof but still a
-    /// proof: it resolves through the canonical state singleton's exclusive
-    /// flock, which a live daemon holds for its whole lifetime. Selecting
-    /// `.unpublished` therefore never asserts absence, it only decides which
-    /// question `unregisterAndWait` must get a "yes" to before mutating.
-    static func daemonDepartureProof(
-        probe: () throws -> DaemonProcessWitness
-    ) -> DaemonFenceWitness {
-        guard let witness = try? probe() else { return .unpublished }
-        return .process(witness)
-    }
-
     private static func runtimePaths(bundle: Bundle) throws -> [URL] {
         try runtimePaths(
             socketDirectory: try PortableFSAppGroupBootstrap.prepare(bundle: bundle)
@@ -1031,7 +1003,7 @@ public enum PortableFSDServiceCoordinator {
 
     private static func acquireEmptyInventoryGuard(
         bundle: Bundle,
-        registeredIdentity: PortableFSDReleaseIdentity?
+        runningIdentity: PortableFSDReleaseIdentity?
     ) throws -> EmptyInventoryGuard {
         let cliURL = bundle.bundleURL
             .appendingPathComponent("Contents/Helpers", isDirectory: true)
@@ -1048,12 +1020,12 @@ public enum PortableFSDServiceCoordinator {
         var arguments = [
             "lifecycle", "hold-install-exclusive", "--json"
         ]
-        if let registeredIdentity {
+        if let runningIdentity {
             arguments += [
-                "--expected-daemon-version", registeredIdentity.daemonVersion,
-                "--expected-daemon-sha256", registeredIdentity.executableSHA256,
-                "--expected-pfslocal-major", String(registeredIdentity.pfslocalMajor),
-                "--expected-pfslocal-minor", String(registeredIdentity.pfslocalMinor),
+                "--expected-daemon-version", runningIdentity.daemonVersion,
+                "--expected-daemon-sha256", runningIdentity.executableSHA256,
+                "--expected-pfslocal-major", String(runningIdentity.pfslocalMajor),
+                "--expected-pfslocal-minor", String(runningIdentity.pfslocalMinor),
             ]
         }
         process.arguments = arguments
@@ -1332,16 +1304,67 @@ public enum PortableFSDServiceCoordinator {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private static func liveDaemonMatches(
-        _ releaseIdentity: PortableFSDReleaseIdentity,
-        bundle: Bundle
-    ) -> Bool {
+    private static func runningDaemon(configuration: Configuration) throws -> RunningDaemon? {
+        let fd: Int32
         do {
-            let witness = try probeLiveDaemon(releaseIdentity, bundle: bundle)
-            witness.close()
-            return true
-        } catch {
-            return false
+            fd = try PfsUnixSocket.connect(path: try controlSocketURL().path)
+        } catch PfsLocalClientError.system(let code, let operation)
+            where operation == "connect" && code == ENOENT {
+            return nil
+        }
+        defer { PfsUnixSocket.close(fd) }
+        let peer = try captureDaemonPeer(fd)
+        let bundleURL = try daemonOwningBundle(executableURL: peer.executableURL)
+        guard let bundle = Bundle(url: bundleURL) else {
+            throw RegistrationError.invalidHostBundle(bundleURL.path)
+        }
+        let owner = try validateHostAndConfiguration(bundle: bundle)
+        try validateServiceOwner(owner, expected: configuration)
+        let releaseIdentity = try validateSealedBundle(bundle: bundle, configuration: owner)
+        let witness = try authenticateDaemonPeer(
+            peer,
+            releaseIdentity: releaseIdentity,
+            configuration: owner,
+            bundle: bundle
+        )
+        let reported = try readDaemonIdentity(fd)
+        let runningIdentity = try reported.releaseIdentity(sealed: releaseIdentity)
+        guard try !witness.hasExited() else {
+            throw RegistrationError.invalidDaemonProcessWitness
+        }
+        return RunningDaemon(bundle: bundle, releaseIdentity: runningIdentity)
+    }
+
+    /// The kernel supplies the executing path; only the canonical nested
+    /// service layout can identify an owning app. No app-directory search or
+    /// preference can nominate a different release for that socket.
+    static func daemonOwningBundle(executableURL: URL) throws -> URL {
+        guard executableURL.isFileURL else {
+            throw RegistrationError.invalidDaemonProcessWitness
+        }
+        var owner = executableURL.standardizedFileURL
+        for component in bundleProgram.split(separator: "/").reversed() {
+            guard owner.lastPathComponent == component else {
+                throw RegistrationError.invalidDaemonProcessWitness
+            }
+            owner.deleteLastPathComponent()
+        }
+        guard owner.pathExtension == "app" else {
+            throw RegistrationError.invalidHostBundle(owner.path)
+        }
+        return owner
+    }
+
+    static func validateServiceOwner(_ owner: Configuration, expected: Configuration) throws {
+        guard owner.hostBundleIdentifier == expected.hostBundleIdentifier,
+              owner.plistName == expected.plistName,
+              owner.label == expected.label,
+              owner.serviceBundleIdentifier == expected.serviceBundleIdentifier,
+              owner.teamIdentifier == expected.teamIdentifier,
+              owner.appGroupIdentifier == expected.appGroupIdentifier else {
+            throw RegistrationError.liveIdentityFailed(
+                "the control socket belongs to a different signed service"
+            )
         }
     }
 
@@ -1374,11 +1397,39 @@ public enum PortableFSDServiceCoordinator {
         let fd = try PfsUnixSocket.connect(path: try controlSocketURL().path)
         defer { PfsUnixSocket.close(fd) }
         let processWitness = try authenticateDaemonPeer(
-            fd,
+            captureDaemonPeer(fd),
             releaseIdentity: releaseIdentity,
             configuration: configuration,
             bundle: bundle
         )
+        try requireDaemonIdentity(fd, releaseIdentity: releaseIdentity, processWitness: processWitness)
+        return processWitness
+    }
+
+    private static func requireDaemonIdentity(
+        _ fd: Int32,
+        releaseIdentity: PortableFSDReleaseIdentity,
+        processWitness: DaemonProcessWitness
+    ) throws {
+        let identity = try readDaemonIdentity(fd)
+        guard identity.schemaVersion == releaseIdentity.identitySchema,
+              identity.controlProtocol == releaseIdentity.controlProtocol,
+              identity.daemonVersion == releaseIdentity.daemonVersion,
+              identity.executableSha256 == releaseIdentity.executableSHA256,
+              identity.pfslocalMajor == releaseIdentity.pfslocalMajor,
+              identity.pfslocalMinor == releaseIdentity.pfslocalMinor else {
+            throw RegistrationError.liveIdentityFailed(
+                "running daemon does not match the sealed executable"
+            )
+        }
+        guard try !processWitness.hasExited() else {
+            throw RegistrationError.liveIdentityFailed(
+                "authenticated daemon exited during identity proof"
+            )
+        }
+    }
+
+    private static func readDaemonIdentity(_ fd: Int32) throws -> LiveDaemonIdentity {
         var timeout = timeval(tv_sec: 2, tv_usec: 0)
         guard setsockopt(
             fd,
@@ -1403,7 +1454,8 @@ public enum PortableFSDServiceCoordinator {
         var sent = 0
         while sent < request.count {
             let count = request.withUnsafeBytes { bytes in
-                Darwin.write(fd, bytes.baseAddress!.advanced(by: sent), request.count - sent)
+                guard let baseAddress = bytes.baseAddress else { return -1 }
+                return Darwin.write(fd, baseAddress.advanced(by: sent), request.count - sent)
             }
             if count < 0, errno == EINTR { continue }
             guard count > 0 else {
@@ -1434,31 +1486,16 @@ public enum PortableFSDServiceCoordinator {
         }
         let body = response[boundary.upperBound...]
         try PortableFSDStrictJSON.validate(Data(body))
-        let identity = try JSONDecoder().decode(LiveDaemonIdentity.self, from: body)
-        guard identity.schemaVersion == releaseIdentity.identitySchema,
-              identity.controlProtocol == releaseIdentity.controlProtocol,
-              identity.daemonVersion == releaseIdentity.daemonVersion,
-              identity.executableSha256 == releaseIdentity.executableSHA256,
-              identity.pfslocalMajor == releaseIdentity.pfslocalMajor,
-              identity.pfslocalMinor == releaseIdentity.pfslocalMinor else {
-            throw RegistrationError.liveIdentityFailed(
-                "running daemon does not match the sealed executable"
-            )
-        }
-        guard try !processWitness.hasExited() else {
-            throw RegistrationError.liveIdentityFailed(
-                "authenticated daemon exited during identity proof"
-            )
-        }
-        return processWitness
+        return try JSONDecoder().decode(LiveDaemonIdentity.self, from: body)
     }
 
-    private static func authenticateDaemonPeer(
-        _ descriptor: Int32,
-        releaseIdentity: PortableFSDReleaseIdentity,
-        configuration: Configuration,
-        bundle: Bundle
-    ) throws -> DaemonProcessWitness {
+    private struct DaemonPeer {
+        let auditToken: Data
+        let executableURL: URL
+        let processWitness: DaemonProcessWitness
+    }
+
+    private static func captureDaemonPeer(_ descriptor: Int32) throws -> DaemonPeer {
         var peerUID: uid_t = 0
         var peerGID: gid_t = 0
         guard Darwin.getpeereid(descriptor, &peerUID, &peerGID) == 0,
@@ -1497,9 +1534,6 @@ public enum PortableFSDServiceCoordinator {
             throw RegistrationError.invalidDaemonProcessWitness
         }
 
-        let expectedExecutable = bundle.bundleURL
-            .appendingPathComponent(bundleProgram, isDirectory: false)
-            .standardizedFileURL
         var path = [CChar](repeating: 0, count: 4 * 1_024)
         let pathLength = proc_pidpath_audittoken(
             &token,
@@ -1510,12 +1544,10 @@ public enum PortableFSDServiceCoordinator {
             throw RegistrationError.inspectDaemonProcess(errno)
         }
         let pathBytes = path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
-        guard URL(
+        let executableURL = URL(
             fileURLWithPath: String(decoding: pathBytes, as: UTF8.self),
             isDirectory: false
-        ).standardizedFileURL == expectedExecutable else {
-            throw RegistrationError.invalidDaemonProcessWitness
-        }
+        ).standardizedFileURL
 
         // Register the process event before inspecting code. If this execution
         // exits at any point after its audit token was captured, the queued
@@ -1525,8 +1557,26 @@ public enum PortableFSDServiceCoordinator {
             pid: pid,
             pidVersion: pidVersion
         )
-        let tokenData = withUnsafeBytes(of: &token) { Data($0) }
-        let attributes = [kSecGuestAttributeAudit: tokenData] as CFDictionary
+        return DaemonPeer(
+            auditToken: withUnsafeBytes(of: &token) { Data($0) },
+            executableURL: executableURL,
+            processWitness: processWitness
+        )
+    }
+
+    private static func authenticateDaemonPeer(
+        _ peer: DaemonPeer,
+        releaseIdentity: PortableFSDReleaseIdentity,
+        configuration: Configuration,
+        bundle: Bundle
+    ) throws -> DaemonProcessWitness {
+        let expectedExecutable = bundle.bundleURL
+            .appendingPathComponent(bundleProgram, isDirectory: false)
+            .standardizedFileURL
+        guard peer.executableURL == expectedExecutable else {
+            throw RegistrationError.invalidDaemonProcessWitness
+        }
+        let attributes = [kSecGuestAttributeAudit: peer.auditToken] as CFDictionary
         var dynamicCode: SecCode?
         guard SecCodeCopyGuestWithAttributes(
             nil,
@@ -1587,10 +1637,10 @@ public enum PortableFSDServiceCoordinator {
               entitlements.count == 1,
               entitlements["com.apple.security.application-groups"] as? [String] == [configuration.appGroupIdentifier],
               entitlements["com.apple.security.get-task-allow"] == nil,
-              try !processWitness.hasExited() else {
+              try !peer.processWitness.hasExited() else {
             throw RegistrationError.invalidDaemonProcessWitness
         }
-        return processWitness
+        return peer.processWitness
     }
 
     private enum RegistrationError: LocalizedError {
@@ -1614,7 +1664,6 @@ public enum PortableFSDServiceCoordinator {
         case daemonProcessStillPresent
         case unregisterDidNotComplete
         case liveIdentityFailed(String)
-        case persistIdentity
         case serviceNotFound
         case registrationDidNotPersist
         case registrationFailed(any Error)
@@ -1663,8 +1712,6 @@ public enum PortableFSDServiceCoordinator {
                 return "Service Management did not finish unregistering the previous PortableFS daemon."
             case .liveIdentityFailed(let detail):
                 return "The live PortableFS daemon did not prove the sealed release identity: \(detail)"
-            case .persistIdentity:
-                return "PortableFS could not persist the registered daemon release identity."
             case .serviceNotFound:
                 return "Service Management could not find the bundled PortableFS LaunchAgent."
             case .registrationDidNotPersist:

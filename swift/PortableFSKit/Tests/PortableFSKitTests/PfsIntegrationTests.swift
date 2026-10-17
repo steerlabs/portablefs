@@ -200,11 +200,13 @@ extension PfsLocalMockDaemonTests {
     )
     let before = await core.testingDebugState()
     do {
-        _ = try await core.testingAdoptDaemonItem(identity: PfsItemIdentity(
-            itemID: PfsFSKitMapping.localRepairIdentifierFloor,
-            generation: 1,
-            stableIdentity: Data(repeating: 0x7a, count: 16)
-        ))
+        var attr = PfsAttr()
+        attr.item.itemID = 42
+        attr.item.itemGeneration = 1
+        attr.item.stableIdentity = Data(repeating: 0x7a, count: 16)
+        attr.kind = .file
+        attr.fileID = PfsFSKitMapping.localRepairIdentifierFloor
+        _ = try await core.testingAdoptAttributes(attr)
         Issue.record("expected the reserved daemon item identifier to fail")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EOVERFLOW)
@@ -335,11 +337,11 @@ extension PfsLocalMockDaemonTests {
     let oldContent = bytes("[core]\n\trepositoryformatversion = 0\n")
     let newContent = bytes("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n")
 
-    let config = try await core.createFile(in: git.item, name: bytes("config"), mode: 0o644, exclusive: true)
+    let config = try await core.createFile(in: git.item, name: bytes("config"), mode: 0o644)
     _ = try await core.write(item: config.item, offset: 0, data: oldContent)
     try await core.close(item: config.item)
 
-    let lock = try await core.createFile(in: git.item, name: bytes("config.lock"), mode: 0o644, exclusive: true)
+    let lock = try await core.createFile(in: git.item, name: bytes("config.lock"), mode: 0o644)
     _ = try await core.write(item: lock.item, offset: 0, data: newContent)
     try await core.close(item: lock.item)
 
@@ -451,20 +453,21 @@ extension PfsLocalMockDaemonTests {
     }
 }
 
-@Test func itemTableDetectsGenerationMismatch() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let stale = await core.testingAdoptItem(identity: PfsItemIdentity(itemID: 99, generation: 1))
-    _ = await core.testingAdoptItem(identity: PfsItemIdentity(itemID: 99, generation: 2))
-
-    do {
-        _ = try await core.getattr(item: stale)
-        Issue.record("expected old generation to be rejected")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ESTALE)
+@Test func itemTableRejectsOwnershipHandleReuse() async throws {
+    let core = VolumeCore(client: PfsLocalClient(socketPath: "/unused-identity-test"))
+    var attr = PfsAttr()
+    attr.item.itemID = 99
+    attr.item.itemGeneration = 1
+    attr.fileID = 99
+    attr.kind = .file
+    let item = try await core.testingAdoptAttributes(attr)
+    attr.item.itemGeneration = 2
+    await #expect(throws: PfsLocalClientError.self) {
+        try await core.testingAdoptAttributes(attr)
     }
+    #expect(!item.reclaimed)
+    try await core.reclaimLocalRepairSource(item: item)
+    #expect(item.reclaimed)
 }
 
 /// The chflags(2) write path end to end: the extension forwards the intent and

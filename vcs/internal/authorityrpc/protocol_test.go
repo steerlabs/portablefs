@@ -59,7 +59,7 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_Tmpfile{}, true, false, false},
 		{&authoritypb.Request_GetLock{}, true, false, false},
 		{&authoritypb.Request_SetLock{}, true, false, false},
-		{&authoritypb.Request_Write{}, true, false, false},
+		{&authoritypb.Request_Write{}, true, true, false},
 		{&authoritypb.Request_NextLeaseEvent{}, false, false, false},
 		{&authoritypb.Request_AcknowledgeLeaseEvent{}, false, false, false},
 		{&authoritypb.Request_RenewLeases{}, false, false, false},

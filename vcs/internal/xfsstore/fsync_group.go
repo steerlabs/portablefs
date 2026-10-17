@@ -12,6 +12,7 @@ type fsyncWaiter struct {
 	fd                 int
 	lead               chan []*fsyncWaiter
 	done               chan error
+	failure            func(error) error
 }
 
 // inodeFsyncState is shared by every open handle for one stable incarnation.
@@ -25,6 +26,7 @@ type inodeFsyncState struct {
 	appliedGeneration uint64
 	inFlight          bool
 	pending           []*fsyncWaiter
+	syncFailure       error
 	refs              int
 
 	// PortableFS rejects every xattr mutation, and the authority exclusively
@@ -70,11 +72,20 @@ func (s *inodeFsyncState) applied() {
 }
 
 func (s *inodeFsyncState) barrier(fd int, dataOnly bool, fsync, fdatasync func(int) error) (int, error) {
+	return s.barrierWithFailure(fd, dataOnly, fsync, fdatasync, nil)
+}
+
+func (s *inodeFsyncState) barrierWithFailure(fd int, dataOnly bool, fsync, fdatasync func(int) error, failure func(error) error) (int, error) {
 	waiter := &fsyncWaiter{
 		full: !dataOnly, fd: fd,
-		lead: make(chan []*fsyncWaiter, 1), done: make(chan error, 1),
+		lead: make(chan []*fsyncWaiter, 1), done: make(chan error, 1), failure: failure,
 	}
 	s.mu.Lock()
+	if failure != nil && s.syncFailure != nil {
+		err := s.syncFailure
+		s.mu.Unlock()
+		return 0, failure(err)
+	}
 	waiter.requiredGeneration = s.appliedGeneration
 	if !s.inFlight {
 		s.inFlight = true
@@ -108,6 +119,23 @@ func (s *inodeFsyncState) runFsyncBatch(leader *fsyncWaiter, batch []*fsyncWaite
 		err = fdatasync(leader.fd)
 	}
 
+	// Linux errseq reports a writeback failure once per open description. Keep
+	// every observed error, including ordinary fsync failures, so a later
+	// required barrier cannot mistake a consumed error for durable storage.
+	s.mu.Lock()
+	if err != nil && s.syncFailure == nil {
+		s.syncFailure = err
+	}
+	sticky := s.syncFailure
+	s.mu.Unlock()
+	if sticky != nil {
+		for _, waiter := range batch {
+			if waiter.failure != nil {
+				err = waiter.failure(sticky)
+				break
+			}
+		}
+	}
 	s.mu.Lock()
 	for _, waiter := range batch {
 		if waiter.requiredGeneration > coveredGeneration || waiter.full && !full {

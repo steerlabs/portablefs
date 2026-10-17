@@ -8,8 +8,8 @@ import (
 )
 
 func TestProtocolMinorRequiresAuthorityProtocolV5(t *testing.T) {
-	if ProtocolMinor != 15 {
-		t.Fatalf("ProtocolMinor = %d, want 15", ProtocolMinor)
+	if ProtocolMinor != 16 {
+		t.Fatalf("ProtocolMinor = %d, want 16", ProtocolMinor)
 	}
 	if VisibilityPhasePrepare != 1 || VisibilityPhaseComplete != 2 {
 		t.Fatalf("visibility phase values changed: prepare=%d complete=%d", VisibilityPhasePrepare, VisibilityPhaseComplete)

@@ -40,10 +40,8 @@ public enum PfsErrorMapper {
 
 public enum PfsFSKitMapping {
     /// FSKit reserves identifiers 0, 1, and 2 for invalid, parent-of-root,
-    /// and root respectively. PortableFS uses authority inode 1 for its root,
-    /// so expose the complete pfslocal identity space through one checked
-    /// offset at the platform boundary. VolumeCore and portablefsd continue
-    /// to use the unmodified durable identity.
+    /// and root respectively. PortableFS assigns file ID 1 to its root. File IDs
+    /// are independent of daemon ownership handles and use one checked offset.
     ///
     /// The high half of the identifier space is minted locally for macOS 26
     /// repair scratch items, which the daemon must never know about. This is a
@@ -53,16 +51,16 @@ public enum PfsFSKitMapping {
     /// former 4,096-ID band exhausted under an ordinary peer-create soak and
     /// terminally broke coherence even though XFS had ample space.
     ///
-    /// Refusing an authority item with the high bit set keeps the two spaces
-    /// provably disjoint while leaving 2^63-1 durable item identifiers.
+    /// Refusing an authority file ID with the high bit set keeps the two spaces
+    /// provably disjoint while leaving 2^63-1 filesystem object numbers.
     public static let localRepairIdentifierFloor: UInt64 = 1 << 63
 
-    public static func itemIdentifier(from itemID: UInt64) throws -> FSItem.Identifier {
-        guard itemID > 0, itemID < localRepairIdentifierFloor,
-              let identifier = FSItem.Identifier(rawValue: itemID + 1) else {
+    public static func itemIdentifier(from fileID: UInt64) throws -> FSItem.Identifier {
+        guard fileID > 0, fileID < localRepairIdentifierFloor,
+              let identifier = FSItem.Identifier(rawValue: fileID + 1) else {
             throw PfsLocalClientError.daemon(
                 errno: EOVERFLOW,
-                message: "pfslocal item identifier cannot be represented by FSKit"
+                message: "pfslocal file ID cannot be represented by FSKit"
             )
         }
         return identifier
@@ -118,13 +116,13 @@ public enum PfsFSKitMapping {
     }
 
     private static func parentIdentifier(from attr: PfsAttr) throws -> FSItem.Identifier {
-        if attr.item.itemID == 1 {
+        if attr.fileID == 1 {
             return .parentOfRoot
         }
-        guard attr.hasParent else {
+        guard attr.parentFileID != 0 else {
             return .invalid
         }
-        return try itemIdentifier(from: attr.parent.itemID)
+        return try itemIdentifier(from: attr.parentFileID)
     }
 
     /// The identifier the synthetic `".."` entry carries during enumeration.
@@ -133,10 +131,10 @@ public enum PfsFSKitMapping {
     /// whose last name is gone has no live parent to name, so both resolve to
     /// the enumerated directory itself.
     public static func parentDirectoryIdentifier(from attr: PfsAttr) throws -> FSItem.Identifier {
-        guard attr.item.itemID != 1, attr.hasParent else {
-            return try itemIdentifier(from: attr.item.itemID)
+        guard attr.fileID != 1, attr.parentFileID != 0 else {
+            return try itemIdentifier(from: attr.fileID)
         }
-        return try itemIdentifier(from: attr.parent.itemID)
+        return try itemIdentifier(from: attr.parentFileID)
     }
 
     /// Builds one atomic FSKit snapshot. Get-attribute and readdir-plus callers
@@ -156,7 +154,7 @@ public enum PfsFSKitMapping {
         try attributes(
             from: attr,
             requested: requested,
-            fileIdentifier: itemIdentifier(from: attr.item.itemID)
+            fileIdentifier: itemIdentifier(from: attr.fileID)
         )
     }
 
@@ -168,9 +166,9 @@ public enum PfsFSKitMapping {
         from attr: PfsAttr,
         requested: FSItem.Attribute? = nil
     ) throws -> FSItem.Attributes {
-        guard attr.item.itemID >= localRepairIdentifierFloor,
-              attr.item.itemID < UInt64.max,
-              let identifier = FSItem.Identifier(rawValue: attr.item.itemID + 1) else {
+        guard attr.fileID >= localRepairIdentifierFloor,
+              attr.fileID < UInt64.max,
+              let identifier = FSItem.Identifier(rawValue: attr.fileID + 1) else {
             throw PfsLocalClientError.daemon(
                 errno: EOVERFLOW,
                 message: "local repair identifier cannot be represented by FSKit"
@@ -350,7 +348,7 @@ public enum PfsFSKitMapping {
 
     public static func supportedCapabilities(from capabilities: PfsCapabilities) -> FSVolume.SupportedCapabilities {
         let supported = FSVolume.SupportedCapabilities()
-        supported.supportsPersistentObjectIDs = true
+        supported.supportsPersistentObjectIDs = false
         supported.supportsSymbolicLinks = capabilities.symlinks
         supported.supportsHardLinks = capabilities.hardLinks
         supported.supports64BitObjectIDs = true

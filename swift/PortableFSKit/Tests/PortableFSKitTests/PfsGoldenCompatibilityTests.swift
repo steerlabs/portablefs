@@ -211,3 +211,116 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     expectedEnvelope.body = .getAttrReply(expectedReply)
     try assertFrameRoundTrip(expectedEnvelope, golden: frame)
 }
+
+private func goldenRootItem() -> PfsItem {
+    var root = PfsItem()
+    root.itemID = 1
+    root.itemGeneration = 9
+    root.stableIdentity = Data(repeating: 0x20, count: 16)
+    return root
+}
+
+@Test func goAttrFileIDsGoldenDecodesAndReencodesByteIdentically() throws {
+    let frame = try goldenFrame("attr_file_ids.hex")
+    let envelope = try decodeSingleGoldenEnvelope(frame)
+    guard case let .lookupReply(reply)? = envelope.body else {
+        Issue.record("expected lookupReply body, got \(String(describing: envelope.body))")
+        return
+    }
+    #expect(reply.attr.fileID == (1 << 62) + 5)
+    #expect(reply.attr.parentFileID == 1)
+    #expect(reply.attr.item.itemID == 23)
+
+    var item = PfsItem()
+    item.itemID = 23
+    item.itemGeneration = 9
+    item.stableIdentity = Data(repeating: 0x44, count: 16)
+    var attr = PfsAttr()
+    attr.item = item
+    attr.kind = .file
+    attr.mode = 0o644
+    attr.nlink = 2
+    attr.uid = 501
+    attr.gid = 20
+    attr.size = 4097
+    attr.mtimeMs = 31
+    attr.ctimeMs = 37
+    attr.atimeMs = 41
+    attr.birthtimeMs = 43
+    attr.parent = goldenRootItem()
+    attr.allocSize = 8192
+    attr.fileID = (1 << 62) + 5
+    attr.parentFileID = 1
+    var expectedReply = PfsLookupReply()
+    expectedReply.attr = attr
+    var expectedEnvelope = PfsEnvelope()
+    expectedEnvelope.requestID = 59
+    expectedEnvelope.publicationAckRequired = true
+    expectedEnvelope.operationID = 4
+    expectedEnvelope.body = .lookupReply(expectedReply)
+    try assertFrameRoundTrip(expectedEnvelope, golden: frame)
+}
+
+@Test func goEnumerateEntriesRequestGoldenDecodesAndReencodesByteIdentically() throws {
+    let frame = try goldenFrame("enumerate_entries_request.hex")
+    var request = PfsEnumerateEntriesRequest()
+    request.dir = goldenRootItem()
+    request.cookie = (1 << 63) + 3
+    request.maxEntries = 64
+    request.wantAttrs = true
+    request.handle = 7
+    var expectedEnvelope = PfsEnvelope()
+    expectedEnvelope.requestID = 61
+    expectedEnvelope.operationID = 5
+    expectedEnvelope.body = .enumerateEntries(request)
+    #expect(try decodeSingleGoldenEnvelope(frame) == expectedEnvelope)
+    try assertFrameRoundTrip(expectedEnvelope, golden: frame)
+}
+
+@Test func goEnumerateEntriesReplyGoldenCarriesNonOwningSnapshots() throws {
+    let frame = try goldenFrame("enumerate_entries_reply.hex")
+    let envelope = try decodeSingleGoldenEnvelope(frame)
+    guard case let .enumerateEntriesReply(reply)? = envelope.body else {
+        Issue.record("expected enumerateEntriesReply body, got \(String(describing: envelope.body))")
+        return
+    }
+    // The Go codec always emits Attr.item; a snapshot's is the empty message.
+    #expect(reply.entries.allSatisfy { $0.attr.item == PfsItem() && !$0.attr.hasParent })
+
+    var file = PfsAttr()
+    file.item = PfsItem()
+    file.kind = .file
+    file.mode = 0o644
+    file.nlink = 2
+    file.uid = 501
+    file.gid = 20
+    file.size = 3
+    file.mtimeMs = 31
+    file.ctimeMs = 37
+    file.atimeMs = 41
+    file.birthtimeMs = 43
+    file.allocSize = 4096
+    file.fileID = 1234
+    file.parentFileID = 1
+    var first = PfsDirEntry()
+    first.name = Data("a".utf8)
+    first.attr = file
+    first.cookie = (1 << 63) + 4
+    var directory = PfsAttr()
+    directory.item = PfsItem()
+    directory.kind = .directory
+    directory.fileID = 5678
+    directory.parentFileID = 1
+    var second = PfsDirEntry()
+    second.name = Data([0xFF, 0x62])
+    second.attr = directory
+    var expectedReply = PfsEnumerateEntriesReply()
+    expectedReply.entries = [first, second]
+    expectedReply.dirVersion = 77
+    var expectedEnvelope = PfsEnvelope()
+    expectedEnvelope.requestID = 61
+    expectedEnvelope.publicationAckRequired = true
+    expectedEnvelope.operationID = 5
+    expectedEnvelope.body = .enumerateEntriesReply(expectedReply)
+    try assertFrameRoundTrip(expectedEnvelope, golden: frame)
+}

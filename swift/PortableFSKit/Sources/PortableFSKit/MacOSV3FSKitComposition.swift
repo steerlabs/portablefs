@@ -187,6 +187,12 @@ private final class PfsMacOSCallbackIngressRegistry: @unchecked Sendable {
         return removed
     }
 
+    func contains(_ reservation: PfsMacOSCallbackIngressReservation) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending[ObjectIdentifier(reservation)] != nil
+    }
+
     func count() -> Int {
         lock.lock()
         defer { lock.unlock() }
@@ -497,6 +503,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
 
     private struct AdmissionWaiter {
         let continuation: CheckedContinuation<Void, Error>
+        let waitingForCapacity: Bool
     }
 
     private let localAuthoritySessionID: Data
@@ -506,7 +513,14 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     private var admissionState = AdmissionState.open
     private var terminal: Error?
     private var admitted: [ObjectIdentifier: PfsMacOSAdmittedCallbackTicket] = [:]
+    // Kernel reclaim bursts are larger than the daemon's request window.
+    // Bound execution here, while ingress remains visible to PREPARE, and
+    // leave authenticated actuator callbacks outside the ordinary window.
+    private let maximumConcurrentCallbacks: Int
+    private var executing: Set<ObjectIdentifier> = []
     private var admissionWaiters: [UUID: AdmissionWaiter] = [:]
+    private var capacityWaiterOrder: [UUID] = []
+    private var capacityWaiterHead = 0
     /// Exact cache coordinates touched by the current repair. They scope the
     /// PREPARE drain and post-PREPARE refusal. Namespace mutators declare a
     /// whole-parent selector in addition to their exact child coordinate: live
@@ -530,8 +544,10 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
 
     public init(
         localAuthoritySessionID: Data,
-        policy: PfsMacOSCachePolicy = .synchronousVFSRepairV2
+        policy: PfsMacOSCachePolicy = .synchronousVFSRepairV2,
+        maximumConcurrentCallbacks: Int = 128
     ) throws {
+        precondition(maximumConcurrentCallbacks > 0)
         guard localAuthoritySessionID.count == 16 else {
             throw PfsMacOSCoherenceError.invalidSessionIDLength(localAuthoritySessionID.count)
         }
@@ -550,6 +566,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         }
         self.admissionRefusal = admissionRefusal
         self.allowsNaturalPeerDrain = allowsNaturalPeerDrain
+        self.maximumConcurrentCallbacks = maximumConcurrentCallbacks
         ingressRegistry = PfsMacOSCallbackIngressRegistry(
             admissionRefusal: admissionRefusal
         )
@@ -587,19 +604,26 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     ) async throws -> PfsMacOSAdmittedCallbackTicket? {
         let ticket = reservation.ticket
         let key = ObjectIdentifier(ticket)
-        let wasPending = ingressRegistry.remove(reservation)
+        let wasPending = ingressRegistry.contains(reservation)
         if exemptFromAdmission {
+            ingressRegistry.remove(reservation)
             admitted.removeValue(forKey: key)
             return nil
         }
-        if admitted[key] != nil {
+        if let terminal { throw terminal }
+        if admitted[key] != nil, ticket.hasClosedFutureRequests() {
+            // PREPARE already owns this pre-cut callback. Its closed ticket
+            // permits no RPC, so it can return its definite refusal without
+            // waiting for execution capacity held by the drain itself.
             return ticket
         }
-        guard wasPending else {
+        guard wasPending || admitted[key] != nil else {
             if let terminal { throw terminal }
             throw PfsMacOSCoherenceError.transportClosed
         }
-        return try await admitExisting(ticket, scope: reservation.scope)
+        let admittedTicket = try await admitExisting(ticket, scope: reservation.scope)
+        ingressRegistry.remove(reservation)
+        return admittedTicket
     }
 
     /// Finalizes every reservation only after its FSKit reply closure returns.
@@ -637,12 +661,26 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         _ ticket: PfsMacOSAdmittedCallbackTicket,
         scope: PfsMacOSCallbackScope
     ) async throws -> PfsMacOSAdmittedCallbackTicket {
+        // A resumed waiter can observe cancellation after its cancellation
+        // handler has left scope. Hand unused capacity onward on every exit,
+        // including that gap between waking and installing an executing ticket.
+        defer {
+            if executing.count < maximumConcurrentCallbacks { wakeCapacityWaiter() }
+        }
         while true {
             try Task.checkCancellation()
             if let terminal { throw terminal }
+            if admitted[ObjectIdentifier(ticket)] != nil,
+               ticket.hasClosedFutureRequests() {
+                return ticket
+            }
             let overlaps = scope.overlaps(closedRepairScope ?? .conservative)
             switch admissionState {
             case .open:
+                if executing.count >= maximumConcurrentCallbacks {
+                    try await waitForAdmission(waitingForCapacity: true)
+                    continue
+                }
                 try Task.checkCancellation()
                 return admitImmediately(ticket)
             case .repairActive where overlaps:
@@ -666,26 +704,16 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
                 }
                 throw admissionRefusal
             case .awaitingAuthorityAcknowledgement where overlaps:
-                let waiterID = UUID()
-                try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation {
-                        (continuation: CheckedContinuation<Void, Error>) in
-                        if Task.isCancelled {
-                            continuation.resume(throwing: CancellationError())
-                            return
-                        }
-                        admissionWaiters[waiterID] = AdmissionWaiter(
-                            continuation: continuation
-                        )
-                    }
-                } onCancel: {
-                    Task { await self.cancelAdmissionWaiter(waiterID) }
-                }
+                try await waitForAdmission(waitingForCapacity: false)
                 // ACK and cancellation may wake together. Re-check cancellation
                 // and the current gate state before installing the reserved
                 // ticket, so cancellation cannot leak it into the next drain.
                 continue
             case .repairActive, .awaitingAuthorityAcknowledgement:
+                if executing.count >= maximumConcurrentCallbacks {
+                    try await waitForAdmission(waitingForCapacity: true)
+                    continue
+                }
                 try Task.checkCancellation()
                 return admitImmediately(ticket)
             }
@@ -696,7 +724,52 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         _ ticket: PfsMacOSAdmittedCallbackTicket
     ) -> PfsMacOSAdmittedCallbackTicket {
         admitted[ObjectIdentifier(ticket)] = ticket
+        executing.insert(ObjectIdentifier(ticket))
         return ticket
+    }
+
+    private func waitForAdmission(waitingForCapacity: Bool) async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                admissionWaiters[waiterID] = AdmissionWaiter(
+                    continuation: continuation,
+                    waitingForCapacity: waitingForCapacity
+                )
+                if waitingForCapacity { capacityWaiterOrder.append(waiterID) }
+            }
+        } onCancel: {
+            Task { await self.cancelAdmissionWaiter(waiterID) }
+        }
+    }
+
+    private func wakeCapacityWaiter() {
+        while capacityWaiterHead < capacityWaiterOrder.count {
+            let id = capacityWaiterOrder[capacityWaiterHead]
+            capacityWaiterHead += 1
+            guard let waiter = admissionWaiters.removeValue(forKey: id) else { continue }
+            waiter.continuation.resume()
+            break
+        }
+        if capacityWaiterHead >= 256,
+           capacityWaiterHead >= capacityWaiterOrder.count / 2 {
+            capacityWaiterOrder.removeFirst(capacityWaiterHead)
+            capacityWaiterHead = 0
+        }
+    }
+
+    private func wakeCapacityWaitersForPrepare() {
+        let ids = admissionWaiters.compactMap { $0.value.waitingForCapacity ? $0.key : nil }
+        capacityWaiterOrder.removeAll(keepingCapacity: true)
+        capacityWaiterHead = 0
+        for id in ids {
+            admissionWaiters.removeValue(forKey: id)?.continuation.resume()
+        }
     }
 
     private func cancelAdmissionWaiter(_ id: UUID) {
@@ -748,6 +821,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     public func published(_ ticket: PfsMacOSAdmittedCallbackTicket) {
         let key = ObjectIdentifier(ticket)
         admitted.removeValue(forKey: key)
+        if executing.remove(key) != nil { wakeCapacityWaiter() }
         guard ticket.markPublished() else { return }
         if signposter.isEnabled {
             let now = DispatchTime.now().uptimeNanoseconds
@@ -761,6 +835,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
     }
 
     public func admittedCallbackCount() -> Int { admitted.count }
+    func executingCallbackCount() -> Int { executing.count }
     func pendingAdmissionWaiterCount() -> Int { admissionWaiters.count }
     func refusedCallbackCounts() -> (ordered: UInt64, other: UInt64) {
         (refusedOrderedCallbacks, refusedOtherCallbacks)
@@ -803,6 +878,7 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         // revokes it. Source mutations publish through their own callback and
         // never enter this peer repair stream.
         admissionState = .repairActive
+        wakeCapacityWaitersForPrepare()
         // Snapshot before waiting: callbacks admitted later are held at the
         // gate and are not this barrier's obligation.
         //
@@ -908,6 +984,8 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         // task cancellation.
         let waiters = Array(admissionWaiters.values)
         admissionWaiters.removeAll()
+        capacityWaiterOrder.removeAll(keepingCapacity: true)
+        capacityWaiterHead = 0
         for waiter in waiters {
             waiter.continuation.resume()
         }
@@ -932,6 +1010,8 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
         }
         let waiters = Array(admissionWaiters.values)
         admissionWaiters.removeAll()
+        capacityWaiterOrder.removeAll(keepingCapacity: true)
+        capacityWaiterHead = 0
         for waiter in waiters {
             waiter.continuation.resume(throwing: error)
         }
@@ -1130,7 +1210,7 @@ public final class PfsMacOSV3VolumeCoherence:
         let namespaceIndex = PfsMacOSNamespaceIndex(rootIdentity: rootIdentity)
         let liveObjects = PfsMacOSLiveObjectIndex()
         let rootVFSFileID = try PfsFSKitMapping.itemIdentifier(
-            from: rootItem.identity.itemID
+            from: rootItem.fileID
         ).rawValue
         guard try await liveObjects.record(
             item: rootItem,
@@ -1298,7 +1378,7 @@ public final class PfsMacOSV3NativeVolumeCoherence:
         )
         let liveObjects = PfsMacOSLiveObjectIndex()
         let rootVFSFileID = try PfsFSKitMapping.itemIdentifier(
-            from: rootItem.identity.itemID
+            from: rootItem.fileID
         ).rawValue
         guard try await liveObjects.record(
             item: rootItem,

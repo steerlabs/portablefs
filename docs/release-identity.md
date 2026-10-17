@@ -266,7 +266,14 @@ privilege or accidental CLI privilege.
 **An exact service-update identity.** Before an installed host permits bundle
 replacement, both the old and target nested services are bound by the service
 CodeDirectory hash, full executable SHA-256, daemon version, control identity
-schema, control protocol, and `pfslocal` major/minor. The owner-private durable
+schema, control protocol, and `pfslocal` major/minor. The live socket peer's
+kernel-authenticated executable path identifies its owning signed app. The
+host validates that app's service layout, signing team, product, and app group,
+then proves the live daemon against that sealed release. Preferences are not
+service identity authority. Normal startup can replace an older release of the
+same service only after empty-inventory admission and a fresh process proof
+under that guard; an unknown socket owner is refused before unregistration.
+The owner-private durable
 activation lease stores those tuples, a bounded phase/deadline, and only the
 SHA-256 of a random one-use token. The plaintext token crosses only
 credential-checked Unix-socket sessions and never appears in defaults, argv,

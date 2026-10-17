@@ -25,7 +25,7 @@ set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository, and the
 # same image the privileged XFS/FUSE integration job uses.
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c}"
 : "${PORTABLEFS_XFS_IMAGE_SIZE:=1G}"
 : "${PORTABLEFS_SERVICE_UID:=200001}"
 : "${PORTABLEFS_SERVICE_GID:=200001}"

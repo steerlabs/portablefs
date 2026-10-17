@@ -38,7 +38,9 @@ cache-capable handle accounting, full and writethrough modes, and generation
 checks on every delegated flush. `delegation-control-v1` requires recall,
 break, mode changes, their acks, and batch release. `session-durable-sequence-v1` and `root-directory-barrier-v1` require session
 application/durability tickets and the root FSYNCDIR barrier. Optional
-`batched-close-v1` advertises the bounded DATA close operation below.
+`batched-close-v1` advertises the bounded DATA close operation below. Optional
+FSKit `fskit-direct-write-v1` (Hello) and `fskit-durable-mutations-v1`
+(Activate) are specified under FSKit writes and durability.
 
 Linux no longer requires or advertises `lease-coherence-v1`,
 `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`,
@@ -544,6 +546,37 @@ identity turn. This bound does not establish kernel mount absence: old durable
 records still block topology changes and archive proof. Prior compatibility or
 untyped legacy membership continues to require explicit fencing evidence.
 
+
+## FSKit writes and durability
+
+The authority advertises `fskit-direct-write-v1` in the FSKit Hello reply and
+`fskit-durable-mutations-v1` in the FSKit Activate reply. Neither joins the
+frozen required sets: an older Mac client ignores them, while a current Mac
+client requires both and refuses an authority that lacks either.
+
+`fskit-direct-write-v1` admits the ordinary `Request.write` body (tag 55) for
+FSKit sessions. Its meaning is unchanged: one positioned write of an
+out-of-line payload no larger than the negotiated maximum write, with the
+existing replay fingerprint, short-write, and post-apply carriers. FSKit
+sessions must leave `append`, `sync`, `data_sync`, `delegation`,
+`flush_sequence`, `lock_owner`, and the LOCK_OWNER write flag unset; the
+authority refuses them with EINVAL before admission. The request carries the
+FSKit source-publication gate for the open handle's item attributes and data,
+like fragmented COMMIT. FSKit sessions receive no application ticket or durable
+sequence. The fragmented BEGIN/DATA/COMMIT/ABORT bodies keep their meanings for
+clients that still use them.
+
+FSKit delivers no fsync, directory-sync, or F_FULLFSYNC callback. Under
+`fskit-durable-mutations-v1`, every FSKit mutation that applied or may have
+applied is therefore made durable before its reply is sent or retained as a
+replay outcome. The authority forces the operation's last storage transaction:
+a full fsync of the written, truncated, or attribute-changed inode, of a newly
+created file or directory, or of the changed parent directory for symlink,
+link, unlink, and rename. When no syncable descriptor can be opened, such as an
+object whose owner lacks read permission or a symlink, it uses syncfs on the
+volume root. Any error from that sync is an uncertain EIO with
+FAILURE_CLASS_STORAGE and fences the epoch. Visibility publication may precede
+durability; the reply may not.
 
 ## Batched descriptor close
 

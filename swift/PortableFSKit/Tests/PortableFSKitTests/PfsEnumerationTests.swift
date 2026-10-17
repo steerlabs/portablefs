@@ -97,7 +97,7 @@ extension PfsLocalMockDaemonTests {
     #expect(stats.enumerateRequests == 5)
 }
 
-@Test func directCoreEnumerationMetadataCannotBeAdoptedAfterPrefixZeroSettlement() async throws {
+@Test func directCoreEnumerationTransfersNoItemOwnership() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(
@@ -131,17 +131,11 @@ extension PfsLocalMockDaemonTests {
     )
     #expect(page.entries.count == 2)
     #expect(await core.testingDebugState().itemCount == 1)
-    await #expect(throws: PfsLocalClientError.invalidFrame(
-        "enumeration item adoption requires an unsettled resource reply"
-    )) {
-        try await core.adoptEnumeratedItems(page.entries)
-    }
-    #expect(await core.testingDebugState().itemCount == 1)
-    for _ in 0..<100 {
-        if await daemon.stats().resourceAcceptedItemCounts.count >= 2 { break }
-        try await Task.sleep(nanoseconds: 1_000_000)
-    }
-    #expect(await daemon.stats().resourceAcceptedItemCounts.allSatisfy { $0 == 0 })
+    #expect(page.entries.allSatisfy { $0.attr.item == PfsItem() && $0.attr.parent == PfsItem() && $0.attr.fileID > 1 })
+    #expect(page.entries.allSatisfy { $0.attr.parentFileID == root.fileID })
+    let stats = await daemon.stats()
+    #expect(stats.resourceAcceptedItemCounts == [0]) // Retained directory open only.
+    #expect(stats.reclaimRequests == 0)
     try await core.close(item: root, retainingModes: .unspecified)
 }
 }

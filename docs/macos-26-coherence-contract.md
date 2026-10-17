@@ -1,19 +1,20 @@
 # macOS 26 FSKit synchronous-repair contract
 
-Status: **admitted protocol-6 `FSKIT_SYNC_REPAIR` profile with best-effort host
+Status: **admitted protocol-7 `FSKIT_SYNC_REPAIR` profile with best-effort host
 cache repair**
 
 This document defines the deliberately weaker macOS 26 platform contract and
 preserves its dated protocol-5 measurements as evidence. Current admission
 rules are in [fskit-mount.md](./fskit-mount.md); historical measurements below
-remain labeled and are not represented as protocol-6 qualification.
+remain labeled and are not represented as protocol-7 qualification.
 
 PortableFS now names these guarantees instead of pretending both operating
 systems expose the same cache controls:
 
-- Linux uses the exact protocol-6 N/A/D/E lease profile on stock FUSE 7.31+.
+- Linux uses the exact protocol-7 subscription/delegation profile on stock
+  FUSE 7.31+.
 - macOS 26 uses `macos26-synchronous-vfs-repair-v2`. It provides ordinary
-  mounted filesystem behavior, authenticated protocol-6 access, synchronous
+  mounted filesystem behavior, authenticated protocol-7 access, synchronous
   repair attempts, and fail-closed error handling. It does not claim an exact
   multi-writer cache cut that FSKit 26 cannot express.
 - The macOS 27 handler uses the same FSKit profile with stronger native data
@@ -26,9 +27,10 @@ There is no TTL downgrade, local-filesystem substitution, or protocol fallback.
 ## What works on macOS 26
 
 The shipping FSKit composition is `PortableFSFileSystem.macOS26BestEffort()`.
-It uses the protocol-6 FSKit profile, replay identities, source-publication
-operations, fragmented-write staging, TLS identity checks, and terminal
-fencing. It does not enter the Linux lease profile.
+It uses the protocol-7 FSKit profile, replay identities, source-publication
+operations, one-frame writes, durable mutation acknowledgements, TLS identity
+checks, and terminal fencing. It does not enter the Linux subscription/delegation
+profile.
 
 The following behavior has been exercised against the hosted protocol-5 stack,
 including runs with a simultaneously attached Linux reader:
@@ -97,8 +99,11 @@ protocol bookkeeping:
 - authority responses remain retained until the physical FSKit reply,
   `PublicationAck`, duplicate-handler retirement, and resource disposition
   boundaries are complete;
-- write BEGIN, DATA, COMMIT, and ABORT responses belong to the same logical
-  publication lifetime;
+- each write chunk is one authority mutation whose response belongs to its
+  callback's publication lifetime (older clients' BEGIN, DATA, COMMIT, and
+  ABORT share one lifetime);
+- every applied mutation is durable on authority storage before its reply,
+  because FSKit delivers no fsync callback that could carry durability later;
 - a terminal authority response cannot be acknowledged before the local reply
   boundary it represents;
 - a definite pre-apply rejection publishes no mutation, while an assigned or
@@ -117,7 +122,7 @@ produced:
 
 | path | median |
 | --- | ---: |
-| macOS FSKit durable write (`write` + `fsync`) | 128.2 MiB/s |
+| macOS FSKit `write` + `fsync` (authority-applied, not storage-durable) | 128.2 MiB/s |
 | macOS FSKit `F_NOCACHE` read with SHA verification | 71.1 MiB/s |
 | Linux strict durable write with Mac peer attached (pre-lease diagnostic) | 100.8 MiB/s |
 | Linux strict durable write after clean Mac handoff | 120.9 MiB/s |
@@ -131,6 +136,11 @@ MiB/s, with every digest matching. Small-operation Mac medians included create 1
 stat 0.001 ms, negative lookup 1.0 ms, open/read/close 2.3 ms, rename 16.7 ms,
 and unlink 16.1 ms. The ordinary Mac `write` return rate is page-cache
 acceptance and is not reported as durable throughput.
+
+These protocol-5 Mac rows predate durable FSKit acknowledgements. FSKit
+delivers no fsync callback, and the authority did not then sync Mac mutations,
+so their `fsync` completed at authority application rather than storage
+durability. They are not a durable baseline for the current profile.
 
 Historical Archil numbers used a different machine, transport, cache policy,
 and completion boundary. They remain useful context, not an exact ranking.

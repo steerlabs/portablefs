@@ -461,7 +461,13 @@ for (const { relativePath, contents } of appGroupBuildInputs) {
     "$(PORTABLEFS_APP_GROUP)",
     `${relativePath} exact app-group build setting`
   );
+  if (/\/(App|PortableFSKitDev|PortableFSKitMacOS27Dev)\/Info\.plist$/.test(relativePath)) {
+    requireText(contents, "<key>NSLocalNetworkUsageDescription</key>", `${relativePath} local network purpose`);
+    requireText(contents, "<key>NSNetworkVolumesUsageDescription</key>", `${relativePath} network volume access purpose`);
+  }
 }
+requireText(helperEmbedder, "-insert NSLocalNetworkUsageDescription", "daemon service local network purpose");
+requireText(helperEmbedder, "-insert NSNetworkVolumesUsageDescription", "daemon service network volume access purpose");
 for (const { relativePath, contents } of appGroupBuildConfigs) {
   requireText(
     contents,
@@ -491,7 +497,6 @@ for (const { relativePath, contents } of appGroupBuildConfigs) {
     }
   }
 }
-let developerProjectVersion = "";
 for (const { relativePath, contents } of [
   {
     relativePath: "swift/PortableFSApp/PortableFSApp.xcodeproj/project.pbxproj",
@@ -514,13 +519,17 @@ for (const { relativePath, contents } of [
       `${relativePath} must give all four development configurations one stable SemVer default`
     );
   }
-  if (developerProjectVersion === "") developerProjectVersion = projectVersion;
-  if (projectVersion !== developerProjectVersion) {
+  if (projectVersion !== versionMatch?.[1]) {
     failures.push(
-      `${relativePath} development version ${projectVersion || "<invalid>"} differs from ${developerProjectVersion}`
+      `${relativePath} development version ${projectVersion || "<invalid>"} must match VERSION`
     );
   }
 }
+requireText(
+  helperEmbedder,
+  '[ "${MARKETING_VERSION:-}" != "$version" ]',
+  "embedded tools reject a version different from repository VERSION"
+);
 for (const { relativePath, contents } of developmentProjects) {
   for (const contract of [
     'name = "Embed PortableFS tools";',

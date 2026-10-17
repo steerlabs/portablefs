@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -58,6 +59,8 @@ func (f *fakeV3VisibilityClient) NextVisibility(ctx context.Context, _ *authorit
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-f.done:
+		return nil, io.ErrClosedPipe
 	case result := <-f.next:
 		return result.event, result.err
 	}
@@ -212,6 +215,7 @@ func TestV3CoherenceBridgeRefusesIncompleteContracts(t *testing.T) {
 
 func TestV3CoherenceBridgeFrontendDisconnectFailsTheStrictSession(t *testing.T) {
 	client := newFakeV3VisibilityClient()
+	t.Cleanup(func() { _ = client.Close() })
 	failures := make(chan error, 1)
 	bridge, err := newV3CoherenceBridge(client, v3CachePolicyFSKit, func(err error) { failures <- err })
 	if err != nil {
@@ -243,6 +247,20 @@ func TestV3CoherenceBridgeFrontendDisconnectFailsTheStrictSession(t *testing.T) 
 	}
 	if got := client.ackedCursors(); len(got) != 0 {
 		t.Fatalf("disconnect falsely acknowledged %#v", got)
+	}
+	if err := bridge.beginDetach(); err != nil {
+		t.Fatalf("terminal frontend's pending event prevented exact kernel teardown: %v", err)
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("frontend loss discarded the authority transport before mount-absence proof")
+	default:
+	}
+	_ = bridge.fail(errors.New("mount-absence proof could not be produced"))
+	select {
+	case <-client.SessionDone():
+	default:
+		t.Fatal("an unprovable teardown retained the authority transport")
 	}
 }
 

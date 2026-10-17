@@ -22,6 +22,10 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PortableFS connects to filesystem authorities on your local network to mount and access your files.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority.</string>
 	<key>NSSystemExtensionUsageDescriptionKey</key>
 	<string>Enable the PortableFS file system extension for local development.</string>
 	<key>PFSAppGroupIdentifier</key>

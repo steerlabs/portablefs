@@ -153,10 +153,9 @@ func (b *v3CoherenceBridge) reserveFrontendPublication(localOperationID uint64) 
 	b.sourcePublication.reserve(localOperationID)
 }
 
-// releaseFrontendPublication closes only the handler reservation. The logical
-// operation remains until PublicationAck even when it acquired no source lease:
-// minor 15 makes the callback semantic verdict mandatory and the daemon must
-// reject an unknown, omitted, or duplicate verdict rather than infer success.
+// releaseFrontendPublication closes the callback reservation only after every
+// handler and PublicationAck retire. Keeping it across gaps between requests
+// prevents a delayed handler from withdrawing its continuation's reservation.
 func (b *v3CoherenceBridge) releaseFrontendPublication(localOperationID uint64) {
 	b.sourcePublication.retire(localOperationID)
 }
@@ -195,6 +194,9 @@ func (b *v3CoherenceBridge) acknowledgePublication(
 ) (bool, error) {
 	known, err := b.sourcePublication.acknowledge(localOperationID, semanticCommit)
 	if err != nil {
+		if errors.Is(err, errV3SourcePublicationNotPublished) {
+			return known, b.stopServing(err)
+		}
 		return known, b.fail(err)
 	}
 	return known, nil
@@ -247,14 +249,14 @@ func (b *v3CoherenceBridge) run(ctx context.Context, deliver func(*pfslocal.Even
 			return err
 		}
 		if err := deliver(&pfslocal.Event{Kind: cloneLocalVisibilityEvent(pending.event)}); err != nil {
-			return b.fail(err)
+			return b.stopServing(err)
 		}
 		select {
 		case <-ctx.Done():
 			if b.acceptPlannedDetachCancellation(ctx.Err()) {
 				return ctx.Err()
 			}
-			return b.fail(ctx.Err())
+			return b.stopServing(ctx.Err())
 		case <-pending.advanced:
 		case <-b.client.SessionDone():
 			return b.fail(sessionFailure(b.client))
@@ -262,17 +264,13 @@ func (b *v3CoherenceBridge) run(ctx context.Context, deliver func(*pfslocal.Even
 	}
 }
 
-// beginDetach distinguishes the one intentional frontend disconnect from a
-// crash. A pending visibility event still owns a repair obligation, so detach
-// refuses until it is acknowledged rather than abandoning an in-flight cache
-// transition.
+// beginDetach gives kernel teardown one owner. A healthy pending event still
+// owns its repair obligation. A terminal frontend can only be unmounted; its
+// pending event must never prevent that exact kernel-absence proof.
 func (b *v3CoherenceBridge) beginDetach() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.terminal != nil {
-		return errors.Join(errV3VisibilityTerminal, b.terminal)
-	}
-	if b.pending != nil || b.detaching {
+	if b.detaching || b.terminal == nil && b.pending != nil {
 		return syscall.EBUSY
 	}
 	b.detaching = true
@@ -356,8 +354,9 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 	// callback before the daemon can observe exact kernel absence and deliver
 	// the proof. Canceling the authority call at that point races away the very
 	// strict session needed to leave the barrier cleanly. The detached poll is
-	// bounded by the authority session itself; successful Detach ends it, while
-	// every non-planned frontend loss closes the client immediately below.
+	// bounded by the authority session itself. Frontend loss fences local
+	// serving immediately, but the supervisor still needs this transport to
+	// deliver exact mount-absence proof before releasing the participant.
 	type nextResult struct {
 		event *authoritypb.VisibilityEvent
 		err   error
@@ -367,8 +366,8 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 	go func() {
 		// The planned-detach branch deliberately leaves this poll alive until
 		// DetachAfterUnmount ends the authority session. Whichever event ends the
-		// poll still releases the child context here; cancellation is idempotent,
-		// so the ordinary-loss branch may also call it to wake NextVisibility.
+		// poll still releases the child context here. Frontend cancellation does
+		// not cancel this authority call before the supervisor can prove unmount.
 		defer cancelPoll()
 		event, err := b.client.NextVisibility(pollCtx, after)
 		polled <- nextResult{event: event, err: err}
@@ -384,8 +383,7 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 			// lane, then ends the session and releases this one goroutine.
 			return nil, ctx.Err()
 		}
-		cancelPoll()
-		return nil, b.fail(ctx.Err())
+		return nil, b.stopServing(ctx.Err())
 	}
 	if err != nil {
 		return nil, b.fail(err)
@@ -558,6 +556,18 @@ func (b *v3CoherenceBridge) abandonBeforeMount() {
 }
 
 func (b *v3CoherenceBridge) fail(cause error) error {
+	cause = b.stopServing(cause)
+	// A transport/protocol failure cannot deliver trustworthy later evidence.
+	// This close also retires a locally terminal bridge after exact unmount.
+	_ = b.client.Close()
+	return cause
+}
+
+// stopServing terminally withdraws local admission and publication. Frontend
+// loss retains the authority transport for the supervisor's exact unmount and
+// absence proof; fail closes it on a transport or protocol error. Neither path
+// permits a replacement frontend to bind this bridge.
+func (b *v3CoherenceBridge) stopServing(cause error) error {
 	if cause == nil {
 		cause = errV3VisibilityTerminal
 	}
@@ -574,7 +584,6 @@ func (b *v3CoherenceBridge) fail(cause error) error {
 		}
 		b.mu.Unlock()
 		b.sourcePublication.fail(cause)
-		_ = b.client.Close()
 		if b.onFailure != nil {
 			b.onFailure(cause)
 		}

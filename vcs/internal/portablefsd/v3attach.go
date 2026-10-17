@@ -432,6 +432,12 @@ func (a *attach) fenceV3(cause error) {
 	}
 }
 
+func (a *attach) stopV3Serving(cause error) {
+	if d := a.v3Backend(); d != nil {
+		_ = d.stopServing(cause)
+	}
+}
+
 // startV3 activates a fresh v3 attach: it dials the authority under the exact
 // declared transport (no probing, no fallback between modes), attaches the
 // branchless strict session, constructs the data plane and coherence bridge,
@@ -670,7 +676,7 @@ func v3LatePublishingReplyDiscardable(body any, errno int32) bool {
 	}
 	switch request := body.(type) {
 	case *pfslocal.LookupRequest,
-		*pfslocal.EnumerateRequest,
+		*pfslocal.EnumerateEntriesRequest,
 		*pfslocal.GetAttrRequest,
 		*pfslocal.ReadRequest,
 		*pfslocal.ReadlinkRequest,
@@ -683,8 +689,8 @@ func v3LatePublishingReplyDiscardable(body any, errno int32) bool {
 		return !request.SetFlags && request.Mode == nil && request.Size == nil &&
 			request.MtimeMs == nil && request.AtimeMs == nil
 	case *pfslocal.WriteRequest:
-		// Zero-length Write is implemented as an exact GetAttr and never opens a
-		// transaction or changes append/position state.
+		// Zero-length Write is implemented as an exact GetAttr and never sends a
+		// mutation or changes append/position state.
 		return len(request.Data) == 0
 	default:
 		return false
@@ -742,6 +748,12 @@ func (c *frontendConn) handleV3Attached(
 		resources.visible = true
 	}
 	dispatchCtx := context.WithValue(gateCtx, v3ReplyResourceContextKey{}, resources)
+	// Once assigned, an authority request must settle on its original session
+	// even if the frontend disappears. Preserve the operation's absolute bound;
+	// cancellation still governs local admission and never extends this budget.
+	deadline, _ := ctx.Deadline()
+	dispatchCtx, cancelDispatch := context.WithDeadline(context.WithoutCancel(dispatchCtx), deadline)
+	defer cancelDispatch()
 	dispatchCtx = context.WithValue(
 		dispatchCtx,
 		v3ResponseConsumptionRevokerContextKey{},
@@ -768,17 +780,17 @@ func (c *frontendConn) handleV3Attached(
 	if eno != 0 {
 		if d != nil && (len(resources.items) != 0 || len(resources.handles) != 0) {
 			cleanup, prepareErr := d.abandonCollectedReplyResources(resources)
-			if cleanup != nil && prepareErr == nil {
-				if cleanup.required() {
-					go func() {
-						if err := cleanup.finish(); err != nil {
-							_ = d.fail(err)
-						}
-					}()
-				}
-			}
 			if prepareErr != nil {
 				_ = d.fail(prepareErr)
+			}
+			// finish always runs, even after a terminal verdict: it settles the
+			// abandoned resources' cleanup debt.
+			if cleanup.required() {
+				go func() {
+					if err := cleanup.finish(); err != nil {
+						_ = d.fail(err)
+					}
+				}()
 			}
 			// Incomplete publication of a successful visible resource reply is
 			// detected by the synchronous disposition above. Re-read the terminal
@@ -794,7 +806,7 @@ func (c *frontendConn) handleV3Attached(
 				// ordinary ENOTCONN reply. Revoke the pfslocal serving boundary before
 				// the handler can expose any substitute frame; connection teardown
 				// will retire the response under the already-recorded terminal cause.
-				c.revokeV3ResponseConsumption(a, terminal)
+				c.stopV3FrontendPublication(a, terminal)
 				consumeV3ResponseConsumptions(resources.responseConsumptions)
 				resources.responseConsumptions = nil
 				return
@@ -807,7 +819,7 @@ func (c *frontendConn) handleV3Attached(
 				consumeV3ResponseConsumptions(resources.responseConsumptions)
 				resources.responseConsumptions = nil
 			} else if len(resources.responseConsumptions) != 0 {
-				c.revokeV3ResponseConsumption(a, errors.New("portablefsd: retained authority error reply was not delivered"))
+				c.stopV3FrontendPublication(a, errors.New("portablefsd: retained authority error reply was not delivered"))
 				consumeV3ResponseConsumptions(resources.responseConsumptions)
 				resources.responseConsumptions = nil
 			}
@@ -839,7 +851,7 @@ func (c *frontendConn) handleV3Attached(
 			}
 		}
 		resourceErr = errors.Join(resourceErr, prepareErr)
-		c.revokeV3ResponseConsumption(a, resourceErr)
+		c.stopV3FrontendPublication(a, resourceErr)
 		consumeV3ProvisionalResponses(provisional)
 		consumeV3ResponseConsumptions(resources.responseConsumptions)
 		resources.responseConsumptions = nil
@@ -861,7 +873,7 @@ func (c *frontendConn) handleV3Attached(
 					err = errors.Join(err, cleanupErr)
 				}
 			}
-			c.revokeV3ResponseConsumption(a, err)
+			c.stopV3FrontendPublication(a, err)
 			consumeV3ProvisionalResponses(provisional)
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
@@ -870,7 +882,7 @@ func (c *frontendConn) handleV3Attached(
 		cleanup, registered, err := c.registerProvisionalResourceOrAbandon(requestID, provisional)
 		if !registered {
 			if err != nil {
-				c.revokeV3ResponseConsumption(a, err)
+				c.stopV3FrontendPublication(a, err)
 			} else if cleanup.required() {
 				go func() {
 					if err := cleanup.finish(); err != nil {
@@ -879,7 +891,7 @@ func (c *frontendConn) handleV3Attached(
 				}()
 			}
 			if err == nil {
-				c.revokeV3ResponseConsumption(a, errors.New("portablefsd: retained resource reply lost its disposition table"))
+				c.stopV3FrontendPublication(a, errors.New("portablefsd: retained resource reply lost its disposition table"))
 			}
 			consumeV3ProvisionalResponses(provisional)
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
@@ -894,12 +906,12 @@ func (c *frontendConn) handleV3Attached(
 	if discarded && resourceReply {
 		// The callback already proved NOT_PUBLISHED, so no frontend can send a
 		// ResourceReplyDisposition for this unexposed frame. Withdraw the exact
-		// provisional capabilities without treating a read-only Lookup/Enumerate
-		// result as a failed visible mutation.
+		// provisional capabilities without treating a read-only Lookup result as
+		// a failed visible mutation.
 		if !c.settleProvisionalResource(&pfslocal.ResourceReplyDisposition{
 			TargetRequestID: requestID,
 		}) {
-			c.revokeV3ResponseConsumption(a, errors.New(
+			c.stopV3FrontendPublication(a, errors.New(
 				"portablefsd: discarded late resource reply lost its provisional ownership",
 			))
 		}
@@ -909,7 +921,7 @@ func (c *frontendConn) handleV3Attached(
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
 		} else if len(resources.responseConsumptions) != 0 {
-			c.revokeV3ResponseConsumption(a, errors.New("portablefsd: retained authority reply was not delivered"))
+			c.stopV3FrontendPublication(a, errors.New("portablefsd: retained authority reply was not delivered"))
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
 		}
@@ -927,6 +939,19 @@ func (c *frontendConn) revokeV3ResponseConsumption(a *attach, cause error) {
 	defer c.writeMu.Unlock()
 	if a != nil {
 		a.fenceV3(cause)
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+}
+
+// stopV3FrontendPublication revokes reply delivery without discarding the
+// authority transport needed for the supervisor's exact kernel-absence proof.
+func (c *frontendConn) stopV3FrontendPublication(a *attach, cause error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if a != nil {
+		a.stopV3Serving(cause)
 	}
 	if c.conn != nil {
 		_ = c.conn.Close()
@@ -962,13 +987,17 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 			// A normal v3 detach is deliberately two-phase on Darwin.
 			// dounmount without MNT_FORCE first runs ubc_umount and
 			// VFS_SYNC(MNT_WAIT), returning any sync error before it reaches
-			// vflush. PortableFS itself retains the mount-root descriptor that
-			// macOS 26 repair actuation requires, so that fully synchronized
-			// pass then answers EBUSY. Only that exact errno authorizes the
-			// second MNT_FORCE pass, which revokes the product-owned vnode and
-			// open user references but is not trusted as a flush barrier (XNU
-			// skips VFS_SYNC for forced unmounts). Any other first-pass error
-			// leaves the live mount attached.
+			// vflush. That pass pushes dirty kernel pages as FSKit write
+			// callbacks, and the authority makes every FSKit mutation durable
+			// before replying, so a completed flush is a durable one; no
+			// separate authority sync is reached from VFS_SYNC. PortableFS
+			// itself retains the mount-root descriptor that macOS 26 repair
+			// actuation requires, so that flushed pass then answers EBUSY.
+			// Only that exact errno authorizes the second MNT_FORCE pass,
+			// which revokes the product-owned vnode and open user references
+			// but is not trusted as a flush barrier (XNU skips VFS_SYNC for
+			// forced unmounts). Any other first-pass error leaves the live
+			// mount attached.
 			detachErr = ops.unmountExact(a.mountPath, a.ref, true)
 		}
 		if detachErr != nil {
@@ -1004,20 +1033,30 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	session := a.v3Session
 	d := a.v3Data
 	a.mu.RUnlock()
-	if session != nil && d != nil && d.terminalError() == nil {
-		proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
-		deliverErr := session.DetachAfterUnmount(proofCtx, proof)
-		cancel()
-		if deliverErr != nil {
-			// The proof exists but the authority did not accept it. Ending the
-			// session here is what keeps the detach honest: the authority
-			// fences this participant on its lease instead of carrying a
-			// barrier member whose mount silently vanished.
-			a.fenceV3(fmt.Errorf("deliver v3 mount-absence proof: %w", deliverErr))
-			log.Printf(
-				"portablefsd: attach %s: kernel mount at %s is exactly absent but the mount-absence proof could not be delivered (%v); the strict session ends fenced",
-				a.ref, a.mountPath, deliverErr,
-			)
+	if session != nil && d != nil {
+		// Frontend loss is terminal locally, but the original authority
+		// transport can still accept this exact kernel-absence proof. A
+		// transport already lost or fenced must never be re-established here.
+		select {
+		case <-d.client.SessionDone():
+		default:
+			// Retirements already submitted settle on the live session; the
+			// detach itself releases every capability retired after this point.
+			d.reclaimer.drain()
+			proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
+			deliverErr := session.DetachAfterUnmount(proofCtx, proof)
+			cancel()
+			if deliverErr != nil {
+				// The proof exists but the authority did not accept it. Ending the
+				// session here is what keeps the detach honest: the authority
+				// fences this participant on its lease instead of carrying a
+				// barrier member whose mount silently vanished.
+				a.fenceV3(fmt.Errorf("deliver v3 mount-absence proof: %w", deliverErr))
+				log.Printf(
+					"portablefsd: attach %s: kernel mount at %s is exactly absent but the mount-absence proof could not be delivered (%v); the strict session ends fenced",
+					a.ref, a.mountPath, deliverErr,
+				)
+			}
 		}
 	}
 	// Terminal either way: an already-fenced plane keeps its original cause.

@@ -148,11 +148,15 @@ func (pki v3TestPKI) enrollmentCertificateForClientKey(t *testing.T, enrollmentI
 // authorityrpc server transport: mutual TLS, the full Hello/Attach handshake,
 // and enough of the operation surface for the daemon's v3 data plane.
 type v3TestAuthority struct {
-	epoch                        []byte
-	session                      []byte
-	leaseMillis                  uint64
-	maxFskitWrite                uint64
-	mountEnrollment              bool
+	epoch           []byte
+	session         []byte
+	leaseMillis     uint64
+	maxFskitWrite   uint64
+	mountEnrollment bool
+	// omitDirectWrite/omitDurableMutations model an authority that predates
+	// the FSKit direct-write and durable-mutation contracts.
+	omitDirectWrite              bool
+	omitDurableMutations         bool
 	initialAuthorizationDeadline int64
 	renewedAuthorizationDeadline int64
 
@@ -242,6 +246,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			"authority-keyed-replay-fingerprint-v1", "mandatory-dual-transport-v1", "exact-resource-acquisition",
 			"fskit-sync-repair-v1", "fskit-source-publication-v1", "fskit-fragmented-write-v1",
 		}
+		if !h.omitDirectWrite {
+			features = append(features, "fskit-direct-write-v1")
+		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
 		}
@@ -267,6 +274,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			"stable-item-identity", "volume-syncfs-barrier", "exact-resource-acquisition",
 			"fskit-sync-repair-v1", "fskit-source-publication-v1", "fskit-fragmented-write-v1",
 			"peer-complete-fifo-feedback",
+		}
+		if !h.omitDurableMutations {
+			features = append(features, "fskit-durable-mutations-v1")
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
@@ -784,6 +794,36 @@ func TestV3AttachRequiresFullFSKitWriteCapacityBeforeAttach(t *testing.T) {
 	}
 }
 
+// The daemon sends one ordinary WRITE per chunk and acknowledges FSKit
+// mutations as durable, so an authority that lacks either contract must be
+// refused before a mount exists, never served with weaker semantics.
+func TestV3AttachRefusesAnAuthorityWithoutDirectWriteOrDurableMutations(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*v3TestAuthority)
+	}{
+		{name: "no-direct-write", mutate: func(h *v3TestAuthority) { h.omitDirectWrite = true }},
+		{name: "no-durable-mutations", mutate: func(h *v3TestAuthority) { h.omitDurableMutations = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			test.mutate(handler)
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			t.Cleanup(r.stopPersister)
+			if _, _, err := r.ensure(context.Background(), v3TestEnsureRequest(
+				address, pki, "/Volumes/PortableFSV3MissingContract",
+			)); err == nil {
+				t.Fatal("an authority without the FSKit direct-write/durability contract was accepted")
+			}
+			if len(r.list()) != 0 {
+				t.Fatal("a refused authority contract left a daemon attach registered")
+			}
+		})
+	}
+}
+
 func TestV3DataPlanePreflightFailureReleasesActiveSessionBeforeFSKitMount(t *testing.T) {
 	pki := newV3TestPKI(t)
 	handler := newV3TestAuthority()
@@ -966,6 +1006,75 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 	}
 	if handler.recordedDetach() != nil {
 		t.Fatal("a fenced session delivered detach evidence")
+	}
+}
+
+func TestV3FrontendLossDeliversAbsenceProofBeforeClosingAuthority(t *testing.T) {
+	for name, initiallyPresent := range map[string]bool{"already-absent": false, "mounted": true} {
+		t.Run(name, func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			t.Cleanup(r.stopPersister)
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSFrontendLoss"))
+			d := a.v3Backend()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			done := make(chan error, 1)
+			go func() { done <- d.bridge.run(ctx, func(*pfslocal.Event) error { return nil }) }()
+			deadline := time.Now().Add(time.Second)
+			for {
+				d.bridge.mu.Lock()
+				subscribed := d.bridge.subscribed
+				d.bridge.mu.Unlock()
+				if subscribed {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("frontend did not subscribe")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("frontend loss = %v", err)
+			}
+			if d.terminalError() == nil {
+				t.Fatal("frontend loss did not stop local serving")
+			}
+			select {
+			case <-d.client.SessionDone():
+				t.Fatal("frontend loss closed the authority before the supervisor observed unmount")
+			default:
+			}
+			mounted := initiallyPresent
+			ops := fskitKernelOps{
+				present: func(_, _ string) (bool, error) { return mounted, nil },
+				unmountExact: func(_, _ string, force bool) error {
+					if !mounted || !force {
+						return errors.New("terminal teardown must force only the existing mount")
+					}
+					mounted = false
+					return nil
+				},
+			}
+			if found, _, err := r.unmountFSKitWith(a.ref, true, ops); !found || err != nil {
+				t.Fatalf("retire frontend loss = (%v, %v)", found, err)
+			}
+			if detach := handler.recordedDetach(); detach == nil || detach.GetMountAbsence() == nil {
+				t.Fatal("authority did not receive the exact session's mount-absence proof")
+			}
+			if r.get(a.ref) != nil {
+				t.Fatal("proved retirement left the attach registered")
+			}
+			select {
+			case <-d.client.SessionDone():
+			default:
+				t.Fatal("proved retirement did not close its authority transport")
+			}
+
+		})
 	}
 }
 

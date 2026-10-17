@@ -331,13 +331,13 @@ private func attributeRefreshPlan(
         itemID: 42,
         generation: 1,
         stableIdentity: directoryEvictionItem.bytes
-    ))
+    ), fileID: 42, kind: .file)
     let secondIdentity = try PfsMacOSStableIdentity(Data(repeating: 0xE2, count: 16))
     let second = PortableFSItem(identity: .init(
         itemID: 43,
         generation: 1,
         stableIdentity: secondIdentity.bytes
-    ))
+    ), fileID: 43, kind: .file)
     #expect(try await liveObjects.record(item: first, vfsFileID: 42, capacity: 1))
     #expect(try await liveObjects.record(item: first, vfsFileID: 42, capacity: 1))
     #expect(try await liveObjects.record(item: second, vfsFileID: 43, capacity: 1) == false)
@@ -350,12 +350,12 @@ private func attributeRefreshPlan(
         itemID: 45,
         generation: 1,
         stableIdentity: Data(repeating: 0xE4, count: 16)
-    ))
+    ), fileID: 45, kind: .file)
     let second = PortableFSItem(identity: .init(
         itemID: 46,
         generation: 1,
         stableIdentity: Data(repeating: 0xE5, count: 16)
-    ))
+    ), fileID: 46, kind: .file)
     async let firstRecorded = liveObjects.record(item: first, vfsFileID: 45, capacity: 1)
     async let secondRecorded = liveObjects.record(item: second, vfsFileID: 46, capacity: 1)
     let admitted = try await [firstRecorded, secondRecorded].filter { $0 }

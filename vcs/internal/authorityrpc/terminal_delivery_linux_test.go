@@ -498,3 +498,27 @@ func TestTerminalDeliveryTimeoutDoesNotInventTheOtherFailureClass(t *testing.T) 
 		})
 	}
 }
+
+func TestFragmentedPostApplyReplyCarriesExactTerminalReceiptState(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*authoritypb.Response)
+		want   bool
+	}{
+		{"exact", func(*authoritypb.Response) {}, true},
+		{"missing committed", func(r *authoritypb.Response) { r.GetFskitWrite().Flags = fskitWriteReplyPostApply }, false},
+		{"no sequence", func(r *authoritypb.Response) { r.GetFskitWrite().VisibilitySequence = 0 }, false},
+		{"wrong size", func(r *authoritypb.Response) { r.GetFskitWrite().PostSize = 8 }, false},
+		{"not failed", func(r *authoritypb.Response) { r.GetFskitWrite().Error = 0 }, false},
+		{"outer uncertain", func(r *authoritypb.Response) { r.Uncertain = true }, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := terminalFallocateResponse(9, 4)
+			response.Body = &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{Flags: fskitWriteReplyCommitted | fskitWriteReplyPostApply, Error: -int32(syscall.EIO), PostSize: 9, VisibilitySequence: 4}}
+			test.change(response)
+			if got := terminalReceiptCarriesExactAppliedState(response); got != test.want {
+				t.Fatalf("receipt eligibility=%v want %v", got, test.want)
+			}
+		})
+	}
+}

@@ -97,7 +97,7 @@ func run() error {
 	flag.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "hosted mode: monotonic authority generation")
 	flag.UintVar(&o.maxFrame, "max-frame-bytes", 16<<20, "hard protobuf frame allocation bound")
 	flag.UintVar(&o.maxRead, "max-read-bytes", 1<<20, "maximum bytes in one read reply")
-	flag.UintVar(&o.maxWrite, "max-write-bytes", 1<<20, "maximum bytes in one write request")
+	flag.UintVar(&o.maxWrite, "max-write-bytes", defaultMaxWriteBytes, "maximum bytes in one write request")
 	flag.UintVar(&o.replaySlots, "max-replay-slots", 256, "maximum concurrent retry slots per session")
 	flag.UintVar(&o.maxSessions, "max-sessions", defaultMaxSessions, "maximum live mount sessions for this volume worker")
 	flag.UintVar(&o.maxLockRecords, "max-lock-records", 65536, "maximum held and waiting POSIX lock records")
@@ -106,7 +106,7 @@ func run() error {
 	flag.UintVar(&o.maxItems, "max-items", 65536, "maximum descriptor-backed item capabilities for the worker")
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
 	flag.Uint64Var(&o.maxRetainedReplyBytes, "max-retained-reply-bytes", 512<<20, "total bytes this worker may hold in replay slots")
-	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", 512<<20, "total bytes this worker may have allocated for inbound frames")
+	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", defaultMaxFrameBytesInFlight, "total bytes this worker may have allocated for inbound frames")
 	flag.StringVar(&o.writeStaging, "write-staging-dir", "", "absolute private 0700 directory for unnamed transactional-write staging")
 	flag.Uint64Var(&o.maxWriteStagingBytesPerSession, "max-write-staging-bytes-per-session", 16<<30, "staging bytes reserved by one session")
 	flag.Uint64Var(&o.maxWriteStagingBytes, "max-write-staging-bytes", 64<<30, "staging bytes reserved by this worker")
@@ -198,8 +198,8 @@ func run() error {
 	if o.maxRetainedReplyBytes < uint64(o.maxFrame) {
 		return errors.New("max-retained-reply-bytes must admit at least one maximal reply")
 	}
-	if o.maxFrameBytesInFlight < uint64(o.maxWrite)+reserve {
-		return errors.New("max-frame-bytes-in-flight must admit at least one maximal request")
+	if minimum := authorityrpc.MinimumFrameBytesInFlight(uint32(uint64(o.maxWrite) + reserve)); o.maxFrameBytesInFlight < minimum {
+		return fmt.Errorf("max-frame-bytes-in-flight must be at least %d for one maximal DATA allocation plus the CONTROL/bootstrap reserve", minimum)
 	}
 
 	metrics, err := authoritymetrics.New(o.volumeID)

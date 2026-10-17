@@ -1046,7 +1046,7 @@ func startTestServer(t *testing.T, handler Handler, maxInFlight int, idle time.D
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
 		Handler: handler, MaxFrame: testMaxFrame, MaxInFlight: maxInFlight, MaxConnections: 8,
-		MaxFrameBytesInFlight: 8 << 20, HandshakeTimeout: time.Second, IdleTimeout: idle, WriteTimeout: time.Second,
+		MaxFrameBytesInFlight: controlFrameReserve() + 8<<20, HandshakeTimeout: time.Second, IdleTimeout: idle, WriteTimeout: time.Second,
 	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(ctx, listener, serverTLS) }()

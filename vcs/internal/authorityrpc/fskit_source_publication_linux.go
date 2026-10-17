@@ -120,6 +120,12 @@ func (resolver *operationResolutionContext) deriveSourcePublicationGate(req *aut
 			return volumeserver.SourcePublicationGate{}, syscall.EINVAL
 		}
 		builder.addItem(identity, true, set.Size != nil)
+	case *authoritypb.Request_Write:
+		resolved, err := resolver.open(body.Write.GetHandle())
+		if err != nil {
+			return volumeserver.SourcePublicationGate{}, err
+		}
+		builder.addItem(resolved.identity, true, true)
 	case *authoritypb.Request_FskitWrite:
 		if body.FskitWrite.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT {
 			return volumeserver.SourcePublicationGate{}, syscall.EINVAL

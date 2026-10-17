@@ -259,7 +259,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 						// The source coordinator made the terminal decision while it
 						// still owned the exact lease. Fence the attach before any
 						// frontend publication bookkeeping can release a broader gate.
-						a.fenceV3(err)
+						a.stopV3Serving(err)
 						log.Printf("portablefsd frontend: closing connection: publication semantic commit failed for operation %d: %v", req.OperationID, err)
 						return
 					}
@@ -323,6 +323,13 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 		default:
 			if state != frontendAttached {
+				return
+			}
+			if _, itemOwning := req.(*pfslocal.EnumerateRequest); itemOwning {
+				// Minor 16 lists directories with non-owning entry snapshots. A
+				// frontend that passed the minimum-minor gate never sends the
+				// item-owning form, whose entries would have to be adopted.
+				log.Printf("portablefsd frontend: closing connection: item-owning EnumerateRequest is not served at pfslocal minor %d", pfslocal.ProtocolMinor)
 				return
 			}
 			// Visibility acknowledgement is the strict mount's reserved control
@@ -463,10 +470,10 @@ func (c *frontendConn) close() {
 				"%w: frontend disconnected after exposing %d publishing reply(s) without PublicationAck",
 				errFrontendPublicationUnprovable, lostPublications,
 			)
+			log.Printf("portablefsd: attach %s stopped serving: %v", c.currentAttachRef(), cause)
 			if a := c.currentAttach(); a != nil {
-				a.fenceV3(cause)
+				a.stopV3Serving(cause)
 			}
-			log.Printf("portablefsd: attach %s fenced: %v", c.currentAttachRef(), cause)
 		}
 		// A handler that reached resource registration during the publication
 		// scan has been blocked on resourceMu. Release it only after the exact
@@ -475,10 +482,12 @@ func (c *frontendConn) close() {
 		c.resourceMu.Unlock()
 		if cleanups := abandonV3ProvisionalResources(orphanedResources); len(cleanups) != 0 {
 			go func() {
+				// Every orphaned cleanup finishes, even after one fails, so its
+				// share of the cleanup debt settles; a failure is terminal and
+				// the rest then send nothing.
 				for _, cleanup := range cleanups {
 					if err := cleanup.finish(); err != nil {
 						_ = cleanup.d.fail(err)
-						return
 					}
 				}
 			}()
@@ -507,7 +516,6 @@ func (c *frontendConn) close() {
 		c.publicationMu.Unlock()
 		for operationID, entry := range pending {
 			<-entry.ready
-			c.releaseFrontendPublication(operationID)
 			c.finishLogicalOperation(operationID, entry)
 		}
 		if a := c.currentAttach(); a != nil {
@@ -593,10 +601,6 @@ func resourceBearingV3Reply(body any, collected *v3ReplyResourceCollector) (bool
 		if items != 1 || handles != 0 {
 			return true, fmt.Errorf("portablefsd: %T did not collect exactly one item", body)
 		}
-	case *pfslocal.EnumerateReply:
-		if handles != 0 {
-			return true, errors.New("portablefsd: EnumerateReply unexpectedly collected a handle")
-		}
 	default:
 		if items != 0 || handles != 0 {
 			return false, fmt.Errorf("portablefsd: %T collected resources but has no disposition contract", body)
@@ -607,12 +611,16 @@ func resourceBearingV3Reply(body any, collected *v3ReplyResourceCollector) (bool
 }
 
 func (c *frontendConn) registerProvisionalResource(requestID uint64, resources *v3ProvisionalResources) bool {
-	if requestID == 0 || resources == nil {
+	if requestID == 0 || resources == nil || resources.d == nil {
 		return false
 	}
 	c.resourceMu.Lock()
 	defer c.resourceMu.Unlock()
-	if c.resourceClosed || len(c.provisional) >= maxProvisionalResourcesPerConnection {
+	// Abandoned resources still awaiting authority cleanup share the bound. It
+	// is a terminal capacity guard, not backpressure: a refused registration
+	// makes the handler abandon the reply and stop serving the mount.
+	if c.resourceClosed ||
+		len(c.provisional)+resources.d.outstandingCleanup() >= maxProvisionalResourcesPerConnection {
 		return false
 	}
 	if c.provisional == nil {
@@ -934,7 +942,7 @@ func (c *frontendConn) markPublicationReplyExposedForV3(
 		op := entry.op
 		c.publicationMu.Unlock()
 		op.attach.finishFrontendOperation(op)
-		op.attach.fenceV3(fmt.Errorf(
+		op.attach.stopV3Serving(fmt.Errorf(
 			"%w: logical operation %d produced a publishing reply after its callback acknowledged",
 			errFrontendPublicationUnprovable, operationID,
 		))
@@ -1057,9 +1065,6 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 		delete(c.operations, operationID)
 	}
 	c.publicationMu.Unlock()
-	if inactive {
-		c.releaseFrontendPublication(operationID)
-	}
 	if finish {
 		c.finishLogicalOperation(operationID, entry)
 	}
@@ -1068,20 +1073,16 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *frontendOperationEntry) {
 	if entry != nil && entry.op != nil {
 		a := entry.op.attach
-		a.finishFrontendOperation(entry.op)
-		if bridge := a.v3CoherenceBridge(); bridge != nil {
-			_ = bridge.finishFrontendPublication(operationID)
-		}
-	}
-}
-
-// releaseFrontendPublication closes the authority bridge's serial-reader
-// reservation when activeRequests reaches zero. A source lease is released
-// only after both this retirement and the callback's PublicationAck.
-func (c *frontendConn) releaseFrontendPublication(operationID uint64) {
-	if a := c.currentAttach(); a != nil {
-		if bridge := a.v3CoherenceBridge(); bridge != nil {
+		bridge := a.v3CoherenceBridge()
+		if bridge != nil {
+			// One reservation covers the whole callback, including gaps between
+			// its requests. Only finalization, after every handler and the ack,
+			// retires both ledgers and permits response consumption.
 			bridge.releaseFrontendPublication(operationID)
+		}
+		a.finishFrontendOperation(entry.op)
+		if bridge != nil {
+			_ = bridge.finishFrontendPublication(operationID)
 		}
 	}
 }

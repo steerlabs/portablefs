@@ -3,7 +3,21 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
+
+func TestShippedDefaultFrameCapacity(t *testing.T) {
+	// These are the constants used by main_linux.go's flag registrations, not
+	// a reduced connection-count fixture that could hide a default startup refusal.
+	if err := validateConnectionCapacity(defaultMaxSessions, defaultMaxConnections); err != nil {
+		t.Fatal(err)
+	}
+	minimum := authorityrpc.MinimumFrameBytesInFlight(defaultMaxWriteBytes + authorityrpc.FramePayloadReserve)
+	if defaultMaxFrameBytesInFlight < minimum {
+		t.Fatalf("shipped frame budget %d < startup floor %d (connections %d)", defaultMaxFrameBytesInFlight, minimum, defaultMaxConnections)
+	}
+}
 
 func TestValidateConnectionCapacity(t *testing.T) {
 	tests := []struct {

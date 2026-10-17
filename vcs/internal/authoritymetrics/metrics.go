@@ -144,23 +144,25 @@ type rpcSeries struct {
 // Arrays make operation/outcome selection a direct index into precomputed
 // handles rather than a label map lookup.
 type Metrics struct {
-	coherenceSource      atomic.Pointer[coherenceSource]
-	volume               string
-	registry             *Registry
-	rpc                  [operationCount][outcomeCount]rpcSeries
-	rpcDuration          [operationCount]*Histogram
-	activeSessions       *Gauge
-	itemsHighWater       *Gauge
-	writeTransactions    *Gauge
-	writeWaiting         *Gauge
-	writeStagedBytes     *Gauge
-	writeAdmissionBlocks *Counter
-	writeAdmissionWait   *Histogram
-	fsyncBarrierHandles  *Counter
-	fsyncStorageSyncs    *Counter
-	visibilityDuration   *Histogram
-	visibilityAudience   *Histogram
-	fences               [fenceReasonCount]*Counter
+	coherenceSource         atomic.Pointer[coherenceSource]
+	volume                  string
+	registry                *Registry
+	rpc                     [operationCount][outcomeCount]rpcSeries
+	rpcDuration             [operationCount]*Histogram
+	activeSessions          *Gauge
+	itemsHighWater          *Gauge
+	writeTransactions       *Gauge
+	writeWaiting            *Gauge
+	writeStagedBytes        *Gauge
+	writeAdmissionBlocks    *Counter
+	writeAdmissionWait      *Histogram
+	fsyncBarrierHandles     *Counter
+	fsyncStorageSyncs       *Counter
+	fskitDurabilitySyncs    [3]*Counter
+	fskitDurabilityDuration [3]*Histogram
+	visibilityDuration      *Histogram
+	visibilityAudience      *Histogram
+	fences                  [fenceReasonCount]*Counter
 }
 
 var rpcDurationBuckets = []float64{
@@ -241,6 +243,17 @@ func New(volume string) (*Metrics, error) {
 	metrics.fsyncStorageSyncs, err = registry.RegisterCounter("portablefs_authority_fsync_storage_syncs_total", "Completed storage sync syscalls serving fsync barrier batches.", base)
 	if err != nil {
 		return nil, err
+	}
+	for index, kind := range []string{"handle", "object", "syncfs"} {
+		labels := []Label{base, {Name: "target", Value: kind}}
+		metrics.fskitDurabilitySyncs[index], err = registry.RegisterCounter("portablefs_authority_fskit_durability_syncs_total", "Required FSKit mutation durability barriers by target kind.", labels...)
+		if err != nil {
+			return nil, err
+		}
+		metrics.fskitDurabilityDuration[index], err = registry.RegisterHistogram("portablefs_authority_fskit_durability_duration_seconds", "FSKit mutation durability barrier latency by target kind.", rpcDurationBuckets, labels...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	metrics.visibilityDuration, err = registry.RegisterHistogram("portablefs_authority_visibility_barrier_duration_seconds", "Time from visibility PREPARE dispatch through COMPLETE acknowledgments.", visibilityDurationBuckets, base)
 	if err != nil {
@@ -366,4 +379,25 @@ func (m *Metrics) Fence(reason FenceReason) {
 		reason = FenceOther
 	}
 	m.fences[reason].Inc()
+}
+
+// ObserveFskitDurability counts obligations, including failed barriers. The
+// target vocabulary is fixed and never contains capability or inode labels.
+func (m *Metrics) ObserveFskitDurability(kind string, elapsed time.Duration) {
+	if m == nil {
+		return
+	}
+	index := 0
+	switch kind {
+	case "handle":
+		index = 0
+	case "object":
+		index = 1
+	case "syncfs":
+		index = 2
+	default:
+		return
+	}
+	m.fskitDurabilitySyncs[index].Inc()
+	m.fskitDurabilityDuration[index].Observe(elapsed.Seconds())
 }

@@ -63,10 +63,10 @@ portablefs umount ~/work --json
 ```
 
 A normal unmount runs the full drain barrier and fails, leaving the mount
-attached, if the drain cannot complete. `--force` skips the proof rather than
-abandoning data: a mount holds no local durability debt, because every
-acknowledged write is already applied at the authority. Use `--force` when the
-authority is unreachable and you need the mount gone now.
+attached, if the drain cannot complete. `--force` detaches without that drain,
+so writes still buffered in the local page cache or a delegated write buffer
+can be lost. Use `--force` only when the authority is unreachable and you need
+the mount gone now.
 
 ## The commands that exist
 
@@ -155,8 +155,8 @@ identity.
 
 ## Safety notes
 
-- **Acknowledged means applied.** A returned `write(2)` is in the volume. There
-  is no flush window to wait out and no local tail to lose.
+- **A returned `write(2)` is accepted, not yet durable.** It may still sit in
+  the macOS page cache or a Linux delegated write buffer, as on a local disk.
 - **`close` is not `fsync`.** If you need durability across power loss, `fsync`
   the file and its parent directory, as you would locally.
 - **`syncfs(2)` does not reach the authority** on Linux FUSE. Use file and

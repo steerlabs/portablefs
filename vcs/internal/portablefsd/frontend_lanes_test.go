@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -106,6 +107,182 @@ type countingV3ResponseConsumption struct{ count *atomic.Int32 }
 func (c *countingV3ResponseConsumption) Consume() {
 	if c != nil && c.count != nil {
 		c.count.Add(1)
+	}
+}
+
+func TestPublicationAckRacingLastHandlerRetiresBothLedgersBeforeConsumption(t *testing.T) {
+	const operationID = uint64(307)
+	a, d := publicationTestAttach(t)
+	c := &frontendConn{attach: a}
+	_, participant := publicationTestOperation(t, c, a, operationID)
+	var consumed atomic.Int32
+	if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(
+		operationID, &countingV3ResponseConsumption{count: &consumed},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
+		t.Fatal("semantic publication acknowledgement was refused")
+	}
+	a.finishFrontendParticipant(participant)
+	// Pause the last handler at the actual live failure: its connection count
+	// is zero, while its out-of-lock bridge retirement has not run. The serial
+	// ack reader now owns logical completion and must close both ledgers.
+	c.publicationMu.Lock()
+	c.operations[operationID].activeRequests = 0
+	c.publicationMu.Unlock()
+	if !c.acknowledgePublication(operationID) {
+		t.Fatal("callback acknowledgement was refused")
+	}
+	if err := d.terminalError(); err != nil {
+		t.Fatalf("a healthy publication race terminalized the mount: %v", err)
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("completed publication consumed %d receipts, want 1", got)
+	}
+	// The delayed handler may finish after the ack reader; its retirement is
+	// idempotent and must neither recreate the operation nor consume twice.
+	d.bridge.releaseFrontendPublication(operationID)
+	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
+		t.Fatal(err)
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("late handler consumed the receipt again: %d", got)
+	}
+}
+
+func TestPublicationReservationCoversEveryRequestUntilCallbackCompletion(t *testing.T) {
+	for _, requests := range []int{1, 3} {
+		t.Run(fmt.Sprintf("requests-%d", requests), func(t *testing.T) {
+			const operationID = uint64(308)
+			a, d := publicationTestAttach(t)
+			c := &frontendConn{attach: a}
+			_, participant := publicationTestOperation(t, c, a, operationID)
+			for request := 0; request < requests; request++ {
+				a.finishFrontendParticipant(participant)
+				c.finishLogicalRequest(operationID)
+				d.bridge.sourcePublication.mu.Lock()
+				op := d.bridge.sourcePublication.operations[operationID]
+				reserved := op != nil && op.reserved
+				d.bridge.sourcePublication.mu.Unlock()
+				if !reserved {
+					t.Fatal("a handler withdrew the still-live callback's reservation")
+				}
+				if request+1 < requests {
+					initialize, ok := c.reserveLogicalOperation(operationID, false)
+					if initialize || !ok {
+						t.Fatal("continuation could not join its live callback")
+					}
+					d.bridge.reserveFrontendPublication(operationID)
+					_, next, _, _, err := c.beginLogicalOperation(
+						context.Background(), a, operationID, false, &pfslocal.GetAttrRequest{},
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					participant = next
+				}
+			}
+			if !acknowledgeBridgePublished(t, d.bridge, operationID) ||
+				!c.acknowledgePublication(operationID) {
+				t.Fatal("completed callback acknowledgement was refused")
+			}
+			d.bridge.sourcePublication.mu.Lock()
+			_, retained := d.bridge.sourcePublication.operations[operationID]
+			d.bridge.sourcePublication.mu.Unlock()
+			if retained || d.terminalError() != nil {
+				t.Fatal("completed callback retained its reservation or terminalized the mount")
+			}
+		})
+	}
+}
+
+func TestFrontendLossDrainsAssignedMutationWithoutDiscardingAuthority(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "assigned-loss", v3Data: d, v3Coherence: d.bridge}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &frontendConn{conn: server, attach: a, cancel: cancel}
+	const exposedID, assignedID = uint64(8001), uint64(8002)
+	_, participant := publicationTestOperation(t, c, a, exposedID)
+	if !c.markPublicationReplyExposed(exposedID) {
+		t.Fatal("prior callback did not expose its reply")
+	}
+	a.finishFrontendParticipant(participant)
+	c.finishLogicalRequest(exposedID)
+	initialize, ok := c.reserveLogicalOperation(assignedID, true)
+	if !ok || !initialize {
+		t.Fatal("mutation callback was not reserved")
+	}
+	d.bridge.reserveFrontendPublication(assignedID)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var consumed atomic.Int32
+	client.mu.Lock()
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetMkdir() == nil {
+			return nil, errors.New("unexpected compensation during terminal retirement")
+		}
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+		}
+		response := exactTestMutationReply(identity)
+		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
+			Item: authorityTestItem(2, authoritypb.Attr_DIRECTORY, 0x71, 0x72),
+		}}
+		return response, nil
+	}
+	client.mu.Unlock()
+	c.handlerWG.Add(1)
+	go func() {
+		defer c.handlerWG.Done()
+		c.handleV3Attached(ctx, a, 1, assignedID, true, &pfslocal.MkdirRequest{
+			Dir: d.resolveReply().Root, Name: []byte("during-crash"), Mode: 0o755,
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("mutation never reached its assigned authority call")
+	}
+	closed := make(chan struct{})
+	go func() { c.close(); close(closed) }()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("frontend cancellation did not run")
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("assigned mutation did not settle during frontend retirement")
+	}
+	if !errors.Is(d.terminalError(), errFrontendPublicationUnprovable) {
+		t.Fatalf("local terminal cause = %v", d.terminalError())
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("frontend loss discarded the original authority before mount-absence proof")
+	default:
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("assigned response consumed %d times, want once after revocation", got)
 	}
 }
 
@@ -218,7 +395,7 @@ func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T)
 	a.finishFrontendParticipant(participant)
 }
 
-// A successful authority COMMIT is not consumed at the Go return boundary.
+// A successful authority WRITE is not consumed at the Go return boundary.
 // The receipt remains owned by the exact logical operation while its pfslocal
 // frame is written and while the callback owes PublicationAck. Only the joint
 // Ack + handler-retirement boundary may send the terminal delivery receipt.
@@ -276,14 +453,14 @@ func TestV3RetainedMutationReceiptWaitsForPhysicalReplyAndPublicationAck(t *test
 	}
 	a.finishFrontendParticipant(participant)
 	c.finishLogicalRequest(operationID)
-	if got := consumed.Load(); got != 3 {
-		t.Fatalf("completed logical publication consumed receipt %d time(s), want BEGIN+DATA+COMMIT=3", got)
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("completed logical publication consumed receipt %d time(s), want the one WRITE", got)
 	}
 	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
 		t.Fatal(err)
 	}
-	if got := consumed.Load(); got != 3 {
-		t.Fatalf("duplicate finish consumed receipt %d time(s), want exactly 3", got)
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("duplicate finish consumed receipt %d time(s), want exactly 1", got)
 	}
 }
 
@@ -359,8 +536,8 @@ func TestV3RetainedMutationReceiptTimeoutRevokesBeforeConsumption(t *testing.T) 
 
 	a.finishFrontendParticipant(participant)
 	c.close()
-	if got := consumed.Load(); got != 3 {
-		t.Fatalf("revoked logical publication consumed receipt %d time(s), want BEGIN+DATA+COMMIT=3", got)
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("revoked logical publication consumed receipt %d time(s), want the one WRITE", got)
 	}
 }
 
@@ -792,7 +969,7 @@ func TestV3InvalidResourceDispositionRevokesBeforeReceiptConsumption(t *testing.
 	}
 }
 
-// A malformed parsed COMMIT can itself carry the terminal delivery token. It
+// A malformed parsed WRITE can itself carry the terminal delivery token. It
 // must take the same synchronized local-revocation path as the bounded force
 // callback before the callMutation defer consumes (and therefore receipts)
 // that response.
@@ -809,7 +986,7 @@ func TestV3MalformedRetainedMutationRevokesBeforeReceiptConsumption(t *testing.T
 		return &countingV3ResponseConsumption{count: &consumed}
 	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		response := exactTestWriteCommit(identity, request)
+		response := exactTestWriteReply(identity, request)
 		response.Uncertain = true
 		return response, nil
 	}

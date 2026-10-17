@@ -74,6 +74,13 @@
 // mandatory DATA and CONTROL transports and becomes usable only after its
 // provisional attach is activated. A pre-15 frontend cannot implement these
 // ordering and failure-atomicity rules, so it must fail the minimum-minor gate.
+// Protocol minor 16 separates file identity from item ownership. Attr gains
+// file_id and parent_file_id, the filesystem object numbers FSKit reports;
+// Item stays a daemon-local ownership handle. EnumerateEntriesRequest and
+// EnumerateEntriesReply list a directory as non-owning entry snapshots: no
+// entry carries an Item or transfers item ownership, so listing retains no
+// authority capability. EnumerateRequest/EnumerateReply keep their item-owning
+// meaning and are not served to a minor-16 frontend.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -102,9 +109,10 @@
 // second writer's offset. Without append intent, FSKit's callback remains
 // indistinguishable from an ordinary positional write.
 //
-// Identity model: items are addressed by (item_id, item_generation) — the
-// authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
-// treats them as opaque. attach_ref is an opaque string minted by the daemon's
+// Identity model: items are addressed by (item_id, item_generation), opaque
+// daemon-local ownership handles for authority capabilities. A handle names
+// one retained capability, not a file: after reclaim the same file can return
+// under a new handle. Attr.file_id is the file's identity as FSKit reports it. attach_ref is an opaque string minted by the daemon's
 // control API (EnsureAttach); it carries no secrets and is safe to appear in a
 // mount URL / logs.
 
@@ -198,6 +206,7 @@ message Envelope {
     VisibilityAckRequest visibility_ack = 37;
     V3LivenessRequest v3_liveness = 38;
     ResourceReplyDisposition resource_reply_disposition = 39;
+    EnumerateEntriesRequest enumerate_entries = 40;
 
     // daemon → client (replies)
     HelloReply hello_reply = 60;
@@ -228,6 +237,7 @@ message Envelope {
     SyncVolumeReply sync_volume_reply = 85;
     VisibilityAckReply visibility_ack_reply = 86;
     V3LivenessReply v3_liveness_reply = 87;
+    EnumerateEntriesReply enumerate_entries_reply = 88;
 
     // daemon → client (either)
     ErrorReply error = 90;   // reply position: op failed with errno
@@ -434,10 +444,12 @@ message Attr {
   int64 atime_ms = 10;
   int64 birthtime_ms = 11;
   uint64 content_version = 12; // coherence version; bumps on content change
-  // Actual frontend identity of one live parent binding. Absent for the root
-  // and for retained-but-unlinked Items. Hard-linked Items may have multiple
-  // parents; the daemon returns the parent of the concrete alias used for the
-  // operation, or a deterministic live alias for identity-only operations.
+  // Actual frontend identity of one live parent binding. Absent for the root,
+  // for retained-but-unlinked Items, and whenever no live binding is known,
+  // such as after the observed alias of a hard-linked Item was removed; the
+  // daemon never reports a parent it knows to be stale. Hard-linked Items may
+  // have multiple parents; the daemon returns the parent of the concrete alias
+  // it last observed.
   Item parent = 13;
   // Darwin st_flags. Authority-backed PortableFS Items are zero because the
   // authority exposes no BSD file-flags operation; local grafts carry st_flags.
@@ -445,6 +457,15 @@ message Attr {
   // Storage allocation reported to FSKit. Authority-backed PortableFS uses
   // logical quota allocation; local grafts carry the backing stat allocation.
   uint64 alloc_size = 15;
+  // Filesystem object number, independent of the ownership handle in item.
+  // The volume root is 1; every other authority-backed object is its XFS inode
+  // number, in [2, 2^63). Hard-link aliases share it, and it survives reclaim
+  // and re-lookup of the same inode. It authorizes nothing.
+  uint64 file_id = 16;
+  // file_id of the live parent binding described by parent. Zero exactly when
+  // no live binding is known (see parent). Enumeration entries carry it
+  // without parent.
+  uint64 parent_file_id = 17;
 }
 
 // errno values use the darwin numbering (the daemon translates); message is for logs only.
@@ -479,6 +500,26 @@ message EnumerateReply {
   repeated DirEntry entries = 1;
   uint64 next_cookie = 2; // resume after the last returned entry (== last entry's cookie, 0 at end)
   uint64 dir_version = 3; // directory coherence version at enumeration time
+}
+
+// Lists one page of a directory as non-owning entry snapshots. Field meanings
+// match EnumerateRequest, including the mandatory retained read handle.
+message EnumerateEntriesRequest {
+  Item dir = 1;
+  uint64 cookie = 2;
+  uint32 max_entries = 3;
+  bool want_attrs = 4;
+  uint64 handle = 5;
+}
+// Every entry's attr has kind and file_id, plus full attributes when
+// want_attrs; attr.item and attr.parent are always empty and attr.parent_file_id
+// names the listed directory. The reply transfers no item ownership and
+// takes no ResourceReplyDisposition. A later lookup of an entry returns the
+// same file_id under its own ownership handle.
+message EnumerateEntriesReply {
+  repeated DirEntry entries = 1;
+  uint64 next_cookie = 2;
+  uint64 dir_version = 3;
 }
 
 message GetAttrRequest {

@@ -43,7 +43,7 @@ func (s *Server) acceptTransportHello(
 		return nil, nil, err
 	}
 	request := new(authoritypb.Request)
-	release, err := readFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
+	release, _, err := readFrameWithContext(ctx, conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request, true, false, false)
 	if err != nil {
 		return nil, nil, err
 	}

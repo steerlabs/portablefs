@@ -1267,3 +1267,191 @@ private actor DrainPublicationGate {
     await barrier.published(disjoint)
 }
 }
+
+private func waitForCapacityWaiter(
+    _ barrier: PfsMacOSFSKitPublicationBarrier,
+    count: Int = 1
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(5))
+    while await barrier.pendingAdmissionWaiterCount() != count {
+        try Task.checkCancellation()
+        guard clock.now < deadline else { throw PfsLocalClientError.timeout }
+        await Task.yield()
+    }
+}
+
+@Test func callbackBurstBackpressuresBeforeDaemonRequestSaturation() async throws {
+    let barrier = try PfsMacOSFSKitPublicationBarrier(
+        localAuthoritySessionID: drainLocalSession,
+        maximumConcurrentCallbacks: 3
+    )
+    let counts = try await withThrowingTaskGroup(of: Int.self) { group in
+        for _ in 0..<2_000 {
+            group.addTask {
+                let ticket = try await barrier.admit()
+                let count = await barrier.executingCallbackCount()
+                await Task.yield()
+                await barrier.published(ticket)
+                return count
+            }
+        }
+        var values: [Int] = []
+        for try await count in group { values.append(count) }
+        return values
+    }
+    #expect(counts.count == 2_000)
+    #expect(counts.allSatisfy { $0 <= 3 })
+    #expect(await barrier.executingCallbackCount() == 0)
+    #expect(await barrier.admittedCallbackCount() == 0)
+    #expect(await barrier.pendingAdmissionWaiterCount() == 0)
+}
+
+@Test func prepareAdoptsCapacityQueuedIngressWithoutWaitingForItsExecutionSlot() async throws {
+    let barrier = try PfsMacOSFSKitPublicationBarrier(
+        localAuthoritySessionID: drainLocalSession,
+        maximumConcurrentCallbacks: 1
+    )
+    let first = try await barrier.admit()
+    let reservation = barrier.reserveCallbackIngress(
+        scope: .conservative,
+        callbackKind: "queued-reclaim",
+        ingressUptimeNanoseconds: 1
+    )
+    let queued = Task {
+        try await barrier.resolveAdmission(for: reservation, exemptFromAdmission: false)
+    }
+    defer { queued.cancel() }
+    try await waitForCapacityWaiter(barrier)
+    #expect(await barrier.pendingIngressReservationCount() == 1)
+    let prepared = CapacityDrainCompletion()
+    let preparing = Task {
+        try await barrier.prepare(drainEvent(initiatorSession: drainPeerSession))
+        await prepared.mark()
+    }
+    defer { preparing.cancel() }
+    let ticket = try #require(try await queued.value)
+    #expect(ticket === reservation.ticket)
+    #expect(ticket.ordinaryRequestSubmitted() == nil)
+    #expect(!ticket.orderedMutationSubmitted())
+    #expect(await barrier.executingCallbackCount() == 1)
+    #expect(!(await prepared.value()))
+    await barrier.callbackReplyReturned(reservation)
+    #expect(!(await prepared.value()))
+    await barrier.published(first)
+    try await preparing.value
+    #expect(await barrier.executingCallbackCount() == 0)
+    #expect(await barrier.pendingIngressReservationCount() == 0)
+}
+
+@Test func authenticatedRepairBypassesAFullCallbackExecutionWindow() async throws {
+    let barrier = try PfsMacOSFSKitPublicationBarrier(
+        localAuthoritySessionID: drainLocalSession,
+        maximumConcurrentCallbacks: 1
+    )
+    let first = try await barrier.admit()
+    let queued = Task { try await barrier.admit() }
+    defer { queued.cancel() }
+    try await waitForCapacityWaiter(barrier)
+    let repair = barrier.reserveCallbackIngress(
+        scope: .conservative,
+        callbackKind: "authenticated-repair",
+        ingressUptimeNanoseconds: 1
+    )
+    let ticket = try await barrier.resolveAdmission(for: repair, exemptFromAdmission: true)
+    #expect(ticket == nil)
+    #expect(await barrier.executingCallbackCount() == 1)
+    #expect(await barrier.pendingAdmissionWaiterCount() == 1)
+    await barrier.callbackReplyReturned(repair)
+    await barrier.published(first)
+    let admitted = try await queued.value
+    await barrier.published(admitted)
+    #expect(await barrier.executingCallbackCount() == 0)
+}
+
+@Test func cancellingCapacityWaiterCannotLeakExecutionOrIngress() async throws {
+    let barrier = try PfsMacOSFSKitPublicationBarrier(
+        localAuthoritySessionID: drainLocalSession,
+        maximumConcurrentCallbacks: 1
+    )
+    let first = try await barrier.admit()
+    let reservation = barrier.reserveCallbackIngress(
+        scope: .conservative,
+        callbackKind: "cancelled-capacity-waiter",
+        ingressUptimeNanoseconds: 1
+    )
+    let queued = Task {
+        try await barrier.resolveAdmission(for: reservation, exemptFromAdmission: false)
+    }
+    try await waitForCapacityWaiter(barrier)
+    queued.cancel()
+    await #expect(throws: CancellationError.self) { _ = try await queued.value }
+    // Failed admission still owns the real framework reply boundary.
+    #expect(await barrier.pendingIngressReservationCount() == 1)
+    await barrier.callbackReplyReturned(reservation)
+    await barrier.published(first)
+    let next = try await barrier.admit()
+    await barrier.published(next)
+    #expect(await barrier.pendingIngressReservationCount() == 0)
+    #expect(await barrier.executingCallbackCount() == 0)
+    #expect(await barrier.pendingAdmissionWaiterCount() == 0)
+}
+
+@Test func terminalFailureWakesCapacityWaitersAndRejectsFutureAdmission() async throws {
+    let barrier = try PfsMacOSFSKitPublicationBarrier(
+        localAuthoritySessionID: drainLocalSession,
+        maximumConcurrentCallbacks: 1
+    )
+    let first = try await barrier.admit()
+    let queued = Task { try await barrier.admit() }
+    try await waitForCapacityWaiter(barrier)
+    await barrier.fail(PfsMacOSCoherenceError.transportClosed)
+    await #expect(throws: PfsMacOSCoherenceError.transportClosed) { _ = try await queued.value }
+    await #expect(throws: PfsMacOSCoherenceError.transportClosed) { _ = try await barrier.admit() }
+    await barrier.published(first)
+    #expect(await barrier.executingCallbackCount() == 0)
+    #expect(await barrier.pendingAdmissionWaiterCount() == 0)
+}
+
+private actor CapacityDrainCompletion {
+    private var done = false
+    func mark() { done = true }
+    func value() -> Bool { done }
+}
+
+@Test func cancellationRacingCapacityWakeCannotStrandTheNextCallback() async throws {
+    for _ in 0..<100 {
+        let barrier = try PfsMacOSFSKitPublicationBarrier(
+            localAuthoritySessionID: drainLocalSession,
+            maximumConcurrentCallbacks: 1
+        )
+        let first = try await barrier.admit()
+        let cancelling = Task {
+            let ticket = try await barrier.admit()
+            await barrier.published(ticket)
+        }
+        try await waitForCapacityWaiter(barrier)
+        let finished = CapacityDrainCompletion()
+        let following = Task {
+            let ticket = try await barrier.admit()
+            await barrier.published(ticket)
+            await finished.mark()
+        }
+        try await waitForCapacityWaiter(barrier, count: 2)
+        await barrier.published(first)
+        cancelling.cancel()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        while !(await finished.value()), clock.now < deadline {
+            await Task.yield()
+        }
+        let madeProgress = await finished.value()
+        if !madeProgress { await barrier.fail(PfsLocalClientError.timeout) }
+        _ = await cancelling.result
+        _ = await following.result
+        #expect(madeProgress)
+        #expect(await barrier.executingCallbackCount() == 0)
+        #expect(await barrier.pendingAdmissionWaiterCount() == 0)
+        if !madeProgress { return }
+    }
+}

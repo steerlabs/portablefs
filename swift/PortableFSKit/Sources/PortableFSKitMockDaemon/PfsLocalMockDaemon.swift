@@ -125,6 +125,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         /// repair contract's central claim is that a consumed repair callback
         /// produces no request at all, and only the daemon can testify to that.
         public var createRequests: Int
+        public var createExclusiveFlags: [Bool]
         public var removeRequests: Int
         public var renameRequests: Int
         public var xattrGetRequests: Int
@@ -161,6 +162,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var lookupNoReplyNames: Set<String>
         public var strictItemNamespace: Bool
         public var protocolMinor: UInt32?
+        public var fileIDOffset: UInt64
         /// Optional strict-v3 coherence terms returned by resolve. Tests leave
         /// this nil unless they are exercising strict-v3 minor negotiation.
         public var v3Coherence: PfsV3CoherenceContract?
@@ -216,6 +218,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             lookupNoReplyNames: Set<String> = [],
             strictItemNamespace: Bool = false,
             protocolMinor: UInt32? = nil,
+            fileIDOffset: UInt64 = 0,
             v3Coherence: PfsV3CoherenceContract? = nil,
             v3LivenessDelayNanoseconds: UInt64 = 0,
             v3LivenessEpochOverride: Data? = nil,
@@ -239,6 +242,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.lookupNoReplyNames = lookupNoReplyNames
             self.strictItemNamespace = strictItemNamespace
             self.protocolMinor = protocolMinor
+            self.fileIDOffset = fileIDOffset
             self.v3Coherence = v3Coherence
             self.v3LivenessDelayNanoseconds = v3LivenessDelayNanoseconds
             self.v3LivenessEpochOverride = v3LivenessEpochOverride
@@ -370,6 +374,17 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.omitNextOpenHandle()
     }
 
+    public func pauseReads() async { await fileSystem.pauseReads() }
+    public func resumeReads() async { await fileSystem.resumeReads() }
+
+    public func pauseReclaims() async { await fileSystem.pauseReclaims() }
+    public func resumeReclaims() async { await fileSystem.resumeReclaims() }
+    public func loseWriteReply(atIndex index: Int) async {
+        await fileSystem.loseWriteReply(atIndex: index)
+    }
+
+    public func failNextReclaim() async { await fileSystem.failNextReclaim() }
+
     public func delayNextClose(nanoseconds: UInt64) async {
         await fileSystem.delayNextClose(nanoseconds: nanoseconds)
     }
@@ -486,6 +501,16 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
     public func v3LivenessRequests() async -> [PfsV3LivenessRequest] {
         await fileSystem.v3LivenessRequestsSnapshot()
+    }
+
+    /// A transform returns nil until its target reply appears. It runs after
+    /// application, allowing tests to corrupt successful post-state precisely.
+    public func transformNextReply(_ transform: @escaping @Sendable (PfsEnvelope) -> PfsEnvelope?) async {
+        await fileSystem.transformNextReply(transform)
+    }
+
+    public func delayNextCreate(nanoseconds: UInt64) async {
+        await fileSystem.delayNextCreate(nanoseconds: nanoseconds)
     }
 
     public func resetStats() async {
@@ -960,6 +985,7 @@ private actor MockFileSystem {
     private final class Node {
         let id: UInt64
         let generation: UInt64
+        var itemID: UInt64
         var kind: PfsItemKind
         var mode: UInt32
         var nlink: UInt32
@@ -980,6 +1006,7 @@ private actor MockFileSystem {
         init(id: UInt64, kind: PfsItemKind, mode: UInt32, parent: UInt64?) {
             self.id = id
             self.generation = 1
+            self.itemID = id
             self.kind = kind
             self.mode = mode
             self.nlink = kind == .directory ? 2 : 1
@@ -1001,7 +1028,7 @@ private actor MockFileSystem {
 
         var item: PfsItem {
             var item = PfsItem()
-            item.itemID = id
+            item.itemID = itemID
             item.itemGeneration = generation
             item.stableIdentity = Node.stableIdentity(for: id)
             return item
@@ -1027,6 +1054,9 @@ private actor MockFileSystem {
     private let configuration: PfsLocalMockDaemon.Configuration
     private var nodes: [UInt64: Node] = [:]
     private var handles: [UInt64: UInt64] = [:]
+    private var itemsByID: [UInt64: Node] = [:]
+    private var acceptedItems: Set<UInt64> = [1]
+    private var nextItemID: UInt64 = 2
     private var nextNodeID: UInt64 = 2
     private var nextHandle: UInt64 = 1
     private var openRequests = 0
@@ -1039,6 +1069,7 @@ private actor MockFileSystem {
     private var setAttrRequests = 0
     private var lookupRequests = 0
     private var createRequests = 0
+    private var createExclusiveFlags: [Bool] = []
     private var removeRequests = 0
     private var renameRequests = 0
     private var xattrGetRequests = 0
@@ -1061,6 +1092,8 @@ private actor MockFileSystem {
     private var pendingLostRetiredCloseErrnos: [Int32] = []
     private var retiredCloseReplies: [UInt64: PfsCloseReply] = [:]
     private var pendingOpenDelaysNanoseconds: [UInt64] = []
+    private var pendingReplyTransforms: [@Sendable (PfsEnvelope) -> PfsEnvelope?] = []
+    private var pendingCreateDelaysNanoseconds: [UInt64] = []
     private var pendingCreateHandlesToOmit = 0
     private var pendingOpenHandlesToOmit = 0
     private var pendingLookupItemIdentifiersToCorrupt = 0
@@ -1069,11 +1102,17 @@ private actor MockFileSystem {
     private struct ProvisionalResource {
         var handle: UInt64
         var itemCount: UInt32
+        var itemID: UInt64 = 0
     }
     private var provisionalResourcesByRequestID: [UInt64: ProvisionalResource] = [:]
     private var resourceAccepts = 0
     private var resourceAbandons = 0
     private var resourceAcceptedItemCounts: [UInt32] = []
+    private var readsPaused = false
+    private var readWaiters: [CheckedContinuation<Void, Never>] = []
+    private var reclaimsPaused = false
+    private var reclaimWaiters: [CheckedContinuation<Void, Never>] = []
+    private var pendingReclaimFailure = false
     private var pendingCloseDelaysNanoseconds: [UInt64] = []
     private var pendingReadDelaysNanoseconds: [UInt64] = []
     private var pendingWriteDelaysNanoseconds: [UInt64] = []
@@ -1082,12 +1121,14 @@ private actor MockFileSystem {
     /// of one framework callback fails after chunks 0..<k committed", and that
     /// needs the failure placed at a known request, not merely next in line.
     private var writeErrnoByIndex: [Int: Int32] = [:]
+    private var lostWriteReplyIndexes: Set<Int> = []
     private var pendingWriteShortCounts: [Int] = []
 
     init(configuration: PfsLocalMockDaemon.Configuration) {
         self.configuration = configuration
         let root = Node(id: 1, kind: .directory, mode: 0o755, parent: nil)
         nodes[root.id] = root
+        itemsByID[root.itemID] = root
     }
 
     func rootIdentity() -> PfsItemIdentity {
@@ -1111,6 +1152,7 @@ private actor MockFileSystem {
             setAttrRequests: setAttrRequests,
             lookupRequests: lookupRequests,
             createRequests: createRequests,
+            createExclusiveFlags: createExclusiveFlags,
             removeRequests: removeRequests,
             renameRequests: renameRequests,
             xattrGetRequests: xattrGetRequests,
@@ -1140,6 +1182,14 @@ private actor MockFileSystem {
         v3LivenessRequests
     }
 
+    func transformNextReply(_ transform: @escaping @Sendable (PfsEnvelope) -> PfsEnvelope?) {
+        pendingReplyTransforms.append(transform)
+    }
+
+    func delayNextCreate(nanoseconds: UInt64) {
+        pendingCreateDelaysNanoseconds.append(nanoseconds)
+    }
+
     func resetStats() {
         openRequests = 0
         closeRequests = 0
@@ -1151,6 +1201,7 @@ private actor MockFileSystem {
         setAttrRequests = 0
         lookupRequests = 0
         createRequests = 0
+        createExclusiveFlags.removeAll()
         removeRequests = 0
         renameRequests = 0
         xattrGetRequests = 0
@@ -1207,6 +1258,23 @@ private actor MockFileSystem {
         pendingOpenHandlesToOmit += 1
     }
 
+    func pauseReads() { readsPaused = true }
+    func resumeReads() {
+        readsPaused = false
+        let waiters = readWaiters
+        readWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func pauseReclaims() { reclaimsPaused = true }
+    func resumeReclaims() {
+        reclaimsPaused = false
+        let waiters = reclaimWaiters
+        reclaimWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+    func failNextReclaim() { pendingReclaimFailure = true }
+
     func delayNextClose(nanoseconds: UInt64) {
         pendingCloseDelaysNanoseconds.append(nanoseconds)
     }
@@ -1227,6 +1295,8 @@ private actor MockFileSystem {
         pendingWriteDelaysNanoseconds.append(nanoseconds)
     }
 
+    func loseWriteReply(atIndex index: Int) { lostWriteReplyIndexes.insert(index) }
+
     func failWrite(atIndex index: Int, errno code: Int32) {
         writeErrnoByIndex[index] = code
     }
@@ -1243,7 +1313,7 @@ private actor MockFileSystem {
                 throw MockPOSIXError(errno: EINVAL, message: "missing body")
             }
             switch body {
-            case .lookup(_), .enumerate(_), .getAttr(_), .setAttr(_),
+            case .lookup(_), .enumerateEntries(_), .getAttr(_), .setAttr(_),
                  .read(_), .write(_), .create(_), .mkdir(_), .remove(_),
                  .rename(_), .symlink(_), .readlink(_), .hardLink(_),
                  .xattrGet(_), .xattrSet(_), .xattrList(_), .xattrRemove(_):
@@ -1272,7 +1342,7 @@ private actor MockFileSystem {
             case let .hello(request):
                 var response = PfsHelloReply()
                 response.protocolMajor = request.protocolMajor
-                response.protocolMinor = configuration.protocolMinor ?? request.protocolMinor
+                response.protocolMinor = configuration.protocolMinor ?? 16
                 response.daemonVersion = "mock"
                 reply.body = .helloReply(response)
             case let .resolve(request):
@@ -1325,19 +1395,19 @@ private actor MockFileSystem {
                 response.attr = attr(for: child, parent: directory)
                 if pendingLookupItemIdentifiersToCorrupt > 0 {
                     pendingLookupItemIdentifiersToCorrupt -= 1
-                    response.attr.item.itemID =
+                    response.attr.fileID =
                         PfsFSKitMapping.localRepairIdentifierFloor
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
-                    ProvisionalResource(handle: 0, itemCount: 1)
+                    ProvisionalResource(handle: 0, itemCount: 1, itemID: child.itemID)
                 reply.body = .lookupReply(response)
-            case let .enumerate(request):
+            case let .enumerateEntries(request):
                 enumerateRequests += 1
                 let directory = try node(for: request.dir)
                 guard directory.kind == .directory else {
                     throw MockPOSIXError(errno: ENOTDIR, message: "not a directory")
                 }
-                guard request.handle != 0, handles[request.handle] == directory.item.itemID else {
+                guard request.handle != 0, handles[request.handle] == directory.id else {
                     throw MockPOSIXError(errno: EBADF, message: "enumeration handle does not belong to directory")
                 }
                 let ordered = orderedChildren(of: directory)
@@ -1345,25 +1415,24 @@ private actor MockFileSystem {
                 let start = ordered.firstIndex { $0.cursor > resume } ?? ordered.count
                 let maxEntries = max(1, Int(request.maxEntries))
                 let end = min(ordered.count, start + maxEntries)
-                var response = PfsEnumerateReply()
+                var response = PfsEnumerateEntriesReply()
                 for index in start..<end {
                     let name = ordered[index].name
                     if let childID = directory.children[name], let child = nodes[childID] {
                         var entry = PfsDirEntry()
                         entry.name = name
-                        entry.attr = attr(for: child, parent: directory)
+                        entry.attr = attr(for: child, parent: directory, metadataOnly: true)
+                        // The Go codec emits an empty Item message even when
+                        // its value carries no capability. Presence is not ownership.
+                        entry.attr.item = PfsItem()
+                        entry.attr.clearParent()
                         entry.cookie = index + 1 >= ordered.count ? 0 : encodeCookie(cursor: ordered[index].cursor)
                         response.entries.append(entry)
                     }
                 }
                 response.nextCookie = response.entries.last?.cookie ?? 0
                 response.dirVersion = directory.contentVersion
-                provisionalResourcesByRequestID[envelope.requestID] =
-                    ProvisionalResource(
-                        handle: 0,
-                        itemCount: UInt32(clamping: response.entries.count)
-                    )
-                reply.body = .enumerateReply(response)
+                reply.body = .enumerateEntriesReply(response)
             case let .getAttr(request):
                 getAttrRequests += 1
                 var response = PfsGetAttrReply()
@@ -1403,7 +1472,7 @@ private actor MockFileSystem {
                 response.attr = attr(for: node)
                 reply.body = .setAttrReply(response)
             case let .open(request):
-                _ = try namespaceNode(for: request.item)
+                let node = try namespaceNode(for: request.item)
                 openRequests += 1
                 let handle: UInt64
                 if pendingOpenHandlesToOmit > 0 {
@@ -1412,7 +1481,7 @@ private actor MockFileSystem {
                 } else {
                     handle = nextHandle
                     nextHandle += 1
-                    handles[handle] = request.item.itemID
+                    handles[handle] = node.id
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
                     ProvisionalResource(handle: handle, itemCount: 0)
@@ -1456,6 +1525,9 @@ private actor MockFileSystem {
                 }
             case let .read(request):
                 readRequests += 1
+                if readsPaused {
+                    await withCheckedContinuation { readWaiters.append($0) }
+                }
                 maxReadLength = max(maxReadLength, request.length)
                 if !pendingReadDelaysNanoseconds.isEmpty {
                     let delay = pendingReadDelaysNanoseconds.removeFirst()
@@ -1489,15 +1561,26 @@ private actor MockFileSystem {
                 response.written = UInt32(payload.count)
                 response.attr = attr(for: node)
                 reply.body = .writeReply(response)
+                if lostWriteReplyIndexes.remove(writeIndex) != nil { session.close() }
             case let .create(request):
                 createRequests += 1
+                createExclusiveFlags.append(request.exclusive)
                 let directory = try node(for: request.dir)
-                guard directory.children[request.name] == nil else {
-                    throw MockPOSIXError(errno: EEXIST, message: "exists")
+                let node: Node
+                if let existingID = directory.children[request.name], let existing = nodes[existingID] {
+                    guard !request.exclusive else {
+                        throw MockPOSIXError(errno: EEXIST, message: "exists")
+                    }
+                    guard existing.kind == .file else {
+                        throw MockPOSIXError(errno: EISDIR, message: "not a regular file")
+                    }
+                    node = existing
+                    intern(node)
+                } else {
+                    node = createNode(kind: .file, mode: request.mode, parent: directory.id)
+                    directory.children[request.name] = node.id
+                    bump(directory)
                 }
-                let node = createNode(kind: .file, mode: request.mode, parent: directory.id)
-                directory.children[request.name] = node.id
-                bump(directory)
                 let handle: UInt64
                 if pendingCreateHandlesToOmit > 0 {
                     pendingCreateHandlesToOmit -= 1
@@ -1508,11 +1591,14 @@ private actor MockFileSystem {
                     handles[handle] = node.id
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
-                    ProvisionalResource(handle: handle, itemCount: 1)
+                    ProvisionalResource(handle: handle, itemCount: 1, itemID: node.itemID)
                 var response = PfsCreateReply()
                 response.attr = attr(for: node)
                 response.handle = handle
                 reply.body = .createReply(response)
+                if !pendingCreateDelaysNanoseconds.isEmpty {
+                    try await Task.sleep(nanoseconds: pendingCreateDelaysNanoseconds.removeFirst())
+                }
             case let .mkdir(request):
                 createRequests += 1
                 let directory = try node(for: request.dir)
@@ -1525,7 +1611,7 @@ private actor MockFileSystem {
                 var response = PfsMkdirReply()
                 response.attr = attr(for: node)
                 provisionalResourcesByRequestID[envelope.requestID] =
-                    ProvisionalResource(handle: 0, itemCount: 1)
+                    ProvisionalResource(handle: 0, itemCount: 1, itemID: node.itemID)
                 reply.body = .mkdirReply(response)
             case let .remove(request):
                 removeRequests += 1
@@ -1587,7 +1673,7 @@ private actor MockFileSystem {
                 var response = PfsSymlinkReply()
                 response.attr = attr(for: node)
                 provisionalResourcesByRequestID[envelope.requestID] =
-                    ProvisionalResource(handle: 0, itemCount: 1)
+                    ProvisionalResource(handle: 0, itemCount: 1, itemID: node.itemID)
                 reply.body = .symlinkReply(response)
             case let .readlink(request):
                 let node = try node(for: request.item)
@@ -1675,14 +1761,26 @@ private actor MockFileSystem {
                 reply.body = .fsyncReply(PfsFsyncReply())
             case let .reclaim(request):
                 reclaimRequests += 1
-                // Reclaim can legally arrive after unlink+close already reaped
-                // the node: the kernel's last reference is gone either way, so
-                // an absent node is a completed reclaim, not a stale item. A
-                // node that still exists under a different generation is.
-                if let node = nodes[request.item.itemID],
-                   node.generation != request.item.itemGeneration {
-                    throw MockPOSIXError(errno: ESTALE, message: "stale item")
+                let fail = pendingReclaimFailure
+                pendingReclaimFailure = false
+                if !fail {
+                    // A provisional reply keeps the same record alive. Actual
+                    // retirement detaches before the authority round trip, so a
+                    // concurrent lookup interns a fresh handle for the same inode.
+                    if let node = itemsByID[request.item.itemID] {
+                        guard node.item == request.item else {
+                            throw MockPOSIXError(errno: ESTALE, message: "stale item")
+                        }
+                        acceptedItems.remove(request.item.itemID)
+                        if !provisionalResourcesByRequestID.values.contains(where: { $0.itemID == request.item.itemID }) {
+                            itemsByID.removeValue(forKey: request.item.itemID)
+                        }
+                    }
                 }
+                if reclaimsPaused {
+                    await withCheckedContinuation { reclaimWaiters.append($0) }
+                }
+                if fail { throw MockPOSIXError(errno: EIO, message: "injected reclaim failure") }
                 reply.body = .reclaimReply(PfsReclaimReply())
             case .subscribeEvents:
                 session.setSubscribed()
@@ -1719,7 +1817,9 @@ private actor MockFileSystem {
                     ? (configuration.v3LivenessSessionOverride ?? request.sessionID)
                     : request.sessionID
                 reply.body = .v3LivenessReply(response)
-            case .helloReply, .resolveReply, .lookupReply, .enumerateReply, .getAttrReply,
+            case .enumerate:
+                throw MockPOSIXError(errno: EPROTO, message: "minor 16 requires metadata-only enumeration")
+            case .helloReply, .resolveReply, .lookupReply, .enumerateReply, .enumerateEntriesReply, .getAttrReply,
                  .setAttrReply, .openReply, .closeReply, .readReply, .writeReply,
                  .createReply, .mkdirReply, .removeReply, .renameReply, .symlinkReply,
                  .readlinkReply, .xattrGetReply, .xattrSetReply, .xattrListReply,
@@ -1738,6 +1838,10 @@ private actor MockFileSystem {
             errorReply.errno = EIO
             errorReply.message = String(describing: error)
             reply.body = .error(errorReply)
+        }
+        if let transform = pendingReplyTransforms.first, let transformed = transform(reply) {
+            pendingReplyTransforms.removeFirst()
+            reply = transformed
         }
         return reply
     }
@@ -1783,6 +1887,14 @@ private actor MockFileSystem {
                   !request.acceptHandles || resource.handle != 0 else {
                 return .closeConnection
             }
+            if resource.itemID != 0 {
+                if request.acceptedItemCount > 0 {
+                    acceptedItems.insert(resource.itemID)
+                } else if !acceptedItems.contains(resource.itemID),
+                          !provisionalResourcesByRequestID.values.contains(where: { $0.itemID == resource.itemID }) {
+                    itemsByID.removeValue(forKey: resource.itemID)
+                }
+            }
             resourceAcceptedItemCounts.append(request.acceptedItemCount)
             if request.acceptHandles || request.acceptedItemCount > 0 {
                 resourceAccepts += 1
@@ -1801,7 +1913,7 @@ private actor MockFileSystem {
     }
 
     private func node(for item: PfsItem) throws -> Node {
-        guard let node = nodes[item.itemID], node.generation == item.itemGeneration else {
+        guard let node = itemsByID[item.itemID], node.item == item else {
             throw MockPOSIXError(errno: ESTALE, message: "stale item")
         }
         return node
@@ -1812,7 +1924,7 @@ private actor MockFileSystem {
             return try namespaceNode(for: item)
         }
         let retained = try node(forHandle: handle)
-        guard retained.id == item.itemID, retained.generation == item.itemGeneration else {
+        guard retained.item == item else {
             throw MockPOSIXError(errno: EINVAL, message: "handle does not belong to item")
         }
         return retained
@@ -1841,13 +1953,23 @@ private actor MockFileSystem {
             return
         }
         nodes.removeValue(forKey: nodeID)
+        itemsByID.removeValue(forKey: node.itemID)
+        acceptedItems.remove(node.itemID)
     }
 
     private func createNode(kind: PfsItemKind, mode: UInt32, parent: UInt64) -> Node {
         let node = Node(id: nextNodeID, kind: kind, mode: mode, parent: parent)
         nextNodeID += 1
         nodes[node.id] = node
+        intern(node)
         return node
+    }
+
+    private func intern(_ node: Node) {
+        guard itemsByID[node.itemID] !== node else { return }
+        node.itemID = nextItemID
+        nextItemID += 1
+        itemsByID[node.itemID] = node
     }
 
     private func liveParent(for node: Node) -> Node? {
@@ -1862,11 +1984,20 @@ private actor MockFileSystem {
             .min { lhs, rhs in lhs.id < rhs.id }
     }
 
-    private func attr(for node: Node, parent explicitParent: Node? = nil) -> PfsAttr {
+    private func fileID(for node: Node) -> UInt64 {
+        node.id == 1 ? 1 : node.id + configuration.fileIDOffset
+    }
+
+    private func attr(for node: Node, parent explicitParent: Node? = nil, metadataOnly: Bool = false) -> PfsAttr {
         var attr = PfsAttr()
-        attr.item = node.item
+        if !metadataOnly {
+            intern(node)
+            attr.item = node.item
+        }
+        attr.fileID = fileID(for: node)
         if let parent = explicitParent ?? liveParent(for: node) {
-            attr.parent = parent.item
+            if !metadataOnly { attr.parent = parent.item }
+            attr.parentFileID = fileID(for: parent)
         }
         attr.kind = node.kind
         attr.mode = node.mode

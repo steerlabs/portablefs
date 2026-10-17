@@ -18,11 +18,12 @@
 // than ENOTSUP, so XNU does not create an AppleDouble sidecar. There is no local
 // WAL, delegated xattr map, or alternate metadata truth.
 //
-// The pfslocal Item identity returned to filesystem frontends is stable across
-// daemon restarts for a revived attach. portablefsd uses the authority inode as
-// ItemID when available and a persisted per-attach identity epoch as
-// ItemGeneration. The attach registry also stores the item-to-path table so a
-// kernel-held Item minted before a daemon crash can still address the same
-// authority object after credentials revive the attach. fsproto coherence
-// versions are cache invalidation state and are not part of Item identity.
+// A pfslocal Item is a daemon-local ownership handle for one retained
+// authority capability, allocated monotonically and never reused within an
+// attach; ItemGeneration is the attach's persisted identity epoch. File
+// identity is separate: Attr.FileID is 1 for the volume root and the authority
+// inode for every other object, so it survives reclaim and re-lookup under a
+// new handle, and hard-link aliases share it. A v3 session dies with the
+// daemon process, so a revived attach serves no Item at all and exists only
+// for its exact unmount.
 package portablefsd

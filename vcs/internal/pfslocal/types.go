@@ -58,7 +58,13 @@ const (
 	// requires failure-atomic DATA/CONTROL transport activation, replaces source
 	// visibility phases with daemon-owned source-publication gates, and makes
 	// every callback's PublicationAck semantic-commit verdict explicit.
-	ProtocolMinor = 15
+	//
+	// ProtocolMinor 16 separates file identity from item ownership: Attr gains
+	// FileID/ParentFileID, and EnumerateEntriesRequest lists a directory as
+	// non-owning entry snapshots. The item-owning EnumerateRequest is not
+	// served to a minor-16 frontend, so an older frontend that still sends it
+	// must fail the minimum-minor gate rather than lose its enumeration.
+	ProtocolMinor = 16
 	MaxFrameBytes = 16 << 20
 )
 
@@ -216,12 +222,12 @@ type Capabilities struct {
 	XattrSetSupported bool
 }
 
-// Item is the frontend-visible filesystem object identity. portablefsd keeps
-// ItemID tied to the authority's stable inode when one is available, falling
-// back to a deterministic path inode only for authority entries that lack one.
-// ItemGeneration is a per-attach identity epoch persisted in the daemon
-// state-dir; it is not a cache/coherence version and must survive daemon
-// restarts so kernel-held FSItems remain valid for revived attaches.
+// Item is a daemon-local ownership handle for one retained authority
+// capability, not a file identity: after reclaim the same file returns under a
+// new ItemID, and Attr.FileID is what names the file. ItemIDs are allocated
+// monotonically and never reused within an attach. ItemGeneration is the
+// attach's persisted identity epoch; StableIdentity is the authority identity
+// shared by every hard-link alias.
 type Item struct {
 	ItemID         uint64
 	ItemGeneration uint64
@@ -253,6 +259,13 @@ type Attr struct {
 	Parent         *Item
 	Flags          uint32
 	AllocSize      uint64
+	// FileID is the filesystem object number FSKit reports: 1 for the volume
+	// root, the authority inode in [2, 2^63) for every other object. Hard-link
+	// aliases share it and it survives reclaim; it authorizes nothing.
+	FileID uint64
+	// ParentFileID is the FileID of the parent binding described by Parent,
+	// zero when there is none. Enumeration entries carry it without Parent.
+	ParentFileID uint64
 }
 
 type ErrorReply struct {
@@ -281,6 +294,27 @@ type DirEntry struct {
 }
 
 type EnumerateReply struct {
+	Entries    []DirEntry
+	NextCookie uint64
+	DirVersion uint64
+}
+
+// EnumerateEntriesRequest lists one page of a directory as non-owning entry
+// snapshots. Its fields and field numbers match EnumerateRequest, including
+// the mandatory retained read handle.
+type EnumerateEntriesRequest struct {
+	Dir        Item
+	Cookie     uint64
+	MaxEntries uint32
+	WantAttrs  bool
+	Handle     uint64
+}
+
+// EnumerateEntriesReply carries entries whose Attr names the object by
+// FileID only: Attr.Item and Attr.Parent are empty and ParentFileID is the
+// listed directory. The reply transfers no item ownership and takes no
+// ResourceReplyDisposition.
+type EnumerateEntriesReply struct {
 	Entries    []DirEntry
 	NextCookie uint64
 	DirVersion uint64

@@ -260,7 +260,7 @@ private func expectEIO(_ error: any Error) {
         name: Data("a".utf8)
     ))
     #expect(binding.identity == fileIdentity)
-    #expect(binding.entry.vfsFileID == file.identity.itemID + 1)
+    #expect(binding.entry.vfsFileID == file.fileID + 1)
     let createdObjects = await harness.coherence.liveObjects.objects(for: fileIdentity)
     #expect(createdObjects.count == 1)
     #expect(createdObjects.first?.itemKind == .file)
@@ -378,12 +378,12 @@ private func expectEIO(_ error: any Error) {
     #expect(path.components == [Data("new-alias".utf8)])
     #expect(parentIdentity == harness.rootIdentity)
     #expect(repairedIdentity == identity)
-    #expect(expectedVFSFileID == file.identity.itemID + 1)
+    #expect(expectedVFSFileID == file.fileID + 1)
     #expect(itemKind == .file)
 }
 
 @available(macOS 26.0, *)
-@Test func adapterPopulatesTheNamespaceIndexFromEnumerationHits() async throws {
+@Test func adapterEnumerationDoesNotPopulateNamespaceIndex() async throws {
     let harness = try await makeWiringHarness()
     for name in ["one", "two", "three"] {
         _ = try await harness.volume.createItem(
@@ -393,9 +393,7 @@ private func expectEIO(_ error: any Error) {
             attributes: FSItem.SetAttributesRequest()
         )
     }
-    // A fresh index proves enumeration itself records: the bindings created
-    // above are already there, so wipe them by using names the packer walk
-    // republishes and checking identity of the enumeration-recorded facts.
+    // A fresh index isolates facts learned solely from packed entry snapshots.
     let fresh = PfsMacOSNamespaceIndex(rootIdentity: harness.rootIdentity)
     let enumerating = PfsMacOSV3VolumeCoherence(
         contract: nil,
@@ -425,8 +423,25 @@ private func expectEIO(_ error: any Error) {
         #expect(await fresh.binding(
             parentIdentity: harness.rootIdentity,
             name: Data(name.utf8)
-        ) != nil)
+        ) == nil)
     }
+}
+
+@available(macOS 26.0, *)
+@Test func coherenceIndexesUseFileIDsInsteadOfOwnershipHandles() async throws {
+    let harness = try await makeWiringHarness(daemonConfiguration: .init(fileIDOffset: 5_000))
+    let (created, _) = try await harness.volume.createItem(
+        named: FSFileName(string: "file-id"), type: .file,
+        inDirectory: harness.root, attributes: FSItem.SetAttributesRequest()
+    )
+    let file = try #require(created as? PortableFSItem)
+    #expect(file.fileID != file.identity.itemID)
+    let identity = try PfsMacOSStableIdentity(file.identity.stableIdentity)
+    let binding = try #require(await harness.coherence.namespaceIndex.binding(
+        parentIdentity: harness.rootIdentity, name: Data("file-id".utf8)
+    ))
+    #expect(binding.entry.vfsFileID == file.fileID + 1)
+    #expect(await harness.coherence.liveObjects.objects(for: identity).map(\.vfsFileID) == [file.fileID + 1])
 }
 
 @available(macOS 26.0, *)
@@ -603,7 +618,7 @@ private func expectEIO(_ error: any Error) {
         path: try PfsMacOSRelativePath(components: [Data("data.bin".utf8)]),
         parentIdentity: harness.rootIdentity,
         itemIdentity: fileIdentity,
-        expectedVFSFileID: file.identity.itemID + 1,
+        expectedVFSFileID: file.fileID + 1,
         authoritativeSize: 4096,
         operand: operand
     ))
@@ -649,7 +664,7 @@ private func expectEIO(_ error: any Error) {
     exact.size = 4096
     let attributes = try await harness.volume.setAttributes(exact, on: file)
     #expect(attributes.size == 4096)
-    #expect(attributes.fileID == FSItem.Identifier(rawValue: file.identity.itemID + 1))
+    #expect(attributes.fileID == FSItem.Identifier(rawValue: file.fileID + 1))
     #expect(attributes.mode == authoritative.mode)
     #expect(attributes.uid == authoritative.uid)
     #expect(attributes.gid == authoritative.gid)
@@ -719,7 +734,7 @@ private func expectEIO(_ error: any Error) {
         path: try PfsMacOSRelativePath(components: [sourceName]),
         parentIdentity: harness.rootIdentity,
         itemIdentity: fileIdentity,
-        expectedVFSFileID: file.identity.itemID + 1,
+        expectedVFSFileID: file.fileID + 1,
         authoritativeSize: 4096,
         operand: operand
     ))

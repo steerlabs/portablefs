@@ -31,7 +31,7 @@ func TestReconnectSurvivesListenerGapBeforeEpochVerdict(t *testing.T) {
 			serve := func(listener net.Listener, epoch []byte) func() {
 				ctx, cancel := context.WithCancel(context.Background())
 				if server == nil || change {
-					server = &Server{Handler: clientTestHandler{epoch: epoch, maxInFlight: 5}, MaxFrame: testMaxFrame, MaxInFlight: 5, MaxConnections: 8, MaxFrameBytesInFlight: 8 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
+					server = &Server{Handler: clientTestHandler{epoch: epoch, maxInFlight: 5}, MaxFrame: testMaxFrame, MaxInFlight: 5, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 8<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
 				}
 				done := make(chan error, 1)
 				go func() { done <- server.Serve(ctx, listener, serverTLS) }()

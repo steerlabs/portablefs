@@ -767,13 +767,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
 
     public func synchronize(flags: FSSyncFlags) async throws {
         do {
-            // The v3 authority durability barrier. No client or daemon
-            // write-back tail exists: mutations are synchronous authority
-            // calls against raw XFS. This waits for the authority's `syncfs`
-            // cut after all prior ordered operations. Cache-visible mutations
-            // retain their separate two-phase repair boundary. An unreachable,
-            // slow, or fenced authority throws; there is never a silent
-            // local-only outcome.
+            // Explicit authority barrier over its captured applied cut. Successful
+            // FSKit mutation replies are already durable. The native framework
+            // must drain prior work: this cannot cover kernel pages not yet
+            // delivered as callbacks or mutations outside that cut. Native
+            // fsync/F_FULLFSYNC waiting and error propagation remain unproven.
+            // Cache-visible mutations retain their separate repair boundary;
+            // authority failures surface through this callback.
             try await core.syncVolume()
             if let stat = try? await core.statfs() {
                 setCachedStatistics(PfsFSKitMapping.statfs(
@@ -1148,7 +1148,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         guard let consumed = await repairGate.consumeArmedAttributeRefresh(
             itemIdentity: portable.identity.stableIdentity
         ), try PfsFSKitMapping.itemIdentifier(
-            from: attributes.item.itemID
+            from: attributes.fileID
         ).rawValue == consumed.expectedVFSFileID else {
             throw PfsMacOSCoherenceError.invalidRepairOperand
         }
@@ -1238,7 +1238,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 guard attributes.item.stableIdentity == portable.identity.stableIdentity,
                       attributes.size == consumed.size,
                       try PfsFSKitMapping.itemIdentifier(
-                          from: attributes.item.itemID
+                          from: attributes.fileID
                       ).rawValue == consumed.expectedVFSFileID else {
                     throw PfsMacOSCoherenceError.invalidRepairOperand
                 }
@@ -1290,8 +1290,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 try await recordPublishedBinding(
                     parent: directory,
                     name: result.canonicalName,
-                    child: result.item,
-                    itemKind: result.attr.kind
+                    child: result.item
                 )
                 return (result.item, PfsFSKitMapping.fileName(from: result.canonicalName))
             } catch {
@@ -1397,7 +1396,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         }
         return try await core.client.withPublicationBoundary {
           do {
-            let mode = newAttributes.isValid(.mode) ? newAttributes.mode : 0o644
+            let mode = newAttributes.isValid(.mode) ? newAttributes.mode : (type == .directory ? 0o755 : 0o644)
             let parent = try portableItem(directory)
             let cachedKind: PfsMacOSCachedItemKind
             switch type {
@@ -1424,7 +1423,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 case .file:
                     result = try await core.createFile(in: parent, name: name.data, mode: mode)
                 case .directory:
-                    result = try await core.mkdir(in: parent, name: name.data, mode: mode == 0o644 ? 0o755 : mode)
+                    result = try await core.mkdir(in: parent, name: name.data, mode: mode)
                 default:
                     throw PfsLocalClientError.daemon(errno: ENOTSUP, message: "unsupported create item type")
                 }
@@ -1498,7 +1497,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 let portable = try portableItem(item)
                 let parent = try portableItem(directory)
                 let kind = try PfsMacOSCachedItemKind(
-                    try await core.getattr(item: portable).kind
+                    portable.kind
                 )
                 let binding = try await reserveBindingPublication(
                     parent: directory,
@@ -1574,7 +1573,6 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         return try await core.client.withPublicationBoundary {
           do {
             let portable = try portableItem(item)
-            let attr = try await core.getattr(item: portable)
             let parent = try portableItem(directory)
             let forgetting = try await reserveBindingForget(
                 parent: directory,
@@ -1586,7 +1584,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                     item: portable,
                     named: name.data,
                     from: parent,
-                    isDirectory: attr.kind == .directory
+                    isDirectory: portable.kind == .directory
                 )
             } catch {
                 await cancelBindingForget(forgetting)
@@ -1716,10 +1714,11 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 attributesRequested: attributesRequested
             )
             let selfIdentifier = try PfsFSKitMapping.itemIdentifier(
-                from: portableDirectory.identity.itemID
+                from: portableDirectory.fileID
             )
             var parentIdentifier = selfIdentifier
-            if synthetics.contains(where: { $0.isParentEntry }),
+            if portableDirectory.fileID != 1,
+               synthetics.contains(where: { $0.isParentEntry }),
                let directoryAttr = try? await core.getattr(item: portableDirectory) {
                 // A retained-but-unlinked directory still enumerates through
                 // its open reference but has no live parent to name; POSIX
@@ -1742,47 +1741,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 }
             }
 
-            var packedEntries: [PfsDirectoryEntry] = []
-            var acceptedPagePrefixes: [(requestID: UInt64, count: UInt32)] = []
-
-            func commitPackedEntries() async throws {
-                let adopted = try await core.adoptEnumeratedItems(packedEntries)
-                do {
-                    for (entry, child) in zip(packedEntries, adopted) {
-                        // Only an entry the packer accepted can become a kernel
-                        // binding. Recording after `packEntry == true` keeps an
-                        // unpacked suffix out of both the namespace repair index
-                        // and VolumeCore's canonical item tables.
-                        try await recordPublishedBinding(
-                            parent: directory,
-                            name: entry.name,
-                            child: child,
-                            itemKind: entry.attr.kind
-                        )
-                    }
-                } catch {
-                    // The packer has accepted this batch but local ownership
-                    // installation could not be completed. Continuing would
-                    // leave the kernel and repair index disagreeing, so retire
-                    // the strict mount instead of publishing a partial cache.
-                    await core.shutdown()
-                    throw PfsLocalClientError.connectionClosed
-                }
-                for prefix in acceptedPagePrefixes {
-                    core.client.acceptProvisionalItemPrefix(
-                        targetRequestID: prefix.requestID,
-                        count: prefix.count
-                    )
-                }
-            }
-
             while true {
-                for (entryIndex, entry) in result.entries.enumerated() {
+                for entry in result.entries {
                     let packed = packer.packEntry(
                         name: PfsFSKitMapping.fileName(from: entry.name),
                         itemType: PfsFSKitMapping.itemType(from: entry.attr.kind),
                         itemID: try PfsFSKitMapping.itemIdentifier(
-                            from: entry.attr.item.itemID
+                            from: entry.attr.fileID
                         ),
                         nextCookie: FSDirectoryCookie(
                             try PfsEnumerationCookies.fskitCookie(
@@ -1797,25 +1762,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                                 requested: attributes?.wantedAttributes
                             )
                     )
-                    if !packed {
-                        acceptedPagePrefixes.append(
-                            (
-                                requestID: result.resourceRequestID,
-                                count: UInt32(clamping: entryIndex)
-                            )
-                        )
-                        try await commitPackedEntries()
-                        return currentVerifier
-                    }
-                    packedEntries.append(entry)
+                    if !packed { return currentVerifier }
                 }
-
-                acceptedPagePrefixes.append(
-                    (
-                        requestID: result.resourceRequestID,
-                        count: UInt32(clamping: result.entries.count)
-                    )
-                )
 
                 daemonCookie = result.nextCookie
                 if daemonCookie == 0 {
@@ -1828,7 +1776,6 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                     maxEntries: PfsEnumerationCookies.daemonPageSize
                 )
             }
-            try await commitPackedEntries()
             return currentVerifier
           } catch let error as PfsLocalClientError where error.posixErrno == ESTALE {
             // The daemon signals an unknown/expired/pre-restart enumeration cookie with
@@ -2724,7 +2671,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         do {
             let childIdentity = try strictStableIdentity(of: child)
             let vfsFileID = try PfsFSKitMapping.itemIdentifier(
-                from: child.identity.itemID
+                from: child.fileID
             ).rawValue
             await coherence.namespaceIndex.commitRecord(
                 pending.reservation,
@@ -2832,7 +2779,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         do {
             let identity = try strictStableIdentity(of: item)
             let vfsFileID = try PfsFSKitMapping.itemIdentifier(
-                from: item.identity.itemID
+                from: item.fileID
             ).rawValue
             await coherence.liveObjects.commit(
                 pending.reservation,
@@ -2862,21 +2809,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     private func recordPublishedBinding(
         parent: FSItem,
         name: Data,
-        child: PortableFSItem,
-        itemKind: PfsItemKind? = nil
+        child: PortableFSItem
     ) async throws {
         guard let coherence = coherenceContext else { return }
         let parentIdentity = try strictStableIdentity(of: try portableItem(parent))
         let childIdentity = try strictStableIdentity(of: child)
-        let cachedItemKind: PfsMacOSCachedItemKind
-        if let itemKind {
-            cachedItemKind = try PfsMacOSCachedItemKind(itemKind)
-        } else {
-            cachedItemKind = try PfsMacOSCachedItemKind(
-                try await core.getattr(item: child).kind
-            )
-        }
-        let vfsFileID = try PfsFSKitMapping.itemIdentifier(from: child.identity.itemID).rawValue
+        let cachedItemKind = try PfsMacOSCachedItemKind(child.kind)
+        let vfsFileID = try PfsFSKitMapping.itemIdentifier(from: child.fileID).rawValue
         guard await coherence.namespaceIndex.record(
             identity: childIdentity,
             entry: .init(
@@ -2939,7 +2878,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     private func recordLiveObject(_ item: PortableFSItem) async throws {
         guard let coherence = coherenceContext else { return }
         _ = try strictStableIdentity(of: item)
-        let vfsFileID = try PfsFSKitMapping.itemIdentifier(from: item.identity.itemID).rawValue
+        let vfsFileID = try PfsFSKitMapping.itemIdentifier(from: item.fileID).rawValue
         do {
             guard try await coherence.liveObjects.record(
                 item: item,

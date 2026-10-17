@@ -83,8 +83,8 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.OperationID = v
-		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 90, 91:
+		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 90, 91:
 			if wt != wireBytes {
 				return nil, ErrMalformed
 			}
@@ -170,6 +170,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 38, marshalV3LivenessRequest(m), nil
 	case *ResourceReplyDisposition:
 		return 39, marshalResourceReplyDisposition(m), nil
+	case *EnumerateEntriesRequest:
+		return 40, marshalEnumerateEntriesRequest(m), nil
 	case *HelloReply:
 		return 60, marshalHelloReply(m), nil
 	case *ResolveReply:
@@ -226,6 +228,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 86, nil, nil
 	case *V3LivenessReply:
 		return 87, marshalV3LivenessReply(m), nil
+	case *EnumerateEntriesReply:
+		return 88, marshalEnumerateEntriesReply(m), nil
 	case *ErrorReply:
 		return 90, marshalErrorReply(m), nil
 	case *Event:
@@ -297,6 +301,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalV3LivenessRequest(b)
 	case 39:
 		return unmarshalResourceReplyDisposition(b)
+	case 40:
+		return unmarshalEnumerateEntriesRequest(b)
 	case 60:
 		return unmarshalHelloReply(b)
 	case 61:
@@ -353,6 +359,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return &VisibilityAckReply{}, nil
 	case 87:
 		return unmarshalV3LivenessReply(b)
+	case 88:
+		return unmarshalEnumerateEntriesReply(b)
 	case 90:
 		return unmarshalErrorReply(b)
 	case 91:
@@ -786,6 +794,8 @@ func marshalAttr(m *Attr) []byte {
 	}
 	b = appendU32(b, 14, m.Flags)
 	b = appendU64(b, 15, m.AllocSize)
+	b = appendU64(b, 16, m.FileID)
+	b = appendU64(b, 17, m.ParentFileID)
 	return b
 }
 
@@ -851,6 +861,10 @@ func parseAttrField(wt int, raw []byte) (Attr, error) {
 			m.Flags = uint32(v)
 		case 15:
 			m.AllocSize, err = scalarU64(wt, raw)
+		case 16:
+			m.FileID, err = scalarU64(wt, raw)
+		case 17:
+			m.ParentFileID, err = scalarU64(wt, raw)
 		}
 		return err
 	})
@@ -1003,6 +1017,26 @@ func unmarshalEnumerateReply(b []byte) (*EnumerateReply, error) {
 		}
 		return err
 	})
+}
+
+// The entries bodies share EnumerateRequest/EnumerateReply field numbers by
+// contract, so they reuse that exact canonical encoding.
+func marshalEnumerateEntriesRequest(m *EnumerateEntriesRequest) []byte {
+	return marshalEnumerateRequest((*EnumerateRequest)(m))
+}
+
+func unmarshalEnumerateEntriesRequest(b []byte) (*EnumerateEntriesRequest, error) {
+	m, err := unmarshalEnumerateRequest(b)
+	return (*EnumerateEntriesRequest)(m), err
+}
+
+func marshalEnumerateEntriesReply(m *EnumerateEntriesReply) []byte {
+	return marshalEnumerateReply((*EnumerateReply)(m))
+}
+
+func unmarshalEnumerateEntriesReply(b []byte) (*EnumerateEntriesReply, error) {
+	m, err := unmarshalEnumerateReply(b)
+	return (*EnumerateEntriesReply)(m), err
 }
 
 func marshalGetAttrRequest(m *GetAttrRequest) []byte {

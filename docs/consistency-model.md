@@ -41,6 +41,11 @@ Visibility does not imply power-loss durability.
 - Rename, link, and unlink flush every named dirty identity before dispatch.
   Namespace atomicity comes from XFS. Durable application protocols retain
   their ordinary file-and-directory fsync discipline.
+- FSKit has no fsync callback. Each successful FSKit mutation reply waits for
+  its storage effect to be durable, covering data, attributes, and namespace
+  changes. Mac `write(2)` returns at kernel page-cache acceptance; whether a
+  native fsync waits for the resulting write callbacks and reports their
+  errors is host behavior that remains unproven pending native qualification.
 - A run opens a directory handle on the mount root before its first operation
   and fsyncs that handle at completion. FSYNCDIR takes a mount-wide accepted
   cut and checks loss since OPENDIR. Failure fails the run. Ordinary stock-FUSE

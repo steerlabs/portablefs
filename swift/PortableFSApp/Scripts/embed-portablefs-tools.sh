@@ -4,6 +4,11 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
 vcs_root="$repo_root/vcs"
+version=$(/bin/cat "$repo_root/VERSION")
+if [ "${MARKETING_VERSION:-}" != "$version" ]; then
+  echo "MARKETING_VERSION must match repository VERSION ($version)" >&2
+  exit 1
+fi
 contents_dir="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH"
 helper_dir="$contents_dir/Helpers"
 launch_agents_dir="$contents_dir/Library/LaunchAgents"
@@ -164,6 +169,8 @@ service_info="$service_contents/Info.plist"
 /usr/bin/plutil -insert CFBundleIdentifier -string "$service_bundle_identifier" "$service_info"
 /usr/bin/plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$service_info"
 /usr/bin/plutil -insert CFBundleName -string PortableFSDService "$service_info"
+/usr/bin/plutil -insert NSLocalNetworkUsageDescription -string "PortableFS connects to filesystem authorities on your local network to mount and access your files." "$service_info"
+/usr/bin/plutil -insert NSNetworkVolumesUsageDescription -string "PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority." "$service_info"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL "$service_info"
 /usr/bin/plutil -insert CFBundleShortVersionString -string "$MARKETING_VERSION" "$service_info"
 /usr/bin/plutil -insert CFBundleVersion -string "$CURRENT_PROJECT_VERSION" "$service_info"

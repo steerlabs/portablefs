@@ -64,12 +64,24 @@ func (h *VolumeHandler) mutateFskitCoherence(
 				return terminal
 			}
 		}
+		if write := req.GetWrite(); write != nil && (write.GetAppend() || write.GetSync() || write.GetDataSync() ||
+			write.GetDelegation() != nil || write.GetFlushSequence() != 0 ||
+			write.GetWriteFlags()&writeLockOwner != 0 || write.GetLockOwner() != 0) {
+			return definiteRejection(syscall.EINVAL)
+		}
 		if !validFskitSourcePublicationPresence(req) {
 			return definiteRejection(syscall.EINVAL)
 		}
 		declared, err := decodeFskitSourcePublication(req)
 		if err != nil || declared == nil {
 			return definiteRejection(syscall.EINVAL)
+		}
+		if op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation); op != nil && op.beforeAdmission != nil {
+			admit := op.beforeAdmission
+			op.beforeAdmission = nil
+			if err := admit(); err != nil {
+				return definiteRejection(err)
+			}
 		}
 		declaration := h.Visibility.DeclareSourceGate(*declared)
 		declarationOwned := true
@@ -177,9 +189,6 @@ func (h *VolumeHandler) mutateFskitCoherence(
 			}
 			return definiteRejection(visibilityErr)
 		}
-		if result == nil {
-			return h.errorResponse(0, errInternal, true)
-		}
 		if publishErr != nil {
 			visibilityErr = errors.Join(visibilityErr, publishErr)
 		}
@@ -188,9 +197,29 @@ func (h *VolumeHandler) mutateFskitCoherence(
 				visibilityErr = errors.Join(visibilityErr, err)
 			}
 		}
+		if changes != nil {
+			if err := h.syncFskitMutation(req, result); err != nil {
+				// A restore barrier may already have failed and fenced the store.
+				// Keep its first terminal outcome and exact applied post-state if
+				// this later sync also fails (including on that existing fence).
+				if result.GetUncertain() && result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE {
+					h.deferStorageFailure(nil, err)
+					return result
+				}
+				if markFskitMutationPostApplyFailure(result, err) {
+					result.Failure = authoritypb.FailureClass_FAILURE_CLASS_STORAGE
+					h.deferStorageFailure(result, err)
+					return result
+				}
+				return h.errorResponse(0, err, true)
+			}
+		}
+		if result == nil {
+			return h.errorResponse(0, errInternal, true)
+		}
 		if visibilityErr != nil {
 			barrier := &volumeserver.VisibilityBarrierError{Applied: changes != nil, Err: visibilityErr}
-			if changes != nil && markFskitWritePostApplyFailure(result, barrier) {
+			if changes != nil && markFskitMutationPostApplyFailure(result, barrier) {
 				h.deferCoherenceFailure(result, barrier)
 				return result
 			}

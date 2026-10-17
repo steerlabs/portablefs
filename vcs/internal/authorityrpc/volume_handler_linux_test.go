@@ -277,7 +277,8 @@ func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 	}
 
 	h := testVolumeHandler()
-	h.Runtime, h.Store, h.Visibility = runtime, &resourceAdmissionFaultStore{}, visibility
+	store := &resourceAdmissionFaultStore{}
+	h.Runtime, h.Store, h.Visibility = runtime, store, visibility
 	h.initCoherence()
 	root := xfsstore.Capability{0x31}
 	if err := h.startSessionResourcesForProfile(source.ID, root, 2, [32]byte{}, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); err != nil {
@@ -338,6 +339,9 @@ func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 		t.Fatalf("mutation returned before change withdrawal: %+v", result)
 	default:
 	}
+	if store.durableObjects.Load() != 0 {
+		t.Fatal("durability preceded withdrawal completion")
+	}
 	if err := h.Coherence.Ack(subscription.Token, events[0].Position); err != nil {
 		t.Fatal(err)
 	}
@@ -345,8 +349,8 @@ func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 	if result.GetErrno() != 0 || result.GetUncertain() {
 		t.Fatalf("mixed-profile mutation response = %+v", result)
 	}
-	if applyCalls != 1 {
-		t.Fatalf("storage apply calls = %d, want 1", applyCalls)
+	if applyCalls != 1 || store.durableObjects.Load() != 1 {
+		t.Fatalf("storage apply/sync calls = %d/%d, want 1/1", applyCalls, store.durableObjects.Load())
 	}
 }
 
@@ -1077,16 +1081,32 @@ func TestCapabilityReservationReleaseAfterSessionCleanupDoesNotUnderflow(t *test
 
 type resourceAdmissionFaultStore struct {
 	volumeStore
-	failure      error
-	create       atomic.Uint32
-	mkdir        atomic.Uint32
-	symlink      atomic.Uint32
-	open         atomic.Uint32
-	lookup       atomic.Uint32
-	forget       atomic.Uint32
-	identityOpen atomic.Uint32
-	lookupItem   xfsstore.Capability
+	failure        error
+	create         atomic.Uint32
+	mkdir          atomic.Uint32
+	symlink        atomic.Uint32
+	open           atomic.Uint32
+	lookup         atomic.Uint32
+	forget         atomic.Uint32
+	identityOpen   atomic.Uint32
+	lookupItem     xfsstore.Capability
+	durableHandles atomic.Uint32
+	durableObjects atomic.Uint32
+	durableVolumes atomic.Uint32
 }
+
+func (s *resourceAdmissionFaultStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
+	return testNoopSyncTarget{&s.durableHandles}, nil
+}
+func (s *resourceAdmissionFaultStore) PinSyncObject(xfsstore.Capability) (xfsstore.SyncTarget, error) {
+	return testNoopSyncTarget{&s.durableObjects}, nil
+}
+func (s *resourceAdmissionFaultStore) SyncMutationFS() error { s.durableVolumes.Add(1); return nil }
+
+type testNoopSyncTarget struct{ calls *atomic.Uint32 }
+
+func (s testNoopSyncTarget) Sync() error { s.calls.Add(1); return nil }
+func (testNoopSyncTarget) Close() error  { return nil }
 
 func (*resourceAdmissionFaultStore) LockMutation([][16]byte) func() { return func() {} }
 

@@ -11,6 +11,8 @@ const (
 	defaultMaxConnections              = defaultMaxSessions * transportConnectionsPerLiveSession
 	defaultMaxInFlight                 = 256
 	defaultMaxWriteTransactions        = 4096
+	defaultMaxWriteBytes               = 1 << 20
+	defaultMaxFrameBytesInFlight       = 512 << 20
 	// The authority has no item-capacity negotiation. This must remain at least
 	// mountv3.CachedNameCapacity so a stock mount can retain its declared cache.
 	defaultMaxItemsPerSession = 1 << 16

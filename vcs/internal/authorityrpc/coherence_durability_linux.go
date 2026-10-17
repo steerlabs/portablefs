@@ -182,9 +182,10 @@ func (h *VolumeHandler) latestCoherenceDurability(session volumeserver.SessionID
 	return h.coherenceDurability.latest(session, h.Coherence.LatestDurable())
 }
 
-// coherenceSyncVolume establishes a volume-wide durability cut. The cut is
-// captured under the same lock that orders storage commits and OnCommit, but
-// the lock is released before syncfs: every captured mutation has finished its
+// coherenceSyncVolume establishes durability over a captured applied commit cut.
+// It does not drain requests accepted on other replay slots before their apply.
+// The cut is captured under the lock that orders storage commits and OnCommit,
+// but the lock is released before syncfs: every captured mutation has finished its
 // storage apply before the syscall starts, while unrelated commits remain free
 // to proceed. Mutations racing after the capture may also become durable, but
 // are deliberately excluded from the published proof.

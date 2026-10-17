@@ -190,14 +190,15 @@ short-lived grants inside the same authority session. The group is all-or-none,
 has exactly one renewal owner, and never falls back to manual renewal. A v3
 volume is branchless: the retired --branch flag is an error.
 
-There is no PortableFS-managed or offline write-back layer. Linux direct-I/O
-write(2) returns after the authority has applied the bytes to XFS. On macOS,
+Protocol 7 uses volume subscriptions and file write delegations on Linux.
+Delegated writes can buffer locally; fsync and the root-directory barrier
+flush the accepted writes and wait for authoritative durability. On macOS,
 ordinary kernel page-cache writeback still applies: write(2) may return before
 FSKit sends the write, while fsync/synchronize waits through the authority's
-server descriptor. Protocol 6 fixes one frontend profile for the whole session
-at attach. A Linux mount holds exact N/A/D/E cache leases and discharges every
-recall before the mutating peer's reply; a macOS FSKit mount runs the
-synchronous-repair stream instead and never receives cache leases.
+server descriptor. The authority fixes one frontend profile for the whole
+session at attach. Linux uses ordered changes and delegation control; a macOS
+FSKit mount runs the synchronous-repair stream and never receives Linux cache
+subscriptions or write delegations.
 --coherence may only be strict; legacy uncached mounts are rejected. Linux
 implements the exact strict-cache contract. macOS 26 declares the named
 macos26-synchronous-vfs-repair-v2 best-effort cache tier: authority ordering,
@@ -234,6 +235,17 @@ PORTABLEFS_FSKIT_CONTROL_SOCKET are rejected. PORTABLEFS_FSKIT_TYPE may only
 assert the signed release type. The daemon is
 always the exact portablefsd sibling from the same installed release;
 PORTABLEFS_FSKIT_DAEMON is rejected.
+
+For authorities on your LAN, macOS also requires Local Network permission for
+PortableFS or PortableFSDService under System Settings > Privacy & Security >
+Local Network. The background agent has its own app permission even when SSH
+or Terminal can reach the address. A denied connection may report "no route
+to host"; check both network routing and this permission before retrying.
+
+macOS may also ask for Network Volumes access when the daemon first opens the
+mounted volume. Allow it under System Settings > Privacy & Security > Files &
+Folders > Network Volumes. An unanswered prompt can delay mount readiness.
+Full Disk Access is not required.
 
 EXAMPLES
   portablefs mount my-workspace ~/work \

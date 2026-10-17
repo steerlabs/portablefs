@@ -220,6 +220,10 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if !hasFeatures(hello.GetFeatures(), requiredFeatures) {
 		return fail(errors.New("authorityrpc: authority omitted required current-state features"))
 	}
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
+		!hasFeatures(hello.GetFeatures(), []string{fskitDirectWriteFeature}) {
+		return fail(errors.New("authorityrpc: FSKit authority omitted fskit-direct-write-v1"))
+	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
 		hello.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
 	) {

@@ -184,6 +184,11 @@ func TestFskitWriteBeginDataCommitReplayAndAbort(t *testing.T) {
 	target := &fskitWriteTestTarget{}
 	store.targets = append(store.targets, target)
 
+	t.Cleanup(func() {
+		if got := store.durableHandles.Load(); got != 1 {
+			t.Errorf("fragmented COMMIT durability count = %d, want 1 including replay", got)
+		}
+	})
 	begin := fskitWritePhaseRequest(1, 1, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN, payload, 0)
 	if response := h.handleFskitWrite(context.Background(), begin, credential, begin.GetFskitWrite()); response.GetErrno() != 0 ||
 		response.GetFskitWrite().GetFlags() != fskitWriteReplyBegun {

@@ -219,23 +219,26 @@ type Volume struct {
 	// descriptions of one inode therefore share the same EOF atomicity domain.
 	// A fixed stripe array avoids an unbounded lifecycle map. Append validation
 	// and every possible size-changing operation participate in this domain.
-	inodeMutation [inodeMutationStripeCount]sync.RWMutex
-	closed        bool
-	fenced        error
-	objects       map[Capability]object
-	opens         map[Capability]*openFile
-	fsyncMu       sync.Mutex
-	fsyncStates   map[[16]byte]*inodeFsyncState
+	inodeMutation  [inodeMutationStripeCount]sync.RWMutex
+	closed         bool
+	fenced         error
+	objects        map[Capability]object
+	opens          map[Capability]*openFile
+	mutationSyncMu sync.Mutex
+	fsyncMu        sync.Mutex
+	fsyncStates    map[[16]byte]*inodeFsyncState
 
 	// The fields below are written once, before the Volume is reachable by
 	// any other goroutine, and never again. That is what makes them safe to
 	// read without mu; it is not an accident of the current call graph.
-	rootFD    int
-	root      Capability
-	device    uint64
-	ownerUID  uint32
-	ownerGID  uint32
-	projectID uint32
+	// Separate open description preserves syncfs errseq for required barriers.
+	mutationRoot *resource
+	rootFD       int
+	root         Capability
+	device       uint64
+	ownerUID     uint32
+	ownerGID     uint32
+	projectID    uint32
 	// productionIdentity requires the exact XFS export handle shape
 	// (type 129, 12 opaque bytes containing inode+generation). Tests on a
 	// non-XFS filesystem may fall back to device+inode, but production never
@@ -256,6 +259,7 @@ type Volume struct {
 	postStat                  func(int) (Attr, error)
 	fsync                     func(int) error
 	fdatasync                 func(int) error
+	syncfs                    func(int) error
 	inspectSecurityCapability func(int) (bool, error)
 	// removeWritePrivileges is fixed to the package implementation in
 	// production. The seam lets tests prove that a delegated killpriv failure
@@ -367,7 +371,12 @@ func (v *Volume) releaseFsyncState(state *inodeFsyncState) {
 		v.fsyncMu.Unlock()
 		panic("xfsstore: fsync state released more times than acquired")
 	}
-	if state.refs == 0 && v.fsyncStates[state.identity] == state {
+	// A consumed writeback error remains evidence for this incarnation even
+	// after the last description closes. Only an epoch restart clears it.
+	state.mu.Lock()
+	failed := state.syncFailure != nil
+	state.mu.Unlock()
+	if state.refs == 0 && !failed && v.fsyncStates[state.identity] == state {
 		delete(v.fsyncStates, state.identity)
 	}
 	v.fsyncMu.Unlock()
@@ -491,6 +500,7 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		copyFileRange:               unix.CopyFileRange,
 		postStat:                    statFD,
 		fsync:                       unix.Fsync,
+		syncfs:                      unix.Syncfs,
 		fdatasync:                   unix.Fdatasync,
 		inspectSecurityCapability:   inspectSecurityCapability,
 		removeWritePrivileges:       removeWritePrivileges,
@@ -506,6 +516,11 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		_ = unix.Flock(fd, unix.LOCK_UN)
 		return fail(err)
 	}
+	mutationFD, err := unix.Openat(fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(fmt.Errorf("open required syncfs root: %w", err))
+	}
+	v.mutationRoot = newResource(mutationFD)
 	v.root = root
 	v.objects[root] = object{res: newResource(fd), kind: KindDirectory, coordinate: ObjectCoordinate{
 		Stable: rootIdentity, Ino: st.Ino,
@@ -581,7 +596,7 @@ func (v *Volume) Close() error {
 	// Releasing the root's flock does not wait for in-flight operations: the
 	// unlock takes effect on the open file description immediately, while the
 	// descriptor itself survives until the last in-flight reference drops it.
-	result := unix.Flock(v.rootFD, unix.LOCK_UN)
+	result := errors.Join(unix.Flock(v.rootFD, unix.LOCK_UN), v.mutationRoot.release())
 	for id, opened := range v.opens {
 		result = errors.Join(result, opened.res.release())
 		v.releaseFsyncState(opened.fsyncState)
@@ -979,21 +994,26 @@ func (v *Volume) reopen(fd, flags int, kind Kind) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	// open(O_TRUNC) has already changed the inode even if verification fails.
+	failure := func(err error) (int, error) {
+		_ = unix.Close(opened)
+		if flags&unix.O_TRUNC != 0 {
+			err = outcomeUncertain(err)
+		}
+		return -1, err
+	}
 	var before, after unix.Stat_t
 	if err := unix.Fstat(fd, &before); err != nil {
-		_ = unix.Close(opened)
-		return -1, err
+		return failure(err)
 	}
 	if err := unix.Fstat(opened, &after); err != nil || before.Dev != after.Dev || before.Ino != after.Ino {
-		_ = unix.Close(opened)
 		if err != nil {
-			return -1, err
+			return failure(err)
 		}
-		return -1, ErrStaleObject
+		return failure(ErrStaleObject)
 	}
 	if err := v.verifyProjectOf(opened, kind); err != nil {
-		_ = unix.Close(opened)
-		return -1, err
+		return failure(err)
 	}
 	return opened, nil
 }
@@ -1050,7 +1070,11 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	if err != nil {
 		return Capability{}, err
 	}
-	return v.installHandle(newResource(fd), id, obj.kind, flags)
+	handle, err := v.installHandle(newResource(fd), id, obj.kind, flags)
+	if err != nil && flags.Truncate {
+		err = outcomeUncertain(err)
+	}
+	return handle, err
 }
 
 // adoptGrantedDescription turns the creation description into this handle.
@@ -1073,7 +1097,11 @@ func (v *Volume) adoptGrantedDescription(grant *createGrant, granted *resource, 
 			return Capability{}, err
 		}
 	}
-	return v.installHandle(granted, id, kind, flags)
+	handle, err := v.installHandle(granted, id, kind, flags)
+	if err != nil && flags.Truncate {
+		err = outcomeUncertain(err)
+	}
+	return handle, err
 }
 
 // installHandle takes ownership of one open file description and issues the
@@ -1866,31 +1894,15 @@ func (v *Volume) GetattrOpen(id Capability) (Attr, error) {
 }
 
 func (v *Volume) SyncObject(id Capability) error {
-	obj, err := v.holdObject(id)
+	target, err := v.PinSyncObject(id)
 	if err != nil {
 		return err
 	}
-	defer obj.release()
-	flags := unix.O_RDONLY
-	if obj.kind == KindDirectory {
-		flags |= unix.O_DIRECTORY
-	}
-	fd, err := v.reopen(obj.fd(), flags, obj.kind)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(fd)
-	return unix.Fsync(fd)
+	defer target.Close()
+	return target.Sync()
 }
 
-func (v *Volume) SyncFS() error {
-	root, err := v.holdObject(v.rootCapability())
-	if err != nil {
-		return err
-	}
-	defer root.release()
-	return unix.Syncfs(root.fd())
-}
+func (v *Volume) SyncFS() error { return v.syncFS(false) }
 
 // rootCapability is safe without the lock: v.root is written once, before the
 // Volume is published.

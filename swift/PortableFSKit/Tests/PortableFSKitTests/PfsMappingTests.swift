@@ -48,6 +48,7 @@ import Testing
     rootItem.itemGeneration = 1
     var root = PfsAttr()
     root.item = rootItem
+    root.fileID = rootItem.itemID
     root.kind = .directory
     root.mode = 0o755
     let attributes = try PfsFSKitMapping.attributes(from: root)
@@ -67,15 +68,15 @@ import Testing
     }
 
     var local = PfsAttr()
-    local.item.itemID = floor
+    local.fileID = floor
     #expect(
         try PfsFSKitMapping.localRepairAttributes(from: local).fileID.rawValue == floor + 1
     )
-    local.item.itemID = UInt64.max - 1
+    local.fileID = UInt64.max - 1
     #expect(
         try PfsFSKitMapping.localRepairAttributes(from: local).fileID.rawValue == UInt64.max
     )
-    local.item.itemID = UInt64.max
+    local.fileID = UInt64.max
     do {
         _ = try PfsFSKitMapping.localRepairAttributes(from: local)
         Issue.record("expected the terminal raw item identifier to fail")
@@ -104,7 +105,9 @@ import Testing
     parent.itemGeneration = 3
     var attr = PfsAttr()
     attr.item = item
+    attr.fileID = item.itemID
     attr.parent = parent
+    attr.parentFileID = parent.itemID
     attr.kind = .file
     attr.mode = 0o640
     attr.nlink = 2
@@ -148,6 +151,7 @@ import Testing
     rootItem.itemGeneration = 5
     var root = PfsAttr()
     root.item = rootItem
+    root.fileID = rootItem.itemID
     root.kind = .directory
     let rootAttributes = try PfsFSKitMapping.attributes(from: root, requested: [.parentID])
     #expect(rootAttributes.isValid(.parentID))
@@ -158,6 +162,7 @@ import Testing
     detachedItem.itemGeneration = 5
     var detached = PfsAttr()
     detached.item = detachedItem
+    detached.fileID = detachedItem.itemID
     let detachedAttributes = try PfsFSKitMapping.attributes(
         from: detached,
         requested: [.parentID]
@@ -169,6 +174,7 @@ import Testing
     invalidParent.itemID = 0
     invalidParent.itemGeneration = 5
     detached.parent = invalidParent
+    detached.parentFileID = PfsFSKitMapping.localRepairIdentifierFloor
     #expect(throws: PfsLocalClientError.self) {
         try PfsFSKitMapping.attributes(from: detached, requested: [.parentID])
     }
@@ -183,7 +189,9 @@ import Testing
     parent.itemGeneration = 1
     var attr = PfsAttr()
     attr.item = item
+    attr.fileID = item.itemID
     attr.parent = parent
+    attr.parentFileID = parent.itemID
     attr.kind = .file
     attr.mode = 0o644
     attr.size = 17
@@ -332,6 +340,7 @@ import Testing
     rootItem.itemGeneration = 2
     var root = PfsAttr()
     root.item = rootItem
+    root.fileID = rootItem.itemID
     root.kind = .directory
     // POSIX makes the root its own parent; .parentOfRoot is a getattr-only
     // answer and would name no packable directory entry.
@@ -342,6 +351,7 @@ import Testing
     childItem.itemGeneration = 1
     var child = PfsAttr()
     child.item = childItem
+    child.fileID = childItem.itemID
     child.kind = .directory
     #expect(
         try PfsFSKitMapping.parentDirectoryIdentifier(from: child)
@@ -349,6 +359,7 @@ import Testing
     )
 
     child.parent = rootItem
+    child.parentFileID = rootItem.itemID
     #expect(try PfsFSKitMapping.parentDirectoryIdentifier(from: child) == .rootDirectory)
 }
 
@@ -425,6 +436,6 @@ import Testing
     #expect(supported.supportsSymbolicLinks)
     #expect(supported.supportsHardLinks)
     #expect(supported.supports64BitObjectIDs)
-    #expect(supported.supportsPersistentObjectIDs)
+    #expect(!supported.supportsPersistentObjectIDs)
     #expect(supported.caseFormat == .sensitive)
 }

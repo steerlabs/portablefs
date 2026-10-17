@@ -891,9 +891,11 @@ func (r *registry) runUnmountTransaction(
 		// The evidence-bearing v3 detach: exact kernel detach, getfsstat
 		// absence observation, proof delivery, then local release. It shares
 		// none of the prepared/force/journal machinery below because a v3
-		// attach has no daemon WAL store to drain. Its normal unforced kernel
-		// pass is still the mandatory FSKit synchronize/authority boundary;
-		// detachV3 alone owns that v3-specific sequence.
+		// attach has no daemon WAL store to drain. Every FSKit mutation is
+		// durable at the authority before its reply, so the normal unforced
+		// kernel pass, which flushes dirty kernel pages through those
+		// callbacks, is the durability boundary; detachV3 alone owns that
+		// v3-specific sequence.
 		if err := r.detachV3(a, forceAuthorized || force, ops); err != nil {
 			return true, "", err
 		}
@@ -1036,9 +1038,10 @@ func (e *preparedDetachAbortDurabilityError) Unwrap() error { return e.cause }
 
 // forceUnmountFSKit durably records the user's force authorization before the
 // irreversible session fence, then performs the exact kernel detach. A v3
-// attach carries no client-side durability debt — every acknowledged write is
-// already applied by the authority — so there is no tail to park and no
-// recovery handle to hand back. The caller owns registry.mutationMu.
+// attach carries no client-side durability debt — every acknowledged FSKit
+// mutation is already durable at the authority — so there is no tail to park
+// and no recovery handle to hand back. Kernel pages never delivered as write
+// callbacks are lost to a forced detach. The caller owns registry.mutationMu.
 func (r *registry) forceUnmountFSKit(
 	a *attach,
 	forceAlreadyAuthorized bool,

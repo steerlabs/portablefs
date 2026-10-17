@@ -10,8 +10,71 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+### Changed
+
+- FSKit mutations are durable before their replies. FSKit delivers no fsync
+  callback, so the authority forces each applied Mac mutation's storage effect,
+  covering data, attributes, and namespace changes, before replying. It
+  advertises this as the optional `fskit-durable-mutations-v1` Activate feature,
+  and a storage sync error fences the epoch.
+- FSKit writes take one authority round trip per chunk. The authority admits
+  the ordinary one-frame `WRITE` for FSKit sessions under the optional
+  `fskit-direct-write-v1` Hello feature, and the daemon no longer serializes a
+  mount-wide BEGIN. Current Mac clients require both features. The fragmented
+  BEGIN/DATA/COMMIT bodies remain for older clients.
+- `pfslocal` 1.16 separates file identity from item ownership. FSKit file IDs
+  derive from XFS inode numbers (inode plus one; the root is 2) and are stable
+  across reclaim and re-lookup. Directory listings
+  are non-owning entry snapshots and retain no authority capabilities. The
+  volume no longer claims persistent object IDs, because it implements no
+  lookup by ID.
+- The daemon retires authority capabilities through one batched reclaimer, and
+  opens, unlinks, and hard links no longer fetch attributes they do not use.
+  Statically refused xattr names are answered locally with the authority's
+  errno.
+- The authority reserves inbound frame memory for CONTROL and handshake traffic,
+  so saturated DATA transfers cannot starve keepalives, acknowledgements, or
+  reconnects.
+
 ### Fixed
 
+- FSKit file creation is exclusive, as the createItem contract requires, and an
+  explicit directory mode such as 0644 is no longer rewritten to 0755.
+- A lookup that races a reclaim of the same FSKit item receives a new item
+  instead of the one being retired, and reclaimed identities no longer
+  accumulate in the published set.
+- A compound SETATTR validates every deterministic constraint before its first
+  change, so a later refusal can no longer report an applied mode change as
+  unchanged.
+- Old-client FSKit post-apply write failures no longer hold teardown open until
+  the terminal receipt timeout.
+- A well-formed post-apply FSKit write failure, such as quota exhaustion, ends
+  local serving but keeps the authority session for the unmount absence proof.
+  It no longer strands the volume's Mac writer lease after a clean unmount.
+- FSKit bounds ordinary callback execution before submitting daemon requests,
+  including kernel reclaim bursts. Queued ingress remains part of PREPARE's
+  publication drain, while authenticated repair callbacks retain progress.
+- FSKit item retirement uses a per-item object index instead of scanning the
+  entire volume for every reclaim or generation change.
+- Frontend loss no longer cancels already-assigned authority requests. Their
+  original deadlines remain in force; terminal publication cleanup settles
+  responses while retaining the original transport and liveness for exact
+  mount-absence proof.
+- FSKit callbacks keep one publication reservation across all their requests.
+  Completion retires both ledgers before consuming authority responses, even
+  when an acknowledgement races the last handler or its continuation.
+- macOS host and service bundles declare their Local Network purpose; mount
+  help explains LAN permission and the current protocol-7 buffering contract.
+- The power-loss harness provisions the FUSE control filesystem required by
+  the mount's exact kernel-abort witness before starting its workloads.
+- macOS service updates derive the outgoing release from its authenticated
+  daemon and signed owning app, rather than a saved preference. Startup and
+  installer activation share the same live release proof. Direct Xcode builds
+  now use the current release version and resolved package pins.
+- FSKit frontend loss stops local serving before kernel teardown, while
+  retaining the original authority transport for exact mount-absence proof.
+  Successful teardown releases writer exclusion without replacing the session.
+- Update the pinned Go toolchain and matching build/test images to 1.26.9.
 - The macOS installer accepts normal trailing slashes on signed app ZIP
   directory entries while still rejecting repeated separators and traversal.
   It also reads the daemon service's dotted app-group entitlement key literally

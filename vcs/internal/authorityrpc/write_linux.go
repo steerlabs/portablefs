@@ -159,6 +159,10 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		if !ok {
 			return nil, syscall.EOPNOTSUPP
 		}
+		if target != nil {
+			_ = target.Close()
+			target = nil
+		}
 		target, err = store.PinWriteTarget(metadata.handle)
 		if err != nil {
 			return nil, err

@@ -66,7 +66,7 @@ internal/
   portablefsd/     The macOS daemon registry, control API, FSKit data plane,
                    synchronous-repair bridge, and evidence-bearing detach.
   pfslocal/        The local protocol between the daemon and the FSKit
-                   extension. Major 1, currently minor 15, additive.
+                   extension. Major 1, currently minor 16, additive.
   mountv3/         The shared mount engine used by both the CLI and the
                    standalone mount binary.
   localdirs/       The .portablefs/local-dirs declaration: parsing,

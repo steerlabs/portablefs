@@ -234,7 +234,7 @@ private func makeAdapterHarness(
 
 extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
-@Test func enumerationTransfersOnlyTheExactPackedItemPrefix() async throws {
+@Test func enumerationPacksSnapshotsWithoutAdoptionAndResumesAfterRefusal() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
 
@@ -270,15 +270,23 @@ extension PfsLocalMockDaemonTests {
     )
     #expect(state.entries.count == 2)
     #expect(state.didRefuse)
-    for _ in 0..<100 {
-        if await harness.daemon.stats().resourceAcceptedItemCounts.count >= 2 {
-            break
-        }
-        try await Task.sleep(nanoseconds: 1_000_000)
-    }
+    let (resumedPacker, resumedState) = makeRecordingPacker(capacity: 10)
+    defer { RecordingPackerRegistry.shared.uninstall(resumedPacker) }
+    _ = try await harness.volume.enumerateDirectory(
+        harness.root,
+        startingAt: FSDirectoryCookie(try #require(state.entries.last).nextCookie),
+        verifier: FSDirectoryVerifier(1),
+        attributes: FSItem.GetAttributesRequest(),
+        packer: resumedPacker
+    )
+    #expect(resumedState.entries.count == 1)
+    #expect(Set((state.entries + resumedState.entries).map(\.name)) == ["prefix-a", "prefix-b", "suffix-rejected"])
     let stats = await harness.daemon.stats()
-    #expect(stats.resourceAcceptedItemCounts.filter { $0 > 0 } == [2])
-    #expect(await harness.core.testingDebugState().itemCount == 3)
+    #expect(stats.resourceAcceptedItemCounts.filter { $0 > 0 }.isEmpty)
+    #expect(stats.resourceAcceptedItemCounts == [0]) // Directory handle only.
+    #expect(stats.reclaimRequests == 0)
+    #expect(await harness.core.testingDebugState().itemCount == 1)
+
 }
 
 @available(macOS 26.0, *)
@@ -1286,7 +1294,7 @@ private func adapterErrno(
 }
 
 @available(macOS 26.0, *)
-@Test func operationsAdapterRenameOverOpenTargetFetchesAttrsWhenSnapshotIsMissing() async throws {
+@Test func operationsAdapterRenameOverOpenTargetFetchesCurrentAttrs() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
 
@@ -1294,8 +1302,6 @@ private func adapterErrno(
     let v2 = adapterBytes("new-config")
     let target = try await createAdapterFile(volume: harness.volume, in: harness.root, name: "config", contents: v1)
     try await harness.volume.openItem(target, modes: [.read])
-    let portableTarget = try #require(target as? PortableFSItem)
-    await harness.core.testingClearOpenAttrSnapshot(item: portableTarget)
     let lock = try await createAdapterFile(volume: harness.volume, in: harness.root, name: "config.lock", contents: v2)
 
     _ = try await harness.volume.renameItem(
@@ -1522,7 +1528,7 @@ private func adapterErrno(
 
 @available(macOS 26.0, *)
 @Test func operationsAdapterPacksParentDirectoryIdentityForDotDot() async throws {
-    let harness = try await makeAdapterHarness()
+    let harness = try await makeAdapterHarness(configuration: .init(fileIDOffset: 5_000))
     defer { harness.daemon.stop() }
     let (parent, _) = try await harness.volume.createItem(
         named: FSFileName(string: "parent"),
@@ -1539,10 +1545,10 @@ private func adapterErrno(
     _ = try await createAdapterFile(volume: harness.volume, in: child, name: "leaf.txt")
 
     let parentID = try PfsFSKitMapping.itemIdentifier(
-        from: try #require(parent as? PortableFSItem).identity.itemID
+        from: try #require(parent as? PortableFSItem).fileID
     ).rawValue
     let childID = try PfsFSKitMapping.itemIdentifier(
-        from: try #require(child as? PortableFSItem).identity.itemID
+        from: try #require(child as? PortableFSItem).fileID
     ).rawValue
 
     let entries = try await collectDirectoryEntries(
@@ -1555,7 +1561,8 @@ private func adapterErrno(
     #expect(entries[0].itemID == childID)
     #expect(entries[1].itemID == parentID)
 
-    // POSIX makes the root its own parent, so "." and ".." agree there.
+    // Root already carries everything needed for ".."; it needs no getattr.
+    await harness.daemon.resetStats()
     let rootEntries = try await collectDirectoryEntries(
         volume: harness.volume,
         directory: harness.root,
@@ -1566,6 +1573,7 @@ private func adapterErrno(
     #expect(rootEntries.prefix(2).map(\.name) == [".", ".."])
     #expect(rootEntries[0].itemID == rootID)
     #expect(rootEntries[1].itemID == rootID)
+    #expect(await harness.daemon.stats().getAttrRequests == 0)
 
     // Readdir-plus must stay synthetic-free: FSKit's contract is "Don't pack
     // `.` and `..` if `attributes` isn't `nil`."

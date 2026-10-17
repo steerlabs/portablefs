@@ -160,7 +160,8 @@ type Server struct {
 	// used by readiness only and must be nonblocking.
 	OnServing func(bool)
 
-	budget *frameBudget
+	budget          *frameBudget
+	frameBudgetOnce sync.Once
 
 	registryMu sync.Mutex
 	registry   *transportRegistry
@@ -185,10 +186,22 @@ func (s *Server) validate() (TransportBounds, error) {
 	if bounds.MaxRequestFrame == 0 || bounds.MaxRequestFrame > s.MaxFrame {
 		return TransportBounds{}, errors.New("authorityrpc: advertised request-frame bound must be positive and within the transport frame")
 	}
-	if s.MaxFrameBytesInFlight < uint64(bounds.MaxRequestFrame) {
-		return TransportBounds{}, errors.New("authorityrpc: frame allocation budget cannot admit one maximal request")
+	if s.MaxFrameBytesInFlight < MinimumFrameBytesInFlight(bounds.MaxRequestFrame) {
+		return TransportBounds{}, errors.New("authorityrpc: frame allocation budget must admit one maximal DATA allocation plus the CONTROL/bootstrap reserve")
 	}
 	return bounds, nil
+}
+
+// MinimumFrameBytesInFlight admits one maximal DATA allocation while leaving
+// the fixed CONTROL/bootstrap reserve available across all connections.
+func MinimumFrameBytesInFlight(maxRequestFrame uint32) uint64 {
+	return uint64(frameAllocationBytes(maxRequestFrame)) + controlFrameReserve()
+}
+
+func (s *Server) initializeFrameBudget() {
+	s.frameBudgetOnce.Do(func() {
+		s.budget = newFrameBudget(s.MaxFrameBytesInFlight, controlFrameReserve())
+	})
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tls.Config) error {
@@ -199,7 +212,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	if tlsConfig == nil || tlsConfig.MinVersion < tls.VersionTLS13 || tlsConfig.ClientAuth != tls.RequireAndVerifyClientCert || tlsConfig.ClientCAs == nil {
 		return errors.New("authorityrpc: TLS 1.3 and CA-verified client certificates are required")
 	}
-	s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
+	s.initializeFrameBudget()
 	if err := s.initializeTransportRegistry(); err != nil {
 		return err
 	}
@@ -284,6 +297,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds Transpo
 // serveConn so the transport can be exercised without standing up TLS, while
 // the exported path stays fail-closed.
 func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, conn net.Conn, bounds TransportBounds, identity volumeserver.PeerIdentity) error {
+	s.initializeFrameBudget()
 	if err := s.initializeTransportRegistry(); err != nil {
 		return err
 	}
@@ -338,12 +352,16 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			inflightMu.Unlock()
 		}()
 	}
+	// The first DATA request binds/resumes the session. It uses bootstrap
+	// capacity; execution stays in a cancellable worker so EOF cancels waits.
+	bootstrapData := entry.role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(s.IdleTimeout)); err != nil {
 			return err
 		}
 		request := new(authoritypb.Request)
-		releaseFrame, payloadDigest, err := readRequestFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
+		allowBulk := entry.role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA && !bootstrapData
+		releaseFrame, payloadDigest, err := readRequestFrameRetained(ctx, conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request, allowBulk)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
@@ -358,6 +376,13 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 		if err := requestAllowedOnRole(request, entry.role); err != nil {
 			releaseFrame()
 			return err
+		}
+		if bootstrapData {
+			if request.GetAttach() == nil && request.GetResume() == nil {
+				releaseFrame()
+				return fmt.Errorf("%w: DATA must first Attach or Resume", ErrTransportBinding)
+			}
+			bootstrapData = false
 		}
 		if cancelRequest := request.GetCancel(); cancelRequest != nil {
 			session, sessionErr := sessionIDFromRequest(request)

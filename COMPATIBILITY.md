@@ -57,8 +57,8 @@ are separate identities. No mixed-major volume deployment is supported.
 | Linux cache authority | Volume subscription, ordered changes, file write delegation; exact feature sets in [wire.md](docs/coherence-v2/wire.md#required-features) | N/A/D/E lease families; `lease-coherence-v1`, `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`, `open-by-identity-v1`, and unconditional Linux `write-through` |
 | Historical wire bodies | Tags and names retained and never reused; no executable old lease path | `Lease*`, `NextLeaseEvent`, `AcknowledgeLeaseEvent`, `RenewLeases`, `SourceLeaseDischarge`, `AcknowledgeSourceLeaseDischarge`, `lease_grants`, `source_lease_discharge`, `lease_cursor` |
 | Frontend enum | Frozen `LINUX_LEASES` spelling now has major-7 semantics; FSKit retains `FSKIT_SYNC_REPAIR`; gateway uses `CACHELESS_READER` | Linux lease execution and gateway use of FSKit repair |
-| Mac daemon / extension | `pfslocal` 1.15; nested authority major 7; shared Go/Swift Resolve golden, built from one commit | Nested authority major 6, refused even though the local major/minor is unchanged |
-| Completion | Root-directory FSYNCDIR barrier and per-handle loss observation; explicit fsync durability | Linux unconditional write-through; stock FUSE_SYNCFS is not a completion surface |
+| Mac daemon / extension | `pfslocal` 1.16; nested authority major 7; shared Go/Swift Resolve golden, built from one commit | Nested authority major 6, refused even though the local major/minor is unchanged |
+| Completion | Linux: root-directory FSYNCDIR barrier, per-handle loss observation, and explicit fsync durability. FSKit: every acknowledged mutation is storage-durable before its reply | Linux unconditional write-through; stock FUSE_SYNCFS is not a completion surface |
 | Retained identities | Existing cache-policy names, local-dirs syntax/hash, environment and CLI spellings, release archive names and signing identity | None renamed or repurposed by this release |
 
 The coordinated [rollout](docs/coherence-v2/rollout.md) covers Authorities,
@@ -107,7 +107,16 @@ establish these prerequisites before launching the mount.
   execution paths have been deleted. FSKit retains `FSKIT_SYNC_REPAIR`,
   its repair/source-publication/fragmented-write assertions, and writer
   exclusion for every attached Mac mount. A feature advertisement cannot
-  manufacture a callback the frontend does not expose. The additive
+  manufacture a callback the frontend does not expose.
+
+  Two optional FSKit features are additive. `fskit-direct-write-v1` (Hello)
+  admits the ordinary one-frame `WRITE` body for FSKit sessions, limited to
+  positioned writes without append, sync intent, delegation, flush sequence, or
+  lock owner. `fskit-durable-mutations-v1` (Activate) states that every
+  successful FSKit mutation reply, fragmented COMMIT included, is durable on
+  authority storage before it is sent or retained for replay. Current Mac clients
+  require both and refuse an older authority at the handshake; older Mac
+  clients keep using the fragmented bodies, which the authority still serves. The additive
   `CACHELESS_READER` profile requires `cacheless-peer-reader-v1`, exactly read
   access, no cache permission and no repair participation. Gateway reads break
   delegated data for read without excluding Linux writers.
@@ -200,8 +209,9 @@ macOS 26 and 27 mount through the explicit protocol-7 `FSKIT_SYNC_REPAIR`
 frontend profile. It is selected before Attach, pinned into the canonical
 session fingerprint, and cannot change on replay or resume. The authority does
 not issue N/A/D/E grants to it; it retains the FSKit PREPARE/COMPLETE,
-source-publication, and fragmented-write bodies behind a strict profile
-allowlist. Linux sessions cannot invoke those bodies, and FSKit sessions cannot
+source-publication, and fragmented-write bodies, plus the ordinary one-frame
+write under `fskit-direct-write-v1`, behind a strict profile allowlist. Linux
+sessions cannot invoke the FSKit-specific bodies, and FSKit sessions cannot
 invoke Linux subscription/delegation control. This is a declared platform contract, not probing,
 fallback to an older protocol major, or local-filesystem substitution.
 
@@ -307,7 +317,10 @@ Additive evolution with versioning; consumers tolerate additions.
   the canonical request encoding rejects them — so a field is added on both sides
   or not at all.
 - `pfslocal` minor version bumps. The local protocol between `portablefsd` and
-  the FSKit extension is major 1, currently minor 15, and grows additively.
+  the FSKit extension is major 1, currently minor 16, and grows additively.
+  Minor 16 adds `Attr.file_id`/`parent_file_id` and the non-owning
+  `EnumerateEntries` listing; the item-owning `Enumerate` keeps its meaning and
+  is not served to a minor-16 frontend.
   Its nested authority contract now requires exact major 7; major 6 is refused.
   This does not change the local major/minor or any frozen field numbers.
 - New environment variables, where leaving one unset preserves previous

@@ -251,8 +251,15 @@ the worker class and workload measurements.
 
 Startup cross-checks them rather than accepting any combination: `--max-frame-bytes`
 must leave a fixed reserve around each read/write payload, `--max-retained-reply-bytes`
-must admit at least one maximal reply, `--max-frame-bytes-in-flight` must admit at
-least one maximal request, `--connection-idle-timeout` must exceed `--session-lease`,
+must admit at least one maximal reply, and `--max-frame-bytes-in-flight` must
+admit one maximal DATA allocation (rounded to its frame-pool class) plus a fixed
+12 MiB CONTROL/bootstrap reserve: 64 allocations at the 192 KiB CONTROL frame
+cap. All inbound frames share that total; DATA acquisitions must leave the
+reserve available, while CONTROL/bootstrap may use any available bytes. The
+floor is 13,697,024 bytes with the default 1 MiB write bound; the 512 MiB default
+leaves DATA headroom independently of the connection count. This reserve
+protects against DATA saturation, not saturation by CONTROL itself.
+`--connection-idle-timeout` must exceed `--session-lease`,
 and `--max-in-flight` must be at least 2 so an ordinary request can proceed
 alongside a blocking lock wait. Protocol 6 also requires `--max-connections` to
 be at least four times `--max-sessions`: two slots hold each mount's current
@@ -509,8 +516,10 @@ kernel pages under D leases. Shared writable file-backed `mmap` is refused;
 read-only and `MAP_PRIVATE` mappings use the clean-data regime. There is no
 incoherent page-cache fallback.
 
-There is no write-back cache: `write(2)` returns after the authority has applied
-the bytes to XFS, and `fsync` waits for the authoritative server descriptor. Use
+Kernel write-back is off. Under a full file delegation the daemon may hold
+accepted writes in its bounded buffer; otherwise `write(2)` returns after the
+authority has applied the bytes to XFS. `fsync` waits for durable application
+on the authoritative server descriptor. Use
 `fsync`/`fdatasync` on files and `fsync` on changed parent directories for
 targeted durability. FUSE SYNCFS is used when the stock kernel advertises it.
 The 7.31 floor predates that request, so PortableFS does not claim a remote
@@ -523,8 +532,8 @@ service.
 
 `portablefs umount <path>` runs the full drain barrier and fails, leaving the
 mount attached, if the drain cannot complete. `--force` detaches without
-draining; a v3 mount holds no client-side durability debt, so nothing is parked
-and nothing is replayed — `--force` simply gives up on proving the drain.
+draining: nothing is parked or replayed, so accepted writes still in a
+delegated write buffer or kernel page cache are lost.
 
 ## Mounting from macOS
 
@@ -544,6 +553,13 @@ runtime feature flag: there is no opt-in, `uncached` mode, or fallback.
 3. Do not issue a production mount until a release explicitly qualifies the
    native FSKit repair contract. The current daemon returns the admission error
    without opening an authority session.
+
+FSKit authorities advertise the optional Hello feature `fskit-direct-write-v1`
+and Activate feature `fskit-durable-mutations-v1`. The first admits positioned
+ordinary WRITE with FSKit source publication; the second guarantees durability
+before retaining or sending an applied mutation result. Current FSKit clients
+require both, while older clients retain fragmented writes. These additions do
+not change the frozen required feature sets or the Linux profile.
 
 The host's launchd-managed `portablefsd` owns the authority session; the CLI
 adopts it through the external owner-private control socket or wakes the exact
@@ -698,6 +714,8 @@ label.
 | `portablefs_authority_write_admission_blocks_total` | How often did a BEGIN find transaction-count or byte capacity unavailable? |
 | `portablefs_authority_write_admission_wait_seconds` | How long did blocked BEGIN requests remain in FIFO capacity admission? |
 | `portablefs_authority_fsync_barrier_handles_total` / `portablefs_authority_fsync_storage_syncs_total` | How many fsync barrier requests did each completed storage sync serve? The ratio is group-commit effectiveness. |
+| `portablefs_authority_fskit_durability_syncs_total{target}` | How many required FSKit mutation barriers ran, including failed attempts? `target` is `handle`, `object`, or `syncfs`. |
+| `portablefs_authority_fskit_durability_duration_seconds{target}` | How long did those barriers take, and how often is a cell-wide syncfs fallback affecting latency? |
 | `portablefs_authority_visibility_barrier_duration_seconds` | How long did PREPARE, XFS apply, and peer COMPLETE acknowledgment take end to end? |
 | `portablefs_authority_visibility_barrier_audience` | How many peer sessions had cache state to repair for each barrier? Routing changes count every strict participant. |
 | `portablefs_authority_fence_events_total{reason}` | Why was a participant told to revoke: `visibility_lost`, `repair_deadline`, `protocol_violation`, `write_transaction_mismatch`, or `other`? |
