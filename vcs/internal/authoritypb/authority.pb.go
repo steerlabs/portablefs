@@ -2395,6 +2395,16 @@ type Response struct {
 	// Largest contiguous session application prefix whose peer withdrawals have
 	// completed. Durability is reported separately and does not imply this cut.
 	VisibleSequence uint64 `protobuf:"varint,70,opt,name=visible_sequence,json=visibleSequence,proto3" json:"visible_sequence,omitempty"`
+	// Present only on a successful KEEPALIVE reply to a session that negotiated
+	// fskit-versioned-metadata-v1. It is the authority-relative duration, sampled
+	// after renewal under the session lock and rounded down, for which this
+	// session's compatibility-writer exclusion is promised: never more than the
+	// remaining lease or authorization, and never positive for a terminal
+	// session. The authority retains that exclusion for the whole promise even if
+	// the session is fenced earlier. A client anchors it at the request's local
+	// send time on a clock that advances across sleep; it is never compared with
+	// a wall clock.
+	SessionValidForNanos uint64 `protobuf:"varint,72,opt,name=session_valid_for_nanos,json=sessionValidForNanos,proto3" json:"session_valid_for_nanos,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Response_Hello
@@ -2591,6 +2601,13 @@ func (x *Response) GetSessionTerminal() bool {
 func (x *Response) GetVisibleSequence() uint64 {
 	if x != nil {
 		return x.VisibleSequence
+	}
+	return 0
+}
+
+func (x *Response) GetSessionValidForNanos() uint64 {
+	if x != nil {
+		return x.SessionValidForNanos
 	}
 	return 0
 }
@@ -11906,7 +11923,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\fR\x04name\x12)\n" +
 	"\x10bound_attributes\x18\x03 \x01(\bR\x0fboundAttributes\x12\x1d\n" +
 	"\n" +
-	"bound_data\x18\x04 \x01(\bR\tboundData\"\xc7\"\n" +
+	"bound_data\x18\x04 \x01(\bR\tboundData\"\xfe\"\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -11926,7 +11943,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x10applied_sequence\x188 \x01(\x04R\x0fappliedSequence\x12%\n" +
 	"\x0evolume_version\x18C \x01(\x04R\rvolumeVersion\x12)\n" +
 	"\x10session_terminal\x18E \x01(\bR\x0fsessionTerminal\x12)\n" +
-	"\x10visible_sequence\x18F \x01(\x04R\x0fvisibleSequence\x12;\n" +
+	"\x10visible_sequence\x18F \x01(\x04R\x0fvisibleSequence\x125\n" +
+	"\x17session_valid_for_nanos\x18H \x01(\x04R\x14sessionValidForNanos\x12;\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2#.portablefs.authority.v1.HelloReplyH\x00R\x05hello\x12>\n" +
 	"\x06attach\x18\v \x01(\v2$.portablefs.authority.v1.AttachReplyH\x00R\x06attach\x12>\n" +

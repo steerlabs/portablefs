@@ -88,6 +88,13 @@ const fskitFragmentedWriteFeature = "fskit-fragmented-write-v1"
 const fskitDirectWriteFeature = "fskit-direct-write-v1"
 const fskitDurableMutationsFeature = "fskit-durable-mutations-v1"
 
+// fskitVersionedMetadataFeature is offered by both peers in Hello and confirmed
+// in Activate. It promises coherent storage-sequence read stamps, whole
+// PostState semantics, hydration-invariant logical mtime, retained
+// compatibility-writer exclusion, and the KeepAlive session_valid_for_nanos
+// proof that the daemon's metadata cache depends on.
+const fskitVersionedMetadataFeature = "fskit-versioned-metadata-v1"
+
 var (
 	requiredCommonHelloFeatures = []string{
 		"xfs-current-state", "session-exact-epoch", "framed-bulk-data-v1",

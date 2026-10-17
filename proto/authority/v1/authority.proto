@@ -181,6 +181,16 @@ message Response {
   // Largest contiguous session application prefix whose peer withdrawals have
   // completed. Durability is reported separately and does not imply this cut.
   uint64 visible_sequence = 70;
+  // Present only on a successful KEEPALIVE reply to a session that negotiated
+  // fskit-versioned-metadata-v1. It is the authority-relative duration, sampled
+  // after renewal under the session lock and rounded down, for which this
+  // session's compatibility-writer exclusion is promised: never more than the
+  // remaining lease or authorization, and never positive for a terminal
+  // session. The authority retains that exclusion for the whole promise even if
+  // the session is fenced earlier. A client anchors it at the request's local
+  // send time on a clock that advances across sleep; it is never compared with
+  // a wall clock.
+  uint64 session_valid_for_nanos = 72;
 
   oneof body {
     HelloReply hello = 10;
