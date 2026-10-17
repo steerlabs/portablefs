@@ -249,6 +249,17 @@ func TestV3CacheHitsYieldToSourceHoldsAndUnresolvedClaims(t *testing.T) {
 	f.requireAuthority("Lookup under an unresolved claim", func() { f.lookup(f.root, "file") })
 	release()
 	f.requireServedLocally("Lookup after release", func() { f.lookup(f.root, "file") })
+
+	// A claim owned by the very callback asking is still a conflict: its own
+	// in-flight request may already have committed.
+	const sameCallback = uint64(9103)
+	release = hold(sameCallback, itemGate)
+	f.requireAuthority("GetAttr under the same callback's hold", func() {
+		if _, errno := dispatchV3Owned(f.d, context.Background(), sameCallback, &pfslocal.GetAttrRequest{Item: file.Item}); errno != 0 {
+			t.Fatalf("getattr errno=%d", errno)
+		}
+	})
+	release()
 }
 
 // The r2 counterexample: a Lookup of an unheld X samples s=5; an unlink of X
@@ -737,6 +748,19 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 			}
 		}},
 		{name: "horizon-expiry", between: func(f *cachedV3Fixture, _ pfslocal.Item) { f.clock.advance(10 * time.Minute) }},
+		// The second acquisition order: a mutation acquires its source claim
+		// after the hit's snapshot but before the frame is written.
+		{name: "claim-acquired-after-snapshot", between: func(f *cachedV3Fixture, _ pfslocal.Item) {
+			gate, err := v3NamespaceSourceGate(f.root, []byte("racing"), false)
+			if err != nil {
+				f.t.Fatal(err)
+			}
+			coordinator := f.d.bridge.sourcePublication
+			coordinator.reserve(9501)
+			if _, err := coordinator.acquireSource(context.Background(), 9501, gate); err != nil {
+				f.t.Fatal(err)
+			}
+		}},
 		{name: "immediate-poison", between: func(f *cachedV3Fixture, _ pfslocal.Item) { f.client.poisoned.Store(true) }},
 	} {
 		for _, lookup := range []bool{false, true} {

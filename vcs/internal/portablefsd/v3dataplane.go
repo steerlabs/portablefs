@@ -217,15 +217,18 @@ type v3DataPlane struct {
 	// debt and provisional replies reach the bound, registration fails and the
 	// mount stops serving. It does not throttle capability acquisition.
 	//
-	// Together with duplicate capabilities held by active handlers (at most one
-	// per admitted operation, so at most DataPlaneOperationLimit), this is the
-	// pre-enqueue half of the release lag. Close and Reclaim reserve owner
-	// capacity before they detach, so they add none. Each abandoned reply owns
-	// at most one item and one handle, and every attached connection holds at
-	// most maxProvisionalResourcesPerConnection provisional replies, so the
-	// total lag behind local retirement is bounded by
-	// 2*B + DataPlaneOperationLimit + 2*maxProvisionalResourcesPerConnection
-	// per attached frontend connection.
+	// Together with tokens held by active handlers, this is the pre-enqueue
+	// half of the release lag. Close and Reclaim reserve owner capacity before
+	// they detach, so they add none. An admitted operation holds a d.ops slot
+	// and at most two tokens before transfer (a duplicate capability, or the
+	// item and handle a failed reply abandons), so handlers add at most
+	// 2*DataPlaneOperationLimit. Each abandoned reply owns at most one item and
+	// one handle, and an attached connection registers at most
+	// maxProvisionalResourcesPerConnection provisional replies, so debt adds at
+	// most 2*maxProvisionalResourcesPerConnection per attached frontend
+	// connection. With the owner's 2*B accepted tokens, that bounds how far
+	// authority capabilities and descriptors can lag local retirement; the
+	// authority's configured capacity must cover live owners plus this lag.
 	abandonedDebt atomic.Int64
 
 	mu              sync.Mutex
