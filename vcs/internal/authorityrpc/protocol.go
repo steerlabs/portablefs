@@ -70,7 +70,9 @@ const batchedCloseFeature = "batched-close-v1"
 // MaxCloseBatch bounds both the request and its retained per-handle outcome.
 const MaxCloseBatch = 128
 
-// MaxCacheProof is the frozen maximum fskit-versioned-metadata-v1 grant.
+// MaxCacheProof is the frozen ceiling of one fskit-versioned-metadata-v1
+// KeepAlive proof. A restarted authority waits this bound plus its epsilon
+// before clearing a prior writer fence, so no proof may promise more.
 const MaxCacheProof = volumeserver.MaxCacheProof
 
 const (

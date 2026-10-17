@@ -994,11 +994,6 @@ func (c *Client) AuthorizationDeadline() time.Time {
 	return c.currentAuthorization
 }
 
-// MaxCacheProof is the frozen ceiling of one fskit-versioned-metadata-v1
-// KeepAlive proof. A restarted authority waits this bound plus its epsilon
-// before clearing a prior writer fence, so no proof may promise more.
-const MaxCacheProof = 60 * time.Second
-
 // KeepAlive renews this exact session. For a session that negotiated
 // fskit-versioned-metadata-v1 it returns the authority's validated relative
 // cache proof R: positive, in whole milliseconds, and no greater than either
