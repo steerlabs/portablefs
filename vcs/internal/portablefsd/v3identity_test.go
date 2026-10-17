@@ -189,7 +189,7 @@ func TestV3EveryLiveAttrCarriesFileIDs(t *testing.T) {
 			},
 			reply: func(_ *fakeV3DataClient, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) *authoritypb.Response {
 				response := exactTestMutationReply(identity)
-				response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1})
+				response.PostState = testV3TargetState(0x40, &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1}, 2)
 				return response
 			},
 			attr:   func(reply any) pfslocal.Attr { return reply.(*pfslocal.SetAttrReply).Attr },
@@ -213,8 +213,10 @@ func TestV3EveryLiveAttrCarriesFileIDs(t *testing.T) {
 			},
 			reply: func(client *fakeV3DataClient, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) *authoritypb.Response {
 				response := exactTestMutationReply(identity)
+				item := client.issueItem(30, authoritypb.Attr_REGULAR, 0x63)
+				response.PostState = testV3RootBinding(item, v3PostStateRoleCreated)
 				response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
-					Item: client.issueItem(30, authoritypb.Attr_REGULAR, 0x63), Handle: bytes.Repeat([]byte{0x64}, 16),
+					Item: item, Handle: bytes.Repeat([]byte{0x64}, 16),
 				}}
 				return response
 			},
@@ -228,7 +230,9 @@ func TestV3EveryLiveAttrCarriesFileIDs(t *testing.T) {
 			},
 			reply: func(client *fakeV3DataClient, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) *authoritypb.Response {
 				response := exactTestMutationReply(identity)
-				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: client.issueItem(31, authoritypb.Attr_DIRECTORY, 0x65)}}
+				item := client.issueItem(31, authoritypb.Attr_DIRECTORY, 0x65)
+				response.PostState = testV3RootBinding(item, v3PostStateRoleCreated)
+				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
 				return response
 			},
 			attr:   func(reply any) pfslocal.Attr { return reply.(*pfslocal.MkdirReply).Attr },
@@ -241,7 +245,9 @@ func TestV3EveryLiveAttrCarriesFileIDs(t *testing.T) {
 			},
 			reply: func(client *fakeV3DataClient, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) *authoritypb.Response {
 				response := exactTestMutationReply(identity)
-				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: client.issueItem(32, authoritypb.Attr_SYMLINK, 0x66)}}
+				item := client.issueItem(32, authoritypb.Attr_SYMLINK, 0x66)
+				response.PostState = testV3RootBinding(item, v3PostStateRoleCreated)
+				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
 				return response
 			},
 			attr:   func(reply any) pfslocal.Attr { return reply.(*pfslocal.SymlinkReply).Attr },
@@ -257,6 +263,7 @@ func TestV3EveryLiveAttrCarriesFileIDs(t *testing.T) {
 				linked.Token = request.GetLink().GetExistingItem()
 				linked.Attr.Nlink = 2
 				response := exactTestMutationReply(identity)
+				response.PostState = testV3RootBinding(linked, v3PostStateRoleTarget)
 				response.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: linked}}
 				return response
 			},
@@ -300,7 +307,7 @@ func TestV3AttrMustDescribeItsOwnItem(t *testing.T) {
 			d := testV3DataPlane(t, client)
 			file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
 			client.read = func(context.Context, *authoritypb.Request) (*authoritypb.Response, error) {
-				return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: test.attr}}}, nil
+				return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: test.attr, ObjectVersion: 1, SnapshotSequence: 1}}}, nil
 			}
 			if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.GetAttrRequest{Item: file.Item}); errno != darwinEIO || d.terminalError() == nil {
 				t.Fatalf("getattr of another object errno=%d, want terminal EIO", errno)
@@ -522,28 +529,41 @@ func TestV3DrainedReleaseOwnerLeavesRetirementToTheDetach(t *testing.T) {
 }
 
 type v3TestObject struct {
-	inode uint64
-	kind  authoritypb.Attr_Kind
-	nlink uint32
+	inode   uint64
+	kind    authoritypb.Attr_Kind
+	nlink   uint32
+	size    int64
+	mode    uint32
+	version uint64
 }
 
-// v3TestNamespace is a fake authority namespace for parent-binding tests:
-// lookups mint fresh capabilities, Rename and Unlink apply the namespace
-// change and its link counts, and GetAttr/Write report each object's current
-// link count.
+// v3TestNamespace is a versioned fake authority: lookups mint fresh
+// capabilities, every committed mutation advances one storage sequence and
+// stamps each changed object with it, and every reply carries the coherent
+// read stamps or whole PostState the real authority sends under
+// fskit-versioned-metadata-v1.
 type v3TestNamespace struct {
 	client  *fakeV3DataClient
 	mu      sync.Mutex
+	seq     uint64
 	objects map[byte]*v3TestObject // by identity byte
 	names   map[string]byte        // parent identity byte + "/" + name
 	tokens  map[[16]byte]byte      // issued capability -> identity byte
+	// hold, when set, is called with each committed reply before it returns,
+	// so a test can deliver replies in a chosen order.
+	hold func(*authoritypb.Request, *authoritypb.Response)
 }
 
 func newV3TestNamespace(client *fakeV3DataClient, objects map[byte]*v3TestObject) *v3TestNamespace {
-	ns := &v3TestNamespace{client: client, objects: objects, names: map[string]byte{}, tokens: map[[16]byte]byte{
+	ns := &v3TestNamespace{client: client, seq: 1, objects: objects, names: map[string]byte{}, tokens: map[[16]byte]byte{
 		[16]byte(client.root.GetToken()): 0x20,
 	}}
-	ns.objects[0x20] = &v3TestObject{inode: 1, kind: authoritypb.Attr_DIRECTORY, nlink: 1}
+	ns.objects[0x20] = &v3TestObject{inode: 1, kind: authoritypb.Attr_DIRECTORY, nlink: 2}
+	for _, object := range ns.objects {
+		if object.version == 0 {
+			object.version = 1
+		}
+	}
 	client.mutation = ns.mutate
 	client.read = ns.read
 	return ns
@@ -559,62 +579,197 @@ func (ns *v3TestNamespace) key(parentToken []byte, name []byte) string {
 
 func (ns *v3TestNamespace) attr(identity byte) *authoritypb.Attr {
 	object := ns.objects[identity]
-	return &authoritypb.Attr{Kind: object.kind, Inode: object.inode, Nlink: object.nlink, Mode: 0o755}
+	mode := object.mode
+	if mode == 0 {
+		mode = 0o755
+	}
+	return &authoritypb.Attr{Kind: object.kind, Inode: object.inode, Nlink: object.nlink, Mode: mode, Size: object.size}
+}
+
+// commit advances the storage sequence and stamps the changed objects.
+func (ns *v3TestNamespace) commit(changed ...byte) uint64 {
+	ns.seq++
+	for _, identity := range changed {
+		ns.objects[identity].version = ns.seq
+	}
+	return ns.seq
+}
+
+func (ns *v3TestNamespace) object(identity byte, roles uint32) testV3PostObject {
+	return testV3PostObject{identity: identity, attr: ns.attr(identity), version: ns.objects[identity].version, roles: roles}
+}
+
+// state merges the roles of repeated identities, as the authority does.
+func (ns *v3TestNamespace) state(objects ...testV3PostObject) *authoritypb.PostState {
+	merged := map[byte]int{}
+	var unique []testV3PostObject
+	for _, object := range objects {
+		if index, seen := merged[object.identity]; seen {
+			unique[index].roles |= object.roles
+			continue
+		}
+		merged[object.identity] = len(unique)
+		unique = append(unique, object)
+	}
+	return testV3MutationState(ns.seq, unique...)
+}
+
+func (ns *v3TestNamespace) issue(identity byte) *authoritypb.Item {
+	object := ns.objects[identity]
+	item := ns.client.issueItem(object.inode, object.kind, identity)
+	item.Attr = ns.attr(identity)
+	item.ObjectVersion, item.SnapshotSequence = object.version, ns.seq
+	ns.tokens[[16]byte(item.GetToken())] = identity
+	return item
 }
 
 func (ns *v3TestNamespace) read(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 	if getattr := request.GetGetAttr(); getattr != nil {
+		identity := ns.tokens[[16]byte(getattr.GetItem())]
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
-			Attr: ns.attr(ns.tokens[[16]byte(getattr.GetItem())]),
+			Attr: ns.attr(identity), ObjectVersion: ns.objects[identity].version, SnapshotSequence: ns.seq,
 		}}}, nil
 	}
 	return &authoritypb.Response{Body: &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{BlockSize: 4096, NameMax: 255}}}, nil
 }
 
 func (ns *v3TestNamespace) mutate(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-	if request.GetReclaim() != nil {
+	switch request.GetBody().(type) {
+	case *authoritypb.Request_Reclaim:
 		return ns.client.reclaim(identity, request), nil
+	case *authoritypb.Request_CloseBatch:
+		return ns.client.closeBatch(identity, request), nil
 	}
 	ns.mu.Lock()
-	defer ns.mu.Unlock()
+	response, err := ns.mutateLocked(identity, request)
+	hold := ns.hold
+	ns.mu.Unlock()
+	if hold != nil && err == nil {
+		hold(request, response)
+	}
+	return response, err
+}
+
+func (ns *v3TestNamespace) mutateLocked(identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 	response := exactTestMutationReply(identity)
 	switch body := request.GetBody().(type) {
 	case *authoritypb.Request_Lookup:
 		target, ok := ns.names[ns.key(body.Lookup.GetParent(), body.Lookup.GetName())]
 		if !ok {
-			response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: 1}}
+			response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: ns.seq}}
 			return response, nil
 		}
-		object := ns.objects[target]
-		item := ns.client.issueItem(object.inode, object.kind, target)
-		item.Attr = ns.attr(target)
-		ns.tokens[[16]byte(item.GetToken())] = target
-		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
+		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: ns.issue(target)}}
 	case *authoritypb.Request_Open:
-		handle := bytes.Repeat([]byte{0x5e}, 16)
+		handle := ns.client.issueHandle()
 		ns.tokens[[16]byte(handle)] = ns.tokens[[16]byte(body.Open.GetItem())]
 		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: handle}}
 	case *authoritypb.Request_Unlink:
+		parent := ns.tokens[[16]byte(body.Unlink.GetParent())]
 		key := ns.key(body.Unlink.GetParent(), body.Unlink.GetName())
-		ns.objects[ns.names[key]].nlink--
+		removed, ok := ns.names[key]
+		if !ok {
+			response.Errno = errnos.ENOENT
+			return response, nil
+		}
+		ns.objects[removed].nlink--
 		delete(ns.names, key)
+		ns.commit(parent, removed)
+		response.PostState = ns.state(ns.object(parent, v3PostStateRoleParent), ns.object(removed, v3PostStateRoleRemoved))
 	case *authoritypb.Request_Rename:
+		oldParent, newParent := ns.tokens[[16]byte(body.Rename.GetOldParent())], ns.tokens[[16]byte(body.Rename.GetNewParent())]
 		from := ns.key(body.Rename.GetOldParent(), body.Rename.GetOldName())
 		to := ns.key(body.Rename.GetNewParent(), body.Rename.GetNewName())
-		moved := ns.names[from]
-		if victim, replaced := ns.names[to]; replaced && victim != moved {
-			ns.objects[victim].nlink--
+		moved, ok := ns.names[from]
+		if !ok {
+			response.Errno = errnos.ENOENT
+			return response, nil
 		}
-		delete(ns.names, from)
-		ns.names[to] = moved
-		response.Body = &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{NewPostIdentity: bytes.Repeat([]byte{moved}, 16)}}
+		reply := &authoritypb.RenameReply{NewPostIdentity: testV3ID(moved)}
+		objects := []testV3PostObject{}
+		if victim, replaced := ns.names[to]; replaced && victim == moved {
+			// POSIX same-inode no-op: both names remain and nothing changes.
+			reply.OldPostIdentity = testV3ID(moved)
+		} else {
+			changed := []byte{oldParent, newParent, moved}
+			if replaced {
+				ns.objects[victim].nlink--
+				changed = append(changed, victim)
+			}
+			delete(ns.names, from)
+			ns.names[to] = moved
+			ns.commit(changed...)
+			if replaced {
+				objects = append(objects, ns.object(victim, v3PostStateRoleOverwritten))
+			}
+		}
+		objects = append(objects, ns.object(moved, v3PostStateRoleMoved),
+			ns.object(oldParent, v3PostStateRoleOldParent), ns.object(newParent, v3PostStateRoleNewParent))
+		response.Body = &authoritypb.Response_Rename{Rename: reply}
+		response.PostState = ns.state(objects...)
 	case *authoritypb.Request_Write:
 		target := ns.tokens[[16]byte(body.Write.GetHandle())]
-		response = exactTestWriteReplyFor(identity, request, target, ns.objects[target].inode)
-		response.GetWrite().GetPostAttr().Nlink = ns.objects[target].nlink
-		response.PostState.Objects[0].Attr.Nlink = ns.objects[target].nlink
+		end := int64(body.Write.GetPosition()) + int64(body.Write.GetSize())
+		ns.objects[target].size = max(ns.objects[target].size, end)
+		ns.commit(target)
+		response.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
+			CommittedSize: uint64(body.Write.GetSize()), AssignedOffset: body.Write.GetPosition(), PostAttr: ns.attr(target),
+		}}
+		response.PostState = ns.state(ns.object(target, v3PostStateRoleTarget))
+	case *authoritypb.Request_SetAttr:
+		target := ns.tokens[[16]byte(body.SetAttr.GetItem())]
+		if body.SetAttr.Mode != nil {
+			ns.objects[target].mode = body.SetAttr.GetMode()
+		}
+		if body.SetAttr.Size != nil {
+			ns.objects[target].size = body.SetAttr.GetSize()
+		}
+		ns.commit(target)
+		response.PostState = ns.state(ns.object(target, v3PostStateRoleTarget))
+	case *authoritypb.Request_Create, *authoritypb.Request_Mkdir:
+		var parentToken, name []byte
+		kind, created := authoritypb.Attr_REGULAR, byte(0)
+		if create := request.GetCreate(); create != nil {
+			parentToken, name = create.GetParent(), create.GetName()
+		} else {
+			parentToken, name, kind = request.GetMkdir().GetParent(), request.GetMkdir().GetName(), authoritypb.Attr_DIRECTORY
+		}
+		parent := ns.tokens[[16]byte(parentToken)]
+		key := ns.key(parentToken, name)
+		if _, exists := ns.names[key]; exists {
+			response.Errno = errnos.EEXIST
+			return response, nil
+		}
+		for created = 0x80; ns.objects[created] != nil; created++ {
+		}
+		ns.objects[created] = &v3TestObject{inode: uint64(created) + 100, kind: kind, nlink: 1}
+		ns.names[key] = created
+		ns.commit(parent, created)
+		item := ns.issue(created)
+		response.PostState = ns.state(ns.object(parent, v3PostStateRoleParent), ns.object(created, v3PostStateRoleCreated))
+		if kind == authoritypb.Attr_REGULAR {
+			handle := ns.client.issueHandle()
+			ns.tokens[[16]byte(handle)] = created
+			response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: item, Handle: handle}}
+		} else {
+			response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
+		}
+	case *authoritypb.Request_Link:
+		target, parent := ns.tokens[[16]byte(body.Link.GetExistingItem())], ns.tokens[[16]byte(body.Link.GetNewParent())]
+		key := ns.key(body.Link.GetNewParent(), body.Link.GetNewName())
+		if _, exists := ns.names[key]; exists {
+			response.Errno = errnos.EEXIST
+			return response, nil
+		}
+		ns.objects[target].nlink++
+		ns.names[key] = target
+		ns.commit(parent, target)
+		item := ns.issue(target)
+		item.Token = body.Link.GetExistingItem()
+		response.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: item}}
+		response.PostState = ns.state(ns.object(parent, v3PostStateRoleParent), ns.object(target, v3PostStateRoleTarget))
 	default:
 		return nil, errors.New("unexpected authority mutation")
 	}
@@ -827,21 +982,23 @@ func TestV3LastLinkRemovalAndRenameMoveTheBindingIndex(t *testing.T) {
 		t.Fatalf("rename errno=%d", errno)
 	}
 	d.mu.Lock()
+	rootRecord, dirRecord := d.itemsByID[root.ItemID], d.itemsByID[dir.Item.ItemID]
 	onlyRecord, movedRecord := d.itemsByID[only.Item.ItemID], d.itemsByID[moved.Item.ItemID]
 	onlyBound := onlyRecord.binding != nil
-	movedKey := movedRecord.binding.key
-	_, staleSource := d.names[v3NameKey{dir: root.StableIdentity, name: "moved"}]
-	indexed := d.names[movedKey] == movedRecord
+	staleSource := rootRecord.children["moved"] != nil
+	indexed := dirRecord.children["moved"] == movedRecord && movedRecord.binding != nil &&
+		movedRecord.binding.parent == dirRecord && movedRecord.binding.name == "moved"
 	d.mu.Unlock()
-	if onlyBound || staleSource || !indexed || movedKey != (v3NameKey{dir: dir.Item.StableIdentity, name: "moved"}) {
-		t.Fatalf("binding index after remove/rename: only bound=%t stale source=%t moved=%+v indexed=%t", onlyBound, staleSource, movedKey, indexed)
+	if onlyBound || staleSource || !indexed {
+		t.Fatalf("binding index after remove/rename: only bound=%t stale source=%t moved indexed=%t", onlyBound, staleSource, indexed)
 	}
-	// Retiring a record drops its index entry with it.
+	// Retiring a record drops its index entry with it, and retiring a directory
+	// drops every name beneath it.
 	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReclaimRequest{Item: moved.Item}); errno != 0 {
 		t.Fatalf("reclaim errno=%d", errno)
 	}
 	d.mu.Lock()
-	_, stillIndexed := d.names[movedKey]
+	_, stillIndexed := dirRecord.children["moved"]
 	d.mu.Unlock()
 	if stillIndexed {
 		t.Fatal("a retired record left its binding in the name index")

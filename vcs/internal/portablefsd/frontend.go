@@ -569,6 +569,20 @@ func (c *frontendConn) write(env *pfslocal.Envelope) error {
 	return pfslocal.WriteFrame(c.conn, env)
 }
 
+// writeCommitted writes env unless commit, evaluated under the frame write
+// lock, refuses it. Every terminal revocation of this connection takes the
+// same lock, so a reply commit admits is either written before a revocation
+// or commit has already observed it. commit may take the source-publication
+// coordinator and d.mu (writeMu → coordinator → d.mu); it must not wait.
+func (c *frontendConn) writeCommitted(env *pfslocal.Envelope, commit func() bool) (bool, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if commit != nil && !commit() {
+		return false, nil
+	}
+	return true, pfslocal.WriteFrame(c.conn, env)
+}
+
 func (c *frontendConn) reply(req uint64, body any) bool {
 	return c.replyWithPublication(req, 0, body, false)
 }
@@ -787,13 +801,29 @@ func (c *frontendConn) replyWithPublicationDisposition(
 	ackRequired bool,
 	lateDiscardable bool,
 ) (delivered bool, written bool, discarded bool) {
+	delivered, written, discarded, _ = c.replyWithPublicationCommit(req, operationID, body, ackRequired, lateDiscardable, nil)
+	return delivered, written, discarded
+}
+
+// replyWithPublicationCommit adds a fourth outcome for a reply computed from
+// the daemon cache: commit, run at the physical write boundary, may refuse
+// it. Nothing is written then, and the caller settles the unexposed candidate
+// and takes the coherent authority path inside the same operation.
+func (c *frontendConn) replyWithPublicationCommit(
+	req uint64,
+	operationID uint64,
+	body any,
+	ackRequired bool,
+	lateDiscardable bool,
+	commit func() bool,
+) (delivered bool, written bool, discarded bool, refused bool) {
 	if ackRequired {
 		exposed, lateDiscarded := c.markPublicationReplyExposedForV3(operationID, lateDiscardable)
 		if !exposed {
 			if !lateDiscarded {
 				_ = c.conn.Close()
 			}
-			return false, false, lateDiscarded
+			return false, false, lateDiscarded, false
 		}
 	}
 	// THE VERDICT AND THE FRAME ARE ONE GATE TRANSITION.
@@ -810,7 +840,7 @@ func (c *frontendConn) replyWithPublicationDisposition(
 	if c.testAfterRetractionCapture != nil {
 		c.testAfterRetractionCapture(operationID)
 	}
-	if err := c.write(&pfslocal.Envelope{
+	admitted, err := c.writeCommitted(&pfslocal.Envelope{
 		RequestID:              req,
 		PublicationAckRequired: ackRequired,
 		OperationID:            operationID,
@@ -831,12 +861,16 @@ func (c *frontendConn) replyWithPublicationDisposition(
 		// happens to publish is unrelated to whether it is the last one the
 		// callback is waiting for.
 		PublicationRetracted: retracted,
-	}); err != nil {
+	}, commit)
+	if err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
-		return false, false, false
+		return false, false, false, false
 	}
-	return !retracted, true, false
+	if !admitted {
+		return false, false, false, true
+	}
+	return !retracted, true, false, false
 }
 
 // publicationRetracted answers whether a delegation handoff has crossed this

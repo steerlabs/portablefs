@@ -346,7 +346,8 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
 			Item: &authoritypb.Item{
 				Token: bytes.Repeat([]byte{0x33}, 16), StableIdentity: bytes.Repeat([]byte{0x44}, 16),
-				Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+				Attr:          &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+				ObjectVersion: 1, SnapshotSequence: 1,
 			},
 		}}
 	case *authoritypb.Request_NextFskitRepair:

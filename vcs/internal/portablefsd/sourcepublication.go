@@ -225,7 +225,11 @@ type v3SourcePublicationLease struct {
 	unresolvedAttributes int
 	unresolvedData       int
 	assigned             uint32
-	released             bool
+	// acquisitions counts this callback's admitted source acquisitions, so a
+	// namespace errno witness can prove no same-callback request was admitted
+	// after it.
+	acquisitions uint64
+	released     bool
 }
 
 // v3SourcePublicationCoordinator is the one local ordering point between
@@ -568,6 +572,7 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 		if op.lease == nil {
 			op.lease = lease
 		}
+		lease.acquisitions++
 		for coordinate := range coordinates {
 			if _, exists := lease.coordinates[coordinate]; !exists {
 				lease.coordinates[coordinate] = struct{}{}
@@ -598,6 +603,61 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 		c.mu.Unlock()
 		return lease, nil
 	}
+}
+
+// v3CacheConflict reports whether any of the coordinates is held or claimed by
+// any source lease (the same callback's included) or by a peer cut.
+type v3CacheConflict func(coordinates ...v3PublicationCoordinate) bool
+
+// cacheRead runs read under the coordinator mutex, the first lock of the short
+// coordinator → d.mu snapshot order used by cache hits. read may take d.mu and
+// must neither wait nor take any other lock. A hit admitted under it is atomic
+// with every source acquisition: a mutation either holds or claims a
+// coordinate the hit checks, or acquires only after the hit's snapshot.
+// Unresolved post-binding claims conflict with every attribute or data read,
+// because the identity they will bind is not known yet.
+func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	read(func(coordinates ...v3PublicationCoordinate) bool {
+		if c.terminal != nil || c.peerSequence != 0 {
+			return true
+		}
+		for _, coordinate := range coordinates {
+			if _, held := c.sourceHolds[coordinate]; held {
+				return true
+			}
+			switch coordinate.kind {
+			case v3PublicationItemAttributes:
+				if len(c.unresolvedAttributes) != 0 {
+					return true
+				}
+			case v3PublicationItemData:
+				if len(c.unresolvedData) != 0 {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
+// observeLease reports, under the coordinator mutex, how many acquisitions
+// the lease's callback has made and whether namespace is held only by this
+// lease with exactly one unresolved claim, the caller's own. observe may take
+// d.mu and nothing else.
+func (c *v3SourcePublicationCoordinator) observeLease(lease *v3SourcePublicationLease, namespace v3PublicationNamespace, observe func(acquisitions uint64, exclusive bool)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if lease == nil || lease.gate != c {
+		observe(0, false)
+		return
+	}
+	coordinate := v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: namespace.parent, name: namespace.name}
+	claims := lease.names[namespace]
+	exclusive := c.terminal == nil && !lease.released && c.sourceHolds[coordinate] == lease &&
+		claims.attributes == 1 && claims.data == 0
+	observe(lease.acquisitions, exclusive)
 }
 
 func (l *v3SourcePublicationLease) markAssigned() error {

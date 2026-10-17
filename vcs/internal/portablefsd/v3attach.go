@@ -738,11 +738,34 @@ func (c *frontendConn) handleV3Attached(
 		return
 	}
 	d := a.v3Backend()
+	// A reply served from the metadata cache is revalidated at the physical
+	// write boundary. If that refuses it, nothing was exposed: the candidate is
+	// settled and the same operation takes the coherent authority path once.
+	for bypassCache := false; ; bypassCache = true {
+		if !c.serveV3Attempt(ctx, gateCtx, a, d, requestID, operationID, publishes, body, bypassCache) {
+			return
+		}
+	}
+}
+
+// serveV3Attempt dispatches one request and publishes its outcome. It reports
+// retry only when a cached reply's revalidation refused it before any byte was
+// written.
+func (c *frontendConn) serveV3Attempt(
+	ctx, gateCtx context.Context,
+	a *attach,
+	d *v3DataPlane,
+	requestID uint64,
+	operationID uint64,
+	publishes bool,
+	body any,
+	bypassCache bool,
+) (retry bool) {
 	var (
 		reply any
 		eno   int32
 	)
-	resources := &v3ReplyResourceCollector{d: d}
+	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
 	switch body.(type) {
 	case *pfslocal.CreateRequest, *pfslocal.MkdirRequest, *pfslocal.SymlinkRequest:
 		resources.visible = true
@@ -777,6 +800,10 @@ func (c *frontendConn) handleV3Attached(
 			eno = darwinENOTCONN
 		}
 	}
+	var commit func() bool
+	if resources.cached != nil {
+		commit = resources.cached.revalidate
+	}
 	if eno != 0 {
 		if d != nil && (len(resources.items) != 0 || len(resources.handles) != 0) {
 			cleanup, prepareErr := d.abandonCollectedReplyResources(resources)
@@ -809,7 +836,7 @@ func (c *frontendConn) handleV3Attached(
 				c.stopV3FrontendPublication(a, terminal)
 				consumeV3ResponseConsumptions(resources.responseConsumptions)
 				resources.responseConsumptions = nil
-				return
+				return false
 			}
 		}
 		failure := &pfslocal.ErrorReply{Errno: eno, Message: errMessage(fmt.Sprintf("%T", body), eno)}
@@ -823,15 +850,20 @@ func (c *frontendConn) handleV3Attached(
 				consumeV3ResponseConsumptions(resources.responseConsumptions)
 				resources.responseConsumptions = nil
 			}
-			return
+			return false
 		}
-		if publishes {
-			_, _, _ = c.replyWithPublicationDisposition(
-				requestID, operationID, failure, true,
-				v3LatePublishingReplyDiscardable(body, eno),
-			)
+		// A cached negative answer is revalidated at the write boundary like
+		// any other cached reply.
+		_, _, _, refused := c.replyWithPublicationCommit(
+			requestID, operationID, failure, true,
+			v3LatePublishingReplyDiscardable(body, eno), commit,
+		)
+		if refused {
+			consumeV3ResponseConsumptions(resources.responseConsumptions)
+			resources.responseConsumptions = nil
+			return true
 		}
-		return
+		return false
 	}
 	resourceReply, resourceErr := resourceBearingV3Reply(reply, resources)
 	if resourceErr != nil {
@@ -855,7 +887,7 @@ func (c *frontendConn) handleV3Attached(
 		consumeV3ProvisionalResponses(provisional)
 		consumeV3ResponseConsumptions(resources.responseConsumptions)
 		resources.responseConsumptions = nil
-		return
+		return false
 	}
 	if resourceReply {
 		provisional, err := d.prepareReplyResources(resources)
@@ -877,7 +909,7 @@ func (c *frontendConn) handleV3Attached(
 			consumeV3ProvisionalResponses(provisional)
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
-			return
+			return false
 		}
 		cleanup, registered, err := c.registerProvisionalResourceOrAbandon(requestID, provisional)
 		if !registered {
@@ -896,13 +928,25 @@ func (c *frontendConn) handleV3Attached(
 			consumeV3ProvisionalResponses(provisional)
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
-			return
+			return false
 		}
 	}
-	_, written, discarded := c.replyWithPublicationDisposition(
+	_, written, discarded, refused := c.replyWithPublicationCommit(
 		requestID, operationID, reply, publishes,
-		v3LatePublishingReplyDiscardable(body, 0),
+		v3LatePublishingReplyDiscardable(body, 0), commit,
 	)
+	if refused {
+		// The cached reply never reached the frontend, so no disposition can
+		// name it: settle its provisional ownership exactly once and retry
+		// coherently.
+		if resourceReply && !c.settleProvisionalResource(&pfslocal.ResourceReplyDisposition{TargetRequestID: requestID}) {
+			c.stopV3FrontendPublication(a, errors.New("portablefsd: refused cached reply lost its provisional ownership"))
+			return false
+		}
+		consumeV3ResponseConsumptions(resources.responseConsumptions)
+		resources.responseConsumptions = nil
+		return true
+	}
 	if discarded && resourceReply {
 		// The callback already proved NOT_PUBLISHED, so no frontend can send a
 		// ResourceReplyDisposition for this unexposed frame. Withdraw the exact
@@ -926,6 +970,7 @@ func (c *frontendConn) handleV3Attached(
 			resources.responseConsumptions = nil
 		}
 	}
+	return false
 }
 
 func (c *frontendConn) revokeV3ResponseConsumption(a *attach, cause error) {

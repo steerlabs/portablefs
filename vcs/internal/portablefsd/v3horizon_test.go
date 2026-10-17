@@ -44,6 +44,13 @@ func testV3DataPlaneWithClock(t *testing.T, client *fakeV3DataClient, clock *fak
 // testV3DataPlaneOnClient serves through a wrapper of the fake client.
 func testV3DataPlaneOnClient(t *testing.T, wrapper v3DataPlaneClient, client *fakeV3DataClient, clock *fakeV3Clock) *v3DataPlane {
 	t.Helper()
+	client.mu.Lock()
+	if client.proof == 0 {
+		// A clocked data plane is for horizon and cache tests: give it the
+		// longest proof the session lease allows.
+		client.proof = min(client.lease, authorityrpc.MaxCacheProof)
+	}
+	client.mu.Unlock()
 	d, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{
 		Client: wrapper, VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9,
 		PrincipalUID: 501, PrincipalGID: 20, CachePolicy: v3CachePolicyFSKit, Clock: clock.read,
