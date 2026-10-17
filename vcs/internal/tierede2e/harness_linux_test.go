@@ -211,8 +211,11 @@ func (s *parkableStore) LogicalSize(entry uint32) (int64, error) { return s.inne
 func (s *parkableStore) PWrite(entry uint32, off int64, data []byte) error {
 	return s.inner.PWrite(entry, off, data)
 }
-func (s *parkableStore) Fdatasync(entry uint32) error    { return s.inner.Fdatasync(entry) }
-func (s *parkableStore) RestoreMtime(entry uint32) error { return s.inner.RestoreMtime(entry) }
+func (s *parkableStore) Fdatasync(entry uint32) error      { return s.inner.Fdatasync(entry) }
+func (s *parkableStore) Mtime(entry uint32) (int64, error) { return s.inner.Mtime(entry) }
+func (s *parkableStore) RestoreMtime(entry uint32, nanos int64) error {
+	return s.inner.RestoreMtime(entry, nanos)
+}
 func (s *parkableStore) Linked(entry uint32) (bool, error) {
 	if s.isParked() {
 		return false, nil
