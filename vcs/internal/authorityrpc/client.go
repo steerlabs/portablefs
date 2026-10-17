@@ -169,6 +169,7 @@ type lane struct {
 type Client struct {
 	batchedClose          atomic.Bool
 	orderedDelegatedFlush atomic.Bool
+	versionedMetadata     atomic.Bool // fskit-versioned-metadata-v1: Hello offer and echo, Activate confirmation
 	flush                 lane
 	cfg                   ClientConfig
 
@@ -195,6 +196,7 @@ type Client struct {
 	root                      *authoritypb.Item
 	routesRevision            [32]byte
 	authorizationDeadline     time.Time
+	currentAuthorization      time.Time // installed now; Reauthorize replaces the activation deadline
 	maxRead                   uint32
 	maxWrite                  uint32
 	maxFskitWrite             uint64
@@ -648,9 +650,20 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	if !ok || !hasFeatures(active.GetFeatures(), required) {
 		return errors.New("authorityrpc: authority omitted required frontend-profile features")
 	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
-		!hasFeatures(active.GetFeatures(), []string{fskitDurableMutationsFeature}) {
-		return errors.New("authorityrpc: FSKit authority omitted fskit-durable-mutations-v1")
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		if !hasFeatures(active.GetFeatures(), []string{fskitDurableMutationsFeature}) {
+			return errors.New("authorityrpc: FSKit authority omitted fskit-durable-mutations-v1")
+		}
+		// The daemon's one release owner retires closes through CloseBatch's
+		// exact replay; there is no per-handle Close fallback to negotiate down to.
+		if !hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}) {
+			return errors.New("authorityrpc: FSKit authority omitted batched-close-v1")
+		}
+		// Hello already required the echo; Activate must confirm the same
+		// contract for this exact session. There is no uncached mode to fall to.
+		if !hasFeatures(active.GetFeatures(), []string{fskitVersionedMetadataFeature}) {
+			return errors.New("authorityrpc: FSKit activation did not confirm fskit-versioned-metadata-v1")
+		}
 	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
 		active.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
@@ -686,17 +699,22 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
+	// Linux treats CloseBatch as optional; FSKit required it above.
+	c.batchedClose.Store((c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES ||
+		c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR) &&
+		hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
 	ordered := c.canPipelineFlushes() && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature})
 	if ordered && !hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}) {
 		return errors.New("authorityrpc: activation changed the negotiated flush admission mode")
 	}
 	c.orderedDelegatedFlush.Store(ordered)
+	c.versionedMetadata.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
 	if active.GetAuthorizationDeadlineUnixNanos() != 0 {
 		c.authorizationDeadline = authorizationDeadline
+		c.currentAuthorization = authorizationDeadline
 	}
 	if fskitCursor != nil {
 		c.fskitRepairCursor = proto.Clone(fskitCursor).(*authoritypb.VisibilityCursor)
@@ -865,6 +883,9 @@ func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64)
 		c.signalSessionEnd(ErrSessionEnded)
 		return time.Time{}, ErrSessionEnded
 	}
+	c.lifecycle.Lock()
+	c.currentAuthorization = deadline
+	c.lifecycle.Unlock()
 	return deadline, nil
 }
 
@@ -961,6 +982,73 @@ func (c *Client) InitialAuthorizationDeadline() time.Time {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
 	return c.authorizationDeadline
+}
+
+// AuthorizationDeadline is the signed deadline of the authorization installed
+// now, including any replacement accepted by Reauthorize; zero means the
+// session carries none. It is a local denial bound, never a cross-machine
+// freshness proof.
+func (c *Client) AuthorizationDeadline() time.Time {
+	c.lifecycle.Lock()
+	defer c.lifecycle.Unlock()
+	return c.currentAuthorization
+}
+
+// MaxCacheProof is the frozen ceiling of one fskit-versioned-metadata-v1
+// KeepAlive proof. A restarted authority waits this bound plus its epsilon
+// before clearing a prior writer fence, so no proof may promise more.
+const MaxCacheProof = 60 * time.Second
+
+// KeepAlive renews this exact session. For a session that negotiated
+// fskit-versioned-metadata-v1 it returns the authority's validated relative
+// cache proof R: positive, in whole milliseconds, and no greater than either
+// the advertised session lease or MaxCacheProof. Every other session returns
+// zero. A refused renewal or a negotiated reply without a valid proof is an
+// error; a malformed proof also ends the session, because the authority broke
+// the negotiated contract (an overgrant is never clamped). R is relative to
+// the authority; the caller anchors it at its own request start.
+func (c *Client) KeepAlive(ctx context.Context) (time.Duration, error) {
+	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+	if err != nil {
+		return 0, err
+	}
+	if response.GetUncertain() || response.GetErrno() != 0 || response.GetRoutesMismatch().GetSessionRefused() {
+		return 0, fmt.Errorf("authorityrpc: authority refused keepalive with errno %d", response.GetErrno())
+	}
+	if !c.versionedMetadata.Load() {
+		return 0, nil
+	}
+	proof := response.GetSessionValidForNanos()
+	lease := c.SessionLease()
+	if proof == 0 || proof%uint64(time.Millisecond) != 0 || lease <= 0 ||
+		proof > uint64(lease) || proof > uint64(MaxCacheProof) {
+		err := fmt.Errorf("%w: keepalive proof %dns is not a positive whole-millisecond duration within lease %s and %s",
+			ErrTransportBinding, proof, lease, MaxCacheProof)
+		c.signalSessionEnd(err)
+		return 0, err
+	}
+	return time.Duration(proof), nil
+}
+
+// BeginLocalPublication admits one frontend reply served from daemon state as
+// if it were an authority response: it is refused once the session is
+// poisoned, and until Consume it holds back SessionEndPending/SessionDone
+// exactly like a retained authority reply, with force revoking the frontend
+// serving boundary when the terminal drain bound expires. It carries no
+// terminal-delivery token, because no authority response exists to receipt.
+func (c *Client) BeginLocalPublication(force func(error)) (ResponseConsumption, error) {
+	receipt, err := c.beginResponseConsumption(force)
+	if err != nil {
+		return nil, err
+	}
+	return receipt, nil
+}
+
+// LocalAdmissionOpen reports, without registering anything, whether the
+// session could admit a new request right now. It turns false at the first
+// terminal edge, before any public terminal signal.
+func (c *Client) LocalAdmissionOpen() bool {
+	return !c.poisoned.Load() && !c.closed.Load()
 }
 
 // InitialLeaseCursor remains as a nil-valued ABI accessor for the shared
@@ -1601,7 +1689,11 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 
 func (c *Client) completeCall(request *authoritypb.Request, completed callResult) (*authoritypb.Response, func(), error) {
 	if completed.err == nil && completed.response != nil {
-		if err := c.validateResponseFrontendProfile(completed.response); err != nil {
+		err := c.validateResponseFrontendProfile(completed.response)
+		if err == nil {
+			err = c.validateSessionProofPlacement(request, completed.response)
+		}
+		if err != nil {
 			if completed.releaseFrame != nil {
 				completed.releaseFrame()
 			}
@@ -1613,6 +1705,17 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 		c.signalSessionEnd(ErrSessionEnded)
 	}
 	return completed.response, completed.releaseFrame, completed.err
+}
+
+// validateSessionProofPlacement admits session_valid_for_nanos only on a
+// successful KeepAlive to a session that negotiated it. Anywhere else it is an
+// unrequested promise the client must refuse rather than ignore.
+func (c *Client) validateSessionProofPlacement(request *authoritypb.Request, response *authoritypb.Response) error {
+	if response.GetSessionValidForNanos() != 0 && (!c.versionedMetadata.Load() || request.GetKeepAlive() == nil ||
+		response.GetErrno() != 0 || response.GetUncertain()) {
+		return fmt.Errorf("%w: session_valid_for_nanos outside a negotiated successful keepalive", ErrTransportBinding)
+	}
+	return nil
 }
 
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {

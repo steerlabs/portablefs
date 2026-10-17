@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"math"
 	"sync"
@@ -33,6 +32,11 @@ type fakeV3DataClient struct {
 	sequence       uint64
 	readCalls      int
 	keepErr        error
+	proof          time.Duration // KeepAlive proof; zero is a valid but unusable 1 ms proof
+	keepAlive      func(context.Context) (time.Duration, error)
+	keepAlives     int
+	authorization  time.Time
+	poisoned       atomic.Bool
 	read           func(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	beforeAssigned func(*authoritypb.Request) error
 	mutation       func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error)
@@ -40,6 +44,7 @@ type fakeV3DataClient struct {
 	nextToken      uint64
 	live           map[[16]byte]bool
 	reclaims       [][][]byte
+	closeBatches   [][][]byte
 	mutations      []*authoritypb.Request
 }
 
@@ -56,10 +61,13 @@ func newFakeV3DataClient() *fakeV3DataClient {
 	return client
 }
 
+// authorityTestItem is a coherent read sample at the storage baseline:
+// object version 1 in snapshot 1.
 func authorityTestItem(inode uint64, kind authoritypb.Attr_Kind, tokenByte, identityByte byte) *authoritypb.Item {
 	return &authoritypb.Item{
 		Token: bytes.Repeat([]byte{tokenByte}, 16), StableIdentity: bytes.Repeat([]byte{identityByte}, 16),
-		Attr: &authoritypb.Attr{Kind: kind, Inode: inode, Mode: 0o755, Nlink: 1},
+		Attr:          &authoritypb.Attr{Kind: kind, Inode: inode, Mode: 0o755, Nlink: 1},
+		ObjectVersion: 1, SnapshotSequence: 1,
 	}
 }
 
@@ -90,6 +98,52 @@ func (f *fakeV3DataClient) reclaimBatches() [][][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([][][]byte(nil), f.reclaims...)
+}
+
+func (f *fakeV3DataClient) closedBatches() [][][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][][]byte(nil), f.closeBatches...)
+}
+
+// issueHandle mints an authority open handle that the fake's CloseBatch
+// accepts exactly once.
+func (f *fakeV3DataClient) issueHandle() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextToken++
+	var token [16]byte
+	token[0] = 0xd0
+	binary.BigEndian.PutUint64(token[8:], f.nextToken)
+	f.live[token] = true
+	return token[:]
+}
+
+// closeBatch applies the authority's per-entry CloseBatch outcomes: a live
+// handle retires cleanly, anything else reports ESTALE without retirement.
+func (f *fakeV3DataClient) closeBatch(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
+	response := exactTestMutationReply(identity)
+	closes := request.GetCloseBatch().GetCloses()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	handles := make([][]byte, len(closes))
+	results := make([]*authoritypb.CloseBatchResult, len(closes))
+	for index, close := range closes {
+		handles[index] = cloneBytesV3(close.GetHandle())
+		results[index] = &authoritypb.CloseBatchResult{Retired: true}
+		if len(close.GetHandle()) != 16 || !f.live[[16]byte(close.GetHandle())] {
+			results[index] = &authoritypb.CloseBatchResult{Errno: errnos.ESTALE}
+			continue
+		}
+		delete(f.live, [16]byte(close.GetHandle()))
+	}
+	f.closeBatches = append(f.closeBatches, handles)
+	if len(closes) == 0 || len(closes) > authorityrpc.MaxCloseBatch {
+		response.Errno = errnos.EINVAL
+		return response
+	}
+	response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}
+	return response
 }
 
 func (f *fakeV3DataClient) mutationRequests() []*authoritypb.Request {
@@ -134,6 +188,43 @@ func (f *fakeV3DataClient) Root() *authoritypb.Item      { return f.root }
 func (f *fakeV3DataClient) IOLimits() (uint32, uint32)   { return 4096, f.maxWrite }
 func (f *fakeV3DataClient) SessionLease() time.Duration  { return f.lease }
 func (f *fakeV3DataClient) DataPlaneOperationLimit() int { return f.limit }
+func (f *fakeV3DataClient) SupportsBatchedClose() bool   { return true }
+func (f *fakeV3DataClient) KeepAlive(ctx context.Context) (time.Duration, error) {
+	f.mu.Lock()
+	f.keepAlives++
+	keepErr, proof, hook := f.keepErr, f.proof, f.keepAlive
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(ctx)
+	}
+	if keepErr != nil {
+		return 0, keepErr
+	}
+	if proof == 0 {
+		// A valid proof too short to anchor any horizon: tests about the
+		// authority path stay on it unless they opt into cache hits.
+		proof = time.Millisecond
+	}
+	return proof, nil
+}
+func (f *fakeV3DataClient) AuthorizationDeadline() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authorization
+}
+func (f *fakeV3DataClient) BeginLocalPublication(force func(error)) (authorityrpc.ResponseConsumption, error) {
+	if f.poisoned.Load() {
+		return nil, authorityrpc.ErrSessionEnded
+	}
+	f.mu.Lock()
+	newConsumption := f.newConsumption
+	f.mu.Unlock()
+	if newConsumption != nil {
+		return newConsumption(force), nil
+	}
+	return &fakeV3ResponseConsumption{consume: func() {}}, nil
+}
+func (f *fakeV3DataClient) LocalAdmissionOpen() bool { return !f.poisoned.Load() }
 func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.readCalls++
@@ -145,18 +236,17 @@ func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Re
 	switch request.GetBody().(type) {
 	case *authoritypb.Request_StatFs:
 		return &authoritypb.Response{Body: &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{BlockSize: 4096, NameMax: 255}}}, nil
-	case *authoritypb.Request_KeepAlive:
-		if f.keepErr != nil {
-			return nil, f.keepErr
-		}
-		return &authoritypb.Response{}, nil
 	case *authoritypb.Request_GetAttr:
 		if bytes.Equal(request.GetGetAttr().GetItem(), f.root.GetToken()) {
-			return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: proto.Clone(f.root.GetAttr()).(*authoritypb.Attr)}}}, nil
+			return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+				Attr: proto.Clone(f.root.GetAttr()).(*authoritypb.Attr), ObjectVersion: 1, SnapshotSequence: 1,
+			}}}, nil
 		}
+		// The default file's attributes at the baseline, identical to the Item
+		// its default lookup returns.
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: &authoritypb.Attr{
-			Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1,
-		}}}}, nil
+			Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o755, Nlink: 1,
+		}, ObjectVersion: 1, SnapshotSequence: 1}}}, nil
 	default:
 		return &authoritypb.Response{}, nil
 	}
@@ -205,8 +295,10 @@ func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.issueItem(2, authoritypb.Attr_REGULAR, 0x40)}}
 	case *authoritypb.Request_Reclaim:
 		return f.reclaim(identity, request), nil
+	case *authoritypb.Request_CloseBatch:
+		return f.closeBatch(identity, request), nil
 	case *authoritypb.Request_Open:
-		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: bytes.Repeat([]byte{0x51}, 16)}}
+		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: f.issueHandle()}}
 	case *authoritypb.Request_Write:
 		return exactTestWriteReply(identity, request), nil
 	case *authoritypb.Request_SyncFs:
@@ -412,8 +504,7 @@ func collectTestItem(
 ) *v3ItemRecord {
 	t.Helper()
 	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
-	name := []byte(hex.EncodeToString(candidate.GetStableIdentity()))
-	record, errno := d.intern(ctx, candidate, d.itemsByID[v3RootItemID], name)
+	record, errno := d.intern(ctx, candidate)
 	if errno != 0 {
 		t.Fatalf("intern errno=%d", errno)
 	}
@@ -542,7 +633,7 @@ func TestV3AssignedResourceCleanupSurvivesFrontendWithdrawal(t *testing.T) {
 	})
 	client.mu.Lock()
 	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetClose() == nil {
+		if request.GetCloseBatch() == nil {
 			return nil, errors.New("unexpected cleanup request")
 		}
 		close(entered)
@@ -550,15 +641,16 @@ func TestV3AssignedResourceCleanupSurvivesFrontendWithdrawal(t *testing.T) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-release:
-			return exactTestMutationReply(identity), nil
+			return client.closeBatch(identity, request), nil
 		}
 	}
 	client.mu.Unlock()
 	cleanup := &v3ResourceCleanup{d: d, handles: []*v3HandleRecord{{
-		id: 42, token: bytes.Repeat([]byte{0x51}, 16),
+		id: 42, token: client.issueHandle(),
 	}}}
-	done := make(chan error, 1)
-	go func() { done <- cleanup.finish() }()
+	if err := cleanup.finish(); err != nil {
+		t.Fatalf("cleanup transfer = %v", err)
+	}
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -566,13 +658,10 @@ func TestV3AssignedResourceCleanupSurvivesFrontendWithdrawal(t *testing.T) {
 	}
 	_ = d.stopServing(errors.New("frontend disconnected during cleanup"))
 	close(release)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("assigned cleanup was canceled by local withdrawal: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("assigned cleanup did not finish")
+	// The batch already in flight settles on the original session even though
+	// local serving was withdrawn underneath it.
+	if err := d.releases.drain(context.Background()); err != nil {
+		t.Fatalf("assigned cleanup was canceled by local withdrawal: %v", err)
 	}
 	select {
 	case <-client.SessionDone():
@@ -652,15 +741,8 @@ func TestV3ReclaimWaitsForOverlappingItemDisposition(t *testing.T) {
 func TestV3FrontendDisconnectAbandonsProvisionalOpen(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
-	var closes int
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetClose() != nil {
-			closes++
-		}
-		return exactTestMutationReply(identity), nil
-	}
 	record := acceptedTestItem(t, d, authorityTestItem(2, authoritypb.Attr_REGULAR, 0x37, 0x47))
-	handle, err := d.installHandle(bytes.Repeat([]byte{0x57}, 16), record.item, false)
+	handle, err := d.installHandle(client.issueHandle(), record.item, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,8 +770,9 @@ func TestV3FrontendDisconnectAbandonsProvisionalOpen(t *testing.T) {
 	if err := cleanups[0].finish(); err != nil {
 		t.Fatal(err)
 	}
-	if closes != 1 {
-		t.Fatalf("authority closes=%d, want one", closes)
+	waitV3ReleasesIdle(t, d)
+	if batches := client.closedBatches(); len(batches) != 1 || len(batches[0]) != 1 {
+		t.Fatalf("authority closes=%x, want one", batches)
 	}
 }
 
@@ -733,15 +816,8 @@ func TestV3PostInternReplyBuildFailureRollsBackCollectedItem(t *testing.T) {
 func TestV3RegistrationRaceSynchronouslyAbandonsOpen(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
-	var closes int
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetClose() != nil {
-			closes++
-		}
-		return exactTestMutationReply(identity), nil
-	}
 	record := acceptedTestItem(t, d, authorityTestItem(2, authoritypb.Attr_REGULAR, 0x39, 0x49))
-	handle, err := d.installHandle(bytes.Repeat([]byte{0x59}, 16), record.item, false)
+	handle, err := d.installHandle(client.issueHandle(), record.item, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -769,8 +845,9 @@ func TestV3RegistrationRaceSynchronouslyAbandonsOpen(t *testing.T) {
 	if err := cleanup.finish(); err != nil {
 		t.Fatal(err)
 	}
-	if closes != 1 {
-		t.Fatalf("authority closes=%d, want one", closes)
+	waitV3ReleasesIdle(t, d)
+	if batches := client.closedBatches(); len(batches) != 1 || len(batches[0]) != 1 {
+		t.Fatalf("authority closes=%x, want one", batches)
 	}
 }
 
@@ -806,7 +883,7 @@ func TestV3DataPlaneItemHandlesStopAtTheRepairPartition(t *testing.T) {
 		t.Fatalf("last daemon item=%#v", last)
 	}
 	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, &v3ReplyResourceCollector{d: d})
-	if _, errno := d.intern(ctx, authorityTestItem(3, authoritypb.Attr_REGULAR, 0x32, 0x42), d.itemsByID[v3RootItemID], []byte("next")); errno != darwinEIO {
+	if _, errno := d.intern(ctx, authorityTestItem(3, authoritypb.Attr_REGULAR, 0x32, 0x42)); errno != darwinEIO {
 		t.Fatalf("first repair-partition item errno=%d, want %d", errno, darwinEIO)
 	}
 }
@@ -1013,10 +1090,12 @@ func TestV3DataPlaneCreateDeclaresAndResolvesItsExactSourceGate(t *testing.T) {
 			!gate.GetTargets()[1].GetNamespace().GetBoundAttributes() || gate.GetTargets()[1].GetNamespace().GetBoundData() {
 			return nil, errors.New("create lost its canonical parent+namespace source gate")
 		}
+		item := authorityTestItem(3, authoritypb.Attr_REGULAR, 0x61, 0x62)
 		return &authoritypb.Response{
-			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			Mutation:  &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			PostState: testV3RootBinding(item, v3PostStateRoleCreated),
 			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
-				Item:   authorityTestItem(3, authoritypb.Attr_REGULAR, 0x61, 0x62),
+				Item:   item,
 				Handle: bytes.Repeat([]byte{0x63}, 16),
 			}},
 		}, nil
@@ -1072,6 +1151,10 @@ func TestV3DataPlaneRenameConsumesExactAuthoritativePostBindings(t *testing.T) {
 				}
 				response := exactTestMutationReply(identity)
 				response.Body = &authoritypb.Response_Rename{Rename: reply}
+				response.PostState = testV3MutationState(2,
+					testV3PostObject{identity: 0x20, attr: testV3DirAttr(1, 2), version: 2, roles: v3PostStateRoleOldParent | v3PostStateRoleNewParent},
+					testV3PostObject{identity: test.newIdentity, attr: testV3FileAttr(9, 0, 1), version: 2, roles: v3PostStateRoleMoved},
+				)
 				return response, nil
 			}
 			operationID := uint64(890 + index)
@@ -1245,31 +1328,45 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 				}
 				return nil
 			}
+			rootAttr := testV3DirAttr(1, 3)
+			parent := testV3PostObject{identity: 0x20, attr: rootAttr, version: 2, roles: v3PostStateRoleParent}
 			client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 				response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
+				created := func(identity byte, attr *authoritypb.Attr) *authoritypb.Item {
+					response.PostState = testV3MutationState(2, parent, testV3PostObject{identity: identity, attr: attr, version: 2, roles: v3PostStateRoleCreated})
+					return testV3StampedItem(bytes.Repeat([]byte{identity - 1}, 16), identity, attr, 2, 2)
+				}
 				switch request.GetBody().(type) {
 				case *authoritypb.Request_SetAttr:
-					response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7})
+					response.PostState = testV3TargetState(0x40, &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7}, 2)
+				case *authoritypb.Request_RemoveXattr:
+					response.PostState = testV3TargetState(0x40, testV3FileAttr(2, 0, 1), 2)
 				case *authoritypb.Request_Write:
 					response = exactTestWriteReply(identity, request)
 					response.GetWrite().GetPostAttr().Mode = 0o600
-					v3PostAttr(response).Mode = 0o600
+					response.GetPostState().GetObjects()[0].GetAttr().Mode = 0o600
+				case *authoritypb.Request_Unlink:
+					response.PostState = testV3MutationState(2, parent, testV3PostObject{identity: 0xa7, attr: testV3FileAttr(13, 0, 0), version: 2, roles: v3PostStateRoleRemoved})
 				case *authoritypb.Request_Rename:
 					response.Body = &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
 						NewPostIdentity: bytes.Repeat([]byte{0xaf}, 16),
 					}}
+					response.PostState = testV3MutationState(2,
+						testV3PostObject{identity: 0x20, attr: rootAttr, version: 2, roles: v3PostStateRoleOldParent | v3PostStateRoleNewParent},
+						testV3PostObject{identity: 0xaf, attr: testV3FileAttr(14, 0, 1), version: 2, roles: v3PostStateRoleMoved},
+					)
 				case *authoritypb.Request_Create:
-					response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: authorityTestItem(10, authoritypb.Attr_REGULAR, 0xa0, 0xa1), Handle: bytes.Repeat([]byte{0xa2}, 16)}}
+					response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: created(0xa1, testV3FileAttr(10, 0, 1)), Handle: bytes.Repeat([]byte{0xa2}, 16)}}
 				case *authoritypb.Request_Mkdir:
-					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(11, authoritypb.Attr_DIRECTORY, 0xa3, 0xa4)}}
+					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: created(0xa4, testV3DirAttr(11, 2))}}
 				case *authoritypb.Request_Symlink:
-					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(12, authoritypb.Attr_SYMLINK, 0xa5, 0xa6)}}
+					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: created(0xa6, &authoritypb.Attr{Kind: authoritypb.Attr_SYMLINK, Inode: 12, Mode: 0o777, Nlink: 1})}}
 				case *authoritypb.Request_Link:
 					// LINK returns the source's own capability.
-					linked := authorityTestItem(2, authoritypb.Attr_REGULAR, 0, 0x40)
-					linked.Token = request.GetLink().GetExistingItem()
-					linked.Attr.Nlink = 2
+					attr := testV3FileAttr(2, 0, 2)
+					linked := testV3StampedItem(request.GetLink().GetExistingItem(), 0x40, attr, 2, 2)
 					response.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: linked}}
+					response.PostState = testV3MutationState(2, parent, testV3PostObject{identity: 0x40, attr: attr, version: 2, roles: v3PostStateRoleTarget})
 				}
 				return response, nil
 			}
@@ -1443,6 +1540,7 @@ func testV3Dirent(name string, inode uint64, kind authoritypb.Attr_Kind, identit
 		Name: []byte(name), NextCookie: []byte{cookie},
 		Attr:           &authoritypb.Attr{Kind: kind, Inode: inode, Mode: 0o644, Nlink: 1, Size: 3},
 		StableIdentity: bytes.Repeat([]byte{identityByte}, 16),
+		ObjectVersion:  1, SnapshotSequence: 1,
 	}
 }
 
@@ -1468,7 +1566,8 @@ func TestV3EnumerateAssignsIndependentBatchesToConcurrentWalks(t *testing.T) {
 			response.Body = &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{
 				Entries: entries, Verifier: verifier, Eof: true,
 			}}
-		case *authoritypb.Request_Close:
+		case *authoritypb.Request_CloseBatch:
+			return client.closeBatch(identity, request), nil
 		default:
 			return nil, errors.New("unexpected enumeration mutation")
 		}
@@ -1684,7 +1783,9 @@ func TestV3LivenessBypassesSaturatedOperationsAndProvesExactSession(t *testing.T
 func TestV3LivenessAuthorityFailureIsTerminal(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
+	client.mu.Lock()
 	client.keepErr = errors.New("authority unreachable")
+	client.mu.Unlock()
 	_, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.V3LivenessRequest{
 		AuthorityEpoch: client.Epoch(), SessionID: client.SessionID(),
 	})
@@ -1705,9 +1806,10 @@ func TestV3KeepAliveIntervalAndFailureAreTerminal(t *testing.T) {
 	if got := v3KeepAliveInterval(time.Minute, 12*time.Second); got != 4*time.Second {
 		t.Fatalf("repair interval=%s", got)
 	}
+	if got := v3KeepAliveInterval(10*time.Minute, 10*time.Minute); got != authorityrpc.MaxCacheProof/3 {
+		t.Fatalf("large lease and budget interval=%s, want MaxCacheProof/3", got)
+	}
 	client := newFakeV3DataClient()
-	client.lease = 6 * time.Millisecond
-	client.budget = 6 * time.Millisecond
 	client.keepErr = errors.New("fenced")
 	d := testV3DataPlane(t, client)
 	select {

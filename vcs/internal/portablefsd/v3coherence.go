@@ -96,6 +96,11 @@ type v3CoherenceBridge struct {
 	terminal           error
 	failOnce           sync.Once
 	onFailure          func(error)
+	// refusePeerRepair is fixed before the bridge is shared. A data plane whose
+	// metadata cache rests on writer exclusion sets it: no peer repair can then
+	// be addressed to this session, so one that arrives is terminal before any
+	// actuation.
+	refusePeerRepair bool
 }
 
 func newV3CoherenceBridge(client v3VisibilityClient, cachePolicy string, onFailure func(error)) (*v3CoherenceBridge, error) {
@@ -394,6 +399,10 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 	}
 	if bytes.Equal(local.InitiatorSessionID, b.contract.SessionID) {
 		return nil, b.fail(errors.New("portablefsd: authority delivered a filesystem visibility phase to its source participant"))
+	}
+	if b.refusePeerRepair && len(local.Targets) != 0 {
+		return nil, b.fail(fmt.Errorf("portablefsd: authority delivered peer repair sequence %d to a session whose metadata cache holds writer exclusion",
+			local.Cursor.Sequence))
 	}
 	pending := &v3PendingVisibility{
 		event:    local,

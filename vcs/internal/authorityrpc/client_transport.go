@@ -199,6 +199,12 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if c.canPipelineFlushes() {
 		request.GetHello().Features = append(request.GetHello().Features, orderedDelegatedFlushFeature)
 	}
+	// Offering the versioned-metadata contract is what authorizes the authority
+	// to send the KeepAlive proof field: an older decoder rejects unknown fields,
+	// so an Activate advertisement alone could not.
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		request.GetHello().Features = append(request.GetHello().Features, fskitVersionedMetadataFeature)
+	}
 	if err := writeFrame(conn, c.cfg.MaxFrame, request); err != nil {
 		return fail(err)
 	}
@@ -223,6 +229,10 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
 		!hasFeatures(hello.GetFeatures(), []string{fskitDirectWriteFeature}) {
 		return fail(errors.New("authorityrpc: FSKit authority omitted fskit-direct-write-v1"))
+	}
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
+		!hasFeatures(hello.GetFeatures(), []string{fskitVersionedMetadataFeature}) {
+		return fail(errors.New("authorityrpc: FSKit authority did not accept fskit-versioned-metadata-v1 in Hello"))
 	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
 		hello.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},

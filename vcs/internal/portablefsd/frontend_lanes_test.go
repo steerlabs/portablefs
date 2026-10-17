@@ -242,9 +242,9 @@ func TestFrontendLossDrainsAssignedMutationWithoutDiscardingAuthority(t *testing
 		case <-release:
 		}
 		response := exactTestMutationReply(identity)
-		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
-			Item: authorityTestItem(2, authoritypb.Attr_DIRECTORY, 0x71, 0x72),
-		}}
+		item := authorityTestItem(2, authoritypb.Attr_DIRECTORY, 0x71, 0x72)
+		response.PostState = testV3RootBinding(item, v3PostStateRoleCreated)
+		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
 		return response, nil
 	}
 	client.mu.Unlock()
@@ -654,7 +654,7 @@ func TestV3LateHealthyReadAfterNotPublishedAckIsDiscarded(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
-			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o755, Nlink: 1}, ObjectVersion: 1, SnapshotSequence: 1,
 		}}}, nil
 	}
 	var consumed atomic.Int32

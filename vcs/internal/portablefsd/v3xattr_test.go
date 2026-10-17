@@ -51,7 +51,9 @@ func TestV3StaticallyRefusedXattrsNeverReachTheAuthority(t *testing.T) {
 				}
 				client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
 					mutations++
-					return exactTestMutationReply(identity), nil
+					response := exactTestMutationReply(identity)
+					response.PostState = testV3TargetState(0x40, &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o755, Nlink: 1}, 2)
+					return response, nil
 				}
 				_, errno := dispatchV3Test(d, context.Background(), 0, operation.request(file.Item, test.attribute))
 				if errno != test.errno {

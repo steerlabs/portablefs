@@ -312,9 +312,12 @@ func TestV3EnumerateEntriesHoldsHeldIdentitiesImmutable(t *testing.T) {
 			d := testV3DataPlane(t, client)
 			held := lookupTestAttr(t, d, d.resolveReply().Root, "file")
 			root, handle := enumerateTestRoot(t, d)
+			// The listing is a later coherent sample than the lookup.
+			entry := testV3Dirent("entry", test.inode, test.kind, test.identity, 1)
+			entry.ObjectVersion, entry.SnapshotSequence = 2, 2
 			client.mutation, _ = readDirPages(&authoritypb.ReadDirReply{
 				Verifier: bytes.Repeat([]byte{0x76}, 16), Eof: true,
-				Entries: []*authoritypb.Dirent{testV3Dirent("entry", test.inode, test.kind, test.identity, 1)},
+				Entries: []*authoritypb.Dirent{entry},
 			})
 			replyAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
 				Dir: root, Handle: handle, MaxEntries: 16,

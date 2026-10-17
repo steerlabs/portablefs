@@ -62,7 +62,7 @@ func TestV3WriteSendsOneExactWritePerChunk(t *testing.T) {
 		t.Fatalf("write sent %d authority mutations, want exactly one", len(sent))
 	}
 	want := &authoritypb.WriteRequest{
-		Handle: bytes.Repeat([]byte{0x51}, 16), Position: 7, Size: 5,
+		Handle: d.handles[handle].token, Position: 7, Size: 5,
 		Data: []byte("abcde"), WriteFlags: v3WriteFlagKillSUIDGID,
 	}
 	if !proto.Equal(sent[0].GetWrite(), want) || sent[0].GetFskitFrontendOperationId() != operationID {
@@ -105,15 +105,15 @@ func TestV3WriteReplyIsValidatedExactly(t *testing.T) {
 		{name: "post-attr-disagrees", mutate: func(r *authoritypb.Response) { r.GetWrite().GetPostAttr().Mode = 0o777 }},
 		{name: "other-kind", mutate: func(r *authoritypb.Response) {
 			r.GetWrite().GetPostAttr().Kind = authoritypb.Attr_DIRECTORY
-			v3PostAttr(r).Kind = authoritypb.Attr_DIRECTORY
+			r.PostState.Objects[0].Attr.Kind = authoritypb.Attr_DIRECTORY
 		}},
 		{name: "other-inode", mutate: func(r *authoritypb.Response) {
 			r.GetWrite().GetPostAttr().Inode = 3
-			v3PostAttr(r).Inode = 3
+			r.PostState.Objects[0].Attr.Inode = 3
 		}},
 		{name: "size-short-of-end", mutate: func(r *authoritypb.Response) {
 			r.GetWrite().GetPostAttr().Size = 4
-			v3PostAttr(r).Size = 4
+			r.PostState.Objects[0].Attr.Size = 4
 		}},
 		{name: "positive-errno", mutate: func(r *authoritypb.Response) { r.GetWrite().Error = 5 }},
 		{name: "target-other-identity", mutate: func(r *authoritypb.Response) {

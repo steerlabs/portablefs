@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -153,10 +154,13 @@ type v3TestAuthority struct {
 	leaseMillis     uint64
 	maxFskitWrite   uint64
 	mountEnrollment bool
-	// omitDirectWrite/omitDurableMutations model an authority that predates
-	// the FSKit direct-write and durable-mutation contracts.
+	// omitDirectWrite/omitDurableMutations/omitBatchedClose model an
+	// authority that predates the FSKit direct-write, durable-mutation, and
+	// FSKit CloseBatch contracts.
 	omitDirectWrite              bool
 	omitDurableMutations         bool
+	omitBatchedClose             bool
+	omitVersionedMetadata        bool
 	initialAuthorizationDeadline int64
 	renewedAuthorizationDeadline int64
 
@@ -252,6 +256,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
 		}
+		if !h.omitVersionedMetadata && slices.Contains(req.GetHello().GetFeatures(), "fskit-versioned-metadata-v1") {
+			features = append(features, "fskit-versioned-metadata-v1")
+		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 			ProtocolMajor: authorityrpc.ProtocolMajor, Features: features,
 			Role: req.GetHello().GetRole(), ConnectionSetId: append([]byte(nil), req.GetHello().GetConnectionSetId()...),
@@ -277,6 +284,12 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		}
 		if !h.omitDurableMutations {
 			features = append(features, "fskit-durable-mutations-v1")
+		}
+		if !h.omitBatchedClose {
+			features = append(features, "batched-close-v1")
+		}
+		if !h.omitVersionedMetadata {
+			features = append(features, "fskit-versioned-metadata-v1")
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
@@ -310,6 +323,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		h.mu.Lock()
 		response.Errno = h.keepAliveErrno
 		h.mu.Unlock()
+		if response.Errno == 0 {
+			response.SessionValidForNanos = uint64(min(time.Duration(h.leaseMillis)*time.Millisecond, authorityrpc.MaxCacheProof))
+		}
 	case *authoritypb.Request_StatFs:
 		h.mu.Lock()
 		h.statfsCalls++
@@ -330,7 +346,8 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
 			Item: &authoritypb.Item{
 				Token: bytes.Repeat([]byte{0x33}, 16), StableIdentity: bytes.Repeat([]byte{0x44}, 16),
-				Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+				Attr:          &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+				ObjectVersion: 1, SnapshotSequence: 1,
 			},
 		}}
 	case *authoritypb.Request_NextFskitRepair:
@@ -797,13 +814,15 @@ func TestV3AttachRequiresFullFSKitWriteCapacityBeforeAttach(t *testing.T) {
 // The daemon sends one ordinary WRITE per chunk and acknowledges FSKit
 // mutations as durable, so an authority that lacks either contract must be
 // refused before a mount exists, never served with weaker semantics.
-func TestV3AttachRefusesAnAuthorityWithoutDirectWriteOrDurableMutations(t *testing.T) {
+func TestV3AttachRefusesAnAuthorityWithoutARequiredFSKitContract(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(*v3TestAuthority)
 	}{
 		{name: "no-direct-write", mutate: func(h *v3TestAuthority) { h.omitDirectWrite = true }},
 		{name: "no-durable-mutations", mutate: func(h *v3TestAuthority) { h.omitDurableMutations = true }},
+		{name: "no-batched-close", mutate: func(h *v3TestAuthority) { h.omitBatchedClose = true }},
+		{name: "no-versioned-metadata", mutate: func(h *v3TestAuthority) { h.omitVersionedMetadata = true }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pki := newV3TestPKI(t)
@@ -815,7 +834,7 @@ func TestV3AttachRefusesAnAuthorityWithoutDirectWriteOrDurableMutations(t *testi
 			if _, _, err := r.ensure(context.Background(), v3TestEnsureRequest(
 				address, pki, "/Volumes/PortableFSV3MissingContract",
 			)); err == nil {
-				t.Fatal("an authority without the FSKit direct-write/durability contract was accepted")
+				t.Fatal("an authority without a required FSKit contract was accepted")
 			}
 			if len(r.list()) != 0 {
 				t.Fatal("a refused authority contract left a daemon attach registered")
