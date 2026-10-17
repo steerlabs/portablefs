@@ -28,8 +28,23 @@ this file is the human-curated summary.
   are non-owning entry snapshots and retain no authority capabilities. The
   volume no longer claims persistent object IDs, because it implements no
   lookup by ID.
-- The daemon retires authority capabilities through one batched reclaimer, and
-  opens, unlinks, and hard links no longer fetch attributes they do not use.
+- The daemon answers FSKit attribute requests and name lookups, including
+  negative lookups, from a metadata cache while the Mac holds the writer
+  exclusion. Entries are ordered by the authority's storage sequence, and hits
+  are admitted only within the validity the authority last proved through
+  KeepAlive (at most 60 seconds ahead). Allocated size is the last observed
+  value. This uses the optional `fskit-versioned-metadata-v1` feature.
+- FSKit Close and Reclaim complete locally. One background owner releases the
+  authority descriptors and capabilities in batches through `CLOSE_BATCH`,
+  which the authority now admits for FSKit under `batched-close-v1`, and
+  batched Reclaim. Unmount no longer costs one network round trip per retained
+  item. Current Mac clients require both features.
+- When a Mac session ends without a clean unmount, the authority keeps
+  excluding Linux writers until every cache proof it granted that session has
+  expired and its admitted storage work has drained. After a restart with an
+  unproven Mac mount, Linux writes wait 61.06 seconds after takeover; Mac
+  activation still requires operator reconciliation.
+- Opens, unlinks, and hard links no longer fetch attributes they do not use.
   Statically refused xattr names are answered locally with the authority's
   errno.
 - The authority reserves inbound frame memory for CONTROL and handshake traffic,
@@ -38,6 +53,11 @@ this file is the human-curated summary.
 
 ### Fixed
 
+- Restore-mode hydration no longer changes a file's mtime after the user has
+  modified it, and lookups and directory listings no longer expose the
+  transient hydration mtime.
+- FSKit read replies carry version stamps that are coherent with their
+  attributes, in the same storage sequence as mutation post-states.
 - FSKit file creation is exclusive, as the createItem contract requires, and an
   explicit directory mode such as 0644 is no longer rewritten to 0755.
 - A lookup that races a reclaim of the same FSKit item receives a new item

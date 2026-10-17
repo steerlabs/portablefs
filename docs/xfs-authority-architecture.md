@@ -67,7 +67,19 @@ Runtime subscriptions, delegations, connections, locks, handles, and replay
 outcomes are epoch-local. Restart permanently stales old handles; cold
 reattachment permits new opens. The Authority fences prior Linux membership
 through the subscription horizon before conflicting writes. Prior Mac or
-unproven membership retains its separate compatibility/lifecycle fence.
+unproven membership retains its separate compatibility/lifecycle fence: it
+refuses Mac activation until operator reconciliation, and refuses Linux writers
+for the frozen 60-second metadata-cache proof bound plus margin after safe
+takeover.
+
+Three owners keep the Mac writer exclusion distinct. An active FSKit
+participant excludes other writers while it serves. When it is fenced, an
+epoch-local obligation keeps excluding them until the latest KeepAlive cache
+proof granted to that session has expired and its admitted storage
+applications have drained; a clean detach discharges it at once. Durable mount
+membership records topology and survives restart until exact absence or
+operator reconciliation. Out-of-band edits to the backing XFS tree on the
+authority host are unsupported; they would bypass all three.
 No client checkpoint or journal reconstructs XFS.
 
 ### Tiered canonical representation

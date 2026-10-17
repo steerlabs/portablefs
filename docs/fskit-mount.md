@@ -35,8 +35,9 @@ Activate echo that profile; replay or reconnect with a different profile is a
 protocol error. The authority admits only the FSKit repair,
 source-publication, fragmented-write, one-frame write, and shared filesystem
 operations for that session. It does not issue lease grants or accept
-lease-control requests. The current daemon requires `fskit-direct-write-v1`
-and `fskit-durable-mutations-v1` and refuses an authority that lacks either.
+lease-control requests. The current daemon requires `fskit-direct-write-v1`,
+`fskit-durable-mutations-v1`, `fskit-versioned-metadata-v1`, and
+`batched-close-v1`, and refuses an authority that lacks any of them.
 
 ## Writes and durability
 
@@ -76,6 +77,46 @@ it. The authority bounds capabilities per session (65,536 by default) and
 refuses a lookup beyond that with `ENFILE` rather than evicting an item the
 kernel still holds. A workload that keeps more vnodes alive on one mount needs
 a correspondingly provisioned authority budget.
+
+Close and reclaim complete locally. The daemon retires the handle or item,
+transfers the authority release to one background owner, and replies; it does
+not wait a network round trip per callback, which matters because the kernel
+reclaims items one at a time at unmount. That owner sends at most one
+`CLOSE_BATCH` and one batched Reclaim per round trip, with one batch in flight
+and one forming, each of at most 128 tokens. The authority's counts therefore
+lag local state by at most those two batches plus releases still being
+handed over by in-flight callbacks. A failed release ends the mount; it is
+never retried item by item. Unmount drains the owner on the original session
+before the absence proof.
+
+## Metadata cache
+
+While this Mac holds the volume's writer exclusion, it is the only client
+that can change metadata the mount can observe, and every change it makes
+returns through its own daemon with a versioned post-state. The daemon
+therefore answers attribute requests and name lookups, including negative
+ones, from state its session already received, without an authority round
+trip. Misses take the ordinary authority path.
+
+The cache is not a TTL. Its entries are ordered by the authority's storage
+sequence: an older read or mutation result never replaces a newer one, a name
+is filled only from an observation at or after that directory's last applied
+namespace change, and a record learned from an old lookup stays uncacheable
+until a fresh observation. A hit is admitted only when no conflicting
+mutation of the same callback window is in flight, and only within the
+validity the authority last proved through KeepAlive, at most 60 seconds
+ahead and measured on a clock that advances across sleep. The authority keeps
+the writer exclusion for every proof it granted even if the session is fenced
+earlier, so no other client can write while a hit can still be served. Any
+terminal condition clears the cache permanently for that attach.
+
+Size, mtime, mode, ownership, link count, type, and names are exact under
+these rules. Allocated size (`st_blocks`) is the value from the last authority
+observation: XFS can trim speculative preallocation, and restore-mode
+hydration allocates blocks, without a client mutation. Restore-mode ctime is
+already outside its contract. Extended attributes, symlink targets, and
+volume statistics are not cached. The cache does not change FSKit's own
+kernel caching, which keeps the limits stated above.
 
 The frozen policy spellings `macos26-synchronous-vfs-repair-v1`,
 `macos26-synchronous-vfs-repair-v2`, and `fskit-native-revocation-v1` remain
@@ -158,10 +199,12 @@ own sealed service. Saved preferences do not identify the running release.
 An FSKit frontend loss immediately ends local serving. The daemon retains the
 original authenticated authority transport until the mount supervisor proves
 the exact kernel mount absent and delivers that proof through the existing
-detach operation. Only then can the authority release its writer exclusion.
-The terminal frontend cannot reconnect. A lost authority transport or an
-unprovable unmount remains fenced; neither timeout nor a replacement session
-can substitute for the absence proof.
+detach operation. That proof releases the writer exclusion at once and clears
+the durable mount membership. The terminal frontend cannot reconnect. Without
+it, a lost authority transport or an unprovable unmount keeps the membership
+fenced against another Mac until operator reconciliation; Linux writers wait
+only until every metadata-cache proof granted to the old session has expired
+and its admitted storage work has drained.
 
 The launchd-managed daemon appends to
 `~/.local/state/portablefs/portablefsd.log`; per-mount logs are separate, under
