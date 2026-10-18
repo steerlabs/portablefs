@@ -9,8 +9,8 @@ func (d *v3DataPlane) cacheDecisionLocked(metric int, item *v3ItemRecord, name s
 	e := lantrace.Event{Kind: lantrace.KindCache, Phase: lantrace.PhaseCandidate,
 		Candidate: lantrace.CandidateAttrCache, CacheResult: lantrace.CacheMiss,
 		Cert: lantrace.CertAbsent, Search: lantrace.SearchUnknown,
-		Proof: lantrace.ProofValid, SourceState: lantrace.SourceNone,
-		Coordinate: lantrace.CoordinateFirst}
+		SourceState: lantrace.SourceNone,
+		Coordinate:  lantrace.CoordinateFirst}
 	if metric == 0 {
 		e.Item = item.item.ItemID
 		if item.valid {
@@ -25,6 +25,9 @@ func (d *v3DataPlane) cacheDecisionLocked(metric int, item *v3ItemRecord, name s
 			e.Coordinate = lantrace.CoordinateRepeated
 		} else if item.complete != nil {
 			e.Candidate = lantrace.CandidateCompleteness
+			if _, present := item.complete.names[name]; present {
+				e.Coordinate = lantrace.CoordinateRepeated
+			}
 		}
 		if item.complete != nil {
 			e.Cert = lantrace.CertPresent
@@ -35,10 +38,23 @@ func (d *v3DataPlane) cacheDecisionLocked(metric int, item *v3ItemRecord, name s
 			e.Search = item.search
 		}
 	}
-	if d.horizon == 0 {
-		e.Proof = lantrace.ProofAbsent
+	return v3CacheTraceResult(d.cacheProofTraceLocked(e), result)
+}
+
+// Use the admission/renewal clock samples; tracing never reads a clock or
+// decides eligibility. Saturation keeps even a long-expired proof in schema.
+func (d *v3DataPlane) cacheProofTraceLocked(e lantrace.Event) lantrace.Event {
+	e.Proof, e.ProofAge = lantrace.ProofAbsent, 0
+	if d.horizon != 0 {
+		e.Proof = lantrace.ProofValid
+		if d.clockSample >= d.horizon {
+			e.Proof = lantrace.ProofExpired
+		}
+		if d.clockSample >= d.horizonStart {
+			e.ProofAge = min(lantrace.Nanos(d.clockSample-d.horizonStart), lantrace.MaxNanos)
+		}
 	}
-	return v3CacheTraceResult(e, result)
+	return e
 }
 
 func v3CacheTraceResult(e lantrace.Event, result v3CacheResult) lantrace.Event {
@@ -47,9 +63,6 @@ func v3CacheTraceResult(e lantrace.Event, result v3CacheResult) lantrace.Event {
 		e.CacheResult = lantrace.CachePositive
 	} else {
 		e.MissReason = lantrace.MissReason(v3CacheResultNames[result])
-	}
-	if result == v3CacheHorizon && e.Proof != lantrace.ProofAbsent {
-		e.Proof = lantrace.ProofExpired
 	}
 	return e
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
@@ -151,6 +152,8 @@ func TestV3HorizonNeverRegresses(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlaneWithClock(t, client, clock)
 	first := v3Horizon(d)
+	start, _ := clock.read()
+	clock.advance(time.Second)
 	client.mu.Lock()
 	client.keepAlive = func(context.Context) (time.Duration, error) { return 5 * time.Second, nil }
 	client.mu.Unlock()
@@ -159,6 +162,29 @@ func TestV3HorizonNeverRegresses(t *testing.T) {
 	}
 	if got := v3Horizon(d); got != first {
 		t.Fatalf("a shorter later receipt moved the horizon from %d to %d", first, got)
+	}
+	d.mu.Lock()
+	retainedStart := d.horizonStart
+	age := d.cacheProofTraceLocked(lantrace.Event{}).ProofAge
+	d.mu.Unlock()
+	if retainedStart != start || age != lantrace.Nanos(time.Second) {
+		t.Fatalf("losing proof replaced the winning start/age: %d/%d", retainedStart, age)
+	}
+	client.mu.Lock()
+	client.keepAlive = func(context.Context) (time.Duration, error) {
+		clock.advance(2 * time.Second)
+		return authorityrpc.MaxCacheProof, nil
+	}
+	client.mu.Unlock()
+	if err := d.renewHorizon(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	retainedStart = d.horizonStart
+	age = d.cacheProofTraceLocked(lantrace.Event{}).ProofAge
+	d.mu.Unlock()
+	if retainedStart != start+uint64(time.Second) || age != lantrace.Nanos(2*time.Second) || v3Horizon(d) <= first {
+		t.Fatalf("winning proof start/age=%d/%d, want request start including transit", retainedStart, age)
 	}
 }
 

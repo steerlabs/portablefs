@@ -611,6 +611,87 @@ func TestP7ContradictoryErrnoAndLookupDropWholeCertificate(t *testing.T) {
 	}
 }
 
+func TestP7LookupErrnoDropsThroughHandler(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	dir := p7Mkdir(t, f, "dir")
+	p7Create(t, f, dir, "member")
+	p7Create(t, f, dir, "other")
+	p7Members(t, f.d, dir, "member", "other")
+	f.d.mu.Lock()
+	// Membership survives alias loss, but cannot synthesize a positive reply.
+	f.d.dropNameLocked(dir, "member")
+	f.d.mu.Unlock()
+	original := f.client.mutation
+	f.client.mutation = func(ctx context.Context, id authorityrpc.MutationIdentity, req *authoritypb.Request) (*authoritypb.Response, error) {
+		if lookup := req.GetLookup(); lookup != nil && string(lookup.GetName()) == "member" {
+			r := exactTestMutationReply(id)
+			r.Errno = errnos.ENOENT
+			return r, nil
+		}
+		return original(ctx, id, req)
+	}
+	p7Absence(t, f, dir, "member", false)
+	f.d.mu.Lock()
+	discarded := dir.complete == nil && f.d.completeDirs == 0 && f.d.completeNames == 0 && f.d.completeBytes == 0 &&
+		dir.certificateDrop == lantrace.CertDropNamespaceCut && dir.search == lantrace.SearchUnknown
+	f.d.mu.Unlock()
+	if !discarded {
+		t.Fatal("Lookup definite ENOENT retained contradictory certificate or its accounting")
+	}
+	p7Absence(t, f, dir, "fresh", false)
+}
+
+func TestP7KnownMemberTraceCoordinate(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	dir := p7Mkdir(t, f, "dir")
+	p7Create(t, f, dir, "member")
+	f.d.mu.Lock()
+	f.d.dropNameLocked(dir, "member")
+	e := f.d.cacheDecisionLocked(1, dir, "member", v3CacheResource)
+	f.d.mu.Unlock()
+	if e.Coordinate != lantrace.CoordinateRepeated || e.Candidate != lantrace.CandidateCompleteness || e.MissReason != lantrace.MissResource {
+		t.Fatalf("retained member decision=%+v", e)
+	}
+}
+
+func TestP7ProofTraceAdmission(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		elapsed       time.Duration
+		authorization bool
+		absent        bool
+		result        v3CacheResult
+		proof         lantrace.ProofState
+		age           lantrace.Nanos
+	}{
+		{name: "aged-live", elapsed: 2 * time.Second, result: v3CacheHit, proof: lantrace.ProofValid, age: lantrace.Nanos(2 * time.Second)},
+		{name: "authorization", elapsed: 2 * time.Second, authorization: true, result: v3CacheAuthorization, proof: lantrace.ProofValid, age: lantrace.Nanos(2 * time.Second)},
+		{name: "simultaneous-expiry", elapsed: 10 * time.Minute, authorization: true, result: v3CacheAuthorization, proof: lantrace.ProofExpired, age: lantrace.Nanos(10 * time.Minute)},
+		{name: "horizon", elapsed: 10 * time.Minute, result: v3CacheHorizon, proof: lantrace.ProofExpired, age: lantrace.Nanos(10 * time.Minute)},
+		{name: "absent", elapsed: 2 * time.Second, absent: true, result: v3CacheHorizon, proof: lantrace.ProofAbsent},
+		{name: "bounded-age", elapsed: time.Duration(lantrace.MaxNanos) + time.Second, result: v3CacheHorizon, proof: lantrace.ProofExpired, age: lantrace.MaxNanos},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newCachedV3Fixture(t, v3FileObjects())
+			dir := p7Mkdir(t, f, "dir")
+			f.clock.advance(test.elapsed)
+			f.d.mu.Lock()
+			if test.authorization {
+				f.d.authorizationDeadline = time.Now().Add(-time.Second)
+			}
+			if test.absent {
+				f.d.horizon = 0
+			}
+			result := f.d.cacheAdmissionLocked()
+			e := f.d.cacheDecisionLocked(1, dir, "fresh", result)
+			f.d.mu.Unlock()
+			if result != test.result || e.Proof != test.proof || e.ProofAge != test.age {
+				t.Fatalf("admission=%v proof=%s age=%d, want %v/%s/%d", result, e.Proof, e.ProofAge, test.result, test.proof, test.age)
+			}
+		})
+	}
+}
+
 func TestP7ParentRetirementAndAdmissionLoss(t *testing.T) {
 	for _, kind := range []string{"retirement", "horizon", "authorization", "client-admission", "terminal"} {
 		t.Run(kind, func(t *testing.T) {
@@ -740,10 +821,11 @@ func TestP7EveryCompletenessLimit(t *testing.T) {
 }
 
 func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
-	for _, kind := range []string{"exposed", "expiry", "authorization", "retirement", "overlapping-effect", "write-failure"} {
+	for _, kind := range []string{"exposed", "expiry", "authorization", "authorization-expiry", "retirement", "overlapping-effect", "write-failure"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newCachedV3Fixture(t, v3FileObjects())
 			dir := p7Mkdir(t, f, "dir")
+			f.clock.advance(2 * time.Second)
 			var stream bytes.Buffer
 			r := p6Recorder(t, &stream, lantrace.LayerDaemon, lantrace.RecorderConfig{})
 			a := &attach{ref: "p7", v3Data: f.d, v3Coherence: f.d.bridge}
@@ -763,7 +845,10 @@ func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
 					switch kind {
 					case "expiry":
 						f.clock.advance(10 * time.Minute)
-					case "authorization":
+					case "authorization", "authorization-expiry":
+						if kind == "authorization-expiry" {
+							f.clock.advance(10 * time.Minute)
+						}
 						f.d.mu.Lock()
 						f.d.authorizationDeadline = time.Now().Add(-time.Second)
 						f.d.mu.Unlock()
@@ -800,7 +885,7 @@ func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
 			} else if err != nil || envelope.Body.(*pfslocal.ErrorReply).Errno != darwinENOENT {
 				t.Fatalf("reply=%+v err=%v", envelope, err)
 			}
-			if (kind == "exposed" || kind == "overlapping-effect") && f.authorityCalls() != before || (kind == "expiry" || kind == "authorization") && f.authorityCalls() != before+1 {
+			if (kind == "exposed" || kind == "overlapping-effect") && f.authorityCalls() != before || (kind == "expiry" || kind == "authorization" || kind == "authorization-expiry") && f.authorityCalls() != before+1 {
 				t.Fatal("wrong authority retry count")
 			}
 			if kind != "retirement" && kind != "write-failure" {
@@ -824,8 +909,24 @@ func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
 				}
 				if e.Phase == lantrace.PhaseCandidate {
 					candidates++
+					if e.Proof != lantrace.ProofValid || e.ProofAge != lantrace.Nanos(2*time.Second) {
+						t.Fatalf("aged live candidate=%+v", e)
+					}
 				} else {
 					finals++
+					proof, age := lantrace.ProofValid, lantrace.Nanos(2*time.Second)
+					miss := lantrace.MissReason("")
+					switch kind {
+					case "expiry":
+						proof, age, miss = lantrace.ProofExpired, lantrace.Nanos(2*time.Second+10*time.Minute), lantrace.MissHorizon
+					case "authorization-expiry":
+						proof, age, miss = lantrace.ProofExpired, lantrace.Nanos(2*time.Second+10*time.Minute), lantrace.MissAuthorization
+					case "authorization":
+						miss = lantrace.MissAuthorization
+					}
+					if kind != "retirement" && kind != "write-failure" && (e.Proof != proof || e.ProofAge != age || e.MissReason != miss) {
+						t.Fatalf("final proof decision=%+v, want %s/%d/%s", e, proof, age, miss)
+					}
 					if e.Exposure == lantrace.ExposureAccepted {
 						accepted++
 					}

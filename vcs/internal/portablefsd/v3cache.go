@@ -272,18 +272,26 @@ func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 // extra local denial. H expiry alone does not end the session; it only makes
 // every read take the authority path. d.mu is held.
 func (d *v3DataPlane) cacheAdmissionLocked() v3CacheResult {
+	// Sample a retained proof even when another denial wins the miss reason,
+	// so diagnostics describe its age and expiry independently of that reason.
+	var now uint64
+	var clockErr error
+	if d.horizon != 0 {
+		now, clockErr = d.readClockLocked()
+	}
 	if d.terminal != nil || !d.client.LocalAdmissionOpen() {
 		return v3CacheTerminal
 	}
 	if !d.authorizationDeadline.IsZero() && !time.Now().Before(d.authorizationDeadline) {
 		return v3CacheAuthorization
 	}
+	if clockErr != nil {
+		return v3CacheClock
+	}
 	if d.horizon == 0 {
 		return v3CacheHorizon
 	}
-	if now, err := d.readClockLocked(); err != nil {
-		return v3CacheClock
-	} else if now >= d.horizon {
+	if now >= d.horizon {
 		return v3CacheHorizon
 	}
 	return v3CacheHit
@@ -519,6 +527,7 @@ func (d *v3DataPlane) serveCached(
 			reason = v3CacheResource
 		}
 		candidate.finalReason = reason
+		candidate.trace = d.cacheProofTraceLocked(candidate.trace)
 		if reason != v3CacheHit && !candidate.accounted {
 			d.cacheCounters.reads[metric][reason]++
 			candidate.accounted = true

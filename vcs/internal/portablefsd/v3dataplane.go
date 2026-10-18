@@ -257,10 +257,14 @@ type v3DataPlane struct {
 	// means no usable proof.
 	// authorizationDeadline is the installed signed deadline, an additional
 	// wall-clock denial check (zero: none). All are protected by mu.
-	renewalMu             sync.Mutex
-	clock                 func() (uint64, error)
-	clockFault            error
-	horizon               uint64
+	renewalMu  sync.Mutex
+	clock      func() (uint64, error)
+	clockFault error
+	horizon    uint64
+	// Diagnostics retain the winning proof's request start and the latest
+	// existing clock sample. Neither participates in cache permission.
+	horizonStart          uint64
+	clockSample           uint64
 	authorizationDeadline time.Time
 
 	failOnce sync.Once
@@ -2854,6 +2858,7 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	candidate, usable := v3HorizonCandidate(start, proof)
 	if usable && d.clockFault == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
 		d.horizon = candidate
+		d.horizonStart = start
 	}
 	d.mu.Unlock()
 	if nowErr != nil {
@@ -2877,6 +2882,7 @@ func (d *v3DataPlane) readClockLocked() (uint64, error) {
 		d.horizon = 0
 		return 0, err
 	}
+	d.clockSample = now
 	return now, nil
 }
 
