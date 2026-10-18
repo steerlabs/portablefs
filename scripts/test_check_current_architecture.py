@@ -176,6 +176,56 @@ class RequiredInventories(unittest.TestCase):
         self.assertEqual(checker.required_list_entries(text), ["pkg:TestA", "pkg:TestB", "pkg:TestC/Sub"])
 
 
+class RootInventory(unittest.TestCase):
+    def suite(self, entries: list) -> str:
+        body = "".join(f'  "{entry}"\n' for entry in entries)
+        return (
+            "REQUIRED_TESTS=()\n"
+            f"REQUIRED_ROOT_TESTS=(\n{body})\n"
+            "run_root_boundary_suite() {\n  validate_root_tests\n}\n"
+            "validate_root_tests() {\n  :\n}\n"
+        )
+
+    def test_current_obligation_passes(self) -> None:
+        self.assertEqual(checker.root_inventory_problems(self.suite(sorted(checker.ROOT_REQUIRED))), [])
+
+    def test_empty_inventory_fails(self) -> None:
+        problems = checker.root_inventory_problems(self.suite([]))
+        self.assertTrue(any("is empty" in p for p in problems), problems)
+        self.assertTrue(any("does not require root obligations" in p for p in problems), problems)
+
+    def test_missing_inventory_fails(self) -> None:
+        problems = checker.root_inventory_problems("REQUIRED_TESTS=()\n")
+        self.assertEqual(problems, ["scripts/xfs-fuse-integration.sh declares no REQUIRED_ROOT_TESTS"])
+
+    def test_foreign_package_duplicate_and_missing_validation_fail(self) -> None:
+        current = sorted(checker.ROOT_REQUIRED)
+        foreign = self.suite(current + ["github.com/steerlabs/portablefs/vcs/internal/fusev3:TestA"])
+        self.assertTrue(any("is not a top-level test" in p for p in checker.root_inventory_problems(foreign)))
+        duplicate = self.suite(current + current)
+        self.assertTrue(any("repeats an entry" in p for p in checker.root_inventory_problems(duplicate)))
+        unvalidated = self.suite(current).replace("  validate_root_tests\n", "")
+        self.assertTrue(any("does not validate" in p for p in checker.root_inventory_problems(unvalidated)))
+
+    def test_checks_read_the_suite_from_the_tree(self) -> None:
+        # The two inventory checks must fail when the real suite's root list
+        # is emptied, not only when the helper is called directly.
+        original = checker.read
+        empty = self.suite([])
+
+        def patched(relative: str) -> str:
+            if relative == "scripts/xfs-fuse-integration.sh":
+                return empty + "".join(f"# {name}\n" for name in ("xfs-required-authority-tests.txt", "xfs-required-fuse-tests.txt", "xfs-required-tiered-tests.txt"))
+            return original(relative)
+
+        checker.read = patched
+        try:
+            with self.assertRaises(checker.CheckFailure):
+                checker.check_required_inventories()
+        finally:
+            checker.read = original
+
+
 class ReadinessRoutes(unittest.TestCase):
     def test_dispatch_case_and_request_suffix(self) -> None:
         text = 'case "frontend-ready":\n url := "/v2/attaches/" + ref + "/frontend-ready"\n s := "ready"'

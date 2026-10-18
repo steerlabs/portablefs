@@ -178,6 +178,19 @@ REQUIRED_TEST_LISTS = (
     "scripts/xfs-required-tiered-tests.txt",
 )
 
+# The privileged suite's root invocation: the cell helper's root-owned volume
+# provisioning proved against real XFS project quota, and the shared-cell
+# writeback-domain fault proof. The invocation is provisioned for exactly these
+# packages, so every root entry must name a top-level test in one of them.
+ROOT_TEST_PACKAGES = {
+    "github.com/steerlabs/portablefs/vcs/internal/cellhost",
+    "github.com/steerlabs/portablefs/vcs/internal/xfsstore",
+}
+ROOT_REQUIRED = {
+    "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement",
+    "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestSharedXFSWritebackDomain",
+}
+
 # The device-level power-cut harness must cover both durability contracts:
 # fsync-gated Linux writes and every acknowledged FSKit mutation.
 POWERLOSS_REQUIRED = {
@@ -843,6 +856,7 @@ def check_required_inventories() -> None:
     lists_named = set(re.findall(r"xfs-required-[a-z]+-tests\.txt", suite))
     require(problems, lists_named == {pathlib.Path(name).name for name in REQUIRED_TEST_LISTS},
             f"scripts/xfs-fuse-integration.sh names required lists {sorted(lists_named)}")
+    problems.extend(root_inventory_problems(suite))
     gate = read("scripts/verify-local.sh")
     require(problems, "scripts/check-current-architecture.py" in gate, "scripts/verify-local.sh does not run this check")
     finish(problems)
@@ -859,6 +873,29 @@ def shell_array(text: str, name: str) -> List[str]:
         if line:
             words.append(line.strip('"'))
     return words
+
+
+def root_inventory_problems(suite: str) -> List[str]:
+    """Problems with the root invocation's inventory in the suite's text.
+
+    The root invocation derives its -run selector from REQUIRED_ROOT_TESTS, so
+    an empty or missing list would select nothing and require nothing.
+    """
+    problems: List[str] = []
+    if not re.search(r"(?m)^REQUIRED_ROOT_TESTS=\(", suite):
+        return ["scripts/xfs-fuse-integration.sh declares no REQUIRED_ROOT_TESTS"]
+    entries = shell_array(suite, "REQUIRED_ROOT_TESTS")
+    require(problems, bool(entries), "scripts/xfs-fuse-integration.sh REQUIRED_ROOT_TESTS is empty")
+    require(problems, len(entries) == len(set(entries)), "scripts/xfs-fuse-integration.sh REQUIRED_ROOT_TESTS repeats an entry")
+    for entry in entries:
+        package, _, test = entry.partition(":")
+        require(problems, package in ROOT_TEST_PACKAGES and re.fullmatch(r"Test[A-Za-z0-9_]+", test) is not None,
+                f"root required entry {entry!r} is not a top-level test in {sorted(ROOT_TEST_PACKAGES)}")
+    missing = ROOT_REQUIRED - set(entries)
+    require(problems, not missing, f"scripts/xfs-fuse-integration.sh does not require root obligations {sorted(missing)}")
+    require(problems, "validate_root_tests" in suite and re.search(r"(?m)^\s+validate_root_tests$", suite) is not None,
+            "scripts/xfs-fuse-integration.sh does not validate its root inventory before running it")
+    return problems
 
 
 def required_list_entries(text: str) -> List[str]:
