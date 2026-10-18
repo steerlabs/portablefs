@@ -128,14 +128,27 @@ func (m *Mount) recoverEpoch(ctx context.Context) error {
 }
 
 func waitEpochRecovery(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	delay := epochRecoveryRetryDelay
-	if deadline, ok := ctx.Deadline(); ok {
-		delay = min(delay, time.Until(deadline))
+	deadline, bounded := ctx.Deadline()
+	if bounded {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return context.DeadlineExceeded
+		}
+		delay = min(delay, remaining)
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
+		// The context's cancellation goroutine can be scheduled after this
+		// timer. The actual deadline still forbids another connection attempt.
+		if bounded && !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
