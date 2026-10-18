@@ -13,28 +13,13 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
     case missingBody
     case unexpectedReply(String)
     case daemon(errno: Int32, message: String)
-    /// The daemon resolved a strict-v3 authority attach whose declared cache
-    /// policy this build does not implement — an unknown policy string, or the
-    /// native macOS 27 policy that stays gated on the final SDK. Mounting
-    /// while ignoring the declared contract would serve stale kernel state,
-    /// so resolution closes the client and terminates with ENOTSUP.
-    case v3CoherenceIntegrationUnavailable
+    /// A filesystem request or event subscription was attempted before this
+    /// connection completed its single Resolve. pfslocal binds every request
+    /// to the resolved attach; the daemon closes a connection that skips it,
+    /// so the client refuses locally instead of sending the frame.
+    case unresolved
     case socketPath(String)
     case system(errno: Int32, operation: String)
-    /// PREPARE was already closed before this FSKit callback could issue any
-    /// daemon request, so no attempt exists to acknowledge or replay.
-    /// macOS 26 transparently re-enters some EINTR callbacks: live
-    /// testing observed hidden replay after EINTR, EBUSY, and EAGAIN. Policy
-    /// v2 therefore uses the non-restartable ECANCELED verdict for this
-    /// definite-preapply boundary. It also releases FSKit's namespace lane so
-    /// the repair can run instead of deadlocking behind this callback.
-    case publicationAdmissionClosed
-    /// Ordinary local contention, and the frozen v1 admission verdict. Unlike
-    /// v2's non-restartable ECANCELED, legacy v1 exposed EBUSY at every local
-    /// definite-preapply boundary. Namespace-index reservation collisions are
-    /// also local contention rather than a coherence-policy refusal and use
-    /// this errno under every policy.
-    case publicationAdmissionBusy
 
     public var description: String {
         switch self {
@@ -58,16 +43,12 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
             return "unexpected pfslocal reply: \(message)"
         case let .daemon(errnoValue, message):
             return "daemon error errno=\(errnoValue): \(message)"
-        case .v3CoherenceIntegrationUnavailable:
-            return "strict v3 coherence is not integrated into the live FSKit mount"
+        case .unresolved:
+            return "pfslocal connection is not bound to an attach"
         case let .socketPath(message):
             return "invalid socket path: \(message)"
         case let .system(errnoValue, operation):
             return "\(operation) failed with errno \(errnoValue)"
-        case .publicationAdmissionClosed:
-            return "pfslocal publication admission is temporarily closed"
-        case .publicationAdmissionBusy:
-            return "pfslocal publication admission is busy"
         }
     }
 
@@ -91,12 +72,8 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
             return ETIMEDOUT
         case .cancelled:
             return EINTR
-        case .publicationAdmissionClosed:
-            return ECANCELED
-        case .publicationAdmissionBusy:
-            return EBUSY
-        case .v3CoherenceIntegrationUnavailable:
-            return ENOTSUP
+        case .unresolved:
+            return ENXIO
         case .socketPath, .protocolMismatch, .missingBody, .unexpectedReply, .invalidFrame:
             return EINVAL
         case .frameTooLarge:

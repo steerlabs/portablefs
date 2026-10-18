@@ -7,4 +7,3 @@ PORTABLEFS_APP_GROUP = $(TeamIdentifierPrefix)pfsoss
 // contract from the Xcode-signed host and extension. Forks must override both
 // this identity and DEVELOPMENT_TEAM together.
 PORTABLEFS_SERVICE_SIGN_IDENTITY = Developer ID Application: TrendUp AI, Inc. (B47U2LLKHW)
-PORTABLEFS_NATIVE_QUALIFICATION =

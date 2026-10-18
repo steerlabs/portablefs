@@ -1,6 +1,34 @@
 import Foundation
 import FSKit
+import OSLog
 @preconcurrency import Darwin
+
+/// A syntactically valid request to set a user xattr: the one validator
+/// for that grammar. It holds no item, so a caller can only obtain one by
+/// deciding the request's syntax before it converts or looks up the target:
+/// EINVAL outranks every item verdict, including a foreign FSItem that
+/// never was a PortableFS item.
+public struct PfsXattrSetRequest: Sendable, Equatable {
+    public let name: String
+    public let createOnly: Bool
+    public let replaceOnly: Bool
+
+    public init(name: String, createOnly: Bool, replaceOnly: Bool) throws {
+        let nameBytes = name.utf8
+        guard !nameBytes.isEmpty,
+              nameBytes.count <= 255,
+              !nameBytes.contains(0),
+              !(createOnly && replaceOnly) else {
+            throw PfsLocalClientError.daemon(
+                errno: EINVAL,
+                message: "invalid xattr set request"
+            )
+        }
+        self.name = name
+        self.createOnly = createOnly
+        self.replaceOnly = replaceOnly
+    }
+}
 
 /// Stable item identity carried by pfslocal and surfaced to FSKit.
 public struct PfsItemIdentity: Hashable, Sendable {
@@ -50,7 +78,6 @@ public struct PfsResolvedVolume: Sendable {
     public var root: PortableFSItem
     public var rootAttr: PfsAttr
     public var volumeID: String
-    public var branch: String
     public var volumeName: String
     public var capabilities: PfsCapabilities
 }
@@ -98,9 +125,8 @@ public struct PfsSetAttributes: Sendable {
     /// clear every flag, which is why this is an Optional rather than a
     /// sentinel value.
     ///
-    /// The extension always FORWARDS the intent: only the daemon knows whether
-    /// this attach's authority persists flags, so it — not the mapping layer —
-    /// is what answers ENOTSUP when it cannot.
+    /// The extension always forwards the intent: the daemon decides per
+    /// object and refuses the whole SetAttr before applying any of it.
     public var flags: UInt32?
 
     public init(
@@ -132,26 +158,20 @@ public struct VolumeCoreDebugState: Sendable, Equatable {
     public var openHandleCount: Int
 }
 
-/// Frontend-independent volume brain shared by current and future FSKit adapters.
+/// The volume brain behind the FSKit adapter.
 ///
 /// `VolumeCore` owns the pfslocal client, the FSItem identity table, and the
 /// open-handle table. Adapters must not cache filesystem state: they translate
 /// their platform callbacks into these typed async operations and translate
-/// returned values back to frontend-specific types. `OperationsAdapter` uses
-/// this actor for macOS 26's `FSVolume.Operations` family; a future macOS 27
-/// adapter can call the same methods while adding newer SDK integration.
+/// returned values back to FSKit types.
 public actor VolumeCore {
     private static let maximumIOChunkBytes = 8 * 1024 * 1024
 
     public let client: PfsLocalClient
     public private(set) var resolvedVolume: PfsResolvedVolume?
-    /// The raw resolve reply and validated terms of a strict-v3 attach whose
-    /// declared cache policy exactly matches this frontend adapter. The FSKit
-    /// adapter composes its coherence stack from these before the volume may
-    /// serve; a different declared policy is never treated as a fallback.
-    public private(set) var strictV3ResolveReply: PfsResolveReply?
-    public private(set) var strictV3Contract: PfsMacOSV3LocalContract?
-    private let supportedCachePolicies: Set<PfsMacOSCachePolicy>
+    /// The bound connection's request-trace label, kept from Resolve: a
+    /// session never changes connections after Hello.
+    private(set) var traceConnection = ""
 
     private var itemsByIdentity: [PfsItemIdentity: PortableFSItem] = [:]
     private var identitiesByObject: [ObjectIdentifier: PfsItemIdentity] = [:]
@@ -170,33 +190,6 @@ public actor VolumeCore {
     private var stopped = false
     private var openHandles: [ObjectIdentifier: OpenState] = [:]
     private var lifecycleGates: [ObjectIdentifier: LifecycleGateState] = [:]
-    /// Items that exist only inside this process, for the macOS 26 repair
-    /// scratch entry. FSKit's create callback must hand the kernel an `FSItem`,
-    /// but the entry it names must never be known to the daemon, so these are
-    /// deliberately absent from every identity table above. The only thing that
-    /// can reach one is the kernel reference the create callback returned.
-    private struct LocalRepairBindingKey: Hashable {
-        let parentIdentity: Data
-        let name: Data
-    }
-
-    private struct LocalRepairItemState {
-        let item: PortableFSItem
-        let binding: LocalRepairBindingKey
-        var attributes: PfsAttr
-        var xattrs: [String: Data] = [:]
-    }
-
-    private var localRepairItems: [ObjectIdentifier: LocalRepairItemState] = [:]
-    /// The scratch create is a real kernel namespace transition even though it
-    /// is not an authority mutation. A following unlink may resolve the name
-    /// again before FSKit sends removeItem, so the local object needs one
-    /// exact, process-local binding just like an ordinary filesystem object.
-    private var localRepairBindings: [LocalRepairBindingKey: PortableFSItem] = [:]
-    /// Minted downward through the high-half raw pfslocal identifier partition.
-    /// Daemon file IDs must remain below this partition. Ownership handles
-    /// carry no FSKit identifier semantics.
-    private var nextLocalRepairItemID: UInt64 = UInt64.max - 1
 
     /// The open file descriptions one object holds. Each keeps exactly the
     /// access it was opened with. A missing right is acquired as its own
@@ -212,6 +205,9 @@ public actor VolumeCore {
         // daemon confirms each close. This prevents a failed close from
         // turning a live daemon descriptor into unreachable state.
         var pendingCloseHandles: [UInt64] = []
+        /// The read/write description CREATE returned, while it is held.
+        /// Attribution only: it never changes which description serves.
+        var creationHandle: UInt64?
 
         /// The one description that covers `mode`, if any.
         func handle(covering mode: PfsOpenMode) -> UInt64? {
@@ -261,6 +257,7 @@ public actor VolumeCore {
                 pendingCloseHandles.append(write)
                 writeHandle = nil
             }
+            forgetRetiredCreationHandle()
         }
 
         mutating func retireAll() {
@@ -268,6 +265,17 @@ public actor VolumeCore {
             if let write = writeHandle, write != readHandle { pendingCloseHandles.append(write) }
             readHandle = nil
             writeHandle = nil
+            creationHandle = nil
+        }
+
+        private mutating func forgetRetiredCreationHandle() {
+            if let creation = creationHandle, creation != readHandle, creation != writeHandle {
+                creationHandle = nil
+            }
+        }
+
+        var heldAccess: PfsOpenMode {
+            PfsOpenMode(read: readHandle != nil, write: writeHandle != nil)
         }
 
         var handleCount: Int {
@@ -294,73 +302,37 @@ public actor VolumeCore {
         var waiters: [LifecycleWaiter] = []
     }
 
-    public init(
-        client: PfsLocalClient,
-        supportedCachePolicies: Set<PfsMacOSCachePolicy> = [
-            .synchronousVFSRepairV1,
-            .synchronousVFSRepairV2,
-        ]
-    ) {
+    public init(client: PfsLocalClient) {
         self.client = client
-        self.supportedCachePolicies = supportedCachePolicies
     }
 
     public static func connect(
         socketPath: String,
         attachRef: String,
-        supportedCachePolicies: Set<PfsMacOSCachePolicy> = [
-            .synchronousVFSRepairV1,
-            .synchronousVFSRepairV2,
-        ],
         configuration: PfsLocalClient.Configuration = .init()
     ) async throws -> VolumeCore {
         let client = PfsLocalClient(socketPath: socketPath, configuration: configuration)
-        let core = VolumeCore(
-            client: client,
-            supportedCachePolicies: supportedCachePolicies
-        )
+        let core = VolumeCore(client: client)
         try await core.resolve(attachRef: attachRef)
         return core
     }
 
+    /// Binds this volume's connection to one attach incarnation and installs
+    /// its root. A malformed root closes the client before any volume state
+    /// exists.
     @discardableResult
     public func resolve(attachRef: String) async throws -> PfsResolvedVolume {
         let reply = try await client.resolve(attachRef: attachRef)
         do {
-            guard reply.root == reply.rootAttr.item, reply.root.itemID > 0, reply.rootAttr.fileID == 1,
+            guard reply.root == reply.rootAttr.item, reply.rootAttr.fileID == 1,
                   reply.rootAttr.kind == .directory, reply.rootAttr.parentFileID == 0 else {
                 throw PfsLocalClientError.invalidFrame("invalid root attributes")
             }
+            try validateOwningItem(reply.root)
             try validateFileAttributes(reply.rootAttr, allowingRoot: true)
         } catch {
-            await client.close()
+            await client.close(error: error)
             throw error
-        }
-        if reply.hasV3Coherence {
-            // Cache-coherence behavior is a DECLARED policy carried by the
-            // resolve contract, never an OS inference. Every frontend adapter
-            // declares the exact named policies it implements. The macOS 26
-            // adapter keeps both frozen compatibility revisions; the native
-            // adapter declares only its native policy. A mismatch follows the
-            // same close-first discipline as an unknown policy, so portablefsd
-            // fails its authority session rather than waiting for a subscriber
-            // that will never honor the promised repair contract.
-            let contract: PfsMacOSV3LocalContract
-            do {
-                contract = try PfsLocalMacOSV3CoherenceTransport.parseContract(reply.v3Coherence)
-            } catch {
-                await client.close()
-                if case PfsMacOSCoherenceError.invalidCachePolicy = error {
-                    throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
-                }
-                throw error
-            }
-            guard supportedCachePolicies.contains(contract.cachePolicy) else {
-                await client.close()
-                throw PfsLocalClientError.v3CoherenceIntegrationUnavailable
-            }
-            strictV3ResolveReply = reply
-            strictV3Contract = contract
         }
         let root = try daemonItem(for: reply.rootAttr, allowingRoot: true)
         publishedItems.insert(ObjectIdentifier(root))
@@ -368,178 +340,22 @@ public actor VolumeCore {
             root: root,
             rootAttr: reply.rootAttr,
             volumeID: reply.volumeID,
-            branch: reply.branch,
             volumeName: reply.volumeName.isEmpty ? attachRef : reply.volumeName,
             capabilities: reply.capabilities
         )
         resolvedVolume = resolved
+        traceConnection = await client.traceConnectionLabel
         return resolved
     }
 
-    @discardableResult
+    /// Establishes this connection's single event binding; see
+    /// `PfsLocalClient.subscribeEvents`.
     public func subscribeEvents() async throws -> AsyncStream<PfsEvent> {
         try await client.subscribeEvents()
     }
 
-    /// Mints a process-local `FSItem` for a macOS 26 repair scratch entry.
-    ///
-    /// The identifier comes from the reserved top of the space that
-    /// `PfsFSKitMapping.itemIdentifier(from:)` refuses for daemon items, so the
-    /// kernel can never see one identifier standing for two different things.
-    /// The item is registered in no identity table: `identity(for:)` will
-    /// refuse it, which is the point — nothing can turn it into a pfslocal
-    /// request.
-    public func mintLocalRepairItem(
-        parent: PortableFSItem,
-        name: Data,
-        mode: UInt32,
-        uid: UInt32,
-        gid: UInt32
-    ) throws -> PortableFSItem {
-        let binding = LocalRepairBindingKey(
-            parentIdentity: parent.identity.stableIdentity,
-            name: name
-        )
-        guard localRepairBindings[binding] == nil else {
-            throw PfsLocalClientError.daemon(
-                errno: EEXIST,
-                message: "local repair binding already exists"
-            )
-        }
-        guard nextLocalRepairItemID >= PfsFSKitMapping.localRepairIdentifierFloor else {
-            throw PfsLocalClientError.daemon(
-                errno: ENOSPC,
-                message: "local repair identifier space exhausted"
-            )
-        }
-        let identity = PfsItemIdentity(itemID: nextLocalRepairItemID, generation: 0)
-        nextLocalRepairItemID -= 1
-        let item = PortableFSItem(identity: identity, fileID: identity.itemID, kind: .file)
-        let nowMilliseconds = Int64(Date().timeIntervalSince1970 * 1_000)
-        var attributes = PfsAttr()
-        attributes.item = identity.proto
-        attributes.parent = parent.identity.proto
-        attributes.fileID = item.fileID
-        attributes.parentFileID = parent.fileID
-        attributes.kind = .file
-        attributes.mode = mode
-        attributes.nlink = 1
-        attributes.uid = uid
-        attributes.gid = gid
-        attributes.flags = 0
-        attributes.size = 0
-        attributes.allocSize = 0
-        attributes.atimeMs = nowMilliseconds
-        attributes.mtimeMs = nowMilliseconds
-        attributes.ctimeMs = nowMilliseconds
-        attributes.birthtimeMs = nowMilliseconds
-        localRepairItems[ObjectIdentifier(item)] = LocalRepairItemState(
-            item: item,
-            binding: binding,
-            attributes: attributes
-        )
-        localRepairBindings[binding] = item
-        return item
-    }
-
-    public func isLocalRepairItem(_ item: PortableFSItem) -> Bool {
-        localRepairItems[ObjectIdentifier(item)] != nil
-    }
-
-    public func localRepairAttributes(_ item: PortableFSItem) -> PfsAttr? {
-        localRepairItems[ObjectIdentifier(item)]?.attributes
-    }
-
-    public func localRepairItem(
-        in parent: PortableFSItem,
-        named name: Data
-    ) -> PortableFSItem? {
-        localRepairBindings[
-            LocalRepairBindingKey(
-                parentIdentity: parent.identity.stableIdentity,
-                name: name
-            )
-        ]
-    }
-
-    /// Returns `nil` only when `item` is not a live synthetic repair item.
-    /// A live item with no value returns `.some(nil)`; the distinction keeps a
-    /// missing local xattr from accidentally falling through to the daemon.
-    public func localRepairXattr(
-        named name: String,
-        of item: PortableFSItem
-    ) -> Data?? {
-        guard let state = localRepairItems[ObjectIdentifier(item)] else {
-            return nil
-        }
-        return .some(state.xattrs[name])
-    }
-
-    public func localRepairXattrs(of item: PortableFSItem) -> [String]? {
-        guard let state = localRepairItems[ObjectIdentifier(item)] else {
-            return nil
-        }
-        return state.xattrs.keys.sorted()
-    }
-
-    /// Applies one normal xattr policy to the process-local scratch object.
-    /// `false` means the item is not local; every local outcome either applies
-    /// or throws the same POSIX error an authority-backed object would.
-    public func updateLocalRepairXattr(
-        named name: String,
-        value: Data?,
-        on item: PortableFSItem,
-        createOnly: Bool,
-        replaceOnly: Bool,
-        remove: Bool
-    ) throws -> Bool {
-        let key = ObjectIdentifier(item)
-        guard var state = localRepairItems[key] else { return false }
-        let exists = state.xattrs[name] != nil
-        if remove {
-            guard exists else {
-                throw PfsLocalClientError.daemon(errno: ENOATTR, message: "xattr missing")
-            }
-            state.xattrs.removeValue(forKey: name)
-        } else {
-            if createOnly && exists {
-                throw PfsLocalClientError.daemon(errno: EEXIST, message: "xattr exists")
-            }
-            if replaceOnly && !exists {
-                throw PfsLocalClientError.daemon(errno: ENOATTR, message: "xattr missing")
-            }
-            state.xattrs[name] = value ?? Data()
-        }
-        localRepairItems[key] = state
-        return true
-    }
-
-    public func releaseLocalRepairItem(_ item: PortableFSItem) {
-        if let state = localRepairItems.removeValue(forKey: ObjectIdentifier(item)) {
-            if localRepairBindings[state.binding] === item {
-                localRepairBindings.removeValue(forKey: state.binding)
-            }
-            state.item.markReclaimed()
-        }
-    }
-
-    /// Retires only the process-local namespace coordinate for a synthetic
-    /// repair item. `removeItem` is not the end of the item's vnode lifetime:
-    /// FSKit may still deliver getattr/open/close/reclaim while unlinkat(2) is
-    /// completing. Keeping the object classified locally until the repair
-    /// lease releases prevents that teardown tail from entering the closed
-    /// authority publication gate.
-    public func retireLocalRepairBinding(_ item: PortableFSItem) {
-        guard let state = localRepairItems[ObjectIdentifier(item)],
-              localRepairBindings[state.binding] === item else {
-            return
-        }
-        localRepairBindings.removeValue(forKey: state.binding)
-    }
-
-    public func localRepairItemCount() -> Int { localRepairItems.count }
-
     public func rootItem() throws -> PortableFSItem {
+        try client.publicationGate.check()
         guard let root = resolvedVolume?.root else {
             throw PfsLocalClientError.unexpectedReply("volume has not been resolved")
         }
@@ -665,26 +481,6 @@ public actor VolumeCore {
         if let mtime = attributes.mtimeMilliseconds { request.mtimeMs = mtime }
         if let atime = attributes.atimeMilliseconds { request.atimeMs = atime }
         if let flags = attributes.flags {
-            // The forwarding invariant, at the boundary that actually sends
-            // the frame: `set_flags`/`flags` are APPENDED fields, so a daemon
-            // built before them discards both and applies the rest of the
-            // setattr as if the flags change had never been asked for. Only an
-            // affirmative `flagsUnderstood` in this attach's resolve reply
-            // proves the daemon reads them; anything else — including the
-            // absent field an old daemon leaves at false — is refused here
-            // rather than turned into a successful no-op.
-            //
-            // The check is COMPREHENSION, never `flagsSupported`: that field
-            // is about the authority's durable storage, and a machine-local
-            // graft in the same namespace needs no authority feature to make
-            // chflags(2) stick. Whether THIS object can take a flag word is
-            // the daemon's call, per target, answered as an errno.
-            guard resolvedVolume?.capabilities.flagsUnderstood == true else {
-                throw PfsLocalClientError.daemon(
-                    errno: ENOTSUP,
-                    message: "this PortableFS daemon does not understand BSD file flags"
-                )
-            }
             // setFlags is the intent; a zero word is a legal "clear
             // everything", so the bool must be set even when flags stays 0.
             request.setFlags = true
@@ -721,7 +517,9 @@ public actor VolumeCore {
         try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
-            requestedMode: mode
+            requestedMode: mode,
+            origin: "open",
+            fileID: item.fileID
         )
     }
 
@@ -877,9 +675,9 @@ public actor VolumeCore {
         }
         guard reply.handle != 0 else {
             // Create's success contract transfers an open descriptor. Sending
-            // accept_handles for zero would itself violate minor 12; accepting
-            // only the item would publish a file whose required open state was
-            // never installed. Retire the ownership epoch instead.
+            // accept_handles for zero would itself violate the disposition
+            // contract; accepting only the item would publish a file whose
+            // required open state was never installed. End the session.
             await shutdown()
             throw PfsLocalClientError.connectionClosed
         }
@@ -897,7 +695,8 @@ public actor VolumeCore {
         }
         openHandles[ObjectIdentifier(newItem)] = OpenState(
             readHandle: reply.handle,
-            writeHandle: reply.handle
+            writeHandle: reply.handle,
+            creationHandle: reply.handle
         )
         lease.acceptHandles()
         await lease.complete(itemsPublished: true)
@@ -981,7 +780,8 @@ public actor VolumeCore {
     public func recordRenameReplacement(replacedItem: PortableFSItem) throws {
         // Rename-over removes one NAME, not necessarily the inode's last
         // link. The daemon owns the authoritative identity and link count:
-        // a peer-only hard-link alias may still resolve to this same Item.
+        // another hard-link alias this mount never looked up may still
+        // resolve to this same Item.
         // Keep the canonical object until FSKit's explicit reclaim boundary
         // and let getattr/lookup return the authority's actual nlink.
         _ = try identity(for: replacedItem)
@@ -1074,101 +874,23 @@ public actor VolumeCore {
         return reply.value
     }
 
-    public func xattrSet(item: PortableFSItem, name: String, value: Data, createOnly: Bool, replaceOnly: Bool) async throws {
-        let objectID = ObjectIdentifier(item)
-        try await withDescriptorGate(for: objectID) {
-            try await xattrSetLocked(
-                item: item,
-                objectID: objectID,
-                name: name,
-                value: value,
-                createOnly: createOnly,
-                replaceOnly: replaceOnly
-            )
-        }
-    }
-
-    /// Validate a set-xattr callback before it enters publication admission.
-    ///
-    /// A production XFS attach negotiates xattr-set as unsupported. That
-    /// verdict is independent of a coherence repair and must therefore reach
-    /// FSKit before an ordered callback can be refused by a closed PREPARE
-    /// gate. The same helper is reused by the forwarding path so item/name/
-    /// mode validation cannot drift between preflight and execution.
-    func preflightXattrSet(
+    /// The fixed refusal for setting a user xattr. PortableFS user xattrs are
+    /// readable and removable but never settable, and the refusal is local:
+    /// no request is sent and nothing enters ordered publication. Precedence
+    /// is fixed: a malformed request is EINVAL, which constructing `request`
+    /// already decided before any item existed to consult; a reclaimed or
+    /// foreign item is ESTALE; only a valid request on a live item reaches
+    /// ENOTSUP, which the FSKit boundary maps to Darwin's EOPNOTSUPP so the
+    /// VFS never falls back to an AppleDouble sidecar.
+    public func refuseXattrSet(
         item: PortableFSItem,
-        name: String,
-        createOnly: Bool,
-        replaceOnly: Bool
-    ) throws {
-        _ = try validatedXattrSetIdentity(
-            item: item,
-            name: name,
-            createOnly: createOnly,
-            replaceOnly: replaceOnly
+        request: PfsXattrSetRequest
+    ) throws -> Never {
+        _ = try identity(for: item)
+        throw PfsLocalClientError.daemon(
+            errno: ENOTSUP,
+            message: "PortableFS user xattrs are read-only"
         )
-        guard resolvedVolume?.capabilities.xattrSetSupported == true else {
-            throw PfsLocalClientError.daemon(
-                errno: ENOTSUP,
-                message: "xattr set is not supported by this daemon"
-            )
-        }
-    }
-
-    private func xattrSetLocked(
-        item: PortableFSItem,
-        objectID: ObjectIdentifier,
-        name: String,
-        value: Data,
-        createOnly: Bool,
-        replaceOnly: Bool
-    ) async throws {
-        let itemIdentity = try validatedXattrSetIdentity(
-            item: item,
-            name: name,
-            createOnly: createOnly,
-            replaceOnly: replaceOnly
-        )
-        guard resolvedVolume?.capabilities.xattrSetSupported == true else {
-            throw PfsLocalClientError.daemon(
-                errno: ENOTSUP,
-                message: "xattr set is not supported by this daemon"
-            )
-        }
-        var request = PfsXattrSetRequest()
-        request.item = itemIdentity.proto
-        request.name = name
-        request.value = value
-        request.createOnly = createOnly
-        request.replaceOnly = replaceOnly
-        request.handle = openHandles[objectID]?.anyHandle ?? 0
-        let envelope = try await client.request(.xattrSet(request))
-        guard case .xattrSetReply? = envelope.body else {
-            throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
-        }
-    }
-
-    private func validatedXattrSetIdentity(
-        item: PortableFSItem,
-        name: String,
-        createOnly: Bool,
-        replaceOnly: Bool
-    ) throws -> PfsItemIdentity {
-        // Validate request grammar before resolving the item, then consult the
-        // negotiated forwarding capability. This pins the public precedence:
-        // malformed request (EINVAL), reclaimed/foreign item (ESTALE), valid
-        // unsupported set (ENOTSUP, mapped to Darwin EOPNOTSUPP).
-        let nameBytes = name.utf8
-        guard !nameBytes.isEmpty,
-              nameBytes.count <= 255,
-              !nameBytes.contains(0),
-              !(createOnly && replaceOnly) else {
-            throw PfsLocalClientError.daemon(
-                errno: EINVAL,
-                message: "invalid xattr set request"
-            )
-        }
-        return try identity(for: item)
     }
 
     public func xattrList(item: PortableFSItem) async throws -> [String] {
@@ -1228,9 +950,9 @@ public actor VolumeCore {
     /// This call cannot cover kernel pages not yet delivered as callbacks or
     /// mutations not yet applied when the authority captures its cut. The caller
     /// or native framework must establish the required prior-work drain; native
-    /// fsync/F_FULLFSYNC waiting and error propagation remain unproven. This is
-    /// not an additional macOS cache-revocation boundary. Authority failures
-    /// surface to the caller rather than becoming local-only success.
+    /// fsync/F_FULLFSYNC waiting and error propagation remain unproven. It does
+    /// not withdraw kernel cache state. Authority failures surface to the
+    /// caller rather than becoming local-only success.
     public func syncVolume() async throws {
         let envelope = try await client.request(.syncVolume(PfsSyncVolumeRequest()))
         guard case .syncVolumeReply? = envelope.body else {
@@ -1255,19 +977,6 @@ public actor VolumeCore {
         try await Task {
             try await completeRetirement(item, identity: identity, objectID: objectID)
         }.value
-    }
-
-    /// A repair-source retirement drops only the frontend object. Its authority
-    /// capability remains available for the next pathname lookup.
-    public func reclaimLocalRepairSource(item: PortableFSItem) async throws {
-        let objectID = ObjectIdentifier(item)
-        _ = try identity(for: item)
-        guard openHandles[objectID] == nil,
-              lifecycleGates[objectID]?.exclusiveOwner != true else {
-            await shutdown()
-            throw PfsLocalClientError.daemon(errno: EIO, message: "repair-source reclaim encountered a live daemon handle transition")
-        }
-        retireReclaimedItem(item, objectID: objectID)
     }
 
     private func completeRetirement(
@@ -1357,6 +1066,7 @@ public actor VolumeCore {
     }
 
     public func shutdown() async {
+        client.publicationGate.revoke(PfsLocalClientError.shutdown)
         stopped = true
         await client.close()
         for item in itemsByObject.values { item.markReclaimed() }
@@ -1373,11 +1083,6 @@ public actor VolumeCore {
         settlementWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
         openHandles.removeAll()
-        for state in localRepairItems.values {
-            state.item.markReclaimed()
-        }
-        localRepairItems.removeAll()
-        localRepairBindings.removeAll()
     }
 
     func testingAdoptAttributes(_ attr: PfsAttr) throws -> PortableFSItem {
@@ -1439,7 +1144,9 @@ public actor VolumeCore {
         try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
-            requestedMode: mode
+            requestedMode: mode,
+            origin: "io",
+            fileID: item.fileID
         )
         guard let handle = openHandles[objectID]?.handle(covering: mode) else {
             throw PfsLocalClientError.unexpectedReply("open did not produce a handle")
@@ -1455,9 +1162,26 @@ public actor VolumeCore {
     private func reconcileOpenHandleLocked(
         objectID: ObjectIdentifier,
         identity: PfsItemIdentity,
-        requestedMode: PfsOpenMode
+        requestedMode: PfsOpenMode,
+        origin: StaticString,
+        fileID: UInt64
     ) async throws {
-        let missing = (openHandles[objectID] ?? OpenState()).missing(requestedMode)
+        let held = openHandles[objectID] ?? OpenState()
+        let missing = held.missing(requestedMode)
+        // OPEN attribution for the measured LAN workload: whether an open or
+        // I/O reused a held description, including CREATE's creation
+        // description, or issued a real OPEN for missing access.
+        client.trace.emit {
+            PfsTraceRecord(.openDecision, connection: traceConnection, [
+                "callback": PfsLocalClient.currentCallbackLabel,
+                "origin": origin,
+                "file": fileID,
+                "requested": requestedMode.rawValue,
+                "held": held.heldAccess.rawValue,
+                "creation": held.creationHandle != nil,
+                "opening": missing.rawValue,
+            ])
+        }
         guard missing != .unspecified else {
             return
         }
@@ -1748,11 +1472,23 @@ public actor VolumeCore {
         }
     }
 
-    private func daemonItem(for attr: PfsAttr, allowingRoot: Bool = false) throws -> PortableFSItem {
-        try validateFileAttributes(attr, allowingRoot: allowingRoot)
-        guard attr.item.itemID > 0 else {
+    /// An owning Item carries a positive ownership handle and generation and
+    /// the authority's immutable 16-byte stable identity, which is never all
+    /// zero. Non-owning enumeration entries carry an empty Item instead and
+    /// never reach this check.
+    private func validateOwningItem(_ item: PfsItem) throws {
+        guard item.itemID > 0, item.itemGeneration > 0 else {
             throw PfsLocalClientError.invalidFrame("missing item ownership handle")
         }
+        guard item.stableIdentity.count == 16,
+              item.stableIdentity.contains(where: { $0 != 0 }) else {
+            throw PfsLocalClientError.invalidFrame("owning item lacks its stable identity")
+        }
+    }
+
+    private func daemonItem(for attr: PfsAttr, allowingRoot: Bool = false) throws -> PortableFSItem {
+        try validateFileAttributes(attr, allowingRoot: allowingRoot)
+        try validateOwningItem(attr.item)
         let identity = PfsItemIdentity(attr.item)
         for objectID in objectIDsByItemID[identity.itemID, default: []] {
             if let existing = itemsByObject[objectID], !existing.reclaimed,

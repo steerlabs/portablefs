@@ -25,11 +25,7 @@ private func updateTestIdentity(_ marker: Character) -> PortableFSDReleaseIdenti
     PortableFSDReleaseIdentity(
         codeDirectoryHash: String(repeating: marker, count: 40),
         executableSHA256: String(repeating: marker, count: 64),
-        daemonVersion: marker == "a" ? "0.2.3" : "0.2.4",
-        identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 16
+        daemonVersion: marker == "a" ? "0.2.3" : "0.2.4"
     )
 }
 
@@ -140,6 +136,29 @@ private func withUpdateStore(
     }
 }
 
+@Test func updateLeaseRejectsRemovedProtocolMembersInEitherRelease() throws {
+    for member in ["identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"] {
+        for key in ["oldRelease", "targetRelease"] {
+            try withUpdateStore { store, directory in
+                let lease = updateTestLease()
+                try store.create(lease)
+                #expect(try store.load() == lease)
+                var object = try #require(
+                    JSONSerialization.jsonObject(with: JSONEncoder().encode(lease)) as? [String: Any]
+                )
+                var release = try #require(object[key] as? [String: Any])
+                #expect(Set(release.keys) == PortableFSDReleaseIdentity.jsonKeys)
+                release[member] = 1
+                object[key] = release
+                let path = directory.appendingPathComponent("activation.json")
+                try JSONSerialization.data(withJSONObject: object).write(to: path)
+                #expect(Darwin.chmod(path.path, 0o600) == 0)
+                #expect(throws: PortableFSDUpdateLeaseError.invalidEncoding) { _ = try store.load() }
+            }
+        }
+    }
+}
+
 @Test func updateLeaseRefusesDuplicateKeysAndTrailingGarbage() throws {
     try withUpdateStore { store, directory in
         let encoded = try JSONEncoder().encode(updateTestLease())
@@ -169,15 +188,11 @@ private func withUpdateStore(
     }
 }
 
-@Test func updateLeaseAllowsSameReleaseAndMinorZero() throws {
+@Test func updateLeaseAllowsSameRelease() throws {
     let release = PortableFSDReleaseIdentity(
         codeDirectoryHash: String(repeating: "a", count: 40),
         executableSHA256: String(repeating: "b", count: 64),
-        daemonVersion: "0.2.3",
-        identitySchema: 2,
-        controlProtocol: 3,
-        pfslocalMajor: 1,
-        pfslocalMinor: 0
+        daemonVersion: "0.2.3"
     )
     let created: Int64 = 1_800_000_000_000
     try PortableFSDUpdateLease(

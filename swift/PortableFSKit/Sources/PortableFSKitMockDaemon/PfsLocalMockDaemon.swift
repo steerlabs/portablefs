@@ -106,6 +106,28 @@ private final class PfsMockWireControlCompletion: @unchecked Sendable {
     }
 }
 
+private final class PfsMockBindingCompletion: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var reply: PfsEnvelope?
+
+    func complete(_ reply: PfsEnvelope) {
+        condition.lock()
+        self.reply = reply
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait() -> PfsEnvelope {
+        condition.lock()
+        while reply == nil {
+            condition.wait()
+        }
+        let resolved = reply!
+        condition.unlock()
+        return resolved
+    }
+}
+
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
         /// Hello handshakes received. Each is one connection attempt, so a
@@ -124,24 +146,19 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var enumerateRequests: Int
         public var getAttrRequests: Int
         public var setAttrRequests: Int
-        /// Lookups that actually crossed the socket. The reserved repair
-        /// namespace must be refused locally, and only the daemon can testify
-        /// that no probe of it ever became a request.
+        /// Lookups that actually crossed the socket.
         public var lookupRequests: Int
-        /// Namespace mutations that actually crossed the socket. The macOS 26
-        /// repair contract's central claim is that a consumed repair callback
-        /// produces no request at all, and only the daemon can testify to that.
+        /// Namespace creations (create, mkdir, symlink, link) that actually
+        /// crossed the socket.
         public var createRequests: Int
         public var createExclusiveFlags: [Bool]
         public var removeRequests: Int
         public var renameRequests: Int
         public var xattrGetRequests: Int
-        public var xattrSetRequests: Int
         public var xattrListRequests: Int
         public var xattrRemoveRequests: Int
-        /// Setattr requests that arrived carrying `set_flags`. The frontend
-        /// gate is invisible from the outside — a refused change and a
-        /// forwarded-then-refused change both surface as ENOTSUP — so proving
+        /// Setattr requests that arrived carrying `set_flags`. A frontend
+        /// refusal and a daemon refusal both surface as ENOTSUP, so proving
         /// forwarding needs the daemon to say it saw the frame.
         public var flagChangeRequests: Int
         public var maxReadLength: UInt32
@@ -155,8 +172,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         /// order. Enumeration tests use occurrences rather than item IDs so
         /// duplicate hard-link aliases remain distinguishable.
         public var resourceAcceptedItemCounts: [UInt32]
-        public var visibilityAcks: Int
-        public var v3LivenessRequests: Int
+        public var subscribeRequests: Int
         public var syncVolumeRequests: Int
     }
 
@@ -164,104 +180,41 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var attachRef: String
         public var volumeID: String
         public var volumeName: String
-        public var branch: String
         public var lookupDelaysNanoseconds: [String: UInt64]
         public var lookupNoReplyNames: Set<String>
         public var strictItemNamespace: Bool
-        public var protocolMinor: UInt32?
         public var fileIDOffset: UInt64
-        /// Optional strict-v3 coherence terms returned by resolve. Tests leave
-        /// this nil unless they are exercising strict-v3 minor negotiation.
-        public var v3Coherence: PfsV3CoherenceContract?
-        /// Test-only delay or identity corruption for the on-demand authority
-        /// liveness reply. A normal reply echoes the request exactly.
-        public var v3LivenessDelayNanoseconds: UInt64
-        public var v3LivenessEpochOverride: Data?
-        public var v3LivenessSessionOverride: Data?
-        public var v3LivenessOverrideAfterRequestCount: Int
-        /// Mirrors the real daemon's per-attach AUTHORITY knowledge: it rides
-        /// the resolve reply as `Capabilities.flagsSupported`, and a setattr
-        /// carrying `setFlags` against an AUTHORITY-BACKED node without it is
-        /// answered ENOTSUP rather than silently dropped. It says nothing
-        /// about grafted nodes — see `graftBackedNames`.
-        public var flagsSupported: Bool
-        /// Mirrors `Capabilities.flagsUnderstood`: this daemon parses
-        /// `set_flags`/`flags` at all. A real daemon sets it unconditionally;
-        /// it is configurable here only so a test can model one that does not.
-        /// This — not `flagsSupported` — is what the frontend gates on.
-        public var flagsUnderstood: Bool
-        /// Mirrors `Capabilities.xattrSetSupported`. The mock is writable by
-        /// default so existing round-trip fixtures keep modelling a backend
-        /// that implements the full xattr family; production v3 advertises
-        /// false and is exercised by opting out explicitly.
-        public var xattrSetSupported: Bool
-        /// Names whose backing is machine-local (a graft over the volume
-        /// namespace). chflags(2) on such a node is applied to a real host
-        /// inode, so it succeeds regardless of `flagsSupported`: no authority
-        /// feature is involved. This is what makes a volume's flag support
-        /// PER-OBJECT, and why a volume-wide frontend gate is wrong.
-        public var graftBackedNames: Set<String>
-        /// Models a daemon built BEFORE `set_flags`/`flags` existed. Both are
-        /// appended fields at the same protocol minor, so such a daemon
-        /// proto3-discards them: it never advertises `flagsSupported`, it
-        /// cannot refuse what it does not parse, and it applies the rest of
-        /// the setattr and reports success. That silent no-op is the failure
-        /// the frontend-side gate exists to prevent.
-        public var predatesFlagFields: Bool
+        /// HelloReply.request_deadline_ms. The production daemon announces
+        /// 60000; timeout tests shorten it here, never on the client.
+        public var requestDeadlineMilliseconds: UInt32
         /// Optional per-operation failures for exercising the FSKit xattr
-        /// boundary. `nil` preserves the mock's writable in-memory xattrs;
-        /// a value makes the corresponding request fail after it is counted
-        /// but before it observes or mutates a node.
+        /// boundary. A value makes the corresponding request fail after it is
+        /// counted but before it observes or mutates a node.
         public var xattrGetErrno: Int32?
-        public var xattrSetErrno: Int32?
         public var xattrListErrno: Int32?
         public var xattrRemoveErrno: Int32?
         public init(
             attachRef: String = "mock",
             volumeID: String = "mock-volume",
             volumeName: String = "PortableFS Mock",
-            branch: String = "main",
             lookupDelaysNanoseconds: [String: UInt64] = [:],
             lookupNoReplyNames: Set<String> = [],
             strictItemNamespace: Bool = false,
-            protocolMinor: UInt32? = nil,
             fileIDOffset: UInt64 = 0,
-            v3Coherence: PfsV3CoherenceContract? = nil,
-            v3LivenessDelayNanoseconds: UInt64 = 0,
-            v3LivenessEpochOverride: Data? = nil,
-            v3LivenessSessionOverride: Data? = nil,
-            v3LivenessOverrideAfterRequestCount: Int = 0,
-            flagsSupported: Bool = true,
-            flagsUnderstood: Bool = true,
-            xattrSetSupported: Bool = true,
-            graftBackedNames: Set<String> = [],
-            predatesFlagFields: Bool = false,
+            requestDeadlineMilliseconds: UInt32 = 60_000,
             xattrGetErrno: Int32? = nil,
-            xattrSetErrno: Int32? = nil,
             xattrListErrno: Int32? = nil,
             xattrRemoveErrno: Int32? = nil
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
             self.volumeName = volumeName
-            self.branch = branch
             self.lookupDelaysNanoseconds = lookupDelaysNanoseconds
             self.lookupNoReplyNames = lookupNoReplyNames
             self.strictItemNamespace = strictItemNamespace
-            self.protocolMinor = protocolMinor
             self.fileIDOffset = fileIDOffset
-            self.v3Coherence = v3Coherence
-            self.v3LivenessDelayNanoseconds = v3LivenessDelayNanoseconds
-            self.v3LivenessEpochOverride = v3LivenessEpochOverride
-            self.v3LivenessSessionOverride = v3LivenessSessionOverride
-            self.v3LivenessOverrideAfterRequestCount = v3LivenessOverrideAfterRequestCount
-            self.flagsSupported = flagsSupported
-            self.flagsUnderstood = flagsUnderstood
-            self.xattrSetSupported = xattrSetSupported
-            self.graftBackedNames = graftBackedNames
-            self.predatesFlagFields = predatesFlagFields
+            self.requestDeadlineMilliseconds = requestDeadlineMilliseconds
             self.xattrGetErrno = xattrGetErrno
-            self.xattrSetErrno = xattrSetErrno
             self.xattrListErrno = xattrListErrno
             self.xattrRemoveErrno = xattrRemoveErrno
         }
@@ -343,8 +296,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.omitNextCreateHandle()
     }
 
-    /// Corrupts the next successful LookupReply with an identifier from the
-    /// frontend-owned repair partition so VolumeCore's mapping rejection and
+    /// Corrupts the next successful LookupReply with the one file ID FSKit
+    /// cannot represent (UInt64.max) so VolumeCore's mapping rejection and
     /// item-abandonment path can be exercised directly.
     public func corruptNextLookupItemIdentifier() async {
         await fileSystem.corruptNextLookupItemIdentifier()
@@ -409,48 +362,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.shortenNextWrite(to: written)
     }
 
-    public func emitInvalidation(
-        item: PfsItem,
-        contentChanged: Bool = true,
-        attrsChanged: Bool = true,
-        namespaceChanged: Bool = false,
-        contentVersion: UInt64 = 1
-    ) {
-        var invalidation = PfsInvalidation()
-        invalidation.item = item
-        invalidation.contentChanged = contentChanged
-        invalidation.attrsChanged = attrsChanged
-        invalidation.namespaceChanged = namespaceChanged
-        invalidation.contentVersion = contentVersion
-
-        var event = PfsEvent()
-        event.kind = .invalidation(invalidation)
-
-        var envelope = PfsEnvelope()
-        envelope.requestID = 0
-        envelope.body = .event(event)
-
-        for session in runtime.sessionSnapshot() where session.isSubscribed {
-            session.send(envelope)
-        }
-    }
-
-    /// Publishes an authority-shaped minor-8 visibility event to every
-    /// subscribed client, preserving the same request-id-zero event lane as
-    /// the production daemon.
-    public func emitVisibility(_ visibility: PfsV3VisibilityEvent) {
-        var event = PfsEvent()
-        event.kind = .visibility(visibility)
-
-        var envelope = PfsEnvelope()
-        envelope.requestID = 0
-        envelope.body = .event(event)
-
-        for session in runtime.sessionSnapshot() where session.isSubscribed {
-            session.send(envelope)
-        }
-    }
-
     public func emitAttachState(_ state: PfsAttachState.State, detail: String = "") {
         var attachState = PfsAttachState()
         attachState.state = state
@@ -476,12 +387,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.stats()
     }
 
-    public func visibilityAcknowledgements() async -> [PfsVisibilityAckRequest] {
-        await fileSystem.visibilityAcknowledgements()
-    }
-
-    public func v3LivenessRequests() async -> [PfsV3LivenessRequest] {
-        await fileSystem.v3LivenessRequestsSnapshot()
+    /// Places a user xattr on an existing item. PortableFS user xattrs are
+    /// read-only through pfslocal, so tests seed them out of band, as data
+    /// already present in the authority's XFS store.
+    public func seedXattr(named name: String, value: Data, on item: PfsItemIdentity) async throws {
+        try await fileSystem.seedXattr(named: name, value: value, on: item)
     }
 
     /// A transform returns nil until its target reply appears. It runs after
@@ -627,6 +537,11 @@ private final class PfsMockDaemonRuntime: @unchecked Sendable {
         while !isStopped {
             do {
                 let envelope = try reader.readFrame()
+                // Like the production reader: one Hello, then one Resolve,
+                // then everything else. Any other order closes the connection.
+                guard session.admitsFrame(envelope.body) else {
+                    return
+                }
                 // The production reader reserves an operation before its
                 // ordinary handler can run. Recording the ID in a detached
                 // handler allowed a priority-lane PublicationAck to overtake
@@ -638,6 +553,12 @@ private final class PfsMockDaemonRuntime: @unchecked Sendable {
                         == .continueReading else {
                         return
                     }
+                    continue
+                case .hello?, .resolve?:
+                    // The production reader answers the binding frames
+                    // itself, so the state they establish is in place before
+                    // the next frame is read.
+                    handleBinding(envelope, session: session)
                     continue
                 default:
                     break
@@ -671,6 +592,14 @@ private final class PfsMockDaemonRuntime: @unchecked Sendable {
             completion.complete(outcome)
         }
         return completion.wait()
+    }
+
+    private func handleBinding(_ envelope: PfsEnvelope, session: MockSession) {
+        let completion = PfsMockBindingCompletion()
+        Task.detached(priority: .userInitiated) { [fileSystem, session, completion] in
+            completion.complete(await fileSystem.handle(envelope, session: session))
+        }
+        session.send(completion.wait())
     }
 
     private var isStopped: Bool {
@@ -737,6 +666,36 @@ private final class MockSession: @unchecked Sendable {
     func setSubscribed() {
         stateLock.lock()
         subscribed = true
+        stateLock.unlock()
+    }
+
+    enum ProtocolState {
+        case awaitingHello
+        case awaitingResolve
+        case attached
+    }
+
+    private var protocolState = ProtocolState.awaitingHello
+
+    /// The production reader's binding order. Hello and Resolve are handled
+    /// on the reader itself and advance the state before their reply, so the
+    /// check never races a conforming client.
+    func admitsFrame(_ body: PfsEnvelope.OneOf_Body?) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        switch body {
+        case .hello?:
+            return protocolState == .awaitingHello
+        case .resolve?:
+            return protocolState == .awaitingResolve
+        default:
+            return protocolState == .attached
+        }
+    }
+
+    func advance(to state: ProtocolState) {
+        stateLock.lock()
+        protocolState = state
         stateLock.unlock()
     }
 
@@ -1015,10 +974,9 @@ private actor MockFileSystem {
             return item
         }
 
-        /// A strict daemon supplies a 16-byte stable XFS identity for every
-        /// item; the v3 namespace/live-object indexes are keyed by it. The
-        /// mock derives one deterministically from the node ID so tests can
-        /// predict it.
+        /// Every owning Item carries the authority's nonzero 16-byte stable
+        /// identity, shared by all hard-link aliases. The mock derives one
+        /// deterministically from the node ID so tests can predict it.
         static func stableIdentity(for id: UInt64) -> Data {
             var identity = Data("pfsmock!".utf8)
             var bigEndian = id.bigEndian
@@ -1066,7 +1024,6 @@ private actor MockFileSystem {
     private var removeRequests = 0
     private var renameRequests = 0
     private var xattrGetRequests = 0
-    private var xattrSetRequests = 0
     private var xattrListRequests = 0
     private var xattrRemoveRequests = 0
     private var flagChangeRequests = 0
@@ -1075,8 +1032,7 @@ private actor MockFileSystem {
     private var publicationAcks = 0
     private var publishedPublicationAcks = 0
     private var notPublishedPublicationAcks = 0
-    private var visibilityAcks: [PfsVisibilityAckRequest] = []
-    private var v3LivenessRequests: [PfsV3LivenessRequest] = []
+    private var subscribeRequests = 0
     private var syncVolumeRequests = 0
     private var pendingCloseFailures = 0
     private var pendingRetiredCloseErrnos: [Int32] = []
@@ -1149,7 +1105,6 @@ private actor MockFileSystem {
             removeRequests: removeRequests,
             renameRequests: renameRequests,
             xattrGetRequests: xattrGetRequests,
-            xattrSetRequests: xattrSetRequests,
             xattrListRequests: xattrListRequests,
             xattrRemoveRequests: xattrRemoveRequests,
             flagChangeRequests: flagChangeRequests,
@@ -1161,18 +1116,14 @@ private actor MockFileSystem {
             resourceAccepts: resourceAccepts,
             resourceAbandons: resourceAbandons,
             resourceAcceptedItemCounts: resourceAcceptedItemCounts,
-            visibilityAcks: visibilityAcks.count,
-            v3LivenessRequests: v3LivenessRequests.count,
+            subscribeRequests: subscribeRequests,
             syncVolumeRequests: syncVolumeRequests
         )
     }
 
-    func visibilityAcknowledgements() -> [PfsVisibilityAckRequest] {
-        visibilityAcks
-    }
-
-    func v3LivenessRequestsSnapshot() -> [PfsV3LivenessRequest] {
-        v3LivenessRequests
+    func seedXattr(named name: String, value: Data, on item: PfsItemIdentity) throws {
+        let node = try node(for: item.proto)
+        node.xattrs[name] = value
     }
 
     func transformNextReply(_ transform: @escaping @Sendable (PfsEnvelope) -> PfsEnvelope?) {
@@ -1200,7 +1151,6 @@ private actor MockFileSystem {
         removeRequests = 0
         renameRequests = 0
         xattrGetRequests = 0
-        xattrSetRequests = 0
         xattrListRequests = 0
         xattrRemoveRequests = 0
         flagChangeRequests = 0
@@ -1212,8 +1162,7 @@ private actor MockFileSystem {
         publicationAcks = 0
         publishedPublicationAcks = 0
         notPublishedPublicationAcks = 0
-        visibilityAcks.removeAll()
-        v3LivenessRequests.removeAll()
+        subscribeRequests = 0
         syncVolumeRequests = 0
     }
 
@@ -1303,19 +1252,21 @@ private actor MockFileSystem {
             case .lookup(_), .enumerateEntries(_), .getAttr(_), .setAttr(_),
                  .read(_), .write(_), .create(_), .mkdir(_), .remove(_),
                  .rename(_), .symlink(_), .readlink(_), .hardLink(_),
-                 .xattrGet(_), .xattrSet(_), .xattrList(_), .xattrRemove(_):
+                 .xattrGet(_), .xattrList(_), .xattrRemove(_):
                 reply.publicationAckRequired = true
             default:
                 reply.publicationAckRequired = false
             }
             switch body {
-            case let .hello(request):
+            case .hello:
                 helloRequests += 1
                 var response = PfsHelloReply()
-                response.protocolMajor = request.protocolMajor
-                response.protocolMinor = configuration.protocolMinor ?? 16
+                response.protocolMajor = PfsLocalClient.protocolMajor
+                response.protocolMinor = PfsLocalClient.protocolMinor
                 response.daemonVersion = "mock"
+                response.requestDeadlineMs = configuration.requestDeadlineMilliseconds
                 reply.body = .helloReply(response)
+                session.advance(to: .awaitingResolve)
             case let .resolve(request):
                 guard request.attachRef == configuration.attachRef else {
                     throw MockPOSIXError(errno: ENOENT, message: "unknown attachRef")
@@ -1326,26 +1277,13 @@ private actor MockFileSystem {
                 response.rootAttr = attr(for: root)
                 response.volumeID = configuration.volumeID
                 response.volumeName = configuration.volumeName
-                response.branch = configuration.branch
                 var capabilities = PfsCapabilities()
-                capabilities.symlinks = true
-                capabilities.hardLinks = true
-                capabilities.xattrs = true
-                capabilities.caseSensitive = true
                 capabilities.maxNameBytes = 255
                 capabilities.maxFileSize = UInt64.max
                 capabilities.preferredIoBytes = 1_048_576
-                // A daemon predating the flag fields advertises neither: it
-                // cannot set fields it does not know exist, and both decode
-                // false on the frontend.
-                capabilities.flagsSupported = configuration.flagsSupported && !configuration.predatesFlagFields
-                capabilities.flagsUnderstood = configuration.flagsUnderstood && !configuration.predatesFlagFields
-                capabilities.xattrSetSupported = configuration.xattrSetSupported
                 response.capabilities = capabilities
-                if let v3Coherence = configuration.v3Coherence {
-                    response.v3Coherence = v3Coherence
-                }
                 reply.body = .resolveReply(response)
+                session.advance(to: .attached)
             case let .lookup(request):
                 lookupRequests += 1
                 let name = displayName(request.name)
@@ -1366,8 +1304,7 @@ private actor MockFileSystem {
                 response.attr = attr(for: child, parent: directory)
                 if pendingLookupItemIdentifiersToCorrupt > 0 {
                     pendingLookupItemIdentifiersToCorrupt -= 1
-                    response.attr.fileID =
-                        PfsFSKitMapping.localRepairIdentifierFloor
+                    response.attr.fileID = UInt64.max
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
                     ProvisionalResource(handle: 0, itemCount: 1, itemID: child.itemID)
@@ -1412,24 +1349,11 @@ private actor MockFileSystem {
             case let .setAttr(request):
                 setAttrRequests += 1
                 let node = try node(for: request.item, handle: request.handle)
-                // A daemon predating the appended fields never observes them:
-                // proto3 discards unknown fields before any handler runs, so
-                // it can neither apply nor refuse the flags change.
-                let setFlags = request.setFlags && !configuration.predatesFlagFields
-                if setFlags {
+                // The shipping daemon refuses every BSD flags change, before
+                // applying any other attribute in the same SetAttr.
+                if request.setFlags {
                     flagChangeRequests += 1
-                }
-                // The real daemon's decision is PER TARGET, taken where the
-                // backing is known. A grafted node's backing is a real host
-                // inode, so its chflags(2) lands whatever the authority can or
-                // cannot store; an authority-backed node without
-                // FeatureFlagPersistence is refused the WHOLE setattr before
-                // anything is applied. The frontend cannot make this call — it
-                // does not know what backs the object — which is exactly why
-                // its own gate asks a different question (does this daemon
-                // parse set_flags at all).
-                if setFlags && !configuration.flagsSupported && !isGraftBacked(node) {
-                    throw MockPOSIXError(errno: ENOTSUP, message: "authority does not persist BSD file flags")
+                    throw MockPOSIXError(errno: ENOTSUP, message: "PortableFS objects take no BSD file flags")
                 }
                 // Like the authority, a truncate through a description needs
                 // one open for writing; without a description it is checked
@@ -1444,7 +1368,6 @@ private actor MockFileSystem {
                 if request.hasSize { resize(node: node, size: Int(request.size)) }
                 if request.hasMtimeMs { node.mtimeMs = request.mtimeMs }
                 if request.hasAtimeMs { node.atimeMs = request.atimeMs }
-                if setFlags { node.flags = request.flags }
                 node.ctimeMs = nowMs()
                 var response = PfsSetAttrReply()
                 response.attr = attr(for: node)
@@ -1720,21 +1643,6 @@ private actor MockFileSystem {
                 var response = PfsXattrGetReply()
                 response.value = value
                 reply.body = .xattrGetReply(response)
-            case let .xattrSet(request):
-                xattrSetRequests += 1
-                if let errno = configuration.xattrSetErrno {
-                    throw MockPOSIXError(errno: errno, message: "injected set-xattr failure")
-                }
-                let node = try node(for: request.item, handle: request.handle)
-                let exists = node.xattrs[request.name] != nil
-                if request.createOnly && exists {
-                    throw MockPOSIXError(errno: EEXIST, message: "xattr exists")
-                }
-                if request.replaceOnly && !exists {
-                    throw MockPOSIXError(errno: ENOATTR, message: "xattr missing")
-                }
-                node.xattrs[request.name] = request.value
-                reply.body = .xattrSetReply(PfsXattrSetReply())
             case let .xattrList(request):
                 xattrListRequests += 1
                 if let errno = configuration.xattrListErrno {
@@ -1765,8 +1673,6 @@ private actor MockFileSystem {
             case .syncVolume:
                 syncVolumeRequests += 1
                 reply.body = .syncVolumeReply(PfsSyncVolumeReply())
-            case .fsync:
-                reply.body = .fsyncReply(PfsFsyncReply())
             case let .reclaim(request):
                 reclaimRequests += 1
                 let fail = pendingReclaimFailure
@@ -1791,49 +1697,18 @@ private actor MockFileSystem {
                 if fail { throw MockPOSIXError(errno: EIO, message: "injected reclaim failure") }
                 reply.body = .reclaimReply(PfsReclaimReply())
             case .subscribeEvents:
+                subscribeRequests += 1
                 session.setSubscribed()
                 reply.body = .subscribeEventsReply(PfsSubscribeEventsReply())
             case .publicationAck, .resourceReplyDisposition:
                 preconditionFailure("reader-ordered wire control reached ordinary dispatcher")
-            case let .visibilityAck(request):
-                visibilityAcks.append(request)
-                reply.body = .visibilityAckReply(PfsVisibilityAckReply())
-            case let .v3Liveness(request):
-                guard request.authorityEpoch.count == 16,
-                      request.sessionID.count == 16 else {
-                    throw MockPOSIXError(errno: EINVAL, message: "invalid v3 liveness identity")
-                }
-                if let contract = configuration.v3Coherence {
-                    guard request.authorityEpoch == contract.authorityEpoch,
-                          request.sessionID == contract.sessionID else {
-                        throw MockPOSIXError(errno: EINVAL, message: "wrong v3 liveness identity")
-                    }
-                }
-                v3LivenessRequests.append(request)
-                if configuration.v3LivenessDelayNanoseconds > 0 {
-                    try await Task.sleep(
-                        nanoseconds: configuration.v3LivenessDelayNanoseconds
-                    )
-                }
-                var response = PfsV3LivenessReply()
-                let applyOverrides = v3LivenessRequests.count
-                    > configuration.v3LivenessOverrideAfterRequestCount
-                response.authorityEpoch = applyOverrides
-                    ? (configuration.v3LivenessEpochOverride ?? request.authorityEpoch)
-                    : request.authorityEpoch
-                response.sessionID = applyOverrides
-                    ? (configuration.v3LivenessSessionOverride ?? request.sessionID)
-                    : request.sessionID
-                reply.body = .v3LivenessReply(response)
-            case .enumerate:
-                throw MockPOSIXError(errno: EPROTO, message: "minor 16 requires metadata-only enumeration")
-            case .helloReply, .resolveReply, .lookupReply, .enumerateReply, .enumerateEntriesReply, .getAttrReply,
+            case .helloReply, .resolveReply, .lookupReply, .enumerateEntriesReply, .getAttrReply,
                  .setAttrReply, .openReply, .closeReply, .readReply, .writeReply,
                  .createReply, .mkdirReply, .removeReply, .renameReply, .symlinkReply,
-                 .readlinkReply, .xattrGetReply, .xattrSetReply, .xattrListReply,
-                 .xattrRemoveReply, .statfsReply, .fsyncReply, .reclaimReply,
+                 .readlinkReply, .xattrGetReply, .xattrListReply,
+                 .xattrRemoveReply, .statfsReply, .reclaimReply,
                  .subscribeEventsReply, .hardLinkReply, .syncVolumeReply,
-                 .visibilityAckReply, .v3LivenessReply, .error, .event:
+                 .error, .event:
                 throw MockPOSIXError(errno: EINVAL, message: "daemon received reply body")
             }
         } catch let error as MockPOSIXError {
@@ -2063,25 +1938,6 @@ private actor MockFileSystem {
 
     private func nowMs() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
-    }
-
-    /// A node is graft-backed when its name matches a configured graft rule.
-    /// The real daemon knows this from its routing table; the mock recovers the
-    /// name from the parent's directory map so no rename path has to keep a
-    /// second copy of it in sync.
-    private func isGraftBacked(_ node: Node) -> Bool {
-        if configuration.graftBackedNames.isEmpty {
-            return false
-        }
-        guard let parentID = node.parent, let directory = nodes[parentID] else {
-            return false
-        }
-        for (name, id) in directory.children where id == node.id {
-            if configuration.graftBackedNames.contains(displayName(name)) {
-                return true
-            }
-        }
-        return false
     }
 
     private func displayName(_ data: Data) -> String {

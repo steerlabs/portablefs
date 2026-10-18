@@ -7,21 +7,13 @@ import Testing
 private let updateOldRelease = PortableFSDReleaseIdentity(
     codeDirectoryHash: String(repeating: "1", count: 40),
     executableSHA256: String(repeating: "2", count: 64),
-    daemonVersion: "1.2.3",
-    identitySchema: 1,
-    controlProtocol: 1,
-    pfslocalMajor: 1,
-    pfslocalMinor: 16
+    daemonVersion: "1.2.3"
 )
 
 private let updateTargetRelease = PortableFSDReleaseIdentity(
     codeDirectoryHash: String(repeating: "3", count: 40),
     executableSHA256: String(repeating: "4", count: 64),
-    daemonVersion: "1.2.4",
-    identitySchema: 1,
-    controlProtocol: 1,
-    pfslocalMajor: 1,
-    pfslocalMinor: 16
+    daemonVersion: "1.2.4"
 )
 
 private let updateToken = String(repeating: "a", count: 64)
@@ -713,11 +705,7 @@ private final class DirectorySyncInjector: @unchecked Sendable {
     let wrongOld = PortableFSDReleaseIdentity(
         codeDirectoryHash: String(repeating: "c", count: 40),
         executableSHA256: String(repeating: "d", count: 64),
-        daemonVersion: "0.2.3",
-        identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 16
+        daemonVersion: "0.2.3"
     )
     let connection = FakeUpdateConnection()
     connection.reads = [{ _ in try activationResumeFrame(
@@ -735,6 +723,38 @@ private final class DirectorySyncInjector: @unchecked Sendable {
     #expect(recorder.fenced.isEmpty)
     #expect(recorder.resumed == 0)
     #expect(connection.writes.isEmpty)
+}
+
+@Test func updateServerRejectsRemovedProtocolMembersBeforeActivation() throws {
+    for member in ["identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"] {
+        for (operation, key) in [
+            ("activate-target", "release"), ("resume-target", "release"),
+            ("resume-target", "oldRelease"), ("resume-target", "targetRelease"),
+        ] {
+            let fixture = try UpdateServerFixture()
+            let lease = fixture.lease(phase: .oldAbsent)
+            try fixture.store.create(lease)
+            let recorder = UpdateActionRecorder()
+            let handler = fixture.handler(recorder: recorder, sealed: updateTargetRelease)
+            let original = operation == "activate-target"
+                ? try activationFrame(operation: operation, token: updateToken, release: updateTargetRelease)
+                : try activationResumeFrame(operation: operation, token: updateToken, release: updateTargetRelease)
+            var object = try #require(JSONSerialization.jsonObject(with: original) as? [String: Any])
+            var release = try #require(object[key] as? [String: Any])
+            #expect(Set(release.keys) == PortableFSDReleaseIdentity.jsonKeys)
+            release[member] = 1
+            object[key] = release
+            var frame = try JSONSerialization.data(withJSONObject: object)
+            frame.append(0x0a)
+            let connection = FakeUpdateConnection()
+            connection.reads = [{ _ in frame }]
+            handler.handle(connection)
+            #expect(recorder.activated.isEmpty)
+            #expect(recorder.fenced.isEmpty)
+            #expect(connection.writes.isEmpty)
+            #expect(try fixture.store.load() == lease)
+        }
+    }
 }
 
 @Test func updateServerDuplicateEscapedKeyAndExpiredLeaseCauseNoMutation() throws {
@@ -1032,10 +1052,6 @@ private func releaseObject(_ release: PortableFSDReleaseIdentity) -> [String: An
         "codeDirectoryHash": release.codeDirectoryHash,
         "executableSHA256": release.executableSHA256,
         "daemonVersion": release.daemonVersion,
-        "identitySchema": release.identitySchema,
-        "controlProtocol": release.controlProtocol,
-        "pfslocalMajor": release.pfslocalMajor,
-        "pfslocalMinor": release.pfslocalMinor,
     ]
 }
 

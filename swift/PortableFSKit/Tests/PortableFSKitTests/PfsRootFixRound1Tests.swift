@@ -316,21 +316,6 @@ extension PfsLocalMockDaemonTests {
     }
 }
 
-@Test func repairSourceHandleInvariantTerminatesWithoutReadoption() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let root = try await core.rootItem()
-    let previous = try await core.createFile(in: root, name: Data("repair-handle".utf8), mode: 0o644).item
-    await #expect(throws: PfsLocalClientError.self) { try await core.reclaimLocalRepairSource(item: previous) }
-    #expect(previous.reclaimed)
-    #expect(root.reclaimed)
-    #expect(await daemon.stats().lookupRequests == 0)
-    #expect(await daemon.stats().reclaimRequests == 0)
-    #expect(await core.testingDebugState().openHandleCount == 0)
-    await #expect(throws: PfsLocalClientError.shutdown) { try await core.statfs() }
-}
-
 @Test func cancellationAfterCreateDispatchStillAdoptsTheDurableReply() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -427,7 +412,7 @@ extension PfsLocalMockDaemonTests {
     let first = try await core.createFile(in: root, name: Data("first".utf8), mode: 0o644).item
     let second = try await core.createFile(in: root, name: Data("second".utf8), mode: 0o644).item
     try await core.close(item: second)
-    try await core.reclaimLocalRepairSource(item: second)
+    try await core.reclaim(item: second)
     await daemon.transformNextReply {
         Round1AttrReply.lookup.replacingAttributes(in: $0) { $0.fileID = first.fileID }
     }
@@ -464,13 +449,7 @@ extension PfsLocalMockDaemonTests {
 
 @Test func invalidRootClosesClientBeforeInstallingVolumeState() async throws {
     for badParent in [false, true] {
-        var contract = PfsV3CoherenceContract()
-        contract.authorityProtocolMajor = 7
-        contract.authorityEpoch = Data(repeating: 0xE1, count: 16)
-        contract.sessionID = Data(repeating: 0x51, count: 16)
-        contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
-        contract.repairBudgetMillis = 2_500
-        let daemon = try PfsLocalMockDaemon(configuration: .init(v3Coherence: contract))
+        let daemon = try PfsLocalMockDaemon()
         defer { daemon.stop() }
         let client = PfsLocalClient(socketPath: daemon.socketPath)
         let core = VolumeCore(client: client)
@@ -481,10 +460,10 @@ extension PfsLocalMockDaemonTests {
             }
         }
         await #expect(throws: PfsLocalClientError.self) { try await core.resolve(attachRef: "mock") }
-        #expect(await core.strictV3ResolveReply == nil)
-        #expect(await core.strictV3Contract == nil)
         #expect(await core.resolvedVolume == nil)
-        await #expect(throws: PfsLocalClientError.shutdown) { try await client.request(.statfs(PfsStatfsRequest())) }
+        await #expect(throws: PfsLocalClientError.invalidFrame("invalid root attributes")) {
+            try await client.request(.statfs(PfsStatfsRequest()))
+        }
     }
 }
 }

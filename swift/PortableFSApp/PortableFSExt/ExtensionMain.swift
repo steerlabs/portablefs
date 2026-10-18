@@ -5,6 +5,6 @@ import PortableFSKit
 @main
 struct PortableFSExtension: UnaryFileSystemExtension {
     var fileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
-        PortableFSFileSystem.macOS26BestEffort()
+        PortableFSFileSystem()
     }
 }

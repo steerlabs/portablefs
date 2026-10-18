@@ -403,6 +403,66 @@ extension PfsLocalMockDaemonTests {
     #expect(stats.activeHandles == 0)
 }
 
+/// CREATE returns a real, charged creation description even when no open
+/// ever follows. It stays owned by the item until reclaim closes it: no
+/// timeout, no speculative cancellation, no leak.
+@Test func createWithoutAnyOpenOwnsItsCreationDescriptionUntilReclaim() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    await daemon.resetStats()
+
+    let created = try await core.createFile(in: root, name: lifecycleBytes("never-opened"), mode: 0o600)
+    try await waitForLifecycleStats(daemon) { $0.resourceAccepts == 1 }
+    var stats = await daemon.stats()
+    #expect(stats.openRequests == 0)
+    #expect(stats.activeHandles == 1)
+    #expect(await core.testingDebugState().openHandleCount == 1)
+
+    try await core.reclaim(item: created.item)
+    stats = await daemon.stats()
+    #expect(stats.openRequests == 0)
+    #expect(stats.closeRequests == 1)
+    #expect(stats.reclaimRequests == 1)
+    #expect(stats.activeHandles == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
+}
+
+/// Every access the creation description grants is served from it without
+/// another OPEN. After the final close, a later open is an independent
+/// access decision and issues a fresh OPEN.
+@Test func compatibleOpenAfterCreateReusesTheCreationDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    await daemon.resetStats()
+
+    let created = try await core.createFile(in: root, name: lifecycleBytes("reused"), mode: 0o644)
+    for mode in [PfsOpenMode.read, .write, .readWrite] {
+        try await core.open(item: created.item, mode: mode)
+    }
+    _ = try await core.write(item: created.item, offset: 0, data: lifecycleBytes("data"))
+    #expect(try await core.read(item: created.item, offset: 0, length: 4) == lifecycleBytes("data"))
+    var stats = await daemon.stats()
+    #expect(stats.openRequests == 0)
+    #expect(stats.activeHandles == 1)
+
+    try await core.close(item: created.item, retainingModes: .unspecified)
+    stats = await daemon.stats()
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+
+    try await core.open(item: created.item, mode: .read)
+    stats = await daemon.stats()
+    #expect(stats.openRequests == 1)
+    #expect(stats.openModes == [.read])
+    #expect(stats.activeHandles == 1)
+    try await core.close(item: created.item, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
 /// Only a CREATE that actually creates the file carries the creation grant.
 /// A non-exclusive CREATE of an existing name is an open: its read/write
 /// description must pass the ordinary access check against the existing
@@ -738,18 +798,22 @@ private func chmod(_ core: VolumeCore, _ file: PortableFSItem, _ mode: UInt32) a
     #expect(await core.testingDebugState().openHandleCount == 0)
 }
 
-@Test func lostRetiredCloseReplyReplaysTerminalOutcomeAndReleasesSwiftHandle() async throws {
+/// A close whose reply is lost with the connection cannot be confirmed: Swift
+/// keeps owning the description, the session ends, and nothing reconnects to
+/// replay it. Whole-session teardown is what finally releases it.
+@Test func lostRetiredCloseReplyEndsTheSessionAndKeepsOwnershipUntilTeardown() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(
         socketPath: daemon.socketPath,
         attachRef: "mock",
         configuration: .init(
-            maxReconnectAttempts: 10,
-            reconnectBaseDelayNanoseconds: 5_000_000
+            maxConnectAttempts: 10,
+            connectRetryBaseDelayNanoseconds: 5_000_000
         )
     )
     let file = try await closedTestFile(core: core, daemon: daemon, name: "lost-close-reply")
+    let hellos = await daemon.stats().helloRequests
 
     try await core.open(item: file, mode: .read)
     await daemon.loseNextRetiredCloseReply(errno: EIO)
@@ -760,28 +824,21 @@ private func chmod(_ core: VolumeCore, _ file: PortableFSItem, _ mode: UInt32) a
         #expect(error == .connectionClosed)
     }
 
-    var stats = await daemon.stats()
+    let stats = await daemon.stats()
     #expect(stats.closeRequests == 1)
     #expect(stats.activeHandles == 0)
     // No retirement confirmation reached Swift, so it must retain ownership.
     #expect(await core.testingDebugState().openHandleCount == 1)
 
-    do {
+    await #expect(throws: PfsLocalClientError.connectionClosed) {
         try await core.close(item: file, retainingModes: .unspecified)
-        Issue.record("expected the replayed terminal close error")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EIO)
     }
+    #expect(await daemon.stats().closeRequests == 1)
+    #expect(await daemon.stats().helloRequests == hellos)
+    #expect(await core.testingDebugState().openHandleCount == 1)
 
-    stats = await daemon.stats()
-    #expect(stats.closeRequests == 2)
-    #expect(stats.activeHandles == 0)
+    await core.shutdown()
     #expect(await core.testingDebugState().openHandleCount == 0)
-
-    // Swift consumed the replayed confirmation, so it never sends a third
-    // close for the already-retired handle.
-    try await core.close(item: file, retainingModes: .unspecified)
-    #expect(await daemon.stats().closeRequests == 2)
 }
 
 @Test func failedPartialCloseRemainsTrackedUntilReclaim() async throws {

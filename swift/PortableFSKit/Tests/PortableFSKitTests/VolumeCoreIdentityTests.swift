@@ -1,23 +1,41 @@
 import Foundation
 import Testing
 @testable import PortableFSKit
+import PortableFSKitMockDaemon
 
+extension PfsLocalMockDaemonTests {
+/// A kernel teardown burst retires many objects at once. Every reclaim takes
+/// the real Close/Reclaim path, and the identity, ownership-handle and
+/// file-ID indexes return exactly to the root alone.
 @Test func bulkReclaimRetiresEveryObject() async throws {
-    let core = VolumeCore(client: PfsLocalClient(socketPath: "/unused-pure-identity-test"))
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    let baseline = await core.testingDebugState()
+
     var items: [PortableFSItem] = []
-    for id in 2...10_001 {
-        var attr = PfsAttr()
-        attr.item.itemID = UInt64(id)
-        attr.item.itemGeneration = 1
-        attr.fileID = UInt64(id)
-        attr.kind = .file
-        items.append(try await core.testingAdoptAttributes(attr))
+    for index in 0..<512 {
+        let created = try await core.createFile(
+            in: root,
+            name: Data("bulk-\(index)".utf8),
+            mode: 0o644
+        )
+        items.append(created.item)
     }
-    #expect(await core.testingDebugState().objectIdentityCount == items.count)
-    for item in items { try await core.reclaimLocalRepairSource(item: item) }
+    #expect(await core.testingDebugState().objectIdentityCount == baseline.objectIdentityCount + items.count)
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for item in items {
+            group.addTask { try await core.reclaim(item: item) }
+        }
+        try await group.waitForAll()
+    }
     let final = await core.testingDebugState()
     #expect(items.allSatisfy { $0.reclaimed })
-    #expect(final.itemCount == 0)
-    #expect(final.objectIdentityCount == 0)
-    #expect(final.openHandleCount == 0)
+    #expect(final == baseline)
+    let stats = await daemon.stats()
+    #expect(stats.reclaimRequests == items.count)
+    #expect(stats.activeHandles == 0)
+}
 }

@@ -35,9 +35,9 @@ private func rootFixAttr(handle: UInt64, fileID: UInt64, identity: UInt8 = 1) ->
     #expect(try PfsFSKitMapping.attributes(from: attr).parentID == .invalid)
     #expect(try PfsFSKitMapping.parentDirectoryIdentifier(from: attr).rawValue == 701)
 
-    attr.fileID = PfsFSKitMapping.localRepairIdentifierFloor
-    #expect(throws: PfsLocalClientError.self) { try PfsFSKitMapping.attributes(from: attr) }
-    #expect(try PfsFSKitMapping.localRepairAttributes(from: attr).fileID.rawValue == attr.fileID + 1)
+    // The former high-half partition holds ordinary daemon file IDs.
+    attr.fileID = UInt64(1) << 63
+    #expect(try PfsFSKitMapping.attributes(from: attr).fileID.rawValue == attr.fileID + 1)
 }
 
 @Test func itemIngestionRejectsChangedIdentityAndUnknownKind() async throws {
@@ -64,18 +64,6 @@ private func rootFixAttr(handle: UInt64, fileID: UInt64, identity: UInt8 = 1) ->
     await #expect(throws: PfsLocalClientError.self) { try await core.testingAdoptAttributes(changed) }
 }
 
-@Test func fileIDSurvivesRetirementAndANewOwnershipHandle() async throws {
-    let core = VolumeCore(client: PfsLocalClient(socketPath: "/unused-root-fix-test"))
-    let previous = try await core.testingAdoptAttributes(rootFixAttr(handle: 900, fileID: 700))
-    try await core.reclaimLocalRepairSource(item: previous)
-    let current = try await core.testingAdoptAttributes(rootFixAttr(handle: 901, fileID: 700))
-    #expect(previous !== current)
-    #expect(previous.reclaimed)
-    #expect(current.fileID == previous.fileID)
-    #expect(current.identity.itemID != previous.identity.itemID)
-    #expect(try PfsFSKitMapping.itemIdentifier(from: current.fileID).rawValue == 701)
-}
-
 private func waitForRootFixState(_ predicate: () async -> Bool) async throws {
     let deadline = ContinuousClock.now + .seconds(3)
     while !(await predicate()), ContinuousClock.now < deadline {
@@ -85,10 +73,33 @@ private func waitForRootFixState(_ predicate: () async -> Bool) async throws {
 }
 
 extension PfsLocalMockDaemonTests {
-@Test func minor16FrontendRefusesMinor15Daemon() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(protocolMinor: 15))
+@Test func fileIDSurvivesRetirementAndANewOwnershipHandle() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(fileIDOffset: 700))
     defer { daemon.stop() }
-    await #expect(throws: PfsLocalClientError.protocolMismatch(major: 1, minor: 15)) {
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    let previous = try await core.createFile(in: root, name: Data("retired".utf8), mode: 0o644).item
+    try await core.reclaim(item: previous)
+    let current = try await core.lookup(in: root, name: Data("retired".utf8)).item
+    #expect(previous !== current)
+    #expect(previous.reclaimed)
+    #expect(current.fileID == previous.fileID)
+    #expect(current.identity.itemID != previous.identity.itemID)
+    #expect(current.identity.stableIdentity == previous.identity.stableIdentity)
+    #expect(try PfsFSKitMapping.itemIdentifier(from: current.fileID).rawValue == current.fileID + 1)
+}
+
+@Test func volumeCoreRequiresTheExactPairedLocalProtocol() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    await daemon.transformNextReply { envelope in
+        guard case var .helloReply(reply)? = envelope.body else { return nil }
+        reply.protocolMinor = 1
+        var changed = envelope
+        changed.body = .helloReply(reply)
+        return changed
+    }
+    await #expect(throws: PfsLocalClientError.protocolMismatch(major: 2, minor: 1)) {
         _ = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
     }
 }
@@ -298,7 +309,7 @@ extension PfsLocalMockDaemonTests {
     let root = try await core.rootItem()
     let created = try await core.createFile(in: root, name: Data("shared".utf8), mode: 0o644)
     try await core.close(item: created.item)
-    try await core.reclaimLocalRepairSource(item: created.item)
+    try await core.reclaim(item: created.item)
     let client = await core.client
     let (first, abandon) = await client.withDeferredPublication {
         try await core.lookup(in: root, name: Data("shared".utf8))
@@ -314,30 +325,6 @@ extension PfsLocalMockDaemonTests {
     #expect(await core.testingDebugState().provisionalItemCount == 1)
     await publish(true)
     #expect(!item.reclaimed)
-    #expect(await core.testingDebugState().publishedItemCount == 2)
-    #expect(await core.testingDebugState().provisionalItemCount == 0)
-}
-
-@Test func repairSourceRetirementDoesNotWaitForPublicationOrReclaimAuthority() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let root = try await core.rootItem()
-    let created = try await core.createFile(in: root, name: Data("repair-source".utf8), mode: 0o644)
-    try await core.close(item: created.item)
-    let client = await core.client
-    let (prior, publish) = await client.withDeferredPublication {
-        try await core.lookup(in: root, name: Data("repair-source".utf8))
-    }
-    let previous = try prior.get().item
-    try await core.reclaimLocalRepairSource(item: previous)
-    #expect(previous.reclaimed)
-    #expect(await core.testingDebugState().retiringItemCount == 0)
-    let replacement = try await core.lookup(in: root, name: Data("repair-source".utf8))
-    await publish(true)
-    #expect(replacement.item !== previous)
-    #expect(!replacement.item.reclaimed)
-    #expect(await daemon.stats().reclaimRequests == 0)
     #expect(await core.testingDebugState().publishedItemCount == 2)
     #expect(await core.testingDebugState().provisionalItemCount == 0)
 }

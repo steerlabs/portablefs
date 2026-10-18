@@ -8,225 +8,46 @@ private func bytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
-private func strictV3Contract(
-    policy: String = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
-) -> PfsV3CoherenceContract {
-    var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 7
-    contract.authorityEpoch = Data(repeating: 0xA1, count: 16)
-    contract.sessionID = Data(repeating: 0xB2, count: 16)
-    contract.cachePolicy = policy
-    contract.repairBudgetMillis = 1_000
-    return contract
-}
-
 extension PfsLocalMockDaemonTests {
-@Test func volumeCoreRequiresTheFrontendAdaptersExactDeclaredPolicySet() async throws {
-    // The shipping macOS 26 adapter preserves both frozen compatibility
-    // revisions. Resolve records only a declared member of that exact set.
-    for policy in [
-        PfsMacOSCachePolicy.synchronousVFSRepairV1,
-        .synchronousVFSRepairV2,
-    ] {
-        let strictDaemon = try PfsLocalMockDaemon(
-            configuration: .init(v3Coherence: strictV3Contract(
-                policy: policy.rawValue
-            ))
-        )
-        defer { strictDaemon.stop() }
-        let strict = try await VolumeCore.connect(
-            socketPath: strictDaemon.socketPath,
-            attachRef: "mock"
-        )
-        #expect(await strict.strictV3Contract?.cachePolicy == policy)
-        #expect(await strict.strictV3ResolveReply?.hasV3Coherence == true)
-        await strict.shutdown()
-    }
+/// Every owning Item carries a positive handle and generation and a nonzero
+/// 16-byte stable identity. An owning reply without one is a malformed frame,
+/// and adoption leaves the item tables untouched. A file ID in the former
+/// high-half partition is an ordinary daemon object.
+@Test func owningItemsRequireTheirFullIdentity() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let before = await core.testingDebugState()
 
-    // A future SDK-27 adapter may name the native policy explicitly. This
-    // admits only the local contract; it does not enable that adapter or claim
-    // the kernel cache matrix has passed.
-    let nativeDaemon = try PfsLocalMockDaemon(
-        configuration: .init(v3Coherence: strictV3Contract(
-            policy: PfsMacOSCachePolicy.nativeFSKitRevocationV1.rawValue
-        ))
-    )
-    defer { nativeDaemon.stop() }
-    let native = try await VolumeCore.connect(
-        socketPath: nativeDaemon.socketPath,
-        attachRef: "mock",
-        supportedCachePolicies: [.nativeFSKitRevocationV1]
-    )
-    #expect(await native.strictV3Contract?.cachePolicy == .nativeFSKitRevocationV1)
-    // Policy parsing is not production wiring. The shipping macOS 26 volume
-    // composition must still refuse this core until the SDK-27 target supplies
-    // its own native revoker and Handler adapter.
-    await #expect(throws: PfsMacOSCoherenceError.unsupportedRepair) {
-        _ = try await PortableFSVolume.make(core: native, attachRef: "mock")
+    func owning(itemID: UInt64, generation: UInt64, identity: Data, fileID: UInt64) -> PfsAttr {
+        var attr = PfsAttr()
+        attr.item.itemID = itemID
+        attr.item.itemGeneration = generation
+        attr.item.stableIdentity = identity
+        attr.kind = .file
+        attr.fileID = fileID
+        return attr
     }
-    await native.shutdown()
-
-    // The current macOS 26 adapter still refuses native, and an unknown policy
-    // is a contract no adapter can honor. Both fail closed with the same
-    // close-first ENOTSUP discipline — never a silent fallback.
-    for refusedPolicy in [
-        PfsMacOSCachePolicy.nativeFSKitRevocationV1.rawValue,
-        "automatic"
+    let valid = Data(repeating: 0x7a, count: 16)
+    for malformed in [
+        owning(itemID: 0, generation: 1, identity: valid, fileID: 40),
+        owning(itemID: 41, generation: 0, identity: valid, fileID: 41),
+        owning(itemID: 42, generation: 1, identity: Data(), fileID: 42),
+        owning(itemID: 43, generation: 1, identity: Data(repeating: 0, count: 16), fileID: 43),
+        owning(itemID: 44, generation: 1, identity: Data(repeating: 0x7a, count: 15), fileID: 44),
+        owning(itemID: 45, generation: 1, identity: valid, fileID: UInt64.max),
     ] {
-        let refusingDaemon = try PfsLocalMockDaemon(
-            configuration: .init(v3Coherence: strictV3Contract(policy: refusedPolicy))
-        )
-        defer { refusingDaemon.stop() }
-        do {
-            _ = try await VolumeCore.connect(
-                socketPath: refusingDaemon.socketPath,
-                attachRef: "mock"
-            )
-            Issue.record("expected policy \(refusedPolicy) to be refused")
-        } catch let error as PfsLocalClientError {
-            #expect(error == .v3CoherenceIntegrationUnavailable)
-            #expect(error.posixErrno == ENOTSUP)
+        await #expect(throws: PfsLocalClientError.self) {
+            _ = try await core.testingAdoptAttributes(malformed)
         }
     }
-
-    // Native selection is equally exact in the other direction. It cannot
-    // reinterpret a macOS 26 attach as its own policy.
-    let compatibilityDaemon = try PfsLocalMockDaemon(
-        configuration: .init(v3Coherence: strictV3Contract())
-    )
-    defer { compatibilityDaemon.stop() }
-    do {
-        _ = try await VolumeCore.connect(
-            socketPath: compatibilityDaemon.socketPath,
-            attachRef: "mock",
-            supportedCachePolicies: [.nativeFSKitRevocationV1]
-        )
-        Issue.record("expected native adapter policy selection to be exact")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .v3CoherenceIntegrationUnavailable)
-        #expect(error.posixErrno == ENOTSUP)
-    }
-
-    // Legacy resolves continue through the exact same production entry point.
-    let legacyDaemon = try PfsLocalMockDaemon()
-    defer { legacyDaemon.stop() }
-    let legacy = try await VolumeCore.connect(
-        socketPath: legacyDaemon.socketPath,
-        attachRef: "mock"
-    )
-    #expect(await legacy.resolvedVolume?.volumeID == "mock-volume")
-    #expect(await legacy.strictV3Contract == nil)
-}
-
-@Test func localRepairIdentifierPartitionOutlivesTheFormer4096EventBand() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-    let core = try await VolumeCore.connect(
-        socketPath: daemon.socketPath,
-        attachRef: "mock"
-    )
-    let root = try await core.rootItem()
-    var identifiers: Set<UInt64> = []
-
-    // Keep this just beyond the former UInt64.max-4096 partition. A live peer
-    // create storm reached this boundary in minutes and made the repair
-    // scratch create fail ENOSPC even though both local storage and XFS were
-    // healthy. Releasing each object models an ordinary scratch lifecycle;
-    // identifiers still remain unique because FSKit may retain an unlinked
-    // vnode until its later reclaim callback.
-    for index in 0..<5_000 {
-        let item = try await core.mintLocalRepairItem(
-            parent: root,
-            name: Data("repair-\(index)".utf8),
-            mode: 0o600,
-            uid: 501,
-            gid: 20
-        )
-        #expect(item.identity.itemID >= PfsFSKitMapping.localRepairIdentifierFloor)
-        #expect(identifiers.insert(item.identity.itemID).inserted)
-        await core.releaseLocalRepairItem(item)
-    }
-    #expect(identifiers.count == 5_000)
-    #expect(await core.localRepairItemCount() == 0)
-    await core.shutdown()
-}
-
-@Test func failedDuplicateRepairCreateDoesNotConsumeAnIdentifier() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-    let core = try await VolumeCore.connect(
-        socketPath: daemon.socketPath,
-        attachRef: "mock"
-    )
-    let root = try await core.rootItem()
-    let first = try await core.mintLocalRepairItem(
-        parent: root,
-        name: Data("same".utf8),
-        mode: 0o600,
-        uid: 501,
-        gid: 20
-    )
-    do {
-        _ = try await core.mintLocalRepairItem(
-            parent: root,
-            name: Data("same".utf8),
-            mode: 0o600,
-            uid: 501,
-            gid: 20
-        )
-        Issue.record("expected the duplicate repair binding to fail")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EEXIST)
-    }
-    let second = try await core.mintLocalRepairItem(
-        parent: root,
-        name: Data("different".utf8),
-        mode: 0o600,
-        uid: 501,
-        gid: 20
-    )
-    #expect(second.identity.itemID == first.identity.itemID - 1)
-    await core.releaseLocalRepairItem(first)
-    await core.releaseLocalRepairItem(second)
-    await core.shutdown()
-}
-
-@Test func daemonItemCannotEnterTheLocalRepairPartition() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-    let core = try await VolumeCore.connect(
-        socketPath: daemon.socketPath,
-        attachRef: "mock"
-    )
-    let before = await core.testingDebugState()
-    do {
-        var attr = PfsAttr()
-        attr.item.itemID = 42
-        attr.item.itemGeneration = 1
-        attr.item.stableIdentity = Data(repeating: 0x7a, count: 16)
-        attr.kind = .file
-        attr.fileID = PfsFSKitMapping.localRepairIdentifierFloor
-        _ = try await core.testingAdoptAttributes(attr)
-        Issue.record("expected the reserved daemon item identifier to fail")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EOVERFLOW)
-    }
     #expect(await core.testingDebugState() == before)
-    await core.shutdown()
-}
 
-@Test func clientRejectsDaemonWithoutAttrParentContract() async throws {
-    let daemon = try PfsLocalMockDaemon(
-        configuration: .init(protocolMinor: 4)
+    let high = try await core.testingAdoptAttributes(
+        owning(itemID: 46, generation: 1, identity: valid, fileID: (UInt64(1) << 63) + 1)
     )
-    defer { daemon.stop() }
-
-    do {
-        _ = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-        Issue.record("expected protocol-minor mismatch")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .protocolMismatch(major: 1, minor: 4))
-    }
+    #expect(high.fileID == (UInt64(1) << 63) + 1)
+    await core.shutdown()
 }
 
 @Test func volumeCoreRoundTripsAgainstMockDaemon() async throws {
@@ -235,14 +56,13 @@ extension PfsLocalMockDaemonTests {
 
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
     let root = try await core.rootItem()
-    #expect(await core.resolvedVolume?.capabilities.xattrSetSupported == true)
 
     let created = try await core.createFile(in: root, name: bytes("hello.txt"), mode: 0o644)
     let write = try await core.write(item: created.item, offset: 0, data: bytes("hello"))
     #expect(write.written == 5)
     #expect(try await core.read(item: created.item, offset: 0, length: 5) == bytes("hello"))
 
-    try await core.xattrSet(item: created.item, name: "user.note", value: bytes("note"), createOnly: false, replaceOnly: false)
+    try await daemon.seedXattr(named: "user.note", value: bytes("note"), on: created.item.identity)
     #expect(try await core.xattrGet(item: created.item, name: "user.note") == bytes("note"))
     #expect(try await core.xattrList(item: created.item).contains("user.note"))
     try await core.xattrRemove(item: created.item, name: "user.note")
@@ -385,56 +205,6 @@ extension PfsLocalMockDaemonTests {
     }
 }
 
-@Test func connectionDropFailsInflightAndNextOperationReconnects() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(lookupDelaysNanoseconds: ["slow": 500_000_000]))
-    defer { daemon.stop() }
-
-    let core = try await VolumeCore.connect(
-        socketPath: daemon.socketPath,
-        attachRef: "mock",
-        configuration: .init(maxReconnectAttempts: 10, reconnectBaseDelayNanoseconds: 5_000_000)
-    )
-    let root = try await core.rootItem()
-    _ = try await core.createFile(in: root, name: bytes("slow"), mode: 0o644)
-    _ = try await core.createFile(in: root, name: bytes("fast"), mode: 0o644)
-
-    let slowLookup = Task {
-        try await core.lookup(in: root, name: bytes("slow"))
-    }
-    try await Task.sleep(nanoseconds: 50_000_000)
-    daemon.dropConnections()
-
-    do {
-        _ = try await slowLookup.value
-        Issue.record("expected in-flight lookup to fail on connection drop")
-    } catch {
-        #expect(PfsErrorMapper.fsKitError(for: error).code == Int(EIO))
-    }
-
-    let recovered = try await core.lookup(in: root, name: bytes("fast"))
-    #expect(recovered.attr.item.itemID != 0)
-}
-
-@Test func eventsAreDeliveredAfterSubscribe() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let stream = try await core.subscribeEvents()
-    var iterator = stream.makeAsyncIterator()
-
-    let rootIdentity = await daemon.rootIdentity()
-    daemon.emitInvalidation(item: rootIdentity.proto, contentVersion: 7)
-
-    let event = await iterator.next()
-    guard case let .invalidation(invalidation)? = event?.kind else {
-        Issue.record("expected invalidation event")
-        return
-    }
-    #expect(invalidation.item.itemID == rootIdentity.itemID)
-    #expect(invalidation.contentVersion == 7)
-}
-
 @Test func detachingAttachStateMakesBoundClientFailWithENXIO() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -458,6 +228,7 @@ extension PfsLocalMockDaemonTests {
     var attr = PfsAttr()
     attr.item.itemID = 99
     attr.item.itemGeneration = 1
+    attr.item.stableIdentity = Data(repeating: 0x63, count: 16)
     attr.fileID = 99
     attr.kind = .file
     let item = try await core.testingAdoptAttributes(attr)
@@ -466,154 +237,42 @@ extension PfsLocalMockDaemonTests {
         try await core.testingAdoptAttributes(attr)
     }
     #expect(!item.reclaimed)
-    try await core.reclaimLocalRepairSource(item: item)
+    await core.shutdown()
     #expect(item.reclaimed)
 }
 
-/// The chflags(2) write path end to end: the extension forwards the intent and
-/// the daemon — the only layer that knows the attached authority's features —
-/// persists it. A zero word is a real "clear everything", not "no change".
-@Test func flagChangesRoundTripThroughTheDaemonWhenTheAuthorityPersistsThem() async throws {
+/// The chflags(2) path end to end: the extension always forwards the intent
+/// and the daemon refuses the entire compound SetAttr before applying any of
+/// it. A flags change can therefore never become a partial success.
+@Test func flagChangesAreForwardedAndRefusedAtomicallyByTheDaemon() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let capabilities = await core.resolvedVolume?.capabilities
-    #expect(capabilities?.flagsSupported == true)
-    #expect(capabilities?.flagsUnderstood == true)
-
     let root = try await core.rootItem()
     let created = try await core.createFile(in: root, name: bytes("flagged.txt"), mode: 0o644)
     #expect(created.attr.flags == 0)
 
-    let immutable = UInt32(UF_IMMUTABLE) | UInt32(UF_HIDDEN)
-    let set = try await core.setattr(item: created.item, attributes: .init(flags: immutable))
-    #expect(set.flags == immutable)
-    #expect(try await core.getattr(item: created.item).flags == immutable)
-
-    // Clearing is a durable state of its own, and it must not disturb a
-    // neighbouring group applied in the same request.
-    let cleared = try await core.setattr(item: created.item, attributes: .init(mode: 0o600, flags: 0))
-    #expect(cleared.flags == 0)
-    #expect(cleared.mode == 0o600)
-
-    // A setattr with no flags intent leaves the stored word alone rather than
-    // resetting it to the proto default.
-    _ = try await core.setattr(item: created.item, attributes: .init(flags: immutable))
-    _ = try await core.setattr(item: created.item, attributes: .init(mtimeMilliseconds: 123_000))
-    #expect(try await core.getattr(item: created.item).flags == immutable)
-}
-
-/// THE REGRESSION THIS PINS. `flagsSupported` describes the attached
-/// AUTHORITY's durable flag storage; it is not a verdict on the volume. A
-/// machine-local graft in the same namespace is backed by a real host inode,
-/// so chflags(2) on it persists with no authority feature involved. A frontend
-/// that gated forwarding on `flagsSupported` refused every flags change on
-/// such a mount — including the graft ones that would have worked, and
-/// including via a static capability that stopped the kernel before the
-/// extension was even asked.
-///
-/// So: `flagsUnderstood` true with `flagsSupported` false means FORWARD, and
-/// let the daemon answer per target.
-@Test func flagChangesAreForwardedWhenTheDaemonUnderstandsThemEvenWithoutAuthorityPersistence() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(
-        flagsSupported: false,
-        flagsUnderstood: true,
-        graftBackedNames: ["grafted.txt"]
-    ))
-    defer { daemon.stop() }
-
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let capabilities = await core.resolvedVolume?.capabilities
-    #expect(capabilities?.flagsSupported == false)
-    #expect(capabilities?.flagsUnderstood == true)
-    // The static capability must not declare blanket non-support: some objects
-    // on this volume take a flag word. The kernel has to let the request
-    // through so the per-object answer can be given.
-    #expect(!PfsFSKitMapping.supportedCapabilities(
-        from: capabilities ?? PfsCapabilities()
-    ).doesNotSupportImmutableFiles)
-
-    let root = try await core.rootItem()
-    let grafted = try await core.createFile(in: root, name: bytes("grafted.txt"), mode: 0o644)
-
-    // Graft-backed: the change is forwarded AND applied, with no authority
-    // feature anywhere in the story.
-    let immutable = UInt32(UF_IMMUTABLE) | UInt32(UF_HIDDEN)
-    let set = try await core.setattr(item: grafted.item, attributes: .init(flags: immutable))
-    #expect(set.flags == immutable)
-    #expect(try await core.getattr(item: grafted.item).flags == immutable)
-
-    // Authority-backed, same connection, same request shape: refused — and
-    // refused by the DAEMON, which is the only layer that knows the backing.
-    let remote = try await core.createFile(in: root, name: bytes("authority.txt"), mode: 0o644)
-    do {
-        _ = try await core.setattr(
-            item: remote.item,
-            attributes: .init(mode: 0o600, flags: immutable)
-        )
-        Issue.record("an authority without flag persistence accepted a chflags")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ENOTSUP)
-        #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOTSUP))
+    for flags in [UInt32(UF_IMMUTABLE) | UInt32(UF_HIDDEN), 0] {
+        do {
+            _ = try await core.setattr(
+                item: created.item,
+                attributes: .init(mode: 0o600, flags: flags)
+            )
+            Issue.record("a flags change \(flags) succeeded")
+        } catch let error as PfsLocalClientError {
+            #expect(error.posixErrno == ENOTSUP)
+            #expect(PfsErrorMapper.fsKitError(for: error).code == Int(ENOTSUP))
+        }
     }
-    // The refusal applied nothing, co-travelling groups included.
-    #expect(try await core.getattr(item: remote.item).mode == 0o644)
-
-    // Both requests REACHED the daemon. This is the assertion that fails when
-    // the extension gates on `flagsSupported`: it would have refused locally
-    // and the daemon would have seen no flags change at all.
-    let stats = await daemon.stats()
-    #expect(stats.flagChangeRequests == 2)
-}
-
-/// The rolling-upgrade case the daemon-side refusal cannot cover: a NEW
-/// frontend against an OLD daemon at the SAME protocol minor. `set_flags` and
-/// `flags` are appended fields, so that daemon proto3-discards them, applies
-/// the rest of the setattr and answers OK — a chflags(2) that returns success
-/// while nothing changed. It advertises neither `flagsSupported` nor
-/// `flagsUnderstood` — it cannot set fields it does not know exist — so the
-/// absent `flagsUnderstood` decodes false and the frontend's own gate refuses
-/// instead of forwarding. Forwarding here is the bug; the mock deliberately
-/// would NOT complain about it.
-@Test func flagChangesAreNotForwardedToADaemonPredatingTheFlagFields() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(predatesFlagFields: true))
-    defer { daemon.stop() }
-
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
-    let capabilities = await core.resolvedVolume?.capabilities
-    #expect(capabilities?.flagsSupported == false)
-    #expect(capabilities?.flagsUnderstood == false)
-    // A daemon that cannot parse the request is the one case where a blanket
-    // "no immutable files" is the truth.
-    #expect(PfsFSKitMapping.supportedCapabilities(
-        from: capabilities ?? PfsCapabilities()
-    ).doesNotSupportImmutableFiles)
-
-    let root = try await core.rootItem()
-    let created = try await core.createFile(in: root, name: bytes("old-daemon.txt"), mode: 0o644)
-
-    do {
-        _ = try await core.setattr(
-            item: created.item,
-            attributes: .init(mode: 0o600, flags: UInt32(UF_IMMUTABLE))
-        )
-        Issue.record("a flags change was forwarded to a daemon that silently discards it")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ENOTSUP)
-    }
-
-    // Proof the refusal was the frontend's: had it forwarded, this daemon
-    // would have reported success with the flag word dropped and the mode
-    // applied.
+    // Nothing applied, the co-travelling mode change included.
     let after = try await core.getattr(item: created.item)
-    #expect(after.flags == 0)
     #expect(after.mode == 0o644)
+    #expect(after.flags == 0)
+    // Both requests reached the daemon: the refusal is the daemon's.
+    #expect(await daemon.stats().flagChangeRequests == 2)
 
-    // Nothing was even sent: the refusal happened before the frame was built.
-    #expect(await daemon.stats().flagChangeRequests == 0)
-
-    // Everything an old daemon DOES understand keeps working.
+    // Everything without a flags intent keeps working.
     let modeOnly = try await core.setattr(item: created.item, attributes: .init(mode: 0o600))
     #expect(modeOnly.mode == 0o600)
 }
