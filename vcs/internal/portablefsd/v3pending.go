@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -42,7 +41,6 @@ type v3PendingMetrics struct {
 
 type v3PendingReservation struct {
 	budget *v3PendingBudget
-	trace  v3RequestTrace
 }
 
 func newV3PendingBudget(limit int) *v3PendingBudget {
@@ -56,7 +54,6 @@ func (b *v3PendingBudget) signalLocked() {
 
 func (b *v3PendingBudget) reserve(ctx context.Context) (*v3PendingReservation, error) {
 	started := time.Now()
-	trace, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
 	b.mu.Lock()
 	waited := false
 	defer func() {
@@ -64,10 +61,7 @@ func (b *v3PendingBudget) reserve(ctx context.Context) (*v3PendingReservation, e
 			b.stats.Waiters--
 			b.stats.AdmissionWaitNS += uint64(time.Since(started))
 		}
-		count := len(b.active)
 		b.mu.Unlock()
-		trace.wait(lantrace.WaitReservation, time.Since(started))
-		trace.pending(count, b.limit)
 	}()
 	for {
 		if err := ctx.Err(); err != nil {
@@ -77,7 +71,7 @@ func (b *v3PendingBudget) reserve(ctx context.Context) (*v3PendingReservation, e
 			return nil, errV3ReleaseClosed
 		}
 		if len(b.active) < b.limit {
-			r := &v3PendingReservation{budget: b, trace: trace}
+			r := &v3PendingReservation{budget: b}
 			b.active[r] = struct{}{}
 			b.stats.Reserved++
 			b.stats.Peak = max(b.stats.Peak, len(b.active))
@@ -118,9 +112,7 @@ func (r *v3PendingReservation) retire() {
 	delete(b.active, r)
 	b.stats.Retired++
 	b.signalLocked()
-	count := len(b.active)
 	b.mu.Unlock()
-	r.trace.pending(count, b.limit)
 }
 
 // takeForTeardown explicitly owns all pending tokens and records, including
@@ -134,16 +126,9 @@ func (b *v3PendingBudget) takeForTeardown() {
 	b.closed = true
 	b.stats.Teardown += uint64(len(b.active))
 	b.stats.Retired += uint64(len(b.active))
-	traces := make([]v3RequestTrace, 0, len(b.active))
-	for r := range b.active {
-		traces = append(traces, r.trace)
-		delete(b.active, r)
-	}
+	clear(b.active)
 	b.signalLocked()
 	b.mu.Unlock()
-	for _, trace := range traces {
-		trace.pending(0, b.limit)
-	}
 }
 
 func (b *v3PendingBudget) metrics() v3PendingMetrics {
@@ -174,14 +159,12 @@ func (c *v3ReplyResourceCollector) retirePending() {
 
 // Duplicate capabilities never enter a disposition table. Their request keeps
 // its reservation while the same release owner accepts the redundant token.
-func (d *v3DataPlane) submitPendingRelease(ctx context.Context, closes, reclaims [][]byte) error {
+func (d *v3DataPlane) submitPendingRelease(closes, reclaims [][]byte) error {
 	started := time.Now()
 	err := d.releases.submit(closes, reclaims)
 	elapsed := time.Since(started)
 	d.pending.mu.Lock()
 	d.pending.stats.CleanupWaitNS += uint64(elapsed)
 	d.pending.mu.Unlock()
-	t, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
-	t.wait(lantrace.WaitReservation, elapsed)
 	return err
 }

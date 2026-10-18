@@ -24,24 +24,10 @@ const (
 	linuxENOTRECOVERABLE int32 = 131
 )
 
-// RPCObservation is one scalar request outcome for a nonblocking observer.
-type RPCObservation struct {
-	RequestID         uint64
-	Session           [16]byte
-	Operation         authoritymetrics.Operation
-	Outcome           authoritymetrics.Outcome
-	Started           time.Time
-	Duration          time.Duration
-	Errno             int32
-	CommittedSequence uint64
-	VisibleSequence   uint64
-	LookupFound       bool
-}
-
 // dispatchRequest instruments the single handler invocation for each accepted
-// request. With no metrics or observer it retains the direct-call cost.
+// request. With no metrics it retains the direct-call cost.
 func (s *Server) dispatchRequest(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
-	if s.Metrics == nil && s.OnRPC == nil {
+	if s.Metrics == nil {
 		return handleTransportRequest(s.Handler, ctx, request)
 	}
 	started := time.Now()
@@ -50,14 +36,7 @@ func (s *Server) dispatchRequest(ctx context.Context, request *authoritypb.Reque
 	operation := requestOperation(request)
 	outcome := responseOutcome(response)
 	s.Metrics.ObserveRPC(operation, outcome, elapsed)
-	if s.Metrics != nil {
-		s.logRPC(request, response, operation, outcome, elapsed)
-	}
-	if s.OnRPC != nil {
-		observation := RPCObservation{RequestID: request.GetRequestId(), Operation: operation, Outcome: outcome, Started: started, Duration: elapsed, Errno: response.GetErrno(), CommittedSequence: response.GetVolumeVersion(), VisibleSequence: response.GetVisibleSequence(), LookupFound: request.GetLookup() != nil && response.GetErrno() == 0 && response.GetLookup().GetItem() != nil}
-		copy(observation.Session[:], request.GetSession().GetId())
-		s.OnRPC(observation)
-	}
+	s.logRPC(request, response, operation, outcome, elapsed)
 	return response
 }
 

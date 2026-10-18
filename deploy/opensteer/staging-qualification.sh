@@ -643,14 +643,14 @@ not a clean result, it is a result the authority paid for:
   1. Session fencing and Linux withdrawal delays. A missing withdrawal
      acknowledgement delays a conflicting mutation until the old promised
      horizon ends or exact withdrawal is proved. Inspect the authority's admin
-     endpoint and the correlated request trace:
+     endpoint snapshots and the existing session logs:
 
        portablefs_authority_fence_events_total
        portablefs_authority_rpc_requests_total{outcome="coherence"}
 
-     Compare counter increments over this run with session and request trace
-     outcomes. A fence counter alone does not identify the cause or prove a
-     peer was too slow; retain the reason and exact session evidence.
+     Compare counter increments over the recorded observation windows with
+     session log outcomes. A fence counter alone does not identify the cause or
+     prove a peer was too slow; retain the reason and exact session evidence.
 
   2. Uncertain-outcome revocations. When the authority cannot establish the
      exact result of an operation, it reports uncertainty or ends the session

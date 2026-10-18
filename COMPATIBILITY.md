@@ -498,7 +498,7 @@ story.
 No stability promise, including in patch releases: Go package paths and layout
 under `vcs/`, Swift package internals under `swift/`, mount records,
 environment knobs not documented in this file or under [docs/](./docs/), test
-helpers, scripts, benchmark harnesses and their trace format, metric names not
+helpers, scripts, benchmark harnesses and their output formats, metric names not
 listed in the deployment guide, and documentation wording. The hosted Manager
 state, signed cell-plan schema, and helper state are internal formats with
 exact markers; their external outputs are listed above.

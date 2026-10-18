@@ -100,8 +100,7 @@ test/coherence/       The black-box cross-mount matrix and its driver commands
                       ../scripts/coherence-matrix-linux.sh.
 test/powerloss/       The dm-log-writes power-cut harness. Driven by
                       ../scripts/run-powerloss.sh.
-bench/                Measurement tools and the bounded correlated trace
-                      collector. See ../docs/performance.md.
+bench/                Measurement tools. See ../docs/performance.md.
 ```
 
 ## Build and test

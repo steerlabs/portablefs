@@ -71,7 +71,3 @@ is not yet qualified.
   blacklist of retired names.
 - Power-cut scenarios for the FSKit authority handler in the power-loss
   harness.
-- `vcs/bench/lantrace` and `pfs-lan-trace`, a bounded correlated diagnostic
-  trace for LAN workload attribution, with an allowlisted grammar, one
-  sequence rule for every producer, and a producer content rule that keeps
-  credentials and user content out.

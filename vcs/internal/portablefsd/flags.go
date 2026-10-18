@@ -33,8 +33,6 @@ func ParseFlags(version string) (Config, bool, bool) {
 	flag.StringVar(&cfg.ControlSocket, "control-socket", defaultControlSocket, "portablefsd control Unix socket")
 	flag.StringVar(&cfg.StateDir, "state-dir", defaultState, "portablefsd per-user state directory")
 	flag.StringVar(&cfg.MountLogDir, "mount-log-dir", "", "private per-mount log directory (defaults beside -state-dir)")
-	flag.StringVar(&cfg.TraceFile, "trace-file", "", "opt-in synthetic-workload LAN trace file (created exclusively)")
-	flag.StringVar(&cfg.TraceRun, "trace-run", "", "LAN trace run label shared by all producers (requires -trace-file)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	showIdentity := flag.Bool("identity-json", false, "print the stamped FSKit identity as JSON and exit")
 	flag.Parse()

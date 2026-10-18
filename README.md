@@ -293,8 +293,8 @@ handler; see [docs/power-loss-testing.md](./docs/power-loss-testing.md).
   the black-box behaviour matrix and its falsifiability controls.
 - [docs/power-loss-testing.md](./docs/power-loss-testing.md) — device-level
   power-cut evidence and what it does not claim.
-- [docs/performance.md](./docs/performance.md) — measurement method, the
-  correlated trace, and the LAN workload target.
+- [docs/performance.md](./docs/performance.md) — snapshot measurement method and the
+  LAN workload target.
 - [docs/agents.md](./docs/agents.md) — using a workspace from an agent.
 - [docs/open-after-unlink.md](./docs/open-after-unlink.md) and
   [docs/graft-security.md](./docs/graft-security.md) — two specific contracts

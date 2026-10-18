@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
@@ -20,11 +19,6 @@ import (
 )
 
 type Config struct {
-	// Trace is nil outside explicitly authorized diagnostic runs. Its owner
-	// drains it after serving has stopped, independently of mount teardown.
-	Trace            *lantrace.Recorder
-	TraceFile        string
-	TraceRun         string
 	FrontendSocket   string
 	ControlSocket    string
 	StateDir         string

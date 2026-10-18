@@ -2,19 +2,13 @@ import Foundation
 import os
 import Synchronization
 
-/// One record of the correlation trace for the measured LAN workload.
+/// One local Instruments signpost record, also exposed to the test observer.
 ///
-/// The trace joins an FSKit callback to the pfslocal requests it issued,
-/// their replies, ownership dispositions and publication verdicts, and its
-/// OPEN decisions by explicit labels, never by timing or thread:
-///
-/// - Request-bearing records join the daemon trace by frontend_pid,
-///   attach_ref, conn_role (the exact Hello client_name), and request_id.
-///   The connection UUID is a Swift-local label for callback/operation joins;
-///   it is never a cross-process join key.
-/// - Every FSKit callback carries a process-unique callback label. Its
-///   requests and OPEN decisions repeat that label, and the operation it binds
-///   is announced exactly once by a CallbackOperation record.
+/// Process-local labels connect FSKit callbacks with their pfslocal requests,
+/// replies, ownership dispositions, publication verdicts, and OPEN decisions.
+/// A CallbackOperation record binds each callback to its logical operation.
+/// These records provide no complete callback inventory, loss accounting, or
+/// cross-process correlation guarantee.
 ///
 /// Records carry labels, IDs, request kinds, errnos and access modes only: no
 /// names, contents or credentials.

@@ -15,7 +15,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
@@ -112,11 +111,12 @@ type v3ItemRecord struct {
 	watermark uint64
 	// mkdirWitness retains only the evaluated permission and exact committed
 	// snapshot; completeness consumes it only at an unsuperseded cut.
-	mkdirWitness    *v3MkdirWitness
-	complete        *v3DirectoryCertificate
-	certificateDrop lantrace.CertDrop
-	permissionCut   uint64
-	search          lantrace.SearchState
+	mkdirWitness  *v3MkdirWitness
+	complete      *v3DirectoryCertificate
+	permissionCut uint64
+	// Only proven permission at the current cut authorizes absence; unknown
+	// and denied both leave searchPermitted false.
+	searchPermitted bool
 }
 
 // v3MkdirWitness is the authority's evaluated observation at creation.
@@ -257,14 +257,10 @@ type v3DataPlane struct {
 	// means no usable proof.
 	// authorizationDeadline is the installed signed deadline, an additional
 	// wall-clock denial check (zero: none). All are protected by mu.
-	renewalMu  sync.Mutex
-	clock      func() (uint64, error)
-	clockFault error
-	horizon    uint64
-	// Diagnostics retain the winning proof's request start and the latest
-	// existing clock sample. Neither participates in cache permission.
-	horizonStart          uint64
-	clockSample           uint64
+	renewalMu             sync.Mutex
+	clock                 func() (uint64, error)
+	clockFault            error
+	horizon               uint64
 	authorizationDeadline time.Time
 
 	failOnce sync.Once
@@ -1323,7 +1319,7 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 	if err != nil {
 		return d.malformed("link " + err.Error())
 	}
-	if errno := d.adoptAlias(ctx, item, linked.GetItem()); errno != 0 {
+	if errno := d.adoptAlias(item, linked.GetItem()); errno != 0 {
 		return nil, errno
 	}
 	if err := d.applyMutation(effect); err != nil {
@@ -1510,7 +1506,7 @@ func (d *v3DataPlane) detachItemLocked(record *v3ItemRecord) {
 	}
 	record.binding = nil
 	d.forgetNamesLocked(record)
-	d.dropCompletenessLocked(record, lantrace.CertDropNamespaceCut)
+	d.dropCompletenessLocked(record)
 	for batchID, batch := range d.cookieBatches {
 		if batch.dirID == record.item.ItemID {
 			d.removeCookieBatchLocked(batchID)
@@ -2017,7 +2013,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item) (
 	collector.items = append(collector.items, record)
 	d.mu.Unlock()
 	if duplicate {
-		if err := d.submitPendingRelease(ctx, nil, [][]byte{parsed.token}); err != nil {
+		if err := d.submitPendingRelease(nil, [][]byte{parsed.token}); err != nil {
 			return nil, darwinEIO
 		}
 	}
@@ -2029,7 +2025,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item) (
 // must still be the one the callback named; the capability is either that
 // record's own or a duplicate the release owner retires. The new binding is
 // part of the mutation's cache application, not of adoption.
-func (d *v3DataPlane) adoptAlias(ctx context.Context, item *v3ItemRecord, linked *authoritypb.Item) int32 {
+func (d *v3DataPlane) adoptAlias(item *v3ItemRecord, linked *authoritypb.Item) int32 {
 	parsed, err := d.recordFromAuthority(linked, 0)
 	if err != nil {
 		_, errno := d.malformed(err.Error())
@@ -2045,7 +2041,7 @@ func (d *v3DataPlane) adoptAlias(ctx context.Context, item *v3ItemRecord, linked
 	duplicate := !bytes.Equal(item.token, parsed.token)
 	d.mu.Unlock()
 	if duplicate {
-		if err := d.submitPendingRelease(ctx, nil, [][]byte{parsed.token}); err != nil {
+		if err := d.submitPendingRelease(nil, [][]byte{parsed.token}); err != nil {
 			return darwinEIO
 		}
 	}
@@ -2551,7 +2547,6 @@ func (cleanup *v3ResourceCleanup) finish() error {
 				r.budget.mu.Lock()
 				r.budget.stats.CleanupWaitNS += uint64(elapsed)
 				r.budget.mu.Unlock()
-				r.trace.wait(lantrace.WaitReservation, elapsed)
 				r.retire()
 			}
 		}()
@@ -2734,7 +2729,7 @@ func (d *v3DataPlane) recordTerminal(err error) {
 		d.terminal = err
 		d.horizon = 0
 		for _, record := range d.itemsByID {
-			d.dropCompletenessLocked(record, lantrace.CertDropTerminal)
+			d.dropCompletenessLocked(record)
 		}
 		d.mu.Unlock()
 		// Session cleanup, not item-by-item replay, owns every release this
@@ -2858,7 +2853,6 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	candidate, usable := v3HorizonCandidate(start, proof)
 	if usable && d.clockFault == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
 		d.horizon = candidate
-		d.horizonStart = start
 	}
 	d.mu.Unlock()
 	if nowErr != nil {
@@ -2882,7 +2876,6 @@ func (d *v3DataPlane) readClockLocked() (uint64, error) {
 		d.horizon = 0
 		return 0, err
 	}
-	d.clockSample = now
 	return now, nil
 }
 

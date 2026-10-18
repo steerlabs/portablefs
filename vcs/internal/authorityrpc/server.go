@@ -169,9 +169,6 @@ type Server struct {
 	// OnServing observes the lifetime of the validated TLS accept loop. It is
 	// used by readiness only and must be nonblocking.
 	OnServing func(bool)
-	// OnRPC receives one scalar observation per accepted transport request.
-	// A trace collector must use bounded, nonblocking admission and count drops.
-	OnRPC func(RPCObservation)
 
 	budget          *frameBudget
 	frameBudgetOnce sync.Once

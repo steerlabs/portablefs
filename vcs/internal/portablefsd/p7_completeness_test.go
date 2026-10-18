@@ -5,13 +5,11 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
@@ -70,7 +68,7 @@ func TestP7MkdirWitnessAndDeterministicCallReduction(t *testing.T) {
 		dir := p7Mkdir(t, f, "dir")
 		// Test-only ablation; the product has no cache-feature selector.
 		f.d.mu.Lock()
-		f.d.dropCompletenessLocked(dir, lantrace.CertDropNamespaceCut)
+		f.d.dropCompletenessLocked(dir)
 		f.d.mu.Unlock()
 		before := f.authorityCalls()
 		for i := range 64 {
@@ -142,7 +140,7 @@ func TestP7PermissionWitnessDenialAndSearchOnly(t *testing.T) {
 						t.Fatalf("denied lookup=%d", errno)
 					}
 				})
-				if dir.search != lantrace.SearchDenied {
+				if dir.searchPermitted {
 					t.Fatal("failed Lookup manufactured permission")
 				}
 			}
@@ -179,7 +177,7 @@ func TestP7DelayedMkdirCannotEraseNewerChild(t *testing.T) {
 	if errno := <-done; errno != 0 {
 		t.Fatal(errno)
 	}
-	if dir.complete != nil || dir.search == lantrace.SearchPermitted {
+	if dir.complete != nil || dir.searchPermitted {
 		t.Fatal("delayed mkdir installed empty/search knowledge")
 	}
 	_, _ = f.d.bridge.acknowledgePublication(testCallback(op), pfslocal.PublicationSemanticCommitPublished)
@@ -378,7 +376,7 @@ func TestP7PermissionABARejectsOldLookupAndMkdir(t *testing.T) {
 			}
 			// Force a real old Lookup, then hold its stamped-negative response.
 			f.d.mu.Lock()
-			dir.search = lantrace.SearchDenied
+			dir.searchPermitted = false
 			f.d.mu.Unlock()
 			sampled, release := make(chan struct{}), make(chan struct{})
 			f.ns.hold = func(req *authoritypb.Request, _ *authoritypb.Response) {
@@ -410,7 +408,7 @@ func TestP7PermissionABARejectsOldLookupAndMkdir(t *testing.T) {
 			}
 			f.d.mu.Lock()
 			canSeed := f.d.mkdirSeedEligibleLocked(&v3MutationEffect{snapshot: old, mkdir: dir, mkdirWitness: dir.mkdirWitness})
-			bad := canSeed || dir.complete != nil || dir.search == lantrace.SearchPermitted || len(dir.negatives) != 0 || dir.permissionCut != old+2
+			bad := canSeed || dir.complete != nil || dir.searchPermitted || len(dir.negatives) != 0 || dir.permissionCut != old+2
 			f.d.mu.Unlock()
 			if bad {
 				t.Fatal("permission ABA resurrected old lookup or MKDIR knowledge")
@@ -437,10 +435,10 @@ func TestP7ConservativeVersionInflationPreservesFacts(t *testing.T) {
 	p7Members(t, f.d, dir, "member")
 	p7Absence(t, f, dir, "absent", true)
 	f.d.mu.Lock()
-	dir.search = lantrace.SearchDenied
+	dir.searchPermitted = false
 	err = f.d.observeLocked(dir, dir.attr, 101, 101)
 	f.d.mu.Unlock()
-	if err != nil || dir.search != lantrace.SearchDenied {
+	if err != nil || dir.searchPermitted {
 		t.Fatal("inflation granted search")
 	}
 }
@@ -458,6 +456,65 @@ func TestP7SetattrPermissionIntentDropsEvenEqualAttributes(t *testing.T) {
 	p7Absence(t, f, dir, "unseen", false)
 }
 
+// p7WireAbsence exercises dispatch, final exposure, and status accounting over
+// a real reply writer. The callback is acknowledged before closing its socket.
+func p7WireAbsence(t *testing.T, f *cachedV3Fixture, dir *v3ItemRecord, name string) {
+	t.Helper()
+	a := &attach{ref: "p7", v3Data: f.d, v3Coherence: f.d.bridge}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{origin: 1, conn: server, attach: a}
+	defer c.close()
+	op := 30_000 + testV3OperationID.Add(1)
+	initialize, ok := c.reserveLogicalOperation(op, true)
+	if !initialize || !ok {
+		t.Fatal("reserve callback")
+	}
+	f.d.bridge.reserveFrontendPublication(testCallback(op))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.handleV3Attached(t.Context(), a, 1, op, true, &pfslocal.LookupRequest{Dir: dir.item, Name: []byte(name)})
+	}()
+	envelope, err := pfslocal.ReadFrame(peer)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, ok := envelope.Body.(*pfslocal.ErrorReply)
+	if !ok || reply.Errno != darwinENOENT {
+		t.Fatalf("absence reply=%+v", envelope)
+	}
+	if _, err := f.d.bridge.acknowledgePublication(testCallback(op), pfslocal.PublicationSemanticCommitPublished); err != nil {
+		t.Fatal(err)
+	}
+	if !c.acknowledgePublication(op) {
+		t.Fatal("callback acknowledgement refused")
+	}
+}
+
+func p7LookupDelta(t *testing.T, before, after *v3CacheMetrics, reason, polarity string) {
+	t.Helper()
+	for name, count := range after.Lookup {
+		want := uint64(0)
+		if name == reason {
+			want = 1
+		}
+		if got := count - before.Lookup[name]; got != want {
+			t.Errorf("lookup %s delta=%d, want %d", name, got, want)
+		}
+	}
+	for name, count := range after.LookupPolarity {
+		want := uint64(0)
+		if name == polarity {
+			want = 1
+		}
+		if got := count - before.LookupPolarity[name]; got != want {
+			t.Errorf("polarity %s delta=%d, want %d", name, got, want)
+		}
+	}
+}
+
 func TestP7ActiveSourceConflictAndSettledSourceRescueCountOnce(t *testing.T) {
 	f := newCachedV3Fixture(t, v3FileObjects())
 	dir := p7Mkdir(t, f, "dir")
@@ -469,64 +526,44 @@ func TestP7ActiveSourceConflictAndSettledSourceRescueCountOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p7Absence(t, f, dir, "held", false)
+	before, calls := f.d.cacheMetrics(), f.authorityCalls()
+	p7WireAbsence(t, f, dir, "held")
+	if f.authorityCalls() != calls+1 {
+		t.Fatal("active source did not require exactly one authority lookup")
+	}
+	p7LookupDelta(t, before, f.d.cacheMetrics(), "held", "negative")
 	if err := lease.resolveNoBindings(gate); err != nil {
 		t.Fatal(err)
 	}
 	lease.finishRequest()
 	// No PublicationAck yet: settled source holds must not block completeness.
-	p7Absence(t, f, dir, "settled", true)
+	before, calls = f.d.cacheMetrics(), f.authorityCalls()
+	p7WireAbsence(t, f, dir, "settled")
+	if f.authorityCalls() != calls {
+		t.Fatal("settled source blocked completeness")
+	}
+	p7LookupDelta(t, before, f.d.cacheMetrics(), "hit", "negative")
 	// Record a real source absence, making both caches able to rescue it.
 	if err := f.d.applyMutation(&v3MutationEffect{snapshot: dir.watermark + 1, namesComplete: true,
 		names: []v3NameEffect{{parent: dir, name: "both"}}}); err != nil {
 		t.Fatal(err)
 	}
-	var stream bytes.Buffer
-	r := p6Recorder(t, &stream, lantrace.LayerDaemon, lantrace.RecorderConfig{})
-	trace := v3RequestTrace{FrontendPID: os.Getpid(), AttachRef: "p7", ConnRole: "fskit", RequestID: 1, Origin: 1, localOp: lantrace.LocalLookup, recorder: r}
-	ctx := context.WithValue(context.Background(), v3RequestTraceContextKey{}, trace)
-	collector := &v3ReplyResourceCollector{d: f.d}
-	reply, errno := f.d.dispatchFrontend(context.WithValue(ctx, v3ReplyResourceContextKey{}, collector), 0,
-		&pfslocal.LookupRequest{Dir: dir.item, Name: []byte("both")})
-	if reply != nil || errno != darwinENOENT || collector.cached == nil {
-		t.Fatalf("both caches = (%v,%d)", reply, errno)
+	before, calls = f.d.cacheMetrics(), f.authorityCalls()
+	p7WireAbsence(t, f, dir, "both")
+	if f.authorityCalls() != calls {
+		t.Fatal("cached absence reached authority")
 	}
-	if !collector.cached.revalidate() {
-		t.Fatal("candidate refused")
-	}
-	collector.cached.traceFinal(trace, true)
-	collector.retirePending()
-	consumeV3ResponseConsumptions(collector.responseConsumptions)
-	if err := r.Close(); err != nil {
-		t.Fatal(err)
-	}
-	report := p6TraceReport(t, stream.Bytes())
-	if report.ProducerLost != 0 || report.Rejected != 0 {
-		t.Fatalf("trace=%+v", report)
-	}
-	count := 0
-	for _, e := range p6TraceEvents(t, stream.Bytes()) {
-		if e.Kind == lantrace.KindCache && e.Phase == lantrace.PhaseFinal {
-			count++
-			if e.Candidate != lantrace.CandidateEntryCache || e.Cert != lantrace.CertPresent || e.Exposure != lantrace.ExposureAccepted {
-				t.Fatalf("double-source attribution=%+v", e)
-			}
-		}
-	}
-	if count != 1 {
-		t.Fatalf("rescues=%d", count)
-	}
+	p7LookupDelta(t, before, f.d.cacheMetrics(), "hit", "negative")
 	_, _ = coordinator.acknowledge(testCallback(op), pfslocal.PublicationSemanticCommitPublished)
 	coordinator.retire(testCallback(op))
 }
 
-func TestP7TraceRecordsCertificateAbsenceDropsAndSearchDenial(t *testing.T) {
+func TestP7CertificateAbsenceDropsAndSearchDenial(t *testing.T) {
 	for _, kind := range []string{"absent", "permission", "namespace", "denied"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newCachedV3Fixture(t, v3FileObjects())
 			var dir *v3ItemRecord
-			cert, drop, search := lantrace.CertAbsent, lantrace.CertDrop(""), lantrace.SearchUnknown
-			miss := lantrace.MissUnknownName
+			miss := "unknown_name"
 			if kind == "absent" {
 				f.getattr(f.root)
 				dir = f.record(f.root)
@@ -544,41 +581,21 @@ func TestP7TraceRecordsCertificateAbsenceDropsAndSearchDenial(t *testing.T) {
 					f.d.mu.Lock()
 					f.d.permissionChangedLocked(dir, dir.watermark+1)
 					f.d.mu.Unlock()
-					cert, drop = lantrace.CertDropped, lantrace.CertDropPermissionCut
 				case "namespace":
 					f.d.settleNameErrno(dir, []byte("unseen"), darwinEEXIST)
-					cert, drop = lantrace.CertDropped, lantrace.CertDropNamespaceCut
 				case "denied":
-					cert, search, miss = lantrace.CertPresent, lantrace.SearchDenied, lantrace.MissSearchPermission
+					miss = "search_permission"
 				}
 			}
-			var stream bytes.Buffer
-			r := p6Recorder(t, &stream, lantrace.LayerDaemon, lantrace.RecorderConfig{})
-			trace := v3RequestTrace{FrontendPID: os.Getpid(), AttachRef: "p7", ConnRole: "fskit", RequestID: 1, Origin: 1, localOp: lantrace.LocalLookup, recorder: r}
-			ctx := context.WithValue(context.Background(), v3RequestTraceContextKey{}, trace)
-			if _, errno := dispatchV3Test(f.d, ctx, 0, &pfslocal.LookupRequest{Dir: dir.item, Name: []byte("unseen")}); errno != darwinENOENT {
-				t.Fatal(errno)
+			if (dir.complete != nil) != (kind == "denied") || dir.searchPermitted {
+				t.Fatal("certificate or permission survived denial/drop")
 			}
-			if err := r.Close(); err != nil {
-				t.Fatal(err)
+			before, calls := f.d.cacheMetrics(), f.authorityCalls()
+			p7WireAbsence(t, f, dir, "unseen")
+			if f.authorityCalls() != calls+1 {
+				t.Fatal("missing certificate or permission did not reach authority once")
 			}
-			report := p6TraceReport(t, stream.Bytes())
-			if report.Rejected != 0 || report.ProducerLost != 0 {
-				t.Fatalf("trace=%+v", report)
-			}
-			count := 0
-			for _, e := range p6TraceEvents(t, stream.Bytes()) {
-				if e.Kind != lantrace.KindCache {
-					continue
-				}
-				count++
-				if e.Cert != cert || e.CertDrop != drop || e.Search != search || e.MissReason != miss || e.CacheResult != lantrace.CacheMiss {
-					t.Fatalf("decision=%+v", e)
-				}
-			}
-			if count != 2 {
-				t.Fatalf("candidate/final records=%d", count)
-			}
+			p7LookupDelta(t, before, f.d.cacheMetrics(), miss, "negative")
 		})
 	}
 }
@@ -633,7 +650,7 @@ func TestP7LookupErrnoDropsThroughHandler(t *testing.T) {
 	p7Absence(t, f, dir, "member", false)
 	f.d.mu.Lock()
 	discarded := dir.complete == nil && f.d.completeDirs == 0 && f.d.completeNames == 0 && f.d.completeBytes == 0 &&
-		dir.certificateDrop == lantrace.CertDropNamespaceCut && dir.search == lantrace.SearchUnknown
+		!dir.searchPermitted
 	f.d.mu.Unlock()
 	if !discarded {
 		t.Fatal("Lookup definite ENOENT retained contradictory certificate or its accounting")
@@ -641,39 +658,22 @@ func TestP7LookupErrnoDropsThroughHandler(t *testing.T) {
 	p7Absence(t, f, dir, "fresh", false)
 }
 
-func TestP7KnownMemberTraceCoordinate(t *testing.T) {
-	f := newCachedV3Fixture(t, v3FileObjects())
-	dir := p7Mkdir(t, f, "dir")
-	p7Create(t, f, dir, "member")
-	f.d.mu.Lock()
-	f.d.dropNameLocked(dir, "member")
-	e := f.d.cacheDecisionLocked(1, dir, "member", v3CacheResource)
-	f.d.mu.Unlock()
-	if e.Coordinate != lantrace.CoordinateRepeated || e.Candidate != lantrace.CandidateCompleteness || e.MissReason != lantrace.MissResource {
-		t.Fatalf("retained member decision=%+v", e)
-	}
-}
-
-func TestP7ProofTraceAdmission(t *testing.T) {
+func TestP7ProofAdmission(t *testing.T) {
 	for _, test := range []struct {
 		name          string
 		elapsed       time.Duration
 		authorization bool
 		absent        bool
 		result        v3CacheResult
-		proof         lantrace.ProofState
-		age           lantrace.Nanos
 	}{
-		{name: "aged-live", elapsed: 2 * time.Second, result: v3CacheHit, proof: lantrace.ProofValid, age: lantrace.Nanos(2 * time.Second)},
-		{name: "authorization", elapsed: 2 * time.Second, authorization: true, result: v3CacheAuthorization, proof: lantrace.ProofValid, age: lantrace.Nanos(2 * time.Second)},
-		{name: "simultaneous-expiry", elapsed: 10 * time.Minute, authorization: true, result: v3CacheAuthorization, proof: lantrace.ProofExpired, age: lantrace.Nanos(10 * time.Minute)},
-		{name: "horizon", elapsed: 10 * time.Minute, result: v3CacheHorizon, proof: lantrace.ProofExpired, age: lantrace.Nanos(10 * time.Minute)},
-		{name: "absent", elapsed: 2 * time.Second, absent: true, result: v3CacheHorizon, proof: lantrace.ProofAbsent},
-		{name: "bounded-age", elapsed: time.Duration(lantrace.MaxNanos) + time.Second, result: v3CacheHorizon, proof: lantrace.ProofExpired, age: lantrace.MaxNanos},
+		{name: "aged-live", elapsed: 2 * time.Second, result: v3CacheHit},
+		{name: "authorization", elapsed: 2 * time.Second, authorization: true, result: v3CacheAuthorization},
+		{name: "simultaneous-expiry", elapsed: 10 * time.Minute, authorization: true, result: v3CacheAuthorization},
+		{name: "horizon", elapsed: 10 * time.Minute, result: v3CacheHorizon},
+		{name: "absent", elapsed: 2 * time.Second, absent: true, result: v3CacheHorizon},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newCachedV3Fixture(t, v3FileObjects())
-			dir := p7Mkdir(t, f, "dir")
 			f.clock.advance(test.elapsed)
 			f.d.mu.Lock()
 			if test.authorization {
@@ -683,10 +683,9 @@ func TestP7ProofTraceAdmission(t *testing.T) {
 				f.d.horizon = 0
 			}
 			result := f.d.cacheAdmissionLocked()
-			e := f.d.cacheDecisionLocked(1, dir, "fresh", result)
 			f.d.mu.Unlock()
-			if result != test.result || e.Proof != test.proof || e.ProofAge != test.age {
-				t.Fatalf("admission=%v proof=%s age=%d, want %v/%s/%d", result, e.Proof, e.ProofAge, test.result, test.proof, test.age)
+			if result != test.result {
+				t.Fatalf("admission=%v, want %v", result, test.result)
 			}
 		})
 	}
@@ -778,7 +777,7 @@ func TestP7EveryCompletenessLimit(t *testing.T) {
 				}
 				f.d.mu.Unlock()
 				other := p7Mkdir(t, f, "overflow")
-				if other.complete != nil || other.certificateDrop != lantrace.CertDropCapacity || f.d.completeDirs != v3MaxCompleteDirs {
+				if other.complete != nil || f.d.completeDirs != v3MaxCompleteDirs {
 					t.Fatal("directory bound")
 				}
 				p7Absence(t, f, other, "new", false)
@@ -812,7 +811,7 @@ func TestP7EveryCompletenessLimit(t *testing.T) {
 			if err := f.d.applyMutation(&v3MutationEffect{snapshot: uint64(limit) + 4, namesComplete: true, names: []v3NameEffect{{parent: dir, name: "overflow", bound: true}}}); err != nil {
 				t.Fatal(err)
 			}
-			if dir.complete != nil || f.d.completeNames != 0 || f.d.completeBytes != 0 || f.d.completeDirs != 0 || dir.certificateDrop != lantrace.CertDropCapacity {
+			if dir.complete != nil || f.d.completeNames != 0 || f.d.completeBytes != 0 || f.d.completeDirs != 0 {
 				t.Fatal("overflow retained certificate accounting")
 			}
 			p7Absence(t, f, dir, "new", false)
@@ -820,14 +819,12 @@ func TestP7EveryCompletenessLimit(t *testing.T) {
 	}
 }
 
-func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
+func TestP7FinalExposureCountsOnce(t *testing.T) {
 	for _, kind := range []string{"exposed", "expiry", "authorization", "authorization-expiry", "retirement", "overlapping-effect", "write-failure"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newCachedV3Fixture(t, v3FileObjects())
 			dir := p7Mkdir(t, f, "dir")
 			f.clock.advance(2 * time.Second)
-			var stream bytes.Buffer
-			r := p6Recorder(t, &stream, lantrace.LayerDaemon, lantrace.RecorderConfig{})
 			a := &attach{ref: "p7", v3Data: f.d, v3Coherence: f.d.bridge}
 			server, peer := net.Pipe()
 			defer peer.Close()
@@ -868,9 +865,8 @@ func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			trace := v3RequestTrace{FrontendPID: os.Getpid(), AttachRef: "p7", ConnRole: "fskit", RequestID: 1, OperationID: op, Origin: 1, localOp: lantrace.LocalLookup, recorder: r}
-			ctx = context.WithValue(ctx, v3RequestTraceContextKey{}, trace)
 			before := f.authorityCalls()
+			metrics := f.d.cacheMetrics()
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
@@ -885,59 +881,25 @@ func TestP7FinalExposureAndTraceAttribution(t *testing.T) {
 			} else if err != nil || envelope.Body.(*pfslocal.ErrorReply).Errno != darwinENOENT {
 				t.Fatalf("reply=%+v err=%v", envelope, err)
 			}
-			if (kind == "exposed" || kind == "overlapping-effect") && f.authorityCalls() != before || (kind == "expiry" || kind == "authorization" || kind == "authorization-expiry") && f.authorityCalls() != before+1 {
-				t.Fatal("wrong authority retry count")
+			calls := 0
+			reason, polarity := "hit", "negative"
+			switch kind {
+			case "expiry":
+				calls, reason = 1, "horizon"
+			case "authorization", "authorization-expiry":
+				calls, reason = 1, "authorization"
+			case "retirement":
+				reason, polarity = "resource", "error"
+			case "write-failure":
+				reason, polarity = "terminal", "error"
 			}
+			if got := f.authorityCalls() - before; got != calls {
+				t.Fatalf("authority calls=%d, want %d", got, calls)
+			}
+			p7LookupDelta(t, metrics, f.d.cacheMetrics(), reason, polarity)
 			if kind != "retirement" && kind != "write-failure" {
 				_, _ = f.d.bridge.acknowledgePublication(testCallback(op), pfslocal.PublicationSemanticCommitPublished)
 				_ = c.acknowledgePublication(op)
-			}
-			if err := r.Close(); err != nil {
-				t.Fatal(err)
-			}
-			report := p6TraceReport(t, stream.Bytes())
-			if report.ProducerLost != 0 || report.Rejected != 0 || report.InconsistentStreams != 0 {
-				t.Fatalf("trace=%+v", report)
-			}
-			candidates, finals, accepted := 0, 0, 0
-			for _, e := range p6TraceEvents(t, stream.Bytes()) {
-				if e.Kind != lantrace.KindCache {
-					continue
-				}
-				if e.Candidate != lantrace.CandidateCompleteness || e.Cert != lantrace.CertPresent || e.Search != lantrace.SearchPermitted {
-					t.Fatalf("decision=%+v", e)
-				}
-				if e.Phase == lantrace.PhaseCandidate {
-					candidates++
-					if e.Proof != lantrace.ProofValid || e.ProofAge != lantrace.Nanos(2*time.Second) {
-						t.Fatalf("aged live candidate=%+v", e)
-					}
-				} else {
-					finals++
-					proof, age := lantrace.ProofValid, lantrace.Nanos(2*time.Second)
-					miss := lantrace.MissReason("")
-					switch kind {
-					case "expiry":
-						proof, age, miss = lantrace.ProofExpired, lantrace.Nanos(2*time.Second+10*time.Minute), lantrace.MissHorizon
-					case "authorization-expiry":
-						proof, age, miss = lantrace.ProofExpired, lantrace.Nanos(2*time.Second+10*time.Minute), lantrace.MissAuthorization
-					case "authorization":
-						miss = lantrace.MissAuthorization
-					}
-					if kind != "retirement" && kind != "write-failure" && (e.Proof != proof || e.ProofAge != age || e.MissReason != miss) {
-						t.Fatalf("final proof decision=%+v, want %s/%d/%s", e, proof, age, miss)
-					}
-					if e.Exposure == lantrace.ExposureAccepted {
-						accepted++
-					}
-				}
-			}
-			wantAccepted := 0
-			if kind == "exposed" || kind == "overlapping-effect" {
-				wantAccepted = 1
-			}
-			if candidates != 1 || finals != 1 || accepted != wantAccepted {
-				t.Fatalf("candidate/final/exposed=%d/%d/%d", candidates, finals, accepted)
 			}
 		})
 	}

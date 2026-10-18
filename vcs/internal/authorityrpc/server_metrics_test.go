@@ -1,8 +1,10 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,36 +60,51 @@ func BenchmarkDispatchInstrumentation(b *testing.B) {
 	}
 }
 
-func TestRPCObservationWithoutMetrics(t *testing.T) {
-	request := &authoritypb.Request{RequestId: 17, Session: &authoritypb.SessionProof{Id: []byte{1}}, Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
-	handler := &benchmarkDispatchHandler{response: &authoritypb.Response{RequestId: 17}}
-	var observations []RPCObservation
-	server := &Server{Handler: handler, OnRPC: func(o RPCObservation) { observations = append(observations, o) }}
-	if response := server.dispatchRequest(t.Context(), request); response != handler.response {
-		t.Fatal("observation replaced the handler reply")
-	}
-	if len(observations) != 1 || observations[0].RequestID != 17 || observations[0].Session[0] != 1 || observations[0].Operation != authoritymetrics.OperationKeepAlive || observations[0].Started.IsZero() || observations[0].Duration < 0 {
-		t.Fatalf("missing correlated request observation: %v", observations)
-	}
+type countingDispatchHandler struct {
+	benchmarkDispatchHandler
+	calls int
 }
 
-func TestRPCLookupObservationPolarity(t *testing.T) {
+func (h *countingDispatchHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	h.calls++
+	return h.benchmarkDispatchHandler.Handle(ctx, request)
+}
+
+func TestDispatchRecordsCompletedHandlerOnce(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		response *authoritypb.Response
-		found    bool
+		outcome  string
 	}{
-		{"positive", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: &authoritypb.Item{}}}}, true},
-		{"negative", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: 7}}}, false},
-		{"error", &authoritypb.Response{Errno: 13}, false},
+		{"positive", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: &authoritypb.Item{}}}}, "success"},
+		{"stamped-negative", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: 7}}}, "success"},
+		{"permission", &authoritypb.Response{Errno: 13}, "permission"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var observed RPCObservation
-			server := &Server{Handler: &benchmarkDispatchHandler{response: tc.response}, OnRPC: func(o RPCObservation) { observed = o }}
+			metrics, err := authoritymetrics.New("dispatch-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := &countingDispatchHandler{benchmarkDispatchHandler: benchmarkDispatchHandler{response: tc.response}}
+			server := &Server{Handler: handler, Metrics: metrics}
 			request := &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}
-			server.dispatchRequest(t.Context(), request)
-			if observed.Operation != authoritymetrics.OperationLookup || observed.LookupFound != tc.found {
-				t.Fatalf("observation=%+v, want found=%v", observed, tc.found)
+			if response := server.dispatchRequest(t.Context(), request); response != handler.response {
+				t.Fatal("dispatch replaced the handler reply")
+			}
+			if handler.calls != 1 {
+				t.Fatalf("handler invocations=%d, want 1", handler.calls)
+			}
+			var rendered bytes.Buffer
+			if err := metrics.Registry().WritePrometheus(&rendered); err != nil {
+				t.Fatal(err)
+			}
+			for _, sample := range []string{
+				`portablefs_authority_rpc_requests_total{volume="dispatch-test",opcode="lookup",outcome="` + tc.outcome + `"} 1`,
+				`portablefs_authority_rpc_duration_seconds_count{volume="dispatch-test",opcode="lookup"} 1`,
+			} {
+				if !strings.Contains(rendered.String(), sample+"\n") {
+					t.Errorf("missing completed invocation: %s", sample)
+				}
 			}
 		})
 	}

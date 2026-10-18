@@ -10,7 +10,8 @@ git history holds them.
 The acceptance workload is unchanged: an initial Git add of 1,200 files through
 a macOS mount over a LAN, inside its original 120-second subprocess deadline,
 followed by subsequent commits, `git fsck`, a clean status, the full workload,
-and integrity checks. Missing the deadline is reported with its measured cause.
+and integrity checks. A missed deadline stays a failure; report elapsed time
+and measured aggregates, with causal attribution unresolved.
 It is never met by deferring durability, guessing an OPEN success, widening the
 deadline, changing the corpus, or adding Git-specific routing.
 
@@ -65,81 +66,105 @@ diagnostic size or a same-N, different-D corpus is needed.
 Elapsed time also depends on serialization, overlap, per-operation service
 time, and durability cost. About 2,655 handleless durability barriers would make
 each additional millisecond of non-overlapped barrier latency cost about 2.7
-seconds; that count and the lack of overlap need trace confirmation. On a
+seconds; neither that count nor the lack of overlap has been established. On a
 shared cell, `syncfs` cost depends on other projects' dirty data, so mean and
 tail both need measuring. The earlier 95–120-second planning range is
 withdrawn.
 
-## Correlated trace
+## Snapshot measurement
 
-Attribution comes from an explicit opt-in, bounded diagnostic trace, not from
-aggregate counters alone. `vcs/bench/lantrace` defines the stream and
-`vcs/bench/cmd/pfs-lan-trace` collects, reports, and reconciles it:
+The next LAN qualification uses elapsed subprocess time, the authority's existing
+Prometheus metrics, and the daemon's per-attach metadata-cache and reservation
+counters. This needs no service mode, installed plist edit, replacement daemon,
+new environment variable, control operation, or process exit. Verify the paired
+signed artifact and live service through the normal qualification procedure,
+recording artifact revisions, configuration, and process-start witnesses for
+both the daemon and the authority worker.
 
-- Each producer process (Swift frontend, Go daemon, authority, Linux client)
-  writes one JSON Lines stream: a header naming the run, layer, and process, a
-  bounded sequence of events with per-process monotonic timestamps, and a
-  trailer with emitted and lost counts. A stream without its trailer is
-  incomplete.
-- Every producer follows one sequence rule: each event it accepts consumes the
-  next sequence number whether it is written or lost, so every gap in a
-  stream's numbers is a counted loss. The collector flags a stream whose
-  numbers do not reconcile with its trailer, and the report refuses a
-  collection whose sequence history is internally inconsistent.
-- The grammar admits only allowlisted keys, enumerated categories, short
-  opaque labels and exact trace identifiers from a restricted alphabet,
-  bounded integers, and raw names as bounded hex. That excludes free-text fields; it does not establish where a
-  value came from. Keeping tokens, credentials, capabilities, file contents,
-  pointers, and arbitrary user paths out of the trace, and emitting raw names
-  only for the authorized synthetic corpus, is a content rule each producer
-  must enforce at its emission sites.
-- Producers emit through a bounded queue and byte budget that never block the
-  filesystem path; overflow increments the lost count. The collector merges one
-  run's streams into a bounded output and keeps bounded correlation state.
-- Daemon requests join authority turns by session label and authority request
-  ID. Every request-bearing frontend and daemon record carries `frontend_pid`
-  (the extension PID; the daemon reads it from the accepted socket's peer),
-  `attach_ref` from Resolve, `conn_role` equal to Hello's exact `client_name`,
-  and `request_id`. The analyzer derives the cross-process key from
-  `(run, frontend_pid, attach_ref, conn_role, request_id)`. Each producer's
-  `conn` stays local: a Swift UUID or a daemon origin counter, encoded as a
-  string and scoped by its producer stream. No diagnostic wire exchange is
-  needed, and those local IDs need not agree.
-- A bounded whole-run inventory (at most 256 tuples, never evicted) must prove
-  exactly one connection per producer for each PID/attach/role tuple. Duplicate
-  same-role connections, PID reuse in another process stream, a connection
-  changing its binding, pre-bind attempts, missing fields or inventory overflow
-  make the frontend/daemon join unavailable, with zero matches claimed even
-  for earlier candidates. These fields must appear on non-anchor request
-  records too. The pending-anchor join window remains bounded at 65,536 by
-  default. Matching anchors must agree on operation and on mount when both
-  provide one. Cross-host clocks are never subtracted.
-- The report separates candidate from exposed cache hits, positive from
-  stamped-negative Lookups, OPEN reasons (first open, expansion, reopen after
-  final close, directory cursor, CREATE description reuse) with emitted versus
-  avoided RPCs, barrier kind and syscall latency, coalesced waiters, reservation
-  and callback-window pressure, and close/reclaim batch counts versus released
-  tokens. Any lost, rejected, incomplete, inconsistent, evicted, unmatched,
-  unqualified, or conflicting record marks exact attribution invalid for the
-  run; it says nothing about filesystem correctness.
+Read `GET /v2/attaches/{attachRef}` over the existing private daemon control
+socket with `X-PortableFS-Control-Protocol: 2`. Retain the expected attach and
+volume identities and `metadataCache`. Scrape the authority worker's existing
+loopback admin `GET /metrics` through the authorized lab connection.
 
-The current diagnostic grammar is `pfs-lan-trace-2`; it replaces the previous
-unshipped grammar and has no alternate decoder. The trace format is internal
-and may change without notice. Producer
-instrumentation belongs to each component and is not yet complete.
+For each measured subprocess, collect both before snapshots before launch,
+time the subprocess with the harness's monotonic clock, and collect both after
+snapshots after exit or deadline handling. Record each scrape's start and end:
+the observations have separate windows, with no atomic cross-process cut.
+Keep setup, initial add, subsequent commits, integrity checks, and unmount as
+separate phases. Finish the live-attach snapshot before unmount removes the
+data plane; collect authority cleanup deltas and actual unmount/inventory
+outcomes separately. Do not insert syncs, remounts, or sleeps to manufacture a
+measurement boundary.
 
-Run order: the unchanged 32-file probe and a diagnostic 256-file probe with
-opcode breakdowns, a third size or same-N/different-D corpus, quiet
-dedicated-volume and shared-cell dirty-neighbor conditions on authorized test
-infrastructure, then the unchanged 1,200-file add and full workload. Record
-exact artifact revisions and configuration, reconcile trace totals against the
-counters, and report mean and tail critical-path contributions.
+The external harness owns result files on ordinary local storage outside every
+PortableFS mount. It closes them after saving raw snapshots, observation times,
+subprocess status, elapsed time, and measurement validity. Rendering snapshots
+and writing results use diagnostic/control paths; filesystem requests update
+only the existing bounded counters. A failed or slow collector cannot hold a
+serving reply or unmount waiting for diagnostic finalization. Short counter-copy
+locks remain, so this is not a claim of zero measurement overhead.
 
-Local request anchors must be emitted in strictly increasing `request_id`
-order per connection on each producer. Reuse or reordering makes the local
-join unavailable and clears even earlier matches; non-anchor stages may arrive
-out of order. Bounded per-connection high-water marks retain this evidence for
-the whole run.
+Use one measured client/workload on the target volume during initial add, and
+leave the later concurrent status observer in its original phase. For the dirty
+neighbor experiment, retain the separate-project workload and identify the
+shared filesystem. Disclose other clients, background FSKit work, and requests
+crossing scrape boundaries. Subtracting an estimated idle rate does not yield
+exact foreground traffic.
+
+An attach or worker restart, process-identity change, missing snapshot or
+required series, counter decrease, malformed output, or failed scrape invalidates
+the delta. A restart invalidates even a numerically increasing counter. Preserve
+workload failure when collection also fails; absent data never means zero.
+After a timeout, request deltas describe handlers that completed in the observed
+window, excluding any attempted or in-flight work that had not completed.
+
+### Counter semantics
+
+`portablefs_authority_rpc_requests_total{volume,opcode,outcome}` counts completed
+handler invocations. `close` combines CLOSE and CLOSE_BATCH and counts requests,
+not released tokens. Errno-zero stamped-negative Lookup counts as authority
+`success`; daemon `lookupPolarity` includes cached replies and cannot partition
+authority Lookup outcomes. Daemon cache hits count physically written replies.
+A candidate rejected at final exposure records one miss, and its ordinary
+authority retry adds neither a second cache decision nor a second polarity.
+
+Retain handler-duration histograms, mutation executed/replayed/refused counters,
+physical storage-sync counts/durations/waiters, and FSKit durability-target
+counts/durations. Handler latency omits some transport, admission, and frontend
+waits. Histogram deltas describe bucket distributions and aggregate duration;
+buckets are cumulative, not independent populations. Gauges remain snapshots,
+and lifetime high-water gauges are not interval maxima obtained by subtraction.
+Do not add overlapping handler, durability, and syscall sums into elapsed time.
+
+Swift's Instruments signposts remain an independent local diagnostic facility,
+with a test observer. An operator can attach Instruments for an exploratory
+capture and stop it normally without restarting the service. It supplies no
+complete callback inventory, zero-loss guarantee, or daemon/authority join.
+There are no authority request anchors in this measurement method.
+
+### Permitted conclusions
+
+Report the measured initial-add duration and 120-second verdict, subsequent
+workload/integrity/detach outcomes, completed-request deltas by opcode, actual
+daemon hits and miss categories, reservation pressure, and aggregate server and
+storage costs for the stated windows. Comparisons need an equally specified
+earlier run with corpus and artifact differences disclosed.
+
+These observations cannot identify exact foreground serial trips, callback-to-RPC
+attribution, OPEN causes, unique eliminated operations, separate source-cache,
+completeness, or MKDIR-witness savings, or a critical-path latency decomposition.
+Request count multiplied by RTT does not prove elapsed time; cache category
+sums do not prove counterfactual savings. A pass establishes the workload result
+on that artifact and configuration, not general throughput or all-platform
+qualification. A later causal investigation needs its own complete reviewed
+implementation.
+
+Run the unchanged 32-file probe and diagnostic 256-file probe with opcode
+breakdowns, a third size or same-N/different-D corpus, quiet dedicated-volume
+and shared-cell dirty-neighbor conditions on authorized infrastructure, then
+the unchanged 1,200-file add and full workload. Keep SQLite 4x200, Git 1,200
+files/31 commits, every 120-second subprocess deadline, bulk 4x256 MiB, native
+fsync/quota, and the roughly 2,600-item unmount unchanged.
 
 ## The costs accepted on purpose
 
@@ -184,7 +209,6 @@ None of these is a release SLO gate.
 
 | Tool | What it measures |
 | --- | --- |
-| `vcs/bench/cmd/pfs-lan-trace` | Collects, reports, and reconciles the bounded correlated trace above. |
 | `vcs/bench/cmd/fsops` | Per-syscall latency distributions against a mount or a plain directory, read against a measured RTT; probe, enumeration, and bulk-write phases. |
 | `vcs/bench/cmd/netprobe` | The protocol-free network floor to an authority endpoint: TCP connect RTT, TLS handshake cost, sustained upload throughput. |
 | `vcs/bench/cmd/coherence-bench` | The install, Git status, and two-mount workloads of `vcs/bench/coherencebench` against one or two POSIX paths. |
@@ -201,11 +225,9 @@ same concurrent-reader shape against a live staging cell.
 
 ## What is missing before a number belongs here
 
-1. Producer instrumentation for the correlated trace in the frontend, daemon,
-   authority, and Linux client, reconciled against their counters.
-2. A protocol-8 run of the diagnostic probes and the unchanged acceptance
+1. A protocol-8 run of the diagnostic probes and the unchanged acceptance
    workload on authorized LAN infrastructure.
-3. Shared-cell barrier latency under a dirty neighbor, against a dedicated
+2. Shared-cell barrier latency under a dirty neighbor, against a dedicated
    filesystem control.
-4. A repeatable several-machine load job and exported authority phase
+3. A repeatable several-machine load job and exported authority phase
    histograms before any capacity claim.

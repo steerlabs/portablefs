@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -46,25 +45,13 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 			_ = c.Close()
 			continue
 		}
-		peer, ok := c.(*net.UnixConn)
-		if !ok {
-			s.frontendConnections.Add(-1)
-			_ = c.Close()
-			continue
-		}
-		pid, err := frontendPeerPID(peer)
-		if err != nil || pid <= 0 {
-			s.frontendConnections.Add(-1)
-			_ = c.Close()
-			continue
-		}
 		origin := allocateFrontendOrigin(&frontendOrigins)
 		if origin == 0 {
 			s.frontendConnections.Add(-1)
 			_ = c.Close()
 			continue
 		}
-		fc := &frontendConn{srv: s, conn: c, frontendPID: pid, origin: origin}
+		fc := &frontendConn{srv: s, conn: c, origin: origin}
 		go func() {
 			defer s.frontendConnections.Add(-1)
 			fc.serve(ctx)
@@ -73,10 +60,9 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 }
 
 type frontendConn struct {
-	srv         *Server
-	conn        net.Conn
-	origin      uint64
-	frontendPID int
+	srv    *Server
+	conn   net.Conn
+	origin uint64
 	// helloClientName is frozen by the one accepted Hello frame. It is used
 	// only to distinguish the shipping FSKit frontend from daemon self-probes;
 	// the app-group socket remains the peer authorization boundary.
@@ -197,11 +183,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			req := env.Body.(*pfslocal.PublicationAck)
-			publication := lantrace.PublicationNotPublished
-			if req.SemanticCommit == pfslocal.PublicationSemanticCommitPublished {
-				publication = lantrace.PublicationPublished
-			}
-			c.requestTrace(0, req.OperationID, nil).emit(lantrace.Event{Kind: lantrace.KindSource, Phase: lantrace.PhaseAck, Publication: publication})
 			if req.OperationID == 0 ||
 				(req.SemanticCommit != pfslocal.PublicationSemanticCommitPublished &&
 					req.SemanticCommit != pfslocal.PublicationSemanticCommitNotPublished) {
@@ -246,16 +227,12 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			c.helloClientName = req.ClientName
-			c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseEnqueue, 0)
-			written := c.reply(env.RequestID, &pfslocal.HelloReply{
+			c.reply(env.RequestID, &pfslocal.HelloReply{
 				ProtocolMajor:     pfslocal.ProtocolMajor,
 				ProtocolMinor:     pfslocal.ProtocolMinor,
 				DaemonVersion:     c.srv.cfg.Version,
 				RequestDeadlineMs: uint32(frontendRequestDeadline().Milliseconds()),
 			})
-			if written {
-				c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseReply, 0)
-			}
 			state = frontendAwaitingResolve
 		case *pfslocal.ResolveRequest:
 			if state != frontendAwaitingResolve {
@@ -274,10 +251,8 @@ func (c *frontendConn) serve(ctx context.Context) {
 			if !c.setAttach(a) {
 				return
 			}
-			c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseEnqueue, 0)
 			state = frontendAttached
 			if c.reply(env.RequestID, &rep) {
-				c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseReply, 0)
 				if c.helloClientName == shippingFSKitFrontendClientName {
 					a.registerFrontendWitness(c)
 				}
@@ -286,7 +261,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 			if state != frontendAttached {
 				return
 			}
-			c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseEnqueue, 0)
 			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
 				c.inFlight.Add(-1)
 				return
@@ -644,9 +618,6 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 	if resources == nil {
 		return false
 	}
-	if resources.reservation != nil {
-		resources.reservation.trace.local(lantrace.PhaseDisposition, 0)
-	}
 	cleanup, err := resources.d.applyReplyResourceDisposition(
 		resources, disposition.AcceptHandles, disposition.AcceptedItemCount,
 	)
@@ -881,7 +852,6 @@ func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *fronten
 			// requests; finalization waits for every handler and PublicationAck.
 			bridge.releaseFrontendPublication(c.callback(operationID))
 			_ = bridge.finishFrontendPublication(c.callback(operationID))
-			c.requestTrace(0, operationID, nil).emit(lantrace.Event{Kind: lantrace.KindSource, Phase: lantrace.PhaseRelease})
 		}
 	}
 }
@@ -979,8 +949,6 @@ func (c *frontendConn) handleAttached(
 	initializeOperation bool,
 	body any,
 ) {
-	trace := c.requestTrace(requestID, operationID, body)
-	ctx = context.WithValue(ctx, v3RequestTraceContextKey{}, trace)
 	c.handleV3Attached(
 		ctx, a, requestID, operationID,
 		initializeOperation, body,

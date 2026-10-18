@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
@@ -163,13 +162,6 @@ func TestV3HorizonNeverRegresses(t *testing.T) {
 	if got := v3Horizon(d); got != first {
 		t.Fatalf("a shorter later receipt moved the horizon from %d to %d", first, got)
 	}
-	d.mu.Lock()
-	retainedStart := d.horizonStart
-	age := d.cacheProofTraceLocked(lantrace.Event{}).ProofAge
-	d.mu.Unlock()
-	if retainedStart != start || age != lantrace.Nanos(time.Second) {
-		t.Fatalf("losing proof replaced the winning start/age: %d/%d", retainedStart, age)
-	}
 	client.mu.Lock()
 	client.keepAlive = func(context.Context) (time.Duration, error) {
 		clock.advance(2 * time.Second)
@@ -179,12 +171,9 @@ func TestV3HorizonNeverRegresses(t *testing.T) {
 	if err := d.renewHorizon(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	d.mu.Lock()
-	retainedStart = d.horizonStart
-	age = d.cacheProofTraceLocked(lantrace.Event{}).ProofAge
-	d.mu.Unlock()
-	if retainedStart != start+uint64(time.Second) || age != lantrace.Nanos(2*time.Second) || v3Horizon(d) <= first {
-		t.Fatalf("winning proof start/age=%d/%d, want request start including transit", retainedStart, age)
+	want, usable := v3HorizonCandidate(start+uint64(time.Second), authorityrpc.MaxCacheProof)
+	if !usable || v3Horizon(d) != want || want <= first {
+		t.Fatalf("longer delayed proof horizon=%d, want request-start horizon %d", v3Horizon(d), want)
 	}
 }
 

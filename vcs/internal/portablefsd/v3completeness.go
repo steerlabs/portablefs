@@ -1,9 +1,6 @@
 package portablefsd
 
-import (
-	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
-	"github.com/steerlabs/portablefs/vcs/internal/pathcomponent"
-)
+import "github.com/steerlabs/portablefs/vcs/internal/pathcomponent"
 
 const (
 	v3MaxCompleteDirs  = 1024
@@ -19,20 +16,19 @@ type v3DirectoryCertificate struct {
 }
 
 // All helpers in this file require d.mu. There is no independent cache owner.
-func (d *v3DataPlane) dropCompletenessLocked(dir *v3ItemRecord, reason lantrace.CertDrop) {
+func (d *v3DataPlane) dropCompletenessLocked(dir *v3ItemRecord) {
 	if c := dir.complete; c != nil {
 		d.completeDirs--
 		d.completeNames -= len(c.names)
 		d.completeBytes -= c.bytes
 		dir.complete = nil
 	}
-	dir.certificateDrop = reason
-	dir.search = lantrace.SearchUnknown
+	dir.searchPermitted = false
 }
 
 func (d *v3DataPlane) permissionChangedLocked(dir *v3ItemRecord, cut uint64) {
 	dir.permissionCut = max(dir.permissionCut, cut)
-	d.dropCompletenessLocked(dir, lantrace.CertDropPermissionCut)
+	d.dropCompletenessLocked(dir)
 	d.forgetNamesLocked(dir)
 	dir.watermark = max(dir.watermark, cut)
 }
@@ -52,17 +48,17 @@ func (d *v3DataPlane) mkdirSeedEligibleLocked(effect *v3MutationEffect) bool {
 	dir.mkdirWitness = w
 	switch {
 	case w.identity != dir.item.StableIdentity || w.snapshot != effect.snapshot:
-		d.dropCompletenessLocked(dir, lantrace.CertDropNamespaceCut)
+		d.dropCompletenessLocked(dir)
 	case w.snapshot <= dir.permissionCut:
-		d.dropCompletenessLocked(dir, lantrace.CertDropPermissionCut)
+		d.dropCompletenessLocked(dir)
 	case w.snapshot <= dir.watermark || w.snapshot < dir.snapshot:
 		// An exact duplicate can keep existing knowledge, but cannot re-seed it.
 		if dir.complete == nil {
-			d.dropCompletenessLocked(dir, lantrace.CertDropNamespaceCut)
+			d.dropCompletenessLocked(dir)
 		}
 	case w.snapshot <= d.coldFloor:
 		if dir.complete == nil {
-			d.dropCompletenessLocked(dir, lantrace.CertDropColdCut)
+			d.dropCompletenessLocked(dir)
 		}
 	default:
 		return true
@@ -75,17 +71,13 @@ func (d *v3DataPlane) seedMkdirLocked(dir *v3ItemRecord) {
 		return
 	}
 	if d.completeDirs == v3MaxCompleteDirs {
-		d.dropCompletenessLocked(dir, lantrace.CertDropCapacity)
+		d.dropCompletenessLocked(dir)
 		return
 	}
 	dir.complete = &v3DirectoryCertificate{names: make(map[string]struct{})}
-	dir.certificateDrop = ""
 	dir.watermark = max(dir.watermark, dir.mkdirWitness.snapshot)
 	dir.permissionCut = max(dir.permissionCut, dir.mkdirWitness.snapshot)
-	dir.search = lantrace.SearchDenied
-	if dir.mkdirWitness.searchPermitted {
-		dir.search = lantrace.SearchPermitted
-	}
+	dir.searchPermitted = dir.mkdirWitness.searchPermitted
 	d.completeDirs++
 }
 
@@ -135,7 +127,7 @@ func (d *v3DataPlane) applyCompletenessLocked(effect *v3MutationEffect) {
 	if invalid {
 		for dir := range parents {
 			if dir != nil && dir.complete != nil {
-				d.dropCompletenessLocked(dir, lantrace.CertDropNamespaceCut)
+				d.dropCompletenessLocked(dir)
 			}
 		}
 		return
@@ -164,7 +156,7 @@ func (d *v3DataPlane) applyCompletenessLocked(effect *v3MutationEffect) {
 	if d.completeNames+deltaNames > v3MaxCompleteNames || d.completeBytes+deltaBytes > v3MaxCompleteBytes {
 		for dir := range parents {
 			if dir != nil && dir.complete != nil {
-				d.dropCompletenessLocked(dir, lantrace.CertDropCapacity)
+				d.dropCompletenessLocked(dir)
 			}
 		}
 		return
