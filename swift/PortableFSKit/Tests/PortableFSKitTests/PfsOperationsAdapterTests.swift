@@ -636,38 +636,30 @@ private func adapterErrno(
             )
         } == Int(EOPNOTSUPP))
     }
-    do {
+    #expect(await clientErrno {
         try await harness.core.refuseXattrSet(
             item: portable,
-            name: "user.direct",
-            createOnly: false,
-            replaceOnly: false
+            request: try PfsXattrSetRequest(name: "user.direct", createOnly: false, replaceOnly: false)
         )
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ENOTSUP)
-    }
+    } == ENOTSUP)
 
-    // Invalid input keeps its own verdict ahead of the fixed refusal.
-    do {
-        try await harness.core.refuseXattrSet(
-            item: portable,
-            name: "",
-            createOnly: false,
-            replaceOnly: false
-        )
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EINVAL)
+    // Invalid input keeps its own verdict ahead of the fixed refusal: the
+    // shared grammar refuses it before any item can be consulted.
+    for (name, createOnly, replaceOnly) in [
+        ("", false, false),
+        (String(repeating: "x", count: 256), false, false),
+        ("user.\u{0}nul", false, false),
+        ("user.both", true, true),
+    ] {
+        #expect(await clientErrno {
+            _ = try PfsXattrSetRequest(name: name, createOnly: createOnly, replaceOnly: replaceOnly)
+        } == EINVAL)
     }
-    do {
-        try await harness.core.refuseXattrSet(
-            item: portable,
-            name: "user.both",
-            createOnly: true,
-            replaceOnly: true
-        )
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EINVAL)
-    }
+    #expect((try? PfsXattrSetRequest(
+        name: String(repeating: "x", count: 255),
+        createOnly: false,
+        replaceOnly: false
+    )) != nil)
     #expect(await adapterErrno("invalid UTF-8 xattr name") {
         try await harness.volume.setXattr(
             named: FSFileName(data: Data([0xff])),
@@ -712,16 +704,12 @@ private func adapterErrno(
     )
     let stalePortable = try #require(staleItem as? PortableFSItem)
     try await harness.core.reclaim(item: stalePortable)
-    do {
+    #expect(await clientErrno {
         try await harness.core.refuseXattrSet(
             item: stalePortable,
-            name: "user.test",
-            createOnly: false,
-            replaceOnly: false
+            request: try PfsXattrSetRequest(name: "user.test", createOnly: false, replaceOnly: false)
         )
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ESTALE)
-    }
+    } == ESTALE)
     #expect(await adapterErrno("reclaimed adapter xattr set") {
         try await harness.volume.setXattr(
             named: name,
@@ -731,27 +719,62 @@ private func adapterErrno(
         )
     } == Int(ESTALE))
 
-    // Grammar wins even when the same callback also names a reclaimed item.
-    // This cross-product pins EINVAL > ESTALE > EOPNOTSUPP rather than testing
-    // each dimension only against an otherwise valid request.
-    do {
-        try await harness.core.refuseXattrSet(
-            item: stalePortable,
-            name: "",
-            createOnly: false,
-            replaceOnly: false
-        )
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EINVAL)
+    // Grammar wins even when the same callback also names a reclaimed or a
+    // foreign item. This cross-product pins EINVAL > ESTALE > EOPNOTSUPP
+    // rather than testing each dimension only against an otherwise valid
+    // request. A foreign FSItem fails conversion, not lookup, so it proves
+    // the syntax is decided before the item is touched at all.
+    // FSFileName itself truncates at an embedded NUL, so that grammar rule is
+    // pinned on the shared validator above rather than through FSKit.
+    let foreignItem = FSItem()
+    let malformedNames = [
+        FSFileName(data: Data([0xff])),
+        FSFileName(string: ""),
+        FSFileName(string: String(repeating: "x", count: 256)),
+    ]
+    for target in [staleItem, foreignItem] {
+        for malformed in malformedNames {
+            #expect(await adapterErrno("malformed xattr set on \(target === foreignItem ? "foreign" : "reclaimed") item") {
+                try await harness.volume.setXattr(
+                    named: malformed,
+                    to: Data(),
+                    on: target,
+                    policy: .alwaysSet
+                )
+            } == Int(EINVAL))
+        }
+        #expect(await adapterErrno("unknown xattr policy") {
+            try await harness.volume.setXattr(
+                named: name,
+                to: Data(),
+                on: target,
+                policy: FSVolume.SetXattrPolicy(rawValue: 99)!
+            )
+        } == Int(EINVAL))
     }
-    #expect(await adapterErrno("malformed reclaimed adapter xattr set") {
+    #expect(await adapterErrno("foreign adapter xattr set") {
         try await harness.volume.setXattr(
-            named: FSFileName(data: Data([0xff])),
+            named: name,
             to: Data(),
-            on: staleItem,
+            on: foreignItem,
             policy: .alwaysSet
         )
-    } == Int(EINVAL))
+    } == Int(ESTALE))
+}
+
+/// The POSIX errno a direct core or validator call threw, or nil when it
+/// returned.
+private func clientErrno(_ body: () async throws -> Void) async -> Int32? {
+    do {
+        try await body()
+        Issue.record("call unexpectedly succeeded")
+        return nil
+    } catch let error as PfsLocalClientError {
+        return error.posixErrno
+    } catch {
+        Issue.record("unexpected error \(error)")
+        return nil
+    }
 }
 
 @available(macOS 26.0, *)

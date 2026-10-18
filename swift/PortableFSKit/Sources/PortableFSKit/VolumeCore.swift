@@ -12,6 +12,33 @@ private let volumeOpenSignposter = OSSignposter(
     category: "OpenAttribution"
 )
 
+/// A syntactically valid request to set a user xattr: the one validator
+/// for that grammar. It holds no item, so a caller can only obtain one by
+/// deciding the request's syntax before it converts or looks up the target:
+/// EINVAL outranks every item verdict, including a foreign FSItem that
+/// never was a PortableFS item.
+public struct PfsXattrSetRequest: Sendable, Equatable {
+    public let name: String
+    public let createOnly: Bool
+    public let replaceOnly: Bool
+
+    public init(name: String, createOnly: Bool, replaceOnly: Bool) throws {
+        let nameBytes = name.utf8
+        guard !nameBytes.isEmpty,
+              nameBytes.count <= 255,
+              !nameBytes.contains(0),
+              !(createOnly && replaceOnly) else {
+            throw PfsLocalClientError.daemon(
+                errno: EINVAL,
+                message: "invalid xattr set request"
+            )
+        }
+        self.name = name
+        self.createOnly = createOnly
+        self.replaceOnly = replaceOnly
+    }
+}
+
 /// Stable item identity carried by pfslocal and surfaced to FSKit.
 public struct PfsItemIdentity: Hashable, Sendable {
     public var itemID: UInt64
@@ -854,26 +881,15 @@ public actor VolumeCore {
     /// The fixed refusal for setting a user xattr. PortableFS user xattrs are
     /// readable and removable but never settable, and the refusal is local:
     /// no request is sent and nothing enters ordered publication. Precedence
-    /// is fixed: a malformed request is EINVAL even for a reclaimed item; a
-    /// reclaimed or foreign item is ESTALE; only a valid request on a live
-    /// item reaches ENOTSUP, which the FSKit boundary maps to Darwin's
-    /// EOPNOTSUPP so the VFS never falls back to an AppleDouble sidecar.
+    /// is fixed: a malformed request is EINVAL, which constructing `request`
+    /// already decided before any item existed to consult; a reclaimed or
+    /// foreign item is ESTALE; only a valid request on a live item reaches
+    /// ENOTSUP, which the FSKit boundary maps to Darwin's EOPNOTSUPP so the
+    /// VFS never falls back to an AppleDouble sidecar.
     public func refuseXattrSet(
         item: PortableFSItem,
-        name: String,
-        createOnly: Bool,
-        replaceOnly: Bool
+        request: PfsXattrSetRequest
     ) throws -> Never {
-        let nameBytes = name.utf8
-        guard !nameBytes.isEmpty,
-              nameBytes.count <= 255,
-              !nameBytes.contains(0),
-              !(createOnly && replaceOnly) else {
-            throw PfsLocalClientError.daemon(
-                errno: EINVAL,
-                message: "invalid xattr set request"
-            )
-        }
         _ = try identity(for: item)
         throw PfsLocalClientError.daemon(
             errno: ENOTSUP,

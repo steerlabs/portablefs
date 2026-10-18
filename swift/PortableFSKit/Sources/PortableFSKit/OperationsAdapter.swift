@@ -1420,35 +1420,32 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         })
     }
 
-    /// Validates the xattr name and FSKit policy before item lifecycle, so a
-    /// malformed request is EINVAL even for a reclaimed item. A set policy
-    /// then always throws the fixed refusal; only delete returns, with the
-    /// validated name.
+    /// Decides the whole request's syntax (name encoding, policy, and for a
+    /// set the shared `PfsXattrSetRequest` grammar) before the item is even
+    /// converted, so a malformed request is EINVAL for a reclaimed and for a
+    /// foreign FSItem alike. A set policy then always throws the fixed
+    /// refusal; only delete returns, with the validated name.
     private func refuseXattrSetIfRequested(
         named name: FSFileName,
         on item: FSItem,
         policy: FSVolume.SetXattrPolicy
     ) async throws -> String {
         let xattrName = try PfsFSKitMapping.xattrName(from: name)
-        let setModes: (createOnly: Bool, replaceOnly: Bool)
+        let request: PfsXattrSetRequest
         switch policy {
         case .delete:
             return xattrName
         case .mustCreate:
-            setModes = (true, false)
+            request = try PfsXattrSetRequest(name: xattrName, createOnly: true, replaceOnly: false)
         case .mustReplace:
-            setModes = (false, true)
+            request = try PfsXattrSetRequest(name: xattrName, createOnly: false, replaceOnly: true)
         case .alwaysSet:
-            setModes = (false, false)
+            request = try PfsXattrSetRequest(name: xattrName, createOnly: false, replaceOnly: false)
         @unknown default:
             throw PfsLocalClientError.daemon(errno: EINVAL, message: "unknown xattr policy")
         }
-        try await core.refuseXattrSet(
-            item: try portableItem(item),
-            name: xattrName,
-            createOnly: setModes.createOnly,
-            replaceOnly: setModes.replaceOnly
-        )
+        let target = try portableItem(item)
+        try await core.refuseXattrSet(item: target, request: request)
     }
 
     private func setCachedStatistics(_ statistics: FSStatFSResult) {

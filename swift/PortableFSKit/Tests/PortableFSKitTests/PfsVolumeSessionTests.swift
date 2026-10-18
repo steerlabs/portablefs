@@ -647,13 +647,19 @@ private func expectHeldCallbacksRevoked(
         #expect(try await setXattrErrno(FSFileName(string: "user.test"), on: staleItem, policy: policy)
             == Int(ESTALE))
     }
-    #expect(try await setXattrErrno(FSFileName(data: Data([0xff])), on: staleItem, policy: .alwaysSet)
-        == Int(EINVAL))
-    #expect(try await setXattrErrno(
-        FSFileName(string: String(repeating: "x", count: 256)),
-        on: staleItem,
-        policy: .alwaysSet
-    ) == Int(EINVAL))
+    // A foreign FSItem is stale too, and still loses to malformed syntax.
+    let foreignItem = FSItem()
+    #expect(try await setXattrErrno(FSFileName(string: "user.test"), on: foreignItem, policy: .alwaysSet)
+        == Int(ESTALE))
+    for target in [staleItem, foreignItem] {
+        #expect(try await setXattrErrno(FSFileName(data: Data([0xff])), on: target, policy: .alwaysSet)
+            == Int(EINVAL))
+        #expect(try await setXattrErrno(
+            FSFileName(string: String(repeating: "x", count: 256)),
+            on: target,
+            policy: .alwaysSet
+        ) == Int(EINVAL))
+    }
 
     #expect(await harness.volume.window.waiterCount() == 0)
     #expect(await harness.volume.window.admittedCount() == 1)
