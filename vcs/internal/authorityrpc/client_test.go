@@ -50,10 +50,8 @@ func testPreKernelMountAbsence(context.Context) (*authoritypb.MountAbsenceProof,
 }
 
 // coherentTestClientConfig keeps ordinary transport tests on the exact Linux
-// protocol-7 mount contract.
+// protocol-8 mount contract.
 func coherentTestClientConfig(address string, clientTLS *tls.Config, volumeID string, replaySlots uint32, maxInFlight int) ClientConfig {
-	maxInFlight = max(maxInFlight, MinimumLinuxInFlight)
-	replaySlots = max(replaySlots, uint32(maxInFlight))
 	return ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: volumeID, AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
@@ -65,7 +63,6 @@ func coherentTestClientConfig(address string, clientTLS *tls.Config, volumeID st
 }
 
 func testBounds(maxInFlight int) TransportBounds {
-	maxInFlight = max(maxInFlight, MinimumLinuxInFlight)
 	return TransportBounds{MaxFrame: testMaxFrame, MaxRequestFrame: (1 << 20) + FramePayloadReserve, MaxInFlight: maxInFlight}
 }
 
@@ -94,7 +91,7 @@ func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 		clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9},
 		assigned:          assignedOnWire,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 3, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
@@ -205,7 +202,7 @@ func (h *clientReauthorizationHandler) Handle(ctx context.Context, request *auth
 
 func TestClientReauthorizationInstallsOnlyAValidatedReplacementCertificate(t *testing.T) {
 	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
@@ -351,8 +348,8 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	return response
 }
 
-func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, 5, time.Minute)
+func TestClientReservesIndependentProtocol8ControlLanes(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
@@ -366,9 +363,9 @@ func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if cap(client.ordinary.permits) != 2 || cap(client.flush.permits) != 1 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 2 {
-		t.Fatalf("strict lanes ordinary/poll/ack/liveness/blocking = %d/%d/%d/%d/%d, want 2/1/1/1/2",
-			cap(client.ordinary.permits), cap(client.controlPoll.permits), cap(client.controlAck.permits), cap(client.liveness.permits), cap(client.blocking.permits))
+	if cap(client.ordinary.permits) != 1 || cap(client.flush.permits) != 4 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.changeAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 4 {
+		t.Fatalf("lanes ordinary/flush/poll/delegation-ack/change-ack/liveness/blocking = %d/%d/%d/%d/%d/%d/%d, want 1/4/1/1/1/1/4",
+			cap(client.ordinary.permits), cap(client.flush.permits), cap(client.controlPoll.permits), cap(client.controlAck.permits), cap(client.changeAck.permits), cap(client.liveness.permits), cap(client.blocking.permits))
 	}
 	next := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
 	ack := &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}
@@ -421,9 +418,9 @@ func TestClientRefusesAReadBoundBelowTheWriteBound(t *testing.T) {
 			address, clientTLS, stop := startTestServer(t, clientTestHandler{
 				epoch: bytes.Repeat([]byte{0x2c}, 16), maxInFlight: 9,
 				readBound: &bound, attachCount: &attaches,
-			}, 4, time.Minute)
+			}, 9, time.Minute)
 			defer stop()
-			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 			if !tc.refused {
 				if err != nil {
 					t.Fatal(err)
@@ -456,9 +453,9 @@ func TestClientRefusesAReadBoundBelowTheWriteBound(t *testing.T) {
 func TestClientResumesItsTLSSessionAcrossTransportReconnects(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{
 		epoch: bytes.Repeat([]byte{0x2d}, 16), maxInFlight: 9,
-	}, 5, time.Minute)
+	}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 5, 5))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,9 +494,9 @@ func TestReauthorizedCertificateDropsResumableTLSSessions(t *testing.T) {
 	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{
 		epoch: bytes.Repeat([]byte{0x2e}, 16), maxInFlight: 9,
 	}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +589,7 @@ func (h *strictContractHandler) recordedDetach() *authoritypb.DetachRequest {
 // committedCleanupHandler models only the ownership boundary under test: an
 // ACTIVE response means the strict membership is durable, and only a
 // successful authenticated Detach removes it. Transport state transitions are
-// still exercised by the real protocol-7 Server around this handler.
+// still exercised by the real protocol-8 Server around this handler.
 type committedCleanupHandler struct {
 	clientTestHandler
 	mutateActive    func(*authoritypb.ActivateReply)
@@ -675,7 +672,7 @@ func TestCommittedActiveLocalValidationFailureDetachesWithExactPreKernelEvidence
 				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x71}, 16), maxInFlight: 9},
 				mutateActive:      test.mutate,
 			}
-			address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+			address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 			defer stop()
 			var observations atomic.Int32
 			proof := &authoritypb.MountAbsenceProof{
@@ -802,7 +799,7 @@ func TestCommittedActiveCleanupFailureNeverInventsFallback(t *testing.T) {
 				mutateActive:      func(reply *authoritypb.ActivateReply) { reply.Root = nil },
 				detachErrno:       test.detachErrno, loseDetachReply: test.loseReply,
 			}
-			address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+			address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 			defer stop()
 			client, err := DialClient(context.Background(), strictCleanupClientConfig(address, clientTLS, test.observer))
 			if err == nil {
@@ -848,7 +845,7 @@ func TestPreActivationFailuresNeverObservePreKernelAbsence(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			address, clientTLS, stop := startTestServer(t, test.handler, 5, time.Minute)
+			address, clientTLS, stop := startTestServer(t, test.handler, 9, time.Minute)
 			defer stop()
 			var observations atomic.Int32
 			observer := func(ctx context.Context) (*authoritypb.MountAbsenceProof, error) {
@@ -878,7 +875,7 @@ func TestReleaseBeforeMountIsOneAuthenticatedIdempotentTransition(t *testing.T) 
 	handler := &committedCleanupHandler{
 		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x75}, 16), maxInFlight: 9},
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	var observations atomic.Int32
 	observer := func(ctx context.Context) (*authoritypb.MountAbsenceProof, error) {
@@ -909,7 +906,7 @@ func TestReleaseBeforeMountIsOneAuthenticatedIdempotentTransition(t *testing.T) 
 // cache could still leave the barrier just by asking.
 func TestStrictDetachRequiresSuppliedEvidence(t *testing.T) {
 	handler := &strictContractHandler{epoch: make([]byte, 16), maxInFlight: 9}
-	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
@@ -957,7 +954,6 @@ func TestStrictDetachRequiresSuppliedEvidence(t *testing.T) {
 }
 
 func startTestServer(t *testing.T, handler Handler, maxInFlight int, idle time.Duration) (string, *tls.Config, func()) {
-	maxInFlight = max(maxInFlight, MinimumLinuxInFlight)
 	t.Helper()
 	serverTLS, clientTLS := testTLSConfigs(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -981,7 +977,7 @@ func startTestServer(t *testing.T, handler Handler, maxInFlight int, idle time.D
 
 func TestClientSignalsTerminalSessionOnExpiredKeepAlive(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), keepAliveErrno: int32(syscall.ESTALE), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,7 +1000,7 @@ func TestClientSignalsTerminalSessionOnExpiredKeepAlive(t *testing.T) {
 func TestIdleLinuxControlLossResumesWithoutEndingSession(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1047,7 +1043,7 @@ func TestIdleLinuxControlLossResumesWithoutEndingSession(t *testing.T) {
 func TestClientConfiguredForMountEnrollmentRequiresSignedDeadline(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.RequireMountEnrollmentReauthorization = true
 	_, err := DialClient(context.Background(), cfg)
 	if err == nil || !strings.Contains(err.Error(), "signed authorization deadline") {
@@ -1058,7 +1054,7 @@ func TestClientConfiguredForMountEnrollmentRequiresSignedDeadline(t *testing.T) 
 func TestClientConfiguredForMountEnrollmentPinsAuthorityDeadline(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight, mountEnrollment: true}, testMaxInFlight, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.RequireMountEnrollmentReauthorization = true
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -1073,8 +1069,8 @@ func TestClientConfiguredForMountEnrollmentPinsAuthorityDeadline(t *testing.T) {
 
 func TestClientCancellationDrainsAuthorityOutcome(t *testing.T) {
 	started := make(chan struct{})
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), started: started, once: new(sync.Once), maxInFlight: 9}, 3, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 3, 3))
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), started: started, once: new(sync.Once), maxInFlight: 9}, 9, time.Minute)
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1100,7 +1096,7 @@ func TestClientCancellationDrainsAuthorityOutcome(t *testing.T) {
 
 func TestTLSClientAttachAndMultiplexedCall(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1115,9 +1111,9 @@ func TestTLSClientAttachAndMultiplexedCall(t *testing.T) {
 }
 
 func TestMutationAPIRefusesControlTraffic(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x09}, 16), maxInFlight: 9}, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x09}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1157,9 +1153,9 @@ func (h *splitNegotiationHandler) Handle(ctx context.Context, request *authority
 
 func TestClientRefusesSplitRoleNegotiationBeforeAttach(t *testing.T) {
 	handler := &splitNegotiationHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x10}, 16), maxInFlight: 9}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.AccessToken = []byte("single-use-cap")
 	client, err := DialClient(context.Background(), cfg)
 	if err == nil {
@@ -1193,9 +1189,9 @@ func (h *transportTraceHandler) Handle(ctx context.Context, request *authoritypb
 
 func TestClientCompletesBothHellosBeforeDataAttachAndControlActivate(t *testing.T) {
 	handler := &transportTraceHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 9}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1265,9 +1261,9 @@ func TestLostProvisionalAttachReplyReplaysTheExactAttempt(t *testing.T) {
 		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x21}, 16), maxInFlight: 9},
 		closeFirstAttach:  true,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.AccessToken = []byte("single-use-cap")
 	cfg.DialTimeout = 2 * time.Second
 	client, err := DialClient(context.Background(), cfg)
@@ -1292,9 +1288,9 @@ func TestLostActivateReplyResumesBothRolesAndNeverAborts(t *testing.T) {
 		clientTestHandler:  clientTestHandler{epoch: bytes.Repeat([]byte{0x22}, 16), maxInFlight: 9},
 		closeFirstActivate: true,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.DialTimeout = 2 * time.Second
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -1317,9 +1313,9 @@ func TestDefiniteActivationRefusalAbortsTheProvisionalAttempt(t *testing.T) {
 		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x23}, 16), maxInFlight: 9},
 		refuseActivate:    true,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err == nil {
 		_ = client.Close()
 		t.Fatal("client published after a definite activation refusal")
@@ -1416,7 +1412,7 @@ func TestClientRefusesWrongHelloTransportEcho(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			address, clientTLS, stop := startWrongHelloEchoServer(t, tc.mutate)
 			defer stop()
-			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 			if err == nil {
 				_ = client.Close()
 				t.Fatal("client accepted a Hello that changed its physical transport identity")
@@ -1660,9 +1656,9 @@ func TestDataAndControlOwnIndependentPendingNamespaces(t *testing.T) {
 		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 9},
 		reached:           make(chan authoritypb.TransportRole, 2), release: make(chan struct{}),
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1707,9 +1703,9 @@ func TestDataAndControlOwnIndependentPendingNamespaces(t *testing.T) {
 }
 
 func TestBlockedMaximumDataFrameCannotBlockControlProgress(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x13}, 16), maxInFlight: 9}, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x13}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1759,9 +1755,9 @@ func TestBlockedMaximumDataFrameCannotBlockControlProgress(t *testing.T) {
 func TestIdempotentWriteSkipsDefensiveRequestClone(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{
 		epoch: bytes.Repeat([]byte{0x7d}, 16), maxInFlight: 9,
-	}, 4, time.Minute)
+	}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1807,9 +1803,9 @@ func TestClientRetainsPooledReadPayloadUntilConsumption(t *testing.T) {
 	handler := &pooledReadClientHandler{clientTestHandler: clientTestHandler{
 		epoch: bytes.Repeat([]byte{0x4A}, 16), maxInFlight: 9,
 	}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1845,7 +1841,7 @@ func TestClientRetainsPooledReadPayloadUntilConsumption(t *testing.T) {
 }
 
 func TestIdleDataLossReconnectsOnlyDataRole(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x14}, 16), maxInFlight: 9}, 5, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x14}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
@@ -1893,9 +1889,9 @@ func TestIdleDataLossReconnectsOnlyDataRole(t *testing.T) {
 }
 
 func TestInFlightControlLossReconnectsOnlyControlRole(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x15}, 16), maxInFlight: 9}, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x15}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2487,7 +2483,7 @@ func TestMalformedTerminalDeliveryTokenRevokesBeforeLocalDrain(t *testing.T) {
 
 func TestConcurrentCallsReconnectWhenConnectionIsTransientlyMissing(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2842,7 +2838,7 @@ func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
 	}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "reclaim-replay-volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "reclaim-replay-volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2897,7 +2893,7 @@ func TestFskitCloseBatchLostReplyReplaysExactOutcome(t *testing.T) {
 	}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "closebatch-replay-volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "closebatch-replay-volume", 9, 9)
 	cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -2964,7 +2960,7 @@ func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
 	// Three slots reserve independent flush and blocking lanes, putting every ordinary mutation on
 	// the same slot, which is what makes the desynchronization observable
 	// immediately instead of after a full slot cycle.
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "read-only-volume", 3, 3))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "read-only-volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3009,7 +3005,7 @@ func TestSuppressedSlotStateStillCannotDesynchronize(t *testing.T) {
 	handler := &replayHandler{runtime: runtime, access: volumeserver.AccessRead | volumeserver.AccessWrite, suppressState: true}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "suppressed-volume", 3, 3))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "suppressed-volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3049,7 +3045,7 @@ type blockingLockHandler struct {
 }
 
 func (h *blockingLockHandler) Epoch() []byte           { return append([]byte(nil), h.epoch...) }
-func (h *blockingLockHandler) Bounds() TransportBounds { return testBounds(4) }
+func (h *blockingLockHandler) Bounds() TransportBounds { return testBounds(9) }
 func (h *blockingLockHandler) RegisterSessionEndHook(func(volumeserver.SessionID)) {
 }
 func (h *blockingLockHandler) SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool) {
@@ -3111,9 +3107,9 @@ func (h *blockingLockHandler) Handle(ctx context.Context, req *authoritypb.Reque
 // torn down while the authority was healthy.
 func TestBlockingLockWaitsCannotStarveTheOrdinaryLane(t *testing.T) {
 	handler := &blockingLockHandler{epoch: make([]byte, 16), release: make(chan struct{}), parked: make(chan struct{}, 8)}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.CancelDrainTimeout = 2 * time.Second
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -3206,8 +3202,8 @@ func TestCanonicalFormIsPinnedByValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// field 36 (reclaim), length 5; nested field 1 (item), length 3.
-	want := []byte{0xA2, 0x02, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03}
+	// field 36 (reclaim), length 5; nested field 2 (items), length 3.
+	want := []byte{0xA2, 0x02, 0x05, 0x12, 0x03, 0x01, 0x02, 0x03}
 	if fmt.Sprintf("%x", encoded) != fmt.Sprintf("%x", want) {
 		t.Fatalf("canonical encoding = %x, want %x", encoded, want)
 	}
@@ -3300,9 +3296,9 @@ func TestInvalidDelegationReleaseDoesNotConsumeSequence(t *testing.T) {
 				seen <- proto.Clone(r.GetDelegationRelease()).(*authoritypb.DelegationReleaseRequest)
 				return releaseReceiptResponse(r)
 			}}
-			address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+			address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 			defer stop()
-			client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+			client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 9, 9))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3344,9 +3340,9 @@ func TestMalformedDelegationReleaseReplyEndsSession(t *testing.T) {
 		calls.Add(1)
 		return &authoritypb.Response{RequestId: r.RequestId, Epoch: make([]byte, 16), Body: &authoritypb.Response_ChangeAck{ChangeAck: &authoritypb.ChangeAckReply{}}}
 	}}
-	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3389,9 +3385,9 @@ func TestDelegationReleaseSequenceSurvivesControlReconnectAndHoldsLane(t *testin
 		}
 		return releaseReceiptResponse(r)
 	}}
-	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3449,9 +3445,9 @@ func TestUncertainDelegationReleaseRequiresColdSubscriptionWithoutEndingSession(
 		}
 		return releaseReceiptResponse(r)
 	}}
-	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	config := coherentTestClientConfig(address, tlsConfig, "volume", 5, 5)
+	config := coherentTestClientConfig(address, tlsConfig, "volume", 9, 9)
 	config.CancelDrainTimeout = 10 * time.Millisecond
 	client, err := DialClient(t.Context(), config)
 	if err != nil {

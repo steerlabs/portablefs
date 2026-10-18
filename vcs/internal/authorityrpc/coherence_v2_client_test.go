@@ -98,7 +98,7 @@ func (h *coherenceV2ClientHandler) Handle(ctx context.Context, request *authorit
 
 func TestSubscribePaginationKeepsInitialHorizonAnchor(t *testing.T) {
 	handler := &coherenceV2ClientHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x19}, 16), maxInFlight: 6},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x19}, 16), maxInFlight: 9},
 		pollStarted:       make(chan struct{}),
 		pollRelease:       make(chan struct{}),
 		paginate:          true,
@@ -123,9 +123,9 @@ func TestSubscribePaginationKeepsInitialHorizonAnchor(t *testing.T) {
 
 func dialCoherenceV2TestClient(t *testing.T, handler *coherenceV2ClientHandler) *Client {
 	t.Helper()
-	address, clientTLS, stop := startTestServer(t, handler, 6, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	t.Cleanup(stop)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 6, 6))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func dialCoherenceV2TestClient(t *testing.T, handler *coherenceV2ClientHandler) 
 
 func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T) {
 	handler := &coherenceV2ClientHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 6},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 9},
 		pollStarted:       make(chan struct{}),
 		pollRelease:       make(chan struct{}),
 	}
@@ -144,7 +144,7 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 	if client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}) != &client.controlPoll ||
 		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}) != &client.changeAck ||
 		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}}) != &client.liveness {
-		t.Fatal("protocol-7 poll, acknowledgment, and renewal did not receive independent admission lanes")
+		t.Fatal("protocol-8 poll, acknowledgment, and renewal did not receive independent admission lanes")
 	}
 
 	pollResult := make(chan error, 1)
@@ -181,7 +181,7 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 
 func TestCoherenceV2ClientMethodsValidateAndCloneWireResults(t *testing.T) {
 	handler := &coherenceV2ClientHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 6},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 9},
 		pollStarted:       make(chan struct{}),
 		pollRelease:       make(chan struct{}),
 	}
@@ -240,7 +240,7 @@ func TestCoherenceV2ClientMethodsValidateAndCloneWireResults(t *testing.T) {
 	}
 }
 
-func TestValidateControlEventRejectsMalformedProtocol7Bodies(t *testing.T) {
+func TestValidateControlEventRejectsMalformedControlBodies(t *testing.T) {
 	identity := bytes.Repeat([]byte{0x61}, 16)
 	ref := &authoritypb.DelegationRef{Id: bytes.Repeat([]byte{0x62}, 16), Generation: 1}
 	tests := []struct {

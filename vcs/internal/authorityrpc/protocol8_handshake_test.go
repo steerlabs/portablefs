@@ -131,3 +131,87 @@ func TestDelegationReferenceIsPartOfMutationFingerprint(t *testing.T) {
 func int64Pointer(value int64) *int64 {
 	return &value
 }
+
+// Exercise the server's real first-frame transition on each authenticated
+// transport role, rather than just calling the role-independent major helper.
+func TestProtocol8ServerBothRolesRefuseUnequalMajor(t *testing.T) {
+	for _, role := range []authoritypb.TransportRole{authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL} {
+		for _, major := range []uint32{0, ProtocolMajor - 1, ProtocolMajor + 1, math.MaxUint32} {
+			t.Run(fmt.Sprintf("%s/%d", role, major), func(t *testing.T) {
+				server := transportHelloTestServer(t, 9)
+				if err := exchangeTransportHello(t, server, role, major); !errors.Is(err, ErrTransportBinding) || !strings.Contains(err.Error(), "protocol major") {
+					t.Fatalf("unequal major accepted or refused for wrong reason: %v", err)
+				}
+				if len(server.registry.pairs) != 0 {
+					t.Fatal("refused Hello published a transport binding")
+				}
+			})
+		}
+	}
+}
+
+func TestProtocol8LinuxClientRefusesInsufficientCapacityBeforeDial(t *testing.T) {
+	_, clientTLS := testTLSConfigs(t)
+	for limit := 2; limit < MinimumLinuxInFlight; limit++ {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			cfg := coherentTestClientConfig("invalid address must never be dialed", clientTLS, "volume", uint32(limit), limit)
+			client, err := DialClient(t.Context(), cfg)
+			if client != nil || err == nil || !strings.Contains(err.Error(), "Linux max-in-flight must be at least 9") {
+				t.Fatalf("limit=%d client=%v err=%v", limit, client, err)
+			}
+		})
+	}
+}
+
+func TestProtocol8LinuxServerRefusesInsufficientCapacity(t *testing.T) {
+	for _, role := range []authoritypb.TransportRole{authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL} {
+		for limit := 2; limit < MinimumLinuxInFlight; limit++ {
+			t.Run(fmt.Sprintf("%s/%d", role, limit), func(t *testing.T) {
+				server := transportHelloTestServer(t, limit)
+				if err := exchangeTransportHello(t, server, role, ProtocolMajor); !errors.Is(err, ErrTransportBinding) || !strings.Contains(err.Error(), "bound is below 9") {
+					t.Fatalf("insufficient Linux capacity accepted or refused for wrong reason: %v", err)
+				}
+				if len(server.registry.pairs) != 0 {
+					t.Fatal("refused Hello published a transport binding")
+				}
+			})
+		}
+	}
+}
+
+func transportHelloTestServer(t *testing.T, limit int) *Server {
+	t.Helper()
+	server := &Server{
+		Handler:  clientTestHandler{epoch: bytes.Repeat([]byte{1}, 16), maxInFlight: limit},
+		MaxFrame: testMaxFrame, MaxInFlight: limit, MaxConnections: 2,
+		MaxFrameBytesInFlight: MinimumFrameBytesInFlight(testBounds(limit).MaxRequestFrame),
+		HandshakeTimeout:      time.Second, WriteTimeout: time.Second,
+	}
+	server.initializeFrameBudget()
+	if err := server.initializeTransportRegistry(); err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func exchangeTransportHello(t *testing.T, server *Server, role authoritypb.TransportRole, major uint32) error {
+	t.Helper()
+	client, peer := net.Pipe()
+	defer client.Close()
+	defer peer.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	sent := make(chan error, 1)
+	go func() {
+		_ = client.SetWriteDeadline(time.Now().Add(time.Second))
+		sent <- writeFrame(client, testMaxFrame, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
+			ProtocolMajor: major, Role: role, FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+			ConnectionSetId: bytes.Repeat([]byte{2}, 32),
+		}}})
+	}()
+	_, _, err := server.acceptTransportHello(ctx, cancel, peer, server.Handler.Bounds(), volumeserver.PeerIdentity{3})
+	if sendErr := <-sent; sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	return err
+}

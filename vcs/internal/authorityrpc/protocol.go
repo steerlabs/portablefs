@@ -166,7 +166,7 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 			*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
 			*authoritypb.Request_Cancel, *authoritypb.Request_Reauthorize,
 			*authoritypb.Request_Lookup, *authoritypb.Request_GetAttr,
-			*authoritypb.Request_Close, *authoritypb.Request_CloseBatch, *authoritypb.Request_Read,
+			*authoritypb.Request_Close, *authoritypb.Request_Read,
 			*authoritypb.Request_ReadDir, *authoritypb.Request_Reclaim:
 			return true
 		case *authoritypb.Request_Open:
@@ -562,12 +562,13 @@ func canonicalBytes(message protoreflect.Message) ([]byte, error) {
 }
 
 // Linux DATA keeps four ordered flushes independent of ordinary and blocking
-// work. Admission rejects smaller bounds before these lanes are constructed.
+// work. CONTROL retains ordinary acknowledgment and liveness capacity.
+// Admission rejects smaller bounds before these lanes are constructed.
 const MinimumLinuxInFlight = 9
 
-func executionLanes(maxInFlight int, profile authoritypb.FrontendProfile) (ordinary, blocking, flush int) {
+func executionLanes(maxInFlight int, profile authoritypb.FrontendProfile, role authoritypb.TransportRole) (ordinary, blocking, flush int) {
 	ordinary, blocking = blockingWaitLane(maxInFlight)
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA {
 		flush = volumeserver.OrderedFlushWindow
 		ordinary -= flush
 	}

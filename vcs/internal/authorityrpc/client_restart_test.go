@@ -43,7 +43,7 @@ func TestReconnectSurvivesListenerGapBeforeEpochVerdict(t *testing.T) {
 				}
 			}
 			stop := serve(listener, epoch)
-			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 5, 5))
+			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 			if err != nil {
 				stop()
 				t.Fatal(err)
@@ -86,8 +86,8 @@ func TestReconnectSurvivesListenerGapBeforeEpochVerdict(t *testing.T) {
 }
 
 func TestReconnectUnavailableListenerHonorsCallerDeadline(t *testing.T) {
-	address, tls, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, 5, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, tls, "volume", 5, 5))
+	address, tls, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, 9, time.Minute)
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, tls, "volume", 9, 9))
 	if err != nil {
 		stop()
 		t.Fatal(err)

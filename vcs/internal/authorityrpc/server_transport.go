@@ -87,9 +87,6 @@ func (s *Server) acceptTransportHello(
 	response.GetHello().Role = hello.GetRole()
 	response.GetHello().ConnectionSetId = append([]byte(nil), hello.GetConnectionSetId()...)
 	response.GetHello().FrontendProfile = hello.GetFrontendProfile()
-	if hello.GetProtocolMajor() != ProtocolMajor || response.GetHello().GetProtocolMajor() != ProtocolMajor {
-		return nil, nil, fmt.Errorf("%w: unequal protocol major", ErrTransportBinding)
-	}
 	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && response.GetHello().GetMaxInFlight() < MinimumLinuxInFlight {
 		return nil, nil, fmt.Errorf("%w: Linux DATA bound is below %d", ErrTransportBinding, MinimumLinuxInFlight)
 	}

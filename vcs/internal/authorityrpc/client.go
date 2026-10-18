@@ -324,7 +324,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 // is published. Both peers use the same partition: a flush must never wait for
 // ordinary work whose completion depends on that flush.
 func (c *Client) initializeExecutionLanes() {
-	ordinary, blocking, flush := executionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile)
+	ordinary, blocking, flush := executionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
 	slots := make([]clientSlot, c.cfg.ReplaySlots)
 	blockingBase := len(slots) - blocking
 	flushBase := blockingBase - flush

@@ -87,10 +87,6 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationCancel
 	case *authoritypb.Request_TerminalDeliveryReceipt:
 		return authoritymetrics.OperationTerminalDeliveryReceipt
-	case *authoritypb.Request_NextFskitRepair:
-		return authoritymetrics.OperationNextFskitRepair
-	case *authoritypb.Request_AckFskitRepair:
-		return authoritymetrics.OperationAckFskitRepair
 	case *authoritypb.Request_ApplyRoutes:
 		return authoritymetrics.OperationApplyRoutes
 	case *authoritypb.Request_Lookup:
@@ -121,19 +117,6 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationRead
 	case *authoritypb.Request_Write:
 		return authoritymetrics.OperationWrite
-	case *authoritypb.Request_FskitWrite:
-		switch request.GetFskitWrite().GetPhase() {
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
-			return authoritymetrics.OperationFskitWriteBegin
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
-			return authoritymetrics.OperationFskitWriteData
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT:
-			return authoritymetrics.OperationFskitWriteCommit
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
-			return authoritymetrics.OperationFskitWriteAbort
-		default:
-			return authoritymetrics.OperationUnknown
-		}
 	case *authoritypb.Request_Fallocate:
 		return authoritymetrics.OperationFallocate
 	case *authoritypb.Request_CopyFileRange:
@@ -185,10 +168,6 @@ func responseOutcome(response *authoritypb.Response) authoritymetrics.Outcome {
 		return authoritymetrics.OutcomeCoherence
 	case authoritypb.FailureClass_FAILURE_CLASS_ROUTES:
 		return authoritymetrics.OutcomeRoutes
-	case authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED:
-		return authoritymetrics.OutcomeFskitRepairInterrupted
-	case authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY:
-		return authoritymetrics.OutcomeFskitRepairRetry
 	}
 	errno := response.GetErrno()
 	switch {

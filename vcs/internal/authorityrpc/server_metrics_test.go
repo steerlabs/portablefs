@@ -63,23 +63,6 @@ func TestRequestOperationAndResponseOutcome(t *testing.T) {
 	if got := requestOperation(request); got != authoritymetrics.OperationWrite {
 		t.Fatalf("operation = %s, want positioned_write", got)
 	}
-	for phase, want := range map[authoritypb.FskitWritePhase]authoritymetrics.Operation{
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:  authoritymetrics.OperationFskitWriteBegin,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:   authoritymetrics.OperationFskitWriteData,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT: authoritymetrics.OperationFskitWriteCommit,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:  authoritymetrics.OperationFskitWriteAbort,
-	} {
-		request = &authoritypb.Request{Body: &authoritypb.Request_FskitWrite{FskitWrite: &authoritypb.FskitWriteRequest{Phase: phase}}}
-		if got := requestOperation(request); got != want {
-			t.Fatalf("FSKit write %s operation = %s, want %s", phase, got, want)
-		}
-	}
-	if got := requestOperation(&authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}); got != authoritymetrics.OperationNextFskitRepair {
-		t.Fatalf("next FSKit repair operation = %s", got)
-	}
-	if got := requestOperation(&authoritypb.Request{Body: &authoritypb.Request_AckFskitRepair{}}); got != authoritymetrics.OperationAckFskitRepair {
-		t.Fatalf("ack FSKit repair operation = %s", got)
-	}
 	response := &authoritypb.Response{Errno: 5, Failure: authoritypb.FailureClass_FAILURE_CLASS_STORAGE}
 	if got := responseOutcome(response); got != authoritymetrics.OutcomeStorage {
 		t.Fatalf("outcome = %s, want storage", got)
@@ -134,7 +117,7 @@ func TestServerServingObserverTracksTLSAcceptLoop(t *testing.T) {
 	}
 }
 
-func TestProtocolSevenOperationMetrics(t *testing.T) {
+func TestLinuxCoherenceOperationMetrics(t *testing.T) {
 	for _, tc := range []struct {
 		request *authoritypb.Request
 		want    authoritymetrics.Operation

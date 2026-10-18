@@ -33,10 +33,10 @@ func TestTerminalSessionReplyEndsClientBeforeSocketClose(t *testing.T) {
 		{"invalid marker", true, 0, ErrTransportBinding},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h := terminalReplyHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, terminal: tc.terminal, errno: tc.errno}
-			address, tls, stop := startTestServer(t, h, 5, time.Minute)
+			h := terminalReplyHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, terminal: tc.terminal, errno: tc.errno}
+			address, tls, stop := startTestServer(t, h, 9, time.Minute)
 			defer stop()
-			c, err := DialClient(t.Context(), coherentTestClientConfig(address, tls, "volume", 5, 5))
+			c, err := DialClient(t.Context(), coherentTestClientConfig(address, tls, "volume", 9, 9))
 			if err != nil {
 				t.Fatal(err)
 			}

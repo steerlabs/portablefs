@@ -131,6 +131,16 @@ func writeObservedResponse(conn net.Conn, maxFrame uint32, timeout time.Duration
 	}
 	err = writeFrame(conn, maxFrame, response)
 	observedErr = err
+	if errors.Is(err, ErrFrameEncoding) || errors.Is(err, ErrFramePayload) {
+		// Validation writes no bytes. Report a terminal internal defect using a
+		// fresh envelope: none of the invalid proof, body or replay state may be
+		// reused. Uncertainty ends client admission without claiming that the
+		// runtime has fenced. The observer retires the original as undelivered.
+		return writeFrame(conn, maxFrame, &authoritypb.Response{
+			RequestId: requestID, Epoch: handler.Epoch(), Errno: int32(syscall.EIO),
+			Failure: authoritypb.FailureClass_FAILURE_CLASS_INTERNAL, Uncertain: true,
+		})
+	}
 	if errors.Is(err, ErrFrameBounds) {
 		// The replacement must carry the same epoch and the same recorded
 		// replay-slot state as the reply it stands in for. Dropping either would
@@ -176,7 +186,7 @@ func (s *Server) validate() (TransportBounds, error) {
 		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must independently admit ordinary work and a blocking wait")
 	}
 	if s.MaxConnections < 2 {
-		return TransportBounds{}, errors.New("authorityrpc: protocol 7 requires capacity for one DATA/CONTROL connection pair")
+		return TransportBounds{}, errors.New("authorityrpc: protocol 8 requires capacity for one DATA/CONTROL connection pair")
 	}
 	bounds := s.Handler.Bounds()
 	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {
@@ -317,10 +327,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 	if err != nil {
 		return err
 	}
-	if entry.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && s.MaxInFlight < 3 {
-		return errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
-	}
-	ordinaryLimit, blockingLimit, flushLimit := serverExecutionLanes(s.MaxInFlight, entry.profile, entry.orderedFlush)
+	ordinaryLimit, blockingLimit, flushLimit := executionLanes(s.MaxInFlight, entry.profile, entry.role)
 	ordinary := make(chan struct{}, ordinaryLimit)
 	blocking := make(chan struct{}, blockingLimit)
 	flushes := make(chan struct{}, flushLimit)
@@ -498,20 +505,4 @@ func delegatedFlushRequest(request *authoritypb.Request) bool {
 		return fallocate.GetDelegation() != nil
 	}
 	return false
-}
-
-func serverExecutionLanes(maxInFlight int, profile authoritypb.FrontendProfile, orderedMode ...bool) (ordinary, blocking, flush int) {
-	ordinary, blocking = blockingWaitLane(maxInFlight)
-	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return ordinary, blocking, 0
-	}
-	// Preserve the protocol's half-capacity blocking-lock lane. One slot from
-	// the ordinary half is enough to break a cross-recall dependency while the
-	// remaining ordinary requests wait for holder acknowledgments.
-	flush = 1
-	if len(orderedMode) == 1 && orderedMode[0] && ordinary >= volumeserver.OrderedFlushWindow+1 {
-		flush = volumeserver.OrderedFlushWindow
-	}
-	ordinary -= flush
-	return ordinary, blocking, flush
 }

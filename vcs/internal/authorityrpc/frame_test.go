@@ -483,10 +483,10 @@ func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
 		t.Fatal(err)
 	}
 	var decoded authoritypb.Request
-	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
 		t.Fatalf("oversized repeated field = %v, want ErrFrameEncoding", err)
 	}
-	if decoded.GetHello() != nil {
+	if decoded.GetRequestId() != 0 || decoded.GetBody() != nil {
 		t.Fatal("repeated-field amplification reached protobuf decode")
 	}
 	var outbound bytes.Buffer
@@ -1253,14 +1253,5 @@ func TestServerDelegatedFlushUsesIndependentDataLane(t *testing.T) {
 	if delegatedFlushRequest(&authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}) {
 		t.Fatal("ordinary write used flush lane")
 	}
-	for _, limit := range []int{3, 8, 127} {
-		ordinary, blocking, flush := serverExecutionLanes(limit, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX)
-		if ordinary < 1 || blocking < 1 || flush < 1 || ordinary+blocking+flush != limit || blocking != limit/2 {
-			t.Fatalf("serverExecutionLanes(%d) = %d,%d,%d", limit, ordinary, blocking, flush)
-		}
-	}
-	ordinary, blocking, flush := serverExecutionLanes(2, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE)
-	if ordinary != 1 || blocking != 1 || flush != 0 {
-		t.Fatalf("FSKit serverExecutionLanes(2) = %d,%d,%d", ordinary, blocking, flush)
-	}
+
 }

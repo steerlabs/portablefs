@@ -1209,7 +1209,7 @@ public nonisolated struct PfsDirEntry: Sendable {
 
   public var name: Data = Data()
 
-  /// always has item+kind; full attrs when want_attrs
+  /// non-owning kind+file_id; full attrs when want_attrs
   public var attr: PfsAttr {
     get {_attr ?? PfsAttr()}
     set {_attr = newValue}

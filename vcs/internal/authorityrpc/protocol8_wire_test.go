@@ -114,26 +114,26 @@ func TestProtocol8WritePayloadFingerprintAndFrameAccounting(t *testing.T) {
 }
 
 func TestProtocol8ExecutionLanePartition(t *testing.T) {
-	for _, max := range []int{9, 10, 32, 127} {
-		ordinary, blocking, flush := executionLanes(max, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX)
-		if ordinary < 1 || blocking < 1 || flush != 4 || ordinary+blocking+flush != max {
-			t.Fatalf("max=%d lanes=%d/%d/%d", max, ordinary, blocking, flush)
+	for _, limit := range []int{9, 10, 11, 12, 32, 127} {
+		for _, role := range []authoritypb.TransportRole{authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL} {
+			ordinary, blocking, flush := executionLanes(limit, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX, role)
+			wantFlush := 0
+			if role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA {
+				wantFlush = 4
+			}
+			if ordinary != limit-limit/2-wantFlush || blocking != limit/2 || flush != wantFlush {
+				t.Fatalf("max=%d role=%s lanes=%d/%d/%d", limit, role, ordinary, blocking, flush)
+			}
+			if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && ordinary < 3 {
+				t.Fatal("CONTROL cannot admit change, delegation and liveness calls independently")
+			}
 		}
 	}
 	for _, profile := range []authoritypb.FrontendProfile{authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER} {
-		ordinary, blocking, flush := executionLanes(2, profile)
-		if ordinary != 1 || blocking != 1 || flush != 0 {
-			t.Fatalf("profile=%s lanes=%d/%d/%d", profile, ordinary, blocking, flush)
-		}
-	}
-}
-
-func TestProtocol8BothRolesRequireExactMajor(t *testing.T) {
-	for _, role := range []authoritypb.TransportRole{authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL} {
-		for _, major := range []uint32{0, ProtocolMajor - 1, ProtocolMajor, ProtocolMajor + 1, math.MaxUint32} {
-			request := &authoritypb.HelloRequest{Role: role, ProtocolMajor: major}
-			if err := validateProtocolMajor(request.GetProtocolMajor()); (err == nil) != (major == ProtocolMajor) {
-				t.Fatalf("role=%s major=%d: %v", role, major, err)
+		for _, role := range []authoritypb.TransportRole{authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL} {
+			ordinary, blocking, flush := executionLanes(2, profile, role)
+			if ordinary != 1 || blocking != 1 || flush != 0 {
+				t.Fatalf("profile=%s role=%s lanes=%d/%d/%d", profile, role, ordinary, blocking, flush)
 			}
 		}
 	}

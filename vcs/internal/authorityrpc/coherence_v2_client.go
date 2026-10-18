@@ -315,7 +315,7 @@ func (c *Client) WaitVisibility(ctx context.Context, cutSequence uint64) (*autho
 }
 
 func (c *Client) linuxSubscriptionProfile() bool {
-	return c != nil && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+	return c != nil && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 }
 
 func (c *Client) validateDelegationAck(incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef) error {

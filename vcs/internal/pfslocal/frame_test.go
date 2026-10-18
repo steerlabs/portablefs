@@ -17,6 +17,13 @@ func readGolden(t *testing.T, name string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
+	swift, err := os.ReadFile(filepath.Join("..", "..", "..", "swift", "PortableFSKit", "Tests", "PortableFSKitTests", "Goldens", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, swift) {
+		t.Fatalf("Go and Swift golden %s differ", name)
+	}
 	b, err := hex.DecodeString(string(bytes.TrimSpace(raw)))
 	if err != nil {
 		t.Fatal(err)

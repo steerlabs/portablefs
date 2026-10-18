@@ -322,7 +322,7 @@ message LookupReply {
 
 message DirEntry {
   bytes name = 1;
-  Attr attr = 2; // always has item+kind; full attrs when want_attrs
+  Attr attr = 2; // non-owning kind+file_id; full attrs when want_attrs
   uint64 cookie = 3; // resume enumeration AFTER this entry; 0 only for the final entry/end
 }
 // Lists one page of a directory as non-owning entry snapshots, using the

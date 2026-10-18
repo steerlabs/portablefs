@@ -68,7 +68,8 @@ type ResolveReply struct {
 	VolumeID     string
 	VolumeName   string
 	Capabilities Capabilities
-	V3Coherence  *V3CoherenceContract
+	// Required on the wire; nil represents omission and is rejected by the codec.
+	V3Coherence *V3CoherenceContract
 }
 
 type V3CoherenceContract struct {

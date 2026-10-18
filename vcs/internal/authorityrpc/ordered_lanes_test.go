@@ -75,7 +75,7 @@ func TestDelegatedFlushProgressUnderOrdinarySaturation(t *testing.T) {
 				if err != nil || reply.GetWrite().GetCommittedSize() != 1 {
 					t.Fatalf("flush could not progress while ordinary calls waited: %v, %v", reply, err)
 				}
-				ordinary, blocking, flush := executionLanes(limit, c.cfg.FrontendProfile)
+				ordinary, blocking, flush := executionLanes(limit, c.cfg.FrontendProfile, authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
 				if cap(c.ordinary.permits) != ordinary || cap(c.blocking.permits) != blocking || cap(c.flush.permits) != flush || ordinary+blocking+flush != limit {
 					t.Fatal("client and server execution budgets differ")
 				}

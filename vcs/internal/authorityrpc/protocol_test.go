@@ -38,7 +38,7 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_Readlink{}, true, true, false},
 		{&authoritypb.Request_Open{}, true, true, true},
 		{&authoritypb.Request_Close{}, true, false, true},
-		{&authoritypb.Request_CloseBatch{}, true, true, true},
+		{&authoritypb.Request_CloseBatch{}, true, true, false},
 		{&authoritypb.Request_Read{}, true, true, true},
 		{&authoritypb.Request_Fsync{}, true, true, false},
 		{&authoritypb.Request_ReadDir{}, true, true, true},

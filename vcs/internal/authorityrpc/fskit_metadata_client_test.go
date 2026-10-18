@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -60,9 +61,9 @@ func (h fskitProofTestHandler) Handle(ctx context.Context, req *authoritypb.Requ
 
 func dialFskitProofTestClient(t *testing.T, handler Handler, configure func(*ClientConfig)) (*Client, error) {
 	t.Helper()
-	address, tls, stop := startTestServer(t, handler, 4, time.Minute)
+	address, tls, stop := startTestServer(t, handler, 9, time.Minute)
 	t.Cleanup(stop)
-	cfg := coherentTestClientConfig(address, tls, "fskit", 4, 4)
+	cfg := coherentTestClientConfig(address, tls, "fskit", 9, 9)
 	cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
 	if configure != nil {
 		configure(&cfg)
@@ -113,10 +114,8 @@ func TestFskitKeepAliveValidatesTheSessionProof(t *testing.T) {
 	}
 }
 
-// Only the complete KeepAlive success shape renews. A reply the frame layer
-// admits but that contradicts success (replay state, a route record, a repair
-// retry, or, with no proof to trip the frame grammar, any other populated
-// outcome field) ends the session and never yields a proof.
+// Only the complete KeepAlive success shape renews. Inject contradictory peer
+// replies as raw bytes so egress validation cannot hide an ingress defect.
 func TestKeepAliveRequiresTheCompleteSuccessShape(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -143,15 +142,20 @@ func TestKeepAliveRequiresTheCompleteSuccessShape(t *testing.T) {
 			var err error
 			if test.fskit {
 				handler := newFskitProofTestHandler()
-				handler.set(uint64(time.Second), test.mutate, 0)
+				handler.set(uint64(time.Second), nil, 0)
 				client, err = dialFskitProofTestClient(t, handler, nil)
 			} else {
-				client, err = dialLinuxKeepAliveTestClient(t, test.mutate)
+				client, err = dialLinuxKeepAliveTestClient(t, nil)
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if proof, err := client.KeepAlive(t.Context()); err == nil || proof != 0 || client.LocalAdmissionOpen() {
+			response := &authoritypb.Response{}
+			if test.fskit {
+				response.SessionValidForNanos = uint64(time.Second)
+			}
+			test.mutate(response)
+			if proof, err := injectKeepAliveReply(t, client, response); err == nil || proof != 0 || client.LocalAdmissionOpen() {
 				t.Fatalf("contradicting keepalive = (%s,%v) admission=%t, want a terminal refusal", proof, err, client.LocalAdmissionOpen())
 			}
 		})
@@ -244,9 +248,9 @@ func (h keepAliveTestHandler) Handle(ctx context.Context, req *authoritypb.Reque
 
 func dialLinuxKeepAliveTestClient(t *testing.T, mutate func(*authoritypb.Response)) (*Client, error) {
 	t.Helper()
-	address, tls, stop := startTestServer(t, keepAliveTestHandler{clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, mutate}, 4, time.Minute)
+	address, tls, stop := startTestServer(t, keepAliveTestHandler{clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, mutate}, 9, time.Minute)
 	t.Cleanup(stop)
-	cfg := coherentTestClientConfig(address, tls, "linux", 4, 4)
+	cfg := coherentTestClientConfig(address, tls, "linux", 9, 9)
 	cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 	client, err := DialClient(t.Context(), cfg)
 	if err == nil {
@@ -341,5 +345,60 @@ func TestLocalPublicationParticipatesInTerminalRevocation(t *testing.T) {
 	}
 	if forced.Load() != 0 {
 		t.Fatal("a consumed local reply was force-revoked")
+	}
+}
+
+// Swap only the established CONTROL generation, then inject a peer response
+// without passing it through the authority's outgoing validation.
+func injectKeepAliveReply(t *testing.T, client *Client, response *authoritypb.Response) (time.Duration, error) {
+	t.Helper()
+	local, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	client.control.pendingMu.Lock()
+	old := client.control.conn
+	client.control.conn = local
+	client.control.pendingMu.Unlock()
+	_ = old.Close()
+	go client.readLoop(client.control, local)
+	done := make(chan error, 1)
+	go func() {
+		_ = peer.SetDeadline(time.Now().Add(5 * time.Second))
+		request := new(authoritypb.Request)
+		if err := readFrame(peer, testMaxFrame, nil, 0, request); err != nil {
+			done <- err
+			return
+		}
+		response.RequestId, response.Epoch = request.GetRequestId(), client.Epoch()
+		frame, err := rawResponseFrame(response, nil)
+		if err == nil {
+			_, err = peer.Write(frame)
+		}
+		done <- err
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	proof, err := client.KeepAlive(ctx)
+	if sendErr := <-done; sendErr != nil {
+		t.Fatal(sendErr)
+	}
+	return proof, err
+}
+
+func TestAuthorityEncodingDefectReturnsTerminalRefusal(t *testing.T) {
+	handler := newFskitProofTestHandler()
+	handler.set(uint64(time.Second), func(response *authoritypb.Response) {
+		response.Mutation = &authoritypb.MutationState{Slot: 1, AcceptedSequence: 1}
+	}, 0)
+	client, err := dialFskitProofTestClient(t, handler, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	response, err := client.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+	if err != nil || response == nil || response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || response.GetSessionValidForNanos() != 0 ||
+		response.GetMutation() != nil || client.LocalAdmissionOpen() {
+		t.Fatalf("encoding defect = (%v, %v), admission=%t, want terminal internal refusal", response, err, client.LocalAdmissionOpen())
 	}
 }
