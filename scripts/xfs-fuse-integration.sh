@@ -26,6 +26,17 @@ set -euo pipefail
 # deletion there fails the job instead of quietly shrinking privileged coverage.
 REQUIRED_TESTS=()
 
+# The cell helper's root-only boundary: work it performs with privileges the
+# authority service identity never holds (chown of service-readable files and
+# root-owned launch configuration). These cannot run under the unprivileged
+# data-plane identity, where they skip, so they run in their own root
+# invocation. Keeping an exact required list prevents a renamed or skipped test
+# from masquerading as qualification.
+REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestLaunchConfigsAndWorkerDropInsUsePinnedBinds"
+  "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestQuiesceRequestIsFreshAndReadableByTheAuthority"
+)
+
 fail() {
   echo "xfs-fuse-integration: $1" >&2
   exit "${2:-1}"
@@ -330,6 +341,37 @@ run_suite() {
   verify_required_tests "$log"
 }
 
+run_root_boundary_suite() {
+  local log=/var/tmp/portablefs-root-boundary.log
+  local pattern="" entry status=0
+  for entry in "${REQUIRED_ROOT_TESTS[@]}"; do
+    pattern="${pattern:+$pattern|}${entry##*:}"
+  done
+  # Run as root against the same provisioned XFS cell, retaining the production
+  # service UID/GID as the ownership the helper must establish.
+  set +e
+  env -i \
+    HOME=/root \
+    PATH=/usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TMPDIR=/var/tmp \
+    GOCACHE=/var/tmp/portablefs-cellhost-gocache \
+    GOMODCACHE=/home/portablefs/gomodcache \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=readonly \
+    PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
+    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
+    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
+    -run "^(${pattern})\$" \
+    ./internal/cellhost >"$log" 2>&1
+  status=$?
+  set -e
+  cat -- "$log"
+  [[ $status -eq 0 ]] || fail "root cell-helper boundary tests exited $status" "$status"
+  verify_exact_tests "$log" "${REQUIRED_ROOT_TESTS[@]}"
+  echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
+}
+
 # go test reports a skipped test as "--- SKIP" and a passing one as "--- PASS".
 # Matching the exact package/test pairs catches a renamed, deleted, or silently
 # skipped privileged test, which a plain exit code cannot.
@@ -362,6 +404,9 @@ run_container() {
   provision_xfs
   provision_volume
   run_suite
+  if [[ ${PORTABLEFS_SOAK_TEST:-} != 1 ]]; then
+    run_root_boundary_suite
+  fi
 }
 
 case "${1:-}" in
