@@ -448,7 +448,6 @@ func (d *v3DataPlane) resolveReply() *pfslocal.ResolveReply {
 		Root: root.item, RootAttr: attr, VolumeID: d.cfg.VolumeID,
 		VolumeName: d.cfg.VolumeName,
 		Capabilities: pfslocal.Capabilities{
-
 			MaxNameBytes: nameMax, MaxFileSize: math.MaxInt64, PreferredIOSize: preferred,
 		},
 	}
@@ -1356,12 +1355,6 @@ func (d *v3DataPlane) xattrGet(ctx context.Context, operationID uint64, request 
 	}
 	return &pfslocal.XattrGetReply{Value: cloneBytesV3(response.GetGetXattr().GetValue())}, 0
 }
-
-// xattrSet keeps the frozen local validation order and then answers the
-// refusal the authority gives every set: this attach advertises
-// XattrSetSupported=false because XFS does not charge attribute blocks to the
-// project quota. The authority's EOPNOTSUPP crosses the same wire mapping a
-// round trip would use, and no mutation or publication gate is involved.
 
 func (d *v3DataPlane) xattrList(ctx context.Context, operationID uint64, request *pfslocal.XattrListRequest) (any, int32) {
 	item, handle, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
@@ -2764,18 +2757,26 @@ func (d *v3DataPlane) stopServing(err error) error {
 // keepAlive is the sole periodic renewal owner. Completion starts the next
 // interval; slow requests never accumulate a ticker backlog or overlap.
 func (d *v3DataPlane) keepAlive() {
+	d.keepAliveWithTimer(func(interval time.Duration) (<-chan time.Time, func()) {
+		timer := time.NewTimer(interval)
+		return timer.C, func() { timer.Stop() }
+	})
+}
+
+func (d *v3DataPlane) keepAliveWithTimer(newTimer func(time.Duration) (<-chan time.Time, func())) {
 	interval := v3KeepAliveInterval(d.client.SessionLease())
 	if interval <= 0 {
 		_ = d.fail(errors.New("invalid authority renewal interval"))
 		return
 	}
 	for {
-		timer := time.NewTimer(interval)
+		tick, stop := newTimer(interval)
 		select {
 		case <-d.client.SessionDone():
-			timer.Stop()
+			stop()
 			return
-		case <-timer.C:
+		case <-tick:
+			stop()
 		}
 		if !d.scheduledRenewal() {
 			return
@@ -2796,13 +2797,8 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	defer d.renewalMu.Unlock()
 	wallStart := time.Now()
 	d.mu.Lock()
-	start, startErr := d.readClockLocked()
 	authorization := d.authorizationDeadline
 	d.mu.Unlock()
-	if startErr != nil {
-		_ = d.endOnClockFault()
-		return startErr
-	}
 	if !authorization.IsZero() && !wallStart.Before(authorization) {
 		return errors.New("installed authority authorization expired")
 	}
@@ -2812,27 +2808,42 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	}
 	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
+	waitDeadline, _ := ctx.Deadline()
+	stopBudget, err := startV3RenewalBudget(time.Until(waitDeadline), cancel)
+	if err != nil {
+		return err
+	}
+	defer stopBudget()
+	// The native wait budget is armed before t0. It remains bounded across
+	// sleep even if the cache clock fails; no proof uses a substitute clock.
+	d.mu.Lock()
+	start, startErr := d.readClockLocked()
+	d.mu.Unlock()
+	if startErr != nil {
+		_ = d.endOnClockFault()
+		// Renewal preserves the original session for later absence evidence.
+		// A broken cache clock must not end that independent transport owner.
+	}
 	proof, err := d.client.KeepAlive(ctx)
 	if err != nil {
 		return err
 	}
-	if proof <= 0 || proof%time.Millisecond != 0 || proof > authorityrpc.MaxCacheProof || proof > d.client.SessionLease() || (!authorization.IsZero() && proof > authorization.Sub(wallStart)) {
+	if proof <= 0 || proof%time.Millisecond != 0 || proof > authorityrpc.MaxCacheProof || proof > d.client.SessionLease() {
 		return errors.New("authority renewal returned an invalid proof")
 	}
 	d.mu.Lock()
 	now, nowErr := d.readClockLocked()
 	candidate, usable := v3HorizonCandidate(start, proof)
-	if usable && nowErr == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
+	if usable && d.clockFault == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
 		d.horizon = candidate
 	}
 	d.mu.Unlock()
 	if nowErr != nil {
 		_ = d.endOnClockFault()
-		return nowErr
 	}
-	if !usable || now >= candidate {
-		return errors.New("authority renewal returned an unusable delayed proof")
-	}
+	// Scalar-valid answers can outlive their entire cache horizon in transit.
+	// They renew the session but grant no cache eligibility; this is not a
+	// transport or proof-format failure. Startup checks usability separately.
 	return nil
 }
 
@@ -3099,23 +3110,19 @@ func v3LocalErrno(err error) int32 {
 	return darwinEIO
 }
 
-// scheduledRenewal distinguishes a definitively settled local timeout from a
-// refused or poisoned authority session. KeepAlive owns cancel-drain settlement.
+// scheduledRenewal keeps local cancellation separate from session failure.
+// KeepAlive must report terminal transport outcomes independently of ctx.Err().
 func (d *v3DataPlane) scheduledRenewal() bool {
 	err := d.renewHorizon(context.Background())
-	if err == nil {
-		return true
-	}
 	d.mu.Lock()
-	clockFault := d.clockFault
 	authorization := d.authorizationDeadline
 	d.mu.Unlock()
-	if clockFault != nil {
-		return false
-	}
 	if !authorization.IsZero() && !time.Now().Before(authorization) {
 		_ = d.fail(errors.New("installed authority authorization expired"))
 		return false
+	}
+	if err == nil {
+		return true
 	}
 	if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && d.client.SessionError() == nil && d.client.LocalAdmissionOpen() {
 		select {

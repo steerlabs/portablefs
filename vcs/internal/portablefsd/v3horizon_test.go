@@ -137,8 +137,8 @@ func TestV3HorizonIsAnchoredAtRequestStart(t *testing.T) {
 	}
 	client.mu.Unlock()
 	clock.advance(time.Second)
-	if err := d.renewHorizon(context.Background()); err == nil {
-		t.Fatal("expired proof accepted")
+	if err := d.renewHorizon(context.Background()); err != nil {
+		t.Fatalf("well-formed expired proof became terminal: %v", err)
 	}
 	if got := v3Horizon(d); got != want {
 		t.Fatalf("delay-consumed proof moved the horizon to %d, want %d", got, want)
@@ -358,8 +358,8 @@ func TestV3ClockFaultDuringRenewalEndsServing(t *testing.T) {
 					return time.Minute, nil
 				}
 				client.mu.Unlock()
-				if err := d.renewHorizon(context.Background()); err == nil {
-					t.Fatal("clock failure succeeded")
+				if err := d.renewHorizon(context.Background()); err != nil {
+					t.Fatalf("clock fault ended transport renewal: %v", err)
 				}
 				fault.recover(clock)
 				_ = d.renewHorizon(context.Background())

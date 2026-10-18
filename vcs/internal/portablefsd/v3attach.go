@@ -200,7 +200,6 @@ func (c *v3AttachConfig) persisted() *persistedV3Attach {
 		return nil
 	}
 	return &persistedV3Attach{
-
 		RoutesRevision: hex.EncodeToString(c.routesRevision[:]),
 	}
 }
@@ -270,7 +269,6 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 		return nil, fmt.Errorf("v3 attach requires mutually authenticated TLS; transport %q is refused", req.DataPlaneTransport)
 	}
 	if err := validPersistedV3Attach(&persistedV3Attach{
-
 		RoutesRevision: v3.RoutesRevision,
 	}); err != nil {
 		return nil, err
@@ -306,7 +304,6 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 	}
 	return &v3AttachConfig{
 		identity: &identity, routesRevision: revision,
-
 		enrollmentClient: enrollmentClient, enrollmentID: enrollmentID,
 		initialAuthorizationDeadline: initialAuthorizationDeadline,
 		preKernelMountAbsence:        req.observePreKernelMountAbsence,
@@ -319,9 +316,6 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 type v3AuthoritySession interface {
 	DetachAfterUnmount(context.Context, *authoritypb.MountAbsenceProof) error
 }
-
-// isV3 is stable for the attach lifetime: v3Config is assigned before the
-// attach is registered and never mutated afterwards.
 
 func (a *attach) v3Backend() *v3DataPlane {
 	a.mu.RLock()
@@ -407,18 +401,17 @@ func (a *attach) startV3(ctx context.Context) error {
 		}
 	}
 	client, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
-		Purpose:            authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile:    authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
-		Address:            a.authorityAddr,
-		TLS:                tlsCfg,
-		VolumeID:           a.volumeID,
-		AccessToken:        []byte(token),
-		ReplaySlots:        v3AttachReplaySlots,
-		MaxFrame:           v3AttachMaxFrame,
-		DialTimeout:        v3AttachDialTimeout,
-		CancelDrainTimeout: v3AttachCancelDrainTimeout,
-		MaxInFlight:        v3AttachMaxInFlight,
-
+		Purpose:                               authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:                       authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
+		Address:                               a.authorityAddr,
+		TLS:                                   tlsCfg,
+		VolumeID:                              a.volumeID,
+		AccessToken:                           []byte(token),
+		ReplaySlots:                           v3AttachReplaySlots,
+		MaxFrame:                              v3AttachMaxFrame,
+		DialTimeout:                           v3AttachDialTimeout,
+		CancelDrainTimeout:                    v3AttachCancelDrainTimeout,
+		MaxInFlight:                           v3AttachMaxInFlight,
 		RoutesRevision:                        cfg.routesRevision,
 		RequireMountEnrollmentReauthorization: cfg.enrollmentClient != nil,
 		ObservePreKernelMountAbsence:          preKernelMountAbsence,
@@ -612,7 +605,6 @@ func (c *frontendConn) handleV3Attached(
 	if operationID != 0 {
 		defer c.finishLogicalRequest(operationID)
 	}
-	ctx = context.WithValue(ctx, v3CallbackContextKey{}, c.origin)
 	ctx, cancelOperation := withOperationDeadline(ctx)
 	defer cancelOperation()
 	publishes, err := c.beginLogicalOperation(
@@ -656,7 +648,6 @@ func (c *frontendConn) serveV3Attempt(
 	bypassCache bool,
 ) (retry bool) {
 	ctx = context.WithValue(ctx, v3CallbackContextKey{}, c.origin)
-
 	var (
 		reply any
 		eno   int32
@@ -944,8 +935,7 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 		// so its release transfer and proof are not repeated.
 		a.frontendSerial.Lock()
 		a.nsMu.Lock()
-		_, err := a.finishDetachWithNSLocked("", nil)
-		return err
+		return a.finishDetachWithNSLocked(nil)
 	}
 	present, err := ops.present(a.mountPath, a.ref)
 	if err != nil {
@@ -1024,6 +1014,5 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	a.fenceV3(errV3AttachDetached)
 	a.frontendSerial.Lock()
 	a.nsMu.Lock()
-	_, err = a.finishDetachWithNSLocked("", errors.Join(proofErr, releaseErr))
-	return err
+	return a.finishDetachWithNSLocked(errors.Join(proofErr, releaseErr))
 }

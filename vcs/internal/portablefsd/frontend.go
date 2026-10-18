@@ -171,8 +171,8 @@ func (c *frontendConn) serve(ctx context.Context) {
 				(req.SemanticCommit != pfslocal.PublicationSemanticCommitPublished &&
 					req.SemanticCommit != pfslocal.PublicationSemanticCommitNotPublished) {
 				log.Printf(
-					"portablefsd frontend: closing connection: malformed publication ack (operationID=%d semanticCommit=%d)",
-					req.OperationID, req.SemanticCommit,
+					"portablefsd frontend: closing connection: malformed publication ack (origin=%d operationID=%d semanticCommit=%d)",
+					c.origin, req.OperationID, req.SemanticCommit,
 				)
 				return
 			}
@@ -184,24 +184,24 @@ func (c *frontendConn) serve(ctx context.Context) {
 						// still owned the exact lease. Fence the attach before any
 						// frontend publication bookkeeping can release a broader gate.
 						a.stopV3Serving(err)
-						log.Printf("portablefsd frontend: closing connection: publication semantic commit failed for operation %d: %v", req.OperationID, err)
+						log.Printf("portablefsd frontend: closing connection: publication semantic commit failed for callback %d/%d: %v", c.origin, req.OperationID, err)
 						return
 					}
 					if !known {
-						log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+						log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged callback %d/%d", c.origin, req.OperationID)
 						return
 					}
 				}
 			}
 			if !c.acknowledgePublication(req.OperationID) {
-				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged callback %d/%d", c.origin, req.OperationID)
 				return
 			}
 			continue
 		} else {
-			lane, ok := admitRequestID(env.RequestID, &lastRequestID)
+			ok := admitRequestID(env.RequestID, &lastRequestID)
 			if !ok {
-				log.Printf("portablefsd frontend: closing connection: %s-lane request id %d violated its lane's strictly-increasing order", lane, env.RequestID)
+				log.Printf("portablefsd frontend: closing connection: origin=%d request id %d violated strictly-increasing order", c.origin, env.RequestID)
 				return
 			}
 		}
@@ -292,7 +292,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				defer c.handlerWG.Done()
 				defer c.inFlight.Add(-1)
 				c.handleAttached(
-					context.WithValue(connCtx, v3CallbackContextKey{}, c.origin),
+					connCtx,
 					a,
 					requestID,
 					operationID,
@@ -746,8 +746,8 @@ func (c *frontendConn) markPublicationReplyExposedForV3(
 		a := entry.attach
 		c.publicationMu.Unlock()
 		a.stopV3Serving(fmt.Errorf(
-			"%w: logical operation %d produced a publishing reply after its callback acknowledged",
-			errFrontendPublicationUnprovable, operationID,
+			"%w: callback %d/%d produced a publishing reply after its callback acknowledged",
+			errFrontendPublicationUnprovable, c.origin, operationID,
 		))
 		return false, false
 	}
@@ -766,15 +766,6 @@ func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32
 		req, operationID, &pfslocal.ErrorReply{Errno: eno, Message: msg}, false,
 	)
 }
-
-// admitLaneRequestID enforces per-lane replay protection. Request IDs are
-// allocated in one increasing sequence but written on two lanes, and the
-// control lane (visibility acknowledgments, liveness) deliberately overtakes
-// queued ordinary requests — so a control frame may legally arrive carrying a
-// lower ID than an ordinary frame already received. Each lane is FIFO with
-// increasing IDs within itself; that per-lane monotonicity is the replay
-// protection, and enforcing it globally once killed healthy mounts the
-// moment a barrier acknowledgment overtook a request burst.
 
 // acknowledgePublication retires the logical operation the frontend has
 // finished with.
@@ -883,7 +874,10 @@ func (c *frontendConn) reserveLogicalOperation(
 		return false, false
 	}
 	c.operations[operationID] = &frontendOperationEntry{
-		ready:          make(chan struct{}),
+		ready: make(chan struct{}),
+		// Reservation precedes handler startup. Close must still own its
+		// coordinator record if the queued handler has not begun yet.
+		attach:         c.currentAttach(),
 		activeRequests: 1,
 	}
 	c.lastOperationID = operationID
@@ -1095,12 +1089,14 @@ func (l *publishedUnixListener) Close() error {
 	return l.err
 }
 
-func admitRequestID(id uint64, last *uint64) (string, bool) {
+// All request/reply frames share one FIFO sequence. Only one-way publication
+// and resource dispositions bypass it with request ID zero.
+func admitRequestID(id uint64, last *uint64) bool {
 	if id == 0 || id <= *last {
-		return "request", false
+		return false
 	}
 	*last = id
-	return "request", true
+	return true
 }
 func (c *frontendConn) callback(operation uint64) v3CallbackID {
 	return v3CallbackID{origin: c.origin, operation: operation}

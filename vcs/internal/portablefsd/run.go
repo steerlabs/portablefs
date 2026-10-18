@@ -344,7 +344,7 @@ func acquireLock(dirPath, name, owner string) (*singletonLock, error) {
 }
 
 // errSingletonHeld distinguishes "another process holds this lock" from every
-// other acquisition failure, so only that case reaches the takeover policy.
+// other acquisition failure without interpreting bytes in the lock inode.
 var errSingletonHeld = errors.New("portablefsd singleton is held")
 
 func tryAcquireLock(dirPath, name, owner string) (*singletonLock, error) {
@@ -374,20 +374,6 @@ func tryAcquireLock(dirPath, name, owner string) (*singletonLock, error) {
 	}
 	return guard, nil
 }
-
-// describeSingletonHolder names WHO holds a refused lock. An operator reading
-// "resource temporarily unavailable" has nothing to act on; an operator reading
-// the holder's pid and state does.
-
-// singletonHolderIsProvablyGone classifies the holder of an existing lock file
-// WITHOUT creating, renaming or writing anything. It answers false for every
-// ambiguity: a missing lock, an unreadable one, no owner record, an unprovable
-// platform, or a live holder.
-
-// takeOverDeadSingleton replaces a lock inode whose recorded owner is PROVEN
-// unable to act again. It returns (nil, nil) when the holder is live or cannot
-// be proven dead — the only safe default, and the one that keeps a merely slow
-// daemon from being displaced.
 
 func Main(version string) int {
 	cfg, showVersion, showIdentity := ParseFlags(version)

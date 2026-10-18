@@ -170,6 +170,7 @@ type v3TestAuthority struct {
 
 	mu               sync.Mutex
 	keepAliveErrno   int32
+	keepAliveHook    func(context.Context, *authoritypb.Request)
 	statfsNameMax    uint32
 	attach           *authoritypb.AttachRequest
 	detach           *authoritypb.DetachRequest
@@ -289,7 +290,11 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	case *authoritypb.Request_KeepAlive:
 		h.mu.Lock()
 		response.Errno = h.keepAliveErrno
+		hook := h.keepAliveHook
 		h.mu.Unlock()
+		if hook != nil {
+			hook(ctx, req)
+		}
 		if response.Errno == 0 {
 			response.SessionValidForNanos = uint64(min(time.Duration(h.leaseMillis)*time.Millisecond, authorityrpc.MaxCacheProof))
 		}
@@ -525,7 +530,7 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 	if _, handled, err := a.rotateLiveCredential(context.Background(), "manual", renewedDeadline.UnixMilli(), 2, pki.clientCertPEM, false); !handled || err == nil || !strings.Contains(err.Error(), "automatic reauthorization owner") {
 		t.Fatalf("manual fallback against automatic owner: handled=%t err=%v", handled, err)
 	}
-	if found, _, err := r.delete(context.Background(), a.ref, true); err != nil || !found {
+	if found, err := r.delete(context.Background(), a.ref, true); err != nil || !found {
 		t.Fatalf("detach automatic renewal owner: found=%t err=%v", found, err)
 	}
 	select {
@@ -778,9 +783,9 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 			return nil
 		},
 	}
-	found, jobID, err := r.unmountFSKitWith(a.ref, false, ops)
-	if err != nil || !found || jobID != "" {
-		t.Fatalf("v3 unmount=(%v,%q,%v)", found, jobID, err)
+	found, err := r.unmountFSKitWith(a.ref, false, ops)
+	if err != nil || !found {
+		t.Fatalf("v3 unmount=(%v,%v)", found, err)
 	}
 	if detachesBeforeUnmount != 0 {
 		t.Fatal("mount-absence proof reached the authority before the kernel detach")
@@ -819,7 +824,7 @@ func TestV3NormalDetachNeverForcesPastASynchronizeFailure(t *testing.T) {
 	))
 
 	var kernelDetachModes []bool
-	found, _, err := r.unmountFSKitWith(a.ref, false, fskitKernelOps{
+	found, err := r.unmountFSKitWith(a.ref, false, fskitKernelOps{
 		present: func(_, _ string) (bool, error) { return true, nil },
 		unmountExact: func(_, _ string, force bool) error {
 			kernelDetachModes = append(kernelDetachModes, force)
@@ -865,7 +870,7 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 			return nil
 		},
 	}
-	found, _, err := r.unmountFSKitWith(a.ref, false, ops)
+	found, err := r.unmountFSKitWith(a.ref, false, ops)
 	if !found || err == nil {
 		t.Fatalf("unprovable v3 detach = (%v, %v), want a definite refusal", found, err)
 	}
@@ -890,7 +895,7 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 		present:      func(_, _ string) (bool, error) { return false, nil },
 		unmountExact: func(_, _ string, _ bool) error { return errors.New("nothing to detach") },
 	}
-	if found, _, err := r.unmountFSKitWith(a.ref, false, absent); err == nil || !found {
+	if found, err := r.unmountFSKitWith(a.ref, false, absent); err == nil || !found {
 		t.Fatalf("fenced v3 detach retry = (%v, %v)", found, err)
 	}
 	if r.get(a.ref) != nil || !a.isDetached() {
@@ -950,7 +955,7 @@ func TestV3FrontendLossDeliversAbsenceProofBeforeClosingAuthority(t *testing.T) 
 					return nil
 				},
 			}
-			if found, _, err := r.unmountFSKitWith(a.ref, true, ops); !found || err != nil {
+			if found, err := r.unmountFSKitWith(a.ref, true, ops); !found || err != nil {
 				t.Fatalf("retire frontend loss = (%v, %v)", found, err)
 			}
 			if detach := handler.recordedDetach(); detach == nil || detach.GetMountAbsence() == nil {
@@ -975,9 +980,6 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
 	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Terminal")
-	// A short repair budget makes the liveness pulse fast (min(lease,budget)/3)
-	// without touching any production constant.
-
 	a := ensureV3TestAttach(t, r, req)
 	d := a.v3Backend()
 	if d == nil {
@@ -1036,12 +1038,12 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 	if _, eno := b.v3RootReply(); eno != darwinEIO {
 		t.Fatalf("revived v3 resolve errno=%d, want %d", eno, darwinEIO)
 	}
-	found, jobID, err := revived.unmountFSKitWith(ref, false, fskitKernelOps{
+	found, err := revived.unmountFSKitWith(ref, false, fskitKernelOps{
 		present:      func(_, _ string) (bool, error) { return false, nil },
 		unmountExact: func(_, _ string, _ bool) error { return errors.New("nothing to detach") },
 	})
-	if err != nil || !found || jobID != "" {
-		t.Fatalf("revived v3 unmount=(%v,%q,%v)", found, jobID, err)
+	if err != nil || !found {
+		t.Fatalf("revived v3 unmount=(%v,%v)", found, err)
 	}
 	if revived.get(ref) != nil {
 		t.Fatal("revived v3 attach was not released by the exact unmount")
@@ -1092,7 +1094,7 @@ func TestV3DetachSeparatesReleaseDiagnosticsFromAcceptedAbsence(t *testing.T) {
 					return nil
 				},
 			}
-			found, _, err := r.unmountFSKitWith(a.ref, false, ops)
+			found, err := r.unmountFSKitWith(a.ref, false, ops)
 			if !found || (err != nil) != test.wantErr || err != nil && !strings.Contains(err.Error(), "authority release cleanup") {
 				t.Fatalf("unmount = (%v,%v), want release diagnostic=%t", found, err, test.wantErr)
 			}
@@ -1140,7 +1142,7 @@ func TestV3ExactAbsenceUsesControlDespiteReleaseFailure(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				_, _, err := r.unmountFSKitWith(a.ref, true, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
+				_, err := r.unmountFSKitWith(a.ref, true, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
 				done <- err
 			}()
 			select {

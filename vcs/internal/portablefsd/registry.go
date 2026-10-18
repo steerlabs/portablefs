@@ -302,7 +302,7 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		delete(r.byRef, ref)
 		delete(r.byKey, key)
 		r.mu.Unlock()
-		_, detachErr := a.detach(ctx, true)
+		detachErr := a.detach(true)
 		return nil, false, errors.Join(err, detachErr)
 	}
 	return a, true, nil
@@ -352,19 +352,19 @@ func (r *registry) list() []*attach {
 }
 
 // delete retires the attach and then removes its registry record.
-func (r *registry) delete(ctx context.Context, ref string, force bool) (found bool, jobID string, err error) {
+func (r *registry) delete(ctx context.Context, ref string, force bool) (found bool, err error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
 	r.mu.RLock()
 	a := r.byRef[ref]
 	r.mu.RUnlock()
 	if a == nil {
-		return false, "", nil
+		return false, nil
 	}
-	jobID, err = a.detach(ctx, force)
+	err = a.detach(force)
 	if err != nil {
 		// Keep the record until its required detach transition completes.
-		return true, jobID, err
+		return true, err
 	}
 	r.mu.Lock()
 	delete(r.byRef, ref)
@@ -380,10 +380,10 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 		r.mu.Unlock()
 		err = errors.Join(err, perr)
 	}
-	return true, jobID, err
+	return true, err
 }
 
-func (r *registry) unmountFSKit(ctx context.Context, ref string, force bool) (bool, string, error) {
+func (r *registry) unmountFSKit(ctx context.Context, ref string, force bool) (bool, error) {
 	return r.unmountFSKitWithContext(ctx, ref, force, hostFSKitKernelOps())
 }
 
@@ -391,7 +391,7 @@ func (r *registry) unmountFSKitWith(
 	ref string,
 	force bool,
 	ops fskitKernelOps,
-) (bool, string, error) {
+) (bool, error) {
 	return r.unmountFSKitWithContext(context.Background(), ref, force, ops)
 }
 
@@ -399,7 +399,6 @@ var unmountTransactionBudget = 40 * time.Second
 
 type unmountOutcome struct {
 	found bool
-	jobID string
 	err   error
 }
 
@@ -408,14 +407,14 @@ type unmountOutcome struct {
 // every later request — including a --force — joins it rather than queueing a
 // second one behind it.
 //
-// Force escalates the running transaction and cancels its drain wait. The
-// goroutine that owns the transaction also owns the transition to fencing.
+// Explicit force authorizes forced revocation at the next kernel attempt.
+// The transaction goroutine remains the sole teardown owner.
 func (r *registry) unmountFSKitWithContext(
 	ctx context.Context,
 	ref string,
 	force bool,
 	ops fskitKernelOps,
-) (bool, string, error) {
+) (bool, error) {
 	r.unmountMu.Lock()
 	if r.unmounting == nil {
 		r.unmounting = map[string]*unmountTransaction{}
@@ -424,13 +423,12 @@ func (r *registry) unmountFSKitWithContext(
 	if tx == nil {
 		tx = &unmountTransaction{
 			done:     make(chan struct{}),
-			escalate: make(chan struct{}),
 			force:    force,
 			deadline: time.Now().Add(unmountTransactionBudget),
 		}
 		r.unmounting[ref] = tx
 		go func() {
-			found, jobID, err := r.runUnmountTransaction(ref, tx, ops)
+			found, err := r.runUnmountTransaction(ref, tx, ops)
 			r.unmountMu.Lock()
 			// Publish the outcome to existing joiners and atomically make this
 			// transaction undiscoverable before waking them. If close(done)
@@ -440,7 +438,7 @@ func (r *registry) unmountFSKitWithContext(
 			// tx, so deleting first loses nothing; close below is their happens-
 			// before edge for outcome. A new retry starts the one next
 			// transaction and observes current kernel state.
-			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
+			tx.outcome = unmountOutcome{found: found, err: err}
 			if r.unmounting[ref] == tx {
 				delete(r.unmounting, ref)
 			}
@@ -450,7 +448,6 @@ func (r *registry) unmountFSKitWithContext(
 	} else if force && !tx.force {
 		// ESCALATE the running normal transaction in place.
 		tx.force = true
-		close(tx.escalate)
 	}
 	deadline := tx.deadline
 	r.unmountMu.Unlock()
@@ -462,37 +459,34 @@ func (r *registry) unmountFSKitWithContext(
 	defer timer.Stop()
 	select {
 	case <-tx.done:
-		return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+		return tx.outcome.found, tx.outcome.err
 	case <-ctx.Done():
 		// Only THIS waiter gave up. The transaction owns durable state and
 		// keeps running; it is never abandoned by a departing joiner.
 		select {
 		case <-tx.done:
-			return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+			return tx.outcome.found, tx.outcome.err
 		default:
 		}
-		return true, "", r.unmountInProgressVerdict(ref, r.escalated(tx), ctx.Err())
+		return true, r.unmountInProgressVerdict(ref, r.escalated(tx), ctx.Err())
 	case <-timer.C:
 		// The timer and completion can fire together; completion wins.
 		select {
 		case <-tx.done:
-			return tx.outcome.found, tx.outcome.jobID, tx.outcome.err
+			return tx.outcome.found, tx.outcome.err
 		default:
 		}
-		return true, "", r.unmountInProgressVerdict(ref, r.escalated(tx), nil)
+		return true, r.unmountInProgressVerdict(ref, r.escalated(tx), nil)
 	}
 }
 
 // unmountTransaction is one running detach, shared by every request that
 // observes it. outcome is written exactly once, before done closes.
 //
-// force and escalate are the escalation channel: force is read under
-// registry.unmountMu by the transaction goroutine at each decision point, and
-// escalate is closed exactly once, by the force request that upgraded a normal
-// transaction, so an in-flight drain can be cancelled.
+// force is read and upgraded under registry.unmountMu. No second teardown
+// owner or cancellable drain runs alongside this transaction.
 type unmountTransaction struct {
 	done     chan struct{}
-	escalate chan struct{}
 	deadline time.Time
 	force    bool
 	outcome  unmountOutcome
@@ -590,14 +584,14 @@ func (r *registry) runUnmountTransaction(
 	ref string,
 	tx *unmountTransaction,
 	ops fskitKernelOps,
-) (bool, string, error) {
+) (bool, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
 	r.mu.RLock()
 	a := r.byRef[ref]
 	r.mu.RUnlock()
 	if a == nil {
-		return false, "", nil
+		return false, nil
 	}
 	force := r.escalated(tx)
 	detachErr := r.detachV3(a, force, ops)
@@ -608,10 +602,9 @@ func (r *registry) runUnmountTransaction(
 			detachErr = r.detachV3(a, true, ops)
 		}
 		if detachErr != nil && !a.isDetached() {
-			return true, "", detachErr
+			return true, detachErr
 		}
 	}
-	jobID := ""
 	r.mu.Lock()
 	delete(r.byRef, ref)
 	delete(r.byKey, a.key)
@@ -622,9 +615,9 @@ func (r *registry) runUnmountTransaction(
 		r.byRef[ref] = a
 		r.byKey[a.key] = a
 		r.mu.Unlock()
-		return true, jobID, errors.Join(detachErr, err)
+		return true, errors.Join(detachErr, err)
 	}
-	return true, jobID, detachErr
+	return true, detachErr
 }
 
 // closeAll is the cooperative daemon-termination path. Every attach must pass
@@ -635,7 +628,7 @@ func (r *registry) closeAll(ctx context.Context) error {
 	defer r.mutationMu.Unlock()
 	var shutdownErrs []error
 	for _, a := range r.list() {
-		if _, err := a.detach(ctx, false); err != nil {
+		if err := a.detach(false); err != nil {
 			shutdownErrs = append(shutdownErrs, fmt.Errorf("detach %s: %w", a.ref, err))
 		}
 	}
@@ -1002,8 +995,7 @@ func (a *attach) authorizationDeadline() int64 {
 
 // detach terminally fences the attach. Force does so before waiting for
 // namespace locks, so an in-flight handler cannot withhold its own revocation.
-func (a *attach) detach(ctx context.Context, force bool) (jobID string, err error) {
-	_ = ctx
+func (a *attach) detach(force bool) error {
 	if force {
 		return a.forcedDetach()
 	}
@@ -1015,27 +1007,25 @@ func (a *attach) detach(ctx context.Context, force bool) (jobID string, err erro
 	a.nsMu.Lock()
 	a.mu.RLock()
 	alreadyDetached := a.detached
-	existingJobID := ""
 	a.mu.RUnlock()
 	if alreadyDetached {
 		a.nsMu.Unlock()
 		a.frontendSerial.Unlock()
-		return existingJobID, nil
+		return nil
 	}
 	exitBarrier := a.enterDetachBarrier()
 	a.fenceV3(errV3AttachDetached)
 	exitBarrier()
-	return a.finishDetachWithNSLocked(jobID, err)
+	return a.finishDetachWithNSLocked(nil)
 }
 
 // forcedDetach fences the session before taking namespace locks.
-func (a *attach) forcedDetach() (jobID string, err error) {
+func (a *attach) forcedDetach() error {
 	a.mu.RLock()
 	alreadyDetached := a.detached
-	existingJobID := ""
 	a.mu.RUnlock()
 	if alreadyDetached {
-		return existingJobID, nil
+		return nil
 	}
 	// Fence the strict session first: every operation still inside the
 	// namespace locks then reaches a definite outcome, so the acquisition
@@ -1051,26 +1041,21 @@ func (a *attach) forcedDetach() (jobID string, err error) {
 		a.mu.RUnlock()
 		a.nsMu.Unlock()
 		a.frontendSerial.Unlock()
-		return existingJobID, err
+		return nil
 	}
 	a.mu.RUnlock()
-	return a.finishDetachWithNSLocked("", err)
+	return a.finishDetachWithNSLocked(nil)
 }
-
-// detachWithFinalizerContext lets the unmount transaction cancel its own drain
-// barrier when a --force escalates it (see runUnmountTransaction). ctx bounds
-// only the barrier wait; nothing committed is abandoned.
 
 // finishDetachWithNSLocked publishes the terminal attach state and releases
 // the admission freeze. The caller owns frontendSerial and nsMu exclusively.
-func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string, error) {
+func (a *attach) finishDetachWithNSLocked(priorErr error) error {
 	a.mu.Lock()
 	if a.detached {
-		existingJobID := ""
 		a.mu.Unlock()
 		a.nsMu.Unlock()
 		a.frontendSerial.Unlock()
-		return existingJobID, priorErr
+		return priorErr
 	}
 	a.detached = true
 	a.retireFrontendWitnessesLocked()
@@ -1131,7 +1116,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 			log.Printf("portablefsd: detached mount enrollment %s could not be closed and will expire or be revoked remotely: %v", v3Config.enrollmentID, closeErr)
 		}
 	}
-	return jobID, priorErr
+	return priorErr
 }
 
 const (

@@ -1,8 +1,10 @@
 package portablefsd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -52,6 +54,10 @@ func (s *Server) ServeControl(ctx context.Context) error {
 }
 
 func (s *Server) handleStopIfIdle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeHTTPError(w, http.StatusBadRequest, "lifecycle requests do not accept a query")
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -70,8 +76,12 @@ func (s *Server) handleStopIfIdle(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusConflict, fmt.Sprintf("daemon has %d attach(es); cleanly unmount all volumes before stopping it", attachCount))
 		return
 	}
+	// Publish the quiescence result before Run can exit and release singleton
+	// exclusion. The caller must receive the empty 204 before observing exit.
+	w.Header().Set("Connection", "close")
 	w.WriteHeader(http.StatusNoContent)
-	go s.stopOnce.Do(func() { close(s.stopCh) })
+	_ = http.NewResponseController(w).Flush()
+	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
 func requireControlProtocol(next http.Handler) http.Handler {
@@ -88,15 +98,8 @@ func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var req ensureAttachRequest
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&req); err != nil {
+		if err := decodeControlRequest(r.Body, &req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); err != io.EOF {
-			writeHTTPError(w, http.StatusBadRequest, "trailing attach input")
 			return
 		}
 		a, _, err := s.registry.ensure(context.Background(), req)
@@ -175,20 +178,13 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		// The HTTP request's context bounds only THIS waiter: a client that
 		// hangs up (or its own timeout) must never abandon a transaction that
 		// owns durable state.
-		found, jobID, err := s.registry.unmountFSKit(r.Context(), ref, force)
+		found, err := s.registry.unmountFSKit(r.Context(), ref, force)
 		if err != nil {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}
 		if !found {
 			writeHTTPError(w, http.StatusNotFound, "unknown attach")
-			return
-		}
-		if force || jobID != "" {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"forced":      force,
-				"recoveryJob": jobID,
-			})
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -203,14 +199,13 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			// this credential (unix ms). It is what bounds the UNPROVEN state:
 			// past it a credential no handshake ever accepted or refused
 			// hardens into the definite expired verdict instead of pending
-			// forever. OPTIONAL and additive — an older CLI omits it, the zero
-			// value states no deadline, and nothing hardens.
+			// forever. Zero states no deadline and supplies no expiry verdict.
 			AuthTokenExpiresAtMs int64  `json:"authTokenExpiresAtMs,omitempty"`
 			AuthSequence         uint64 `json:"authSequence,omitempty"`
 			ClientCertPEM        string `json:"clientCertPem,omitempty"`
 			OnlyIfPending        bool   `json:"onlyIfPending,omitempty"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeControlRequest(r.Body, &req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -269,6 +264,28 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+const maxControlRequestBytes = 8 << 20
+
+func decodeControlRequest(body io.Reader, value any) error {
+	data, err := io.ReadAll(io.LimitReader(body, maxControlRequestBytes+1))
+	if err != nil {
+		return fmt.Errorf("read control request: %w", err)
+	}
+	if len(data) > maxControlRequestBytes {
+		return errors.New("control request exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return errors.New("trailing control input")
+	}
+	return nil
+}
+
 func httpStatusForErr(eno int32) int {
 	switch eno {
 	case darwinENOENT:
@@ -283,6 +300,10 @@ func httpStatusForErr(eno int32) int {
 }
 
 func (s *Server) handleLifecycleIdentity(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeHTTPError(w, http.StatusBadRequest, "lifecycle requests do not accept a query")
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -297,6 +318,10 @@ func (s *Server) handleLifecycleIdentity(w http.ResponseWriter, r *http.Request)
 	_, _ = w.Write(body)
 }
 func (s *Server) handleLifecycleInventory(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeHTTPError(w, http.StatusBadRequest, "lifecycle requests do not accept a query")
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return

@@ -16,12 +16,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
-// The live failure this pins: the frontend's control lane (visibility
-// acknowledgments, liveness) deliberately overtakes queued ordinary requests,
-// so under a mutation storm a barrier acknowledgment legally arrives with a
-// LOWER request id than an ordinary frame already received. A single global
-// watermark read that as replay and closed the connection — killing the mount
-// the moment it was busy enough for the ack to overtake anything.
+// Nonzero request IDs share one FIFO sequence; one-way callback acknowledgments
+// and resource dispositions retain reader-side progress with request ID zero.
 
 func publicationTestOperation(
 	t *testing.T,

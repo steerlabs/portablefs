@@ -199,6 +199,9 @@ func (d *v3DataPlane) observeHeld(record *v3ItemRecord, attr *authoritypb.Attr, 
 	return d.observeLocked(record, attr, version, snapshot)
 }
 
+// applyMutation installs one durable source effect at its authority snapshot.
+// Advancing the cold floor first prevents older in-flight reads from restoring
+// metadata or name knowledge contradicted by this settled effect.
 func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

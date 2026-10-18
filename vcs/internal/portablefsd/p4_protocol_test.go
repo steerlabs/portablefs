@@ -264,37 +264,32 @@ func TestP4RenewalBudgetExceedsCadence(t *testing.T) {
 
 func TestP4RenewalOutcomeClassification(t *testing.T) {
 	for _, test := range []struct {
-		name        string
-		hook        func(*fakeV3DataClient, *fakeV3Clock, *v3DataPlane) func(context.Context) (time.Duration, error)
-		keepServing bool
+		name         string
+		hook         func(*fakeV3DataClient, *fakeV3Clock, *v3DataPlane) func(context.Context) (time.Duration, error)
+		keepRenewing bool
+		terminal     bool
 	}{
 		{"settled-timeout", func(_ *fakeV3DataClient, _ *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
 			return func(context.Context) (time.Duration, error) { return 0, context.DeadlineExceeded }
-		}, true},
-		{"transport-poison", func(c *fakeV3DataClient, _ *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
-			return func(context.Context) (time.Duration, error) {
-				c.poisoned.Store(true)
-				return 0, context.DeadlineExceeded
-			}
-		}, false},
+		}, true, false},
 		{"transport-loss", func(c *fakeV3DataClient, _ *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
 			return func(context.Context) (time.Duration, error) { _ = c.Close(); return 0, io.ErrClosedPipe }
-		}, false},
+		}, false, true},
 		{"refusal", func(_ *fakeV3DataClient, _ *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
 			return func(context.Context) (time.Duration, error) { return 0, errors.New("refused") }
-		}, false},
+		}, false, true},
 		{"expired-answer", func(_ *fakeV3DataClient, clock *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
 			return func(context.Context) (time.Duration, error) { clock.advance(time.Minute); return time.Minute, nil }
-		}, false},
+		}, true, false},
 		{"fractional-proof", func(_ *fakeV3DataClient, _ *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
 			return func(context.Context) (time.Duration, error) { return time.Second + 1, nil }
-		}, false},
+		}, false, true},
 		{"clock-fault", func(_ *fakeV3DataClient, clock *fakeV3Clock, _ *v3DataPlane) func(context.Context) (time.Duration, error) {
 			return func(context.Context) (time.Duration, error) {
 				clock.fail(errors.New("clock unavailable"))
 				return time.Minute, nil
 			}
-		}, false},
+		}, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c := newFakeV3DataClient()
@@ -303,10 +298,10 @@ func TestP4RenewalOutcomeClassification(t *testing.T) {
 			c.mu.Lock()
 			c.keepAlive = test.hook(c, clock, d)
 			c.mu.Unlock()
-			if got := d.scheduledRenewal(); got != test.keepServing {
+			if got := d.scheduledRenewal(); got != test.keepRenewing {
 				t.Fatalf("continue=%t terminal=%v", got, d.terminalError())
 			}
-			if (d.terminalError() == nil) != test.keepServing {
+			if (d.terminalError() != nil) != test.terminal {
 				t.Fatalf("terminal=%v", d.terminalError())
 			}
 		})
@@ -330,9 +325,17 @@ func TestP4ExpiredHorizonUsesOriginalDataDuringRenewal(t *testing.T) {
 		t.Fatal("horizon expiry invented terminal session")
 	}
 	close(release)
-	if <-done || f.d.terminalError() == nil {
-		t.Fatal("expired delayed proof restored serving")
+	if !<-done || f.d.terminalError() != nil {
+		t.Fatal("expired delayed proof ended the valid session")
 	}
+	f.requireAuthority("expired answer grants no H", func() { f.getattr(file.Item) })
+	f.client.mu.Lock()
+	f.client.keepAlive = nil
+	f.client.mu.Unlock()
+	if !f.d.scheduledRenewal() {
+		t.Fatal("normal renewal did not resume")
+	}
+	f.requireServedLocally("usable successor proof", func() { f.getattr(file.Item) })
 }
 
 func TestP4MkdirRetainsEvaluatedWitness(t *testing.T) {
@@ -435,6 +438,25 @@ func TestP4LifecycleRoutesAreIndependentAndStrict(t *testing.T) {
 	for _, path := range []string{daemonctl.LifecycleIdentityPath, daemonctl.LifecycleInventoryPath} {
 		if status, _ := request("HEAD", path, ""); status != 405 {
 			t.Fatalf("HEAD %s=%d", path, status)
+		}
+	}
+	for _, test := range []struct {
+		method, path string
+		want         int
+	}{
+		{"POST", daemonctl.LifecycleIdentityPath, 405},
+		{"HEAD", daemonctl.LifecycleStopIfIdlePath, 405},
+		{"GET", daemonctl.LifecycleStopIfIdlePath, 405},
+		{"PUT", daemonctl.LifecycleInventoryPath, 405},
+		{"GET", "/lifecycle/v1/unknown", 404},
+		{"GET", "/lifecycle/v2/identity", 404},
+		{"GET", daemonctl.LifecycleIdentityPath + "/", 404},
+		{"GET", daemonctl.LifecycleIdentityPath + "?x=1", 400},
+		{"GET", daemonctl.LifecycleInventoryPath + "?", 400},
+		{"POST", daemonctl.LifecycleStopIfIdlePath + "?x=1", 400},
+	} {
+		if status, _ := request(test.method, test.path, ""); status != test.want {
+			t.Fatalf("%s %s=%d, want %d", test.method, test.path, status, test.want)
 		}
 	}
 	if status, _ := request("GET", "/v2/identity", ""); status != 426 {
@@ -640,12 +662,12 @@ func TestP4ItemHandlesUseFullUInt64AndNeverWrap(t *testing.T) {
 func TestP4PeriodicRenewalHasOneOwnerAndNoTickBacklog(t *testing.T) {
 	c := newFakeV3DataClient()
 	c.lease = 6 * time.Second
-	clock := newFakeV3Clock()
-	d := testV3DataPlaneWithClock(t, c, clock)
+	t.Cleanup(func() { _ = c.Close() })
+	d := &v3DataPlane{client: c, clock: newFakeV3Clock().read}
 	started := make(chan int32, 2)
 	release := make(chan struct{})
+	defer close(release)
 	var calls, inflight atomic.Int32
-	c.mu.Lock()
 	c.keepAlive = func(ctx context.Context) (time.Duration, error) {
 		if inflight.Add(1) != 1 {
 			t.Error("overlapping renewal requests")
@@ -662,27 +684,55 @@ func TestP4PeriodicRenewalHasOneOwnerAndNoTickBacklog(t *testing.T) {
 		}
 		return 6 * time.Second, nil
 	}
-	c.mu.Unlock()
-	select {
-	case <-started:
-	case <-time.After(3 * time.Second):
-		t.Fatal("renewal owner did not start")
+	timers := make(chan chan time.Time, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.keepAliveWithTimer(func(interval time.Duration) (<-chan time.Time, func()) {
+			if interval != 2*time.Second {
+				t.Errorf("interval=%s", interval)
+			}
+			tick := make(chan time.Time, 4)
+			timers <- tick
+			return tick, func() {}
+		})
+	}()
+	nextTimer := func() chan time.Time {
+		t.Helper()
+		select {
+		case timer := <-timers:
+			return timer
+		case <-time.After(5 * time.Second):
+			t.Fatal("renewal owner did not schedule its next interval")
+			return nil
+		}
 	}
-	time.Sleep(2200 * time.Millisecond)
-	close(release)
-	waitV3PublicationCondition(t, func() bool { return inflight.Load() == 0 })
-	select {
-	case <-started:
-		t.Fatal("ticker backlog triggered an immediate renewal")
-	case <-time.After(time.Second):
+	first := nextTimer()
+	first <- time.Now()
+	<-started
+	// Simulate a scheduler backlog while the first request remains in flight.
+	for range cap(first) {
+		first <- time.Now()
 	}
 	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("normal cadence did not resume")
+	case <-timers:
+		t.Fatal("another interval was scheduled before request settlement")
+	default:
 	}
-	if d.terminalError() != nil {
-		t.Fatal(d.terminalError())
+	release <- struct{}{}
+	second := nextTimer() // completion, not cadence, owns the next interval
+	if second == first || calls.Load() != 1 || inflight.Load() != 0 {
+		t.Fatal("completion reused queued ticks or started another renewal")
+	}
+	second <- time.Now()
+	if n := <-started; n != 2 {
+		t.Fatalf("next interval started renewal %d", n)
+	}
+	_ = c.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("session closure did not stop renewal")
 	}
 }
 
@@ -819,7 +869,7 @@ func TestP4InventoryWaitsForDurableRemovalVerdict(t *testing.T) {
 	r.persistMu.Lock()
 	removed := make(chan error, 1)
 	go func() {
-		_, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
+		_, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
 		removed <- err
 	}()
 	waitV3PublicationCondition(t, func() bool { return r.get(testFSKitAttachRef) == nil })

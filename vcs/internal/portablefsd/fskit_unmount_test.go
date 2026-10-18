@@ -56,7 +56,7 @@ func TestRevivedFSKitExactUnmount(t *testing.T) {
 			r := newRegistry(dir)
 			present := test.present
 			attempts := 0
-			found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
+			found, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
 				present: func(string, string) (bool, error) { return present, nil },
 				unmountExact: func(_, _ string, force bool) error {
 					attempts++
@@ -97,7 +97,7 @@ func TestFSKitIdentityMismatchPreservesAttach(t *testing.T) {
 	writeFSKitDetachFixture(t, dir)
 	r := newRegistry(dir)
 	mismatch := errors.New("foreign kernel mount")
-	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, mismatch }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }})
+	found, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, mismatch }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }})
 	if !found || !errors.Is(err, mismatch) || r.get(testFSKitAttachRef) == nil {
 		t.Fatalf("identity refusal=%v", err)
 	}
@@ -113,7 +113,7 @@ func TestRegistryRestoresDetachedRecordAfterRemovalPersistenceFailure(t *testing
 	}
 	r.stateDir = bad
 	ops := fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }}
-	found, _, err := r.unmountFSKitWith(a.ref, false, ops)
+	found, err := r.unmountFSKitWith(a.ref, false, ops)
 	if !found || err == nil || !a.isDetached() || r.get(a.ref) != a || r.byKey[a.key] != a {
 		t.Fatalf("failed removal lost exact detached owner: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestRegistryRestoresDetachedRecordAfterRemovalPersistenceFailure(t *testing
 		t.Error("completed teardown repeated kernel observation")
 		return false, nil
 	}
-	found, _, err = r.unmountFSKitWith(a.ref, false, ops)
+	found, err = r.unmountFSKitWith(a.ref, false, ops)
 	if !found || err != nil || r.get(a.ref) != nil {
 		t.Fatalf("retry=%v", err)
 	}
@@ -139,12 +139,12 @@ func TestFailedUnmountRetryNeverJoinsStaleCompletedOutcome(t *testing.T) {
 		var observations atomic.Int32
 		first := errors.New("first observation failed")
 		ops := fskitKernelOps{present: func(string, string) (bool, error) { observations.Add(1); return false, first }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }}
-		_, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, ops)
+		_, err := r.unmountFSKitWith(testFSKitAttachRef, false, ops)
 		if !errors.Is(err, first) {
 			t.Fatal(err)
 		}
 		ops.present = func(string, string) (bool, error) { observations.Add(1); return false, nil }
-		found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, ops)
+		found, err := r.unmountFSKitWith(testFSKitAttachRef, false, ops)
 		if !found || err != nil || observations.Load() != 2 {
 			t.Fatalf("retry=%v observations=%d", err, observations.Load())
 		}

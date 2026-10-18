@@ -653,9 +653,6 @@ func TestV3CacheNegativeEntriesAreBounded(t *testing.T) {
 	}
 }
 
-// A peer repair event while the metadata cache rests on writer exclusion is
-// terminal before any actuation.
-
 // Definite namespace refusals evict affected cache coordinates without
 // deriving a causal contradiction from an older cached observation.
 func TestV3CacheNamespaceErrnoEvictsTheCoordinate(t *testing.T) {
