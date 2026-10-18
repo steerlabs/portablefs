@@ -416,6 +416,9 @@ func Open(rootPath string, config Config) (*Volume, error) {
 	if config.ExpectedProjectID == 0 {
 		return nil, fmt.Errorf("%w: project ID must be nonzero", ErrProjectIsolation)
 	}
+	if err := checkAuthorityKernel(); err != nil {
+		return nil, err
+	}
 	return open(rootPath, true, config.ExpectedProjectID, &config)
 }
 

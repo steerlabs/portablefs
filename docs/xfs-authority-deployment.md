@@ -30,8 +30,14 @@ Two things an operator has to decide or accept before deploying:
 
 ## Host and disk
 
-Use a current Nitro EC2 instance on a supported Linux baseline with stock FUSE
-protocol 7.31 or newer (Linux 5.10 is the product floor). Attach a dedicated,
+Use a current Nitro EC2 instance with Linux 5.17 or newer for the authority.
+Startup refuses older kernels, including vendor kernels with a lower release
+number. Handleless FSKit mutations rely on syncfs reporting XFS log-force
+errors; mainline 5.17 includes both
+[the XFS error propagation](https://github.com/torvalds/linux/blob/v5.17/fs/xfs/xfs_super.c#L689-L707)
+and [the VFS sync_fs error propagation](https://github.com/torvalds/linux/blob/v5.17/fs/sync.c).
+The Linux mount client separately requires stock FUSE protocol 7.31 or newer
+(Linux 5.10 or newer). Attach a dedicated,
 encrypted EBS data volume with `DeleteOnTermination=false`. Choose gp3 or io2
 from measured IOPS, throughput, latency, and durability requirements; the
 architecture does not impose one capacity tier. Do not use EBS Multi-Attach: two
