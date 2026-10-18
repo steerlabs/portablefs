@@ -283,6 +283,14 @@ type OpenFlags struct {
 	DataSync bool
 }
 
+// Validate runs before any CREATE side effect as well as before OPEN.
+func (f OpenFlags) Validate() error {
+	if !f.Read && !f.Write || (f.Append || f.Truncate) && !f.Write {
+		return fs.ErrInvalid
+	}
+	return nil
+}
+
 // RenameFlags map to renameat2's atomic behaviors.
 type RenameFlags uint32
 

@@ -984,6 +984,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var releaseMutation func()
 		bindingRefreshes := 0
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+			if err := openFlags(body.Create.GetFlags()).Validate(); err != nil {
+				return nil, err
+			}
 			if err := namespaceName(body.Create.GetName()); err != nil {
 				return nil, err
 			}
@@ -1104,7 +1107,13 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				err = openCreated()
 			}
 			if err != nil {
-				targets := createdTargets(item)
+				// A failed reopen has not reached O_TRUNC unless the store
+				// explicitly reports a post-apply outcome. New-name creation has
+				// already changed the namespace regardless of the open result.
+				var targets []volumeserver.VisibilityTarget
+				if !existed || errors.Is(err, xfsstore.ErrOutcomeUncertain) {
+					targets = createdTargets(item)
+				}
 				var post *authoritypb.PostState
 				var durability *xfsstore.DurabilityError
 				if existed && handle != (xfsstore.Capability{}) && errors.As(err, &durability) {
@@ -1173,7 +1182,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				parentAttr, parentErr := h.getattrItem(parent)
 				if parentErr != nil {
 					cleanupUndeliverable()
-					return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+					return h.errorResponse(0, parentErr, body.Create.GetFlags().GetTruncate()), createdTargets(item)
 				}
 				truncated := body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate()
 				resp := h.success(0)

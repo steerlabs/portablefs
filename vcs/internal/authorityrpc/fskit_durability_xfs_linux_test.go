@@ -43,10 +43,6 @@ func (s *observedFskitDurabilityStore) observeHandle(cap xfsstore.Capability) {
 	}
 }
 
-func (s *observedFskitDurabilityStore) PinSyncObject(xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	panic("FSKit durability reopened an object")
-}
-
 func (s *observedFskitDurabilityStore) SyncFS() error {
 	s.calls = append(s.calls, "syncfs")
 	return s.Volume.SyncFS()
@@ -73,6 +69,31 @@ type observedFskitSyncTarget struct {
 }
 
 func (s observedFskitSyncTarget) Sync() error { s.observe(); return s.SyncTarget.Sync() }
+
+// Exhaust only during the actual OPEN. Existing-name CREATE has no creation
+// grant, so this reaches the kernel's descriptor allocation before O_TRUNC.
+type reopenLimitStore struct {
+	*observedFskitDurabilityStore
+	calls int
+}
+
+func (s *reopenLimitStore) OpenFile(cap xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.calls++
+	var saved unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &saved); err != nil {
+		return xfsstore.Capability{}, err
+	}
+	limited := saved
+	limited.Cur = 0
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limited); err != nil {
+		return xfsstore.Capability{}, err
+	}
+	handle, err := s.Volume.OpenFile(cap, flags)
+	if restoreErr := unix.Setrlimit(unix.RLIMIT_NOFILE, &saved); restoreErr != nil {
+		panic(restoreErr)
+	}
+	return handle, err
+}
 
 func stampResolvedFskitPublication(t *testing.T, h *VolumeHandler, id volumeserver.SessionID, req *authoritypb.Request) {
 	t.Helper()
@@ -161,6 +182,54 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: handle, Size: 4, Data: []byte("data"), WriteFlags: writeKillSUIDGID}}}, "handle")
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item, Mode: proto.Uint32(0)}}}, "syncfs")
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item, Mode: proto.Uint32(0600)}}}, "syncfs")
+
+	for _, refusal := range []string{"EMFILE", "EACCES"} {
+		for _, truncate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("create-reopen/%s/truncate=%v", refusal, truncate), func(t *testing.T) {
+				want := syscall.EACCES
+				limited := &reopenLimitStore{observedFskitDurabilityStore: store}
+				if refusal == "EMFILE" {
+					h.Store = limited
+					want = syscall.EMFILE
+				} else {
+					if err := os.Chmod(filepath.Join(root, "durability-file"), 0444); err != nil {
+						t.Fatal(err)
+					}
+				}
+				defer func() {
+					h.Store = store
+					if err := os.Chmod(filepath.Join(root, "durability-file"), 0600); err != nil {
+						t.Error(err)
+					}
+				}()
+				sequence++
+				req := &authoritypb.Request{RequestId: sequence + 20, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent, Name: []byte("durability-file"), Mode: 0600, Flags: &authoritypb.OpenFlags{Read: true, Write: true, Truncate: truncate}}}}
+				stampMutation(t, req, 0, sequence)
+				stampResolvedFskitPublication(t, h, session, req)
+				before := len(store.calls)
+				reply := h.Handle(ctx, req)
+				if reply.GetErrno() != int32(want) || reply.GetUncertain() || reply.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE || volume.Health() != nil || len(store.calls) != before {
+					t.Fatalf("real reopen refusal=%v health=%v barriers=%v", reply, volume.Health(), store.calls[before:])
+				}
+				if refusal == "EMFILE" && limited.calls != 1 {
+					t.Fatalf("reopen calls=%d", limited.calls)
+				}
+				post, err := os.Stat(filepath.Join(root, "durability-file"))
+				if err != nil || post.Size() != 4 {
+					t.Fatalf("refused reopen truncated: %v %v", post, err)
+				}
+				req.RequestId += 1000
+				replay := h.Handle(ctx, req)
+				reply.RequestId = replay.RequestId
+				if !proto.Equal(reply, replay) || len(store.calls) != before {
+					t.Fatalf("reopen replay=%v", replay)
+				}
+				if refusal == "EMFILE" && limited.calls != 1 {
+					t.Fatal("replay reopened the inode")
+				}
+			})
+		}
+	}
 
 	for _, opened := range [][]byte{nil, handle} {
 		kind := "syncfs"

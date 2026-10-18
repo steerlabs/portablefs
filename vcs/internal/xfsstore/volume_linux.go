@@ -1023,11 +1023,8 @@ func (v *Volume) verifyProjectOf(fd int, kind Kind) error {
 }
 
 func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
-	if !flags.Read && !flags.Write {
-		return Capability{}, fs.ErrInvalid
-	}
-	if flags.Append && !flags.Write || flags.Truncate && !flags.Write {
-		return Capability{}, fs.ErrInvalid
+	if err := flags.Validate(); err != nil {
+		return Capability{}, err
 	}
 	obj, err := v.holdObject(id)
 	if err != nil {

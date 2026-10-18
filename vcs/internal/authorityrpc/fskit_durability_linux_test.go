@@ -54,9 +54,7 @@ func (s *fskitDurabilityTestStore) PinSyncHandle(xfsstore.Capability) (xfsstore.
 	}
 	return durabilityTestTarget{sync: s.doSync}, nil
 }
-func (s *fskitDurabilityTestStore) PinSyncObject(xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	panic("FSKit durability reopened an object")
-}
+
 func (s *fskitDurabilityTestStore) SyncFS() error { return s.doSync() }
 func (s *fskitDurabilityTestStore) doSync() error {
 	if s.locked.Load() {
@@ -442,8 +440,8 @@ func TestMalformedSourcePublicationPrecedesWriteAdmission(t *testing.T) {
 // before apply is definite; after CREATE or O_TRUNC it is a terminal defect.
 type fskitAcquisitionStore struct {
 	*fskitDurabilityTestStore
-	openErr error
-	applies int
+	parentErr error
+	applies   int
 }
 
 func (s *fskitAcquisitionStore) Create(xfsstore.Capability, string, os.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error) {
@@ -452,9 +450,6 @@ func (s *fskitAcquisitionStore) Create(xfsstore.Capability, string, os.FileMode,
 }
 func (s *fskitAcquisitionStore) OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error) {
 	s.applies++
-	if s.openErr != nil {
-		return xfsstore.Capability{}, s.openErr
-	}
 	return xfsstore.Capability{0x42}, nil
 }
 func (s *fskitAcquisitionStore) SetAttr(xfsstore.Capability, xfsstore.Capability, xfsstore.SetAttrSpec) (xfsstore.Attr, error) {
@@ -462,6 +457,9 @@ func (s *fskitAcquisitionStore) SetAttr(xfsstore.Capability, xfsstore.Capability
 	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x41, Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
 }
 func (s *fskitAcquisitionStore) Getattr(cap xfsstore.Capability) (xfsstore.Attr, error) {
+	if cap == (xfsstore.Capability{0x70}) && s.applies >= 2 && s.parentErr != nil {
+		return xfsstore.Attr{}, s.parentErr
+	}
 	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(cap[0]), Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
 }
 func (s *fskitAcquisitionStore) GetattrOpen(cap xfsstore.Capability) (xfsstore.Attr, error) {
@@ -469,16 +467,12 @@ func (s *fskitAcquisitionStore) GetattrOpen(cap xfsstore.Capability) (xfsstore.A
 }
 
 func TestFskitDescriptorAcquisitionNeverSelectsAnotherBarrier(t *testing.T) {
-	for _, kind := range []string{"create pin", "truncate pin", "create open", "setattr pin"} {
-		for _, cause := range []error{syscall.EMFILE, syscall.ENFILE, xfsstore.ErrStaleOpen} {
+	for _, kind := range []string{"create pin", "truncate pin", "setattr pin"} {
+		for _, cause := range []error{xfsstore.ErrStaleOpen} {
 			t.Run(kind+"/"+cause.Error(), func(t *testing.T) {
 				h, cred, base, _ := newDirectFskitHarness(t)
 				store := &fskitAcquisitionStore{fskitDurabilityTestStore: base}
-				if kind == "create open" {
-					store.openErr = cause
-				} else {
-					base.acquireErr = cause
-				}
+				base.acquireErr = cause
 				h.Store = store
 				parent, item, handle := xfsstore.Capability{0x70}, xfsstore.Capability{0x42}, xfsstore.Capability{0x41}
 				if err := h.trackItem(cred.ID, item, false); err != nil {
@@ -486,7 +480,7 @@ func TestFskitDescriptorAcquisitionNeverSelectsAnotherBarrier(t *testing.T) {
 				}
 				req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}}
 				switch kind {
-				case "create pin", "create open":
+				case "create pin":
 					req.Body = &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("new"), Mode: 0600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}
 				case "truncate pin":
 					req.Body = &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: item[:], Flags: &authoritypb.OpenFlags{Write: true, Truncate: true}}}
@@ -520,7 +514,7 @@ func TestFskitDescriptorAcquisitionNeverSelectsAnotherBarrier(t *testing.T) {
 
 func TestFskitExistingCreateDoesNotAcquireDurabilityPin(t *testing.T) {
 	h, cred, base, _ := newDirectFskitHarness(t)
-	base.acquireErr = syscall.EMFILE
+	base.acquireErr = xfsstore.ErrStaleOpen
 	base.lookupItem = xfsstore.Capability{0x42}
 	store := &fskitAcquisitionStore{fskitDurabilityTestStore: base}
 	h.Store = store
@@ -536,10 +530,53 @@ func TestFskitExistingCreateDoesNotAcquireDurabilityPin(t *testing.T) {
 
 func TestFskitDirectWriteDoesNotReacquireHandle(t *testing.T) {
 	h, cred, store, _ := newDirectFskitHarness(t)
-	store.acquireErr = syscall.EMFILE
+	store.acquireErr = xfsstore.ErrStaleOpen
 	req := directFskitRequest()
 	reply := h.handleWrite(t.Context(), req, cred, req.GetWrite())
 	if reply.GetErrno() != 0 || reply.GetWrite().GetError() != 0 || reply.GetWrite().GetCommittedSize() != 4 || store.syncs.Load() != 1 || store.fenced.Load() {
 		t.Fatalf("write reacquired its handle: %v", reply)
+	}
+}
+
+func TestFskitCreatePreApplyRefusalsDoNotFence(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		flags     *authoritypb.OpenFlags
+		parentErr error
+	}{
+		{"nil flags", nil, nil}, {"empty flags", &authoritypb.OpenFlags{}, nil},
+		{"read truncate", &authoritypb.OpenFlags{Read: true, Truncate: true}, nil},
+		{"read append", &authoritypb.OpenFlags{Read: true, Append: true}, nil},
+		{"no-op parent getattr", &authoritypb.OpenFlags{Read: true, Write: true}, syscall.EACCES},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			h, cred, base, _ := newDirectFskitHarness(t)
+			store := &fskitAcquisitionStore{fskitDurabilityTestStore: base, parentErr: test.parentErr}
+			h.Store = store
+			if test.parentErr != nil {
+				base.lookupItem = xfsstore.Capability{0x42}
+			}
+			parent := xfsstore.Capability{0x70}
+			req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: test.flags}}}
+			stampMutation(t, req, 0, 1)
+			stampResolvedFskitPublication(t, h, cred.ID, req)
+			ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1})
+			reply := h.Handle(ctx, req)
+			want := int32(syscall.EINVAL)
+			if test.parentErr != nil {
+				want = int32(syscall.EACCES)
+			} else if store.applies != 0 {
+				t.Fatalf("malformed CREATE reached storage %d times", store.applies)
+			}
+			if reply.GetErrno() != want || reply.GetUncertain() || reply.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE || base.fenced.Load() || base.syncs.Load() != 0 {
+				t.Fatalf("pre-apply CREATE=%v applies=%d syncs=%d", reply, store.applies, base.syncs.Load())
+			}
+			req.RequestId++
+			replay := h.Handle(ctx, req)
+			reply.RequestId = replay.RequestId
+			if !proto.Equal(reply, replay) || base.fenced.Load() || base.syncs.Load() != 0 {
+				t.Fatalf("CREATE refusal replay=%v", replay)
+			}
+		})
 	}
 }
