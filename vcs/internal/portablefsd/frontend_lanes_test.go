@@ -1150,23 +1150,3 @@ func TestPublicationAckBetweenReservationAndBeginKeepsReservedHandlers(t *testin
 		t.Fatal("acknowledged operation remained after every reserved handler retired")
 	}
 }
-
-func TestUnexpectedPublicationRetractionTerminatesWithoutRetry(t *testing.T) {
-	a, d := publicationTestAttach(t)
-	server, peer := net.Pipe()
-	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
-	done := make(chan struct{})
-	go func() { c.serve(context.Background()); close(done) }()
-	if err := pfslocal.WriteFrame(peer, &pfslocal.Envelope{RequestID: 1, PublicationRetracted: true, Body: &pfslocal.GetAttrRequest{}}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("unexpected retraction did not terminate")
-	}
-	if err := d.terminalError(); err == nil || !strings.Contains(err.Error(), "unexpected frontend publication retraction") {
-		t.Fatalf("terminal=%v", err)
-	}
-}

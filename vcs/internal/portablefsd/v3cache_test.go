@@ -708,7 +708,7 @@ func TestV3CacheNamespaceErrnoEvictsTheCoordinate(t *testing.T) {
 }
 
 // Paused replies retain their snapshot across overlapping local effects.
-// Only proof expiry admits an authority miss; poison and clock errors revoke
+// Proof or authorization expiry admits one authority miss; poison and clock errors revoke
 // publication, and provisional ownership settles exactly once.
 func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 	for _, test := range []struct {
@@ -749,16 +749,20 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 		{name: "immediate-poison", between: func(f *cachedV3Fixture, _ pfslocal.Item) { f.client.poisoned.Store(true) }},
 		{name: "clock-read-error", between: func(f *cachedV3Fixture, _ pfslocal.Item) { v3ClockFaults[0].fault(f.clock) }},
 	} {
-		for _, lookup := range []bool{false, true} {
-			name := test.name + "/getattr"
-			if lookup {
-				name = test.name + "/lookup"
-			}
+		for _, kind := range []string{"getattr", "lookup", "negative-lookup"} {
+			lookup := kind != "getattr"
+			negative := kind == "negative-lookup"
+			name := test.name + "/" + kind
 			t.Run(name, func(t *testing.T) {
 				f := newCachedV3Fixture(t, v3FileObjects())
 				f.ns.bind(0x20, "file", 0x70)
 				f.getattr(f.root)
 				file := f.lookup(f.root, "file").Item
+				if negative {
+					if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("missing")}); errno != darwinENOENT {
+						t.Fatal(errno)
+					}
+				}
 				a := &attach{ref: "write-boundary", v3Data: f.d, v3Coherence: f.d.bridge}
 				server, peer := net.Pipe()
 				defer peer.Close()
@@ -772,9 +776,14 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 				}
 				f.d.bridge.reserveFrontendPublication(operationID)
 				before := f.authorityCalls()
+				beforeMetrics := f.d.cacheMetrics()
 				var body any = &pfslocal.GetAttrRequest{Item: file}
 				if lookup {
-					body = &pfslocal.LookupRequest{Dir: f.root, Name: []byte("file")}
+					lookupName := "file"
+					if negative {
+						lookupName = "missing"
+					}
+					body = &pfslocal.LookupRequest{Dir: f.root, Name: []byte(lookupName)}
 				}
 				done := make(chan struct{})
 				go func() {
@@ -783,7 +792,48 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 				}()
 				envelope, err := pfslocal.ReadFrame(peer)
 				<-done
-				if test.name == "immediate-poison" || test.name == "terminal-service" || test.name == "expired-authorization" {
+				afterMetrics := f.d.cacheMetrics()
+				countsBefore, countsAfter := beforeMetrics.GetAttr, afterMetrics.GetAttr
+				if lookup {
+					countsBefore, countsAfter = beforeMetrics.Lookup, afterMetrics.Lookup
+					polarity := "positive"
+					if negative {
+						polarity = "negative"
+					}
+					if err != nil || f.d.terminalError() != nil {
+						polarity = "error"
+					}
+					for _, result := range []string{"positive", "negative", "error"} {
+						want := uint64(0)
+						if result == polarity {
+							want = 1
+						}
+						if got := afterMetrics.LookupPolarity[result] - beforeMetrics.LookupPolarity[result]; got != want {
+							t.Errorf("lookup polarity %s delta=%d, want %d", result, got, want)
+						}
+					}
+				}
+				reason := "hit"
+				switch test.name {
+				case "horizon-expiry":
+					reason = "horizon"
+				case "expired-authorization":
+					reason = "authorization"
+				case "immediate-poison", "terminal-service":
+					reason = "terminal"
+				case "clock-read-error":
+					reason = "clock"
+				}
+				for result := range countsAfter {
+					want := uint64(0)
+					if result == reason {
+						want = 1
+					}
+					if got := countsAfter[result] - countsBefore[result]; got != want {
+						t.Errorf("cache result %s delta=%d, want %d", result, got, want)
+					}
+				}
+				if test.name == "immediate-poison" || test.name == "terminal-service" {
 					if f.authorityCalls() != before {
 						t.Fatal("ineligible reply issued an authority substitute")
 					}
@@ -810,7 +860,7 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 					return
 				}
 				wantCalls := before
-				if test.name == "horizon-expiry" {
+				if test.name == "horizon-expiry" || test.name == "expired-authorization" {
 					wantCalls++
 				}
 				if f.authorityCalls() != wantCalls {
@@ -825,13 +875,20 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 					attr = reply.Attr
 				case *pfslocal.LookupReply:
 					attr = reply.Attr
+				case *pfslocal.ErrorReply:
+					if !negative || reply.Errno != darwinENOENT {
+						t.Fatalf("unexpected error reply: %+v", reply)
+					}
 				default:
 					t.Fatalf("reply = %#v", envelope.Body)
 				}
-				if test.name == "intervening-mutation" && attr.Size != 3 {
+				if test.name == "intervening-mutation" && !negative && attr.Size != 3 {
 					t.Fatalf("overlapping read lost its admitted snapshot: size=%d", attr.Size)
 				}
-				if lookup {
+				if f.d.terminalError() != nil {
+					t.Fatalf("ordinary cache miss terminated the session: %v", f.d.terminalError())
+				}
+				if lookup && !negative {
 					resources := c.provisional[1]
 					if resources == nil || len(resources.items) != 1 || resources.items[0].provisional != 1 {
 						t.Fatalf("lookup provisional ownership after refusal = %+v", resources)
@@ -1026,8 +1083,8 @@ func TestV3CachedReplySurvivesReauthorizationWithValidPermission(t *testing.T) {
 	d.mu.Lock()
 	d.authorizationDeadline = time.Now().Add(-time.Second)
 	d.mu.Unlock()
-	if collector.cached.revalidate() || collector.cached.expired {
-		t.Fatal("expired replacement permission allowed exposure or an authority substitute")
+	if collector.cached.revalidate() || !collector.cached.expired {
+		t.Fatal("expired replacement permission did not require one authority read")
 	}
 }
 
@@ -1400,7 +1457,7 @@ func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
 				t.Fatal(err)
 			}
 			lease.gate.cacheRead(func(conflict v3CacheConflict) {
-				if !conflict(v3AttributeCoordinate(f.record(file.Item))) {
+				if conflict(v3AttributeCoordinate(f.record(file.Item))) != v3CacheHeld {
 					t.Fatal("new request failed to reactivate retained holds")
 				}
 			})
@@ -1412,38 +1469,61 @@ func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
 	}
 }
 
+type closeObservingV3Client struct {
+	*fakeV3DataClient
+	onClose func()
+}
+
+func (c *closeObservingV3Client) Close() error {
+	c.onClose()
+	return c.fakeV3DataClient.Close()
+}
+
 func TestV3ActiveHandlerCoversPostStateValidation(t *testing.T) {
-	f := newCachedV3Fixture(t, v3FileObjects())
-	f.ns.bind(0x20, "file", 0x70)
-	file := f.lookup(f.root, "file")
+	client := newFakeV3DataClient()
+	ns := newV3TestNamespace(client, v3FileObjects())
+	ns.bind(0x20, "file", 0x70)
 	const operationID = uint64(97502)
-	f.d.bridge.reserveFrontendPublication(operationID)
-	gate, _ := v3ItemSourceGate(file.Item, false)
-	item := f.record(file.Item)
+	var d *v3DataPlane
+	var checked sync.Once
+	var observed atomic.Bool
+	wrapper := &closeObservingV3Client{fakeV3DataClient: client, onClose: func() {
+		checked.Do(func() {
+			observed.Store(true)
+			lease := d.bridge.sourcePublication.operationLease(operationID)
+			if lease == nil {
+				t.Error("malformed handler had no source lease")
+				return
+			}
+			lease.gate.mu.Lock()
+			defer lease.gate.mu.Unlock()
+			if lease.active != 1 || lease.gate.terminal == nil {
+				t.Errorf("malformed handler closed its transport with active=%d terminal=%v, want terminal before settlement", lease.active, lease.gate.terminal)
+			}
+		})
+	}}
+	d = testV3DataPlaneOnClient(t, wrapper, client, newFakeV3Clock())
+	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
+	d.bridge.reserveFrontendPublication(operationID)
+	mutate := client.mutation
+	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		response, err := mutate(ctx, identity, request)
+		response.PostState = nil
+		return response, err
+	}
 	mode := uint32(0o600)
-	response, errno, finish := f.d.callMutation(context.Background(), operationID, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item.token, Mode: &mode}}}, gate)
-	if errno != 0 {
-		t.Fatal(errno)
+	if _, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.SetAttrRequest{Item: file.Item, Mode: &mode}); errno != darwinEIO || d.terminalError() == nil {
+		t.Fatalf("malformed SetAttr = %d terminal=%v", errno, d.terminalError())
 	}
-	lease := f.d.bridge.sourcePublication.operationLease(operationID)
-	lease.gate.cacheRead(func(conflict v3CacheConflict) {
-		if !conflict(v3AttributeCoordinate(item)) || lease.active != 1 {
-			t.Fatal("RPC return exposed idle cache eligibility before validation")
-		}
-	})
-	// Malformed PostState is terminal before handler settlement, so no idle
-	// interval can admit a cache read after the decrement.
-	response.PostState = nil
-	if _, _, err := v3TargetEffect(response.GetPostState(), item); err == nil {
-		t.Fatal("malformed PostState accepted")
+	if !observed.Load() {
+		t.Fatal("malformed handler never closed its transport")
 	}
-	_, _ = f.d.malformed("injected malformed PostState")
-	finish()
-	lease.gate.cacheRead(func(conflict v3CacheConflict) {
-		if !conflict(v3AttributeCoordinate(item)) || lease.active != 0 {
-			t.Fatal("malformed outcome opened cache admission")
-		}
-	})
+	lease := d.bridge.sourcePublication.operationLease(operationID)
+	lease.gate.mu.Lock()
+	defer lease.gate.mu.Unlock()
+	if lease.active != 0 || lease.gate.terminal == nil {
+		t.Fatalf("malformed handler left active=%d terminal=%v", lease.active, lease.gate.terminal)
+	}
 }
 
 func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
@@ -1485,6 +1565,39 @@ func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
 	}
 	if metrics.Lookup["unknown_name"] != 2 || metrics.Lookup["hit"] != 1 || metrics.LookupPolarity["positive"] != 1 || metrics.LookupPolarity["negative"] != 2 {
 		t.Fatalf("lookup metrics: %+v", metrics)
+	}
+}
+
+func TestV3CacheMetricsDistinguishTerminalCoordinatorFromSourceHolds(t *testing.T) {
+	for _, peerCut := range []bool{false, true} {
+		t.Run(map[bool]string{false: "terminal", true: "peer-cut"}[peerCut], func(t *testing.T) {
+			f := newCachedV3Fixture(t, v3FileObjects())
+			f.ns.bind(0x20, "file", 0x70)
+			file := f.lookup(f.root, "file")
+			record := f.record(file.Item)
+			coordinator := f.d.bridge.sourcePublication
+			// Withdraw between the initial admission check and the atomic
+			// snapshot, without a source holder to obscure the reason.
+			f.client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+				coordinator.mu.Lock()
+				if peerCut {
+					coordinator.peerSequence = 1
+				} else {
+					coordinator.terminal = errors.New("coordinator withdrawn")
+				}
+				coordinator.mu.Unlock()
+				return &fakeV3ResponseConsumption{consume: func() {}}
+			}
+			collector := &v3ReplyResourceCollector{d: f.d}
+			ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
+			if _, hit, errno := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
+				t.Fatalf("withdrawn coordinator: hit=%t errno=%d", hit, errno)
+			}
+			metrics := f.d.cacheMetrics()
+			if metrics.GetAttr["terminal"] != 1 || metrics.GetAttr["held"] != 0 || metrics.GetAttr["hit"] != 0 {
+				t.Fatalf("withdrawn coordinator metrics = %v", metrics.GetAttr)
+			}
+		})
 	}
 }
 

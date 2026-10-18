@@ -487,17 +487,7 @@ func (d *v3DataPlane) dispatchFrontend(
 	}
 	switch request := body.(type) {
 	case *pfslocal.LookupRequest:
-		reply, errno := d.lookup(ctx, operationID, request)
-		polarity := 2
-		if errno == 0 {
-			polarity = 0
-		} else if errno == darwinENOENT {
-			polarity = 1
-		}
-		d.mu.Lock()
-		d.cacheCounters.lookup[polarity]++
-		d.mu.Unlock()
-		return reply, errno
+		return d.lookup(ctx, operationID, request)
 	case *pfslocal.EnumerateEntriesRequest:
 		return d.enumerateEntries(ctx, operationID, request)
 	case *pfslocal.GetAttrRequest:
@@ -2647,7 +2637,8 @@ func (cleanup *v3ResourceCleanup) finish() error {
 // then at most one Reclaim. Each request owns an exact replay assignment, so it
 // runs on the data plane's lifetime rather than any caller's: a lost reply
 // replays the same mutation inside the client, and local withdrawal cannot
-// cancel it. Every outcome other than complete success is terminal.
+// cancel it. Before transfer to session teardown, every outcome other than
+// complete success is terminal.
 func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), operationAdmissionBudgetValue())
 	defer cancel()
@@ -2754,6 +2745,7 @@ func v3DefiniteReleaseFailure(class authoritypb.FailureClass) bool {
 
 // transferReleases closes admission without waiting on DATA. Session teardown
 // owns unsent tokens; the worker retains its in-flight request until it returns.
+// Only a failure classified before this transfer is a cleanup diagnostic.
 func (d *v3DataPlane) transferReleases() error {
 	d.releaseMu.Lock()
 	defer d.releaseMu.Unlock()
