@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/restorefixture"
@@ -120,6 +121,72 @@ func TestMkdirSearchWitnessOnXFS(t *testing.T) {
 }
 
 const mathMaxUint32 = ^uint32(0)
+
+type heldMkdirWitnessStore struct {
+	*xfsstore.Volume
+	observed, release chan struct{}
+}
+
+func (s *heldMkdirWitnessStore) SearchPermitted(item xfsstore.Capability) (bool, error) {
+	allowed, err := s.Volume.SearchPermitted(item)
+	close(s.observed)
+	<-s.release
+	return allowed, err
+}
+
+func TestMkdirWitnessProtectsNewChildThroughCommitOnXFS(t *testing.T) {
+	f := newKernelAuthorityFixture(t)
+	store := &heldMkdirWitnessStore{Volume: f.store, observed: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-store.release:
+		default:
+			close(store.release)
+		}
+	}()
+	f.h.Store = store
+	mkdir := &authoritypb.Request{RequestId: 21, Epoch: f.epoch, Session: f.proof, Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: f.root, Name: []byte("racing"), Mode: 0100}}}
+	lookup := &authoritypb.Request{RequestId: 22, Epoch: f.epoch, Session: f.proof, Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: f.root, Name: []byte("racing")}}}
+	stampMutation(t, mkdir, 0, 1)
+	stampMutation(t, lookup, 1, 1)
+	created, lookedUp := make(chan *authoritypb.Response, 1), make(chan *authoritypb.Response, 1)
+	go func() { created <- f.h.Handle(f.ctx, mkdir) }()
+	select {
+	case <-store.observed:
+	case response := <-created:
+		t.Fatalf("mkdir did not reach its witness: %v", response)
+	case <-time.After(time.Second):
+		t.Fatal("mkdir did not reach its witness")
+	}
+	go func() { lookedUp <- f.h.Handle(f.ctx, lookup) }()
+	select {
+	case response := <-lookedUp:
+		close(store.release)
+		<-created
+		t.Fatalf("lookup exposed the child before witness/commit: %v", response)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(store.release)
+	first, found := <-created, <-lookedUp
+	if first.GetErrno() != 0 || found.GetErrno() != 0 || !first.GetMkdir().GetChildSearchPermitted() || found.GetLookup().GetItem().GetSnapshotSequence() < first.GetMkdir().GetItem().GetSnapshotSequence() {
+		t.Fatalf("inconsistent child publication: mkdir=%v lookup=%v", first, found)
+	}
+	f.seq[0], f.seq[1] = 1, 1
+	f.request = 22
+	// The first legitimate holder may now change permissions immediately. A
+	// delayed original outcome retains the old cut rather than resampling it.
+	mode := uint32(0)
+	f.call(t, 1, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: found.GetLookup().GetItem().GetToken(), Mode: &mode}}})
+	mkdir.RequestId = 24
+	replayed := f.h.Handle(f.ctx, mkdir)
+	if first.GetMkdir().GetItem().GetSnapshotSequence() >= f.h.coherenceVersionNow() || !first.GetMkdir().GetChildSearchPermitted() {
+		t.Fatal("later permission change restamped the original witness")
+	}
+	first.RequestId = replayed.RequestId
+	if !proto.Equal(first, replayed) {
+		t.Fatalf("delayed mkdir outcome changed after chmod: %v", replayed)
+	}
+}
 
 func TestMkdirWitnessReplayAndNewChildOrderingOnXFS(t *testing.T) {
 	f := newKernelAuthorityFixture(t)
