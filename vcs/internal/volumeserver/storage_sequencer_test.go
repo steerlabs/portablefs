@@ -9,7 +9,7 @@ import (
 func TestStorageDeclarationSeparatesReadTurnsFromBindingChanges(t *testing.T) {
 	for _, changed := range []bool{false, true} {
 		s := NewStorageSequencer()
-		deps := MutationDependenciesForTargets([]VisibilityTarget{{Scope: VisibilityNamespace, ParentIdentity: [16]byte{1}, Name: []byte("child")}})
+		deps := MutationDependenciesForTargets([]MutationTarget{{Scope: MutationNamespace, ParentIdentity: [16]byte{1}, Name: []byte("child")}})
 		d := s.Declare(deps)
 		var release func()
 		var err error
@@ -38,7 +38,7 @@ func TestStorageDeclarationSeparatesReadTurnsFromBindingChanges(t *testing.T) {
 }
 func TestStorageDeclarationCancellationReleasesWatchers(t *testing.T) {
 	s := NewStorageSequencer()
-	deps := MutationDependenciesForTargets([]VisibilityTarget{{Scope: VisibilityAttributes, Identity: [16]byte{2}}})
+	deps := MutationDependenciesForTargets([]MutationTarget{{Scope: MutationAttributes, Identity: [16]byte{2}}})
 	release, err := s.Acquire(t.Context(), deps)
 	if err != nil {
 		t.Fatal(err)

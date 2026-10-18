@@ -22,10 +22,10 @@ func checkAuthorityKernel() error {
 // syncfs. A vendor backport is not a separately supported durability contract.
 func validateAuthorityKernel(release string) error {
 	parts := strings.SplitN(release, ".", 3)
-	if len(parts) == 3 && !strings.Contains(release, "-rc") {
+	if len(parts) == 3 {
 		major, majorErr := strconv.ParseUint(parts[0], 10, 32)
 		minor, minorErr := strconv.ParseUint(parts[1], 10, 32)
-		if majorErr == nil && minorErr == nil && parts[2] != "" && (major > 5 || major == 5 && minor >= 17) {
+		if majorErr == nil && minorErr == nil && parts[2] != "" && (major > 5 || major == 5 && (minor > 17 || minor == 17 && !strings.Contains(parts[2], "-rc"))) {
 			return nil
 		}
 	}

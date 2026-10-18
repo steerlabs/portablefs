@@ -2,8 +2,8 @@
 # restoremode. scripts/xfs-fuse-integration.sh requires every entry of this
 # list, xfs-required-fuse-tests.txt and xfs-required-tiered-tests.txt to run to
 # a PASS; load_required_tests there defines the line format and validation.
-github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilityPriorMembershipMappingOnXFS
-github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestWriterPriorMembershipMappingOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestWriterSafeTakeoverWaitsForPendingApplyOnXFS
 github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestHydrationPreservesCurrentMtimeOnXFS
 github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSProjectGate
 github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSGateRefusesAForeignProjectID
@@ -22,3 +22,16 @@ github.com/steerlabs/portablefs/vcs/internal/hydrator:TestMaterializeRestoresRes
 github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode
 github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator
 github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirSearchWitnessOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessProtectsNewChildThroughCommitOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessReplayAndNewChildOrderingOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessUnexpectedFailureIsAppliedAndSyncedOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestHandlerProofRetainsWriterExclusionThroughApplyDrainOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestLinuxReplaySyncAndLocksSurviveMacWriterExclusionOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyActivationRecallAndPendingRoutesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyCachelessBreakAndPendingRoutesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyActivationAndRoutePublicationOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyApplyCancellationLeavesLocksAndRoutesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyRouteValidationAndNoOpPrecedenceOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyRouteCancellationAfterPublicationSettlesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyActivationDeferredFenceUsesProductionCleanupOnXFS

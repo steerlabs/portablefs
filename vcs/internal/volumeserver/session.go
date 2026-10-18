@@ -71,7 +71,7 @@ const (
 	// hide a directory tree from every other machine. Mount mutations under
 	// .portablefs/ are refused outright for the same reason: the file is
 	// reachable only through ApplyRoutes, which runs the change through the
-	// visibility barrier instead of skewing one machine's topology silently.
+	// topology exclusion instead of skewing one machine's topology silently.
 	AccessAdmin
 )
 
@@ -172,7 +172,7 @@ type session struct {
 	ending         bool
 	active         uint64
 	cleanupStarted bool
-	exclusion      *CompatibilityExclusion
+	exclusion      *WriterExclusion
 	terminal       chan struct{}
 	slots          []replaySlot
 	activation     *ActivationToken
@@ -198,7 +198,7 @@ type attachAttempt struct {
 
 // ActivationToken is an opaque, single transition reservation returned by
 // PrepareActivation. While it is live, AbortProvisional and Sweep cannot race
-// between durable visibility registration and the runtime commit. The caller
+// between durable mount registration and the runtime commit. The caller
 // must either CommitActivation or CancelActivation on every path.
 type ActivationToken struct {
 	authority *Authority
@@ -451,7 +451,7 @@ func (a *Authority) purgeAttachAttemptsLocked(now time.Time) {
 	}
 }
 
-// PrepareAttach creates one non-executable session for an exact protocol-7
+// PrepareAttach creates one non-executable session for an exact protocol-8
 // attach attempt. Admission is reserved before authorize is called, so a full
 // authority neither spends a single-use capability nor starts unbounded work.
 // The attempt record is installed before the call and retained through its
@@ -613,7 +613,7 @@ func credentialMatchesSession(s *session, cred SessionCredential) bool {
 
 // PrepareActivation authenticates proof that the peer received the provisional
 // AttachReply and reserves the only PROVISIONAL -> ACTIVE transition. The
-// reservation closes the abort/sweep race while durable visibility membership
+// reservation closes the abort/sweep race while durable mount membership
 // is written. An exact replay after commit succeeds with a no-op token.
 func (a *Authority) PrepareActivation(ctx context.Context, cred SessionCredential, attemptID AttachAttemptID) (*ActivationToken, error) {
 	if ctx == nil || cred.Epoch != a.epoch || attemptID == (AttachAttemptID{}) {
@@ -928,7 +928,7 @@ func (a *Authority) notifySessionEnd(id SessionID) {
 
 // AttachActiveForTest creates an immediately active session solely for direct
 // tests of post-activation runtime behavior. Its explicit name prevents a
-// production handler from accidentally bypassing protocol 7's provisional
+// production handler from accidentally bypassing protocol 8's provisional
 // receipt proof and lifecycle-transactional activation boundary.
 func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authorization Authorization) (SessionCredential, error) {
 	if err := a.ValidateAttachSlots(slots); err != nil {
@@ -989,8 +989,9 @@ func (a *Authority) SessionTerminal(id SessionID) (<-chan struct{}, error) {
 
 // FenceSession ends one session immediately and permanently. It is the action
 // behind participant-scoped cache fencing: the authority stops recognising this
-// mount, and the mount learns it has been fenced from its own session dying,
-// which is what obliges it to revoke its kernel mount locally. It is idempotent,
+// mount. The frontend stops publication when it observes terminal session
+// state; this does not synchronously withdraw retained FSKit kernel caches.
+// It is idempotent,
 // so the path that fences a session and the terminal-channel watcher that
 // observes the result can both call it.
 func (a *Authority) FenceSession(id SessionID) {

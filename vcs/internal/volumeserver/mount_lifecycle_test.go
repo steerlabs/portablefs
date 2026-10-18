@@ -7,22 +7,26 @@ import (
 )
 
 type mountLifecycleMembership struct {
-	active      map[SessionID]struct{}
+	active      map[SessionID]MountMembershipProfile
 	activateErr error
 	removeErr   error
 	activates   int
 	deactivates int
 }
 
-func (m *mountLifecycleMembership) Activate(id SessionID) error {
+func (*mountLifecycleMembership) PriorCacheState() (PriorEpochDisposition, bool) {
+	return PriorEpochStrictMountsFenced, false
+}
+
+func (m *mountLifecycleMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
 	m.activates++
 	if m.activateErr != nil {
 		return m.activateErr
 	}
 	if m.active == nil {
-		m.active = make(map[SessionID]struct{})
+		m.active = make(map[SessionID]MountMembershipProfile)
 	}
-	m.active[id] = struct{}{}
+	m.active[id] = profile
 	return nil
 }
 
@@ -44,21 +48,14 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fencer := newTestFencer()
-	visibility, err := NewVisibilityCoordinator(VisibilityConfig{
-		Membership: membership, Prior: PriorEpochStrictMountsFenced, Fencer: fencer,
-		MaxCachedNameCapacity: testCacheCapacity, MaxRepairBudget: testRepairBudget, MaxClockSkew: time.Second,
-		Now: func() time.Time { return now },
-	})
+	visibility, err := NewWriterRegistry(WriterRegistryConfig{Prior: PriorEpochStrictMountsFenced})
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := SessionID{9}
-	terminal := fencer.attach(id)
-	if err := lifecycle.Activate(id, func() error {
-		_, activateErr := visibility.ActivateParticipantInMemory(
-			id, CoherenceStrict, terminal, testVisibilityCommitment(), nil, func() {},
-		)
+	terminal := make(chan struct{})
+	if err := lifecycle.ActivateProfile(id, MembershipFSKitExclusive, func() error {
+		activateErr := visibility.Activate(id, terminal, &WriterExclusion{now: continuousNow}, func() error { return nil }, func() {})
 		return activateErr
 	}); err != nil {
 		t.Fatal(err)
@@ -68,7 +65,7 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 	}
 	proof := MountAbsenceProof{Component: "test", Observation: []byte{1}, ObservedUnixNanos: now.UnixNano()}
 	if err := lifecycle.CleanDetach(id, proof, func() error {
-		return visibility.CleanDetachInMemory(id, proof)
+		return visibility.Remove(id)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -76,14 +73,16 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 		t.Fatalf("durable Deactivate calls = %d, want exactly 1", membership.deactivates)
 	}
 
+	visibility.mu.Lock()
+	for _, e := range visibility.exclusions {
+		e.drain()
+	}
+	visibility.mu.Unlock()
 	failingID := SessionID{10}
-	failingTerminal := fencer.attach(failingID)
+	failingTerminal := make(chan struct{})
 	publishErr := errors.New("retain activation reply")
-	if err := lifecycle.Activate(failingID, func() error {
-		_, activateErr := visibility.ActivateParticipantInMemory(
-			failingID, CoherenceStrict, failingTerminal, testVisibilityCommitment(),
-			func(VisibilityCursor) ([][16]byte, error) { return nil, publishErr }, func() {},
-		)
+	if err := lifecycle.ActivateProfile(failingID, MembershipFSKitExclusive, func() error {
+		activateErr := visibility.Activate(failingID, failingTerminal, &WriterExclusion{now: continuousNow}, func() error { return publishErr }, func() {})
 		return activateErr
 	}); !errors.Is(err, publishErr) {
 		t.Fatalf("failed activation = %v, want %v", err, publishErr)
@@ -100,7 +99,7 @@ func TestMountLifecyclePriorUnprovenOnlyBlocksRouteChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := SessionID{1}
-	if err := lifecycle.Activate(id, func() error { return nil }); err != nil {
+	if err := lifecycle.ActivateProfile(id, MembershipFSKitExclusive, func() error { return nil }); err != nil {
 		t.Fatalf("Activate during prior uncertainty: %v", err)
 	}
 	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrRoutesLive) {
@@ -122,17 +121,17 @@ func TestMountLifecycleActivationRollbackAndExactCleanDetach(t *testing.T) {
 	}
 	id := SessionID{1}
 	publishErr := errors.New("publish failed")
-	if err := lifecycle.Activate(id, func() error { return publishErr }); !errors.Is(err, publishErr) {
+	if err := lifecycle.ActivateProfile(id, MembershipFSKitExclusive, func() error { return publishErr }); !errors.Is(err, publishErr) {
 		t.Fatalf("failed Activate = %v, want %v", err, publishErr)
 	}
 	if _, ok := membership.active[id]; ok {
 		t.Fatal("failed activation remained durable")
 	}
-	if err := lifecycle.Activate(id, func() error { return nil }); err != nil {
+	if err := lifecycle.ActivateProfile(id, MembershipFSKitExclusive, func() error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if err := lifecycle.CleanDetach(id, MountAbsenceProof{}, func() error { return nil }); !errors.Is(err, ErrVisibilityProof) {
-		t.Fatalf("incomplete CleanDetach = %v, want %v", err, ErrVisibilityProof)
+	if err := lifecycle.CleanDetach(id, MountAbsenceProof{}, func() error { return nil }); !errors.Is(err, ErrMountProof) {
+		t.Fatalf("incomplete CleanDetach = %v, want %v", err, ErrMountProof)
 	}
 	removed := false
 	proof := MountAbsenceProof{ObservedUnixNanos: now.UnixNano(), Observation: []byte("mount gone"), Component: "test"}
@@ -158,10 +157,51 @@ func TestMountLifecycleFailedDurableActivationRollbackBlocksRoutes(t *testing.T)
 	}
 	membership.removeErr = errors.New("durable deactivate failed")
 	publishErr := errors.New("runtime publish failed")
-	if err := lifecycle.Activate(SessionID{1}, func() error { return publishErr }); !errors.Is(err, publishErr) || !errors.Is(err, membership.removeErr) {
+	if err := lifecycle.ActivateProfile(SessionID{1}, MembershipFSKitExclusive, func() error { return publishErr }); !errors.Is(err, publishErr) || !errors.Is(err, membership.removeErr) {
 		t.Fatalf("Activate error = %v, want joined publish and rollback failures", err)
 	}
 	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrRoutesLive) {
 		t.Fatalf("route absence after failed durable rollback = %v, want %v", err, ErrRoutesLive)
+	}
+}
+
+func TestMountLifecyclePreservesProfileThroughDetachRollback(t *testing.T) {
+	for _, profile := range []MountMembershipProfile{MembershipLinux, MembershipFSKitExclusive, MembershipCacheless} {
+		t.Run(string(profile), func(t *testing.T) {
+			now := time.Unix(100, 0)
+			membership := &mountLifecycleMembership{}
+			lifecycle, err := NewMountLifecycle(MountLifecycleConfig{
+				Membership: membership, Prior: PriorEpochStrictMountsFenced, Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := SessionID{1}
+			if err := lifecycle.ActivateProfile(id, profile, func() error {
+				if membership.active[id] != profile {
+					t.Fatal("exact profile was not durable before publication")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			proof := MountAbsenceProof{ObservedUnixNanos: now.UnixNano(), Observation: []byte("mount gone"), Component: "test"}
+			removeErr := errors.New("runtime removal failed")
+			if err := lifecycle.CleanDetach(id, proof, func() error { return removeErr }); !errors.Is(err, removeErr) {
+				t.Fatalf("failed detach = %v, want %v", err, removeErr)
+			}
+			if membership.active[id] != profile {
+				t.Fatal("failed detach did not restore the exact durable profile")
+			}
+			if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrRoutesLive) {
+				t.Fatalf("failed detach dropped the topology obligation: %v", err)
+			}
+			if err := lifecycle.CleanDetach(id, proof, func() error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if err := lifecycle.RequireCleanRouteAbsence(); err != nil {
+				t.Fatalf("clean detach retained the topology obligation: %v", err)
+			}
+		})
 	}
 }

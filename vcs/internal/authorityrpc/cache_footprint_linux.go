@@ -12,7 +12,7 @@ func (h *VolumeHandler) coherenceCacheToken(id volumeserver.SessionID) (volumese
 	if err != nil {
 		return volumeserver.SubscriptionToken{}, err
 	}
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER || profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER || profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		return volumeserver.SubscriptionToken{}, nil
 	}
 	return h.coherenceToken(id)
@@ -24,7 +24,7 @@ func (h *VolumeHandler) admitCoherenceCache(token volumeserver.SubscriptionToken
 	return h.Coherence.AdmitCache(token, a)
 }
 
-func sourceCacheAdmission(gate volumeserver.SourcePublicationGate, resp *authoritypb.Response) volumeserver.CacheAdmission {
+func sourceCacheAdmission(gate volumeserver.MutationFootprint, resp *authoritypb.Response) volumeserver.CacheAdmission {
 	var a volumeserver.CacheAdmission
 	for _, target := range gate.Targets {
 		if target.ParentIdentity != ([16]byte{}) {

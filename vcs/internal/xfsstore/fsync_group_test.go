@@ -25,7 +25,7 @@ func TestFsyncGroupRaceSafety(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			for iteration := range iterations {
-				if _, err := state.barrier(worker, (worker+iteration)%2 == 0, syncCall, syncCall); err != nil {
+				if _, err := state.barrier(worker, (worker+iteration)%2 == 0, syncCall, syncCall, nil); err != nil {
 					t.Errorf("barrier: %v", err)
 				}
 			}
@@ -51,10 +51,10 @@ func TestSyncGroupFailureReleasesAllWaitersWithoutRetry(t *testing.T) {
 		return nil // The kernel's error cursor would now appear successful.
 	}
 	first, followers := make(chan error, 1), make(chan error, 4)
-	go func() { _, err := state.barrier(1, true, syncCall, syncCall); first <- err }()
+	go func() { _, err := state.barrier(1, true, syncCall, syncCall, nil); first <- err }()
 	<-entered
 	for range 4 {
-		go func() { _, err := state.barrier(2, false, syncCall, syncCall); followers <- err }()
+		go func() { _, err := state.barrier(2, false, syncCall, syncCall, nil); followers <- err }()
 	}
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -78,7 +78,7 @@ func TestSyncGroupFailureReleasesAllWaitersWithoutRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := state.barrier(3, false, syncCall, syncCall); err != cause {
+	if _, err := state.barrier(3, false, syncCall, syncCall, nil); err != cause {
 		t.Fatal(err)
 	}
 	if calls.Load() != 1 {

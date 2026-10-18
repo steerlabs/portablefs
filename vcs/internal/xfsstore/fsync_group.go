@@ -67,7 +67,7 @@ type syncGroup struct {
 	syncFailure error
 }
 
-func (s *syncGroup) barrier(fd int, dataOnly bool, fsync, fdatasync func(int) error) (int, error) {
+func (s *syncGroup) barrier(fd int, dataOnly bool, fsync, fdatasync func(int) error, completed func(int)) (int, error) {
 	waiter := &syncWaiter{full: !dataOnly, fd: fd,
 		lead: make(chan []*syncWaiter, 1), done: make(chan error, 1)}
 	s.mu.Lock()
@@ -79,19 +79,19 @@ func (s *syncGroup) barrier(fd int, dataOnly bool, fsync, fdatasync func(int) er
 	if !s.inFlight {
 		s.inFlight = true
 		s.mu.Unlock()
-		return s.runBatch(waiter, []*syncWaiter{waiter}, fsync, fdatasync)
+		return s.runBatch(waiter, []*syncWaiter{waiter}, fsync, fdatasync, completed)
 	}
 	s.pending = append(s.pending, waiter)
 	s.mu.Unlock()
 	select {
 	case batch := <-waiter.lead:
-		return s.runBatch(waiter, batch, fsync, fdatasync)
+		return s.runBatch(waiter, batch, fsync, fdatasync, completed)
 	case err := <-waiter.done:
 		return 0, err
 	}
 }
 
-func (s *syncGroup) runBatch(leader *syncWaiter, batch []*syncWaiter, fsync, fdatasync func(int) error) (int, error) {
+func (s *syncGroup) runBatch(leader *syncWaiter, batch []*syncWaiter, fsync, fdatasync func(int) error, completed func(int)) (int, error) {
 	full := false
 	for _, waiter := range batch {
 		full = full || waiter.full
@@ -101,6 +101,9 @@ func (s *syncGroup) runBatch(leader *syncWaiter, batch []*syncWaiter, fsync, fda
 		err = fsync(leader.fd)
 	} else {
 		err = fdatasync(leader.fd)
+	}
+	if completed != nil {
+		completed(len(batch))
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

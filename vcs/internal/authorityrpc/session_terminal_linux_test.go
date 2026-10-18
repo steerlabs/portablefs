@@ -4,10 +4,11 @@ package authorityrpc
 
 import (
 	"fmt"
-	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
-	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"syscall"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
 func TestSessionExpiryRefusalCarriesTerminalWitness(t *testing.T) {

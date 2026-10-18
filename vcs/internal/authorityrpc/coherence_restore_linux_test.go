@@ -130,7 +130,6 @@ func TestRestoreTruncatePostApplyFailureFencesStorage(t *testing.T) {
 					req.Body = &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: &authoritypb.OpenFlags{Write: true, Truncate: true}}}
 				}
 				stampMutation(t, req, 0, 1)
-				stampResolvedFskitPublication(t, h, cred.ID, req)
 				ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1})
 				reply := h.Handle(ctx, req)
 				if reply.GetErrno() != int32(syscall.EIO) || !reply.GetUncertain() || reply.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || reply.GetMutation() == nil || backend.applies != 1 || restoreStore.calls != 1 {

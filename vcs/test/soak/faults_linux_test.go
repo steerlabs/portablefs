@@ -492,7 +492,7 @@ func (f *integrationFixture) replaceAuthorityEpoch() {
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: f.store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: uint64(f.cfg.CachedNameCapacity), MaxRepairBudget: time.Minute, Now: f.now,
+		Now: f.now,
 	})
 	if err != nil {
 		f.t.Fatalf("assemble replacement authority coordination: %v", err)
@@ -504,16 +504,8 @@ func (f *integrationFixture) replaceAuthorityEpoch() {
 		MaxFrame: integrationMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight: integrationServerInFlight, MaxItemsPerSession: f.cfg.MaxItemsPerSession,
 		MaxOpensPerSession: 4096, MaxItems: f.cfg.MaxItems, MaxOpens: 16384,
-		MaxRetainedReplyBytes: integrationAllocationBudget, WriteAdmission: f.writeAdmission,
-		MaxWriteBytesPerSession: integrationWriteBytesPerSession, MaxWriteBytesInFlight: integrationWriteBytes,
-		MaxWritesPerSession: integrationWritesPerSession, MaxWrites: integrationWrites,
-		WriteAdmissionProgressTimeout: integrationWriteProgressTimeout, WriteAbsoluteTimeout: integrationWriteAbsoluteTimeout,
-		TerminalDeliveryTimeout: integrationTerminalDeliveryTimeout, FskitWriteStaging: f.fskitStaging,
-		MaxFskitWriteBytes:                  authorityrpc.RequiredFskitWriteBytes,
-		MaxFskitWriteStagingBytesPerSession: integrationWriteBytesPerSession,
-		MaxFskitWriteStagingBytes:           integrationWriteBytes, MaxFskitWritesPerSession: integrationWritesPerSession,
-		MaxFskitWrites: integrationWrites, FskitWriteProgressTimeout: integrationWriteProgressTimeout,
-		FskitWriteAbsoluteTimeout: integrationWriteAbsoluteTimeout,
+		MaxRetainedReplyBytes:   integrationAllocationBudget,
+		TerminalDeliveryTimeout: integrationTerminalDeliveryTimeout,
 	}
 	coordination.Bind(handler)
 	priorCounts := map[string]int{}

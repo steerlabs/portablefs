@@ -3,50 +3,48 @@ package volumeserver
 import "fmt"
 
 // ValidateTargets proves storage preparation stays inside its acquired turn.
-func (d MutationDependencies) ValidateTargets(targets []VisibilityTarget) error {
-	if !d.valid() || validateVisibilityTargets(targets) != nil || !d.covers(targets) {
-		return ErrVisibilityTargets
+func (d MutationDependencies) ValidateTargets(targets []MutationTarget) error {
+	if !d.valid() || validateMutationTargets(targets) != nil || !d.covers(targets) {
+		return ErrMutationTargets
 	}
 	return nil
 }
 
 // ValidateMutationCompletion proves the committed post-state stays inside the
-// prepared footprint. Both protocol 7 and Mac repair use this pure invariant.
-func ValidateMutationCompletion(complete, prepared []VisibilityTarget) error {
-	if err := validateVisibilityTargets(complete); err != nil {
-		return ErrVisibilityTargets
+// prepared footprint, including every dependency named in the Linux change log.
+func ValidateMutationCompletion(complete, prepared []MutationTarget) error {
+	if err := validateMutationTargets(complete); err != nil {
+		return ErrMutationTargets
 	}
 	exactCount := 0
 	for _, target := range complete {
-		if target.Scope == VisibilityNamespace {
+		if target.Scope == MutationNamespace {
 			continue
 		}
 		exactCount++
 		if target.ExactPostState == nil || target.ExactPostState.ObjectVersion == 0 {
-			return fmt.Errorf("%w: completion inode target omitted exact committed attributes", ErrVisibilityTargets)
+			return fmt.Errorf("%w: completion inode target omitted exact committed attributes", ErrMutationTargets)
 		}
 	}
 	if exactCount > 4 {
-		return fmt.Errorf("%w: completion exceeded the four-object exact repair bound", ErrVisibilityTargets)
+		return fmt.Errorf("%w: completion exceeded the four-object outcome bound", ErrMutationTargets)
 	}
-	// Fan-out chooses its audience from the PREPARE targets. A COMPLETE target
-	// outside that set would be a repair instruction addressed to mounts that
-	// were never asked to close publication for it, so it is an invariant
-	// violation rather than a case to widen the audience for.
-	if !visibilityTargetsCovered(complete, prepared) {
-		return fmt.Errorf("%w: completion named a coordinate prepare did not", ErrVisibilityTargets)
+	// Completion cannot widen the dependencies after storage apply. Other
+	// operations may already be using coordinates outside the acquired turn.
+	if !mutationTargetsCovered(complete, prepared) {
+		return fmt.Errorf("%w: completion named a coordinate prepare did not", ErrMutationTargets)
 	}
-	completeKeys := visibilityTargetKeySet(complete)
+	completeKeys := mutationTargetKeySet(complete)
 	for _, target := range complete {
-		if target.Scope != VisibilityAttributes {
+		if target.Scope != MutationAttributes {
 			continue
 		}
 		for _, preparedTarget := range prepared {
-			if preparedTarget.Scope != VisibilityNamespace || preparedTarget.ParentIdentity != target.Identity {
+			if preparedTarget.Scope != MutationNamespace || preparedTarget.ParentIdentity != target.Identity {
 				continue
 			}
 			if _, ok := completeKeys[string(preparedTarget.key())]; !ok {
-				return fmt.Errorf("%w: parent attributes completed without a prepared namespace dependency", ErrVisibilityTargets)
+				return fmt.Errorf("%w: parent attributes completed without a prepared namespace dependency", ErrMutationTargets)
 			}
 		}
 	}

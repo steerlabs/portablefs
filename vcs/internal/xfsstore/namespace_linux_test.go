@@ -3,7 +3,6 @@
 package xfsstore
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +21,7 @@ func TestTmpfileRetainsCreationAccessAndExactLinkability(t *testing.T) {
 	item, attr, err := v.Tmpfile(root, 0o400, false)
 	if errors.Is(err, syscall.EOPNOTSUPP) {
 		// The non-production test volume may be overlayfs. Production Open has
-		// already required XFS and qualified O_TMPFILE for write staging.
+		// already required XFS and qualified its O_TMPFILE support.
 		t.Skip("test filesystem does not support O_TMPFILE")
 	}
 	if err != nil {
@@ -360,7 +359,7 @@ func TestCreateGrantCarriesAccessAndTruncate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, off, post, err := target.CommitWrite(bytes.NewReader([]byte("two")), WriteCommit{RequestedSize: 3, RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 2)); n != 3 || off != 3 || post.Size != 6 || err != nil {
+	if n, off, post, err := target.CommitWriteData([]byte("two"), WriteCommit{RequestedSize: 3, RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}); n != 3 || off != 3 || post.Size != 6 || err != nil {
 		t.Fatalf("per-call append = (%d, %d, %d, %v)", n, off, post, err)
 	}
 	if err := target.Close(); err != nil {

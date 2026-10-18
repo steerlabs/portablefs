@@ -14,7 +14,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	"log"
 	"math/big"
 	"net"
@@ -30,6 +29,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
@@ -129,18 +130,12 @@ const (
 	// admit one maximal request and one maximal reply.
 	integrationAllocationBudget = 64 << 20
 	// The strict cache commitment every mount in this fixture declares.
-	integrationCachedNames  = 65536
-	integrationRepairBudget = 20 * time.Second
+	integrationCachedNames       = 65536
+	integrationWithdrawalTimeout = 20 * time.Second
 
 	// Match the production authority's bounded standard-WRITE admission
 	// profile without making the integration fixture a weaker peer than the
 	// mount it is qualifying.
-	integrationWriteBytesPerSession    = 16 << 30
-	integrationWriteBytes              = 64 << 30
-	integrationWritesPerSession        = 8
-	integrationWrites                  = 4096
-	integrationWriteProgressTimeout    = 2 * time.Minute
-	integrationWriteAbsoluteTimeout    = 30 * time.Minute
 	integrationTerminalDeliveryTimeout = 45 * time.Second
 )
 
@@ -177,10 +172,10 @@ type integrationConfig struct {
 	// fixture's compact default. Zero preserves the normal integration limits.
 	MaxItemsPerSession uint32
 	MaxItems           uint32
-	// CachedNameCapacity overrides the compact integration cache. Zero keeps
+	// NameCacheCapacity overrides the compact integration cache. Zero keeps
 	// the existing 4,096-name test profile.
-	CachedNameCapacity int
-	wrapListener       func(net.Listener) net.Listener
+	NameCacheCapacity int
+	wrapListener      func(net.Listener) net.Listener
 
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
 	rules localroutes.RuleSet
@@ -188,23 +183,27 @@ type integrationConfig struct {
 
 // recordingMembership is the durable control-plane record the coordinator
 // requires, plus the one thing a test needs that production gets from its own
-// transport: the session ID the authority just registered. Activate is called
-// inside attach, before the reply is written, so the fixture can pair it with
-// the client it is dialling.
+// transport: the session ID the authority just registered. ActivateProfile runs
+// before the activation reply is written, so the fixture can pair the session
+// with the client it is dialling.
 type recordingMembership struct {
 	mu      sync.Mutex
-	active  map[volumeserver.SessionID]struct{}
+	active  map[volumeserver.SessionID]volumeserver.MountMembershipProfile
 	ordered []volumeserver.SessionID
 }
 
 func newRecordingMembership() *recordingMembership {
-	return &recordingMembership{active: make(map[volumeserver.SessionID]struct{})}
+	return &recordingMembership{active: make(map[volumeserver.SessionID]volumeserver.MountMembershipProfile)}
 }
 
-func (m *recordingMembership) Activate(id volumeserver.SessionID) error {
+func (*recordingMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *recordingMembership) ActivateProfile(id volumeserver.SessionID, profile volumeserver.MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active[id] = struct{}{}
+	m.active[id] = profile
 	m.ordered = append(m.ordered, id)
 	return nil
 }
@@ -341,12 +340,8 @@ type integrationFixture struct {
 	// production project gate, no test can observe another test's names, and the
 	// exclusive lock xfsstore takes on a volume root never collides.
 	volumeRoot string
-	// writeStagingRoot is a sibling of volumeRoot. It inherits the provisioned
-	// XFS project but is outside the authoritative namespace, so inert payloads
-	// can only exist in private unnamed O_TMPFILE stages.
-	writeStagingRoot string
-	writeAdmission   *authorityrpc.WriteAdmission
-	paths            []string
+
+	paths []string
 	// backing is one per-machine tree per mount: these mounts stand in for
 	// different machines, and machine-local storage is not shared between them.
 	backing []string
@@ -361,19 +356,18 @@ type integrationFixture struct {
 	// without making the test sleep for real.
 	clockSkew atomic.Int64
 
-	store        *xfsstore.Volume
-	routes       *authorityrpc.RoutesController
-	authority    *volumeserver.Authority
-	coherence    *volumeserver.CoherenceCoordinator
-	fskitStaging *authorityrpc.FskitWriteStaging
-	membership   *recordingMembership
-	fencer       *recordingFencer
-	counter      *countingHandler
-	server       *authorityrpc.Server
-	listener     net.Listener
-	stopServe    context.CancelFunc
-	served       chan error
-	stopped      bool
+	store      *xfsstore.Volume
+	routes     *authorityrpc.RoutesController
+	authority  *volumeserver.Authority
+	coherence  *volumeserver.CoherenceCoordinator
+	membership *recordingMembership
+	fencer     *recordingFencer
+	counter    *countingHandler
+	server     *authorityrpc.Server
+	listener   net.Listener
+	stopServe  context.CancelFunc
+	served     chan error
+	stopped    bool
 
 	clients    []*authorityrpc.Client
 	transports []*integrationTransport
@@ -394,8 +388,8 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 	if cfg.MaxItems == 0 {
 		cfg.MaxItems = 131072
 	}
-	if cfg.CachedNameCapacity == 0 {
-		cfg.CachedNameCapacity = integrationCachedNames
+	if cfg.NameCacheCapacity == 0 {
+		cfg.NameCacheCapacity = integrationCachedNames
 	}
 	rules, err := fusev3.ActivateRoutes([]byte(cfg.Routes))
 	if err != nil {
@@ -415,20 +409,6 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 			t.Errorf("remove per-test volume root: %v", err)
 		}
 	})
-	f.writeStagingRoot = f.volumeRoot + ".write-staging"
-	if err := os.Mkdir(f.writeStagingRoot, 0o700); err != nil {
-		t.Fatalf("create per-test write staging root: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(f.writeStagingRoot); err != nil {
-			t.Errorf("remove per-test write staging root: %v", err)
-		}
-	})
-	f.writeAdmission, err = authorityrpc.OpenWriteAdmission(f.writeStagingRoot)
-	if err != nil {
-		t.Fatalf("open per-test write staging root: %v", err)
-	}
-	t.Cleanup(f.closeWriteStaging)
 
 	mountRoot := t.TempDir()
 	for i := range cfg.Mounts {
@@ -524,24 +504,11 @@ func (f *integrationFixture) start() {
 	f.listener = listener
 	f.membership = newRecordingMembership()
 	f.fencer = &recordingFencer{inner: authority}
-	// The FSKit-write bounds are what makes this authority able to accept a
-	// synchronous-repair frontend at all: HELLO refuses that profile outright
-	// unless they are complete. The cacheless gateway never enters that profile;
-	// keeping the Mac bounds here matches the production authority assembly.
-	fskitStaging, err := authorityrpc.OpenFskitWriteStaging(f.writeStagingRoot)
-	if err != nil {
-		t.Fatalf("open FSKit write staging: %v", err)
-	}
-	f.fskitStaging = fskitStaging
-	// The authority is the source of truth for the volume's machine-local
-	// routing revision, and it refuses every mount whose declared revision is
-	// not the active one. The fixture therefore installs the declaration these
-	// mounts are about to agree with, through the same assembly and the same
-	// barrier a live operator's change would use.
+
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: uint64(f.cfg.CachedNameCapacity), MaxRepairBudget: time.Minute, Now: f.now,
+		Now: f.now,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
@@ -562,24 +529,8 @@ func (f *integrationFixture) start() {
 		MaxInFlight:        integrationServerInFlight,
 		MaxItemsPerSession: f.cfg.MaxItemsPerSession, MaxOpensPerSession: 4096,
 		MaxItems: f.cfg.MaxItems, MaxOpens: 16384,
-		MaxRetainedReplyBytes:         integrationAllocationBudget,
-		WriteAdmission:                f.writeAdmission,
-		MaxWriteBytesPerSession:       integrationWriteBytesPerSession,
-		MaxWriteBytesInFlight:         integrationWriteBytes,
-		MaxWritesPerSession:           integrationWritesPerSession,
-		MaxWrites:                     integrationWrites,
-		WriteAdmissionProgressTimeout: integrationWriteProgressTimeout,
-		WriteAbsoluteTimeout:          integrationWriteAbsoluteTimeout,
-		TerminalDeliveryTimeout:       integrationTerminalDeliveryTimeout,
-
-		FskitWriteStaging:                   f.fskitStaging,
-		MaxFskitWriteBytes:                  authorityrpc.RequiredFskitWriteBytes,
-		MaxFskitWriteStagingBytesPerSession: integrationWriteBytesPerSession,
-		MaxFskitWriteStagingBytes:           integrationWriteBytes,
-		MaxFskitWritesPerSession:            integrationWritesPerSession,
-		MaxFskitWrites:                      integrationWrites,
-		FskitWriteProgressTimeout:           integrationWriteProgressTimeout,
-		FskitWriteAbsoluteTimeout:           integrationWriteAbsoluteTimeout,
+		MaxRetainedReplyBytes:   integrationAllocationBudget,
+		TerminalDeliveryTimeout: integrationTerminalDeliveryTimeout,
 	}
 	coordination.Bind(handler)
 	f.counter = &countingHandler{inner: handler}
@@ -617,9 +568,9 @@ func (f *integrationFixture) mountAll() {
 			// out of this number, so it must be exactly the transport's bound.
 			MaxInFlight:  integrationMaxInFlight,
 			PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-			Coherence: fusev3.CoherenceStrict, CachedNameCapacity: f.cfg.CachedNameCapacity,
-			RepairBudget: integrationRepairBudget,
-			Routes:       f.cfg.rules, LocalBacking: f.backing[i],
+			NameCacheCapacity: f.cfg.NameCacheCapacity,
+			WithdrawalTimeout: integrationWithdrawalTimeout,
+			Routes:            f.cfg.rules, LocalBacking: f.backing[i],
 			Debug: os.Getenv(envFUSEDebug) == "1", OnWritebackDrop: f.cfg.OnWritebackDrop,
 			OnRevoked: func(report fusev3.RevocationReport) {
 				log.Printf("soak-frontend-revoked reason=%s cause=%s withdrawn=%t steps=%v", report.Reason, report.Cause, report.KernelStateWithdrawn, report.Withdrawal)
@@ -638,7 +589,7 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 	f.t.Helper()
 	cfg := authorityrpc.ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         f.listener.Addr().String(), TLS: f.clientTLS.Clone(), VolumeID: integrationVolumeID,
 		AccessToken: []byte("test-capability"), ReplaySlots: integrationReplaySlots,
 		MaxFrame: integrationMaxFrame, DialTimeout: 5 * time.Second,
@@ -710,12 +661,6 @@ func (f *integrationFixture) resumeAuthority() {
 }
 
 func (f *integrationFixture) closeStore() {
-	if f.fskitStaging != nil {
-		if err := f.fskitStaging.Close(); err != nil {
-			f.t.Errorf("close FSKit write staging: %v", err)
-		}
-		f.fskitStaging = nil
-	}
 	if f.store == nil {
 		return
 	}
@@ -751,16 +696,6 @@ func (f *recordingFencer) fenced() []volumeserver.SessionID {
 	return slices.Clone(f.ordered)
 }
 
-func (f *integrationFixture) closeWriteStaging() {
-	if f.writeAdmission == nil {
-		return
-	}
-	if err := f.writeAdmission.Close(); err != nil {
-		f.t.Errorf("close write admission: %v", err)
-	}
-	f.writeAdmission = nil
-}
-
 // shutdown is the cleanup path. It tolerates mounts that already aborted
 // themselves, because several tests deliberately destroy the authority.
 func (f *integrationFixture) shutdown() {
@@ -782,7 +717,6 @@ func (f *integrationFixture) shutdown() {
 	f.mounts, f.clients, f.transports = nil, nil, nil
 	f.stopAuthority()
 	f.closeStore()
-	f.closeWriteStaging()
 }
 
 // unmountAll releases every mount cleanly, in protocol: each detach carries

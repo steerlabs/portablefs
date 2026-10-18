@@ -5,6 +5,7 @@ package xfsstore
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -62,19 +63,39 @@ func (v *Volume) syncBarrier(group *syncGroup, fd int, dataOnly bool, fsync, fda
 	if err := v.syncHealth(); err != nil {
 		return 0, err
 	}
-	persist := func(call func(int) error) func(int) error {
+	var observation StorageSync
+	persist := func(kind string, call func(int) error) func(int) error {
 		return func(fd int) error {
 			// A queued batch may have outlived a failure on another inode.
 			if err := v.syncHealth(); err != nil {
 				return err
 			}
-			if err := call(fd); err != nil {
-				return v.failDurability(err)
+			var started time.Time
+			if v.onStorageSync != nil {
+				started = time.Now()
 			}
-			return v.syncHealth()
+			err := call(fd)
+			if v.onStorageSync != nil {
+				observation = StorageSync{Kind: kind, Elapsed: time.Since(started)}
+			}
+			if err != nil {
+				err = v.failDurability(err)
+			} else {
+				err = v.syncHealth()
+			}
+			return err
 		}
 	}
-	return group.barrier(fd, dataOnly, persist(fsync), persist(fdatasync))
+	kind := "fsync"
+	if group == &v.volumeSync {
+		kind = "syncfs"
+	}
+	return group.barrier(fd, dataOnly, persist(kind, fsync), persist("fdatasync", fdatasync), func(waiters int) {
+		if v.onStorageSync != nil && observation.Kind != "" {
+			observation.Waiters = waiters
+			v.onStorageSync(observation)
+		}
+	})
 }
 
 func (v *Volume) syncInode(state *inodeFsyncState, fd int, dataOnly bool) (int, error) {

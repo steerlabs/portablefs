@@ -13,23 +13,19 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
-// coherenceRead shares storage sampling across profiles. Admission remains
-// profile-specific: FSKit records repair coordinates, Linux consumes its
-// subscription/delegations, and cacheless readers break delegated data.
-// ErrVisibilityRetry cannot arise for the production FSKit profile: the sole
-// compatibility writer is always the source of its barriers, and route switches
-// hold registration exclusively. Another pending peer PREPARE cannot coexist.
+// Every read retains storage identity and sampling guards. FSKit has no peer
+// actuation wait; Linux and cacheless paths still break delegated data reads.
 func (h *VolumeHandler) coherenceRead(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential) (*authoritypb.Response, bool) {
 	if req == nil {
 		return nil, false
 	}
 	profile, err := h.sessionFrontendProfile(cred.ID)
-	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		return nil, false
 	}
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_Read:
-		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			return nil, false
 		}
 		return h.coherenceReadData(ctx, req.GetRequestId(), cred.ID, body.Read), true
@@ -40,7 +36,7 @@ func (h *VolumeHandler) coherenceRead(ctx context.Context, req *authoritypb.Requ
 	case *authoritypb.Request_ReadDir:
 		return h.coherenceReadDir(ctx, req, cred, body.ReadDir), true
 	case *authoritypb.Request_Fsync:
-		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			return nil, false
 		}
 		return h.coherenceFsync(ctx, req.GetRequestId(), cred.ID, body.Fsync), true
@@ -87,19 +83,19 @@ func (h *VolumeHandler) coherenceFsync(ctx context.Context, requestID uint64, se
 }
 
 func coherenceInodeDependencies(identity [16]byte) volumeserver.MutationDependencies {
-	return volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{{
-		Scope: volumeserver.VisibilityAttributes, Identity: identity,
+	return volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{{
+		Scope: volumeserver.MutationAttributes, Identity: identity,
 	}})
 }
 
 func coherenceBindingDependencies(parent [16]byte, name []byte, identity [16]byte) volumeserver.MutationDependencies {
-	target := volumeserver.VisibilityTarget{
-		Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: name,
+	target := volumeserver.MutationTarget{
+		Scope: volumeserver.MutationNamespace, ParentIdentity: parent, Name: name,
 	}
 	if identity != ([16]byte{}) {
 		target.RelatedIdentities = [][16]byte{identity}
 	}
-	return volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{target})
+	return volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{target})
 }
 
 func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volumeserver.SessionID, identity [16]byte) (*volumeserver.DataGuard, error) {
@@ -110,9 +106,8 @@ func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volu
 	if err != nil {
 		return nil, err
 	}
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		_, err := h.Visibility.Stabilize(ctx, session, volumeserver.VisibilityResolution{Identity: identity})
-		return nil, err
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
+		return nil, nil
 	}
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return h.Coherence.BreakForReadSet(ctx, [][16]byte{identity})
@@ -124,8 +119,7 @@ func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volu
 	return h.Coherence.DataConsumed(ctx, token, identity)
 }
 
-// coherenceReadSetAdmission handles Linux/cacheless data footprints. FSKit
-// directory pages register their complete names and identities with Stabilize.
+// coherenceReadSetAdmission protects the complete directory-page footprint.
 func (h *VolumeHandler) coherenceReadSetAdmission(ctx context.Context, session volumeserver.SessionID, identities [][16]byte) (*volumeserver.DataGuard, error) {
 	if h.Coherence == nil || h.coherenceStorage == nil {
 		return nil, errInternal
@@ -133,6 +127,9 @@ func (h *VolumeHandler) coherenceReadSetAdmission(ctx context.Context, session v
 	profile, err := h.sessionFrontendProfile(session)
 	if err != nil {
 		return nil, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
+		return nil, nil
 	}
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return h.Coherence.BreakForReadSet(ctx, identities)
@@ -149,7 +146,10 @@ func (h *VolumeHandler) coherenceTryReadAdmission(ctx context.Context, session v
 	if err != nil {
 		return nil, false, err
 	}
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER || profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
+		return nil, true, nil
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return nil, false, nil
 	}
 	token, err := h.coherenceToken(session)
@@ -217,7 +217,7 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 		if err != nil {
 			return h.errorResponse(requestID, err, false)
 		}
-		if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			return h.errorResponse(requestID, syscall.EINVAL, false)
 		}
 	}
@@ -279,11 +279,11 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 	if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Attributes: [][16]byte{identity}}); err != nil {
 		return h.coherenceError(requestID, err)
 	}
-	version := h.coherenceVersionNow()
+	version, stamps := h.sampleVersions(identity)
 	response := h.success(requestID)
 	response.VolumeVersion = version
 	response.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
-		Attr: attrProto(attr), ObjectVersion: h.sampledObjectVersion(identity), SnapshotSequence: version,
+		Attr: attrProto(attr), ObjectVersion: stamps[0], SnapshotSequence: version,
 	}}
 	return response
 }
@@ -305,12 +305,7 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 		if err != nil {
 			return h.coherenceError(0, err)
 		}
-		if coordinator := h.strictCache(cred.ID); coordinator != nil {
-			if _, err := coordinator.Stabilize(ctx, cred.ID, volumeserver.VisibilityResolution{Parent: parentIdentity, Name: request.GetName()}); err != nil {
-				return h.errorResponse(0, err, false)
-			}
-		}
-		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
+		for attempt := 0; attempt < maxResolutionAttempts; attempt++ {
 			binding := coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{})
 			probeTurn, err := h.coherenceStorage.AcquireReadTurn(ctx, binding)
 			if err != nil {
@@ -389,13 +384,13 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 				guard.Release()
 				return h.coherenceError(0, err)
 			}
-			version := h.coherenceVersionNow()
+			version, stamps := h.sampleVersions(identity)
 			if err := h.trackItem(cred.ID, item, h.protectedChild(cred.ID, parent, request.GetName())); err != nil {
 				completeRelease()
 				guard.Release()
 				return h.errorResponse(0, err, false)
 			}
-			objectVersion := h.sampledObjectVersion(identity)
+			objectVersion := stamps[0]
 			completeRelease()
 			guard.Release()
 			itemReply := itemProto(item, attr, identity)
@@ -510,34 +505,19 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				guards = append(guards, guard)
 			}
 			storageRelease := storageTurn.Release
-			coordinator := h.strictCache(cred.ID)
-			if coordinator != nil || !immediate || !storageTurn.TryExpand(dependencies) {
+			if !immediate || !storageTurn.TryExpand(dependencies) {
 				// Never wait for a delegation or a contended child while holding
 				// the directory turn. Queue the complete footprints, then verify
 				// that the probe still names the page we protected.
 				storageTurn.Release()
 				releaseDataGuards(guards)
-				if coordinator != nil {
-					resolutions := make([]volumeserver.VisibilityResolution, 1, len(candidates)+1)
-					resolutions[0] = volumeserver.VisibilityResolution{Identity: directoryIdentity}
-					for _, candidate := range candidates {
-						resolutions = append(resolutions, volumeserver.VisibilityResolution{Parent: directoryIdentity, Name: candidate.dirent.GetName(), Identity: candidate.identity})
-					}
-					if _, err := coordinator.Stabilize(ctx, cred.ID, resolutions...); err != nil {
-						h.forgetDirectoryCandidates(candidates)
-						return h.errorResponse(0, err, false)
-					}
-					// Include opaque names too. Even without a child identity the
-					// published binding must enter the repair index before storage.
-					guards = nil
-				} else {
-					pageGuard, setErr := h.coherenceReadSetAdmission(ctx, cred.ID, identities)
-					if setErr != nil {
-						h.forgetDirectoryCandidates(candidates)
-						return h.coherenceError(0, setErr)
-					}
-					guards = []*volumeserver.DataGuard{pageGuard}
+
+				pageGuard, setErr := h.coherenceReadSetAdmission(ctx, cred.ID, identities)
+				if setErr != nil {
+					h.forgetDirectoryCandidates(candidates)
+					return h.coherenceError(0, setErr)
 				}
+				guards = []*volumeserver.DataGuard{pageGuard}
 				release, readErr := h.coherenceStorage.AcquireRead(ctx, dependencies)
 				if readErr != nil {
 					releaseDataGuards(guards)
@@ -572,11 +552,13 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				h.forgetDirectoryCandidates(candidates)
 				return h.coherenceError(0, err)
 			}
-			version := h.coherenceVersionNow()
-			// The object stamp belongs to the same storage cut as its attributes.
-			// Sampling after release could observe a peer version beyond this snapshot.
-			for _, candidate := range candidates {
-				candidate.dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity)
+			sampleIdentities := make([][16]byte, len(candidates))
+			for i, candidate := range candidates {
+				sampleIdentities[i] = candidate.identity
+			}
+			version, stamps := h.sampleVersions(sampleIdentities...)
+			for i, candidate := range candidates {
+				candidate.dirent.ObjectVersion = stamps[i]
 			}
 			storageRelease()
 			releaseDataGuards(guards)
@@ -624,15 +606,15 @@ func releaseDataGuards(guards []*volumeserver.DataGuard) {
 }
 
 func (h *VolumeHandler) coherenceDirectoryDependencies(directory [16]byte, candidates []directoryPageCandidate) volumeserver.MutationDependencies {
-	targets := make([]volumeserver.VisibilityTarget, 0, len(candidates)*2+1)
-	targets = append(targets, volumeserver.VisibilityTarget{Scope: volumeserver.VisibilityAttributes, Identity: directory})
+	targets := make([]volumeserver.MutationTarget, 0, len(candidates)*2+1)
+	targets = append(targets, volumeserver.MutationTarget{Scope: volumeserver.MutationAttributes, Identity: directory})
 	for _, candidate := range candidates {
-		namespace := volumeserver.VisibilityTarget{
-			Scope: volumeserver.VisibilityNamespace, ParentIdentity: directory, Name: candidate.dirent.GetName(),
+		namespace := volumeserver.MutationTarget{
+			Scope: volumeserver.MutationNamespace, ParentIdentity: directory, Name: candidate.dirent.GetName(),
 		}
 		if candidate.identity != ([16]byte{}) {
 			namespace.RelatedIdentities = [][16]byte{candidate.identity}
-			targets = append(targets, volumeserver.VisibilityTarget{Scope: volumeserver.VisibilityAttributes, Identity: candidate.identity})
+			targets = append(targets, volumeserver.MutationTarget{Scope: volumeserver.MutationAttributes, Identity: candidate.identity})
 		}
 		targets = append(targets, namespace)
 	}

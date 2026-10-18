@@ -13,13 +13,13 @@ var (
 )
 
 // MountLifecycle owns durable mount membership and topology exclusion.
-// Cache authority belongs to the independent v7 and Mac coordinators.
+// Cache authority belongs to the Linux coordinator and writer registry.
 type MountLifecycle struct {
-	membership DurableVisibilityMembership
+	membership DurableMountMembership
 	now        func() time.Time
 	clockSkew  time.Duration
 
-	topology sync.RWMutex
+	topology topologyGate
 	mu       sync.Mutex
 	active   map[SessionID]time.Time
 	profiles map[SessionID]MountMembershipProfile
@@ -29,7 +29,7 @@ type MountLifecycle struct {
 }
 
 type MountLifecycleConfig struct {
-	Membership DurableVisibilityMembership
+	Membership DurableMountMembership
 	Prior      PriorEpochDisposition
 	Now        func() time.Time
 	ClockSkew  time.Duration
@@ -50,9 +50,14 @@ func NewMountLifecycle(cfg MountLifecycleConfig) (*MountLifecycle, error) {
 
 // AcquireTopologyRead pins one attach or filesystem request to the active LOCAL
 // route revision until it can no longer reach storage.
-func (l *MountLifecycle) AcquireTopologyRead() *TopologyReadGuard {
-	l.topology.RLock()
-	return &TopologyReadGuard{release: l.topology.RUnlock}
+func (l *MountLifecycle) AcquireTopologyRead(ctx context.Context) (*TopologyReadGuard, error) {
+	if ctx == nil {
+		return nil, errors.New("volumeserver: topology admission needs a context")
+	}
+	if err := l.topology.acquire(ctx, false); err != nil {
+		return nil, err
+	}
+	return &TopologyReadGuard{release: func() { l.topology.release(false) }}, nil
 }
 
 // ExecuteTopologyExclusive serializes the route CAS and durable publication
@@ -62,8 +67,13 @@ func (l *MountLifecycle) ExecuteTopologyExclusive(ctx context.Context, execute f
 	if ctx == nil || execute == nil {
 		return 0, errors.New("volumeserver: topology transition needs a context and executor")
 	}
-	l.topology.Lock()
-	defer l.topology.Unlock()
+	if err := l.topology.acquire(ctx, true); err != nil {
+		return 0, err
+	}
+	defer l.topology.release(true)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	return execute()
 }
 
@@ -80,22 +90,10 @@ func (l *MountLifecycle) RequireCleanRouteAbsence() error {
 	return nil
 }
 
-// Activate records durable membership before the supplied infallible runtime
-// publication can escape. The caller already holds a topology read guard so a
-// route change cannot fit between revision admission and this registration.
-func (l *MountLifecycle) Activate(id SessionID, publish func() error) error {
-	return l.ActivateProfile(id, MembershipCompatibility, publish)
-}
-
-func activateMembership(m DurableVisibilityMembership, id SessionID, profile MountMembershipProfile) error {
-	if typed, ok := m.(interface {
-		ActivateProfile(SessionID, MountMembershipProfile) error
-	}); ok {
-		return typed.ActivateProfile(id, profile)
-	}
-	return m.Activate(id)
-}
-
+// ActivateProfile records durable membership before reply preparation and runtime
+// publication. Failed preparation rolls membership back. The caller already holds
+// a topology read guard so a route change cannot fit between revision admission
+// and this registration.
 func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipProfile, publish func() error) error {
 	if id == (SessionID{}) || publish == nil {
 		return ErrMountHolder
@@ -105,7 +103,7 @@ func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipPr
 	if _, exists := l.active[id]; exists {
 		return ErrMountHolder
 	}
-	if err := activateMembership(l.membership, id, profile); err != nil {
+	if err := l.membership.ActivateProfile(id, profile); err != nil {
 		return err
 	}
 	if err := publish(); err != nil {
@@ -128,7 +126,7 @@ func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipPr
 // latter fails, membership is restored so a restart remains fail-closed.
 func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remove func() error) error {
 	if remove == nil {
-		return ErrVisibilityProof
+		return ErrMountProof
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -143,7 +141,7 @@ func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remo
 		return err
 	}
 	if err := remove(); err != nil {
-		rollbackErr := activateMembership(l.membership, id, l.profiles[id])
+		rollbackErr := l.membership.ActivateProfile(id, l.profiles[id])
 		if rollbackErr != nil {
 			l.priorUnproven = true
 		}
@@ -157,12 +155,12 @@ func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remo
 func (l *MountLifecycle) validateMountAbsence(proof MountAbsenceProof, registered time.Time) error {
 	if len(proof.Observation) == 0 || len(proof.Observation) > maxMountAbsenceObservation ||
 		proof.Component == "" || len(proof.Component) > maxMountAbsenceComponent || proof.ObservedUnixNanos <= 0 {
-		return ErrVisibilityProof
+		return ErrMountProof
 	}
 	observed := time.Unix(0, proof.ObservedUnixNanos)
 	now := l.now()
 	if observed.After(now.Add(l.clockSkew)) || observed.Before(registered.Add(-l.clockSkew)) {
-		return ErrVisibilityProof
+		return ErrMountProof
 	}
 	return nil
 }

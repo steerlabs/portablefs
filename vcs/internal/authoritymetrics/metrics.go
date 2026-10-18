@@ -20,8 +20,6 @@ const (
 	OperationDetach
 	OperationCancel
 	OperationTerminalDeliveryReceipt
-	OperationNextFskitRepair
-	OperationAckFskitRepair
 	OperationApplyRoutes
 	OperationLookup
 	OperationGetAttr
@@ -37,10 +35,6 @@ const (
 	OperationClose
 	OperationRead
 	OperationWrite
-	OperationFskitWriteBegin
-	OperationFskitWriteData
-	OperationFskitWriteCommit
-	OperationFskitWriteAbort
 	OperationFallocate
 	OperationCopyFileRange
 	OperationTmpfile
@@ -69,11 +63,11 @@ const (
 	operationCount
 )
 
-var operationNames = [...]string{
+var operationNames = [operationCount]string{
 	"unknown", "hello", "attach", "resume", "activate", "abort_attach", "keep_alive", "reauthorize", "detach", "cancel",
-	"terminal_delivery_receipt", "next_fskit_repair", "ack_fskit_repair", "apply_routes", "lookup", "getattr", "setattr", "create",
-	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "positioned_write", "fskit_write_begin",
-	"fskit_write_data", "fskit_write_commit", "fskit_write_abort", "fallocate", "copy_file_range", "tmpfile",
+	"terminal_delivery_receipt", "apply_routes", "lookup", "getattr", "setattr", "create",
+	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "positioned_write",
+	"fallocate", "copy_file_range", "tmpfile",
 	"fsync", "readdir", "reclaim", "flush", "getxattr", "setxattr", "listxattr", "removexattr", "statfs", "syncfs",
 	"getlock", "setlock",
 	"subscribe", "renew_subscription", "next_control_event", "change_ack", "delegation_recall_ack", "delegation_break_ack", "delegation_mode_change_ack", "delegation_release", "barrier", "wait_visibility",
@@ -102,16 +96,14 @@ const (
 	OutcomeInternal
 	OutcomeCoherence
 	OutcomeRoutes
-	OutcomeFskitRepairInterrupted
-	OutcomeFskitRepairRetry
 	OutcomeIO
 	OutcomeOther
 	outcomeCount
 )
 
-var outcomeNames = [...]string{
+var outcomeNames = [outcomeCount]string{
 	"success", "not_found", "permission", "stale", "invalid", "saturation", "unsupported", "conflict", "canceled",
-	"storage", "internal", "coherence", "routes", "fskit_repair_interrupted", "fskit_repair_retry", "io", "other",
+	"storage", "internal", "coherence", "routes", "io", "other",
 }
 
 func (o Outcome) String() string {
@@ -119,21 +111,6 @@ func (o Outcome) String() string {
 		return outcomeNames[OutcomeOther]
 	}
 	return outcomeNames[o]
-}
-
-type FenceReason uint8
-
-const (
-	FenceFskitRepairLost FenceReason = iota
-	FenceRepairDeadline
-	FenceProtocolViolation
-	FenceFskitWriteMismatch
-	FenceOther
-	fenceReasonCount
-)
-
-var fenceReasonNames = [...]string{
-	"fskit_repair_lost", "repair_deadline", "protocol_violation", "fskit_write_mismatch", "other",
 }
 
 type rpcSeries struct {
@@ -149,36 +126,22 @@ type Metrics struct {
 	registry                *Registry
 	rpc                     [operationCount][outcomeCount]rpcSeries
 	rpcDuration             [operationCount]*Histogram
+	mutations               [3]*Counter
 	activeSessions          *Gauge
 	itemsHighWater          *Gauge
-	writeTransactions       *Gauge
-	writeWaiting            *Gauge
-	writeStagedBytes        *Gauge
-	writeAdmissionBlocks    *Counter
-	writeAdmissionWait      *Histogram
 	fsyncBarrierHandles     *Counter
 	fsyncStorageSyncs       *Counter
+	storageSyncs            [3]*Counter
+	storageSyncDuration     [3]*Histogram
+	storageSyncWaiters      [3]*Counter
 	fskitDurabilitySyncs    [2]*Counter
 	fskitDurabilityDuration [2]*Histogram
-	visibilityDuration      *Histogram
-	visibilityAudience      *Histogram
-	fences                  [fenceReasonCount]*Counter
 }
 
 var rpcDurationBuckets = []float64{
 	0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05,
 	0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30,
 }
-
-var admissionDurationBuckets = []float64{
-	0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 15, 30, 120,
-}
-
-var visibilityDurationBuckets = []float64{
-	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
-}
-
-var visibilityAudienceBuckets = []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
 
 func New(volume string) (*Metrics, error) {
 	if volume == "" {
@@ -212,27 +175,13 @@ func New(volume string) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	for index, disposition := range []string{"executed", "replayed", "refused"} {
+		metrics.mutations[index], err = registry.RegisterCounter("portablefs_authority_mutations_total", "Replay-tracked requests by execution disposition.", base, Label{Name: "disposition", Value: disposition})
+		if err != nil {
+			return nil, err
+		}
+	}
 	metrics.itemsHighWater, err = registry.RegisterGauge("portablefs_authority_session_items_high_water", "Largest descriptor-backed item table observed for one session since process start.", base)
-	if err != nil {
-		return nil, err
-	}
-	metrics.writeTransactions, err = registry.RegisterGauge("portablefs_authority_write_transactions_active", "Currently admitted staged FSKit writes.", base)
-	if err != nil {
-		return nil, err
-	}
-	metrics.writeWaiting, err = registry.RegisterGauge("portablefs_authority_write_transactions_waiting", "FSKit writes currently waiting in FIFO staging admission.", base)
-	if err != nil {
-		return nil, err
-	}
-	metrics.writeStagedBytes, err = registry.RegisterGauge("portablefs_authority_write_staged_bytes", "Payload bytes currently written into inert transaction staging.", base)
-	if err != nil {
-		return nil, err
-	}
-	metrics.writeAdmissionBlocks, err = registry.RegisterCounter("portablefs_authority_write_admission_blocks_total", "FSKit writes that had to wait for staging capacity.", base)
-	if err != nil {
-		return nil, err
-	}
-	metrics.writeAdmissionWait, err = registry.RegisterHistogram("portablefs_authority_write_admission_wait_seconds", "Time spent waiting in FIFO FSKit-write staging admission.", admissionDurationBuckets, base)
 	if err != nil {
 		return nil, err
 	}
@@ -243,6 +192,21 @@ func New(volume string) (*Metrics, error) {
 	metrics.fsyncStorageSyncs, err = registry.RegisterCounter("portablefs_authority_fsync_storage_syncs_total", "Completed storage sync syscalls serving fsync barrier batches.", base)
 	if err != nil {
 		return nil, err
+	}
+	for index, kind := range []string{"fsync", "fdatasync", "syncfs"} {
+		labels := []Label{base, {Name: "syscall", Value: kind}}
+		metrics.storageSyncs[index], err = registry.RegisterCounter("portablefs_authority_storage_syncs_total", "Actual persistence syscalls, including failed calls.", labels...)
+		if err != nil {
+			return nil, err
+		}
+		metrics.storageSyncWaiters[index], err = registry.RegisterCounter("portablefs_authority_storage_sync_waiters_total", "Logical requests in physical persistence batches.", labels...)
+		if err != nil {
+			return nil, err
+		}
+		metrics.storageSyncDuration[index], err = registry.RegisterHistogram("portablefs_authority_storage_sync_duration_seconds", "Actual persistence syscall latency.", rpcDurationBuckets, labels...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	for index, kind := range []string{"handle", "syncfs"} {
 		labels := []Label{base, {Name: "target", Value: kind}}
@@ -255,27 +219,27 @@ func New(volume string) (*Metrics, error) {
 			return nil, err
 		}
 	}
-	metrics.visibilityDuration, err = registry.RegisterHistogram("portablefs_authority_visibility_barrier_duration_seconds", "Time from visibility PREPARE dispatch through COMPLETE acknowledgments.", visibilityDurationBuckets, base)
-	if err != nil {
-		return nil, err
-	}
-	metrics.visibilityAudience, err = registry.RegisterHistogram("portablefs_authority_visibility_barrier_audience", "Number of peer sessions selected for one visibility barrier.", visibilityAudienceBuckets, base)
-	if err != nil {
-		return nil, err
-	}
-	for reason := FenceReason(0); reason < fenceReasonCount; reason++ {
-		metrics.fences[reason], err = registry.RegisterCounter(
-			"portablefs_authority_fence_events_total", "Participant fence or revocation events by bounded reason.",
-			base, Label{Name: "reason", Value: fenceReasonNames[reason]},
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if err := metrics.registerCoherenceMetrics(base); err != nil {
 		return nil, err
 	}
 	return metrics, nil
+}
+
+func (m *Metrics) ObserveMutation(disposition string) {
+	if m == nil {
+		return
+	}
+	index := 0
+	switch disposition {
+	case "executed":
+	case "replayed":
+		index = 1
+	case "refused":
+		index = 2
+	default:
+		return
+	}
+	m.mutations[index].Add(1)
 }
 
 func (m *Metrics) Registry() *Registry {
@@ -321,37 +285,6 @@ func (m *Metrics) ObserveSessionItems(items int) {
 		m.itemsHighWater.SetMax(int64(items))
 	}
 }
-func (m *Metrics) WriteTransactionAdmitted() {
-	if m != nil {
-		m.writeTransactions.Inc()
-	}
-}
-func (m *Metrics) WriteTransactionReleased() {
-	if m != nil {
-		m.writeTransactions.Dec()
-	}
-}
-func (m *Metrics) WriteStagedBytes(delta int64) {
-	if m != nil {
-		m.writeStagedBytes.Add(delta)
-	}
-}
-
-func (m *Metrics) WriteAdmissionBlocked() {
-	if m == nil {
-		return
-	}
-	m.writeAdmissionBlocks.Inc()
-	m.writeWaiting.Inc()
-}
-
-func (m *Metrics) WriteAdmissionFinished(elapsed time.Duration) {
-	if m == nil {
-		return
-	}
-	m.writeWaiting.Dec()
-	m.writeAdmissionWait.Observe(elapsed.Seconds())
-}
 
 // ObserveFsyncBatch records the two counters whose ratio is the group-commit
 // effectiveness: barrier handles per real storage sync.
@@ -361,24 +294,6 @@ func (m *Metrics) ObserveFsyncBatch(handles int) {
 	}
 	m.fsyncBarrierHandles.Add(uint64(handles))
 	m.fsyncStorageSyncs.Inc()
-}
-
-func (m *Metrics) ObserveVisibilityBarrier(elapsed time.Duration, audience int) {
-	if m == nil {
-		return
-	}
-	m.visibilityDuration.Observe(elapsed.Seconds())
-	m.visibilityAudience.Observe(float64(audience))
-}
-
-func (m *Metrics) Fence(reason FenceReason) {
-	if m == nil {
-		return
-	}
-	if reason >= fenceReasonCount {
-		reason = FenceOther
-	}
-	m.fences[reason].Inc()
 }
 
 // ObserveFskitDurability counts obligations, including failed barriers. The
@@ -398,4 +313,28 @@ func (m *Metrics) ObserveFskitDurability(kind string, elapsed time.Duration) {
 	}
 	m.fskitDurabilitySyncs[index].Inc()
 	m.fskitDurabilityDuration[index].Observe(elapsed.Seconds())
+}
+
+// ObserveStorageSync records physical calls, distinct from logical FSKit
+// durability obligations and coalesced waiter counts.
+func (m *Metrics) ObserveStorageSync(kind string, elapsed time.Duration, waiters int) {
+	if m == nil {
+		return
+	}
+	var index int
+	switch kind {
+	case "fsync":
+		index = 0
+	case "fdatasync":
+		index = 1
+	case "syncfs":
+		index = 2
+	default:
+		return
+	}
+	m.storageSyncs[index].Inc()
+	if waiters > 0 {
+		m.storageSyncWaiters[index].Add(uint64(waiters))
+	}
+	m.storageSyncDuration[index].Observe(elapsed.Seconds())
 }

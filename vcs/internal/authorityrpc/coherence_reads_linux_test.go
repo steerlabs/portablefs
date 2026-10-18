@@ -583,7 +583,7 @@ func TestCoherenceReadDirPublishesRevalidatedPageStamp(t *testing.T) {
 }
 
 type coherenceChurningDirectoryStore struct {
-	readdirPostStabilizationChangeStore
+	readdirPageChangeStore
 	lookupCalls atomic.Uint32
 	unstableFor uint32
 	eagainFor   uint32
@@ -612,12 +612,12 @@ func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T
 		unstable uint32
 		eagain   uint32
 	}{
-		{name: "revalidation changes", unstable: 2 * maxStabilizeAttempts},
-		{name: "openat2 retry", eagain: maxStabilizeAttempts + 3},
+		{name: "revalidation changes", unstable: 2 * maxResolutionAttempts},
+		{name: "openat2 retry", eagain: maxResolutionAttempts + 3},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := &coherenceChurningDirectoryStore{
-				readdirPostStabilizationChangeStore: readdirPostStabilizationChangeStore{
+				readdirPageChangeStore: readdirPageChangeStore{
 					root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 				},
 				unstableFor: test.unstable, eagainFor: test.eagain,
@@ -635,7 +635,7 @@ func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T
 			if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 || response.GetReadDir().GetEntries()[0].GetAttr().GetMode() != 0o640 {
 				t.Fatalf("READDIR under churn = %+v", response)
 			}
-			if calls := store.lookupCalls.Load(); calls <= maxStabilizeAttempts {
+			if calls := store.lookupCalls.Load(); calls <= maxResolutionAttempts {
 				t.Fatalf("lookup calls=%d, regression did not cross the former retry bound", calls)
 			}
 			if got := len(h.resources[credential.ID].items); got != 1 {
@@ -697,9 +697,9 @@ func TestCoherenceReadDependenciesCoverBindingsAndObjects(t *testing.T) {
 	parent := [16]byte{0x11}
 	child := [16]byte{0x22}
 	got := coherenceBindingDependencies(parent, []byte("child"), child)
-	want := volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{
+	want := volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{
 		{
-			Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: []byte("child"),
+			Scope: volumeserver.MutationNamespace, ParentIdentity: parent, Name: []byte("child"),
 			RelatedIdentities: [][16]byte{child},
 		},
 	})
@@ -714,13 +714,13 @@ func TestCoherenceReadDependenciesCoverBindingsAndObjects(t *testing.T) {
 		dirent:   &authoritypb.Dirent{Name: []byte("child")},
 	}}
 	got = h.coherenceDirectoryDependencies(directory, candidates)
-	want = volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{
-		{Scope: volumeserver.VisibilityAttributes, Identity: directory},
+	want = volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{
+		{Scope: volumeserver.MutationAttributes, Identity: directory},
 		{
-			Scope: volumeserver.VisibilityNamespace, ParentIdentity: directory, Name: []byte("child"),
+			Scope: volumeserver.MutationNamespace, ParentIdentity: directory, Name: []byte("child"),
 			RelatedIdentities: [][16]byte{child},
 		},
-		{Scope: volumeserver.VisibilityAttributes, Identity: child},
+		{Scope: volumeserver.MutationAttributes, Identity: child},
 	})
 	if !got.Equal(want) {
 		t.Fatal("readdir did not acquire the complete directory/name/child footprint")

@@ -713,18 +713,17 @@ func TestDrainConvergesAndWritesProgress(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := os.Stat(filepath.Join(mode.cfg.StateRoot, ProgressFilename)); err != nil {
-		time.Sleep(30 * time.Millisecond)
-		_, err = os.Stat(filepath.Join(mode.cfg.StateRoot, ProgressFilename))
-		if err != nil {
+	// Convergence and periodic progress have independent publication cuts. An
+	// earlier progress file may already exist when convergence becomes visible.
+	var progress progressRecord
+	waitForRestoreMode(t, time.Until(deadline), "final drain progress record", func() bool {
+		err := readStrictJSON(filepath.Join(mode.cfg.StateRoot, ProgressFilename), &progress)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
-	}
-	var progress progressRecord
-	if err := readStrictJSON(filepath.Join(mode.cfg.StateRoot, ProgressFilename), &progress); err != nil {
-		t.Fatal(err)
-	}
-	if progress.Version != 1 || progress.ProgressPermille != 1000 || progress.State != StateHealthy || progress.DrainedBytes != 8 {
+		return err == nil && progress.ProgressPermille == 1000 && progress.State == StateHealthy && progress.DrainedBytes == 8
+	})
+	if progress.Version != 1 {
 		t.Fatalf("progress = %+v", progress)
 	}
 	var converged convergedRecord

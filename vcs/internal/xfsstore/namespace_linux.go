@@ -4,6 +4,7 @@ package xfsstore
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"syscall"
 
@@ -221,11 +222,19 @@ func (v *Volume) Mkdir(parent Capability, name string, mode fs.FileMode) (Capabi
 	if err := unix.Mkdirat(p.fd(), name, 0o700); err != nil {
 		return Capability{}, Attr{}, err
 	}
-	if err := v.verifyCreatedDirectory(p.fd(), name); err != nil {
-		return Capability{}, Attr{}, outcomeUncertain(err)
-	}
 	fd, err := openChildAt(p.fd(), name)
 	if err != nil {
+		return Capability{}, Attr{}, outcomeUncertain(err)
+	}
+	// A default ACL can remove the owner access requested by mkdirat. Restore
+	// the already private temporary mode on this held child before project
+	// verification, then install final requested attributes below.
+	if err := v.chmodCapability(fd, KindDirectory, 0700); err != nil {
+		_ = unix.Close(fd)
+		return Capability{}, Attr{}, outcomeUncertain(err)
+	}
+	if err := v.verifyCreatedDirectory(p.fd(), name); err != nil {
+		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
 	if err := v.chmodCapability(fd, KindDirectory, unixMode); err != nil {
@@ -422,4 +431,27 @@ func (v *Volume) Link(source Capability, newParent Capability, newName string) (
 	default:
 		return Attr{}, outcomeUncertain(err)
 	}
+}
+
+// SearchPermitted evaluates access through the held identity, including the
+// kernel's ACL and effective-credential rules. It needs no readable reopen and
+// accepts mode-000 directories as successful creations with a false witness.
+// The caller keeps the newly created child unexposed under its storage turn.
+func (v *Volume) SearchPermitted(item Capability) (bool, error) {
+	object, err := v.holdObject(item)
+	if err != nil {
+		return false, err
+	}
+	defer object.release()
+	if object.kind != KindDirectory {
+		return false, syscall.ENOTDIR
+	}
+	err = unix.Faccessat2(object.fd(), "", unix.X_OK, unix.AT_EMPTY_PATH|unix.AT_EACCESS)
+	if errors.Is(err, syscall.EACCES) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check child search permission: %w", err)
+	}
+	return true, nil
 }

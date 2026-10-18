@@ -6,27 +6,6 @@ import (
 	"time"
 )
 
-// CheckCompatibilityWriter refuses foreign writers during prior-epoch grace,
-// active FSKit ownership, and retained cache-proof or admitted-apply obligations.
-// The handler holds its profile admission guard across this check and any
-// operation which can establish write intent.
-func (c *VisibilityCoordinator) CheckCompatibilityWriter(source SessionID) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.priorCompatibilityWriterBlockedLocked() || c.compatibilityExcludedLocked(source) {
-		return ErrCompatibilityWriterLease
-	}
-	for id, p := range c.participants {
-		if id != source && p.compatibilityWriter {
-			return ErrCompatibilityWriterLease
-		}
-	}
-	return nil
-}
-
-// DelegatedIdentities is a point snapshot used when a Mac compatibility mount
-// takes exclusive writer admission. It includes reservations: those must also
-// retire before an unrevocable Mac cache can become active.
 func (c *CoherenceCoordinator) DelegatedIdentities() [][16]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -37,71 +16,40 @@ func (c *CoherenceCoordinator) DelegatedIdentities() [][16]byte {
 	return result
 }
 
-func (c *VisibilityCoordinator) retainExclusionLocked(p *visibilityParticipant, absent bool) {
-	if !p.compatibilityWriter || p.exclusion == nil {
-		return
-	}
-	p.exclusion.stop(absent)
-	c.exclusions[p.id] = p.exclusion
-}
-
-func (c *VisibilityCoordinator) compatibilityExcludedLocked(source SessionID) bool {
-	for id, exclusion := range c.exclusions {
-		if !exclusion.outstanding() {
-			delete(c.exclusions, id)
-		} else if id != source {
-			return true
-		}
-	}
-	return false
-}
-
-// SweepCompatibilityExclusions reuses the session sweep, so retired proofs do
-// not accumulate when there is no foreign writer to trigger admission cleanup.
-func (c *VisibilityCoordinator) SweepCompatibilityExclusions() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, exclusion := range c.exclusions {
-		if !exclusion.outstanding() {
-			delete(c.exclusions, id)
-		}
-	}
-}
-
-// CompatibilityRestartGrace is frozen alongside MaxCacheProof. The extra
+// WriterRestartGrace is frozen alongside MaxCacheProof. The extra
 // second and 1,000 ppm term cover the supported cross-host clock assumptions.
-const CompatibilityRestartGrace = MaxCacheProof + time.Second + (MaxCacheProof+999)/1000
+const WriterRestartGrace = MaxCacheProof + time.Second + (MaxCacheProof+999)/1000
 
-// StartCompatibilityWriterGrace must be called only after safe takeover: root
+// StartWriterGrace must be called only after safe takeover: root
 // and membership ownership are exclusive, predecessor renewal is irrevocably
 // closed, and predecessor storage work has drained. Shipping shutdown joins
 // transport workers and restore background work before releasing those locks.
 // A root lock alone is not proof of an arbitrary embedding's quiescence.
-func (c *VisibilityCoordinator) StartCompatibilityWriterGrace() error {
+func (c *WriterRegistry) StartWriterGrace() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.writerRestartStarted {
-		return fmt.Errorf("volumeserver: compatibility takeover already sampled")
+		return fmt.Errorf("volumeserver: writer takeover already sampled")
 	}
 	c.writerRestartStarted = true
-	now, err := c.cfg.ContinuousNow()
-	if err != nil || now < 0 || now > time.Duration(math.MaxInt64)-CompatibilityRestartGrace {
+	now, err := c.now()
+	if err != nil || now < 0 || now > time.Duration(math.MaxInt64)-WriterRestartGrace {
 		c.writerRestartFailed = true
 		return fmt.Errorf("volumeserver: unusable continuous takeover clock (sample %v): %v", now, err)
 	}
 	c.writerRestartLast = now
-	c.writerRestartDeadline = now + CompatibilityRestartGrace
+	c.writerRestartDeadline = now + WriterRestartGrace
 	return nil
 }
 
-func (c *VisibilityCoordinator) priorCompatibilityWriterBlockedLocked() bool {
+func (c *WriterRegistry) priorWriterBlockedLocked() bool {
 	if c.startupReady {
 		return false
 	}
 	if !c.writerRestartStarted || c.writerRestartFailed {
 		return true
 	}
-	now, err := c.cfg.ContinuousNow()
+	now, err := c.now()
 	if err != nil || now < c.writerRestartLast {
 		c.writerRestartFailed = true
 		return true

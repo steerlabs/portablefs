@@ -25,7 +25,7 @@ type operationResolutionContext struct {
 type sourceResolvedIdentity struct {
 	cap        xfsstore.Capability
 	identity   [16]byte
-	coordinate visibilityCoordinate
+	coordinate mutationCoordinate
 }
 
 type namespaceResolutionKey struct {
@@ -34,7 +34,7 @@ type namespaceResolutionKey struct {
 }
 
 type namespaceResolution struct {
-	coordinate visibilityCoordinate
+	coordinate mutationCoordinate
 	size       int64
 	found      bool
 }

@@ -60,7 +60,6 @@ func newTestCoordination(store *xfsstore.Volume, fencer volumeserver.SessionFenc
 	return NewCoordination(CoordinationConfig{
 		Store: store, Fencer: fencer, Locks: locks, Membership: noopMembership{},
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
-		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute,
 	})
 }
 
@@ -70,7 +69,12 @@ func testRoutesController(t *testing.T, store *xfsstore.Volume) *RoutesControlle
 
 type noopMembership struct{}
 
-func (noopMembership) Activate(volumeserver.SessionID) error   { return nil }
+func (noopMembership) ActivateProfile(volumeserver.SessionID, volumeserver.MountMembershipProfile) error {
+	return nil
+}
+func (noopMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
 func (noopMembership) Deactivate(volumeserver.SessionID) error { return nil }
 
 type noopFencer struct{}
@@ -85,11 +89,10 @@ func TestRouteLockWaitAdmissionCannotSlipPastTransition(t *testing.T) {
 	routes.lockWaitAdmission.Lock()
 
 	active := true
-	started := make(chan struct{})
+	waitCtx := newAdmissionWaitContext(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		close(started)
-		_, err := routes.beginLockWait(func() error {
+		_, err := routes.beginLockWait(waitCtx, func() error {
 			if !active {
 				return volumeserver.ErrSessionExpired
 			}
@@ -102,12 +105,7 @@ func TestRouteLockWaitAdmissionCannotSlipPastTransition(t *testing.T) {
 		})
 		done <- err
 	}()
-	<-started
-	select {
-	case err := <-done:
-		t.Fatalf("wait admission crossed a held topology writer: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
+	admissionReceive(t, waitCtx.waiting)
 
 	// Apply changes the authoritative revision while it owns the writer. The
 	// queued admission can run only afterwards and must see the new verdict.
@@ -134,14 +132,13 @@ func loadedCoordination(rules string) *Coordination {
 }
 
 func loadedCoordinationFor(rules string, fencer volumeserver.SessionFencer,
-	membership volumeserver.DurableVisibilityMembership, cachedNames uint64) *Coordination {
+	membership volumeserver.DurableMountMembership, cachedNames uint64) *Coordination {
 	parsed, err := localroutes.Parse([]byte(rules))
 	if err != nil {
 		panic(err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, ExternalMembership: true, Fencer: fencer,
-		MaxCachedNameCapacity: cachedNames, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	visibility, err := volumeserver.NewWriterRegistry(volumeserver.WriterRegistryConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Fencer: fencer,
 	})
 	if err != nil {
 		panic(err)
@@ -157,7 +154,7 @@ func loadedCoordinationFor(rules string, fencer volumeserver.SessionFencer,
 		Mounts: lifecycle, Locks: volumeserver.NewLockTable(1024, 1024, time.Now),
 		loaded: true, revision: parsed.Revision(), canonical: parsed.Canonical(),
 	}
-	return &Coordination{Lifecycle: lifecycle, Visibility: visibility, Routes: routes}
+	return &Coordination{Lifecycle: lifecycle, Writers: visibility, Routes: routes}
 }
 
 func routesRevisionOf(rules string) [32]byte {
@@ -179,7 +176,7 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
 	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
+		SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -198,9 +195,9 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			response := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{
 				Attach: &authoritypb.AttachRequest{
-					VolumeId: "routes-volume", AccessToken: []byte("test-only"), ReplaySlots: 2,
+					VolumeId: "routes-volume", AccessToken: []byte("test-only"), ReplaySlots: 9,
 					Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-					FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+					FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 					RoutesRevision:  test.revision, AttachAttemptId: testAttachAttempt(1),
 				}}})
 			if response.GetAttach() != nil {
@@ -259,7 +256,7 @@ func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
 	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
+		SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -314,81 +311,6 @@ func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 		if !strings.Contains(mismatch.GetDetail(), want) {
 			t.Fatalf("detail %q does not name %q", mismatch.GetDetail(), want)
 		}
-	}
-}
-
-// The FSKit repair stream is barrier control, not filesystem work. The barrier
-// that installs a new routing revision still needs its participants'
-// acknowledgments and blocked reports after the commit point — refusing them
-// through the session-routes gate would convert every routing change into one
-// full repair-budget stall per strict participant. So after the revision
-// moves, an ordinary request is refused as stale (the control assertion), but
-// a visibility request must reach its own handler.
-func TestFskitRepairControlIsNotRoutesGated(t *testing.T) {
-	first := routesRevisionOf("node_modules\n")
-	second := routesRevisionOf("node_modules\ntarget\n")
-	h := testVolumeHandler()
-	h.Store = &xfsstore.Volume{}
-	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
-	loadedCoordination("node_modules\n").Bind(h)
-	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	h.Runtime = runtime
-	cred, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{1},
-		volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.startSessionResourcesForProfile(
-		cred.ID, xfsstore.Capability{0xAA}, 2, first,
-		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
-	); err != nil {
-		t.Fatal(err)
-	}
-	h.Visibility = nil
-	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{1})
-	request := func(id uint64, body any) *authoritypb.Response {
-		req := &authoritypb.Request{
-			RequestId: id, Epoch: cred.Epoch[:],
-			Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]},
-		}
-		switch body := body.(type) {
-		case *authoritypb.KeepAliveRequest:
-			req.Body = &authoritypb.Request_KeepAlive{KeepAlive: body}
-		case *authoritypb.AckVisibilityRequest:
-			req.Body = &authoritypb.Request_AckFskitRepair{AckFskitRepair: body}
-		case *authoritypb.NextVisibilityRequest:
-			req.Body = &authoritypb.Request_NextFskitRepair{NextFskitRepair: body}
-		default:
-			t.Fatalf("unhandled body %T", body)
-		}
-		return h.Handle(ctx, req)
-	}
-
-	// The topology changes under the mount.
-	h.Routes.mu.Lock()
-	h.Routes.revision = second
-	h.Routes.mu.Unlock()
-
-	if response := request(1, &authoritypb.KeepAliveRequest{}); response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
-		t.Fatalf("keepalive after the revision moved = %+v, want the ROUTES refusal proving the session is stale", response)
-	}
-	ack := request(2, &authoritypb.AckVisibilityRequest{Cursor: &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE}})
-	if ack.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
-		t.Fatalf("a repair acknowledgment was refused by the routes gate: %+v", ack)
-	}
-	if ack.GetErrno() != int32(syscall.EOPNOTSUPP) {
-		// This fixture registers no visibility coordinator, so the request
-		// must reach the visibility handler and be answered by it.
-		t.Fatalf("repair acknowledgment = %+v, want the visibility handler's own EOPNOTSUPP", ack)
-	}
-	next := request(3, &authoritypb.NextVisibilityRequest{})
-	if next.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
-		t.Fatalf("a visibility poll was refused by the routes gate: %+v", next)
 	}
 }
 
@@ -898,7 +820,7 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 	h.Authorizer = authorizer
 	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
+		SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -909,9 +831,9 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 	attach := func(id uint64, revision []byte) *authoritypb.Response {
 		return h.Handle(ctx, &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{
 			Attach: &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", AccessToken: capability, ReplaySlots: 2,
+				VolumeId: "routes-volume", AccessToken: capability, ReplaySlots: 9,
 				Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-				FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+				FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 				RoutesRevision:  revision, AttachAttemptId: testAttachAttempt(id),
 			}}})
 	}
@@ -961,7 +883,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 				VolumeId: "routes-volume", ReplaySlots: 0, Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			},
 			valid: &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", ReplaySlots: 2, Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+				VolumeId: "routes-volume", ReplaySlots: 9, Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			},
 		},
 	} {
@@ -972,7 +894,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 			h.Authorizer = authorizer
 			loadedCoordination("").Bind(h)
 			runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-				SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
+				SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 8,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -984,7 +906,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 			for _, attach := range []*authoritypb.AttachRequest{test.invalid, test.valid} {
 				attach.AccessToken = token
 				attach.RoutesRevision = append([]byte(nil), revision[:]...)
-				attach.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+				attach.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 			}
 			test.invalid.AttachAttemptId = testAttachAttempt(1)
 			test.valid.AttachAttemptId = testAttachAttempt(2)
@@ -1010,7 +932,7 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	h.Authorizer = authorizer
 	coordination.Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
+		SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1018,9 +940,9 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	h.Runtime = runtime
 	revision := routesRevisionOf("")
 	attach := &authoritypb.AttachRequest{
-		VolumeId: "routes-volume", AccessToken: []byte("token"), ReplaySlots: 2,
+		VolumeId: "routes-volume", AccessToken: []byte("token"), ReplaySlots: 9,
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		RoutesRevision:  append([]byte(nil), revision[:]...),
 		AttachAttemptId: testAttachAttempt(1),
 	}
@@ -1037,18 +959,20 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	}
 
 	checked := make(chan struct{})
+	writerCtx := newAdmissionWaitContext(t.Context())
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
+		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(writerCtx, func() (int, error) {
 			close(checked)
 			return 0, nil
 		})
 		writerDone <- err
 	}()
+	admissionReceive(t, writerCtx.waiting)
 	select {
 	case <-checked:
 		t.Fatal("route CAS ran while attach admission was paused")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	close(authorizer.release)
 	select {
@@ -1072,26 +996,28 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 	coordination.Bind(h)
 	id := volumeserver.SessionID{1}
 	revision := routesRevisionOf("")
-	if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision, volumeserver.CoherenceStrict); err != nil {
+	if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision); err != nil {
 		t.Fatal(err)
 	}
-	guard, err := h.beginTopologyRequest(id)
+	guard, err := h.beginTopologyRequest(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checked := make(chan struct{})
+	writerCtx := newAdmissionWaitContext(t.Context())
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
+		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(writerCtx, func() (int, error) {
 			close(checked)
 			return 0, nil
 		})
 		writerDone <- err
 	}()
+	admissionReceive(t, writerCtx.waiting)
 	select {
 	case <-checked:
 		t.Fatal("route CAS ran while an admitted filesystem request was paused")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	guard.Release()
 	select {
@@ -1101,24 +1027,5 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("route writer did not resume after filesystem completion")
-	}
-}
-
-// The retired repair models keep their enum numbers reserved, so a peer can
-// still put those bytes on the wire. Reserving a number is not refusing it:
-// this asserts the decode refuses both, by number, without mapping either onto
-// an admitted model.
-func TestReservedNamespaceRepairNumbersAreRefused(t *testing.T) {
-	for name, number := range map[string]authoritypb.NamespaceRepair{
-		"parent-exclusive":    1,
-		"lockless-expiration": 5,
-	} {
-		repair, err := namespaceRepair(number)
-		if !errors.Is(err, syscall.EINVAL) {
-			t.Fatalf("namespaceRepair(%s) error = %v, want EINVAL", name, err)
-		}
-		if repair != volumeserver.NamespaceRepairUnspecified {
-			t.Fatalf("namespaceRepair(%s) = %v, want unspecified", name, repair)
-		}
 	}
 }

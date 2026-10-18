@@ -37,7 +37,7 @@ func TestCoherenceReplyCacheAdmissions(t *testing.T) {
 				if kind != "negative" {
 					store.lookupItem = xfsstore.Capability{0x33}
 				}
-				profile := authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+				profile := authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 				if cacheless {
 					profile = authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
 				}
@@ -109,7 +109,7 @@ func TestCoherenceSourceReplyAdmitsUnchangedCreateAndNewDirectory(t *testing.T) 
 		h, _ := newCoherenceControlTestHandler(t, 1<<20)
 		_, token := subscribeCoherenceControlTest(t, h, volumeserver.SessionID{1})
 		parent, child := [16]byte{2}, [16]byte{3}
-		gate := volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{{ParentIdentity: parent, Name: []byte("dir")}}}
+		gate := volumeserver.MutationFootprint{Targets: []volumeserver.FootprintTarget{{ParentIdentity: parent, Name: []byte("dir")}}}
 		response := &authoritypb.Response{PostState: &authoritypb.PostState{Objects: []*authoritypb.ObjectPostState{{StableIdentity: child[:], Attr: &authoritypb.Attr{Kind: authoritypb.Attr_DIRECTORY}}}}}
 		h.Coherence.OnCommitTargeted(nil, token, sourceCacheAdmission(gate, response))
 		requireAdmittedChange(t, h, volumeserver.ChangeEntry{Kind: volumeserver.NamespaceChanged, ParentIdentity: child, Name: "new"}, true)
