@@ -66,10 +66,12 @@ another, and none is bumped to match another.
 | Daemon operational control | `2` | Exact; `X-PortableFS-Control-Protocol` header and `/v2/` paths; paired by the sealed release. |
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |
+| Sealed release protocol record | `PortableFSDService.app/Contents/Resources/PortableFSProtocol.json` | Signed with the service: `identitySchema` 1, `controlProtocol`, `pfslocalMajor`, `pfslocalMinor`; strict decoding. |
 | Mount membership file | `mount.membership`, header `PFS-MEMBERSHIP-1` | Exact; one shared codec for authority and cell host. |
 | Signed cell plan | version `3` | Exact version, token prefix, and signing domain. |
 | Daemon attach registry, Manager snapshot | schema `3` | Exact; private. |
 | Cell helper durable state | version `2` | Exact; private. |
+| CLI mount state, active-route state, operation intent | schemas `1`, `1`, `3` | Exact; private. |
 
 The exact current authority grammar is the descriptor manifest
 `vcs/internal/authoritypb/testdata/protocol8-schema.json`, checked by the Go
@@ -362,7 +364,12 @@ The daemon's operational control and `pfslocal` interfaces are private and
 paired: the CLI and app require an exact identity match (daemon version,
 executable digest, control protocol, `pfslocal` major and minor) before any
 operational request, and never insert their own compiled numbers as the
-expected values of another release. Lifecycle v1 is the one cross-release
+expected values of another release. A release's protocol values are sealed into
+its signed service bundle as `PortableFSProtocol.json`; an outgoing release is
+described by its own authenticated sealed values, and an incoming release's
+must equal the current build's. The executable digest is not part of that
+record, because a signed resource cannot contain the digest of its own signed
+code; it comes from the authenticated executable. Lifecycle v1 is the one cross-release
 surface on that socket:
 
 | Route | Purpose |

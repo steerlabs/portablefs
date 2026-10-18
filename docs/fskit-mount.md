@@ -221,7 +221,9 @@ performs no I/O on the mounted root and holds no mount-root descriptor.
 options. A real reference from Finder, Spotlight, `fseventsd`, or a user process
 returns the actual `EBUSY`, and the mount stays usable or reports its existing
 terminal state. Only an explicit `--force` requests forced revocation, with the
-data-loss boundary above.
+data-loss boundary above. A forced unmount parks no recovery job and keeps no
+replay record: the daemon acknowledges it with an empty response, and pages the
+kernel never delivered are gone.
 
 After exact absence of the original kernel mount is observed, the daemon
 delivers the absence proof on the original CONTROL transport without first
