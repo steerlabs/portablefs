@@ -4,15 +4,12 @@
 // Transport: a SOCK_STREAM Unix domain socket. Every frame is a 4-byte
 // little-endian unsigned length N (N <= 16 MiB) followed by N bytes encoding one
 // Envelope. Client→daemon envelopes carry request bodies with a nonzero,
-// client-chosen request_id, strictly increasing WITHIN ITS ORDERING LANE.
-// There are two lanes: the reserved control lane (V3Liveness), which the
-// client writes ahead of ordinary requests, and the ordinary request lane
-// for all other bodies. Each lane is FIFO with increasing IDs;
-// the two interleave on the wire, so a control frame may legally carry a
-// LOWER id than an already-received ordinary frame and the daemon keeps one
-// replay watermark per lane. PublicationAck and ResourceReplyDisposition are
-// one-way client messages and use request_id 0. PublicationAck carries the
-// callback's explicit semantic verdict after its FSKit reply boundary:
+// client-chosen request_id, strictly increasing within the connection.
+// PublicationAck and ResourceReplyDisposition are one-way client messages and
+// use request_id 0. Their processing, terminal events and resource cleanup must
+// progress independently of ordinary request admission. The serial socket
+// reader must not wait for an ordinary operation's reservation. PublicationAck
+// carries the callback's explicit semantic verdict after its FSKit reply boundary:
 // PUBLISHED means the final result (including a cacheable negative/error such
 // as ENOENT) crossed into the kernel; NOT_PUBLISHED means it did not. Socket
 // receipt alone proves neither outcome.
@@ -69,7 +66,10 @@ message Envelope {
   // callback first issues a cache-producing request. Earlier nonpublishing
   // requests carry zero; later requests from that callback carry the same
   // nonzero ID, making a multi-RPC callback one admission and publication unit
-  // for publication. This is a lazy allocation rule;
+  // for publication. IDs are unique only within this connection. Mount-shared
+  // state must qualify the ID with a never-reused connection incarnation;
+  // an ack or close on one connection cannot settle another's callback.
+  // This is a lazy allocation rule;
   // a fresh nonpublishing request with a nonzero ID is a protocol violation.
   uint64 operation_id = 3;
   oneof body {
@@ -90,7 +90,6 @@ message Envelope {
     SymlinkRequest symlink = 24;
     ReadlinkRequest readlink = 25;
     XattrGetRequest xattr_get = 26;
-    XattrSetRequest xattr_set = 27;
     XattrListRequest xattr_list = 28;
     XattrRemoveRequest xattr_remove = 29;
     StatfsRequest statfs = 30;
@@ -99,7 +98,6 @@ message Envelope {
     HardLinkRequest hard_link = 34;
     SyncVolumeRequest sync_volume = 35;
     PublicationAck publication_ack = 36;
-    V3LivenessRequest v3_liveness = 38;
     ResourceReplyDisposition resource_reply_disposition = 39;
     EnumerateEntriesRequest enumerate_entries = 40;
 
@@ -120,7 +118,6 @@ message Envelope {
     SymlinkReply symlink_reply = 74;
     ReadlinkReply readlink_reply = 75;
     XattrGetReply xattr_get_reply = 76;
-    XattrSetReply xattr_set_reply = 77;
     XattrListReply xattr_list_reply = 78;
     XattrRemoveReply xattr_remove_reply = 79;
     StatfsReply statfs_reply = 80;
@@ -128,7 +125,6 @@ message Envelope {
     SubscribeEventsReply subscribe_events_reply = 83;
     HardLinkReply hard_link_reply = 84;
     SyncVolumeReply sync_volume_reply = 85;
-    V3LivenessReply v3_liveness_reply = 87;
     EnumerateEntriesReply enumerate_entries_reply = 88;
 
     // daemon → client (either)
@@ -158,6 +154,7 @@ enum PublicationSemanticCommit {
 // operation produced only a cacheable error/negative result. NOT_PUBLISHED is
 // safe only when no visible authority mutation in the operation committed.
 message PublicationAck {
+  // Names only a callback on this exact frontend connection.
   uint64 operation_id = 2;
   PublicationSemanticCommit semantic_commit = 3;
 }
@@ -187,8 +184,9 @@ message HelloReply {
 }
 
 // Resolve binds this connection to one attach. All subsequent item ops on the
-// connection are scoped to it. One attach per connection; the extension opens
-// one connection per mounted volume (plus one for events if it prefers).
+// connection are scoped to this exact attach incarnation. Binding loss is
+// terminal; the connection never reconnects or resolves into a successor.
+// A separate event connection must be explicitly bound to the same attach.
 message ResolveRequest {
   string attach_ref = 1;
 }
@@ -199,55 +197,15 @@ message ResolveReply {
   string volume_id = 3;
   string volume_name = 5;      // display name for the mounted volume
   Capabilities capabilities = 6;
-  V3CoherenceContract v3_coherence = 7;
 }
 
-// Mandatory exact mount incarnation and exclusive-writer cache contract.
-message V3CoherenceContract {
-  bytes authority_epoch = 2;
-  bytes session_id = 3;
-  string cache_policy = 4; // exactly fskit-exclusive-writer-v1
-  uint64 liveness_interval_millis = 7; // required and positive
-}
-
-// A strict-v3 frontend sends the exact authority identity from Resolve. A
-// successful reply is emitted only after portablefsd completes an on-demand
-// authority KeepAlive on the session's reserved liveness lane. Mismatched
-// identities are a protocol error; there is no local-only fallback.
-message V3LivenessRequest {
-  bytes authority_epoch = 1;
-  bytes session_id = 2;
-}
-
-message V3LivenessReply {
-  bytes authority_epoch = 1;
-  bytes session_id = 2;
-}
-
+// Symlinks, hard links, case-sensitive names and xattr get/list/remove are
+// baseline semantics. Xattr set is refused locally after syntax and live-item
+// validation, with Darwin EOPNOTSUPP mapping to prevent AppleDouble fallback.
 message Capabilities {
-  bool symlinks = 1;
-  bool hard_links = 2;
-  // xattrs is TRUE when the frontend may expose the pfslocal xattr operation
-  // family. It is not a promise that every operation succeeds for every
-  // backing: the production v3 XFS attach supports get, list, and removal of
-  // pre-existing portable user attributes while xattr_set_supported is FALSE.
-  // FSKit validates set input, refuses it locally with the internal Darwin
-  // ENOTSUP representation, and translates that boundary verdict to Darwin's
-  // distinct EOPNOTSUPP so XNU cannot invoke AppleDouble fallback. FALSE is
-  // reserved for a daemon with no xattr surface at all.
-  bool xattrs = 3;
-  bool case_sensitive = 4;
   uint32 max_name_bytes = 5;    // e.g. 255
   uint64 max_file_size = 6;     // 0 = unlimited/unknown
   uint32 preferred_io_bytes = 7; // daemon's preferred read/write chunk, e.g. 1 MiB
-  // xattr_set_supported is TRUE exactly when this daemon will accept an
-  // XattrSetRequest for at least one ordinary volume object. Xattrs remains
-  // the operation-family capability: get/list/remove can stay available while
-  // this narrower mutation capability is FALSE. A frontend must validate the
-  // caller's item and name first, then refuse set/create/replace/upsert locally
-  // when this field is false so an unsupported user operation never enters the
-  // ordered-mutation/publication machinery.
-  bool xattr_set_supported = 10;
 }
 
 // ---------- core types ----------
@@ -499,8 +457,6 @@ message HardLinkReply {
 
 message XattrGetRequest { Item item = 1; string name = 2; uint64 handle = 3; }
 message XattrGetReply { bytes value = 1; }
-message XattrSetRequest { Item item = 1; string name = 2; bytes value = 3; bool create_only = 4; bool replace_only = 5; uint64 handle = 6; }
-message XattrSetReply {}
 message XattrListRequest { Item item = 1; uint64 handle = 2; }
 message XattrListReply { repeated string names = 1; }
 message XattrRemoveRequest { Item item = 1; string name = 2; uint64 handle = 3; }

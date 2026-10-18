@@ -6,14 +6,15 @@ const (
 	ProtocolMajor = 2
 	ProtocolMinor = 0
 	MaxFrameBytes = 16 << 20
-	CachePolicy   = "fskit-exclusive-writer-v1"
 )
 
 type Envelope struct {
 	RequestID              uint64
 	PublicationAckRequired bool
-	OperationID            uint64
-	Body                   any
+	// OperationID is connection-scoped. Mount-shared callback state must also
+	// carry a never-reused connection incarnation, including ack and cleanup.
+	OperationID uint64
+	Body        any
 }
 
 type Hello struct {
@@ -34,6 +35,7 @@ type HelloReply struct {
 }
 
 type PublicationAck struct {
+	// OperationID names only a callback on this exact frontend connection.
 	OperationID    uint64
 	SemanticCommit PublicationSemanticCommit
 }
@@ -68,49 +70,13 @@ type ResolveReply struct {
 	VolumeID     string
 	VolumeName   string
 	Capabilities Capabilities
-	// Required on the wire; nil represents omission and is rejected by the codec.
-	V3Coherence *V3CoherenceContract
 }
 
-type V3CoherenceContract struct {
-	AuthorityEpoch         []byte
-	SessionID              []byte
-	CachePolicy            string
-	LivenessIntervalMillis uint64
-}
-
-type V3LivenessRequest struct {
-	AuthorityEpoch []byte
-	SessionID      []byte
-}
-
-type V3LivenessReply struct {
-	AuthorityEpoch []byte
-	SessionID      []byte
-}
-
+// Capabilities contains numeric limits; filesystem semantics are fixed by 2.0.
 type Capabilities struct {
-	Symlinks  bool
-	HardLinks bool
-	// Xattrs is true when the frontend may expose the pfslocal xattr operation
-	// family. It is not a promise that every operation succeeds for every
-	// backing: the production v3 XFS attach supports get, list, and removal of
-	// pre-existing portable user attributes while XattrSetSupported is false.
-	// FSKit validates set input, refuses it locally with the internal Darwin
-	// ENOTSUP representation, and translates that boundary verdict to Darwin's
-	// distinct EOPNOTSUPP so XNU cannot invoke AppleDouble fallback. False means
-	// the daemon has no xattr surface at all.
-	Xattrs          bool
-	CaseSensitive   bool
 	MaxNameBytes    uint32
 	MaxFileSize     uint64
 	PreferredIOSize uint32
-	// XattrSetSupported is true exactly when this daemon accepts an
-	// XattrSetRequest for at least one ordinary volume object. Xattrs remains
-	// the operation-family capability: get/list/remove may remain available
-	// while this narrower mutation capability is false. Frontends validate the
-	// item and name before using this field as a local forwarding gate.
-	XattrSetSupported bool
 }
 
 // Item is a daemon-local ownership handle for one retained authority
@@ -335,16 +301,6 @@ type XattrGetRequest struct {
 	Handle uint64
 }
 type XattrGetReply struct{ Value []byte }
-
-type XattrSetRequest struct {
-	Item        Item
-	Name        string
-	Value       []byte
-	CreateOnly  bool
-	ReplaceOnly bool
-	Handle      uint64
-}
-type XattrSetReply struct{}
 
 type XattrListRequest struct {
 	Item   Item

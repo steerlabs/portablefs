@@ -15,7 +15,7 @@ import (
 
 func currentResolve() *ResolveReply {
 	root := Item{ItemID: 1, ItemGeneration: 9, StableIdentity: [16]byte{0x20}}
-	return &ResolveReply{Root: root, RootAttr: Attr{Item: root, Kind: ItemKindDirectory, FileID: 1}, VolumeID: "volume", VolumeName: "Shared", Capabilities: Capabilities{Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true, MaxNameBytes: 255, PreferredIOSize: 1 << 20}, V3Coherence: &V3CoherenceContract{AuthorityEpoch: bytes.Repeat([]byte{0xa1}, 16), SessionID: bytes.Repeat([]byte{0xb2}, 16), CachePolicy: CachePolicy, LivenessIntervalMillis: 5000}}
+	return &ResolveReply{Root: root, RootAttr: Attr{Item: root, Kind: ItemKindDirectory, FileID: 1}, VolumeID: "volume", VolumeName: "Shared", Capabilities: Capabilities{MaxNameBytes: 255, PreferredIOSize: 1 << 20}}
 }
 
 func TestGoldenResolveContract(t *testing.T) {
@@ -56,20 +56,11 @@ func TestProtocol2RequiresExactPairAndPositiveDeadline(t *testing.T) {
 	}
 }
 
-func TestProtocol2RejectsRemovedAndMalformedGrammar(t *testing.T) {
-	for _, field := range []int{4, 5, 13, 31, 37, 63, 81, 86, 92} {
-		if _, err := UnmarshalEnvelope(appendMsg(nil, field, nil)); !errors.Is(err, ErrMalformed) {
-			t.Fatalf("accepted envelope field %d: %v", field, err)
-		}
-	}
-	for _, test := range []struct {
-		body  int
-		field int
-	}{
-		{61, 4}, {61, 8}, {85, 1}, {91, 1}, {91, 3},
-	} {
-		if _, err := UnmarshalEnvelope(appendMsg(nil, test.body, appendMsg(nil, test.field, nil))); !errors.Is(err, ErrMalformed) {
-			t.Fatalf("accepted body %d field %d: %v", test.body, test.field, err)
+func TestProtocol2RejectsUnknownAndMalformedGrammar(t *testing.T) {
+	for _, name := range []string{".pfslocal.v1.Envelope", ".pfslocal.v1.ResolveReply", ".pfslocal.v1.Capabilities", ".pfslocal.v1.Event"} {
+		state := localWireState{}
+		if err := validateLocalMessage(appendMsg(nil, 500, nil), name, 0, false, &state); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("accepted unknown field in %s: %v", name, err)
 		}
 	}
 	for _, raw := range [][]byte{
@@ -93,14 +84,8 @@ func TestProtocol2RejectsRemovedAndMalformedGrammar(t *testing.T) {
 	}
 }
 
-func TestProtocol2RequiresCompleteContractAndOwningIdentity(t *testing.T) {
+func TestProtocol2RequiresResolveAndOwningIdentity(t *testing.T) {
 	for _, change := range []func(*ResolveReply){
-		func(r *ResolveReply) { r.V3Coherence = nil },
-		func(r *ResolveReply) { r.V3Coherence.AuthorityEpoch = nil },
-		func(r *ResolveReply) { r.V3Coherence.SessionID = make([]byte, 16) },
-		func(r *ResolveReply) { r.V3Coherence.CachePolicy = "unknown" },
-		func(r *ResolveReply) { r.V3Coherence.LivenessIntervalMillis = 0 },
-		func(r *ResolveReply) { r.V3Coherence.LivenessIntervalMillis = math.MaxUint64 },
 		func(r *ResolveReply) { r.Root.StableIdentity = [16]byte{} },
 		func(r *ResolveReply) { r.Root.ItemID = 0 },
 		func(r *ResolveReply) { r.Root.ItemGeneration = 0 },
@@ -111,19 +96,24 @@ func TestProtocol2RequiresCompleteContractAndOwningIdentity(t *testing.T) {
 			t.Fatalf("accepted incomplete resolve: %v", err)
 		}
 	}
-	// Deletions are also rejected inside a valid enclosing contract/capabilities.
-	for _, test := range []struct {
-		name   string
-		fields []int
-	}{
-		{".pfslocal.v1.V3CoherenceContract", []int{1, 5, 6}},
-		{".pfslocal.v1.Capabilities", []int{8, 9}},
-	} {
-		for _, field := range test.fields {
-			state := localWireState{}
-			if err := validateLocalMessage(appendU64Present(nil, field, 1), test.name, 0, false, &state); !errors.Is(err, ErrMalformed) {
-				t.Fatalf("accepted %s field %d", test.name, field)
+	encoded := marshalResolveReply(currentResolve())
+	if _, err := UnmarshalEnvelope(appendMsg(nil, 61, encoded)); err != nil {
+		t.Fatal(err)
+	}
+	// The root and its attributes are both required, independently of limits.
+	for _, field := range []int{1, 2} {
+		var incomplete []byte
+		if err := scan(encoded, func(n, wt int, raw []byte) error {
+			if n != field {
+				incomplete = appendVarint(incomplete, uint64(n<<3|wt))
+				incomplete = append(incomplete, raw...)
 			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := UnmarshalEnvelope(appendMsg(nil, 61, incomplete)); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("accepted missing Resolve field %d: %v", field, err)
 		}
 	}
 }

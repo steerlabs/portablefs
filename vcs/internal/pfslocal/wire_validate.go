@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"time"
 	"unicode/utf8"
 )
 
@@ -163,16 +162,8 @@ func validateLocalMessage(raw []byte, name string, depth int, listing bool, stat
 			return fmt.Errorf("%w: missing request deadline", ErrMalformed)
 		}
 	case ".pfslocal.v1.ResolveReply":
-		if !has(1) || !has(2) || !has(7) {
+		if !has(1) || !has(2) {
 			return fmt.Errorf("%w: incomplete Resolve", ErrMalformed)
-		}
-	case ".pfslocal.v1.V3CoherenceContract":
-		if !nonzero(b(2)) || !nonzero(b(3)) || string(b(4)) != CachePolicy || u(7) == 0 || u(7) > uint64(math.MaxInt64/int64(time.Millisecond)) {
-			return fmt.Errorf("%w: invalid mount contract", ErrMalformed)
-		}
-	case ".pfslocal.v1.V3LivenessRequest", ".pfslocal.v1.V3LivenessReply":
-		if !nonzero(b(1)) || !nonzero(b(2)) {
-			return fmt.Errorf("%w: invalid mount incarnation", ErrMalformed)
 		}
 	case ".pfslocal.v1.Item":
 		if listing {

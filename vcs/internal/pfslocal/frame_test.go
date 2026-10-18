@@ -156,10 +156,6 @@ func TestExactObjectHandlesRoundTrip(t *testing.T) {
 			MtimeMs: &mtime, AtimeMs: &atime,
 		},
 		&XattrGetRequest{Item: item, Name: "user.key", Handle: 47},
-		&XattrSetRequest{
-			Item: item, Name: "user.key", Value: []byte("value"),
-			CreateOnly: true, Handle: 53,
-		},
 		&XattrListRequest{Item: item, Handle: 59},
 		&XattrRemoveRequest{Item: item, Name: "user.key", Handle: 61},
 	}
@@ -320,44 +316,18 @@ func TestSetAttrWithoutFlagIntent(t *testing.T) {
 	}
 }
 
-// TestCapabilitiesXattrSetSupportedRoundTrip pins the distinction between an
-// xattr operation surface and a writable xattr surface. Production v3 uses
-// xattrs=true with xattr_set_supported=false; writable mocks and future
-// backends opt in explicitly.
-func TestCapabilitiesXattrSetSupportedRoundTrip(t *testing.T) {
-	for _, supported := range []bool{false, true} {
-		want := Capabilities{
-			Xattrs: true, XattrSetSupported: supported,
-		}
+func TestCapabilitiesNumericLimitsRoundTrip(t *testing.T) {
+	for _, want := range []Capabilities{
+		{},
+		{MaxNameBytes: 255, PreferredIOSize: 1 << 20},
+		{MaxNameBytes: ^uint32(0), MaxFileSize: ^uint64(0), PreferredIOSize: ^uint32(0)},
+	} {
 		decoded, err := parseCapabilitiesField(wireBytes, marshalCapabilities(&want))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if decoded.Xattrs != want.Xattrs ||
-			decoded.XattrSetSupported != want.XattrSetSupported {
-			t.Fatalf("xattr capabilities round trip: got %+v, want %+v", decoded, want)
+		if err != nil || decoded != want {
+			t.Fatalf("capabilities round trip: got %+v, %v; want %+v", decoded, err, want)
 		}
 	}
-}
-
-func TestReadOnlyXattrCapabilities(t *testing.T) {
-	old := Capabilities{Xattrs: true}
-	encoded := marshalCapabilities(&old)
-	if err := scan(encoded, func(num int, _ int, _ []byte) error {
-		if num == 10 {
-			t.Fatalf("false xattr_set_supported encoded field 10: % x", encoded)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := parseCapabilitiesField(wireBytes, encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !decoded.Xattrs || decoded.XattrSetSupported {
-		t.Fatalf("xattr capabilities changed meaning: %+v", decoded)
-	}
+	assertWireFields(t, marshalCapabilities(&Capabilities{MaxNameBytes: 255, MaxFileSize: 1, PreferredIOSize: 1 << 20}), 5, 6, 7)
 }
 
 // Set UPDATE_GOLDENS=1 to regenerate both language fixture copies together.

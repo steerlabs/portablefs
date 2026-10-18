@@ -6,6 +6,6 @@ UPDATE_GOLDENS=1 go -C vcs test ./internal/pfslocal
 ```
 
 `hello_request.hex` and `hello_reply.hex` carry a live 2.0 pairing and a positive
-request deadline. `resolve_contract.hex` carries the mandatory incarnation,
-`fskit-exclusive-writer-v1` policy, and 5,000 ms liveness interval. Owning Items
+request deadline. `resolve_contract.hex` carries the root, root attributes, volume identity/name
+and numeric limits. Resolve binds the connection to one exact attach incarnation. Owning Items
 carry nonzero stable identities; enumeration snapshots transfer no ownership.

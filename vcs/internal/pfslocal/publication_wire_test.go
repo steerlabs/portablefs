@@ -76,21 +76,14 @@ func TestResourceReplyDispositionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestV3CoherenceResolveReplyRoundTrip(t *testing.T) {
+func TestResolveReplyRoundTrip(t *testing.T) {
 	want := &ResolveReply{
 		Root:       Item{ItemID: 11, ItemGeneration: 13, StableIdentity: [16]byte{1}},
 		RootAttr:   Attr{Item: Item{ItemID: 11, ItemGeneration: 13, StableIdentity: [16]byte{1}}, Kind: ItemKindDirectory},
 		VolumeID:   "vol-17",
 		VolumeName: "Shared",
 		Capabilities: Capabilities{
-			Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
 			MaxNameBytes: 255, PreferredIOSize: 1 << 20,
-		},
-		V3Coherence: &V3CoherenceContract{
-			AuthorityEpoch:         bytes.Repeat([]byte{0xa1}, 16),
-			SessionID:              bytes.Repeat([]byte{0xb2}, 16),
-			CachePolicy:            CachePolicy,
-			LivenessIntervalMillis: 5_000,
 		},
 	}
 
@@ -100,8 +93,7 @@ func TestV3CoherenceResolveReplyRoundTrip(t *testing.T) {
 	}
 
 	encoded := marshalResolveReply(want)
-	assertWireField(t, encoded, 7, wireBytes)
-	assertWireFields(t, marshalV3CoherenceContract(want.V3Coherence), 2, 3, 4, 7)
+	assertWireFields(t, encoded, 1, 2, 3, 5, 6)
 }
 
 func TestItemStableIdentityWireIsExact(t *testing.T) {
@@ -114,36 +106,6 @@ func TestItemStableIdentityWireIsExact(t *testing.T) {
 	if _, err := parseItemField(wireBytes, appendBytesField(nil, 3, []byte{1, 2, 3})); err != ErrMalformed {
 		t.Fatalf("short stable identity = %v, want ErrMalformed", err)
 	}
-}
-
-func TestV3LivenessBodiesRoundTripAndPinEnvelopeFields(t *testing.T) {
-	want := &V3LivenessRequest{
-		AuthorityEpoch: bytes.Repeat([]byte{0x81}, 16),
-		SessionID:      bytes.Repeat([]byte{0x82}, 16),
-	}
-	decoded := roundTripBody(t, want)
-	if !reflect.DeepEqual(decoded, want) {
-		t.Fatalf("liveness request round trip:\n got  %#v\n want %#v", decoded, want)
-	}
-	wire, err := MarshalEnvelope(&Envelope{RequestID: 9, Body: want})
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertWireField(t, wire, 38, wireBytes)
-	assertWireFields(t, marshalV3LivenessRequest(want), 1, 2)
-
-	reply := &V3LivenessReply{
-		AuthorityEpoch: bytes.Repeat([]byte{0x81}, 16),
-		SessionID:      bytes.Repeat([]byte{0x82}, 16),
-	}
-	if got := roundTripBody(t, reply); !reflect.DeepEqual(got, reply) {
-		t.Fatalf("liveness reply round trip: got %#v, want %#v", got, reply)
-	}
-	replyWire, err := MarshalEnvelope(&Envelope{RequestID: 9, Body: reply})
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertWireField(t, replyWire, 87, wireBytes)
 }
 
 func roundTripBody(t *testing.T, body any) any {
