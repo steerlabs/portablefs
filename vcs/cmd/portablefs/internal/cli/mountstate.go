@@ -117,11 +117,8 @@ const (
 	mountRevokedUnclassified = "unclassified"
 )
 
-// mountRevocation is one platform's revocation verdict in the shape the
-// supervisor persists. It is deliberately platform-neutral: the Linux engine
-// reports a fusev3.RevocationReport
-// probe decision, but both reduce to the same three facts, and `portablefs
-// mounts` must not have to know which one produced a row.
+// mountRevocation carries the Linux engine's fusev3.RevocationReport in the
+// shape the supervisor persists and `portablefs mounts` reports.
 type mountRevocation struct {
 	reason string
 	detail string

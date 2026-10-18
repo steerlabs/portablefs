@@ -278,3 +278,69 @@ func TestFSDControlRequiresImmutableReleaseAtConstruction(t *testing.T) {
 		t.Fatal("missing native authenticator admitted")
 	}
 }
+
+func TestLiveMacOSServiceReleaseSelectsIncomingPairingAndOutgoingVerification(t *testing.T) {
+	app := filepath.Join(shortSocketDir(t), "PortableFS.app")
+	path := filepath.Join(app, "Contents", filepath.FromSlash(macOSPortableFSDRelativePath))
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	expected := nativeCLIImage(t, filepath.Dir(path), filepath.Base(path))
+	for _, protocols := range []struct {
+		name    string
+		control int
+		major   uint32
+		minor   uint32
+	}{
+		{"paired", daemonctl.ControlProtocolVersion, pfslocal.ProtocolMajor, pfslocal.ProtocolMinor},
+		{"other control", daemonctl.ControlProtocolVersion + 1, pfslocal.ProtocolMajor, pfslocal.ProtocolMinor},
+		{"other pfslocal major", daemonctl.ControlProtocolVersion, pfslocal.ProtocolMajor + 1, pfslocal.ProtocolMinor},
+		{"other pfslocal minor", daemonctl.ControlProtocolVersion, pfslocal.ProtocolMajor, pfslocal.ProtocolMinor + 1},
+		{"other control and pfslocal", 71, 72, 73},
+	} {
+		t.Run(protocols.name, func(t *testing.T) {
+			socket := filepath.Join(shortSocketDir(t), "control.sock")
+			identity := daemonctl.Identity{
+				SchemaVersion: daemonctl.IdentitySchemaVersion, ControlProtocol: protocols.control,
+				DaemonVersion: expected.identity.DaemonVersion, ExecutableSHA256: expected.identity.ExecutableSHA256,
+				PFSLocalMajor: protocols.major, PFSLocalMinor: protocols.minor,
+			}
+			_, requests := startCLIImage(t, expected, socket, identity)
+			inspections, authentications := 0, 0
+			cfg := fskitConfig{
+				controlSock: socket,
+				// The fixture supplies static release metadata at the bundle
+				// boundary; the real audit-token authenticator checks its image.
+				releaseForTest: func(gotPath, version string) (daemonRelease, error) {
+					inspections++
+					if gotPath != path || version != expected.identity.DaemonVersion {
+						t.Fatalf("installer inspected %q version %q", gotPath, version)
+					}
+					return expected, nil
+				},
+				authenticatePeerForTest: func(conn net.Conn, path, hash string) error {
+					authentications++
+					return authenticateFSDPeer(conn, path, hash)
+				},
+			}
+			for _, incoming := range []bool{true, false} {
+				err := requireLiveMacOSServiceReleaseWithConfig(cfg, app, expected.identity, incoming, time.Second)
+				wantError := incoming && protocols.name != "paired"
+				if (err != nil) != wantError || wantError && !strings.Contains(err.Error(), "is incompatible") {
+					t.Fatalf("incoming=%t protocols=%+v error=%v, wantError=%t", incoming, identity, err, wantError)
+				}
+				select {
+				case request := <-requests:
+					if request != "request "+daemonctl.LifecycleIdentityPath {
+						t.Fatalf("installer used non-lifecycle verification: %s", request)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("installer did not verify authenticated live identity")
+				}
+			}
+			if inspections != 2 || authentications != 2 {
+				t.Fatalf("release inspections=%d authenticated dials=%d, want 2 each", inspections, authentications)
+			}
+		})
+	}
+}

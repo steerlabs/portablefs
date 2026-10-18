@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 )
@@ -71,8 +72,28 @@ func decodeAttachInventory(body []byte) ([]cliAttachStatus, error) {
 			}
 		}
 		var status cliAttachStatus
-		if err := json.Unmarshal(record, &status); err != nil {
-			return nil, fmt.Errorf("decode daemon attach identity: %w", err)
+		members := map[string]any{
+			"attachRef": &status.AttachRef, "mountPath": &status.MountPath, "volumeId": &status.VolumeID,
+			"state": &status.State, "lastError": &status.LastError, "sessionTerminal": &status.SessionTerminal,
+			"mountEnrollmentId": &status.MountEnrollmentID, "authorizationDeadlineAtMs": &status.AuthorizationDeadlineAtMs,
+			"lastReauthorizationAtMs": &status.LastReauthorizationAtMs, "nextReauthorizationAtMs": &status.NextReauthorizationAtMs,
+			"reauthorizationFailures": &status.ReauthorizationFailures, "reauthorizationError": &status.ReauthorizationError,
+		}
+		// Only exact tokenized keys may populate known members. Go's struct
+		// decoder folds case, allowing an alias to overwrite an absence proof.
+		for key, raw := range fields {
+			member, known := members[key]
+			if !known {
+				for name := range members {
+					if strings.EqualFold(key, name) {
+						return nil, fmt.Errorf("daemon attach inventory contains ambiguous member %q", key)
+					}
+				}
+				continue
+			}
+			if err := json.Unmarshal(raw, member); err != nil {
+				return nil, fmt.Errorf("decode daemon attach member %s: %w", key, err)
+			}
 		}
 		if !mountid.ValidAttachRef(status.AttachRef) || !validCanonicalMountPath(status.MountPath) || !validVolumeName(status.VolumeID) || seen[status.AttachRef] {
 			return nil, fmt.Errorf("daemon attach inventory contains an incomplete or duplicate identity")

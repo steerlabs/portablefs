@@ -3006,23 +3006,23 @@ func completeOrResumeMacOSActivation(
 }
 
 func requireLiveMacOSServiceRelease(app string, release hostctl.ReleaseIdentity, incoming bool, timeout time.Duration) error {
-	controlSocket, err := defaultFskitControlSocket()
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return err
 	}
+	return requireLiveMacOSServiceReleaseWithConfig(cfg, app, release, incoming, timeout)
+}
+
+func requireLiveMacOSServiceReleaseWithConfig(cfg fskitConfig, app string, release hostctl.ReleaseIdentity, incoming bool, timeout time.Duration) error {
 	path := filepath.Join(app, "Contents", filepath.FromSlash(macOSPortableFSDRelativePath))
-	expected, err := authenticateDaemonRelease(path, release.DaemonVersion)
-	if err != nil {
-		return err
-	}
-	if expected.identity != release {
-		return fmt.Errorf("authenticated daemon release changed")
-	}
-	ctl, err := newFsdControl(controlSocket, expected)
+	ctl, err := cfg.controlForRelease(path, release.DaemonVersion)
 	if err != nil {
 		return err
 	}
 	defer ctl.close()
+	if ctl.expected.identity != release {
+		return fmt.Errorf("authenticated daemon release changed")
+	}
 	if incoming {
 		return ctl.requireCompatibleIdentityWithin(release.DaemonVersion, release.ExecutableSHA256, timeout)
 	}

@@ -260,7 +260,7 @@ func TestUmountStaleFSKitStartsExactDaemonAndForceReconciles(t *testing.T) {
 	}
 }
 
-func TestUmountStaleFSKitNormalRefusalPreservesEvidenceAndGuidesForce(t *testing.T) {
+func TestUmountStaleFSKitNormalRefusalPreservesEvidenceAndReportsUnconfirmedCompletion(t *testing.T) {
 	e, _, stderr, stateDir := umountTestEnv(t)
 	mountPath, err := canonicalMountPath(t.TempDir())
 	if err != nil {
@@ -278,8 +278,9 @@ func TestUmountStaleFSKitNormalRefusalPreservesEvidenceAndGuidesForce(t *testing
 	if rc := e.run([]string{"umount", mountPath}); rc == 0 {
 		t.Fatalf("credential-pending normal reconciliation succeeded, stderr=%q", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "--force") || calls.unmount.Load() != 1 {
-		t.Fatalf("normal refusal lacks deterministic force guidance: calls=%d stderr=%q", calls.unmount.Load(), stderr.String())
+	want := "kernel mount is absent; daemon unmount completion is unconfirmed (absence-proof delivery or cleanup may be incomplete): portablefsd: normal detach requires an active credential (HTTP 409); state and intent were preserved"
+	if !strings.Contains(stderr.String(), want) || strings.Contains(stderr.String(), "--force") || calls.unmount.Load() != 1 || calls.forceUnmount.Load() != 0 {
+		t.Fatalf("normal refusal misstated completion: calls=%d forceCalls=%d stderr=%q", calls.unmount.Load(), calls.forceUnmount.Load(), stderr.String())
 	}
 	if current, err := readMountState(stateDir, mountPath); err != nil || current == nil {
 		t.Fatalf("normal refusal lost state: state=%+v err=%v", current, err)

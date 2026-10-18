@@ -1909,28 +1909,8 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 	if !mounted && !mountProcessMatches(st) {
 		if st.Strategy == "fskit" && st.AttachRef != "" {
-			cfg, cfgErr := fixedFSKitConfig()
-			if cfgErr != nil {
-				return e.fail("umount", cfgErr)
-			}
-			ctl, connectErr := e.ensureFskitDaemon(cfg, filepath.Dir(stateDir))
-			if connectErr != nil {
-				return e.fail("umount", fmt.Errorf("reconcile absent kernel mount's attach: %w", connectErr))
-			}
-			present, inventoryErr := verifyRecordedFskitAttach(ctl, st)
-			if inventoryErr != nil {
-				return e.fail("umount", inventoryErr)
-			}
-			if present {
-				var cleanupErr error
-				if force {
-					cleanupErr = ctl.forceDetach(st.AttachRef)
-				} else {
-					cleanupErr = ctl.unmountRecordedAttach(st)
-				}
-				if err := cleanupErr; err != nil {
-					return e.fail("umount", fmt.Errorf("kernel mount is absent; attach cleanup failed: %w; retry cleanup or use `portablefs umount --force`", err))
-				}
+			if _, err := e.v3FSKitDaemonDetach(st, force); err != nil {
+				return e.fail("umount", err)
 			}
 		}
 		if err := publishResourcesCleanedIntent(operation, stateDir, mountPath); err != nil {

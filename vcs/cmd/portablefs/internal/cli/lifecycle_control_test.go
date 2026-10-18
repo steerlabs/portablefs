@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -162,5 +163,51 @@ func TestAttachInventoryCannotTurnMalformedRepliesIntoAbsence(t *testing.T) {
 		if inventory, err := decodeAttachInventory([]byte(body)); err != nil || len(inventory) != 0 {
 			t.Fatalf("paired empty inventory %s: %v", body, err)
 		}
+	}
+}
+
+func TestAttachInventoryRejectsAmbiguousIdentityMembers(t *testing.T) {
+	st := validFSKitMountState(t, "/test/mount")
+	for _, member := range []struct {
+		name, alias, escaped, replacement string
+	}{
+		{"attachRef", "AttachRef", `attach\u0052ef`, "att_BBBBBBBBBBBBBBBBBBBBBB"},
+		{"mountPath", "MountPath", `mount\u0050ath`, "/test/replacement"},
+		{"volumeId", "VolumeId", `volume\u0049d`, "replacement"},
+	} {
+		for _, spelling := range []string{member.alias, strings.ToUpper(member.name), member.name, member.escaped} {
+			for _, extraFirst := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/extraFirst=%t", member.name, spelling, extraFirst), func(t *testing.T) {
+					canonical := fmt.Sprintf(`"attachRef":%q,"mountPath":%q,"volumeId":%q`, st.AttachRef, st.MountPath, st.VolumeID)
+					extra := fmt.Sprintf(`"%s":%q`, spelling, member.replacement)
+					members := canonical + "," + extra
+					if extraFirst {
+						members = extra + "," + canonical
+					}
+					body := `{"attaches":[{` + members + `}]}`
+					if _, err := decodeAttachInventory([]byte(body)); err == nil {
+						t.Fatalf("ambiguous inventory accepted: %s", body)
+					}
+					ctl := &fsdControl{httpClient: &http.Client{Transport: lifecycleRoundTrip(func(r *http.Request) (*http.Response, error) {
+						status, response := http.StatusNotFound, ""
+						if r.URL.Path == "/v2/attaches" {
+							status, response = http.StatusOK, body
+						}
+						return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(response)), Header: make(http.Header)}, nil
+					})}}
+					ctl.pairOnce.Do(func() {})
+					if err := finalizeExternallyAbsentFSKit(ctl, &st); err == nil {
+						t.Fatal("ambiguous inventory authorized cleanup after 404")
+					}
+				})
+			}
+		}
+	}
+	// Escaped canonical keys are valid once; duplicate detection runs after
+	// JSON unescaping, and unknown producer status fields remain ignorable.
+	body := fmt.Sprintf(`{"attaches":[{"attach\u0052ef":%q,"mount\u0050ath":%q,"volume\u0049d":%q,"state":"mounted","sessionTerminal":true,"reauthorizationFailures":3,"unknown":{}}]}`, st.AttachRef, st.MountPath, st.VolumeID)
+	got, err := decodeAttachInventory([]byte(body))
+	if err != nil || len(got) != 1 || got[0].AttachRef != st.AttachRef || got[0].MountPath != st.MountPath || got[0].VolumeID != st.VolumeID || got[0].State != "mounted" || !got[0].SessionTerminal || got[0].ReauthorizationFailures != 3 {
+		t.Fatalf("exact escaped inventory=%+v error=%v", got, err)
 	}
 }
