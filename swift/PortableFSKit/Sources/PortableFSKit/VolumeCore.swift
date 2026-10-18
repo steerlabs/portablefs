@@ -331,7 +331,7 @@ public actor VolumeCore {
             try validateOwningItem(reply.root)
             try validateFileAttributes(reply.rootAttr, allowingRoot: true)
         } catch {
-            await client.close()
+            await client.close(error: error)
             throw error
         }
         let root = try daemonItem(for: reply.rootAttr, allowingRoot: true)
@@ -355,6 +355,7 @@ public actor VolumeCore {
     }
 
     public func rootItem() throws -> PortableFSItem {
+        try client.publicationGate.check()
         guard let root = resolvedVolume?.root else {
             throw PfsLocalClientError.unexpectedReply("volume has not been resolved")
         }
@@ -1065,6 +1066,7 @@ public actor VolumeCore {
     }
 
     public func shutdown() async {
+        client.publicationGate.revoke(PfsLocalClientError.shutdown)
         stopped = true
         await client.close()
         for item in itemsByObject.values { item.markReclaimed() }

@@ -7,30 +7,53 @@ public final class PfsCallbackTicket: Sendable {
     fileprivate init() {}
 }
 
-/// Bounds the FSKit callbacks one volume executes at once.
-///
-/// Kernel open, getattr and reclaim bursts can be far larger than the
-/// daemon's request window. Each callback holds a slot from admission until
-/// its reply has returned to FSKit, so a burst queues here in FIFO order
-/// instead of piling requests onto the session. A freed slot is handed
-/// directly to the oldest waiter, so a later arrival can never overtake it.
-///
-/// The window has exactly one terminal path: `fail` refuses every later
-/// admission and wakes every waiter with the terminal error. The attach event
-/// monitor invokes it on connection loss and on a degraded or detaching
-/// attach, and volume teardown invokes it too.
-///
-/// Final publication and terminal revocation are one serialized decision on
-/// this actor. An admitted callback replies to FSKit only inside `settle`:
-/// before `fail` it replies with its own outcome, after `fail` with the
-/// terminal error. A callback that already holds a result therefore cannot
-/// install it into FSKit once the session has ended, and no terminal
-/// transition can interleave between the decision and the reply.
+/// Serializes session termination with the final synchronous framework reply.
+/// It is independent of actor scheduling: a socket close or core teardown
+/// revokes publication before changing session state, even while the window
+/// or event consumer is occupied. The lock covers the reply itself, so no
+/// check/reply interval can admit a terminal transition.
+final class PfsSessionPublicationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var terminal: Error?
+
+    var terminalError: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminal
+    }
+
+    @discardableResult
+    func revoke(_ error: Error) -> Error {
+        lock.lock()
+        defer { lock.unlock() }
+        if terminal == nil { terminal = error }
+        return terminal ?? error
+    }
+
+    func check() throws {
+        if let error = terminalError { throw error }
+    }
+
+    @discardableResult
+    func decide(_ reply: (Error?) -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        reply(terminal)
+        return terminal == nil
+    }
+}
+
+/// Bounds one volume's callbacks from admission through their framework reply.
+/// Slots pass directly to FIFO waiters. The client's shared publication gate
+/// decides every reply; the event consumer only drains queued admissions after
+/// termination. Admitted callbacks still settle their slots and resources once.
 public actor PfsCallbackWindow {
     public static let defaultCapacity = 128
 
     private let capacity: Int
-    private var terminal: Error?
+    nonisolated let publicationGate: PfsSessionPublicationGate
+    private var beforeSettlement: (@Sendable () async -> Void)?
+    private var beforeTerminalDrain: (@Sendable () async -> Void)?
     private var admitted: Set<ObjectIdentifier> = []
     private var waiters: [UUID: CheckedContinuation<PfsCallbackTicket, Error>] = [:]
     private var waiterOrder: [UUID] = []
@@ -39,6 +62,13 @@ public actor PfsCallbackWindow {
     public init(capacity: Int = PfsCallbackWindow.defaultCapacity) {
         precondition(capacity > 0)
         self.capacity = capacity
+        self.publicationGate = PfsSessionPublicationGate()
+    }
+
+    init(capacity: Int, publicationGate: PfsSessionPublicationGate) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        self.publicationGate = publicationGate
     }
 
     /// Waits for a slot. Cancellation while queued surfaces as the client's
@@ -46,14 +76,14 @@ public actor PfsCallbackWindow {
     /// and must still be published.
     public func admit() async throws -> PfsCallbackTicket {
         if Task.isCancelled { throw PfsLocalClientError.cancelled }
-        if let terminal { throw terminal }
+        if let terminal = publicationGate.terminalError { throw terminal }
         if admitted.count < capacity, waiters.isEmpty {
             return admitTicket()
         }
         let waiterID = UUID()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                if let terminal {
+                if let terminal = publicationGate.terminalError {
                     continuation.resume(throwing: terminal)
                     return
                 }
@@ -69,30 +99,23 @@ public actor PfsCallbackWindow {
         }
     }
 
-    /// The callback's final publication. `reply` runs here, on the actor
-    /// that serializes `fail`: with nil while the window is live, so the
-    /// callback replies with its own outcome, or with the terminal error once
-    /// the window failed, so a publication that lost to terminal failure
-    /// replies with that error instead. Either way the slot is released after
-    /// the reply returned. Returns whether the callback's own outcome reached
-    /// FSKit; the caller settles its publication unit as published only then.
-    ///
-    /// A ticket settles exactly once. A second settlement runs nothing and
-    /// frees no slot.
+    /// Replies under the session gate and releases this slot exactly once.
+    /// False means a duplicate settlement or a terminal verdict; either way
+    /// the caller must not publish its original successful result.
     public func settle(
         _ ticket: PfsCallbackTicket,
         reply: @Sendable (_ terminal: Error?) -> Void
-    ) -> Bool {
+    ) async -> Bool {
+        if let beforeSettlement { await beforeSettlement() }
         guard admitted.remove(ObjectIdentifier(ticket)) != nil else { return false }
-        reply(terminal)
+        let published = publicationGate.decide(reply)
         handOffFreedSlots()
-        return terminal == nil
+        return published
     }
 
     /// The window's single terminal transition.
     public func fail(_ error: Error) {
-        guard terminal == nil else { return }
-        terminal = error
+        let error = publicationGate.revoke(error)
         let pending = waiterOrder[waiterHead...].compactMap { waiters[$0] }
         waiters.removeAll()
         waiterOrder.removeAll()
@@ -104,7 +127,25 @@ public actor PfsCallbackWindow {
 
     public func admittedCount() -> Int { admitted.count }
     public func waiterCount() -> Int { waiters.count }
-    public func isFailed() -> Bool { terminal != nil }
+    public func isFailed() -> Bool { publicationGate.terminalError != nil }
+
+    /// The session has already revoked publication at its terminal source.
+    /// Draining admission can run later without allowing a completed result
+    /// to escape in that interval.
+    func sessionEnded(_ error: Error) async {
+        let hook = beforeTerminalDrain
+        beforeTerminalDrain = nil
+        await hook?()
+        fail(error)
+    }
+
+    func testingBeforeSettlement(_ hook: @escaping @Sendable () async -> Void) {
+        beforeSettlement = hook
+    }
+
+    func testingBeforeTerminalDrain(_ hook: @escaping @Sendable () async -> Void) {
+        beforeTerminalDrain = hook
+    }
 
     private func admitTicket() -> PfsCallbackTicket {
         let ticket = PfsCallbackTicket()
@@ -113,7 +154,7 @@ public actor PfsCallbackWindow {
     }
 
     private func handOffFreedSlots() {
-        guard terminal == nil else { return }
+        guard publicationGate.terminalError == nil else { return }
         while admitted.count < capacity, waiterHead < waiterOrder.count {
             let waiterID = waiterOrder[waiterHead]
             waiterHead += 1
@@ -133,9 +174,10 @@ public actor PfsCallbackWindow {
 }
 
 /// Consumes the one event stream bound to a volume's pfslocal connection and
-/// turns its end, or a terminal attach state, into the session's terminal
-/// transition. There is no frontend heartbeat: the daemon is the only
-/// authority-renewal owner, and loss of this binding is the frontend's signal.
+/// drains admissions after its end or a terminal attach state. The client
+/// has already revoked publication. There is no frontend heartbeat: the
+/// daemon is the only authority-renewal owner, and loss of this binding is
+/// the frontend's signal.
 enum PfsAttachEventMonitor {
     /// The terminal cause an event carries, or nil for a healthy attach.
     static func terminalCause(of event: PfsEvent) -> PfsLocalClientError? {
@@ -156,11 +198,9 @@ enum PfsAttachEventMonitor {
         }
     }
 
-    /// Runs until the stream ends or reports a terminal state, then fails
-    /// the window, which decides every later publication as revoked, wakes
-    /// its waiters and refuses admission, and closes the client, which fails
-    /// every in-flight request and ends the session. The window fails first
-    /// so the terminal decision precedes the requests' failures.
+    /// The client revokes publication when it receives a terminal event or
+    /// closes the connection. This consumer drains window waiters afterward;
+    /// its scheduling is never the publication boundary.
     static func run(
         events: AsyncStream<PfsEvent>,
         client: PfsLocalClient,
@@ -173,10 +213,11 @@ enum PfsAttachEventMonitor {
                 break
             }
         }
+        let terminal = client.publicationGate.terminalError ?? cause
         pfsClientLogger.error(
-            "FSKit volume session ended: \(String(describing: cause), privacy: .public)"
+            "FSKit volume session ended: \(String(describing: terminal), privacy: .public)"
         )
-        await window.fail(cause)
-        await client.close()
+        await window.sessionEnded(terminal)
+        await client.close(error: terminal)
     }
 }

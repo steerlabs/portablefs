@@ -461,7 +461,9 @@ extension PfsLocalMockDaemonTests {
         }
         await #expect(throws: PfsLocalClientError.self) { try await core.resolve(attachRef: "mock") }
         #expect(await core.resolvedVolume == nil)
-        await #expect(throws: PfsLocalClientError.shutdown) { try await client.request(.statfs(PfsStatfsRequest())) }
+        await #expect(throws: PfsLocalClientError.invalidFrame("invalid root attributes")) {
+            try await client.request(.statfs(PfsStatfsRequest()))
+        }
     }
 }
 }

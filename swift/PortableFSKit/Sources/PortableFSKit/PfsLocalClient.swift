@@ -717,9 +717,7 @@ public actor PfsLocalClient {
     private let configuration: Configuration
     /// The request trace of this session and of the volume above it.
     nonisolated let trace: PfsTrace
-    /// The first protocol defect any connection reported. A peer that sent
-    /// one malformed frame is not trusted again, even before Hello completed.
-    private var protocolDefect: PfsLocalClientError?
+    nonisolated let publicationGate = PfsSessionPublicationGate()
     private var connection: PfsConnection?
     private var connectingTask: Task<Void, Error>?
     /// True once Hello succeeded on `connection`. It is never reset: losing
@@ -730,16 +728,11 @@ public actor PfsLocalClient {
     private var pending: [UInt64: PfsPendingRequest] = [:]
     private var nextRequestID: UInt64 = 1
     private var isShutdown = false
-    private var attachIsDetaching = false
     private var beforeNextResourceSettlement: (@Sendable () async -> Void)?
 
     /// Only terminal session state permits frontend-only ownership retirement.
     var isDetachingOrStopped: Bool {
-        attachIsDetaching || isShutdown || isSessionLost
-    }
-
-    private var isSessionLost: Bool {
-        sessionEstablished && connection == nil
+        publicationGate.terminalError != nil
     }
 
     public nonisolated var hasActivePublicationBoundary: Bool {
@@ -773,6 +766,7 @@ public actor PfsLocalClient {
     }
 
     deinit {
+        publicationGate.revoke(PfsLocalClientError.connectionClosed)
         connection?.socket.close()
         eventSink?.finish()
     }
@@ -980,6 +974,11 @@ public actor PfsLocalClient {
 
     /// Closes the session and fails all in-flight requests.
     public func close() {
+        close(error: PfsLocalClientError.shutdown)
+    }
+
+    func close(error: Error) {
+        let cause = publicationGate.revoke(error)
         guard !isShutdown else {
             return
         }
@@ -988,7 +987,7 @@ public actor PfsLocalClient {
         connectingTask = nil
         connection?.socket.close()
         connection = nil
-        failAllPending(with: PfsLocalClientError.shutdown)
+        failAllPending(with: cause)
         eventSink?.finish()
     }
 
@@ -1000,14 +999,9 @@ public actor PfsLocalClient {
     }
 
     private func ensureConnected() async throws {
-        if attachIsDetaching {
-            throw PfsLocalClientError.daemon(errno: ENXIO, message: "attach is detaching")
-        }
+        try publicationGate.check()
         if isShutdown {
             throw PfsLocalClientError.shutdown
-        }
-        if let protocolDefect {
-            throw protocolDefect
         }
         if sessionEstablished {
             guard connection != nil else {
@@ -1117,8 +1111,13 @@ public actor PfsLocalClient {
                 )
                 return
             }
-            if case let .attachState(state)? = event.kind, state.state == .detaching {
-                attachIsDetaching = true
+            if let cause = PfsAttachEventMonitor.terminalCause(of: event) {
+                // Revoke before exposing the event to a separately scheduled
+                // consumer, including DEGRADED and malformed attach states.
+                publicationGate.revoke(cause)
+                eventSink.yield(event)
+                closeCurrentConnection(connectionID, error: cause)
+                return
             }
             eventSink.yield(event)
             return
@@ -1189,16 +1188,16 @@ public actor PfsLocalClient {
         pfsClientLogger.error(
             "pfslocal connection closed: \(String(describing: error), privacy: .public); established=\(self.sessionEstablished) pending=\(self.pending.count)"
         )
-        if protocolDefect == nil,
-           let defect = error as? PfsLocalClientError,
-           defect.isProtocolDefect {
-            protocolDefect = defect
-        }
+        // Failed attempts before Hello may retry; an established session or
+        // a protocol defect is terminal and must revoke before the teardown.
+        let isProtocolDefect = (error as? PfsLocalClientError)?.isProtocolDefect == true
+        let cause = sessionEstablished || isProtocolDefect
+            ? publicationGate.revoke(error) : error
         let socket = connection?.socket
         connection = nil
         socket?.close()
         eventSink?.finish()
-        failAllPending(with: error)
+        failAllPending(with: cause)
     }
 
     private func failAllPending(with error: Error) {

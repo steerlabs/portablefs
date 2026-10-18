@@ -225,9 +225,16 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
                         attachRef,
                         moduleIdentity
                     )
-                    storeVolume(volume, attachRef: attachRef)
-                    containerStatus = .ready
-                    reply.call(volume, nil)
+                    let published = volume.core.client.publicationGate.decide { terminal in
+                        if let terminal {
+                            reply.call(nil, PfsErrorMapper.fsKitError(for: terminal))
+                        } else {
+                            storeVolume(volume, attachRef: attachRef)
+                            containerStatus = .ready
+                            reply.call(volume, nil)
+                        }
+                    }
+                    if !published { await volume.shutdown() }
                 } catch {
                     logger.error("loadResource failed: \(String(describing: error), privacy: .public)")
                     reply.call(nil, PfsErrorMapper.fsKitError(for: error))
@@ -376,8 +383,8 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
 /// publication decision, and only then sends the daemon its publication
 /// verdict. The volume holds exactly one
 /// pfslocal session, bound to its attach at Resolve and to its attach-state
-/// events at construction; the end of that event binding is the volume's
-/// single terminal path.
+/// events at construction. The client revokes publication at each terminal
+/// source, before an event consumer can drain the window.
 @available(macOS 26.0, *)
 public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.OpenCloseOperations, FSVolume.ReadWriteOperations, FSVolume.XattrOperations, FSVolume.PathConfOperations, @unchecked Sendable {
     public let core: VolumeCore
@@ -408,8 +415,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         }
         do {
             let events = try await core.subscribeEvents()
-            let window = PfsCallbackWindow(capacity: windowCapacity)
             let client = core.client
+            let window = PfsCallbackWindow(
+                capacity: windowCapacity, publicationGate: client.publicationGate
+            )
             let eventMonitor = Task.detached(priority: .userInitiated) {
                 await PfsAttachEventMonitor.run(
                     events: events,
@@ -424,6 +433,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 await window.fail(error)
                 throw error
             }
+            try client.publicationGate.check()
             return PortableFSVolume(
                 core: core,
                 attachRef: attachRef,
@@ -521,50 +531,97 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         return statistics
     }
 
+    @nonobjc
     public func activate(options: FSTaskOptions) async throws -> FSItem {
-        do {
-            return try await core.rootItem()
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
+        let root: PfsUncheckedSendableBox<FSItem> = try await withCheckedThrowingContinuation { continuation in
+            activate(options: options) { item, error in
+                if let error { continuation.resume(throwing: error) }
+                else if let item { continuation.resume(returning: PfsUncheckedSendableBox(item)) }
+                else { continuation.resume(throwing: PfsLocalClientError.connectionClosed) }
+            }
         }
+        return root.value
+    }
+
+    public func activate(
+        options: FSTaskOptions,
+        replyHandler reply: @escaping (FSItem?, Error?) -> Void
+    ) {
+        publishAfterReply({ try await self.core.rootItem() }, reply: { result in
+            switch result {
+            case let .success(root): reply(root, nil)
+            case let .failure(error): reply(nil, error)
+            }
+        })
     }
 
     public func deactivate(options: FSDeactivateOptions = []) async throws {
+        // Teardown acknowledges completed cleanup; it cannot publish an item
+        // or certify a live session after shutdown.
         await shutdown()
     }
 
-    public func mount(options: FSTaskOptions) async throws {}
+    @nonobjc
+    public func mount(options: FSTaskOptions) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            mount(options: options) { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
+            }
+        }
+    }
+
+    public func mount(options: FSTaskOptions, replyHandler reply: @escaping (Error?) -> Void) {
+        publishAfterReply({}, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
+    }
 
     public func unmount() async {
         await shutdown()
     }
 
+    @nonobjc
     public func synchronize(flags: FSSyncFlags) async throws {
-        do {
-            // Explicit authority barrier over its captured applied cut. Successful
-            // FSKit mutation replies are already durable. The native framework
-            // must drain prior work: this cannot cover kernel pages not yet
-            // delivered as callbacks or mutations outside that cut. Native
-            // fsync/F_FULLFSYNC waiting and error propagation remain unproven.
-            // Authority failures surface through this callback.
-            try await core.syncVolume()
-            if let stat = try? await core.statfs() {
-                setCachedStatistics(PfsFSKitMapping.statfs(
-                    from: stat,
-                    capabilities: capabilities,
-                    fileSystemTypeName: fileSystemTypeName
-                ))
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            synchronize(flags: flags) { error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume() }
             }
-        } catch {
-            throw PfsErrorMapper.fsKitError(for: error)
         }
+    }
+
+    public func synchronize(flags: FSSyncFlags, replyHandler reply: @escaping (Error?) -> Void) {
+        publishAfterReply({
+            // Explicit authority barrier over its captured applied cut.
+            // Successful mutation replies are already durable. The framework
+            // must drain prior work: this cannot cover undelivered kernel
+            // pages or mutations outside that cut. Native fsync/F_FULLFSYNC
+            // waiting and error propagation remain unproven.
+            try await self.core.syncVolume()
+            let stat = try await self.core.statfs()
+            self.setCachedStatistics(PfsFSKitMapping.statfs(
+                from: stat,
+                capabilities: self.capabilities,
+                fileSystemTypeName: self.fileSystemTypeName
+            ))
+        }, reply: { result in
+            switch result {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        })
     }
 
     /// Ends this volume: the window refuses every later callback, wakes its
     /// waiters and revokes every later publication, then the core closes its
     /// session and forgets its items.
     public func shutdown() async {
-        await window.fail(PfsLocalClientError.shutdown)
+        core.client.publicationGate.revoke(PfsLocalClientError.shutdown)
+        await window.sessionEnded(PfsLocalClientError.shutdown)
         eventMonitor.cancel()
         await core.shutdown()
     }
@@ -584,7 +641,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         callbackKind: StaticString = #function,
         preflight: @escaping @Sendable () async throws -> Void = {},
         _ operation: @escaping () async throws -> Value,
-        reply: @escaping (Result<Value, Error>) -> Void
+        reply: @escaping (Result<Value, Error>) -> Void,
+        settled: @escaping @Sendable () -> Void = {}
     ) {
         let trace = PfsCallbackTrace(
             kind: callbackKind,
@@ -594,6 +652,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         let operation = PfsUncheckedSendableBox(operation)
         let reply = PfsUncheckedSendableBox(reply)
         Task(priority: .userInitiated) {
+            defer { settled() }
             trace.emit("TaskStarted")
             do {
                 try await preflight()
@@ -649,13 +708,15 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     func testOnlyPublishAfterReply<Value>(
         preflight: @escaping @Sendable () async throws -> Void = {},
         operation: @escaping () async throws -> Value,
-        reply: @escaping (Result<Value, Error>) -> Void
+        reply: @escaping (Result<Value, Error>) -> Void,
+        settled: @escaping @Sendable () -> Void = {}
     ) {
         publishAfterReply(
             callbackKind: "testOnlyCallback",
             preflight: preflight,
             operation,
-            reply: reply
+            reply: reply,
+            settled: settled
         )
     }
 

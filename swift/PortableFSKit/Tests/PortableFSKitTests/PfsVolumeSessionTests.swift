@@ -44,14 +44,31 @@ private func waitUntil(
     return await condition()
 }
 
-private final class SessionReplyBox<Value>: @unchecked Sendable {
+private final class SessionReplyBox<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Value?
+    private var waiters: [CheckedContinuation<Value, Never>] = []
 
     func set(_ value: Value) {
         lock.lock()
         stored = value
+        let pending = waiters
+        waiters.removeAll()
         lock.unlock()
+        for waiter in pending { waiter.resume(returning: value) }
+    }
+
+    func wait() async -> Value {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let stored {
+                lock.unlock()
+                continuation.resume(returning: stored)
+            } else {
+                waiters.append(continuation)
+                lock.unlock()
+            }
+        }
     }
 
     func get() -> Value? {
@@ -67,14 +84,23 @@ private actor SessionGate {
     private var open = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var entered = 0
+    private var observers: [(Int, CheckedContinuation<Void, Never>)] = []
 
     func enter() async {
         entered += 1
+        let ready = observers.filter { $0.0 <= entered }
+        observers.removeAll { $0.0 <= entered }
+        for (_, observer) in ready { observer.resume() }
         if open { return }
         await withCheckedContinuation { waiters.append($0) }
     }
 
     func enteredCount() -> Int { entered }
+
+    func waitForEntries(_ count: Int) async {
+        if entered >= count { return }
+        await withCheckedContinuation { observers.append((count, $0)) }
+    }
 
     func release() {
         open = true
@@ -236,6 +262,39 @@ private func settle(_ window: PfsCallbackWindow, _ ticket: PfsCallbackTicket) as
     #expect(await window.waiterCount() == 0)
 }
 
+/// Termination cannot split the final decision from a synchronous reply that
+/// already won. Conversely, every reply after revocation sees the first cause.
+@Test func sessionTerminationWaitsForTheWinningSynchronousReply() async {
+    let gate = PfsSessionPublicationGate()
+    let entered = SessionReplyBox<Bool>()
+    let release = DispatchSemaphore(value: 0)
+    let publication = Task.detached {
+        gate.decide { terminal in
+            #expect(terminal == nil)
+            entered.set(true)
+            release.wait()
+        }
+    }
+    _ = await entered.wait()
+    let revoking = SessionReplyBox<Bool>()
+    let revoked = SessionReplyBox<Bool>()
+    let termination = Task.detached {
+        revoking.set(true)
+        gate.revoke(PfsLocalClientError.connectionClosed)
+        revoked.set(true)
+    }
+    _ = await revoking.wait()
+    #expect(revoked.get() == nil)
+    release.signal()
+    #expect(await publication.value)
+    await termination.value
+    gate.revoke(PfsLocalClientError.shutdown)
+    let published = gate.decide { terminal in
+        #expect(terminal as? PfsLocalClientError == .connectionClosed)
+    }
+    #expect(!published)
+}
+
 @Test func attachEventsSelectTheTerminalCause() {
     func event(_ state: PfsAttachState.State, detail: String = "") -> PfsEvent {
         var attachState = PfsAttachState()
@@ -271,10 +330,13 @@ private struct SessionHarness {
 @available(macOS 26.0, *)
 private func makeSessionHarness(
     daemonConfiguration: PfsLocalMockDaemon.Configuration = .init(),
-    windowCapacity: Int = PfsCallbackWindow.defaultCapacity
+    windowCapacity: Int = PfsCallbackWindow.defaultCapacity,
+    clientConfiguration: PfsLocalClient.Configuration = .init()
 ) async throws -> SessionHarness {
     let daemon = try PfsLocalMockDaemon(configuration: daemonConfiguration)
-    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let core = try await VolumeCore.connect(
+        socketPath: daemon.socketPath, attachRef: "mock", configuration: clientConfiguration
+    )
     let volume = try await PortableFSVolume.make(
         core: core,
         attachRef: "mock",
@@ -357,6 +419,8 @@ private struct HeldCallbacks {
     let readReply: SessionReplyBox<Int>
     let lookupReply: SessionReplyBox<Int>
     let lookedUp: SessionReplyBox<PortableFSItem>
+    let readSettled: SessionReplyBox<Bool>
+    let lookupSettled: SessionReplyBox<Bool>
 }
 
 @available(macOS 26.0, *)
@@ -375,22 +439,26 @@ private func holdCompletedCallbacks(_ harness: SessionHarness) async throws -> H
         gate: SessionGate(),
         readReply: SessionReplyBox(),
         lookupReply: SessionReplyBox(),
-        lookedUp: SessionReplyBox()
+        lookedUp: SessionReplyBox(),
+        readSettled: SessionReplyBox(),
+        lookupSettled: SessionReplyBox()
     )
     let core = harness.core
     let root = harness.root
+    // Park completed publications on the window actor, before its final
+    // synchronous gate/reply decision. No scheduler delay guesses are needed.
+    await harness.volume.window.testingBeforeSettlement { await held.gate.enter() }
     harness.volume.testOnlyPublishAfterReply(operation: {
-        let attr = try await core.getattr(item: root)
-        await held.gate.enter()
-        return attr
-    }, reply: { result in held.readReply.set(replyErrno(result)) })
+        try await core.getattr(item: root)
+    }, reply: { result in held.readReply.set(replyErrno(result)) },
+    settled: { held.readSettled.set(true) })
     harness.volume.testOnlyPublishAfterReply(operation: {
         let found = try await core.lookup(in: root, name: Data("held".utf8))
         held.lookedUp.set(found.item)
-        await held.gate.enter()
         return found.item
-    }, reply: { result in held.lookupReply.set(replyErrno(result)) })
-    #expect(try await waitUntil { await held.gate.enteredCount() == 2 })
+    }, reply: { result in held.lookupReply.set(replyErrno(result)) },
+    settled: { held.lookupSettled.set(true) })
+    await held.gate.waitForEntries(2)
     #expect(await harness.core.testingDebugState().provisionalItemCount == 1)
     return held
 }
@@ -408,12 +476,13 @@ private func expectHeldCallbacksRevoked(
     #expect(held.readReply.get() == nil)
     #expect(held.lookupReply.get() == nil)
     await held.gate.release()
-    #expect(try await waitUntil { held.readReply.get() != nil && held.lookupReply.get() != nil })
-    #expect(held.readReply.get() == Int(expected))
-    #expect(held.lookupReply.get() == Int(expected))
-    #expect(try await waitUntil { await harness.volume.window.admittedCount() == 0 })
+    #expect(await held.readReply.wait() == Int(expected))
+    #expect(await held.lookupReply.wait() == Int(expected))
+    _ = await held.readSettled.wait()
+    _ = await held.lookupSettled.wait()
+    #expect(await harness.volume.window.admittedCount() == 0)
     let item = try #require(held.lookedUp.get())
-    #expect(try await waitUntil { item.reclaimed })
+    #expect(item.reclaimed)
     #expect(await harness.core.testingDebugState().provisionalItemCount == 0)
 }
 
@@ -432,24 +501,30 @@ private func expectHeldCallbacksRevoked(
     harness.volume.getAttributes(FSItem.GetAttributesRequest(), of: harness.root) { _, error in
         queuedReply.set((error as NSError?)?.code ?? 0)
     }
-    #expect(try await waitUntil { await harness.volume.window.waiterCount() == 1 })
+    while await harness.volume.window.waiterCount() != 1 { await Task.yield() }
     #expect(queuedReply.get() == nil)
 
+    let drain = SessionGate()
+    await harness.volume.window.testingBeforeTerminalDrain { await drain.enter() }
     harness.daemon.emitAttachState(.degraded, detail: "authority unreachable")
-    #expect(try await waitUntil { queuedReply.get() != nil })
-    #expect(queuedReply.get() == Int(EIO))
-    #expect(await harness.volume.window.isFailed())
-    #expect(try await waitUntil { await harness.core.client.isDetachingOrStopped })
+    await drain.waitForEntries(1)
+    #expect(await harness.core.client.isDetachingOrStopped)
+    #expect(await harness.volume.window.waiterCount() == 1)
+    #expect(queuedReply.get() == nil)
     #expect(await harness.daemon.stats().getAttrRequests == 0)
+
+    // The event consumer has not failed/drained the window. Already completed
+    // publications still lose to the client's terminal transition itself.
+    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+    #expect(await harness.volume.window.waiterCount() == 1)
+    await drain.release()
+    #expect(await queuedReply.wait() == Int(EIO))
 
     let laterReply = SessionReplyBox<Int>()
     harness.volume.getAttributes(FSItem.GetAttributesRequest(), of: harness.root) { _, error in
         laterReply.set((error as NSError?)?.code ?? 0)
     }
-    #expect(try await waitUntil { laterReply.get() != nil })
-    #expect(laterReply.get() == Int(EIO))
-
-    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+    #expect(await laterReply.wait() == Int(EIO))
 }
 
 /// Loss of the bound socket revokes the publication of callbacks that
@@ -459,10 +534,13 @@ private func expectHeldCallbacksRevoked(
     let harness = try await makeSessionHarness(windowCapacity: 2)
     defer { harness.daemon.stop() }
     let held = try await holdCompletedCallbacks(harness)
+    let drain = SessionGate()
+    await harness.volume.window.testingBeforeTerminalDrain { await drain.enter() }
     harness.daemon.dropConnections()
-    #expect(try await waitUntil { await harness.volume.window.isFailed() })
-    #expect(try await waitUntil { await harness.core.client.isDetachingOrStopped })
+    await drain.waitForEntries(1)
+    #expect(await harness.core.client.isDetachingOrStopped)
     try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+    await drain.release()
 }
 
 /// Volume teardown is the same terminal decision.
@@ -471,8 +549,223 @@ private func expectHeldCallbacksRevoked(
     let harness = try await makeSessionHarness(windowCapacity: 2)
     defer { harness.daemon.stop() }
     let held = try await holdCompletedCallbacks(harness)
-    await harness.volume.shutdown()
+    let drain = SessionGate()
+    await harness.volume.window.testingBeforeTerminalDrain { await drain.enter() }
+    let shutdown = Task { await harness.volume.shutdown() }
+    await drain.waitForEntries(1)
     try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+    await drain.release()
+    await shutdown.value
+}
+
+/// Core teardown does not pass through PortableFSVolume.shutdown. It must
+/// revoke synchronously before its first actor hop to close the client.
+@available(macOS 26.0, *)
+@Test func coreShutdownRevokesCompletedCallbacksBeforeTheMonitorDrains() async throws {
+    let harness = try await makeSessionHarness(windowCapacity: 2)
+    defer { harness.daemon.stop() }
+    let held = try await holdCompletedCallbacks(harness)
+    let drain = SessionGate()
+    await harness.volume.window.testingBeforeTerminalDrain { await drain.enter() }
+    await harness.core.shutdown()
+    await drain.waitForEntries(1)
+    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+    await drain.release()
+}
+
+/// A malformed wire reply ends the same session, without waiting for the
+/// event consumer. Later shutdown must retain the original defect.
+@available(macOS 26.0, *)
+@Test func protocolDefectRevokesCompletedCallbacksBeforeTheMonitorDrains() async throws {
+    let harness = try await makeSessionHarness(windowCapacity: 2)
+    defer { harness.daemon.stop() }
+    let held = try await holdCompletedCallbacks(harness)
+    let drain = SessionGate()
+    await harness.volume.window.testingBeforeTerminalDrain { await drain.enter() }
+    await harness.daemon.transformNextReply { envelope in
+        guard case .statfsReply? = envelope.body,
+              var bytes = try? envelope.serializedData() else { return nil }
+        bytes.append(contentsOf: [0x20, 0x01]) // Removed envelope field 4.
+        return try? PfsEnvelope(serializedBytes: bytes)
+    }
+    await #expect(throws: PfsLocalClientError.invalidFrame(
+        "envelope carries a field outside pfslocal 2.0"
+    )) { _ = try await harness.core.statfs() }
+    await drain.waitForEntries(1)
+    await harness.core.client.close()
+    try await expectHeldCallbacksRevoked(held, harness, errno: EINVAL)
+    await drain.release()
+}
+
+/// The native synchronize probe, with continuation handshakes in place of
+/// sleeps: hold its Statfs dispatch after a successful authority barrier,
+/// start real volume shutdown, then release the dispatch after revocation.
+@available(macOS 26.0, *)
+@Test func nativeSynchronizeCannotSucceedAfterShutdownWinsItsReply() async throws {
+    let armed = SessionReplyBox<Bool>()
+    let statfsReached = SessionReplyBox<Bool>()
+    let releaseStatfs = DispatchSemaphore(value: 0)
+    var configuration = PfsLocalClient.Configuration()
+    configuration.traceObserver = { record in
+        if record.event == .dispatched, record.value("kind") == "statfs", armed.get() == true {
+            statfsReached.set(true)
+            releaseStatfs.wait()
+        }
+    }
+    let harness = try await makeSessionHarness(clientConfiguration: configuration)
+    defer { harness.daemon.stop() }
+    armed.set(true)
+    let synchronize = Task { () -> Int in
+        do { try await harness.volume.synchronize(flags: .wait); return 0 }
+        catch { return (error as NSError).code }
+    }
+    _ = await statfsReached.wait()
+    #expect(await harness.daemon.stats().syncVolumeRequests == 1)
+    let shuttingDown = SessionReplyBox<Bool>()
+    await harness.volume.window.testingBeforeTerminalDrain { shuttingDown.set(true) }
+    let shutdown = Task { await harness.volume.shutdown() }
+    _ = await shuttingDown.wait()
+    #expect(await harness.volume.window.isFailed())
+    releaseStatfs.signal()
+    #expect(await synchronize.value == Int(EIO))
+    await shutdown.value
+    #expect(await harness.core.client.isDetachingOrStopped)
+    #expect(await harness.volume.window.admittedCount() == 0)
+}
+
+/// Removing try? alone cannot close the native publication race. This
+/// variant holds an actual successful Statfs response before returning it
+/// to synchronize, so only its final gated reply can reject the result.
+@available(macOS 26.0, *)
+@Test func nativeSynchronizeRevokesItsSuccessfulStatfsResultAtFinalReply() async throws {
+    let armed = SessionReplyBox<Bool>()
+    let statfsID = SessionReplyBox<String>()
+    let statfsReplied = SessionReplyBox<Bool>()
+    let releaseStatfs = DispatchSemaphore(value: 0)
+    var configuration = PfsLocalClient.Configuration()
+    configuration.traceObserver = { record in
+        guard armed.get() == true else { return }
+        if record.event == .dispatched, record.value("kind") == "statfs",
+           let requestID = record.value("request_id") {
+            statfsID.set(requestID)
+        }
+        if record.event == .replied, let requestID = statfsID.get(),
+           record.value("request_id") == requestID {
+            #expect(record.value("errno") == "0")
+            statfsReplied.set(true)
+            releaseStatfs.wait()
+        }
+    }
+    let harness = try await makeSessionHarness(clientConfiguration: configuration)
+    defer { harness.daemon.stop() }
+    armed.set(true)
+    let synchronize = Task { () -> Int in
+        do { try await harness.volume.synchronize(flags: .wait); return 0 }
+        catch { return (error as NSError).code }
+    }
+    _ = await statfsReplied.wait()
+    #expect(await harness.daemon.stats().syncVolumeRequests == 1)
+    await harness.volume.window.fail(PfsLocalClientError.daemon(
+        errno: ENXIO, message: "session ended before synchronize reply"
+    ))
+    releaseStatfs.signal()
+    #expect(await synchronize.value == Int(ENXIO))
+    #expect(await harness.volume.window.admittedCount() == 0)
+    await harness.volume.shutdown()
+}
+
+/// Statfs failure is part of synchronize's outcome, even after the durable
+/// barrier succeeded. It must not become an optional statistics refresh.
+@available(macOS 26.0, *)
+@Test func nativeSynchronizePropagatesItsPostBarrierStatfsError() async throws {
+    let harness = try await makeSessionHarness()
+    defer { harness.daemon.stop() }
+    await harness.daemon.transformNextReply { envelope in
+        guard case .statfsReply? = envelope.body else { return nil }
+        var response = envelope
+        var error = PfsErrorReply()
+        error.errno = EACCES
+        error.message = "statfs refused"
+        response.body = .error(error)
+        return response
+    }
+    let reply = SessionReplyBox<Int>()
+    harness.volume.synchronize(flags: .wait) { error in
+        reply.set((error as NSError?)?.code ?? 0)
+    }
+    #expect(await reply.wait() == Int(EACCES))
+    #expect(await harness.daemon.stats().syncVolumeRequests == 1)
+    #expect(!(await harness.core.client.isDetachingOrStopped))
+    try await harness.volume.synchronize(flags: .wait)
+    #expect(await harness.daemon.stats().syncVolumeRequests == 2)
+    await harness.volume.shutdown()
+}
+
+/// Construction saves a root but does not authorize later activation or
+/// mounting. Both native reply handlers must reenter the publication gate.
+@available(macOS 26.0, *)
+@Test func nativeLifecycleCallbacksRejectTerminationBeforeActivation() async throws {
+    let harness = try await makeSessionHarness()
+    defer { harness.daemon.stop() }
+    let options = try #require(class_createInstance(FSTaskOptions.self, 0) as? FSTaskOptions)
+    #expect(try await harness.volume.activate(options: options) === harness.root)
+    try await harness.volume.mount(options: options)
+
+    let cause = PfsLocalClientError.daemon(errno: ENXIO, message: "session ended before activation")
+    await harness.core.client.close(error: cause)
+    await #expect(throws: cause) { _ = try await harness.core.rootItem() }
+    let activate = SessionReplyBox<Int>()
+    harness.volume.activate(options: options) { item, error in
+        #expect(item == nil)
+        activate.set((error as NSError?)?.code ?? 0)
+    }
+    let mount = SessionReplyBox<Int>()
+    harness.volume.mount(options: options) { error in
+        mount.set((error as NSError?)?.code ?? 0)
+    }
+    let synchronize = SessionReplyBox<Int>()
+    harness.volume.synchronize(flags: .wait) { error in
+        synchronize.set((error as NSError?)?.code ?? 0)
+    }
+    #expect(await activate.wait() == Int(ENXIO))
+    #expect(await mount.wait() == Int(ENXIO))
+    #expect(await synchronize.wait() == Int(ENXIO))
+    #expect(await harness.daemon.stats().syncVolumeRequests == 0)
+    await harness.volume.shutdown()
+    let client = await harness.core.client
+    #expect(client.publicationGate.terminalError as? PfsLocalClientError == cause)
+}
+
+/// loadResource may resume its factory after the constructed volume has
+/// ended. Its final framework reply shares the session gate too.
+@available(macOS 26.0, *)
+@Test func loadResourceRejectsTerminationAfterVolumeConstruction() async throws {
+    let harness = try await makeSessionHarness()
+    defer { harness.daemon.stop() }
+    let factory = SessionGate()
+    let socketPath = harness.daemon.socketPath
+    let fileSystem = PortableFSFileSystem(
+        moduleIdentity: PortableFSIdentity.moduleIdentity,
+        resolverFactory: {
+            PfsSocketPathResolver(infoDictionary: ["PFSDaemonSocketPath": socketPath])
+        },
+        volumeFactory: { _, _, _ in
+            await factory.enter()
+            return harness.volume
+        }
+    )
+    let options = try #require(class_createInstance(FSTaskOptions.self, 0) as? FSTaskOptions)
+    let resource = FSGenericURLResource(url: try #require(URL(string: "dev.portablefs.oss://mock")))
+    let reply = SessionReplyBox<Int>()
+    fileSystem.loadResource(resource: resource, options: options) { volume, error in
+        #expect(volume == nil)
+        reply.set((error as NSError?)?.code ?? 0)
+    }
+    await factory.waitForEntries(1)
+    await harness.core.client.close()
+    await factory.release()
+    #expect(await reply.wait() == Int(EIO))
+    await harness.volume.shutdown()
 }
 
 /// The terminal decision alone settles the losing callback's publication
@@ -501,7 +794,7 @@ private func expectHeldCallbacksRevoked(
     let held = try await holdCompletedCallbacks(harness)
     await harness.daemon.resetStats()
     await harness.volume.window.fail(PfsLocalClientError.shutdown)
-    #expect(!(await harness.core.client.isDetachingOrStopped))
+    // The socket remains connected so the daemon can observe unpublished verdicts.
     try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
 
     #expect(try await waitUntil { await harness.daemon.stats().publicationAcks == 2 })

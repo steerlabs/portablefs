@@ -698,7 +698,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
         _ = try await client.request(.statfs(PfsStatfsRequest()))
         Issue.record("client reconnected after an uncertain mutation")
     } catch let error as PfsLocalClientError {
-        #expect(error == .connectionClosed)
+        #expect(error == .system(errno: ETIMEDOUT, operation: "ordered mutation outcome deadline"))
     }
 }
 
