@@ -192,12 +192,12 @@ func TestFSKitCanceledBeforeDispatchKeepsSessionUsable(t *testing.T) {
 					// Bypass admission's select so a ready ctx.Done cannot hide a
 					// missing dispatch check by winning against the free permit.
 					request := &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
-					response, releaseFrame, dispatchErr := client.dispatchOwnedFrame(ctx, request)
+					response, releaseFrame, submitted, dispatchErr := client.dispatchOwnedFrame(ctx, request)
 					if releaseFrame != nil {
 						releaseFrame()
 					}
 					err = dispatchErr
-					if response != nil || request.GetRequestId() != 0 || request.GetSession() != nil || len(request.GetEpoch()) != 0 {
+					if submitted || response != nil || request.GetRequestId() != 0 || request.GetSession() != nil || len(request.GetEpoch()) != 0 {
 						t.Fatalf("canceled dispatch stamped or completed a request: request=%v response=%v", request, response)
 					}
 				} else {

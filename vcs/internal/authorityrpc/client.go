@@ -1395,7 +1395,8 @@ func (c *Client) callFrame(ctx context.Context, request *authoritypb.Request) (*
 		return nil, nil, err
 	}
 	defer func() { <-admitted.permits }()
-	return c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err := c.dispatchOwnedFrame(ctx, request)
+	return response, releaseFrame, err
 }
 
 // admitCall is the single shape and concurrency boundary for non-mutation
@@ -1430,27 +1431,30 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 // same-epoch reconnect; copying for each attempt only duplicated large write
 // payloads without adding isolation.
 func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	response, releaseFrame, err := c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err := c.dispatchOwnedFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
 }
 
-func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
+// submitted is true once a socket write is attempted: a failed write may have
+// delivered bytes. False settles only this attempt, never an earlier send of the
+// same replay identity. Request IDs alone do not establish submission.
+func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), submitted bool, err error) {
 	// Refuse an already-canceled attempt before stamping or touching a transport:
 	// an expired write deadline must not break a usable connection.
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
 		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
-		return nil, nil, syscall.EOPNOTSUPP
+		return nil, nil, false, syscall.EOPNOTSUPP
 	}
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT &&
 		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
-		return nil, nil, syscall.EOPNOTSUPP
+		return nil, nil, false, syscall.EOPNOTSUPP
 	}
 	role, err := roleForRequest(request)
 	if err != nil {
-		return nil, nil, syscall.EINVAL
+		return nil, nil, false, syscall.EINVAL
 	}
 	transport := c.transportForRole(role)
 	// An idle DATA failure has no coherence meaning. Rebind it lazily before a
@@ -1458,7 +1462,7 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 	// replay, because no bytes for this request have been assigned or sent yet.
 	if role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA && !c.transportIsLive(transport) && !c.poisoned.Load() {
 		if err := c.reconnectTransport(ctx, role); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 	// Request IDs are physical-connection envelopes, not replay identities. A
@@ -1471,26 +1475,27 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 	transport.pendingMu.Lock()
 	if c.closed.Load() {
 		transport.pendingMu.Unlock()
-		return nil, nil, net.ErrClosed
+		return nil, nil, false, net.ErrClosed
 	}
 	if transport.conn == nil {
 		terminal := c.poisoned.Load()
 		transport.pendingMu.Unlock()
 		if terminal {
 			if err := c.SessionEndCause(); err != nil {
-				return nil, nil, err
+				return nil, nil, false, err
 			}
-			return nil, nil, ErrSessionEnded
+			return nil, nil, false, ErrSessionEnded
 		}
 		// Nothing was written. Classifying this as a transport break lets the
 		// read and mutation wrappers safely establish the same epoch and submit
 		// the operation once, while their replay identity remains unchanged.
-		return nil, nil, ErrTransportUncertain
+		return nil, nil, false, ErrTransportUncertain
 	}
 	transport.pending[request.RequestId] = result
 	conn := transport.conn
 	transport.pendingMu.Unlock()
 
+	submitted = true
 	err = c.writeRequest(ctx, transport, conn, request)
 	if err != nil {
 		c.failConnection(transport, conn, ErrTransportUncertain)
@@ -1502,19 +1507,21 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 		defer timer.Stop()
 		select {
 		case completed := <-result:
-			return c.completeCall(request, completed)
+			response, releaseFrame, err = c.completeCall(request, completed)
+			return
 		case <-timer.C:
 			c.failConnection(transport, conn, ErrTransportUncertain)
 			// For every profile, a transport failure after session end reports
 			// the recorded cause, including cancellation during an epoch change.
 			// A local context error cannot replace that terminal verdict.
 			if err := c.SessionEndCause(); err != nil {
-				return nil, nil, err
+				return nil, nil, submitted, err
 			}
-			return nil, nil, ctx.Err()
+			return nil, nil, submitted, ctx.Err()
 		}
 	case completed := <-result:
-		return c.completeCall(request, completed)
+		response, releaseFrame, err = c.completeCall(request, completed)
+		return
 	}
 }
 
@@ -1649,6 +1656,9 @@ func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Reques
 
 func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), err error) {
 	if c.poisoned.Load() {
+		if err := c.SessionEndCause(); err != nil {
+			return nil, nil, err
+		}
 		return nil, nil, ErrTransportUncertain
 	}
 	admitted, err := c.admitCall(ctx, request)
@@ -1700,7 +1710,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 			c.releaseInvalidIncarnation.Store(body.GetIncarnation())
 		}()
 	}
-	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
 	if !errors.Is(err, ErrTransportUncertain) {
 		return response, releaseFrame, err
 	}
@@ -1715,7 +1725,8 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 	if err := c.reconnectTransport(ctx, role); err != nil {
 		return nil, nil, err
 	}
-	return c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
+	return response, releaseFrame, err
 }
 
 // CallIdempotentRetained retains the response until the frontend physically
@@ -1769,8 +1780,8 @@ func (c *Client) callRetained(
 //
 // The client never infers that the authority advanced a slot: every rejection
 // the authority makes before recording an outcome leaves both counters equal.
-// Cancellation after send poisons the client because the outcome is genuinely
-// uncertain to the caller.
+// Cancellation after send without an exact outcome poisons the client because
+// the outcome is genuinely uncertain to the caller.
 func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
@@ -1827,6 +1838,9 @@ func (c *Client) CallMutationWithIdentityRetained(
 	force func(error),
 ) (*authoritypb.Response, ResponseConsumption, error) {
 	if c.poisoned.Load() {
+		if err := c.SessionEndCause(); err != nil {
+			return nil, nil, err
+		}
 		return nil, nil, ErrTransportUncertain
 	}
 	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
@@ -1870,26 +1884,33 @@ func (c *Client) CallMutationWithIdentityRetained(
 			return nil, nil, err
 		}
 	}
-	response, releaseFrame, err := c.dispatchOwnedFrame(ctx, request)
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		consumption.releaseFrame = releaseFrame
-		c.signalSessionEnd(ErrTransportUncertain)
-		return nil, nil, ErrTransportUncertain
-	}
+	response, releaseFrame, submitted, err := c.dispatchOwnedFrame(ctx, request)
 	if errors.Is(err, ErrTransportUncertain) {
 		if releaseFrame != nil {
 			releaseFrame()
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
+			if !submitted && (errors.Is(reconnectErr, context.Canceled) || errors.Is(reconnectErr, context.DeadlineExceeded)) {
+				return nil, nil, reconnectErr
+			}
 			if !errors.Is(reconnectErr, ErrAuthorityChanged) && !errors.Is(reconnectErr, ErrSessionEnded) && !errors.Is(reconnectErr, ErrTransportBinding) {
 				reconnectErr = ErrTransportUncertain
 			}
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
-		response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
+		var replaySubmitted bool
+		response, releaseFrame, replaySubmitted, err = c.dispatchOwnedFrame(ctx, request)
+		submitted = submitted || replaySubmitted
 	}
 	consumption.releaseFrame = releaseFrame
+	// Refusing an unsent attempt leaves its slot unchanged. Once any attempt
+	// may have reached the authority, cancellation cannot settle that identity,
+	// even when the exact replay was refused before its own socket write.
+	if submitted && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		c.signalSessionEnd(ErrTransportUncertain)
+		return nil, nil, c.SessionEndCause()
+	}
 	if err != nil {
 		return nil, nil, err
 	}

@@ -77,6 +77,61 @@ func TestInterruptedIdempotentReportsSessionEndCause(t *testing.T) {
 	}
 }
 
+func TestAlreadyEndedPublicCallsReportSessionEndCause(t *testing.T) {
+	for _, profile := range []authoritypb.FrontendProfile{
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER,
+	} {
+		for _, mutation := range []bool{false, true} {
+			if mutation && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+				continue
+			}
+			for _, cause := range []error{ErrAuthorityChanged, ErrSessionEnded, fmt.Errorf("%w: terminal frame defect", ErrTransportBinding), nil} {
+				for _, canceled := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/mutation=%t/cause=%v/canceled=%t", profile, mutation, cause, canceled), func(t *testing.T) {
+						client := newTerminalDrainTestClient(nil, nil, time.Second)
+						client.cfg.FrontendProfile = profile
+						// The cause is available before frontend enforcement releases
+						// SessionDone. Entry refusal must use this internal verdict.
+						client.cfg.RequireLocalSessionEnforcement = true
+						defer client.Close()
+						want := cause
+						if cause == nil {
+							// Preserve the guards' existing fallback when a poison
+							// edge has no recorded cause yet.
+							client.poisoned.Store(true)
+							want = ErrTransportUncertain
+						} else {
+							client.signalSessionEnd(cause)
+						}
+						ctx, cancel := context.WithCancel(t.Context())
+						defer cancel()
+						if canceled {
+							cancel()
+						}
+						var err error
+						if mutation {
+							_, err = client.CallMutation(ctx, settlementTestMkdir())
+						} else {
+							_, err = client.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}}})
+						}
+						if err != want {
+							t.Fatalf("already ended call = %v, want recorded cause %v", err, want)
+						}
+						if client.data.nextID.Load() != 0 || client.control.nextID.Load() != 0 || client.ordinary.nextSlot.Load() != 0 {
+							t.Fatal("ended call assigned an envelope or replay slot")
+						}
+						if client.SessionError() != nil {
+							t.Fatal("entry refusal bypassed local enforcement")
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 func TestLinuxCanceledMutationReportsSessionEndCause(t *testing.T) {
 	local, peer := net.Pipe()
 	defer peer.Close()

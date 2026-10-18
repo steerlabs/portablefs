@@ -3367,14 +3367,15 @@ func TestMalformedDelegationReleaseReplyEndsSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 1)); err == nil {
+	_, cause := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 1))
+	if cause == nil {
 		t.Fatal("malformed release succeeded")
 	}
 	if client.releaseCompleted != 0 || !client.poisoned.Load() || client.SessionError() == nil {
 		t.Fatal("uncertain result was receipted or session survived")
 	}
-	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 2)); !errors.Is(err, ErrTransportUncertain) {
-		t.Fatal(err)
+	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 2)); err != cause {
+		t.Fatalf("later release = %v, want recorded cause %v", err, cause)
 	}
 	if calls.Load() != 1 {
 		t.Fatal("later release reached wire")
