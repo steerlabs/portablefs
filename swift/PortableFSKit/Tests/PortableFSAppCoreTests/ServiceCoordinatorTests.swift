@@ -690,32 +690,85 @@ private func ownProcessExecutablePath() throws -> String {
     }
 }
 
-/// The app a live daemon was started from was deleted, moved, or replaced
-/// out of band. The daemon cannot be authenticated, so it is refused rather
-/// than stopped.
-@Test func liveOwnerDecisionRefusesADeletedOrReplacedOwnerApp() throws {
+private func ownerMessage(_ owner: Coordinator.UnauthenticatedServiceOwner?) -> String {
+    guard let owner else { return "" }
+    return Coordinator.RegistrationError.unauthenticatedServiceOwner(owner).localizedDescription
+}
+
+/// Only an observed absence is reported as a missing owner app. A bundle
+/// that exists but does not authenticate is reported as exactly that
+/// failure, with the underlying error, not as a guessed replacement.
+@Test func liveOwnerDecisionRefusesAMissingOrUnauthenticatableOwnerApp() throws {
     try withOwnerFixtureDirectory { root in
         let configuration = try ownerTestConfiguration()
+        let socket = root.appendingPathComponent("control.sock").path
 
         let deleted = root.appendingPathComponent("Deleted.app", isDirectory: true)
-        #expect(ownerRefusal {
-            _ = try Coordinator.ownerApp(at: deleted, expected: configuration)
-        } == .ownerAppMissing(app: deleted.path))
+        let missing = ownerRefusal {
+            _ = try Coordinator.ownerApp(at: deleted, expected: configuration, controlSocket: socket)
+        }
+        #expect(missing == .ownerAppMissing(app: deleted.path))
+        #expect(ownerMessage(missing).contains("no longer exists at that path"))
+        #expect(ownerMessage(missing).contains("log out"))
 
-        // A bundle that is present but no longer carries a valid signature
-        // for the release the daemon runs.
-        let replaced = root.appendingPathComponent("Replaced.app", isDirectory: true)
-        _ = try makeOwnerBundle(at: replaced, identifier: "dev.portablefs.oss.KitDev")
-        #expect(ownerRefusal {
-            _ = try Coordinator.ownerApp(at: replaced, expected: configuration)
-        } == .ownerAppReplaced(app: replaced.path))
+        // Present, plausible, but unsigned: the signature check's own error
+        // is the reported failure.
+        let unsigned = root.appendingPathComponent("Unsigned.app", isDirectory: true)
+        _ = try makeOwnerBundle(at: unsigned, identifier: "dev.portablefs.oss.KitDev")
+        let unauthenticated = ownerRefusal {
+            _ = try Coordinator.ownerApp(at: unsigned, expected: configuration, controlSocket: socket)
+        }
+        guard case let .unauthenticated(reportedSocket, step, failure)? = unauthenticated else {
+            Issue.record("an unsigned owner app must be reported as a failed authentication")
+            return
+        }
+        #expect(reportedSocket == socket)
+        #expect(step == .ownerAppSignature(app: unsigned.path))
+        #expect(failure.contains("signature"))
+        #expect(!ownerMessage(unauthenticated).contains("was replaced while"))
 
-        let overwritten = root.appendingPathComponent("Overwritten.app", isDirectory: false)
-        #expect(FileManager.default.createFile(atPath: overwritten.path, contents: Data("x".utf8)))
+        let file = root.appendingPathComponent("File.app", isDirectory: false)
+        #expect(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)))
         #expect(ownerRefusal {
-            _ = try Coordinator.ownerApp(at: overwritten, expected: configuration)
-        } == .ownerAppReplaced(app: overwritten.path))
+            _ = try Coordinator.ownerApp(at: file, expected: configuration, controlSocket: socket)
+        } == .unauthenticated(
+            socket: socket,
+            step: .ownerAppSignature(app: file.path),
+            failure: "the path is not an app bundle"
+        ))
     }
+}
+
+/// "Replaced" is reserved for an established identity mismatch: the daemon
+/// reports a different release or executable than the signed app at its
+/// path. Any other identity mismatch is only a failed proof.
+@Test func ownerReplacementRequiresAnEstablishedIdentityMismatch() {
+    let installed = ownerTestRelease(version: "0.4.2", digit: "b")
+    let app = "/Applications/PortableFS.app"
+    let socket = "/tmp/control.sock"
+    struct Mismatch: LocalizedError { var errorDescription: String? { "identity mismatch" } }
+
+    let olderDaemon = Coordinator.LiveDaemonIdentity(
+        schemaVersion: 1, controlProtocol: 1, daemonVersion: "0.4.1",
+        executableSha256: String(repeating: "c", count: 64), pfslocalMajor: 1, pfslocalMinor: 16
+    )
+    let replaced = Coordinator.identityRefusal(
+        reported: olderDaemon, sealed: installed, app: app, socket: socket, failure: Mismatch()
+    )
+    #expect(replaced == .ownerAppReplaced(
+        app: app,
+        running: "0.4.1 (executable cccccccccccc)",
+        installed: "0.4.2 (executable bbbbbbbbbbbb)"
+    ))
+    #expect(ownerMessage(replaced).contains("was replaced while its daemon ran"))
+
+    let sameReleaseOtherSchema = Coordinator.LiveDaemonIdentity(
+        schemaVersion: 2, controlProtocol: 1, daemonVersion: installed.daemonVersion,
+        executableSha256: installed.executableSHA256, pfslocalMajor: 1, pfslocalMinor: 16
+    )
+    #expect(Coordinator.identityRefusal(
+        reported: sameReleaseOtherSchema, sealed: installed, app: app, socket: socket, failure: Mismatch()
+    ) == .unauthenticated(socket: socket, step: .daemonIdentity, failure: "identity mismatch"))
 }
 
 /// Whatever serves the endpoint without being the daemon nested in a
@@ -734,64 +787,82 @@ private func ownProcessExecutablePath() throws -> String {
                 configuration: configuration
             )
         }
-        #expect(refusal == .foreignProcess(
-            socket: socket.path,
-            executable: try ownProcessExecutablePath()
-        ))
+        let executable = try ownProcessExecutablePath()
+        #expect(refusal == .foreignProcess(socket: socket.path, executable: executable))
+        #expect(ownerMessage(refusal).contains(executable))
+        #expect(ownerMessage(refusal).contains("Quit that program"))
     }
 }
 
-/// A socket that exists but has no listener cannot be attributed to any
-/// owner. It is refused, not treated as an absent daemon.
-@Test func liveOwnerDecisionRefusesAnEndpointWithoutAListener() throws {
+/// connect(2) failures are classified by their real errno. Only
+/// ECONNREFUSED, a socket with no accepting daemon, gets the no-listener
+/// explanation. A file that is not a socket, or a path through a file,
+/// reports the OS error and invents no owner history or recovery.
+@Test func liveOwnerDecisionClassifiesConnectFailuresByTheirErrno() throws {
     try withOwnerFixtureDirectory { root in
-        let socket = root.appendingPathComponent("control.sock")
-        PfsUnixSocket.close(try PfsUnixSocket.bindAndListen(path: socket.path))
-
-        let refusal = ownerRefusal {
-            _ = try Coordinator.inspectLiveServiceOwner(
-                controlSocket: socket,
-                configuration: try ownerTestConfiguration()
-            )
+        let configuration = try ownerTestConfiguration()
+        func classify(_ socket: URL) -> Coordinator.UnauthenticatedServiceOwner? {
+            ownerRefusal {
+                _ = try Coordinator.inspectLiveServiceOwner(
+                    controlSocket: socket,
+                    configuration: configuration
+                )
+            }
         }
-        #expect(refusal == .unreachableEndpoint(socket: socket.path, errno: ECONNREFUSED))
+
+        let stale = root.appendingPathComponent("stale.sock")
+        PfsUnixSocket.close(try PfsUnixSocket.bindAndListen(path: stale.path))
+        let refused = classify(stale)
+        #expect(refused == .unreachableEndpoint(socket: stale.path, errno: ECONNREFUSED))
+        #expect(ownerMessage(refused).contains("no daemon accepted a connection"))
+
+        let regular = root.appendingPathComponent("regular.sock")
+        #expect(FileManager.default.createFile(atPath: regular.path, contents: Data()))
+        let notSocket = classify(regular)
+        #expect(notSocket == .unreachableEndpoint(socket: regular.path, errno: ENOTSOCK))
+        #expect(ownerMessage(notSocket).contains("could not connect"))
+        #expect(ownerMessage(notSocket).contains(String(cString: strerror(ENOTSOCK))))
+        #expect(!ownerMessage(notSocket).contains("restarting"))
+        #expect(!ownerMessage(notSocket).contains("log out"))
+
+        let throughFile = regular.appendingPathComponent("control.sock")
+        let notDirectory = classify(throughFile)
+        #expect(notDirectory == .unreachableEndpoint(socket: throughFile.path, errno: ENOTDIR))
+        #expect(ownerMessage(notDirectory).contains(String(cString: strerror(ENOTDIR))))
     }
 }
 
-/// Each refusal states what happened and the sanctioned recovery. None of
-/// them asks the app to stop the owner it could not authenticate.
-@Test func unauthenticatedOwnerDiagnosesStateTheCauseAndTheSanctionedRecovery() {
+/// Every refusal says that authentication identifies whose inventory may be
+/// trusted, and none of them asks the app to stop the owner it could not
+/// authenticate. Recovery is prescribed only where the cause is observed.
+@Test func unauthenticatedOwnerDiagnosesNameOnlyWhatWasObserved() {
     let socket = "/Users/example/.local/state/portablefs/portablefsd/control.sock"
     let app = "/Applications/PortableFS.app"
     let cases: [(Coordinator.UnauthenticatedServiceOwner, [String])] = [
-        (.unreachableEndpoint(socket: socket, errno: ECONNREFUSED),
-         [socket, "Connection refused", "Reopen PortableFS", "log out"]),
         (.occupiedStateSingleton,
-         ["state lock", "starting or stopping", "installer finish", "log out"]),
-        (.foreignProcess(socket: socket, executable: "/usr/local/bin/portablefsd"),
-         [socket, "/usr/local/bin/portablefsd", "not the daemon service nested", "Quit that program"]),
-        (.foreignProcess(socket: socket, executable: nil),
-         [socket, "cannot bind", "Quit that program"]),
+         ["state lock", "starting or stopping", "another copy of PortableFS", "log out"]),
         (.foreignService(app: "/Applications/PortableFSKitDev.app"),
          ["/Applications/PortableFSKitDev.app", "different signed PortableFS product", "Quit that app", "Login Items"]),
         (.ownerAppMissing(app: app),
-         [app, "deleted or moved", "Unmount", "log out", "installer", "quiesces"]),
-        (.ownerAppMissing(app: nil),
-         ["no longer on disk", "Unmount", "log out", "installer"]),
-        (.ownerAppReplaced(app: app),
-         [app, "modified or replaced", "Unmount", "log out", "installer", "quiesces"]),
+         [app, "no longer exists", "Unmount", "log out", "installer", "quiesces"]),
+        (.ownerAppReplaced(app: app, running: "0.4.1 (executable c)", installed: "0.4.2 (executable b)"),
+         [app, "0.4.1 (executable c)", "0.4.2 (executable b)", "Unmount", "log out", "installer"]),
+        (.unauthenticated(socket: socket, step: .peerBinding, failure: "Operation not permitted"),
+         [socket, "could not bind the process serving it", "Operation not permitted.", "Quit any other copy", "installer"]),
+        (.unauthenticated(socket: socket, step: .executableResolution, failure: "No such file or directory"),
+         ["could not resolve the executable", "No such file or directory."]),
+        (.unauthenticated(socket: socket, step: .daemonIdentity, failure: "invalid control reply"),
+         ["could not read its running daemon's release identity", "invalid control reply."]),
         (.exitedDuringProof,
          ["exited", "Reopen PortableFS"]),
     ]
     for (owner, facts) in cases {
-        let message = Coordinator.RegistrationError
-            .unauthenticatedServiceOwner(owner)
-            .localizedDescription
+        let message = ownerMessage(owner)
         for fact in facts {
             #expect(message.contains(fact), "\(owner) diagnosis omits \"\(fact)\": \(message)")
         }
         if owner != .exitedDuringProof {
-            #expect(message.contains("only a daemon it can authenticate"))
+            #expect(message.contains("authentication identifies the daemon whose mount inventory"))
         }
     }
 }

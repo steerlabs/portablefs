@@ -203,14 +203,20 @@ The host owns service replacement: it derives the outgoing release from the
 authenticated live daemon and its signed owning app, proves an empty mount and
 attach inventory, and unregisters that exact execution before registering its
 own sealed service. Saved preferences do not identify the running release.
-An owner the host cannot authenticate is never stopped, because only that
-proof shows it serves no mounts: a daemon whose app was deleted or replaced
-while it ran, a foreign process or another signed product on the control
-socket, an endpoint without a listener, or a held state lock without an
-endpoint. Startup fails with the cause and the sanctioned recovery: quit the
-other app, let a running installer finish, or unmount and log out to end an
-orphaned daemon. Updates go through the installer, which quiesces the running
-daemon before it replaces the app.
+Authentication identifies whose mount inventory may be trusted; the
+empty-inventory guard is what proves that daemon serves no mounts. An owner
+the host cannot authenticate is therefore never stopped. Examples are a
+daemon whose app was deleted or replaced while it ran, a foreign process or
+another signed product on the control socket, an endpoint the host cannot
+connect to, and a state lock held without an endpoint. Startup fails and
+reports what it observed. Where the cause is established it also gives the
+sanctioned recovery: quit the other app, let a running installer finish, or
+unmount and log out to end an orphaned daemon. Otherwise it reports the
+authentication step that failed and the underlying error. While replacing a
+service that has no endpoint, the host holds the state lock across
+unregistration, so a daemon cannot start between the absence proof and the
+stop. Updates go through the installer, which quiesces the running daemon
+before it replaces the app.
 
 An FSKit frontend loss immediately ends local serving. The daemon retains the
 original authenticated authority transport until the mount supervisor proves

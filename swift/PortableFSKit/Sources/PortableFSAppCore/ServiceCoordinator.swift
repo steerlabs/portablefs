@@ -1579,17 +1579,18 @@ public enum PortableFSDServiceCoordinator {
     /// Classifies whoever serves the account's daemon control endpoint. A
     /// missing endpoint is not proof of absence by itself; see
     /// `replacementWitness`. Every owner that cannot be authenticated as a
-    /// signed release of this product is refused with the precise reason, and
-    /// is never stopped: a socket this app cannot authenticate is no evidence
-    /// that its owner serves no mounts.
+    /// signed release of this product is refused and never stopped, because
+    /// only authentication identifies whose mount inventory the replacement
+    /// may trust. A refusal names a cause only where this probe observed it;
+    /// otherwise it reports the step that failed and the underlying error.
     static func inspectLiveServiceOwner(
         controlSocket: URL,
         configuration: Configuration
     ) throws -> LiveServiceOwner {
+        let socket = controlSocket.path
         func refuse(_ owner: UnauthenticatedServiceOwner) -> RegistrationError {
             .unauthenticatedServiceOwner(owner)
         }
-        let socket = controlSocket.path
         let fd: Int32
         do {
             fd = try PfsUnixSocket.connect(path: socket)
@@ -1603,12 +1604,28 @@ public enum PortableFSDServiceCoordinator {
         let peer: DaemonPeer
         do {
             peer = try captureDaemonPeer(fd)
-        } catch RegistrationError.unresolvableDaemonExecutable(let code) {
-            throw refuse(code == ESRCH ? .exitedDuringProof : .ownerAppMissing(app: nil))
+        } catch RegistrationError.unresolvableDaemonExecutable(let code) where code == ESRCH {
+            throw refuse(.exitedDuringProof)
         } catch RegistrationError.inspectDaemonProcess(let code) where code == ESRCH {
             throw refuse(.exitedDuringProof)
+        } catch RegistrationError.unresolvableDaemonExecutable(let code) {
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .executableResolution,
+                failure: String(cString: strerror(code))
+            ))
+        } catch RegistrationError.inspectDaemonProcess(let code) {
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .peerBinding,
+                failure: String(cString: strerror(code))
+            ))
         } catch RegistrationError.invalidDaemonProcessWitness {
-            throw refuse(.foreignProcess(socket: socket, executable: nil))
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .peerBinding,
+                failure: "its peer credentials, audit token, and process ID do not identify one execution owned by this account"
+            ))
         }
         let bundleURL: URL
         do {
@@ -1616,7 +1633,8 @@ public enum PortableFSDServiceCoordinator {
         } catch {
             throw refuse(.foreignProcess(socket: socket, executable: peer.executableURL.path))
         }
-        let owner = try ownerApp(at: bundleURL, expected: configuration)
+        let app = bundleURL.path
+        let owner = try ownerApp(at: bundleURL, expected: configuration, controlSocket: socket)
         let witness: DaemonProcessWitness
         do {
             witness = try authenticateDaemonPeer(
@@ -1625,28 +1643,68 @@ public enum PortableFSDServiceCoordinator {
                 configuration: owner.configuration,
                 bundle: owner.bundle
             )
-        } catch {
-            throw refuse(
-                try peer.processWitness.hasExited()
-                    ? .exitedDuringProof
-                    : .ownerAppReplaced(app: bundleURL.path)
-            )
+        } catch RegistrationError.invalidDaemonProcessWitness {
+            if try peer.processWitness.hasExited() { throw refuse(.exitedDuringProof) }
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .daemonSignature(app: app),
+                failure: "its running code does not satisfy that app's signing requirement, code directory hash, or entitlements"
+            ))
         }
-        let reported = try readDaemonIdentity(fd)
+        let reported: LiveDaemonIdentity
+        do {
+            reported = try readDaemonIdentity(fd)
+        } catch {
+            if try witness.hasExited() { throw refuse(.exitedDuringProof) }
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .daemonIdentity,
+                failure: error.localizedDescription
+            ))
+        }
         let runningIdentity: PortableFSDReleaseIdentity
         do {
             runningIdentity = try reported.releaseIdentity(sealed: owner.releaseIdentity)
         } catch {
-            // The code signature matched the app on disk, but the process
-            // reports another release: the app was replaced in place while
-            // the old executable kept running.
-            throw refuse(.ownerAppReplaced(app: bundleURL.path))
+            throw refuse(identityRefusal(
+                reported: reported,
+                sealed: owner.releaseIdentity,
+                app: app,
+                socket: socket,
+                failure: error
+            ))
         }
         guard try !witness.hasExited() else {
             throw refuse(.exitedDuringProof)
         }
         return .authenticated(
             RunningDaemon(bundle: owner.bundle, releaseIdentity: runningIdentity)
+        )
+    }
+
+    /// The code signature matched the app on disk, but the daemon's reported
+    /// identity did not. A different release or executable is direct
+    /// evidence that the app was replaced while the old executable kept
+    /// running; any other mismatch is only a failed identity proof.
+    static func identityRefusal(
+        reported: LiveDaemonIdentity,
+        sealed: PortableFSDReleaseIdentity,
+        app: String,
+        socket: String,
+        failure: Error
+    ) -> UnauthenticatedServiceOwner {
+        guard reported.daemonVersion != sealed.daemonVersion
+            || reported.executableSha256 != sealed.executableSHA256 else {
+            return .unauthenticated(
+                socket: socket,
+                step: .daemonIdentity,
+                failure: failure.localizedDescription
+            )
+        }
+        return .ownerAppReplaced(
+            app: app,
+            running: "\(reported.daemonVersion) (executable \(reported.executableSha256.prefix(12)))",
+            installed: "\(sealed.daemonVersion) (executable \(sealed.executableSHA256.prefix(12)))"
         )
     }
 
@@ -1657,42 +1715,43 @@ public enum PortableFSDServiceCoordinator {
     }
 
     /// Authenticates the app a live daemon was started from, as it exists on
-    /// disk now. A missing bundle and a bundle that no longer validates as the
-    /// sealed release are both out-of-band changes to a running service;
-    /// a valid bundle of another signed product is a foreign owner.
+    /// disk now. Only an absent path is reported as a missing app, and only a
+    /// valid bundle of another signed product as a foreign owner; any other
+    /// failure is reported as exactly that failure.
     static func ownerApp(
         at bundleURL: URL,
-        expected: Configuration
+        expected: Configuration,
+        controlSocket: String
     ) throws -> OwnerApp {
+        let app = bundleURL.path
+        func refuse(_ owner: UnauthenticatedServiceOwner) -> RegistrationError {
+            .unauthenticatedServiceOwner(owner)
+        }
+        func refuse(_ step: AuthenticationStep, _ failure: String) -> RegistrationError {
+            refuse(.unauthenticated(socket: controlSocket, step: step, failure: failure))
+        }
         var entry = stat()
-        guard Darwin.lstat(bundleURL.path, &entry) == 0 else {
+        guard Darwin.lstat(app, &entry) == 0 else {
             let code = errno
             if code == ENOENT || code == ENOTDIR {
-                throw RegistrationError.unauthenticatedServiceOwner(
-                    .ownerAppMissing(app: bundleURL.path)
-                )
+                throw refuse(.ownerAppMissing(app: app))
             }
-            throw RegistrationError.inspectOwnerApp(bundleURL.path, code)
+            throw refuse(.ownerAppInspection(app: app), String(cString: strerror(code)))
         }
-        let replaced = RegistrationError.unauthenticatedServiceOwner(
-            .ownerAppReplaced(app: bundleURL.path)
-        )
         guard entry.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
               let bundle = Bundle(url: bundleURL) else {
-            throw replaced
+            throw refuse(.ownerAppSignature(app: app), "the path is not an app bundle")
         }
         let configuration: Configuration
         do {
             configuration = try validateHostAndConfiguration(bundle: bundle)
         } catch {
-            throw replaced
+            throw refuse(.ownerAppSignature(app: app), error.localizedDescription)
         }
         do {
             try validateServiceOwner(configuration, expected: expected)
         } catch {
-            throw RegistrationError.unauthenticatedServiceOwner(
-                .foreignService(app: bundleURL.path)
-            )
+            throw refuse(.foreignService(app: app))
         }
         let releaseIdentity: PortableFSDReleaseIdentity
         do {
@@ -1701,7 +1760,7 @@ public enum PortableFSDServiceCoordinator {
                 configuration: configuration
             )
         } catch {
-            throw replaced
+            throw refuse(.ownerAppSignature(app: app), error.localizedDescription)
         }
         return OwnerApp(
             bundle: bundle,
@@ -2018,50 +2077,83 @@ public enum PortableFSDServiceCoordinator {
         return peer.processWitness
     }
 
+    /// The step of live-owner authentication that failed when no more
+    /// specific cause was observed.
+    enum AuthenticationStep: Equatable {
+        case peerBinding
+        case executableResolution
+        case ownerAppInspection(app: String)
+        case ownerAppSignature(app: String)
+        case daemonSignature(app: String)
+        case daemonIdentity
+
+        var action: String {
+            switch self {
+            case .peerBinding:
+                return "bind the process serving it to one execution in this account"
+            case .executableResolution:
+                return "resolve the executable of the process serving it"
+            case .ownerAppInspection(let app):
+                return "inspect \(app), the app that started its daemon"
+            case .ownerAppSignature(let app):
+                return "authenticate \(app), the app that started its daemon"
+            case .daemonSignature(let app):
+                return "authenticate its running daemon against \(app)"
+            case .daemonIdentity:
+                return "read its running daemon's release identity"
+            }
+        }
+    }
+
     /// A live service owner, or the state singleton behind a missing
-    /// endpoint, that this app cannot authenticate. Authentication is the only
-    /// evidence that a daemon serves no mounts and may be stopped, so each
-    /// case refuses replacement and names a recovery that does not need it.
+    /// endpoint, that this app cannot authenticate. Each case states only
+    /// what the probe observed; the replacement is refused in every case.
     enum UnauthenticatedServiceOwner: Equatable {
-        /// A socket exists at the endpoint, but no daemon accepted a connection.
+        /// connect(2) to the endpoint failed with this errno.
         case unreachableEndpoint(socket: String, errno: Int32)
-        /// No endpoint is published, but a daemon holds the state singleton.
+        /// No endpoint is published, but another process holds the state
+        /// singleton.
         case occupiedStateSingleton
-        /// The endpoint is served by something other than the service nested
-        /// in an app bundle, or by a process outside this account.
-        case foreignProcess(socket: String, executable: String?)
-        /// The endpoint belongs to a different signed product, team, or app group.
+        /// The endpoint is served by an executable outside the daemon service
+        /// nested in an app bundle.
+        case foreignProcess(socket: String, executable: String)
+        /// A validly signed app of another product, team, or app group owns
+        /// the endpoint.
         case foreignService(app: String)
-        /// The daemon's app is gone from the path it was started from. Nil
-        /// when the kernel can no longer name the daemon's executable.
-        case ownerAppMissing(app: String?)
-        /// The app on disk no longer validates as the release the daemon runs.
-        case ownerAppReplaced(app: String)
+        /// The kernel names the daemon's executable inside an app that no
+        /// longer exists at that path.
+        case ownerAppMissing(app: String)
+        /// The daemon reports a different release or executable than the
+        /// signed app at its path.
+        case ownerAppReplaced(app: String, running: String, installed: String)
+        /// An authentication step failed; nothing more is established.
+        case unauthenticated(socket: String, step: AuthenticationStep, failure: String)
         /// The daemon exited while it was being authenticated.
         case exitedDuringProof
 
         var diagnosis: String {
-            let refusal = "PortableFS stops or replaces only a daemon it can authenticate, because nothing else proves that the daemon serves no mounts."
-            let orphanRecovery = "Unmount any PortableFS volumes, log out of macOS and back in to end that daemon, then reopen PortableFS. Update PortableFS with its installer, which quiesces the running daemon before it replaces the app."
+            let refusal = "PortableFS stops or replaces only a daemon it can authenticate, because authentication identifies the daemon whose mount inventory the replacement then proves empty."
+            let installer = "Update PortableFS only with its installer, which quiesces the running daemon before it replaces the app."
+            let orphanRecovery = "Unmount any PortableFS volumes, log out of macOS and back in to end that daemon, then reopen PortableFS. \(installer)"
+            let daemonLog = "~/.local/state/portablefs/portablefsd.log"
             switch self {
+            case let .unreachableEndpoint(socket, code) where code == ECONNREFUSED:
+                return "A socket exists at \(socket), but no daemon accepted a connection on it (\(String(cString: strerror(code)))). \(refusal) Reopen PortableFS in a moment: a starting daemon replaces a socket left by one that stopped. If this persists, \(daemonLog) records why no daemon is listening."
             case let .unreachableEndpoint(socket, code):
-                return "A PortableFS daemon control socket exists at \(socket), but no daemon accepted a connection (\(String(cString: strerror(code)))). A daemon is restarting, or exited without removing its socket. \(refusal) Reopen PortableFS in a moment; if this persists, log out of macOS and back in, then reopen PortableFS."
+                return "PortableFS could not connect to its daemon control socket at \(socket): \(String(cString: strerror(code))). \(refusal) PortableFS leaves that path unchanged; \(daemonLog) records the daemon's own view of it."
             case .occupiedStateSingleton:
-                return "No PortableFS daemon has published its control socket, but a daemon holds the PortableFS state lock, so it is still starting or stopping. \(refusal) Reopen PortableFS once it settles, and let any running PortableFS installer finish first; if this persists, log out of macOS and back in, then reopen PortableFS."
+                return "No PortableFS daemon has published its control socket, but another process holds the PortableFS state lock: a daemon that is starting or stopping, or another copy of PortableFS replacing the service. \(refusal) Reopen PortableFS once it settles. If this persists, quit every other copy of PortableFS; if it still persists, log out of macOS and back in."
             case let .foreignProcess(socket, executable):
-                let owner = executable.map {
-                    "\($0), which is not the daemon service nested in a PortableFS app"
-                } ?? "a process that PortableFS cannot bind to one execution in this account"
-                return "The PortableFS daemon control socket at \(socket) is served by \(owner). \(refusal) Quit that program, then reopen PortableFS."
+                return "The PortableFS daemon control socket at \(socket) is served by \(executable), which is not the daemon service nested in a PortableFS app. \(refusal) Quit that program, then reopen PortableFS."
             case let .foreignService(app):
                 return "The running PortableFS daemon belongs to \(app), a different signed PortableFS product; only one product can own this account's daemon. \(refusal) Quit that app and turn off its background item in System Settings > General > Login Items, then reopen this app."
             case let .ownerAppMissing(app):
-                let origin = app.map {
-                    "was started from \($0), which was deleted or moved while the daemon ran"
-                } ?? "runs an executable that is no longer on disk; its app was deleted or replaced while the daemon ran"
-                return "The running PortableFS daemon \(origin). \(refusal) \(orphanRecovery)"
-            case let .ownerAppReplaced(app):
-                return "The app at \(app) was modified or replaced while its PortableFS daemon was running, so that daemon no longer matches the signed app on disk. \(refusal) \(orphanRecovery)"
+                return "The running PortableFS daemon was started from \(app), which no longer exists at that path. \(refusal) \(orphanRecovery)"
+            case let .ownerAppReplaced(app, running, installed):
+                return "The running PortableFS daemon is release \(running), but \(app) now contains release \(installed): the app was replaced while its daemon ran. \(refusal) \(orphanRecovery)"
+            case let .unauthenticated(socket, step, failure):
+                let reason = failure.hasSuffix(".") ? failure : failure + "."
+                return "PortableFS could not \(step.action) for the daemon control socket at \(socket): \(reason) \(refusal) Quit any other copy of PortableFS and reopen this one. If the app that started the daemon was deleted or replaced while it ran, unmount any PortableFS volumes and log out of macOS and back in to end that daemon. \(installer)"
             case .exitedDuringProof:
                 return "The PortableFS daemon exited while PortableFS was authenticating it. Reopen PortableFS."
             }
@@ -2085,7 +2177,6 @@ public enum PortableFSDServiceCoordinator {
         case unresolvableDaemonExecutable(Int32)
         case invalidDaemonProcessWitness
         case unauthenticatedServiceOwner(UnauthenticatedServiceOwner)
-        case inspectOwnerApp(String, Int32)
         case inspectDaemonStateSingleton(Int32)
         case invalidDaemonStateSingleton
         case daemonStateSingletonHeld
@@ -2132,8 +2223,6 @@ public enum PortableFSDServiceCoordinator {
                 return "PortableFS could not bind the live daemon to its exact signed process execution."
             case .unauthenticatedServiceOwner(let owner):
                 return owner.diagnosis
-            case .inspectOwnerApp(let path, let code):
-                return "PortableFS could not inspect the app at \(path) that started the live daemon: \(String(cString: strerror(code)))"
             case .inspectDaemonStateSingleton(let code):
                 return "PortableFS could not inspect the canonical daemon state singleton: \(String(cString: strerror(code)))"
             case .invalidDaemonStateSingleton:

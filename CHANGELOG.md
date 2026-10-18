@@ -56,18 +56,28 @@ this file is the human-curated summary.
 ### Fixed
 
 - When the macOS app cannot authenticate the live owner of its daemon
-  service, it leaves that owner running and reports the precise cause, such as
-  a deleted or replaced owning app, a foreign socket owner, or a state lock
-  held without an endpoint, together with the sanctioned recovery. It
-  previously surfaced a generic identity or witness error.
+  service, it leaves that owner running and reports what it observed. If it
+  established the cause, it also gives the sanctioned recovery. Established
+  causes are a missing owning app, a replaced app whose daemon reports another
+  release, a foreign process or product on the socket, a socket without a
+  listener, and a state lock held without an endpoint. Otherwise it names the
+  authentication step that failed and the underlying error. It previously
+  surfaced a generic identity or witness error. When replacing a service that
+  has no endpoint, the app now holds the daemon state lock across
+  unregistration, so KeepAlive cannot start an unauthenticated daemon between
+  the absence proof and the stop.
 - The macOS extension runs each FSKit callback once. It no longer reissues a
   callback whose reply carries `publication_retracted`: no daemon withdraws a
-  sent publication, so that bit is a frame defect that retires the connection
-  and fails the callback.
+  sent publication, so that bit is a frame defect that fails the callback and
+  makes the client terminal, including during Hello. Connection backoff now
+  retries only failures to reach the daemon, never a protocol defect, error
+  reply, or version mismatch.
 - An FSKit write through an O_WRONLY open uses that write-only description
   instead of replacing it with a second, read/write OPEN. Rewriting an existing
-  file costs one authority OPEN, a writable but unreadable (0200) file accepts
-  writes, and a chmod after open no longer affects the open's access.
+  file costs one authority OPEN and a writable but unreadable (0200) file
+  accepts writes. An open or I/O that needs another right acquires only that
+  right as its own description instead of reopening both. So a chmod after
+  open never revokes access an earlier open was granted.
 - Restore-mode hydration no longer changes a file's mtime after the user has
   modified it, and lookups and directory listings no longer expose the
   transient hydration mtime.
