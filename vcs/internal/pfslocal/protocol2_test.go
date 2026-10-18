@@ -101,20 +101,33 @@ func TestProtocol2RequiresResolveAndOwningIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The root and its attributes are both required, independently of limits.
-	for _, field := range []int{1, 2} {
-		var incomplete []byte
-		if err := scan(encoded, func(n, wt int, raw []byte) error {
-			if n != field {
-				incomplete = appendVarint(incomplete, uint64(n<<3|wt))
-				incomplete = append(incomplete, raw...)
+	for _, test := range []struct {
+		name  string
+		field int
+	}{
+		{"missing root", 1},
+		{"missing root attributes", 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var incomplete []byte
+			if err := scan(encoded, func(n, wt int, raw []byte) error {
+				if n != test.field {
+					if wt == 2 {
+						incomplete = appendMsg(incomplete, n, raw)
+					} else {
+						incomplete = appendVarint(incomplete, uint64(n<<3|wt))
+						incomplete = append(incomplete, raw...)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
 			}
-			return nil
-		}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := UnmarshalEnvelope(appendMsg(nil, 61, incomplete)); !errors.Is(err, ErrMalformed) {
-			t.Fatalf("accepted missing Resolve field %d: %v", field, err)
-		}
+			want := fmt.Sprintf("%v: incomplete Resolve", ErrMalformed)
+			if _, err := UnmarshalEnvelope(appendMsg(nil, 61, incomplete)); !errors.Is(err, ErrMalformed) || err.Error() != want {
+				t.Fatalf("missing Resolve field %d: got %v, want %q", test.field, err, want)
+			}
+		})
 	}
 }
 

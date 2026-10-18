@@ -2157,7 +2157,7 @@ func TestTerminalSessionEndCannotOvertakeBufferedDataResponse(t *testing.T) {
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	// An authenticated session verdict, not a socket EOF, is terminal.
 	client.signalSessionEnd(ErrSessionEnded)
 	waitForClientTerminalCause(t, client)
 	select {
@@ -2227,7 +2227,7 @@ func TestTerminalSessionEndCannotOvertakeDeliveredResponseCallback(t *testing.T)
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	// An authenticated session verdict, not a socket EOF, is terminal.
 	client.signalSessionEnd(ErrSessionEnded)
 	waitForClientTerminalCause(t, client)
 	select {
@@ -2286,7 +2286,7 @@ func TestTerminalDrainRevokesBeforeForcedSessionDone(t *testing.T) {
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	// An authenticated session verdict, not a socket EOF, is terminal.
 	client.signalSessionEnd(ErrSessionEnded)
 	select {
 	case <-forced:

@@ -36,27 +36,34 @@ func TestSharedConsumerVectors(t *testing.T) {
 			}
 			// The authority needs the complete profile-bearing set to restore
 			// admission/exclusion ownership; cellhost needs its validated size.
-			for _, consumer := range []string{"authority restore", "host absence count"} {
-				t.Run(consumer, func(t *testing.T) {
-					records, err := Decode(encoded, test.volume)
-					if err != nil || len(records) != len(test.records) {
-						t.Fatalf("decode = %v, %v", records, err)
+			t.Run("authority restore", func(t *testing.T) {
+				records, err := Decode(encoded, test.volume)
+				if err != nil || len(records) != len(test.records) {
+					t.Fatalf("decode = %v, %v", records, err)
+				}
+				reencoded, err := Encode(test.volume, records)
+				if err != nil || !bytes.Equal(encoded, reencoded) {
+					t.Fatalf("restored profiles changed: %q, %v", reencoded, err)
+				}
+				for _, want := range test.records {
+					found := false
+					for _, got := range records {
+						found = found || got == want
 					}
-					reencoded, err := Encode(test.volume, records)
-					if err != nil || !bytes.Equal(encoded, reencoded) {
-						t.Fatalf("restored profiles changed: %q, %v", reencoded, err)
+					if !found {
+						t.Fatalf("lost membership %+v", want)
 					}
-					for _, want := range test.records {
-						found := false
-						for _, got := range records {
-							found = found || got == want
-						}
-						if !found {
-							t.Fatalf("lost membership %+v", want)
-						}
-					}
-				})
-			}
+				}
+			})
+			t.Run("host absence count", func(t *testing.T) {
+				records, err := Decode(encoded, test.volume)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got, want := len(records), len(test.records); got != want {
+					t.Fatalf("validated membership count = %d, want %d", got, want)
+				}
+			})
 		})
 	}
 }

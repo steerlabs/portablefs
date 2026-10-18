@@ -75,6 +75,32 @@ func TestMkdirReplyCanonicalFrame(t *testing.T) {
 	}
 }
 
+func TestMkdirFrameRejectsMalformedResult(t *testing.T) {
+	reply := mkdirTestReply(true)
+	reply.GetMkdir().Item = nil
+	want := fmt.Sprintf("%v: malformed mkdir result", ErrFrameEncoding)
+	t.Run("write", func(t *testing.T) {
+		var frame bytes.Buffer
+		if err := writeFrame(&frame, testMaxFrame, reply); !errors.Is(err, ErrFrameEncoding) || err.Error() != want {
+			t.Fatalf("write malformed mkdir: got %v, want %q", err, want)
+		}
+		if frame.Len() != 0 {
+			t.Fatal("wrote bytes before rejecting malformed mkdir")
+		}
+	})
+	t.Run("read", func(t *testing.T) {
+		// Bypass the writer's check so ingress must validate the body itself.
+		raw, err := canonicalBytes(reply.ProtoReflect())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded authoritypb.Response
+		if err := readFrame(bytes.NewReader(encodedRawFrame(raw, nil)), testMaxFrame, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) || err.Error() != want {
+			t.Fatalf("read malformed mkdir: got %v, want %q", err, want)
+		}
+	})
+}
+
 func TestMkdirClientRequiresExactOwningResult(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -100,6 +126,8 @@ func TestMkdirClientRequiresExactOwningResult(t *testing.T) {
 		{"unequal snapshot", func(r *authoritypb.Response) { r.PostState.SnapshotSequence = 12; r.PostState.VisibilitySequence = 12 }},
 		{"unequal visibility", func(r *authoritypb.Response) { r.PostState.VisibilitySequence = 10 }},
 		{"missing parent", func(r *authoritypb.Response) { r.PostState.Objects = r.PostState.Objects[1:] }},
+		{"parent not a directory", func(r *authoritypb.Response) { r.PostState.Objects[0].Attr.Kind = authoritypb.Attr_REGULAR }},
+		{"zero parent inode", func(r *authoritypb.Response) { r.PostState.Objects[0].Attr.Inode = 0 }},
 		{"wrong roles", func(r *authoritypb.Response) { r.PostState.Objects[1].Roles = postStateRoleTarget }},
 		{"duplicate objects", func(r *authoritypb.Response) { r.PostState.Objects[0] = r.PostState.Objects[1] }},
 		{"zero post identity", func(r *authoritypb.Response) { r.PostState.Objects[0].StableIdentity = make([]byte, 16) }},
