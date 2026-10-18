@@ -17,11 +17,10 @@ import (
 
 // An actor performs POSIX operations against one mount of the volume under
 // test. Every case in the matrix is written against this interface alone, so
-// exactly the same case body runs when both mounts are on this machine (two
-// FUSE mounts of one authority) and when the second mount lives on another
-// machine reached over ssh (a Linux peer of a Mac's FSKit mount). That is what
-// makes a Linux result and a macOS result directly comparable rather than two
-// independently written suites that happen to share vocabulary.
+// shared case bodies run with two local FUSE mounts or a Mac and an SSH Linux
+// peer. Their names are comparable within the declared actor roles: exclusive
+// mode routes both logical writers to the Mac, with Linux observing its effects;
+// only the Linux matrix measures two writable mounts.
 type actor interface {
 	name() string
 	exec(request) (response, error)
@@ -76,13 +75,14 @@ type statInfo struct {
 	Nlink   uint64 `json:"nlink"`
 	MtimeNs int64  `json:"mtime_ns"`
 	AtimeNs int64  `json:"atime_ns"`
+	CtimeNs int64  `json:"ctime_ns"`
 	IsDir   bool   `json:"is_dir"`
 	IsLink  bool   `json:"is_link"`
 }
 
 func (s *statInfo) String() string {
-	return fmt.Sprintf("{ino=%d size=%d perm=%04o nlink=%d uid=%d gid=%d mtime=%d dir=%t link=%t}",
-		s.Ino, s.Size, s.Perm, s.Nlink, s.UID, s.GID, s.MtimeNs, s.IsDir, s.IsLink)
+	return fmt.Sprintf("{ino=%d size=%d perm=%04o nlink=%d uid=%d gid=%d mtime=%d atime=%d ctime=%d mode=%#o dir=%t link=%t}",
+		s.Ino, s.Size, s.Perm, s.Nlink, s.UID, s.GID, s.MtimeNs, s.AtimeNs, s.CtimeNs, s.Mode, s.IsDir, s.IsLink)
 }
 
 // ---------------------------------------------------------------------------

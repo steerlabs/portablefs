@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"path"
 	"slices"
 	"syscall"
 )
@@ -40,44 +41,67 @@ func readerMutationAttempts(c *caseRun) []request {
 	}
 }
 
-// exclusionSnapshot is everything either mount can observe about the fixture.
-type exclusionSnapshot struct {
-	names    []string
-	kept     statInfo
-	keptData []byte
-	keptdir  statInfo
+// exclusionMetadata includes the targets, their containing directory, and its
+// parent. Compare each mount with itself: owner mapping, directory sizes and
+// timestamp representations need not agree between FSKit and Linux.
+type exclusionMetadata struct {
+	kept, keptdir, dir, parent statInfo
 }
 
-func (s exclusionSnapshot) equal(o exclusionSnapshot) bool {
-	return slices.Equal(s.names, o.names) && bytes.Equal(s.keptData, o.keptData) &&
-		s.kept.Ino == o.kept.Ino && s.kept.Size == o.kept.Size && s.kept.Perm == o.kept.Perm &&
+// Preserve the initial cross-mount checks for the common logical attributes.
+// The full per-mount comparisons below also cover platform-specific fields.
+func (s exclusionMetadata) sameFixture(o exclusionMetadata) bool {
+	return s.kept.Ino == o.kept.Ino && s.kept.Size == o.kept.Size && s.kept.Perm == o.kept.Perm &&
 		s.kept.Nlink == o.kept.Nlink && s.kept.MtimeNs == o.kept.MtimeNs &&
 		s.keptdir.Ino == o.keptdir.Ino && s.keptdir.Perm == o.keptdir.Perm && s.keptdir.IsDir == o.keptdir.IsDir
 }
 
-func (s exclusionSnapshot) String() string {
-	return fmt.Sprintf("names=%v kept=%s data=%q keptdir=%s", s.names, s.kept.String(), preview(s.keptData), s.keptdir.String())
+func (s exclusionMetadata) String() string {
+	return fmt.Sprintf("kept=%s keptdir=%s dir=%s parent=%s", &s.kept, &s.keptdir, &s.dir, &s.parent)
 }
 
-// snapshotOn reads the fixture through one mount. Any failure to observe
-// aborts the case: both mounts must stay readable throughout.
-func snapshotOn(c *caseRun, who actor) exclusionSnapshot {
-	var s exclusionSnapshot
-	s.names = c.names(who, c.dir)
-	kept, err := c.stat(who, c.p("kept"))
-	if err != "" {
-		c.abort("%s: stat kept: %s", who.name(), err)
+func exclusionMetadataOn(c *caseRun, who actor) exclusionMetadata {
+	var s exclusionMetadata
+	for _, target := range []struct {
+		path string
+		stat *statInfo
+	}{
+		{c.p("kept"), &s.kept},
+		{c.p("keptdir"), &s.keptdir},
+		{c.dir, &s.dir},
+		{path.Dir(c.dir), &s.parent},
+	} {
+		st, err := c.stat(who, target.path)
+		if err != "" || st == nil {
+			c.abort("%s: stat %s: %s (metadata present: %t)", who.name(), target.path, err, st != nil)
+		}
+		*target.stat = *st
 	}
+	return s
+}
+
+type exclusionSnapshot struct {
+	names    []string
+	keptData []byte
+}
+
+func (s exclusionSnapshot) equal(o exclusionSnapshot) bool {
+	return slices.Equal(s.names, o.names) && bytes.Equal(s.keptData, o.keptData)
+}
+
+func (s exclusionSnapshot) String() string {
+	return fmt.Sprintf("names=%v data=%q", s.names, preview(s.keptData))
+}
+
+// Observe contents only after both mounts' timestamp checks: reads and readdir
+// can update the shared inode's atime even when exclusion is working.
+func snapshotOn(c *caseRun, who actor) exclusionSnapshot {
+	names := c.names(who, c.dir)
 	data, err := c.readBytes(who, c.p("kept"))
 	if err != "" {
 		c.abort("%s: read kept: %s", who.name(), err)
 	}
-	keptdir, err := c.stat(who, c.p("keptdir"))
-	if err != "" {
-		c.abort("%s: stat keptdir: %s", who.name(), err)
-	}
-	s.kept, s.keptData, s.keptdir = *kept, data, *keptdir
-	return s
+	return exclusionSnapshot{names: names, keptData: data}
 }
 
 func runWriterExclusion(c *caseRun) {
@@ -91,7 +115,18 @@ func runWriterExclusion(c *caseRun) {
 		c.abort("the reader does not observe the writer's fixture before any attempt: writer %s, reader %s", before, readerView)
 	}
 
+	writerMetadata, readerMetadata := exclusionMetadataOn(c, c.writer), exclusionMetadataOn(c, c.reader)
+	if !readerMetadata.sameFixture(writerMetadata) {
+		c.abort("the reader does not observe the writer's initial metadata: writer %s, reader %s", writerMetadata, readerMetadata)
+	}
+	mounts := []actor{c.writer, c.reader}
 	for _, req := range readerMutationAttempts(c) {
+		// All observational reads from the preceding attempt finish before
+		// these baselines; no content read intervenes until both checks end.
+		beforeMetadata := make([]exclusionMetadata, len(mounts))
+		for i, who := range mounts {
+			beforeMetadata[i] = exclusionMetadataOn(c, who)
+		}
 		out := c.do(c.reader, req)
 		if out.Handle != 0 {
 			// A write-intent open that succeeded is itself the violation;
@@ -106,7 +141,13 @@ func runWriterExclusion(c *caseRun) {
 		}
 		// No refused attempt may leave a partial effect visible to either
 		// mount, and both mounts must still read the fixture.
-		for _, who := range []actor{c.writer, c.reader} {
+		for i, who := range mounts {
+			if after := exclusionMetadataOn(c, who); after != beforeMetadata[i] {
+				c.fail("%s: metadata changed after the reader's refused %s %s: before %s, after %s",
+					who.name(), req.Op, req.Path, beforeMetadata[i], after)
+			}
+		}
+		for _, who := range mounts {
 			if after := snapshotOn(c, who); !after.equal(before) {
 				c.fail("%s: the fixture changed after the reader's refused %s %s: before %s, after %s",
 					who.name(), req.Op, req.Path, before, after)

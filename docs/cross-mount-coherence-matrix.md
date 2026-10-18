@@ -255,14 +255,19 @@ its mutations on the Mac and its pathname observations on the Linux peer; an
 operation on a descriptor runs on the mount that opened it, and the peer-loss
 case, whose roles already match, runs on the real mounts. Each retained case
 therefore checks that Linux observes the Mac's changes coherently. One added
-case, `writer_exclusion_refuses_reader_mutations`, asserts the exclusion
+case (30 cases versus the ordinary/Linux driver's 29),
+`writer_exclusion_refuses_reader_mutations`, asserts the exclusion
 positively: it attempts a write-intent open, create, write, unlink, rename,
 mkdir, rmdir, chmod, truncate, timestamp change, symlink and hard link from the
 Linux peer, requires each to fail with exactly `EBUSY`, requires both mounts to
-read an unchanged fixture (names, bytes, inode, size, mode, link count, mtime)
-after every attempt, and then requires a new Mac write to reach Linux. Any other
-errno, a success, a partial change, a hang, or a failed observation fails the
-run; no case is declared to fail. Cases that need Linux-side harness commands or
+read unchanged names and bytes after every attempt. Each mount's file,
+`keptdir`, case-directory and parent metadata (inode, size, full mode, ownership,
+link count, atime, mtime and ctime) must equal that mount's own pre-attempt
+baseline. Both mounts' metadata is checked before content reads or directory
+enumeration can update atime; fields such as owner mapping and directory size
+are not compared across platforms. The case then requires a new Mac write to
+reach Linux. Any other errno, a success, a partial change, a hang, or a failed
+observation fails the run; no case is declared to fail. Cases that need Linux-side harness commands or
 machine-local routes, the ownership case on a single-principal volume, and the
 peer-loss case without a fence command are declared SKIP and skip by themselves
 with the same reason. The two-writer form of the shared cases is measured only

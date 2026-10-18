@@ -244,7 +244,8 @@ echo
 "$MATRIX_BIN" "${ARGS[@]}" "${EXPECT[@]}" --json "${PFS_MATRIX_JSON:-/dev/null}"
 status=$?
 echo
-echo "The case names above are identical to scripts/coherence-matrix-linux.sh."
-echo "Compare the two matrices directly; a case that is green on Linux and red"
-echo "here is a macOS frontend defect, not a difference in what was measured."
+echo "Shared case names are comparable within each matrix's declared actor roles."
+echo "This mode has 30 cases versus Linux's 29, adding"
+echo "writer_exclusion_refuses_reader_mutations. Shared cases write through the Mac"
+echo "and observe from Linux; two-writer cross-mount behavior is measured by Linux."
 exit $status
