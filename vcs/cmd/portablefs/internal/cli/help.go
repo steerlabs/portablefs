@@ -116,8 +116,8 @@ stdin open across the exact ServiceManagement unregister/register transaction;
 closing stdin releases both guards.
 When replacing a release, the host derives all four expected-daemon fields
 from the authenticated live daemon and its signed executable and sealed release.
-The CLI authenticates the socket peer and reads lifecycle v1 inventory using
-that outgoing release's actual protocol values. The four fields are all-or-none; omission is valid
+The CLI authenticates the socket peer and checks the outgoing release identity
+before reading the fixed lifecycle v1 inventory. The four fields are all-or-none; omission is valid
 only when no prior live daemon needs adoption.
 Identity prints the linker-stamped FSKit app group for packaging validation;
 portablefsd exposes the same JSON with ` + "`portablefsd -identity-json`" + `.
@@ -243,8 +243,9 @@ EXAMPLES
 Unmount a PortableFS mount and stop its supervisor. On macOS, normal unmount
 makes one unforced kernel attempt. EBUSY leaves the mount present and requires
 closing user or system references before retrying; PortableFS never escalates
-a normal request to force. Exact absence, authority proof delivery, and local
-cleanup are reported separately.
+a normal request to force. Errors distinguish exact kernel absence from a
+still-present or unverified kernel mount. A daemon error can mean incomplete
+authority proof delivery or local cleanup; the daemon does not identify which.
 
 --force requests immediate detach of the exact recorded mount. Kernel dirty
 pages may not have crossed the normal synchronization boundary.
@@ -254,7 +255,7 @@ The command reconciles the exact process, resources and durable mount state.
 Missing or conflicting identity fails closed.
 
 --discard-record is the terminal for BOOKKEEPING, not for a mount. It unmounts
-nothing, signals nothing and parks nothing; it removes this path's mount record
+nothing and signals nothing; it removes this path's mount record
 and any incomplete operation intent, and only after proving all of: no kernel
 mount exists at the path, the recorded mount owner is gone, the incomplete
 operation's owner is gone, portablefsd holds no durable attach for the path, and

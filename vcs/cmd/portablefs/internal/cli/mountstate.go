@@ -82,10 +82,6 @@ type mountState struct {
 	// two different verdicts wearing one file.
 	StatusReason string `json:"statusReason,omitempty"`
 	StatusDetail string `json:"statusDetail,omitempty"`
-	// ForceParkAcknowledged is the durable response frame for the exact
-	// identity-bound SIGUSR1 force protocol used by Linux FUSE. The owner
-	// publishes it only after CloseJournalDurable has fsynced the recovery
-	// job, and before it detaches the kernel mount.
 }
 
 // Exact data-plane identities for the two supported mount strategies.
@@ -594,7 +590,7 @@ func validatePersistedDataPlaneTransport(st *mountState) error {
 	return nil
 }
 
-// emptyRoutesRevision is the revision of a volume that declares nothing —
+// emptyRoutesRevision is the revision of a volume with no local routes.
 func emptyRoutesRevision() string { return localroutes.RuleSet{}.RevisionHex() }
 
 // The recorded canonical rules must hash to the exact authority-pinned revision.
@@ -761,9 +757,6 @@ func writeLocalRoutesRecord(mountsDir, volumeID string, routes mountRoutes, nowM
 	return nil
 }
 
-// readPersistedLocalDirs loads the graft roots remembered for a mount key;
-// missing or unreadable records mean "none" (the record is a convenience, not
-// a source of truth the mount should fail on).
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false

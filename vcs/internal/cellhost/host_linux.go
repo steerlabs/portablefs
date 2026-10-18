@@ -518,6 +518,12 @@ func (host *Host) openCellRoot() (int, error) {
 		_ = unix.Close(rootFD)
 		return -1, err
 	}
+	// The service owns the volume child, never the namespace containing it.
+	// Otherwise it could replace the child between privileged operations.
+	if rootStat.Uid != 0 || rootStat.Gid != 0 || rootStat.Mode&0o022 != 0 {
+		_ = unix.Close(rootFD)
+		return -1, errors.New("cellhost: cell root must be root-owned and not writable by group or others")
+	}
 	if err := unix.Stat(filepath.Dir(host.cfg.CellRoot), &parentStat); err != nil {
 		_ = unix.Close(rootFD)
 		return -1, err

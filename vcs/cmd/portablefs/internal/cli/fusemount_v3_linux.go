@@ -30,9 +30,7 @@ type fuseV3Config struct {
 	mountInstanceID string
 	// backingRoot is the per-machine tree that serves the volume's declared
 	// machine-local routes; used only when the adopted rule set is non-empty.
-	backingRoot string
-	// noLocalDirs refuses a volume that declares machine-local routes instead
-	// of serving them (adopt=false in the attach protocol).
+	backingRoot            string
 	requireMountEnrollment bool
 	// onRevoked observes this mount's self-revocation. It is handed to the
 	// engine at construction because a strict mount can revoke before

@@ -905,61 +905,6 @@ func terminateUnidentifiedStartedMount(cmd *exec.Cmd, operation *mountOperation,
 	)
 }
 
-func detachFUSEWithPreparedIntent(operation *mountOperation, pid int, identity string, detach func() error) error {
-	if operation == nil || detach == nil {
-		return fmt.Errorf("missing FUSE detach transaction")
-	}
-	prior, err := readMountIntent(operation.intentPath, operation.mountPath)
-	if err != nil {
-		return fmt.Errorf("read pre-detach intent: %w", err)
-	}
-	if prior == nil {
-		return fmt.Errorf("pre-detach intent is missing")
-	}
-	if prior.Phase == "force-prepared" {
-		// The explicit force request and durable journal-park proof already
-		// form the recovery barrier. Preserve that stronger fact until exact
-		// detach and resource finalization complete.
-		return detach()
-	}
-	if err := operation.writeIntent("drain-prepared", pid, identity); err != nil {
-		return fmt.Errorf("publish drain-prepared intent: %w", err)
-	}
-	if err := detach(); err != nil {
-		operationIdentity, identityErr := processStartIdentity(os.Getpid())
-		if identityErr == nil {
-			prior.OperationOwnerPID = os.Getpid()
-			prior.OperationOwnerStartIdentity = operationIdentity
-			prior.UpdatedAtMs = time.Now().UnixMilli()
-		}
-		rollbackErr := writeMountIntentRecord(operation.intentPath, prior)
-		abortErr := func() error {
-			if identityErr != nil {
-				return fmt.Errorf("record drain-prepared abort identity: %w", identityErr)
-			}
-			if rollbackErr != nil {
-				return fmt.Errorf("durably abort drain-prepared intent: %w", rollbackErr)
-			}
-			return nil
-		}()
-		if rollbackErr != nil {
-			return &fusePreparedAbortFailFrozenError{cause: errors.Join(err, abortErr)}
-		}
-		return errors.Join(err, abortErr)
-	}
-	return nil
-}
-
-type fusePreparedAbortFailFrozenError struct {
-	cause error
-}
-
-func (e *fusePreparedAbortFailFrozenError) Error() string { return e.cause.Error() }
-func (e *fusePreparedAbortFailFrozenError) Unwrap() error { return e.cause }
-func (e *fusePreparedAbortFailFrozenError) KeepWritebackFrozen() bool {
-	return true
-}
-
 func terminateSpawnedMount(cmd *exec.Cmd, expectedStart string) error {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -1268,9 +1213,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		return nil
 	}
 	finalizeCleanedStartup := func(cause error) int {
-		// Callers enter only after exact kernel/attach cleanup. Lease release
-		// is part of the same transaction and precedes deletion of either
-		// recovery anchor.
+		// Exact kernel/attach cleanup precedes deletion of either recovery anchor.
 		if err := publishCleanedResources(); err != nil {
 			return failReady(errors.Join(cause, err))
 		}
@@ -1608,9 +1551,8 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		}
 		// The daemon-owned v3 attach: portablefsd dials the authority under
 		// this exact transport with the mutual-TLS identity below, declares the
-		// strict barrier contract, and never exposes the credentials to the
-		// FSKit extension. Branch is empty (a v3 volume is branchless) and the
-		// clientcore-only options are omitted — the daemon refuses both.
+		// strict barrier contract, and receives the current required attach
+		// shape. Credentials never enter the FSKit extension.
 		attachReply, err := ctl.ensureAttachDetailed(fskitEnsureAttachRequest{
 			AttachRef:            attachRef,
 			VolumeID:             volumeID,
@@ -1683,7 +1625,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err := operation.writeIntent("kernel-mounted", os.Getpid(), processIdentity); err != nil {
 			return failAfterKernelMount(err)
 		}
-		attestReadiness := func() error { return ctl.requireNativeFrontendReady(attachRef) }
+		attestReadiness := func() error { return ctl.requireFrontendReady(attachRef) }
 		if err := waitForFSKitReady(
 			mountPath,
 			fskitCfg.fsType,
@@ -1738,8 +1680,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				continue
 			}
 			if shutdownRequested && present {
-				if err := ctl.unmountAttach(attachRef); err != nil {
-					fmt.Fprintf(e.stderr, "portablefs mount: daemon-owned shutdown transaction refused; mount remains live: %v\n", err)
+				_, shutdownErr := unmountFSKitWithKernelOutcome(&state, func() error { return ctl.unmountAttach(attachRef) })
+				if shutdownErr != nil {
+					fmt.Fprintf(e.stderr, "portablefs mount: daemon-owned shutdown transaction failed: %v; state and intent were preserved\n", shutdownErr)
 					continue
 				}
 				present = false
@@ -1783,7 +1726,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 					fmt.Fprintf(e.stderr, "portablefs mount: kernel mount is gone and the daemon barrier is unavailable (%v); finalizing locally, the authority session ends fenced\n", err)
 					break
 				}
-				fmt.Fprintf(e.stderr, "portablefs mount: detach after kernel unmount refused; attach remains live: %v\n", err)
+				fmt.Fprintf(e.stderr, "portablefs mount: kernel mount is absent; daemon finalization failed: %v\n", err)
 				continue
 			}
 			break
@@ -2124,7 +2067,6 @@ type detachOutcome uint8
 const (
 	detachNone detachOutcome = iota
 	detachFUSECooperative
-	detachFUSEForced
 	detachFSKitDaemon
 )
 
@@ -2137,8 +2079,6 @@ func decidePostUnmount(mounted bool, outcome detachOutcome) (needsPlatformUnmoun
 		return false, false, fmt.Errorf("unmount produced an unknown detach outcome %d; state and intent were preserved", outcome)
 	case mounted && outcome == detachFSKitDaemon:
 		return false, false, fmt.Errorf("daemon-owned FSKit unmount acknowledged completion but the exact kernel mount remains; state and intent were preserved")
-	case mounted && outcome == detachFUSEForced:
-		return false, false, fmt.Errorf("forced FUSE owner acknowledged parking but the exact kernel mount remains; state and intent were preserved")
 	case mounted && outcome == detachFUSECooperative:
 		return false, false, fmt.Errorf("cooperative FUSE unmount completed but the exact kernel mount remains; state and intent were preserved")
 	case mounted:
@@ -2347,8 +2287,14 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
 			return err
 		}
 		if present {
-			if err := ctl.unmountRecordedAttach(st); err != nil {
-				return err
+			var cleanupErr error
+			if force {
+				cleanupErr = ctl.forceDetach(st.AttachRef)
+			} else {
+				cleanupErr = ctl.unmountRecordedAttach(st)
+			}
+			if cleanupErr != nil {
+				return fmt.Errorf("kernel mount is absent; daemon cleanup or absence-proof delivery failed: %w", cleanupErr)
 			}
 		}
 	}
@@ -2389,9 +2335,6 @@ func (e *cmdEnv) drainBeforeUnmount(st *mountState) error {
 	return fmt.Errorf("unsupported recorded mount strategy %q", st.Strategy)
 }
 
-// forceDetachForUnmount runs the required explicit force path against the
-// exact live daemon attach. The caller must not remove the kernel mount,
-// state, or intent unless this durable parking acknowledgement succeeds.
 // v3FSKitDaemonDetach runs the daemon-owned detach transaction for a v3
 // attach when the daemon still owns one, and reports whether that transaction
 // already performed the kernel detach.
@@ -2444,15 +2387,25 @@ func (e *cmdEnv) v3FSKitDaemonDetach(st *mountState, force bool) (kernelDetached
 		}
 		return true, nil
 	}
-	if err := ctl.unmountRecordedAttach(st); err != nil {
-		present, classifyErr := recordedKernelMountPresent(st)
-		if classifyErr != nil {
-			return false, errors.Join(fmt.Errorf("daemon-owned FSKit unmount failed: %w", err), classifyErr)
-		}
+	return unmountFSKitWithKernelOutcome(st, func() error { return ctl.unmountRecordedAttach(st) })
+}
+
+// A daemon error cannot establish whether the kernel detach completed. Keep
+// exact kernel absence independent of the daemon's remaining transaction work.
+func unmountFSKitWithKernelOutcome(st *mountState, unmount func() error) (bool, error) {
+	unmountErr := unmount()
+	present, classifyErr := recordedKernelMountPresent(st)
+	if classifyErr != nil {
+		return false, errors.Join(unmountErr, fmt.Errorf("kernel mount presence is unverified: %w", classifyErr))
+	}
+	if unmountErr != nil {
 		if !present {
-			return true, fmt.Errorf("kernel mount is absent; daemon cleanup or absence-proof delivery failed: %w", err)
+			return true, fmt.Errorf("kernel mount is absent; daemon cleanup or absence-proof delivery failed: %w", unmountErr)
 		}
-		return false, fmt.Errorf("daemon-owned FSKit unmount failed; kernel mount remains present: %w", err)
+		return false, fmt.Errorf("daemon-owned FSKit unmount failed; kernel mount remains present: %w", unmountErr)
+	}
+	if present {
+		return false, fmt.Errorf("daemon-owned FSKit unmount acknowledged completion but the exact kernel mount remains")
 	}
 	return true, nil
 }

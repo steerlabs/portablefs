@@ -25,10 +25,15 @@ concurrency:
 jobs:
   # dm-log-writes is not exposed on GitHub-hosted runners, so this instrument
   # uses a capability-labeled self-host. The label says nothing about a custom
-  # FUSE dialect; the filesystem under test uses the same stock interface as CI.
+  # FUSE dialect or an exact kernel patch release. The authority requires
+  # upstream Linux 5.17 final or newer plus the real filesystem/capability
+  # probes; the filesystem under test uses the same stock interface as CI.
   linux-power-loss:
     runs-on: [self-hosted, linux, x64, portablefs-dm-log-writes]
-    timeout-minutes: 90
+    # Linux checkpoints, FSKit acknowledged mutations, and process-crash cuts
+    # share one suite. Leave room beyond its own timeout for provisioning and
+    # evidence upload so a native test timeout retains its diagnostics.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -46,6 +51,8 @@ jobs:
           test -e /dev/fuse
           sudo dmsetup targets | grep -q '^log-writes'
       - name: Power-cut and crash-consistency harness
+        env:
+          PORTABLEFS_POWERLOSS_TIMEOUT: 90m
         run: bash scripts/run-powerloss.sh
       # The suite output and the data-plane process logs are what a failed run
       # is read from. The harness writes them into this directory from inside

@@ -640,19 +640,17 @@ tolerates one documented residual (phase 7).
 WATCH THESE WHILE THE CORPUS RUNS — a pass here with either of these firing is
 not a clean result, it is a result the authority paid for:
 
-  1. RecallBudget exhaustion. When a peer mount does not discharge a recall
-     within the authority's recall budget, the authority fences that peer's
-     session and the mutation waits out the old conservative expiry bound. It
-     delays one mutation and does not fence the volume, so it is invisible from
-     inside this script. Watch the authority's admin endpoint:
+  1. Session fencing and Linux withdrawal delays. A missing withdrawal
+     acknowledgement delays a conflicting mutation until the old promised
+     horizon ends or exact withdrawal is proved. Inspect the authority's admin
+     endpoint and the correlated request trace:
 
-       portablefs_authority_fence_events_total{reason="repair_deadline"}
-       portablefs_authority_fence_events_total{reason="other"}
-       portablefs_authority_visibility_barrier_duration_seconds
+       portablefs_authority_fence_events_total
+       portablefs_authority_rpc_requests_total{outcome="coherence"}
 
-     Any nonzero increment of the fence counters during a run means a peer was
-     too slow to give a lease back. Rising barrier duration without fences is
-     the same problem before it becomes one.
+     Compare counter increments over this run with session and request trace
+     outcomes. A fence counter alone does not identify the cause or prove a
+     peer was too slow; retain the reason and exact session evidence.
 
   2. Uncertain-outcome revocations. When the authority cannot establish the
      exact result of an operation, it reports uncertainty or ends the session

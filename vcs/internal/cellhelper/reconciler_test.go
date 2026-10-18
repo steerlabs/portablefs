@@ -500,7 +500,16 @@ func TestEffectiveVolumePlanInheritsEnclosingTrust(t *testing.T) {
 }
 
 func TestHelperStateKeepsExactVersionTwoWithPlanThree(t *testing.T) {
-	state, err := loadState(filepath.Join(t.TempDir(), "helper.state"), "11111111-1111-4111-8111-111111111111")
+	path := filepath.Join(t.TempDir(), "helper.state")
+	const cellID = "11111111-1111-4111-8111-111111111111"
+	state, err := loadState(path, cellID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadState(path, cellID)
 	if err != nil {
 		t.Fatal(err)
 	}

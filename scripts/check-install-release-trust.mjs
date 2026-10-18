@@ -143,7 +143,7 @@ for (const contract of [
   "const darwinProcessNameLimit = len(unix.ExternProc{}.P_comm) - 1",
   "p_comm is only a conservative rejection filter",
 ]) {
-   requireText(cliMacOSInstaller, contract, `prepared host process witness ${contract}`);
+  requireText(cliMacOSInstaller, contract, `prepared host process witness ${contract}`);
 }
 for (const contract of [
   "type ProcessWitness struct",
@@ -398,7 +398,7 @@ for (const contract of [
   'entitlements["com.apple.security.application-groups"]',
   "signed %s must carry no entitlements",
 ]) {
-   requireText(cliMacOSInstaller, contract, `immutable macOS installer layout ${contract}`);
+  requireText(cliMacOSInstaller, contract, `immutable macOS installer layout ${contract}`);
 }
 for (const forbidden of [
   'plistStringArray(entitlementPath, "com.apple.security.application-groups")',
@@ -406,6 +406,15 @@ for (const forbidden of [
 ]) {
   if (cliMacOSInstaller.includes(forbidden)) {
     failures.push(`macOS installer parses literal dotted entitlement keys as paths: ${forbidden}`);
+  }
+}
+for (const forbidden of [
+  "PORTABLEFS_INSTALL_LAYOUT",
+  "PORTABLEFS_APP_NAME",
+  "PORTABLEFS_EXTENSION_NAME",
+]) {
+  if (cliMacOSInstaller.includes(forbidden)) {
+    failures.push(`macOS installer layout became runtime-configurable through ${forbidden}`);
   }
 }
 for (const [source, label] of [
@@ -594,6 +603,7 @@ for (const cliControlContract of [
   'filepath.Join(home, ".local", "state", "portablefs", "portablefsd", "control.sock")',
   "apphost.LaunchContainingApp(executable)",
   '"/v2/attaches/"+url.PathEscape(ref)+"/frontend-preflight"',
+  '"/v2/attaches/"+url.PathEscape(ref)+"/frontend-ready"',
 ]) {
   requireText(cliFSKit, cliControlContract, `unentitled CLI control contract ${cliControlContract}`);
 }
@@ -873,6 +883,14 @@ for (const contract of [
 ]) requireText(helperEmbedder, contract, `sealed protocol producer ${contract}`);
 for (const contract of ["daemonctl.DecodeSealedProtocols", "protocols.ControlProtocol", "protocols.PFSLocalMajor", "targetRelease.ControlProtocol != daemonctl.ControlProtocolVersion"]) {
   requireText(cliMacOSInstaller, contract, `exact sealed protocol pairing ${contract}`);
+}
+
+// Releases have two trust chains: attested Linux archives and the notarized
+// macOS app. Publishing an image would introduce an unreviewed third chain.
+for (const retiredControlPlane of ["ghcr.io", "docker/build-push-action", "Dockerfile"]) {
+  if (workflow.includes(retiredControlPlane)) {
+    failures.push(`release workflow still publishes retired control-plane images (${retiredControlPlane})`);
+  }
 }
 
 if (failures.length > 0) {

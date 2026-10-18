@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,21 +70,11 @@ func TestDecidePostUnmount(t *testing.T) {
 			outcome: detachFUSECooperative,
 		},
 		{
-			name:    "acknowledged forced FUSE absence is normal completion",
-			outcome: detachFUSEForced,
-		},
-		{
 			name:        "acknowledged FSKit mount remaining is FSKit failure",
 			mounted:     true,
 			outcome:     detachFSKitDaemon,
 			wantError:   "FSKit unmount acknowledged completion",
 			rejectError: "FUSE",
-		},
-		{
-			name:      "acknowledged forced FUSE mount remaining is FUSE failure",
-			mounted:   true,
-			outcome:   detachFUSEForced,
-			wantError: "forced FUSE owner acknowledged parking",
 		},
 		{
 			name:        "cooperative FUSE mount remaining is a completion failure",
@@ -158,7 +151,7 @@ func TestReconcileFSKitIntentStartsExactDaemon(t *testing.T) {
 	if err := e.reconcileMountIntent(intent, true); err != nil {
 		t.Fatalf("reconcile FSKit intent: %v", err)
 	}
-	if ensures != 1 || calls.unmount.Load() != 1 {
+	if ensures != 1 || calls.unmount.Load() != 1 || calls.forceUnmount.Load() != 1 {
 		t.Fatalf("ensure calls=%d force calls=%d, want 1 each", ensures, calls.unmount.Load())
 	}
 }
@@ -282,5 +275,67 @@ func TestForceFSKitUnmountRefusesWithoutExactDaemonAndPreservesAnchors(t *testin
 	_, intentPath := mountOperationPaths(stateDir, mountPath)
 	if _, err := os.Lstat(intentPath); err != nil {
 		t.Fatalf("unmount intent was not preserved: %v", err)
+	}
+}
+
+func TestReconcileFSKitIntentWithAbsentKernelHonorsForce(t *testing.T) {
+	for _, phase := range []string{"attached", "kernel-mounted"} {
+		for _, force := range []bool{false, true} {
+			for _, forceFailure := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/force=%t/failure=%t", phase, force, forceFailure), func(t *testing.T) {
+					e, _, stderr, stateDir := umountTestEnv(t)
+					mountPath, err := canonicalMountPath(t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					const ref = "att_AAAAAAAAAAAAAAAAAAAAAA"
+					seedMountIntent(t, stateDir, mountPath, phase, "fskit", ref)
+					stubMountIdentification(t, nil, func(string) ([]kernelMountIdentity, error) { return nil, nil })
+					unmounts := 0
+					ctl := &fsdControl{httpClient: &http.Client{Transport: lifecycleRoundTrip(func(r *http.Request) (*http.Response, error) {
+						status, body := http.StatusOK, fmt.Sprintf(`{"attaches":[{"attachRef":%q,"mountPath":%q,"volumeId":"vol_intent"}]}`, ref, mountPath)
+						switch r.URL.Path {
+						case "/v2/attaches":
+						case "/v2/attaches/" + ref + "/unmount":
+							unmounts++
+							if got := r.URL.Query().Get("force") == "1"; got != force {
+								t.Errorf("force query=%t, want %t", got, force)
+							}
+							status, body = http.StatusConflict, `{"error":"detach refused"}`
+							if force && !forceFailure {
+								status, body = http.StatusNoContent, ""
+							}
+						default:
+							t.Errorf("unexpected path %s", r.URL.Path)
+						}
+						return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+					})}}
+					e.ensurePortablefsdFn = func(fskitConfig, string, string) (*fsdControl, error) { return ctl, nil }
+					args := []string{"umount", mountPath}
+					if force {
+						args = append(args, "--force")
+					}
+					rc := e.run(args)
+					wantSuccess := force && !forceFailure
+					if (rc == 0) != wantSuccess || unmounts != 1 {
+						t.Fatalf("rc=%d unmounts=%d stderr=%s", rc, unmounts, stderr.String())
+					}
+					_, intentPath := mountOperationPaths(stateDir, mountPath)
+					_, statErr := os.Stat(intentPath)
+					if wantSuccess {
+						if !os.IsNotExist(statErr) {
+							t.Fatalf("completed intent remains: %v", statErr)
+						}
+					} else {
+						if statErr != nil {
+							t.Fatal(statErr)
+						}
+						if !strings.Contains(stderr.String(), "kernel mount is absent") || strings.Contains(stderr.String(), "mount remains live") {
+							t.Fatalf("wrong absence outcome: %s", stderr.String())
+						}
+					}
+				})
+			}
+		}
 	}
 }

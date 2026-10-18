@@ -8,5 +8,5 @@ import (
 )
 
 func requireSupportedFSKit() error {
-	return fmt.Errorf("FSKit cache policy selection is unsupported on %s", runtime.GOOS)
+	return fmt.Errorf("FSKit is unsupported on %s", runtime.GOOS)
 }

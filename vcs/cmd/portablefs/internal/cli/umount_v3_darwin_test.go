@@ -314,3 +314,50 @@ func TestFSKitUnmountErrorReportsIndependentKernelAbsence(t *testing.T) {
 		})
 	}
 }
+
+func TestFSKitSupervisorShutdownReportsKernelOutcome(t *testing.T) {
+	for _, outcome := range []string{"absent", "present", "unverified", "success still present"} {
+		t.Run(outcome, func(t *testing.T) {
+			st := validFSKitMountState(t, filepath.Join(t.TempDir(), "mount"))
+			afterDetach := false
+			classificationErr := errors.New("kernel inventory unavailable")
+			stubMountIdentification(t, nil, func(path string) ([]kernelMountIdentity, error) {
+				if afterDetach && outcome == "unverified" {
+					return nil, classificationErr
+				}
+				if afterDetach && outcome == "absent" {
+					return nil, nil
+				}
+				return []kernelMountIdentity{{path: path, fsType: defaultFskitType, source: fskitidentity.ResourcePrefix + st.AttachRef}}, nil
+			})
+			detachErr := errors.New("daemon transaction incomplete")
+			absent, err := unmountFSKitWithKernelOutcome(&st, func() error {
+				afterDetach = true
+				if outcome == "success still present" {
+					return nil
+				}
+				return detachErr
+			})
+			if err == nil || absent != (outcome == "absent") {
+				t.Fatalf("absent=%t error=%v", absent, err)
+			}
+			if outcome != "success still present" && !errors.Is(err, detachErr) {
+				t.Fatalf("lost daemon error: %v", err)
+			}
+			switch outcome {
+			case "absent":
+				if !strings.Contains(err.Error(), "kernel mount is absent") || strings.Contains(err.Error(), "remains") {
+					t.Fatal(err)
+				}
+			case "present", "success still present":
+				if !strings.Contains(err.Error(), "kernel mount remains") {
+					t.Fatal(err)
+				}
+			case "unverified":
+				if !strings.Contains(err.Error(), "kernel mount presence is unverified") || !errors.Is(err, classificationErr) {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

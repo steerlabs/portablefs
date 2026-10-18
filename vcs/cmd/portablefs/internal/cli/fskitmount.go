@@ -486,10 +486,10 @@ func (c *fsdControl) preflightAttach(ref string) error {
 	return nil
 }
 
-func (c *fsdControl) requireNativeFrontendReady(ref string) error {
+func (c *fsdControl) requireFrontendReady(ref string) error {
 	status, body, err := c.do(
 		http.MethodPost,
-		"/v2/attaches/"+url.PathEscape(ref)+"/native-frontend-ready",
+		"/v2/attaches/"+url.PathEscape(ref)+"/frontend-ready",
 		nil,
 	)
 	if err != nil {

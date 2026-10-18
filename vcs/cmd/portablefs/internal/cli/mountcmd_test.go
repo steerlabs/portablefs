@@ -144,10 +144,11 @@ func umountTestEnv(t *testing.T) (e *cmdEnv, stdout, stderr *bytes.Buffer, state
 }
 
 type fsKitReconcileCalls struct {
-	unmount     atomic.Int32
-	credential  atomic.Int32
-	pendingOnly atomic.Bool
-	token       atomic.Value
+	unmount      atomic.Int32
+	forceUnmount atomic.Int32
+	credential   atomic.Int32
+	pendingOnly  atomic.Bool
+	token        atomic.Value
 }
 
 func serveFSKitReconcileControl(
@@ -204,6 +205,9 @@ func serveFSKitReconcileControl(
 	})
 	mux.HandleFunc("/v2/attaches/"+st.AttachRef+"/unmount", func(w http.ResponseWriter, r *http.Request) {
 		calls.unmount.Add(1)
+		if r.URL.Query().Get("force") == "1" {
+			calls.forceUnmount.Add(1)
+		}
 		if unmountStatus >= 200 && unmountStatus < 300 {
 			w.WriteHeader(http.StatusNoContent)
 			return

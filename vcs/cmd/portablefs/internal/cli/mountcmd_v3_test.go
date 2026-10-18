@@ -176,8 +176,7 @@ func TestValidateDirectV3MountOptsNamesEveryMissingPiece(t *testing.T) {
 }
 
 // TestMountCommandRequiresDirectCredentials pins the CLI edge: the
-// plain v2-era invocation fails with the direct-credential guidance and never
-// falls back to the clientcore engine.
+// invocation without credentials fails before starting a mount.
 func TestMountCommandRequiresDirectCredentials(t *testing.T) {
 	e, _, stderr := testEnv(t)
 	if rc := e.run([]string{"mount", "vol_1", filepath.Join(t.TempDir(), "m")}); rc == 0 {
@@ -301,9 +300,8 @@ func TestMountIntentEngineValidation(t *testing.T) {
 }
 
 // TestFskitEnsureRequestCarriesTheDaemonV3Contract pins the exact wire shape
-// portablefsd's v3AttachRequest decodes: the mutual-TLS identity, the two
-// barrier numbers, the declared macOS 26 cache policy, an empty branch, and
-// a well-formed 64-hex routes revision.
+// portablefsd decodes: an explicit initial authorization deadline and a
+// required v3 block with mutual-TLS identity and the canonical routes revision.
 func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 	req := fskitEnsureAttachRequest{
 		AttachRef:           "att_AAAAAAAAAAAAAAAAAAAAAA",
@@ -326,6 +324,15 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 	var decoded map[string]any
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
+	}
+	wantKeys := []string{"attachRef", "volumeId", "authorityUrl", "authToken", "authTokenExpiresAtMs", "dataPlaneTransport", "dataPlaneServerName", "mountPath", "v3"}
+	if len(decoded) != len(wantKeys) {
+		t.Fatalf("unexpected attach fields: %s", data)
+	}
+	for _, key := range wantKeys {
+		if _, ok := decoded[key]; !ok {
+			t.Fatalf("missing attach field %s: %s", key, data)
+		}
 	}
 	if deadline, present := decoded["authTokenExpiresAtMs"]; !present || deadline != float64(0) {
 		t.Fatalf("standalone deadline must be explicit zero: %s", data)
@@ -353,8 +360,7 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 
 // TestUmountReconcilesStaleV3FuseRecordWithoutForce pins the engine-aware
 // teardown: a v3 FUSE mount holds no write-back tail, so a record whose
-// kernel mount and owner are both gone reconciles on a plain umount — the v2
-// path demanded --force here to park a journal that v3 does not have.
+// kernel mount and owner are both gone reconciles on a plain umount.
 func TestUmountReconcilesStaleV3FuseRecordWithoutForce(t *testing.T) {
 	e, stdout, stderr, stateDir := umountTestEnv(t)
 	mountPath, err := canonicalMountPath(t.TempDir())

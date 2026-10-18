@@ -4,12 +4,13 @@ package cellhost
 
 import (
 	"encoding/hex"
-	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
-	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
+	"golang.org/x/sys/unix"
 )
 
 // Use the authority writer's shared encoder, not a second format fixture.
@@ -89,9 +90,9 @@ func TestStrictMembershipEmptyFailsClosedOnAnythingUnreadable(t *testing.T) {
 		"header only":      mountmembership.Header + "\n",
 		"another volume":   membershipDocument(other),
 		"plaintext volume": mountmembership.Header + "\n" + testVolumeID + "\n",
-		"short session":    membershipDocument(testVolumeID) + hex.EncodeToString(make([]byte, 8)) + "\n",
-		"non-hex session":  membershipDocument(testVolumeID) + "not-hex\n",
-		"zero session":     membershipDocument(testVolumeID) + session + "\n",
+		"short session":    membershipDocument(testVolumeID) + hex.EncodeToString(make([]byte, 8)) + "\tfskit-exclusive\n",
+		"non-hex session":  membershipDocument(testVolumeID) + strings.Repeat("z", 32) + "\tfskit-exclusive\n",
+		"zero session":     membershipDocument(testVolumeID) + session + "\tfskit-exclusive\n",
 		"duplicate":        membershipDocument(testVolumeID, [16]byte{9}) + strings.TrimPrefix(membershipDocument(testVolumeID, [16]byte{9}), membershipDocument(testVolumeID)),
 	}
 	for name, contents := range cases {

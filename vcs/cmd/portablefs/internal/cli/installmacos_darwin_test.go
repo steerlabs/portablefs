@@ -1065,25 +1065,15 @@ func TestSignedEmptyEntitlementPayloadIsAnExactEmptyDictionary(t *testing.T) {
 	if err := validateAbsentMacOSAppGroupEntitlementDictionary(entitlements, "CLI"); err != nil {
 		t.Fatalf("unentitled signed CLI was rejected: %v", err)
 	}
-	if err := validateExactEntitlementDictionary(entitlements, map[string]any{}, "CLI"); err != nil {
-		t.Fatalf("empty signed entitlement policy was rejected: %v", err)
-	}
 }
 
-func TestSignedEntitlementPoliciesRejectMissingWrongTypeExtraAndMalformed(t *testing.T) {
+func TestSignedEntitlementPoliciesRejectMissingWrongTypeAndMalformed(t *testing.T) {
 	const group = "B47U2LLKHW.pfsoss"
-	valid := map[string]any{
-		"com.apple.security.application-groups": []any{group},
-	}
 	missing := map[string]any{
 		"com.apple.security.get-task-allow": true,
 	}
 	wrongType := map[string]any{
 		"com.apple.security.application-groups": group,
-	}
-	extra := map[string]any{
-		"com.apple.security.application-groups": []any{group},
-		"unexpected":                            true,
 	}
 	if err := validateExactMacOSAppGroupEntitlementDictionary(missing, "host", group); err == nil {
 		t.Fatal("missing app-group entitlement was accepted")
@@ -1093,9 +1083,6 @@ func TestSignedEntitlementPoliciesRejectMissingWrongTypeExtraAndMalformed(t *tes
 	}
 	if err := validateAbsentMacOSAppGroupEntitlementDictionary(missing, "CLI"); err == nil {
 		t.Fatal("unknown nonempty CLI entitlement dictionary was accepted")
-	}
-	if err := validateExactEntitlementDictionary(extra, valid, "service"); err == nil {
-		t.Fatal("extra entitlement key was accepted by an exact policy")
 	}
 	if _, err := decodeExactCodeEntitlements([]byte("not a property list"), t.TempDir()); err == nil {
 		t.Fatal("malformed signed entitlement payload was accepted")

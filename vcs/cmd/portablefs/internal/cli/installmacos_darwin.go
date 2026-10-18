@@ -3390,12 +3390,6 @@ func darwinMountTable() ([]darwinMount, error) {
 	}
 }
 
-type macOSBundleIdentityGeneration uint8
-
-const (
-	macOSBundleIdentityCurrent macOSBundleIdentityGeneration = iota + 1
-)
-
 func validateStagedBundleForPublication(app, version, expectedAppID string) error {
 	return validateStagedBundleForPublicationWithLayout(
 		app,
@@ -3637,7 +3631,7 @@ func validateMacOSBundleForPublicationWithPolicy(
 	if err != nil {
 		return err
 	}
-	generation, profileOK := classifyMacOSBundleIdentity(
+	profileOK := validMacOSBundleRegistration(
 		extensionFSName,
 		extensionPersonalityName,
 		supportsGenericURLResources,
@@ -3700,7 +3694,7 @@ func validateMacOSBundleForPublicationWithPolicy(
 		if err != nil {
 			return fmt.Errorf("read staged %s identity: %w", name, err)
 		}
-		if !validMacOSBundleIdentityJSON(out, generation) {
+		if !validMacOSBundleIdentityJSON(out) {
 			return fmt.Errorf(
 				"staged %s identity does not match release identity %+v",
 				name,
@@ -3821,23 +3815,6 @@ func decodeExactCodeEntitlements(entitlements []byte, tempRoot string) (map[stri
 		return nil, fmt.Errorf("parse exact staged entitlements: %w", err)
 	}
 	return result, nil
-}
-
-func validateExactEntitlementDictionary(observed, expected map[string]any, name string) error {
-	if reflect.DeepEqual(observed, expected) {
-		return nil
-	}
-	observedJSON, observedErr := json.Marshal(observed)
-	expectedJSON, expectedErr := json.Marshal(expected)
-	if observedErr != nil || expectedErr != nil {
-		return fmt.Errorf("qualification code %s has a non-JSON entitlement dictionary", name)
-	}
-	return fmt.Errorf(
-		"qualification code %s has entitlements %s, expected %s",
-		name,
-		observedJSON,
-		expectedJSON,
-	)
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {
@@ -3971,57 +3948,33 @@ func writeEntitlementValidationFile(
 	return path, cleanup, nil
 }
 
-func classifyMacOSBundleIdentity(
+func validMacOSBundleRegistration(
 	fsName string,
 	personalityName string,
 	supportsGenericURLResources string,
 	resourceSchemes []string,
-) (macOSBundleIdentityGeneration, bool) {
-	if fsName != defaultFskitType ||
-		personalityName != defaultFskitType ||
-		supportsGenericURLResources != "true" ||
-		len(resourceSchemes) != 1 {
-		return 0, false
-	}
-	switch resourceSchemes[0] {
-	case fskitidentity.ResourceScheme:
-		return macOSBundleIdentityCurrent, true
-	default:
-		return 0, false
-	}
+) bool {
+	return fsName == defaultFskitType &&
+		personalityName == defaultFskitType &&
+		supportsGenericURLResources == "true" &&
+		len(resourceSchemes) == 1 && resourceSchemes[0] == fskitidentity.ResourceScheme
 }
 
-func validMacOSBundleIdentityJSON(
-	data []byte,
-	generation macOSBundleIdentityGeneration,
-) bool {
+func validMacOSBundleIdentityJSON(data []byte) bool {
 	object, ok := decodeExactJSONObject(data)
-	if !ok {
+	if !ok || len(object) != 4 {
 		return false
 	}
-	switch generation {
-	case macOSBundleIdentityCurrent:
-		if len(object) != 4 {
-			return false
-		}
-		var identity fskitidentity.Identity
-		if err := json.Unmarshal(data, &identity); err != nil {
-			return false
-		}
-		for _, key := range []string{
-			"schemaVersion",
-			"fsType",
-			"resourceScheme",
-			"appGroup",
-		} {
-			if _, ok := object[key]; !ok {
-				return false
-			}
-		}
-		return identity == fskitidentity.Current()
-	default:
+	var identity fskitidentity.Identity
+	if err := json.Unmarshal(data, &identity); err != nil {
 		return false
 	}
+	for _, key := range []string{"schemaVersion", "fsType", "resourceScheme", "appGroup"} {
+		if _, ok := object[key]; !ok {
+			return false
+		}
+	}
+	return identity == fskitidentity.Current()
 }
 
 func decodeExactJSONObject(data []byte) (map[string]json.RawMessage, bool) {
