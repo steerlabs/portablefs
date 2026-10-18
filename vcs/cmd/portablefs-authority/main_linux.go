@@ -329,47 +329,13 @@ func run() error {
 	defer quiesce.Close()
 
 	storageFailure := make(chan error, 1)
-	var restore *restoremode.Mode
-	var restoreFiles *xfsstore.RestoreFiles
-	restoreActive, err := restoremode.Active(stateRoot)
-	if err != nil {
-		return fmt.Errorf("inspect restore activation markers: %w", err)
-	}
-	if restoreActive {
-		bindings, err := restoremode.LoadBindings(filepath.Join(stateRoot, restoremode.BindingsFilename), 1<<24)
-		if err != nil {
-			return err
-		}
-		walkBound := uint64(bindings.Len())*2 + 1024
-		restoreFiles, err = store.ResolveRestoreFiles(bindings.IdentityMap(), walkBound)
-		if err != nil {
-			return fmt.Errorf("bind restored namespace identities: %w", err)
-		}
-		defer restoreFiles.Close()
-		restore, err = restoremode.Open(ctx, restoremode.Config{
-			StateRoot: stateRoot, VolumeID: o.volumeID, AuthorityEpoch: o.authorityGeneration,
-			Store: restoreFiles, Bindings: bindings,
-			OnStorageFailure: func(err error) {
-				store.Fence(err)
-				select {
-				case storageFailure <- err:
-				default:
-				}
-				stop()
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("start restore mode: %w", err)
-		}
-		defer restore.Close()
-	}
 	coherenceFailure := make(chan error, 1)
 	// The transport bound and the advertised bound are one value here, and
 	// Serve refuses to start if the handler ever advertises anything else.
 	maxFrame, maxInFlight := uint32(o.maxFrame), o.maxInFlight
 	handler := &authorityrpc.VolumeHandler{
 		Store: store, Runtime: runtime, Authorizer: authorizer, Metrics: metrics,
-		Restore: restore, Quiesce: quiesce,
+		Quiesce:  quiesce,
 		MaxFrame: maxFrame, MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(maxInFlight),
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
@@ -403,6 +369,32 @@ func run() error {
 		},
 	}
 	coordination.Bind(handler)
+	restoreActive, err := restoremode.Active(stateRoot)
+	if err != nil {
+		return fmt.Errorf("inspect restore activation markers: %w", err)
+	}
+	if restoreActive {
+		bindings, err := restoremode.LoadBindings(filepath.Join(stateRoot, restoremode.BindingsFilename), 1<<24)
+		if err != nil {
+			return err
+		}
+		walkBound := uint64(bindings.Len())*2 + 1024
+		restoreFiles, err := store.ResolveRestoreFiles(bindings.IdentityMap(), walkBound)
+		if err != nil {
+			return fmt.Errorf("bind restored namespace identities: %w", err)
+		}
+		defer restoreFiles.Close()
+		restore, err := restoremode.Open(ctx, restoremode.Config{
+			StateRoot: stateRoot, VolumeID: o.volumeID, AuthorityEpoch: o.authorityGeneration,
+			Store: restoreFiles, Bindings: bindings,
+			OnStorageFailure: handler.ReportStorageFailure,
+		})
+		if err != nil {
+			return fmt.Errorf("start restore mode: %w", err)
+		}
+		handler.Restore = restore
+		defer restore.Close()
+	}
 	server := &authorityrpc.Server{
 		Handler: handler, Metrics: metrics, MaxFrame: maxFrame, MaxInFlight: maxInFlight, MaxConnections: o.maxConnections,
 		MaxFrameBytesInFlight: o.maxFrameBytesInFlight,

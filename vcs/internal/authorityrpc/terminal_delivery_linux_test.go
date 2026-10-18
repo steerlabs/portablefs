@@ -543,3 +543,41 @@ func TestCopyFileRangeTerminalReceiptUsesDestinationPostState(t *testing.T) {
 		t.Fatal("mismatched CFR post size accepted")
 	}
 }
+
+func TestBackgroundStorageFailureDrainsAdmittedRequests(t *testing.T) {
+	store := &terminalDeliveryStore{}
+	h := testVolumeHandler()
+	h.Store = store
+	called := make(chan error, 1)
+	h.OnStorageFailure = func(err error) { called <- err }
+	req := &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}}}
+	if !h.beginTerminalRequest(req) {
+		t.Fatal("request was not admitted")
+	}
+	cause := &xfsstore.DurabilityError{Cause: syscall.ENOSPC}
+	h.ReportStorageFailure(cause)
+	if store.fences.Load() != 1 || h.beginTerminalRequest(req) {
+		t.Fatal("background failure did not fence admission")
+	}
+	select {
+	case err := <-called:
+		t.Fatalf("stopped before admitted handler drained: %v", err)
+	default:
+	}
+	h.endTerminalRequest()
+	select {
+	case err := <-called:
+		var got *xfsstore.DurabilityError
+		if !errors.As(err, &got) || got != cause {
+			t.Fatalf("background terminal cause=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background failure did not terminate after drain")
+	}
+	h.ReportStorageFailure(cause)
+	select {
+	case err := <-called:
+		t.Fatalf("repeated terminal callback: %v", err)
+	default:
+	}
+}

@@ -3698,7 +3698,10 @@ func (h *VolumeHandler) deferStorageFailure(response *authoritypb.Response, err 
 	h.runTerminalCallbacks(storage, coherence)
 }
 
-func (h *VolumeHandler) recordStorageFailure(err error) {
+// ReportStorageFailure routes background storage failures through the same
+// fence and terminal delivery drain as request-discovered failures. It never
+// waits for admitted handlers or background workers to stop.
+func (h *VolumeHandler) ReportStorageFailure(err error) {
 	h.deferStorageFailure(nil, err)
 }
 
@@ -4475,7 +4478,7 @@ func (h *VolumeHandler) closeOpen(handle xfsstore.Capability) {
 		return
 	}
 	if err := h.Store.CloseOpen(handle); err != nil && !errors.Is(err, xfsstore.ErrStaleOpen) && !errors.Is(err, xfsstore.ErrClosed) {
-		h.recordStorageFailure(err)
+		h.ReportStorageFailure(err)
 	}
 }
 
@@ -4484,6 +4487,6 @@ func (h *VolumeHandler) forgetItem(item xfsstore.Capability) {
 		return
 	}
 	if err := h.Store.Forget(item); err != nil && !errors.Is(err, xfsstore.ErrStaleObject) && !errors.Is(err, xfsstore.ErrClosed) {
-		h.recordStorageFailure(err)
+		h.ReportStorageFailure(err)
 	}
 }
