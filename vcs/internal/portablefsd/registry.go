@@ -586,9 +586,7 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 	}
 	jobID, err = a.detach(ctx, force)
 	if err != nil {
-		// No detach mode may unregister an attach whose required durability
-		// transition failed. In particular, force is permission to park a
-		// tail, not permission to discard a failed parking transaction.
+		// Keep the record until its required detach transition completes.
 		return true, jobID, err
 	}
 	r.mu.Lock()
@@ -857,6 +855,7 @@ func (r *registry) runUnmountTransaction(
 	if failFrozen {
 		return true, jobID, fmt.Errorf("attach admissions are fail-frozen because the prepared-detach abort could not be persisted; restart portablefsd to reconcile the durable marker")
 	}
+	var detachErr error
 	switch {
 	case a.isV3():
 		// The evidence-bearing v3 detach: exact kernel detach, getfsstat
@@ -867,9 +866,12 @@ func (r *registry) runUnmountTransaction(
 		// kernel pass, which flushes dirty kernel pages through those
 		// callbacks, is the durability boundary; detachV3 alone owns that
 		// v3-specific sequence.
-		if err := r.detachV3(a, forceAuthorized || force, ops); err != nil {
-			return true, "", err
+		detachErr = r.detachV3(a, forceAuthorized || force, ops)
+		if detachErr != nil && !a.isDetached() {
+			return true, "", detachErr
 		}
+		// A completed local teardown has a final verdict. Remove its record
+		// while preserving that verdict for every transaction joiner.
 	case prepared:
 		present, err := ops.present(a.mountPath, ref)
 		if err != nil {
@@ -906,7 +908,7 @@ func (r *registry) runUnmountTransaction(
 		// THE DRAIN IS CANCELLABLE BY ESCALATION. A --force arriving while this
 		// barrier is running closes tx.escalate; the drain then unwinds
 		// promptly and this same goroutine — which already owns mutationMu —
-		// takes the journal-first park/fence path, so force never queues behind
+		// takes the forced-detach path, so force never queues behind
 		// the wait it exists to escape.
 		drainCtx, cancelDrain := context.WithCancel(context.Background())
 		drainDone := make(chan struct{})
@@ -963,8 +965,8 @@ func (r *registry) runUnmountTransaction(
 		cancelDrain()
 		if err != nil {
 			// An ESCALATION that aborted this drain is not a failed unmount: it
-			// is the same transaction changing decision. Take the journal-first
-			// park/fence path now, on the goroutine that already holds
+			// is the same transaction changing decision. Take the forced-detach
+			// path now, on the goroutine that already holds
 			// mutationMu, before anything irreversible has happened. Any other
 			// error is the normal transaction's own definite failure.
 			if r.escalated(tx) {
@@ -978,7 +980,7 @@ func (r *registry) runUnmountTransaction(
 			}
 		}
 		// If the drain WON the race with an escalation, the normal detach is
-		// complete and durable — strictly stronger than parking the tail — and
+		// complete and durable, and
 		// that is the outcome every joiner, force or not, is given.
 	}
 	r.mu.Lock()
@@ -991,9 +993,9 @@ func (r *registry) runUnmountTransaction(
 		r.byRef[ref] = a
 		r.byKey[a.key] = a
 		r.mu.Unlock()
-		return true, jobID, err
+		return true, jobID, errors.Join(detachErr, err)
 	}
-	return true, jobID, nil
+	return true, jobID, detachErr
 }
 
 // preparedDetachAbortDurabilityError means the exact unmount failed and the

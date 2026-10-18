@@ -509,25 +509,6 @@ func TestV3ReclaimBatchFailureIsTerminalForTheDataPlane(t *testing.T) {
 	}
 }
 
-func TestV3DrainedReleaseOwnerLeavesRetirementToTheDetach(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
-	if err := waitV3ReleaseOwner(context.Background(), d.releases); err != nil {
-		t.Fatal(err)
-	}
-	before := len(client.mutationRequests())
-	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReclaimRequest{Item: file.Item}); errno != 0 {
-		t.Fatalf("reclaim after drain errno=%d", errno)
-	}
-	if after := len(client.mutationRequests()); after != before {
-		t.Fatalf("reclaim after drain sent %d authority requests, want none", after-before)
-	}
-	if d.terminalError() != nil {
-		t.Fatalf("reclaim after drain was terminal: %v", d.terminalError())
-	}
-}
-
 type v3TestObject struct {
 	inode   uint64
 	kind    authoritypb.Attr_Kind

@@ -2669,12 +2669,12 @@ func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 // sendRelease preserves the original transport on a definite, well-formed
 // refusal. Once exact absence transfers ownership to session teardown, a late
 // DATA outcome cannot turn an accepted CONTROL Detach into a transport failure.
-func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Request, closes int) error {
+func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Request, closes int) (err error) {
 	d.releaseMu.Lock()
 	transferred := d.releaseSessionOwned
 	d.releaseMu.Unlock()
 	if transferred {
-		return errV3ReleaseClosed
+		return nil
 	}
 	var assigned authorityrpc.MutationIdentity
 	response, callErr := d.client.CallMutationWithIdentity(ctx, request, func(identity authorityrpc.MutationIdentity) error {
@@ -2682,9 +2682,20 @@ func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Requ
 		return nil
 	})
 	d.releaseMu.Lock()
-	defer d.releaseMu.Unlock()
+	defer func() {
+		// Record the classified failure before transfer can take ownership,
+		// rather than waiting for the worker to record it after this returns.
+		if err != nil {
+			d.releases.mu.Lock()
+			if d.releases.failure == nil {
+				d.releases.failure = err
+			}
+			d.releases.mu.Unlock()
+		}
+		d.releaseMu.Unlock()
+	}()
 	if d.releaseSessionOwned {
-		return errors.Join(errors.New("portablefsd: in-flight release transferred to session teardown"), callErr)
+		return nil
 	}
 	response, errno := d.classify(response, callErr, true)
 	if response == nil {
@@ -2752,9 +2763,6 @@ func (d *v3DataPlane) transferReleases() error {
 	defer d.releases.mu.Unlock()
 	if d.releases.failure != nil {
 		return d.releases.failure
-	}
-	if d.releases.running {
-		return errors.New("portablefsd: in-flight authority releases transferred to session teardown")
 	}
 	return nil
 }
