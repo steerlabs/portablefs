@@ -49,7 +49,7 @@ func (d *StorageDeclaration) Release() {
 // is held. A binding changed since the probe requires a fresh resolution.
 func (s *StorageSequencer) AcquireDeclared(ctx context.Context, dependencies MutationDependencies, d *StorageDeclaration) (func(), bool, error) {
 	if d == nil || d.snapshot == nil || d.snapshot.sequencer != s.sequencer {
-		return nil, false, ErrVisibilityTargets
+		return nil, false, ErrMutationTargets
 	}
 	for key := range d.snapshot.versions {
 		found := false
@@ -60,7 +60,7 @@ func (s *StorageSequencer) AcquireDeclared(ctx context.Context, dependencies Mut
 			}
 		}
 		if !found {
-			return nil, false, ErrVisibilityTargets
+			return nil, false, ErrMutationTargets
 		}
 	}
 	release, err := s.AcquireRead(ctx, dependencies)

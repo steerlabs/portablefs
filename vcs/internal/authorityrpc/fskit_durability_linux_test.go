@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -85,9 +84,6 @@ func newDirectFskitHarness(t *testing.T) (*VolumeHandler, volumeserver.SessionCr
 func directFskitRequest() *authoritypb.Request {
 	req := stockWriteTestRequest(1, 0, 1, xfsstore.Capability{0x41}, []byte("data"), 0, writeKillSUIDGID)
 	req.GetWrite().WriteFlags = writeKillSUIDGID
-	req.FskitFrontendOperationId = 1
-	identity := [16]byte{0x41}
-	req.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{Identity: identity[:], Attributes: true, Data: true}}}}}
 	return req
 }
 
@@ -107,6 +103,8 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h, cred, store, target := newDirectFskitHarness(t)
+			var observations []MutationObservation
+			h.OnMutation = func(o MutationObservation) { observations = append(observations, o) }
 			target.committed = test.committed
 			target.err = test.applyErr
 			store.syncErr = test.errorSync
@@ -138,20 +136,10 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 			if calls, _ := target.directSnapshot(); calls != 1 || store.syncs.Load() != 1 {
 				t.Fatalf("apply/sync=%d/%d", calls, store.syncs.Load())
 			}
-			h.writeAdmissionMu.Lock()
-			count, reservedBytes := h.totalWrites, h.totalWriteBytes
-			h.writeAdmissionMu.Unlock()
-			if count != 0 || reservedBytes != 0 {
-				t.Fatalf("admission leaked %d/%d", count, reservedBytes)
+			if len(observations) != 2 || observations[0].Disposition != "executed" || observations[1].Disposition != "replayed" || observations[0].Sequence != observations[1].Sequence || observations[0].Session != cred.ID {
+				t.Fatalf("mutation trace lost exact replay identity: %v", observations)
 			}
-			var metrics bytes.Buffer
-			if err := h.Metrics.Registry().WritePrometheus(&metrics); err != nil {
-				t.Fatal(err)
-			}
-			kind := "handle"
-			if !strings.Contains(metrics.String(), fmt.Sprintf(`portablefs_authority_fskit_durability_syncs_total{volume="fskit-durable",target="%s"} 1`, kind)) {
-				t.Fatalf("missing durability metric: %s", kind)
-			}
+
 		})
 	}
 }
@@ -171,7 +159,6 @@ func TestFskitDirectWriteRefusalsBeforeApply(t *testing.T) {
 		{"bad size", func(r *authoritypb.Request) { r.GetWrite().Size = 1 }},
 		{"bad flags", func(r *authoritypb.Request) { r.GetWrite().WriteFlags = 0x80000000 }},
 		{"cross session handle", func(r *authoritypb.Request) { r.GetWrite().Handle = bytes.Repeat([]byte{9}, 16) }},
-		{"wrong source gate", func(r *authoritypb.Request) { r.FskitSourcePublication.Targets[0].GetItem().Data = false }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h, cred, store, target := newDirectFskitHarness(t)
@@ -181,7 +168,7 @@ func TestFskitDirectWriteRefusalsBeforeApply(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if err := h.startSessionResourcesForProfile(other.ID, xfsstore.Capability{0x70}, 2, [32]byte{}, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); err != nil {
+				if err := h.startSessionResourcesForProfile(other.ID, xfsstore.Capability{0x70}, 2, [32]byte{}, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE); err != nil {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() { h.closeSessionResources(other.ID) })
@@ -205,9 +192,6 @@ func TestFskitDirectWriteRefusalsBeforeApply(t *testing.T) {
 			if calls, _ := target.directSnapshot(); calls != 0 || store.syncs.Load() != 0 {
 				t.Fatal("refusal applied or synced")
 			}
-			if h.totalWrites != 0 || h.totalWriteBytes != 0 {
-				t.Fatal("refusal leaked admission")
-			}
 		})
 	}
 }
@@ -220,7 +204,7 @@ func TestFskitUnadmittedWriteENOMEMShape(t *testing.T) {
 	if result.GetErrno() != 0 || result.GetUncertain() || result.GetSessionTerminal() || result.GetMutation() != nil || result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED || result.GetWrite().GetError() != -int32(syscall.ENOMEM) || result.GetWrite().GetPostAttr() != nil || result.GetPostState() != nil || result.GetWrite().GetCommittedSize() != 0 {
 		t.Fatalf("unadmitted WRITE=%v", result)
 	}
-	if calls, _ := target.directSnapshot(); calls != 0 || store.syncs.Load() != 0 || h.totalWrites != 0 {
+	if calls, _ := target.directSnapshot(); calls != 0 || store.syncs.Load() != 0 {
 		t.Fatal("unadmitted WRITE acquired resources")
 	}
 	h.MaxRetainedReplyBytes = 1 << 20
@@ -272,14 +256,12 @@ func TestFskitNonWriteDurabilityFailureIsUncertainStorage(t *testing.T) {
 			identity := [16]byte{0x70}
 			req := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item[:], Mode: proto.Uint32(0600)}}}
 			stampMutation(t, req, 0, 1)
-			req.FskitFrontendOperationId = 1
-			req.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{Identity: identity[:], Attributes: true}}}}}
-			result := h.mutateVisibleSequence(t.Context(), req, cred, func() ([]volumeserver.VisibilityTarget, error) {
-				return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, visibilityCoordinate{identity: identity, ino: 0x70, device: 1}, 0)}, nil
-			}, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			result := h.mutateVisibleSequence(t.Context(), req, cred, func() ([]volumeserver.MutationTarget, error) {
+				return []volumeserver.MutationTarget{inodeTarget(volumeserver.MutationAttributes, mutationCoordinate{identity: identity, ino: 0x70, device: 1}, 0)}, nil
+			}, func(sequence uint64, changed *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 				r := h.success(0)
-				r.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: identity, attr: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x70, Mode: 0600}, roles: postStateRoleTarget, changed: true})
-				return r, []volumeserver.VisibilityTarget{}
+				r.PostState = h.mutationPostState(changed, sequence, postStateSnapshot{identity: identity, attr: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x70, Mode: 0600}, roles: postStateRoleTarget, changed: true})
+				return r, []volumeserver.MutationTarget{}
 			}, nil)
 			if result.GetErrno() != int32(syscall.EIO) || !result.GetUncertain() || result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || !store.fenced.Load() {
 				t.Fatalf("sync failure=%v", result)
@@ -291,55 +273,6 @@ func TestFskitNonWriteDurabilityFailureIsUncertainStorage(t *testing.T) {
 	}
 }
 
-func TestFskitWriteAdmissionRetainsOnlyAppliedExecution(t *testing.T) {
-	h, cred, store, _ := newDirectFskitHarness(t)
-	h.MaxWritesPerSession = 1
-	h.MaxWrites = 1
-	secondTarget := &writeTestTarget{sync: store.doSync, coordinate: xfsstore.ObjectCoordinate{Stable: [16]byte{0x42}, Ino: 0x42, DeviceMinor: 1}, committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x42, Size: 4, Mode: 0600, Nlink: 1}}
-	store.targets = append(store.targets, secondTarget)
-	entered, release := make(chan struct{}), make(chan struct{})
-	store.barrier = func() {
-		if store.syncs.Load() == 1 {
-			close(entered)
-			<-release
-		}
-	}
-	firstReq := directFskitRequest()
-	secondReq := proto.Clone(firstReq).(*authoritypb.Request)
-	secondReq.RequestId = 2
-	secondReq.Mutation.Slot = 1
-	secondReq.FskitFrontendOperationId = 2
-	secondHandle := xfsstore.Capability{0x42}
-	if err := h.trackOpen(cred.ID, secondHandle, false); err != nil {
-		t.Fatal(err)
-	}
-	secondReq.GetWrite().Handle = secondHandle[:]
-	secondReq.FskitSourcePublication.Targets[0].GetItem().Identity = secondHandle[:]
-	first, second := make(chan *authoritypb.Response, 1), make(chan *authoritypb.Response, 1)
-	go func() { first <- h.handleWrite(t.Context(), firstReq, cred, firstReq.GetWrite()) }()
-	<-entered
-	h.writeAdmissionMu.Lock()
-	count, reserved := h.totalWrites, h.totalWriteBytes
-	h.writeAdmissionMu.Unlock()
-	if count != 1 || reserved != 4 {
-		t.Fatalf("applied execution admission=%d/%d", count, reserved)
-	}
-	go func() { second <- h.handleWrite(t.Context(), secondReq, cred, secondReq.GetWrite()) }()
-	waitWriteAdmissionQueue(t, h, 1)
-	if calls, _ := secondTarget.directSnapshot(); calls != 0 {
-		t.Fatal("WRITE bypassed FIFO admission")
-	}
-	close(release)
-	for _, result := range []chan *authoritypb.Response{first, second} {
-		if r := <-result; r.GetWrite().GetCommittedSize() != 4 {
-			t.Fatalf("WRITE=%v", r)
-		}
-	}
-	if h.totalWrites != 0 || h.totalWriteBytes != 0 {
-		t.Fatal("durable writes leaked admission")
-	}
-}
-
 type fragmentedDurabilityFailureStore struct {
 	*fskitWriteTestStore
 	fences atomic.Int32
@@ -348,35 +281,6 @@ type fragmentedDurabilityFailureStore struct {
 func (s *fragmentedDurabilityFailureStore) Fence(error) { s.fences.Add(1) }
 func (s *fragmentedDurabilityFailureStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
 	panic("fragmented COMMIT reacquired its handle")
-}
-func TestFragmentedCommitRetainsDurabilityFailureAndExactReceipt(t *testing.T) {
-	for _, failure := range []error{syscall.EIO, syscall.ENOSPC} {
-		t.Run(failure.Error(), func(t *testing.T) {
-			h, cred, store, _ := newFskitWriteHarness(t)
-			wrapped := &fragmentedDurabilityFailureStore{fskitWriteTestStore: store}
-			h.Store = wrapped
-			target := &fskitWriteTestTarget{sync: func() error { store.durableHandles.Add(1); return failure }}
-			store.targets = append(store.targets, target)
-			payload := []byte("fragmented")
-			for index, phase := range []authoritypb.FskitWritePhase{authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA} {
-				req := fskitWritePhaseRequest(uint64(index+1), 1, phase, payload, 0)
-				if response := h.handleFskitWrite(t.Context(), req, cred, req.GetFskitWrite()); response.GetErrno() != 0 {
-					t.Fatalf("staging=%v", response)
-				}
-			}
-			req := fskitWritePhaseRequest(3, 1, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT, payload, uint64(len(payload)))
-			reply := h.commitFskitWrite(t.Context(), req, cred, req.GetFskitWrite())
-			if reply.GetFskitWrite().GetCommittedSize() != uint64(len(payload)) || reply.GetFskitWrite().GetError() != -int32(syscall.EIO) || reply.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || wrapped.fences.Load() == 0 || !terminalReceiptCarriesExactAppliedState(reply) {
-				t.Fatalf("fragmented durability failure=%v", reply)
-			}
-			req.RequestId++
-			replayed := h.commitFskitWrite(t.Context(), req, cred, req.GetFskitWrite())
-			reply.RequestId = replayed.RequestId
-			if !proto.Equal(reply, replayed) || store.durableHandles.Load() != 1 || len(target.snapshot()) != 1 {
-				t.Fatalf("fragmented replay repeated apply/sync: %v", replayed)
-			}
-		})
-	}
 }
 
 type partialSetAttrStore struct {
@@ -399,7 +303,6 @@ func TestSetAttrPartialApplyRetainsPostStateAndDurabilityOnReplay(t *testing.T) 
 	item := xfsstore.Capability{0x70}
 	req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item[:], Mode: proto.Uint32(0600), Size: proto.Int64(2)}}}
 	stampMutation(t, req, 0, 1)
-	stampResolvedFskitPublication(t, h, cred.ID, req)
 	ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1})
 	reply := h.Handle(ctx, req)
 	if !reply.GetUncertain() || reply.GetPostState() == nil || reply.GetMutation() == nil || partial.applies != 1 || store.syncs.Load() != 1 {
@@ -413,34 +316,12 @@ func TestSetAttrPartialApplyRetainsPostStateAndDurabilityOnReplay(t *testing.T) 
 	}
 }
 
-func TestMalformedSourcePublicationPrecedesWriteAdmission(t *testing.T) {
-	for _, malformed := range []string{"absent", "invalid"} {
-		t.Run(malformed, func(t *testing.T) {
-			h, cred, store, _ := newDirectFskitHarness(t)
-			req := directFskitRequest()
-			if malformed == "absent" {
-				req.FskitSourcePublication = nil
-			} else {
-				req.FskitSourcePublication.Targets[0].GetItem().Identity = []byte{1}
-			}
-			called := false
-			ctx := context.WithValue(t.Context(), coherenceOperationKey{}, &coherenceOperation{beforeAdmission: func() error { called = true; return nil }})
-			reply := h.mutateFskitCoherence(ctx, req, cred, nil, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-				t.Fatal("malformed request applied")
-				return nil, nil
-			}, nil)
-			if reply.GetErrno() != int32(syscall.EINVAL) || called || store.syncs.Load() != 0 {
-				t.Fatalf("malformed source gate = %v; admission=%v", reply, called)
-			}
-		})
-	}
-}
-
 // Descriptor acquisition is distinct from the persistence syscall. A failure
 // before apply is definite; after CREATE or O_TRUNC it is a terminal defect.
 type fskitAcquisitionStore struct {
 	*fskitDurabilityTestStore
 	parentErr error
+	openErr   error
 	applies   int
 }
 
@@ -450,6 +331,9 @@ func (s *fskitAcquisitionStore) Create(xfsstore.Capability, string, os.FileMode,
 }
 func (s *fskitAcquisitionStore) OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error) {
 	s.applies++
+	if s.openErr != nil {
+		return xfsstore.Capability{}, s.openErr
+	}
 	return xfsstore.Capability{0x42}, nil
 }
 func (s *fskitAcquisitionStore) SetAttr(xfsstore.Capability, xfsstore.Capability, xfsstore.SetAttrSpec) (xfsstore.Attr, error) {
@@ -488,7 +372,6 @@ func TestFskitDescriptorAcquisitionNeverSelectsAnotherBarrier(t *testing.T) {
 					req.Body = &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Handle: handle[:], Mode: proto.Uint32(0600)}}
 				}
 				stampMutation(t, req, 0, 1)
-				stampResolvedFskitPublication(t, h, cred.ID, req)
 				reply := h.Handle(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), req)
 				if reply.GetErrno() == 0 || base.syncs.Load() != 0 {
 					t.Fatalf("alternate durability success: %v syncs=%d", reply, base.syncs.Load())
@@ -521,10 +404,31 @@ func TestFskitExistingCreateDoesNotAcquireDurabilityPin(t *testing.T) {
 	parent := xfsstore.Capability{0x70}
 	req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
 	stampMutation(t, req, 0, 1)
-	stampResolvedFskitPublication(t, h, cred.ID, req)
 	reply := h.Handle(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), req)
 	if reply.GetErrno() != 0 || reply.GetUncertain() || base.fenced.Load() || base.syncs.Load() != 0 {
 		t.Fatalf("nonmutating CREATE acquired durability: %v", reply)
+	}
+}
+
+func TestFskitExistingCreateRawEIOIsUncertain(t *testing.T) {
+	h, cred, base, _ := newDirectFskitHarness(t)
+	base.lookupItem = xfsstore.Capability{0x42}
+	store := &fskitAcquisitionStore{fskitDurabilityTestStore: base, openErr: syscall.EIO}
+	h.Store = store
+	parent := xfsstore.Capability{0x70}
+	request := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: &authoritypb.OpenFlags{Write: true, Truncate: true}}}}
+	stampMutation(t, request, 0, 1)
+	ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1})
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || !base.fenced.Load() {
+		t.Fatalf("raw reopen EIO was treated as definite: %v", response)
+	}
+	before := store.applies
+	request.RequestId++
+	replay := h.Handle(ctx, request)
+	response.RequestId = replay.RequestId
+	if !proto.Equal(response, replay) || store.applies != before {
+		t.Fatalf("reopen EIO was reapplied: %v", replay)
 	}
 }
 
@@ -562,7 +466,6 @@ func TestFskitCreatePreApplyRefusalsDoNotFence(t *testing.T) {
 			parent := xfsstore.Capability{0x70}
 			req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: test.flags, WriteIntent: test.writeIntent}}}
 			stampMutation(t, req, 0, 1)
-			stampResolvedFskitPublication(t, h, cred.ID, req)
 			ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1})
 			reply := h.Handle(ctx, req)
 			want := int32(syscall.EINVAL)
@@ -581,53 +484,5 @@ func TestFskitCreatePreApplyRefusalsDoNotFence(t *testing.T) {
 				t.Fatalf("CREATE refusal replay=%v", replay)
 			}
 		})
-	}
-}
-
-func TestFragmentedCommitLogicalSyncFailureRetainsExactAppliedReply(t *testing.T) {
-	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
-		for _, dataOnly := range []bool{false, true} {
-			t.Run(cause.Error()+map[bool]string{false: "/sync", true: "/datasync"}[dataOnly], func(t *testing.T) {
-				h, cred, store, _ := newFskitWriteHarness(t)
-				h.Store = &fragmentedDurabilityFailureStore{fskitWriteTestStore: store}
-				h.OnStorageFailure = func(error) {}
-				failure := &xfsstore.DurabilityError{Cause: cause}
-				target := &fskitWriteTestTarget{commitErr: errors.Join(xfsstore.ErrWritePostApply, failure), sync: func() error { return failure }}
-				store.targets = append(store.targets, target)
-				payload := []byte("fragmented")
-				for index, phase := range []authoritypb.FskitWritePhase{authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA} {
-					req := fskitWritePhaseRequest(uint64(index+1), 1, phase, payload, 0)
-					req.GetFskitWrite().Flags = uint32(syscall.O_SYNC)
-					if dataOnly {
-						req.GetFskitWrite().Flags = uint32(syscall.O_DSYNC)
-					}
-					if response := h.handleFskitWrite(t.Context(), req, cred, req.GetFskitWrite()); response.GetErrno() != 0 {
-						t.Fatalf("staging=%v", response)
-					}
-				}
-				req := fskitWritePhaseRequest(3, 1, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT, payload, uint64(len(payload)))
-				req.GetFskitWrite().Flags = uint32(syscall.O_SYNC)
-				if dataOnly {
-					req.GetFskitWrite().Flags = uint32(syscall.O_DSYNC)
-				}
-				reply := h.commitFskitWrite(t.Context(), req, cred, req.GetFskitWrite())
-				got := reply.GetFskitWrite()
-				if reply.GetErrno() != 0 || reply.GetUncertain() || got.GetCommittedSize() != uint64(len(payload)) || got.GetAssignedOffset() != 0 || got.GetPostSize() != uint64(len(payload)) || got.GetError() != -int32(syscall.EIO) || got.GetFlags() != fskitWriteReplyCommitted|fskitWriteReplyPostApply || reply.GetPostState() == nil || !terminalReceiptCarriesExactAppliedState(reply) {
-					t.Fatalf("logical sync COMMIT=%v", reply)
-				}
-				h.terminalFailureMu.Lock()
-				draining, receipts := h.terminalDraining, len(h.terminalReceiptFrames)
-				h.terminalFailureMu.Unlock()
-				if !draining || receipts == 0 {
-					t.Fatalf("no terminal delivery drain: %v/%d", draining, receipts)
-				}
-				req.RequestId++
-				replay := h.commitFskitWrite(t.Context(), req, cred, req.GetFskitWrite())
-				reply.RequestId = replay.RequestId
-				if !proto.Equal(reply, replay) || len(target.snapshot()) != 1 {
-					t.Fatalf("exact COMMIT replay=%v", replay)
-				}
-			})
-		}
 	}
 }

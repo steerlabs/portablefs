@@ -5,74 +5,74 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
 )
 
-const visibilityMembershipHeader = "PFS-VISIBILITY-2"
-
-// Unknown legacy mounts retain the Mac activation and topology fencing requirement.
-type MountMembershipProfile string
+// Profiles share the sole current membership codec with the privileged host.
+type MountMembershipProfile = mountmembership.Profile
 
 const (
-	MembershipCompatibility MountMembershipProfile = "compatibility"
-	MembershipLinuxV7       MountMembershipProfile = "linux-v7"
-	MembershipCacheless     MountMembershipProfile = "cacheless"
+	MembershipFSKitExclusive = mountmembership.ProfileFSKitExclusive
+	MembershipLinux          = mountmembership.ProfileLinux
+	MembershipCacheless      = mountmembership.ProfileCacheless
 )
 
-// FileVisibilityMembership is the small durable control-plane record that
+// FileMountMembership is the small durable control-plane record that
 // survives authority-process loss. It is bound to one volume and contains only
 // strict session IDs, never filesystem metadata or contents. The manager must
-// prove old hosts/mounts fenced before it asks OpenFileVisibilityMembership to
+// prove old hosts/mounts fenced before it asks OpenFileMountMembership to
 // clear old records.
-type FileVisibilityMembership struct {
-	mu                 sync.Mutex
-	path               string
-	volumeID           string
-	lockFile           *os.File
-	active             map[SessionID]struct{}
-	profiles           map[SessionID]MountMembershipProfile
-	priorCompatibility PriorEpochDisposition
-	priorLinux         bool
-	cleared            []SessionID
-	quiesceNonce       string
-	quiesceProof       func() error
-	proofWritten       bool
+type FileMountMembership struct {
+	mu           sync.Mutex
+	path         string
+	volumeID     string
+	lockFile     *os.File
+	active       map[SessionID]struct{}
+	profiles     map[SessionID]MountMembershipProfile
+	priorWriter  PriorEpochDisposition
+	priorLinux   bool
+	cleared      []SessionID
+	quiesceNonce string
+	quiesceProof func() error
+	proofWritten bool
 }
 
-// visibilityMembershipAuditSuffix names the append-only record of operator
+// membershipAuditSuffix names the append-only record of operator
 // assertions. -prior-strict-mounts-fenced is an unverified human claim that
 // every recorded kernel mount was made unusable, and it is the one input that
 // can erase this authority's memory of an unsafe mount. It stays explicit and
 // human-driven, but it stops being invisible: what was cleared, for which
 // volume, and when is written down before the record it clears is rewritten.
-const visibilityMembershipAuditSuffix = ".audit"
+const membershipAuditSuffix = ".audit"
 
-// OpenFileVisibilityMembership takes an exclusive process lock and loads the
+// OpenFileMountMembership takes an exclusive process lock and loads the
 // exact active set. If priorFenced is true, the caller asserts it has already
 // made every recorded old kernel mount unusable; only then are records cleared.
-func OpenFileVisibilityMembership(path, volumeID string, priorFenced bool) (*FileVisibilityMembership, PriorEpochDisposition, error) {
-	if !filepath.IsAbs(path) {
-		return nil, PriorEpochUnproven, errors.New("volumeserver: visibility membership path must be absolute")
+func OpenFileMountMembership(path, volumeID string, priorFenced bool) (*FileMountMembership, PriorEpochDisposition, error) {
+	if !filepath.IsAbs(path) || filepath.Base(path) != mountmembership.Filename {
+		return nil, PriorEpochUnproven, errors.New("volumeserver: mount membership path must be absolute and end in mount.membership")
 	}
 	if volumeID == "" || len(volumeID) > 1024 {
-		return nil, PriorEpochUnproven, errors.New("volumeserver: visibility membership volume ID is invalid")
+		return nil, PriorEpochUnproven, errors.New("volumeserver: mount membership volume ID is invalid")
 	}
 	dir := filepath.Dir(path)
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return nil, PriorEpochUnproven, errors.New("volumeserver: visibility membership directory must exist and be private")
+		return nil, PriorEpochUnproven, errors.New("volumeserver: mount membership directory must exist and be private")
 	}
-	lockFile, err := lockVisibilityFile(path + ".lock")
+	lockFile, err := lockMembershipFile(path + ".lock")
 	if err != nil {
 		return nil, PriorEpochUnproven, err
 	}
-	m := &FileVisibilityMembership{path: path, volumeID: volumeID, lockFile: lockFile, active: make(map[SessionID]struct{}), profiles: make(map[SessionID]MountMembershipProfile)}
-	closeOnError := func(err error) (*FileVisibilityMembership, PriorEpochDisposition, error) {
+	m := &FileMountMembership{path: path, volumeID: volumeID, lockFile: lockFile, active: make(map[SessionID]struct{}), profiles: make(map[SessionID]MountMembershipProfile)}
+	closeOnError := func(err error) (*FileMountMembership, PriorEpochDisposition, error) {
 		_ = m.Close()
 		return nil, PriorEpochUnproven, err
 	}
@@ -95,14 +95,14 @@ func OpenFileVisibilityMembership(path, volumeID string, priorFenced bool) (*Fil
 	if len(m.active) != 0 {
 		disposition = PriorEpochUnproven
 	}
-	m.priorCompatibility = PriorEpochStrictMountsFenced
+	m.priorWriter = PriorEpochStrictMountsFenced
 	for id := range m.active {
 		switch m.profiles[id] {
-		case MembershipLinuxV7:
+		case MembershipLinux:
 			m.priorLinux = true
 		case MembershipCacheless:
 		default:
-			m.priorCompatibility = PriorEpochUnproven
+			m.priorWriter = PriorEpochUnproven
 		}
 	}
 	return m, disposition, nil
@@ -111,7 +111,7 @@ func OpenFileVisibilityMembership(path, volumeID string, priorFenced bool) (*Fil
 // ClearedByOperatorAssertion reports the exact strict mounts this process
 // forgot because an operator asserted they were fenced. It is never empty
 // without a matching durable audit record.
-func (m *FileVisibilityMembership) ClearedByOperatorAssertion() []SessionID {
+func (m *FileMountMembership) ClearedByOperatorAssertion() []SessionID {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]SessionID(nil), m.cleared...)
@@ -120,11 +120,11 @@ func (m *FileVisibilityMembership) ClearedByOperatorAssertion() []SessionID {
 // auditOperatorClearLocked appends and fsyncs the assertion record before the
 // membership file is rewritten, so a crash between the two leaves evidence of
 // the claim rather than a silently emptied record.
-func (m *FileVisibilityMembership) auditOperatorClearLocked(cleared []SessionID) error {
-	path := m.path + visibilityMembershipAuditSuffix
+func (m *FileMountMembership) auditOperatorClearLocked(cleared []SessionID) error {
+	path := m.path + membershipAuditSuffix
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
-		return fmt.Errorf("open visibility membership audit: %w", err)
+		return fmt.Errorf("open mount membership audit: %w", err)
 	}
 	defer file.Close()
 	writer := bufio.NewWriter(file)
@@ -149,24 +149,24 @@ func sortedSessionIDs(set map[SessionID]struct{}) []SessionID {
 	return ids
 }
 
-// PriorCacheState separates bounded v7 cache horizons from unrevocable Mac
+// PriorCacheState separates bounded Linux cache horizons from unrevocable Mac
 // caches. Neither result clears the durable topology or archive obligation.
-func (m *FileVisibilityMembership) PriorCacheState() (PriorEpochDisposition, bool) {
-	return m.priorCompatibility, m.priorLinux
+func (m *FileMountMembership) PriorCacheState() (PriorEpochDisposition, bool) {
+	return m.priorWriter, m.priorLinux
 }
 
-func (m *FileVisibilityMembership) Activate(id SessionID) error {
-	return m.ActivateProfile(id, MembershipCompatibility)
+func (m *FileMountMembership) Activate(id SessionID) error {
+	return m.ActivateProfile(id, MembershipFSKitExclusive)
 }
 
-func (m *FileVisibilityMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
-	if profile != MembershipCompatibility && profile != MembershipLinuxV7 && profile != MembershipCacheless {
+func (m *FileMountMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
+	if profile != MembershipFSKitExclusive && profile != MembershipLinux && profile != MembershipCacheless {
 		return errors.New("volumeserver: invalid membership profile")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lockFile == nil {
-		return errors.New("volumeserver: visibility membership is closed")
+		return errors.New("volumeserver: mount membership is closed")
 	}
 	if m.quiesceNonce != "" {
 		return ErrQuiescing
@@ -187,11 +187,11 @@ func (m *FileVisibilityMembership) ActivateProfile(id SessionID, profile MountMe
 	return nil
 }
 
-func (m *FileVisibilityMembership) Deactivate(id SessionID) error {
+func (m *FileMountMembership) Deactivate(id SessionID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lockFile == nil {
-		return errors.New("volumeserver: visibility membership is closed")
+		return errors.New("volumeserver: mount membership is closed")
 	}
 	if _, exists := m.active[id]; !exists {
 		return nil
@@ -217,11 +217,11 @@ func (m *FileVisibilityMembership) Deactivate(id SessionID) error {
 // serializes Activate and Deactivate, writes proof once the durable active set
 // is empty. A new nonce replaces a stale proof obligation. An empty nonce
 // reopens admission after a cancelled archive attempt.
-func (m *FileVisibilityMembership) SetQuiescing(nonce string, writeProof func() error) error {
+func (m *FileMountMembership) SetQuiescing(nonce string, writeProof func() error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lockFile == nil {
-		return errors.New("volumeserver: visibility membership is closed")
+		return errors.New("volumeserver: mount membership is closed")
 	}
 	if nonce == "" {
 		m.quiesceNonce, m.quiesceProof, m.proofWritten = "", nil, false
@@ -242,81 +242,59 @@ func (m *FileVisibilityMembership) SetQuiescing(nonce string, writeProof func() 
 	return nil
 }
 
-func (m *FileVisibilityMembership) Close() error {
+func (m *FileMountMembership) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lockFile == nil {
 		return nil
 	}
-	err := unlockVisibilityFile(m.lockFile)
+	err := unlockMembershipFile(m.lockFile)
 	m.lockFile = nil
 	return err
 }
 
-func (m *FileVisibilityMembership) load() error {
-	file, err := openVisibilityMembership(m.path)
+func (m *FileMountMembership) load() error {
+	file, err := openMountMembership(m.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return m.persistLocked()
 	}
 	if err != nil {
-		return fmt.Errorf("open visibility membership: %w", err)
+		return fmt.Errorf("open mount membership: %w", err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return errors.New("volumeserver: visibility membership must be a private regular file")
+		return errors.New("volumeserver: mount membership must be a private regular file")
 	}
-	scanner := bufio.NewScanner(file)
-	if !scanner.Scan() {
-		return errors.New("volumeserver: missing visibility membership header")
+	data, err := io.ReadAll(io.LimitReader(file, mountmembership.MaxBytes+1))
+	if err != nil {
+		return fmt.Errorf("read mount membership: %w", err)
 	}
-	legacy := scanner.Text() == "PFS-VISIBILITY-1"
-	if !legacy && scanner.Text() != visibilityMembershipHeader {
-		return errors.New("volumeserver: invalid visibility membership header")
+	records, err := mountmembership.Decode(data, m.volumeID)
+	if err != nil {
+		return fmt.Errorf("decode mount membership: %w", err)
 	}
-	if !scanner.Scan() || scanner.Text() != hex.EncodeToString([]byte(m.volumeID)) {
-		return errors.New("volumeserver: visibility membership belongs to a different volume")
-	}
-	for scanner.Scan() {
-		record := scanner.Text()
-		profile := MembershipCompatibility
-		if !legacy {
-			fields := strings.Split(record, "\t")
-			if len(fields) != 2 {
-				return errors.New("volumeserver: invalid profiled membership record")
-			}
-			record, profile = fields[0], MountMembershipProfile(fields[1])
-			if profile != MembershipCompatibility && profile != MembershipLinuxV7 && profile != MembershipCacheless {
-				return errors.New("volumeserver: unknown membership profile")
-			}
-		}
-		raw, err := hex.DecodeString(record)
-		if err != nil || len(raw) != len(SessionID{}) {
-			return errors.New("volumeserver: invalid visibility membership record")
-		}
-		var id SessionID
-		copy(id[:], raw)
-		if id == (SessionID{}) {
-			return errors.New("volumeserver: zero visibility membership record")
-		}
-		if _, duplicate := m.active[id]; duplicate {
-			return errors.New("volumeserver: duplicate visibility membership record")
-		}
+	for _, record := range records {
+		id := SessionID(record.SessionID)
 		m.active[id] = struct{}{}
-		m.profiles[id] = profile
-	}
-	if err := scanner.Err(); err != nil {
-		return err
+		m.profiles[id] = record.Profile
 	}
 	return nil
 }
 
-func (m *FileVisibilityMembership) persistLocked() error {
-	ids := sortedSessionIDs(m.active)
-	dir := filepath.Dir(m.path)
-	temp, err := os.CreateTemp(dir, ".portablefs-visibility-*")
+func (m *FileMountMembership) persistLocked() error {
+	records := make([]mountmembership.Record, 0, len(m.active))
+	for id := range m.active {
+		records = append(records, mountmembership.Record{SessionID: [16]byte(id), Profile: m.profiles[id]})
+	}
+	data, err := mountmembership.Encode(m.volumeID, records)
 	if err != nil {
-		return fmt.Errorf("create visibility membership temp file: %w", err)
+		return fmt.Errorf("encode mount membership: %w", err)
+	}
+	dir := filepath.Dir(m.path)
+	temp, err := os.CreateTemp(dir, ".portablefs-membership-*")
+	if err != nil {
+		return fmt.Errorf("create mount membership temp file: %w", err)
 	}
 	tempPath := temp.Name()
 	cleanup := func() { _ = temp.Close(); _ = os.Remove(tempPath) }
@@ -324,22 +302,7 @@ func (m *FileVisibilityMembership) persistLocked() error {
 		cleanup()
 		return err
 	}
-	writer := bufio.NewWriter(temp)
-	if _, err := fmt.Fprintln(writer, visibilityMembershipHeader); err != nil {
-		cleanup()
-		return err
-	}
-	if _, err := fmt.Fprintln(writer, hex.EncodeToString([]byte(m.volumeID))); err != nil {
-		cleanup()
-		return err
-	}
-	for _, id := range ids {
-		if _, err := fmt.Fprintf(writer, "%s\t%s\n", hex.EncodeToString(id[:]), m.profiles[id]); err != nil {
-			cleanup()
-			return err
-		}
-	}
-	if err := writer.Flush(); err != nil {
+	if _, err := temp.Write(data); err != nil {
 		cleanup()
 		return err
 	}

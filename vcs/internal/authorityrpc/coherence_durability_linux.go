@@ -22,7 +22,7 @@ type coherenceSessionApplications struct {
 }
 
 // coherenceDurability maps the session application-ticket domain exposed
-// on protocol 7 to the volume commit domain covered by syncfs. The volume
+// on protocol 8 to the volume commit domain covered by syncfs. The volume
 // handler's commit-publication lock orders recordApplied with volume-version
 // assignment; this mutex protects only the per-session indexes and is never
 // held across storage I/O.

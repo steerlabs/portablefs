@@ -136,9 +136,9 @@ func TestHandlerAttributeSamplesWaitForRestoreEntryLock(t *testing.T) {
 			store := &restoreSampleStore{}
 			// Linux's both-field refusal is covered separately; FSKit has the
 			// same storage sampling path after its profile-specific admission.
-			profile := authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+			profile := authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 			if operation == "both getattr" {
-				profile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+				profile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
 			}
 			h, ctx, cred, root := resourceAdmissionRequestHarnessForProfile(t, store, 16, 16, profile)
 			h.Restore = newRestoreTruncateMode(t, &restoreTruncateSyncFailure{}, false, true)

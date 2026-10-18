@@ -253,12 +253,12 @@ type Volume struct {
 	// later zero-byte data-path failure.
 	pwrite                    func(int, []byte, int64) (int, error)
 	pwritev2                  func(int, [][]byte, int64, int) (int, error)
-	sendfile                  func(int, int, *int64, int) (int, error)
 	copyFileRange             func(int, *int64, int, *int64, int, int) (int, error)
 	postStat                  func(int) (Attr, error)
 	fsync                     func(int) error
 	fdatasync                 func(int) error
 	syncfs                    func(int) error
+	onStorageSync             func(StorageSync)
 	inspectSecurityCapability func(int) (bool, error)
 	// removeWritePrivileges is fixed to the package implementation in
 	// production. The seam lets tests prove that a delegated killpriv failure
@@ -495,7 +495,6 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		fallocateAllocationUnit:     xfsFallocateAllocationUnit,
 		pwrite:                      unix.Pwrite,
 		pwritev2:                    unix.Pwritev2,
-		sendfile:                    unix.Sendfile,
 		copyFileRange:               unix.CopyFileRange,
 		postStat:                    statFD,
 		fsync:                       unix.Fsync,
@@ -504,6 +503,9 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		inspectSecurityCapability:   inspectSecurityCapability,
 		removeWritePrivileges:       removeWritePrivileges,
 		removePinnedWritePrivileges: removeWritePrivilegesWithCapability,
+	}
+	if config != nil {
+		v.onStorageSync = config.OnStorageSync
 	}
 	rootIdentity, err := stableIdentityFD(fd, requireXFS)
 	if err != nil {
@@ -1042,7 +1044,7 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	// the handle instead of being installed on the fd: transactional writes may
 	// span many bounded pwrite calls and must issue one aggregate sync, while
 	// XFS fallocate/CFR semantics need the immutable OPEN intent once after a
-	// clean operation. A sticky O_SYNC/O_DSYNC fd would flush every fragment.
+	// clean operation. A sticky O_SYNC/O_DSYNC fd would add implicit syncs to direct writes.
 	if granted := obj.grant.take(); granted != nil {
 		return v.adoptGrantedDescription(obj.grant, granted, id, obj.kind, flags)
 	}
@@ -1247,82 +1249,6 @@ func (v *Volume) syncDescriptor(state *inodeFsyncState, fd int, full, dataOnly b
 
 type writeTargetApply func(limit, assigned uint64) (committed uint64, dispatched, invalidResult bool, err error)
 
-func (t *writeTarget) CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (uint64, uint64, Attr, error) {
-	if staged == nil || spec.Mode == WriteAppend && len(scratch) == 0 {
-		return 0, 0, Attr{}, fs.ErrInvalid
-	}
-	return t.commitWrite(spec, func(limit, assigned uint64) (uint64, bool, bool, error) {
-		if spec.Mode == WritePositioned {
-			stageFD, ok := staged.(interface{ Fd() uintptr })
-			if !ok || stageFD.Fd() > uintptr(math.MaxInt) {
-				return 0, false, false, fs.ErrInvalid
-			}
-			var stageStat unix.Stat_t
-			if err := unix.Fstat(int(stageFD.Fd()), &stageStat); err != nil {
-				return 0, false, false, err
-			}
-			if stageStat.Mode&unix.S_IFMT != unix.S_IFREG || stageStat.Size < int64(limit) {
-				return 0, false, false, io.ErrUnexpectedEOF
-			}
-			// sendfile has no output-offset argument. The inode mutation lock
-			// excludes every PortableFS size-changing operation while this cursor
-			// is installed and consumed.
-			if _, err := unix.Seek(t.res.fd, int64(assigned), io.SeekStart); err != nil {
-				return 0, false, false, err
-			}
-			inputOffset := int64(0)
-			n, copyErr := t.volume.sendfile(t.res.fd, int(stageFD.Fd()), &inputOffset, int(limit))
-			invalid := false
-			if n < 0 {
-				if n == -1 && copyErr != nil {
-					n = 0
-				} else {
-					invalid = true
-					n = 0
-				}
-			}
-			if uint64(n) > limit || inputOffset != int64(n) {
-				invalid = true
-			}
-			committed := uint64(n)
-			if invalid {
-				return committed, true, true, syscall.EIO
-			}
-			if copyErr == nil && committed != limit {
-				copyErr = io.ErrShortWrite
-			}
-			return committed, true, false, copyErr
-		}
-
-		var committed uint64
-		for committed < limit {
-			chunk := uint64(len(scratch))
-			if remaining := limit - committed; chunk > remaining {
-				chunk = remaining
-			}
-			buf := scratch[:int(chunk)]
-			n, readErr := staged.ReadAt(buf, int64(committed))
-			if n != len(buf) || readErr != nil && !errors.Is(readErr, io.EOF) {
-				if committed != 0 {
-					return committed, true, false, outcomeUncertain(firstError(readErr, io.ErrUnexpectedEOF))
-				}
-				return 0, false, false, firstError(readErr, io.ErrUnexpectedEOF)
-			}
-			written, writeErr := t.volume.pwritev2(t.res.fd, [][]byte{buf}, 0, unix.RWF_APPEND)
-			if written > 0 {
-				committed += uint64(written)
-			}
-			if writeErr != nil || written != len(buf) {
-				if writeErr == nil {
-					writeErr = io.ErrShortWrite
-				}
-				return committed, true, false, writeErr
-			}
-		}
-		return committed, true, false, nil
-	})
-}
-
 // CommitWriteData applies a complete one-frame write directly from the
 // retained authority frame. It never creates a staging file and dispatches
 // exactly one data syscall to XFS.
@@ -1448,7 +1374,7 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		// syscall error can therefore have changed timestamps, privilege bits,
 		// or security.capability even when EOF and every data byte are intact.
 		// Conservatively publish the exact post-state for every dispatched zero
-		// result; only validation/staging failures before dispatch are definite
+		// result; only validation failures before dispatch are definite
 		// no-change rejections.
 		cause := errors.Join(applyErr, postApplyErr)
 		if cause == nil {

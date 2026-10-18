@@ -53,11 +53,11 @@ func newMutationDependencies(keys ...[]byte) MutationDependencies {
 	return MutationDependencies{keys: encoded[:write]}
 }
 
-func mutationDependenciesForTargets(targets []VisibilityTarget) MutationDependencies {
+func mutationDependenciesForTargets(targets []MutationTarget) MutationDependencies {
 	keys := make([][]byte, 0, len(targets)*2)
 	for _, target := range targets {
 		keys = append(keys, target.key())
-		if target.Scope == VisibilityNamespace {
+		if target.Scope == MutationNamespace {
 			keys = append(keys, inodeKey(target.ParentIdentity))
 			for _, identity := range target.RelatedIdentities {
 				keys = append(keys, inodeKey(identity))
@@ -68,14 +68,13 @@ func mutationDependenciesForTargets(targets []VisibilityTarget) MutationDependen
 }
 
 // MutationDependenciesForTargets is the explicit dependency declaration for a
-// caller that already has an authority-derived visibility footprint. Normal
-// FSKit synchronous-repair requests use DeclareSourceGate so binding identities
-// can be version-checked across their XFS resolution.
-func MutationDependenciesForTargets(targets []VisibilityTarget) MutationDependencies {
+// caller that already has authority-derived mutation targets. Footprint callers
+// also include the binding identities checked across storage acquisition.
+func MutationDependenciesForTargets(targets []MutationTarget) MutationDependencies {
 	return mutationDependenciesForTargets(targets)
 }
 
-func mutationDependenciesForSourceGate(gate SourcePublicationGate) MutationDependencies {
+func MutationDependenciesForFootprint(gate MutationFootprint) MutationDependencies {
 	keys := make([][]byte, 0, len(gate.Targets)*3)
 	for _, target := range gate.Targets {
 		if !target.namespace() {
@@ -85,16 +84,6 @@ func mutationDependenciesForSourceGate(gate SourcePublicationGate) MutationDepen
 		keys = append(keys, inodeKey(target.ParentIdentity), nameKey(target.ParentIdentity, target.Name))
 		for _, identity := range target.BoundIdentities {
 			keys = append(keys, inodeKey(identity))
-		}
-	}
-	return newMutationDependencies(keys...)
-}
-
-func bindingDependenciesForSourceGate(gate SourcePublicationGate) MutationDependencies {
-	keys := make([][]byte, 0, len(gate.Targets))
-	for _, target := range gate.Targets {
-		if target.namespace() {
-			keys = append(keys, nameKey(target.ParentIdentity, target.Name))
 		}
 	}
 	return newMutationDependencies(keys...)
@@ -125,12 +114,12 @@ func (d MutationDependencies) equal(other MutationDependencies) bool {
 	return true
 }
 
-func (d MutationDependencies) covers(targets []VisibilityTarget) bool {
+func (d MutationDependencies) covers(targets []MutationTarget) bool {
 	for _, target := range targets {
 		if !d.contains(target.key()) {
 			return false
 		}
-		if target.Scope != VisibilityNamespace {
+		if target.Scope != MutationNamespace {
 			continue
 		}
 		if !d.contains(inodeKey(target.ParentIdentity)) {
@@ -154,19 +143,6 @@ type dependencySnapshot struct {
 	sequencer *mutationSequencer
 	versions  map[string]uint64
 	once      sync.Once
-}
-
-func (d DependencyDeclaration) validFor(gate SourcePublicationGate, sequencer *mutationSequencer) bool {
-	bindings := bindingDependenciesForSourceGate(gate)
-	if d.snapshot == nil || d.snapshot.sequencer != sequencer || len(d.snapshot.versions) != len(bindings.keys) {
-		return false
-	}
-	for _, key := range bindings.keys {
-		if _, ok := d.snapshot.versions[key]; !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // mutationSequencer grants dependency sets atomically under one short registry
@@ -543,8 +519,8 @@ func (w *mutationSequencerWaiter) release() {
 }
 
 // settle is the idempotent deferred form used by Execute. A requeued waiter may
-// have abandoned itself on cancellation or a newly pending repair before the
-// caller unwinds; that path has already released every key.
+// abandon itself on cancellation before the caller unwinds; that path has
+// already released every key.
 func (w *mutationSequencerWaiter) settle() {
 	s := w.sequencer
 	s.mu.Lock()

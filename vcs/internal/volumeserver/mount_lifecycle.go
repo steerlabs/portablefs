@@ -13,9 +13,9 @@ var (
 )
 
 // MountLifecycle owns durable mount membership and topology exclusion.
-// Cache authority belongs to the independent v7 and Mac coordinators.
+// Cache authority belongs to the Linux coordinator and writer registry.
 type MountLifecycle struct {
-	membership DurableVisibilityMembership
+	membership DurableMountMembership
 	now        func() time.Time
 	clockSkew  time.Duration
 
@@ -29,7 +29,7 @@ type MountLifecycle struct {
 }
 
 type MountLifecycleConfig struct {
-	Membership DurableVisibilityMembership
+	Membership DurableMountMembership
 	Prior      PriorEpochDisposition
 	Now        func() time.Time
 	ClockSkew  time.Duration
@@ -84,10 +84,10 @@ func (l *MountLifecycle) RequireCleanRouteAbsence() error {
 // publication can escape. The caller already holds a topology read guard so a
 // route change cannot fit between revision admission and this registration.
 func (l *MountLifecycle) Activate(id SessionID, publish func() error) error {
-	return l.ActivateProfile(id, MembershipCompatibility, publish)
+	return l.ActivateProfile(id, MembershipFSKitExclusive, publish)
 }
 
-func activateMembership(m DurableVisibilityMembership, id SessionID, profile MountMembershipProfile) error {
+func activateMembership(m DurableMountMembership, id SessionID, profile MountMembershipProfile) error {
 	if typed, ok := m.(interface {
 		ActivateProfile(SessionID, MountMembershipProfile) error
 	}); ok {
@@ -128,7 +128,7 @@ func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipPr
 // latter fails, membership is restored so a restart remains fail-closed.
 func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remove func() error) error {
 	if remove == nil {
-		return ErrVisibilityProof
+		return ErrMountProof
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -157,12 +157,12 @@ func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remo
 func (l *MountLifecycle) validateMountAbsence(proof MountAbsenceProof, registered time.Time) error {
 	if len(proof.Observation) == 0 || len(proof.Observation) > maxMountAbsenceObservation ||
 		proof.Component == "" || len(proof.Component) > maxMountAbsenceComponent || proof.ObservedUnixNanos <= 0 {
-		return ErrVisibilityProof
+		return ErrMountProof
 	}
 	observed := time.Unix(0, proof.ObservedUnixNanos)
 	now := l.now()
 	if observed.After(now.Add(l.clockSkew)) || observed.Before(registered.Add(-l.clockSkew)) {
-		return ErrVisibilityProof
+		return ErrMountProof
 	}
 	return nil
 }

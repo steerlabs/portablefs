@@ -243,7 +243,7 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		r.mu.Unlock()
 		return next, err
 	}
-	acknowledged, err := r.Mounts.ExecuteTopologyExclusive(ctx, func() (int, error) {
+	_, err = r.Mounts.ExecuteTopologyExclusive(ctx, func() (int, error) {
 		shouldApply, checkErr := check()
 		if checkErr != nil || !shouldApply {
 			return 0, checkErr
@@ -269,9 +269,8 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		}, nil
 	}
 	return &authoritypb.ApplyRoutesReply{
-		Revision:                 append([]byte(nil), next.Revision[:]...),
-		Canonical:                append([]byte(nil), next.Canonical...),
-		AcknowledgedParticipants: uint32(acknowledged),
+		Revision:  append([]byte(nil), next.Revision[:]...),
+		Canonical: append([]byte(nil), next.Canonical...),
 	}, nil
 }
 
@@ -556,10 +555,9 @@ func (r *RoutesController) directory(root xfsstore.Capability) (xfsstore.Capabil
 // of the canonical mutation hash, so a routing change cannot desynchronize a
 // replay slot.
 //
-// It is airtight because the switch happens under the barrier's registration
-// write lock: no Execute is running, none can start, and no attach can be in
-// progress, so no request exists that was admitted under one revision and
-// executes under the other.
+// MountLifecycle serializes this switch with durable activation and requires
+// an empty membership set. An admitted mount therefore cannot straddle route
+// revisions, including while its last runtime use is still draining.
 func (h *VolumeHandler) admitSessionRoutes(id volumeserver.SessionID) error {
 	h.resourcesMu.Lock()
 	resources := h.resources[id]
@@ -609,21 +607,6 @@ func routesRevision(raw []byte) ([32]byte, error) {
 	}
 	copy(revision[:], raw)
 	return revision, nil
-}
-
-func namespaceRepair(repair authoritypb.NamespaceRepair) (volumeserver.NamespaceRepair, error) {
-	switch repair {
-	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED:
-		return volumeserver.NamespaceRepairUnspecified, nil
-	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT:
-		return volumeserver.NamespaceRepairIndependent, nil
-	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED:
-		return volumeserver.NamespaceRepairCallbackSerialized, nil
-	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED:
-		return volumeserver.NamespaceRepairCallbackSerializedPipelined, nil
-	default:
-		return volumeserver.NamespaceRepairUnspecified, syscall.EINVAL
-	}
 }
 
 func absentEntry(err error) bool {

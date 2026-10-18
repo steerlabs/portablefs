@@ -4,7 +4,6 @@ package authorityrpc
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"net"
 	"os"
@@ -36,38 +35,32 @@ func openTakeoverTestStore(t *testing.T, root string) *xfsstore.Volume {
 	return store
 }
 
-func TestCompatibilityPriorMembershipMappingOnXFS(t *testing.T) {
-	for _, kind := range []string{"legacy", "compatibility", "Linux only"} {
+func TestWriterPriorMembershipMappingOnXFS(t *testing.T) {
+	for _, kind := range []string{"fskit-exclusive", "Linux only"} {
 		t.Run(kind, func(t *testing.T) {
 			root := restorefixture.Root(t)
 			store := openTakeoverTestStore(t, root)
-			path := filepath.Join(t.TempDir(), "membership")
+			path := filepath.Join(t.TempDir(), "mount.membership")
 			if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
 				t.Fatal(err)
 			}
 			old := volumeserver.SessionID{1}
-			if kind == "legacy" {
-				raw := "PFS-VISIBILITY-1\n" + hex.EncodeToString([]byte("vol")) + "\n" + hex.EncodeToString(old[:]) + "\n"
-				if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				membership, _, err := volumeserver.OpenFileVisibilityMembership(path, "vol", false)
-				if err != nil {
-					t.Fatal(err)
-				}
-				profile := volumeserver.MembershipCompatibility
-				if kind == "Linux only" {
-					profile = volumeserver.MembershipLinuxV7
-				}
-				if err := membership.ActivateProfile(old, profile); err != nil {
-					t.Fatal(err)
-				}
-				if err := membership.Close(); err != nil {
-					t.Fatal(err)
-				}
+
+			membership, _, err := volumeserver.OpenFileMountMembership(path, "vol", false)
+			if err != nil {
+				t.Fatal(err)
 			}
-			membership, prior, err := volumeserver.OpenFileVisibilityMembership(path, "vol", false)
+			profile := volumeserver.MembershipFSKitExclusive
+			if kind == "Linux only" {
+				profile = volumeserver.MembershipLinux
+			}
+			if err := membership.ActivateProfile(old, profile); err != nil {
+				t.Fatal(err)
+			}
+			if err := membership.Close(); err != nil {
+				t.Fatal(err)
+			}
+			membership, prior, err := volumeserver.OpenFileMountMembership(path, "vol", false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,12 +75,12 @@ func TestCompatibilityPriorMembershipMappingOnXFS(t *testing.T) {
 				t.Fatalf("prior mapping: %v Linux=%v", compatibility, linux)
 			}
 			var elapsed atomic.Int64
-			c, err := NewCoordination(CoordinationConfig{Store: store, Fencer: noopFencer{}, Locks: volumeserver.NewLockTable(16, 16, time.Now), Membership: membership, Prior: prior, MaxCachedNameCapacity: 16, MaxRepairBudget: time.Second, ContinuousNow: func() (time.Duration, error) { return time.Duration(elapsed.Load()), nil }})
+			c, err := NewCoordination(CoordinationConfig{Store: store, Fencer: noopFencer{}, Locks: volumeserver.NewLockTable(16, 16, time.Now), Membership: membership, Prior: prior, ContinuousNow: func() (time.Duration, error) { return time.Duration(elapsed.Load()), nil }})
 			if err != nil {
 				t.Fatal(err)
 			}
 			writer := volumeserver.SessionID{2}
-			err = c.Visibility.CheckCompatibilityWriter(writer)
+			err = c.Writers.CheckWriter(writer)
 			if wantLinux {
 				// No takeover sample and no 61.06s wait may be needed for
 				// compatibility admission when only Linux subscribed before.
@@ -100,24 +93,21 @@ func TestCompatibilityPriorMembershipMappingOnXFS(t *testing.T) {
 					t.Fatalf("lost independent Linux prior horizon: %v", err)
 				}
 			} else {
-				if !errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+				if !errors.Is(err, volumeserver.ErrWriterExcluded) {
 					t.Fatalf("unproven writer=%v", err)
 				}
-				if err := c.Visibility.StartCompatibilityWriterGrace(); err != nil {
+				if err := c.Writers.StartWriterGrace(); err != nil {
 					t.Fatal(err)
 				}
-				elapsed.Store(int64(volumeserver.CompatibilityRestartGrace - time.Nanosecond))
-				if err := c.Visibility.CheckCompatibilityWriter(writer); !errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+				elapsed.Store(int64(volumeserver.WriterRestartGrace - time.Nanosecond))
+				if err := c.Writers.CheckWriter(writer); !errors.Is(err, volumeserver.ErrWriterExcluded) {
 					t.Fatalf("early writer=%v", err)
 				}
-				elapsed.Store(int64(volumeserver.CompatibilityRestartGrace))
-				if err := c.Visibility.CheckCompatibilityWriter(writer); err != nil {
+				elapsed.Store(int64(volumeserver.WriterRestartGrace))
+				if err := c.Writers.CheckWriter(writer); err != nil {
 					t.Fatal(err)
 				}
-				commitment := volumeserver.VisibilityCommitment{CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairCallbackSerializedPipelined, CompatibilityWriter: true}
-				if err := c.Visibility.Register(writer, volumeserver.CoherenceStrict, make(chan struct{}), commitment); !errors.Is(err, volumeserver.ErrVisibilityStartup) {
-					t.Fatalf("Mac activation=%v", err)
-				}
+
 			}
 			if err := c.Lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, volumeserver.ErrRoutesLive) {
 				t.Fatalf("grace changed topology obligation: %v", err)
@@ -156,27 +146,27 @@ func (t *handoffApplyTarget) CommitWriteData(data []byte, spec xfsstore.WriteCom
 	return t.WriteTarget.CommitWriteData(data, spec)
 }
 
-func TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS(t *testing.T) {
+func TestWriterSafeTakeoverWaitsForPendingApplyOnXFS(t *testing.T) {
 	root := restorefixture.Root(t)
 	store := openTakeoverTestStore(t, root)
-	path := filepath.Join(t.TempDir(), "membership")
+	path := filepath.Join(t.TempDir(), "mount.membership")
 	if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	membership, prior, err := volumeserver.OpenFileVisibilityMembership(path, "handoff", false)
+	membership, prior, err := volumeserver.OpenFileMountMembership(path, "handoff", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer membership.Close()
-	runtime, err := volumeserver.New("handoff", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("handoff", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewCoordination(CoordinationConfig{Store: store, Fencer: runtime, Locks: runtime.Locks(), Membership: membership, Prior: prior, MaxCachedNameCapacity: 1024, MaxRepairBudget: time.Second})
+	c, err := NewCoordination(CoordinationConfig{Store: store, Fencer: runtime, Locks: runtime.Locks(), Membership: membership, Prior: prior})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Visibility.StartCompatibilityWriterGrace(); err != nil {
+	if err := c.Writers.StartWriterGrace(); err != nil {
 		t.Fatal(err)
 	}
 	backend := &handoffApplyStore{Volume: store, entered: make(chan struct{}), release: make(chan struct{})}
@@ -207,7 +197,7 @@ func TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS(t *testing.T) {
 			}
 		}
 	}()
-	clientConfig := coherentTestClientConfig(listener.Addr().String(), clientTLS, "handoff", 8, int(h.MaxInFlight))
+	clientConfig := coherentTestClientConfig(listener.Addr().String(), clientTLS, "handoff", h.MaxInFlight, int(h.MaxInFlight))
 	clientConfig.RoutesRevision = routesRevisionOf("")
 	client, err := DialClient(t.Context(), clientConfig)
 	if err != nil {
@@ -250,7 +240,7 @@ func TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS(t *testing.T) {
 		}
 		t.Fatalf("takeover with pending apply: %v", err)
 	}
-	if second, _, err := volumeserver.OpenFileVisibilityMembership(path, "handoff", false); err == nil {
+	if second, _, err := volumeserver.OpenFileMountMembership(path, "handoff", false); err == nil {
 		second.Close()
 		t.Fatal("membership ownership escaped before apply drain")
 	}
@@ -274,20 +264,20 @@ func TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS(t *testing.T) {
 		t.Fatal(err)
 	}
 	next := openTakeoverTestStore(t, root)
-	nextMembership, nextPrior, err := volumeserver.OpenFileVisibilityMembership(path, "handoff", false)
+	nextMembership, nextPrior, err := volumeserver.OpenFileMountMembership(path, "handoff", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer nextMembership.Close()
 	var samples atomic.Int64
-	nextC, err := NewCoordination(CoordinationConfig{Store: next, Fencer: noopFencer{}, Locks: volumeserver.NewLockTable(16, 16, time.Now), Membership: nextMembership, Prior: nextPrior, MaxCachedNameCapacity: 16, MaxRepairBudget: time.Second, ContinuousNow: func() (time.Duration, error) { samples.Add(1); return time.Second, nil }})
+	nextC, err := NewCoordination(CoordinationConfig{Store: next, Fencer: noopFencer{}, Locks: volumeserver.NewLockTable(16, 16, time.Now), Membership: nextMembership, Prior: nextPrior, ContinuousNow: func() (time.Duration, error) { samples.Add(1); return time.Second, nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if samples.Load() != 0 {
 		t.Fatal("takeover sampled during construction")
 	}
-	if err := nextC.Visibility.StartCompatibilityWriterGrace(); err != nil {
+	if err := nextC.Writers.StartWriterGrace(); err != nil {
 		t.Fatal(err)
 	}
 	if samples.Load() != 1 {

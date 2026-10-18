@@ -3,7 +3,6 @@ package volumeserver
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,23 +21,6 @@ func waitForMutationSequencerQueue(t *testing.T, sequencer *mutationSequencer, w
 	for sequencer.queued() != want {
 		if time.Now().After(deadline) {
 			t.Fatalf("queued mutation dependency sets = %d, want %d", sequencer.queued(), want)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func waitForVisibilityLaneWaiters(t *testing.T, coordinator *VisibilityCoordinator, want int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		coordinator.mu.Lock()
-		got := len(coordinator.laneWaiters)
-		coordinator.mu.Unlock()
-		if got == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("visibility lane waiters = %d, want %d", got, want)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -187,8 +169,8 @@ func TestMutationSequencerBindingVersionsLiveOnlyForActiveDeclarations(t *testin
 
 func TestMutationDependenciesCoverageRequiresNamespaceObservationKeys(t *testing.T) {
 	parent, bound := modelInode(1), modelInode(2)
-	targets := []VisibilityTarget{{
-		Scope: VisibilityNamespace, ParentIdentity: parent, Name: []byte("child"),
+	targets := []MutationTarget{{
+		Scope: MutationNamespace, ParentIdentity: parent, Name: []byte("child"),
 		RelatedIdentities: [][16]byte{bound},
 	}}
 	partial := newMutationDependencies(targets[0].key(), inodeKey(parent))
@@ -200,62 +182,31 @@ func TestMutationDependenciesCoverageRequiresNamespaceObservationKeys(t *testing
 	}
 }
 
-func TestVisibilityNamespaceRevalidationRepeatsAfterOlderReservation(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.register(t, source, testRepairBudget)
-
-	gate := testSourcePublicationGate("child")
-	var oldIdentity, intermediateIdentity, finalIdentity [16]byte
-	oldIdentity[0], intermediateIdentity[0], finalIdentity[0] = 0x31, 0x32, 0x33
-	gate.Targets[0].BoundIdentities = [][16]byte{oldIdentity}
-	declaration := h.coordinator.DeclareSourceGate(gate)
-	binding := bindingDependenciesForSourceGate(gate)
-
-	// Make the pre-resolution declaration stale, then reserve an ordinal before
-	// Execute enqueues. The reserved waiter is claimed only during the first
-	// refresh, which models a dormant frontend fairness credit becoming active.
-	changed, err := h.coordinator.sequencer.acquire(t.Context(), binding)
+func TestMutationNamespaceRevalidationRepeatsAfterBindingChange(t *testing.T) {
+	storage := NewStorageSequencer()
+	footprint := testMutationFootprint("child")
+	deps := bindingDependenciesForFootprint(footprint)
+	declaration := storage.Declare(deps)
+	release, err := storage.Acquire(t.Context(), deps)
 	if err != nil {
 		t.Fatal(err)
 	}
-	changed.release()
-	reserved := h.coordinator.sequencer.reserveOrdinal()
-	current := intermediateIdentity
-	var refreshes atomic.Int32
-	refresh := func() (SourcePublicationGate, error) {
-		refreshed := cloneSourcePublicationGate(gate)
-		refreshed.Targets[0].BoundIdentities = [][16]byte{current}
-		if refreshes.Add(1) == 1 {
-			older := h.coordinator.sequencer.enqueueFor(binding, reserved)
-			go func() {
-				<-older.ready
-				current = finalIdentity
-				older.release()
-			}()
-		}
-		return refreshed, nil
-	}
-	targets := testVisibilityTargets("child")
-	err = h.coordinator.ExecuteWithSourceGate(
-		context.Background(), source, MutationID{Sequence: 1}, declaration, gate, refresh,
-		func() ([]VisibilityTarget, error) { return targets, nil },
-		func() ([]VisibilityTarget, bool) { return targets, true },
-		func() ([]VisibilityResolution, error) { return nil, nil },
-	)
+	release()
+	release, unchanged, err := storage.AcquireDeclared(t.Context(), deps, declaration)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := refreshes.Load(); got != 3 {
-		t.Fatalf("namespace refreshes = %d, want initial correction, older-waiter correction, and stable proof", got)
+	release()
+	if unchanged {
+		t.Fatal("changed binding accepted under its old declaration")
 	}
-
-	h.coordinator.mu.Lock()
-	participant := h.coordinator.participants[source]
-	hasIntermediate := participant.index.contains(inodeKey(intermediateIdentity))
-	hasFinal := participant.index.contains(inodeKey(finalIdentity))
-	h.coordinator.mu.Unlock()
-	if hasIntermediate || !hasFinal {
-		t.Fatalf("source index intermediate/final binding = %t/%t, want false/true", hasIntermediate, hasFinal)
+	declaration = storage.Declare(deps)
+	release, unchanged, err = storage.AcquireDeclared(t.Context(), deps, declaration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if !unchanged {
+		t.Fatal("stable refreshed binding was refused")
 	}
 }

@@ -22,7 +22,7 @@ func (c *exclusionTestClock) continuous() (time.Duration, error) {
 	return time.Duration(c.elapsed.Load()), nil
 }
 
-func compatibilitySession(t *testing.T, lease, authorization time.Duration) (*Authority, SessionCredential, *VisibilityCoordinator, *CompatibilityExclusion, *exclusionTestClock) {
+func writerSession(t *testing.T, lease, authorization time.Duration) (*Authority, SessionCredential, *WriterRegistry, *WriterExclusion, *exclusionTestClock) {
 	t.Helper()
 	clock := &exclusionTestClock{}
 	clock.elapsed.Store(int64(time.Second))
@@ -34,11 +34,11 @@ func compatibilitySession(t *testing.T, lease, authorization time.Duration) (*Au
 	if err != nil {
 		t.Fatal(err)
 	}
-	exclusion, err := a.CompatibilityExclusion(cred.ID)
+	exclusion, err := a.WriterExclusion(cred.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := NewVisibilityCoordinator(VisibilityConfig{Prior: PriorEpochStrictMountsFenced, Membership: newTestDurableVisibilityMembership(), Fencer: a, MaxCachedNameCapacity: 16, MaxRepairBudget: time.Second, Now: clock.now})
+	c, err := NewWriterRegistry(WriterRegistryConfig{Prior: PriorEpochStrictMountsFenced, Fencer: a, ContinuousNow: clock.continuous})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,10 +46,10 @@ func compatibilitySession(t *testing.T, lease, authorization time.Duration) (*Au
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Register(cred.ID, CoherenceStrict, terminal, VisibilityCommitment{CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairCallbackSerializedPipelined, CompatibilityWriter: true, Exclusion: exclusion}); err != nil {
+	if err := c.Activate(cred.ID, terminal, exclusion, func() error { return nil }, func() {}); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { c.Fence(cred.ID, nil) })
+	t.Cleanup(func() { c.Fence(cred.ID) })
 	return a, cred, c, exclusion, clock
 }
 
@@ -64,7 +64,7 @@ func TestKeepAliveProofCapsAndQuantizesValidity(t *testing.T) {
 		{"submillisecond", time.Minute, time.Microsecond, 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			a, cred, _, _, _ := compatibilitySession(t, test.lease, test.auth)
+			a, cred, _, _, _ := writerSession(t, test.lease, test.auth)
 			use, err := a.Begin(cred)
 			if err != nil {
 				t.Fatal(err)
@@ -78,8 +78,8 @@ func TestKeepAliveProofCapsAndQuantizesValidity(t *testing.T) {
 	}
 }
 
-func TestCompatibilityFenceRetainsMaximumProofAndApplyDrain(t *testing.T) {
-	a, cred, c, _, clock := compatibilitySession(t, 10*time.Minute, time.Hour)
+func TestWriterFenceRetainsMaximumProofAndApplyDrain(t *testing.T) {
+	a, cred, c, _, clock := writerSession(t, 10*time.Minute, time.Hour)
 	apply, err := a.Begin(cred)
 	if err != nil {
 		t.Fatal(err)
@@ -96,22 +96,21 @@ func TestCompatibilityFenceRetainsMaximumProofAndApplyDrain(t *testing.T) {
 	if proof, err := apply.RenewalProof(); err != nil || proof != 2*time.Second {
 		t.Fatalf("short proof=%v, %v", proof, err)
 	}
-	c.Fence(cred.ID, nil)
+	c.Fence(cred.ID)
 	if proof, err := apply.RenewalProof(); proof != 0 || !errors.Is(err, ErrSessionFenced) {
 		t.Fatalf("fenced proof=%v, %v", proof, err)
 	}
 	for _, now := range []time.Duration{13 * time.Second, 61*time.Second - time.Nanosecond, 61 * time.Second} {
 		clock.elapsed.Store(int64(now))
-		if err := c.CheckCompatibilityWriter(SessionID{2}); !errors.Is(err, ErrCompatibilityWriterLease) {
+		if err := c.CheckWriter(SessionID{2}); !errors.Is(err, ErrWriterExcluded) {
 			t.Fatalf("writer before drain at %v: %v", now, err)
 		}
-		commitment := VisibilityCommitment{CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairCallbackSerializedPipelined, CompatibilityWriter: true}
-		if err := c.Register(SessionID{2}, CoherenceStrict, make(chan struct{}), commitment); !errors.Is(err, ErrCompatibilityWriterLease) {
+		if err := c.Activate(SessionID{2}, make(chan struct{}), &WriterExclusion{now: clock.continuous}, func() error { return nil }, func() {}); !errors.Is(err, ErrWriterExcluded) {
 			t.Fatalf("second Mac at %v: %v", now, err)
 		}
 	}
 	apply.End()
-	if err := c.CheckCompatibilityWriter(SessionID{2}); err != nil {
+	if err := c.CheckWriter(SessionID{2}); err != nil {
 		t.Fatalf("writer after deadline and drain: %v", err)
 	}
 	if _, err := a.Begin(cred); !errors.Is(err, ErrSessionExpired) {
@@ -119,22 +118,22 @@ func TestCompatibilityFenceRetainsMaximumProofAndApplyDrain(t *testing.T) {
 	}
 }
 
-func TestCompatibilityOrdinaryRenewalGrantsNoCacheProof(t *testing.T) {
-	a, cred, c, _, clock := compatibilitySession(t, 10*time.Minute, time.Hour)
+func TestWriterOrdinaryRenewalGrantsNoCacheProof(t *testing.T) {
+	a, cred, c, _, clock := writerSession(t, 10*time.Minute, time.Hour)
 	use, err := a.Begin(cred)
 	if err != nil {
 		t.Fatal(err)
 	}
 	use.End()
-	c.Fence(cred.ID, nil)
+	c.Fence(cred.ID)
 	clock.elapsed.Store(int64(2 * time.Second))
-	if err := c.CheckCompatibilityWriter(SessionID{2}); err != nil {
+	if err := c.CheckWriter(SessionID{2}); err != nil {
 		t.Fatalf("ordinary lease retained as cache proof: %v", err)
 	}
 }
 
-func TestCompatibilityCleanAbsenceDischargesProofAfterDrain(t *testing.T) {
-	a, cred, c, _, clock := compatibilitySession(t, time.Minute, time.Hour)
+func TestWriterCleanAbsenceDischargesProofAfterDrain(t *testing.T) {
+	a, cred, c, _, _ := writerSession(t, time.Minute, time.Hour)
 	use, err := a.Begin(cred)
 	if err != nil {
 		t.Fatal(err)
@@ -142,25 +141,25 @@ func TestCompatibilityCleanAbsenceDischargesProofAfterDrain(t *testing.T) {
 	if _, err := use.RenewalProof(); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.CleanDetach(cred.ID, MountAbsenceProof{ObservedUnixNanos: clock.now().UnixNano(), Observation: []byte("exact absence"), Component: "supervisor"}); err != nil {
+	if err := c.Remove(cred.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.Detach(cred); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.CheckCompatibilityWriter(SessionID{2}); !errors.Is(err, ErrCompatibilityWriterLease) {
+	if err := c.CheckWriter(SessionID{2}); !errors.Is(err, ErrWriterExcluded) {
 		t.Fatalf("old apply escaped absence: %v", err)
 	}
 	use.End()
-	if err := c.CheckCompatibilityWriter(SessionID{2}); err != nil {
+	if err := c.CheckWriter(SessionID{2}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestCompatibilityClockFailureCannotReleaseOrGrant(t *testing.T) {
+func TestWriterClockFailureCannotReleaseOrGrant(t *testing.T) {
 	for _, fault := range []string{"failure", "regression", "overflow"} {
 		t.Run(fault, func(t *testing.T) {
-			a, cred, c, _, clock := compatibilitySession(t, time.Minute, time.Hour)
+			a, cred, c, _, clock := writerSession(t, time.Minute, time.Hour)
 			use, err := a.Begin(cred)
 			if err != nil {
 				t.Fatal(err)
@@ -180,19 +179,19 @@ func TestCompatibilityClockFailureCannotReleaseOrGrant(t *testing.T) {
 			if _, err := use.RenewalProof(); err == nil {
 				t.Fatal("bad clock granted proof")
 			}
-			c.Fence(cred.ID, nil)
+			c.Fence(cred.ID)
 			use.End()
 			clock.failed.Store(false)
 			clock.elapsed.Store(int64(time.Hour))
-			if err := c.CheckCompatibilityWriter(SessionID{2}); !errors.Is(err, ErrCompatibilityWriterLease) {
+			if err := c.CheckWriter(SessionID{2}); !errors.Is(err, ErrWriterExcluded) {
 				t.Fatalf("bad clock released exclusion: %v", err)
 			}
 		})
 	}
 }
 
-func TestCompatibilityLastMomentProofRetainsGrantTimeDespiteLateDelivery(t *testing.T) {
-	a, cred, c, e, clock := compatibilitySession(t, 10*time.Minute, time.Hour)
+func TestWriterLastMomentProofRetainsGrantTimeDespiteLateDelivery(t *testing.T) {
+	a, cred, c, e, clock := writerSession(t, 10*time.Minute, time.Hour)
 	first, err := a.Begin(cred)
 	if err != nil {
 		t.Fatal(err)
@@ -213,9 +212,9 @@ func TestCompatibilityLastMomentProofRetainsGrantTimeDespiteLateDelivery(t *test
 	}
 	last.End()
 	// Delivery is deliberately still withheld when the session is fenced.
-	c.Fence(cred.ID, nil)
+	c.Fence(cred.ID)
 	clock.elapsed.Store(int64(119 * time.Second))
-	if err := c.CheckCompatibilityWriter(SessionID{2}); !errors.Is(err, ErrCompatibilityWriterLease) {
+	if err := c.CheckWriter(SessionID{2}); !errors.Is(err, ErrWriterExcluded) {
 		t.Fatalf("late proof lost retention: %v", err)
 	}
 	e.mu.Lock()
@@ -225,24 +224,24 @@ func TestCompatibilityLastMomentProofRetainsGrantTimeDespiteLateDelivery(t *test
 		t.Fatalf("grant deadline=%v, want 120s", deadline)
 	}
 	clock.elapsed.Store(int64(deadline))
-	if err := c.CheckCompatibilityWriter(SessionID{2}); err != nil {
+	if err := c.CheckWriter(SessionID{2}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestCompatibilityOldDaemonExclusionEndsOnlyAfterApplyDrain(t *testing.T) {
-	a, cred, c, _, clock := compatibilitySession(t, time.Minute, time.Hour)
+func TestWriterUnprovenTimeExclusionEndsOnlyAfterApplyDrain(t *testing.T) {
+	a, cred, c, _, clock := writerSession(t, time.Minute, time.Hour)
 	apply, err := a.Begin(cred)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Fence(cred.ID, nil)
+	c.Fence(cred.ID)
 	clock.elapsed.Store(int64(24 * time.Hour))
-	if err := c.CheckCompatibilityWriter(SessionID{2}); !errors.Is(err, ErrCompatibilityWriterLease) {
-		t.Fatalf("old daemon apply escaped fence: %v", err)
+	if err := c.CheckWriter(SessionID{2}); !errors.Is(err, ErrWriterExcluded) {
+		t.Fatalf("unproven-time writer apply escaped fence: %v", err)
 	}
 	apply.End()
-	if err := c.CheckCompatibilityWriter(SessionID{2}); err != nil {
-		t.Fatalf("old daemon retained an ungranted time promise: %v", err)
+	if err := c.CheckWriter(SessionID{2}); err != nil {
+		t.Fatalf("unproven-time writer retained an ungranted time promise: %v", err)
 	}
 }

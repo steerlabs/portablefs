@@ -617,3 +617,70 @@ func TestLogicalSyncThenFullBarrierUsesTwoSyscalls(t *testing.T) {
 		})
 	}
 }
+
+func TestStorageSyncObserverCountsPhysicalBatchesAfterFencing(t *testing.T) {
+	v := openTestVolume(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	observations := make(chan StorageSync, 4)
+	v.onStorageSync = func(observation StorageSync) { observations <- observation }
+	var calls atomic.Int32
+	v.syncfs = func(int) error {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil
+	}
+	first := make(chan error, 1)
+	go func() { first <- v.SyncFS() }()
+	<-started
+	followers := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		go func() { followers <- v.SyncFS() }()
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		v.volumeSync.mu.Lock()
+		pending := len(v.volumeSync.pending)
+		v.volumeSync.mu.Unlock()
+		if pending == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("syncfs followers did not join next batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := <-followers; err != nil {
+			t.Fatal(err)
+		}
+	}
+	one, two := <-observations, <-observations
+	if calls.Load() != 2 || one.Kind != "syncfs" || two.Kind != "syncfs" || one.Waiters != 1 || two.Waiters != 3 || one.Elapsed <= 0 || two.Elapsed <= 0 {
+		t.Fatalf("physical batches=%v %v calls=%d", one, two, calls.Load())
+	}
+	// Observation is after the sticky failure boundary, before failed waiters
+	// can claim completion. It never invents a later successful storage call.
+	v.onStorageSync = func(observation StorageSync) {
+		if v.Health() == nil {
+			t.Error("observer ran before the failed syscall fenced storage")
+		}
+		observations <- observation
+	}
+	v.syncfs = func(int) error { calls.Add(1); return syscall.EDQUOT }
+	if err := v.SyncFS(); !errors.Is(err, ErrOutcomeUncertain) {
+		t.Fatalf("failed sync=%v", err)
+	}
+	<-observations
+	if err := v.SyncFS(); err == nil {
+		t.Fatal("sticky failure lost")
+	}
+	if calls.Load() != 3 {
+		t.Fatal("fenced store issued another syncfs")
+	}
+}

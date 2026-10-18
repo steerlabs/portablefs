@@ -8,7 +8,7 @@ import (
 )
 
 // coherenceProfileGate lets ordinary Linux writer admission overlap while a
-// macOS compatibility-writer activation remains exclusive. The mutex protects
+// macOS exclusive-writer activation remains exclusive. The mutex protects
 // only the counters and wake channel; callers hold a counted permit,
 // rather than this mutex, across storage and coordinator waits.
 //

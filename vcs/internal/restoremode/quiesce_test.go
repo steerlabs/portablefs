@@ -20,7 +20,7 @@ func TestQuiesceProofIsWrittenOnlyUnderEmptyMembershipLock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	membership, _, err := volumeserver.OpenFileVisibilityMembership(filepath.Join(stateRoot, "visibility.membership"), "volume-a", false)
+	membership, _, err := volumeserver.OpenFileMountMembership(filepath.Join(stateRoot, "mount.membership"), "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}

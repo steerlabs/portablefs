@@ -7,14 +7,14 @@ import (
 	"time"
 )
 
-// MaxCacheProof is frozen by fskit-versioned-metadata-v1, independent of the
+// MaxCacheProof is the protocol-8 metadata-proof ceiling, independent of the
 // configured renewable session lease.
 const MaxCacheProof = 60 * time.Second
 
-// CompatibilityExclusion follows one session, independently of its repair
-// participation. Fence closes grants before removing the participant; the last
+// WriterExclusion follows one session. Fence closes grants before removing
+// writer ownership; the last
 // session pin supplies the proof that old storage applies have drained.
-type CompatibilityExclusion struct {
+type WriterExclusion struct {
 	mu          sync.Mutex
 	now         func() (time.Duration, error)
 	deadline    time.Duration
@@ -25,7 +25,7 @@ type CompatibilityExclusion struct {
 	absent      bool
 }
 
-func (e *CompatibilityExclusion) grant(remaining time.Duration) error {
+func (e *WriterExclusion) grant(remaining time.Duration) error {
 	if e == nil {
 		return nil
 	}
@@ -44,7 +44,7 @@ func (e *CompatibilityExclusion) grant(remaining time.Duration) error {
 	return nil
 }
 
-func (e *CompatibilityExclusion) closed() bool {
+func (e *WriterExclusion) closed() bool {
 	if e == nil {
 		return false
 	}
@@ -53,7 +53,7 @@ func (e *CompatibilityExclusion) closed() bool {
 	return e.stopped || e.clockFailed
 }
 
-func (e *CompatibilityExclusion) stop(absent bool) {
+func (e *WriterExclusion) stop(absent bool) {
 	if e == nil {
 		return
 	}
@@ -63,7 +63,7 @@ func (e *CompatibilityExclusion) stop(absent bool) {
 	e.mu.Unlock()
 }
 
-func (e *CompatibilityExclusion) drain() {
+func (e *WriterExclusion) drain() {
 	if e == nil {
 		return
 	}
@@ -72,7 +72,7 @@ func (e *CompatibilityExclusion) drain() {
 	e.mu.Unlock()
 }
 
-func (e *CompatibilityExclusion) outstanding() bool {
+func (e *WriterExclusion) outstanding() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.stopped || !e.drained {
@@ -89,9 +89,9 @@ func (e *CompatibilityExclusion) outstanding() bool {
 	return e.clockFailed || now < e.deadline
 }
 
-// CompatibilityExclusion binds the existing session's proof grants and drain to
+// WriterExclusion binds the existing session's proof grants and drain to
 // the coordinator before activation commits. It allocates no durable state.
-func (a *Authority) CompatibilityExclusion(id SessionID) (*CompatibilityExclusion, error) {
+func (a *Authority) WriterExclusion(id SessionID) (*WriterExclusion, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s := a.sessions[id]
@@ -103,10 +103,10 @@ func (a *Authority) CompatibilityExclusion(id SessionID) (*CompatibilityExclusio
 	if s.fenced || s.ending {
 		return nil, ErrSessionFenced
 	}
-	// Old FSKit daemons receive no negotiated daemon-cache proof. They still
-	// need this obligation through admitted-apply drain, with no time promise.
+	// Apply drain is retained even before this session has granted any cache
+	// proof. An ordinary lease renewal alone never grants a time promise.
 	if s.exclusion == nil {
-		s.exclusion = &CompatibilityExclusion{now: a.cfg.ContinuousNow}
+		s.exclusion = &WriterExclusion{now: a.cfg.ContinuousNow}
 	}
 	return s.exclusion, nil
 }

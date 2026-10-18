@@ -50,25 +50,15 @@ type options struct {
 	maxItemsPerSession, maxOpensPerSession         uint
 	maxItems, maxOpens                             uint
 	maxRetainedReplyBytes, maxFrameBytesInFlight   uint64
-	writeStaging                                   string
-	maxWriteStagingBytesPerSession                 uint64
-	maxWriteStagingBytes                           uint64
-	maxWriteTransactionsPerSession                 uint
-	maxWriteTransactions                           uint
-	writeTransactionProgressTimeout                time.Duration
-	writeTransactionAbsoluteTimeout                time.Duration
 	terminalDeliveryTimeout                        time.Duration
 	capabilityLifetime                             time.Duration
 	capabilityNonces                               uint
 	sessionLease                                   time.Duration
-	cacheLeaseTTL                                  time.Duration
-	maxCacheLeasesPerSession, maxCacheLeases       uint
 	maxInFlight, maxConnections                    int
 	handshakeTimeout, idleTimeout, writeTimeout    time.Duration
-	visibilityMembership                           string
+	mountMembership                                string
+	mountAbsenceClockSkew                          time.Duration
 	priorStrictMountsFenced                        bool
-	maxCachedNameCapacity                          uint64
-	maxRepairBudget, visibilityClockSkew           time.Duration
 }
 
 // Recovery always waits this frozen maximum after an unclean process restart,
@@ -107,43 +97,19 @@ func run() error {
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
 	flag.Uint64Var(&o.maxRetainedReplyBytes, "max-retained-reply-bytes", 512<<20, "total bytes this worker may hold in replay slots")
 	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", defaultMaxFrameBytesInFlight, "total bytes this worker may have allocated for inbound frames")
-	flag.StringVar(&o.writeStaging, "write-staging-dir", "", "absolute private 0700 directory for unnamed transactional-write staging")
-	flag.Uint64Var(&o.maxWriteStagingBytesPerSession, "max-write-staging-bytes-per-session", 16<<30, "staging bytes reserved by one session")
-	flag.Uint64Var(&o.maxWriteStagingBytes, "max-write-staging-bytes", 64<<30, "staging bytes reserved by this worker")
-	flag.UintVar(&o.maxWriteTransactionsPerSession, "max-write-transactions-per-session", defaultWriteTransactionsPerSession(defaultMaxInFlight, defaultMaxWriteTransactions), "inert or committing write transactions owned by one session")
-	flag.UintVar(&o.maxWriteTransactions, "max-write-transactions", defaultMaxWriteTransactions, "inert or committing write transactions owned by this worker")
-	flag.DurationVar(&o.writeTransactionProgressTimeout, "write-transaction-progress-timeout", 2*time.Minute, "maximum idle interval between write transaction phases")
-	flag.DurationVar(&o.writeTransactionAbsoluteTimeout, "write-transaction-absolute-timeout", 30*time.Minute, "absolute lifetime of a write transaction")
-	flag.DurationVar(&o.terminalDeliveryTimeout, "terminal-delivery-timeout", 45*time.Second, "maximum drain from a terminal exact result through peer repair and source kernel publication receipt")
+	flag.DurationVar(&o.terminalDeliveryTimeout, "terminal-delivery-timeout", 45*time.Second, "maximum drain from a terminal exact result through source kernel publication receipt")
 	flag.DurationVar(&o.capabilityLifetime, "capability-max-lifetime", 15*time.Minute, "longest capability validity window this authority will honour")
 	flag.UintVar(&o.capabilityNonces, "capability-nonce-records", 65536, "single-use capability records retained until expiry")
 	flag.DurationVar(&o.sessionLease, "session-lease", 2*time.Minute, "renewable session lease")
-	flag.DurationVar(&o.cacheLeaseTTL, "cache-lease-ttl", 20*time.Second, "deprecated compatibility option; unused by protocol 7")
-	flag.UintVar(&o.maxCacheLeasesPerSession, "max-cache-leases-per-session", 65536, "deprecated compatibility option; unused by protocol 7")
-	flag.UintVar(&o.maxCacheLeases, "max-cache-leases", 1<<20, "deprecated compatibility option; unused by protocol 7")
 	flag.IntVar(&o.maxInFlight, "max-in-flight", defaultMaxInFlight, "requests concurrently executing per TLS connection")
 	flag.IntVar(&o.maxConnections, "max-connections", defaultMaxConnections, "maximum accepted TLS connections for the worker; must be at least 4 times max-sessions")
 	flag.DurationVar(&o.handshakeTimeout, "tls-handshake-timeout", 10*time.Second, "maximum TLS handshake duration")
 	flag.DurationVar(&o.idleTimeout, "connection-idle-timeout", 5*time.Minute, "maximum interval without a complete request frame")
 	flag.DurationVar(&o.writeTimeout, "connection-write-timeout", 30*time.Second, "maximum response frame write duration")
-	flag.StringVar(&o.visibilityMembership, "visibility-membership-file", "", "absolute durable strict-mount membership file")
+	flag.StringVar(&o.mountMembership, "mount-membership-file", "", "absolute durable strict-mount membership file")
 	flag.BoolVar(&o.priorStrictMountsFenced, "prior-strict-mounts-fenced", false, "control plane proved every recorded prior strict kernel mount unusable")
-	flag.Uint64Var(&o.maxCachedNameCapacity, "max-cached-name-capacity", 1<<16, "largest kernel-cache bound a strict mount may declare; sizes the per-session resolved index")
-	// The default must admit the mount's own default repair budget, or a stock
-	// mount cannot attach to a stock authority at all. Both defaults are stated
-	// against each other rather than chosen independently.
-	flag.DurationVar(&o.maxRepairBudget, "max-repair-budget", 30*time.Second, "longest per-phase cache-repair deadline a strict mount may commit to before it is fenced; must be at least the mount's -repair-budget")
-	flag.DurationVar(&o.visibilityClockSkew, "visibility-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
+	flag.DurationVar(&o.mountAbsenceClockSkew, "mount-absence-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
 	flag.Parse()
-	writeTransactionLimitOverridden := false
-	flag.Visit(func(value *flag.Flag) {
-		if value.Name == "max-write-transactions-per-session" {
-			writeTransactionLimitOverridden = true
-		}
-	})
-	if !writeTransactionLimitOverridden {
-		o.maxWriteTransactionsPerSession = defaultWriteTransactionsPerSession(o.maxInFlight, o.maxWriteTransactions)
-	}
 	if *showVersion {
 		_, _ = fmt.Fprintln(os.Stdout, version)
 		return nil
@@ -152,9 +118,10 @@ func run() error {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
 	}
 	if (o.listen == "" && !systemdSocketAvailable()) || o.volumeID == "" || o.root == "" || o.projectID == 0 ||
-		o.adminListen == "" || o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" || o.writeStaging == "" {
-		return errors.New("a listen address or one systemd socket, nonempty admin-listen, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, visibility membership file, and write staging directory are required")
+		o.adminListen == "" || o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.mountMembership == "" {
+		return errors.New("listen socket, admin-listen, volume-id, root, project-id, TLS, client CA, capability key and mount membership are required")
 	}
+
 	hosted := o.productAuthorizationPublicKey != "" || o.productIssuer != "" || o.authorizationDomain != "" ||
 		o.owner != "" || o.cellID != "" || o.authorityID != "" || o.authorityGeneration != 0
 	if hosted && (o.productAuthorizationPublicKey == "" || o.productIssuer == "" || o.productAudience == "" ||
@@ -169,13 +136,8 @@ func run() error {
 		o.maxItemsPerSession == 0 || o.maxItemsPerSession > maxUint32 || o.maxOpensPerSession == 0 || o.maxOpensPerSession > maxUint32 ||
 		o.maxItems == 0 || o.maxItems > maxUint32 || o.maxOpens == 0 || o.maxOpens > maxUint32 ||
 		o.maxItemsPerSession > o.maxItems || o.maxOpensPerSession > o.maxOpens ||
-		o.maxWriteStagingBytesPerSession < uint64(o.maxWrite) ||
-		o.maxWriteStagingBytes < o.maxWriteStagingBytesPerSession ||
-		o.maxWriteTransactionsPerSession == 0 || o.maxWriteTransactionsPerSession > maxUint32 ||
-		o.maxWriteTransactions == 0 || o.maxWriteTransactions > maxUint32 || o.maxWriteTransactionsPerSession > o.maxWriteTransactions ||
-		o.writeTransactionProgressTimeout <= 0 || o.writeTransactionAbsoluteTimeout < o.writeTransactionProgressTimeout || o.terminalDeliveryTimeout < o.maxRepairBudget ||
-		o.capabilityLifetime <= 0 || o.capabilityNonces == 0 || o.capabilityNonces > uint(^uint32(0)) ||
-		o.maxInFlight < 2 || uint64(o.maxInFlight) > uint64(maxUint32) || o.maxConnections <= 0 || o.handshakeTimeout <= 0 || o.idleTimeout <= o.sessionLease || o.writeTimeout <= 0 {
+		o.terminalDeliveryTimeout <= 0 || o.mountAbsenceClockSkew < 0 || o.capabilityLifetime <= 0 || o.capabilityNonces == 0 || o.capabilityNonces > uint(^uint32(0)) ||
+		o.maxInFlight < authorityrpc.MinimumLinuxInFlight || uint64(o.maxInFlight) > uint64(maxUint32) || o.maxConnections <= 0 || o.handshakeTimeout <= 0 || o.idleTimeout <= o.sessionLease || o.writeTimeout <= 0 {
 		return errors.New("protocol allocation and replay bounds must be positive uint32 values, and max-in-flight must admit an ordinary request alongside a blocking lock wait")
 	}
 	if err := validateConnectionCapacity(o.maxSessions, o.maxConnections); err != nil {
@@ -195,8 +157,8 @@ func run() error {
 	// no configuration can produce a volume whose directories cannot be listed.
 	// What must still be sized explicitly is how many reply bytes the worker may
 	// retain and how many inbound frame bytes it may have allocated at once.
-	if o.maxRetainedReplyBytes < uint64(o.maxFrame) {
-		return errors.New("max-retained-reply-bytes must admit at least one maximal reply")
+	if err := validateExecutionCapacity(o.maxInFlight, o.replaySlots, o.maxFrame, o.maxRetainedReplyBytes); err != nil {
+		return err
 	}
 	if minimum := authorityrpc.MinimumFrameBytesInFlight(uint32(uint64(o.maxWrite) + reserve)); o.maxFrameBytesInFlight < minimum {
 		return fmt.Errorf("max-frame-bytes-in-flight must be at least %d for one maximal DATA allocation plus the CONTROL/bootstrap reserve", minimum)
@@ -207,6 +169,7 @@ func run() error {
 		return err
 	}
 	store, err := xfsstore.Open(o.root, xfsstore.Config{
+		OnStorageSync:     func(sync xfsstore.StorageSync) { metrics.ObserveStorageSync(sync.Kind, sync.Elapsed, sync.Waiters) },
 		ExpectedProjectID: uint32(o.projectID),
 		ExpectedOwnerUID:  uint32(os.Geteuid()), ExpectedOwnerGID: uint32(os.Getegid()),
 	})
@@ -232,16 +195,6 @@ func run() error {
 	})
 	readiness.SetVolumeOpen(true)
 	defer readiness.SetVolumeOpen(false)
-	writeStaging, err := authorityrpc.OpenWriteAdmission(o.writeStaging)
-	if err != nil {
-		return err
-	}
-	defer writeStaging.Close()
-	fskitWriteStaging, err := authorityrpc.OpenFskitWriteStaging(o.writeStaging)
-	if err != nil {
-		return err
-	}
-	defer fskitWriteStaging.Close()
 	runtime, err := volumeserver.New(o.volumeID, volumeserver.Config{
 		SessionLease: o.sessionLease, MaxReplaySlots: uint32(o.replaySlots),
 		MaxSessions: uint32(o.maxSessions), MaxLockRecords: uint32(o.maxLockRecords),
@@ -251,12 +204,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if o.maxCachedNameCapacity == 0 || o.maxRepairBudget <= 0 || o.visibilityClockSkew < 0 {
-		return errors.New("max-cached-name-capacity and max-repair-budget must be positive and visibility-clock-skew must not be negative")
-	}
-	membership, priorDisposition, err := volumeserver.OpenFileVisibilityMembership(o.visibilityMembership, o.volumeID, o.priorStrictMountsFenced)
+	membership, priorDisposition, err := volumeserver.OpenFileMountMembership(o.mountMembership, o.volumeID, o.priorStrictMountsFenced)
 	if err != nil {
-		return fmt.Errorf("open durable visibility membership: %w", err)
+		return fmt.Errorf("open durable mount membership: %w", err)
 	}
 	defer membership.Close()
 	// -prior-strict-mounts-fenced is an unverified operator assertion and the
@@ -274,9 +224,7 @@ func run() error {
 	// a topology this volume does not have.
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: runtime, Locks: runtime.Locks(),
-		Membership: membership, Prior: priorDisposition, ClockSkew: o.visibilityClockSkew,
-		MaxCachedNameCapacity: o.maxCachedNameCapacity, MaxRepairBudget: o.maxRepairBudget,
-		OnBarrier: metrics.ObserveVisibilityBarrier,
+		Membership: membership, Prior: priorDisposition, ClockSkew: o.mountAbsenceClockSkew,
 	})
 	if err != nil {
 		return err
@@ -284,8 +232,8 @@ func run() error {
 
 	// Root and membership locks now belong to this process. The shipping
 	// predecessor drains Serve and restore workers before releasing them.
-	if err := coordination.Visibility.StartCompatibilityWriterGrace(); err != nil {
-		return fmt.Errorf("establish compatibility writer takeover: %w", err)
+	if err := coordination.Writers.StartWriterGrace(); err != nil {
+		return fmt.Errorf("establish exclusive writer takeover: %w", err)
 	}
 	if revision, err := coordination.Routes.Revision(); err == nil {
 		fmt.Fprintf(os.Stderr, "portablefs-authority: volume %s routing revision %x\n", o.volumeID, revision)
@@ -317,7 +265,7 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	stateRoot := filepath.Dir(o.visibilityMembership)
+	stateRoot := filepath.Dir(o.mountMembership)
 	quiesce, err := restoremode.NewQuiesceWatcher(ctx, restoremode.QuiesceConfig{
 		ConfigRoot: "/run/portablefs-volume", StateRoot: stateRoot,
 		VolumeID: o.volumeID, AuthorityEpoch: o.authorityGeneration,
@@ -340,19 +288,7 @@ func run() error {
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
 		MaxRetainedReplyBytes:   o.maxRetainedReplyBytes,
-		WriteAdmission:          writeStaging,
-		MaxFskitWriteBytes:      authorityrpc.RequiredFskitWriteBytes,
-		FskitWriteStaging:       fskitWriteStaging,
-		MaxWriteBytesPerSession: o.maxWriteStagingBytesPerSession, MaxWriteBytesInFlight: o.maxWriteStagingBytes,
-		MaxWritesPerSession: uint32(o.maxWriteTransactionsPerSession), MaxWrites: uint32(o.maxWriteTransactions),
-		WriteAdmissionProgressTimeout: o.writeTransactionProgressTimeout, WriteAbsoluteTimeout: o.writeTransactionAbsoluteTimeout,
-		MaxFskitWriteStagingBytesPerSession: o.maxWriteStagingBytesPerSession,
-		MaxFskitWriteStagingBytes:           o.maxWriteStagingBytes,
-		MaxFskitWritesPerSession:            uint32(o.maxWriteTransactionsPerSession),
-		MaxFskitWrites:                      uint32(o.maxWriteTransactions),
-		FskitWriteProgressTimeout:           o.writeTransactionProgressTimeout,
-		FskitWriteAbsoluteTimeout:           o.writeTransactionAbsoluteTimeout,
-		TerminalDeliveryTimeout:             o.terminalDeliveryTimeout,
+		TerminalDeliveryTimeout: o.terminalDeliveryTimeout,
 		OnStorageFailure: func(err error) {
 			select {
 			case storageFailure <- err:
@@ -448,19 +384,6 @@ func run() error {
 		return fmt.Errorf("strict cache coherence failed and this epoch was fenced: %w", failure)
 	default:
 		return serveErr
-	}
-}
-
-func fenceMetricReason(reason error) authoritymetrics.FenceReason {
-	switch {
-	case errors.Is(reason, volumeserver.ErrVisibilityLost):
-		return authoritymetrics.FenceFskitRepairLost
-	case errors.Is(reason, volumeserver.ErrVisibilityDeadline):
-		return authoritymetrics.FenceRepairDeadline
-	case errors.Is(reason, volumeserver.ErrVisibilitySequence), errors.Is(reason, volumeserver.ErrSourcePublicationGate):
-		return authoritymetrics.FenceProtocolViolation
-	default:
-		return authoritymetrics.FenceOther
 	}
 }
 

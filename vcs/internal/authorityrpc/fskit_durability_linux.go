@@ -13,7 +13,7 @@ import (
 // retainFskitMutationHandle takes a reference to an already-open description.
 // Call it while applying the mutation, before its storage turn is released.
 func (h *VolumeHandler) retainFskitMutationHandle(profile authoritypb.FrontendProfile, handle xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		return nil, nil
 	}
 	return h.Store.PinSyncHandle(handle)
@@ -45,5 +45,5 @@ func (h *VolumeHandler) syncFskitMutation(syncHandle func() error) error {
 }
 
 func markFskitMutationPostApplyFailure(response *authoritypb.Response, cause error) bool {
-	return markWritePostApplyFailure(response, cause) || markFskitWritePostApplyFailure(response, cause)
+	return markWritePostApplyFailure(response, cause)
 }

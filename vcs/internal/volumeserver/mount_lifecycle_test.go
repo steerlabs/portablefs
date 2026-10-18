@@ -44,21 +44,14 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fencer := newTestFencer()
-	visibility, err := NewVisibilityCoordinator(VisibilityConfig{
-		Membership: membership, Prior: PriorEpochStrictMountsFenced, Fencer: fencer,
-		MaxCachedNameCapacity: testCacheCapacity, MaxRepairBudget: testRepairBudget, MaxClockSkew: time.Second,
-		Now: func() time.Time { return now },
-	})
+	visibility, err := NewWriterRegistry(WriterRegistryConfig{Prior: PriorEpochStrictMountsFenced})
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := SessionID{9}
-	terminal := fencer.attach(id)
+	terminal := make(chan struct{})
 	if err := lifecycle.Activate(id, func() error {
-		_, activateErr := visibility.ActivateParticipantInMemory(
-			id, CoherenceStrict, terminal, testVisibilityCommitment(), nil, func() {},
-		)
+		activateErr := visibility.Activate(id, terminal, &WriterExclusion{now: continuousNow}, func() error { return nil }, func() {})
 		return activateErr
 	}); err != nil {
 		t.Fatal(err)
@@ -68,7 +61,7 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 	}
 	proof := MountAbsenceProof{Component: "test", Observation: []byte{1}, ObservedUnixNanos: now.UnixNano()}
 	if err := lifecycle.CleanDetach(id, proof, func() error {
-		return visibility.CleanDetachInMemory(id, proof)
+		return visibility.Remove(id)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -76,14 +69,16 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 		t.Fatalf("durable Deactivate calls = %d, want exactly 1", membership.deactivates)
 	}
 
+	visibility.mu.Lock()
+	for _, e := range visibility.exclusions {
+		e.drain()
+	}
+	visibility.mu.Unlock()
 	failingID := SessionID{10}
-	failingTerminal := fencer.attach(failingID)
+	failingTerminal := make(chan struct{})
 	publishErr := errors.New("retain activation reply")
 	if err := lifecycle.Activate(failingID, func() error {
-		_, activateErr := visibility.ActivateParticipantInMemory(
-			failingID, CoherenceStrict, failingTerminal, testVisibilityCommitment(),
-			func(VisibilityCursor) ([][16]byte, error) { return nil, publishErr }, func() {},
-		)
+		activateErr := visibility.Activate(failingID, failingTerminal, &WriterExclusion{now: continuousNow}, func() error { return publishErr }, func() {})
 		return activateErr
 	}); !errors.Is(err, publishErr) {
 		t.Fatalf("failed activation = %v, want %v", err, publishErr)
@@ -131,8 +126,8 @@ func TestMountLifecycleActivationRollbackAndExactCleanDetach(t *testing.T) {
 	if err := lifecycle.Activate(id, func() error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if err := lifecycle.CleanDetach(id, MountAbsenceProof{}, func() error { return nil }); !errors.Is(err, ErrVisibilityProof) {
-		t.Fatalf("incomplete CleanDetach = %v, want %v", err, ErrVisibilityProof)
+	if err := lifecycle.CleanDetach(id, MountAbsenceProof{}, func() error { return nil }); !errors.Is(err, ErrMountProof) {
+		t.Fatalf("incomplete CleanDetach = %v, want %v", err, ErrMountProof)
 	}
 	removed := false
 	proof := MountAbsenceProof{ObservedUnixNanos: now.UnixNano(), Observation: []byte("mount gone"), Component: "test"}

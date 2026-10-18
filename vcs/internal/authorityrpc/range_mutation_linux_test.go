@@ -172,7 +172,7 @@ func newRangeMutationHarness(t *testing.T) (*VolumeHandler, volumeserver.Session
 	h.Store, h.Runtime = store, runtime
 	root := xfsstore.Capability{0x11}
 	input, output := xfsstore.Capability{0x21}, xfsstore.Capability{0x31}
-	if err := h.startSessionResources(credential.ID, root, 4, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+	if err := h.startSessionResources(credential.ID, root, 4, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.trackOpen(credential.ID, input, false); err != nil {

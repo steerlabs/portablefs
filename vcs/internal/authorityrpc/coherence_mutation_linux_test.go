@@ -51,19 +51,19 @@ func TestCoherenceStaleFlushRefusedWhole(t *testing.T) {
 				result = h.handleWrite(t.Context(), req, cred, req.GetWrite())
 			case "setattr":
 				req.Body = &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Handle: handle[:], Size: proto.Int64(0), Delegation: stale}}
-				result = h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+				result = h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.MutationTarget, error) {
 					t.Fatal("stale SETATTR reached storage preparation")
 					return nil, nil
-				}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				}, func(uint64, *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 					t.Fatal("stale SETATTR applied")
 					return nil, nil
 				}, nil)
 			case "fallocate":
 				req.Body = &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: handle[:], Length: 4, Delegation: stale}}
-				result = h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+				result = h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.MutationTarget, error) {
 					t.Fatal("stale FALLOCATE reached storage preparation")
 					return nil, nil
-				}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				}, func(uint64, *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 					t.Fatal("stale FALLOCATE applied")
 					return nil, nil
 				}, nil)
@@ -166,10 +166,10 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 
 func TestCoherenceChangeCoordinates(t *testing.T) {
 	parent, child := [16]byte{1}, [16]byte{2}
-	targets := []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: []byte("child")}, {Scope: volumeserver.VisibilityAttributes, Identity: parent}, {Scope: volumeserver.VisibilityData, Identity: child}}
+	targets := []volumeserver.MutationTarget{{Scope: volumeserver.MutationNamespace, ParentIdentity: parent, Name: []byte("child")}, {Scope: volumeserver.MutationAttributes, Identity: parent}, {Scope: volumeserver.MutationData, Identity: child}}
 	req := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}
 	resp := &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{AssignedOffset: 3, CommittedSize: 7}}}
-	entries := coherenceChanges(req, resp, targets, 8)
+	entries := coherenceChanges(req, resp, targets, 8, &mutationChanges{identities: [4][16]byte{parent, child}, count: 2})
 	if len(entries) != 4 {
 		t.Fatalf("changes = %+v", entries)
 	}
@@ -209,10 +209,10 @@ func BenchmarkCoherenceHandlerOnCommit(b *testing.B) {
 	c := volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{})
 	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}
 	response := &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: 4096}}}
-	targets := []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityData, Identity: [16]byte{1}}, {Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{1}}}
+	targets := []volumeserver.MutationTarget{{Scope: volumeserver.MutationData, Identity: [16]byte{1}}, {Scope: volumeserver.MutationAttributes, Identity: [16]byte{1}}}
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		c.OnCommit(coherenceChanges(request, response, targets, uint64(i+1)))
+		c.OnCommit(coherenceChanges(request, response, targets, uint64(i+1), &mutationChanges{identities: [4][16]byte{{1}}, count: 1}))
 	}
 }
 
@@ -354,7 +354,7 @@ func TestCoherenceNoOpWriteReportsExistingDurablePrefix(t *testing.T) {
 	h.Coherence.DurableSequence(1)
 	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}
 	response := &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}}
-	if position := h.publishCoherenceCommit(request, session, identity, 1, response, nil); position != 0 {
+	if position := h.publishCoherenceCommit(request, session, identity, response, nil, &mutationChanges{}); position != 0 {
 		t.Fatalf("no-op position = %d", position)
 	}
 	if response.GetAppliedSequence() != 0 || response.GetWrite().GetDurableSequence() != 1 {
@@ -418,21 +418,14 @@ func TestCoherenceRecallFlushPassesPendingMacActivation(t *testing.T) {
 	}
 }
 
-func TestLinuxV7MutationRefusedBeforeApplyByActiveMacCompatibilityWriter(t *testing.T) {
+func TestLinuxMutationRefusedBeforeApplyByActiveMacWriter(t *testing.T) {
 	h, cred, store := newWriteHarness(t)
 	mac, err := h.Runtime.AttachActiveForTest(4, volumeserver.PeerIdentity{2}, volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.Runtime.SessionTerminal(mac.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Visibility.Register(mac.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairCallbackSerializedPipelined, CompatibilityWriter: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
+	registerTestWriter(t, h, mac)
+
 	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}}
 	handle := prepareOneShotTarget(t, h, cred, store, target)
 	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
@@ -443,7 +436,8 @@ func TestLinuxV7MutationRefusedBeforeApplyByActiveMacCompatibilityWriter(t *test
 	if calls, _ := target.commitSnapshot(); calls != 0 {
 		t.Fatal("excluded Linux write reached storage")
 	}
-	h.Visibility.Fence(mac.ID, volumeserver.ErrVisibilityLost)
+	h.Runtime.FenceSession(mac.ID)
+	h.Writers.Fence(mac.ID)
 	response = h.handleWrite(t.Context(), req, cred, req.GetWrite())
 	if response.GetErrno() != 0 || response.GetAppliedSequence() != 1 {
 		t.Fatalf("write after Mac departure=%v", response)
@@ -451,12 +445,10 @@ func TestLinuxV7MutationRefusedBeforeApplyByActiveMacCompatibilityWriter(t *test
 	if calls, _ := target.commitSnapshot(); calls != 1 {
 		t.Fatalf("applies=%d", calls)
 	}
-	if h.strictCache(cred.ID) != nil {
-		t.Fatal("Linux entered Mac read repair")
-	}
+
 }
 
-func TestLinuxV7MutationHoldsMacAdmissionThroughStorageApply(t *testing.T) {
+func TestLinuxMutationHoldsMacAdmissionThroughStorageApply(t *testing.T) {
 	h, cred, store := newWriteHarness(t)
 	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}, started: make(chan struct{}), release: make(chan struct{})}
 	defer func() {
@@ -497,16 +489,16 @@ func TestLinuxV7MutationHoldsMacAdmissionThroughStorageApply(t *testing.T) {
 	waitWriteTestSignal(t, admitted, "Mac admission after Linux apply")
 }
 
-func TestLinuxV7MutationFenceBeforeApplyDoesNotCommitStorage(t *testing.T) {
+func TestLinuxMutationFenceBeforeApplyDoesNotCommitStorage(t *testing.T) {
 	h, cred, store := newWriteHarness(t)
 	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
 	request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
 	ctx := &fenceOnArmedContext{Context: t.Context(), fence: func() { h.Runtime.FenceSession(cred.ID) }}
 	var applies atomic.Uint32
-	response := h.mutateCoherenceVisibleSequenceResolved(ctx, request, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+	response := h.mutateCoherenceVisibleSequenceResolved(ctx, request, cred, func(*operationResolutionContext) ([]volumeserver.MutationTarget, error) {
 		ctx.armed.Store(true)
-		return []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityData, Identity: [16]byte{0x41}}}, nil
-	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return []volumeserver.MutationTarget{{Scope: volumeserver.MutationData, Identity: [16]byte{0x41}}}, nil
+	}, func(uint64, *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 		applies.Add(1)
 		return &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}}, nil
 	}, nil)
@@ -522,9 +514,9 @@ func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {
 	h, cred, store := newWriteHarness(t)
 	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
 	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
-	response := h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
-		return []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{0x99}}}, nil
-	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.MutationTarget, error) {
+		return []volumeserver.MutationTarget{{Scope: volumeserver.MutationAttributes, Identity: [16]byte{0x99}}}, nil
+	}, func(uint64, *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 		t.Fatal("uncovered preparation applied")
 		return nil, nil
 	}, nil)

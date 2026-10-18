@@ -5,7 +5,6 @@ package authorityrpc
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -156,31 +155,26 @@ func TestOrderedFlushReplyAdmissionRefusalRetiresPendingSuccessors(t *testing.T)
 }
 
 func TestOrderedFlushAuthenticatedPreReplayRefusalRetiresGrant(t *testing.T) {
-	for _, negotiated := range []bool{false, true} {
-		t.Run(fmt.Sprint(negotiated), func(t *testing.T) {
-			h, cred, _ := newWriteHarness(t)
-			h.Authorizer, h.Routes = allowAuthorizer{access: volumeserver.AccessRead | volumeserver.AccessWrite}, &RoutesController{Mounts: h.Lifecycle, loaded: true}
-			token, _ := h.coherenceToken(cred.ID)
-			grant, err := h.Coherence.DataMutated(t.Context(), token, [16]byte{0x41})
-			if err != nil {
-				t.Fatal(err)
-			}
-			r := stockWriteTestRequest(1, 0, 1, [16]byte{0x41}, []byte("data"), 0, 0)
-			r.Epoch, r.Session, r.Mutation = cred.Epoch[:], &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, nil
-			r.GetWrite().Delegation, r.GetWrite().FlushSequence = coherenceDelegationRefProto(grant), 1
-			ctx := withTransportConnection(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), &transportConnection{orderedFlush: negotiated})
-			reply := h.Handle(ctx, r)
-			want := syscall.EINVAL
-			if !negotiated {
-				want = syscall.EOPNOTSUPP
-			}
-			if reply.GetErrno() != int32(want) || reply.GetMutation() != nil {
-				t.Fatalf("pre-replay refusal: %v", reply)
-			}
-			if _, ok := h.Coherence.LookupDelegation(grant.Identity); ok {
-				t.Fatal("refused ordinal retained a permanent gap")
-			}
-		})
+
+	h, cred, _ := newWriteHarness(t)
+	h.Authorizer, h.Routes = allowAuthorizer{access: volumeserver.AccessRead | volumeserver.AccessWrite}, &RoutesController{Mounts: h.Lifecycle, loaded: true}
+	token, _ := h.coherenceToken(cred.ID)
+	grant, err := h.Coherence.DataMutated(t.Context(), token, [16]byte{0x41})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := stockWriteTestRequest(1, 0, 1, [16]byte{0x41}, []byte("data"), 0, 0)
+	r.Epoch, r.Session, r.Mutation = cred.Epoch[:], &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, nil
+	r.GetWrite().Delegation, r.GetWrite().FlushSequence = coherenceDelegationRefProto(grant), 1
+	ctx := withTransportConnection(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), &transportConnection{})
+	reply := h.Handle(ctx, r)
+	want := syscall.EINVAL
+
+	if reply.GetErrno() != int32(want) || reply.GetMutation() != nil {
+		t.Fatalf("pre-replay refusal: %v", reply)
+	}
+	if _, ok := h.Coherence.LookupDelegation(grant.Identity); ok {
+		t.Fatal("refused ordinal retained a permanent gap")
 	}
 }
 

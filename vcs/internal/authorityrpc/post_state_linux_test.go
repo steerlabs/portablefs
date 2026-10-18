@@ -52,7 +52,7 @@ func TestMutationPostStateExactObjectRoleSets(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler := &VolumeHandler{}
-			state := handler.mutationPostState(9, test.input...)
+			state := handler.mutationPostState(&mutationChanges{}, 9, test.input...)
 			if !validMutationPostStateRoles(test.request, state) {
 				t.Fatalf("role set rejected: %+v", state.GetObjects())
 			}
@@ -72,7 +72,7 @@ func TestMutationPostStateExactObjectRoleSets(t *testing.T) {
 func TestMutationPostStateCarriesMaskedStatxFlags(t *testing.T) {
 	identity := postStateTestIdentity(0x71)
 	const flags = uint32(0x00300870)
-	state := (&VolumeHandler{}).mutationPostState(23, postStateSnapshot{
+	state := (&VolumeHandler{}).mutationPostState(&mutationChanges{}, 23, postStateSnapshot{
 		identity: identity,
 		attr: xfsstore.Attr{
 			Kind: xfsstore.KindRegular, Ino: 71, Mode: 0o600, Nlink: 1, Flags: flags,
@@ -90,7 +90,8 @@ func TestMutationPostStateRetainsExactChangedIdentitySet(t *testing.T) {
 	unchanged := postStateTestIdentity(2)
 	newborn := postStateTestIdentity(3)
 	handler := &VolumeHandler{}
-	handler.mutationPostState(1,
+	changes := new(mutationChanges)
+	handler.mutationPostState(changes, 1,
 		postStateSnapshot{
 			identity: changed,
 			attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 1},
@@ -110,11 +111,7 @@ func TestMutationPostStateRetainsExactChangedIdentitySet(t *testing.T) {
 			changed:  true,
 		},
 	)
-	got := handler.takePostStateChanges(1)
-	if !reflect.DeepEqual(got, map[[16]byte]struct{}{changed: {}}) {
-		t.Fatalf("changed identity set = %#v, want only %x", got, changed)
-	}
-	if second := handler.takePostStateChanges(1); second != nil {
-		t.Fatalf("changed identity set was not consumed exactly once: %#v", second)
+	if changes.count != 2 || !changes.contains(changed) || !changes.contains(newborn) || changes.contains(unchanged) {
+		t.Fatalf("changed set=%v", changes)
 	}
 }

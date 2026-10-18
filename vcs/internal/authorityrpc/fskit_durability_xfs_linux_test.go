@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -95,25 +96,6 @@ func (s *reopenLimitStore) OpenFile(cap xfsstore.Capability, flags xfsstore.Open
 	return handle, err
 }
 
-func stampResolvedFskitPublication(t *testing.T, h *VolumeHandler, id volumeserver.SessionID, req *authoritypb.Request) {
-	t.Helper()
-	gate, err := newOperationResolutionContext(h, id).deriveSourcePublicationGate(req, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.FskitFrontendOperationId = req.RequestId
-	req.FskitSourcePublication = &authoritypb.FskitSourcePublication{}
-	for _, target := range gate.Targets {
-		wire := &authoritypb.FskitSourcePublicationTarget{}
-		if target.Identity != ([16]byte{}) {
-			wire.Coordinate = &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{Identity: target.Identity[:], Attributes: target.Attributes, Data: target.Data}}
-		} else {
-			wire.Coordinate = &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{ParentIdentity: target.ParentIdentity[:], Name: target.Name, BoundAttributes: target.BoundAttributes, BoundData: target.BoundData}}
-		}
-		req.FskitSourcePublication.Targets = append(req.FskitSourcePublication.Targets, wire)
-	}
-}
-
 func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 	root, projectRaw := os.Getenv("PORTABLEFS_XFS_TEST_ROOT"), os.Getenv("PORTABLEFS_XFS_TEST_PROJECT")
 	if root == "" || projectRaw == "" {
@@ -126,6 +108,18 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 		t.Fatal("durability permission coverage requires the unprivileged volume owner")
 	}
 	resetXFSRouteDeclaration(t, root)
+	// Descriptor exhaustion changes a process-wide limit. Run this fixture in
+	// its own process so unrelated tests and their I/O cannot observe the cut.
+	if os.Getenv("PORTABLEFS_TEST_REOPEN_CHILD") != "1" {
+		command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestVolumeHandlerEndToEndOnXFSFskitDurability$", "-test.v")
+		command.Env = append(os.Environ(), "PORTABLEFS_TEST_REOPEN_CHILD=1")
+		output, err := command.CombinedOutput()
+		t.Logf("%s", output)
+		if err != nil {
+			t.Fatalf("isolated descriptor-limit fixture: %v", err)
+		}
+		return
+	}
 	project, err := strconv.ParseUint(projectRaw, 10, 32)
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +140,7 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
 	testCoordinationWithFencer(t, volume, runtime).Bind(h)
 	ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{7})
-	active, epoch, proof := attachAndActivateHandler(t, h, ctx, 1, &authoritypb.AttachRequest{VolumeId: "fskit-durability-xfs", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(), Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT, FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR, FskitCachedNameCapacity: 64, FskitRepairBudgetMillis: 1000, FskitNamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED})
+	active, epoch, proof := attachAndActivateHandler(t, h, ctx, 1, &authoritypb.AttachRequest{VolumeId: "fskit-durability-xfs", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(), Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT, FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE})
 	var session volumeserver.SessionID
 	copy(session[:], proof.GetId())
 	sequence := uint64(0)
@@ -158,7 +152,6 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 		req.Session = proof
 		stampMutation(t, req, 0, sequence)
 		if opened := req.GetOpen(); opened == nil || opened.GetFlags().GetTruncate() {
-			stampResolvedFskitPublication(t, h, session, req)
 		}
 		before := len(store.calls)
 		reply := h.Handle(ctx, req)
@@ -205,7 +198,6 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 				sequence++
 				req := &authoritypb.Request{RequestId: sequence + 20, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent, Name: []byte("durability-file"), Mode: 0600, Flags: &authoritypb.OpenFlags{Read: true, Write: true, Truncate: truncate}}}}
 				stampMutation(t, req, 0, sequence)
-				stampResolvedFskitPublication(t, h, session, req)
 				before := len(store.calls)
 				reply := h.Handle(ctx, req)
 				if reply.GetErrno() != int32(want) || reply.GetUncertain() || reply.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE || volume.Health() != nil || len(store.calls) != before {
@@ -248,7 +240,7 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent, Name: []byte("durability-file"), Mode: 0600, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}})
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: parent, Name: []byte("durability-readable-dir"), Mode: 0755}}}, "syncfs")
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: parent, Name: []byte("durability-readable-dir"), Directory: true}}}, "syncfs")
-	directory := call(t, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: parent, Name: []byte("durability-dir"), Mode: 0300}}}, "syncfs").GetLookup().GetItem().GetToken()
+	directory := call(t, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: parent, Name: []byte("durability-dir"), Mode: 0300}}}, "syncfs").GetMkdir().GetItem().GetToken()
 	defer func() { var cap xfsstore.Capability; copy(cap[:], directory); _ = volume.Chmod(cap, 0700) }()
 	link := call(t, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: directory, Name: []byte("link"), Target: []byte("missing")}}}, "syncfs").GetLookup().GetItem().GetToken()
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: link, AtimeNow: true}}}, "syncfs")
@@ -300,7 +292,7 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 						t.Fatal(err)
 					}
 				case "directory":
-					token = call(t, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: parent, Name: []byte(name), Mode: uint32(test.oldMode)}}}, "syncfs").GetLookup().GetItem().GetToken()
+					token = call(t, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: parent, Name: []byte(name), Mode: uint32(test.oldMode)}}}, "syncfs").GetMkdir().GetItem().GetToken()
 					if withHandle {
 						opened = call(t, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: token, Flags: &authoritypb.OpenFlags{Read: true}}}}).GetOpen().GetHandle()
 					}
@@ -331,16 +323,7 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 				req.Epoch = epoch
 				req.Session = proof
 				stampMutation(t, req, 0, sequence)
-				if test.kind == "symlink" && withHandle {
-					identity, err := volume.Identity(cap)
-					if err != nil {
-						t.Fatal(err)
-					}
-					req.FskitFrontendOperationId = req.RequestId
-					req.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{Identity: identity[:], Attributes: true, Data: true}}}}}
-				} else {
-					stampResolvedFskitPublication(t, h, session, req)
-				}
+
 				syncs := len(store.calls)
 				reply := h.Handle(ctx, req)
 				want := syscall.EACCES

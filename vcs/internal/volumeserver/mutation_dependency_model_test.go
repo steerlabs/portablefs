@@ -14,59 +14,54 @@ import (
 
 type dependencyModelOperation struct {
 	name     string
-	gate     SourcePublicationGate
-	targets  []VisibilityTarget
+	gate     MutationFootprint
+	targets  []MutationTarget
 	produces [16]byte
 }
 
 func modelInode(id byte) [16]byte { return [16]byte{id} }
 
-func modelInodeTarget(scope VisibilityScope, identity [16]byte) VisibilityTarget {
-	return VisibilityTarget{Scope: scope, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}
+func modelInodeTarget(scope MutationScope, identity [16]byte) MutationTarget {
+	return MutationTarget{Scope: scope, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}
 }
 
-func modelNameTarget(parent [16]byte, name string, related ...[16]byte) VisibilityTarget {
-	return VisibilityTarget{
-		Scope: VisibilityNamespace, ParentIdentity: parent, ParentKernelIno: uint64(parent[0]), Device: 1,
+func modelNameTarget(parent [16]byte, name string, related ...[16]byte) MutationTarget {
+	return MutationTarget{
+		Scope: MutationNamespace, ParentIdentity: parent, ParentKernelIno: uint64(parent[0]), Device: 1,
 		Name: []byte(name), RelatedIdentities: append([][16]byte(nil), related...),
 	}
 }
 
 func (operation dependencyModelOperation) dependencies() MutationDependencies {
-	return mutationDependenciesForSourceGate(operation.gate)
+	return MutationDependenciesForFootprint(operation.gate)
 }
 
 // observationKeys derives the read side independently from the exact
-// coordinates Stabilize publishes. It deliberately does not inspect the
+// coordinates a completed mutation publishes. It deliberately does not inspect the
 // mutation dependency builder: deleting parent or RelatedIdentities coverage
 // there makes this model fail.
 func (operation dependencyModelOperation) observationKeys() map[string]struct{} {
-	resolutions := make([]VisibilityResolution, 0, len(operation.targets)*2)
+	keys := make(map[string]struct{})
 	for _, target := range operation.targets {
-		if target.Scope == VisibilityNamespace {
-			resolutions = append(resolutions, VisibilityResolution{Parent: target.ParentIdentity, Name: target.Name})
+		if target.Scope == MutationNamespace {
+			keys[string(nameKey(target.ParentIdentity, target.Name))] = struct{}{}
+			keys[string(inodeKey(target.ParentIdentity))] = struct{}{}
 			for _, identity := range target.RelatedIdentities {
-				resolutions = append(resolutions, VisibilityResolution{Identity: identity})
+				keys[string(inodeKey(identity))] = struct{}{}
 			}
-			continue
-		}
-		resolutions = append(resolutions, VisibilityResolution{Identity: target.Identity})
-	}
-	keys := make(map[string]struct{}, len(resolutions)*2)
-	for _, resolution := range resolutions {
-		for _, key := range resolution.keys() {
-			keys[string(key)] = struct{}{}
+		} else {
+			keys[string(inodeKey(target.Identity))] = struct{}{}
 		}
 	}
 	return keys
 }
 
 func modelItemOperation(name string, identities ...byte) dependencyModelOperation {
-	targets := make([]VisibilityTarget, 0, len(identities))
-	gate := SourcePublicationGate{}
+	targets := make([]MutationTarget, 0, len(identities))
+	gate := MutationFootprint{}
 	for _, identity := range identities {
-		targets = append(targets, modelInodeTarget(VisibilityData, modelInode(identity)))
-		gate.Targets = append(gate.Targets, SourcePublicationTarget{
+		targets = append(targets, modelInodeTarget(MutationData, modelInode(identity)))
+		gate.Targets = append(gate.Targets, FootprintTarget{
 			Identity: modelInode(identity), Attributes: true, Data: true,
 		})
 	}
@@ -76,13 +71,13 @@ func modelItemOperation(name string, identities ...byte) dependencyModelOperatio
 func modelCreateOperation(name string, parent byte, binding string, created byte) dependencyModelOperation {
 	return dependencyModelOperation{
 		name: name,
-		gate: SourcePublicationGate{Targets: []SourcePublicationTarget{
+		gate: MutationFootprint{Targets: []FootprintTarget{
 			{Identity: modelInode(parent), Attributes: true},
 			{ParentIdentity: modelInode(parent), Name: []byte(binding), BoundAttributes: true},
 		}},
-		targets: []VisibilityTarget{
+		targets: []MutationTarget{
 			modelNameTarget(modelInode(parent), binding),
-			modelInodeTarget(VisibilityAttributes, modelInode(parent)),
+			modelInodeTarget(MutationAttributes, modelInode(parent)),
 		},
 		// The identity is learned only after apply. No other operation can name
 		// it until this namespace publication completes, so it is a result, not
@@ -94,17 +89,17 @@ func modelCreateOperation(name string, parent byte, binding string, created byte
 func modelRemoveOperation(name string, parent byte, binding string, bound byte) dependencyModelOperation {
 	return dependencyModelOperation{
 		name: name,
-		gate: SourcePublicationGate{Targets: []SourcePublicationTarget{
+		gate: MutationFootprint{Targets: []FootprintTarget{
 			{Identity: modelInode(parent), Attributes: true},
 			{
 				ParentIdentity: modelInode(parent), Name: []byte(binding), BoundAttributes: true,
 				BoundIdentities: [][16]byte{modelInode(bound)},
 			},
 		}},
-		targets: []VisibilityTarget{
+		targets: []MutationTarget{
 			modelNameTarget(modelInode(parent), binding, modelInode(bound)),
-			modelInodeTarget(VisibilityAttributes, modelInode(parent)),
-			modelInodeTarget(VisibilityAttributes, modelInode(bound)),
+			modelInodeTarget(MutationAttributes, modelInode(parent)),
+			modelInodeTarget(MutationAttributes, modelInode(bound)),
 		},
 	}
 }
@@ -112,15 +107,15 @@ func modelRemoveOperation(name string, parent byte, binding string, bound byte) 
 func modelLinkOperation(parent byte, binding string, existing byte) dependencyModelOperation {
 	return dependencyModelOperation{
 		name: "link",
-		gate: SourcePublicationGate{Targets: []SourcePublicationTarget{
+		gate: MutationFootprint{Targets: []FootprintTarget{
 			{Identity: modelInode(existing), Attributes: true},
 			{Identity: modelInode(parent), Attributes: true},
 			{ParentIdentity: modelInode(parent), Name: []byte(binding), BoundAttributes: true},
 		}},
-		targets: []VisibilityTarget{
+		targets: []MutationTarget{
 			modelNameTarget(modelInode(parent), binding, modelInode(existing)),
-			modelInodeTarget(VisibilityAttributes, modelInode(parent)),
-			modelInodeTarget(VisibilityAttributes, modelInode(existing)),
+			modelInodeTarget(MutationAttributes, modelInode(parent)),
+			modelInodeTarget(MutationAttributes, modelInode(existing)),
 		},
 	}
 }
@@ -128,23 +123,23 @@ func modelLinkOperation(parent byte, binding string, existing byte) dependencyMo
 func modelRenameOperation(oldParent byte, oldName string, newParent byte, newName string, moved byte, replaced ...byte) dependencyModelOperation {
 	oldTarget := modelNameTarget(modelInode(oldParent), oldName, modelInode(moved))
 	newTarget := modelNameTarget(modelInode(newParent), newName, modelInode(moved))
-	targets := []VisibilityTarget{
+	targets := []MutationTarget{
 		oldTarget,
 		newTarget,
-		modelInodeTarget(VisibilityAttributes, modelInode(oldParent)),
-		modelInodeTarget(VisibilityAttributes, modelInode(newParent)),
-		modelInodeTarget(VisibilityAttributes, modelInode(moved)),
+		modelInodeTarget(MutationAttributes, modelInode(oldParent)),
+		modelInodeTarget(MutationAttributes, modelInode(newParent)),
+		modelInodeTarget(MutationAttributes, modelInode(moved)),
 	}
 	for _, identity := range replaced {
 		newTarget.RelatedIdentities = append(newTarget.RelatedIdentities, modelInode(identity))
-		targets = append(targets, modelInodeTarget(VisibilityAttributes, modelInode(identity)))
+		targets = append(targets, modelInodeTarget(MutationAttributes, modelInode(identity)))
 	}
 	targets[1] = newTarget
-	oldGateTarget := SourcePublicationTarget{
+	oldGateTarget := FootprintTarget{
 		ParentIdentity: modelInode(oldParent), Name: []byte(oldName), BoundAttributes: true,
 		BoundIdentities: [][16]byte{modelInode(moved)},
 	}
-	newGateTarget := SourcePublicationTarget{
+	newGateTarget := FootprintTarget{
 		ParentIdentity: modelInode(newParent), Name: []byte(newName), BoundAttributes: true,
 	}
 	for _, identity := range replaced {
@@ -152,7 +147,7 @@ func modelRenameOperation(oldParent byte, oldName string, newParent byte, newNam
 	}
 	return dependencyModelOperation{
 		name: "rename",
-		gate: SourcePublicationGate{Targets: []SourcePublicationTarget{
+		gate: MutationFootprint{Targets: []FootprintTarget{
 			{Identity: modelInode(oldParent), Attributes: true},
 			{Identity: modelInode(newParent), Attributes: true},
 			oldGateTarget,
@@ -480,524 +475,6 @@ func TestMutationSequencerRandomizedSchedulingModel(t *testing.T) {
 			t.Error(err)
 		}
 	}
-}
-
-func TestVisibilityCoordinatorAppliesDisjointInodesConcurrently(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	leftSource, rightSource := SessionID{1}, SessionID{2}
-	h.register(t, leftSource, testRepairBudget)
-	h.register(t, rightSource, testRepairBudget)
-
-	release := make(chan struct{})
-	entered := make(chan byte, 2)
-	sequences := make(chan uint64, 2)
-	results := make(chan error, 2)
-	start := func(source SessionID, identity byte) {
-		gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{
-			Identity: modelInode(identity), Attributes: true, Data: true,
-		}}}
-		declaration := h.coordinator.DeclareSourceGate(gate)
-		go func() {
-			sequence, err := h.coordinator.ExecuteWithSourceGateSequence(
-				context.Background(), source, MutationID{Sequence: uint64(identity)}, declaration, gate,
-				func() (SourcePublicationGate, error) { return gate, nil },
-				func() ([]VisibilityTarget, error) {
-					return []VisibilityTarget{{Scope: VisibilityData, Identity: modelInode(identity)}}, nil
-				},
-				func(chosen uint64) ([]VisibilityTarget, bool) {
-					entered <- identity
-					<-release
-					return testExactVisibilityTargets(chosen, []VisibilityTarget{{Scope: VisibilityData, Identity: modelInode(identity)}}), true
-				},
-				func() ([]VisibilityResolution, error) { return nil, nil },
-			)
-			sequences <- sequence
-			results <- err
-		}()
-	}
-	start(leftSource, 21)
-	start(rightSource, 22)
-	for count := 0; count < 2; count++ {
-		select {
-		case <-entered:
-		case <-time.After(2 * time.Second):
-			close(release)
-			t.Fatal("disjoint inode mutations did not reach apply concurrently")
-		}
-	}
-	close(release)
-	for count := 0; count < 2; count++ {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-	leftSequence, rightSequence := <-sequences, <-sequences
-	if leftSequence == 0 || rightSequence == 0 || leftSequence == rightSequence {
-		t.Fatalf("disjoint visibility sequences = %d, %d", leftSequence, rightSequence)
-	}
-}
-
-func TestVisibilityDisjointPeerBarriersAndStabilizeProceedIndependently(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	leftPeer, rightPeer, observer := SessionID{1}, SessionID{2}, SessionID{3}
-	h.register(t, leftPeer, testRepairBudget)
-	h.register(t, rightPeer, testRepairBudget)
-	h.register(t, observer, testRepairBudget)
-	leftIdentity, rightIdentity := modelInode(41), modelInode(42)
-	h.coordinator.RecordResolvedInode(leftPeer, leftIdentity)
-	h.coordinator.RecordResolvedInode(rightPeer, rightIdentity)
-
-	leftRelease, rightRelease := make(chan struct{}), make(chan struct{})
-	leftApplied, rightApplied := make(chan struct{}), make(chan struct{})
-	results := make(chan error, 2)
-	start := func(source SessionID, identity [16]byte, applied chan<- struct{}, release <-chan struct{}) {
-		targets := []VisibilityTarget{{Scope: VisibilityData, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}}
-		go func() {
-			results <- executeTestExact(h.coordinator,
-				context.Background(), source, MutationID{Sequence: uint64(identity[0])},
-				mutationDependenciesForTargets(targets),
-				func() ([]VisibilityTarget, error) { return targets, nil },
-				func() ([]VisibilityTarget, bool) {
-					close(applied)
-					<-release
-					return targets, true
-				},
-			)
-		}()
-	}
-	start(SessionID{8}, leftIdentity, leftApplied, leftRelease)
-	start(SessionID{9}, rightIdentity, rightApplied, rightRelease)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	leftPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, leftPeer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, rightPeer)
-	if err != nil {
-		t.Fatal("right disjoint PREPARE did not open beside left PREPARE:", err)
-	}
-
-	type stabilizeResult struct {
-		identity byte
-		waited   bool
-		err      error
-	}
-	stabilized := make(chan stabilizeResult, 2)
-	for _, identity := range [][16]byte{leftIdentity, rightIdentity} {
-		identity := identity
-		go func() {
-			waited, stabilizeErr := h.coordinator.Stabilize(ctx, observer, VisibilityResolution{Identity: identity})
-			stabilized <- stabilizeResult{identity: identity[0], waited: waited, err: stabilizeErr}
-		}()
-	}
-	select {
-	case got := <-stabilized:
-		t.Fatalf("observer stabilized inode %d before its apply: %+v", got.identity, got)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	if err := h.coordinator.Ack(leftPeer, leftPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	<-leftApplied
-	close(leftRelease)
-	got := <-stabilized
-	if got.identity != leftIdentity[0] || !got.waited || got.err != nil {
-		t.Fatalf("left stabilization = %+v, want inode %d after wait", got, leftIdentity[0])
-	}
-	select {
-	case got := <-stabilized:
-		t.Fatalf("right stabilization escaped when only left applied: %+v", got)
-	case <-time.After(20 * time.Millisecond):
-	}
-	leftComplete, err := h.coordinator.Next(ctx, leftPeer, leftPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(leftPeer, leftComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := h.coordinator.Ack(rightPeer, rightPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	<-rightApplied
-	close(rightRelease)
-	got = <-stabilized
-	if got.identity != rightIdentity[0] || !got.waited || got.err != nil {
-		t.Fatalf("right stabilization = %+v, want inode %d after wait", got, rightIdentity[0])
-	}
-	rightComplete, err := h.coordinator.Next(ctx, rightPeer, rightPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightPeer, rightComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	for count := 0; count < 2; count++ {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func TestVisibilityStabilizeUnwindsCrossMountPrepareCycle(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	leftMount, rightMount := SessionID{1}, SessionID{2}
-	const budget = 500 * time.Millisecond
-	h.register(t, leftMount, budget)
-	h.register(t, rightMount, budget)
-	leftIdentity, rightIdentity := modelInode(51), modelInode(52)
-	h.coordinator.RecordResolvedInode(leftMount, leftIdentity)
-	h.coordinator.RecordResolvedInode(rightMount, rightIdentity)
-
-	results := make(chan error, 2)
-	start := func(source SessionID, identity [16]byte) {
-		targets := []VisibilityTarget{{Scope: VisibilityData, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}}
-		go func() {
-			results <- executeTestExact(h.coordinator,
-				context.Background(), source, MutationID{Sequence: uint64(identity[0])},
-				mutationDependenciesForTargets(targets),
-				func() ([]VisibilityTarget, error) { return targets, nil },
-				func() ([]VisibilityTarget, bool) { return targets, true },
-			)
-		}()
-	}
-	start(SessionID{8}, leftIdentity)
-	start(SessionID{9}, rightIdentity)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	leftPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, leftMount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, rightMount)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	type stabilizeResult struct {
-		mount  SessionID
-		waited bool
-		err    error
-	}
-	stabilized := make(chan stabilizeResult, 2)
-	for _, mount := range []SessionID{leftMount, rightMount} {
-		mount := mount
-		go func() {
-			waited, stabilizeErr := h.coordinator.Stabilize(ctx, mount,
-				VisibilityResolution{Identity: leftIdentity},
-				VisibilityResolution{Identity: rightIdentity},
-			)
-			stabilized <- stabilizeResult{mount: mount, waited: waited, err: stabilizeErr}
-		}()
-	}
-	for count := 0; count < 2; count++ {
-		select {
-		case got := <-stabilized:
-			sequence, sequenced := VisibilityRetrySequence(got.err)
-			wantSequence := leftPrepare.Cursor.Sequence
-			if got.mount == rightMount {
-				wantSequence = rightPrepare.Cursor.Sequence
-			}
-			if !got.waited || !errors.Is(got.err, ErrVisibilityRetry) || !sequenced || sequence != wantSequence {
-				t.Fatalf("mount %x cross-PREPARE stabilization = waited %t, err %v, sequence %d/%t; want retry sequence %d",
-					got.mount, got.waited, got.err, sequence, sequenced, wantSequence)
-			}
-		case <-time.After(100 * time.Millisecond):
-			t.Fatal("cross-mount Stabilize/PREPARE cycle did not unwind before the repair deadline")
-		}
-	}
-
-	// The raced reads were discarded, so neither mount may advertise the inode
-	// owned only by the concurrent mutation's audience.
-	h.coordinator.mu.Lock()
-	leftPublishedRight := h.coordinator.participants[leftMount].index.contains(inodeKey(rightIdentity))
-	rightPublishedLeft := h.coordinator.participants[rightMount].index.contains(inodeKey(leftIdentity))
-	h.coordinator.mu.Unlock()
-	if leftPublishedRight || rightPublishedLeft {
-		t.Fatalf("raced cross-mount reads entered visibility index: left/right=%t/%t", leftPublishedRight, rightPublishedLeft)
-	}
-
-	if err := h.coordinator.Ack(leftMount, leftPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	leftComplete, err := h.coordinator.Next(ctx, leftMount, leftPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightComplete, err := h.coordinator.Next(ctx, rightMount, rightPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(leftMount, leftComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	for count := 0; count < 2; count++ {
-		if err := <-results; err != nil {
-			t.Fatal(err)
-		}
-	}
-	if h.fencer.wasFenced(leftMount) || h.fencer.wasFenced(rightMount) {
-		t.Fatalf("healthy mounts fenced while breaking cross-PREPARE cycle: left=%v right=%v",
-			h.fenceReasonFor(leftMount), h.fenceReasonFor(rightMount))
-	}
-}
-
-func TestVisibilityLaneTicketsPreventMultiAudienceStarvation(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	leftMount, rightMount := SessionID{1}, SessionID{2}
-	h.register(t, leftMount, testRepairBudget)
-	h.register(t, rightMount, testRepairBudget)
-
-	leftBlocker, rightBlocker := modelInode(61), modelInode(62)
-	leftLater, rightLater := modelInode(63), modelInode(64)
-	h.coordinator.RecordResolvedInode(leftMount, leftBlocker)
-	h.coordinator.RecordResolvedInode(leftMount, leftLater)
-	h.coordinator.RecordResolvedInode(rightMount, rightBlocker)
-	h.coordinator.RecordResolvedInode(rightMount, rightLater)
-	renameOldParent, renameNewParent := modelInode(65), modelInode(66)
-	moved, replaced := modelInode(67), modelInode(68)
-	h.coordinator.RecordResolvedName(leftMount, renameOldParent, []byte("old"))
-	h.coordinator.RecordResolvedName(rightMount, renameNewParent, []byte("new"))
-	renameTargets := []VisibilityTarget{
-		{Scope: VisibilityNamespace, ParentIdentity: renameOldParent, ParentKernelIno: 65, Device: 1, Name: []byte("old"), RelatedIdentities: [][16]byte{moved}},
-		{Scope: VisibilityNamespace, ParentIdentity: renameNewParent, ParentKernelIno: 66, Device: 1, Name: []byte("new"), RelatedIdentities: [][16]byte{moved, replaced}},
-		{Scope: VisibilityAttributes, Identity: renameOldParent, KernelIno: 65, Device: 1},
-		{Scope: VisibilityAttributes, Identity: renameNewParent, KernelIno: 66, Device: 1},
-		{Scope: VisibilityAttributes, Identity: moved, KernelIno: 67, Device: 1},
-		{Scope: VisibilityAttributes, Identity: replaced, KernelIno: 68, Device: 1},
-	}
-
-	type mutationRun struct {
-		sequence uint64
-		result   <-chan error
-	}
-	start := func(ctx context.Context, source SessionID, sequence uint64, targets []VisibilityTarget) mutationRun {
-		result := make(chan error, 1)
-		go func() {
-			result <- executeTestExact(h.coordinator,
-				ctx, source, MutationID{Sequence: sequence}, mutationDependenciesForTargets(targets),
-				func() ([]VisibilityTarget, error) { return targets, nil },
-				func() ([]VisibilityTarget, bool) { return targets, true },
-			)
-		}()
-		return mutationRun{sequence: sequence, result: result}
-	}
-	inodeTargets := func(identity [16]byte) []VisibilityTarget {
-		return []VisibilityTarget{{Scope: VisibilityData, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	leftFirst := start(ctx, SessionID{8}, 1, inodeTargets(leftBlocker))
-	rightFirst := start(ctx, SessionID{9}, 2, inodeTargets(rightBlocker))
-	leftPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, leftMount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, rightMount)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	rename := start(ctx, SessionID{10}, 100, renameTargets)
-	waitForVisibilityLaneWaiters(t, h.coordinator, 1)
-	leftQueued := start(ctx, SessionID{11}, 101, inodeTargets(leftLater))
-	rightQueued := start(ctx, SessionID{12}, 102, inodeTargets(rightLater))
-	waitForVisibilityLaneWaiters(t, h.coordinator, 3)
-
-	if err := h.coordinator.Ack(leftMount, leftPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	leftComplete, err := h.coordinator.Next(ctx, leftMount, leftPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightComplete, err := h.coordinator.Next(ctx, rightMount, rightPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(leftMount, leftComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-leftFirst.result; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-rightFirst.result; err != nil {
-		t.Fatal(err)
-	}
-
-	leftRenamePrepare, err := h.coordinator.Next(ctx, leftMount, leftComplete.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightRenamePrepare, err := h.coordinator.Next(ctx, rightMount, rightComplete.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if leftRenamePrepare.MutationSequence != rename.sequence || rightRenamePrepare.MutationSequence != rename.sequence ||
-		leftRenamePrepare.Cursor != rightRenamePrepare.Cursor {
-		t.Fatalf("later single-lane barriers overtook rename: left=%+v right=%+v", leftRenamePrepare, rightRenamePrepare)
-	}
-	if err := h.coordinator.Ack(leftMount, leftRenamePrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightRenamePrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	leftRenameComplete, err := h.coordinator.Next(ctx, leftMount, leftRenamePrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightRenameComplete, err := h.coordinator.Next(ctx, rightMount, rightRenamePrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(leftMount, leftRenameComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightRenameComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-rename.result; err != nil {
-		t.Fatal(err)
-	}
-
-	leftLaterPrepare, err := h.coordinator.Next(ctx, leftMount, leftRenameComplete.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightLaterPrepare, err := h.coordinator.Next(ctx, rightMount, rightRenameComplete.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if leftLaterPrepare.MutationSequence != leftQueued.sequence || rightLaterPrepare.MutationSequence != rightQueued.sequence {
-		t.Fatalf("queued single-lane mutations = left %d right %d, want %d/%d",
-			leftLaterPrepare.MutationSequence, rightLaterPrepare.MutationSequence, leftQueued.sequence, rightQueued.sequence)
-	}
-	if err := h.coordinator.Ack(leftMount, leftLaterPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightLaterPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	leftLaterComplete, err := h.coordinator.Next(ctx, leftMount, leftLaterPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rightLaterComplete, err := h.coordinator.Next(ctx, rightMount, rightLaterPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(leftMount, leftLaterComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightLaterComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-leftQueued.result; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-rightQueued.result; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestVisibilityLaneWaitCancellationReleasesReservation(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	leftMount, rightMount := SessionID{1}, SessionID{2}
-	h.register(t, leftMount, testRepairBudget)
-	h.register(t, rightMount, testRepairBudget)
-	leftHeld, sharedLeft, sharedRight, rightLater := modelInode(71), modelInode(72), modelInode(73), modelInode(74)
-	h.coordinator.RecordResolvedInode(leftMount, leftHeld)
-	h.coordinator.RecordResolvedInode(leftMount, sharedLeft)
-	h.coordinator.RecordResolvedInode(rightMount, sharedRight)
-	h.coordinator.RecordResolvedInode(rightMount, rightLater)
-	inodeTargets := func(identities ...[16]byte) []VisibilityTarget {
-		targets := make([]VisibilityTarget, 0, len(identities))
-		for _, identity := range identities {
-			targets = append(targets, VisibilityTarget{Scope: VisibilityData, Identity: identity, KernelIno: uint64(identity[0]), Device: 1})
-		}
-		return targets
-	}
-	start := func(ctx context.Context, source SessionID, sequence uint64, targets []VisibilityTarget) <-chan error {
-		result := make(chan error, 1)
-		go func() {
-			result <- executeTestExact(h.coordinator, ctx, source, MutationID{Sequence: sequence}, mutationDependenciesForTargets(targets),
-				func() ([]VisibilityTarget, error) { return targets, nil },
-				func() ([]VisibilityTarget, bool) { return targets, true })
-		}()
-		return result
-	}
-
-	ctx, cancelAll := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancelAll()
-	leftResult := start(ctx, SessionID{8}, 1, inodeTargets(leftHeld))
-	leftPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, leftMount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitCtx, cancelWait := context.WithCancel(ctx)
-	sharedResult := start(waitCtx, SessionID{9}, 2, inodeTargets(sharedLeft, sharedRight))
-	waitForVisibilityLaneWaiters(t, h.coordinator, 1)
-	rightResult := start(ctx, SessionID{10}, 3, inodeTargets(rightLater))
-	waitForVisibilityLaneWaiters(t, h.coordinator, 2)
-
-	cancelWait()
-	if err := <-sharedResult; !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled multi-lane mutation = %v, want context.Canceled", err)
-	}
-	rightPrepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, rightMount)
-	if err != nil {
-		t.Fatalf("right lane stayed reserved after cancellation: %v", err)
-	}
-	if rightPrepare.MutationSequence != 3 {
-		t.Fatalf("right event after cancellation = mutation %d, want 3", rightPrepare.MutationSequence)
-	}
-	if err := h.coordinator.Ack(rightMount, rightPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	rightComplete, err := h.coordinator.Next(ctx, rightMount, rightPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(rightMount, rightComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-rightResult; err != nil {
-		t.Fatal(err)
-	}
-
-	if err := h.coordinator.Ack(leftMount, leftPrepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	leftComplete, err := h.coordinator.Next(ctx, leftMount, leftPrepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(leftMount, leftComplete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-leftResult; err != nil {
-		t.Fatal(err)
-	}
-	waitForVisibilityLaneWaiters(t, h.coordinator, 0)
 }
 
 func BenchmarkMutationSequencerDisjointScaling(b *testing.B) {

@@ -13,6 +13,11 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
+const (
+	writeLockOwner   uint32 = 1 << 1
+	writeKillSUIDGID uint32 = 1 << 2
+)
+
 type writeMetadata struct {
 	handle        xfsstore.Capability
 	requestedSize uint64
@@ -112,48 +117,20 @@ func markWritePostApplyFailure(response *authoritypb.Response, cause error) bool
 // budgets as staged transactions, but the retained frame payload is written
 // directly and no staging object or transaction ID exists.
 func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteRequest) *authoritypb.Response {
-	if h.WriteAbsoluteTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, h.WriteAbsoluteTimeout)
-		defer cancel()
-	}
 	metadata, metadataErr := stockWriteMetadata(body, h.MaxWrite)
-	var resources *sessionResources
 	var target xfsstore.WriteTarget
-	var coordinate visibilityCoordinate
+	var coordinate mutationCoordinate
 	var preparedSize int64
 	var releaseMutation func()
-	reserved := false
 	defer func() {
 		if target != nil {
 			_ = target.Close()
 		}
-		if reserved {
-			h.releaseWriteAdmission(resources, metadata.requestedSize)
-		}
+
 	}()
 
-	admit := func() error {
-		if metadataErr != nil {
-			return metadataErr
-		}
-		var err error
-		resources, err = h.sessionResources(credential.ID)
-		if err != nil {
-			return err
-		}
-		terminal, err := h.Runtime.SessionTerminal(credential.ID)
-		if err != nil {
-			return err
-		}
-		if err = h.reserveWriteAdmission(ctx, terminal, resources, metadata.requestedSize); err != nil {
-			return err
-		}
-		reserved = true
-		return nil
-	}
-	ctx = context.WithValue(ctx, coherenceOperationKey{}, &coherenceOperation{beforeAdmission: admit})
-	prepare := func() ([]volumeserver.VisibilityTarget, error) {
+	ctx = context.WithValue(ctx, coherenceOperationKey{}, &coherenceOperation{beforeAdmission: func() error { return metadataErr }})
+	prepare := func() ([]volumeserver.MutationTarget, error) {
 		var err error
 		store, ok := h.Store.(writeStore)
 		if !ok {
@@ -171,7 +148,7 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		if object.Stable == ([16]byte{}) || object.Ino == 0 {
 			return nil, syscall.EIO
 		}
-		coordinate = visibilityCoordinate{
+		coordinate = mutationCoordinate{
 			identity: object.Stable, ino: object.Ino,
 			device: uint64(object.DeviceMajor)<<32 | uint64(object.DeviceMinor),
 		}
@@ -190,13 +167,13 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 			}
 			preparedSize = attr.Size
 		}
-		return []volumeserver.VisibilityTarget{
-			inodeTarget(volumeserver.VisibilityData, coordinate, 0),
-			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
+		return []volumeserver.MutationTarget{
+			inodeTarget(volumeserver.MutationData, coordinate, 0),
+			inodeTarget(volumeserver.MutationAttributes, coordinate, 0),
 		}, nil
 	}
 
-	response := h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64, changed *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 		if target == nil {
 			return h.errorResponse(0, syscall.EIO, false), nil
 		}
@@ -231,10 +208,10 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply)
 		if committed == 0 && !zeroPostApply {
 			if applyErr == nil {
-				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+				return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 			}
 			if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) || errors.Is(applyErr, xfsstore.ErrWritePostApply) {
-				return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
+				return h.errorResponse(0, applyErr, true), []volumeserver.MutationTarget{}
 			}
 			var limit *xfsstore.WriteLimitError
 			response := stockWriteRejection(applyErr, errors.As(applyErr, &limit) && limit.RLimit)
@@ -243,48 +220,48 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		}
 		if zeroPostApply {
 			if post.Kind != xfsstore.KindRegular || post.Size < 0 || sequence == 0 {
-				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+				return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 			}
 			response := stockWriteCommitReply(0, 0, uint64(post.Size), sequence, post, applyErr)
-			response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
+			response.PostState = h.mutationPostState(changed, sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 			h.deferStorageFailure(response, applyErr)
-			return response, []volumeserver.VisibilityTarget{
-				inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
-				inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
+			return response, []volumeserver.MutationTarget{
+				inodeTarget(volumeserver.MutationData, coordinate, post.Size),
+				inodeTarget(volumeserver.MutationAttributes, coordinate, 0),
 			}
 		}
 		if committed > metadata.requestedSize || assigned > math.MaxInt64 || committed > math.MaxInt64-assigned {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 		}
 		end := assigned + committed
 		if post.Kind != xfsstore.KindRegular || post.Size < 0 || uint64(post.Size) < end || sequence == 0 {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 		}
 		// An append is exact only if the object ends exactly where the committed
 		// bytes end: any other post size means another writer interleaved inside
 		// the writer stripe, which cannot happen.
 		if metadata.mode == xfsstore.WriteAppend && uint64(post.Size) != end {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 		}
 		if metadata.mode == xfsstore.WritePositioned && assigned != metadata.position {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 		}
 		// ErrWritePostApply promises exact placement and attributes, including
 		// when the failed obligation is a terminal persistence syscall.
 		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
-			return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, applyErr, true), []volumeserver.MutationTarget{}
 		}
 		if applyErr != nil && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			applyErr = nil
 		}
 		response := stockWriteCommitReply(committed, assigned, uint64(post.Size), sequence, post, applyErr)
-		response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
+		response.PostState = h.mutationPostState(changed, sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		if applyErr != nil {
 			h.deferStorageFailure(response, applyErr)
 		}
-		return response, []volumeserver.VisibilityTarget{
-			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
-			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
+		return response, []volumeserver.MutationTarget{
+			inodeTarget(volumeserver.MutationData, coordinate, post.Size),
+			inodeTarget(volumeserver.MutationAttributes, coordinate, 0),
 		}
 	}, func() error { return target.Sync() }, &releaseMutation)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) && response != nil && response.GetErrno() == 0 && response.GetWrite() == nil {

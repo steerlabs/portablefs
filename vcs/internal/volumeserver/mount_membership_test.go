@@ -8,18 +8,18 @@ import (
 	"testing"
 )
 
-func TestFileVisibilityMembershipActivateRollsBackAfterPersistFailure(t *testing.T) {
+func TestFileMountMembershipActivateRollsBackAfterPersistFailure(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "strict-membership")
-	registry, _, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	path := filepath.Join(dir, "mount.membership")
+	registry, _, err := OpenFileMountMembership(path, "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := SessionID{1}
-	registry.path = filepath.Join(dir, "missing", "strict-membership")
+	registry.path = filepath.Join(dir, "missing", "mount.membership")
 	if err := registry.Activate(id); err == nil {
 		t.Fatal("activate succeeded without a durable membership path")
 	}
@@ -34,7 +34,7 @@ func TestFileVisibilityMembershipActivateRollsBackAfterPersistFailure(t *testing
 		t.Fatal(err)
 	}
 
-	restarted, disposition, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	restarted, disposition, err := OpenFileMountMembership(path, "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,13 +47,13 @@ func TestFileVisibilityMembershipActivateRollsBackAfterPersistFailure(t *testing
 	}
 }
 
-func TestFileVisibilityMembershipSurvivesRestartUntilFencingProof(t *testing.T) {
+func TestFileMountMembershipSurvivesRestartUntilFencingProof(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "strict-membership")
-	registry, disposition, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	path := filepath.Join(dir, "mount.membership")
+	registry, disposition, err := OpenFileMountMembership(path, "volume-a", false)
 	if err != nil || disposition != PriorEpochStrictMountsFenced {
 		t.Fatalf("open fresh membership = %v, %v", disposition, err)
 	}
@@ -65,21 +65,21 @@ func TestFileVisibilityMembershipSurvivesRestartUntilFencingProof(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	restarted, disposition, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	restarted, disposition, err := OpenFileMountMembership(path, "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if disposition != PriorEpochUnproven {
 		t.Fatalf("restart disposition = %v, want unproven", disposition)
 	}
-	if _, _, err := OpenFileVisibilityMembership(path, "volume-a", false); err == nil {
+	if _, _, err := OpenFileMountMembership(path, "volume-a", false); err == nil {
 		t.Fatal("second authority acquired the same membership lock")
 	}
 	if err := restarted.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	fenced, disposition, err := OpenFileVisibilityMembership(path, "volume-a", true)
+	fenced, disposition, err := OpenFileMountMembership(path, "volume-a", true)
 	if err != nil || disposition != PriorEpochStrictMountsFenced {
 		t.Fatalf("open after fencing proof = %v, %v", disposition, err)
 	}
@@ -94,13 +94,13 @@ func TestFileVisibilityMembershipSurvivesRestartUntilFencingProof(t *testing.T) 
 // -prior-strict-mounts-fenced stays an explicit human assertion, but it stops
 // being an invisible one: the exact mounts it erased are durably recorded and
 // reported before the record it erases is rewritten.
-func TestFileVisibilityMembershipAuditsOperatorAssertedFencing(t *testing.T) {
+func TestFileMountMembershipAuditsOperatorAssertedFencing(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "strict-membership")
-	registry, _, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	path := filepath.Join(dir, "mount.membership")
+	registry, _, err := OpenFileMountMembership(path, "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestFileVisibilityMembershipAuditsOperatorAssertedFencing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fenced, disposition, err := OpenFileVisibilityMembership(path, "volume-a", true)
+	fenced, disposition, err := OpenFileMountMembership(path, "volume-a", true)
 	if err != nil || disposition != PriorEpochStrictMountsFenced {
 		t.Fatalf("open after fencing proof = %v, %v", disposition, err)
 	}
@@ -123,7 +123,7 @@ func TestFileVisibilityMembershipAuditsOperatorAssertedFencing(t *testing.T) {
 	if len(cleared) != 2 || cleared[0] != first || cleared[1] != second {
 		t.Fatalf("cleared set = %x, want both prior mounts", cleared)
 	}
-	audit, err := os.ReadFile(path + visibilityMembershipAuditSuffix)
+	audit, err := os.ReadFile(path + membershipAuditSuffix)
 	if err != nil {
 		t.Fatalf("read durable audit: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestFileVisibilityMembershipAuditsOperatorAssertedFencing(t *testing.T) {
 	if err := fenced.Close(); err != nil {
 		t.Fatal(err)
 	}
-	again, _, err := OpenFileVisibilityMembership(path, "volume-a", true)
+	again, _, err := OpenFileMountMembership(path, "volume-a", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,20 +150,20 @@ func TestFileVisibilityMembershipAuditsOperatorAssertedFencing(t *testing.T) {
 	}
 }
 
-func TestFileVisibilityMembershipIsBoundToOneVolume(t *testing.T) {
+func TestFileMountMembershipIsBoundToOneVolume(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "strict-membership")
-	registry, _, err := OpenFileVisibilityMembership(path, "volume-a", false)
+	path := filepath.Join(dir, "mount.membership")
+	registry, _, err := OpenFileMountMembership(path, "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := registry.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := OpenFileVisibilityMembership(path, "volume-b", false); err == nil {
+	if _, _, err := OpenFileMountMembership(path, "volume-b", false); err == nil {
 		t.Fatal("membership file was accepted for a different volume")
 	}
 }
@@ -175,18 +175,18 @@ func TestProfiledMembershipPreservesMacExclusionAcrossRestart(t *testing.T) {
 		compatibility PriorEpochDisposition
 		linux         bool
 	}{
-		{"linux", []MountMembershipProfile{MembershipLinuxV7}, PriorEpochStrictMountsFenced, true},
-		{"mac", []MountMembershipProfile{MembershipCompatibility}, PriorEpochUnproven, false},
+		{"linux", []MountMembershipProfile{MembershipLinux}, PriorEpochStrictMountsFenced, true},
+		{"mac", []MountMembershipProfile{MembershipFSKitExclusive}, PriorEpochUnproven, false},
 		{"gateway", []MountMembershipProfile{MembershipCacheless}, PriorEpochStrictMountsFenced, false},
-		{"mixed", []MountMembershipProfile{MembershipLinuxV7, MembershipCompatibility, MembershipCacheless}, PriorEpochUnproven, true},
+		{"mixed", []MountMembershipProfile{MembershipLinux, MembershipFSKitExclusive, MembershipCacheless}, PriorEpochUnproven, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
 				t.Fatal(err)
 			}
-			path := filepath.Join(dir, "membership")
-			m, _, err := OpenFileVisibilityMembership(path, "vol", false)
+			path := filepath.Join(dir, "mount.membership")
+			m, _, err := OpenFileMountMembership(path, "vol", false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -198,7 +198,7 @@ func TestProfiledMembershipPreservesMacExclusionAcrossRestart(t *testing.T) {
 			if err := m.Close(); err != nil {
 				t.Fatal(err)
 			}
-			m, prior, err := OpenFileVisibilityMembership(path, "vol", false)
+			m, prior, err := OpenFileMountMembership(path, "vol", false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -214,7 +214,7 @@ func TestProfiledMembershipPreservesMacExclusionAcrossRestart(t *testing.T) {
 			if err := m.Close(); err != nil {
 				t.Fatal(err)
 			}
-			m, prior, err = OpenFileVisibilityMembership(path, "vol", true)
+			m, prior, err = OpenFileMountMembership(path, "vol", true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -224,32 +224,5 @@ func TestProfiledMembershipPreservesMacExclusionAcrossRestart(t *testing.T) {
 				t.Fatal("operator clear did not audit and clear every profile")
 			}
 		})
-	}
-}
-
-func TestLegacyMembershipCannotBeInferredToBeLinux(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "membership")
-	id := SessionID{7}
-	if err := os.WriteFile(path, []byte("PFS-VISIBILITY-1\n"+hex.EncodeToString([]byte("vol"))+"\n"+hex.EncodeToString(id[:])+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	m, prior, err := OpenFileVisibilityMembership(path, "vol", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Close()
-	compatibility, linux := m.PriorCacheState()
-	if prior != PriorEpochUnproven || compatibility != PriorEpochUnproven || linux {
-		t.Fatal("legacy record lost conservative fencing obligation")
-	}
-	if err := m.ActivateProfile(SessionID{8}, MembershipLinuxV7); err != nil {
-		t.Fatal(err)
-	}
-	if m.profiles[id] != MembershipCompatibility {
-		t.Fatal("migration reclassified legacy mount")
 	}
 }

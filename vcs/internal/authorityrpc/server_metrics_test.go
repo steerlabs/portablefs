@@ -58,6 +58,19 @@ func BenchmarkDispatchInstrumentation(b *testing.B) {
 	}
 }
 
+func TestRPCObservationWithoutMetrics(t *testing.T) {
+	request := &authoritypb.Request{RequestId: 17, Session: &authoritypb.SessionProof{Id: []byte{1}}, Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
+	handler := &benchmarkDispatchHandler{response: &authoritypb.Response{RequestId: 17}}
+	var observations []RPCObservation
+	server := &Server{Handler: handler, OnRPC: func(o RPCObservation) { observations = append(observations, o) }}
+	if response := server.dispatchRequest(t.Context(), request); response != handler.response {
+		t.Fatal("observation replaced the handler reply")
+	}
+	if len(observations) != 1 || observations[0].RequestID != 17 || observations[0].Session[0] != 1 || observations[0].Operation != authoritymetrics.OperationKeepAlive || observations[0].Started.IsZero() || observations[0].Duration < 0 {
+		t.Fatalf("missing correlated request observation: %v", observations)
+	}
+}
+
 func TestRequestOperationAndResponseOutcome(t *testing.T) {
 	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}
 	if got := requestOperation(request); got != authoritymetrics.OperationWrite {
