@@ -232,7 +232,14 @@ requirement (`ExpectationsAfterRestart`).
 - It covers the authority's FSKit durability claim and nothing on the Mac side.
   What the daemon, the extension or the macOS kernel held and never delivered
   as a callback is outside the instrument; so are FSKit's own flush, fsync and
-  unmount semantics.
+  unmount semantics. Completed deactivation and resource unloading certify
+  local cleanup only; unmount's completion has no error or errno and supplies
+  no durability verdict. Mutation replies still require authority durability,
+  and synchronize still covers only its captured applied cut and propagates
+  errors through its serving publication gate. Exact kernel absence and
+  daemon/CLI reconciliation require independent evidence. Native
+  fsync/F_FULLFSYNC waiting and dirty-page drain remain separate
+  [qualification gates](./fskit-mount.md#verification).
 - It makes no crash claim for restore hydration's mtime restoration, which is
   not crash-atomic and is not in either workload.
 - It makes no per-volume isolation claim for `syncfs`. Every project on one XFS

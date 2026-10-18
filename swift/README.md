@@ -54,9 +54,16 @@ request and the live item.
 each callback's operation ID and PublicationAck verdict, sends one
 ResourceReplyDisposition per resource-bearing reply, and owns the single
 terminal path: socket or event-binding loss, or a degraded or detaching attach
-state, fails the callback window, wakes every waiter, revokes outstanding
-tickets, and stops publication. The extension keeps no metadata cache and sends
-no heartbeat; the daemon owns the cache and the authority renewal.
+state, fails the serving callback window, wakes every waiter, revokes
+outstanding tickets, and stops successful serving publication. Completed
+deactivation and resource unloading acknowledge local cleanup only, including
+after terminal failure; unmount has an errorless completion at the same cleanup
+boundary. These acknowledgements preserve the first terminal cause and prove
+neither durability, kernel absence, nor daemon/CLI reconciliation. Loading,
+activation, mounting, and synchronize remain gated; close, reclaim, release,
+and other cleanup activity retain their publication and resource-settlement
+rules. The extension keeps no metadata cache and sends no heartbeat; the daemon
+owns the cache and the authority renewal.
 
 The contract these implement, and what is not yet qualified, is
 [../docs/fskit-mount.md](../docs/fskit-mount.md).

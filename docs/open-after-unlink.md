@@ -42,9 +42,12 @@ Authority epoch state is disposable, and a server file descriptor is epoch
 state. When an authority dies, the kernel closes every descriptor it held, and
 an inode with no remaining link is then destroyed. On a Linux mount that
 reattaches to the new epoch, applications holding that file observe `ESTALE`
-or `EIO` on the old handle; a Mac mount's session is terminal and every
-operation fails until it is unmounted. Either way the content is gone: it had
-no name under which anything could recover it.
+or `EIO` on the old handle; a Mac mount's session is terminal and serving
+operations fail until it is unmounted. Completed deactivation and resource
+unloading, and errorless unmount completion, still acknowledge local cleanup
+only ([FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown)).
+Either way the content is gone: it had no name under which anything could
+recover it.
 
 This is stated rather than worked around. Surviving an epoch change would
 require a durable PortableFS-side namespace parallel to XFS, which v3

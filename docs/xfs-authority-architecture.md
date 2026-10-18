@@ -85,6 +85,31 @@ does not filter, relabel, or reset such an error and does not rotate the
 description to clear the cursor. Isolation requires a separate filesystem per
 volume.
 
+The FSKit frontend gates successful serving replies against session
+termination: no callback publishing data, metadata, namespace, or durability
+reports success after the session is terminal. Resource loading, activation,
+mounting, and synchronize obey that gate. Synchronize waits for the authority
+barrier over its captured applied cut, then Statfs, propagates their errors,
+and can still fail at final publication if termination wins. It cannot cover
+undelivered kernel pages; native fsync/F_FULLFSYNC waiting, dirty-page drain,
+and error propagation remain unqualified.
+
+Completed volume deactivation and resource unloading acknowledge local cleanup
+only, including after terminal failure; genuine request or cleanup errors
+remain errors, and repeated completed teardown is idempotent. Unmount's void
+completion has no errno and acknowledges the same cleanup boundary. These
+acknowledgements never certify durability, clear the first terminal cause,
+revive serving, prove kernel absence or authority acceptance of absence, or
+certify daemon/CLI reconciliation. Every successful mutation reply still
+requires authority-storage durability. Close, reclaim, release, and other
+cleanup activity retain their existing publication and settlement rules. The
+CLI independently reports exact kernel absence and daemon completion; a Swift
+teardown acknowledgement authorizes neither a daemon 204 nor registry removal.
+Closing a terminal session cannot retract already-published kernel cache, and
+a real sync failure or busy reference may still block normal unmount. See
+[the FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown)
+and [detach reporting](./fskit-mount.md#unmount-and-detach).
+
 Runtime subscriptions, delegations, connections, locks, handles, and replay
 outcomes are epoch-local. Restart permanently stales old handles; cold
 reattachment permits new opens. The Authority fences prior Linux membership

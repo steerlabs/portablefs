@@ -241,11 +241,14 @@ Changing the key is a new mTLS principal and requires a new mount/session.
 Temporary Manager failures retry the same sequence with bounded exponential
 backoff. A definitive denial fails closed immediately. If renewal cannot finish
 before the safety margin, Linux unmounts while the last grant is still valid.
-The macOS daemon instead terminalizes the attach's data plane: every operation
-fails closed and only an exact unmount resolves it. PortableFS does not remove
-the Mac's kernel mount automatically, and terminal enforcement does not
-withdraw kernel cache state the Mac already holds. Clean detach closes the
-enrollment; the product may revoke it earlier. Revocation cannot erase an
+The macOS daemon instead terminalizes the attach's data plane: serving
+operations fail closed until exact unmount and reconciliation. Completed
+deactivation and resource unloading still acknowledge local cleanup only;
+unmount's errorless completion proves neither durability nor kernel absence
+([FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown)).
+PortableFS does not remove the Mac's kernel mount automatically, and terminal
+enforcement does not withdraw kernel cache state the Mac already holds. Clean
+detach closes the enrollment; the product may revoke it earlier. Revocation cannot erase an
 installed grant, so its remaining exposure is bounded by the short grant
 lifetime.
 

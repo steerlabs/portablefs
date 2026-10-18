@@ -45,14 +45,51 @@ the offset.
 ### Terminal enforcement does not withdraw kernel state
 
 When the Mac's session ends, is fenced, or loses its daemon, the daemon stops
-answering from its caches, stops publishing replies, and the extension fails
-every waiting callback. That bounds what PortableFS serves. It does not
-synchronously remove names, attributes, or pages the macOS kernel already
-holds for the mount; processes on that Mac can observe retained kernel state
-until the mount is unmounted. PortableFS does not unmount automatically on
+answering from its caches and the extension rejects successful serving
+publication through the gate below. That bounds what PortableFS serves. It
+does not synchronously remove names, attributes, or pages the macOS kernel
+already holds for the mount; processes on that Mac can observe retained kernel
+state until the mount is unmounted. PortableFS does not unmount automatically on
 fence. The authority's retained writer exclusion keeps every other client from
 writing while the old daemon could still serve; it does not revoke the old
 Mac's kernel caches.
+
+### Callback publication and local teardown
+
+Once the session is terminal, no FSKit callback that publishes data, metadata,
+namespace or durability reports success. Resource loading, volume activation
+and mounting are serving callbacks and obey the same rule. Session termination
+and each serving callback's final synchronous reply share one publication gate:
+a reply that wins the gate precedes termination; when termination wins, the
+final gate rejects publication with the first terminal cause. Earlier definite
+request refusals remain failures.
+
+Volume deactivation and resource unloading acknowledge local teardown only.
+They must perform their local cleanup even after terminal failure and report
+success only after the cleanup they acknowledge has completed. An earlier
+session-terminal cause does not make completed cleanup fail. A genuine error
+in the teardown request or its local cleanup remains an error. Repeated
+completed teardown is idempotent. Unmount's errorless completion acknowledges
+the same local cleanup boundary.
+
+A teardown acknowledgement does not certify durability, erase or replace the
+first terminal cause, revive a session, prove kernel mount absence, prove
+authority acceptance of absence, or certify daemon/CLI reconciliation. Mutation
+and synchronize failures retain their existing error paths. Every successful
+FSKit mutation reply still requires authority-storage durability before
+publication.
+
+The named teardown operations are `deactivate`, `unloadResource`, and
+`unmount`; the last has a void completion with no error or errno. Close,
+reclaim, release, cancellation, and other cleanup activity retain their existing
+publication and resource-settlement rules. `loadResource`, `activate`, `mount`,
+and `synchronize` remain gated. Teardown revokes serving publication before
+its first suspension, then releases local ownership without depending on a
+remote response. It adds no durability barrier, reconnect, authority release
+drain, timer, or kernel unmount attempt. Malformed unload requests and genuine
+local cleanup errors still fail. Overlapping teardown callers must wait for
+the cleanup they acknowledge; an absent registration alone does not prove
+that in-flight cleanup has completed.
 
 ## Writer exclusion
 
@@ -78,8 +115,7 @@ that proof.
 
 ## Writes and durability
 
-FSKit delivers no fsync, directory-sync, or `F_FULLFSYNC` callback; the
-mutation callbacks are the only events that can carry durability. Every
+FSKit delivers no fsync, directory-sync, or `F_FULLFSYNC` callback. Every
 successful FSKit mutation reply therefore waits until its effect is durable on
 the authority: data, size, attributes, and namespace changes, including new
 empty files and unlinks. A handle-backed mutation full-fsyncs its retained
@@ -87,7 +123,14 @@ description; a handleless mutation uses `syncfs` on the authority's retained
 XFS-root description, whose error and latency scope is the whole XFS cell (see
 [COMPATIBILITY.md](../COMPATIBILITY.md#two-limits-that-apply-to-every-deployment)).
 A failed or uncertain reply is not a durability receipt, and a failed storage
-sync fences the store; there is no success after it.
+sync fences the store; no later barrier can certify durability.
+
+The volume's `synchronize` callback waits for the authority SyncVolume barrier
+over its captured applied cut, then Statfs. Barrier and Statfs errors propagate;
+even after both succeed, termination that wins the final publication gate
+fails the callback with the first terminal cause. This barrier cannot cover
+mutations outside that cut or dirty kernel pages not yet delivered as
+callbacks. Successful local teardown supplies no second durability verdict.
 
 Writes are direct: each callback chunk of up to the negotiated maximum write is
 one positioned authority WRITE, without append, sync, delegation, flush
@@ -193,8 +236,8 @@ then one batched Reclaim. A failed release ends the mount; it is never retried
 item by item. Callback state shared across frontend connections is keyed by the
 connection's never-reused incarnation and the callback's operation ID, so one
 connection's acknowledgment or close cannot settle another's. The extension
-admits at most 128 concurrent callbacks; terminal loss fails that window, wakes
-every waiter, and revokes outstanding tickets.
+admits at most 128 concurrent serving callbacks; terminal loss fails that
+window, wakes every waiter, and revokes outstanding tickets.
 
 ## Liveness and readiness
 
@@ -225,6 +268,11 @@ the data-loss boundary above. A forced unmount parks no recovery job and keeps
 no replay record, and pages the kernel never delivered are gone. No daemon
 failure, terminal authority session, slow reply, or proven daemon death forces
 an unmount: none of them proves that FSKit delivered every dirty page.
+A real sync failure or busy reference can prevent ordinary unmount of a
+terminal writable mount. Cleanup-only acknowledgements remove no genuine
+sync veto and do not promise that normal unmount will succeed. Explicit force
+promises removal only if the OS completes it, and never certifies undelivered
+kernel writes as durable.
 
 The mount supervisor owns startup, readiness and its exact mount records, not
 the authority session's health. In steady state it waits for user signals and
@@ -246,8 +294,9 @@ delivers the absence proof on the original CONTROL transport without first
 draining DATA, and hands unsent cleanup to session teardown; it keeps the
 proof-delivery and cleanup errors separately and attempts the proof even if
 release cleanup fails. Over operational control it answers with an empty 204
-for a completed unmount or with one combined error. The CLI independently
-classifies the exact kernel mount:
+for a completed unmount or with one combined error. A Swift teardown
+acknowledgement neither authorizes that 204 nor removes a durable registry
+record. The CLI independently classifies the exact kernel mount:
 
 - daemon error and kernel absent: "kernel mount is absent; daemon unmount
   completion is unconfirmed (absence-proof delivery or cleanup may be
@@ -261,12 +310,18 @@ classifies the exact kernel mount:
   reported unmounted;
 - empty 204 but the kernel mount present, or a malformed success: an error.
 
-Every daemon-error case preserves state and intent and exits with failure, and
-none triggers another automatic kernel action. A later 204 or a 404 is not a
-receipt that the authority accepted an earlier absence proof. A poisoned or
-lost session is never reconnected to submit evidence. An accepted proof clears
+Every daemon-error, present, unverified, or malformed-success case preserves
+state and intent and exits with failure, and none triggers another automatic
+kernel action. A later 204 or a 404 is not a receipt that the authority accepted
+an earlier absence proof. A poisoned or lost session is never reconnected to
+submit evidence. An accepted proof clears
 durable membership and the session's cache-proof obligation; writer exclusion
 still waits for admitted storage work to drain.
+
+Timeout or EOF does not prove that authority proof delivery failed, and nil
+local teardown does not prove delivery succeeded. CLI cleanup requires both
+valid empty 204 and independently observed exact kernel absence; even that
+local reconciliation does not certify pages abandoned by force as durable.
 
 ## Local topology
 
@@ -369,6 +424,16 @@ Exercised by the repository suites (not native FSKit qualification):
 - callback, window, resource, and cache behavior through Go unit tests and the
   native Xcode suite: `bash scripts/test-swift-xcode.sh`.
 
+Deterministic native regressions must invoke the imported
+`any FSVolume.Operations` completion-handler requirements and actual
+`loadResource`/`unloadResource` callbacks. They must cover termination before
+teardown, ordinary unmount followed by teardown, completed repeats and
+overlapping unloads, preserving the first cause and malformed-request errors.
+Continuation handshakes must prove that replies follow cleanup, including
+request cancellation, and that held serving replies and synchronize still lose
+to termination. Cleanup must finish without a remote response or new authority
+barrier. These are local ordering and ownership proofs, not live-mount evidence.
+
 Not yet qualified on native macOS 26 and 27:
 
 - first usable proof before readiness, terminal enforcement, and the callback
@@ -387,3 +452,13 @@ Not yet qualified on native macOS 26 and 27:
 scripts/coherence-matrix-macos.sh --mount-a /path/on/mac \
   --remote user@linux-host --remote-mount /path/on/linux
 ```
+
+For teardown qualification, use isolated signed real mounts on both releases
+with healthy and terminal sessions, busy references, and undelivered dirty
+pages. Record callbacks, `/sbin/umount` status, exact kernel inventory, and
+PortableFS reconciliation. Check ordinary refusal and explicit force
+independently, eventual cleanup, and a fresh attach incarnation. A test-only
+deactivate/unload error injected after cleanup may distinguish framework
+bookkeeping from kernel removal; it must not become a production policy switch.
+Neither unit fixtures nor static framework inspection qualify these outcomes.
+Do not restart fskitd or disturb existing mounts to obtain this evidence.

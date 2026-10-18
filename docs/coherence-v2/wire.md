@@ -560,6 +560,35 @@ before waiters are released; the first failure survives an apparently
 successful later syscall. Linux withdrawal may precede durability; the reply
 may not. Cancellation after apply does not abandon the barrier.
 
+**Frontend publication and teardown.** No FSKit callback publishing data,
+metadata, namespace, or durability reports success after the session is
+terminal. Resource loading, volume activation, mounting, and synchronize remain
+serving callbacks. Their final synchronous reply and session termination share
+one publication gate: a reply that wins precedes termination; termination that
+wins rejects publication with the first terminal cause. Earlier definite
+request refusals remain failures.
+
+Volume deactivation and resource unloading acknowledge completed local cleanup
+only, even after terminal failure. Genuine request or local cleanup errors
+remain errors; repeated completed teardown is idempotent, and overlapping
+callers wait for the cleanup they acknowledge. Unmount's void completion has
+no error or errno and acknowledges the same local boundary. None certifies
+durability, replaces the first terminal cause, revives the session, proves
+kernel absence or authority acceptance of absence, or certifies daemon/CLI
+reconciliation. This exception does not change close, reclaim, release,
+cancellation, or other publication and resource-settlement rules.
+
+Mutation durability above is unchanged. Synchronize waits for the authority
+barrier over its captured applied cut and then Statfs, propagates their errors,
+and still passes the final serving gate. It cannot cover undelivered kernel
+pages or mutations outside the cut; native fsync/F_FULLFSYNC waiting, dirty-page
+drain, and error propagation remain qualification boundaries. Closing a session
+cannot retract kernel cache already published. Local teardown success neither
+authorizes a daemon control 204 nor removes a durable registry record: the CLI
+independently checks exact kernel absence and daemon completion under
+[the detach reporting contract](../fskit-mount.md#unmount-and-detach). No new
+wire outcome or typed teardown receipt follows from these local callbacks.
+
 **Stamps.** FSKit read and mutation replies carry the conservative versions
 above. The authority samples existence, attributes, `v`, and `s` under one
 storage read dependency set; every attribute sample honours the hydration lock.
