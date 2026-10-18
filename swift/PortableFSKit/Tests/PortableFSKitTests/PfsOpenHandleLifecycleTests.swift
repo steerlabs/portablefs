@@ -394,6 +394,61 @@ extension PfsLocalMockDaemonTests {
     #expect(stats.activeHandles == 0)
 }
 
+/// Only a CREATE that actually creates the file carries the creation grant.
+/// A non-exclusive CREATE of an existing name is an open: its read/write
+/// description must pass the ordinary access check against the existing
+/// mode, and a refusal allocates nothing.
+@Test func createOfAnExistingNameGetsNoCreationGrant() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    func create(_ name: String, mode: UInt32) async throws -> PfsCreateReply {
+        var request = PfsCreateRequest()
+        request.dir = resolved.root
+        request.name = lifecycleBytes(name)
+        request.mode = mode
+        let envelope = try await client.request(.create(request))
+        guard case let .createReply(reply)? = envelope.body else {
+            throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
+        }
+        return reply
+    }
+    func close(_ handle: UInt64) async throws {
+        var request = PfsCloseRequest()
+        request.handle = handle
+        _ = try await client.request(.close(request))
+    }
+
+    // Positive control: a genuinely new 0444 file is writable through its
+    // creation description.
+    let fresh = try await create("existing-read-only", mode: 0o444)
+    var write = PfsWriteRequest()
+    write.handle = fresh.handle
+    write.data = lifecycleBytes("granted")
+    _ = try await client.request(.write(write))
+    try await close(fresh.handle)
+    #expect(await daemon.stats().activeHandles == 0)
+
+    // The same name again opens the existing 0444 file: read/write access
+    // is refused by its mode and no handle is allocated.
+    #expect(await lifecycleErrno {
+        _ = try await create("existing-read-only", mode: 0o644)
+    } == EACCES)
+    #expect(await daemon.stats().activeHandles == 0)
+
+    // An existing name whose mode grants read/write opens normally.
+    let writable = try await create("existing-writable", mode: 0o644)
+    try await close(writable.handle)
+    let reopened = try await create("existing-writable", mode: 0o444)
+    #expect(reopened.handle != 0)
+    write.handle = reopened.handle
+    _ = try await client.request(.write(write))
+    try await close(reopened.handle)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
 /// An unlinked file is reachable only through descriptions that already
 /// exist. A write-only description must keep serving writes after the last
 /// name is gone; a replacement OPEN could not even address the item.

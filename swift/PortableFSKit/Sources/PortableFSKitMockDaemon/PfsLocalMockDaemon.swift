@@ -1562,6 +1562,12 @@ private actor MockFileSystem {
                     guard existing.kind == .file else {
                         throw MockPOSIXError(errno: EISDIR, message: "not a regular file")
                     }
+                    // Opening an existing name creates nothing, so no creation
+                    // grant exists: the read/write description it returns
+                    // passes the ordinary OPEN access check.
+                    guard existing.mode & 0o600 == 0o600 else {
+                        throw MockPOSIXError(errno: EACCES, message: "open access denied by mode")
+                    }
                     node = existing
                     intern(node)
                 } else {
@@ -1576,8 +1582,9 @@ private actor MockFileSystem {
                 } else {
                     handle = nextHandle
                     nextHandle += 1
-                    // The creating caller is granted read/write access by the
-                    // creation itself, whatever mode the new file carries.
+                    // A new file's creator is granted read/write access by the
+                    // creation itself, whatever mode the file carries; an
+                    // existing name passed the OPEN access check above.
                     handles[handle] = OpenDescription(
                         nodeID: node.id,
                         readable: true,
