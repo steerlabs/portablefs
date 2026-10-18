@@ -667,7 +667,7 @@ func TestV3AssignedResourceCleanupSurvivesFrontendWithdrawal(t *testing.T) {
 	close(release)
 	// The batch already in flight settles on the original session even though
 	// local serving was withdrawn underneath it.
-	if err := d.releases.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), d.releases); err != nil {
 		t.Fatalf("assigned cleanup was canceled by local withdrawal: %v", err)
 	}
 	select {

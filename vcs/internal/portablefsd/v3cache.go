@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"reflect"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -253,21 +252,27 @@ func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 	return nil
 }
 
-// cacheAdmissibleLocked is the session half of hit admission: a live data
+// cacheAdmissionLocked is the session half of hit admission: a live data
 // plane, a proven horizon not yet reached on the continuous clock, immediate
 // client admission, and the installed signed authorization deadline as an
 // extra local denial. H expiry alone does not end the session; it only makes
 // every read take the authority path. d.mu is held.
-func (d *v3DataPlane) cacheAdmissibleLocked() bool {
-	if d.terminal != nil || d.horizon == 0 || !d.client.LocalAdmissionOpen() {
-		return false
+func (d *v3DataPlane) cacheAdmissionLocked() v3CacheResult {
+	if d.terminal != nil || !d.client.LocalAdmissionOpen() {
+		return v3CacheTerminal
 	}
-	if now, err := d.readClockLocked(); err != nil || now >= d.horizon {
-		// A clock fault is latched by readClockLocked; the caller ends serving
-		// once it has released its locks.
-		return false
+	if !d.authorizationDeadline.IsZero() && !time.Now().Before(d.authorizationDeadline) {
+		return v3CacheAuthorization
 	}
-	return d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)
+	if d.horizon == 0 {
+		return v3CacheHorizon
+	}
+	if now, err := d.readClockLocked(); err != nil {
+		return v3CacheClock
+	} else if now >= d.horizon {
+		return v3CacheHorizon
+	}
+	return v3CacheHit
 }
 
 func v3AttributeCoordinate(record *v3ItemRecord) v3PublicationCoordinate {
@@ -280,64 +285,81 @@ func v3NamespaceCoordinate(parent *v3ItemRecord, name string) v3PublicationCoord
 
 // attrHitLocked answers an item or handle GetAttr from a valid, unconflicted
 // record. Coordinator then d.mu are held.
-func (d *v3DataPlane) attrHitLocked(conflict v3CacheConflict, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, bool) {
-	if !d.cacheAdmissibleLocked() || d.itemsByID[item.item.ItemID] != item || !item.valid ||
-		handle != nil && d.handles[handle.id] != handle || conflict(v3AttributeCoordinate(item)) {
-		return pfslocal.Attr{}, false
+func (d *v3DataPlane) attrHitLocked(conflict v3CacheConflict, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, v3CacheResult) {
+	if reason := d.cacheAdmissionLocked(); reason != v3CacheHit {
+		return pfslocal.Attr{}, reason
+	}
+	if d.itemsByID[item.item.ItemID] != item || handle != nil && d.handles[handle.id] != handle {
+		return pfslocal.Attr{}, v3CacheResource
+	}
+	if !item.valid {
+		return pfslocal.Attr{}, v3CacheCold
+	}
+	if conflict(v3AttributeCoordinate(item)) {
+		return pfslocal.Attr{}, v3CacheHeld
 	}
 	attr, err := d.localAttr(item, item.attr, d.parentOfLocked(item))
-	return attr, err == nil
+	if err != nil {
+		return pfslocal.Attr{}, v3CacheResource
+	}
+	return attr, v3CacheHit
 }
 
-// lookupHitLocked answers a Lookup from the name cache. A positive hit needs a
-// valid parent, its remembered binding, and valid target attrs, and it retains
-// one provisional reference on the target when collector is non-nil; a
-// negative hit needs a valid parent and a recorded absence. Coordinator then
-// d.mu are held.
-func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRecord, name string, collector *v3ReplyResourceCollector) (any, int32, bool) {
-	if !d.cacheAdmissibleLocked() || d.itemsByID[parent.item.ItemID] != parent || !parent.valid ||
-		conflict(v3AttributeCoordinate(parent), v3NamespaceCoordinate(parent, name)) {
-		return nil, 0, false
+func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRecord, name string, collector *v3ReplyResourceCollector) (any, int32, v3CacheResult) {
+	if reason := d.cacheAdmissionLocked(); reason != v3CacheHit {
+		return nil, 0, reason
+	}
+	if d.itemsByID[parent.item.ItemID] != parent {
+		return nil, 0, v3CacheResource
+	}
+	if !parent.valid {
+		return nil, 0, v3CacheCold
+	}
+	if conflict(v3AttributeCoordinate(parent), v3NamespaceCoordinate(parent, name)) {
+		return nil, 0, v3CacheHeld
 	}
 	if child := parent.children[name]; child != nil {
-		if !child.valid || d.itemsByID[child.item.ItemID] != child || conflict(v3AttributeCoordinate(child)) {
-			return nil, 0, false
+		if d.itemsByID[child.item.ItemID] != child {
+			return nil, 0, v3CacheResource
+		}
+		if !child.valid {
+			return nil, 0, v3CacheCold
+		}
+		if conflict(v3AttributeCoordinate(child)) {
+			return nil, 0, v3CacheHeld
 		}
 		attr, err := d.localAttr(child, child.attr, v3ParentOf(parent))
 		if err != nil || collector != nil && child.provisional == math.MaxUint32 {
-			return nil, 0, false
+			return nil, 0, v3CacheResource
 		}
 		if collector != nil {
 			child.provisional++
 			collector.items = append(collector.items, child)
 		}
-		return &pfslocal.LookupReply{Attr: attr}, 0, true
+		return &pfslocal.LookupReply{Attr: attr}, 0, v3CacheHit
 	}
 	if _, absent := parent.negatives[name]; absent {
-		return nil, darwinENOENT, true
+		return nil, darwinENOENT, v3CacheHit
 	}
-	return nil, 0, false
+	return nil, 0, v3CacheUnknownName
 }
 
-// v3CachedReply is a reply computed from the cache but not yet exposed. Its
-// revalidation runs under the frontend's frame write lock immediately before
-// the physical write, so poison, horizon expiry, a changed authorization
-// generation, an intervening mutation, or a new source hold between the hit
-// and the write cannot let a stale unexposed success escape.
+// v3CachedReply owns an unexposed snapshot. Only proof expiry admits one
+// authority miss; terminal admission or lost ownership never substitutes a reply.
 type v3CachedReply struct {
 	revalidate func() bool
+	expired    bool
 }
 
 // serveCachedAttr is the GetAttr half of hit admission for currentAttr.
 func (d *v3DataPlane) serveCachedAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, bool, int32) {
 	var attr pfslocal.Attr
-	hit, errno := d.serveCached(ctx, operationID, func(conflict v3CacheConflict, _ *v3ReplyResourceCollector) bool {
-		var ok bool
-		attr, ok = d.attrHitLocked(conflict, item, handle)
-		return ok
-	}, func(conflict v3CacheConflict) bool {
-		again, ok := d.attrHitLocked(conflict, item, handle)
-		return ok && reflect.DeepEqual(again, attr)
+	hit, errno := d.serveCached(ctx, operationID, 0, func(conflict v3CacheConflict, _ *v3ReplyResourceCollector) v3CacheResult {
+		var reason v3CacheResult
+		attr, reason = d.attrHitLocked(conflict, item, handle)
+		return reason
+	}, func() bool {
+		return d.itemsByID[item.item.ItemID] == item && (handle == nil || d.handles[handle.id] == handle)
 	})
 	return attr, hit, errno
 }
@@ -345,16 +367,19 @@ func (d *v3DataPlane) serveCachedAttr(ctx context.Context, operationID uint64, i
 // serveCachedLookup is the Lookup half of hit admission.
 func (d *v3DataPlane) serveCachedLookup(ctx context.Context, operationID uint64, parent *v3ItemRecord, name string) (any, int32, bool) {
 	var (
-		reply any
-		errno int32
+		reply  any
+		errno  int32
+		target *v3ItemRecord
 	)
-	hit, localErrno := d.serveCached(ctx, operationID, func(conflict v3CacheConflict, collector *v3ReplyResourceCollector) bool {
-		var ok bool
-		reply, errno, ok = d.lookupHitLocked(conflict, parent, name, collector)
-		return ok
-	}, func(conflict v3CacheConflict) bool {
-		again, againErrno, ok := d.lookupHitLocked(conflict, parent, name, nil)
-		return ok && againErrno == errno && reflect.DeepEqual(again, reply)
+	hit, localErrno := d.serveCached(ctx, operationID, 1, func(conflict v3CacheConflict, collector *v3ReplyResourceCollector) v3CacheResult {
+		var reason v3CacheResult
+		reply, errno, reason = d.lookupHitLocked(conflict, parent, name, collector)
+		if reason == v3CacheHit && reply != nil {
+			target = collector.items[len(collector.items)-1]
+		}
+		return reason
+	}, func() bool {
+		return d.itemsByID[parent.item.ItemID] == parent && (target == nil || d.itemsByID[target.item.ItemID] == target && target.provisional != 0)
 	})
 	if localErrno != 0 {
 		return nil, localErrno, true
@@ -372,9 +397,12 @@ func (d *v3DataPlane) serveCachedLookup(ctx context.Context, operationID uint64,
 func (d *v3DataPlane) serveCached(
 	ctx context.Context,
 	operationID uint64,
-	snapshot func(v3CacheConflict, *v3ReplyResourceCollector) bool,
-	recheck func(v3CacheConflict) bool,
+	metric int,
+	snapshot func(v3CacheConflict, *v3ReplyResourceCollector) v3CacheResult,
+	owns func() bool,
 ) (bool, int32) {
+	result := v3CacheBypass
+	defer func() { d.mu.Lock(); d.cacheCounters.reads[metric][result]++; d.mu.Unlock() }()
 	collector, _ := ctx.Value(v3ReplyResourceContextKey{}).(*v3ReplyResourceCollector)
 	if collector == nil || collector.d != d || collector.taken || collector.bypassCache {
 		return false, 0
@@ -382,12 +410,12 @@ func (d *v3DataPlane) serveCached(
 	// A session that cannot admit any hit right now (no proof horizon, say)
 	// takes the authority path without registering a receipt.
 	d.mu.Lock()
-	admissible := d.cacheAdmissibleLocked()
+	result = d.cacheAdmissionLocked()
 	d.mu.Unlock()
 	if d.endOnClockFault() != nil {
 		return true, darwinEIO
 	}
-	if !admissible {
+	if result != v3CacheHit {
 		return false, 0
 	}
 	receipt, err := d.client.BeginLocalPublication(func(cause error) {
@@ -396,20 +424,19 @@ func (d *v3DataPlane) serveCached(
 		))
 	})
 	if err != nil {
+		result = v3CacheTerminal
 		return false, 0
 	}
-	hit := false
-	var generation uint64
 	d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		hit, generation = snapshot(conflict, collector), d.authGeneration
+		result = snapshot(conflict, collector)
 	})
 	if d.endOnClockFault() != nil {
 		receipt.Consume()
 		return true, darwinEIO
 	}
-	if !hit {
+	if result != v3CacheHit {
 		receipt.Consume()
 		return false, 0
 	}
@@ -417,19 +444,16 @@ func (d *v3DataPlane) serveCached(
 		d.revokeRetainedResponse(ctx, err)
 		return true, darwinEIO
 	}
-	collector.cached = &v3CachedReply{revalidate: func() bool {
-		admitted := false
-		d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
-			d.mu.Lock()
-			defer d.mu.Unlock()
-			// A reauthorization since the snapshot voids the candidate even if
-			// a fresh proof now admits an identical answer.
-			admitted = d.authGeneration == generation && recheck(conflict)
-		})
-		// A clock fault seen here ends serving before the coherent retry can
-		// run, so that retry fails closed instead of succeeding.
-		return d.endOnClockFault() == nil && admitted
-	}}
+	candidate := &v3CachedReply{}
+	candidate.revalidate = func() bool {
+		d.mu.Lock()
+		reason := d.cacheAdmissionLocked()
+		owned := owns()
+		candidate.expired = reason == v3CacheHorizon && owned && d.clockFault == nil
+		d.mu.Unlock()
+		return d.endOnClockFault() == nil && reason == v3CacheHit && owned
+	}
+	collector.cached = candidate
 	return true, 0
 }
 
@@ -440,91 +464,15 @@ func (d *v3DataPlane) retainLocalPublication(collector *v3ReplyResourceCollector
 	return d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, receipt)
 }
 
-// v3NameWitness is the causal witness that lets a namespace mutation's errno
-// prove an invariant violation: the cached answer at the coordinate was valid
-// under the horizon when the operation obtained its source cut, the parent and
-// permission state stayed valid, and no other request of the same callback
-// could have touched the coordinate in between. Only then is EEXIST against a
-// proved absence, or ENOENT against a proved presence, terminal; otherwise the
-// coordinate is conservatively evicted.
-type v3NameWitness struct {
-	parent *v3ItemRecord
-	name   string
-	// contradiction is the errno that would contradict the witnessed state:
-	// darwinEEXIST for a proved absence, darwinENOENT for a proved presence.
-	contradiction int32
-	lease         *v3SourcePublicationLease
-	acquisitions  uint64
-	proved        bool
-}
-
-func newV3NameWitness(parent *v3ItemRecord, name []byte, contradiction int32) *v3NameWitness {
-	return &v3NameWitness{parent: parent, name: string(name), contradiction: contradiction}
-}
-
-// witnessedLocked reports whether the cache still proves the predicate the
-// errno would contradict. Coordinator then d.mu are held.
-func (w *v3NameWitness) witnessedLocked(d *v3DataPlane) bool {
-	parent := w.parent
-	if d.itemsByID[parent.item.ItemID] != parent || !parent.valid || parent.attr.GetNlink() == 0 {
-		return false
-	}
-	if w.contradiction == darwinEEXIST {
-		_, absent := parent.negatives[w.name]
-		return absent
-	}
-	return parent.children[w.name] != nil
-}
-
-// capture records the witness right after source admission.
-func (w *v3NameWitness) capture(d *v3DataPlane, lease *v3SourcePublicationLease) {
-	if w == nil {
-		return
-	}
-	w.lease = lease
-	d.bridge.sourcePublication.observeLease(lease, v3PublicationNamespace{
-		parent: v3PublicationIdentity(w.parent.item.StableIdentity), name: w.name,
-	}, func(acquisitions uint64, exclusive bool) {
-		w.acquisitions = acquisitions
-		if !exclusive {
-			return
-		}
+// settleNameErrno invalidates an affected name on a definite namespace
+// refusal. It does not manufacture a causal proof from previously cached state.
+func (d *v3DataPlane) settleNameErrno(parent *v3ItemRecord, name []byte, errno int32) int32 {
+	if errno == darwinEEXIST || errno == darwinENOENT {
 		d.mu.Lock()
-		defer d.mu.Unlock()
-		w.proved = d.cacheAdmissibleLocked() && w.witnessedLocked(d)
-	})
-}
-
-// settle classifies a definite errno from the witnessed mutation. A proved
-// contradiction stops serving; an unproved EEXIST/ENOENT evicts the
-// coordinate; any other errno changes nothing.
-func (d *v3DataPlane) settleNameErrno(w *v3NameWitness, errno int32) int32 {
-	if w == nil || errno != darwinEEXIST && errno != darwinENOENT {
-		return errno
+		if d.itemsByID[parent.item.ItemID] == parent {
+			d.dropNameLocked(parent, string(name))
+		}
+		d.mu.Unlock()
 	}
-	contradicted := false
-	if w.proved && errno == w.contradiction {
-		d.bridge.sourcePublication.observeLease(w.lease, v3PublicationNamespace{
-			parent: v3PublicationIdentity(w.parent.item.StableIdentity), name: w.name,
-		}, func(acquisitions uint64, _ bool) {
-			if acquisitions != w.acquisitions {
-				return
-			}
-			d.mu.Lock()
-			defer d.mu.Unlock()
-			contradicted = w.witnessedLocked(d)
-		})
-	}
-	if contradicted {
-		// The writer-exclusion premise is broken, not the transport: keep the
-		// session for the supervisor's exact absence proof.
-		_ = d.stopServing(fmt.Errorf("portablefsd: authority errno %d contradicts the exclusively held cached name %q", errno, w.name))
-		return darwinEIO
-	}
-	d.mu.Lock()
-	if d.itemsByID[w.parent.item.ItemID] == w.parent {
-		d.dropNameLocked(w.parent, w.name)
-	}
-	d.mu.Unlock()
 	return errno
 }

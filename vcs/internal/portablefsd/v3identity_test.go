@@ -513,7 +513,7 @@ func TestV3DrainedReleaseOwnerLeavesRetirementToTheDetach(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
-	if err := d.releases.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), d.releases); err != nil {
 		t.Fatal(err)
 	}
 	before := len(client.mutationRequests())

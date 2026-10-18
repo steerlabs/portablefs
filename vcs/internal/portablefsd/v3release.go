@@ -237,27 +237,3 @@ func (r *v3ReleaseOwner) abandon() {
 	}
 	r.signalLocked()
 }
-
-// drain is teardown after exact kernel absence. It closes admission, so every
-// token not yet accepted is explicitly owned by the authenticated detach that
-// follows, then waits until all accepted work has settled on the original
-// session and returns the sticky failure. A drain never claims success for a
-// batch that failed or did not finish before ctx.
-func (r *v3ReleaseOwner) drain(ctx context.Context) error {
-	r.mu.Lock()
-	r.closed = true
-	r.signalLocked()
-	for r.running || r.forming != nil && r.forming.tokens()+r.forming.reserved != 0 {
-		changed := r.changed
-		r.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return errors.Join(errors.New("portablefsd: release drain did not settle"), ctx.Err())
-		}
-		r.mu.Lock()
-	}
-	err := r.failure
-	r.mu.Unlock()
-	return err
-}

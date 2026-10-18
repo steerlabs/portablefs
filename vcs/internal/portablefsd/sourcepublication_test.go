@@ -772,3 +772,51 @@ func TestV3SourcePublicationFailureIsTerminalAndNeverReopens(t *testing.T) {
 		t.Fatalf("terminal coordinator admitted a later source: (%#v, %v)", next, err)
 	}
 }
+
+func TestV3CacheReadNeedsEveryActiveSourceRequestAndClaimSettled(t *testing.T) {
+	c := newV3SourcePublicationCoordinator()
+	c.reserve(98001)
+	parent := testV3PublicationItem(1, 0x20)
+	gate, err := v3NamespaceSourceGate(parent, []byte("name"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := c.acquireSource(context.Background(), 98001, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.acquireSource(context.Background(), 98001, gate)
+	if err != nil || second != first {
+		t.Fatalf("second acquisition: %v", err)
+	}
+	coordinate := v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: testV3PublicationIdentity(0x20), name: "name"}
+	check := func(want bool) {
+		t.Helper()
+		c.cacheRead(func(conflict v3CacheConflict) {
+			if got := conflict(coordinate); got != want {
+				t.Fatalf("conflict=%t, want %t", got, want)
+			}
+		})
+	}
+	check(true)
+	if err := first.resolveNoBindings(gate); err != nil {
+		t.Fatal(err)
+	}
+	first.finishRequest()
+	check(true) // the second request and its claim are still active
+	second.finishRequest()
+	check(true) // an unresolved claim prevents eligibility even at active=0
+	if err := second.resolveNoBindings(gate); err != nil {
+		t.Fatal(err)
+	}
+	check(false)
+	if !sourceV3PublicationHeld(c, coordinate) {
+		t.Fatal("cache eligibility released mutation ordering hold before ack")
+	}
+	c.reserve(98002)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.acquireSource(ctx, 98002, gate); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mutation passed retained hold: %v", err)
+	}
+}
