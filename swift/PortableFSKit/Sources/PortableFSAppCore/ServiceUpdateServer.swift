@@ -864,10 +864,7 @@ final class PortableFSDServiceUpdateSessionHandler: @unchecked Sendable {
               Set(root.keys) == keys else {
             throw PortableFSDServiceUpdateServerError.invalidFrame
         }
-        let expectedReleaseKeys: Set<String> = [
-            "codeDirectoryHash", "executableSHA256", "daemonVersion",
-            "identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor",
-        ]
+        let expectedReleaseKeys = PortableFSDReleaseIdentity.jsonKeys
         for key in releaseKeys {
             guard let release = root[key] as? [String: Any],
                   Set(release.keys) == expectedReleaseKeys else {

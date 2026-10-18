@@ -377,10 +377,7 @@ final class PortableFSDUpdateLeaseStore: @unchecked Sendable {
               let target = root["targetRelease"] as? [String: Any] else {
             throw PortableFSDUpdateLeaseError.invalidEncoding
         }
-        let releaseKeys: Set<String> = [
-            "codeDirectoryHash", "executableSHA256", "daemonVersion",
-            "identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor",
-        ]
+        let releaseKeys = PortableFSDReleaseIdentity.jsonKeys
         guard Set(old.keys) == releaseKeys, Set(target.keys) == releaseKeys else {
             throw PortableFSDUpdateLeaseError.invalidEncoding
         }

@@ -7,9 +7,9 @@ import Foundation
 ///
 /// Numbers are judged on their token text with the grammar Go's
 /// encoding/json applies to the peer field's type, so the Swift and Go
-/// decoders of one sealed resource or lifecycle identity accept exactly the
-/// same bodies. An unsigned field accepts only digits: `-0` is refused, as Go
-/// refuses it for uint32. A signed field also takes an optional minus sign.
+/// decoders of one lifecycle identity accept exactly the same bodies. An
+/// unsigned field accepts only digits: `-0` is refused, as Go refuses it for
+/// uint32. A signed field also takes an optional minus sign.
 /// Fractions, exponents and out-of-range values are refused for both.
 enum PortableFSDStrictObject {
     static func decode(
@@ -53,47 +53,14 @@ enum PortableFSDStrictObject {
     }
 }
 
-/// The protocol numbers a daemon release seals into its service bundle's
-/// signed resources. Read only after the bundle's code signature validated.
-/// The executable hash and daemon version come from the signed executable and
-/// bundle themselves: an executable's hash cannot sit inside the resources
-/// its own signature covers.
-struct PortableFSDSealedProtocols: Equatable, Sendable {
-    static let relativePath = "Contents/Resources/PortableFSProtocol.json"
-    static let maximumBytes = 4_096
-
-    let identitySchema: Int
-    let controlProtocol: Int
-    let pfslocalMajor: UInt32
-    let pfslocalMinor: UInt32
-
-    static func decode(_ data: Data) throws -> PortableFSDSealedProtocols {
-        let object = try PortableFSDStrictObject.decode(
-            data,
-            maximumBytes: maximumBytes,
-            keys: ["identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"]
-        )
-        guard let identitySchema = PortableFSDStrictObject.positiveInt(object["identitySchema"]),
-              identitySchema == PortableFSDLifecycle.identitySchemaVersion,
-              let controlProtocol = PortableFSDStrictObject.positiveInt(object["controlProtocol"]),
-              let pfslocalMajor = PortableFSDStrictObject.uint32(object["pfslocalMajor"]),
-              pfslocalMajor > 0,
-              let pfslocalMinor = PortableFSDStrictObject.uint32(object["pfslocalMinor"]) else {
-            throw PortableFSDStrictJSONError.invalid
-        }
-        return PortableFSDSealedProtocols(
-            identitySchema: identitySchema,
-            controlProtocol: controlProtocol,
-            pfslocalMajor: pfslocalMajor,
-            pfslocalMinor: pfslocalMinor
-        )
-    }
-}
-
 /// The identity a live daemon reports on the lifecycle endpoint: identity
-/// schema 1, the serving release's actual protocol numbers and its executable
-/// hash. Its claims are never authority by themselves; they must equal the
-/// sealed release of the app whose signed daemon the socket peer proved to be.
+/// schema 1, the serving release's actual protocol numbers, its version and
+/// its executable hash. Its claims are never authority by themselves. They
+/// are read only from a peer whose running image already authenticated as a
+/// signed release, and that release's version and hash must match them. The
+/// protocol numbers are then that trusted executable's own report: accepted
+/// as they are for an outgoing release, required to equal this build's
+/// pairing for this app's own daemon.
 struct PortableFSDLiveIdentity: Equatable, Sendable {
     let schemaVersion: Int
     let controlProtocol: Int
@@ -102,13 +69,10 @@ struct PortableFSDLiveIdentity: Equatable, Sendable {
     let pfslocalMajor: UInt32
     let pfslocalMinor: UInt32
 
-    func matches(_ sealed: PortableFSDReleaseIdentity) -> Bool {
-        schemaVersion == sealed.identitySchema
-            && controlProtocol == sealed.controlProtocol
-            && daemonVersion == sealed.daemonVersion
-            && executableSha256 == sealed.executableSHA256
-            && pfslocalMajor == sealed.pfslocalMajor
-            && pfslocalMinor == sealed.pfslocalMinor
+    /// The decoder already required schema 1 and valid protocol scalars.
+    func matches(_ release: PortableFSDReleaseIdentity) -> Bool {
+        daemonVersion == release.daemonVersion
+            && executableSha256 == release.executableSHA256
     }
 
     static func decode(_ data: Data) throws -> PortableFSDLiveIdentity {
