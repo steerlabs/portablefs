@@ -116,6 +116,14 @@ type openVisibilityRPC struct {
 	grant   *authoritypb.Delegation
 }
 
+func (f *openVisibilityRPC) CallMutation(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
+	if req.GetBarrier() != nil {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return f.delegationFakeRPC.CallMutation(ctx, req)
+}
+
 func (f *openVisibilityRPC) CallIdempotent(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
 	if req.GetWaitVisibility() != nil {
 		done := f.manager.HandleControlEvent(ctx, &authoritypb.ControlEvent{Incarnation: 7, Sequence: 2, Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{
