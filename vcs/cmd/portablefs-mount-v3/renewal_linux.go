@@ -22,9 +22,9 @@ type authorizedSessionProvider interface {
 
 // credentialRenewal is the running renewal for one mount. Failed reports the
 // single terminal verdict: the renewer could not install the next
-// authorization before its safe cutoff, so the mount must be withdrawn while
-// the authorization it still holds is valid, rather than left to be fenced
-// mid-operation when the deadline passes.
+// authorization before its safe cutoff. The supervisor reports that result;
+// the mount's existing authorization/session owner still enforces its deadline.
+// A renewal failure does not request a normal unmount.
 type credentialRenewal struct {
 	failed chan error
 	stop   context.CancelFunc
@@ -34,10 +34,9 @@ type credentialRenewal struct {
 // startCredentialRenewal renews this mount's authorization from the same
 // capability file the mount was started with.
 //
-// It is unconditional. A mount whose credential file is never rotated fails
-// closed at the renewer's cutoff exactly as a mount with no renewal fails at
-// its deadline, so there is no configuration in which renewal is off and
-// nothing to get wrong; a mount whose file is rotated keeps running. The
+// It is unconditional. A mount whose credential file is never rotated reports
+// failure at the renewer's cutoff and remains subject to authorization expiry;
+// a mount whose file is rotated keeps running. The
 // authority assigns the session, the credential manager mints against it, and
 // the mount is the only party that can present the result to its own session.
 func startCredentialRenewal(provider authorizedSessionProvider, capabilityFile string, attachCapability []byte) (*credentialRenewal, error) {

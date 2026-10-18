@@ -1202,11 +1202,25 @@ func (m *Mount) startKernelConnection() {
 	}()
 }
 
+// UnmountKernel makes one identity-checked normal unmount attempt. It does not
+// release the authority session; the serving supervisor finalizes with Close
+// after Wait reports the exact connection terminal.
+func (m *Mount) UnmountKernel() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return m.closeErr
+	}
+	return m.unmountOwnedKernelMount()
+}
+
+// Unmount combines one normal attempt with exact-connection finalization for
+// callers that own both operations synchronously.
 func (m *Mount) Unmount() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return nil
+		return m.closeErr
 	}
 	if err := m.unmountOwnedKernelMount(); err != nil {
 		return err

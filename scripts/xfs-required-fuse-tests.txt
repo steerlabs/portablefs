@@ -30,6 +30,7 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionExpiryReleasesABl
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestShippingCLIEpochReplacementRequiresFreshRenewedMount
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalHonorsRenewalsWhileControlDeliveryStalls
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNormalUnmountRequiresAnotherSignalAfterBusyDescriptor
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesDurableMembership
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts

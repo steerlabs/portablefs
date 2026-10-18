@@ -314,6 +314,10 @@ func (k kernelMount) absent() (MountAbsenceProof, error) {
 	if err != nil {
 		return MountAbsenceProof{}, err
 	}
+	return k.absenceProof(records)
+}
+
+func (k kernelMount) absenceProof(records []kernelMount) (MountAbsenceProof, error) {
 	for _, record := range records {
 		matches, err := k.matches(record)
 		if err != nil {
@@ -821,7 +825,7 @@ func (m *Mount) detach() error {
 	}
 	// Refuse a live mount immediately. If it is absent because MNT_DETACH was
 	// used, wait below for retained references to release the old connection.
-	if _, err := m.kernelMount.absent(); err != nil {
+	if _, err := m.kernelMount.cleanAbsent(); err != nil {
 		return fmt.Errorf("fusev3: clean detach cannot establish exact mount absence: %w", err)
 	}
 	if m.kernelConnectionDone == nil {
@@ -834,7 +838,7 @@ func (m *Mount) detach() error {
 	}
 	// Produce the statement after connection termination so its timestamp names
 	// the complete condition, not merely the earlier namespace detach.
-	proof, err := m.kernelMount.absent()
+	proof, err := m.kernelMount.cleanAbsent()
 	if err != nil {
 		return fmt.Errorf("fusev3: clean detach cannot re-establish exact mount absence: %w", err)
 	}

@@ -192,8 +192,32 @@ func (m *Mount) unmountOwnedKernelMount() error {
 		}
 	}
 	present, err := installed.detachTargetInstalled()
-	if err != nil || !present {
+	if err != nil {
+		return err
+	}
+	if !present {
+		_, err := installed.cleanAbsent()
 		return err
 	}
 	return m.server.Unmount()
+}
+
+// cleanAbsent also refuses a successor at the original path. Revocation may
+// prove the old filesystem absent while leaving that successor alone; a clean
+// user request must instead report that its target identity changed.
+func (k kernelMount) cleanAbsent() (MountAbsenceProof, error) {
+	records, err := readKernelMounts()
+	if err != nil {
+		return MountAbsenceProof{}, err
+	}
+	proof, err := k.absenceProof(records)
+	if err != nil {
+		return MountAbsenceProof{}, err
+	}
+	for _, record := range records {
+		if record.point == k.point {
+			return MountAbsenceProof{}, fmt.Errorf("fusev3: mountpoint %s now names a different kernel mount identity", k.point)
+		}
+	}
+	return proof, nil
 }

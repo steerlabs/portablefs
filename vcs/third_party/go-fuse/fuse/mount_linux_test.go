@@ -1,9 +1,14 @@
 package fuse
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -287,5 +292,45 @@ func TestEscapedMountOption(t *testing.T) {
 	m := *mounts[0]
 	if m.Source != fsname {
 		t.Errorf("mountinfo(%q): got %q want %q", mnt, m.Source, fsname)
+	}
+}
+
+func TestNormalUnmountInvokesTheHelperOncePerRequest(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "attempts")
+	t.Setenv("PATH", dir)
+	t.Setenv("PORTABLEFS_TEST_UNMOUNT_COUNTER", counter)
+	for _, exit := range []string{"16", "1", "0"} {
+		t.Run("exit_"+exit, func(t *testing.T) {
+			script := "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> \"$PORTABLEFS_TEST_UNMOUNT_COUNTER\"\nexit " + exit + "\n"
+			if err := os.WriteFile(filepath.Join(dir, "fusermount3"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(counter, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{mountPoint: "/owned", opts: &MountOptions{}}
+			for want := 1; want <= 2; want++ {
+				err := server.Unmount()
+				if exit == "0" {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					var helperErr *exec.ExitError
+					if !errors.As(err, &helperErr) || strconv.Itoa(helperErr.ExitCode()) != exit {
+						t.Fatalf("actual helper result lost: %v", err)
+					}
+				}
+				data, err := os.ReadFile(counter)
+				attempts := want
+				if exit == "0" {
+					attempts = 1 // An already unmounted server is idempotent.
+				}
+				if err != nil || string(data) != strings.Repeat("-u /owned\n", attempts) {
+					t.Fatalf("helper attempts = %q, %v", data, err)
+				}
+			}
+		})
 	}
 }
