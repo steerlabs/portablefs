@@ -1082,12 +1082,11 @@ func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
 }
 
 // SessionDone closes when this client can no longer safely continue the mount:
-// an idle connection died without an in-flight call to drive same-epoch
-// recovery, the authority epoch changed, an exact outcome became uncertain, or
-// the client was closed. A terminal edge poisons new admission immediately,
-// but its public signal waits for every already-parsed retained response to
-// cross the frontend's physical publication boundary. When the frontend opted
-// into local enforcement, the public signal also waits for its bounded kernel
+// the FSKit CONTROL transport was lost, the authority epoch changed, an exact
+// outcome became uncertain, or the client was closed. A terminal edge poisons
+// new admission immediately, but its public signal waits for already-parsed
+// retained responses to cross the frontend's physical publication boundary.
+// When the frontend opted into local enforcement, it also waits for bounded kernel
 // withdrawal to finish. SessionError becomes observable at the same boundary.
 func (c *Client) SessionDone() <-chan struct{} { return c.fatalDone }
 
@@ -1502,6 +1501,12 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 			return c.completeCall(request, completed)
 		case <-timer.C:
 			c.failConnection(transport, conn, ErrTransportUncertain)
+			// An unsettled transport loss can end the session even while this
+			// caller is draining cancellation. Preserve that terminal boundary
+			// rather than reporting a safely settled local context error.
+			if err := c.SessionEndCause(); err != nil {
+				return nil, nil, err
+			}
 			return nil, nil, ctx.Err()
 		}
 	case completed := <-result:
@@ -1692,7 +1697,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		}()
 	}
 	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
-	if !errors.Is(err, ErrTransportUncertain) {
+	if !errors.Is(err, ErrTransportUncertain) || c.poisoned.Load() {
 		return response, releaseFrame, err
 	}
 	if releaseFrame != nil {
@@ -2011,13 +2016,13 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	transport.conn = nil
 	pending := transport.pending
 	transport.pending = make(map[uint64]chan callResult)
-	idle := len(pending) == 0 && !c.closed.Load()
 	// Losing an idle DATA socket is only a transport event: the next safe read
-	// or exact mutation replay lazily resumes that one role. CONTROL owns the
-	// subscription horizon, which independently withdraws stale caches. An
-	// idle socket loss cannot prove an epoch or session outcome. Other profiles
-	// retain their existing terminal CONTROL contract.
-	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
+	// or exact mutation replay lazily resumes that one role. FSKit CONTROL loss
+	// is terminal even with pending requests: poison admission before notifying
+	// their waiters, while retained replies and local enforcement keep their
+	// existing ownership of the terminal drain. Other profiles retain their
+	// transport recovery policy.
+	if !c.closed.Load() && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		c.signalSessionEnd(err)
 	}
 	transport.pendingMu.Unlock()
