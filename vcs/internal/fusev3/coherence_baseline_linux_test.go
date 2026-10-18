@@ -45,7 +45,7 @@ type baselineMeasurement struct {
 // runs the design's representative install, git, and cross-mount workloads
 // against a real PortableFS mount and against the loop-backed XFS that backs
 // the same Authority. Every PORTABLEFS_BASELINE line is one self-contained JSON
-// observation suitable for docs/coherence-v2/baseline.md.
+// observation.
 func TestCoherenceBaseline(t *testing.T) {
 	if os.Getenv(envPerformance) != "1" {
 		t.Skipf("set %s=1 to run the coherence-v2 baseline", envPerformance)

@@ -1415,14 +1415,15 @@ func TestOpendirRejectsMalformedOpenReply(t *testing.T) {
 	}
 }
 
-// TestOpendirWithoutAnEnumerationLeaseOpensUncached pins the frontend half of
-// the enumeration contract. A grant on a read-side reply is a MAY, not a MUST
-// (docs/portable-coherence.md §2.2), and a directory under sustained mutation
-// is exactly where one is withheld or overtaken by a newer recall's grant
-// floor. An ungranted OPENDIR therefore yields a usable, uncached handle.
-// Requiring the grant here revoked live mounts under an ordinary package
-// install; see TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing.
-func TestOpendirWithoutAnEnumerationLeaseOpensUncached(t *testing.T) {
+// TestOpendirWithoutEnumerationCoverageOpensUncached pins the frontend half of
+// the enumeration contract. Cache permission comes from the subscription stamp,
+// never from the reply itself (docs/portable-coherence.md, "Visibility and
+// cache permission"), and a directory under sustained mutation is exactly where
+// a stamp is overtaken by a newer change. An uncovered OPENDIR therefore
+// yields a usable, uncached handle. Requiring coverage here revoked live mounts
+// under an ordinary package install; see
+// TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing.
+func TestOpendirWithoutEnumerationCoverageOpensUncached(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
 		if request.GetOpen() != nil {
