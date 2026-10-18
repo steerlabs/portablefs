@@ -9,9 +9,9 @@ private let updateOldRelease = PortableFSDReleaseIdentity(
     executableSHA256: String(repeating: "2", count: 64),
     daemonVersion: "1.2.3",
     identitySchema: 1,
-    controlProtocol: 1,
-    pfslocalMajor: 1,
-    pfslocalMinor: 16
+    controlProtocol: 2,
+    pfslocalMajor: 2,
+    pfslocalMinor: 0
 )
 
 private let updateTargetRelease = PortableFSDReleaseIdentity(
@@ -19,9 +19,9 @@ private let updateTargetRelease = PortableFSDReleaseIdentity(
     executableSHA256: String(repeating: "4", count: 64),
     daemonVersion: "1.2.4",
     identitySchema: 1,
-    controlProtocol: 1,
-    pfslocalMajor: 1,
-    pfslocalMinor: 16
+    controlProtocol: 2,
+    pfslocalMajor: 2,
+    pfslocalMinor: 0
 )
 
 private let updateToken = String(repeating: "a", count: 64)
@@ -715,9 +715,9 @@ private final class DirectorySyncInjector: @unchecked Sendable {
         executableSHA256: String(repeating: "d", count: 64),
         daemonVersion: "0.2.3",
         identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 16
+        controlProtocol: 2,
+        pfslocalMajor: 2,
+        pfslocalMinor: 0
     )
     let connection = FakeUpdateConnection()
     connection.reads = [{ _ in try activationResumeFrame(

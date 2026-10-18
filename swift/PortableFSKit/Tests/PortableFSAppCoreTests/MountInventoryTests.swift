@@ -8,7 +8,6 @@ import Testing
         {
           "mountPath": "/Volumes/repo",
           "volumeId": "repo",
-          "branch": "",
           "health": "cleanup-required",
           "cleanupRequired": true,
           "operationPhase": "mount-published"
@@ -22,13 +21,13 @@ import Testing
     #expect(row.attachState.isEmpty)
 }
 
-@Test func olderLiveRowsDecodeWithAdditiveDefaults() throws {
+/// The CLI omits its empty optional members; their absence is the empty value.
+@Test func omittedEmptyMembersDecodeAsEmpty() throws {
     let data = Data(
         #"""
         {
           "mountPath": "/Volumes/repo",
           "volumeId": "repo",
-          "branch": "",
           "attachRef": "att_1",
           "health": "live"
         }
@@ -48,7 +47,6 @@ import Testing
         {
           "mountPath": "/Volumes/repo",
           "volumeId": "repo",
-          "branch": "",
           "attachRef": "att_1",
           "health": "live",
           "attachState": "degraded",

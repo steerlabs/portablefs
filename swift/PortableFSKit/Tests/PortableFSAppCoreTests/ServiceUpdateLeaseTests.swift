@@ -27,9 +27,9 @@ private func updateTestIdentity(_ marker: Character) -> PortableFSDReleaseIdenti
         executableSHA256: String(repeating: marker, count: 64),
         daemonVersion: marker == "a" ? "0.2.3" : "0.2.4",
         identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 16
+        controlProtocol: 2,
+        pfslocalMajor: 2,
+        pfslocalMinor: 0
     )
 }
 

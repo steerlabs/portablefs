@@ -51,9 +51,9 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
         executableSHA256: String(repeating: "b", count: 64),
         daemonVersion: "0.2.3",
         identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 16
+        controlProtocol: 2,
+        pfslocalMajor: 2,
+        pfslocalMinor: 0
     )
     try identity.validate()
     let object = try #require(
@@ -71,9 +71,9 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
             executableSHA256: String(repeating: "b", count: 64),
             daemonVersion: "0.2.3",
             identitySchema: 1,
-            controlProtocol: 1,
-            pfslocalMajor: 1,
-            pfslocalMinor: 16
+            controlProtocol: 2,
+            pfslocalMajor: 2,
+            pfslocalMinor: 0
         ).validate()
     }
 
@@ -82,8 +82,8 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
         executableSHA256: String(repeating: "b", count: 64),
         daemonVersion: "0.2.3",
         identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
+        controlProtocol: 77,
+        pfslocalMajor: 91,
         pfslocalMinor: 0
     ).validate()
 }
@@ -202,38 +202,250 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     }
 }
 
-@Test func authenticatedOutgoingReleaseKeepsItsOwnLocalProtocol() throws {
-    let sealed = PortableFSDReleaseIdentity(
-        codeDirectoryHash: String(repeating: "a", count: 40),
-        executableSHA256: String(repeating: "b", count: 64),
-        daemonVersion: "0.3.0",
-        identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 16
-    )
-    let reported = PortableFSDServiceCoordinator.LiveDaemonIdentity(
-        schemaVersion: 1, controlProtocol: 1, daemonVersion: "0.3.0",
-        executableSha256: sealed.executableSHA256, pfslocalMajor: 1, pfslocalMinor: 14
-    )
-    let running = try reported.releaseIdentity(sealed: sealed)
-    #expect(running.codeDirectoryHash == sealed.codeDirectoryHash)
-    #expect(running.pfslocalMinor == 14)
-
-    for (schema, control, version, digest, major) in [
-        (2, 1, "0.3.0", sealed.executableSHA256, UInt32(1)),
-        (1, 2, "0.3.0", sealed.executableSHA256, UInt32(1)),
-        (1, 1, "0.4.1", sealed.executableSHA256, UInt32(1)),
-        (1, 1, "0.3.0", String(repeating: "c", count: 64), UInt32(1)),
-        (1, 1, "0.3.0", sealed.executableSHA256, UInt32(0)),
-    ] {
-        let invalid = PortableFSDServiceCoordinator.LiveDaemonIdentity(
-            schemaVersion: schema, controlProtocol: control, daemonVersion: version,
-            executableSha256: digest, pfslocalMajor: major, pfslocalMinor: 14
+/// A live daemon's reported identity is accepted only as an exact match of
+/// the release sealed into the app whose signed daemon the socket peer
+/// proved to be. An arbitrary outgoing release keeps its own operational and
+/// pfslocal numbers; this build's pairing is never expected of it, and any
+/// single deviation from the seal, including a spoofed protocol number, is
+/// refused.
+@Test func liveIdentityMustEqualTheSealedReleaseExactly() {
+    for (control, major, minor) in [(77, UInt32(91), UInt32(18)), (2, 2, 0), (1, UInt32.max, UInt32.max)] {
+        let sealed = PortableFSDReleaseIdentity(
+            codeDirectoryHash: String(repeating: "a", count: 40),
+            executableSHA256: String(repeating: "b", count: 64),
+            daemonVersion: "0.3.0",
+            identitySchema: 1,
+            controlProtocol: control,
+            pfslocalMajor: major,
+            pfslocalMinor: minor
         )
-        #expect(throws: (any Error).self) {
-            try invalid.releaseIdentity(sealed: sealed)
+        let exact = PortableFSDLiveIdentity(
+            schemaVersion: 1, controlProtocol: control, daemonVersion: "0.3.0",
+            executableSha256: sealed.executableSHA256,
+            pfslocalMajor: major, pfslocalMinor: minor
+        )
+        #expect(exact.matches(sealed))
+
+        let deviations = [
+            PortableFSDLiveIdentity(schemaVersion: 2, controlProtocol: control, daemonVersion: "0.3.0",
+                executableSha256: sealed.executableSHA256, pfslocalMajor: major, pfslocalMinor: minor),
+            PortableFSDLiveIdentity(schemaVersion: 1, controlProtocol: control + 1, daemonVersion: "0.3.0",
+                executableSha256: sealed.executableSHA256, pfslocalMajor: major, pfslocalMinor: minor),
+            PortableFSDLiveIdentity(schemaVersion: 1, controlProtocol: control, daemonVersion: "0.4.1",
+                executableSha256: sealed.executableSHA256, pfslocalMajor: major, pfslocalMinor: minor),
+            PortableFSDLiveIdentity(schemaVersion: 1, controlProtocol: control, daemonVersion: "0.3.0",
+                executableSha256: String(repeating: "c", count: 64), pfslocalMajor: major, pfslocalMinor: minor),
+            PortableFSDLiveIdentity(schemaVersion: 1, controlProtocol: control, daemonVersion: "0.3.0",
+                executableSha256: sealed.executableSHA256, pfslocalMajor: major &- 1, pfslocalMinor: minor),
+            PortableFSDLiveIdentity(schemaVersion: 1, controlProtocol: control, daemonVersion: "0.3.0",
+                executableSha256: sealed.executableSHA256, pfslocalMajor: major, pfslocalMinor: minor &+ 1),
+        ]
+        for deviation in deviations {
+            #expect(!deviation.matches(sealed))
         }
+    }
+}
+
+/// The daemon sealed into this app's own bundle must be exactly paired with
+/// this build. That requirement is applied to the incoming release only.
+@Test func incomingReleaseRequiresExactPairing() {
+    func release(_ schema: Int, _ control: Int, _ major: UInt32, _ minor: UInt32) -> PortableFSDReleaseIdentity {
+        PortableFSDReleaseIdentity(
+            codeDirectoryHash: String(repeating: "a", count: 40),
+            executableSHA256: String(repeating: "b", count: 64),
+            daemonVersion: "0.5.0",
+            identitySchema: schema,
+            controlProtocol: control,
+            pfslocalMajor: major,
+            pfslocalMinor: minor
+        )
+    }
+    #expect(PortableFSDServiceCoordinator.pairedControlProtocol == 2)
+    #expect(PortableFSDServiceCoordinator.pairedPFSLocalMajor == 2)
+    #expect(PortableFSDServiceCoordinator.pairedPFSLocalMinor == 0)
+    #expect(PortableFSDServiceCoordinator.isPaired(release(1, 2, 2, 0)))
+    for unpaired in [release(2, 2, 2, 0), release(1, 1, 2, 0), release(1, 3, 2, 0),
+                     release(1, 2, 1, 16), release(1, 2, 2, 1), release(1, 2, 3, 0)] {
+        #expect(!PortableFSDServiceCoordinator.isPaired(unpaired))
+    }
+}
+
+@Test func sealedProtocolResourceDecodesStrictly() throws {
+    for (control, major, minor) in [(2, UInt32(2), UInt32(0)), (77, 91, 18), (1, UInt32.max, UInt32.max)] {
+        let data = Data(#"{"identitySchema":1,"controlProtocol":\#(control),"pfslocalMajor":\#(major),"pfslocalMinor":\#(minor)}"#.utf8)
+        #expect(try PortableFSDSealedProtocols.decode(data) == PortableFSDSealedProtocols(
+            identitySchema: 1, controlProtocol: control, pfslocalMajor: major, pfslocalMinor: minor
+        ))
+    }
+    let valid = #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":0}"#
+    // Whitespace, key order and escaped key spellings are JSON, not grammar.
+    _ = try PortableFSDSealedProtocols.decode(Data(#" { "pfslocalMinor" : 0, "pfslocalMajor":2, "controlProtocol":2, "identitySchema":1 } "#.utf8))
+    var invalid = [
+        "", "null", "[]", valid + "{}", valid + " x", String(repeating: " ", count: 4_096) + valid,
+        #"{"identitySchema":2,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":0,"pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":-2,"pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":0,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":4294967296,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":-1}"#,
+        #"{"identitySchema":1,"controlProtocol":2.0,"pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":2e0,"pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":"2","pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":true,"pfslocalMajor":2,"pfslocalMinor":0}"#,
+        #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":0,"executableSHA256":"b"}"#,
+        #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":{"x":0}}"#,
+    ]
+    for key in ["identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"] {
+        let member = #"""# + key + #"":"#
+        invalid.append(valid.replacingOccurrences(of: member, with: #""unknown":"#))
+        invalid.append(valid.replacingOccurrences(of: member, with: member + "null," + member))
+        invalid.append(valid.replacingOccurrences(of: member, with: member + "1," + member))
+    }
+    for data in invalid {
+        #expect(throws: (any Error).self, "accepted \(data)") {
+            _ = try PortableFSDSealedProtocols.decode(Data(data.utf8))
+        }
+    }
+}
+
+/// Lifecycle identity is schema 1 with exactly six members and bounded
+/// scalar shapes, decoded without any expectation of this build's numbers.
+@Test func lifecycleIdentityDecodesStrictly() throws {
+    let digest = String(repeating: "d", count: 64)
+    let valid = #"{"schemaVersion":1,"controlProtocol":77,"daemonVersion":"0.9.1","executableSha256":"\#(digest)","pfslocalMajor":91,"pfslocalMinor":0}"#
+    let decoded = try PortableFSDLiveIdentity.decode(Data(valid.utf8))
+    #expect(decoded == PortableFSDLiveIdentity(
+        schemaVersion: 1, controlProtocol: 77, daemonVersion: "0.9.1",
+        executableSha256: digest, pfslocalMajor: 91, pfslocalMinor: 0
+    ))
+    // Trailing JSON whitespace is not trailing data.
+    #expect(try PortableFSDLiveIdentity.decode(Data((valid + "\n").utf8)) == decoded)
+
+    var invalid = [
+        valid.replacingOccurrences(of: #""schemaVersion":1"#, with: #""schemaVersion":2"#),
+        valid.replacingOccurrences(of: #""controlProtocol":77"#, with: #""controlProtocol":0"#),
+        valid.replacingOccurrences(of: #""controlProtocol":77"#, with: #""controlProtocol":7.5"#),
+        valid.replacingOccurrences(of: #""pfslocalMajor":91"#, with: #""pfslocalMajor":0"#),
+        valid.replacingOccurrences(of: #""pfslocalMinor":0"#, with: #""pfslocalMinor":4294967296"#),
+        valid.replacingOccurrences(of: #""0.9.1""#, with: #""""#),
+        valid.replacingOccurrences(of: #""0.9.1""#, with: #""0.9 1""#),
+        valid.replacingOccurrences(of: #""0.9.1""#, with: #"""# + String(repeating: "v", count: 129) + #"""#),
+        valid.replacingOccurrences(of: digest, with: String(repeating: "D", count: 64)),
+        valid.replacingOccurrences(of: digest, with: String(repeating: "d", count: 63)),
+        valid.replacingOccurrences(of: #""pfslocalMinor":0"#, with: #""pfslocalMinor":0,"pid":1"#),
+        valid + "{}",
+        "[" + valid + "]",
+    ]
+    for key in ["schemaVersion", "controlProtocol", "daemonVersion", "executableSha256", "pfslocalMajor", "pfslocalMinor"] {
+        let member = #"""# + key + #"":"#
+        invalid.append(valid.replacingOccurrences(of: member, with: #""Unknown":"#))
+        invalid.append(valid.replacingOccurrences(of: member, with: member + "null," + member))
+        invalid.append(valid.replacingOccurrences(of: member, with: #""A":0,"# + member))
+    }
+    for data in invalid {
+        #expect(throws: (any Error).self, "accepted \(data)") {
+            _ = try PortableFSDLiveIdentity.decode(Data(data.utf8))
+        }
+    }
+}
+
+private func lifecycleResponse(_ status: String, headers: [String] = [], body: String = "") -> Data {
+    var text = "HTTP/1.1 \(status)\r\n"
+    for header in headers { text += header + "\r\n" }
+    text += "\r\n" + body
+    return Data(text.utf8)
+}
+
+/// Identity is exactly HTTP 200 with its strict body; stop-if-idle is exactly
+/// HTTP 204 with no body, 409 is the definite busy refusal, and every other
+/// status, a missing endpoint included, proves nothing. Chunked transfer,
+/// oversized bodies and a mismatched Content-Length are refused.
+@Test func lifecycleResponsesAreClassifiedExactly() throws {
+    let digest = String(repeating: "e", count: 64)
+    let body = #"{"schemaVersion":1,"controlProtocol":2,"daemonVersion":"0.5.0","executableSha256":"\#(digest)","pfslocalMajor":2,"pfslocalMinor":0}"#
+    let identity = try PortableFSDLifecycle.identity(from: PortableFSDLifecycle.parseResponse(
+        lifecycleResponse("200 OK", headers: ["Content-Type: application/json", "Content-Length: \(body.utf8.count)"], body: body)
+    ))
+    #expect(identity.executableSha256 == digest)
+    for status in ["404 Not Found", "426 Upgrade Required", "500 Internal Server Error", "301 Moved Permanently", "204 No Content"] {
+        #expect(throws: PortableFSDLifecycleError.self) {
+            _ = try PortableFSDLifecycle.identity(from: PortableFSDLifecycle.parseResponse(
+                lifecycleResponse(status, body: status.hasPrefix("204") ? "" : body)
+            ))
+        }
+    }
+
+    try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(lifecycleResponse("204 No Content")))
+    #expect(throws: PortableFSDLifecycleError.busy) {
+        try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(
+            lifecycleResponse("409 Conflict", headers: ["Content-Length: 11"], body: "busy detail")
+        ))
+    }
+    for (status, responseBody) in [("204 No Content", "{}"), ("200 OK", ""), ("202 Accepted", ""),
+                                   ("404 Not Found", ""), ("307 Temporary Redirect", ""), ("500 Internal Server Error", "")] {
+        #expect(throws: PortableFSDLifecycleError.self) {
+            try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(
+                lifecycleResponse(status, body: responseBody)
+            ))
+        }
+    }
+    do {
+        try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(lifecycleResponse("404 Not Found")))
+    } catch let error as PortableFSDLifecycleError {
+        #expect(error == .refused(status: 404))
+    }
+
+    for malformed in [
+        lifecycleResponse("200 OK", headers: ["Transfer-Encoding: chunked"], body: "5\r\nhello\r\n0\r\n\r\n"),
+        lifecycleResponse("200 OK", headers: ["Content-Length: 3"], body: body),
+        lifecycleResponse("200 OK", headers: ["Content-Length: 1", "Content-Length: 1"], body: "x"),
+        lifecycleResponse("200 OK", body: String(repeating: " ", count: 4_097)),
+        lifecycleResponse("2000 OK"),
+        Data("HTTP/1.0 200 OK\r\n\r\n".utf8),
+        Data("HTTP/1.1 200 OK\r\nno-colon-header\r\n\r\n".utf8),
+        Data("HTTP/1.1 200 OK\r\n".utf8),
+    ] {
+        #expect(throws: PortableFSDLifecycleError.malformedResponse) {
+            _ = try PortableFSDLifecycle.parseResponse(malformed)
+        }
+    }
+}
+
+/// The exchange speaks the fixed lifecycle request grammar: exact method and
+/// path, no operational control-protocol header, an empty POST body.
+@Test func lifecycleExchangeSpeaksTheFixedRequestGrammar() throws {
+    for (method, path, response) in [
+        ("GET", PortableFSDLifecycle.identityPath, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+        ("POST", PortableFSDLifecycle.stopIfIdlePath, "HTTP/1.1 204 No Content\r\n\r\n"),
+    ] {
+        var pair: [Int32] = [-1, -1]
+        try #require(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0)
+        let server = pair[1]
+        let received = DispatchSemaphore(value: 0)
+        final class Captured: @unchecked Sendable { var request = Data() }
+        let captured = Captured()
+        let thread = Thread {
+            var buffer = [UInt8](repeating: 0, count: 1_024)
+            while captured.request.range(of: Data("\r\n\r\n".utf8)) == nil {
+                let count = Darwin.read(server, &buffer, buffer.count)
+                if count <= 0 { break }
+                captured.request.append(buffer, count: count)
+            }
+            _ = response.withCString { Darwin.write(server, $0, strlen($0)) }
+            Darwin.close(server)
+            received.signal()
+        }
+        thread.start()
+        let reply = try PortableFSDLifecycle.exchange(pair[0], method: method, path: path)
+        Darwin.close(pair[0])
+        received.wait()
+        let request = String(decoding: captured.request, as: UTF8.self)
+        var expected = "\(method) \(path) HTTP/1.1\r\nHost: portablefsd\r\nConnection: close\r\n"
+        if method == "POST" { expected += "Content-Length: 0\r\n" }
+        expected += "\r\n"
+        #expect(request == expected)
+        #expect(!request.contains("X-PortableFS-Control-Protocol"))
+        #expect(reply.status == (method == "GET" ? 200 : 204))
     }
 }
 
@@ -469,15 +681,17 @@ private func ownerTestConfiguration() throws -> Coordinator.Configuration {
 private func ownerTestRelease(
     version: String,
     digit: Character,
-    pfslocalMinor: UInt32 = 16
+    controlProtocol: Int = 2,
+    pfslocalMajor: UInt32 = 2,
+    pfslocalMinor: UInt32 = 0
 ) -> PortableFSDReleaseIdentity {
     PortableFSDReleaseIdentity(
         codeDirectoryHash: String(repeating: digit, count: 40),
         executableSHA256: String(repeating: digit, count: 64),
         daemonVersion: version,
         identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
+        controlProtocol: controlProtocol,
+        pfslocalMajor: pfslocalMajor,
         pfslocalMinor: pfslocalMinor
     )
 }
@@ -541,7 +755,15 @@ private func ownProcessExecutablePath() throws -> String {
 @Test func liveOwnerDecisionReplacesAValidOlderReleaseThroughItsOwnIdentity() throws {
     try withOwnerFixtureDirectory { root in
         let incoming = ownerTestRelease(version: "0.4.2", digit: "b")
-        let older = ownerTestRelease(version: "0.4.1", digit: "c", pfslocalMinor: 15)
+        // An arbitrary distinct release: its own operational and pfslocal
+        // numbers are carried through, never this build's pairing.
+        let older = ownerTestRelease(
+            version: "0.4.1",
+            digit: "c",
+            controlProtocol: 7,
+            pfslocalMajor: 3,
+            pfslocalMinor: 15
+        )
         let incomingURL = root.appendingPathComponent("New.app", isDirectory: true)
         let oldBundle = try makeOwnerBundle(
             at: root.appendingPathComponent("Old.app", isDirectory: true),
@@ -562,7 +784,7 @@ private func ownProcessExecutablePath() throws -> String {
             "lifecycle", "hold-install-exclusive", "--json",
             "--expected-daemon-version", "0.4.1",
             "--expected-daemon-sha256", String(repeating: "c", count: 64),
-            "--expected-pfslocal-major", "1",
+            "--expected-pfslocal-major", "3",
             "--expected-pfslocal-minor", "15",
         ])
 
@@ -746,14 +968,12 @@ private func ownerMessage(_ owner: Coordinator.UnauthenticatedServiceOwner?) -> 
     let installed = ownerTestRelease(version: "0.4.2", digit: "b")
     let app = "/Applications/PortableFS.app"
     let socket = "/tmp/control.sock"
-    struct Mismatch: LocalizedError { var errorDescription: String? { "identity mismatch" } }
-
-    let olderDaemon = Coordinator.LiveDaemonIdentity(
-        schemaVersion: 1, controlProtocol: 1, daemonVersion: "0.4.1",
-        executableSha256: String(repeating: "c", count: 64), pfslocalMajor: 1, pfslocalMinor: 16
+    let olderDaemon = PortableFSDLiveIdentity(
+        schemaVersion: 1, controlProtocol: 2, daemonVersion: "0.4.1",
+        executableSha256: String(repeating: "c", count: 64), pfslocalMajor: 2, pfslocalMinor: 0
     )
     let replaced = Coordinator.identityRefusal(
-        reported: olderDaemon, sealed: installed, app: app, socket: socket, failure: Mismatch()
+        reported: olderDaemon, sealed: installed, app: app, socket: socket
     )
     #expect(replaced == .ownerAppReplaced(
         app: app,
@@ -762,13 +982,20 @@ private func ownerMessage(_ owner: Coordinator.UnauthenticatedServiceOwner?) -> 
     ))
     #expect(ownerMessage(replaced).contains("was replaced while its daemon ran"))
 
-    let sameReleaseOtherSchema = Coordinator.LiveDaemonIdentity(
-        schemaVersion: 2, controlProtocol: 1, daemonVersion: installed.daemonVersion,
-        executableSha256: installed.executableSHA256, pfslocalMajor: 1, pfslocalMinor: 16
+    // Same release and executable, but protocol numbers the seal does not
+    // declare: a spoofed claim, refused as a failed identity proof.
+    let spoofedProtocol = PortableFSDLiveIdentity(
+        schemaVersion: 1, controlProtocol: 3, daemonVersion: installed.daemonVersion,
+        executableSha256: installed.executableSHA256, pfslocalMajor: 2, pfslocalMinor: 0
     )
+    #expect(!spoofedProtocol.matches(installed))
     #expect(Coordinator.identityRefusal(
-        reported: sameReleaseOtherSchema, sealed: installed, app: app, socket: socket, failure: Mismatch()
-    ) == .unauthenticated(socket: socket, step: .daemonIdentity, failure: "identity mismatch"))
+        reported: spoofedProtocol, sealed: installed, app: app, socket: socket
+    ) == .unauthenticated(
+        socket: socket,
+        step: .daemonIdentity,
+        failure: "its reported protocol numbers differ from the release sealed into that app"
+    ))
 }
 
 /// Whatever serves the endpoint without being the daemon nested in a
@@ -887,16 +1114,22 @@ private func simulatedDaemonAcquiresStateSingleton(in directory: URL) throws -> 
     return false
 }
 
-/// The fields portablefsd's readSingletonOwner requires before it will even
-/// consider a takeover, and the Darwin start-identity shape it compares.
-private func expectLiveOwnerRecord(in directory: URL) throws {
-    let body = try Data(contentsOf: directory.appendingPathComponent(".portablefsd-state.lock"))
-    let record = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
-    #expect(record["schemaVersion"] as? Int == 1)
-    #expect(record["pid"] as? Int == Int(getpid()))
-    let start = try #require(record["startIdentity"] as? String)
-    let parts = start.split(separator: ":")
-    #expect(parts.count == 2 && parts.allSatisfy { Int($0) != nil })
+/// The exclusion is the flock on the one canonical inode. It never writes,
+/// truncates, renames or replaces the lock, so whatever bytes a previous
+/// process left there stay exactly as they were.
+private func expectLockUntouched(in directory: URL, bytes: Data, inode: ino_t) throws {
+    let lock = directory.appendingPathComponent(".portablefsd-state.lock")
+    #expect(try Data(contentsOf: lock) == bytes)
+    var status = stat()
+    #expect(Darwin.lstat(lock.path, &status) == 0)
+    #expect(status.st_ino == inode)
+    #expect(status.st_nlink == 1)
+}
+
+private func lockInode(in directory: URL) -> ino_t {
+    var status = stat()
+    _ = Darwin.lstat(directory.appendingPathComponent(".portablefsd-state.lock").path, &status)
+    return status.st_ino
 }
 
 /// The absence proof is held, not sampled. Between classification and the
@@ -912,27 +1145,36 @@ private func expectLiveOwnerRecord(in directory: URL) throws {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
-        // A previous daemon's record names a process that no longer exists.
-        // Left in place, it would let a starting daemon prove the holder
-        // departed and take the lock over.
+        // Bytes a previous process left behind, including an old-format
+        // record naming a long-gone pid, are irrelevant: only the flock on
+        // this inode excludes, and no content can grant a takeover.
         let lock = stateDirectory.appendingPathComponent(".portablefsd-state.lock")
-        #expect(FileManager.default.createFile(
-            atPath: lock.path,
-            contents: Data(#"{"schemaVersion":1,"pid":2147483646,"startIdentity":"1:1","version":"","owner":"old"}"#.utf8),
-            attributes: [.posixPermissions: 0o600]
-        ))
+        for stale in [
+            Data(#"{"schemaVersion":1,"pid":2147483646,"startIdentity":"1:1","version":"","owner":"old"}"#.utf8),
+            Data(),
+            Data([0xff, 0x00, 0x0a]),
+        ] {
+            try? FileManager.default.removeItem(at: lock)
+            #expect(FileManager.default.createFile(
+                atPath: lock.path,
+                contents: stale,
+                attributes: [.posixPermissions: 0o600]
+            ))
+            let inode = lockInode(in: stateDirectory)
 
-        let exclusion = try #require(
-            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
-        )
-        #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
-        try expectLiveOwnerRecord(in: stateDirectory)
-        #expect(try !Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
-        // A second replacement cannot take it either.
-        #expect(try Coordinator.acquireStateSingletonExclusion(at: stateDirectory) == nil)
+            let exclusion = try #require(
+                try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+            )
+            #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+            #expect(try !Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+            // A second replacement cannot take it either.
+            #expect(try Coordinator.acquireStateSingletonExclusion(at: stateDirectory) == nil)
+            try expectLockUntouched(in: stateDirectory, bytes: stale, inode: inode)
 
-        exclusion.release()
-        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+            exclusion.release()
+            #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+            try expectLockUntouched(in: stateDirectory, bytes: stale, inode: inode)
+        }
     }
 }
 
@@ -963,7 +1205,7 @@ private func expectLiveOwnerRecord(in directory: URL) throws {
         #expect(lock.st_mode & 0o777 == 0o600)
         #expect(lock.st_nlink == 1)
         #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
-        try expectLiveOwnerRecord(in: stateDirectory)
+        try expectLockUntouched(in: stateDirectory, bytes: Data(), inode: lock.st_ino)
 
         exclusion.release()
         #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
