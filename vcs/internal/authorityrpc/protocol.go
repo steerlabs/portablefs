@@ -240,9 +240,9 @@ func requestRequiresAdmin(req *authoritypb.Request) bool {
 // requestUsesTopology reports whether a request is a filesystem operation whose
 // path ownership was decided by the mount's active machine-local routes. Those
 // requests hold the coordinator's topology read guard from revision admission
-// through their final result. Session and visibility control must not take the
-// guard: ApplyRoutes waits for visibility acknowledgments while holding the
-// writer, so making Ack depend on the read side would deadlock the barrier.
+// through their final result. Session and coherence control bypass the guard
+// so acknowledgments and terminal cleanup can progress independently of a
+// topology transition. ApplyRoutes does not wait for visibility acknowledgments.
 func requestUsesTopology(req *authoritypb.Request) bool {
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_Resume, *authoritypb.Request_Activate, *authoritypb.Request_AbortAttach,
@@ -262,10 +262,9 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		// authority-epoch runtime state, so the topology invariant — no
 		// filesystem operation reaches XFS under a stale routing revision —
 		// does not apply to the wait. Holding the read guard across an
-		// unbounded F_SETLKW would let one waiter plus one queued ApplyRoutes
-		// writer stall every guarded request on the volume (a Go RWMutex
-		// admits no new readers once a writer is queued), so the wait is
-		// admitted through the ordinary session-routes check instead.
+		// unbounded F_SETLKW would prevent clean-absence route transitions from
+		// acquiring exclusion to interrupt old lock waiters. Registration uses
+		// its own short admission gate instead.
 		// Non-blocking lock calls keep the guard: they are cheap and complete
 		// immediately, so uniformity there costs nothing.
 		return body.SetLock.GetUnlock() || !body.SetLock.GetWait()

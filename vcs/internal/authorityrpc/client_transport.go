@@ -523,11 +523,8 @@ func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.Tr
 	if transport == nil {
 		return ErrTransportBinding
 	}
-	if c.poisoned.Load() {
-		if err := c.SessionEndCause(); err != nil {
-			return err
-		}
-		return ErrSessionEnded
+	if err := c.checkCallEntry(); err != nil {
+		return err
 	}
 	transport.lifecycle.Lock()
 	defer transport.lifecycle.Unlock()

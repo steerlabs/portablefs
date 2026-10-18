@@ -3,6 +3,7 @@ package authorityrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,11 +17,16 @@ import (
 type mutationSettlementTestHandler struct {
 	fskitProofTestHandler
 	mutations atomic.Int32
+	writes    atomic.Int32
 	mutation  func(context.Context)
 	resume    func()
 }
 
 func (h *mutationSettlementTestHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	if request.GetWrite() != nil {
+		h.writes.Add(1)
+		return &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: h.Epoch(), Errno: int32(syscall.EACCES)}
+	}
 	if request.GetMkdir() != nil {
 		if h.mutations.Add(1) == 1 && h.mutation != nil {
 			h.mutation(ctx)
@@ -38,6 +44,67 @@ func settlementTestMkdir() *authoritypb.Request {
 	return &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{
 		Parent: make([]byte, 16), Name: []byte("x"), Mode: 0o755,
 	}}}
+}
+
+func TestNonLinuxFinalizedFlushSequenceIsRefused(t *testing.T) {
+	for _, segmented := range []bool{false, true} {
+		for _, assignment := range []string{"preset", "assigned", "cleared"} {
+			t.Run(fmt.Sprintf("segmented=%t/%s", segmented, assignment), func(t *testing.T) {
+				handler := &mutationSettlementTestHandler{fskitProofTestHandler: newFskitProofTestHandler()}
+				handler.set(uint64(time.Second), nil, 0)
+				client, err := dialFskitProofTestClient(t, handler, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				write := &authoritypb.WriteRequest{Handle: make([]byte, 16), Size: 1}
+				if assignment != "assigned" {
+					write.FlushSequence = 1
+				}
+				request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: write}}
+				assignments := 0
+				assigned := func(MutationIdentity) error {
+					assignments++
+					if assignment == "assigned" {
+						write.FlushSequence = 1
+					} else if assignment == "cleared" {
+						write.FlushSequence = 0
+					}
+					return nil
+				}
+				var response *authoritypb.Response
+				if segmented {
+					response, err = client.CallMutationSegments(t.Context(), request, [][]byte{[]byte("x")}, assigned)
+				} else {
+					write.Data = []byte("x")
+					response, err = client.CallMutationWithIdentity(t.Context(), request, assigned)
+				}
+				if assignment == "cleared" {
+					if err != nil || response.GetErrno() != int32(syscall.EACCES) || handler.writes.Load() != 1 {
+						t.Fatalf("cleared flush sequence = (%v, %v), calls=%d", response, err, handler.writes.Load())
+					}
+				} else {
+					if err != syscall.EOPNOTSUPP || response != nil || handler.writes.Load() != 0 {
+						t.Fatalf("non-Linux flush = (%v, %v), calls=%d", response, err, handler.writes.Load())
+					}
+					if request.GetRequestId() != 0 || request.GetSession() != nil || len(request.GetEpoch()) != 0 {
+						t.Fatal("refused flush assigned a physical envelope")
+					}
+				}
+				if assignments != 1 || client.ordinary.slots[0].sequence != 0 {
+					t.Fatal("finalized refusal changed assignment or advanced the replay slot")
+				}
+				client.fatalMu.Lock()
+				retained := len(client.responseConsumptions)
+				client.fatalMu.Unlock()
+				if retained != 0 || len(client.ordinary.permits) != 0 || !client.LocalAdmissionOpen() || client.SessionEndCause() != nil {
+					t.Fatalf("flush retained ownership or ended the session: receipts=%d cause=%v", retained, client.SessionEndCause())
+				}
+				if _, err := client.KeepAlive(t.Context()); err != nil {
+					t.Fatalf("renewal after flush validation: %v", err)
+				}
+			})
+		}
+	}
 }
 
 // This is the R2-S1 review probe, tightened to require local cancellation with
