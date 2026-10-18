@@ -198,14 +198,83 @@ public actor VolumeCore {
     /// carry no FSKit identifier semantics.
     private var nextLocalRepairItemID: UInt64 = UInt64.max - 1
 
+    /// The open file descriptions one object holds. Each keeps exactly the
+    /// access it was opened with. A missing right is acquired as its own
+    /// description, never by reopening the union: a fresh OPEN re-checks
+    /// every right it names against the current mode, so reopening could
+    /// lose a right an earlier open was granted. An object therefore holds at
+    /// most one read-capable and one write-capable description, and they are
+    /// the same description when one open granted both.
     private struct OpenState: Sendable {
-        var identity: PfsItemIdentity
-        var handle: UInt64
-        var mode: PfsOpenMode
-        // Handles superseded by a successful mode upgrade remain owned here
-        // until the daemon confirms each close. This prevents a failed close
-        // from turning a live daemon descriptor into unreachable state.
-        var pendingCloseHandles: [UInt64]
+        var readHandle: UInt64?
+        var writeHandle: UInt64?
+        // Descriptions FSKit no longer needs remain owned here until the
+        // daemon confirms each close. This prevents a failed close from
+        // turning a live daemon descriptor into unreachable state.
+        var pendingCloseHandles: [UInt64] = []
+
+        /// The one description that covers `mode`, if any.
+        func handle(covering mode: PfsOpenMode) -> UInt64? {
+            switch mode {
+            case .read:
+                return readHandle
+            case .write:
+                return writeHandle
+            case .readWrite:
+                return readHandle == writeHandle ? readHandle : nil
+            default:
+                return nil
+            }
+        }
+
+        /// A description to name the object by when no access is needed.
+        var anyHandle: UInt64? { readHandle ?? writeHandle }
+
+        /// The access `requested` needs that no held description grants.
+        func missing(_ requested: PfsOpenMode) -> PfsOpenMode {
+            PfsOpenMode(
+                read: requested.grantsRead && readHandle == nil,
+                write: requested.grantsWrite && writeHandle == nil
+            )
+        }
+
+        mutating func install(_ handle: UInt64, granting mode: PfsOpenMode) {
+            if mode.grantsRead { readHandle = handle }
+            if mode.grantsWrite { writeHandle = handle }
+        }
+
+        /// FSKit reports the modes that stay open. A description that
+        /// carries none of them is no longer needed; one that carries any is
+        /// kept whole. A read/write description therefore survives a partial
+        /// close, which matters because it may be the only remaining
+        /// capability for an unlinked or rename-replaced object.
+        mutating func retireDescriptions(notCarrying retained: PfsOpenMode) {
+            if let read = readHandle, read == writeHandle {
+                if !retained.grantsRead && !retained.grantsWrite { retireAll() }
+                return
+            }
+            if let read = readHandle, !retained.grantsRead {
+                pendingCloseHandles.append(read)
+                readHandle = nil
+            }
+            if let write = writeHandle, !retained.grantsWrite {
+                pendingCloseHandles.append(write)
+                writeHandle = nil
+            }
+        }
+
+        mutating func retireAll() {
+            if let read = readHandle { pendingCloseHandles.append(read) }
+            if let write = writeHandle, write != readHandle { pendingCloseHandles.append(write) }
+            readHandle = nil
+            writeHandle = nil
+        }
+
+        var handleCount: Int {
+            Set([readHandle, writeHandle].compactMap { $0 }).count + pendingCloseHandles.count
+        }
+
+        var isEmpty: Bool { handleCount == 0 }
     }
 
     private enum LifecycleGateMode {
@@ -545,7 +614,7 @@ public actor VolumeCore {
     ) async throws -> PfsAttr {
         var request = PfsGetAttrRequest()
         request.item = try identity(for: item).proto
-        request.handle = openHandles[objectID]?.handle ?? 0
+        request.handle = openHandles[objectID]?.anyHandle ?? 0
         let envelope: PfsEnvelope
         do {
             envelope = try await client.request(.getAttr(request))
@@ -583,7 +652,12 @@ public actor VolumeCore {
     ) async throws -> PfsAttr {
         var request = PfsSetAttrRequest()
         request.item = try identity(for: item).proto
-        request.handle = openHandles[objectID]?.handle ?? 0
+        // The authority truncates through the named description and refuses
+        // one not open for writing. Without a write-capable description the
+        // truncate is checked against the object instead, like truncate(2).
+        request.handle = (attributes.size == nil
+            ? openHandles[objectID]?.anyHandle
+            : openHandles[objectID]?.writeHandle) ?? 0
         if let mode = attributes.mode { request.mode = mode }
         if let uid = attributes.uid { request.uid = uid }
         if let gid = attributes.gid { request.gid = gid }
@@ -667,40 +741,13 @@ public actor VolumeCore {
         objectID: ObjectIdentifier,
         retainingModes: PfsOpenMode?
     ) async throws {
-        let identity = try identity(for: item)
-        guard let state = openHandles[objectID] else {
+        _ = try identity(for: item)
+        guard openHandles[objectID] != nil else {
             return
         }
-
-        let retainedMode = retainingModes ?? .unspecified
-        if retainedMode == .unspecified {
-            try await closeAllDaemonHandles(objectID: objectID)
-            return
-        }
-
-        // FSKit reports the modes that remain live, not a request to replace
-        // the backing descriptor. A broader descriptor already covers that
-        // retained access and, critically, may be the only remaining
-        // capability for an unlinked or rename-replaced object.
-        if Self.mode(state.mode, covers: retainedMode) {
-            try await closePendingDaemonHandles(objectID: objectID)
-            return
-        }
-
-        let opened = try await openDaemonHandle(
-            identity: identity,
-            mode: retainedMode
-        )
-        var replacement = OpenState(
-            identity: identity,
-            handle: opened.handle,
-            mode: retainedMode,
-            pendingCloseHandles: state.pendingCloseHandles
-        )
-        replacement.pendingCloseHandles.append(state.handle)
-        openHandles[objectID] = replacement
-        opened.lease.acceptHandles()
-        await opened.lease.complete(itemsPublished: true)
+        // Closing never opens: access FSKit still reports open but no held
+        // description carries is acquired by the next I/O that needs it.
+        openHandles[objectID]?.retireDescriptions(notCarrying: retainingModes ?? .unspecified)
         try await closePendingDaemonHandles(objectID: objectID)
     }
 
@@ -745,9 +792,14 @@ public actor VolumeCore {
         return reply.data
     }
 
+    /// A write needs exactly write access, which an O_WRONLY or read/write
+    /// description already holds. Demanding read access as well would OPEN a
+    /// read description the write never uses: an extra authority round trip
+    /// per O_WRONLY rewrite, and EACCES for a writable but unreadable (0200)
+    /// file.
     @discardableResult
     public func write(item: PortableFSItem, offset: UInt64, data: Data) async throws -> (written: UInt32, attr: PfsAttr) {
-        return try await withDescriptorHandle(item: item, mode: .readWrite) { handle in
+        return try await withDescriptorHandle(item: item, mode: .write) { handle in
             if data.isEmpty {
                 let result = try await writeChunk(handle: handle, offset: offset, data: data)
                 try validateAttributes(result.attr, for: item)
@@ -844,10 +896,8 @@ public actor VolumeCore {
             throw error
         }
         openHandles[ObjectIdentifier(newItem)] = OpenState(
-            identity: PfsItemIdentity(reply.attr.item),
-            handle: reply.handle,
-            mode: .readWrite,
-            pendingCloseHandles: []
+            readHandle: reply.handle,
+            writeHandle: reply.handle
         )
         lease.acceptHandles()
         await lease.complete(itemsPublished: true)
@@ -1016,7 +1066,7 @@ public actor VolumeCore {
         var request = PfsXattrGetRequest()
         request.item = try identity(for: item).proto
         request.name = name
-        request.handle = openHandles[objectID]?.handle ?? 0
+        request.handle = openHandles[objectID]?.anyHandle ?? 0
         let envelope = try await client.request(.xattrGet(request))
         guard case let .xattrGetReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -1091,7 +1141,7 @@ public actor VolumeCore {
         request.value = value
         request.createOnly = createOnly
         request.replaceOnly = replaceOnly
-        request.handle = openHandles[objectID]?.handle ?? 0
+        request.handle = openHandles[objectID]?.anyHandle ?? 0
         let envelope = try await client.request(.xattrSet(request))
         guard case .xattrSetReply? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -1134,7 +1184,7 @@ public actor VolumeCore {
     ) async throws -> [String] {
         var request = PfsXattrListRequest()
         request.item = try identity(for: item).proto
-        request.handle = openHandles[objectID]?.handle ?? 0
+        request.handle = openHandles[objectID]?.anyHandle ?? 0
         let envelope = try await client.request(.xattrList(request))
         guard case let .xattrListReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -1157,7 +1207,7 @@ public actor VolumeCore {
         var request = PfsXattrRemoveRequest()
         request.item = try identity(for: item).proto
         request.name = name
-        request.handle = openHandles[objectID]?.handle ?? 0
+        request.handle = openHandles[objectID]?.anyHandle ?? 0
         let envelope = try await client.request(.xattrRemove(request))
         guard case .xattrRemoveReply? = envelope.body else {
             await shutdown()
@@ -1342,15 +1392,13 @@ public actor VolumeCore {
             provisionalItemCount: provisionalItemReferences.values.reduce(0, +),
             retiringItemCount: retiringItems.count,
             retirementWaiterCount: retirementWaiters.values.reduce(0) { $0 + $1.count },
-            openHandleCount: openHandles.values.reduce(into: 0) { count, state in
-                count += 1 + state.pendingCloseHandles.count
-            }
+            openHandleCount: openHandles.values.reduce(0) { $0 + $1.handleCount }
         )
     }
 
     /// Runs a complete descriptor operation under shared gate ownership. If
-    /// the operation first needs to open or upgrade a descriptor, it performs
-    /// that transition exclusively and atomically downgrades to shared
+    /// the operation first needs a description for its access, it acquires
+    /// that description exclusively and atomically downgrades to shared
     /// ownership before exposing the handle.
     private func withDescriptorHandle<T>(
         item: PortableFSItem,
@@ -1359,9 +1407,9 @@ public actor VolumeCore {
     ) async throws -> T {
         let objectID = ObjectIdentifier(item)
         try await acquireLifecycleGate(for: objectID, mode: .shared)
-        if let state = openHandles[objectID], Self.mode(state.mode, covers: mode) {
+        if let handle = openHandles[objectID]?.handle(covering: mode) {
             defer { releaseLifecycleGate(for: objectID, mode: .shared) }
-            return try await operation(state.handle)
+            return try await operation(handle)
         }
         releaseLifecycleGate(for: objectID, mode: .shared)
 
@@ -1388,66 +1436,38 @@ public actor VolumeCore {
         mode: PfsOpenMode
     ) async throws -> UInt64 {
         let identity = try identity(for: item)
-        if let state = openHandles[objectID], Self.mode(state.mode, covers: mode) {
-            return state.handle
-        }
         try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
             requestedMode: mode
         )
-        guard let state = openHandles[objectID] else {
+        guard let handle = openHandles[objectID]?.handle(covering: mode) else {
             throw PfsLocalClientError.unexpectedReply("open did not produce a handle")
         }
-        return state.handle
+        return handle
     }
 
-    /// Reconciles one object's descriptor state while its lifecycle gate is
-    /// held. No open/close/reclaim transition for this object can interleave
-    /// across the daemon awaits below.
+    /// Acquires only the access no held description grants, as one new
+    /// description, while the object's lifecycle gate is held. No
+    /// open/close/reclaim transition for this object can interleave across
+    /// the daemon await below. A refused OPEN leaves every held description
+    /// installed and usable.
     private func reconcileOpenHandleLocked(
         objectID: ObjectIdentifier,
         identity: PfsItemIdentity,
         requestedMode: PfsOpenMode
     ) async throws {
-        guard requestedMode != .unspecified else {
+        let missing = (openHandles[objectID] ?? OpenState()).missing(requestedMode)
+        guard missing != .unspecified else {
             return
         }
-
-        if let state = openHandles[objectID] {
-            if Self.mode(state.mode, covers: requestedMode) {
-                return
-            }
-
-            let targetMode = Self.union(state.mode, requestedMode)
-            let opened = try await openDaemonHandle(
-                identity: identity,
-                mode: targetMode
-            )
-            var replacement = OpenState(
-                identity: identity,
-                handle: opened.handle,
-                mode: targetMode,
-                pendingCloseHandles: state.pendingCloseHandles
-            )
-            replacement.pendingCloseHandles.append(state.handle)
-            openHandles[objectID] = replacement
-            opened.lease.acceptHandles()
-            await opened.lease.complete(itemsPublished: true)
-            try await closePendingDaemonHandles(objectID: objectID)
-            return
-        }
-
         let opened = try await openDaemonHandle(
             identity: identity,
-            mode: requestedMode
+            mode: missing
         )
-        openHandles[objectID] = OpenState(
-            identity: identity,
-            handle: opened.handle,
-            mode: requestedMode,
-            pendingCloseHandles: []
-        )
+        var state = openHandles[objectID] ?? OpenState()
+        state.install(opened.handle, granting: missing)
+        openHandles[objectID] = state
         opened.lease.acceptHandles()
         await opened.lease.complete(itemsPublished: true)
     }
@@ -1497,44 +1517,35 @@ public actor VolumeCore {
         )
     }
 
-    /// Closes superseded descriptors in creation order. A handle leaves actor
-    /// state only after the daemon confirms that exact close.
+    /// Closes every retired description in retirement order. A handle leaves
+    /// actor state only after the daemon confirms that exact close; one that
+    /// fails stays tracked for the next close or reclaim. Every handle gets
+    /// its close attempt, and the first failure is surfaced afterwards.
     private func closePendingDaemonHandles(objectID: ObjectIdentifier) async throws {
-        while let handle = openHandles[objectID]?.pendingCloseHandles.first {
-            let confirmation = try await closeDaemonHandle(handle)
-            if var current = openHandles[objectID],
-               let index = current.pendingCloseHandles.firstIndex(of: handle) {
-                current.pendingCloseHandles.remove(at: index)
-                openHandles[objectID] = current
-            }
-            if let errno = confirmation.terminalErrno {
-                throw PfsLocalClientError.daemon(
-                    errno: errno,
-                    message: "close retired handle \(handle) with a terminal error"
-                )
+        var firstFailure: Error?
+        for handle in openHandles[objectID]?.pendingCloseHandles ?? [] {
+            do {
+                let confirmation = try await closeDaemonHandle(handle)
+                openHandles[objectID]?.pendingCloseHandles.removeAll { $0 == handle }
+                if let errno = confirmation.terminalErrno, firstFailure == nil {
+                    firstFailure = PfsLocalClientError.daemon(
+                        errno: errno,
+                        message: "close retired handle \(handle) with a terminal error"
+                    )
+                }
+            } catch {
+                if firstFailure == nil { firstFailure = error }
             }
         }
-    }
-
-    /// Drains superseded descriptors before the primary descriptor so a
-    /// failure always leaves every still-live handle represented in state.
-    private func closeAllDaemonHandles(objectID: ObjectIdentifier) async throws {
-        try await closePendingDaemonHandles(objectID: objectID)
-        guard let state = openHandles[objectID] else {
-            return
-        }
-        let confirmation = try await closeDaemonHandle(state.handle)
-        if let current = openHandles[objectID],
-           current.handle == state.handle,
-           current.pendingCloseHandles.isEmpty {
+        if openHandles[objectID]?.isEmpty == true {
             openHandles.removeValue(forKey: objectID)
         }
-        if let errno = confirmation.terminalErrno {
-            throw PfsLocalClientError.daemon(
-                errno: errno,
-                message: "close retired handle \(state.handle) with a terminal error"
-            )
-        }
+        if let firstFailure { throw firstFailure }
+    }
+
+    private func closeAllDaemonHandles(objectID: ObjectIdentifier) async throws {
+        openHandles[objectID]?.retireAll()
+        try await closePendingDaemonHandles(objectID: objectID)
     }
 
     /// Takes the exclusive side of one object's lifecycle gate. Descriptor
@@ -1836,33 +1847,18 @@ public actor VolumeCore {
         let base = preferred > 0 ? preferred : Self.maximumIOChunkBytes
         return max(1, min(base, Self.maximumIOChunkBytes))
     }
+}
 
-    private static func mode(_ existing: PfsOpenMode, covers requested: PfsOpenMode) -> Bool {
-        switch (existing, requested) {
-        case (_, .unspecified):
-            return true
-        case (.readWrite, .read), (.readWrite, .write), (.readWrite, .readWrite):
-            return true
-        case (.read, .read), (.write, .write):
-            return true
-        default:
-            return false
-        }
-    }
+private extension PfsOpenMode {
+    var grantsRead: Bool { self == .read || self == .readWrite }
+    var grantsWrite: Bool { self == .write || self == .readWrite }
 
-    private static func union(_ lhs: PfsOpenMode, _ rhs: PfsOpenMode) -> PfsOpenMode {
-        if lhs == .readWrite || rhs == .readWrite {
-            return .readWrite
+    init(read: Bool, write: Bool) {
+        switch (read, write) {
+        case (true, true): self = .readWrite
+        case (true, false): self = .read
+        case (false, true): self = .write
+        case (false, false): self = .unspecified
         }
-        if lhs == .unspecified {
-            return rhs
-        }
-        if rhs == .unspecified {
-            return lhs
-        }
-        if lhs != rhs {
-            return .readWrite
-        }
-        return lhs
     }
 }

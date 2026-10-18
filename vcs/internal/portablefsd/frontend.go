@@ -215,12 +215,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			return
 		}
-		if env.PublicationRetracted {
-			if a := c.currentAttach(); a != nil {
-				a.stopV3Serving(errors.New("portablefsd: unexpected frontend publication retraction"))
-			}
-			return
-		}
 		if disposition, ok := env.Body.(*pfslocal.ResourceReplyDisposition); ok {
 			if state != frontendAttached || env.RequestID != 0 || env.OperationID != 0 || disposition.TargetRequestID == 0 {
 				log.Printf("portablefsd frontend: closing connection: malformed resource reply disposition")

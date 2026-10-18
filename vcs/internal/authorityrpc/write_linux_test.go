@@ -4,6 +4,7 @@ package authorityrpc
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 	"syscall"
@@ -391,4 +392,43 @@ func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestWriteLogicalSyncFailureRetainsExactAppliedReply(t *testing.T) {
+	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+		for _, dataOnly := range []bool{false, true} {
+			t.Run(cause.Error()+map[bool]string{false: "/sync", true: "/datasync"}[dataOnly], func(t *testing.T) {
+				h, cred, store := newWriteHarness(t)
+				h.OnStorageFailure = func(error) {}
+				post := xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 7, Mode: 0600, Nlink: 1}
+				target := &writeTestTarget{committed: 4, assigned: 3, post: post, err: errors.Join(xfsstore.ErrWritePostApply, &xfsstore.DurabilityError{Cause: cause})}
+				handle := prepareOneShotTarget(t, h, cred, store, target)
+				req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 3, 0)
+				req.GetWrite().Sync = !dataOnly
+				req.GetWrite().DataSync = dataOnly
+				reply := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+				if reply.GetErrno() != 0 || reply.GetUncertain() || reply.GetWrite().GetCommittedSize() != 4 || reply.GetWrite().GetAssignedOffset() != 3 || reply.GetWrite().GetPostAttr().GetSize() != 7 || reply.GetWrite().GetError() != -int32(syscall.EIO) || reply.GetPostState() == nil || !terminalReceiptCarriesExactAppliedState(reply) {
+					t.Fatalf("logical sync WRITE=%v", reply)
+				}
+				h.terminalFailureMu.Lock()
+				draining, receipts := h.terminalDraining, len(h.terminalReceiptFrames)
+				h.terminalFailureMu.Unlock()
+				if !draining || receipts == 0 {
+					t.Fatalf("no terminal delivery drain: draining=%v receipts=%d", draining, receipts)
+				}
+				if _, specs := target.directSnapshot(); len(specs) != 1 || specs[0].Sync != !dataOnly || specs[0].DataSync != dataOnly {
+					t.Fatalf("sync intent=%+v", specs)
+				}
+				req.RequestId++
+				replay := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+				reply.RequestId = replay.RequestId
+				if !proto.Equal(reply, replay) {
+					t.Fatalf("exact replay=%v", replay)
+				}
+				if calls, _ := target.directSnapshot(); calls != 1 {
+					t.Fatalf("reapplied WRITE: %d", calls)
+				}
+			})
+		}
+	}
 }

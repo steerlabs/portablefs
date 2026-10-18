@@ -834,15 +834,29 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 			t.Fatalf("clean Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
 		}
 
-		syncs = 0
-		v.fallocate = func(int, uint32, int64, int64) error { return syscall.ENOSPC }
-		v.removeWritePrivileges = removeWritePrivileges
-		post, err = v.Fallocate(handle, FallocateSpec{
+	})
+
+	t.Run("fallocate-backend-error-does-not-sync", func(t *testing.T) {
+		v := openTestVolume(t)
+		root, _ := v.Root()
+		item, _, err := v.Create(root, "backend-fallocate", 0600, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle, err := v.OpenFile(item, OpenFlags{Write: true, Sync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(handle)
+		syncs, applies := 0, 0
+		v.fsync = func(int) error { syncs++; return nil }
+		v.fallocate = func(int, uint32, int64, int64) error { applies++; return syscall.ENOSPC }
+		post, err := v.Fallocate(handle, FallocateSpec{
 			Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE),
 		})
-		if syncs != 0 || post != (Attr{}) || !errors.Is(err, ErrFenced) {
-			t.Fatalf("failed Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
+		if applies != 1 || syncs != 0 || post.Kind != KindRegular || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) || v.Health() != nil {
+			t.Fatalf("backend Fallocate = (post=%+v, err=%v), applies=%d syncs=%d health=%v", post, err, applies, syncs, v.Health())
 		}
 	})
 
@@ -894,16 +908,40 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 			t.Fatalf("CopyFileRange = (%d,%+v,%v), fdatasyncs=%d", copied, post, err, dataSyncs)
 		}
 
-		dataSyncs = 0
-		v.removeWritePrivileges = removeWritePrivileges
-		v.copyFileRange = func(int, *int64, int, *int64, int, int) (int, error) {
-			return -1, syscall.ENOSPC
+	})
+
+	t.Run("copy-backend-error-does-not-sync", func(t *testing.T) {
+		v := openTestVolume(t)
+		root, _ := v.Root()
+		item, _, err := v.Create(root, "backend-copy-source", 0600, true)
+		if err != nil {
+			t.Fatal(err)
 		}
-		copied, post, err = v.CopyFileRange(source, destination, CopyFileRangeSpec{
+		source, err := v.OpenFile(item, OpenFlags{Read: true, Write: true, DataSync: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(source)
+		if _, err := v.WriteAt(source, []byte("x"), 0); err != nil {
+			t.Fatal(err)
+		}
+		item, _, err = v.Create(root, "backend-copy-dest", 0600, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		destination, err := v.OpenFile(item, OpenFlags{Write: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer v.CloseOpen(destination)
+		dataSyncs, applies := 0, 0
+		v.fdatasync = func(int) error { dataSyncs++; return nil }
+		v.copyFileRange = func(int, *int64, int, *int64, int, int) (int, error) { applies++; return -1, syscall.ENOSPC }
+		copied, post, err := v.CopyFileRange(source, destination, CopyFileRangeSpec{
 			Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 		})
-		if copied != 0 || post != (Attr{}) || dataSyncs != 0 || !errors.Is(err, ErrFenced) {
-			t.Fatalf("failed CopyFileRange = (%d,%+v,%v), fdatasyncs=%d", copied, post, err, dataSyncs)
+		if copied != 0 || applies != 1 || post.Kind != KindRegular || dataSyncs != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) || v.Health() != nil {
+			t.Fatalf("backend CopyFileRange = (%d,%+v,%v), applies=%d fdatasyncs=%d health=%v", copied, post, err, applies, dataSyncs, v.Health())
 		}
 	})
 }

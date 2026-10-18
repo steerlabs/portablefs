@@ -386,9 +386,10 @@ func dispatchV3Test(d *v3DataPlane, ctx context.Context, operationID uint64, bod
 // dispatchV3Owned is the resource half of handleV3Attached: the reply's
 // collector owns whatever the request interned, and the frontend's verdict is
 // to accept a successful reply's resources and abandon a failed one's.
-func dispatchV3Owned(d *v3DataPlane, ctx context.Context, operationID uint64, body any) (any, int32) {
+func dispatchV3Owned(d *v3DataPlane, ctx context.Context, operationID uint64, body any) (reply any, errno int32) {
+	defer func() { d.recordLookupPolarity(body, errno) }()
 	collector := &v3ReplyResourceCollector{d: d}
-	reply, errno := d.dispatchFrontend(context.WithValue(ctx, v3ReplyResourceContextKey{}, collector), operationID, body)
+	reply, errno = d.dispatchFrontend(context.WithValue(ctx, v3ReplyResourceContextKey{}, collector), operationID, body)
 	resources, err := d.prepareReplyResources(collector)
 	if err != nil {
 		_ = d.fail(err)
@@ -408,6 +409,10 @@ func dispatchV3Owned(d *v3DataPlane, ctx context.Context, operationID uint64, bo
 		if err := cleanup.finish(); err != nil {
 			_ = d.fail(err)
 		}
+	}
+	if collector.cached != nil {
+		// This fake frontend installs its sampled reply immediately.
+		d.recordCacheResult(collector.cached.metric, v3CacheHit)
 	}
 	return reply, errno
 }

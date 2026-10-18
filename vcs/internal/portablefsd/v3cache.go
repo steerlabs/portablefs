@@ -295,8 +295,8 @@ func (d *v3DataPlane) attrHitLocked(conflict v3CacheConflict, item *v3ItemRecord
 	if !item.valid {
 		return pfslocal.Attr{}, v3CacheCold
 	}
-	if conflict(v3AttributeCoordinate(item)) {
-		return pfslocal.Attr{}, v3CacheHeld
+	if reason := conflict(v3AttributeCoordinate(item)); reason != v3CacheHit {
+		return pfslocal.Attr{}, reason
 	}
 	attr, err := d.localAttr(item, item.attr, d.parentOfLocked(item))
 	if err != nil {
@@ -315,8 +315,8 @@ func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRe
 	if !parent.valid {
 		return nil, 0, v3CacheCold
 	}
-	if conflict(v3AttributeCoordinate(parent), v3NamespaceCoordinate(parent, name)) {
-		return nil, 0, v3CacheHeld
+	if reason := conflict(v3AttributeCoordinate(parent), v3NamespaceCoordinate(parent, name)); reason != v3CacheHit {
+		return nil, 0, reason
 	}
 	if child := parent.children[name]; child != nil {
 		if d.itemsByID[child.item.ItemID] != child {
@@ -325,8 +325,8 @@ func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRe
 		if !child.valid {
 			return nil, 0, v3CacheCold
 		}
-		if conflict(v3AttributeCoordinate(child)) {
-			return nil, 0, v3CacheHeld
+		if reason := conflict(v3AttributeCoordinate(child)); reason != v3CacheHit {
+			return nil, 0, reason
 		}
 		attr, err := d.localAttr(child, child.attr, v3ParentOf(parent))
 		if err != nil || collector != nil && child.provisional == math.MaxUint32 {
@@ -344,11 +344,12 @@ func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRe
 	return nil, 0, v3CacheUnknownName
 }
 
-// v3CachedReply owns an unexposed snapshot. Only proof expiry admits one
-// authority miss; terminal admission or lost ownership never substitutes a reply.
+// v3CachedReply owns an unexposed snapshot. Proof or authorization expiry admits
+// one authority miss; terminal admission or lost ownership never substitutes a reply.
 type v3CachedReply struct {
 	revalidate func() bool
 	expired    bool
+	metric     int
 }
 
 // serveCachedAttr is the GetAttr half of hit admission for currentAttr.
@@ -402,9 +403,18 @@ func (d *v3DataPlane) serveCached(
 	owns func() bool,
 ) (bool, int32) {
 	result := v3CacheBypass
-	defer func() { d.mu.Lock(); d.cacheCounters.reads[metric][result]++; d.mu.Unlock() }()
 	collector, _ := ctx.Value(v3ReplyResourceContextKey{}).(*v3ReplyResourceCollector)
-	if collector == nil || collector.d != d || collector.taken || collector.bypassCache {
+	// An exposure-expired candidate already records the miss that caused its
+	// one authority attempt; that attempt is not a second cache decision.
+	if collector != nil && collector.bypassCache {
+		return false, 0
+	}
+	defer func() {
+		if result != v3CacheHit {
+			d.recordCacheResult(metric, result)
+		}
+	}()
+	if collector == nil || collector.d != d || collector.taken {
 		return false, 0
 	}
 	// A session that cannot admit any hit right now (no proof horizon, say)
@@ -441,15 +451,22 @@ func (d *v3DataPlane) serveCached(
 		return false, 0
 	}
 	if err := d.retainLocalPublication(collector, operationID, receipt); err != nil {
+		result = v3CacheTerminal
 		d.revokeRetainedResponse(ctx, err)
 		return true, darwinEIO
 	}
-	candidate := &v3CachedReply{}
+	candidate := &v3CachedReply{metric: metric}
 	candidate.revalidate = func() bool {
 		d.mu.Lock()
 		reason := d.cacheAdmissionLocked()
 		owned := owns()
-		candidate.expired = reason == v3CacheHorizon && owned && d.clockFault == nil
+		candidate.expired = (reason == v3CacheHorizon || reason == v3CacheAuthorization) && owned && d.clockFault == nil
+		if reason == v3CacheHit && !owned {
+			reason = v3CacheResource
+		}
+		if reason != v3CacheHit {
+			d.cacheCounters.reads[metric][reason]++
+		}
 		d.mu.Unlock()
 		return d.endOnClockFault() == nil && reason == v3CacheHit && owned
 	}

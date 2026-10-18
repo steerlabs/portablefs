@@ -42,11 +42,18 @@ func TestCoherenceActiveRestoreRefusesKernelDataCache(t *testing.T) {
 // after apply rather than in the restore recall/preparation path.
 type restoreTruncateSyncFailure struct {
 	restoremode.Store
-	calls   int
-	syncErr error
+	calls     int
+	syncErr   error
+	onFailure func(error)
 }
 
-func (s *restoreTruncateSyncFailure) Fdatasync(uint32) error { s.calls++; return s.syncErr }
+func (s *restoreTruncateSyncFailure) Fdatasync(uint32) error {
+	s.calls++
+	if s.syncErr != nil && s.onFailure != nil {
+		s.onFailure(s.syncErr)
+	}
+	return s.syncErr
+}
 
 type restoreTruncateTestStore struct {
 	*partialSetAttrStore
@@ -104,7 +111,9 @@ func TestRestoreTruncatePostApplyFailureFencesStorage(t *testing.T) {
 				backend := &restoreTruncateTestStore{partialSetAttrStore: &partialSetAttrStore{fskitDurabilityTestStore: store, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x70, Mode: 0600, DeviceMinor: 1}}}
 				h.Store = backend
 				h.OnStorageFailure = func(error) {}
-				restoreStore := &restoreTruncateSyncFailure{syncErr: failure.err}
+				restoreStore := &restoreTruncateSyncFailure{syncErr: failure.err, onFailure: func(err error) {
+					backend.Fence(&xfsstore.DurabilityError{Cause: err})
+				}}
 				h.Restore = newRestoreTruncateMode(t, restoreStore, failure.name == "map", failure.name == "map")
 				item := xfsstore.Capability{0x70}
 				req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}}

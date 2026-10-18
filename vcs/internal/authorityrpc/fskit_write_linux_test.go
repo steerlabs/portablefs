@@ -42,10 +42,11 @@ func (s *fskitWriteTestStore) PinWriteTarget(handle xfsstore.Capability) (xfssto
 func (*fskitWriteTestStore) CloseOpen(xfsstore.Capability) error { return nil }
 
 type fskitWriteTestTarget struct {
-	closed   atomic.Bool
-	sync     func() error
-	mu       sync.Mutex
-	payloads [][]byte
+	closed    atomic.Bool
+	commitErr error
+	sync      func() error
+	mu        sync.Mutex
+	payloads  [][]byte
 }
 
 func (*fskitWriteTestTarget) Coordinate() xfsstore.ObjectCoordinate {
@@ -63,7 +64,7 @@ func (t *fskitWriteTestTarget) CommitWrite(reader io.ReaderAt, spec xfsstore.Wri
 	assigned := spec.Position
 	return uint64(len(payload)), assigned, xfsstore.Attr{
 		Kind: xfsstore.KindRegular, Ino: 0x41, Mode: 0o600, Nlink: 1, Size: int64(assigned) + int64(len(payload)), DeviceMinor: 1,
-	}, nil
+	}, t.commitErr
 }
 
 func (*fskitWriteTestTarget) CommitWriteData([]byte, xfsstore.WriteCommit) (uint64, uint64, xfsstore.Attr, error) {

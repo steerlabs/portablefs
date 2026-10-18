@@ -59,7 +59,9 @@ for replay, a handle-backed mutation retains its authoritative input or output
 file description and performs full fsync on it. This covers WRITE, CREATE,
 truncating OPEN, and handle-backed SETATTR. A mutation without such a
 description uses syncfs on the volume root directly, including namespace
-changes and item-backed metadata. Durability never reopens an object or changes
+changes and item-backed metadata. The authority requires Linux 5.17 or newer
+and refuses older kernels at storage startup: both XFS log-force and VFS
+sync_fs failures must reach syncfs. Durability never reopens an object or changes
 strategy after a descriptor acquisition failure. The sync runs after storage
 locks are released; exact replay repeats neither apply nor sync.
 

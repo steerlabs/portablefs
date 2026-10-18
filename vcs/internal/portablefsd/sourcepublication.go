@@ -624,9 +624,9 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 	}
 }
 
-// v3CacheConflict reports whether any of the coordinates is held or claimed by
-// any source lease (the same callback's included) or by a peer cut.
-type v3CacheConflict func(coordinates ...v3PublicationCoordinate) bool
+// v3CacheConflict distinguishes live source holds from terminal admission or a
+// peer cut, which withdraws this session's cache service entirely.
+type v3CacheConflict func(coordinates ...v3PublicationCoordinate) v3CacheResult
 
 // cacheRead runs read under the coordinator mutex, the first lock of the short
 // coordinator → d.mu snapshot order used by cache hits. read may take d.mu and
@@ -638,28 +638,28 @@ type v3CacheConflict func(coordinates ...v3PublicationCoordinate) bool
 func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	read(func(coordinates ...v3PublicationCoordinate) bool {
+	read(func(coordinates ...v3PublicationCoordinate) v3CacheResult {
 		if c.terminal != nil || c.peerSequence != 0 {
-			return true
+			return v3CacheTerminal
 		}
 		for _, coordinate := range coordinates {
 			for holder := range c.sourceHolds[coordinate] {
 				if holder.active != 0 || holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
-					return true
+					return v3CacheHeld
 				}
 			}
 			switch coordinate.kind {
 			case v3PublicationItemAttributes:
 				if len(c.unresolvedAttributes) != 0 {
-					return true
+					return v3CacheHeld
 				}
 			case v3PublicationItemData:
 				if len(c.unresolvedData) != 0 {
-					return true
+					return v3CacheHeld
 				}
 			}
 		}
-		return false
+		return v3CacheHit
 	})
 }
 

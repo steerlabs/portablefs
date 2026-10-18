@@ -793,7 +793,7 @@ func TestV3CacheReadNeedsEveryActiveSourceRequestAndClaimSettled(t *testing.T) {
 	check := func(want bool) {
 		t.Helper()
 		c.cacheRead(func(conflict v3CacheConflict) {
-			if got := conflict(coordinate); got != want {
+			if got := conflict(coordinate) != v3CacheHit; got != want {
 				t.Fatalf("conflict=%t, want %t", got, want)
 			}
 		})

@@ -138,3 +138,71 @@ func TestHydrationMtimeRestoreFailurePermanentlyStopsSamples(t *testing.T) {
 		t.Fatalf("failure callbacks=%d, corrupt=%v", failures.Load(), mode.isCorrupt())
 	}
 }
+
+type hydrationSyncFailureStore struct {
+	*fakeStore
+	calls   atomic.Int32
+	failure error
+}
+
+func (s *hydrationSyncFailureStore) Fdatasync(uint32) error {
+	s.calls.Add(1)
+	return s.failure
+}
+
+func TestHydrationSyncFailureTerminatesDemandAndBackground(t *testing.T) {
+	for _, path := range []string{"demand", "background", "lazy background"} {
+		for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+			t.Run(path+"/"+cause.Error(), func(t *testing.T) {
+				store := &hydrationSyncFailureStore{fakeStore: newFakeStore(map[uint32]int64{0: 8}), failure: cause}
+				start := make(chan struct{})
+				failed := make(chan error, 1)
+				var callbacks atomic.Int32
+				mode, _, identity := openTestMode(t, store.fakeStore, testInfo([2]uint32{0, 0}, [2]uint32{0, 1}), map[chunkKey]Chunk{{0, 0}: {Extents: []Extent{{Data: []byte("abcd")}}}, {0, 1}: {Extents: []Extent{{Data: []byte("efgh")}}}}, func(c *Config) {
+					c.Store = store
+					c.disableDrain = path == "demand"
+					c.drainStart = start
+					c.DrainWorkers = 2
+					c.OnStorageFailure = func(err error) { callbacks.Add(1); failed <- err }
+				})
+				if path == "lazy background" {
+					if err := mode.EnsureHydrated(t.Context(), identity, 0, 8); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if path == "demand" {
+					// Durable demand uses the same installation as truncation recall.
+					_, err := mode.hydrateLocked(t.Context(), chunkKey{0, 0}, true, true)
+					if !errors.Is(err, cause) {
+						t.Fatalf("hydrate=%v", err)
+					}
+				} else {
+					close(start)
+				}
+				select {
+				case err := <-failed:
+					if !errors.Is(err, cause) || !errors.Is(err, syscall.EIO) {
+						t.Fatalf("terminal failure=%v", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("no terminal storage callback")
+				}
+				// Join drain before inspecting persistent claims or retry counts.
+				mode.cancel()
+				mode.wg.Wait()
+				if !mode.isCorrupt() || callbacks.Load() != 1 || mode.StorageError() == nil {
+					t.Fatalf("terminal state: callbacks=%d err=%v", callbacks.Load(), mode.StorageError())
+				}
+				if mode.hmap.isDurable(chunkKey{0, 0}) || mode.hmap.isDurable(chunkKey{0, 1}) {
+					t.Fatal("failed hydration was marked durable")
+				}
+				if calls := store.calls.Load(); calls > 2 {
+					t.Fatalf("retried terminal persistence: %d", calls)
+				}
+				if err := mode.WithAttrLock(identity, func() error { t.Error("sample after storage failure"); return nil }); err == nil {
+					t.Fatal("sample accepted")
+				}
+			})
+		}
+	}
+}

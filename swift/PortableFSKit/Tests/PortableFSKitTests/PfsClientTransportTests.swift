@@ -989,176 +989,137 @@ private func settledAckBaseline(
     #expect(stats.notPublishedPublicationAcks == 1)
 }
 
-/// A retraction is answered by REISSUING the operation, below userspace.
-///
-/// The retraction contract itself is unchanged — the crossed attempt's values
-/// are never handed back — but the frontend no longer surfaces that as EINTR
-/// and hope the kernel restarts the syscall. FSKit on macOS 26 does not restart
-/// rmdir(2), so the EINTR reached the application. The extension runs the
-/// operation again instead, and only the surviving attempt's values are
-/// returned.
-@Test func retractedDeferredPublicationIsReissuedAndBothAttemptsAcknowledged() async throws {
-    let daemon = try PfsLocalMockDaemon()
+/// No daemon withdraws a publication it has sent, so an envelope claiming a
+/// retraction is a frame defect, never an instruction to reissue. The
+/// operation runs once and fails terminally, no value it carried reaches the
+/// caller, and the client is retired: every other request in flight fails
+/// with the same defect and nothing reconnects.
+@Test func publicationRetractionIsAFrameDefectThatRetiresTheStrictConnection() async throws {
+    var contract = PfsV3CoherenceContract()
+    contract.authorityProtocolMajor = 7
+    contract.authorityEpoch = Data(repeating: 0xE7, count: 16)
+    contract.sessionID = Data(repeating: 0x57, count: 16)
+    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
+    contract.repairBudgetMillis = 2_500
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(lookupNoReplyNames: ["parked"], v3Coherence: contract)
+    )
     defer { daemon.stop() }
 
     let client = PfsLocalClient(socketPath: daemon.socketPath)
     let resolved = try await client.resolve(attachRef: "mock")
+    let baseline = try await settledAckBaseline(daemon, owed: 0)
+    let baselineGetattrs = await daemon.stats().getAttrRequests
+
+    var parkedLookup = PfsLookupRequest()
+    parkedLookup.dir = resolved.root
+    parkedLookup.name = transportBytes("parked")
+    let parked = Task {
+        try await client.request(.lookup(parkedLookup))
+    }
+    for _ in 0..<1_000 {
+        if await daemon.stats().lookupRequests == 1 { break }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    #expect(await daemon.stats().lookupRequests == 1)
+
+    await daemon.transformNextReply { envelope in
+        guard case .getAttrReply? = envelope.body else { return nil }
+        var defective = envelope
+        defective.publicationRetracted = true
+        return defective
+    }
     var getattr = PfsGetAttrRequest()
     getattr.item = resolved.root
-
-    // Nothing before this point publishes, so no ack can be in flight — but
-    // say so exactly rather than assuming it.
-    let baseline = try await settledAckBaseline(daemon, owed: 0)
-    await daemon.retractNextPublications()
-
     let (result, complete) = await client.withDeferredPublication {
         try await client.request(.getAttr(getattr))
     }
-    // The reissue converged, so the caller gets a value rather than an errno.
-    _ = try result.get()
-
-    // The daemon's handoff gate is released for EVERY attempt: retraction is
-    // about what the FRAMEWORK installs, not about the daemon's bookkeeping.
-    // The retracted attempt's ack was sent before the reissue began, so the
-    // reissue could not queue behind the handoff waiting for it.
-    await complete(true)
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
-    #expect(stats.publicationAcks == baseline + 2)
-
-    // The connection is unaffected — a retraction is the daemon speaking on a
-    // healthy connection, not a transport failure.
-    _ = try await client.request(.statfs(PfsStatfsRequest()))
-}
-
-@Test func retractedPublicationBoundaryIsReissuedAndBothAttemptsAcknowledged() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-
-    // Nothing before this point publishes, so no ack can be in flight — but
-    // say so exactly rather than assuming it.
-    let baseline = try await settledAckBaseline(daemon, owed: 0)
-    await daemon.retractNextPublications()
-
-    _ = try await client.withPublicationBoundary {
-        try await client.request(.getAttr(getattr))
-    }
-
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
-    #expect(stats.publicationAcks == baseline + 2)
-}
-
-/// A retraction condemns the whole logical operation, not just the reply that
-/// carried the bit. The framework installs a callback's result as one unit, so
-/// an earlier reply that was individually fine cannot be published on its own.
-///
-/// Here EVERY attempt is retracted, which is what makes the two halves of the
-/// contract visible at once: the reissue is bounded, and a retraction that
-/// never stops still reaches the caller as one verdict for the operation rather
-/// than as an incidental per-request errno.
-@Test func retractionOnLaterReplyCondemnsTheWholeOperationAndReissueIsBounded() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-
-    // Nothing before this point publishes, so no ack can be in flight — but
-    // say so exactly rather than assuming it.
-    let baseline = try await settledAckBaseline(daemon, owed: 0)
-
-    let (result, complete) = await client.withDeferredPublication {
-        _ = try await client.request(.getAttr(getattr))
-        // The handoff crosses here: the first reply is already in hand and
-        // uncondemned, and only the parked continuation carries the verdict.
-        // Re-arming on every attempt models a mount that keeps crossing.
-        await daemon.retractNextPublications()
-        return try await client.request(.getAttr(getattr))
-    }
     do {
         _ = try result.get()
-        Issue.record("expected a late retraction to condemn the whole operation")
+        Issue.record("a retraction-bearing reply delivered its values")
     } catch let error as PfsLocalClientError {
-        #expect(error == .publicationRetracted)
+        guard case .invalidFrame = error else {
+            Issue.record("expected a frame defect, got \(error)")
+            return
+        }
     }
-
     await complete(false)
-    // Both requests of an attempt share one operation ID, so each ATTEMPT owes
-    // exactly one acknowledgement — and every attempt made is acknowledged.
-    let attempts = PfsLocalClient.publicationRetractionReissueLimit
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + attempts)
-    #expect(stats.publicationAcks == baseline + attempts)
+    #expect(await daemon.stats().getAttrRequests == baselineGetattrs + 1)
+
+    do {
+        _ = try await parked.value
+        Issue.record("a request on the retired connection completed")
+    } catch let error as PfsLocalClientError {
+        guard case .invalidFrame = error else {
+            Issue.record("expected the parked request to fail with the defect, got \(error)")
+            return
+        }
+    }
+    // The client is terminal: a later request reports the same defect
+    // without connecting again.
+    let hellosBeforeFollowUp = await daemon.stats().helloRequests
+    do {
+        _ = try await client.request(.statfs(PfsStatfsRequest()))
+        Issue.record("a terminal client sent another request")
+    } catch let error as PfsLocalClientError {
+        guard case .invalidFrame = error else {
+            Issue.record("expected the original defect after termination, got \(error)")
+            return
+        }
+    }
+    #expect(await daemon.stats().helloRequests == hellosBeforeFollowUp)
+    #expect(await daemon.stats().getAttrRequests == baselineGetattrs + 1)
+    #expect(await daemon.stats().publicationAcks == baseline)
 }
 
-@Test func retractionCarriedOnRefusedRequestWithholdsValuesAndLeavesNoMutation() async throws {
+/// Every client is pre-Resolve when it first connects, so a protocol defect
+/// during Hello must be terminal on its own terms. Connection backoff exists
+/// for failures to reach the daemon, not for a peer's malformed answer:
+/// retrying would consume the defect and hide it behind a later success.
+@Test func protocolDefectDuringHelloIsTerminalAndNeverRetried() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-
-    var create = PfsCreateRequest()
-    create.dir = resolved.root
-    create.name = transportBytes("doomed")
-    create.mode = 0o644
-    _ = try await client.request(.create(create))
-
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-    var remove = PfsRemoveRequest()
-    remove.dir = resolved.root
-    remove.name = transportBytes("doomed")
-
-    // `create` is itself a publishing operation and owes an ack of its own,
-    // which may still be in flight at this point.
-    let baseline = try await settledAckBaseline(daemon, owed: 1)
-
-    let (result, complete) = await client.withDeferredPublication {
-        // A first reply binds the operation and arrives uncondemned.
-        _ = try await client.request(.getAttr(getattr))
-        // The handoff crosses. The unlink is the parked request, and the
-        // daemon answers it without executing it.
-        await daemon.refuseNextPublicationsAsRetracted()
-        return try await client.request(.remove(remove))
+    await daemon.transformNextReply { envelope in
+        guard case .helloReply? = envelope.body else { return nil }
+        var defective = envelope
+        defective.publicationRetracted = true
+        return defective
     }
-    do {
-        _ = try result.get()
-        Issue.record("expected a refused-and-retracted operation to withhold its result")
-    } catch let error as PfsLocalClientError {
-        // The collector's verdict wins over the refusal's own errno, so the
-        // caller sees one retraction for the operation. Re-arming the refusal
-        // on every attempt means the reissue can never converge, so the bound
-        // is what ends it — and this is the ONLY way the caller sees a
-        // retraction at all now.
-        #expect(error == .publicationRetracted)
-        #expect(error.posixErrno == EINTR)
-    }
-    await complete(false)
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxReconnectAttempts: 5, reconnectBaseDelayNanoseconds: 1_000_000)
+    )
 
-    // Every attempt is acknowledged; none of them mutated anything.
-    let attempts = PfsLocalClient.publicationRetractionReissueLimit
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + attempts)
-    #expect(stats.publicationAcks == baseline + attempts)
-
-    // The name is still there: the refusal executed no mutation, so the
-    // retried syscall will find exactly the state it started from.
-    var lookup = PfsLookupRequest()
-    lookup.dir = resolved.root
-    lookup.name = transportBytes("doomed")
-    let survivor = try await client.request(.lookup(lookup))
-    guard case .lookupReply? = survivor.body else {
-        Issue.record("expected the retracted unlink to have left its target in place")
-        return
+    for _ in 0..<2 {
+        do {
+            _ = try await client.resolve(attachRef: "mock")
+            Issue.record("a client resolved after a defective HelloReply")
+        } catch let error as PfsLocalClientError {
+            guard case .invalidFrame = error else {
+                Issue.record("expected the original frame defect, got \(error)")
+                return
+            }
+        }
     }
+    #expect(await daemon.stats().helloRequests == 1)
 }
 
-@Test func unretractedPublicationOperationDeliversValuesAndAcknowledges() async throws {
+/// A version mismatch is the daemon's definite answer, not a connection
+/// failure, so it surfaces after exactly one handshake.
+@Test func helloVersionMismatchIsNotRetried() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(protocolMinor: 15))
+    defer { daemon.stop() }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxReconnectAttempts: 5, reconnectBaseDelayNanoseconds: 1_000_000)
+    )
+    await #expect(throws: PfsLocalClientError.protocolMismatch(major: 1, minor: 15)) {
+        _ = try await client.resolve(attachRef: "mock")
+    }
+    #expect(await daemon.stats().helloRequests == 1)
+}
+
+@Test func publicationOperationDeliversValuesAndAcknowledgesOnce() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 

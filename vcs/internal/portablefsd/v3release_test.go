@@ -820,36 +820,85 @@ func TestV3HandleRevalidatesAfterAPausedPointerResolution(t *testing.T) {
 	}
 }
 
+func TestV3ReleaseTransferReportsAlreadyClassifiedFailure(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("malformed=%t", malformed), func(t *testing.T) {
+			client := newFakeV3DataClient()
+			d := testV3DataPlane(t, client)
+			client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
+				response := exactTestMutationReply(identity)
+				if malformed {
+					response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{}}
+				} else {
+					response.Errno = errnos.EINVAL
+				}
+				return response, nil
+			}
+			// No worker records the returned error here: classification itself
+			// must make the failure visible to the ownership transfer.
+			err := d.sendRelease(context.Background(), &authoritypb.Request{Body: &authoritypb.Request_Reclaim{
+				Reclaim: &authoritypb.ReclaimRequest{Items: v3ReleaseTokens("item")},
+			}}, 0)
+			if err == nil || !errors.Is(d.transferReleases(), err) {
+				t.Fatalf("transfer lost the already-classified release failure: %v", err)
+			}
+		})
+	}
+}
+
 // A late release outcome belongs to the original DATA request, but after exact
 // absence it must not overwrite Detach or poison its working CONTROL path.
-func TestV3ReleaseTransferRetainsInflightOwnerWithoutOverwritingDetach(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	entered, settle := make(chan struct{}), make(chan struct{})
-	client.mutation = func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error) {
-		close(entered)
-		<-settle
-		return nil, errors.New("DATA transport closed by successful Detach")
-	}
-	if err := d.releases.submit(v3ReleaseTokens("h"), nil); err != nil {
-		t.Fatal(err)
-	}
-	<-entered
-	if err := d.transferReleases(); err == nil {
-		t.Fatal("in-flight release was reported as settled")
-	}
-	_ = d.stopServing(errV3AttachDetached)
-	close(settle)
-	if err := waitV3ReleaseOwner(context.Background(), d.releases); err == nil {
-		t.Fatal("unconfirmed release was reported as successful")
-	}
-	if !errors.Is(d.terminalError(), errV3AttachDetached) {
-		t.Fatalf("detach verdict replaced: %v", d.terminalError())
-	}
-	select {
-	case <-client.SessionDone():
-		t.Fatal("late DATA error closed the retained transport")
-	default:
+func TestV3ReleaseTransferLeavesLateOutcomesToSessionTeardown(t *testing.T) {
+	for _, outcome := range []string{"success", "refusal", "malformed", "transport-error"} {
+		t.Run(outcome, func(t *testing.T) {
+			client := newFakeV3DataClient()
+			d := testV3DataPlane(t, client)
+			entered, settle := make(chan struct{}), make(chan struct{})
+			client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
+				close(entered)
+				<-settle
+				response := exactTestMutationReply(identity)
+				switch outcome {
+				case "success":
+					response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{
+						Results: []*authoritypb.CloseBatchResult{{Retired: true}},
+					}}
+				case "refusal":
+					response.Errno = errnos.EINVAL
+				case "transport-error":
+					return nil, errors.New("DATA transport closed by session teardown")
+				}
+				return response, nil
+			}
+			if err := d.releases.submit(v3ReleaseTokens("h"), nil); err != nil {
+				t.Fatal(err)
+			}
+			<-entered
+			// A second batch is forming while the first request owns DATA.
+			if err := d.releases.submit(nil, v3ReleaseTokens("item")); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.transferReleases(); err != nil {
+				t.Fatalf("release ownership transfer: %v", err)
+			}
+			close(settle)
+			if err := waitV3ReleaseOwner(context.Background(), d.releases); err != nil {
+				t.Fatalf("session-owned release recorded a failure: %v", err)
+			}
+			// Detach has not fenced or closed the client yet: these assertions
+			// prove the late outcome cannot disrupt CONTROL proof delivery.
+			if err := d.terminalError(); err != nil {
+				t.Fatalf("late release stopped serving before Detach: %v", err)
+			}
+			select {
+			case <-client.SessionDone():
+				t.Fatal("late release closed the retained transport")
+			default:
+			}
+			if got := len(client.mutationRequests()); got != 1 {
+				t.Fatalf("release requests = %d, want only the original in-flight request", got)
+			}
+		})
 	}
 }
 

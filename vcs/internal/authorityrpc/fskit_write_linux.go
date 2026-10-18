@@ -1079,8 +1079,7 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 		transaction.refs.Done()
 		cleanup.finish()
 
-		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
-			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
+		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply)
 		if committed == 0 && !zeroPostApply {
 			if applyErr == nil {
 				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
@@ -1125,7 +1124,9 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 		if metadata.mode == xfsstore.WritePositioned && assigned != metadata.position {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 		}
-		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
+		// ErrWritePostApply promises exact placement and attributes, including
+		// when the failed obligation is a terminal persistence syscall.
+		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
 		}
 		if applyErr != nil && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {

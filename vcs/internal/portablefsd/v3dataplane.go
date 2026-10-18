@@ -487,17 +487,7 @@ func (d *v3DataPlane) dispatchFrontend(
 	}
 	switch request := body.(type) {
 	case *pfslocal.LookupRequest:
-		reply, errno := d.lookup(ctx, operationID, request)
-		polarity := 2
-		if errno == 0 {
-			polarity = 0
-		} else if errno == darwinENOENT {
-			polarity = 1
-		}
-		d.mu.Lock()
-		d.cacheCounters.lookup[polarity]++
-		d.mu.Unlock()
-		return reply, errno
+		return d.lookup(ctx, operationID, request)
 	case *pfslocal.EnumerateEntriesRequest:
 		return d.enumerateEntries(ctx, operationID, request)
 	case *pfslocal.GetAttrRequest:
@@ -2647,7 +2637,8 @@ func (cleanup *v3ResourceCleanup) finish() error {
 // then at most one Reclaim. Each request owns an exact replay assignment, so it
 // runs on the data plane's lifetime rather than any caller's: a lost reply
 // replays the same mutation inside the client, and local withdrawal cannot
-// cancel it. Every outcome other than complete success is terminal.
+// cancel it. Before transfer to session teardown, every outcome other than
+// complete success is terminal.
 func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), operationAdmissionBudgetValue())
 	defer cancel()
@@ -2669,12 +2660,12 @@ func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 // sendRelease preserves the original transport on a definite, well-formed
 // refusal. Once exact absence transfers ownership to session teardown, a late
 // DATA outcome cannot turn an accepted CONTROL Detach into a transport failure.
-func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Request, closes int) error {
+func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Request, closes int) (err error) {
 	d.releaseMu.Lock()
 	transferred := d.releaseSessionOwned
 	d.releaseMu.Unlock()
 	if transferred {
-		return errV3ReleaseClosed
+		return nil
 	}
 	var assigned authorityrpc.MutationIdentity
 	response, callErr := d.client.CallMutationWithIdentity(ctx, request, func(identity authorityrpc.MutationIdentity) error {
@@ -2682,9 +2673,20 @@ func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Requ
 		return nil
 	})
 	d.releaseMu.Lock()
-	defer d.releaseMu.Unlock()
+	defer func() {
+		// Record the classified failure before transfer can take ownership,
+		// rather than waiting for the worker to record it after this returns.
+		if err != nil {
+			d.releases.mu.Lock()
+			if d.releases.failure == nil {
+				d.releases.failure = err
+			}
+			d.releases.mu.Unlock()
+		}
+		d.releaseMu.Unlock()
+	}()
 	if d.releaseSessionOwned {
-		return errors.Join(errors.New("portablefsd: in-flight release transferred to session teardown"), callErr)
+		return nil
 	}
 	response, errno := d.classify(response, callErr, true)
 	if response == nil {
@@ -2743,6 +2745,7 @@ func v3DefiniteReleaseFailure(class authoritypb.FailureClass) bool {
 
 // transferReleases closes admission without waiting on DATA. Session teardown
 // owns unsent tokens; the worker retains its in-flight request until it returns.
+// Only a failure classified before this transfer is a cleanup diagnostic.
 func (d *v3DataPlane) transferReleases() error {
 	d.releaseMu.Lock()
 	defer d.releaseMu.Unlock()
@@ -2752,9 +2755,6 @@ func (d *v3DataPlane) transferReleases() error {
 	defer d.releases.mu.Unlock()
 	if d.releases.failure != nil {
 		return d.releases.failure
-	}
-	if d.releases.running {
-		return errors.New("portablefsd: in-flight authority releases transferred to session teardown")
 	}
 	return nil
 }

@@ -760,6 +760,11 @@ func (c *frontendConn) serveV3Attempt(
 		reply any
 		eno   int32
 	)
+	defer func() {
+		if d != nil && !retry {
+			d.recordLookupPolarity(body, eno)
+		}
+	}()
 	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
 	switch body.(type) {
 	case *pfslocal.CreateRequest, *pfslocal.MkdirRequest, *pfslocal.SymlinkRequest:
@@ -847,14 +852,21 @@ func (c *frontendConn) serveV3Attempt(
 		}
 		// A cached negative answer is revalidated at the write boundary like
 		// any other cached reply.
-		_, _, _, refused := c.replyWithPublicationCommit(
+		_, written, _, refused := c.replyWithPublicationCommit(
 			requestID, operationID, failure, true,
 			v3LatePublishingReplyDiscardable(body, eno), commit,
 		)
 		if refused {
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
-			return c.expiredV3CacheCandidate(a, resources)
+			retry = c.expiredV3CacheCandidate(a, resources)
+			if !retry {
+				eno = darwinENOTCONN
+			}
+			return retry
+		}
+		if written && resources.cached != nil {
+			d.recordCacheResult(resources.cached.metric, v3CacheHit)
 		}
 		return false
 	}
@@ -932,7 +944,14 @@ func (c *frontendConn) serveV3Attempt(
 		}
 		consumeV3ResponseConsumptions(resources.responseConsumptions)
 		resources.responseConsumptions = nil
-		return c.expiredV3CacheCandidate(a, resources)
+		retry = c.expiredV3CacheCandidate(a, resources)
+		if !retry {
+			eno = darwinENOTCONN
+		}
+		return retry
+	}
+	if written && resources.cached != nil {
+		d.recordCacheResult(resources.cached.metric, v3CacheHit)
 	}
 	if discarded && resourceReply {
 		// The callback already proved NOT_PUBLISHED, so no frontend can send a
@@ -1000,7 +1019,8 @@ func (c *frontendConn) stopV3FrontendPublication(a *attach, cause error) {
 
 // detachV3 is the evidence-bearing unmount of one v3 attach. The caller owns
 // registry.mutationMu (it runs inside runUnmountTransaction) and the shared
-// registry-removal tail runs after it returns nil.
+// registry-removal tail runs once local teardown completes, preserving any
+// final proof-delivery or release diagnostic returned here.
 //
 // Order is the contract: exact kernel detach first, then the getfsstat
 // absence observation, then delivery of that proof to the authority, and only
@@ -1010,8 +1030,8 @@ func (c *frontendConn) stopV3FrontendPublication(a *attach, cause error) {
 func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	if a.isDetached() {
 		// An earlier detach completed the teardown and returned its outcome,
-		// including any release failure; only the registry removal it could not
-		// finish remains, so its drain and proof are not repeated.
+		// including any release failure; only durable registry removal remains,
+		// so its release transfer and proof are not repeated.
 		a.frontendSerial.Lock()
 		a.nsMu.Lock()
 		_, err := a.finishDetachWithNSLocked("", nil)
