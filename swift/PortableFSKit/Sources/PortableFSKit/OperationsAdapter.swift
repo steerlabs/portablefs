@@ -413,7 +413,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     private let shutdownLock = NSLock()
     private var shutdownTask: Task<Void, Never>?
     private var beforeShutdownCleanup: (@Sendable () async -> Void)?
-    private var onShutdownWait: (@Sendable () async -> Void)?
+    private var onShutdownWait: (@Sendable (Task<Void, Never>) async -> Void)?
 
     /// Installs a volume around a resolved core. The connection's event
     /// binding is established before the volume can be returned to FSKit:
@@ -642,11 +642,11 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     public func shutdown() async {
         core.client.publicationGate.revoke(PfsLocalClientError.shutdown)
         let (cleanup, onWait) = localShutdown()
-        await onWait?()
+        await onWait?(cleanup)
         await cleanup.value
     }
 
-    private func localShutdown() -> (Task<Void, Never>, (@Sendable () async -> Void)?) {
+    private func localShutdown() -> (Task<Void, Never>, (@Sendable (Task<Void, Never>) async -> Void)?) {
         shutdownLock.lock()
         defer { shutdownLock.unlock() }
         if let shutdownTask { return (shutdownTask, onShutdownWait) }
@@ -665,9 +665,11 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     /// Continuation seams outside the publication gate for teardown ordering tests.
+    /// Expose the exact task selected under shutdownLock so tests can record its
+    /// identity synchronously before announcing that a caller is joining cleanup.
     func testingShutdown(
         beforeCleanup: @escaping @Sendable () async -> Void,
-        onWait: @escaping @Sendable () async -> Void = {}
+        onWait: @escaping @Sendable (Task<Void, Never>) async -> Void = { _ in }
     ) {
         shutdownLock.lock()
         defer { shutdownLock.unlock() }

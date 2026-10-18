@@ -555,9 +555,14 @@ private func checkNativeTeardownWaits(first: NativeTeardown) async throws {
     defer { fixture.harness.daemon.stop() }
     let cleanup = SessionGate()
     let joined = SessionGate()
+    let selected = SessionReplyBox<Task<Void, Never>>()
     await joined.release()
     fixture.harness.volume.testingShutdown(
-        beforeCleanup: { await cleanup.enter() }, onWait: { await joined.enter() }
+        beforeCleanup: { await cleanup.enter() },
+        onWait: { task in
+            selected.set(task)
+            await joined.enter()
+        }
     )
     let requested = SessionReplyBox<SessionReplyBox<Int>>()
     let requester = Task {
@@ -568,6 +573,7 @@ private func checkNativeTeardownWaits(first: NativeTeardown) async throws {
     let firstReply = await requested.wait()
     await cleanup.waitForEntries(1)
     await joined.waitForEntries(1)
+    let firstCleanup = try #require(selected.get())
     requester.cancel()
     #expect(firstReply.get() == nil)
     #expect(!fixture.harness.root.reclaimed)
@@ -583,6 +589,10 @@ private func checkNativeTeardownWaits(first: NativeTeardown) async throws {
         return
     }
     await joined.waitForEntries(2)
+    // Both selections precede their join announcements. The held first task
+    // must be reused even if an independent second task has not finished yet.
+    #expect(selected.count() == 2)
+    #expect(selected.get() == firstCleanup)
     #expect(firstReply.get() == nil)
     #expect(overlapping.get() == nil)
     await cleanup.release()
@@ -604,9 +614,14 @@ private func checkNativeTeardownWaits(first: NativeTeardown) async throws {
     defer { fixture.harness.daemon.stop() }
     let cleanup = SessionGate()
     let joined = SessionGate()
+    let selected = SessionReplyBox<Task<Void, Never>>()
     await joined.release()
     fixture.harness.volume.testingShutdown(
-        beforeCleanup: { await cleanup.enter() }, onWait: { await joined.enter() }
+        beforeCleanup: { await cleanup.enter() },
+        onWait: { task in
+            selected.set(task)
+            await joined.enter()
+        }
     )
     let finished = SessionReplyBox<Int>()
     let requester = Task {
@@ -614,11 +629,16 @@ private func checkNativeTeardownWaits(first: NativeTeardown) async throws {
         catch { finished.set((error as NSError).code) }
     }
     await cleanup.waitForEntries(1)
+    await joined.waitForEntries(1)
+    let firstCleanup = try #require(selected.get())
     requester.cancel()
     let nativeReply = fixture.teardown(.deactivate)
     await joined.waitForEntries(2)
+    #expect(selected.count() == 2)
+    #expect(selected.get() == firstCleanup)
     #expect(finished.get() == nil)
     #expect(nativeReply.get() == nil)
+    #expect(!fixture.harness.root.reclaimed)
     await cleanup.release()
     await requester.value
     #expect(await nativeReply.wait() == 0)
