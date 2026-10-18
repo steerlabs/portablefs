@@ -1,11 +1,12 @@
 # Architecture
 
-Status: **protocol-7 local full-gate qualified on stock Linux FUSE; detailed
-results and production qualification boundaries are recorded in
-[coherence-v2/integration.md](./coherence-v2/integration.md).**
+Status: **protocol 8, specified and not yet qualified.** The open gates are
+listed in [COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status); results
+from earlier protocols are not evidence for this one.
 
 PortableFS exposes one serving XFS project directory through multiple Linux
-mounts. A volume has one canonical representation selected by `(State,
+mounts, at most one macOS mount at a time as the sole writer, and an
+authenticated cacheless gateway. A volume has one canonical representation selected by `(State,
 ArchiveCycleStep)`: READY uses XFS, ARCHIVED uses one sealed immutable archive,
 and RESTORING composes that sealed base, a monotone hydration map, and XFS.
 PortableFS adds authentication, object capabilities, replay protection,
@@ -14,18 +15,18 @@ write-back. It adds no second namespace, durable mutation journal, or offline
 reconciliation. XFS remains the durable truth.
 
 ```text
-stock Linux FUSE 7.31+ mounts
-             |
-    portablefs-mount-v3
-             |
-mutually authenticated TLS 1.3
-  DATA + CONTROL connection pair
-             |
- portablefs-authority (one per volume)
-             |
- descriptor-relative Linux syscalls
-             |
- one XFS project directory (PROJINHERIT)
+stock Linux FUSE 7.31+ mounts      macOS FSKit mount      files gateway
+             |                    (exclusive writer)   (cacheless reader)
+             +------------------------+---------------------+
+                                      |
+                       mutually authenticated TLS 1.3
+                        DATA + CONTROL connection pair
+                                      |
+                     portablefs-authority (one per volume)
+                                      |
+                      descriptor-relative Linux syscalls
+                                      |
+                   one XFS project directory (PROJINHERIT)
 ```
 
 ## Product invariants
@@ -39,6 +40,8 @@ mutually authenticated TLS 1.3
    mutations execute at the Authority. Uncontended file delegations permit
    daemon-buffered data and attributes; fsync/O_SYNC wait for durability.
    A run opens the mount root at start and fsyncs that handle at completion.
+   FSKit has no fsync callback, so every successful macOS mutation reply is
+   itself durable on the authority.
 3. **Cache permission excludes a peer's buffered writes.** A volume subscription
    covers undelegated identities. Granting a delegation first withdraws peer
    cache permission; a peer data/attribute read breaks the holder for read.
@@ -48,10 +51,10 @@ mutually authenticated TLS 1.3
    visible through a successful break-for-read while the holder survives; an
    accepted non-durable tail can be lost under the declared failure rules.
    An overlapping operation may linearize on either side.
-5. **The wire is exact.** Authority protocol 7 uses ALPN
-   `portablefs-authority-v7`, paired authenticated transports, exact feature
-   assertions, and session-bound replay. Protocol 6 is refused; there is no
-   compatibility path.
+5. **The wire is exact.** Authority protocol 8 uses ALPN
+   `portablefs-authority-v8`, paired authenticated transports, an immutable
+   frontend profile, and session-bound replay. There are no feature strings;
+   an unequal major is refused at the handshake.
 6. **The kernel interface is upstream FUSE.** Linux requires FUSE protocol 7.31
    or newer and uses no PortableFS capability bit, opcode, notification, cache
    stamp, completion ring, or publication receipt.
@@ -66,6 +69,11 @@ mutually authenticated TLS 1.3
    placement, entitlement, PKI, authorization, desired state, and observations;
    it never stores filesystem bytes. The hydrator is a serving dependency only
    while one volume is RESTORING. The manager never enters that data path.
+10. **A storage cell is one durability domain.** Volumes in one XFS cell share
+    its superblock: a writeback or log failure from any project can fence any
+    volume at its next filesystem-wide barrier, and other projects' dirty data
+    lengthens that barrier. Isolation requires separate filesystems; see
+    [COMPATIBILITY.md](../COMPATIBILITY.md#two-limits-that-apply-to-every-deployment).
 
 ## Linux cache and I/O profile
 
@@ -95,16 +103,18 @@ The normative model and verbatim design residuals are in
 
 ## Platform status
 
-| Platform | Status |
+| Platform | Profile and status |
 | --- | --- |
-| Linux FUSE 7.31+ | Protocol-7 local real-mount qualification; broader kernel and deployed-runner qualification remain separate. |
-| macOS 26/27 FSKit | Explicit `FSKIT_SYNC_REPAIR` profile with compatibility-writer exclusion for every attached Mac mount. Host cache, append, and lock edges remain weaker than Linux. |
-| Files gateway | Authenticated cacheless peer reader; breaks delegated files for read and does not exclude Linux writers. |
+| Linux FUSE 7.31+ | `FRONTEND_PROFILE_LINUX`: subscriptions and file write delegations. Protocol-8 real-mount qualification pending. |
+| macOS 26/27 FSKit | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`: the volume's only writer while mounted; Linux peers read; a second Mac is refused. Durable mutation replies; no kernel cache revocation, append intent, or advisory locks. Native qualification pending. |
+| Files gateway | `FRONTEND_PROFILE_CACHELESS_READER`: authenticated read-only peer; breaks delegated files for read and does not exclude writers. |
 | Windows | No declared transport or production frontend. |
 
 A TTL, polling loop, or policy label cannot supply missing host-filesystem
-primitives. No FSKit or Windows production qualification is inferred from the
-Linux gates.
+primitives. No FSKit or Windows qualification is inferred from the Linux gates.
+The macOS contract, including why the Mac is an exclusive writer and what
+terminal enforcement cannot withdraw from the kernel, is in
+[fskit-mount.md](./fskit-mount.md).
 
 ## Security and routing
 
@@ -138,8 +148,10 @@ Neither mechanism creates a live mutation log or a second writable truth.
 
 | Subject | Document |
 | --- | --- |
-| Frozen wire, CLI, routing, and release surfaces | [COMPATIBILITY.md](../COMPATIBILITY.md) |
+| Launch contract: versions, profiles, frozen surfaces, qualification status | [COMPATIBILITY.md](../COMPATIBILITY.md) |
+| Authority wire encoding and handshake | [coherence-v2/wire.md](./coherence-v2/wire.md) |
 | Subscription/delegation protocol and stock-FUSE proofs | [portable-coherence.md](./portable-coherence.md) |
+| macOS FSKit mount | [fskit-mount.md](./fskit-mount.md) |
 | Visibility, durability, replay, locks, mmap, and xattrs | [consistency-model.md](./consistency-model.md) |
 | Failure and fencing | [failure-modes.md](./failure-modes.md) |
 | XFS confinement and storage implementation | [xfs-authority-architecture.md](./xfs-authority-architecture.md) |
@@ -150,8 +162,8 @@ Neither mechanism creates a live mutation log or a second writable truth.
 | Promoting one matched release to OpenSteer | [opensteer-production-deployment.md](./opensteer-production-deployment.md) |
 | Machine-local routing | [graft-security.md](./graft-security.md) |
 | Black-box qualification | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |
+| Power-cut durability evidence | [power-loss-testing.md](./power-loss-testing.md) |
+| Measurement method and the LAN target | [performance.md](./performance.md) |
 
-Protocol-5 qualification receipts, the Linux 6.12.100 private ABI description,
-and the private-kernel vNext specification are retained as historical
-implementation records; the ABI's kernel patch series itself is only in git
-history. None of them defines the protocol-7 product.
+Superseded designs, dated qualification receipts, and earlier protocol
+generations live only in git history.
