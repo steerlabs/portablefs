@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
-	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 type recallProgressHandler struct {
@@ -36,11 +35,11 @@ func (h *recallProgressHandler) Handle(ctx context.Context, r *authoritypb.Reque
 }
 
 func TestDelegatedFlushProgressUnderOrdinarySaturation(t *testing.T) {
-	for _, limit := range []int{3, 8, 9, 128} {
-		for _, ordered := range []bool{false, true} {
-			t.Run(fmt.Sprintf("slots=%d/ordered=%t", limit, ordered), func(t *testing.T) {
+	for _, limit := range []int{9, 128} {
+		{
+			t.Run(fmt.Sprintf("slots=%d", limit), func(t *testing.T) {
 				h := &recallProgressHandler{
-					orderedCapabilityHandler: orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: limit}, enabled: ordered},
+					orderedCapabilityHandler: orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: limit}},
 					entered:                  make(chan struct{}, limit), release: make(chan struct{}),
 				}
 				address, tls, stop := startTestServer(t, h, limit, time.Minute)
@@ -76,7 +75,7 @@ func TestDelegatedFlushProgressUnderOrdinarySaturation(t *testing.T) {
 				if err != nil || reply.GetWrite().GetCommittedSize() != 1 {
 					t.Fatalf("flush could not progress while ordinary calls waited: %v, %v", reply, err)
 				}
-				ordinary, blocking, flush := serverExecutionLanes(limit, c.cfg.FrontendProfile, c.SupportsOrderedFlush())
+				ordinary, blocking, flush := executionLanes(limit, c.cfg.FrontendProfile)
 				if cap(c.ordinary.permits) != ordinary || cap(c.blocking.permits) != blocking || cap(c.flush.permits) != flush || ordinary+blocking+flush != limit {
 					t.Fatal("client and server execution budgets differ")
 				}
@@ -85,104 +84,10 @@ func TestDelegatedFlushProgressUnderOrdinarySaturation(t *testing.T) {
 	}
 }
 
-type orderedCapabilityHandler struct {
-	clientTestHandler
-	enabled        bool
-	omitActivation bool
-}
+type orderedCapabilityHandler struct{ clientTestHandler }
 
 func (h *orderedCapabilityHandler) Handle(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
-	response := h.clientTestHandler.Handle(ctx, r)
-	if h.enabled {
-		if hello := response.GetHello(); hello != nil && hasFeatures(r.GetHello().Features, []string{orderedDelegatedFlushFeature}) {
-			hello.Features = append(hello.Features, orderedDelegatedFlushFeature)
-		}
-		if active := response.GetActivate(); active != nil && !h.omitActivation {
-			active.Features = append(active.Features, orderedDelegatedFlushFeature)
-		}
-	}
-	return response
-}
-
-func TestActivationCannotChangeNegotiatedFlushCapacity(t *testing.T) {
-	h := &orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, enabled: true, omitActivation: true}
-	address, tls, stop := startTestServer(t, h, 9, time.Minute)
-	defer stop()
-	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tls, "volume", 9, 9))
-	if client != nil {
-		_ = client.Close()
-	}
-	if err == nil {
-		t.Fatal("published mismatched client and server flush partitions")
-	}
-}
-func TestOrderedFlushNegotiatesIsolatedClientAndServerLanes(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		client int
-		server bool
-		want   bool
-	}{{"legacy", 9, false, false}, {"ordered", 9, true, true}, {"small client", 3, true, false}} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := &orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, enabled: tc.server}
-			address, tls, stop := startTestServer(t, h, 9, time.Minute)
-			defer stop()
-			c, err := DialClient(t.Context(), coherentTestClientConfig(address, tls, "volume", uint32(tc.client), tc.client))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer c.Close()
-			if c.SupportsOrderedFlush() != tc.want {
-				t.Fatal("ordered capability ignored Hello/lane bound")
-			}
-			request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{FlushSequence: 1, Delegation: &authoritypb.DelegationRef{}}}}
-			if tc.want {
-				for _, metadata := range []*authoritypb.Request{
-					{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Delegation: &authoritypb.DelegationRef{}}}},
-					{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Delegation: &authoritypb.DelegationRef{}}}},
-				} {
-					if c.laneFor(metadata) != &c.flush {
-						t.Fatal("metadata bypassed shared server flush bound")
-					}
-				}
-				if c.laneFor(request) != &c.flush || cap(c.flush.permits) != 4 || len(c.flush.slots) != 4 || cap(c.ordinary.permits) != 1 || cap(c.blocking.permits) != 4 {
-					t.Fatal("client lanes overlap or exceed negotiated bound")
-				}
-			} else if _, err := c.CallMutation(t.Context(), request); !errors.Is(err, syscall.EOPNOTSUPP) {
-				t.Fatalf("unnegotiated ordinal dispatched: %v", err)
-			}
-		})
-	}
-	for _, ordered := range []bool{false, true} {
-		ordinary, blocking, flush := serverExecutionLanes(9, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, ordered)
-		wantFlush := 1
-		if ordered {
-			wantFlush = 4
-		}
-		if flush != wantFlush || ordinary+blocking+flush != 9 || ordinary < 1 || blocking != 4 {
-			t.Fatalf("server lane mismatch: %d %d %d", ordinary, blocking, flush)
-		}
-	}
-}
-func TestTransportPairRefusesOrderedLaneModeMismatch(t *testing.T) {
-	r, err := newTransportRegistry(4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	peer, set := volumeserver.PeerIdentity{1}, connectionSetID{1}
-	profile := authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile, func() {}, func() error { return nil }, true, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile, func() {}, func() error { return nil }, false, false); !errors.Is(err, ErrTransportBinding) {
-		t.Fatal("CONTROL changed ordered mode", err)
-	}
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile, func() {}, func() error { return nil }, true, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile, func() {}, func() error { return nil }, false, false); !errors.Is(err, ErrTransportBinding) {
-		t.Fatal("replacement changed ordered mode", err)
-	}
+	return h.clientTestHandler.Handle(ctx, r)
 }
 
 type orderedSocketHandler struct {
@@ -222,7 +127,7 @@ func (h *orderedSocketHandler) Handle(ctx context.Context, r *authoritypb.Reques
 	return &authoritypb.Response{RequestId: r.RequestId, Epoch: h.Epoch(), Mutation: &authoritypb.MutationState{Slot: r.GetMutation().GetSlot(), AcceptedSequence: r.GetMutation().GetSequence()}, Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(len(w.Data))}}}
 }
 func newOrderedSocketHandler(replay bool) *orderedSocketHandler {
-	h := &orderedSocketHandler{orderedCapabilityHandler: orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, enabled: true}, entered: make(chan uint64, 8), received: make(map[uint64]*authoritypb.Request), replayOne: replay}
+	h := &orderedSocketHandler{orderedCapabilityHandler: orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}}, entered: make(chan uint64, 8), received: make(map[uint64]*authoritypb.Request), replayOne: replay}
 	for i := range h.predecessor {
 		h.predecessor[i] = make(chan struct{})
 	}

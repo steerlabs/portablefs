@@ -20,7 +20,6 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 var (
@@ -61,21 +60,15 @@ type ClientConfig struct {
 	Purpose authoritypb.SessionPurpose
 	// FrontendProfile selects one immutable cache-coherence contract for the
 	// complete session. Linux mounts use volume subscriptions and file write
-	// delegations; FSKit mounts use the platform synchronous-repair stream.
+	// delegations; FSKit mounts use the exclusive-writer contract.
 	FrontendProfile authoritypb.FrontendProfile
-	// The FSKit repair declaration is mandatory only for FSKIT_SYNC_REPAIR and
-	// forbidden for every other profile.
-	FskitCachedNameCapacity uint64
-	FskitRepairBudget       time.Duration
-	FskitNamespaceRepair    authoritypb.NamespaceRepair
 	// RoutesRevision is the 32-byte digest of the canonical machine-local
 	// routing rules this mount will run. Required for every profile: a mount
 	// that routes a subtree to local disk hides it from every peer, so the
 	// authority refuses any mount whose topology is not the volume's active one.
 	RoutesRevision [32]byte
-	// RequireMountEnrollmentReauthorization makes automatic hosted renewal an
-	// attach-time contract. A mount configured with a Manager enrollment never
-	// starts against an authority that cannot verify enrollment-backed grants.
+	// RequireMountEnrollmentReauthorization requires an installed signed
+	// authorization deadline before an automatically renewed mount can start.
 	RequireMountEnrollmentReauthorization bool
 	// ObservePreKernelMountAbsence is the strict mount supervisor's exact local
 	// observation that this mount attempt has not installed its kernel source.
@@ -168,11 +161,8 @@ type lane struct {
 }
 
 type Client struct {
-	batchedClose          atomic.Bool
-	orderedDelegatedFlush atomic.Bool
-	versionedMetadata     atomic.Bool // fskit-versioned-metadata-v1: Hello offer and echo, Activate confirmation
-	flush                 lane
-	cfg                   ClientConfig
+	flush lane
+	cfg   ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
@@ -184,13 +174,11 @@ type Client struct {
 	attachAttemptID           [32]byte
 	ordinary                  lane
 	blocking                  lane
-	repairControl             lane
 	controlPoll               lane
 	controlAck                lane
 	changeAck                 lane
 	liveness                  lane
 	epoch                     []byte
-	helloFeatures             []string
 	negotiatedFrame           uint32
 	negotiatedInFlight        uint32
 	proof                     *authoritypb.SessionProof
@@ -200,7 +188,6 @@ type Client struct {
 	currentAuthorization      time.Time // installed now; Reauthorize replaces the activation deadline
 	maxRead                   uint32
 	maxWrite                  uint32
-	maxFskitWrite             uint64
 	lease                     time.Duration
 	releaseInvalidIncarnation atomic.Uint64
 	releaseIncarnation        uint64 // protected by the single controlAck permit
@@ -212,8 +199,6 @@ type Client struct {
 	subscriptionIncarnation   uint64
 	subscriptionHorizonNanos  uint64
 	subscriptionDeadline      time.Time
-	fskitRepairCursor         *authoritypb.VisibilityCursor
-	sessionReauthorization    atomic.Bool
 	poisoned                  atomic.Bool
 	closed                    atomic.Bool
 	fatalMu                   sync.Mutex
@@ -273,8 +258,8 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if cfg.MaxInFlight < 2 {
 		return nil, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
 	}
-	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && cfg.MaxInFlight < 3 {
-		return nil, errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
+	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && cfg.MaxInFlight < MinimumLinuxInFlight {
+		return nil, errors.New("authorityrpc: Linux max-in-flight must be at least 9 for ordinary work, four ordered flushes, and blocking waits")
 	}
 	if uint64(cfg.ReplaySlots) < uint64(cfg.MaxInFlight) {
 		return nil, errors.New("authorityrpc: replay slots must cover every possible in-flight mutation")
@@ -290,31 +275,15 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 			return nil, errors.New("authorityrpc: strict coherence requires an exact pre-kernel mount-absence observer")
 		}
 		switch cfg.FrontendProfile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-			if cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
-				cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
-				return nil, errors.New("authorityrpc: Linux subscription profile cannot declare FSKit repair state")
-			}
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-			if cfg.FskitCachedNameCapacity == 0 || cfg.FskitCachedNameCapacity > math.MaxUint32 ||
-				cfg.FskitRepairBudget < time.Millisecond || cfg.FskitRepairBudget%time.Millisecond != 0 {
-				return nil, errors.New("authorityrpc: FSKit repair profile requires representable cache capacity and repair budget")
-			}
-			switch cfg.FskitNamespaceRepair {
-			case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
-				authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED,
-				authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED:
-			default:
-				return nil, errors.New("authorityrpc: FSKit repair profile requires an FSKit namespace repair primitive")
-			}
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+			authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER,
+			authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE:
 		default:
 			return nil, errors.New("authorityrpc: mount client requires an explicit frontend profile")
 		}
 	} else if cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
 		if cfg.RoutesRevision != ([32]byte{}) || cfg.ObservePreKernelMountAbsence != nil ||
-			cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED ||
-			cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
-			cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
+			cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED {
 			return nil, errors.New("authorityrpc: route-admin client cannot declare mount cache or route state")
 		}
 	} else {
@@ -327,13 +296,12 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
 	c := &Client{
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
-		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
-		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
-		repairControl: lane{permits: make(chan struct{}, 1)},
-		controlPoll:   lane{permits: make(chan struct{}, 1)},
-		controlAck:    lane{permits: make(chan struct{}, 1)},
-		changeAck:     lane{permits: make(chan struct{}, 1)},
-		liveness:      lane{permits: make(chan struct{}, 1)},
+		data:        newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
+		control:     newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
+		controlPoll: lane{permits: make(chan struct{}, 1)},
+		controlAck:  lane{permits: make(chan struct{}, 1)},
+		changeAck:   lane{permits: make(chan struct{}, 1)},
+		liveness:    lane{permits: make(chan struct{}, 1)},
 	}
 	connectionSetID, err := randomProtocolIdentity()
 	if err != nil {
@@ -356,7 +324,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 // is published. Both peers use the same partition: a flush must never wait for
 // ordinary work whose completion depends on that flush.
 func (c *Client) initializeExecutionLanes() {
-	ordinary, blocking, flush := serverExecutionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, c.SupportsOrderedFlush())
+	ordinary, blocking, flush := executionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile)
 	slots := make([]clientSlot, c.cfg.ReplaySlots)
 	blockingBase := len(slots) - blocking
 	flushBase := blockingBase - flush
@@ -365,11 +333,6 @@ func (c *Client) initializeExecutionLanes() {
 	if flush != 0 {
 		c.flush = lane{permits: make(chan struct{}, flush), slots: slots[flushBase:blockingBase], base: uint32(flushBase)}
 	}
-}
-
-func (c *Client) canPipelineFlushes() bool {
-	_, _, flush := serverExecutionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, true)
-	return flush == volumeserver.OrderedFlushWindow
 }
 
 // attachBody builds the attach request for exactly one session purpose. The
@@ -391,11 +354,6 @@ func (c *Client) attachBody() *authoritypb.AttachRequest {
 	}
 	attach.RoutesRevision = append([]byte(nil), c.cfg.RoutesRevision[:]...)
 	attach.FrontendProfile = c.cfg.FrontendProfile
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		attach.FskitCachedNameCapacity = uint32(c.cfg.FskitCachedNameCapacity)
-		attach.FskitRepairBudgetMillis = uint64(c.cfg.FskitRepairBudget / time.Millisecond)
-		attach.FskitNamespaceRepair = c.cfg.FskitNamespaceRepair
-	}
 	return attach
 }
 
@@ -422,14 +380,11 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	}
 	c.lifecycle.Lock()
 	c.epoch = append([]byte(nil), data.epoch...)
-	c.helloFeatures = append([]string(nil), data.features...)
 	c.negotiatedFrame = data.maxFrame
 	c.negotiatedInFlight = data.maxInFlight
 	c.maxRead = data.maxRead
 	c.maxWrite = data.maxWrite
-	c.maxFskitWrite = data.maxFskitWrite
 	c.lifecycle.Unlock()
-	c.sessionReauthorization.Store(hasFeatures(data.features, []string{sessionReauthorizationFeature}))
 
 	attachRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Attach{Attach: c.attachBody()}}
 	response, err := rawRoundTrip(data.conn, data.maxFrame, attachRequest)
@@ -648,14 +603,14 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	if active.GetFrontendProfile() != c.cfg.FrontendProfile {
 		return errors.New("authorityrpc: activation returned the wrong frontend profile")
 	}
-	lease := time.Duration(active.GetSessionLeaseMilliseconds()) * time.Millisecond
-	if lease <= 0 {
-		return errors.New("authorityrpc: authority omitted session lease")
+	leaseMillis := active.GetSessionLeaseMilliseconds()
+	if leaseMillis == 0 || leaseMillis > uint64(math.MaxInt64/int64(time.Millisecond)) {
+		return errors.New("authorityrpc: authority omitted a representable positive session lease")
 	}
+	lease := time.Duration(leaseMillis) * time.Millisecond
 	authorizationDeadline := time.Unix(0, active.GetAuthorizationDeadlineUnixNanos())
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
-		if active.GetRoot() != nil || len(active.GetRoutesRevision()) != len(c.routesRevision) ||
-			active.GetLeaseCursor() != nil || active.GetFskitRepairCursor() != nil {
+		if active.GetRoot() != nil || len(active.GetRoutesRevision()) != len(c.routesRevision) {
 			return errors.New("authorityrpc: route-admin activation exposed mount state")
 		}
 		c.lifecycle.Lock()
@@ -666,30 +621,6 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 		}
 		copy(c.routesRevision[:], active.GetRoutesRevision())
 		return nil
-	}
-	required, ok := activateFeatures(c.cfg.FrontendProfile)
-	if !ok || !hasFeatures(active.GetFeatures(), required) {
-		return errors.New("authorityrpc: authority omitted required frontend-profile features")
-	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		if !hasFeatures(active.GetFeatures(), []string{fskitDurableMutationsFeature}) {
-			return errors.New("authorityrpc: FSKit authority omitted fskit-durable-mutations-v1")
-		}
-		// The daemon's one release owner retires closes through CloseBatch's
-		// exact replay; there is no per-handle Close fallback to negotiate down to.
-		if !hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}) {
-			return errors.New("authorityrpc: FSKit authority omitted batched-close-v1")
-		}
-		// Hello already required the echo; Activate must confirm the same
-		// contract for this exact session. There is no uncached mode to fall to.
-		if !hasFeatures(active.GetFeatures(), []string{fskitVersionedMetadataFeature}) {
-			return errors.New("authorityrpc: FSKit activation did not confirm fskit-versioned-metadata-v1")
-		}
-	}
-	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
-		active.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
-	) {
-		return errors.New("authorityrpc: activation omitted Manager-enrolled mount reauthorization")
 	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !authorizationDeadline.After(time.Now()) {
 		return errors.New("authorityrpc: automatic mount activation omitted its signed authorization deadline")
@@ -703,42 +634,17 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 		!equalBytes(active.GetRoutesRevision(), c.cfg.RoutesRevision[:]) {
 		return errors.New("authorityrpc: activation did not confirm the exact routing revision")
 	}
-	fskitCursor := active.GetFskitRepairCursor()
-	switch c.cfg.FrontendProfile {
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-		if active.GetLeaseCursor() != nil || fskitCursor != nil {
-			return errors.New("authorityrpc: authority returned obsolete Linux lease activation state")
-		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-		if active.GetLeaseCursor() != nil || fskitCursor == nil || fskitCursor.GetSequence() == 0 ||
-			fskitCursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE ||
-			c.maxFskitWrite < RequiredFskitWriteBytes {
-			return errors.New("authorityrpc: authority returned invalid FSKit repair activation state")
-		}
-	default:
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED || !validFrontendProfile(c.cfg.FrontendProfile) {
 		return errors.New("authorityrpc: activation has no mount frontend profile")
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	// Linux treats CloseBatch as optional; FSKit required it above.
-	c.batchedClose.Store((c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES ||
-		c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR) &&
-		hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
-	ordered := c.canPipelineFlushes() && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature})
-	if ordered && !hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}) {
-		return errors.New("authorityrpc: activation changed the negotiated flush admission mode")
-	}
-	c.orderedDelegatedFlush.Store(ordered)
-	c.versionedMetadata.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
 	if active.GetAuthorizationDeadlineUnixNanos() != 0 {
 		c.authorizationDeadline = authorizationDeadline
 		c.currentAuthorization = authorizationDeadline
-	}
-	if fskitCursor != nil {
-		c.fskitRepairCursor = proto.Clone(fskitCursor).(*authoritypb.VisibilityCursor)
 	}
 	return nil
 }
@@ -814,10 +720,7 @@ func (c *Client) Root() *authoritypb.Item {
 	return proto.Clone(c.root).(*authoritypb.Item)
 }
 
-// Epoch is the authority incarnation this client attached to. A strict
-// frontend carries it across its local cache-coherence boundary and echoes it
-// on every visibility acknowledgement; an acknowledgement for any other epoch
-// is stale by definition and must never reach the authority.
+// Epoch is the authority incarnation binding this mount and its local proofs.
 func (c *Client) Epoch() []byte {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
@@ -833,31 +736,15 @@ func (c *Client) IOLimits() (maxRead, maxWrite uint32) {
 	return c.maxRead, c.maxWrite
 }
 
-// MaxWriteTransactionBytes is the FSKit profile's negotiated bound for one
-// framework write callback. DATA frames remain bounded by IOLimits; the
-// authority applies the logical write only at the final COMMIT.
-func (c *Client) MaxWriteTransactionBytes() uint64 {
-	c.lifecycle.Lock()
-	defer c.lifecycle.Unlock()
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return 0
-	}
-	return c.maxFskitWrite
-}
-
 // DataPlaneOperationLimit is the number of ordinary filesystem calls a mount
-// may issue concurrently on DATA. Protocol 6 gives lease/repair control and
+// may issue concurrently on DATA. Linux coherence control and
 // liveness a separate physical CONTROL transport, so those operations consume
 // neither a DATA socket permit nor a DATA replay slot.
 func (c *Client) DataPlaneOperationLimit() int {
 	return cap(c.ordinary.permits)
 }
 
-// SessionID is the authority-assigned session ID from the attach reply. A
-// strict frontend needs it to recognise its own mutations in a visibility
-// event's initiator field: that comparison is what exempts the frontend's own
-// in-flight callback from its own PREPARE drain, so without it a strict mount
-// would deadlock against itself and must refuse to run.
+// SessionID binds local operations and liveness to this mount incarnation.
 func (c *Client) SessionID() []byte {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
@@ -879,9 +766,6 @@ func (c *Client) SessionLease() time.Duration {
 func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64) (time.Time, error) {
 	if len(token) == 0 || sequence == 0 {
 		return time.Time{}, syscall.EINVAL
-	}
-	if !c.sessionReauthorization.Load() {
-		return time.Time{}, syscall.EOPNOTSUPP
 	}
 	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{
 		AccessToken: append([]byte(nil), token...), Sequence: sequence,
@@ -1015,13 +899,13 @@ func (c *Client) AuthorizationDeadline() time.Time {
 	return c.currentAuthorization
 }
 
-// KeepAlive renews this exact session. For a session that negotiated
-// fskit-versioned-metadata-v1 it returns the authority's relative cache proof
+// KeepAlive renews this exact session. For an FSKit-exclusive session it
+// returns the authority's relative cache proof
 // R; every other session returns zero. Only a reply of the complete success
 // shape renews: anything else ends the session and never yields a proof. The
 // frame layer owns the proof's own grammar (nonzero, whole milliseconds, at
 // most MaxCacheProof, only on a plain success envelope); this method owns what
-// depends on the session: the proof is present on every successful negotiated
+// depends on the session: the proof is present on every successful FSKit
 // renewal and never exceeds the advertised lease. An overgrant is never
 // clamped. R is relative to the authority; the caller anchors it at its own
 // request start.
@@ -1036,43 +920,18 @@ func (c *Client) KeepAlive(ctx context.Context) (time.Duration, error) {
 		c.signalSessionEnd(err)
 		return 0, err
 	}
-	if !c.versionedMetadata.Load() {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		// validateSessionProofPlacement already refused a proof here.
 		return 0, nil
 	}
 	proof, lease := response.GetSessionValidForNanos(), c.SessionLease()
 	if proof == 0 || lease <= 0 || proof > uint64(lease) {
-		err := fmt.Errorf("%w: negotiated keepalive proof %dns is missing or exceeds the advertised lease %s",
+		err := fmt.Errorf("%w: FSKit keepalive proof %dns is missing or exceeds the advertised lease %s",
 			ErrTransportBinding, proof, lease)
 		c.signalSessionEnd(err)
 		return 0, err
 	}
 	return time.Duration(proof), nil
-}
-
-// keepAliveSucceeded is the one definition of a successful KeepAlive reply,
-// used for both proof placement and consumption. The success envelope is
-// exactly the request ID, the epoch, and (when negotiated) the proof; any other
-// populated field marks a different outcome: an errno, uncertainty, failure
-// class, route record, replay state, post-state, terminal-delivery token,
-// repair retry, restore detail, application or visibility sequence, terminal
-// flag, retired lease state, a body, or an unknown field. Checking populated
-// fields rather than a list of known markers keeps a future non-success field
-// from passing.
-func keepAliveSucceeded(response *authoritypb.Response) bool {
-	if response == nil || len(response.ProtoReflect().GetUnknown()) != 0 {
-		return false
-	}
-	succeeded := true
-	response.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
-		switch field.Name() {
-		case "request_id", "epoch", "session_valid_for_nanos":
-			return true
-		}
-		succeeded = false
-		return false
-	})
-	return succeeded
 }
 
 // BeginLocalPublication admits one frontend reply served from daemon state as
@@ -1094,85 +953,6 @@ func (c *Client) BeginLocalPublication(force func(error)) (ResponseConsumption, 
 // terminal edge, before any public terminal signal.
 func (c *Client) LocalAdmissionOpen() bool {
 	return !c.poisoned.Load() && !c.closed.Load()
-}
-
-// InitialLeaseCursor remains as a nil-valued ABI accessor for the shared
-// portablefsd attachment checks. Protocol 7 activation rejects a non-nil lease
-// cursor and the Linux client has no executable lease-event path.
-func (c *Client) InitialLeaseCursor() *authoritypb.LeaseEventCursor { return nil }
-
-func (c *Client) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
-	c.lifecycle.Lock()
-	defer c.lifecycle.Unlock()
-	if c.fskitRepairCursor == nil {
-		return nil
-	}
-	return proto.Clone(c.fskitRepairCursor).(*authoritypb.VisibilityCursor)
-}
-
-// VisibilityRepairBudget is the exact per-phase deadline declared by this
-// FSKit mount at Attach. Linux subscription mounts have no platform repair
-// budget because their horizon and invalidation budget are wire-defined.
-func (c *Client) VisibilityRepairBudget() time.Duration {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return 0
-	}
-	return c.cfg.FskitRepairBudget
-}
-
-// NextVisibility long-polls the FSKit synchronous-repair stream. The method
-// name is retained at the daemon boundary; the wire body is explicitly
-// profile-scoped and cannot be sent by a Linux subscription mount.
-func (c *Client) NextVisibility(ctx context.Context, after *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error) {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return nil, syscall.EOPNOTSUPP
-	}
-	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{
-		NextFskitRepair: &authoritypb.NextVisibilityRequest{After: after},
-	}})
-	if err != nil {
-		return nil, err
-	}
-	if response.GetErrno() != 0 {
-		return nil, c.endFSKitMount(syscall.Errno(response.GetErrno()))
-	}
-	if response.GetFskitRepair() == nil {
-		return nil, c.endFSKitMount(errors.New("authorityrpc: FSKit repair poll returned no event"))
-	}
-	return proto.Clone(response.GetFskitRepair()).(*authoritypb.VisibilityEvent), nil
-}
-
-func (c *Client) AckVisibility(ctx context.Context, cursor *authoritypb.VisibilityCursor) error {
-	return c.AckVisibilityWithContention(ctx, cursor, false)
-}
-
-func (c *Client) AckVisibilityWithContention(ctx context.Context, cursor *authoritypb.VisibilityCursor, orderedAdmissionContended bool) error {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return syscall.EOPNOTSUPP
-	}
-	if cursor == nil {
-		return syscall.EINVAL
-	}
-	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_AckFskitRepair{
-		AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Cursor: cursor, OrderedAdmissionContended: orderedAdmissionContended,
-		},
-	}})
-	if err != nil {
-		return err
-	}
-	if response.GetErrno() != 0 {
-		return c.endFSKitMount(syscall.Errno(response.GetErrno()))
-	}
-	return nil
-}
-
-// endFSKitMount makes a synchronous-repair protocol failure terminal. The
-// Linux subscription profile handles coherence refusal by horizon expiry and
-// cold resubscription instead of ending the mount.
-func (c *Client) endFSKitMount(cause error) error {
-	c.signalSessionEnd(ErrSessionEnded)
-	return cause
 }
 
 // ApplyRoutes installs a new machine-local routing declaration for the whole
@@ -1568,7 +1348,7 @@ func (c *Client) forceResponseConsumptionDrain() {
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
 	if c.flush.permits != nil && delegatedFlushRequest(request) {
 		// Flush progress is independent of ordinary calls waiting on recall,
-		// even without ordered pipelining. Metadata shares the server's flush
+		// with four ordered writes. Metadata shares the server's flush
 		// bound so it cannot strand an ordered predecessor behind successors.
 		return &c.flush
 	}
@@ -1582,9 +1362,6 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 		request.GetDelegationRecallAck() != nil || request.GetDelegationBreakAck() != nil ||
 		request.GetDelegationModeChangeAck() != nil || request.GetDelegationRelease() != nil {
 		return &c.controlAck
-	}
-	if request.GetNextFskitRepair() != nil || request.GetAckFskitRepair() != nil {
-		return &c.repairControl
 	}
 	if request.GetReauthorize() != nil || request.GetKeepAlive() != nil || request.GetDetach() != nil ||
 		request.GetTerminalDeliveryReceipt() != nil || request.GetRenewSubscription() != nil {
@@ -1753,13 +1530,13 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 }
 
 // validateSessionProofPlacement admits session_valid_for_nanos only on a
-// successful KeepAlive to a session that negotiated it. The frame layer cannot
-// see the request or the negotiation; anywhere else the proof is an
+// successful KeepAlive to an FSKit-exclusive session. The frame layer cannot
+// see the request or the profile; anywhere else the proof is an
 // unrequested promise the client must refuse rather than ignore.
 func (c *Client) validateSessionProofPlacement(request *authoritypb.Request, response *authoritypb.Response) error {
 	if response.GetSessionValidForNanos() != 0 &&
-		(!c.versionedMetadata.Load() || request.GetKeepAlive() == nil || !keepAliveSucceeded(response)) {
-		return fmt.Errorf("%w: session_valid_for_nanos outside a negotiated successful keepalive", ErrTransportBinding)
+		(c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE || request.GetKeepAlive() == nil || !keepAliveSucceeded(response)) {
+		return fmt.Errorf("%w: session_valid_for_nanos outside a successful FSKit keepalive", ErrTransportBinding)
 	}
 	return nil
 }
@@ -1769,21 +1546,12 @@ func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response)
 		return fmt.Errorf("%w: terminal session response omitted ESTALE", ErrTransportBinding)
 	}
 
-	// The schema keeps historical tags to prevent accidental reuse. This is a
-	// rejection guard shared by every profile, not an executable v6 client.
-	if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil {
-		return fmt.Errorf("%w: peer sent retired protocol state", ErrTransportBinding)
-	}
 	switch c.cfg.FrontendProfile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
+		if response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
 			return fmt.Errorf("%w: cacheless reader received cache participation state", ErrTransportBinding)
 		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
-		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
-			return fmt.Errorf("%w: Linux subscription session received FSKit response state", ErrTransportBinding)
-		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE:
 		if response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 {
 			return fmt.Errorf("%w: FSKit session received Linux subscription state", ErrTransportBinding)
 		}
@@ -1935,7 +1703,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		return nil, nil, syscall.EINVAL
 	}
 	if err := c.reconnectTransport(ctx, role); err != nil {
-		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			c.signalSessionEnd(err)
 		}
 		return nil, nil, err
@@ -2003,11 +1771,6 @@ func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request)
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
 
-const orderedDelegatedFlushFeature = "ordered-delegated-flush-v1"
-
-// SupportsOrderedFlush is negotiated at activation for this exact session.
-func (c *Client) SupportsOrderedFlush() bool { return c.orderedDelegatedFlush.Load() }
-
 type segmentedWriteKey struct{}
 type segmentedWrite struct {
 	request  *authoritypb.Request
@@ -2062,7 +1825,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 	if c.poisoned.Load() {
 		return nil, nil, ErrTransportUncertain
 	}
-	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && !c.SupportsOrderedFlush() {
+	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
 		return nil, nil, syscall.EOPNOTSUPP
 	}
 	role, err := roleForRequest(request)
@@ -2211,7 +1974,7 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 			}
 		}
 		if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE &&
-			c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			c.signalSessionEnd(ErrSessionEnded)
 		}
 		// The volume's routing topology moved under this mount. Continuing would
@@ -2253,10 +2016,10 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	idle := len(pending) == 0 && !c.closed.Load()
 	// Losing an idle DATA socket is only a transport event: the next safe read
 	// or exact mutation replay lazily resumes that one role. CONTROL owns the
-	// v7 subscription horizon, which independently withdraws stale caches. An
+	// subscription horizon, which independently withdraws stale caches. An
 	// idle socket loss cannot prove an epoch or session outcome. Other profiles
 	// retain their existing terminal CONTROL contract.
-	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		c.signalSessionEnd(err)
 	}
 	transport.pendingMu.Unlock()
@@ -2315,6 +2078,3 @@ func equalBytes(a, b []byte) bool {
 	}
 	return different == 0
 }
-
-// SupportsBatchedClose reports the optional capability of this active epoch.
-func (c *Client) SupportsBatchedClose() bool { return c.batchedClose.Load() }

@@ -25,7 +25,7 @@ func (h controlProgressHandler) Handle(ctx context.Context, req *authoritypb.Req
 }
 
 func TestDataBudgetSaturationPreservesControlAndBootstrap(t *testing.T) {
-	server := &Server{Handler: controlProgressHandler{echoHandler{epoch: []byte("epoch")}}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
+	server := &Server{Handler: controlProgressHandler{echoHandler{epoch: []byte("epoch")}}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
 	pair := startActiveTestPair(t, server)
 	defer pair.close(t)
 	// Reading Activate's response can precede its worker releasing the frame.
@@ -53,7 +53,6 @@ func TestDataBudgetSaturationPreservesControlAndBootstrap(t *testing.T) {
 	}
 	for index, body := range []any{
 		&authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
-		&authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
 		&authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}},
 		&authoritypb.Request_TerminalDeliveryReceipt{TerminalDeliveryReceipt: &authoritypb.TerminalDeliveryReceipt{Token: bytes.Repeat([]byte{1}, 16)}},
 		&authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{}},
@@ -63,8 +62,6 @@ func TestDataBudgetSaturationPreservesControlAndBootstrap(t *testing.T) {
 		// same boundary used by production, rather than a byte-budget-only fake.
 		switch b := body.(type) {
 		case *authoritypb.Request_KeepAlive:
-			request.Body = b
-		case *authoritypb.Request_AckFskitRepair:
 			request.Body = b
 		case *authoritypb.Request_ChangeAck:
 			request.Body = b
@@ -177,7 +174,7 @@ func TestInboundBudgetRequiresDataAndFixedControlReserve(t *testing.T) {
 			t.Fatalf("frame %d minimum=%d want %d", test.frame, got, test.want+12<<20)
 		}
 	}
-	server := &Server{Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4, MaxFrameBytesInFlight: MinimumFrameBytesInFlight(4096) - 1, HandshakeTimeout: time.Second, IdleTimeout: time.Second, WriteTimeout: time.Second}
+	server := &Server{Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4, MaxFrameBytesInFlight: MinimumFrameBytesInFlight(4096) - 1, HandshakeTimeout: time.Second, IdleTimeout: time.Second, WriteTimeout: time.Second}
 	if _, err := server.validate(); err == nil {
 		t.Fatal("accepted total without DATA and reserve capacity")
 	}
@@ -290,7 +287,7 @@ func TestBootstrapDisconnectCancelsAttachAndResume(t *testing.T) {
 	for _, attach := range []bool{false, true} {
 		t.Run(map[bool]string{false: "Resume", true: "Attach"}[attach], func(t *testing.T) {
 			handler := disconnectBootstrapHandler{echoHandler: echoHandler{epoch: []byte("epoch")}, entered: make(chan struct{}), canceled: make(chan struct{}), blockAttach: attach}
-			server := &Server{Handler: handler, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4, MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
+			server := &Server{Handler: handler, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4, MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
 			var proof *authoritypb.SessionProof
 			setID := make([]byte, 32)
 			setID[0] = 7
@@ -354,7 +351,7 @@ func TestBootstrapDisconnectCancelsAttachAndResume(t *testing.T) {
 }
 
 func TestTrickledBootstrapFramesLeaveSharedCapacityForReconnect(t *testing.T) {
-	server := &Server{Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Minute, IdleTimeout: time.Minute, WriteTimeout: time.Second}
+	server := &Server{Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Minute, IdleTimeout: time.Minute, WriteTimeout: time.Second}
 	var header [frameHeaderBytes]byte
 	binary.BigEndian.PutUint32(header[:4], 4096)
 	for range 4 {

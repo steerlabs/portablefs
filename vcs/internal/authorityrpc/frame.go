@@ -13,6 +13,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 var (
@@ -28,8 +29,8 @@ const frameHeaderBytes = 8
 // admits 4096 entries, each at most 44 canonical bytes (16-byte ID, uint64
 // generation and applied sequence, including nested tags/lengths). 16 KiB of
 // headroom covers the request/session envelope, and also exceeds the 8192-byte
-// access-token bound used by Attach/Reauthorize and the 64 supported Hello
-// feature names. No bulk body is legal in CONTROL or bootstrap frames.
+// access-token bound used by Attach/Reauthorize. No bulk body is legal in
+// CONTROL or bootstrap frames.
 const maxControlFrameBytes uint32 = maxWireRepeatedElements*44 + 16<<10
 
 // A burst of 64 maximal CONTROL/bootstrap frames leaves room for concurrent
@@ -350,17 +351,18 @@ func writeFrameBulk(w io.Writer, max uint32, message proto.Message, segments [][
 	// Keep the fixed header and small protobuf metadata in one TLS write. The
 	// bulk body remains a second write so it is never copied into a staging
 	// buffer merely to recover writev-like shape above TLS.
-	prefix := make([]byte, frameHeaderBytes, frameHeaderBytes+proto.Size(message))
-	prefix, err = proto.MarshalOptions{Deterministic: true}.MarshalAppend(prefix, message)
+	metadata, err := canonicalBytes(message.ProtoReflect())
 	if carrier != nil {
 		*carrier = bulk
 	}
 	if err != nil {
-		return fmt.Errorf("encode protobuf frame: %w", err)
+		return fmt.Errorf("%w: %v", ErrFrameEncoding, err)
 	}
-	metadata := prefix[frameHeaderBytes:]
-	// Canonical encoding is produced by the typed deterministic marshaler.
-	// Reflective grammar and allocation bounds are checked once, on ingress.
+	if err := validateWireMessage(metadata, message.ProtoReflect().Descriptor()); err != nil {
+		return err
+	}
+	prefix := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata))
+	prefix = append(prefix, metadata...)
 	bulkBytes := uint64(len(bulk))
 	if segments != nil {
 		bulkBytes = segmentedBytes
@@ -404,13 +406,9 @@ func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 		if write := typed.GetWrite(); write != nil {
 			return &write.Data, nil
 		}
-		if write := typed.GetFskitWrite(); write != nil &&
-			write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA {
-			return &write.Data, nil
-		}
 	case *authoritypb.Response:
 		if proof := typed.GetSessionValidForNanos(); proof != 0 &&
-			(proof > uint64(MaxCacheProof) || proof%uint64(time.Millisecond) != 0 || typed.GetErrno() != 0 || typed.GetBody() != nil || typed.GetUncertain() || typed.GetSessionTerminal() || typed.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED) {
+			(proof > uint64(MaxCacheProof) || proof%uint64(time.Millisecond) != 0 || !keepAliveSucceeded(typed)) {
 			return nil, fmt.Errorf("%w: invalid KeepAlive validity proof", ErrFrameEncoding)
 		}
 		if read := typed.GetRead(); read != nil {
@@ -437,4 +435,29 @@ func writeAll(w io.Writer, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// keepAliveSucceeded is the one definition of a successful KeepAlive reply,
+// used for both proof placement and consumption. The success envelope is
+// exactly the request ID, the epoch, and (for FSKit) the proof; any other
+// populated field marks a different outcome: an errno, uncertainty, failure
+// class, route record, replay state, post-state, terminal-delivery token,
+// restore detail, application or visibility sequence, terminal flag, a body,
+// or an unknown field. Checking populated
+// fields rather than a list of known markers keeps a future non-success field
+// from passing.
+func keepAliveSucceeded(response *authoritypb.Response) bool {
+	if response == nil || len(response.ProtoReflect().GetUnknown()) != 0 {
+		return false
+	}
+	succeeded := true
+	response.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		switch field.Name() {
+		case "request_id", "epoch", "session_valid_for_nanos":
+			return true
+		}
+		succeeded = false
+		return false
+	})
+	return succeeded
 }

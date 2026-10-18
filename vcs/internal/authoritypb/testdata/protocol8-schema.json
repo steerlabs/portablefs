@@ -1,0 +1,4236 @@
+{
+  "name": "proto/authority/v1/authority.proto",
+  "package": "portablefs.authority.v1",
+  "message_type": [
+    {
+      "name": "Request",
+      "field": [
+        {
+          "name": "request_id",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "requestId"
+        },
+        {
+          "name": "epoch",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "epoch"
+        },
+        {
+          "name": "session",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SessionProof",
+          "json_name": "session"
+        },
+        {
+          "name": "mutation",
+          "number": 4,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Mutation",
+          "json_name": "mutation"
+        },
+        {
+          "name": "hello",
+          "number": 10,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.HelloRequest",
+          "oneof_index": 0,
+          "json_name": "hello"
+        },
+        {
+          "name": "attach",
+          "number": 11,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.AttachRequest",
+          "oneof_index": 0,
+          "json_name": "attach"
+        },
+        {
+          "name": "resume",
+          "number": 12,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ResumeRequest",
+          "oneof_index": 0,
+          "json_name": "resume"
+        },
+        {
+          "name": "keep_alive",
+          "number": 13,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.KeepAliveRequest",
+          "oneof_index": 0,
+          "json_name": "keepAlive"
+        },
+        {
+          "name": "detach",
+          "number": 14,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DetachRequest",
+          "oneof_index": 0,
+          "json_name": "detach"
+        },
+        {
+          "name": "cancel",
+          "number": 15,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CancelRequest",
+          "oneof_index": 0,
+          "json_name": "cancel"
+        },
+        {
+          "name": "reauthorize",
+          "number": 19,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReauthorizeRequest",
+          "oneof_index": 0,
+          "json_name": "reauthorize"
+        },
+        {
+          "name": "lookup",
+          "number": 20,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LookupRequest",
+          "oneof_index": 0,
+          "json_name": "lookup"
+        },
+        {
+          "name": "get_attr",
+          "number": 21,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.GetAttrRequest",
+          "oneof_index": 0,
+          "json_name": "getAttr"
+        },
+        {
+          "name": "set_attr",
+          "number": 22,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SetAttrRequest",
+          "oneof_index": 0,
+          "json_name": "setAttr"
+        },
+        {
+          "name": "create",
+          "number": 23,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CreateRequest",
+          "oneof_index": 0,
+          "json_name": "create"
+        },
+        {
+          "name": "mkdir",
+          "number": 24,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.MkdirRequest",
+          "oneof_index": 0,
+          "json_name": "mkdir"
+        },
+        {
+          "name": "unlink",
+          "number": 25,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.UnlinkRequest",
+          "oneof_index": 0,
+          "json_name": "unlink"
+        },
+        {
+          "name": "rename",
+          "number": 26,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.RenameRequest",
+          "oneof_index": 0,
+          "json_name": "rename"
+        },
+        {
+          "name": "link",
+          "number": 27,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LinkRequest",
+          "oneof_index": 0,
+          "json_name": "link"
+        },
+        {
+          "name": "symlink",
+          "number": 28,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SymlinkRequest",
+          "oneof_index": 0,
+          "json_name": "symlink"
+        },
+        {
+          "name": "readlink",
+          "number": 29,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReadlinkRequest",
+          "oneof_index": 0,
+          "json_name": "readlink"
+        },
+        {
+          "name": "open",
+          "number": 30,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.OpenRequest",
+          "oneof_index": 0,
+          "json_name": "open"
+        },
+        {
+          "name": "close",
+          "number": 31,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CloseRequest",
+          "oneof_index": 0,
+          "json_name": "close"
+        },
+        {
+          "name": "read",
+          "number": 32,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReadRequest",
+          "oneof_index": 0,
+          "json_name": "read"
+        },
+        {
+          "name": "fsync",
+          "number": 34,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.FsyncRequest",
+          "oneof_index": 0,
+          "json_name": "fsync"
+        },
+        {
+          "name": "read_dir",
+          "number": 35,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReadDirRequest",
+          "oneof_index": 0,
+          "json_name": "readDir"
+        },
+        {
+          "name": "reclaim",
+          "number": 36,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReclaimRequest",
+          "oneof_index": 0,
+          "json_name": "reclaim"
+        },
+        {
+          "name": "flush",
+          "number": 37,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.FlushRequest",
+          "oneof_index": 0,
+          "json_name": "flush"
+        },
+        {
+          "name": "get_xattr",
+          "number": 40,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.GetXattrRequest",
+          "oneof_index": 0,
+          "json_name": "getXattr"
+        },
+        {
+          "name": "set_xattr",
+          "number": 41,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SetXattrRequest",
+          "oneof_index": 0,
+          "json_name": "setXattr"
+        },
+        {
+          "name": "list_xattr",
+          "number": 42,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ListXattrRequest",
+          "oneof_index": 0,
+          "json_name": "listXattr"
+        },
+        {
+          "name": "remove_xattr",
+          "number": 43,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.RemoveXattrRequest",
+          "oneof_index": 0,
+          "json_name": "removeXattr"
+        },
+        {
+          "name": "stat_fs",
+          "number": 44,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.StatFSRequest",
+          "oneof_index": 0,
+          "json_name": "statFs"
+        },
+        {
+          "name": "sync_fs",
+          "number": 45,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SyncFSRequest",
+          "oneof_index": 0,
+          "json_name": "syncFs"
+        },
+        {
+          "name": "fallocate",
+          "number": 47,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.FallocateRequest",
+          "oneof_index": 0,
+          "json_name": "fallocate"
+        },
+        {
+          "name": "copy_file_range",
+          "number": 48,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CopyFileRangeRequest",
+          "oneof_index": 0,
+          "json_name": "copyFileRange"
+        },
+        {
+          "name": "tmpfile",
+          "number": 49,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.TmpfileRequest",
+          "oneof_index": 0,
+          "json_name": "tmpfile"
+        },
+        {
+          "name": "get_lock",
+          "number": 50,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.GetLockRequest",
+          "oneof_index": 0,
+          "json_name": "getLock"
+        },
+        {
+          "name": "set_lock",
+          "number": 51,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SetLockRequest",
+          "oneof_index": 0,
+          "json_name": "setLock"
+        },
+        {
+          "name": "activate",
+          "number": 52,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ActivateRequest",
+          "oneof_index": 0,
+          "json_name": "activate"
+        },
+        {
+          "name": "abort_attach",
+          "number": 53,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.AbortAttachRequest",
+          "oneof_index": 0,
+          "json_name": "abortAttach"
+        },
+        {
+          "name": "terminal_delivery_receipt",
+          "number": 54,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.TerminalDeliveryReceipt",
+          "oneof_index": 0,
+          "json_name": "terminalDeliveryReceipt"
+        },
+        {
+          "name": "apply_routes",
+          "number": 18,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ApplyRoutesRequest",
+          "oneof_index": 0,
+          "json_name": "applyRoutes"
+        },
+        {
+          "name": "write",
+          "number": 55,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.WriteRequest",
+          "oneof_index": 0,
+          "json_name": "write"
+        },
+        {
+          "name": "subscribe",
+          "number": 65,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SubscribeRequest",
+          "oneof_index": 0,
+          "json_name": "subscribe"
+        },
+        {
+          "name": "renew_subscription",
+          "number": 66,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.RenewSubscriptionRequest",
+          "oneof_index": 0,
+          "json_name": "renewSubscription"
+        },
+        {
+          "name": "next_control_event",
+          "number": 67,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.NextControlEventRequest",
+          "oneof_index": 0,
+          "json_name": "nextControlEvent"
+        },
+        {
+          "name": "change_ack",
+          "number": 68,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ChangeAck",
+          "oneof_index": 0,
+          "json_name": "changeAck"
+        },
+        {
+          "name": "delegation_recall_ack",
+          "number": 69,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRecallAck",
+          "oneof_index": 0,
+          "json_name": "delegationRecallAck"
+        },
+        {
+          "name": "delegation_break_ack",
+          "number": 70,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationBreakAck",
+          "oneof_index": 0,
+          "json_name": "delegationBreakAck"
+        },
+        {
+          "name": "delegation_mode_change_ack",
+          "number": 71,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationModeChangeAck",
+          "oneof_index": 0,
+          "json_name": "delegationModeChangeAck"
+        },
+        {
+          "name": "barrier",
+          "number": 72,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.BarrierRequest",
+          "oneof_index": 0,
+          "json_name": "barrier"
+        },
+        {
+          "name": "delegation_release",
+          "number": 73,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationReleaseRequest",
+          "oneof_index": 0,
+          "json_name": "delegationRelease"
+        },
+        {
+          "name": "close_batch",
+          "number": 74,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CloseBatchRequest",
+          "oneof_index": 0,
+          "json_name": "closeBatch"
+        },
+        {
+          "name": "wait_visibility",
+          "number": 75,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.WaitVisibilityRequest",
+          "oneof_index": 0,
+          "json_name": "waitVisibility"
+        }
+      ],
+      "oneof_decl": [
+        {
+          "name": "body"
+        }
+      ]
+    },
+    {
+      "name": "Response",
+      "field": [
+        {
+          "name": "request_id",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "requestId"
+        },
+        {
+          "name": "epoch",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "epoch"
+        },
+        {
+          "name": "errno",
+          "number": 3,
+          "label": 1,
+          "type": 5,
+          "json_name": "errno"
+        },
+        {
+          "name": "uncertain",
+          "number": 4,
+          "label": 1,
+          "type": 8,
+          "json_name": "uncertain"
+        },
+        {
+          "name": "mutation",
+          "number": 6,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.MutationState",
+          "json_name": "mutation"
+        },
+        {
+          "name": "failure",
+          "number": 7,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.FailureClass",
+          "json_name": "failure"
+        },
+        {
+          "name": "routes_mismatch",
+          "number": 8,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.RoutesMismatch",
+          "json_name": "routesMismatch"
+        },
+        {
+          "name": "terminal_delivery_token",
+          "number": 9,
+          "label": 1,
+          "type": 12,
+          "json_name": "terminalDeliveryToken"
+        },
+        {
+          "name": "post_state",
+          "number": 45,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.PostState",
+          "json_name": "postState"
+        },
+        {
+          "name": "restore_detail",
+          "number": 55,
+          "label": 1,
+          "type": 9,
+          "json_name": "restoreDetail"
+        },
+        {
+          "name": "applied_sequence",
+          "number": 56,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        },
+        {
+          "name": "volume_version",
+          "number": 67,
+          "label": 1,
+          "type": 4,
+          "json_name": "volumeVersion"
+        },
+        {
+          "name": "session_terminal",
+          "number": 69,
+          "label": 1,
+          "type": 8,
+          "json_name": "sessionTerminal"
+        },
+        {
+          "name": "visible_sequence",
+          "number": 70,
+          "label": 1,
+          "type": 4,
+          "json_name": "visibleSequence"
+        },
+        {
+          "name": "session_valid_for_nanos",
+          "number": 72,
+          "label": 1,
+          "type": 4,
+          "json_name": "sessionValidForNanos"
+        },
+        {
+          "name": "hello",
+          "number": 10,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.HelloReply",
+          "oneof_index": 0,
+          "json_name": "hello"
+        },
+        {
+          "name": "attach",
+          "number": 11,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.AttachReply",
+          "oneof_index": 0,
+          "json_name": "attach"
+        },
+        {
+          "name": "resume",
+          "number": 12,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ResumeReply",
+          "oneof_index": 0,
+          "json_name": "resume"
+        },
+        {
+          "name": "activate",
+          "number": 13,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ActivateReply",
+          "oneof_index": 0,
+          "json_name": "activate"
+        },
+        {
+          "name": "abort_attach",
+          "number": 14,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.AbortAttachReply",
+          "oneof_index": 0,
+          "json_name": "abortAttach"
+        },
+        {
+          "name": "lookup",
+          "number": 20,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LookupReply",
+          "oneof_index": 0,
+          "json_name": "lookup"
+        },
+        {
+          "name": "get_attr",
+          "number": 21,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.GetAttrReply",
+          "oneof_index": 0,
+          "json_name": "getAttr"
+        },
+        {
+          "name": "create",
+          "number": 22,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CreateReply",
+          "oneof_index": 0,
+          "json_name": "create"
+        },
+        {
+          "name": "readlink",
+          "number": 23,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReadlinkReply",
+          "oneof_index": 0,
+          "json_name": "readlink"
+        },
+        {
+          "name": "open",
+          "number": 24,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.OpenReply",
+          "oneof_index": 0,
+          "json_name": "open"
+        },
+        {
+          "name": "read",
+          "number": 25,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReadReply",
+          "oneof_index": 0,
+          "json_name": "read"
+        },
+        {
+          "name": "read_dir",
+          "number": 27,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReadDirReply",
+          "oneof_index": 0,
+          "json_name": "readDir"
+        },
+        {
+          "name": "get_xattr",
+          "number": 28,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.GetXattrReply",
+          "oneof_index": 0,
+          "json_name": "getXattr"
+        },
+        {
+          "name": "list_xattr",
+          "number": 29,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ListXattrReply",
+          "oneof_index": 0,
+          "json_name": "listXattr"
+        },
+        {
+          "name": "stat_fs",
+          "number": 30,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.StatFSReply",
+          "oneof_index": 0,
+          "json_name": "statFs"
+        },
+        {
+          "name": "get_lock",
+          "number": 31,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.GetLockReply",
+          "oneof_index": 0,
+          "json_name": "getLock"
+        },
+        {
+          "name": "link",
+          "number": 32,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LinkReply",
+          "oneof_index": 0,
+          "json_name": "link"
+        },
+        {
+          "name": "apply_routes",
+          "number": 34,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ApplyRoutesReply",
+          "oneof_index": 0,
+          "json_name": "applyRoutes"
+        },
+        {
+          "name": "sync_fs",
+          "number": 35,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SyncFSReply",
+          "oneof_index": 0,
+          "json_name": "syncFs"
+        },
+        {
+          "name": "reauthorize",
+          "number": 36,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ReauthorizeReply",
+          "oneof_index": 0,
+          "json_name": "reauthorize"
+        },
+        {
+          "name": "rename",
+          "number": 37,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.RenameReply",
+          "oneof_index": 0,
+          "json_name": "rename"
+        },
+        {
+          "name": "fallocate",
+          "number": 39,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.FallocateReply",
+          "oneof_index": 0,
+          "json_name": "fallocate"
+        },
+        {
+          "name": "copy_file_range",
+          "number": 40,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CopyFileRangeReply",
+          "oneof_index": 0,
+          "json_name": "copyFileRange"
+        },
+        {
+          "name": "tmpfile",
+          "number": 41,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.TmpfileReply",
+          "oneof_index": 0,
+          "json_name": "tmpfile"
+        },
+        {
+          "name": "terminal_delivery_receipt",
+          "number": 42,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.TerminalDeliveryReceiptReply",
+          "oneof_index": 0,
+          "json_name": "terminalDeliveryReceipt"
+        },
+        {
+          "name": "write",
+          "number": 44,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.WriteReply",
+          "oneof_index": 0,
+          "json_name": "write"
+        },
+        {
+          "name": "subscribe",
+          "number": 57,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.SubscribeReply",
+          "oneof_index": 0,
+          "json_name": "subscribe"
+        },
+        {
+          "name": "renew_subscription",
+          "number": 58,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.RenewSubscriptionReply",
+          "oneof_index": 0,
+          "json_name": "renewSubscription"
+        },
+        {
+          "name": "control_event",
+          "number": 59,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ControlEvent",
+          "oneof_index": 0,
+          "json_name": "controlEvent"
+        },
+        {
+          "name": "change_ack",
+          "number": 60,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ChangeAckReply",
+          "oneof_index": 0,
+          "json_name": "changeAck"
+        },
+        {
+          "name": "delegation_recall_ack",
+          "number": 61,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRecallAckReply",
+          "oneof_index": 0,
+          "json_name": "delegationRecallAck"
+        },
+        {
+          "name": "delegation_break_ack",
+          "number": 62,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationBreakAckReply",
+          "oneof_index": 0,
+          "json_name": "delegationBreakAck"
+        },
+        {
+          "name": "delegation_mode_change_ack",
+          "number": 63,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationModeChangeAckReply",
+          "oneof_index": 0,
+          "json_name": "delegationModeChangeAck"
+        },
+        {
+          "name": "barrier",
+          "number": 64,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.BarrierReply",
+          "oneof_index": 0,
+          "json_name": "barrier"
+        },
+        {
+          "name": "delegation_release",
+          "number": 65,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationReleaseReply",
+          "oneof_index": 0,
+          "json_name": "delegationRelease"
+        },
+        {
+          "name": "fsync",
+          "number": 66,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.FsyncReply",
+          "oneof_index": 0,
+          "json_name": "fsync"
+        },
+        {
+          "name": "close_batch",
+          "number": 68,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CloseBatchReply",
+          "oneof_index": 0,
+          "json_name": "closeBatch"
+        },
+        {
+          "name": "wait_visibility",
+          "number": 71,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.WaitVisibilityReply",
+          "oneof_index": 0,
+          "json_name": "waitVisibility"
+        }
+      ],
+      "oneof_decl": [
+        {
+          "name": "body"
+        }
+      ]
+    },
+    {
+      "name": "TerminalDeliveryReceipt",
+      "field": [
+        {
+          "name": "token",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "token"
+        }
+      ]
+    },
+    {
+      "name": "TerminalDeliveryReceiptReply"
+    },
+    {
+      "name": "SessionProof",
+      "field": [
+        {
+          "name": "id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "id"
+        },
+        {
+          "name": "generation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "generation"
+        },
+        {
+          "name": "resume_secret",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "resumeSecret"
+        }
+      ]
+    },
+    {
+      "name": "Mutation",
+      "field": [
+        {
+          "name": "slot",
+          "number": 1,
+          "label": 1,
+          "type": 13,
+          "json_name": "slot"
+        },
+        {
+          "name": "sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "sequence"
+        }
+      ]
+    },
+    {
+      "name": "MutationState",
+      "field": [
+        {
+          "name": "slot",
+          "number": 1,
+          "label": 1,
+          "type": 13,
+          "json_name": "slot"
+        },
+        {
+          "name": "accepted_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "acceptedSequence"
+        }
+      ]
+    },
+    {
+      "name": "RoutesMismatch",
+      "field": [
+        {
+          "name": "active_revision",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "activeRevision"
+        },
+        {
+          "name": "presented_revision",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "presentedRevision"
+        },
+        {
+          "name": "detail",
+          "number": 3,
+          "label": 1,
+          "type": 9,
+          "json_name": "detail"
+        },
+        {
+          "name": "session_refused",
+          "number": 4,
+          "label": 1,
+          "type": 8,
+          "json_name": "sessionRefused"
+        },
+        {
+          "name": "canonical_rules",
+          "number": 5,
+          "label": 1,
+          "type": 12,
+          "json_name": "canonicalRules"
+        }
+      ]
+    },
+    {
+      "name": "Item",
+      "field": [
+        {
+          "name": "token",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "token"
+        },
+        {
+          "name": "attr",
+          "number": 2,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Attr",
+          "json_name": "attr"
+        },
+        {
+          "name": "stable_identity",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "stableIdentity"
+        },
+        {
+          "name": "object_version",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "objectVersion"
+        },
+        {
+          "name": "snapshot_sequence",
+          "number": 5,
+          "label": 1,
+          "type": 4,
+          "json_name": "snapshotSequence"
+        }
+      ]
+    },
+    {
+      "name": "Attr",
+      "field": [
+        {
+          "name": "kind",
+          "number": 1,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.Attr.Kind",
+          "json_name": "kind"
+        },
+        {
+          "name": "inode",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "inode"
+        },
+        {
+          "name": "size",
+          "number": 3,
+          "label": 1,
+          "type": 3,
+          "json_name": "size"
+        },
+        {
+          "name": "blocks",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "blocks"
+        },
+        {
+          "name": "mode",
+          "number": 5,
+          "label": 1,
+          "type": 13,
+          "json_name": "mode"
+        },
+        {
+          "name": "uid",
+          "number": 6,
+          "label": 1,
+          "type": 13,
+          "json_name": "uid"
+        },
+        {
+          "name": "gid",
+          "number": 7,
+          "label": 1,
+          "type": 13,
+          "json_name": "gid"
+        },
+        {
+          "name": "nlink",
+          "number": 8,
+          "label": 1,
+          "type": 13,
+          "json_name": "nlink"
+        },
+        {
+          "name": "atime_ns",
+          "number": 9,
+          "label": 1,
+          "type": 3,
+          "json_name": "atimeNs"
+        },
+        {
+          "name": "mtime_ns",
+          "number": 10,
+          "label": 1,
+          "type": 3,
+          "json_name": "mtimeNs"
+        },
+        {
+          "name": "ctime_ns",
+          "number": 11,
+          "label": 1,
+          "type": 3,
+          "json_name": "ctimeNs"
+        },
+        {
+          "name": "birth_time_ns",
+          "number": 12,
+          "label": 1,
+          "type": 3,
+          "json_name": "birthTimeNs"
+        },
+        {
+          "name": "rdev",
+          "number": 13,
+          "label": 1,
+          "type": 13,
+          "json_name": "rdev"
+        },
+        {
+          "name": "blksize",
+          "number": 14,
+          "label": 1,
+          "type": 13,
+          "json_name": "blksize"
+        },
+        {
+          "name": "flags",
+          "number": 15,
+          "label": 1,
+          "type": 13,
+          "json_name": "flags"
+        }
+      ],
+      "enum_type": [
+        {
+          "name": "Kind",
+          "value": [
+            {
+              "name": "KIND_UNSPECIFIED",
+              "number": 0
+            },
+            {
+              "name": "REGULAR",
+              "number": 1
+            },
+            {
+              "name": "DIRECTORY",
+              "number": 2
+            },
+            {
+              "name": "SYMLINK",
+              "number": 3
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "PostState",
+      "field": [
+        {
+          "name": "visibility_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "visibilitySequence"
+        },
+        {
+          "name": "objects",
+          "number": 2,
+          "label": 3,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ObjectPostState",
+          "json_name": "objects"
+        },
+        {
+          "name": "snapshot_sequence",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "snapshotSequence"
+        }
+      ]
+    },
+    {
+      "name": "ObjectPostState",
+      "field": [
+        {
+          "name": "stable_identity",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "stableIdentity"
+        },
+        {
+          "name": "object_version",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "objectVersion"
+        },
+        {
+          "name": "attr",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Attr",
+          "json_name": "attr"
+        },
+        {
+          "name": "roles",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "json_name": "roles"
+        }
+      ]
+    },
+    {
+      "name": "HelloRequest",
+      "field": [
+        {
+          "name": "protocol_major",
+          "number": 1,
+          "label": 1,
+          "type": 13,
+          "json_name": "protocolMajor"
+        },
+        {
+          "name": "role",
+          "number": 3,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.TransportRole",
+          "json_name": "role"
+        },
+        {
+          "name": "connection_set_id",
+          "number": 4,
+          "label": 1,
+          "type": 12,
+          "json_name": "connectionSetId"
+        },
+        {
+          "name": "frontend_profile",
+          "number": 10,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.FrontendProfile",
+          "json_name": "frontendProfile"
+        }
+      ]
+    },
+    {
+      "name": "HelloReply",
+      "field": [
+        {
+          "name": "protocol_major",
+          "number": 1,
+          "label": 1,
+          "type": 13,
+          "json_name": "protocolMajor"
+        },
+        {
+          "name": "max_frame_bytes",
+          "number": 3,
+          "label": 1,
+          "type": 13,
+          "json_name": "maxFrameBytes"
+        },
+        {
+          "name": "max_read_bytes",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "json_name": "maxReadBytes"
+        },
+        {
+          "name": "max_write_bytes",
+          "number": 5,
+          "label": 1,
+          "type": 13,
+          "json_name": "maxWriteBytes"
+        },
+        {
+          "name": "max_in_flight",
+          "number": 6,
+          "label": 1,
+          "type": 13,
+          "json_name": "maxInFlight"
+        },
+        {
+          "name": "role",
+          "number": 7,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.TransportRole",
+          "json_name": "role"
+        },
+        {
+          "name": "connection_set_id",
+          "number": 8,
+          "label": 1,
+          "type": 12,
+          "json_name": "connectionSetId"
+        },
+        {
+          "name": "frontend_profile",
+          "number": 10,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.FrontendProfile",
+          "json_name": "frontendProfile"
+        }
+      ]
+    },
+    {
+      "name": "AttachRequest",
+      "field": [
+        {
+          "name": "volume_id",
+          "number": 1,
+          "label": 1,
+          "type": 9,
+          "json_name": "volumeId"
+        },
+        {
+          "name": "access_token",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "accessToken"
+        },
+        {
+          "name": "replay_slots",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "json_name": "replaySlots"
+        },
+        {
+          "name": "routes_revision",
+          "number": 8,
+          "label": 1,
+          "type": 12,
+          "json_name": "routesRevision"
+        },
+        {
+          "name": "attach_attempt_id",
+          "number": 10,
+          "label": 1,
+          "type": 12,
+          "json_name": "attachAttemptId"
+        },
+        {
+          "name": "purpose",
+          "number": 11,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.SessionPurpose",
+          "json_name": "purpose"
+        },
+        {
+          "name": "frontend_profile",
+          "number": 12,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.FrontendProfile",
+          "json_name": "frontendProfile"
+        }
+      ]
+    },
+    {
+      "name": "AttachReply",
+      "field": [
+        {
+          "name": "session_id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "sessionId"
+        },
+        {
+          "name": "generation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "generation"
+        },
+        {
+          "name": "resume_secret",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "resumeSecret"
+        },
+        {
+          "name": "provisional_deadline_unix_nanos",
+          "number": 10,
+          "label": 1,
+          "type": 3,
+          "json_name": "provisionalDeadlineUnixNanos"
+        },
+        {
+          "name": "data_binding_generation",
+          "number": 11,
+          "label": 1,
+          "type": 4,
+          "json_name": "dataBindingGeneration"
+        },
+        {
+          "name": "control_binding_generation",
+          "number": 12,
+          "label": 1,
+          "type": 4,
+          "json_name": "controlBindingGeneration"
+        }
+      ]
+    },
+    {
+      "name": "ResumeRequest"
+    },
+    {
+      "name": "ResumeReply",
+      "field": [
+        {
+          "name": "role",
+          "number": 1,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.TransportRole",
+          "json_name": "role"
+        },
+        {
+          "name": "binding_generation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "bindingGeneration"
+        },
+        {
+          "name": "state",
+          "number": 3,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.SessionState",
+          "json_name": "state"
+        }
+      ]
+    },
+    {
+      "name": "ActivateRequest",
+      "field": [
+        {
+          "name": "attach_attempt_id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "attachAttemptId"
+        },
+        {
+          "name": "data_binding_generation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "dataBindingGeneration"
+        },
+        {
+          "name": "control_binding_generation",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "controlBindingGeneration"
+        }
+      ]
+    },
+    {
+      "name": "ActivateReply",
+      "field": [
+        {
+          "name": "root",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "root"
+        },
+        {
+          "name": "session_lease_milliseconds",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "sessionLeaseMilliseconds"
+        },
+        {
+          "name": "routes_revision",
+          "number": 5,
+          "label": 1,
+          "type": 12,
+          "json_name": "routesRevision"
+        },
+        {
+          "name": "authorization_deadline_unix_nanos",
+          "number": 6,
+          "label": 1,
+          "type": 3,
+          "json_name": "authorizationDeadlineUnixNanos"
+        },
+        {
+          "name": "state",
+          "number": 7,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.SessionState",
+          "json_name": "state"
+        },
+        {
+          "name": "purpose",
+          "number": 9,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.SessionPurpose",
+          "json_name": "purpose"
+        },
+        {
+          "name": "frontend_profile",
+          "number": 10,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.FrontendProfile",
+          "json_name": "frontendProfile"
+        }
+      ]
+    },
+    {
+      "name": "AbortAttachRequest",
+      "field": [
+        {
+          "name": "attach_attempt_id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "attachAttemptId"
+        }
+      ]
+    },
+    {
+      "name": "AbortAttachReply",
+      "field": [
+        {
+          "name": "state",
+          "number": 1,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.SessionState",
+          "json_name": "state"
+        }
+      ]
+    },
+    {
+      "name": "KeepAliveRequest"
+    },
+    {
+      "name": "ReauthorizeRequest",
+      "field": [
+        {
+          "name": "access_token",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "accessToken"
+        },
+        {
+          "name": "sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "sequence"
+        }
+      ]
+    },
+    {
+      "name": "ReauthorizeReply",
+      "field": [
+        {
+          "name": "sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "sequence"
+        },
+        {
+          "name": "authorization_deadline_unix_nanos",
+          "number": 2,
+          "label": 1,
+          "type": 3,
+          "json_name": "authorizationDeadlineUnixNanos"
+        }
+      ]
+    },
+    {
+      "name": "MountAbsenceProof",
+      "field": [
+        {
+          "name": "observed_unix_nanos",
+          "number": 1,
+          "label": 1,
+          "type": 3,
+          "json_name": "observedUnixNanos"
+        },
+        {
+          "name": "observation",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "observation"
+        },
+        {
+          "name": "component",
+          "number": 3,
+          "label": 1,
+          "type": 9,
+          "json_name": "component"
+        }
+      ]
+    },
+    {
+      "name": "DetachRequest",
+      "field": [
+        {
+          "name": "mount_absence",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.MountAbsenceProof",
+          "json_name": "mountAbsence"
+        }
+      ]
+    },
+    {
+      "name": "CancelRequest",
+      "field": [
+        {
+          "name": "target_request_id",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "targetRequestId"
+        }
+      ]
+    },
+    {
+      "name": "ApplyRoutesRequest",
+      "field": [
+        {
+          "name": "rules",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "rules"
+        },
+        {
+          "name": "expected_revision",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "expectedRevision"
+        }
+      ]
+    },
+    {
+      "name": "ApplyRoutesReply",
+      "field": [
+        {
+          "name": "revision",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "revision"
+        },
+        {
+          "name": "canonical",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "canonical"
+        }
+      ]
+    },
+    {
+      "name": "LookupRequest",
+      "field": [
+        {
+          "name": "parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "parent"
+        },
+        {
+          "name": "name",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        }
+      ]
+    },
+    {
+      "name": "LookupReply",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "item"
+        },
+        {
+          "name": "negative_snapshot_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "negativeSnapshotSequence"
+        }
+      ]
+    },
+    {
+      "name": "GetAttrRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        }
+      ]
+    },
+    {
+      "name": "GetAttrReply",
+      "field": [
+        {
+          "name": "attr",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Attr",
+          "json_name": "attr"
+        },
+        {
+          "name": "object_version",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "objectVersion"
+        },
+        {
+          "name": "snapshot_sequence",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "snapshotSequence"
+        }
+      ]
+    },
+    {
+      "name": "SetAttrRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "mode",
+          "number": 3,
+          "label": 1,
+          "type": 13,
+          "oneof_index": 0,
+          "json_name": "mode",
+          "proto3_optional": true
+        },
+        {
+          "name": "uid",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "oneof_index": 1,
+          "json_name": "uid",
+          "proto3_optional": true
+        },
+        {
+          "name": "gid",
+          "number": 5,
+          "label": 1,
+          "type": 13,
+          "oneof_index": 2,
+          "json_name": "gid",
+          "proto3_optional": true
+        },
+        {
+          "name": "size",
+          "number": 6,
+          "label": 1,
+          "type": 3,
+          "oneof_index": 3,
+          "json_name": "size",
+          "proto3_optional": true
+        },
+        {
+          "name": "atime_ns",
+          "number": 7,
+          "label": 1,
+          "type": 3,
+          "oneof_index": 4,
+          "json_name": "atimeNs",
+          "proto3_optional": true
+        },
+        {
+          "name": "mtime_ns",
+          "number": 8,
+          "label": 1,
+          "type": 3,
+          "oneof_index": 5,
+          "json_name": "mtimeNs",
+          "proto3_optional": true
+        },
+        {
+          "name": "atime_now",
+          "number": 9,
+          "label": 1,
+          "type": 8,
+          "json_name": "atimeNow"
+        },
+        {
+          "name": "mtime_now",
+          "number": 10,
+          "label": 1,
+          "type": 8,
+          "json_name": "mtimeNow"
+        },
+        {
+          "name": "delegation",
+          "number": 11,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        }
+      ],
+      "oneof_decl": [
+        {
+          "name": "_mode"
+        },
+        {
+          "name": "_uid"
+        },
+        {
+          "name": "_gid"
+        },
+        {
+          "name": "_size"
+        },
+        {
+          "name": "_atime_ns"
+        },
+        {
+          "name": "_mtime_ns"
+        }
+      ]
+    },
+    {
+      "name": "OpenFlags",
+      "field": [
+        {
+          "name": "read",
+          "number": 1,
+          "label": 1,
+          "type": 8,
+          "json_name": "read"
+        },
+        {
+          "name": "write",
+          "number": 2,
+          "label": 1,
+          "type": 8,
+          "json_name": "write"
+        },
+        {
+          "name": "append",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "append"
+        },
+        {
+          "name": "truncate",
+          "number": 4,
+          "label": 1,
+          "type": 8,
+          "json_name": "truncate"
+        },
+        {
+          "name": "sync",
+          "number": 5,
+          "label": 1,
+          "type": 8,
+          "json_name": "sync"
+        },
+        {
+          "name": "data_sync",
+          "number": 6,
+          "label": 1,
+          "type": 8,
+          "json_name": "dataSync"
+        }
+      ]
+    },
+    {
+      "name": "CreateRequest",
+      "field": [
+        {
+          "name": "parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "parent"
+        },
+        {
+          "name": "name",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "mode",
+          "number": 3,
+          "label": 1,
+          "type": 13,
+          "json_name": "mode"
+        },
+        {
+          "name": "flags",
+          "number": 4,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.OpenFlags",
+          "json_name": "flags"
+        },
+        {
+          "name": "exclusive",
+          "number": 5,
+          "label": 1,
+          "type": 8,
+          "json_name": "exclusive"
+        },
+        {
+          "name": "write_intent",
+          "number": 6,
+          "label": 1,
+          "type": 8,
+          "json_name": "writeIntent"
+        },
+        {
+          "name": "cache_capable",
+          "number": 7,
+          "label": 1,
+          "type": 8,
+          "json_name": "cacheCapable"
+        }
+      ]
+    },
+    {
+      "name": "CreateReply",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "delegation",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Delegation",
+          "json_name": "delegation"
+        },
+        {
+          "name": "cache_capable",
+          "number": 4,
+          "label": 1,
+          "type": 8,
+          "json_name": "cacheCapable"
+        }
+      ]
+    },
+    {
+      "name": "MkdirRequest",
+      "field": [
+        {
+          "name": "parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "parent"
+        },
+        {
+          "name": "name",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "mode",
+          "number": 3,
+          "label": 1,
+          "type": 13,
+          "json_name": "mode"
+        }
+      ]
+    },
+    {
+      "name": "UnlinkRequest",
+      "field": [
+        {
+          "name": "parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "parent"
+        },
+        {
+          "name": "name",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "directory",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "directory"
+        }
+      ]
+    },
+    {
+      "name": "RenameRequest",
+      "field": [
+        {
+          "name": "old_parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "oldParent"
+        },
+        {
+          "name": "old_name",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "oldName"
+        },
+        {
+          "name": "new_parent",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "newParent"
+        },
+        {
+          "name": "new_name",
+          "number": 4,
+          "label": 1,
+          "type": 12,
+          "json_name": "newName"
+        },
+        {
+          "name": "no_replace",
+          "number": 5,
+          "label": 1,
+          "type": 8,
+          "json_name": "noReplace"
+        },
+        {
+          "name": "exchange",
+          "number": 6,
+          "label": 1,
+          "type": 8,
+          "json_name": "exchange"
+        }
+      ]
+    },
+    {
+      "name": "RenameReply",
+      "field": [
+        {
+          "name": "new_post_identity",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "newPostIdentity"
+        },
+        {
+          "name": "old_post_identity",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "oldPostIdentity"
+        }
+      ]
+    },
+    {
+      "name": "LinkRequest",
+      "field": [
+        {
+          "name": "existing_item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "existingItem"
+        },
+        {
+          "name": "new_parent",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "newParent"
+        },
+        {
+          "name": "new_name",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "newName"
+        }
+      ]
+    },
+    {
+      "name": "LinkReply",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "item"
+        }
+      ]
+    },
+    {
+      "name": "SymlinkRequest",
+      "field": [
+        {
+          "name": "parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "parent"
+        },
+        {
+          "name": "name",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "target",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "target"
+        }
+      ]
+    },
+    {
+      "name": "ReadlinkRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        }
+      ]
+    },
+    {
+      "name": "ReadlinkReply",
+      "field": [
+        {
+          "name": "target",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "target"
+        }
+      ]
+    },
+    {
+      "name": "OpenRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "flags",
+          "number": 2,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.OpenFlags",
+          "json_name": "flags"
+        },
+        {
+          "name": "write_intent",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "writeIntent"
+        },
+        {
+          "name": "cache_capable",
+          "number": 4,
+          "label": 1,
+          "type": 8,
+          "json_name": "cacheCapable"
+        }
+      ]
+    },
+    {
+      "name": "OpenReply",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "delegation",
+          "number": 2,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Delegation",
+          "json_name": "delegation"
+        },
+        {
+          "name": "cache_capable",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "cacheCapable"
+        }
+      ]
+    },
+    {
+      "name": "CloseRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "lock_owner",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "lockOwner"
+        },
+        {
+          "name": "flock_unlock",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "flockUnlock"
+        }
+      ]
+    },
+    {
+      "name": "CloseBatchRequest",
+      "field": [
+        {
+          "name": "closes",
+          "number": 1,
+          "label": 3,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CloseRequest",
+          "json_name": "closes"
+        }
+      ]
+    },
+    {
+      "name": "CloseBatchResult",
+      "field": [
+        {
+          "name": "errno",
+          "number": 1,
+          "label": 1,
+          "type": 5,
+          "json_name": "errno"
+        },
+        {
+          "name": "failure",
+          "number": 2,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.FailureClass",
+          "json_name": "failure"
+        },
+        {
+          "name": "retired",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "retired"
+        }
+      ]
+    },
+    {
+      "name": "CloseBatchReply",
+      "field": [
+        {
+          "name": "results",
+          "number": 1,
+          "label": 3,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.CloseBatchResult",
+          "json_name": "results"
+        }
+      ]
+    },
+    {
+      "name": "ReadRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "offset",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "offset"
+        },
+        {
+          "name": "length",
+          "number": 3,
+          "label": 1,
+          "type": 13,
+          "json_name": "length"
+        }
+      ]
+    },
+    {
+      "name": "ReadReply",
+      "field": [
+        {
+          "name": "data",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "data"
+        },
+        {
+          "name": "volume_version",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "volumeVersion"
+        }
+      ]
+    },
+    {
+      "name": "WriteRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "position",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "position"
+        },
+        {
+          "name": "lock_owner",
+          "number": 5,
+          "label": 1,
+          "type": 4,
+          "json_name": "lockOwner"
+        },
+        {
+          "name": "size",
+          "number": 6,
+          "label": 1,
+          "type": 13,
+          "json_name": "size"
+        },
+        {
+          "name": "write_flags",
+          "number": 7,
+          "label": 1,
+          "type": 13,
+          "json_name": "writeFlags"
+        },
+        {
+          "name": "data",
+          "number": 9,
+          "label": 1,
+          "type": 12,
+          "json_name": "data"
+        },
+        {
+          "name": "append",
+          "number": 10,
+          "label": 1,
+          "type": 8,
+          "json_name": "append"
+        },
+        {
+          "name": "sync",
+          "number": 11,
+          "label": 1,
+          "type": 8,
+          "json_name": "sync"
+        },
+        {
+          "name": "data_sync",
+          "number": 12,
+          "label": 1,
+          "type": 8,
+          "json_name": "dataSync"
+        },
+        {
+          "name": "delegation",
+          "number": 13,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "flush_sequence",
+          "number": 14,
+          "label": 1,
+          "type": 4,
+          "json_name": "flushSequence"
+        }
+      ]
+    },
+    {
+      "name": "WriteReply",
+      "field": [
+        {
+          "name": "committed_size",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "committedSize"
+        },
+        {
+          "name": "post_attr",
+          "number": 2,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Attr",
+          "json_name": "postAttr"
+        },
+        {
+          "name": "error",
+          "number": 3,
+          "label": 1,
+          "type": 5,
+          "json_name": "error"
+        },
+        {
+          "name": "assigned_offset",
+          "number": 7,
+          "label": 1,
+          "type": 4,
+          "json_name": "assignedOffset"
+        },
+        {
+          "name": "durable_sequence",
+          "number": 8,
+          "label": 1,
+          "type": 4,
+          "json_name": "durableSequence"
+        }
+      ]
+    },
+    {
+      "name": "FallocateRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "offset",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "offset"
+        },
+        {
+          "name": "length",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "length"
+        },
+        {
+          "name": "mode",
+          "number": 6,
+          "label": 1,
+          "type": 13,
+          "json_name": "mode"
+        },
+        {
+          "name": "delegation",
+          "number": 8,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        }
+      ]
+    },
+    {
+      "name": "CopyFileRangeRequest",
+      "field": [
+        {
+          "name": "input_handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "inputHandle"
+        },
+        {
+          "name": "input_offset",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "inputOffset"
+        },
+        {
+          "name": "output_handle",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "outputHandle"
+        },
+        {
+          "name": "output_offset",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "outputOffset"
+        },
+        {
+          "name": "length",
+          "number": 5,
+          "label": 1,
+          "type": 4,
+          "json_name": "length"
+        },
+        {
+          "name": "flags",
+          "number": 9,
+          "label": 1,
+          "type": 13,
+          "json_name": "flags"
+        }
+      ]
+    },
+    {
+      "name": "FallocateReply",
+      "field": [
+        {
+          "name": "result_size",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "resultSize"
+        },
+        {
+          "name": "post_size",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "postSize"
+        },
+        {
+          "name": "visibility_sequence",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "visibilitySequence"
+        },
+        {
+          "name": "flags",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "json_name": "flags"
+        },
+        {
+          "name": "error",
+          "number": 5,
+          "label": 1,
+          "type": 5,
+          "json_name": "error"
+        }
+      ]
+    },
+    {
+      "name": "CopyFileRangeReply",
+      "field": [
+        {
+          "name": "result_size",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "resultSize"
+        },
+        {
+          "name": "post_size",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "postSize"
+        },
+        {
+          "name": "visibility_sequence",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "visibilitySequence"
+        },
+        {
+          "name": "flags",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "json_name": "flags"
+        },
+        {
+          "name": "error",
+          "number": 5,
+          "label": 1,
+          "type": 5,
+          "json_name": "error"
+        }
+      ]
+    },
+    {
+      "name": "TmpfileRequest",
+      "field": [
+        {
+          "name": "parent",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "parent"
+        },
+        {
+          "name": "mode",
+          "number": 2,
+          "label": 1,
+          "type": 13,
+          "json_name": "mode"
+        },
+        {
+          "name": "flags",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.OpenFlags",
+          "json_name": "flags"
+        },
+        {
+          "name": "exclusive",
+          "number": 4,
+          "label": 1,
+          "type": 8,
+          "json_name": "exclusive"
+        }
+      ]
+    },
+    {
+      "name": "TmpfileReply",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        }
+      ]
+    },
+    {
+      "name": "FsyncRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "data_only",
+          "number": 2,
+          "label": 1,
+          "type": 8,
+          "json_name": "dataOnly"
+        }
+      ]
+    },
+    {
+      "name": "FsyncReply",
+      "field": [
+        {
+          "name": "durable_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "durableSequence"
+        }
+      ]
+    },
+    {
+      "name": "FlushRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "lock_owner",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "lockOwner"
+        }
+      ]
+    },
+    {
+      "name": "ReadDirRequest",
+      "field": [
+        {
+          "name": "handle",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "cookie",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "cookie"
+        },
+        {
+          "name": "verifier",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "verifier"
+        },
+        {
+          "name": "max_entries",
+          "number": 4,
+          "label": 1,
+          "type": 13,
+          "json_name": "maxEntries"
+        },
+        {
+          "name": "want_items",
+          "number": 5,
+          "label": 1,
+          "type": 8,
+          "json_name": "wantItems"
+        },
+        {
+          "name": "held_identities",
+          "number": 6,
+          "label": 3,
+          "type": 12,
+          "json_name": "heldIdentities"
+        }
+      ]
+    },
+    {
+      "name": "Dirent",
+      "field": [
+        {
+          "name": "name",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "attr",
+          "number": 2,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Attr",
+          "json_name": "attr"
+        },
+        {
+          "name": "next_cookie",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "nextCookie"
+        },
+        {
+          "name": "item",
+          "number": 4,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "item"
+        },
+        {
+          "name": "object_version",
+          "number": 5,
+          "label": 1,
+          "type": 4,
+          "json_name": "objectVersion"
+        },
+        {
+          "name": "snapshot_sequence",
+          "number": 6,
+          "label": 1,
+          "type": 4,
+          "json_name": "snapshotSequence"
+        },
+        {
+          "name": "stable_identity",
+          "number": 7,
+          "label": 1,
+          "type": 12,
+          "json_name": "stableIdentity"
+        }
+      ]
+    },
+    {
+      "name": "ReadDirReply",
+      "field": [
+        {
+          "name": "entries",
+          "number": 1,
+          "label": 3,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Dirent",
+          "json_name": "entries"
+        },
+        {
+          "name": "verifier",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "verifier"
+        },
+        {
+          "name": "eof",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "eof"
+        }
+      ]
+    },
+    {
+      "name": "ReclaimRequest",
+      "field": [
+        {
+          "name": "items",
+          "number": 2,
+          "label": 3,
+          "type": 12,
+          "json_name": "items"
+        }
+      ]
+    },
+    {
+      "name": "GetXattrRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "name",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        }
+      ]
+    },
+    {
+      "name": "GetXattrReply",
+      "field": [
+        {
+          "name": "value",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "value"
+        }
+      ]
+    },
+    {
+      "name": "SetXattrRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "name",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "value",
+          "number": 4,
+          "label": 1,
+          "type": 12,
+          "json_name": "value"
+        },
+        {
+          "name": "mode",
+          "number": 5,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.SetXattrRequest.Mode",
+          "json_name": "mode"
+        }
+      ],
+      "enum_type": [
+        {
+          "name": "Mode",
+          "value": [
+            {
+              "name": "UPSERT",
+              "number": 0
+            },
+            {
+              "name": "CREATE",
+              "number": 1
+            },
+            {
+              "name": "REPLACE",
+              "number": 2
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ListXattrRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        }
+      ]
+    },
+    {
+      "name": "ListXattrReply",
+      "field": [
+        {
+          "name": "names",
+          "number": 1,
+          "label": 3,
+          "type": 12,
+          "json_name": "names"
+        }
+      ]
+    },
+    {
+      "name": "RemoveXattrRequest",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "handle"
+        },
+        {
+          "name": "name",
+          "number": 3,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        }
+      ]
+    },
+    {
+      "name": "StatFSRequest"
+    },
+    {
+      "name": "StatFSReply",
+      "field": [
+        {
+          "name": "block_size",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "blockSize"
+        },
+        {
+          "name": "blocks",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "blocks"
+        },
+        {
+          "name": "blocks_free",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "blocksFree"
+        },
+        {
+          "name": "blocks_available",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "blocksAvailable"
+        },
+        {
+          "name": "files",
+          "number": 5,
+          "label": 1,
+          "type": 4,
+          "json_name": "files"
+        },
+        {
+          "name": "files_free",
+          "number": 6,
+          "label": 1,
+          "type": 4,
+          "json_name": "filesFree"
+        },
+        {
+          "name": "name_max",
+          "number": 7,
+          "label": 1,
+          "type": 13,
+          "json_name": "nameMax"
+        }
+      ]
+    },
+    {
+      "name": "SyncFSRequest"
+    },
+    {
+      "name": "SyncFSReply",
+      "field": [
+        {
+          "name": "durable_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "durableSequence"
+        }
+      ]
+    },
+    {
+      "name": "LockRange",
+      "field": [
+        {
+          "name": "start",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "start"
+        },
+        {
+          "name": "end",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "end"
+        }
+      ]
+    },
+    {
+      "name": "LockSpec",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "item"
+        },
+        {
+          "name": "owner",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "owner"
+        },
+        {
+          "name": "write",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "write"
+        },
+        {
+          "name": "range",
+          "number": 4,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LockRange",
+          "json_name": "range"
+        },
+        {
+          "name": "flock",
+          "number": 5,
+          "label": 1,
+          "type": 8,
+          "json_name": "flock"
+        }
+      ]
+    },
+    {
+      "name": "GetLockRequest",
+      "field": [
+        {
+          "name": "lock",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LockSpec",
+          "json_name": "lock"
+        }
+      ]
+    },
+    {
+      "name": "GetLockReply",
+      "field": [
+        {
+          "name": "conflict",
+          "number": 1,
+          "label": 1,
+          "type": 8,
+          "json_name": "conflict"
+        },
+        {
+          "name": "held",
+          "number": 2,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LockSpec",
+          "json_name": "held"
+        }
+      ]
+    },
+    {
+      "name": "SetLockRequest",
+      "field": [
+        {
+          "name": "lock",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.LockSpec",
+          "json_name": "lock"
+        },
+        {
+          "name": "wait",
+          "number": 2,
+          "label": 1,
+          "type": 8,
+          "json_name": "wait"
+        },
+        {
+          "name": "unlock",
+          "number": 3,
+          "label": 1,
+          "type": 8,
+          "json_name": "unlock"
+        }
+      ]
+    },
+    {
+      "name": "SubscribeRequest",
+      "field": [
+        {
+          "name": "snapshot_id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "snapshotId"
+        },
+        {
+          "name": "after_identity",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "afterIdentity"
+        }
+      ]
+    },
+    {
+      "name": "SubscribeReply",
+      "field": [
+        {
+          "name": "watermark",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "watermark"
+        },
+        {
+          "name": "delegated_identities",
+          "number": 2,
+          "label": 3,
+          "type": 12,
+          "json_name": "delegatedIdentities"
+        },
+        {
+          "name": "incarnation",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "horizon_nanos",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "horizonNanos"
+        },
+        {
+          "name": "snapshot_id",
+          "number": 5,
+          "label": 1,
+          "type": 12,
+          "json_name": "snapshotId"
+        },
+        {
+          "name": "next_after_identity",
+          "number": 6,
+          "label": 1,
+          "type": 12,
+          "json_name": "nextAfterIdentity"
+        }
+      ]
+    },
+    {
+      "name": "RenewSubscriptionRequest",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        }
+      ]
+    },
+    {
+      "name": "RenewSubscriptionReply",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "horizon_nanos",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "horizonNanos"
+        }
+      ]
+    },
+    {
+      "name": "NextControlEventRequest",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "after_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "afterSequence"
+        },
+        {
+          "name": "completed_event_through",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "completedEventThrough"
+        }
+      ]
+    },
+    {
+      "name": "ControlEvent",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "sequence"
+        },
+        {
+          "name": "change_batch",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ChangeBatch",
+          "oneof_index": 0,
+          "json_name": "changeBatch"
+        },
+        {
+          "name": "delegation_recall",
+          "number": 4,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRecall",
+          "oneof_index": 0,
+          "json_name": "delegationRecall"
+        },
+        {
+          "name": "delegation_break",
+          "number": 5,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationBreak",
+          "oneof_index": 0,
+          "json_name": "delegationBreak"
+        },
+        {
+          "name": "delegation_mode_change",
+          "number": 6,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationModeChange",
+          "oneof_index": 0,
+          "json_name": "delegationModeChange"
+        }
+      ],
+      "oneof_decl": [
+        {
+          "name": "event"
+        }
+      ]
+    },
+    {
+      "name": "ByteRange",
+      "field": [
+        {
+          "name": "offset",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "offset"
+        },
+        {
+          "name": "length",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "length"
+        }
+      ]
+    },
+    {
+      "name": "ChangeEntry",
+      "field": [
+        {
+          "name": "position",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "position"
+        },
+        {
+          "name": "volume_version",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "volumeVersion"
+        },
+        {
+          "name": "kind",
+          "number": 3,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.ChangeKind",
+          "json_name": "kind"
+        },
+        {
+          "name": "identity",
+          "number": 4,
+          "label": 1,
+          "type": 12,
+          "json_name": "identity"
+        },
+        {
+          "name": "parent_identity",
+          "number": 5,
+          "label": 1,
+          "type": 12,
+          "json_name": "parentIdentity"
+        },
+        {
+          "name": "name",
+          "number": 6,
+          "label": 1,
+          "type": 12,
+          "json_name": "name"
+        },
+        {
+          "name": "byte_range",
+          "number": 7,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ByteRange",
+          "json_name": "byteRange"
+        }
+      ]
+    },
+    {
+      "name": "ChangeBatch",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "entries",
+          "number": 2,
+          "label": 3,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.ChangeEntry",
+          "json_name": "entries"
+        }
+      ]
+    },
+    {
+      "name": "ChangeAck",
+      "field": [
+        {
+          "name": "position",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "position"
+        },
+        {
+          "name": "incarnation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        }
+      ]
+    },
+    {
+      "name": "ChangeAckReply"
+    },
+    {
+      "name": "DelegationRef",
+      "field": [
+        {
+          "name": "id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "id"
+        },
+        {
+          "name": "generation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "generation"
+        }
+      ]
+    },
+    {
+      "name": "Delegation",
+      "field": [
+        {
+          "name": "id",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "id"
+        },
+        {
+          "name": "generation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "generation"
+        },
+        {
+          "name": "mode",
+          "number": 3,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.DelegationMode",
+          "json_name": "mode"
+        }
+      ]
+    },
+    {
+      "name": "DelegationRecall",
+      "field": [
+        {
+          "name": "delegation",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "identity",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "identity"
+        },
+        {
+          "name": "budget_nanos",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "budgetNanos"
+        }
+      ]
+    },
+    {
+      "name": "DelegationBreak",
+      "field": [
+        {
+          "name": "delegation",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "identity",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "identity"
+        },
+        {
+          "name": "budget_nanos",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "budgetNanos"
+        }
+      ]
+    },
+    {
+      "name": "DelegationModeChange",
+      "field": [
+        {
+          "name": "delegation",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "identity",
+          "number": 2,
+          "label": 1,
+          "type": 12,
+          "json_name": "identity"
+        },
+        {
+          "name": "mode",
+          "number": 3,
+          "label": 1,
+          "type": 14,
+          "type_name": ".portablefs.authority.v1.DelegationMode",
+          "json_name": "mode"
+        },
+        {
+          "name": "budget_nanos",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "budgetNanos"
+        }
+      ]
+    },
+    {
+      "name": "DelegationRecallAck",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "event_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "eventSequence"
+        },
+        {
+          "name": "delegation",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "applied_sequence",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        }
+      ]
+    },
+    {
+      "name": "DelegationRecallAckReply"
+    },
+    {
+      "name": "DelegationBreakAck",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "event_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "eventSequence"
+        },
+        {
+          "name": "delegation",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "applied_sequence",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        }
+      ]
+    },
+    {
+      "name": "DelegationBreakAckReply"
+    },
+    {
+      "name": "DelegationModeChangeAck",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "event_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "eventSequence"
+        },
+        {
+          "name": "delegation",
+          "number": 3,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "applied_sequence",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        }
+      ]
+    },
+    {
+      "name": "DelegationModeChangeAckReply"
+    },
+    {
+      "name": "DelegationRelease",
+      "field": [
+        {
+          "name": "delegation",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRef",
+          "json_name": "delegation"
+        },
+        {
+          "name": "applied_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        }
+      ]
+    },
+    {
+      "name": "DelegationReleaseRequest",
+      "field": [
+        {
+          "name": "incarnation",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "delegations",
+          "number": 2,
+          "label": 3,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DelegationRelease",
+          "json_name": "delegations"
+        },
+        {
+          "name": "release_sequence",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "releaseSequence"
+        },
+        {
+          "name": "completed_release_through",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "completedReleaseThrough"
+        }
+      ]
+    },
+    {
+      "name": "DelegationReleaseReply"
+    },
+    {
+      "name": "BarrierRequest",
+      "field": [
+        {
+          "name": "cut_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "cutSequence"
+        }
+      ]
+    },
+    {
+      "name": "BarrierReply",
+      "field": [
+        {
+          "name": "applied_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        },
+        {
+          "name": "durable_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "durableSequence"
+        }
+      ]
+    },
+    {
+      "name": "WaitVisibilityRequest",
+      "field": [
+        {
+          "name": "cut_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "cutSequence"
+        }
+      ]
+    },
+    {
+      "name": "WaitVisibilityReply",
+      "field": [
+        {
+          "name": "applied_sequence",
+          "number": 1,
+          "label": 1,
+          "type": 4,
+          "json_name": "appliedSequence"
+        },
+        {
+          "name": "visible_sequence",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "visibleSequence"
+        }
+      ]
+    }
+  ],
+  "enum_type": [
+    {
+      "name": "FailureClass",
+      "value": [
+        {
+          "name": "FAILURE_CLASS_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "FAILURE_CLASS_STORAGE",
+          "number": 1
+        },
+        {
+          "name": "FAILURE_CLASS_INTERNAL",
+          "number": 2
+        },
+        {
+          "name": "FAILURE_CLASS_COHERENCE",
+          "number": 3
+        },
+        {
+          "name": "FAILURE_CLASS_ROUTES",
+          "number": 4
+        },
+        {
+          "name": "FAILURE_CLASS_RESTORE",
+          "number": 7
+        }
+      ]
+    },
+    {
+      "name": "TransportRole",
+      "value": [
+        {
+          "name": "TRANSPORT_ROLE_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "TRANSPORT_ROLE_DATA",
+          "number": 1
+        },
+        {
+          "name": "TRANSPORT_ROLE_CONTROL",
+          "number": 2
+        }
+      ]
+    },
+    {
+      "name": "SessionState",
+      "value": [
+        {
+          "name": "SESSION_STATE_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "SESSION_STATE_PROVISIONAL",
+          "number": 1
+        },
+        {
+          "name": "SESSION_STATE_ACTIVE",
+          "number": 2
+        },
+        {
+          "name": "SESSION_STATE_ABORTED",
+          "number": 3
+        },
+        {
+          "name": "SESSION_STATE_TERMINAL",
+          "number": 4
+        }
+      ]
+    },
+    {
+      "name": "FrontendProfile",
+      "value": [
+        {
+          "name": "FRONTEND_PROFILE_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "FRONTEND_PROFILE_LINUX",
+          "number": 1
+        },
+        {
+          "name": "FRONTEND_PROFILE_FSKIT_EXCLUSIVE",
+          "number": 2
+        },
+        {
+          "name": "FRONTEND_PROFILE_CACHELESS_READER",
+          "number": 3
+        }
+      ]
+    },
+    {
+      "name": "SessionPurpose",
+      "value": [
+        {
+          "name": "SESSION_PURPOSE_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "SESSION_PURPOSE_MOUNT",
+          "number": 1
+        },
+        {
+          "name": "SESSION_PURPOSE_ROUTE_ADMIN",
+          "number": 2
+        }
+      ]
+    },
+    {
+      "name": "ChangeKind",
+      "value": [
+        {
+          "name": "CHANGE_KIND_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "CHANGE_KIND_NAMESPACE_CHANGED",
+          "number": 1
+        },
+        {
+          "name": "CHANGE_KIND_ATTRIBUTES_CHANGED",
+          "number": 2
+        },
+        {
+          "name": "CHANGE_KIND_DATA_CHANGED",
+          "number": 3
+        },
+        {
+          "name": "CHANGE_KIND_DELEGATION_GRANTED",
+          "number": 4
+        },
+        {
+          "name": "CHANGE_KIND_DELEGATION_RELEASED",
+          "number": 5
+        },
+        {
+          "name": "CHANGE_KIND_DIRECTORY_CHANGED",
+          "number": 6
+        }
+      ]
+    },
+    {
+      "name": "DelegationMode",
+      "value": [
+        {
+          "name": "DELEGATION_MODE_UNSPECIFIED",
+          "number": 0
+        },
+        {
+          "name": "DELEGATION_MODE_FULL",
+          "number": 1
+        },
+        {
+          "name": "DELEGATION_MODE_WRITETHROUGH",
+          "number": 2
+        }
+      ]
+    }
+  ],
+  "options": {
+    "go_package": "github.com/steerlabs/portablefs/vcs/internal/authoritypb;authoritypb"
+  },
+  "syntax": "proto3"
+}

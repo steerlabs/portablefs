@@ -26,13 +26,11 @@ type transportPairKey struct {
 // proof-bearing Resume (or an exact provisional Attach replay on DATA)
 // promotes it.
 type transportConnection struct {
-	orderedFlush      bool
-	versionedMetadata bool
-	registry          *transportRegistry
-	pair              *transportPair
-	role              authoritypb.TransportRole
-	profile           authoritypb.FrontendProfile
-	generation        uint64
+	registry   *transportRegistry
+	pair       *transportPair
+	role       authoritypb.TransportRole
+	profile    authoritypb.FrontendProfile
+	generation uint64
 	// serving is guarded by registry.mu. Replacement first makes a candidate
 	// current with serving=false, which generation-fences its predecessor. Only
 	// after that predecessor's admitted workers drain is the successor exposed.
@@ -60,16 +58,14 @@ type transportRoleBinding struct {
 // set. The registry's global mutex is never held while operation is acquired,
 // while a handler runs, or while a socket is closed.
 type transportPair struct {
-	orderedFlush      bool
-	versionedMetadata bool
-	operation         sync.Mutex
-	key               transportPairKey
-	profile           authoritypb.FrontendProfile
-	data              transportRoleBinding
-	control           transportRoleBinding
-	session           volumeserver.SessionID
-	state             authoritypb.SessionState
-	terminal          <-chan struct{}
+	operation sync.Mutex
+	key       transportPairKey
+	profile   authoritypb.FrontendProfile
+	data      transportRoleBinding
+	control   transportRoleBinding
+	session   volumeserver.SessionID
+	state     authoritypb.SessionState
+	terminal  <-chan struct{}
 	// done closes exactly when this pair enters a terminal transition.
 	// A replacement may stop waiting for an ancient predecessor only on this
 	// edge, because no successor will then be exposed.
@@ -148,8 +144,8 @@ func validTransportRole(role authoritypb.TransportRole) bool {
 
 func validFrontendProfile(profile authoritypb.FrontendProfile) bool {
 	return profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED ||
-		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES ||
-		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR ||
+		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX ||
+		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE ||
 		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
 }
 
@@ -160,12 +156,8 @@ func (r *transportRegistry) register(
 	profile authoritypb.FrontendProfile,
 	cancel context.CancelFunc,
 	closeConnection func() error,
-	ordered, metadata bool,
 ) (*transportConnection, error) {
 	if peer == (volumeserver.PeerIdentity{}) || set == (connectionSetID{}) || !validTransportRole(role) || !validFrontendProfile(profile) || cancel == nil || closeConnection == nil {
-		return nil, ErrTransportBinding
-	}
-	if ordered && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || metadata && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return nil, ErrTransportBinding
 	}
 	key := transportPairKey{peer: peer, set: set}
@@ -176,9 +168,9 @@ func (r *transportRegistry) register(
 		if len(r.pairs) >= r.maxSets {
 			return nil, fmt.Errorf("%w: connection-set admission bound reached", ErrTransportBinding)
 		}
-		pair = &transportPair{key: key, profile: profile, orderedFlush: ordered, versionedMetadata: metadata, done: make(chan struct{})}
+		pair = &transportPair{key: key, profile: profile, done: make(chan struct{})}
 		r.pairs[key] = pair
-	} else if pair.profile != profile || pair.orderedFlush != ordered || pair.versionedMetadata != metadata {
+	} else if pair.profile != profile {
 		return nil, fmt.Errorf("%w: connection-set frontend profile mismatch", ErrTransportBinding)
 	} else if pair.terminalClosing ||
 		pair.state == authoritypb.SessionState_SESSION_STATE_ABORTED ||
@@ -196,7 +188,7 @@ func (r *transportRegistry) register(
 	executionDrained := make(chan struct{})
 	close(executionDrained)
 	entry := &transportConnection{
-		registry: r, pair: pair, role: role, profile: profile, orderedFlush: ordered, versionedMetadata: metadata, generation: r.nextGeneration,
+		registry: r, pair: pair, role: role, profile: profile, generation: r.nextGeneration,
 		cancel: cancel, close: closeConnection, executionDrained: executionDrained,
 	}
 	if pair.session == (volumeserver.SessionID{}) {

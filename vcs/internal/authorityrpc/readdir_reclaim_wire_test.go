@@ -37,16 +37,4 @@ func TestReadDirHeldIdentityAndReclaimBatchWireBounds(t *testing.T) {
 		}
 	}
 
-	readDir := (&authoritypb.ReadDirRequest{}).ProtoReflect().Descriptor().Fields()
-	if readDir.ByName("held_identities").Number() != 6 {
-		t.Fatal("ReadDirRequest.held_identities did not retain additive tag 6")
-	}
-	dirent := (&authoritypb.Dirent{}).ProtoReflect().Descriptor().Fields()
-	if dirent.ByName("stable_identity").Number() != 7 {
-		t.Fatal("Dirent.stable_identity did not retain additive tag 7")
-	}
-	reclaim := (&authoritypb.ReclaimRequest{}).ProtoReflect().Descriptor().Fields()
-	if reclaim.ByName("item").Number() != 1 || reclaim.ByName("items").Number() != 2 {
-		t.Fatal("ReclaimRequest singular/batch tags changed")
-	}
 }

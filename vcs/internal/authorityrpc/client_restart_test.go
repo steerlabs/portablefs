@@ -31,7 +31,7 @@ func TestReconnectSurvivesListenerGapBeforeEpochVerdict(t *testing.T) {
 			serve := func(listener net.Listener, epoch []byte) func() {
 				ctx, cancel := context.WithCancel(context.Background())
 				if server == nil || change {
-					server = &Server{Handler: clientTestHandler{epoch: epoch, maxInFlight: 5}, MaxFrame: testMaxFrame, MaxInFlight: 5, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 8<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
+					server = &Server{Handler: clientTestHandler{epoch: epoch, maxInFlight: 9}, MaxFrame: testMaxFrame, MaxInFlight: 9, MaxConnections: 8, MaxFrameBytesInFlight: controlFrameReserve() + 8<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second}
 				}
 				done := make(chan error, 1)
 				go func() { done <- server.Serve(ctx, listener, serverTLS) }()
@@ -86,7 +86,7 @@ func TestReconnectSurvivesListenerGapBeforeEpochVerdict(t *testing.T) {
 }
 
 func TestReconnectUnavailableListenerHonorsCallerDeadline(t *testing.T) {
-	address, tls, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, 5, time.Minute)
+	address, tls, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, 5, time.Minute)
 	client, err := DialClient(context.Background(), coherentTestClientConfig(address, tls, "volume", 5, 5))
 	if err != nil {
 		stop()

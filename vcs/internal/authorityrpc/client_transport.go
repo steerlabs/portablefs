@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-// clientTransport is one physical protocol-7 lane. Everything whose identity
+// clientTransport is one physical protocol-8 lane. Everything whose identity
 // is scoped to a TCP/TLS connection lives here: publication, serialization,
 // request IDs, waiters, reconnect exclusion, and negotiated frame accounting.
 // Session identity is deliberately not duplicated here; both transports prove
@@ -37,15 +36,13 @@ type clientTransport struct {
 }
 
 type transportNegotiation struct {
-	conn          net.Conn
-	epoch         []byte
-	features      []string
-	maxFrame      uint32
-	maxRead       uint32
-	maxWrite      uint32
-	maxFskitWrite uint64
-	maxInFlight   uint32
-	role          authoritypb.TransportRole
+	conn        net.Conn
+	epoch       []byte
+	maxFrame    uint32
+	maxRead     uint32
+	maxWrite    uint32
+	maxInFlight uint32
+	role        authoritypb.TransportRole
 	// Set only by proof-bearing Resume during pre-publication activation
 	// recovery. Hello itself never conveys a binding generation.
 	resumedBindingGeneration uint64
@@ -215,26 +212,12 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if err := conn.SetDeadline(deadline); err != nil {
 		return fail(err)
 	}
-	requiredFeatures, ok := helloFeatures(c.cfg.FrontendProfile)
-	if !ok {
-		return fail(errors.New("authorityrpc: unsupported frontend profile"))
-	}
 	request := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
 		ProtocolMajor:   ProtocolMajor,
-		Features:        append([]string(nil), requiredFeatures...),
 		Role:            role,
 		ConnectionSetId: append([]byte(nil), c.connectionSetID[:]...),
 		FrontendProfile: c.cfg.FrontendProfile,
 	}}}
-	if c.canPipelineFlushes() {
-		request.GetHello().Features = append(request.GetHello().Features, orderedDelegatedFlushFeature)
-	}
-	// Offering the versioned-metadata contract is what authorizes the authority
-	// to send the KeepAlive proof field: an older decoder rejects unknown fields,
-	// so an Activate advertisement alone could not.
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		request.GetHello().Features = append(request.GetHello().Features, fskitVersionedMetadataFeature)
-	}
 	if err := writeFrame(conn, c.cfg.MaxFrame, request); err != nil {
 		return fail(err)
 	}
@@ -245,29 +228,15 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	}
 	defer releaseFrame()
 	hello := response.GetHello()
-	if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || hello == nil ||
-		hello.GetProtocolMajor() != ProtocolMajor {
-		return fail(fmt.Errorf("authorityrpc: %s protocol handshake refused with errno %d", role, response.GetErrno()))
+	if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || hello == nil {
+		return fail(fmt.Errorf("%w: %s protocol handshake refused with errno %d", ErrTransportBinding, role, response.GetErrno()))
+	}
+	if err := validateProtocolMajor(hello.GetProtocolMajor()); err != nil {
+		return fail(err)
 	}
 	if hello.GetRole() != role || !equalBytes(hello.GetConnectionSetId(), c.connectionSetID[:]) ||
 		hello.GetFrontendProfile() != c.cfg.FrontendProfile {
 		return fail(fmt.Errorf("%w: %s Hello did not echo its exact transport binding", ErrTransportBinding, role))
-	}
-	if !hasFeatures(hello.GetFeatures(), requiredFeatures) {
-		return fail(errors.New("authorityrpc: authority omitted required current-state features"))
-	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
-		!hasFeatures(hello.GetFeatures(), []string{fskitDirectWriteFeature}) {
-		return fail(errors.New("authorityrpc: FSKit authority omitted fskit-direct-write-v1"))
-	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
-		!hasFeatures(hello.GetFeatures(), []string{fskitVersionedMetadataFeature}) {
-		return fail(errors.New("authorityrpc: FSKit authority did not accept fskit-versioned-metadata-v1 in Hello"))
-	}
-	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
-		hello.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
-	) {
-		return fail(errors.New("authorityrpc: authority does not support Manager-enrolled mount reauthorization"))
 	}
 	if len(response.GetEpoch()) != len(volumeserver.Epoch{}) {
 		return fail(errors.New("authorityrpc: protocol handshake omitted a valid authority epoch"))
@@ -300,17 +269,10 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 			hello.GetMaxReadBytes(), hello.GetMaxWriteBytes(),
 		))
 	}
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR && hello.GetMaxFskitWriteBytes() != 0 {
-		return fail(errors.New("authorityrpc: Linux profile received FSKit write capacity"))
-	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
-		hello.GetMaxFskitWriteBytes() < RequiredFskitWriteBytes {
-		return fail(errors.New("authorityrpc: FSKit profile omitted fragmented-write capacity"))
-	}
 	return &transportNegotiation{
 		conn: conn, epoch: append([]byte(nil), response.GetEpoch()...),
-		features: append([]string(nil), hello.GetFeatures()...), maxFrame: negotiatedFrame,
-		maxRead: hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(), maxFskitWrite: hello.GetMaxFskitWriteBytes(),
+		maxFrame: negotiatedFrame,
+		maxRead:  hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(),
 		maxInFlight: hello.GetMaxInFlight(), role: role,
 	}, nil
 }
@@ -320,9 +282,9 @@ func validateNegotiationPair(data, control *transportNegotiation) error {
 		control.role != authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
 		return errors.New("authorityrpc: incomplete transport pair")
 	}
-	if !equalBytes(data.epoch, control.epoch) || !slices.Equal(data.features, control.features) ||
+	if !equalBytes(data.epoch, control.epoch) ||
 		data.maxFrame != control.maxFrame || data.maxRead != control.maxRead ||
-		data.maxWrite != control.maxWrite || data.maxFskitWrite != control.maxFskitWrite || data.maxInFlight != control.maxInFlight {
+		data.maxWrite != control.maxWrite || data.maxInFlight != control.maxInFlight {
 		return errors.New("authorityrpc: DATA and CONTROL negotiated different authority state")
 	}
 	return nil
@@ -382,8 +344,8 @@ func (c *Client) validateReconnectNegotiation(opened *transportNegotiation) erro
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	if !slices.Equal(opened.features, c.helloFeatures) || opened.maxFrame != c.negotiatedFrame ||
-		opened.maxRead != c.maxRead || opened.maxWrite != c.maxWrite || opened.maxFskitWrite != c.maxFskitWrite ||
+	if opened.maxFrame != c.negotiatedFrame ||
+		opened.maxRead != c.maxRead || opened.maxWrite != c.maxWrite ||
 		opened.maxInFlight != c.negotiatedInFlight {
 		return errors.New("authorityrpc: resumed transport negotiated different authority state")
 	}

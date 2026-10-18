@@ -431,14 +431,6 @@ func TestFrameRejectsInlineBulkCopy(t *testing.T) {
 	}
 }
 
-func encodedRawFrame(metadata, bulk []byte) []byte {
-	frame := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata)+len(bulk))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(metadata)))
-	binary.BigEndian.PutUint32(frame[4:8], uint32(len(bulk)))
-	frame = append(frame, metadata...)
-	return append(frame, bulk...)
-}
-
 func TestFrameRejectsNonCanonicalMetadataBeforeDecode(t *testing.T) {
 	valid, err := proto.Marshal(&authoritypb.Request{
 		RequestId: 17,
@@ -485,14 +477,7 @@ func TestFrameRejectsNonCanonicalMetadataBeforeDecode(t *testing.T) {
 }
 
 func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
-	features := make([]string, maxWireFeatureElements+1)
-	request := &authoritypb.Request{
-		RequestId: 19,
-		Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
-			ProtocolMajor: ProtocolMajor,
-			Features:      features,
-		}},
-	}
+	request := &authoritypb.Request{RequestId: 19, Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: make([][]byte, maxWireRepeatedElements+1)}}}
 	metadata, err := proto.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
@@ -504,13 +489,9 @@ func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
 	if decoded.GetHello() != nil {
 		t.Fatal("repeated-field amplification reached protobuf decode")
 	}
-	// The typed outbound encoder does not repeat untrusted ingress validation.
 	var outbound bytes.Buffer
-	if err := writeFrame(&outbound, 4096, request); err != nil {
-		t.Fatal(err)
-	}
-	if err := readFrame(&outbound, 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("encoded oversized repetition escaped ingress: %v", err)
+	if err := writeFrame(&outbound, 1<<20, request); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("outbound repeated bound: %v", err)
 	}
 
 }
@@ -533,12 +514,10 @@ func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
 		t.Fatal("nested allocation amplification reached protobuf decode")
 	}
 	var outbound bytes.Buffer
-	if err := writeFrame(&outbound, 1<<20, response); err != nil {
-		t.Fatal(err)
+	if err := writeFrame(&outbound, 1<<20, response); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("outbound tree bound: %v", err)
 	}
-	if err := readFrame(&outbound, 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("encoded nested amplification escaped ingress: %v", err)
-	}
+
 }
 
 func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
@@ -912,7 +891,7 @@ func (echoHandler) SessionTerminalForTransport(volumeserver.SessionID) (<-chan s
 	return frameTestNeverTerminal, true
 }
 func (h echoHandler) Bounds() TransportBounds {
-	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 4}
+	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 9}
 }
 func (h echoHandler) Handle(_ context.Context, req *authoritypb.Request) *authoritypb.Response {
 	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch()}
@@ -1034,7 +1013,7 @@ func (p activeTestPair) close(t *testing.T) {
 
 func TestServerMultiplexesRequestIDs(t *testing.T) {
 	s := &Server{
-		Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
+		Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
 		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	pair := startActiveTestPair(t, s)
@@ -1071,7 +1050,7 @@ func (nilResponseHandler) SessionTerminalForTransport(volumeserver.SessionID) (<
 	return frameTestNeverTerminal, true
 }
 func (h nilResponseHandler) Bounds() TransportBounds {
-	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 4}
+	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 9}
 }
 func (h nilResponseHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	if request.GetHello() != nil || request.GetAttach() != nil || request.GetActivate() != nil {
@@ -1086,7 +1065,7 @@ func (h nilResponseHandler) Handle(ctx context.Context, request *authoritypb.Req
 func TestNilHandlerResponseKeepsTheAuthorityEpoch(t *testing.T) {
 	epoch := bytes.Repeat([]byte{0xA5}, 16)
 	s := &Server{
-		Handler: nilResponseHandler{epoch: epoch}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
+		Handler: nilResponseHandler{epoch: epoch}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
 		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	pair := startActiveTestPair(t, s)
@@ -1120,14 +1099,14 @@ func (disagreeingHandler) Bounds() TransportBounds {
 // clients were independent values with nothing forcing agreement.
 func TestServerRefusesToRunWithBoundsItDoesNotEnforce(t *testing.T) {
 	s := &Server{
-		Handler: disagreeingHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
+		Handler: disagreeingHandler{}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
 		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	if _, err := s.validate(); err == nil {
 		t.Fatal("server accepted a handler advertising bounds it does not enforce")
 	}
 	agreeing := &Server{
-		Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
+		Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
 		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	if _, err := agreeing.validate(); err != nil {
@@ -1275,12 +1254,12 @@ func TestServerDelegatedFlushUsesIndependentDataLane(t *testing.T) {
 		t.Fatal("ordinary write used flush lane")
 	}
 	for _, limit := range []int{3, 8, 127} {
-		ordinary, blocking, flush := serverExecutionLanes(limit, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES)
+		ordinary, blocking, flush := serverExecutionLanes(limit, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX)
 		if ordinary < 1 || blocking < 1 || flush < 1 || ordinary+blocking+flush != limit || blocking != limit/2 {
 			t.Fatalf("serverExecutionLanes(%d) = %d,%d,%d", limit, ordinary, blocking, flush)
 		}
 	}
-	ordinary, blocking, flush := serverExecutionLanes(2, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
+	ordinary, blocking, flush := serverExecutionLanes(2, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE)
 	if ordinary != 1 || blocking != 1 || flush != 0 {
 		t.Fatalf("FSKit serverExecutionLanes(2) = %d,%d,%d", ordinary, blocking, flush)
 	}

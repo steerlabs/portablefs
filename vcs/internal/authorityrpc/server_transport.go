@@ -60,6 +60,9 @@ func (s *Server) acceptTransportHello(
 	if !validFrontendProfile(hello.GetFrontendProfile()) {
 		return nil, nil, fmt.Errorf("%w: Hello carried an unknown frontend profile", ErrTransportBinding)
 	}
+	if err := validateProtocolMajor(hello.GetProtocolMajor()); err != nil {
+		return nil, nil, err
+	}
 	setID, err := parseConnectionSetID(hello.GetConnectionSetId())
 	if err != nil {
 		return nil, nil, err
@@ -84,15 +87,13 @@ func (s *Server) acceptTransportHello(
 	response.GetHello().Role = hello.GetRole()
 	response.GetHello().ConnectionSetId = append([]byte(nil), hello.GetConnectionSetId()...)
 	response.GetHello().FrontendProfile = hello.GetFrontendProfile()
-	ordered := hasFeatures(response.GetHello().Features, []string{orderedDelegatedFlushFeature})
-	if ordered && (hello.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || !hasFeatures(hello.Features, []string{orderedDelegatedFlushFeature}) || response.GetHello().GetMaxInFlight() < 9) {
-		return nil, nil, fmt.Errorf("%w: invalid ordered-flush negotiation", ErrTransportBinding)
+	if hello.GetProtocolMajor() != ProtocolMajor || response.GetHello().GetProtocolMajor() != ProtocolMajor {
+		return nil, nil, fmt.Errorf("%w: unequal protocol major", ErrTransportBinding)
 	}
-	metadata := hasFeatures(response.GetHello().Features, []string{fskitVersionedMetadataFeature})
-	if metadata && (hello.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR || !hasFeatures(hello.Features, []string{fskitVersionedMetadataFeature})) {
-		return nil, nil, fmt.Errorf("%w: invalid versioned-metadata negotiation", ErrTransportBinding)
+	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && response.GetHello().GetMaxInFlight() < MinimumLinuxInFlight {
+		return nil, nil, fmt.Errorf("%w: Linux DATA bound is below %d", ErrTransportBinding, MinimumLinuxInFlight)
 	}
-	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close, ordered, metadata)
+	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close)
 	if err != nil {
 		return nil, nil, err
 	}
