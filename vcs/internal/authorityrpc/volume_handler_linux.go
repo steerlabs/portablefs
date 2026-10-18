@@ -118,7 +118,7 @@ func lockMutationStore(store volumeStore, identities ...[16]byte) (func(), error
 }
 
 type VolumeHandler struct {
-	coherenceProfileAdmission coherenceProfileGate
+	coherenceProfileAdmission writerPriorityGate
 
 	Coherence            *volumeserver.CoherenceCoordinator
 	coherenceOnce        sync.Once
@@ -508,7 +508,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		// an old-revision request can pass the check below, pause while ApplyRoutes
 		// commits, and then reach XFS under the topology the frontend used before
 		// the switch.
-		guard, err := h.beginTopologyRequest(cred.ID)
+		guard, err := h.beginTopologyRequest(ctx, cred.ID)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -2122,7 +2122,10 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 		// durable membership are installed. A route-admin session deliberately
 		// takes no topology read side: otherwise it would become the holder that
 		// prevents its own clean-absence route change.
-		topology := h.Routes.AcquireTopologyRead()
+		topology, err := h.Routes.AcquireTopologyRead(ctx)
+		if err != nil {
+			return h.errorResponse(requestID, err, false)
+		}
 		defer topology.Release()
 		if err := h.Routes.Admit(presented, declared, "attach", false); err != nil {
 			return h.errorResponse(requestID, err, false)
@@ -2323,7 +2326,10 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 	// between this check and ACTIVE publication. An already-ACTIVE exact replay
 	// returned above: it must reproduce its retained reply even if a later route
 	// switch has made ordinary work from that session stale.
-	topology := h.Routes.AcquireTopologyRead()
+	topology, err := h.Routes.AcquireTopologyRead(ctx)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
 	defer topology.Release()
 	if err := h.Routes.Admit(resources.routes, true, "activation", false); err != nil {
 		return h.errorResponse(requestID, err, false)
@@ -3121,7 +3127,7 @@ func (h *VolumeHandler) setLock(ctx context.Context, req *authoritypb.Request, c
 		if request.GetUnlock() {
 			err = h.Runtime.Locks().Unlock(lock.Object, lock.Owner, lock.Range)
 		} else if request.GetWait() {
-			wait, waitErr := h.Routes.beginLockWait(func() error {
+			wait, waitErr := h.Routes.beginLockWait(ctx, func() error {
 				return h.admitSessionRoutes(cred.ID)
 			}, lock)
 			if waitErr != nil {

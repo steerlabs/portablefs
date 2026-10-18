@@ -19,7 +19,7 @@ type MountLifecycle struct {
 	now        func() time.Time
 	clockSkew  time.Duration
 
-	topology sync.RWMutex
+	topology topologyGate
 	mu       sync.Mutex
 	active   map[SessionID]time.Time
 	profiles map[SessionID]MountMembershipProfile
@@ -50,9 +50,14 @@ func NewMountLifecycle(cfg MountLifecycleConfig) (*MountLifecycle, error) {
 
 // AcquireTopologyRead pins one attach or filesystem request to the active LOCAL
 // route revision until it can no longer reach storage.
-func (l *MountLifecycle) AcquireTopologyRead() *TopologyReadGuard {
-	l.topology.RLock()
-	return &TopologyReadGuard{release: l.topology.RUnlock}
+func (l *MountLifecycle) AcquireTopologyRead(ctx context.Context) (*TopologyReadGuard, error) {
+	if ctx == nil {
+		return nil, errors.New("volumeserver: topology admission needs a context")
+	}
+	if err := l.topology.acquire(ctx, false); err != nil {
+		return nil, err
+	}
+	return &TopologyReadGuard{release: func() { l.topology.release(false) }}, nil
 }
 
 // ExecuteTopologyExclusive serializes the route CAS and durable publication
@@ -62,8 +67,13 @@ func (l *MountLifecycle) ExecuteTopologyExclusive(ctx context.Context, execute f
 	if ctx == nil || execute == nil {
 		return 0, errors.New("volumeserver: topology transition needs a context and executor")
 	}
-	l.topology.Lock()
-	defer l.topology.Unlock()
+	if err := l.topology.acquire(ctx, true); err != nil {
+		return 0, err
+	}
+	defer l.topology.release(true)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	return execute()
 }
 

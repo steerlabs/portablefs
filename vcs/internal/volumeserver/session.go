@@ -71,7 +71,7 @@ const (
 	// hide a directory tree from every other machine. Mount mutations under
 	// .portablefs/ are refused outright for the same reason: the file is
 	// reachable only through ApplyRoutes, which runs the change through the
-	// visibility barrier instead of skewing one machine's topology silently.
+	// topology exclusion instead of skewing one machine's topology silently.
 	AccessAdmin
 )
 

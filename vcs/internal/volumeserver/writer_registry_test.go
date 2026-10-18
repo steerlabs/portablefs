@@ -2,6 +2,7 @@ package volumeserver
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -86,5 +87,84 @@ func TestWriterCheckOwnerRequiresExactLiveOwner(t *testing.T) {
 				t.Fatalf("CheckOwner=%v, want %v", err, want)
 			}
 		})
+	}
+}
+
+func TestWriterActivationFenceBetweenOwnerPublicationAndCommit(t *testing.T) {
+	a, now := testAuthority(t)
+	registry, err := NewWriterRegistry(WriterRegistryConfig{Prior: PriorEpochStrictMountsFenced, Fencer: a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership := &mountLifecycleMembership{}
+	lifecycle, err := NewMountLifecycle(MountLifecycleConfig{Membership: membership, Prior: PriorEpochStrictMountsFenced})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.OnSessionEnd(func(SessionID) { registry.SweepExclusions() })
+	attempt := AttachAttemptID{19}
+	cred := prepareTestSession(t, a, now, attempt)
+	exclusion, err := a.WriterExclusion(cred.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := a.SessionTerminal(cred.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := a.PrepareActivation(t.Context(), cred, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := lifecycle.AcquireTopologyRead(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Release()
+	published, commit := make(chan struct{}), make(chan struct{})
+	releaseCommit := sync.OnceFunc(func() { close(commit) })
+	defer releaseCommit()
+	done := make(chan error, 1)
+	go func() {
+		done <- lifecycle.Activate(cred.ID, func() error {
+			return registry.Activate(cred.ID, terminal, exclusion, func() error { return nil }, func() { close(published); <-commit; a.CommitActivation(token) })
+		})
+	}()
+	topologyReceive(t, published)
+	// The commit boundary has published the exact owner, but the runtime token
+	// is still provisional. Registry calls must be safe before commit resolves.
+	ownerCheck := make(chan error, 1)
+	go func() { ownerCheck <- registry.CheckOwner(cred.ID) }()
+	if err := topologyReceive(t, ownerCheck); err != nil {
+		t.Fatal(err)
+	}
+	registry.mu.Lock()
+	left := registry.left
+	registry.mu.Unlock()
+	if _, err := a.Begin(cred); !errors.Is(err, ErrSessionProvisional) {
+		t.Fatalf("precommit runtime=%v", err)
+	}
+	bad := cred
+	bad.Secret[0] ^= 1
+	if _, err := a.Begin(bad); err == nil {
+		t.Fatal("bad proof did not request fence")
+	}
+	releaseCommit()
+	if err := topologyReceive(t, done); err != nil {
+		t.Fatal(err)
+	}
+	topologyReceive(t, terminal)
+	topologyReceive(t, left)
+	if _, err := a.Begin(cred); err == nil {
+		t.Fatal("deferred fence admitted new work")
+	}
+	if err := registry.CheckOwner(cred.ID); !errors.Is(err, ErrSessionFenced) {
+		t.Fatalf("owner did not retire: %v", err)
+	}
+	if _, ok := membership.active[cred.ID]; !ok {
+		t.Fatal("fence erased durable membership")
+	}
+	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrRoutesLive) {
+		t.Fatalf("terminal activation cleared route obligation: %v", err)
 	}
 }

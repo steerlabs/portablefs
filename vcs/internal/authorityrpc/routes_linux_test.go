@@ -84,11 +84,10 @@ func TestRouteLockWaitAdmissionCannotSlipPastTransition(t *testing.T) {
 	routes.lockWaitAdmission.Lock()
 
 	active := true
-	started := make(chan struct{})
+	waitCtx := newAdmissionWaitContext(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		close(started)
-		_, err := routes.beginLockWait(func() error {
+		_, err := routes.beginLockWait(waitCtx, func() error {
 			if !active {
 				return volumeserver.ErrSessionExpired
 			}
@@ -101,12 +100,7 @@ func TestRouteLockWaitAdmissionCannotSlipPastTransition(t *testing.T) {
 		})
 		done <- err
 	}()
-	<-started
-	select {
-	case err := <-done:
-		t.Fatalf("wait admission crossed a held topology writer: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
+	admissionReceive(t, waitCtx.waiting)
 
 	// Apply changes the authoritative revision while it owns the writer. The
 	// queued admission can run only afterwards and must see the new verdict.
@@ -960,18 +954,20 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	}
 
 	checked := make(chan struct{})
+	writerCtx := newAdmissionWaitContext(t.Context())
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
+		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(writerCtx, func() (int, error) {
 			close(checked)
 			return 0, nil
 		})
 		writerDone <- err
 	}()
+	admissionReceive(t, writerCtx.waiting)
 	select {
 	case <-checked:
 		t.Fatal("route CAS ran while attach admission was paused")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	close(authorizer.release)
 	select {
@@ -998,23 +994,25 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 	if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision); err != nil {
 		t.Fatal(err)
 	}
-	guard, err := h.beginTopologyRequest(id)
+	guard, err := h.beginTopologyRequest(t.Context(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checked := make(chan struct{})
+	writerCtx := newAdmissionWaitContext(t.Context())
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
+		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(writerCtx, func() (int, error) {
 			close(checked)
 			return 0, nil
 		})
 		writerDone <- err
 	}()
+	admissionReceive(t, writerCtx.waiting)
 	select {
 	case <-checked:
 		t.Fatal("route CAS ran while an admitted filesystem request was paused")
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 	guard.Release()
 	select {

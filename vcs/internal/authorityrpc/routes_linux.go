@@ -81,7 +81,7 @@ type RoutesController struct {
 	// write side while atomically interrupting the old queue and changing the
 	// revision. Unlike the main topology guard, it is never held while F_SETLKW
 	// sleeps, so one lock waiter cannot stall unrelated volume I/O.
-	lockWaitAdmission sync.RWMutex
+	lockWaitAdmission writerPriorityGate
 
 	mu        sync.RWMutex
 	loaded    bool
@@ -96,8 +96,8 @@ type RoutesController struct {
 // AcquireTopologyRead pins the active route revision across one attach or
 // filesystem request. The caller checks admission only after acquiring it and
 // releases it only after the request can no longer reach XFS.
-func (r *RoutesController) AcquireTopologyRead() *volumeserver.TopologyReadGuard {
-	return r.Mounts.AcquireTopologyRead()
+func (r *RoutesController) AcquireTopologyRead(ctx context.Context) (*volumeserver.TopologyReadGuard, error) {
+	return r.Mounts.AcquireTopologyRead(ctx)
 }
 
 // newRoutesController is reached only through NewCoordination, which is what
@@ -176,7 +176,7 @@ func (r *RoutesController) Admit(presented [32]byte, declared bool, subject stri
 	return mismatch
 }
 
-// Apply installs a new declaration through the visibility barrier.
+// Apply installs a new declaration under topology exclusion at clean mount absence.
 //
 // expected is a compare-and-swap against the active revision. Two operators
 // editing the routing file must not last-writer-win silently, and the CAS is
@@ -197,7 +197,9 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 	// waiter admitted before this boundary is already visible in Locks and is
 	// interrupted in the checked transition below. A waiter arriving after it
 	// cannot validate the old revision until the topology change has finished.
-	r.lockWaitAdmission.Lock()
+	if err := r.lockWaitAdmission.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer r.lockWaitAdmission.Unlock()
 
 	var active [32]byte
@@ -251,6 +253,9 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		if cleanErr := r.Mounts.RequireCleanRouteAbsence(); cleanErr != nil {
 			return 0, cleanErr
 		}
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		// Topology exclusion and clean absence cover the whole revision switch.
 		r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
 		apply = true
@@ -277,8 +282,10 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 // beginLockWait admits one blocking byte-range lock against the active route
 // revision and publishes it into the epoch lock table as one indivisible short
 // critical section. The returned waiter owns no routing lock while it sleeps.
-func (r *RoutesController) beginLockWait(admit func() error, lock volumeserver.Lock) (*volumeserver.PendingLock, error) {
-	r.lockWaitAdmission.RLock()
+func (r *RoutesController) beginLockWait(ctx context.Context, admit func() error, lock volumeserver.Lock) (*volumeserver.PendingLock, error) {
+	if err := r.lockWaitAdmission.RLockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer r.lockWaitAdmission.RUnlock()
 	if err := admit(); err != nil {
 		return nil, err
@@ -522,7 +529,7 @@ func (r *RoutesController) writeAll(handle xfsstore.Capability, raw []byte) erro
 
 // directory resolves the protected directory, creating it if the volume has
 // never had one. A concurrent creation is impossible: mounts cannot create this
-// name, and ApplyRoutes holds the barrier's write side.
+// name, and ApplyRoutes holds topology exclusion.
 func (r *RoutesController) directory(root xfsstore.Capability) (xfsstore.Capability, error) {
 	dir, _, err := r.Store.Lookup(root, routesDirName)
 	if err == nil {
@@ -574,8 +581,11 @@ func (h *VolumeHandler) admitSessionRoutes(id volumeserver.SessionID) error {
 // into one operation. The caller holds the returned guard through the final
 // filesystem result, so ApplyRoutes cannot fit between "this session agrees"
 // and the XFS operation that depended on that answer.
-func (h *VolumeHandler) beginTopologyRequest(id volumeserver.SessionID) (*volumeserver.TopologyReadGuard, error) {
-	guard := h.Routes.AcquireTopologyRead()
+func (h *VolumeHandler) beginTopologyRequest(ctx context.Context, id volumeserver.SessionID) (*volumeserver.TopologyReadGuard, error) {
+	guard, err := h.Routes.AcquireTopologyRead(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := h.admitSessionRoutes(id); err != nil {
 		guard.Release()
 		return nil, err
