@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
+	"os"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -30,7 +30,6 @@ type fskitDurabilityTestStore struct {
 	writeTestStore
 	acquireErr error
 	syncErr    error
-	pins       []string
 	syncs      atomic.Int32
 	fenced     atomic.Bool
 	fenceCause atomic.Pointer[xfsstore.DurabilityError]
@@ -49,27 +48,20 @@ func (s *fskitDurabilityTestStore) LockMutation([][16]byte) func() {
 	s.locked.Store(true)
 	return func() { s.locked.Store(false) }
 }
-func (s *fskitDurabilityTestStore) pin(kind string, cap xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	if s.locked.Load() {
-		panic("durability acquired under mutation lock")
-	}
-	s.pins = append(s.pins, fmt.Sprintf("%s:%d", kind, cap[0]))
+func (s *fskitDurabilityTestStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
 	if s.acquireErr != nil {
 		return nil, s.acquireErr
 	}
 	return durabilityTestTarget{sync: s.doSync}, nil
 }
-func (s *fskitDurabilityTestStore) PinSyncHandle(cap xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	return s.pin("handle", cap)
+func (s *fskitDurabilityTestStore) PinSyncObject(xfsstore.Capability) (xfsstore.SyncTarget, error) {
+	panic("FSKit durability reopened an object")
 }
-func (s *fskitDurabilityTestStore) PinSyncObject(cap xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	return s.pin("object", cap)
-}
-func (s *fskitDurabilityTestStore) SyncMutationFS() error {
-	s.pins = append(s.pins, "syncfs")
-	return s.doSync()
-}
+func (s *fskitDurabilityTestStore) SyncFS() error { return s.doSync() }
 func (s *fskitDurabilityTestStore) doSync() error {
+	if s.locked.Load() {
+		panic("durability sync under mutation lock")
+	}
 	s.syncs.Add(1)
 	if s.barrier != nil {
 		s.barrier()
@@ -81,6 +73,7 @@ func newDirectFskitHarness(t *testing.T) (*VolumeHandler, volumeserver.SessionCr
 	h, cred, _, _ := newFskitWriteHarness(t)
 	store := &fskitDurabilityTestStore{}
 	target := &writeTestTarget{coordinate: xfsstore.ObjectCoordinate{Stable: [16]byte{0x41}, Ino: 0x41, DeviceMinor: 1}, committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x41, Size: 4, Mode: 0600, Nlink: 1, DeviceMinor: 1}}
+	target.sync = store.doSync
 	store.targets = []*writeTestTarget{target}
 	h.Store = store
 	h.Routes = &RoutesController{Mounts: h.Lifecycle, Locks: h.Runtime.Locks(), loaded: true}
@@ -100,42 +93,12 @@ func directFskitRequest() *authoritypb.Request {
 	return req
 }
 
-func TestFskitDurabilityTargetSelection(t *testing.T) {
-	item, handle, parent, other := []byte{1}, []byte{2}, []byte{3}, []byte{4}
-	for _, test := range []struct {
-		name  string
-		req   *authoritypb.Request
-		reply *authoritypb.Response
-		want  []fskitDurabilityTarget
-	}{
-		{"write", &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: handle}}}, nil, []fskitDurabilityTarget{{true, handle}}},
-		{"fragmented commit", &authoritypb.Request{Body: &authoritypb.Request_FskitWrite{FskitWrite: &authoritypb.FskitWriteRequest{Handle: handle}}}, nil, []fskitDurabilityTarget{{true, handle}}},
-		{"setattr object", &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item}}}, nil, []fskitDurabilityTarget{{false, item}}},
-		{"setattr handle", &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item, Handle: handle}}}, nil, []fskitDurabilityTarget{{true, handle}}},
-		{"remove xattr object", &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{Item: item}}}, nil, []fskitDurabilityTarget{{false, item}}},
-		{"remove xattr handle", &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{Item: item, Handle: handle}}}, nil, []fskitDurabilityTarget{{true, handle}}},
-		{"truncate open", &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: item}}}, &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: handle}}}, []fskitDurabilityTarget{{true, handle}}},
-		{"create", &authoritypb.Request{Body: &authoritypb.Request_Create{}}, &authoritypb.Response{Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Handle: handle}}}, []fskitDurabilityTarget{{true, handle}}},
-		{"mkdir", &authoritypb.Request{Body: &authoritypb.Request_Mkdir{}}, &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: &authoritypb.Item{Token: item}}}}, []fskitDurabilityTarget{{false, item}}},
-		{"symlink", &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: parent}}}, nil, []fskitDurabilityTarget{{false, parent}}},
-		{"link excludes source", &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: item, NewParent: parent}}}, nil, []fskitDurabilityTarget{{false, parent}}},
-		{"unlink", &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: parent}}}, nil, []fskitDurabilityTarget{{false, parent}}},
-		{"rename", &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{OldParent: parent, NewParent: other}}}, nil, []fskitDurabilityTarget{{false, other}, {false, parent}}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := fskitDurabilityTargets(test.req, test.reply); !reflect.DeepEqual(got, test.want) {
-				t.Fatalf("targets=%+v want %+v", got, test.want)
-			}
-		})
-	}
-}
-
 func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 	for _, test := range []struct {
-		name                              string
-		committed                         uint64
-		applyErr, errorSync, errorAcquire error
-		terminal                          bool
+		name                string
+		committed           uint64
+		applyErr, errorSync error
+		terminal            bool
 	}{
 		{name: "success", committed: 4}, {name: "short", committed: 2},
 		{name: "zero postapply", applyErr: fmt.Errorf("%w: %w", xfsstore.ErrWritePostApply, syscall.EACCES)},
@@ -143,19 +106,11 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 		{name: "EIO", committed: 4, errorSync: syscall.EIO, terminal: true},
 		{name: "ENOSPC", committed: 4, errorSync: syscall.ENOSPC, terminal: true},
 		{name: "EDQUOT", committed: 4, errorSync: syscall.EDQUOT, terminal: true},
-		{name: "unreadable", committed: 4, errorAcquire: syscall.EACCES},
-		{name: "permission", committed: 4, errorAcquire: syscall.EPERM},
-		{name: "reclaimed", committed: 4, errorAcquire: xfsstore.ErrStaleOpen},
-		{name: "EMFILE", committed: 4, errorAcquire: syscall.EMFILE},
-		{name: "ENFILE", committed: 4, errorAcquire: syscall.ENFILE},
-		{name: "syncfs EIO", committed: 4, errorAcquire: syscall.EACCES, errorSync: syscall.EIO, terminal: true},
-		{name: "syncfs ENOSPC", committed: 4, errorAcquire: syscall.EACCES, errorSync: syscall.ENOSPC, terminal: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h, cred, store, target := newDirectFskitHarness(t)
 			target.committed = test.committed
 			target.err = test.applyErr
-			store.acquireErr = test.errorAcquire
 			store.syncErr = test.errorSync
 			req := directFskitRequest()
 			response := h.handleWrite(t.Context(), req, cred, req.GetWrite())
@@ -196,9 +151,6 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 				t.Fatal(err)
 			}
 			kind := "handle"
-			if test.errorAcquire != nil {
-				kind = "syncfs"
-			}
 			if !strings.Contains(metrics.String(), fmt.Sprintf(`portablefs_authority_fskit_durability_syncs_total{volume="fskit-durable",target="%s"} 1`, kind)) {
 				t.Fatalf("missing durability metric: %s", kind)
 			}
@@ -330,7 +282,7 @@ func TestFskitNonWriteDurabilityFailureIsUncertainStorage(t *testing.T) {
 				r := h.success(0)
 				r.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: identity, attr: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x70, Mode: 0600}, roles: postStateRoleTarget, changed: true})
 				return r, []volumeserver.VisibilityTarget{}
-			})
+			}, nil)
 			if result.GetErrno() != int32(syscall.EIO) || !result.GetUncertain() || result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || !store.fenced.Load() {
 				t.Fatalf("sync failure=%v", result)
 			}
@@ -341,34 +293,11 @@ func TestFskitNonWriteDurabilityFailureIsUncertainStorage(t *testing.T) {
 	}
 }
 
-func TestFskitDurabilityDeduplicatesRenameParentsByIdentity(t *testing.T) {
-	for _, test := range []struct {
-		name     string
-		old, new xfsstore.Capability
-		want     []string
-	}{
-		{"same token", xfsstore.Capability{3}, xfsstore.Capability{3}, []string{"object:3"}},
-		{"aliases", xfsstore.Capability{3, 1}, xfsstore.Capability{3, 2}, []string{"object:3"}},
-		{"distinct", xfsstore.Capability{3}, xfsstore.Capability{4}, []string{"object:4", "object:3"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			h, _, store, _ := newDirectFskitHarness(t)
-			req := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{OldParent: test.old[:], NewParent: test.new[:]}}}
-			if err := h.syncFskitMutation(req, nil); err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(store.pins, test.want) {
-				t.Fatalf("sync targets=%v want %v", store.pins, test.want)
-			}
-		})
-	}
-}
-
 func TestFskitWriteAdmissionRetainsOnlyAppliedExecution(t *testing.T) {
 	h, cred, store, _ := newDirectFskitHarness(t)
 	h.MaxWritesPerSession = 1
 	h.MaxWrites = 1
-	secondTarget := &writeTestTarget{coordinate: xfsstore.ObjectCoordinate{Stable: [16]byte{0x42}, Ino: 0x42, DeviceMinor: 1}, committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x42, Size: 4, Mode: 0600, Nlink: 1}}
+	secondTarget := &writeTestTarget{sync: store.doSync, coordinate: xfsstore.ObjectCoordinate{Stable: [16]byte{0x42}, Ino: 0x42, DeviceMinor: 1}, committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x42, Size: 4, Mode: 0600, Nlink: 1}}
 	store.targets = append(store.targets, secondTarget)
 	entered, release := make(chan struct{}), make(chan struct{})
 	store.barrier = func() {
@@ -415,22 +344,20 @@ func TestFskitWriteAdmissionRetainsOnlyAppliedExecution(t *testing.T) {
 
 type fragmentedDurabilityFailureStore struct {
 	*fskitWriteTestStore
-	failure error
-	fences  atomic.Int32
+	fences atomic.Int32
 }
 
 func (s *fragmentedDurabilityFailureStore) Fence(error) { s.fences.Add(1) }
 func (s *fragmentedDurabilityFailureStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	return durabilityTestTarget{sync: func() error { s.durableHandles.Add(1); return s.failure }}, nil
+	panic("fragmented COMMIT reacquired its handle")
 }
-
 func TestFragmentedCommitRetainsDurabilityFailureAndExactReceipt(t *testing.T) {
 	for _, failure := range []error{syscall.EIO, syscall.ENOSPC} {
 		t.Run(failure.Error(), func(t *testing.T) {
 			h, cred, store, _ := newFskitWriteHarness(t)
-			wrapped := &fragmentedDurabilityFailureStore{fskitWriteTestStore: store, failure: failure}
+			wrapped := &fragmentedDurabilityFailureStore{fskitWriteTestStore: store}
 			h.Store = wrapped
-			target := &fskitWriteTestTarget{}
+			target := &fskitWriteTestTarget{sync: func() error { store.durableHandles.Add(1); return failure }}
 			store.targets = append(store.targets, target)
 			payload := []byte("fragmented")
 			for index, phase := range []authoritypb.FskitWritePhase{authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA} {
@@ -503,10 +430,116 @@ func TestMalformedSourcePublicationPrecedesWriteAdmission(t *testing.T) {
 			reply := h.mutateFskitCoherence(ctx, req, cred, nil, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 				t.Fatal("malformed request applied")
 				return nil, nil
-			})
+			}, nil)
 			if reply.GetErrno() != int32(syscall.EINVAL) || called || store.syncs.Load() != 0 {
 				t.Fatalf("malformed source gate = %v; admission=%v", reply, called)
 			}
 		})
+	}
+}
+
+// Descriptor acquisition is distinct from the persistence syscall. A failure
+// before apply is definite; after CREATE or O_TRUNC it is a terminal defect.
+type fskitAcquisitionStore struct {
+	*fskitDurabilityTestStore
+	openErr error
+	applies int
+}
+
+func (s *fskitAcquisitionStore) Create(xfsstore.Capability, string, os.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.applies++
+	return xfsstore.Capability{0x42}, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x42, Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
+}
+func (s *fskitAcquisitionStore) OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.applies++
+	if s.openErr != nil {
+		return xfsstore.Capability{}, s.openErr
+	}
+	return xfsstore.Capability{0x42}, nil
+}
+func (s *fskitAcquisitionStore) SetAttr(xfsstore.Capability, xfsstore.Capability, xfsstore.SetAttrSpec) (xfsstore.Attr, error) {
+	s.applies++
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x41, Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
+}
+func (s *fskitAcquisitionStore) Getattr(cap xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(cap[0]), Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
+}
+func (s *fskitAcquisitionStore) GetattrOpen(cap xfsstore.Capability) (xfsstore.Attr, error) {
+	return s.Getattr(cap)
+}
+
+func TestFskitDescriptorAcquisitionNeverSelectsAnotherBarrier(t *testing.T) {
+	for _, kind := range []string{"create pin", "truncate pin", "create open", "setattr pin"} {
+		for _, cause := range []error{syscall.EMFILE, syscall.ENFILE, xfsstore.ErrStaleOpen} {
+			t.Run(kind+"/"+cause.Error(), func(t *testing.T) {
+				h, cred, base, _ := newDirectFskitHarness(t)
+				store := &fskitAcquisitionStore{fskitDurabilityTestStore: base}
+				if kind == "create open" {
+					store.openErr = cause
+				} else {
+					base.acquireErr = cause
+				}
+				h.Store = store
+				parent, item, handle := xfsstore.Capability{0x70}, xfsstore.Capability{0x42}, xfsstore.Capability{0x41}
+				if err := h.trackItem(cred.ID, item, false); err != nil {
+					t.Fatal(err)
+				}
+				req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}}
+				switch kind {
+				case "create pin", "create open":
+					req.Body = &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("new"), Mode: 0600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}
+				case "truncate pin":
+					req.Body = &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: item[:], Flags: &authoritypb.OpenFlags{Write: true, Truncate: true}}}
+				case "setattr pin":
+					req.Body = &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Handle: handle[:], Mode: proto.Uint32(0600)}}
+				}
+				stampMutation(t, req, 0, 1)
+				stampResolvedFskitPublication(t, h, cred.ID, req)
+				reply := h.Handle(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), req)
+				if reply.GetErrno() == 0 || base.syncs.Load() != 0 {
+					t.Fatalf("alternate durability success: %v syncs=%d", reply, base.syncs.Load())
+				}
+				if kind == "setattr pin" {
+					if reply.GetUncertain() || base.fenced.Load() || store.applies != 0 {
+						t.Fatalf("pre-apply refusal=%v applied=%d", reply, store.applies)
+					}
+				} else if !reply.GetUncertain() || reply.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || !base.fenced.Load() {
+					t.Fatalf("post-apply acquisition was not terminal: %v", reply)
+				}
+				before := store.applies
+				req.RequestId++
+				replay := h.Handle(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), req)
+				reply.RequestId = replay.RequestId
+				if !proto.Equal(reply, replay) || store.applies != before || base.syncs.Load() != 0 {
+					t.Fatalf("acquisition replay changed outcome: %v / %v", reply, replay)
+				}
+			})
+		}
+	}
+}
+
+func TestFskitExistingCreateDoesNotAcquireDurabilityPin(t *testing.T) {
+	h, cred, base, _ := newDirectFskitHarness(t)
+	base.acquireErr = syscall.EMFILE
+	base.lookupItem = xfsstore.Capability{0x42}
+	store := &fskitAcquisitionStore{fskitDurabilityTestStore: base}
+	h.Store = store
+	parent := xfsstore.Capability{0x70}
+	req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
+	stampMutation(t, req, 0, 1)
+	stampResolvedFskitPublication(t, h, cred.ID, req)
+	reply := h.Handle(context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1}), req)
+	if reply.GetErrno() != 0 || reply.GetUncertain() || base.fenced.Load() || base.syncs.Load() != 0 {
+		t.Fatalf("nonmutating CREATE acquired durability: %v", reply)
+	}
+}
+
+func TestFskitDirectWriteDoesNotReacquireHandle(t *testing.T) {
+	h, cred, store, _ := newDirectFskitHarness(t)
+	store.acquireErr = syscall.EMFILE
+	req := directFskitRequest()
+	reply := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+	if reply.GetErrno() != 0 || reply.GetWrite().GetError() != 0 || reply.GetWrite().GetCommittedSize() != 4 || store.syncs.Load() != 1 || store.fenced.Load() {
+		t.Fatalf("write reacquired its handle: %v", reply)
 	}
 }

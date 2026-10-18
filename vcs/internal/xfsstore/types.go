@@ -237,6 +237,7 @@ func (*WriteLimitError) Unwrap() error { return syscall.EFBIG }
 // syscall; CommitWriteData applies a complete retained-frame payload directly.
 // Exactly one primitive is selected by the negotiated max_write boundary.
 type WriteTarget interface {
+	Sync() error
 	Coordinate() ObjectCoordinate
 	CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (committedSize, assignedOffset uint64, post Attr, err error)
 	CommitWriteData(data []byte, spec WriteCommit) (committedSize, assignedOffset uint64, post Attr, err error)

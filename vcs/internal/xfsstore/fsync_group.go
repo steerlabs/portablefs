@@ -2,17 +2,14 @@ package xfsstore
 
 import (
 	"io/fs"
-	"math"
 	"sync"
 )
 
-type fsyncWaiter struct {
-	requiredGeneration uint64
-	full               bool
-	fd                 int
-	lead               chan []*fsyncWaiter
-	done               chan error
-	failure            func(error) error
+type syncWaiter struct {
+	full bool
+	fd   int
+	lead chan []*syncWaiter
+	done chan error
 }
 
 // inodeFsyncState is shared by every open handle for one stable incarnation.
@@ -22,12 +19,8 @@ type fsyncWaiter struct {
 type inodeFsyncState struct {
 	identity [16]byte
 
-	mu                sync.Mutex
-	appliedGeneration uint64
-	inFlight          bool
-	pending           []*fsyncWaiter
-	syncFailure       error
-	refs              int
+	syncGroup
+	refs int
 
 	// PortableFS rejects every xattr mutation, and the authority exclusively
 	// owns the cell, so no supported operation can add security.capability after
@@ -63,53 +56,44 @@ func (s *inodeFsyncState) removeWritePrivileges(fd int, beforeMode uint32, killS
 	return remove(fd, beforeMode, killSUIDGID, &s.securityCapabilityPresent)
 }
 
-func (s *inodeFsyncState) applied() {
-	s.mu.Lock()
-	if s.appliedGeneration != math.MaxUint64 {
-		s.appliedGeneration++
-	}
-	s.mu.Unlock()
+// syncGroup serializes a persistence description's error cursor. The syscall
+// functions must fence their store before returning an error. A failed batch
+// releases all pending waiters with that same failure without another syscall.
+// Arrivals during a successful syscall share the next batch, never this one.
+type syncGroup struct {
+	mu          sync.Mutex
+	inFlight    bool
+	pending     []*syncWaiter
+	syncFailure error
 }
 
-func (s *inodeFsyncState) barrier(fd int, dataOnly bool, fsync, fdatasync func(int) error) (int, error) {
-	return s.barrierWithFailure(fd, dataOnly, fsync, fdatasync, nil)
-}
-
-func (s *inodeFsyncState) barrierWithFailure(fd int, dataOnly bool, fsync, fdatasync func(int) error, failure func(error) error) (int, error) {
-	waiter := &fsyncWaiter{
-		full: !dataOnly, fd: fd,
-		lead: make(chan []*fsyncWaiter, 1), done: make(chan error, 1), failure: failure,
-	}
+func (s *syncGroup) barrier(fd int, dataOnly bool, fsync, fdatasync func(int) error) (int, error) {
+	waiter := &syncWaiter{full: !dataOnly, fd: fd,
+		lead: make(chan []*syncWaiter, 1), done: make(chan error, 1)}
 	s.mu.Lock()
-	if failure != nil && s.syncFailure != nil {
+	if s.syncFailure != nil {
 		err := s.syncFailure
 		s.mu.Unlock()
-		return 0, failure(err)
+		return 0, err
 	}
-	waiter.requiredGeneration = s.appliedGeneration
 	if !s.inFlight {
 		s.inFlight = true
 		s.mu.Unlock()
-		return s.runFsyncBatch(waiter, []*fsyncWaiter{waiter}, fsync, fdatasync)
+		return s.runBatch(waiter, []*syncWaiter{waiter}, fsync, fdatasync)
 	}
 	s.pending = append(s.pending, waiter)
 	s.mu.Unlock()
-
 	select {
 	case batch := <-waiter.lead:
-		return s.runFsyncBatch(waiter, batch, fsync, fdatasync)
+		return s.runBatch(waiter, batch, fsync, fdatasync)
 	case err := <-waiter.done:
 		return 0, err
 	}
 }
 
-func (s *inodeFsyncState) runFsyncBatch(leader *fsyncWaiter, batch []*fsyncWaiter, fsync, fdatasync func(int) error) (int, error) {
-	coveredGeneration := uint64(0)
+func (s *syncGroup) runBatch(leader *syncWaiter, batch []*syncWaiter, fsync, fdatasync func(int) error) (int, error) {
 	full := false
 	for _, waiter := range batch {
-		if waiter.requiredGeneration > coveredGeneration {
-			coveredGeneration = waiter.requiredGeneration
-		}
 		full = full || waiter.full
 	}
 	var err error
@@ -118,40 +102,28 @@ func (s *inodeFsyncState) runFsyncBatch(leader *fsyncWaiter, batch []*fsyncWaite
 	} else {
 		err = fdatasync(leader.fd)
 	}
-
-	// Linux errseq reports a writeback failure once per open description. Keep
-	// every observed error, including ordinary fsync failures, so a later
-	// required barrier cannot mistake a consumed error for durable storage.
 	s.mu.Lock()
-	if err != nil && s.syncFailure == nil {
+	defer s.mu.Unlock()
+	if err != nil {
 		s.syncFailure = err
 	}
-	sticky := s.syncFailure
-	s.mu.Unlock()
-	if sticky != nil {
-		for _, waiter := range batch {
-			if waiter.failure != nil {
-				err = waiter.failure(sticky)
-				break
-			}
-		}
-	}
-	s.mu.Lock()
 	for _, waiter := range batch {
-		if waiter.requiredGeneration > coveredGeneration || waiter.full && !full {
-			panic("xfsstore: fsync batch released an uncovered waiter")
-		}
 		if waiter != leader {
 			waiter.done <- err
 		}
 	}
-	if len(s.pending) == 0 {
+	if err != nil {
+		for _, waiter := range s.pending {
+			waiter.done <- err
+		}
+		s.pending = nil
+		s.inFlight = false
+	} else if len(s.pending) == 0 {
 		s.inFlight = false
 	} else {
 		next := s.pending
 		s.pending = nil
 		next[0].lead <- next
 	}
-	s.mu.Unlock()
 	return len(batch), err
 }

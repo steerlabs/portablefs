@@ -198,7 +198,7 @@ func TestFsyncFullClassIsNeverCoveredByFdatasync(t *testing.T) {
 	}
 }
 
-func TestFsyncGenerationAppliedDuringFlightRequiresNextSync(t *testing.T) {
+func TestFsyncWriteAppliedDuringFlightRequiresNextSync(t *testing.T) {
 	v, handle, state := fsyncTestHandle(t)
 	target, err := v.PinWriteTarget(handle)
 	if err != nil {
@@ -233,13 +233,6 @@ func TestFsyncGenerationAppliedDuringFlightRequiresNextSync(t *testing.T) {
 		second <- fsyncTestResult{batch: batch, err: err}
 	}()
 	waitFsyncPending(t, state, 1)
-	state.mu.Lock()
-	applied := state.appliedGeneration
-	required := state.pending[0].requiredGeneration
-	state.mu.Unlock()
-	if applied != 1 || required != applied {
-		t.Fatalf("generation applied=%d required=%d, want 1/1", applied, required)
-	}
 	close(release[0])
 	<-started[1]
 	if got := <-first; got.err != nil {
@@ -707,7 +700,7 @@ func TestCommitWritePrivilegeFailureStillAttemptsAndJoinsLogicalSync(t *testing.
 	}, nil)
 	if committed != 1 || assigned != 0 || post.Size != 1 || privilegeCalls != 1 || syncCalls != 1 ||
 		!errors.Is(err, ErrWritePostApply) || !errors.Is(err, ErrWritePrivilege) ||
-		!errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
+		!errors.Is(err, syscall.EPERM) || !errors.Is(err, ErrOutcomeUncertain) {
 		t.Fatalf("CommitWrite = (%d,%d,%+v,%v), privilege=%d sync=%d", committed, assigned, post, err, privilegeCalls, syncCalls)
 	}
 }
@@ -809,12 +802,12 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 			Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE),
 		})
-		if syncs != 1 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.EIO) {
+		if syncs != 1 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, ErrOutcomeUncertain) {
 			t.Fatalf("Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
 		}
 	})
 
-	t.Run("fallocate-killpriv-failure-still-syncs-and-backend-error-does-not", func(t *testing.T) {
+	t.Run("fallocate-killpriv-failure-still-syncs-and-fences", func(t *testing.T) {
 		v := openTestVolume(t)
 		root, _ := v.Root()
 		item, _, err := v.Create(root, "sync-fallocate-killpriv", 0o600, true)
@@ -837,7 +830,7 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE), KillPrivileges: true,
 		})
 		if syncs != 1 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) ||
-			!errors.Is(err, ErrWritePrivilege) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
+			!errors.Is(err, ErrWritePrivilege) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, ErrOutcomeUncertain) {
 			t.Fatalf("clean Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
 		}
 
@@ -848,7 +841,7 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 			Offset: 0, Length: 4096, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 			Mode: uint32(unix.FALLOC_FL_KEEP_SIZE),
 		})
-		if syncs != 0 || post.Size != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+		if syncs != 0 || post != (Attr{}) || !errors.Is(err, ErrFenced) {
 			t.Fatalf("failed Fallocate = (post=%+v, err=%v), syncs=%d", post, err, syncs)
 		}
 	})
@@ -897,7 +890,7 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 			Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, KillPrivileges: true,
 		})
 		if copied != 1 || post.Size != 1 || dataSyncs != 1 || !errors.Is(err, ErrWritePostApply) ||
-			!errors.Is(err, ErrWritePrivilege) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
+			!errors.Is(err, ErrWritePrivilege) || !errors.Is(err, syscall.EPERM) || !errors.Is(err, ErrOutcomeUncertain) {
 			t.Fatalf("CopyFileRange = (%d,%+v,%v), fdatasyncs=%d", copied, post, err, dataSyncs)
 		}
 
@@ -909,7 +902,7 @@ func TestRangeMutationsHonorLogicalSyncOnce(t *testing.T) {
 		copied, post, err = v.CopyFileRange(source, destination, CopyFileRangeSpec{
 			Length: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 		})
-		if copied != 0 || post.Size != 1 || dataSyncs != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+		if copied != 0 || post != (Attr{}) || dataSyncs != 0 || !errors.Is(err, ErrFenced) {
 			t.Fatalf("failed CopyFileRange = (%d,%+v,%v), fdatasyncs=%d", copied, post, err, dataSyncs)
 		}
 	})

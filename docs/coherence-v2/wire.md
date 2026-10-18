@@ -569,14 +569,17 @@ clients that still use them.
 FSKit delivers no fsync, directory-sync, or F_FULLFSYNC callback. Under
 `fskit-durable-mutations-v1`, every FSKit mutation that applied or may have
 applied is therefore made durable before its reply is sent or retained as a
-replay outcome. The authority forces the operation's last storage transaction:
-a full fsync of the written, truncated, or attribute-changed inode, of a newly
-created file or directory, or of the changed parent directory for symlink,
-link, unlink, and rename. When no syncable descriptor can be opened, such as an
-object whose owner lacks read permission or a symlink, it uses syncfs on the
-volume root. Any error from that sync is an uncertain EIO with
-FAILURE_CLASS_STORAGE and fences the epoch. Visibility publication may precede
-durability; the reply may not.
+replay outcome. A handle-backed mutation retains its authoritative input or
+output file description through completion and performs full fsync on it:
+WRITE, CREATE, truncating OPEN, and handle-backed SETATTR. Handleless mutations
+use the volume syncfs barrier directly, including namespace operations and
+item-backed metadata. No post-apply reopen or alternate barrier is selected
+on acquisition failure. Failure to retain a required handle after apply is
+terminal.
+Any persistence syscall failure is an uncertain EIO with FAILURE_CLASS_STORAGE
+and fences the epoch before releasing waiters. The first failure survives an
+apparently successful retry. Visibility publication may precede durability;
+the reply may not.
 
 ## FSKit versioned metadata
 

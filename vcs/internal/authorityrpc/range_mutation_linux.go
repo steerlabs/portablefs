@@ -203,7 +203,7 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
-	}, &releaseMutation)
+	}, nil, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()
 	}
@@ -337,7 +337,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			inodeTarget(volumeserver.VisibilityData, destinationCoordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, destinationCoordinate, 0),
 		}
-	}, &releaseMutation)
+	}, nil, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()
 	}

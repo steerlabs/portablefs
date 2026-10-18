@@ -71,6 +71,7 @@ type volumeStore interface {
 	WriteAt(xfsstore.Capability, []byte, int64) (int, error)
 	Truncate(xfsstore.Capability, int64) error
 	Fsync(xfsstore.Capability, bool) error
+	PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error)
 	GetattrOpen(xfsstore.Capability) (xfsstore.Attr, error)
 	SyncFS() error
 	ReadDirOpen(xfsstore.Capability, uint64, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
@@ -517,12 +518,14 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
+	var frontendProfile authoritypb.FrontendProfile
 	switch purpose {
 	case authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT:
 		if access&volumeserver.AccessRead == 0 || requestRequiresWrite(req) && access&volumeserver.AccessWrite == 0 {
 			return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
 		}
-		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		var profileErr error
+		frontendProfile, profileErr = h.sessionFrontendProfile(cred.ID)
 		if profileErr != nil || !requestAllowedForFrontend(req, frontendProfile) {
 			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
 		}
@@ -735,6 +738,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var coordinate visibilityCoordinate
 		var oldSize int64
 		var mode fs.FileMode
+		var durability xfsstore.SyncTarget
+		defer func() {
+			if durability != nil {
+				_ = durability.Close()
+			}
+		}()
 		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			if set.Mode == nil && set.Uid == nil && set.Gid == nil && set.Size == nil && set.AtimeNs == nil && set.MtimeNs == nil && !set.GetAtimeNow() && !set.GetMtimeNow() {
@@ -798,6 +807,16 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if err != nil {
 				return nil, err
 			}
+			if durability != nil {
+				_ = durability.Close()
+				durability = nil
+			}
+			if handle != (xfsstore.Capability{}) {
+				durability, err = h.retainFskitMutationHandle(frontendProfile, handle)
+				if err != nil {
+					return nil, err
+				}
+			}
 			if set.Size != nil {
 				var attr xfsstore.Attr
 				if handle != (xfsstore.Capability{}) {
@@ -822,6 +841,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				targets = append(targets, inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size))
 			}
 			return targets
+		}
+		var syncMutation func() error
+		if len(set.GetHandle()) != 0 {
+			syncMutation = func() error { return syncFskitHandle(durability) }
 		}
 		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var modePtr *fs.FileMode
@@ -860,7 +883,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			resp := h.success(0)
 			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
 			return resp, completeTargets(attr)
-		}, &releaseMutation)
+		}, syncMutation, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -942,7 +965,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
 			)
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -952,6 +975,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var parentCoordinate, existingCoordinate visibilityCoordinate
 		var existingSize int64
 		var existed bool
+		var durability xfsstore.SyncTarget
+		defer func() {
+			if durability != nil {
+				_ = durability.Close()
+			}
+		}()
 		var releaseMutation func()
 		bindingRefreshes := 0
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
@@ -1059,6 +1088,14 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			openCreated := func() error {
 				var openErr error
 				handle, openErr = h.Store.OpenFile(item, openFlags(body.Create.GetFlags()))
+				if openErr == nil && (!existed || body.Create.GetFlags().GetTruncate()) {
+					// Retain before restore bookkeeping: a later map failure
+					// must not discard the description that applied O_TRUNC.
+					durability, openErr = h.retainFskitMutationHandle(frontendProfile, handle)
+					if openErr != nil {
+						return &xfsstore.DurabilityError{Cause: openErr}
+					}
+				}
 				return openErr
 			}
 			if h.Restore != nil && h.Restore.Active() && existed && body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
@@ -1175,7 +1212,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				namespaceTargetPost(parentCoordinate, body.Create.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
 				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
 			}
-		}, &releaseMutation)
+		}, func() error { return syncFskitHandle(durability) }, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1239,7 +1276,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				namespaceTargetPost(parentCoordinate, body.Mkdir.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
 				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
 			}
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1290,7 +1327,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
 			)
 			return resp, targets
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1415,7 +1452,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return resp, nil
 			}
 			return resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, oldPostCoordinate, oldPostBound, true)
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1466,7 +1503,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			)
 			targets := linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, true)
 			return resp, targets
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1526,7 +1563,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				namespaceTargetPost(parentCoordinate, body.Symlink.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
 				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
 			}
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1551,6 +1588,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if profileErr != nil {
 			return h.errorResponse(req.GetRequestId(), profileErr, false)
 		}
+		var durability xfsstore.SyncTarget
+		defer func() {
+			if durability != nil {
+				_ = durability.Close()
+			}
+		}()
 		var openedHandle xfsstore.Capability
 		cleanupOpenedHandle := func() {
 			if openedHandle == (xfsstore.Capability{}) {
@@ -1573,6 +1616,13 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			handle, err := h.Store.OpenFile(item, openFlags(body.Open.GetFlags()))
 			if err != nil {
 				return h.errorResponse(0, err, uncertainFailure(err))
+			}
+			if body.Open.GetFlags().GetTruncate() {
+				durability, err = h.retainFskitMutationHandle(frontendProfile, handle)
+				if err != nil {
+					h.closeOpen(handle)
+					return h.errorResponse(0, &xfsstore.DurabilityError{Cause: err}, true)
+				}
 			}
 			if err := reservation.commit(nil, []trackedCapability{{value: handle, protected: protected}}); err != nil {
 				h.closeOpen(handle)
@@ -1683,7 +1733,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true,
 			})
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
-		}, &releaseMutation)
+		}, func() error { return syncFskitHandle(durability) }, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1850,7 +1900,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			resp := h.success(0)
 			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -1882,7 +1932,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			resp := h.success(0)
 			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
-		}, &releaseMutation)
+		}, nil, &releaseMutation)
 		if releaseMutation != nil {
 			releaseMutation()
 		}
@@ -2678,7 +2728,7 @@ func (h *VolumeHandler) mutateVisible(
 ) *authoritypb.Response {
 	return h.mutateVisibleSequence(ctx, req, cred, prepare, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		return apply()
-	}, releaseMutation...)
+	}, nil, releaseMutation...)
 }
 
 func (h *VolumeHandler) mutateVisibleResolved(
@@ -2691,7 +2741,7 @@ func (h *VolumeHandler) mutateVisibleResolved(
 ) *authoritypb.Response {
 	return h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		return apply()
-	}, releaseMutation...)
+	}, nil, releaseMutation...)
 }
 
 func (h *VolumeHandler) mutateVisibleSequence(
@@ -2700,11 +2750,12 @@ func (h *VolumeHandler) mutateVisibleSequence(
 	cred volumeserver.SessionCredential,
 	prepare func() ([]volumeserver.VisibilityTarget, error),
 	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+	syncMutation func() error,
 	releaseMutation ...*func(),
 ) *authoritypb.Response {
 	return h.mutateVisibleSequenceResolved(ctx, req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 		return prepare()
-	}, apply, releaseMutation...)
+	}, apply, syncMutation, releaseMutation...)
 }
 
 func (h *VolumeHandler) mutateVisibleSequenceResolved(
@@ -2713,9 +2764,10 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 	cred volumeserver.SessionCredential,
 	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
 	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+	syncMutation func() error,
 	releaseMutation ...*func(),
 ) *authoritypb.Response {
-	return h.mutateCoherenceVisibleSequenceResolved(ctx, req, cred, prepare, apply, releaseMutation...)
+	return h.mutateCoherenceVisibleSequenceResolved(ctx, req, cred, prepare, apply, syncMutation, releaseMutation...)
 }
 
 func stampVisibilityTargets(targets []volumeserver.VisibilityTarget, state *authoritypb.PostState) {
