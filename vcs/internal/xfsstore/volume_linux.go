@@ -1041,10 +1041,9 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	// A description this authority created the inode with already carries the
 	// access the creating caller was granted, so it answers this open without
 	// re-deriving anything from the mode. Sync intent is retained logically on
-	// the handle instead of being installed on the fd: transactional writes may
-	// span many bounded pwrite calls and must issue one aggregate sync, while
-	// XFS fallocate/CFR semantics need the immutable OPEN intent once after a
-	// clean operation. A sticky O_SYNC/O_DSYNC fd would add implicit syncs to direct writes.
+	// the handle instead of being installed on the fd: each direct write,
+	// fallocate or copy-file-range operation fulfills the immutable OPEN intent
+	// once after apply. A sticky O_SYNC/O_DSYNC fd would add implicit syncs.
 	if granted := obj.grant.take(); granted != nil {
 		return v.adoptGrantedDescription(obj.grant, granted, id, obj.kind, flags)
 	}

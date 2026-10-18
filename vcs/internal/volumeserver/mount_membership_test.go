@@ -1,12 +1,80 @@
 package volumeserver
 
 import (
+	"bytes"
 	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
 )
+
+func TestFileMountMembershipRequiresCurrentFilename(t *testing.T) {
+	for _, name := range []string{"visibility.membership", "membership", "mount.membership.old"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			if m, _, err := OpenFileMountMembership(path, "volume-a", false); err == nil {
+				m.Close()
+				t.Fatal("accepted a non-current membership filename")
+			}
+			if _, err := os.Stat(path + ".lock"); !os.IsNotExist(err) {
+				t.Fatalf("refused filename created a lock: %v", err)
+			}
+		})
+	}
+}
+
+func TestFileMountMembershipWritesSharedCodecBytesAndRollsBackDeactivate(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, mountmembership.Filename)
+	m, _, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	records := []mountmembership.Record{
+		{SessionID: [16]byte{3}, Profile: MembershipCacheless},
+		{SessionID: [16]byte{1}, Profile: MembershipFSKitExclusive},
+		{SessionID: [16]byte{2}, Profile: MembershipLinux},
+	}
+	assertDisk := func(records []mountmembership.Record) {
+		t.Helper()
+		want, err := mountmembership.Encode("volume-a", records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("disk membership=%q (%v), want shared codec %q", got, err, want)
+		}
+	}
+	assertDisk(nil)
+	for _, record := range records {
+		if err := m.ActivateProfile(SessionID(record.SessionID), record.Profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertDisk(records)
+	m.path = filepath.Join(dir, "missing", mountmembership.Filename)
+	id := SessionID(records[1].SessionID)
+	if err := m.Deactivate(id); err == nil {
+		t.Fatal("deactivate succeeded without persistence")
+	}
+	m.path = path
+	if _, ok := m.active[id]; !ok || m.profiles[id] != MembershipFSKitExclusive {
+		t.Fatal("failed deactivate lost its active profile")
+	}
+	assertDisk(records)
+	if err := m.Deactivate(id); err != nil {
+		t.Fatal(err)
+	}
+	assertDisk([]mountmembership.Record{records[0], records[2]})
+}
 
 func TestFileMountMembershipActivateRollsBackAfterPersistFailure(t *testing.T) {
 	dir := t.TempDir()

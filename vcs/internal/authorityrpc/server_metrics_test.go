@@ -71,6 +71,28 @@ func TestRPCObservationWithoutMetrics(t *testing.T) {
 	}
 }
 
+func TestRPCLookupObservationPolarity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response *authoritypb.Response
+		found    bool
+	}{
+		{"positive", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: &authoritypb.Item{}}}}, true},
+		{"negative", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: 7}}}, false},
+		{"error", &authoritypb.Response{Errno: 13}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var observed RPCObservation
+			server := &Server{Handler: &benchmarkDispatchHandler{response: tc.response}, OnRPC: func(o RPCObservation) { observed = o }}
+			request := &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}
+			server.dispatchRequest(t.Context(), request)
+			if observed.Operation != authoritymetrics.OperationLookup || observed.LookupFound != tc.found {
+				t.Fatalf("observation=%+v, want found=%v", observed, tc.found)
+			}
+		})
+	}
+}
+
 func TestRequestOperationAndResponseOutcome(t *testing.T) {
 	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}
 	if got := requestOperation(request); got != authoritymetrics.OperationWrite {

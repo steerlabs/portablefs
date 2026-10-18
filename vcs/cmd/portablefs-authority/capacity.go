@@ -15,7 +15,7 @@ const (
 	defaultMaxWriteBytes               = 1 << 20
 	defaultMaxFrameBytesInFlight       = 512 << 20
 	// The authority has no item-capacity negotiation. This must remain at least
-	// mountv3.CachedNameCapacity so a stock mount can retain its declared cache.
+	// mountv3.NameCacheCapacity so a stock mount can retain its declared cache.
 	defaultMaxItemsPerSession = 1 << 16
 )
 

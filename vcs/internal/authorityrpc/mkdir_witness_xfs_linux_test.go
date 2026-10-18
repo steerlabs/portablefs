@@ -3,6 +3,7 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -103,21 +104,74 @@ func TestMkdirSearchWitnessOnXFS(t *testing.T) {
 			f.reclaim(t, item.GetToken())
 		})
 	}
-	// A restrictive inherited ACL cannot make the private project-validation
-	// reopen fail or substitute guessed mode bits for the final kernel check.
-	acl := make([]byte, 4+3*8)
-	binary.LittleEndian.PutUint32(acl, 2)
-	for i, tag := range []uint16{1, 4, 32} {
-		binary.LittleEndian.PutUint16(acl[4+i*8:], tag)
-		binary.LittleEndian.PutUint32(acl[8+i*8:], mathMaxUint32)
+	// Final chmod must preserve named entries/default ACLs and update the
+	// access mask exactly, even when inheritance initially removes owner access.
+	for _, named := range []bool{false, true} {
+		t.Run(fmt.Sprintf("default-acl-named-%v", named), func(t *testing.T) {
+			type entry struct {
+				tag, perm uint16
+				id        uint32
+			}
+			encode := func(entries []entry) []byte {
+				acl := make([]byte, 4+len(entries)*8)
+				binary.LittleEndian.PutUint32(acl, 2)
+				for i, e := range entries {
+					binary.LittleEndian.PutUint16(acl[4+i*8:], e.tag)
+					binary.LittleEndian.PutUint16(acl[6+i*8:], e.perm)
+					binary.LittleEndian.PutUint32(acl[8+i*8:], e.id)
+				}
+				return acl
+			}
+			entries := []entry{{1, 0, mathMaxUint32}, {4, 0, mathMaxUint32}, {32, 0, mathMaxUint32}}
+			if named {
+				entries = []entry{{1, 0, mathMaxUint32}, {2, 7, uint32(os.Geteuid() + 1)}, {4, 5, mathMaxUint32}, {16, 0, mathMaxUint32}, {32, 0, mathMaxUint32}}
+			}
+			acl := encode(entries)
+			if err := unix.Setxattr(f.path, "system.posix_acl_default", acl, 0); err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Removexattr(f.path, "system.posix_acl_default")
+			getACL := func(path, name string) ([]byte, error) {
+				buf := make([]byte, 256)
+				n, err := unix.Getxattr(path, name, buf)
+				if err != nil {
+					return nil, err
+				}
+				return buf[:n], nil
+			}
+			for _, mode := range []uint32{0, 0100, 0141, 0700} {
+				name := fmt.Sprintf("acl-named-%v-mode-%03o", named, mode)
+				reply := f.mkdir(t, name, mode)
+				if reply.GetMkdir().GetChildSearchPermitted() != (mode&0100 != 0) {
+					t.Fatalf("kernel witness=%v", reply)
+				}
+				path := filepath.Join(f.path, name)
+				var stat unix.Stat_t
+				if err := unix.Stat(path, &stat); err != nil || stat.Mode&0777 != mode {
+					t.Fatalf("final mode=%03o, want %03o (%v)", stat.Mode&0777, mode, err)
+				}
+				got, err := getACL(path, "system.posix_acl_default")
+				if err != nil || !bytes.Equal(got, acl) {
+					t.Fatalf("default ACL changed: %x, want %x (%v)", got, acl, err)
+				}
+				got, err = getACL(path, "system.posix_acl_access")
+				if !named {
+					if err != syscall.ENODATA {
+						t.Fatalf("minimal ACL was not reduced to mode: %x (%v)", got, err)
+					}
+				} else {
+					access := append([]entry(nil), entries...)
+					access[0].perm, access[3].perm, access[4].perm = uint16(mode>>6&7), uint16(mode>>3&7), uint16(mode&7)
+					want := encode(access)
+					if err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("final access ACL=%x, want %x (%v)", got, want, err)
+					}
+				}
+				f.reclaim(t, reply.GetMkdir().GetItem().GetToken())
+			}
+		})
 	}
-	if err := unix.Setxattr(f.path, "system.posix_acl_default", acl, 0); err != nil {
-		t.Fatalf("install restrictive default ACL: %v", err)
-	}
-	defer unix.Removexattr(f.path, "system.posix_acl_default")
-	if reply := f.mkdir(t, "acl-search", 0100); !reply.GetMkdir().GetChildSearchPermitted() {
-		t.Fatal("final searchable child lost kernel witness under inherited ACL")
-	}
+
 }
 
 const mathMaxUint32 = ^uint32(0)

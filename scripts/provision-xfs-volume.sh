@@ -135,7 +135,7 @@ sync -- "$stage"
 mv -- "$stage" "$destination"
 stage=
 sync -- "$mount_root"
-# Strict-cache membership is durable coordination metadata, not user-visible
+# Mount membership is durable coordination metadata, not user-visible
 # filesystem state. Keep it beside the project volumes, in a per-worker private
 # directory, so an authority restart cannot forget a still-mounted kernel while
 # agents can never reach or mutate the record through PortableFS.
@@ -146,8 +146,8 @@ if [[ ! -e $control_root && ! -L $control_root ]]; then
   sync -- "$control_root"
   sync -- "$mount_root"
 fi
-[[ -d $control_root && ! -L $control_root ]] || fail "visibility control root is not a real directory"
-[[ $(stat -c '%u:%g:%a' -- "$control_root") == 0:0:711 ]] || fail "visibility control root must be root:root mode 0711"
+[[ -d $control_root && ! -L $control_root ]] || fail "mount control root is not a real directory"
+[[ $(stat -c '%u:%g:%a' -- "$control_root") == 0:0:711 ]] || fail "mount control root must be root:root mode 0711"
 control_dir=$control_root/$volume_name
 mkdir -m 0700 -- "$control_dir"
 chown "$service_uid:$service_gid" "$control_dir"
@@ -156,7 +156,6 @@ sync -- "$control_root"
 
 # Projects share this filesystem's writeback-error and latency domain. Quotas
 # constrain allocations; per-volume workers do not isolate syncfs errors/waits.
-sync -- "$control_dir"
 sync -f -- "$mount_root"
 write_registry_record published
 

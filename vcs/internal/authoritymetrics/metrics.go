@@ -63,10 +63,10 @@ const (
 	operationCount
 )
 
-var operationNames = [...]string{
+var operationNames = [operationCount]string{
 	"unknown", "hello", "attach", "resume", "activate", "abort_attach", "keep_alive", "reauthorize", "detach", "cancel",
 	"terminal_delivery_receipt", "apply_routes", "lookup", "getattr", "setattr", "create",
-	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "positioned_write", "fskit_write_begin",
+	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "positioned_write",
 	"fallocate", "copy_file_range", "tmpfile",
 	"fsync", "readdir", "reclaim", "flush", "getxattr", "setxattr", "listxattr", "removexattr", "statfs", "syncfs",
 	"getlock", "setlock",
@@ -101,7 +101,7 @@ const (
 	outcomeCount
 )
 
-var outcomeNames = [...]string{
+var outcomeNames = [outcomeCount]string{
 	"success", "not_found", "permission", "stale", "invalid", "saturation", "unsupported", "conflict", "canceled",
 	"storage", "internal", "coherence", "routes", "io", "other",
 }
@@ -111,18 +111,6 @@ func (o Outcome) String() string {
 		return outcomeNames[OutcomeOther]
 	}
 	return outcomeNames[o]
-}
-
-type FenceReason uint8
-
-const (
-	FenceProtocolViolation FenceReason = iota
-	FenceOther
-	fenceReasonCount
-)
-
-var fenceReasonNames = [...]string{
-	"protocol_violation", "other",
 }
 
 type rpcSeries struct {
@@ -148,7 +136,6 @@ type Metrics struct {
 	storageSyncWaiters      [3]*Counter
 	fskitDurabilitySyncs    [2]*Counter
 	fskitDurabilityDuration [2]*Histogram
-	fences                  [fenceReasonCount]*Counter
 }
 
 var rpcDurationBuckets = []float64{
@@ -232,15 +219,6 @@ func New(volume string) (*Metrics, error) {
 			return nil, err
 		}
 	}
-	for reason := FenceReason(0); reason < fenceReasonCount; reason++ {
-		metrics.fences[reason], err = registry.RegisterCounter(
-			"portablefs_authority_fence_events_total", "Participant fence or revocation events by bounded reason.",
-			base, Label{Name: "reason", Value: fenceReasonNames[reason]},
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if err := metrics.registerCoherenceMetrics(base); err != nil {
 		return nil, err
 	}
@@ -316,16 +294,6 @@ func (m *Metrics) ObserveFsyncBatch(handles int) {
 	}
 	m.fsyncBarrierHandles.Add(uint64(handles))
 	m.fsyncStorageSyncs.Inc()
-}
-
-func (m *Metrics) Fence(reason FenceReason) {
-	if m == nil {
-		return
-	}
-	if reason >= fenceReasonCount {
-		reason = FenceOther
-	}
-	m.fences[reason].Inc()
 }
 
 // ObserveFskitDurability counts obligations, including failed barriers. The
