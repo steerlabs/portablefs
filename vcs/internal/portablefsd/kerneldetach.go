@@ -82,8 +82,7 @@ func (e *kernelDetachAbandonedError) Error() string {
 		"kernel detach of %s did not return within %s and was abandoned in helper pid %d; "+
 			"the kernel is still waiting on the filesystem extension for this mount. "+
 			"portablefsd stayed responsive and remains terminable; re-run `portablefs umount` "+
-			"once the extension is restarted, or `portablefs umount --force` to detach with "+
-			"the unshipped tail parked as a durable recovery job",
+			"once the extension is restarted, or `portablefs umount --force` to revoke the kernel mount",
 		e.mountPath, e.budget, e.pid,
 	)
 }

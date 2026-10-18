@@ -1,21 +1,10 @@
 package portablefsd
 
-import (
-	"errors"
-	"math/bits"
-)
+import "errors"
 
-// v3TicksToNanos converts mach ticks with the timebase numer/denom ratio in
-// 128-bit arithmetic, refusing a result that does not fit 64 bits instead of
-// wrapping into a time that could look valid.
-func v3TicksToNanos(ticks, numer, denom uint64) (uint64, error) {
-	if numer == 0 || denom == 0 {
-		return 0, errors.New("portablefsd: invalid continuous clock timebase")
+func v3TimespecNanos(sec, nsec int64) (uint64, error) {
+	if sec < 0 || nsec < 0 || nsec >= 1e9 || uint64(sec) > (^uint64(0)-uint64(nsec))/1e9 {
+		return 0, errors.New("portablefsd: continuous clock timespec is out of range")
 	}
-	high, low := bits.Mul64(ticks, numer)
-	if high >= denom {
-		return 0, errors.New("portablefsd: continuous clock overflowed")
-	}
-	nanos, _ := bits.Div64(high, low, denom)
-	return nanos, nil
+	return uint64(sec)*1e9 + uint64(nsec), nil
 }

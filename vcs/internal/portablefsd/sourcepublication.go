@@ -227,19 +227,13 @@ type v3SourcePublicationLease struct {
 	assigned             uint32
 	// active counts whole source handlers, through validated cache application
 	// and claim settlement. PublicationAck retains ordering holds independently.
-	active uint32
-	// acquisitions counts this callback's admitted source acquisitions, so a
-	// namespace errno witness can prove no same-callback request was admitted
-	// after it.
-	acquisitions uint64
-	released     bool
+	active   uint32
+	released bool
 }
 
 // v3SourcePublicationCoordinator is the one local ordering point between
 // callback-owned source publication and authority-owned peer repair. It uses
-// stable identities only. The older mount-wide path handoff gate remains a
-// separate delegation mechanism and is never consulted for this correctness
-// cut.
+// stable identities only.
 type v3SourcePublicationCoordinator struct {
 	mu                   sync.Mutex
 	changed              chan struct{}
@@ -601,7 +595,6 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 			op.lease = lease
 		}
 		lease.active++
-		lease.acquisitions++
 		for coordinate := range coordinates {
 			c.holdLocked(coordinate, lease)
 		}
@@ -668,25 +661,6 @@ func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 		}
 		return false
 	})
-}
-
-// observeLease reports, under the coordinator mutex, how many acquisitions
-// the lease's callback has made and whether namespace is held only by this
-// lease with exactly one unresolved claim, the caller's own. observe may take
-// d.mu and nothing else.
-func (c *v3SourcePublicationCoordinator) observeLease(lease *v3SourcePublicationLease, namespace v3PublicationNamespace, observe func(acquisitions uint64, exclusive bool)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if lease == nil || lease.gate != c {
-		observe(0, false)
-		return
-	}
-	coordinate := v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: namespace.parent, name: namespace.name}
-	claims := lease.names[namespace]
-	_, held := c.sourceHolds[coordinate][lease]
-	exclusive := c.terminal == nil && !lease.released && held && len(c.sourceHolds[coordinate]) == 1 &&
-		claims.attributes == 1 && claims.data == 0
-	observe(lease.acquisitions, exclusive)
 }
 
 // finishRequest runs exactly once at the whole handler's return, never at RPC

@@ -196,9 +196,6 @@ type v3CookieBatch struct {
 	order    *list.Element
 }
 
-// v3DataPlane is intentionally not wired into registry.Resolve yet. It is the
-// complete, independently testable authority-v3 backend boundary; making it
-// constructible does not advertise a live FSKit mount or expose credentials.
 type v3DataPlane struct {
 	client v3DataPlaneClient
 	cfg    v3DataPlaneConfig
@@ -266,17 +263,12 @@ type v3DataPlane struct {
 	reauthSequence  uint64
 	// The cache-serving horizon, on the continuous clock. horizon is the latest
 	// instant an explicit KeepAlive proof of this session/epoch makes safe; zero
-	// means no usable proof. authGeneration advances when a reauthorization
-	// starts and when it ends, and authorizing marks one in progress, so no
-	// proof sampled under an earlier authorization can reopen eligibility.
+	// means no usable proof.
 	// authorizationDeadline is the installed signed deadline, an additional
 	// wall-clock denial check (zero: none). All are protected by mu.
 	clock                 func() (uint64, error)
-	clockHigh             uint64
 	clockFault            error
 	horizon               uint64
-	authGeneration        uint64
-	authorizing           bool
 	authorizationDeadline time.Time
 
 	failOnce sync.Once
@@ -316,21 +308,11 @@ func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence ui
 	if sequence < d.reauthSequence || sequence > d.reauthSequence+1 {
 		return time.Time{}, errors.New("reauthorization sequence is not current or exactly next")
 	}
-	// A replacement decision can shorten the session's remaining validity, so
-	// every proof sampled against the current one stops counting before the
-	// request is admitted, and none sampled while it is in flight ever counts.
-	d.mu.Lock()
-	d.horizon = 0
-	d.authGeneration++
-	d.authorizing = true
-	d.mu.Unlock()
 	deadline, err := client.Reauthorize(ctx, token, sequence)
 	if err == nil && !deadline.After(time.Now()) {
 		err = errors.New("reauthorization returned an expired deadline")
 	}
 	d.mu.Lock()
-	d.authGeneration++
-	d.authorizing = false
 	if err == nil {
 		d.authorizationDeadline = deadline
 	}
@@ -339,10 +321,6 @@ func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence ui
 		return time.Time{}, err
 	}
 	d.reauthSequence = sequence
-	// The replacement authorization earns its own proof before any hit.
-	if err := d.renewHorizon(ctx); err != nil {
-		return time.Time{}, d.fail(fmt.Errorf("portablefsd: keepalive after reauthorization failed: %w", err))
-	}
 	return deadline, nil
 }
 
@@ -765,7 +743,7 @@ func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: set}}, gate, nil)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: set}}, gate)
 	defer finish()
 	if errno != 0 {
 		return nil, errno
@@ -955,7 +933,7 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 		Handle: cloneBytesV3(handle.token), Position: request.Offset, Size: uint32(size),
 		Data: request.Data, WriteFlags: v3WriteFlagKillSUIDGID,
-	}}}, gate, nil)
+	}}}, gate)
 	defer finish()
 	if errno != 0 {
 		return nil, errno
@@ -1070,14 +1048,13 @@ func (d *v3DataPlane) create(ctx context.Context, operationID uint64, request *p
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
 	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
 		Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode,
 		Flags: &authoritypb.OpenFlags{Read: true, Write: true, Append: request.Append}, Exclusive: request.Exclusive,
-	}}}, gate, witness)
+	}}}, gate)
 	defer finish()
 	if errno != 0 {
-		return nil, d.settleNameErrno(witness, errno)
+		return nil, d.settleNameErrno(parent, request.Name, errno)
 	}
 	created := response.GetCreate()
 	if created == nil || created.GetItem() == nil || len(created.GetHandle()) != 16 {
@@ -1133,11 +1110,10 @@ func (d *v3DataPlane) mkdir(ctx context.Context, operationID uint64, request *pf
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode}}}, gate)
 	defer finish()
 	if errno != 0 {
-		return nil, d.settleNameErrno(witness, errno)
+		return nil, d.settleNameErrno(parent, request.Name, errno)
 	}
 	record, errno := d.adoptCreated(ctx, operationID, gate, response, parent, request.Name, authoritypb.Attr_DIRECTORY)
 	if errno != 0 {
@@ -1162,11 +1138,10 @@ func (d *v3DataPlane) remove(ctx context.Context, operationID uint64, request *p
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	witness := newV3NameWitness(parent, request.Name, darwinENOENT)
-	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Directory: request.Directory}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Directory: request.Directory}}}, gate)
 	defer finish()
 	if errno != 0 {
-		return nil, d.settleNameErrno(witness, errno)
+		return nil, d.settleNameErrno(parent, request.Name, errno)
 	}
 	effect, err := v3RemoveEffect(response.GetPostState(), parent, request.Name, request.Directory)
 	if err == nil {
@@ -1205,10 +1180,11 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 	}
 	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
 		OldParent: cloneBytesV3(from.token), OldName: cloneBytesV3(request.FromName), NewParent: cloneBytesV3(to.token), NewName: cloneBytesV3(request.ToName), NoReplace: request.NoReplace,
-	}}}, gate, nil)
+	}}}, gate)
 	defer finish()
 	if errno != 0 {
-		return nil, errno
+		d.settleNameErrno(from, request.FromName, errno)
+		return nil, d.settleNameErrno(to, request.ToName, errno)
 	}
 	rename := response.GetRename()
 	if rename == nil {
@@ -1311,11 +1287,10 @@ func (d *v3DataPlane) symlink(ctx context.Context, operationID uint64, request *
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Target: cloneBytesV3(request.Target)}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Target: cloneBytesV3(request.Target)}}}, gate)
 	defer finish()
 	if errno != 0 {
-		return nil, d.settleNameErrno(witness, errno)
+		return nil, d.settleNameErrno(parent, request.Name, errno)
 	}
 	record, errno := d.adoptCreated(ctx, operationID, gate, response, parent, request.Name, authoritypb.Attr_SYMLINK)
 	if errno != 0 {
@@ -1359,11 +1334,10 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytesV3(item.token), NewParent: cloneBytesV3(parent.token), NewName: cloneBytesV3(request.Name)}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytesV3(item.token), NewParent: cloneBytesV3(parent.token), NewName: cloneBytesV3(request.Name)}}}, gate)
 	defer finish()
 	if errno != 0 {
-		return nil, d.settleNameErrno(witness, errno)
+		return nil, d.settleNameErrno(parent, request.Name, errno)
 	}
 	linked := response.GetLink()
 	if linked == nil || linked.GetItem() == nil {
@@ -1490,7 +1464,7 @@ func (d *v3DataPlane) xattrRemove(ctx context.Context, operationID uint64, reque
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: query}}, gate, nil)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: query}}, gate)
 	defer finish()
 	if errno != 0 {
 		return nil, errno
@@ -1804,9 +1778,8 @@ func (d *v3DataPlane) revokeRetainedResponse(ctx context.Context, cause error) {
 }
 
 // callMutation runs one visible mutation under its source-publication lease.
-// A namespace mutation passes the witness of the cached name it may
-// contradict; it is captured right after source admission.
-func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.FskitSourcePublication, witness *v3NameWitness) (*authoritypb.Response, int32, func()) {
+// Its caller defers the returned settlement until the whole handler returns.
+func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.FskitSourcePublication) (*authoritypb.Response, int32, func()) {
 	finish := func() {}
 	if operationID == 0 || request == nil {
 		return nil, darwinEINVAL, finish
@@ -1819,12 +1792,6 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		return nil, v3LocalErrno(err), finish
 	}
 	finish = lease.finishRequest
-	witness.capture(d, lease)
-	if d.endOnClockFault() != nil {
-		// Serving has ended; like a local withdrawal before assignment, no
-		// authority request owns this callback's outcome.
-		return nil, darwinEIO, finish
-	}
 	request.FskitSourcePublication = gate
 	// Carry the exact pfslocal publication/callback identity into authority
 	// scheduling as retry-fairness metadata. Publication ownership itself is
@@ -2724,11 +2691,12 @@ func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Requ
 		return d.terminalError()
 	}
 	state := response.GetMutation()
-	if assigned.Sequence == 0 || state == nil || state.GetSlot() != assigned.Slot || state.GetAcceptedSequence() != assigned.Sequence {
+	if assigned.Sequence == 0 || errno == 0 && state == nil || state != nil && (state.GetSlot() != assigned.Slot || state.GetAcceptedSequence() != assigned.Sequence) {
 		return d.fail(errors.New("portablefsd: release lost its exact replay assignment"))
 	}
 	if errno != 0 {
-		if response.GetBody() != nil || response.GetPostState() != nil || len(response.GetTerminalDeliveryToken()) != 0 {
+		if response.GetBody() != nil || response.GetPostState() != nil || len(response.GetTerminalDeliveryToken()) != 0 ||
+			!v3DefiniteReleaseFailure(response.GetFailure()) {
 			return d.fail(errors.New("portablefsd: malformed release refusal"))
 		}
 		return d.stopServing(fmt.Errorf("portablefsd: authority release refused with errno %d", errno))
@@ -2749,8 +2717,7 @@ func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Requ
 	var refusal error
 	for index, result := range results {
 		if result == nil || result.GetErrno() < 0 || !result.GetRetired() && result.GetErrno() == 0 ||
-			result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
-			result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
+			!v3DefiniteReleaseFailure(result.GetFailure()) ||
 			result.GetErrno() == 0 && result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED {
 			return d.fail(fmt.Errorf("portablefsd: malformed or terminal close result %d: %v", index, result))
 		}
@@ -2762,6 +2729,16 @@ func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Requ
 		return d.stopServing(refusal)
 	}
 	return nil
+}
+
+func v3DefiniteReleaseFailure(class authoritypb.FailureClass) bool {
+	switch class {
+	case authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED, authoritypb.FailureClass_FAILURE_CLASS_INTERNAL,
+		authoritypb.FailureClass_FAILURE_CLASS_ROUTES, authoritypb.FailureClass_FAILURE_CLASS_RESTORE:
+		return true
+	default:
+		return false
+	}
 }
 
 // transferReleases closes admission without waiting on DATA. Session teardown
@@ -2915,7 +2892,6 @@ func v3KeepAliveInterval(lease, repairBudget time.Duration) time.Duration {
 func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
 	d.mu.Lock()
 	start, startErr := d.readClockLocked()
-	generation, authorizing := d.authGeneration, d.authorizing
 	d.mu.Unlock()
 	if startErr != nil {
 		// Serving ends at once; the renewal itself still runs, because liveness
@@ -2929,12 +2905,9 @@ func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
 	d.mu.Lock()
 	now, nowErr := d.readClockLocked()
 	candidate, usable := v3HorizonCandidate(start, proof)
-	// A legitimate proof consumed by delay supplies no horizon; it is not a
-	// protocol defect. A receipt of an older generation, or one arriving out of
-	// order, can neither resurrect a terminal data plane nor move the horizon
-	// backwards. Either read's fault is latched in clockFault.
-	if d.clockFault == nil && usable && now < candidate && !authorizing && d.terminal == nil && !d.authorizing &&
-		d.authGeneration == generation && candidate > d.horizon {
+	// Retained writer exclusion never shrinks on reauthorization. Only the
+	// installed deadline denies local permission; wall time grants no horizon.
+	if d.clockFault == nil && usable && now < candidate && d.terminal == nil && candidate > d.horizon {
 		d.horizon = candidate
 	}
 	d.mu.Unlock()
@@ -2944,16 +2917,11 @@ func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
 	return nil
 }
 
-// readClockLocked reads the continuous clock and refuses a value below the
-// greatest one already observed: the horizon arithmetic assumes the clock
-// never runs backwards, so a regression is a clock fault, not a time. Every
-// observed fault is latched and voids the horizon at once; the caller ends
-// serving with endOnClockFault after releasing its locks. d.mu is held.
+// readClockLocked invalidates the horizon on an actual clock API or
+// representation error. The caller hands that error to stopServing only after
+// releasing the snapshot locks. Supported platform monotonicity is a premise.
 func (d *v3DataPlane) readClockLocked() (uint64, error) {
 	now, err := d.clock()
-	if err == nil && now < d.clockHigh {
-		err = fmt.Errorf("continuous clock regressed from %d to %d", d.clockHigh, now)
-	}
 	if err != nil {
 		if d.clockFault == nil {
 			d.clockFault = err
@@ -2961,7 +2929,6 @@ func (d *v3DataPlane) readClockLocked() (uint64, error) {
 		d.horizon = 0
 		return 0, err
 	}
-	d.clockHigh = now
 	return now, nil
 }
 

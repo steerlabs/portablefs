@@ -182,7 +182,7 @@ func TestV3ReleaseOwnerProducersReturnAtAcceptanceAndCoalesce(t *testing.T) {
 	transport.release <- struct{}{}
 	<-transport.entered
 	transport.release <- struct{}{}
-	if err := r.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
 	sent := transport.sent()
@@ -225,7 +225,7 @@ func TestV3ReleaseOwnerBoundsBatchesWithBackpressure(t *testing.T) {
 	transport.release <- struct{}{}
 	requireV3ReleaseResult(t, blocked, nil)
 	requireV3ReleaseResult(t, reserved, nil)
-	if err := r.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
 	var all []string
@@ -248,7 +248,7 @@ func TestV3ReleaseOwnerSplitsLargeSubmissionsWithinTheBound(t *testing.T) {
 	if err := r.submit(v3ReleaseTokens("h1", "h2", "h3"), v3ReleaseTokens("a", "b")); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
 	var closes, reclaims []string
@@ -282,7 +282,7 @@ func TestV3ReleaseOwnerWaitsForReservationsBeforeSending(t *testing.T) {
 	}
 	reservation.commit(v3ReleaseTokens("h"), nil)
 	<-transport.entered
-	if err := r.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
 	if sent := transport.sent(); len(sent) != 1 || !slices.Equal(sent[0].closes, []string{"h"}) || !slices.Equal(sent[0].reclaims, []string{"a"}) {
@@ -300,7 +300,7 @@ func TestV3ReleaseOwnerFailureIsStickyAndNeverRetriedItemByItem(t *testing.T) {
 	requireV3ReleaseResult(t, submitV3Async(r, nil, v3ReleaseTokens("b")), nil)
 	waitV3ReleaseForming(t, r, 1)
 	transport.release <- struct{}{}
-	if err := r.drain(context.Background()); !errors.Is(err, failure) {
+	if err := waitV3ReleaseOwner(context.Background(), r); !errors.Is(err, failure) {
 		t.Fatalf("drain after failure = %v, want the sticky failure", err)
 	}
 	// The batch formed behind the failed one is never sent, and later
@@ -332,49 +332,6 @@ func TestV3ReleaseOwnerFailureWakesWaitingProducers(t *testing.T) {
 	requireV3ReleaseResult(t, waiting, failure)
 }
 
-// Drain settles accepted work on the original session, then hands every later
-// token to the detach explicitly: later producers return without a round trip
-// and reservations report the closed owner.
-func TestV3ReleaseOwnerDrainSettlesAcceptedWorkAndTransfersLaterTokens(t *testing.T) {
-	transport := newRecordingV3ReleaseSend(true)
-	r := newV3ReleaseOwner(v3ReleaseBatchTokens, transport.send)
-	requireV3ReleaseResult(t, submitV3Async(r, nil, v3ReleaseTokens("a")), nil)
-	<-transport.entered
-	requireV3ReleaseResult(t, submitV3Async(r, v3ReleaseTokens("h"), nil), nil)
-	waitV3ReleaseForming(t, r, 1)
-	drained := make(chan error, 1)
-	go func() { drained <- r.drain(context.Background()) }()
-	requireV3ReleaseBlocked(t, drained)
-	transport.release <- struct{}{}
-	<-transport.entered
-	transport.release <- struct{}{}
-	requireV3ReleaseResult(t, drained, nil)
-	if err := r.submit(nil, v3ReleaseTokens("late")); err != nil {
-		t.Fatalf("submit after drain = %v, want acceptance by the detach", err)
-	}
-	if _, err := r.reserve(context.Background(), 1); !errors.Is(err, errV3ReleaseClosed) {
-		t.Fatalf("reserve after drain = %v, want the closed owner", err)
-	}
-	if sent := transport.sent(); len(sent) != 2 {
-		t.Fatalf("batches = %+v, want only the two accepted before drain", sent)
-	}
-}
-
-// A drain that cannot settle before its bound reports that, rather than
-// letting the detach claim the accepted work was released.
-func TestV3ReleaseOwnerDrainNeverClaimsUnfinishedWork(t *testing.T) {
-	transport := newRecordingV3ReleaseSend(true)
-	r := newV3ReleaseOwner(v3ReleaseBatchTokens, transport.send)
-	requireV3ReleaseResult(t, submitV3Async(r, nil, v3ReleaseTokens("a")), nil)
-	<-transport.entered
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := r.drain(ctx); err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("unfinished drain = %v, want its deadline", err)
-	}
-	transport.release <- struct{}{}
-}
-
 // A terminal data plane leaves forming tokens to session cleanup; the batch
 // already in flight still settles, and producers return.
 func TestV3ReleaseOwnerAbandonLeavesFormingTokensToTheSession(t *testing.T) {
@@ -388,7 +345,7 @@ func TestV3ReleaseOwnerAbandonLeavesFormingTokensToTheSession(t *testing.T) {
 	r.abandon()
 	requireV3ReleaseResult(t, waiting, nil)
 	transport.release <- struct{}{}
-	if err := r.drain(context.Background()); err != nil {
+	if err := waitV3ReleaseOwner(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
 	if sent := transport.sent(); len(sent) != 1 {
@@ -625,6 +582,7 @@ func TestV3ReleaseBatchFailuresAreTerminal(t *testing.T) {
 		{name: "envelope-errno", mutate: func(r *authoritypb.Response) {
 			r.Errno, r.Body = errnos.EINVAL, nil
 		}},
+		{name: "unrecorded-refusal", mutate: func(r *authoritypb.Response) { r.Errno, r.Body, r.Mutation = errnos.ENOMEM, nil, nil }},
 		{name: "reclaim-errno", reclaim: true, mutate: func(r *authoritypb.Response) {
 			r.Errno = errnos.ESTALE
 		}},
@@ -688,10 +646,10 @@ func TestV3ReleaseBatchFailuresAreTerminal(t *testing.T) {
 				}
 				time.Sleep(time.Millisecond)
 			}
-			if err := d.releases.drain(context.Background()); err == nil {
+			if err := waitV3ReleaseOwner(context.Background(), d.releases); err == nil {
 				t.Fatal("drain after a failed release claimed success")
 			}
-			definite := test.name == "first-entry-errno" || test.name == "envelope-errno" || test.name == "reclaim-errno"
+			definite := test.name == "first-entry-errno" || test.name == "envelope-errno" || test.name == "reclaim-errno" || test.name == "unrecorded-refusal"
 			select {
 			case <-client.SessionDone():
 				if definite {
@@ -746,10 +704,10 @@ func TestV3SaturatedReleasesNeverBlockTheSerialReader(t *testing.T) {
 	}
 }
 
-// After exact kernel absence the drain explicitly transfers later releases to
+// Exact kernel absence explicitly transfers later releases to
 // the detach; abandoned cleanup that arrives afterwards settles its debt
 // without a round trip.
-func TestV3DrainTransfersLateAbandonmentToTheDetach(t *testing.T) {
+func TestV3ExactAbsenceTransfersLateAbandonmentToTheDetach(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	collector := &v3ReplyResourceCollector{d: d}
@@ -762,7 +720,7 @@ func TestV3DrainTransfersLateAbandonmentToTheDetach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := d.releases.drain(context.Background()); err != nil {
+	if err := d.transferReleases(); err != nil {
 		t.Fatal(err)
 	}
 	before := len(client.mutationRequests())
@@ -882,7 +840,7 @@ func TestV3ReleaseTransferRetainsInflightOwnerWithoutOverwritingDetach(t *testin
 	}
 	_ = d.stopServing(errV3AttachDetached)
 	close(settle)
-	if err := d.releases.drain(context.Background()); err == nil {
+	if err := waitV3ReleaseOwner(context.Background(), d.releases); err == nil {
 		t.Fatal("unconfirmed release was reported as successful")
 	}
 	if !errors.Is(d.terminalError(), errV3AttachDetached) {
@@ -893,4 +851,23 @@ func TestV3ReleaseTransferRetainsInflightOwnerWithoutOverwritingDetach(t *testin
 		t.Fatal("late DATA error closed the retained transport")
 	default:
 	}
+}
+
+// waitV3ReleaseOwner is a test-only join. Production exact-absence teardown
+// never waits for release success before delivering its CONTROL proof.
+func waitV3ReleaseOwner(ctx context.Context, r *v3ReleaseOwner) error {
+	r.mu.Lock()
+	for r.running || r.forming != nil && r.forming.tokens()+r.forming.reserved != 0 {
+		changed := r.changed
+		r.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		r.mu.Lock()
+	}
+	err := r.failure
+	r.mu.Unlock()
+	return err
 }

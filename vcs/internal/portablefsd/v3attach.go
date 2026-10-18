@@ -701,9 +701,8 @@ func v3LatePublishingReplyDiscardable(body any, errno int32) bool {
 // handleV3Attached serves one frontend request of a v3 attach. It keeps the
 // connection's logical-operation ledger — reservation, exposure, and the one
 // post-callback PublicationAck — because the coherence bridge's source
-// COMPLETE barrier is built on exactly that acknowledgement, but it never
-// enters the clientcore admission, mirror, or delegation machinery: the v3
-// data plane owns its own ordering and concurrency bounds.
+// publication lifetime is built on that acknowledgement. The data plane
+// owns mutation ordering and concurrency bounds.
 func (c *frontendConn) handleV3Attached(
 	ctx context.Context,
 	a *attach,
@@ -717,15 +716,12 @@ func (c *frontendConn) handleV3Attached(
 	}
 	ctx, cancelOperation := withOperationDeadline(ctx)
 	defer cancelOperation()
-	gateCtx, participant, participates, publishes, err := c.beginLogicalOperation(
+	publishes, err := c.beginLogicalOperation(
 		ctx, a, operationID, initializeOperation, body,
 	)
 	if err != nil {
 		_ = c.conn.Close()
 		return
-	}
-	if participates {
-		defer a.finishFrontendParticipant(participant)
 	}
 	if _, ok := body.(*pfslocal.SubscribeEventsRequest); ok {
 		// Subscription binds the one lossless visibility consumer for this
@@ -742,10 +738,8 @@ func (c *frontendConn) handleV3Attached(
 	// A reply served from the metadata cache is revalidated at the physical
 	// write boundary. If that refuses it, nothing was exposed: the candidate is
 	// settled and the same operation takes the coherent authority path once.
-	for bypassCache := false; ; bypassCache = true {
-		if !c.serveV3Attempt(ctx, gateCtx, a, d, requestID, operationID, publishes, body, bypassCache) {
-			return
-		}
+	if c.serveV3Attempt(ctx, a, d, requestID, operationID, publishes, body, false) {
+		c.serveV3Attempt(ctx, a, d, requestID, operationID, publishes, body, true)
 	}
 }
 
@@ -753,7 +747,7 @@ func (c *frontendConn) handleV3Attached(
 // retry only when a cached reply's revalidation refused it before any byte was
 // written.
 func (c *frontendConn) serveV3Attempt(
-	ctx, gateCtx context.Context,
+	ctx context.Context,
 	a *attach,
 	d *v3DataPlane,
 	requestID uint64,
@@ -771,7 +765,7 @@ func (c *frontendConn) serveV3Attempt(
 	case *pfslocal.CreateRequest, *pfslocal.MkdirRequest, *pfslocal.SymlinkRequest:
 		resources.visible = true
 	}
-	dispatchCtx := context.WithValue(gateCtx, v3ReplyResourceContextKey{}, resources)
+	dispatchCtx := context.WithValue(ctx, v3ReplyResourceContextKey{}, resources)
 	// Once assigned, an authority request must settle on its original session
 	// even if the frontend disappears. Preserve the operation's absolute bound;
 	// cancellation still governs local admission and never extends this budget.
@@ -860,7 +854,7 @@ func (c *frontendConn) serveV3Attempt(
 		if refused {
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
-			return true
+			return c.expiredV3CacheCandidate(a, resources)
 		}
 		return false
 	}
@@ -938,7 +932,7 @@ func (c *frontendConn) serveV3Attempt(
 		}
 		consumeV3ResponseConsumptions(resources.responseConsumptions)
 		resources.responseConsumptions = nil
-		return true
+		return c.expiredV3CacheCandidate(a, resources)
 	}
 	if discarded && resourceReply {
 		// The callback already proved NOT_PUBLISHED, so no frontend can send a
@@ -963,6 +957,14 @@ func (c *frontendConn) serveV3Attempt(
 			resources.responseConsumptions = nil
 		}
 	}
+	return false
+}
+
+func (c *frontendConn) expiredV3CacheCandidate(a *attach, resources *v3ReplyResourceCollector) bool {
+	if resources.cached != nil && resources.cached.expired {
+		return true
+	}
+	c.stopV3FrontendPublication(a, errors.New("portablefsd: cached reply lost eligibility or ownership before exposure"))
 	return false
 }
 

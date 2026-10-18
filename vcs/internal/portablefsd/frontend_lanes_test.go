@@ -64,7 +64,7 @@ func publicationTestOperation(
 	c *frontendConn,
 	a *attach,
 	operationID uint64,
-) (*frontendOperation, *frontendOperationParticipant) {
+) {
 	t.Helper()
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
@@ -73,22 +73,10 @@ func publicationTestOperation(
 	if bridge := a.v3CoherenceBridge(); bridge != nil {
 		bridge.reserveFrontendPublication(operationID)
 	}
-	_, participant, participates, publishes, err := c.beginLogicalOperation(
-		context.Background(), a, operationID, true, &pfslocal.GetAttrRequest{},
-	)
-	if err != nil || !participates || !publishes || participant == nil {
-		t.Fatalf(
-			"begin publishing operation = participant=%v participates=%v publishes=%v error=%v",
-			participant, participates, publishes, err,
-		)
+	publishes, err := c.beginLogicalOperation(context.Background(), a, operationID, true, &pfslocal.GetAttrRequest{})
+	if err != nil || !publishes {
+		t.Fatalf("begin publishing operation: %t, %v", publishes, err)
 	}
-	c.publicationMu.Lock()
-	op := c.operations[operationID].op
-	c.publicationMu.Unlock()
-	if op == nil {
-		t.Fatal("publishing operation has no gate record")
-	}
-	return op, participant
 }
 
 func publicationTestAttach(t *testing.T) (*attach, *v3DataPlane) {
@@ -114,7 +102,7 @@ func TestPublicationAckRacingLastHandlerRetiresBothLedgersBeforeConsumption(t *t
 	const operationID = uint64(307)
 	a, d := publicationTestAttach(t)
 	c := &frontendConn{attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 	var consumed atomic.Int32
 	if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(
 		operationID, &countingV3ResponseConsumption{count: &consumed},
@@ -124,7 +112,7 @@ func TestPublicationAckRacingLastHandlerRetiresBothLedgersBeforeConsumption(t *t
 	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 		t.Fatal("semantic publication acknowledgement was refused")
 	}
-	a.finishFrontendParticipant(participant)
+
 	// Pause the last handler at the actual live failure: its connection count
 	// is zero, while its out-of-lock bridge retirement has not run. The serial
 	// ack reader now owns logical completion and must close both ledgers.
@@ -157,9 +145,9 @@ func TestPublicationReservationCoversEveryRequestUntilCallbackCompletion(t *test
 			const operationID = uint64(308)
 			a, d := publicationTestAttach(t)
 			c := &frontendConn{attach: a}
-			_, participant := publicationTestOperation(t, c, a, operationID)
+			publicationTestOperation(t, c, a, operationID)
 			for request := 0; request < requests; request++ {
-				a.finishFrontendParticipant(participant)
+
 				c.finishLogicalRequest(operationID)
 				d.bridge.sourcePublication.mu.Lock()
 				op := d.bridge.sourcePublication.operations[operationID]
@@ -174,13 +162,12 @@ func TestPublicationReservationCoversEveryRequestUntilCallbackCompletion(t *test
 						t.Fatal("continuation could not join its live callback")
 					}
 					d.bridge.reserveFrontendPublication(operationID)
-					_, next, _, _, err := c.beginLogicalOperation(
+					_, err := c.beginLogicalOperation(
 						context.Background(), a, operationID, false, &pfslocal.GetAttrRequest{},
 					)
 					if err != nil {
 						t.Fatal(err)
 					}
-					participant = next
 				}
 			}
 			if !acknowledgeBridgePublished(t, d.bridge, operationID) ||
@@ -207,11 +194,11 @@ func TestFrontendLossDrainsAssignedMutationWithoutDiscardingAuthority(t *testing
 	defer cancel()
 	c := &frontendConn{conn: server, attach: a, cancel: cancel}
 	const exposedID, assignedID = uint64(8001), uint64(8002)
-	_, participant := publicationTestOperation(t, c, a, exposedID)
+	publicationTestOperation(t, c, a, exposedID)
 	if !c.markPublicationReplyExposed(exposedID) {
 		t.Fatal("prior callback did not expose its reply")
 	}
-	a.finishFrontendParticipant(participant)
+
 	c.finishLogicalRequest(exposedID)
 	initialize, ok := c.reserveLogicalOperation(assignedID, true)
 	if !ok || !initialize {
@@ -295,7 +282,7 @@ func TestPublishingReplyAfterCallbackAcknowledgementFencesBeforeExposure(t *test
 	const operationID = uint64(301)
 	a, d := publicationTestAttach(t)
 	c := &frontendConn{attach: a}
-	op, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 
 	if !c.acknowledgePublication(operationID) {
 		t.Fatal("early callback acknowledgement was refused")
@@ -318,15 +305,7 @@ func TestPublishingReplyAfterCallbackAcknowledgementFencesBeforeExposure(t *test
 	if exposed {
 		t.Fatal("late reply was recorded as an exposed publication")
 	}
-	a.frontendGateMu.Lock()
-	completed := op.completed
-	_, active := a.frontendActive[op]
-	a.frontendGateMu.Unlock()
-	if !completed || active {
-		t.Fatalf("gate retired before fence = completed=%v active=%v", completed, active)
-	}
 
-	a.finishFrontendParticipant(participant)
 	c.finishLogicalRequest(operationID)
 }
 
@@ -340,7 +319,7 @@ func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T)
 	server, peer := net.Pipe()
 	defer peer.Close()
 	c := &frontendConn{conn: server, attach: a}
-	op, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 	gate, err := v3ItemSourceGate(testV3PublicationItem(1, 0x5a), true)
 	if err != nil {
 		t.Fatal(err)
@@ -379,20 +358,13 @@ func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T)
 		!strings.Contains(terminal.Error(), "without PublicationAck") {
 		t.Fatalf("terminal cause = %v", terminal)
 	}
-	a.frontendGateMu.Lock()
-	completed := op.completed
-	_, active := a.frontendActive[op]
-	a.frontendGateMu.Unlock()
-	if !completed || active {
-		t.Fatalf("disconnect gate retirement = completed=%v active=%v", completed, active)
-	}
 	d.bridge.sourcePublication.mu.Lock()
 	released, sourceTerminal := lease.released, d.bridge.sourcePublication.terminal
 	d.bridge.sourcePublication.mu.Unlock()
 	if released || sourceTerminal == nil {
 		t.Fatalf("disconnect reopened source lease: released=%t terminal=%v", released, sourceTerminal)
 	}
-	a.finishFrontendParticipant(participant)
+
 }
 
 // A successful authority WRITE is not consumed at the Go return boundary.
@@ -414,7 +386,7 @@ func TestV3RetainedMutationReceiptWaitsForPhysicalReplyAndPublicationAck(t *test
 	defer server.Close()
 	defer peer.Close()
 	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 
 	reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
 		Handle: handle, Data: []byte("receipt"),
@@ -451,7 +423,7 @@ func TestV3RetainedMutationReceiptWaitsForPhysicalReplyAndPublicationAck(t *test
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("PublicationAck consumed receipt %d time(s) before handler retirement", got)
 	}
-	a.finishFrontendParticipant(participant)
+
 	c.finishLogicalRequest(operationID)
 	if got := consumed.Load(); got != 1 {
 		t.Fatalf("completed logical publication consumed receipt %d time(s), want the one WRITE", got)
@@ -484,7 +456,7 @@ func TestV3RetainedMutationReceiptTimeoutRevokesBeforeConsumption(t *testing.T) 
 	server, peer := net.Pipe()
 	defer peer.Close()
 	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 	var revoked atomic.Bool
 	revokeStarted := make(chan struct{})
 	dispatchCtx := context.WithValue(
@@ -534,7 +506,6 @@ func TestV3RetainedMutationReceiptTimeoutRevokesBeforeConsumption(t *testing.T) 
 		t.Fatalf("forced revocation consumed receipt %d time(s) before local teardown", got)
 	}
 
-	a.finishFrontendParticipant(participant)
 	c.close()
 	if got := consumed.Load(); got != 1 {
 		t.Fatalf("revoked logical publication consumed receipt %d time(s), want the one WRITE", got)
@@ -993,7 +964,7 @@ func TestV3MalformedRetainedMutationRevokesBeforeReceiptConsumption(t *testing.T
 	server, peer := net.Pipe()
 	defer peer.Close()
 	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 	dispatchCtx := context.WithValue(
 		context.Background(),
 		v3ResponseConsumptionRevokerContextKey{},
@@ -1016,7 +987,7 @@ func TestV3MalformedRetainedMutationRevokesBeforeReceiptConsumption(t *testing.T
 	if got := consumed.Load(); got != 1 {
 		t.Fatalf("malformed retained result consumed receipt %d time(s), want 1 after revocation", got)
 	}
-	a.finishFrontendParticipant(participant)
+
 	c.close()
 }
 
@@ -1032,7 +1003,7 @@ func TestLostPublicationCauseWinsVisibleProvisionalAbandonment(t *testing.T) {
 	server, peer := net.Pipe()
 	defer peer.Close()
 	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	publicationTestOperation(t, c, a, operationID)
 	if !c.markPublicationReplyExposed(operationID) {
 		t.Fatal("visible mutation reply was not exposed")
 	}
@@ -1076,7 +1047,7 @@ func TestLostPublicationCauseWinsVisibleProvisionalAbandonment(t *testing.T) {
 			resourceClosed, provisionalReplies, itemReachable, identityReachable, provisionalClaims,
 		)
 	}
-	a.finishFrontendParticipant(participant)
+
 }
 
 // Closing a connection does not itself turn an unexposed request, or a reply
@@ -1098,7 +1069,7 @@ func TestFrontendDisconnectDoesNotFenceHarmlessPublicationStates(t *testing.T) {
 			server, peer := net.Pipe()
 			defer peer.Close()
 			c := &frontendConn{conn: server, attach: a}
-			_, participant := publicationTestOperation(t, c, a, operationID)
+			publicationTestOperation(t, c, a, operationID)
 			if test.expose && !c.markPublicationReplyExposed(operationID) {
 				t.Fatal("publishing reply was not exposed")
 			}
@@ -1113,7 +1084,7 @@ func TestFrontendDisconnectDoesNotFenceHarmlessPublicationStates(t *testing.T) {
 			if terminal := d.terminalError(); terminal != nil {
 				t.Fatalf("harmless teardown fenced v3 session: %v", terminal)
 			}
-			a.finishFrontendParticipant(participant)
+
 		})
 	}
 }
@@ -1140,7 +1111,7 @@ func TestPublicationAckBetweenReservationAndBeginKeepsReservedHandlers(t *testin
 
 	c.publicationMu.Lock()
 	entry := c.operations[operationID]
-	if entry == nil || entry.op != nil || entry.activeRequests != 2 {
+	if entry == nil || entry.attach != nil || entry.activeRequests != 2 {
 		c.publicationMu.Unlock()
 		t.Fatalf("pre-handler reservation = %+v, want op=nil activeRequests=2", entry)
 	}
@@ -1156,27 +1127,46 @@ func TestPublicationAckBetweenReservationAndBeginKeepsReservedHandlers(t *testin
 		t.Fatal("a frame arriving after acknowledgement joined the spent operation")
 	}
 
-	_, first, participates, publishes, err := c.beginLogicalOperation(
+	publishes, err := c.beginLogicalOperation(
 		context.Background(), a, operationID, true, &pfslocal.GetAttrRequest{},
 	)
-	if err != nil || !participates || !publishes || first == nil {
-		t.Fatalf("reserved initializer after ack = participant=%v participates=%v publishes=%v error=%v", first, participates, publishes, err)
+	if err != nil || !publishes {
+		t.Fatalf("reserved initializer after ack = publishes=%v error=%v", publishes, err)
 	}
-	_, second, participates, publishes, err := c.beginLogicalOperation(
+	publishes, err = c.beginLogicalOperation(
 		context.Background(), a, operationID, false, &pfslocal.FsyncRequest{},
 	)
-	if err != nil || !participates || publishes || second == nil {
-		t.Fatalf("reserved continuation after ack = participant=%v participates=%v publishes=%v error=%v", second, participates, publishes, err)
+	if err != nil || publishes {
+		t.Fatalf("reserved continuation after ack = publishes=%v error=%v", publishes, err)
 	}
 
-	a.finishFrontendParticipant(second)
 	c.finishLogicalRequest(operationID)
-	a.finishFrontendParticipant(first)
+
 	c.finishLogicalRequest(operationID)
 	c.publicationMu.Lock()
 	_, retained := c.operations[operationID]
 	c.publicationMu.Unlock()
 	if retained {
 		t.Fatal("acknowledged operation remained after every reserved handler retired")
+	}
+}
+
+func TestUnexpectedPublicationRetractionTerminatesWithoutRetry(t *testing.T) {
+	a, d := publicationTestAttach(t)
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	done := make(chan struct{})
+	go func() { c.serve(context.Background()); close(done) }()
+	if err := pfslocal.WriteFrame(peer, &pfslocal.Envelope{RequestID: 1, PublicationRetracted: true, Body: &pfslocal.GetAttrRequest{}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("unexpected retraction did not terminate")
+	}
+	if err := d.terminalError(); err == nil || !strings.Contains(err.Error(), "unexpected frontend publication retraction") {
+		t.Fatalf("terminal=%v", err)
 	}
 }

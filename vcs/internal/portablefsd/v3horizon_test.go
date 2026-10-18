@@ -34,12 +34,6 @@ func (c *fakeV3Clock) advance(elapsed time.Duration) {
 	c.now += uint64(elapsed)
 }
 
-func (c *fakeV3Clock) rewind(elapsed time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now -= uint64(elapsed)
-}
-
 func (c *fakeV3Clock) fail(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -182,60 +176,34 @@ func TestV3ShortAuthorizationRemainingShortensTheHorizon(t *testing.T) {
 	}
 }
 
-// Reauthorization invalidates the horizon before it is admitted; a proof
-// sampled before or during it never counts, and success obtains a new one.
-func TestV3ReauthorizationInvalidatesAndRenewsTheHorizon(t *testing.T) {
+// Reauthorization changes local permission without resetting retained coherence
+// exclusion or earning another KeepAlive proof.
+func TestV3ReauthorizationRetainsTheHorizonAndInstallsItsDeadline(t *testing.T) {
 	clock := newFakeV3Clock()
-	client := &reauthorizingV3Client{fakeV3DataClient: newFakeV3DataClient()}
-	client.deadline = time.Now().Add(time.Hour)
+	client := &reauthorizingV3Client{fakeV3DataClient: newFakeV3DataClient(), deadline: time.Now().Add(time.Hour)}
 	d := testV3DataPlaneOnClient(t, client, client.fakeV3DataClient, clock)
-	if v3Horizon(d) == 0 {
-		t.Fatal("no initial horizon")
-	}
-
-	// A keepalive whose request started before reauthorization replies after it
-	// began: its proof was sampled under the old authorization.
-	entered, release := make(chan struct{}), make(chan struct{})
+	horizon := v3Horizon(d)
 	client.mu.Lock()
-	client.keepAlive = func(context.Context) (time.Duration, error) {
-		close(entered)
-		<-release
-		return time.Minute, nil
-	}
+	keepAlives := client.keepAlives
 	client.mu.Unlock()
-	stale := make(chan error, 1)
-	go func() { stale <- d.renewHorizon(context.Background()) }()
-	<-entered
 	client.duringReauthorize = func() {
-		if v3Horizon(d) != 0 {
-			t.Error("horizon remained usable while reauthorization was admitted")
+		if v3Horizon(d) != horizon {
+			t.Error("reauthorization reset retained proof")
 		}
 	}
-	client.mu.Lock()
-	client.keepAlive = nil
-	client.mu.Unlock()
-	clock.advance(time.Second)
 	if _, err := d.reauthorize(context.Background(), []byte("token"), 1); err != nil {
 		t.Fatal(err)
 	}
-	renewed := v3Horizon(d)
-	want, _ := v3HorizonCandidate(clock.now, time.Minute)
-	if renewed != want {
-		t.Fatalf("horizon after reauthorization = %d, want a fresh proof's %d", renewed, want)
+	client.mu.Lock()
+	if client.keepAlives != keepAlives {
+		t.Error("reauthorization forced an extra KeepAlive")
 	}
-	close(release)
-	if err := <-stale; err != nil {
-		t.Fatal(err)
-	}
-	if got := v3Horizon(d); got != renewed {
-		t.Fatalf("a pre-reauthorization proof moved the horizon to %d", got)
-	}
+	client.mu.Unlock()
 	d.mu.Lock()
-	installed := d.authorizationDeadline
-	d.mu.Unlock()
-	if !installed.Equal(client.deadline) {
-		t.Fatalf("installed deadline %s, want the reauthorized %s", installed, client.deadline)
+	if !d.authorizationDeadline.Equal(client.deadline) || d.horizon != horizon {
+		t.Error("installed deadline or retained horizon differs")
 	}
+	d.mu.Unlock()
 }
 
 type reauthorizingV3Client struct {
@@ -305,15 +273,21 @@ func TestV3DataPlaneRefusesAnUnusableClockOrLease(t *testing.T) {
 	}
 }
 
-func TestV3TicksToNanosIsChecked(t *testing.T) {
-	if got, err := v3TicksToNanos(3_000_000, 125, 3); err != nil || got != 125_000_000 {
-		t.Fatalf("Apple silicon timebase conversion = (%d,%v)", got, err)
-	}
-	if _, err := v3TicksToNanos(math.MaxUint64, 125, 3); err == nil {
-		t.Fatal("overflowing tick conversion was accepted")
-	}
-	if _, err := v3TicksToNanos(1, 1, 0); err == nil {
-		t.Fatal("zero timebase denominator was accepted")
+func TestV3TimespecConversionIsChecked(t *testing.T) {
+	for _, test := range []struct {
+		sec, nsec int64
+		want      uint64
+		valid     bool
+	}{
+		{0, 0, 0, true}, {3, 125, 3_000_000_125, true},
+		{18_446_744_073, 709_551_615, math.MaxUint64, true},
+		{-1, 0, 0, false}, {0, -1, 0, false}, {0, 1_000_000_000, 0, false},
+		{18_446_744_073, 709_551_616, 0, false}, {math.MaxInt64, 0, 0, false},
+	} {
+		got, err := v3TimespecNanos(test.sec, test.nsec)
+		if (err == nil) != test.valid || test.valid && got != test.want {
+			t.Errorf("timespec %d/%d = %d, %v", test.sec, test.nsec, got, err)
+		}
 	}
 	now, err := v3ContinuousNanos()
 	if err != nil {
@@ -329,7 +303,7 @@ func newV3LivenessRequest(client *fakeV3DataClient) *pfslocal.V3LivenessRequest 
 	return &pfslocal.V3LivenessRequest{AuthorityEpoch: client.Epoch(), SessionID: client.SessionID()}
 }
 
-// v3ClockFaults are the two observable clock faults, each with the repair that
+// v3ClockFaults are actual clock read errors, each with the recovery that
 // makes the clock readable again.
 var v3ClockFaults = []struct {
 	name    string
@@ -337,7 +311,6 @@ var v3ClockFaults = []struct {
 	recover func(*fakeV3Clock)
 }{
 	{name: "read-error", fault: func(c *fakeV3Clock) { c.fail(errors.New("timebase lost")) }, recover: func(c *fakeV3Clock) { c.fail(nil) }},
-	{name: "regression", fault: func(c *fakeV3Clock) { c.rewind(time.Second) }, recover: func(c *fakeV3Clock) { c.advance(time.Second) }},
 }
 
 // requireV3ClockTerminal requires the state every observed clock fault leaves:
@@ -400,9 +373,8 @@ func TestV3ClockFaultDuringRenewalEndsServing(t *testing.T) {
 	}
 }
 
-// A clock fault observed by a request (at hit admission, or at a namespace
-// mutation's request start) fails that request without reaching the
-// authority and ends serving for good; the recovered clock revives nothing.
+// A clock fault observed at hit admission fails without an authority read
+// and ends serving for good; the recovered clock revives nothing.
 func TestV3ClockFaultObservedByARequestIsTerminal(t *testing.T) {
 	for _, fault := range v3ClockFaults {
 		for _, test := range []struct {
@@ -414,13 +386,6 @@ func TestV3ClockFaultObservedByARequestIsTerminal(t *testing.T) {
 				file := f.lookup(f.root, "file")
 				f.requireServedLocally("GetAttr before the fault", func() { f.getattr(file.Item) })
 				return &pfslocal.GetAttrRequest{Item: file.Item}
-			}},
-			{name: "request-start", prepare: func(f *cachedV3Fixture) any {
-				f.getattr(f.root)
-				if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")}); errno != darwinENOENT {
-					f.t.Fatalf("negative lookup errno=%d", errno)
-				}
-				return &pfslocal.CreateRequest{Dir: f.root, Name: []byte("n"), Mode: 0o644, Exclusive: true}
 			}},
 		} {
 			t.Run(fault.name+"/"+test.name, func(t *testing.T) {
