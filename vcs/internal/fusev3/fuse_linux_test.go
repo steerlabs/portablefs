@@ -1131,21 +1131,18 @@ func TestForgetNeverBlocksUnderCleanupPressure(t *testing.T) {
 	}
 }
 
-func TestReclaimDrainBatchesTimerResidue(t *testing.T) {
+func TestReclaimDrainCollectsArrivalsWhileOwnerIsInFlight(t *testing.T) {
 	mount, rpc := testMount(t, 1024)
+	mount.reclaimWorkers = 1
 	reached := make(chan *authoritypb.ReclaimRequest, 2)
 	release := make(chan struct{})
 	rpc.hook = func(request *authoritypb.Request) {
-		reclaim := request.GetReclaim()
-		if reclaim == nil {
-			return
+		if reclaim := request.GetReclaim(); reclaim != nil {
+			reached <- proto.Clone(reclaim).(*authoritypb.ReclaimRequest)
+			<-release
 		}
-		reached <- proto.Clone(reclaim).(*authoritypb.ReclaimRequest)
-		<-release
 	}
-	for id := uint64(1); id <= 100; id++ {
-		mount.deferReclaim(testToken(id))
-	}
+	mount.deferReclaim(testToken(1))
 	mount.start(time.Hour)
 	defer func() {
 		close(release)
@@ -1153,16 +1150,26 @@ func TestReclaimDrainBatchesTimerResidue(t *testing.T) {
 	}()
 	select {
 	case request := <-reached:
-		if len(request.GetItems()) != 100 {
-			t.Fatalf("reclaim request batch = %d, want one 100-token batch", len(request.GetItems()))
+		if len(request.GetItems()) != 1 {
+			t.Fatalf("initial batch = %d, want 1", len(request.GetItems()))
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("reclaim residue was not sent at the timer")
+		t.Fatal("available reclaim was not dispatched")
 	}
+	for id := uint64(2); id <= 101; id++ {
+		mount.deferReclaim(testToken(id))
+	}
+	if got := mount.reclaim.pending(); got != 100 {
+		t.Fatalf("in-flight arrivals = %d, want 100", got)
+	}
+	release <- struct{}{}
 	select {
 	case request := <-reached:
-		t.Fatalf("timer residue fragmented into another request: %+v", request)
-	case <-time.After(2 * reclaimBatchDelay):
+		if len(request.GetItems()) != 100 {
+			t.Fatalf("next available batch = %d, want 100", len(request.GetItems()))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued residue was not dispatched when the owner became free")
 	}
 }
 
@@ -1175,10 +1182,9 @@ func TestReclaimQueueFlushesAtWatermarkWithoutMixingEpochs(t *testing.T) {
 	queue.push(queuedReclaim{token: testToken(5), transport: newTransport})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	start := time.Now()
 	batch, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
-	if !ok || len(batch) != 4 || batch[0].transport != oldTransport || time.Since(start) >= reclaimBatchDelay {
-		t.Fatalf("watermark batch = %d ok=%v transport=%T elapsed=%s", len(batch), ok, batch[0].transport, time.Since(start))
+	if !ok || len(batch) != 4 || batch[0].transport != oldTransport {
+		t.Fatalf("watermark batch = %d ok=%v transport=%T", len(batch), ok, batch[0].transport)
 	}
 	next, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
 	if !ok || len(next) != 1 || next[0].transport != newTransport {

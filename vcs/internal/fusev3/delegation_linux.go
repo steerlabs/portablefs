@@ -2030,9 +2030,10 @@ func (m *delegationManager) changePendingCloses(delta int) {
 }
 
 // QueueClose transfers a FUSE RELEASE to the cleanup worker. RELEASE has no
-// kernel reply, so a short collection window can combine final-handle
-// delegation releases while keeping every server handle alive through its
-// application. Unknown descriptor outcomes trigger terminal session cleanup.
+// kernel reply. The worker drains available closes before dispatch and
+// collects arrivals in the queue while the batch is in flight, keeping every
+// server handle alive through application. Unknown descriptor outcomes trigger
+// terminal session cleanup.
 func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
 	if _, err := delegationIdentity(identity); err != nil {
 		return err
@@ -2075,24 +2076,13 @@ func (m *delegationManager) closeLoop() {
 			return
 		}
 		batch := []delegationClose{first}
-		timer := time.NewTimer(25 * time.Millisecond)
 	collect:
 		for len(batch) < authorityrpc.MaxCloseBatch {
 			select {
 			case pending := <-m.closeQueue:
 				batch = append(batch, pending)
-			case <-timer.C:
-				break collect
-			case <-m.ctx.Done():
-				timer.Stop()
-				m.processCloseBatch(batch)
-				return
-			}
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
 			default:
+				break collect
 			}
 		}
 		m.processCloseBatch(batch)

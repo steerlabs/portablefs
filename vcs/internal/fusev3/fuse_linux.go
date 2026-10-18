@@ -56,7 +56,6 @@ const (
 	// fixed fraction of the same budget rather than as an independent knob that
 	// could be configured out of proportion with it.
 	reclaimLaneDivisor = 4
-	reclaimBatchDelay  = 50 * time.Millisecond
 	reclaimRetryDelay  = 100 * time.Millisecond
 
 	// portableFuseMajor/minor are the stock-kernel semantic floor. Protocol
@@ -1123,9 +1122,9 @@ func (q *reclaimQueue) popLocked() (queuedReclaim, int) {
 	return entry, remaining
 }
 
-// popBatch leaves FORGET nonblocking while one collector coalesces cleanup
-// debt. A full admission watermark drains immediately; unavoidable residue is
-// sent after a short timer. The collector never combines authority epochs.
+// popBatch drains the currently available debt when a worker is ready to
+// dispatch. Arrivals during the RPC stay queued for the next available worker.
+// The collector never combines authority epochs or waits to fill a batch.
 func (q *reclaimQueue) popBatch(ctx context.Context, max int) ([]queuedReclaim, bool) {
 	q.batchMu.Lock()
 	defer q.batchMu.Unlock()
@@ -1133,38 +1132,19 @@ func (q *reclaimQueue) popBatch(ctx context.Context, max int) ([]queuedReclaim, 
 	if !ok {
 		return nil, false
 	}
-	batch := make([]queuedReclaim, 0, min(max, q.watermark))
+	batch := make([]queuedReclaim, 0, max)
 	batch = append(batch, first)
-	flushAt := min(max, q.watermark)
-	timer := time.NewTimer(reclaimBatchDelay)
-	defer timer.Stop()
-	for len(batch) < max {
-		q.mu.Lock()
-		if q.head < len(q.tokens) {
-			next := q.tokens[q.head]
-			if next.transport != first.transport {
-				q.mu.Unlock()
-				return batch, true
-			}
-			next, remaining := q.popLocked()
-			q.mu.Unlock()
-			batch = append(batch, next)
-			if remaining > 0 {
-				q.signal()
-			}
-			if len(batch) >= flushAt {
-				return batch, true
-			}
-			continue
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(batch) < max && q.head < len(q.tokens) {
+		if q.tokens[q.head].transport != first.transport {
+			break
 		}
-		q.mu.Unlock()
-		select {
-		case <-q.wake:
-		case <-timer.C:
-			return batch, true
-		case <-ctx.Done():
-			return batch, true
-		}
+		next, _ := q.popLocked()
+		batch = append(batch, next)
+	}
+	if q.head < len(q.tokens) {
+		q.signal()
 	}
 	return batch, true
 }
@@ -2090,9 +2070,9 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 				return nil, nil, syscall.ENOTCONN
 			}
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
-			// A callback can fetch several pages across a withdrawal. Its aggregate
-			// reply stamp keeps the oldest version, but each buffered page owns
-			// its own RPC admission stamp and served version.
+			// Each page owns its RPC admission stamp and served version.
+			// READDIRPLUS ends its reply at this page boundary or an overtaking
+			// withdrawal, so one reply never publishes two page samples.
 			h.pageStamp = pageStamp.withVersion(response.GetVolumeVersion())
 			if h.pageWithdrawn = withdrawals != h.withdrawals; h.pageWithdrawn {
 				// A withdrawal overtook this fetch. This mount's own mutation
@@ -2208,7 +2188,7 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		// The page lost its subscription coverage between callbacks. Retire
 		// its entries and EOF, but preserve the last delivered XFS cookie.
 		// Stable offsets resume after that entry across directory mutations;
-		// the verifier only validates a newly fetched page for publication.
+		// a newly fetched page needs fresh subscription coverage for publication.
 		h.discardPageItemsLocked()
 		h.page, h.index, h.eof = nil, 0, false
 		h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil

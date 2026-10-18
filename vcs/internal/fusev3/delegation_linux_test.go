@@ -995,14 +995,32 @@ func TestDelegationReleaseBatchSortsAndFlushes(t *testing.T) {
 }
 
 func TestDelegationQueueCloseBatchesFinalHandles(t *testing.T) {
-	fake := &delegationFakeRPC{}
+	entered := make(chan *authoritypb.CloseBatchRequest, 2)
+	release := make(chan struct{})
+	fake := &releaseOutcomeRPC{}
+	fake.close = func(batch *authoritypb.CloseBatchRequest) (*authoritypb.Response, error) {
+		entered <- batch
+		<-release
+		return fake.delegationFakeRPC.CallMutation(t.Context(), &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}})
+	}
 	m := newDelegationTestManager(t, fake)
-	idHigh := installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	idLow := installDelegationForTest(t, m, 21, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if _, err := m.Write(context.Background(), idHigh, 0, []byte("high"), false); err != nil {
+	defer close(release)
+	// While the first batch owns the dispatcher, both final handles arrive.
+	// The next batch must drain them together without a collection timer.
+	if err := m.QueueClose(delegationTestIdentity(20), delegationTestToken(20, 2), 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Write(context.Background(), idLow, 0, []byte("low"), false); err != nil {
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("available close was not dispatched")
+	}
+	idHigh := installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	idLow := installDelegationForTest(t, m, 21, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), idHigh, 0, []byte("high"), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Write(t.Context(), idLow, 0, []byte("low"), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.QueueClose(idHigh, delegationTestToken(22, 2), 17, true); err != nil {
@@ -1011,36 +1029,27 @@ func TestDelegationQueueCloseBatchesFinalHandles(t *testing.T) {
 	if err := m.QueueClose(idLow, delegationTestToken(21, 2), 19, false); err != nil {
 		t.Fatal(err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		fake.mu.Lock()
-		var release *authoritypb.DelegationReleaseRequest
-		closes := make([]*authoritypb.CloseRequest, 0, 2)
-		for _, request := range fake.controls {
-			if request.GetDelegationRelease() != nil {
-				release = request.GetDelegationRelease()
-			}
+	release <- struct{}{}
+	var batch *authoritypb.CloseBatchRequest
+	select {
+	case batch = <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued closes did not dispatch when the owner became free")
+	}
+	closes := batch.GetCloses()
+	if len(closes) != 2 || closes[0].GetLockOwner() != 17 || !closes[0].GetFlockUnlock() || closes[1].GetLockOwner() != 19 || closes[1].GetFlockUnlock() {
+		t.Fatalf("close requests = %+v", closes)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	var request *authoritypb.DelegationReleaseRequest
+	for _, control := range fake.controls {
+		if control.GetDelegationRelease() != nil {
+			request = control.GetDelegationRelease()
 		}
-		for _, request := range fake.mutations {
-			if request.GetCloseBatch() != nil {
-				closes = append(closes, request.GetCloseBatch().Closes...)
-			}
-		}
-		fake.mu.Unlock()
-		if release != nil && len(release.GetDelegations()) == 2 && len(closes) == 2 {
-			if bytes.Compare(release.GetDelegations()[0].GetDelegation().GetId(), release.GetDelegations()[1].GetDelegation().GetId()) >= 0 {
-				t.Fatal("queued release batch is not sorted by delegation id")
-			}
-			if closes[0].GetLockOwner() != 17 || !closes[0].GetFlockUnlock() || closes[1].GetLockOwner() != 19 || closes[1].GetFlockUnlock() {
-				t.Fatalf("close requests = %+v", closes)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("release=%+v closes=%+v", release, closes)
-		}
-		time.Sleep(time.Millisecond)
+	}
+	if request == nil || len(request.GetDelegations()) != 2 || bytes.Compare(request.GetDelegations()[0].GetDelegation().GetId(), request.GetDelegations()[1].GetDelegation().GetId()) >= 0 {
+		t.Fatalf("queued release batch is not sorted: %+v", request)
 	}
 }
 
@@ -1048,11 +1057,12 @@ func TestDelegationQueuedCloseIsFencedByEpochChange(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
 	id := installDelegationForTest(t, m, 23, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if err := m.QueueClose(id, delegationTestToken(23, 2), 0, false); err != nil {
-		t.Fatal(err)
-	}
+	m.epoch.RLock()
+	pending := delegationClose{identity: id, handle: delegationTestToken(23, 2), epoch: m.epochSerial}
+	m.epoch.RUnlock()
 	m.EpochChanged("test epoch")
-	time.Sleep(30 * time.Millisecond)
+	m.changePendingCloses(1)
+	m.processCloseBatch([]delegationClose{pending})
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	for _, request := range fake.mutations {
