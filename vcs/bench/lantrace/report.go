@@ -23,16 +23,27 @@ type ReportConfig struct {
 
 // StreamInfo describes one producer stream of the collection.
 type StreamInfo struct {
-	Stream     uint32 `json:"stream"`
-	Layer      Layer  `json:"layer"`
-	Process    Label  `json:"process"`
-	Clock      Label  `json:"clock"`
-	Emitted    uint64 `json:"emitted"`
-	Lost       uint64 `json:"lost"`
-	Read       uint64 `json:"read"`
-	Rejected   uint64 `json:"rejected"`
-	Incomplete bool   `json:"incomplete"`
+	Stream       uint32 `json:"stream"`
+	Layer        Layer  `json:"layer"`
+	Process      Label  `json:"process"`
+	Clock        Label  `json:"clock"`
+	Emitted      uint64 `json:"emitted"`
+	Lost         uint64 `json:"lost"`
+	Read         uint64 `json:"read"`
+	Rejected     uint64 `json:"rejected"`
+	Incomplete   bool   `json:"incomplete"`
+	Inconsistent bool   `json:"inconsistent"`
 }
+
+// Join statuses. A join is exact only when both layers were traced, every
+// anchor carried the identity namespace the key requires, and every anchor
+// matched exactly one partner with the same operation metadata.
+const (
+	JoinNotTraced   = "not_traced"
+	JoinUnavailable = "unavailable"
+	JoinIncomplete  = "incomplete"
+	JoinExact       = "exact"
+)
 
 // JoinCoverage is the cross-layer correlation coverage of one join.
 type JoinCoverage struct {
@@ -41,11 +52,19 @@ type JoinCoverage struct {
 	Left           string `json:"left"`
 	Right          string `json:"right"`
 	Applicable     bool   `json:"applicable"`
+	Status         string `json:"status"`
 	Matched        uint64 `json:"matched"`
 	UnmatchedLeft  uint64 `json:"unmatched_left"`
 	UnmatchedRight uint64 `json:"unmatched_right"`
 	EvictedLeft    uint64 `json:"evicted_left"`
 	EvictedRight   uint64 `json:"evicted_right"`
+	// Unqualified counts anchors that lacked the key's namespace and so could
+	// not be joined at all; any makes the join unavailable.
+	Unqualified uint64 `json:"unqualified"`
+	// Conflicts counts identities whose anchors disagreed on operation
+	// metadata: two anchors with one identity that describe different
+	// operations are different requests, not a match.
+	Conflicts uint64 `json:"conflicts"`
 }
 
 // LatencySummary summarizes in-process durations. P50 and P90 are the upper
@@ -63,18 +82,21 @@ type LatencySummary struct {
 // Report is the analysis of one collection. Counters keys are drawn from
 // AggregateKeys, so they are bounded by the grammar's categories.
 type Report struct {
-	Run               Label                     `json:"run"`
-	Streams           []StreamInfo              `json:"streams"`
-	Events            uint64                    `json:"events"`
-	ProducerLost      uint64                    `json:"producer_lost"`
-	Dropped           uint64                    `json:"dropped"`
-	Rejected          uint64                    `json:"rejected"`
-	IncompleteStreams uint64                    `json:"incomplete_streams"`
-	Joins             []JoinCoverage            `json:"joins"`
-	Counters          map[string]uint64         `json:"counters"`
-	Latencies         map[string]LatencySummary `json:"latencies"`
-	AttributionValid  bool                      `json:"attribution_valid"`
-	InvalidReasons    []string                  `json:"invalid_reasons,omitempty"`
+	Run               Label        `json:"run"`
+	Streams           []StreamInfo `json:"streams"`
+	Events            uint64       `json:"events"`
+	ProducerLost      uint64       `json:"producer_lost"`
+	Dropped           uint64       `json:"dropped"`
+	Rejected          uint64       `json:"rejected"`
+	IncompleteStreams uint64       `json:"incomplete_streams"`
+	// InconsistentStreams counts complete streams whose sequence numbers do
+	// not reconcile with their trailer under the sequence rule.
+	InconsistentStreams uint64                    `json:"inconsistent_streams"`
+	Joins               []JoinCoverage            `json:"joins"`
+	Counters            map[string]uint64         `json:"counters"`
+	Latencies           map[string]LatencySummary `json:"latencies"`
+	AttributionValid    bool                      `json:"attribution_valid"`
+	InvalidReasons      []string                  `json:"invalid_reasons,omitempty"`
 }
 
 const (
@@ -82,7 +104,7 @@ const (
 	joinClientAuthority = "client_authority"
 )
 
-var traceTotals = []string{"events", "producer_lost", "dropped", "rejected", "incomplete_streams", "lost_events"}
+var traceTotals = []string{"events", "producer_lost", "dropped", "rejected", "incomplete_streams", "inconsistent_streams", "lost_events"}
 
 // BuildReport reads one collection written by Collect. A malformed or
 // internally inconsistent collection is an error; lost or uncorrelated
@@ -142,13 +164,18 @@ func BuildReport(r io.Reader, cfg ReportConfig) (*Report, error) {
 	}
 
 	a := &aggregator{counters: rep.Counters, latencies: map[string]*histogram{}}
-	a.joins[0] = newJoin(JoinCoverage{Name: joinFrontendDaemon, Key: "(conn, request)",
+	a.joins[0] = newJoin(JoinCoverage{Name: joinFrontendDaemon, Key: "(conn_ns, conn, request)",
 		Left: "frontend local/send", Right: "daemon local/enqueue",
 		Applicable: present[LayerFrontend] && present[LayerDaemon]}, cfg.JoinWindow)
 	a.joins[1] = newJoin(JoinCoverage{Name: joinClientAuthority, Key: "(session, authority_request)",
 		Left: "daemon or linux_client authority/send", Right: "authority authority/receive",
 		Applicable: (present[LayerDaemon] || present[LayerLinuxClient]) && present[LayerAuthority]}, cfg.JoinWindow)
 
+	// Per-stream sequence state, validated independently of Collect: written
+	// events of one stream carry strictly increasing numbers, so a duplicate
+	// or reordered number is a malformed collection, never a second event.
+	lastSeq := make([]uint64, len(rep.Streams))
+	counted := make([]uint64, len(rep.Streams))
 	trailers := 0
 	var summary *record
 	for summary == nil {
@@ -168,6 +195,11 @@ func BuildReport(r io.Reader, cfg ReportConfig) (*Report, error) {
 			if err := rec.checkEvent(layer); err != nil {
 				return nil, err
 			}
+			if rec.Seq <= lastSeq[rec.Stream-1] {
+				return nil, fmt.Errorf("lantrace: stream %d events are not in strictly increasing sequence order", rec.Stream)
+			}
+			lastSeq[rec.Stream-1] = rec.Seq
+			counted[rec.Stream-1]++
 			rep.Events++
 			a.add(layer, &rec.Event)
 		case recordTrailer:
@@ -176,7 +208,10 @@ func BuildReport(r io.Reader, cfg ReportConfig) (*Report, error) {
 				return nil, errors.New("lantrace: stream trailers must follow in stream order")
 			}
 			s := &rep.Streams[rec.Stream-1]
-			s.Emitted, s.Lost, s.Read, s.Rejected, s.Incomplete = rec.Emitted, rec.Lost, rec.Read, rec.Rejected, rec.Incomplete
+			if rec.Incomplete && rec.Inconsistent {
+				return nil, fmt.Errorf("lantrace: stream %d trailer is both incomplete and inconsistent", rec.Stream)
+			}
+			s.Emitted, s.Lost, s.Read, s.Rejected, s.Incomplete, s.Inconsistent = rec.Emitted, rec.Lost, rec.Read, rec.Rejected, rec.Incomplete, rec.Inconsistent
 		case recordSummary:
 			if trailers != len(rep.Streams) {
 				return nil, errors.New("lantrace: summary before every stream trailer")
@@ -190,20 +225,37 @@ func BuildReport(r io.Reader, cfg ReportConfig) (*Report, error) {
 		return nil, errors.New("lantrace: data after the collection summary")
 	}
 
-	var read, rejected, lost, incomplete uint64
-	for _, s := range rep.Streams {
+	var read, rejected, lost, incomplete, inconsistent uint64
+	for i, s := range rep.Streams {
 		read += s.Read
 		rejected += s.Rejected
 		lost += s.Lost
 		if s.Incomplete {
 			incomplete++
 		}
+		if s.Inconsistent {
+			inconsistent++
+		}
+		// Reconcile this stream's written events with its trailer. With no
+		// collector drops every read event is present, so the collection
+		// must agree exactly; with drops only the bounds can be rechecked,
+		// and a bound Collect missed is still a malformed collection.
+		if counted[i] > s.Read || (summary.Dropped == 0 && counted[i] != s.Read) {
+			return nil, fmt.Errorf("lantrace: stream %d has %d events but its trailer reports %d read", s.Stream, counted[i], s.Read)
+		}
+		if !s.Incomplete {
+			bad := !sequenceConsistent(lastSeq[i], s.Read, s.Rejected, s.Emitted, s.Lost)
+			if bad && !s.Inconsistent || (summary.Dropped == 0 && !bad && s.Inconsistent) {
+				return nil, fmt.Errorf("lantrace: stream %d trailer misstates whether its sequence numbers reconcile", s.Stream)
+			}
+		}
 	}
 	if summary.Events != rep.Events || summary.Events+summary.Dropped != read || summary.Rejected != rejected ||
-		summary.ProducerLost != lost || summary.IncompleteStreams != incomplete {
+		summary.ProducerLost != lost || summary.IncompleteStreams != incomplete || summary.InconsistentStreams != inconsistent {
 		return nil, errors.New("lantrace: collection summary does not match its records")
 	}
-	rep.ProducerLost, rep.Dropped, rep.Rejected, rep.IncompleteStreams = summary.ProducerLost, summary.Dropped, summary.Rejected, summary.IncompleteStreams
+	rep.ProducerLost, rep.Dropped, rep.Rejected, rep.IncompleteStreams, rep.InconsistentStreams =
+		summary.ProducerLost, summary.Dropped, summary.Rejected, summary.IncompleteStreams, summary.InconsistentStreams
 
 	a.finish(rep)
 	rep.judge()
@@ -227,6 +279,9 @@ func (rep *Report) judge() {
 	if rep.IncompleteStreams > 0 {
 		reasons = append(reasons, fmt.Sprintf("%d streams have no trailer", rep.IncompleteStreams))
 	}
+	if rep.InconsistentStreams > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d streams have sequence numbers that do not reconcile with their trailers", rep.InconsistentStreams))
+	}
 	for _, s := range rep.Streams {
 		if !s.Incomplete && s.Emitted != s.Read {
 			reasons = append(reasons, fmt.Sprintf("stream %d trailer reports %d events but %d were read", s.Stream, s.Emitted, s.Read))
@@ -235,6 +290,12 @@ func (rep *Report) judge() {
 	for _, j := range rep.Joins {
 		if !j.Applicable {
 			continue
+		}
+		if j.Unqualified > 0 {
+			reasons = append(reasons, fmt.Sprintf("join %s unavailable: %d anchors lack the identity namespace its key %s requires", j.Name, j.Unqualified, j.Key))
+		}
+		if j.Conflicts > 0 {
+			reasons = append(reasons, fmt.Sprintf("join %s found %d identities whose anchors describe different operations", j.Name, j.Conflicts))
 		}
 		if j.EvictedLeft+j.EvictedRight > 0 {
 			reasons = append(reasons, fmt.Sprintf("join %s evicted %d anchors from its bounded window", j.Name, j.EvictedLeft+j.EvictedRight))
@@ -266,16 +327,17 @@ func (rep *Report) WriteText(w io.Writer) error {
 	for _, s := range rep.Streams {
 		p("%d\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%t\n", s.Stream, s.Layer, s.Process, s.Clock, s.Emitted, s.Lost, s.Read, s.Rejected, !s.Incomplete)
 	}
-	p("\nevents %d  producer_lost %d  dropped %d  rejected %d  incomplete_streams %d\n\n",
-		rep.Events, rep.ProducerLost, rep.Dropped, rep.Rejected, rep.IncompleteStreams)
+	p("\nevents %d  producer_lost %d  dropped %d  rejected %d  incomplete_streams %d  inconsistent_streams %d\n\n",
+		rep.Events, rep.ProducerLost, rep.Dropped, rep.Rejected, rep.IncompleteStreams, rep.InconsistentStreams)
 
-	p("join\tkey\tmatched\tunmatched left\tunmatched right\tevicted left\tevicted right\n")
+	p("join\tkey\tstatus\tmatched\tunmatched left\tunmatched right\tevicted left\tevicted right\tunqualified\tconflicts\n")
 	for _, j := range rep.Joins {
 		if !j.Applicable {
 			p("%s\t%s\tnot traced: needs both %s and %s\n", j.Name, j.Key, j.Left, j.Right)
 			continue
 		}
-		p("%s\t%s\t%d\t%d\t%d\t%d\t%d\n", j.Name, j.Key, j.Matched, j.UnmatchedLeft, j.UnmatchedRight, j.EvictedLeft, j.EvictedRight)
+		p("%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", j.Name, j.Key, j.Status, j.Matched, j.UnmatchedLeft, j.UnmatchedRight,
+			j.EvictedLeft, j.EvictedRight, j.Unqualified, j.Conflicts)
 	}
 
 	p("\ncounter\tvalue\n")
@@ -350,7 +412,15 @@ func (a *aggregator) add(layer Layer, e *Event) {
 			if layer == LayerDaemon {
 				side = 1
 			}
-			a.joins[0].add(side, joinKey{scope: e.Conn, id: e.Request})
+			// conn is unique only within one daemon process, so the key is
+			// qualified by the run-unique namespace both sides must hold.
+			// An anchor without it cannot be joined: the join is unavailable
+			// rather than matched on a number another daemon also uses.
+			if e.ConnNS == "" {
+				a.joins[0].unqualified()
+			} else {
+				a.joins[0].add(side, joinKey{label: e.ConnNS, scope: e.Conn, id: e.Request}, joinMeta{op: string(e.LocalOp), mount: e.Mount})
+			}
 		}
 	case KindCache:
 		c := string(e.Candidate)
@@ -407,7 +477,7 @@ func (a *aggregator) add(layer Layer, e *Event) {
 			} else {
 				a.inc(L, "authority_dispatch", string(e.Dispatch), op)
 			}
-			a.joins[1].add(side, joinKey{label: e.Session, id: e.AuthorityRequest})
+			a.joins[1].add(side, joinKey{label: e.Session, id: e.AuthorityRequest}, joinMeta{op: op})
 		}
 		if e.Phase == reply {
 			if e.Duration > 0 {
@@ -460,6 +530,8 @@ func (a *aggregator) finish(rep *Report) {
 			a.counters[key("trace", "join", j.cov.Name, "matched")] = j.cov.Matched
 			a.counters[key("trace", "join", j.cov.Name, "unmatched")] = j.cov.UnmatchedLeft + j.cov.UnmatchedRight
 			a.counters[key("trace", "join", j.cov.Name, "evicted")] = j.cov.EvictedLeft + j.cov.EvictedRight
+			a.counters[key("trace", "join", j.cov.Name, "unqualified")] = j.cov.Unqualified
+			a.counters[key("trace", "join", j.cov.Name, "conflicts")] = j.cov.Conflicts
 		}
 	}
 	a.counters["trace.events"] = rep.Events
@@ -467,17 +539,30 @@ func (a *aggregator) finish(rep *Report) {
 	a.counters["trace.dropped"] = rep.Dropped
 	a.counters["trace.rejected"] = rep.Rejected
 	a.counters["trace.incomplete_streams"] = rep.IncompleteStreams
+	a.counters["trace.inconsistent_streams"] = rep.InconsistentStreams
 	a.counters["trace.lost_events"] = satAdd(satAdd(rep.ProducerLost, rep.Dropped), rep.Rejected)
 }
 
 type joinKey struct {
+	label Label  // conn_ns for pfslocal identities, session for authority identities
 	scope uint64 // conn, for pfslocal identities
-	label Label  // session, for authority identities
 	id    uint64 // request or authority request
+}
+
+// joinMeta is what both anchors of one identity must agree on. A mount label
+// is compared only when both anchors carry one.
+type joinMeta struct {
+	op    string
+	mount Label
+}
+
+func (m joinMeta) agrees(o joinMeta) bool {
+	return m.op == o.op && (m.mount == "" || o.mount == "" || m.mount == o.mount)
 }
 
 type joinEntry struct {
 	key  joinKey
+	meta joinMeta
 	side int
 	n    uint64
 	elem *list.Element
@@ -501,11 +586,24 @@ func newJoin(cov JoinCoverage, capacity int) *join {
 	return &join{cov: cov, capacity: capacity, pending: map[joinKey]*joinEntry{}}
 }
 
-func (j *join) add(side int, k joinKey) {
+// unqualified counts an anchor that lacks the key's namespace.
+func (j *join) unqualified() {
+	if j.cov.Applicable {
+		j.cov.Unqualified++
+	}
+}
+
+func (j *join) add(side int, k joinKey, meta joinMeta) {
 	if !j.cov.Applicable {
 		return
 	}
 	if e, ok := j.pending[k]; ok {
+		if !e.meta.agrees(meta) {
+			// One identity naming two operations cannot be attributed; the
+			// conflicting anchor is counted, never matched or merged.
+			j.cov.Conflicts++
+			return
+		}
 		if e.side == side {
 			e.n++
 			return
@@ -527,7 +625,7 @@ func (j *join) add(side int, k joinKey) {
 		j.order.Remove(oldest.elem)
 		delete(j.pending, oldest.key)
 	}
-	e := &joinEntry{key: k, side: side, n: 1}
+	e := &joinEntry{key: k, meta: meta, side: side, n: 1}
 	e.elem = j.order.PushBack(e)
 	j.pending[k] = e
 }
@@ -541,6 +639,17 @@ func (j *join) finish() {
 		}
 	}
 	j.pending = nil
+	c := &j.cov
+	switch {
+	case !c.Applicable:
+		c.Status = JoinNotTraced
+	case c.Unqualified > 0:
+		c.Status = JoinUnavailable
+	case c.Conflicts+c.UnmatchedLeft+c.UnmatchedRight+c.EvictedLeft+c.EvictedRight > 0:
+		c.Status = JoinIncomplete
+	default:
+		c.Status = JoinExact
+	}
 }
 
 // histogram is a fixed log-linear histogram: exact below 8, then eight
@@ -608,7 +717,7 @@ func AggregateKeys() map[string]struct{} {
 		add("trace", t)
 	}
 	for _, j := range []string{joinFrontendDaemon, joinClientAuthority} {
-		for _, m := range []string{"matched", "unmatched", "evicted"} {
+		for _, m := range []string{"matched", "unmatched", "evicted", "unqualified", "conflicts"} {
 			add("trace", "join", j, m)
 		}
 	}

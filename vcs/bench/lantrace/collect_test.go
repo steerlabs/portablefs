@@ -118,6 +118,37 @@ func TestCollectBounds(t *testing.T) {
 
 // Events are interleaved by each stream's own elapsed time, never by raw
 // timestamps from unrelated clocks.
+// The sequence rule: every gap in a stream's written numbers is a counted
+// loss, and nothing is read beyond what the trailer says was emitted.
+func TestCollectReconcilesSequenceWithTrailer(t *testing.T) {
+	cases := []struct {
+		name         string
+		stream       *streamBuilder
+		inconsistent uint64
+	}{
+		{"dense", newStream(LayerDaemon).ev(0, waitEvent(1)).ev(1, waitEvent(2)).end(0), 0},
+		{"gap explained by loss", newStream(LayerDaemon).evSeq(1, 0, waitEvent(1)).evSeq(3, 1, waitEvent(2)).end(1), 0},
+		{"tail loss beyond the last written number", newStream(LayerDaemon).ev(0, waitEvent(1)).end(3), 0},
+		{"gap without a counted loss", newStream(LayerDaemon).evSeq(1, 0, waitEvent(1)).evSeq(3, 1, waitEvent(2)).end(0), 1},
+		{"more events than emitted", newStream(LayerDaemon).ev(0, waitEvent(1)).ev(1, waitEvent(2)).raw(`{"record":"trailer","emitted":1,"lost":1}`), 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, sum := collectStreams(t, CollectConfig{}, tc.stream)
+			if sum.InconsistentStreams != tc.inconsistent {
+				t.Fatalf("inconsistent streams = %d, want %d (%+v)", sum.InconsistentStreams, tc.inconsistent, sum)
+			}
+			rep := reportOf(t, out, ReportConfig{})
+			if rep.InconsistentStreams != tc.inconsistent {
+				t.Fatalf("report inconsistent streams = %d, want %d", rep.InconsistentStreams, tc.inconsistent)
+			}
+			if tc.inconsistent > 0 && rep.AttributionValid {
+				t.Fatal("an inconsistent stream certified exact attribution")
+			}
+		})
+	}
+}
+
 func TestCollectInterleavesByPerStreamElapsedTime(t *testing.T) {
 	a := newStream(LayerDaemon).ev(1000, waitEvent(1)).ev(1010, waitEvent(2)).ev(1020, waitEvent(3)).end(0)
 	b := newStream(LayerAuthority).ev(5, waitEvent(4)).ev(15, waitEvent(5)).end(0)

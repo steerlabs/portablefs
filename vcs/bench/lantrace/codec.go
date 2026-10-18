@@ -57,16 +57,18 @@ type record struct {
 	Clock   Label  `json:"clock"`
 	Streams uint32 `json:"streams"`
 
-	Emitted    uint64 `json:"emitted"`
-	Lost       uint64 `json:"lost"`
-	Read       uint64 `json:"read"`
-	Rejected   uint64 `json:"rejected"`
-	Incomplete bool   `json:"incomplete"`
+	Emitted      uint64 `json:"emitted"`
+	Lost         uint64 `json:"lost"`
+	Read         uint64 `json:"read"`
+	Rejected     uint64 `json:"rejected"`
+	Incomplete   bool   `json:"incomplete"`
+	Inconsistent bool   `json:"inconsistent"`
 
-	Events            uint64 `json:"events"`
-	Dropped           uint64 `json:"dropped"`
-	ProducerLost      uint64 `json:"producer_lost"`
-	IncompleteStreams uint64 `json:"incomplete_streams"`
+	Events              uint64 `json:"events"`
+	Dropped             uint64 `json:"dropped"`
+	ProducerLost        uint64 `json:"producer_lost"`
+	IncompleteStreams   uint64 `json:"incomplete_streams"`
+	InconsistentStreams uint64 `json:"inconsistent_streams"`
 
 	Event
 
@@ -126,8 +128,8 @@ var (
 		recordCollection: newKeyRule([]string{"record", "schema", "run", "streams"}, nil),
 		recordHeader:     newKeyRule(append([]string{"stream"}, headerKeys...), nil),
 		recordEvent:      newKeyRule(append([]string{"stream"}, eventKeys...), nil),
-		recordTrailer:    newKeyRule([]string{"record", "stream", "emitted", "lost", "read", "rejected"}, []string{"incomplete"}),
-		recordSummary:    newKeyRule([]string{"record", "events", "dropped", "rejected", "producer_lost", "incomplete_streams"}, nil),
+		recordTrailer:    newKeyRule([]string{"record", "stream", "emitted", "lost", "read", "rejected"}, []string{"incomplete", "inconsistent"}),
+		recordSummary:    newKeyRule([]string{"record", "events", "dropped", "rejected", "producer_lost", "incomplete_streams", "inconsistent_streams"}, nil),
 	}
 )
 

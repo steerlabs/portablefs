@@ -81,28 +81,39 @@ aggregate counters alone. `vcs/bench/lantrace` defines the stream and
   bounded sequence of events with per-process monotonic timestamps, and a
   trailer with emitted and lost counts. A stream without its trailer is
   incomplete.
-- Every field is allowlisted. Categorical fields carry enumerated values,
-  identities are run-local opaque labels, and raw names from the authorized
-  synthetic corpus are carried losslessly as bounded hex. There is no free-text
-  field, so tokens, credentials, capabilities, file contents, pointers, and
-  arbitrary paths cannot enter the trace.
+- Every producer follows one sequence rule: each event it accepts consumes the
+  next sequence number whether it is written or lost, so every gap in a
+  stream's numbers is a counted loss. The collector flags a stream whose
+  numbers do not reconcile with its trailer, and the report refuses a
+  collection whose sequence history is internally inconsistent.
+- The grammar admits only allowlisted keys, enumerated categories, short
+  opaque labels from a restricted alphabet, bounded integers, and raw names as
+  bounded hex. That excludes free-text fields; it does not establish where a
+  value came from. Keeping tokens, credentials, capabilities, file contents,
+  pointers, and arbitrary user paths out of the trace, and emitting raw names
+  only for the authorized synthetic corpus, is a content rule each producer
+  must enforce at its emission sites.
 - Producers emit through a bounded queue and byte budget that never block the
   filesystem path; overflow increments the lost count. The collector merges one
   run's streams into a bounded output and keeps bounded correlation state.
-- Callbacks are correlated by (frontend connection incarnation, operation ID)
-  and pfslocal request ID; daemon requests are correlated to authority turns by
-  session label and authority request ID. Cross-host clocks are never
-  subtracted. The daemon allocates the connection incarnation and pfslocal 2.0
-  does not tell the frontend its value, so the frontend-to-daemon join needs a
-  shared label that is not yet decided; until it is, that join is reported as
-  not traced rather than guessed.
+- Daemon requests are correlated to authority turns by session label and
+  authority request ID. Frontend callbacks would be correlated to daemon
+  requests by (connection namespace, connection incarnation, pfslocal request
+  ID), and matched anchors must name the same operation. The connection
+  incarnation is unique only within one daemon process, and pfslocal 2.0 does
+  not tell the frontend its value, so no producer can yet prove the shared,
+  run-unique connection namespace that join needs; until one can, the report
+  marks that join unavailable and exact attribution invalid rather than
+  matching on numbers another daemon could reuse. Cross-host clocks are never
+  subtracted.
 - The report separates candidate from exposed cache hits, positive from
   stamped-negative Lookups, OPEN reasons (first open, expansion, reopen after
   final close, directory cursor, CREATE description reuse) with emitted versus
   avoided RPCs, barrier kind and syscall latency, coalesced waiters, reservation
   and callback-window pressure, and close/reclaim batch counts versus released
-  tokens. Any lost, incomplete, or evicted correlation marks exact attribution
-  invalid for the run; it says nothing about filesystem correctness.
+  tokens. Any lost, rejected, incomplete, inconsistent, evicted, unmatched,
+  unqualified, or conflicting record marks exact attribution invalid for the
+  run; it says nothing about filesystem correctness.
 
 The trace format is internal and may change without notice. Producer
 instrumentation belongs to each component and is not yet complete.

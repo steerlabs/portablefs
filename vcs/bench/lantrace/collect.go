@@ -13,10 +13,11 @@ const (
 	DefaultMaxEvents = 4 << 20
 	// DefaultMaxBytes is the default bound on event bytes in one collection.
 	DefaultMaxBytes = 1 << 30
-	// MaxDistinctLabels bounds the distinct mount, session and superblock
-	// labels of one run. Labels name a handful of run-local objects; a run
-	// that needs more is using them as per-file or per-request identities,
-	// which the content rule forbids, so further new labels are rejected.
+	// MaxDistinctLabels bounds the distinct mount, connection-namespace,
+	// session and superblock labels of one run. Labels name a handful of
+	// run-local objects; a run that needs more is using them as per-file or
+	// per-request identities, which the content rule forbids, so further new
+	// labels are rejected.
 	MaxDistinctLabels = 256
 )
 
@@ -45,6 +46,9 @@ type Summary struct {
 	Rejected          uint64 `json:"rejected"`
 	ProducerLost      uint64 `json:"producer_lost"`
 	IncompleteStreams uint64 `json:"incomplete_streams"`
+	// InconsistentStreams counts complete streams whose sequence numbers do
+	// not reconcile with their trailer under the sequence rule.
+	InconsistentStreams uint64 `json:"inconsistent_streams"`
 }
 
 type inputStream struct {
@@ -68,12 +72,14 @@ type inputStream struct {
 //	{"record":"collection","schema":...,"run":R,"streams":N}
 //	N headers, each with "stream":i (1-based, in input order)
 //	events, each with "stream":i
-//	N trailers: {"record":"trailer","stream":i,"emitted":E,"lost":X,"read":R,"rejected":J[,"incomplete":true]}
-//	{"record":"summary","events":W,"dropped":D,"rejected":J,"producer_lost":X,"incomplete_streams":I}
+//	N trailers: {"record":"trailer","stream":i,"emitted":E,"lost":X,"read":R,"rejected":J[,"incomplete":true][,"inconsistent":true]}
+//	{"record":"summary","events":W,"dropped":D,"rejected":J,"producer_lost":X,"incomplete_streams":I,"inconsistent_streams":C}
 //
 // Every input must begin with a valid header and all must name the same run;
 // otherwise Collect fails before writing. A later invalid line is rejected
 // and counted, and an input without its trailer is recorded as incomplete.
+// A complete input whose sequence numbers do not reconcile with its trailer
+// under the sequence rule is recorded as inconsistent.
 // Collect holds one pending event per input and a bounded label set, so its
 // memory does not grow with input size.
 //
@@ -179,17 +185,22 @@ func Collect(w io.Writer, inputs []Input, cfg CollectConfig) (Summary, error) {
 
 	for _, s := range streams {
 		t := struct {
-			Record     string `json:"record"`
-			Stream     uint32 `json:"stream"`
-			Emitted    uint64 `json:"emitted"`
-			Lost       uint64 `json:"lost"`
-			Read       uint64 `json:"read"`
-			Rejected   uint64 `json:"rejected"`
-			Incomplete bool   `json:"incomplete,omitempty"`
+			Record       string `json:"record"`
+			Stream       uint32 `json:"stream"`
+			Emitted      uint64 `json:"emitted"`
+			Lost         uint64 `json:"lost"`
+			Read         uint64 `json:"read"`
+			Rejected     uint64 `json:"rejected"`
+			Incomplete   bool   `json:"incomplete,omitempty"`
+			Inconsistent bool   `json:"inconsistent,omitempty"`
 		}{Record: recordTrailer, Stream: s.index, Read: s.read, Rejected: s.rejected}
 		if s.trailer != nil {
 			t.Emitted, t.Lost = s.trailer.Emitted, s.trailer.Lost
 			sum.ProducerLost += s.trailer.Lost
+			if !sequenceConsistent(s.lastSeq, s.read, s.rejected, t.Emitted, t.Lost) {
+				t.Inconsistent = true
+				sum.InconsistentStreams++
+			}
 		} else {
 			t.Incomplete = true
 			sum.IncompleteStreams++
@@ -200,19 +211,36 @@ func Collect(w io.Writer, inputs []Input, cfg CollectConfig) (Summary, error) {
 		}
 	}
 	if err := writeFixed(marshalLine(struct {
-		Record            string `json:"record"`
-		Events            uint64 `json:"events"`
-		Dropped           uint64 `json:"dropped"`
-		Rejected          uint64 `json:"rejected"`
-		ProducerLost      uint64 `json:"producer_lost"`
-		IncompleteStreams uint64 `json:"incomplete_streams"`
-	}{recordSummary, sum.Events, sum.Dropped, sum.Rejected, sum.ProducerLost, sum.IncompleteStreams})); err != nil {
+		Record              string `json:"record"`
+		Events              uint64 `json:"events"`
+		Dropped             uint64 `json:"dropped"`
+		Rejected            uint64 `json:"rejected"`
+		ProducerLost        uint64 `json:"producer_lost"`
+		IncompleteStreams   uint64 `json:"incomplete_streams"`
+		InconsistentStreams uint64 `json:"inconsistent_streams"`
+	}{recordSummary, sum.Events, sum.Dropped, sum.Rejected, sum.ProducerLost, sum.IncompleteStreams, sum.InconsistentStreams})); err != nil {
 		return sum, err
 	}
 	if err := bw.Flush(); err != nil {
 		return sum, fmt.Errorf("lantrace: write collection: %w", err)
 	}
 	return sum, nil
+}
+
+// sequenceConsistent applies the stream sequence rule (see the package
+// documentation) to one complete stream: every accepted event consumed the
+// next number, written or lost, so the last written number cannot exceed
+// emitted+lost, at most emitted events can have been read, and with nothing
+// rejected exactly emitted must have been read. Written numbers are already
+// strictly increasing, so together these mean every gap is a counted loss and
+// no loss is counted twice. A rejected line may have been an event, so with
+// rejections only the bounds can be checked; the rejection itself already
+// invalidates attribution.
+func sequenceConsistent(lastSeq, read, rejected, emitted, lost uint64) bool {
+	if read > emitted || lastSeq > satAdd(emitted, lost) {
+		return false
+	}
+	return rejected > 0 || read == emitted
 }
 
 func (s *inputStream) elapsed() Nanos {
@@ -272,7 +300,7 @@ func (s *inputStream) advance(labels map[Label]struct{}) error {
 // event that would introduce a new label beyond MaxDistinctLabels.
 func admitLabels(labels map[Label]struct{}, e *Event) bool {
 	var added []Label
-	for _, l := range [...]Label{e.Mount, e.Session, e.Superblock} {
+	for _, l := range [...]Label{e.Mount, e.ConnNS, e.Session, e.Superblock} {
 		if l == "" {
 			continue
 		}

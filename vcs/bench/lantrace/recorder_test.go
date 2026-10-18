@@ -139,6 +139,7 @@ func TestRecorderOverflowCountsLostWithoutBlocking(t *testing.T) {
 	if events[3].Seq != 4 {
 		t.Fatalf("queued events carry seq %d..%d", events[0].Seq, events[3].Seq)
 	}
+	assertReconciles(t, w.buf.Bytes())
 }
 
 func TestRecorderByteBudgetCountsLost(t *testing.T) {
@@ -172,6 +173,7 @@ func TestRecorderByteBudgetCountsLost(t *testing.T) {
 			if uint64(len(events)) != tc.emitted || trailer.Emitted != tc.emitted || trailer.Lost != tc.lost {
 				t.Fatalf("events=%d trailer=%+v, want emitted=%d lost=%d", len(events), trailer, tc.emitted, tc.lost)
 			}
+			assertReconciles(t, buf.Bytes())
 		})
 	}
 }
@@ -205,6 +207,61 @@ func TestRecorderRejectsInvalidEventsAndCountsThemLost(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertReconciles collects one Recorder stream and requires its sequence
+// numbers to reconcile with its trailer under the sequence rule.
+func assertReconciles(t *testing.T, data []byte) {
+	t.Helper()
+	var out bytes.Buffer
+	sum, err := Collect(&out, []Input{{Name: "recorder", Reader: bytes.NewReader(data)}}, CollectConfig{})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if sum.InconsistentStreams != 0 || sum.Rejected != 0 || sum.IncompleteStreams != 0 {
+		t.Fatalf("recorder stream does not reconcile: %+v", sum)
+	}
+	if _, err := BuildReport(bytes.NewReader(out.Bytes()), ReportConfig{}); err != nil {
+		t.Fatalf("BuildReport: %v", err)
+	}
+}
+
+// Every accepted Emit consumes one sequence number, so an invalid event, a
+// budget drop and a queue drop each leave a gap that the trailer's lost count
+// explains exactly.
+func TestRecorderStreamsObeyTheSequenceRule(t *testing.T) {
+	var buf bytes.Buffer
+	line := int64(len(`{"record":"event","seq":1,"t_ns":0,"kind":"wait","wait":"reservation","dur_ns":1}`) + 1)
+	r, err := newRecorder(&buf, daemonHeader, RecorderConfig{ByteBudget: 2 * line}, zeroClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Emit(waitEvent(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Emit(Event{Kind: KindWait, Wait: WaitTransport}); err == nil {
+		t.Fatal("invalid event accepted")
+	}
+	if err := r.Emit(waitEvent(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Emit(waitEvent(1)); err != nil { // over the byte budget
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Emit(waitEvent(1)); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Emit after Close = %v, want ErrClosed", err)
+	}
+	if err := r.Emit(Event{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("invalid Emit after Close = %v, want ErrClosed and no late loss", err)
+	}
+	events, trailer := parsedStream(t, buf.Bytes())
+	if len(events) != 2 || events[0].Seq != 1 || events[1].Seq != 3 || trailer.Emitted != 2 || trailer.Lost != 2 {
+		t.Fatalf("events=%v trailer=%+v, want seq 1 and 3 with emitted=2 lost=2", events, trailer)
+	}
+	assertReconciles(t, buf.Bytes())
 }
 
 func TestRecorderRejectsInvalidConfiguration(t *testing.T) {

@@ -40,7 +40,7 @@ func scenario(t *testing.T) []byte {
 		Event{Kind: KindCallback, Phase: PhasePublicationComplete, Callback: 1, CallbackKind: CallbackLookup, Conn: 1, Operation: 9, Publication: PublicationPublished},
 		Event{Kind: KindCallback, Phase: PhaseEntry, Callback: 2, CallbackKind: CallbackGetAttr, Origin: OriginFramework},
 		frontendSend(1, 2, LocalGetAttr),
-		Event{Kind: KindLocal, Phase: PhaseSend, Conn: 1, Request: 3, LocalOp: LocalGetAttr, Origin: OriginSyntheticEnumeration},
+		Event{Kind: KindLocal, Phase: PhaseSend, ConnNS: testConnNS, Conn: 1, Request: 3, LocalOp: LocalGetAttr, Origin: OriginSyntheticEnumeration},
 		Event{Kind: KindOpen, Item: 10, OpenReason: OpenCreateReuse, Mode: ModeWrite, RPC: RPCAvoided, LiveMode: LiveWrite},
 		Event{Kind: KindRelease, Item: 10, ReleaseKind: ReleaseClose},
 	)
@@ -206,7 +206,10 @@ func TestReportAggregatesScenario(t *testing.T) {
 }
 
 func TestReportCorrelationCoverage(t *testing.T) {
-	type cov struct{ matched, unmatchedLeft, unmatchedRight, evictedLeft, evictedRight uint64 }
+	type cov struct {
+		matched, unmatchedLeft, unmatchedRight, evictedLeft, evictedRight, unqualified, conflicts uint64
+		status                                                                                    string
+	}
 	fiveFrontendThenDaemon := func() []*streamBuilder {
 		f, d := newStream(LayerFrontend), newStream(LayerDaemon)
 		// An early daemon event anchors the daemon stream's elapsed time,
@@ -218,6 +221,14 @@ func TestReportCorrelationCoverage(t *testing.T) {
 		}
 		return []*streamBuilder{f.end(0), d.end(0)}
 	}
+	pair := func(front, daemon Event) func() []*streamBuilder {
+		return func() []*streamBuilder {
+			return []*streamBuilder{
+				newStream(LayerFrontend).ev(0, front).end(0),
+				newStream(LayerDaemon).ev(0, daemon).end(0),
+			}
+		}
+	}
 	cases := []struct {
 		name    string
 		streams func() []*streamBuilder
@@ -226,27 +237,48 @@ func TestReportCorrelationCoverage(t *testing.T) {
 		want    cov
 		valid   bool
 	}{
-		{"matched", fiveFrontendThenDaemon, 16, joinFrontendDaemon, cov{matched: 5}, true},
+		{"matched", fiveFrontendThenDaemon, 16, joinFrontendDaemon, cov{matched: 5, status: JoinExact}, true},
 		{"evicted by a small window", fiveFrontendThenDaemon, 2, joinFrontendDaemon,
-			cov{unmatchedRight: 2, evictedLeft: 5, evictedRight: 3}, false},
-		{"same request on another connection does not match", func() []*streamBuilder {
-			return []*streamBuilder{
-				newStream(LayerFrontend).ev(0, frontendSend(1, 7, LocalLookup)).end(0),
-				newStream(LayerDaemon).ev(0, daemonEnqueue(2, 7, LocalLookup)).end(0),
-			}
-		}, 16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1}, false},
+			cov{unmatchedRight: 2, evictedLeft: 5, evictedRight: 3, status: JoinIncomplete}, false},
+		{"same request on another connection does not match",
+			pair(frontendSend(1, 7, LocalLookup), daemonEnqueue(2, 7, LocalLookup)),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
+		{"same connection and request in another namespace does not match",
+			pair(frontendSend(1, 1, LocalLookup), inNamespace("cns-other", daemonEnqueue(1, 1, LocalLookup))),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
+		{"conflicting operation is not a match",
+			pair(frontendSend(1, 1, LocalLookup), daemonEnqueue(1, 1, LocalGetAttr)),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, conflicts: 1, status: JoinIncomplete}, false},
+		{"conflicting mount is not a match",
+			pair(func() Event { e := frontendSend(1, 1, LocalLookup); e.Mount = "mount-a"; return e }(),
+				func() Event { e := daemonEnqueue(1, 1, LocalLookup); e.Mount = "mount-b"; return e }()),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, conflicts: 1, status: JoinIncomplete}, false},
+		// The review's reproduction: two daemons each allocate connection 1,
+		// and nothing proves the frontend and daemon share one namespace.
+		{"anchors without the shared namespace leave the join unavailable",
+			pair(inNamespace("", frontendSend(1, 1, LocalLookup)), inNamespace("", daemonEnqueue(1, 1, LocalGetAttr))),
+			16, joinFrontendDaemon, cov{unqualified: 2, status: JoinUnavailable}, false},
+		{"one side without the namespace leaves the join unavailable",
+			pair(frontendSend(1, 1, LocalLookup), inNamespace("", daemonEnqueue(1, 1, LocalLookup))),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unqualified: 1, status: JoinUnavailable}, false},
 		{"unmatched authority receive", func() []*streamBuilder {
 			return []*streamBuilder{
 				newStream(LayerDaemon).ev(0, authoritySend(session, 1, AuthorityLookup)).end(0),
 				newStream(LayerAuthority).ev(0, authorityReceive(session, 1, AuthorityLookup)).ev(1, authorityReceive("s-other", 1, AuthorityLookup)).end(0),
 			}
-		}, 16, joinClientAuthority, cov{matched: 1, unmatchedRight: 1}, false},
+		}, 16, joinClientAuthority, cov{matched: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
+		{"conflicting authority operation is not a match", func() []*streamBuilder {
+			return []*streamBuilder{
+				newStream(LayerDaemon).ev(0, authoritySend(session, 1, AuthorityLookup)).end(0),
+				newStream(LayerAuthority).ev(0, authorityReceive(session, 1, AuthorityGetAttr)).end(0),
+			}
+		}, 16, joinClientAuthority, cov{unmatchedLeft: 1, conflicts: 1, status: JoinIncomplete}, false},
 		{"linux client joins the authority", func() []*streamBuilder {
 			return []*streamBuilder{
 				newStream(LayerLinuxClient).ev(0, authoritySend("s-linux", 1, AuthorityWrite)).end(0),
 				newStream(LayerAuthority).ev(0, authorityReceive("s-linux", 1, AuthorityWrite)).end(0),
 			}
-		}, 16, joinClientAuthority, cov{matched: 1}, true},
+		}, 16, joinClientAuthority, cov{matched: 1, status: JoinExact}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -261,7 +293,7 @@ func TestReportCorrelationCoverage(t *testing.T) {
 			if !j.Applicable {
 				t.Fatalf("join %s not applicable", tc.join)
 			}
-			got := cov{j.Matched, j.UnmatchedLeft, j.UnmatchedRight, j.EvictedLeft, j.EvictedRight}
+			got := cov{j.Matched, j.UnmatchedLeft, j.UnmatchedRight, j.EvictedLeft, j.EvictedRight, j.Unqualified, j.Conflicts, j.Status}
 			if got != tc.want {
 				t.Fatalf("coverage = %+v, want %+v", got, tc.want)
 			}
@@ -270,6 +302,61 @@ func TestReportCorrelationCoverage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// BuildReport validates per-stream sequence order on its own; it does not
+// rely on Collect having done so.
+func TestReportRejectsInvalidSequenceHistories(t *testing.T) {
+	twoEvents := func() []byte {
+		out, _ := collectStreams(t, CollectConfig{}, newStream(LayerDaemon).ev(0, waitEvent(1)).ev(1, waitEvent(2)).end(0))
+		return out
+	}
+	gapped := func() []byte {
+		// Numbers 1 and 3 with emitted=2, lost=0: one number is unaccounted
+		// for, so Collect flags the stream inconsistent.
+		out, sum := collectStreams(t, CollectConfig{}, newStream(LayerDaemon).evSeq(1, 0, waitEvent(1)).evSeq(3, 1, waitEvent(2)).end(0))
+		if sum.InconsistentStreams != 1 {
+			t.Fatalf("collect did not flag the gap: %+v", sum)
+		}
+		return out
+	}
+	cases := []struct {
+		name   string
+		edit   func([]byte) []byte
+		source func() []byte
+	}{
+		{"duplicate sequence", func(b []byte) []byte { return bytes.Replace(b, []byte(`"seq":2,`), []byte(`"seq":1,`), 1) }, twoEvents},
+		{"reordered sequence", func(b []byte) []byte {
+			b = bytes.Replace(b, []byte(`"seq":1,`), []byte(`"seq":9,`), 1)
+			return b
+		}, twoEvents},
+		{"gap the trailer does not flag", func(b []byte) []byte {
+			b = bytes.Replace(b, []byte(`,"inconsistent":true`), nil, 1)
+			return bytes.Replace(b, []byte(`"inconsistent_streams":1`), []byte(`"inconsistent_streams":0`), 1)
+		}, gapped},
+		{"consistent stream flagged inconsistent", func(b []byte) []byte {
+			b = bytes.Replace(b, []byte(`"rejected":0}`), []byte(`"rejected":0,"inconsistent":true}`), 1)
+			return bytes.Replace(b, []byte(`"inconsistent_streams":0`), []byte(`"inconsistent_streams":1`), 1)
+		}, twoEvents},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			original := tc.source()
+			edited := tc.edit(append([]byte(nil), original...))
+			if bytes.Equal(edited, original) {
+				t.Fatal("edit did not change the collection")
+			}
+			if _, err := BuildReport(bytes.NewReader(edited), ReportConfig{}); err == nil {
+				t.Fatal("BuildReport accepted an invalid sequence history")
+			}
+		})
+	}
+	t.Run("flagged gap invalidates attribution", func(t *testing.T) {
+		rep := reportOf(t, gapped(), ReportConfig{})
+		if rep.AttributionValid || !strings.Contains(strings.Join(rep.InvalidReasons, "\n"), "do not reconcile") {
+			t.Fatalf("valid=%t reasons %v", rep.AttributionValid, rep.InvalidReasons)
+		}
+	})
 }
 
 func TestReportJoinNotApplicableWithoutBothLayers(t *testing.T) {

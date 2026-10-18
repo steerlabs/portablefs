@@ -94,25 +94,34 @@ func newRecorder(w io.Writer, h Header, cfg RecorderConfig, now func() Nanos) (*
 // Emit records e. It returns an error only for an event the grammar rejects,
 // which is also counted as lost; an event dropped for capacity returns nil,
 // because producers must not change behavior on diagnostic pressure.
+//
+// Every event accepted before Close consumes the next sequence number,
+// whether it is written or lost (invalid, over budget, queue full, or a sink
+// failure). That is the stream sequence rule in the package documentation:
+// the trailer's emitted plus lost equals the last number allocated, and every
+// gap in the written numbers is a lost event.
 func (r *Recorder) Emit(e Event) error {
-	if _, err := e.validate(r.layer); err != nil {
-		r.lost.Add(1)
-		return err
-	}
-	body, err := json.Marshal(&e)
-	if err != nil {
-		r.lost.Add(1)
-		return fmt.Errorf("lantrace: encode event: %w", err)
+	_, invalid := e.validate(r.layer)
+	var body []byte
+	if invalid == nil {
+		var err error
+		if body, err = json.Marshal(&e); err != nil {
+			invalid = fmt.Errorf("lantrace: encode event: %w", err)
+		}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return ErrClosed
 	}
-	// seq is consumed even by a dropped event, so the gap marks where the
-	// stream lost attribution. Stamping under the lock that orders the queue
-	// keeps seq and t_ns non-decreasing in the written stream.
+	// Stamping under the lock that orders the queue keeps seq and t_ns
+	// non-decreasing in the written stream, and accounting a loss under it
+	// keeps every loss ahead of the trailer Close writes.
 	r.seq++
+	if invalid != nil {
+		r.lost.Add(1)
+		return invalid
+	}
 	line := appendEvent(make([]byte, 0, len(body)+64), 0, r.seq, r.now(), body)
 	if int64(len(line)) > r.budget || len(line) > MaxLineBytes {
 		r.lost.Add(1)

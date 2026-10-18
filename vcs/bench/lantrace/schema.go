@@ -32,7 +32,9 @@ const (
 
 // Label is a short opaque identifier: a letter followed by up to 63 letters,
 // digits, '.', '_', ':' or '-'. Spaces, slashes and every other byte are
-// unrepresentable, so a label can carry neither free text nor a path.
+// rejected, so a label cannot hold free text or a multi-component path. It
+// can still hold any short string in that alphabet; keeping secrets out of
+// labels is the producer content rule, not something validation can prove.
 type Label string
 
 func (l Label) valid() bool {
@@ -793,6 +795,7 @@ type Event struct {
 	// Run-local identities.
 	Mount            Label   `json:"mount,omitempty"`             // run-local mount label
 	Conn             uint64  `json:"conn,omitempty"`              // daemon frontend-connection incarnation, never reused
+	ConnNS           Label   `json:"conn_ns,omitempty"`           // run-unique namespace of conn, held identically by frontend and daemon
 	Callback         uint64  `json:"callback,omitempty"`          // frontend-local callback ID, unique per frontend process
 	Operation        uint64  `json:"operation,omitempty"`         // pfslocal operation_id, scoped by conn
 	Request          uint64  `json:"request,omitempty"`           // pfslocal request_id (or disposition target), scoped by conn
@@ -885,37 +888,37 @@ var ruleSpecs = map[Kind]rule{
 		layers:   []Layer{LayerFrontend, LayerLinuxClient},
 		phases:   []Phase{PhaseEntry, PhaseReply, PhasePublicationComplete},
 		required: "callback callback_kind",
-		optional: "mount conn operation origin item parent name_hex outcome errno publication",
+		optional: "mount conn conn_ns operation origin item parent name_hex outcome errno publication",
 	},
 	KindLocal: {
 		layers: []Layer{LayerFrontend, LayerDaemon},
 		phases: []Phase{PhaseSend, PhaseEnqueue, PhaseDispatch, PhaseOutcome, PhaseExposure,
 			PhaseReply, PhaseDisposition},
 		required: "conn request local_op",
-		optional: "mount callback operation origin item parent name_hex outcome errno count",
+		optional: "conn_ns mount callback operation origin item parent name_hex outcome errno count",
 	},
 	KindCache: {
 		layers:   []Layer{LayerDaemon},
 		phases:   []Phase{PhaseCandidate, PhaseFinal},
 		required: "conn request candidate cache_result",
-		optional: "mount operation item parent name_hex coordinate miss_reason proof proof_age_ns source_state cert cert_drop search exposure",
+		optional: "conn_ns mount operation item parent name_hex coordinate miss_reason proof proof_age_ns source_state cert cert_drop search exposure",
 	},
 	KindSource: {
 		layers: []Layer{LayerDaemon},
 		phases: []Phase{PhaseAcquire, PhaseActiveInc, PhaseActiveDec, PhasePostState,
 			PhaseClaimSettled, PhaseAck, PhaseRelease},
 		required: "conn operation",
-		optional: "mount request successor count publication",
+		optional: "conn_ns mount request successor count publication",
 	},
 	KindOpen: {
 		layers:   []Layer{LayerFrontend, LayerDaemon, LayerLinuxClient},
 		required: "item open_reason mode rpc",
-		optional: "mount conn callback operation request live_mode flags",
+		optional: "mount conn conn_ns callback operation request live_mode flags",
 	},
 	KindRelease: {
 		layers:   []Layer{LayerFrontend, LayerDaemon, LayerLinuxClient},
 		required: "item release_kind",
-		optional: "mount conn batch",
+		optional: "mount conn conn_ns batch",
 	},
 	KindReleaseBatch: {
 		layers:   []Layer{LayerDaemon, LayerLinuxClient},
@@ -927,7 +930,7 @@ var ruleSpecs = map[Kind]rule{
 		layers:   []Layer{LayerDaemon, LayerLinuxClient, LayerAuthority},
 		phases:   []Phase{PhaseSend, PhaseReceive, PhaseReply},
 		required: "session authority_request authority_op",
-		optional: "mount conn operation request dispatch outcome errno lookup committed_seq visible_seq dur_ns",
+		optional: "mount conn conn_ns operation request dispatch outcome errno lookup committed_seq visible_seq dur_ns",
 	},
 	KindBarrier: {
 		layers:   []Layer{LayerAuthority},
@@ -942,7 +945,7 @@ var ruleSpecs = map[Kind]rule{
 	KindWait: {
 		layers:   allLayers,
 		required: "wait dur_ns",
-		optional: "mount conn callback operation request session authority_request count",
+		optional: "mount conn conn_ns callback operation request session authority_request count",
 	},
 	KindOccupancy: {
 		layers:   allLayers,
@@ -953,7 +956,7 @@ var ruleSpecs = map[Kind]rule{
 	KindMkdirWitness: {
 		layers:   []Layer{LayerDaemon},
 		required: "item witness seed",
-		optional: "mount conn request session authority_request parent cut_seq",
+		optional: "mount conn conn_ns request session authority_request parent cut_seq",
 	},
 	KindRenewal: {
 		layers:   []Layer{LayerDaemon},

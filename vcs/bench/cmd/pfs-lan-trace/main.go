@@ -93,8 +93,8 @@ func collect(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "pfs-lan-trace: %v\n", err)
 		return exitInvalid
 	}
-	fmt.Fprintf(stdout, "collected run %s: %d streams, %d events, %d dropped, %d rejected, %d producer-lost, %d incomplete streams\n",
-		sum.Run, sum.Streams, sum.Events, sum.Dropped, sum.Rejected, sum.ProducerLost, sum.IncompleteStreams)
+	fmt.Fprintf(stdout, "collected run %s: %d streams, %d events, %d dropped, %d rejected, %d producer-lost, %d incomplete streams, %d inconsistent streams\n",
+		sum.Run, sum.Streams, sum.Events, sum.Dropped, sum.Rejected, sum.ProducerLost, sum.IncompleteStreams, sum.InconsistentStreams)
 	return exitOK
 }
 
