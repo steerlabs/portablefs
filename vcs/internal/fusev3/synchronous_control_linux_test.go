@@ -117,3 +117,38 @@ func TestSynchronousApplicationReceiptAllowsControlBeforeVisibility(t *testing.T
 		t.Fatal("visibility completed without the required read cut")
 	}
 }
+
+func TestOpenedApplicationCutBelongsToItsReturnedGrant(t *testing.T) {
+	fake := &openVisibilityRPC{}
+	m := newDelegationTestManager(t, fake)
+	fake.manager = m
+	fake.id = delegationTestIdentity(119)
+	fake.grant = delegationTestGrant(152, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	response := &authoritypb.Response{AppliedSequence: 7, Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: delegationTestToken(119, 2), Delegation: fake.grant}}}
+	if err := m.Install(fake.id, delegationTestToken(119, 1), response.GetOpen().Handle, fake.grant); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- m.openedVisibility(ctx, fake.id, response) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new OPEN's application cut could not satisfy its break")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, req := range fake.controls {
+		if ack := req.GetDelegationBreakAck(); ack != nil {
+			if ack.GetAppliedSequence() != 7 {
+				t.Fatalf("break cut=%d want OPEN application 7", ack.GetAppliedSequence())
+			}
+			return
+		}
+	}
+	t.Fatal("OPEN's visibility completed without a break")
+}

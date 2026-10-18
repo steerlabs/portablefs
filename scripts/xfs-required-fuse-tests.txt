@@ -91,3 +91,4 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSynchronousApplicationRe
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSynchronousOpenPublishesGrantBeforeWaitingForVisibility
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCollectedGrantRejectsDelayedControlDuringSuccessorOpen
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCollectionFloorWaitsForUnreportedGrantsAndPreservesLiveOlderGrant
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpenedApplicationCutBelongsToItsReturnedGrant

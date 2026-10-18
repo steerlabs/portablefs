@@ -1373,6 +1373,27 @@ func (m *delegationManager) openedVisibility(ctx context.Context, identity []byt
 	}
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
+	var grant *authoritypb.Delegation
+	if opened := response.GetOpen(); opened != nil {
+		grant = opened.GetDelegation()
+	} else if created := response.GetCreate(); created != nil {
+		grant = created.GetDelegation()
+	}
+	state := m.retainState(id, false)
+	defer m.releaseState(state)
+	if state != nil && grant != nil {
+		state.admission.RLock()
+		if sameDelegation(state.ref, &authoritypb.DelegationRef{Id: grant.Id, Generation: grant.Generation}) {
+			state.meta.Lock()
+			state.applied = max(state.applied, response.GetAppliedSequence())
+			state.meta.Unlock()
+		}
+		state.admission.RUnlock()
+	}
+	m.durabilityMu.Lock()
+	m.appliedHigh = max(m.appliedHigh, response.GetAppliedSequence())
+	m.durabilityMu.Unlock()
+	m.kickDurability()
 	return m.waitVisibility(ctx, m.buf, id, m.buf.Snapshot(), response.GetAppliedSequence())
 }
 
