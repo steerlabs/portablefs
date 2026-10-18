@@ -84,15 +84,22 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 				}
 			}
 			closeNegotiations(opened)
-			if errors.Is(err, ErrAuthorityChanged) || frameDefect(err) {
-				return nil, err
-			}
+		}
+		if recoveryTerminal(err) {
+			return nil, err
 		}
 		last = err
 		if err := waitTransportRetry(ctx); err != nil {
 			return nil, fmt.Errorf("%v: %w", last, err)
 		}
 	}
+}
+
+// recoveryTerminal reports an error that no retry of a recovery handshake may
+// pass: a changed authority, or a proven frame defect from any read of the
+// attempt (Hello or Resume). Everything else is transport loss, retried.
+func recoveryTerminal(err error) bool {
+	return errors.Is(err, ErrAuthorityChanged) || frameDefect(err)
 }
 
 // frameDefect reports a received frame that is a proven protocol defect:
@@ -137,6 +144,9 @@ func (c *Client) resumeRawPairForActivation(ctx context.Context) (*transportNego
 			return data, control, nil
 		}
 		closeNegotiations(data)
+		if recoveryTerminal(err) {
+			return nil, nil, err
+		}
 		if waitErr := waitTransportRetry(ctx); waitErr != nil {
 			return nil, nil, fmt.Errorf("%v: %w", err, waitErr)
 		}
@@ -355,9 +365,9 @@ func (c *Client) reopenInitialPair(ctx context.Context) (*transportNegotiation, 
 				}
 			}
 			closeNegotiations(data, control)
-			if errors.Is(err, ErrAuthorityChanged) || frameDefect(err) {
-				return nil, nil, err
-			}
+		}
+		if recoveryTerminal(err) {
+			return nil, nil, err
 		}
 		last = err
 		if err := waitTransportRetry(ctx); err != nil {

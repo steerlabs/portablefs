@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"slices"
@@ -1593,6 +1594,133 @@ func TestReconnectMalformedHelloFrameEndsTheSession(t *testing.T) {
 	case <-client.SessionDone():
 	case <-time.After(time.Second):
 		t.Fatal("a malformed Hello frame during recovery did not end the session")
+	}
+}
+
+// startRecoveryScriptServer is a raw authority for pre-publication recovery
+// handshakes. Each connection answers its Hello and then, if asked, one
+// Resume; defect picks the single reply, by role and step, sent outside the
+// wire grammar. Every other reply is healthy, so a client that retried past
+// the defect would succeed. It reports the connections accepted.
+func startRecoveryScriptServer(t *testing.T, epoch []byte, defect func(role authoritypb.TransportRole, resume bool) bool) (string, *tls.Config, func() int32) {
+	t.Helper()
+	serverTLS, clientTLS := testTLSConfigs(t)
+	serverTLS = serverTLS.Clone()
+	serverTLS.NextProtos = []string{protocolALPN}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connections atomic.Int32
+	var defectSent atomic.Bool
+	reply := func(conn net.Conn, response *authoritypb.Response, role authoritypb.TransportRole, resume bool) bool {
+		malformed := defect(role, resume) && defectSent.CompareAndSwap(false, true)
+		if malformed {
+			response.SessionValidForNanos = uint64(time.Second) // a proof is never legal beside a body
+		}
+		frame, err := rawResponseFrame(response, nil)
+		return err == nil && writeAll(conn, frame) == nil && !malformed
+	}
+	// Connections are served concurrently: the client holds one role's
+	// connection open while it opens the other.
+	var served sync.WaitGroup
+	served.Add(1)
+	go func() {
+		defer served.Done()
+		for {
+			raw, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			served.Add(1)
+			go func() {
+				defer served.Done()
+				defer raw.Close()
+				_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+				conn := tls.Server(raw, serverTLS)
+				request := new(authoritypb.Request)
+				if conn.Handshake() != nil || readFrame(conn, testMaxFrame, nil, 0, request) != nil || request.GetHello() == nil {
+					return
+				}
+				hello := request.GetHello()
+				if !reply(conn, &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
+					ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+					MaxFrameBytes: testMaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: 4,
+					Role: hello.GetRole(), ConnectionSetId: hello.GetConnectionSetId(), FrontendProfile: hello.GetFrontendProfile(),
+				}}}, hello.GetRole(), false) {
+					return
+				}
+				request = new(authoritypb.Request)
+				if readFrame(conn, testMaxFrame, nil, 0, request) != nil || request.GetResume() == nil {
+					return
+				}
+				reply(conn, &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{
+					Role: hello.GetRole(), BindingGeneration: 1, State: authoritypb.SessionState_SESSION_STATE_PROVISIONAL,
+				}}}, hello.GetRole(), true)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		served.Wait()
+	})
+	return listener.Addr().String(), clientTLS, connections.Load
+}
+
+// A malformed reply during Attach or Activate recovery is a proven authority
+// defect: each recovery helper returns it at once instead of retrying into the
+// healthy replies that follow, and the recovery wrapper keeps its class.
+func TestRecoveryNeverRetriesPastAFrameDefect(t *testing.T) {
+	data, control := authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL
+	for _, test := range []struct {
+		name        string
+		defect      func(role authoritypb.TransportRole, resume bool) bool
+		recover     func(context.Context, *Client) error
+		connections int32
+	}{
+		{name: "lost-attach-hello", defect: func(authoritypb.TransportRole, bool) bool { return true }, recover: func(ctx context.Context, c *Client) error {
+			data, control, err := c.reopenInitialPair(ctx)
+			closeNegotiations(data, control)
+			return err
+		}, connections: 1},
+		{name: "lost-activate-hello", defect: func(_ authoritypb.TransportRole, resume bool) bool { return !resume }, recover: func(ctx context.Context, c *Client) error {
+			opened, err := c.resumeRawForActivation(ctx, data)
+			closeNegotiations(opened)
+			return err
+		}, connections: 1},
+		{name: "lost-activate-control-resume", defect: func(role authoritypb.TransportRole, resume bool) bool { return role == control && resume }, recover: func(ctx context.Context, c *Client) error {
+			data, control, err := c.resumeRawPairForActivation(ctx)
+			closeNegotiations(data, control)
+			return err
+		}, connections: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			epoch := bytes.Repeat([]byte{0x31}, 16)
+			address, clientTLS, connections := startRecoveryScriptServer(t, epoch, test.defect)
+			client := newReconnectTestClient(address, clientTLS)
+			client.epoch = epoch
+			client.helloFeatures = append([]string(nil), requiredHelloFeatures...)
+			client.negotiatedFrame, client.negotiatedInFlight = testMaxFrame, 4
+			client.maxRead, client.maxWrite = 1<<20, 1<<20
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err := test.recover(ctx, client)
+			if !errors.Is(err, ErrTransportBinding) || !errors.Is(err, ErrFrameEncoding) || ctx.Err() != nil {
+				t.Fatalf("recovery past a malformed reply = %v (deadline %v), want the transport binding defect", err, ctx.Err())
+			}
+			if got := connections(); got != test.connections {
+				t.Fatalf("recovery opened %d connection(s), want %d and no retry past the defect", got, test.connections)
+			}
+			wrapped := recoveryFailure("activation", err)
+			if !errors.Is(wrapped, ErrTransportBinding) || !errors.Is(wrapped, ErrFrameEncoding) || errors.Is(wrapped, ErrTransportUncertain) {
+				t.Fatalf("recovery wrapper = %v, want the defect's own class", wrapped)
+			}
+		})
+	}
+	// Ordinary loss keeps its unknown-outcome class.
+	if lost := recoveryFailure("activation", io.ErrUnexpectedEOF); !errors.Is(lost, ErrTransportUncertain) || errors.Is(lost, ErrTransportBinding) {
+		t.Fatalf("recovery wrapper for transport loss = %v, want ErrTransportUncertain", lost)
 	}
 }
 

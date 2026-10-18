@@ -399,6 +399,16 @@ func (c *Client) attachBody() *authoritypb.AttachRequest {
 	return attach
 }
 
+// recoveryFailure reports a failed Attach or Activate recovery. A proven frame
+// defect keeps its own transport-binding classification; any other failure
+// leaves the attempt's outcome unknown.
+func recoveryFailure(phase string, err error) error {
+	if frameDefect(err) {
+		return fmt.Errorf("authorityrpc: %s recovery failed: %w", phase, err)
+	}
+	return fmt.Errorf("%w: %s recovery failed: %v", ErrTransportUncertain, phase, err)
+}
+
 func (c *Client) attachAndActivate(ctx context.Context) error {
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
 	defer handshakeCancel()
@@ -431,7 +441,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 		closeNegotiations(data, control)
 		data, control, err = c.reopenInitialPair(handshakeCtx)
 		if err != nil {
-			return fail(fmt.Errorf("%w: provisional Attach recovery failed: %v", ErrTransportUncertain, err))
+			return fail(recoveryFailure("provisional Attach", err))
 		}
 		response, err = rawRoundTrip(data.conn, data.maxFrame, attachRequest)
 	}
@@ -484,7 +494,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 		closeNegotiations(data, control)
 		data, control, err = c.resumeRawPairForActivation(handshakeCtx)
 		if err != nil {
-			return fail(fmt.Errorf("%w: activation recovery failed: %v", ErrTransportUncertain, err))
+			return fail(recoveryFailure("activation", err))
 		}
 		dataGeneration = data.bindingGeneration()
 		controlGeneration = control.bindingGeneration()
