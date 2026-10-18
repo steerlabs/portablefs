@@ -10,11 +10,20 @@ private func adapterBytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+/// Re-decodes `envelope` with field 4 set: the deleted publication-retraction
+/// bit, which a pfslocal 2.0 decoder retains only as an unknown field.
+private func adapterEnvelopeWithUnknownField(_ envelope: PfsEnvelope) -> PfsEnvelope? {
+    guard var bytes = try? envelope.serializedData() else { return nil }
+    bytes.append(contentsOf: [0x20, 0x01])
+    return try? PfsEnvelope(serializedBytes: bytes)
+}
+
 @available(macOS 26.0, *)
 private final class ProductionMountAdmissionState: @unchecked Sendable {
     private let lock = NSLock()
     private var resolverCalls = 0
     private var loadResult: (hasVolume: Bool, errno: Int)?
+    private var loadedVolume: FSVolume?
 
     func recordResolverCall() {
         lock.lock()
@@ -25,7 +34,14 @@ private final class ProductionMountAdmissionState: @unchecked Sendable {
     func recordLoad(volume: FSVolume?, error: (any Error)?) {
         lock.lock()
         loadResult = (volume != nil, (error as NSError?)?.code ?? 0)
+        loadedVolume = volume
         lock.unlock()
+    }
+
+    var volume: FSVolume? {
+        lock.lock()
+        defer { lock.unlock() }
+        return loadedVolume
     }
 
     func snapshot() -> (resolverCalls: Int, hasVolume: Bool, errno: Int)? {
@@ -199,25 +215,6 @@ private struct AdapterHarness: @unchecked Sendable {
     var root: FSItem
 }
 
-// Compile-only fixture: these are the three public call shapes shipped before
-// module identity became injectable. Keeping them type-checked prevents a
-// future identity refactor from breaking existing OSS embedders.
-@available(macOS 26.0, *)
-private func legacyAdapterAPISourceCompatibility(
-    core: VolumeCore,
-    statReply: PfsStatfsReply,
-    capabilities: PfsCapabilities
-) async throws {
-    _ = PortableFSFileSystem(
-        resolverFactory: { PfsSocketPathResolver(bundle: .main) }
-    )
-    _ = try await PortableFSVolume.make(core: core, attachRef: "compat")
-    _ = PfsFSKitMapping.statfs(
-        from: statReply,
-        capabilities: capabilities
-    )
-}
-
 @available(macOS 26.0, *)
 private func makeAdapterHarness(
     configuration: PfsLocalMockDaemon.Configuration = .init()
@@ -312,34 +309,45 @@ extension PfsLocalMockDaemonTests {
     #expect(await probe("pfs://att_AAAAAAAAAAAAAAAAAAAAAA") == .notRecognized)
 }
 
+/// The default composition is the product composition: one resolved session
+/// whose event binding exists before FSKit receives the volume.
 @available(macOS 26.0, *)
-@Test func unconfiguredAdapterRefusesBeforeSocketResolution() throws {
+@Test func defaultFileSystemCompositionBuildsTheBoundProductVolume() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
     let identity = try PortableFSModuleIdentity(
         fileSystemTypeName: PortableFSIdentity.fileSystemTypeName,
         resourceScheme: PortableFSIdentity.resourceScheme
     )
     let state = ProductionMountAdmissionState()
+    let socketPath = daemon.socketPath
     let fileSystem = PortableFSFileSystem(
         moduleIdentity: identity,
         resolverFactory: {
             state.recordResolverCall()
-            return PfsSocketPathResolver(bundle: .main)
+            return PfsSocketPathResolver(infoDictionary: ["PFSDaemonSocketPath": socketPath])
         }
     )
     let options = class_createInstance(FSTaskOptions.self, 0) as! FSTaskOptions
-    fileSystem.loadResource(
-        resource: FSGenericURLResource(
-            url: URL(string: "dev.portablefs.oss://att_AAAAAAAAAAAAAAAAAAAAAA")!
-        ),
-        options: options
-    ) { volume, error in
-        state.recordLoad(volume: volume, error: error)
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        fileSystem.loadResource(
+            resource: FSGenericURLResource(url: URL(string: "dev.portablefs.oss://mock")!),
+            options: options
+        ) { volume, error in
+            state.recordLoad(volume: volume, error: error)
+            continuation.resume()
+        }
     }
-
     let result = try #require(state.snapshot())
-    #expect(result.resolverCalls == 0)
-    #expect(result.hasVolume == false)
-    #expect(result.errno == Int(ENOTSUP))
+    #expect(result.resolverCalls == 1)
+    #expect(result.hasVolume)
+    #expect(result.errno == 0)
+    let volume = try #require(state.volume as? PortableFSVolume)
+    let stats = await daemon.stats()
+    #expect(stats.helloRequests == 1)
+    #expect(stats.subscribeRequests == 1)
+    #expect(!(await volume.window.isFailed()))
+    await volume.shutdown()
 }
 
 @available(macOS 26.0, *)
@@ -606,10 +614,8 @@ private func adapterErrno(
 }
 
 @available(macOS 26.0, *)
-@Test func unsupportedXattrSetIsLocalButReadListAndDeleteStillForward() async throws {
-    let harness = try await makeAdapterHarness(configuration: .init(
-        xattrSetSupported: false
-    ))
+@Test func xattrSetIsRefusedLocallyButReadListAndDeleteForward() async throws {
+    let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
     let item = try await createAdapterFile(
         volume: harness.volume,
@@ -621,7 +627,7 @@ private func adapterErrno(
     let beforeSets = await harness.daemon.stats()
 
     for policy: FSVolume.SetXattrPolicy in [.mustCreate, .mustReplace, .alwaysSet] {
-        #expect(await adapterErrno("unsupported xattr set mode \(policy.rawValue)") {
+        #expect(await adapterErrno("xattr set mode \(policy.rawValue)") {
             try await harness.volume.setXattr(
                 named: name,
                 to: adapterBytes("value"),
@@ -631,32 +637,34 @@ private func adapterErrno(
         } == Int(EOPNOTSUPP))
     }
     do {
-        try await harness.core.xattrSet(
+        try await harness.core.refuseXattrSet(
             item: portable,
             name: "user.direct",
-            value: adapterBytes("value"),
             createOnly: false,
             replaceOnly: false
         )
-        Issue.record("VolumeCore forwarded an unsupported xattr set")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == ENOTSUP)
     }
 
-    let afterSets = await harness.daemon.stats()
-    #expect(afterSets.xattrSetRequests == beforeSets.xattrSetRequests)
-
-    // Invalid input keeps its own verdict even when every valid set would be
-    // refused by capability negotiation.
+    // Invalid input keeps its own verdict ahead of the fixed refusal.
     do {
-        try await harness.core.xattrSet(
+        try await harness.core.refuseXattrSet(
             item: portable,
             name: "",
-            value: Data(),
             createOnly: false,
             replaceOnly: false
         )
-        Issue.record("empty xattr name was hidden by capability refusal")
+    } catch let error as PfsLocalClientError {
+        #expect(error.posixErrno == EINVAL)
+    }
+    do {
+        try await harness.core.refuseXattrSet(
+            item: portable,
+            name: "user.both",
+            createOnly: true,
+            replaceOnly: true
+        )
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EINVAL)
     }
@@ -668,19 +676,13 @@ private func adapterErrno(
             policy: .alwaysSet
         )
     } == Int(EINVAL))
-    let afterInvalid = await harness.daemon.stats()
-    #expect(afterInvalid.xattrSetRequests == beforeSets.xattrSetRequests)
+    let afterSets = await harness.daemon.stats()
+    #expect(afterSets.setAttrRequests == beforeSets.setAttrRequests)
+    #expect(afterSets.publicationAcks == beforeSets.publicationAcks)
 
-    // Seed a pre-existing portable attribute through a peer that talks to the
-    // writable mock directly. The negotiated gate is frontend-local; it must
-    // not hide the read/list/remove operations that remain supported.
-    let peer = PfsLocalClient(socketPath: harness.daemon.socketPath)
-    _ = try await peer.resolve(attachRef: "mock")
-    var seed = PfsXattrSetRequest()
-    seed.item = portable.identity.proto
-    seed.name = "user.test"
-    seed.value = adapterBytes("seed")
-    _ = try await peer.request(.xattrSet(seed))
+    // An attribute already present in the authority store stays readable,
+    // listable and removable.
+    try await harness.daemon.seedXattr(named: "user.test", value: adapterBytes("seed"), on: portable.identity)
     let beforeForwarding = await harness.daemon.stats()
 
     #expect(try await harness.volume.xattr(named: name, of: item) == adapterBytes("seed"))
@@ -700,10 +702,9 @@ private func adapterErrno(
     #expect(afterForwarding.xattrGetRequests == beforeForwarding.xattrGetRequests + 1)
     #expect(afterForwarding.xattrListRequests == beforeForwarding.xattrListRequests + 1)
     #expect(afterForwarding.xattrRemoveRequests == beforeForwarding.xattrRemoveRequests + 1)
-    await peer.close()
 
-    // Item validation also precedes capability refusal. A reclaimed object is
-    // ESTALE, not ENOTSUP, and still emits no mutation frame.
+    // Item validation also precedes the fixed refusal. A reclaimed object is
+    // ESTALE, not ENOTSUP.
     let staleItem = try await createAdapterFile(
         volume: harness.volume,
         in: harness.root,
@@ -711,34 +712,35 @@ private func adapterErrno(
     )
     let stalePortable = try #require(staleItem as? PortableFSItem)
     try await harness.core.reclaim(item: stalePortable)
-    let beforeStale = await harness.daemon.stats()
     do {
-        try await harness.core.xattrSet(
+        try await harness.core.refuseXattrSet(
             item: stalePortable,
             name: "user.test",
-            value: Data(),
             createOnly: false,
             replaceOnly: false
         )
-        Issue.record("reclaimed xattr target was hidden by capability refusal")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == ESTALE)
     }
-    let afterStale = await harness.daemon.stats()
-    #expect(afterStale.xattrSetRequests == beforeStale.xattrSetRequests)
+    #expect(await adapterErrno("reclaimed adapter xattr set") {
+        try await harness.volume.setXattr(
+            named: name,
+            to: Data(),
+            on: staleItem,
+            policy: .alwaysSet
+        )
+    } == Int(ESTALE))
 
     // Grammar wins even when the same callback also names a reclaimed item.
     // This cross-product pins EINVAL > ESTALE > EOPNOTSUPP rather than testing
     // each dimension only against an otherwise valid request.
     do {
-        try await harness.core.xattrSet(
+        try await harness.core.refuseXattrSet(
             item: stalePortable,
             name: "",
-            value: Data(),
             createOnly: false,
             replaceOnly: false
         )
-        Issue.record("malformed reclaimed xattr set unexpectedly succeeded")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EINVAL)
     }
@@ -750,15 +752,12 @@ private func adapterErrno(
             policy: .alwaysSet
         )
     } == Int(EINVAL))
-    let afterCompoundInvalid = await harness.daemon.stats()
-    #expect(afterCompoundInvalid.xattrSetRequests == beforeStale.xattrSetRequests)
 }
 
 @available(macOS 26.0, *)
 @Test func operationsAdapterMapsDaemonENOTSUPForEveryXattrOperation() async throws {
     let harness = try await makeAdapterHarness(configuration: .init(
         xattrGetErrno: ENOTSUP,
-        xattrSetErrno: ENOTSUP,
         xattrListErrno: ENOTSUP,
         xattrRemoveErrno: ENOTSUP
     ))
@@ -795,7 +794,6 @@ private func adapterErrno(
 
     let stats = await harness.daemon.stats()
     #expect(stats.xattrGetRequests == 1)
-    #expect(stats.xattrSetRequests == 1)
     #expect(stats.xattrListRequests == 1)
     #expect(stats.xattrRemoveRequests == 1)
 }
@@ -804,7 +802,6 @@ private func adapterErrno(
 @Test func operationsAdapterPreservesNonENOTSUPXattrErrnos() async throws {
     let harness = try await makeAdapterHarness(configuration: .init(
         xattrGetErrno: EIO,
-        xattrSetErrno: EACCES,
         xattrListErrno: EINVAL,
         xattrRemoveErrno: ENOATTR
     ))
@@ -819,14 +816,6 @@ private func adapterErrno(
     #expect(await adapterErrno("get xattr") {
         _ = try await harness.volume.xattr(named: name, of: item)
     } == Int(EIO))
-    #expect(await adapterErrno("set xattr") {
-        try await harness.volume.setXattr(
-            named: name,
-            to: adapterBytes("value"),
-            on: item,
-            policy: .alwaysSet
-        )
-    } == Int(EACCES))
     #expect(await adapterErrno("list xattrs") {
         _ = try await harness.volume.xattrs(of: item)
     } == Int(EINVAL))
@@ -841,7 +830,6 @@ private func adapterErrno(
 
     let stats = await harness.daemon.stats()
     #expect(stats.xattrGetRequests == 1)
-    #expect(stats.xattrSetRequests == 1)
     #expect(stats.xattrListRequests == 1)
     #expect(stats.xattrRemoveRequests == 1)
 }
@@ -886,12 +874,12 @@ private func adapterErrno(
     #expect(stats.publicationAcks >= baseline + 2)
 }
 
-/// At the FSKit boundary a retraction-bearing reply is a protocol defect.
-/// The reply handler IS the framework install, so it must receive an error
-/// rather than the frame's values, and the callback must not be reissued
-/// below userspace.
+/// At the FSKit boundary a reply carrying a field outside pfslocal 2.0 is a
+/// protocol defect. The reply handler IS the framework install, so it must
+/// receive an error rather than the frame's values, and the callback must not
+/// be reissued below userspace.
 @available(macOS 26.0, *)
-@Test func operationsAdapterFailsARetractionBearingReplyWithoutReissue() async throws {
+@Test func operationsAdapterFailsAReplyWithAnUnknownFieldWithoutReissue() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
     _ = try await settledAckBaseline(harness.daemon, owed: 0)
@@ -899,9 +887,7 @@ private func adapterErrno(
 
     await harness.daemon.transformNextReply { envelope in
         guard case .getAttrReply? = envelope.body else { return nil }
-        var defective = envelope
-        defective.publicationRetracted = true
-        return defective
+        return adapterEnvelopeWithUnknownField(envelope)
     }
     let (delivered, failure): (Bool, Int32?) = await withCheckedContinuation { continuation in
         harness.volume.getAttributes(
@@ -1406,12 +1392,12 @@ private func adapterErrno(
     #expect(exactAttr.size == 1)
     #expect(exactAttr.mtimeMs == 123_456)
     #expect(exactAttr.atimeMs == 234_567)
-    try await harness.core.xattrSet(
-        item: portableTarget,
-        name: "user.detached",
+    // An attribute present in the authority store on the detached object
+    // stays readable through its retained description.
+    try await harness.daemon.seedXattr(
+        named: "user.detached",
         value: adapterBytes("old"),
-        createOnly: false,
-        replaceOnly: false
+        on: portableTarget.identity
     )
     #expect(
         try await harness.core.xattrGet(item: portableTarget, name: "user.detached")

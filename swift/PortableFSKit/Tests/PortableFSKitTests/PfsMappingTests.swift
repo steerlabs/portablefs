@@ -22,66 +22,64 @@ import Testing
     #expect(PfsErrorMapper.fsKitXattrError(for: invalid).code == Int(EINVAL))
 }
 
-@Test func itemIdentifiersRespectFSKitReservedValues() throws {
-    let floor = UInt64(1) << 63
-    #expect(PfsFSKitMapping.localRepairIdentifierFloor == floor)
-    #expect(PfsEnumerationCookies.daemonCookieMarker == floor)
-    #expect(
-        try PfsFSKitMapping.itemIdentifier(from: 1) == .rootDirectory
-    )
-    #expect(
-        try PfsFSKitMapping.itemIdentifier(from: 2).rawValue == 3
-    )
-    #expect(
-        try PfsFSKitMapping.itemIdentifier(from: floor - 1).rawValue == floor
-    )
-
-    do {
-        _ = try PfsFSKitMapping.itemIdentifier(from: 0)
-        Issue.record("expected the invalid pfslocal item identifier to fail")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EOVERFLOW)
+/// FSKit reserves 0, 1 and 2; the checked successor maps pfslocal's root 1
+/// to FSKit's root 2 and every ordinary file ID in [2, UInt64.max) above the
+/// reserved values. Both sides of the deleted high-half partition are ordinary
+/// daemon file IDs now. Zero and UInt64.max are refused, for an item's own ID
+/// and for its parent's.
+@Test func itemIdentifiersUseTheCheckedSuccessorAcrossTheWholeRange() throws {
+    let formerPartition = UInt64(1) << 63
+    #expect(try PfsFSKitMapping.itemIdentifier(from: 1) == .rootDirectory)
+    #expect(try PfsFSKitMapping.itemIdentifier(from: 2).rawValue == 3)
+    for fileID in [formerPartition - 1, formerPartition, formerPartition + 1, UInt64.max - 1] {
+        #expect(try PfsFSKitMapping.itemIdentifier(from: fileID).rawValue == fileID + 1)
     }
+    for unrepresentable in [UInt64(0), UInt64.max] {
+        do {
+            _ = try PfsFSKitMapping.itemIdentifier(from: unrepresentable)
+            Issue.record("file ID \(unrepresentable) mapped to an FSKit identifier")
+        } catch let error as PfsLocalClientError {
+            #expect(error.posixErrno == EOVERFLOW)
+        }
+    }
+    // Directory cookies keep their own, unrelated high-bit marker.
+    #expect(PfsEnumerationCookies.daemonCookieMarker == formerPartition)
 
     var rootItem = PfsItem()
     rootItem.itemID = 1
     rootItem.itemGeneration = 1
     var root = PfsAttr()
     root.item = rootItem
-    root.fileID = rootItem.itemID
+    root.fileID = 1
     root.kind = .directory
     root.mode = 0o755
     let attributes = try PfsFSKitMapping.attributes(from: root)
     #expect(attributes.isValid(.fileID))
     #expect(attributes.fileID == .rootDirectory)
     #expect(attributes.type == .directory)
-
     root.nlink = 0
-    let detachedAttributes = try PfsFSKitMapping.attributes(from: root)
-    #expect(detachedAttributes.linkCount == 0)
+    #expect(try PfsFSKitMapping.attributes(from: root).linkCount == 0)
 
-    do {
-        _ = try PfsFSKitMapping.itemIdentifier(from: floor)
-        Issue.record("expected the local repair partition to be refused")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EOVERFLOW)
+    var high = PfsAttr()
+    high.kind = .file
+    high.fileID = formerPartition + 7
+    high.parentFileID = UInt64.max - 1
+    let highAttributes = try PfsFSKitMapping.attributes(from: high, requested: [.fileID, .parentID])
+    #expect(highAttributes.fileID.rawValue == formerPartition + 8)
+    #expect(highAttributes.parentID.rawValue == UInt64.max)
+    #expect(try PfsFSKitMapping.parentDirectoryIdentifier(from: high).rawValue == UInt64.max)
+
+    high.fileID = UInt64.max
+    #expect(throws: PfsLocalClientError.self) {
+        try PfsFSKitMapping.attributes(from: high, requested: [.fileID])
     }
-
-    var local = PfsAttr()
-    local.fileID = floor
-    #expect(
-        try PfsFSKitMapping.localRepairAttributes(from: local).fileID.rawValue == floor + 1
-    )
-    local.fileID = UInt64.max - 1
-    #expect(
-        try PfsFSKitMapping.localRepairAttributes(from: local).fileID.rawValue == UInt64.max
-    )
-    local.fileID = UInt64.max
-    do {
-        _ = try PfsFSKitMapping.localRepairAttributes(from: local)
-        Issue.record("expected the terminal raw item identifier to fail")
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == EOVERFLOW)
+    high.fileID = formerPartition
+    high.parentFileID = UInt64.max
+    #expect(throws: PfsLocalClientError.self) {
+        try PfsFSKitMapping.attributes(from: high, requested: [.parentID])
+    }
+    #expect(throws: PfsLocalClientError.self) {
+        try PfsFSKitMapping.parentDirectoryIdentifier(from: high)
     }
 }
 
@@ -174,7 +172,7 @@ import Testing
     invalidParent.itemID = 0
     invalidParent.itemGeneration = 5
     detached.parent = invalidParent
-    detached.parentFileID = PfsFSKitMapping.localRepairIdentifierFloor
+    detached.parentFileID = UInt64.max
     #expect(throws: PfsLocalClientError.self) {
         try PfsFSKitMapping.attributes(from: detached, requested: [.parentID])
     }
@@ -218,20 +216,18 @@ import Testing
     }
 }
 
-/// A flags change is forwarded exactly when the daemon PARSES the fields —
-/// `flagsUnderstood` from the resolve reply — so the mapping layer consumes
-/// `.flags` whenever the change is actually going to be asked of someone who
-/// can answer. See `flagChangesAreRefusedByTheExtensionWithoutComprehension`
-/// for the refusal half of the contract.
-@Test func flagChangesAreForwardedWhenTheDaemonUnderstandsThem() throws {
+/// A flags change is always forwarded: the daemon decides per object and
+/// refuses the whole SetAttr before applying any of it. The mapping consumes
+/// `.flags` because the change is actually asked of someone who answers.
+@Test func flagChangesAreAlwaysForwarded() {
     let request = FSItem.SetAttributesRequest()
     request.mode = 0o600
-    let modeOnly = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: true)
+    let modeOnly = PfsFSKitMapping.setAttributes(from: request)
     #expect(modeOnly.mode == 0o600)
     #expect(modeOnly.flags == nil)
 
     request.flags = UInt32(UF_IMMUTABLE)
-    let withFlags = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: true)
+    let withFlags = PfsFSKitMapping.setAttributes(from: request)
     #expect(withFlags.flags == UInt32(UF_IMMUTABLE))
     #expect(withFlags.mode == 0o600)
     // FSKit's contract: an attribute the filesystem acts on must be reported
@@ -241,75 +237,8 @@ import Testing
     // Zero is a REQUEST (clear every flag), not "no change".
     let clearing = FSItem.SetAttributesRequest()
     clearing.flags = 0
-    #expect(try PfsFSKitMapping.setAttributes(from: clearing, flagsUnderstood: true).flags == 0)
+    #expect(PfsFSKitMapping.setAttributes(from: clearing).flags == 0)
     #expect(clearing.consumedAttributes.contains(.flags))
-}
-
-/// Without comprehension the extension refuses the change ITSELF, because the
-/// daemon on the other end cannot refuse it: `set_flags` and `flags` are
-/// appended fields, so a daemon predating them discards both, applies the rest
-/// of the setattr and answers success. The refusal must therefore happen
-/// before the request is ever built — and it must take the co-travelling
-/// groups with it, since a chflags(2) that half-applied is not a refusal.
-@Test func flagChangesAreRefusedByTheExtensionWithoutComprehension() throws {
-    let request = FSItem.SetAttributesRequest()
-    request.mode = 0o600
-    request.flags = UInt32(UF_IMMUTABLE)
-    #expect(throws: PfsLocalClientError.self) {
-        _ = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: false)
-    }
-    do {
-        _ = try PfsFSKitMapping.setAttributes(from: request, flagsUnderstood: false)
-    } catch let error as PfsLocalClientError {
-        #expect(error.posixErrno == ENOTSUP)
-    }
-    // Nothing was consumed, so the kernel is not told a change it never got
-    // was honored.
-    #expect(!request.consumedAttributes.contains(.flags))
-    #expect(!request.consumedAttributes.contains(.mode))
-
-    // Clearing to zero is a real change and is refused the same way.
-    let clearing = FSItem.SetAttributesRequest()
-    clearing.flags = 0
-    #expect(throws: PfsLocalClientError.self) {
-        _ = try PfsFSKitMapping.setAttributes(from: clearing, flagsUnderstood: false)
-    }
-
-    // A setattr carrying no flags intent is untouched by the missing bit.
-    let modeOnly = FSItem.SetAttributesRequest()
-    modeOnly.mode = 0o600
-    #expect(try PfsFSKitMapping.setAttributes(from: modeOnly, flagsUnderstood: false).mode == 0o600)
-}
-
-/// The static volume capability is a statement about the WHOLE volume, so it
-/// follows comprehension, not the authority's storage. A volume whose flag
-/// support is per-object — a machine-local graft persists chflags(2) on its
-/// host inode while the authority behind the rest of the namespace cannot —
-/// must not declare blanket non-support, or the kernel refuses graft chflags
-/// before the extension is ever consulted.
-@Test func immutableFileCapabilityFollowsDaemonComprehension() {
-    var unknown = PfsCapabilities()
-    unknown.caseSensitive = true
-    #expect(PfsFSKitMapping.supportedCapabilities(from: unknown).doesNotSupportImmutableFiles)
-
-    // The regression case: the authority persists nothing, but the daemon
-    // understands the request and some objects in this namespace DO take a
-    // flag word. Immutable files must not be declared unsupported.
-    var graftsOnly = unknown
-    graftsOnly.flagsUnderstood = true
-    graftsOnly.flagsSupported = false
-    #expect(!PfsFSKitMapping.supportedCapabilities(from: graftsOnly).doesNotSupportImmutableFiles)
-
-    var both = unknown
-    both.flagsUnderstood = true
-    both.flagsSupported = true
-    #expect(!PfsFSKitMapping.supportedCapabilities(from: both).doesNotSupportImmutableFiles)
-
-    // And an authority that persists flags cannot rescue a daemon that would
-    // discard the request: comprehension is the whole question here.
-    var understandsNothing = unknown
-    understandsNothing.flagsSupported = true
-    #expect(PfsFSKitMapping.supportedCapabilities(from: understandsNothing).doesNotSupportImmutableFiles)
 }
 
 @Test func timespecConversionNormalizesPreEpochNanoseconds() {
@@ -426,16 +355,15 @@ import Testing
     }
 }
 
-@Test func supportedCapabilitiesReflectDaemonCapabilities() {
-    var capabilities = PfsCapabilities()
-    capabilities.symlinks = true
-    capabilities.hardLinks = true
-    capabilities.caseSensitive = true
-
-    let supported = PfsFSKitMapping.supportedCapabilities(from: capabilities)
+/// Symlinks, hard links and case-sensitive names are baseline semantics, not
+/// capabilities a daemon advertises. Immutable-file support stays declared so
+/// a flag change reaches the daemon's explicit per-object refusal.
+@Test func supportedCapabilitiesAreTheFixedBaseline() {
+    let supported = PfsFSKitMapping.supportedCapabilities()
     #expect(supported.supportsSymbolicLinks)
     #expect(supported.supportsHardLinks)
     #expect(supported.supports64BitObjectIDs)
     #expect(!supported.supportsPersistentObjectIDs)
     #expect(supported.caseFormat == .sensitive)
+    #expect(!supported.doesNotSupportImmutableFiles)
 }
