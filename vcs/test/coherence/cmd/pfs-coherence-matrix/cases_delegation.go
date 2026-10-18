@@ -25,6 +25,19 @@ func allCases() []coherenceCase {
 	return append(cases, loss)
 }
 
+// casesFor is the case list a run executes. Exclusive-writer mode adds the
+// positive writer-exclusion assertion; ordinary two-writer runs, and their
+// --list output, are unchanged.
+func casesFor(exclusiveWriter bool) []coherenceCase {
+	cases := allCases()
+	if !exclusiveWriter {
+		return cases
+	}
+	loss := cases[len(cases)-1]
+	cases = append(cases[:len(cases)-1], exclusiveCases()...)
+	return append(cases, loss)
+}
+
 func (c *caseRun) barrier(who actor) {
 	handle := c.ok(who, request{Op: "open", Flags: []string{"rdonly"}}).Handle
 	c.ok(who, request{Op: "fsync", Handle: handle})

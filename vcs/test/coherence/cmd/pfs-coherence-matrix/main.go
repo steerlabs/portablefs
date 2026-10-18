@@ -127,6 +127,8 @@ func runMatrix(arguments []string) error {
 			"falsifiability control: replay the first successful pathname observation on mount A; declared stale-sensitive cases must turn red")
 		expectDisjoint = flags.Bool("expect-disjoint-namespace", false,
 			"control mode: the second root deliberately does not share the volume, so the shared-namespace probe must fail rather than pass")
+		exclusiveWriter = flags.Bool("exclusive-writer", false,
+			"mount A is the volume's only writer (macOS FSKit) and mount B a reader: cases mutate through A and observe through B, and the reader's mutations must fail with EBUSY")
 	)
 	var commands controlCommands
 	flags.StringVar(&commands.Pause, "pause-command", "", "stop mount B and arrange automatic resume after recall budget")
@@ -137,7 +139,7 @@ func runMatrix(arguments []string) error {
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	cases := allCases()
+	cases := casesFor(*exclusiveWriter)
 	if *listCases {
 		for _, entry := range cases {
 			fmt.Printf("%s\t%s\n", entry.name, entry.what)
@@ -155,6 +157,9 @@ func runMatrix(arguments []string) error {
 	}
 	if *timeoutArg <= 0 {
 		return fmt.Errorf("--case-timeout must be positive")
+	}
+	if *exclusiveWriter && (*staleCheck || *expectDisjoint) {
+		return fmt.Errorf("--exclusive-writer measures the real writer and reader; it cannot be combined with a falsifiability control")
 	}
 	known := map[string]bool{}
 	for _, entry := range cases {
@@ -183,19 +188,20 @@ func runMatrix(arguments []string) error {
 
 	runID := fmt.Sprintf("coherence-%d", time.Now().UnixNano())
 	workerBase := isolatedSpec{
-		MountA:         *mountA,
-		MountB:         *mountB,
-		SSHTarget:      *sshTarget,
-		SSHBinary:      *sshBinary,
-		StaleCheck:     *staleCheck,
-		ExpectDisjoint: *expectDisjoint,
-		RunID:          runID,
-		AltGID:         *altGID,
-		FenceCmd:       *fenceCmd,
-		Replaces:       *replaces,
-		LocalRoute:     *localRoute,
-		RoutesContract: *routesContract,
-		Commands:       commands,
+		MountA:          *mountA,
+		MountB:          *mountB,
+		SSHTarget:       *sshTarget,
+		SSHBinary:       *sshBinary,
+		StaleCheck:      *staleCheck,
+		ExpectDisjoint:  *expectDisjoint,
+		RunID:           runID,
+		AltGID:          *altGID,
+		FenceCmd:        *fenceCmd,
+		Replaces:        *replaces,
+		LocalRoute:      *localRoute,
+		RoutesContract:  *routesContract,
+		Commands:        commands,
+		ExclusiveWriter: *exclusiveWriter,
 	}
 	// Even setup runs in an owned process. os.Stat on an unhealthy FUSE mount
 	// can block just as permanently as a syscall in a case, so doing this probe
@@ -217,6 +223,9 @@ func runMatrix(arguments []string) error {
 		fmt.Printf("mount-B:  %s:%s (ssh)\n", *sshTarget, *mountB)
 	} else {
 		fmt.Printf("mount-B:  %s\n", *mountB)
+	}
+	if *exclusiveWriter {
+		fmt.Printf("mode:     exclusive writer: cases mutate through mount-A and observe through mount-B; mount-B's own mutations must fail with EBUSY\n")
 	}
 	fmt.Printf("started:  %s\n\n", time.Now().Format(time.RFC3339))
 
@@ -260,7 +269,7 @@ func runMatrix(arguments []string) error {
 // struct rather than a parameter list because every field is an observation
 // capability: a case that is not given one skips or fails, and adding a
 // positional argument for each of them is how a caller silently passes the wrong
-// one.
+// one. writer and reader are set only inside an exclusive-writer worker.
 type caseInputs struct {
 	altGID         int
 	fenceCmd       string
@@ -268,6 +277,7 @@ type caseInputs struct {
 	localRoute     string
 	routesContract string
 	commands       controlCommands
+	writer, reader actor
 }
 
 func printCase(result outcome) {

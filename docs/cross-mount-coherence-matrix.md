@@ -18,8 +18,10 @@ scripts/coherence-matrix-macos.sh --mount-a A \
 Both scripts use the same driver (`vcs/test/coherence/cmd/pfs-coherence-matrix`;
 `--list` prints every case). It holds 29 cases: 23 shared cases and six Linux
 delegation and lifecycle cases that need the Linux harness's pause, Authority
-restart, and gateway commands. Compare shared cases across platforms under
-their declared contracts; a Linux lifecycle case is not evidence about FSKit.
+restart, and gateway commands. `--exclusive-writer` adds a thirtieth,
+`writer_exclusion_refuses_reader_mutations` (see [macOS](#macos)). Compare shared
+cases across platforms under their declared contracts; a Linux lifecycle case is
+not evidence about FSKit.
 
 No protocol-8 result is recorded in this document. The Linux matrix is part of
 `bash scripts/verify-local.sh --full`, which has not yet passed on the
@@ -246,19 +248,27 @@ exit, when the Linux peer or its driver is unavailable. If the peer is
 unavailable, no case ran, so nothing was demonstrated, and the output says
 exactly that.
 
-Read a run under the exclusive-writer profile. While the Mac mount is attached
-it is the volume's only writer, and the Linux peer's visible mutations return
-`EBUSY` by contract. Every case whose mutation runs on mount B, for example
-`remote_create_visible`, or in which both mounts write, is therefore declared to
-FAIL with that reason: an unexpected pass would mean the Linux peer wrote
-underneath the Mac. The declared FAIL does not by itself check that the errno
-was `EBUSY`; the case output names the refusal. Cases that need Linux-side
-harness commands or machine-local routes are declared SKIP, and the peer-loss
-case skips when no fence command is supplied. The cases where only the Mac
-mutates and the Linux peer observes, such as
-`peer_cached_handle_forces_writethrough`, must pass. A green macOS run does not
-establish Linux-equivalent FSKit withdrawal, and it is not native macOS 26 or 27
-qualification ([fskit-mount.md](./fskit-mount.md#verification)).
+The script runs the driver with `--exclusive-writer`, because while the Mac
+mount is attached it is the volume's only writer and the Linux peer's visible
+mutations return `EBUSY` by contract. In that mode every shared case performs
+its mutations on the Mac and its pathname observations on the Linux peer; an
+operation on a descriptor runs on the mount that opened it, and the peer-loss
+case, whose roles already match, runs on the real mounts. Each retained case
+therefore checks that Linux observes the Mac's changes coherently. One added
+case, `writer_exclusion_refuses_reader_mutations`, asserts the exclusion
+positively: it attempts a write-intent open, create, write, unlink, rename,
+mkdir, rmdir, chmod, truncate, timestamp change, symlink and hard link from the
+Linux peer, requires each to fail with exactly `EBUSY`, requires both mounts to
+read an unchanged fixture (names, bytes, inode, size, mode, link count, mtime)
+after every attempt, and then requires a new Mac write to reach Linux. Any other
+errno, a success, a partial change, a hang, or a failed observation fails the
+run; no case is declared to fail. Cases that need Linux-side harness commands or
+machine-local routes, the ownership case on a single-principal volume, and the
+peer-loss case without a fence command are declared SKIP and skip by themselves
+with the same reason. The two-writer form of the shared cases is measured only
+by the Linux matrix. A green macOS run does not establish Linux-equivalent FSKit
+withdrawal, and it is not native macOS 26 or 27 qualification
+([fskit-mount.md](./fskit-mount.md#verification)).
 
 ## Configuration
 
