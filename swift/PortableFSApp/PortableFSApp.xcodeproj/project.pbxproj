@@ -253,7 +253,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "PORTABLEFS_NATIVE_QUALIFICATION= \"$SRCROOT/Scripts/embed-portablefs-tools.sh\"\n";
+			shellScript = "\"$SRCROOT/Scripts/embed-portablefs-tools.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
