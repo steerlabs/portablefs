@@ -201,11 +201,10 @@ func testItem(inode uint64, kind authoritypb.Attr_Kind, token []byte, size int64
 	}
 }
 
-// A session that leaves without an authenticated detach stays in the
-// authority's barrier audience. The next peer mutation then waits this
-// session's whole repair budget for a phase nobody will acknowledge, and a
-// further budget of post-fence grace after that -- so the writer pays two
-// budgets for a reader that has already exited. Close must not do that.
+// A session that leaves without an authenticated detach keeps its durable
+// mount membership until the authority retires it, so an authority restart in
+// the meantime cannot prove the prior epoch's mounts are gone. Close must
+// detach exactly once.
 func TestClientDetachesBeforeClosingTheTransport(t *testing.T) {
 	rpc := &fakeAuthority{root: testItem(1, authoritypb.Attr_DIRECTORY, []byte("root"), 0)}
 	client := newClient(rpc, time.Second)

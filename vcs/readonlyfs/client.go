@@ -105,8 +105,9 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("readonlyfs: client identity: %w", err)
 	}
-	// This peer owns no kernel cache and joins no mutation withdrawal barrier.
-	// The authority breaks active delegations before answering its reads.
+	// This peer owns no kernel cache and joins no mutation withdrawal: the
+	// cacheless profile has no subscription. The authority breaks active Linux
+	// write delegations before answering its reads, so every read is current.
 	rpc, _, err := mountv3.AttachWithRoutes(ctx, authorityrpc.ClientConfig{
 		AccessToken:        append([]byte(nil), config.Capability...),
 		Address:            config.Address,
@@ -336,8 +337,12 @@ func (c *Client) read(ctx context.Context, request *authoritypb.Request) (*autho
 	return response, responseError(response, err)
 }
 
+// reclaim returns one item capability as soon as the walk no longer needs it,
+// so a resolution holds at most the current and next capability whatever the
+// path depth. Each step has a distinct token, which keeps the one-entry
+// repeated list trivially duplicate-free.
 func (c *Client) reclaim(ctx context.Context, item []byte) error {
-	_, err := c.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: append([]byte(nil), item...)}}})
+	_, err := c.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{append([]byte(nil), item...)}}}})
 	return err
 }
 
@@ -381,9 +386,9 @@ func (c *Client) keepalive(ctx context.Context) {
 	}
 }
 
-// A files reader keeps no kernel or userspace namespace cache. Protocol 5 has
-// one coherent session model, so this cacheless participant still joins the
-// visibility stream and acknowledges each phase only after it has observed it.
+// fail records the first terminal session cause. A files reader keeps no
+// kernel or userspace namespace cache, so ending the session is the whole
+// failure response; later calls report the recorded cause.
 func (c *Client) fail(err error) {
 	c.fatalMu.Lock()
 	if c.fatal == nil {
