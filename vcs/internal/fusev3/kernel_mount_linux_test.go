@@ -9,8 +9,48 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestMountWaitBlocksUntilItsExactConnectionTerminates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mount := &Mount{kernelConnectionDone: make(chan struct{})}
+		other := &Mount{kernelConnectionDone: make(chan struct{})}
+		returned := make(chan struct{})
+		go func() {
+			mount.Wait()
+			close(returned)
+		}()
+
+		// Quiescence proves the waiter has run and durably blocked; no elapsed
+		// interval or goroutine-start signal can establish that state.
+		synctest.Wait()
+		select {
+		case <-returned:
+			t.Fatal("Wait returned before its connection terminated")
+		default:
+		}
+
+		close(other.kernelConnectionDone)
+		other.Wait()
+		synctest.Wait()
+		select {
+		case <-returned:
+			t.Fatal("Wait returned when a different connection terminated")
+		default:
+		}
+
+		close(mount.kernelConnectionDone)
+		synctest.Wait()
+		select {
+		case <-returned:
+		default:
+			t.Fatal("Wait did not return after its exact connection terminated")
+		}
+		mount.Wait()
+	})
+}
 
 func fakeAbortFile(t *testing.T) *kernelAbortFile {
 	t.Helper()
