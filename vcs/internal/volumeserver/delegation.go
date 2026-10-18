@@ -689,6 +689,12 @@ func (c *CoherenceCoordinator) cut(ctx context.Context, r *delegationRecord, rec
 		c.mu.Unlock()
 		return seq, ctx.Err()
 	}
+	// Selection and cut entry use separate lock acquisitions. Promotion may
+	// have returned this private generation to reservation in between them.
+	if r.grant.State == DelegationReserved {
+		c.mu.Unlock()
+		return 0, errDelegationRetry
+	}
 	if r.ephemeral {
 		c.mu.Unlock()
 		for {

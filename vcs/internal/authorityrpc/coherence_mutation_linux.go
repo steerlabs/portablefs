@@ -467,7 +467,7 @@ func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request,
 	if !changed {
 		return withdrawal
 	}
-	if identity != ([16]byte{}) && (req.GetWrite() != nil || req.GetSetAttr() != nil || req.GetFallocate() != nil) {
+	if identity != ([16]byte{}) && (req.GetWrite() != nil || req.GetSetAttr() != nil || req.GetFallocate() != nil || req.GetOpen().GetWriteIntent() || req.GetCreate().GetWriteIntent()) {
 		resp.AppliedSequence = h.coherenceDurability.recordApplied(id, identity, seq)
 	}
 	return withdrawal
