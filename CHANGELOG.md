@@ -55,6 +55,10 @@ this file is the human-curated summary.
 
 ### Fixed
 
+- An FSKit write through an O_WRONLY open uses that write-only description
+  instead of replacing it with a second, read/write OPEN. Rewriting an existing
+  file costs one authority OPEN, a writable but unreadable (0200) file accepts
+  writes, and a chmod after open no longer affects the open's access.
 - Restore-mode hydration no longer changes a file's mtime after the user has
   modified it, and lookups and directory listings no longer expose the
   transient hydration mtime.

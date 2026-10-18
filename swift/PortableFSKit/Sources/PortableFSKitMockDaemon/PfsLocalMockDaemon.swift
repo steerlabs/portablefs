@@ -109,6 +109,10 @@ private final class PfsMockWireControlCompletion: @unchecked Sendable {
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
         public var openRequests: Int
+        /// The access each OPEN asked for, in arrival order. A frontend that
+        /// reuses or upgrades a description is judged by exactly which
+        /// descriptions it asked the authority for, not merely how many.
+        public var openModes: [PfsOpenMode]
         public var closeRequests: Int
         public var reclaimRequests: Int
         public var activeHandles: Int
@@ -1051,15 +1055,26 @@ private actor MockFileSystem {
         var message: String
     }
 
+    /// One open file description. Its access is fixed when it is opened, as
+    /// it is for the authority's real descriptor: a later chmod neither
+    /// grants nor revokes it, and an I/O the description was not opened for
+    /// fails EBADF instead of being served.
+    private struct OpenDescription {
+        var nodeID: UInt64
+        var readable: Bool
+        var writable: Bool
+    }
+
     private let configuration: PfsLocalMockDaemon.Configuration
     private var nodes: [UInt64: Node] = [:]
-    private var handles: [UInt64: UInt64] = [:]
+    private var handles: [UInt64: OpenDescription] = [:]
     private var itemsByID: [UInt64: Node] = [:]
     private var acceptedItems: Set<UInt64> = [1]
     private var nextItemID: UInt64 = 2
     private var nextNodeID: UInt64 = 2
     private var nextHandle: UInt64 = 1
     private var openRequests = 0
+    private var openModes: [PfsOpenMode] = []
     private var closeRequests = 0
     private var reclaimRequests = 0
     private var readRequests = 0
@@ -1142,6 +1157,7 @@ private actor MockFileSystem {
     func stats() -> PfsLocalMockDaemon.Stats {
         PfsLocalMockDaemon.Stats(
             openRequests: openRequests,
+            openModes: openModes,
             closeRequests: closeRequests,
             reclaimRequests: reclaimRequests,
             activeHandles: handles.count,
@@ -1192,6 +1208,7 @@ private actor MockFileSystem {
 
     func resetStats() {
         openRequests = 0
+        openModes.removeAll()
         closeRequests = 0
         reclaimRequests = 0
         readRequests = 0
@@ -1407,7 +1424,7 @@ private actor MockFileSystem {
                 guard directory.kind == .directory else {
                     throw MockPOSIXError(errno: ENOTDIR, message: "not a directory")
                 }
-                guard request.handle != 0, handles[request.handle] == directory.id else {
+                guard request.handle != 0, handles[request.handle]?.nodeID == directory.id else {
                     throw MockPOSIXError(errno: EBADF, message: "enumeration handle does not belong to directory")
                 }
                 let ordered = orderedChildren(of: directory)
@@ -1474,6 +1491,19 @@ private actor MockFileSystem {
             case let .open(request):
                 let node = try namespaceNode(for: request.item)
                 openRequests += 1
+                openModes.append(request.mode)
+                let readable = request.mode == .read || request.mode == .readWrite
+                let writable = request.mode == .write || request.mode == .readWrite
+                guard readable || writable else {
+                    throw MockPOSIXError(errno: EINVAL, message: "open requests no access")
+                }
+                // The authority opens under its own credentials, which own
+                // every object it stores, so the owner bits decide. This is
+                // what makes a mode-0200 file writable but unreadable.
+                guard !readable || node.mode & 0o400 != 0,
+                      !writable || node.mode & 0o200 != 0 else {
+                    throw MockPOSIXError(errno: EACCES, message: "open access denied by mode")
+                }
                 let handle: UInt64
                 if pendingOpenHandlesToOmit > 0 {
                     pendingOpenHandlesToOmit -= 1
@@ -1481,7 +1511,11 @@ private actor MockFileSystem {
                 } else {
                     handle = nextHandle
                     nextHandle += 1
-                    handles[handle] = node.id
+                    handles[handle] = OpenDescription(
+                        nodeID: node.id,
+                        readable: readable,
+                        writable: writable
+                    )
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
                     ProvisionalResource(handle: handle, itemCount: 0)
@@ -1506,7 +1540,7 @@ private actor MockFileSystem {
                     reply.body = .closeReply(response)
                     break
                 }
-                guard let nodeID = handles.removeValue(forKey: request.handle) else {
+                guard let nodeID = handles.removeValue(forKey: request.handle)?.nodeID else {
                     throw MockPOSIXError(errno: EINVAL, message: "unknown handle")
                 }
                 reapIfUnlinked(nodeID: nodeID)
@@ -1533,7 +1567,7 @@ private actor MockFileSystem {
                     let delay = pendingReadDelaysNanoseconds.removeFirst()
                     try await Task.sleep(nanoseconds: delay)
                 }
-                let node = try node(forHandle: request.handle)
+                let node = try node(forHandle: request.handle, reading: true)
                 let offset = min(Int(request.offset), node.data.count)
                 let end = min(node.data.count, offset + Int(request.length))
                 var response = PfsReadReply()
@@ -1550,7 +1584,7 @@ private actor MockFileSystem {
                 if let code = writeErrnoByIndex[writeIndex] {
                     throw MockPOSIXError(errno: code, message: "injected write failure")
                 }
-                let node = try node(forHandle: request.handle)
+                let node = try node(forHandle: request.handle, writing: true)
                 var payload = request.data
                 if !pendingWriteShortCounts.isEmpty {
                     let want = pendingWriteShortCounts.removeFirst()
@@ -1588,7 +1622,13 @@ private actor MockFileSystem {
                 } else {
                     handle = nextHandle
                     nextHandle += 1
-                    handles[handle] = node.id
+                    // The creating caller is granted read/write access by the
+                    // creation itself, whatever mode the new file carries.
+                    handles[handle] = OpenDescription(
+                        nodeID: node.id,
+                        readable: true,
+                        writable: true
+                    )
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
                     ProvisionalResource(handle: handle, itemCount: 1, itemID: node.itemID)
@@ -1902,7 +1942,7 @@ private actor MockFileSystem {
                 resourceAbandons += 1
             }
             if resource.handle != 0, !request.acceptHandles,
-               let nodeID = handles.removeValue(forKey: resource.handle) {
+               let nodeID = handles.removeValue(forKey: resource.handle)?.nodeID {
                 reapIfUnlinked(nodeID: nodeID)
             }
             return .continueReading
@@ -1938,9 +1978,19 @@ private actor MockFileSystem {
         return node
     }
 
-    private func node(forHandle handle: UInt64) throws -> Node {
-        guard let id = handles[handle], let node = nodes[id] else {
+    private func node(
+        forHandle handle: UInt64,
+        reading: Bool = false,
+        writing: Bool = false
+    ) throws -> Node {
+        guard let description = handles[handle], let node = nodes[description.nodeID] else {
             throw MockPOSIXError(errno: EBADF, message: "bad handle")
+        }
+        guard !reading || description.readable else {
+            throw MockPOSIXError(errno: EBADF, message: "handle is not open for reading")
+        }
+        guard !writing || description.writable else {
+            throw MockPOSIXError(errno: EBADF, message: "handle is not open for writing")
         }
         return node
     }
@@ -1949,7 +1999,7 @@ private actor MockFileSystem {
         guard let node = nodes[nodeID], node.nlink == 0 else {
             return
         }
-        if handles.values.contains(nodeID) {
+        if handles.values.contains(where: { $0.nodeID == nodeID }) {
             return
         }
         nodes.removeValue(forKey: nodeID)

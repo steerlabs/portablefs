@@ -1293,6 +1293,34 @@ private func adapterErrno(
     }
 }
 
+/// Rewriting an existing file through O_WRONLY (shell `>`, `cp` onto an
+/// existing file) is one FSKit open and one write. It must cost exactly one
+/// authority OPEN, for exactly the write access the open asked for.
+@available(macOS 26.0, *)
+@Test func operationsAdapterWriteOnlyOpenAndWriteCostOneOpen() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let item = try await createAdapterFile(
+        volume: harness.volume,
+        in: harness.root,
+        name: "rewrite",
+        contents: adapterBytes("old")
+    )
+    await harness.daemon.resetStats()
+
+    try await harness.volume.openItem(item, modes: [.write])
+    let written = try await harness.volume.write(contents: adapterBytes("new"), to: item, at: 0)
+    #expect(written == 3)
+    try await harness.volume.closeItem(item, modes: [])
+
+    let stats = await harness.daemon.stats()
+    #expect(stats.openModes == [.write])
+    #expect(stats.writeRequests == 1)
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+    #expect(try await readViaCore(harness.core, item: item, length: 3) == adapterBytes("new"))
+}
+
 @available(macOS 26.0, *)
 @Test func operationsAdapterRenameOverOpenTargetFetchesCurrentAttrs() async throws {
     let harness = try await makeAdapterHarness()

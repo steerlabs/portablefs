@@ -745,9 +745,15 @@ public actor VolumeCore {
         return reply.data
     }
 
+    /// A write needs exactly write access, which an O_WRONLY or read/write
+    /// description already holds. Demanding read access would replace a
+    /// write-only description with a fresh read/write OPEN: an extra
+    /// authority round trip per O_WRONLY rewrite, EACCES for a writable but
+    /// unreadable (0200) file, and loss of access an open was granted before
+    /// a later chmod.
     @discardableResult
     public func write(item: PortableFSItem, offset: UInt64, data: Data) async throws -> (written: UInt32, attr: PfsAttr) {
-        return try await withDescriptorHandle(item: item, mode: .readWrite) { handle in
+        return try await withDescriptorHandle(item: item, mode: .write) { handle in
             if data.isEmpty {
                 let result = try await writeChunk(handle: handle, offset: offset, data: data)
                 try validateAttributes(result.attr, for: item)

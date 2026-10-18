@@ -262,6 +262,170 @@ extension PfsLocalMockDaemonTests {
     #expect(stats.activeHandles == 0)
 }
 
+/// O_WRONLY installs a write-only description, and a write needs nothing
+/// more. The first write must reuse it, not replace it with a read/write
+/// OPEN and close the original.
+@Test func writeOnlyOpenWritesThroughItsOwnDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "write-only")
+
+    try await core.open(item: file, mode: .write)
+    let result = try await core.write(item: file, offset: 0, data: lifecycleBytes("payload"))
+    #expect(result.written == 7)
+    var stats = await daemon.stats()
+    #expect(stats.openModes == [.write])
+    #expect(stats.writeRequests == 1)
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 1)
+
+    try await core.close(item: file, retainingModes: .unspecified)
+    stats = await daemon.stats()
+    #expect(stats.openModes == [.write])
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+    #expect(try await core.read(item: file, offset: 0, length: 16) == lifecycleBytes("payload"))
+}
+
+/// A mode-0200 file is writable and unreadable. Its write-only description
+/// must serve writes. A read cannot use it, and the mode refuses the
+/// read/write replacement; that refusal must leave the write description
+/// installed and usable.
+@Test func writeOnlyOpenOfAnUnreadableFileWritesAndSurvivesARefusedRead() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    let created = try await core.createFile(
+        in: root,
+        name: lifecycleBytes("unreadable"),
+        mode: 0o200
+    )
+    try await core.close(item: created.item, retainingModes: .unspecified)
+    await daemon.resetStats()
+    let file = created.item
+
+    #expect(await lifecycleErrno { try await core.open(item: file, mode: .read) } == EACCES)
+    try await core.open(item: file, mode: .write)
+    let result = try await core.write(item: file, offset: 0, data: lifecycleBytes("secret"))
+    #expect(result.written == 6)
+    #expect(result.attr.size == 6)
+    var stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 1)
+
+    #expect(await lifecycleErrno {
+        _ = try await core.read(item: file, offset: 0, length: 6)
+    } == EACCES)
+    stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write, .readWrite])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 1)
+    #expect(await core.testingDebugState().openHandleCount == 1)
+
+    let appended = try await core.write(item: file, offset: 6, data: lifecycleBytes("!"))
+    #expect(appended.attr.size == 7)
+    stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write, .readWrite])
+    #expect(stats.writeRequests == 2)
+
+    try await core.close(item: file, retainingModes: .unspecified)
+    stats = await daemon.stats()
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
+}
+
+/// Access is decided when a description is opened. A chmod after the open
+/// neither revokes it nor forces a reopen, for a write-only or a read/write
+/// description.
+@Test func chmodAfterOpenKeepsTheOpenDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+
+    let writeOnly = try await closedTestFile(core: core, daemon: daemon, name: "chmod-write-only")
+    try await core.open(item: writeOnly, mode: .write)
+    _ = try await core.setattr(item: writeOnly, attributes: PfsSetAttributes(mode: 0o000))
+    let written = try await core.write(item: writeOnly, offset: 0, data: lifecycleBytes("kept"))
+    #expect(written.written == 4)
+    #expect(written.attr.mode & 0o777 == 0)
+    var stats = await daemon.stats()
+    #expect(stats.openModes == [.write])
+    #expect(stats.closeRequests == 0)
+    try await core.close(item: writeOnly, retainingModes: .unspecified)
+
+    let readWrite = try await closedTestFile(core: core, daemon: daemon, name: "chmod-read-write")
+    try await core.open(item: readWrite, mode: .readWrite)
+    _ = try await core.setattr(item: readWrite, attributes: PfsSetAttributes(mode: 0o000))
+    _ = try await core.write(item: readWrite, offset: 0, data: lifecycleBytes("both"))
+    #expect(try await core.read(item: readWrite, offset: 0, length: 4) == lifecycleBytes("both"))
+    stats = await daemon.stats()
+    #expect(stats.openModes == [.readWrite])
+    #expect(stats.closeRequests == 0)
+    try await core.close(item: readWrite, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
+/// A description the creation itself granted is read/write whatever mode
+/// the new file carries, so writing a fresh 0444 file needs no OPEN at all.
+@Test func createdFileWritesThroughItsCreationDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    await daemon.resetStats()
+
+    let created = try await core.createFile(
+        in: root,
+        name: lifecycleBytes("read-only-mode"),
+        mode: 0o444
+    )
+    let result = try await core.write(item: created.item, offset: 0, data: lifecycleBytes("granted"))
+    #expect(result.written == 7)
+    var stats = await daemon.stats()
+    #expect(stats.openModes.isEmpty)
+    #expect(stats.closeRequests == 0)
+    try await core.close(item: created.item, retainingModes: .unspecified)
+    stats = await daemon.stats()
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+}
+
+/// An unlinked file is reachable only through descriptions that already
+/// exist. A write-only description must keep serving writes after the last
+/// name is gone; a replacement OPEN could not even address the item.
+@Test func writeOnlyDescriptionOfAnUnlinkedFileKeepsWriting() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(strictItemNamespace: true))
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let root = try await core.rootItem()
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "unlinked-write-only")
+
+    try await core.open(item: file, mode: .write)
+    try await core.remove(
+        item: file,
+        named: lifecycleBytes("unlinked-write-only"),
+        from: root,
+        isDirectory: false
+    )
+    let result = try await core.write(item: file, offset: 0, data: lifecycleBytes("orphan"))
+    #expect(result.written == 6)
+    #expect(result.attr.nlink == 0)
+    var stats = await daemon.stats()
+    #expect(stats.openModes == [.write])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 1)
+
+    try await core.close(item: file, retainingModes: .unspecified)
+    stats = await daemon.stats()
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
+}
+
 @Test func failedUpgradeCloseRemainsTrackedUntilFinalClose() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
@@ -581,6 +745,17 @@ private func closedTestFile(core: VolumeCore, daemon: PfsLocalMockDaemon, name: 
     try await core.close(item: created.item, retainingModes: .unspecified)
     await daemon.resetStats()
     return created.item
+}
+
+private func lifecycleErrno(_ operation: () async throws -> Void) async -> Int32? {
+    do {
+        try await operation()
+        return nil
+    } catch let error as PfsLocalClientError {
+        return error.posixErrno
+    } catch {
+        return EIO
+    }
 }
 
 private struct LifecycleStatsTimeout: Error {}
