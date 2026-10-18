@@ -33,7 +33,6 @@ func frontendRequestPublishes(body any) bool {
 		*pfslocal.ReadlinkRequest,
 		*pfslocal.HardLinkRequest,
 		*pfslocal.XattrGetRequest,
-		*pfslocal.XattrSetRequest,
 		*pfslocal.XattrListRequest,
 		*pfslocal.XattrRemoveRequest:
 		return true

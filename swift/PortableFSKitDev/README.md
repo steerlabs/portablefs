@@ -1,6 +1,10 @@
 # PortableFSKitDev
 
-Minimal local development wrapper for the `PortableFSKit` Swift package.
+Minimal manual-registration development host for the `PortableFSKit` Swift
+package. It builds the same FSKit extension, daemon, and CLI pairing as the
+shipping app (`FRONTEND_PROFILE_FSKIT_EXCLUSIVE`, `pfslocal` 2.0, daemon
+control 2) on macOS 26 and 27; there is no separate per-release host or
+policy build.
 
 ## Build
 
@@ -36,7 +40,8 @@ mkdir -p /tmp/pfs
 /sbin/mount -t pfs "dev.portablefs.oss://<ref>" /tmp/pfs
 ```
 
-6. Unmount when done:
+6. Unmount when done. An unforced unmount returns the real `EBUSY` while
+   anything holds the mount:
 
 ```sh
 umount /tmp/pfs

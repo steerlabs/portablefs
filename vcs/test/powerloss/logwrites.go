@@ -15,10 +15,11 @@ import (
 // any platform, which is the only way the replay engine gets coverage outside
 // the privileged runner.
 //
-// The layout was also confirmed against a log a real 6.x kernel produced
-// before this code was written; docs/power-loss-testing.md records that probe.
-// If a future kernel changes the format, ParseLog fails closed on the magic or
-// the version rather than replaying nonsense.
+// TestReplayReproducesTheDeviceTheKernelWrote recalibrates this transcription
+// against the running kernel on every privileged run, by requiring a full
+// replay to reproduce the device byte for byte. If a future kernel changes the
+// format, ParseLog fails closed on the magic or the version rather than
+// replaying nonsense.
 const (
 	logWritesMagic   uint64 = 0x6a736677736872
 	logWritesVersion uint64 = 1

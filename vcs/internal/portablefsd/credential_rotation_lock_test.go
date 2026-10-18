@@ -7,7 +7,7 @@ package portablefsd
 // namespace lock off it (attach.rotateLiveCredential). One level up, the
 // registry's global mutationMu was left in place — and runUnmountTransaction
 // holds mutationMu across the ENTIRE authority drain barrier plus the exact
-// kernel detach, while registry.delete holds it across a whole detach.
+// kernel detach.
 //
 // So under a flood the CLI's credential push still queued behind all of it,
 // burned its full 60s control timeout, and was dropped. The daemon then went on
@@ -153,7 +153,6 @@ func newLiveCredentialTestAttach(t *testing.T) *attach {
 		MountPath:           "/Volumes/PortableFSCredential",
 	}, privateTestDir(t))
 	a.persist = func() error { return nil }
-	a.schedulePersist = func() {}
 	a.v3Data = &v3DataPlane{}
 	return a
 }

@@ -224,16 +224,16 @@ func TestV3CacheHitsYieldToSourceHoldsAndUnresolvedClaims(t *testing.T) {
 	file := f.lookup(f.root, "file")
 	coordinator := f.d.bridge.sourcePublication
 
-	hold := func(operationID uint64, gate *authoritypb.FskitSourcePublication) func() {
-		coordinator.reserve(operationID)
-		if _, err := coordinator.acquireSource(context.Background(), operationID, gate); err != nil {
+	hold := func(operationID uint64, gate *v3SourceGate) func() {
+		coordinator.reserve(testCallback(operationID))
+		if _, err := coordinator.acquireSource(context.Background(), testCallback(operationID), gate); err != nil {
 			t.Fatal(err)
 		}
 		return func() {
-			if _, err := coordinator.acknowledge(operationID, pfslocal.PublicationSemanticCommitPublished); err != nil {
+			if _, err := coordinator.acknowledge(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished); err != nil {
 				t.Fatal(err)
 			}
-			coordinator.retire(operationID)
+			coordinator.retire(testCallback(operationID))
 		}
 	}
 	itemGate, err := v3ItemSourceGate(file.Item, true)
@@ -653,25 +653,6 @@ func TestV3CacheNegativeEntriesAreBounded(t *testing.T) {
 	}
 }
 
-// A peer repair event while the metadata cache rests on writer exclusion is
-// terminal before any actuation.
-func TestV3CachePeerRepairEventIsTerminal(t *testing.T) {
-	f := newCachedV3Fixture(t, v3FileObjects())
-	f.client.next <- v3VisibilityResult{event: testV3Event(f.client.fakeV3VisibilityClient, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)}
-	if _, err := f.d.bridge.next(context.Background()); err == nil {
-		t.Fatal("peer repair event was accepted")
-	}
-	if f.d.terminalError() == nil {
-		t.Fatal("peer repair event left the data plane serving")
-	}
-	f.d.bridge.sourcePublication.mu.Lock()
-	held := len(f.d.bridge.sourcePublication.peerHolds)
-	f.d.bridge.sourcePublication.mu.Unlock()
-	if held != 0 {
-		t.Fatal("peer repair was actuated before being refused")
-	}
-}
-
 // Definite namespace refusals evict affected cache coordinates without
 // deriving a causal contradiction from an older cached observation.
 func TestV3CacheNamespaceErrnoEvictsTheCoordinate(t *testing.T) {
@@ -735,8 +716,8 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 				f.t.Fatal(err)
 			}
 			coordinator := f.d.bridge.sourcePublication
-			coordinator.reserve(9501)
-			if _, err := coordinator.acquireSource(context.Background(), 9501, gate); err != nil {
+			coordinator.reserve(testCallback(9501))
+			if _, err := coordinator.acquireSource(context.Background(), testCallback(9501), gate); err != nil {
 				f.t.Fatal(err)
 			}
 		}},
@@ -766,7 +747,7 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 				a := &attach{ref: "write-boundary", v3Data: f.d, v3Coherence: f.d.bridge}
 				server, peer := net.Pipe()
 				defer peer.Close()
-				c := &frontendConn{conn: server, attach: a}
+				c := &frontendConn{origin: 1, conn: server, attach: a}
 				const operationID = uint64(9401)
 				var once sync.Once
 				c.testBeforeReplyWrite = func(uint64) { once.Do(func() { test.between(f, file) }) }
@@ -774,7 +755,7 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 				if !ok || !initialize {
 					t.Fatal("operation was not reserved")
 				}
-				f.d.bridge.reserveFrontendPublication(operationID)
+				f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 				before := f.authorityCalls()
 				beforeMetrics := f.d.cacheMetrics()
 				var body any = &pfslocal.GetAttrRequest{Item: file}
@@ -986,7 +967,7 @@ func TestV3CacheRejectsUnrepresentableUnheldPostState(t *testing.T) {
 					case "allocation-overflow":
 						object.Attr.Blocks = math.MaxUint64
 					case "inode-out-of-range":
-						object.Attr.Inode = uint64(1) << 63
+						object.Attr.Inode = math.MaxUint64
 					}
 				}
 			}
@@ -1106,8 +1087,8 @@ func TestV3RenameDelayedPastAHeldSetattrOfTheMovedObjectIsLegal(t *testing.T) {
 		}
 	}
 	const renameOp, setattrOp = uint64(97001), uint64(97002)
-	f.d.bridge.reserveFrontendPublication(renameOp)
-	f.d.bridge.reserveFrontendPublication(setattrOp)
+	f.d.bridge.reserveFrontendPublication(testCallback(renameOp))
+	f.d.bridge.reserveFrontendPublication(testCallback(setattrOp))
 	renamed := make(chan int32, 1)
 	go func() {
 		_, errno := dispatchV3Owned(f.d, context.Background(), renameOp, &pfslocal.RenameRequest{
@@ -1145,11 +1126,11 @@ func TestV3RenameDelayedPastAHeldSetattrOfTheMovedObjectIsLegal(t *testing.T) {
 	}
 	f.requireServedLocally("GetAttr after both handlers settle before either ack", func() { f.getattr(file.Item) })
 	for _, operationID := range []uint64{setattrOp, renameOp} {
-		if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished); err != nil {
+		if _, err := f.d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished); err != nil {
 			t.Fatal(err)
 		}
-		f.d.bridge.releaseFrontendPublication(operationID)
-		_ = f.d.bridge.finishFrontendPublication(operationID)
+		f.d.bridge.releaseFrontendPublication(testCallback(operationID))
+		_ = f.d.bridge.finishFrontendPublication(testCallback(operationID))
 	}
 	f.requireServedLocally("GetAttr after both publish", func() { f.getattr(file.Item) })
 }
@@ -1177,7 +1158,7 @@ func TestV3CacheSameCallbackWritesWithReversedReplies(t *testing.T) {
 		}
 	}
 	const operationID = uint64(97101)
-	f.d.bridge.reserveFrontendPublication(operationID)
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 	first := make(chan int32, 1)
 	go func() {
 		_, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.WriteRequest{Handle: handle, Data: []byte("abcde")})
@@ -1217,7 +1198,7 @@ func TestV3CacheSameCallbackSameNameNamespaceRequests(t *testing.T) {
 		}
 	}
 	const operationID = uint64(97201)
-	f.d.bridge.reserveFrontendPublication(operationID)
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 	created := make(chan int32, 1)
 	go func() {
 		_, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.MkdirRequest{Dir: f.root, Name: []byte("n"), Mode: 0o755})
@@ -1239,11 +1220,11 @@ func TestV3CacheSameCallbackSameNameNamespaceRequests(t *testing.T) {
 	if positive != nil || negative {
 		t.Fatalf("after reversed same-name results positive=%v negative=%t, want the coordinate dropped", positive, negative)
 	}
-	if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished); err != nil {
+	if _, err := f.d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished); err != nil {
 		t.Fatal(err)
 	}
-	f.d.bridge.releaseFrontendPublication(operationID)
-	_ = f.d.bridge.finishFrontendPublication(operationID)
+	f.d.bridge.releaseFrontendPublication(testCallback(operationID))
+	_ = f.d.bridge.finishFrontendPublication(testCallback(operationID))
 	f.requireAuthority("lookup of the dropped coordinate", func() {
 		if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")}); errno != darwinENOENT {
 			t.Fatalf("lookup errno=%d", errno)
@@ -1259,12 +1240,12 @@ func TestV3CacheSameCallbackUnresolvedNamespaceClaimGatesAHit(t *testing.T) {
 	f.getattr(f.root)
 	file := f.lookup(f.root, "file")
 	const operationID = uint64(97301)
-	f.d.bridge.reserveFrontendPublication(operationID)
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 	gate, err := v3NamespaceSourceGate(f.root, []byte("other"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), operationID, gate); err != nil {
+	if _, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), testCallback(operationID), gate); err != nil {
 		t.Fatal(err)
 	}
 	f.requireAuthority("GetAttr under the same callback's unresolved claim", func() {
@@ -1285,7 +1266,7 @@ func TestV3CachedNegativeKeepsItsSnapshotAcrossAnOverlappingCreate(t *testing.T)
 	a := &attach{ref: "negative-boundary", v3Data: f.d, v3Coherence: f.d.bridge}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	var once sync.Once
 	c.testBeforeReplyWrite = func(uint64) {
 		once.Do(func() {
@@ -1299,7 +1280,7 @@ func TestV3CachedNegativeKeepsItsSnapshotAcrossAnOverlappingCreate(t *testing.T)
 	if !ok || !initialize {
 		t.Fatal("operation was not reserved")
 	}
-	f.d.bridge.reserveFrontendPublication(operationID)
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 1, operationID, initialize, &pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")})
@@ -1327,14 +1308,14 @@ func TestV3CachedPositiveAfterNotPublishedAckSettlesOnce(t *testing.T) {
 	server, peer := net.Pipe()
 	defer server.Close()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	const operationID = uint64(97501)
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
 		t.Fatal("operation was not reserved")
 	}
-	f.d.bridge.reserveFrontendPublication(operationID)
-	if known, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitNotPublished); !known || err != nil {
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
+	if known, err := f.d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished); !known || err != nil {
 		t.Fatalf("bridge NOT_PUBLISHED = (%t,%v)", known, err)
 	}
 	if !c.acknowledgePublication(operationID) {
@@ -1367,13 +1348,13 @@ func TestV3CachedPositiveReclaimThenSocketLossSettlesOnce(t *testing.T) {
 	file := f.lookup(f.root, "file")
 	a := &attach{ref: "cached-reclaim-loss", v3Data: f.d, v3Coherence: f.d.bridge}
 	server, peer := net.Pipe()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	const operationID = uint64(97601)
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
 		t.Fatal("operation was not reserved")
 	}
-	f.d.bridge.reserveFrontendPublication(operationID)
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 	go c.handleV3Attached(context.Background(), a, 1, operationID, initialize, &pfslocal.LookupRequest{Dir: f.root, Name: []byte("file")})
 	envelope, err := pfslocal.ReadFrame(peer)
 	if err != nil {
@@ -1412,7 +1393,7 @@ func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
 				handle = reply.(*pfslocal.OpenReply).Handle
 			}
 			const operationID = uint64(97501)
-			f.d.bridge.reserveFrontendPublication(operationID)
+			f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 			var body any
 			switch name {
 			case "create-getattr":
@@ -1431,7 +1412,7 @@ func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
 			if name == "create-getattr" {
 				file = reply.(*pfslocal.CreateReply).Attr
 			}
-			lease := f.d.bridge.sourcePublication.operationLease(operationID)
+			lease := f.d.bridge.sourcePublication.operationLease(testCallback(operationID))
 			lease.gate.mu.Lock()
 			active, claims, holds := lease.active, len(lease.names), len(lease.coordinates)
 			lease.gate.mu.Unlock()
@@ -1453,7 +1434,7 @@ func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
 			// A callback can issue another request before its final ack. Its
 			// acquisition must make the same retained holds active again.
 			gate, _ := v3ItemSourceGate(file.Item, false)
-			if _, err := lease.gate.acquireSource(context.Background(), operationID, gate); err != nil {
+			if _, err := lease.gate.acquireSource(context.Background(), testCallback(operationID), gate); err != nil {
 				t.Fatal(err)
 			}
 			lease.gate.cacheRead(func(conflict v3CacheConflict) {
@@ -1462,7 +1443,7 @@ func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
 				}
 			})
 			lease.finishRequest()
-			if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitNotPublished); !errors.Is(err, errV3SourcePublicationNotPublished) {
+			if _, err := f.d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished); !errors.Is(err, errV3SourcePublicationNotPublished) {
 				t.Fatalf("committed NOT_PUBLISHED=%v", err)
 			}
 		})
@@ -1490,7 +1471,7 @@ func TestV3ActiveHandlerCoversPostStateValidation(t *testing.T) {
 	wrapper := &closeObservingV3Client{fakeV3DataClient: client, onClose: func() {
 		checked.Do(func() {
 			observed.Store(true)
-			lease := d.bridge.sourcePublication.operationLease(operationID)
+			lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 			if lease == nil {
 				t.Error("malformed handler had no source lease")
 				return
@@ -1504,7 +1485,7 @@ func TestV3ActiveHandlerCoversPostStateValidation(t *testing.T) {
 	}}
 	d = testV3DataPlaneOnClient(t, wrapper, client, newFakeV3Clock())
 	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
-	d.bridge.reserveFrontendPublication(operationID)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	mutate := client.mutation
 	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 		response, err := mutate(ctx, identity, request)
@@ -1512,13 +1493,13 @@ func TestV3ActiveHandlerCoversPostStateValidation(t *testing.T) {
 		return response, err
 	}
 	mode := uint32(0o600)
-	if _, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.SetAttrRequest{Item: file.Item, Mode: &mode}); errno != darwinEIO || d.terminalError() == nil {
+	if _, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.SetAttrRequest{Item: file.Item, Mode: &mode}); errno != darwinEIO || d.terminalError() == nil {
 		t.Fatalf("malformed SetAttr = %d terminal=%v", errno, d.terminalError())
 	}
 	if !observed.Load() {
 		t.Fatal("malformed handler never closed its transport")
 	}
-	lease := d.bridge.sourcePublication.operationLease(operationID)
+	lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 	lease.gate.mu.Lock()
 	defer lease.gate.mu.Unlock()
 	if lease.active != 0 || lease.gate.terminal == nil {
@@ -1539,9 +1520,9 @@ func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
 		t.Fatal(errno)
 	}
 	const operationID = uint64(97503)
-	f.d.bridge.reserveFrontendPublication(operationID)
+	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
 	gate, _ := v3ItemSourceGate(file.Item, false)
-	lease, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), operationID, gate)
+	lease, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), testCallback(operationID), gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1569,35 +1550,27 @@ func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
 }
 
 func TestV3CacheMetricsDistinguishTerminalCoordinatorFromSourceHolds(t *testing.T) {
-	for _, peerCut := range []bool{false, true} {
-		t.Run(map[bool]string{false: "terminal", true: "peer-cut"}[peerCut], func(t *testing.T) {
-			f := newCachedV3Fixture(t, v3FileObjects())
-			f.ns.bind(0x20, "file", 0x70)
-			file := f.lookup(f.root, "file")
-			record := f.record(file.Item)
-			coordinator := f.d.bridge.sourcePublication
-			// Withdraw between the initial admission check and the atomic
-			// snapshot, without a source holder to obscure the reason.
-			f.client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
-				coordinator.mu.Lock()
-				if peerCut {
-					coordinator.peerSequence = 1
-				} else {
-					coordinator.terminal = errors.New("coordinator withdrawn")
-				}
-				coordinator.mu.Unlock()
-				return &fakeV3ResponseConsumption{consume: func() {}}
-			}
-			collector := &v3ReplyResourceCollector{d: f.d}
-			ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
-			if _, hit, errno := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
-				t.Fatalf("withdrawn coordinator: hit=%t errno=%d", hit, errno)
-			}
-			metrics := f.d.cacheMetrics()
-			if metrics.GetAttr["terminal"] != 1 || metrics.GetAttr["held"] != 0 || metrics.GetAttr["hit"] != 0 {
-				t.Fatalf("withdrawn coordinator metrics = %v", metrics.GetAttr)
-			}
-		})
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	record := f.record(file.Item)
+	coordinator := f.d.bridge.sourcePublication
+	// Withdraw between the initial admission check and the atomic
+	// snapshot, without a source holder to obscure the reason.
+	f.client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		coordinator.mu.Lock()
+		coordinator.terminal = errors.New("coordinator withdrawn")
+		coordinator.mu.Unlock()
+		return &fakeV3ResponseConsumption{consume: func() {}}
+	}
+	collector := &v3ReplyResourceCollector{d: f.d}
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
+	if _, hit, errno := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
+		t.Fatalf("withdrawn coordinator: hit=%t errno=%d", hit, errno)
+	}
+	metrics := f.d.cacheMetrics()
+	if metrics.GetAttr["terminal"] != 1 || metrics.GetAttr["held"] != 0 || metrics.GetAttr["hit"] != 0 {
+		t.Fatalf("withdrawn coordinator metrics = %v", metrics.GetAttr)
 	}
 }
 
@@ -1614,7 +1587,7 @@ func TestV3WrittenCachedReplyRemainsInTerminalPublicationLifetime(t *testing.T) 
 	a := &attach{ref: "cached-terminal-drain", v3Data: f.d, v3Coherence: f.d.bridge}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	const operationID = uint64(98003)
 	publicationTestOperation(t, c, a, operationID)
 	done := make(chan struct{})
@@ -1660,7 +1633,7 @@ func TestV3AuthorityAndCachedReadsKeepTheSameOverlappingSnapshot(t *testing.T) {
 			a := &attach{ref: "overlap", v3Data: f.d, v3Coherence: f.d.bridge}
 			server, peer := net.Pipe()
 			defer peer.Close()
-			c := &frontendConn{conn: server, attach: a}
+			c := &frontendConn{origin: 1, conn: server, attach: a}
 			if cached {
 				c.testBeforeReplyWrite = func(uint64) { close(admitted); <-resume }
 			}

@@ -1,8 +1,8 @@
 # Tiered storage: identity, lifecycle, and capacity contract
 
-Status: **Phase 0 contract, revision 4 — incorporates both adversarial
-reviews (review-phase0-codex.md, review-phase0-codex-r2.md) and separates
-cell liveness from desired-plan convergence; frozen before implementation**
+Status: **implemented contract for the archive tier (revision 4); separates
+cell liveness from desired-plan convergence. Manager snapshot schema 3, signed
+cell plan version 3, and helper state version 2 are the current exact formats.**
 
 ## 0. Trust boundary for host facts
 
@@ -106,13 +106,13 @@ snapshots:
 1. The helper writes a root-owned quiesce-request file (containing a fresh
    random quiesce nonce) into the volume's ConfigRoot, visible to the
    authority read-only at `/run/portablefs-volume`.
-2. The authority observes the request (checked at strict-attach admission
-   and on a coarse poll) and enters quiesce mode: it **refuses new strict
-   attaches** with a named refusal while continuing to serve existing
+2. The authority observes the request (checked at attach admission and on a
+   coarse poll) and enters quiesce mode: it **refuses new mount attaches**
+   with a named refusal while continuing to serve existing
    sessions and accept `CleanDetach`. Quiesce mode is in-process state; a
    crashed authority is simply absent, and the helper never starts a new
    one during an `ARCHIVE` phase.
-3. When the authority — which owns the membership file and its lock, and
+3. When the authority — which owns the `mount.membership` file and its lock, and
    serializes every `Activate`/`Deactivate` — observes the active set
    empty while attach admission is closed, it writes a durable
    quiesce-proof record into StateRoot `{volume, authority epoch, wire
@@ -142,7 +142,8 @@ unknown fields refused):
   "written_unix":N}`.
 
 After stopping the authority the helper additionally re-reads the
-membership file and requires it empty — both proofs must agree or the
+membership file through the same `mountmembership` codec the authority writes
+and requires it empty — both proofs must agree or the
 quiesce fails closed. The helper removes both files when a quiesce is
 cancelled; a fresh request nonce supersedes any stale proof.
 
@@ -253,7 +254,7 @@ plan unbumped; nothing is half-entered.
       it after dialing, closing the install race (restore-mode.md).
    3. The plan enters phase `ARCHIVE`; the helper runs the authority
       quiesce protocol (§1): quiesce-request file → authority closes
-      strict-attach admission → remaining mounts detach cleanly
+      attach admission → remaining mounts detach cleanly
       (`CleanDetach` still works — the authority is serving) → the
       authority writes the process-bound quiesce proof → the helper stops
       the authority, verifies absence, verifies the proof nonce, and
@@ -262,7 +263,7 @@ plan unbumped; nothing is half-entered.
       the archive is refused: the helper reports quiesce-not-proven, the
       Manager returns the volume to READY (phase back to SERVE), and the
       authority leaves quiesce mode (the helper removes the request file;
-      the authority re-admits strict attaches — no restart happened on
+      the authority re-admits attaches — no restart happened on
       this path, so no epoch change). A membership stale from a fenced,
       never-detaching mount is recovered through the existing restart +
       operator strict-fence flow, then archive retries. Archive is
@@ -408,9 +409,10 @@ referencing the volume are pruned at the transition. One path regardless of
 deployment configuration; the product owns the retention window before it
 calls destroy.
 
-## 3. State schema v2 (Manager)
+## 3. Manager state schema
 
-`StateSchemaVersion = 2`.
+`StateSchemaVersion = 3`, exact. There is no decoder for an earlier schema;
+protocol-8 Manager state is provisioned fresh.
 
 ```go
 type Volume struct {
@@ -462,24 +464,25 @@ type ArchiveRecord struct {
 `SealedMeasured*` is captured by the Manager at the instant the verified seal
 commits, from the placement's last measurement. The volume is quiesced for the
 whole cycle, so that reading is exact or a pre-quiesce lower bound — both safe
-under the `max()` that restore admission applies (§5). Zero is a valid,
-permanently supported value: records sealed before the field existed decode
-zero and are charged from `SealedAllocatedBytes`/`SealedInodes` alone. It is
+under the `max()` that restore admission applies (§5). Zero means unmeasured
+and is a valid value: such a record is charged from
+`SealedAllocatedBytes`/`SealedInodes` alone. It is
 Manager-internal admission input and is deliberately absent from
 `ArchiveSummaryView`, which stays the minimal product projection.
 
 Bounds: `len(Packs) <= 1024`, `len(ObjectRef.Key) <= 512`, serialized
 `ArchiveRecord <= 512 KiB`, and the helper's `ArchiveSealed` observation
 payload `<= 768 KiB` — all comfortably inside the agent's 4 MiB observation
-bound and the Manager's 1 MiB HTTP body bound, which rises to 2 MiB for the
-cell-observation route in the same change.
+bound and the Manager's HTTP body bounds (1 MiB generally, 2 MiB for the
+cell-observation route).
 
-Cells gain `Pool string` (required: `product`, `system`, or `test`),
+Cells carry `Pool string` (required: `product`, `system`, or `test`),
 `Decommissioning bool`, `UsageStaleAfter`-relevant freshness fields, and
-lose `AllocatedBytes`/`AllocatedInodes` entirely. Product-role
-`createVolume` can never land on a `test` pool.
+their immutable allocator bounds with the exact registration digest; there is
+no allocated-entitlement total. Product-role `createVolume` can never land on a
+`test` pool.
 
-### Validator v2
+### Validator
 
 - Placement uniqueness (project/UID/port per cell) and the allocator
   boundary apply to volumes **with** placements.
@@ -495,10 +498,11 @@ lose `AllocatedBytes`/`AllocatedInodes` entirely. Product-role
 - `DESTROYED` volumes must have `Placement == nil`, `Archive == nil`, and
   `DestroyedUnix > 0`.
 
-## 4. Cell plan v2 and helper contract
+## 4. Cell plan and helper contract
 
-`cellplan.Version = 2`, token prefix `v2.`, signature domain
-`portablefs-cell-plan-v2\0`. Agents and helpers accept that exact version.
+`cellplan.Version = 3`, token prefix `v3.`, signature domain
+`portablefs-cell-plan-v3\0`. Agents and helpers accept that exact version and
+refuse any other version, prefix, or domain generically.
 Phases: `PROVISION`, `SERVE`, `FENCE`, `ARCHIVE`, `RESTORE`, `DESTROY`,
 `RELEASE`.
 
@@ -515,20 +519,25 @@ it; they change together in this contract:
 4. the validator's entitlement-sum equality (`types.go:563-567`) is removed
    by §5.
 
-Plan payload hygiene: v2 hoists `AuthorityCAPEM`, `ClientCAPEM`, and
-`CapabilityPublicKey` to plan level (they are Manager-wide and identical
-per volume — the dominant term in the ≈2.2 KiB per-entry size behind the
-~1,399-entry payload ceiling). With release freeing slots and CA material
-hoisted, plan payload scales with live volumes.
+Plan-level trust: `AuthorityCAPEM`, `ClientCAPEM`, and `CapabilityPublicKey`
+are carried once at plan level (they are Manager-wide and identical per
+volume — per volume they would be the dominant term in the ≈2.2 KiB per-entry
+size behind a ~1,399-entry payload ceiling). The signed `VolumePlan` has no
+per-volume trust members: strict decoding rejects them even when empty or
+null, so a volume cannot override the plan's trust. After verification the
+helper builds a separate effective per-volume configuration that inherits the
+plan-level values. With release freeing slots and CA material at plan level,
+plan payload scales with live volumes.
 
-`VolumePlan` v2 adds: `PlacementSequence`, `ArchiveTo {attempt,
+`VolumePlan` carries: `PlacementSequence`, `ArchiveTo {attempt,
 key_version}`, `RestoreFrom {sealed_epoch, attempt, manifest ObjectRef
 digests, sealed totals}`, `ReleaseProof {placement_sequence, epoch,
 destroy_proof_sha256}` — identities and digests only; the helper derives
 object keys locally from root-pinned configuration (§2 step 2), preserving
 the no-network-selected-input rule verbatim.
 
-Helper state v2 (`helperStateVersion = 2`):
+Helper state (`helperStateVersion = 2`, exact, recording applied plan version
+3):
 
 - `Assignment` replaces `QuotaApplied bool` with
   `AppliedQuotaBytes/AppliedQuotaInodes uint64`; the helper re-runs
@@ -543,12 +552,12 @@ Helper state v2 (`helperStateVersion = 2`):
   `PlacementSequence > tombstone.PlacementSequence` (and, transitively,
   a fresh identity tuple by allocator construction).
 
-The Manager always signs cell plan version 2. The agent and helper accept only
+The Manager always signs cell plan version 3. The agent and helper accept only
 that version, so plan delivery cannot depend on a capability observation from
 a plan that has not yet been applied. Archive and restore admission depend on
 the helper's live archive configuration, not on version negotiation.
 
-Every v2 plan also carries the required positive `usage_refresh_seconds` value
+Every plan also carries the required positive `usage_refresh_seconds` value
 derived from the Manager's `UsageStaleAfter` setting. The agent posts a full
 observation when its last accepted full observation reaches one third of that
 bound, even if the usage digest did not change; polls before that point retain
@@ -566,7 +575,7 @@ one: revoking the file stops new archive and restore placement on the next
 poll. The Manager stores it on the cell and requires it for `ArchiveVolume` and
 for restore admission; ordinary create placement does not require it. Absent
 from persisted state it decodes `false`, which refuses archive work until the
-cell reports otherwise — correct and safe under rollback.
+cell reports otherwise.
 
 ## 5. Capacity model
 
@@ -582,9 +591,9 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   (`vcs/internal/xfsstore/metadata_linux.go:212-250`, verified on Linux
   6.8), and the provision-verify path already opens this descriptor. Used
   = `(f_blocks - f_bfree) * f_bsize`; inodes analogous. Zero new
-  privileged surface. The stale sentence in
-  `xfs-authority-architecture.md:438-444` ("statfs retains cell-wide
-  meaning") describes only the no-limit case and is amended by this plan;
+  privileged surface. Cell-wide `statfs` meaning applies only to a project
+  without hard limits
+  ([xfs-authority-architecture.md](../xfs-authority-architecture.md#multi-tenancy-and-quotas));
   a real-XFS test pins the per-project reading.
 - **In-flight charges.** Every placement carries a durable
   `PendingBytes/PendingInodes` charge set at admission. A create charges
@@ -621,9 +630,8 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   create. The fresh-heartbeat bound and `MaxVolumesPerCell` bound how much
   unconverged desired work can accumulate if a cell stops applying plans.
   Mount issue and renewal remain gated by `cellConverged`: a fresh heartbeat
-  at the exact current generation. Restore admission additionally requires the
-  cell to declare plan version 2 **and** `archive_configured` (§4); create
-  admission requires neither. Then:
+  at the exact current generation. Restore admission additionally requires
+  `archive_configured` (§4); create admission does not. Then:
   `Σ_over_placements charge(p) + incoming + reserve ≤ capacity`, where
   `reserve` is the configured cell reserve fraction and per placement
   `charge(p) = max(measured used, pending, provision floor)` — a

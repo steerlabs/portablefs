@@ -1,6 +1,7 @@
 package powerloss
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,18 +24,19 @@ const (
 	// before the mark was taken. This is the only value the harness asserts
 	// presence for.
 	Fsynced Durability = "fsynced"
-	// Acknowledged means the write was acknowledged by the authority and
-	// nothing was fsynced. The authority applies such a write to the served
-	// XFS through sendfile before it acks, so the bytes are in the page cache
-	// - but page cache is exactly what a power cut discards. Presence after a
-	// cut is therefore permitted, not required.
+	// Acknowledged means write(2) through the Linux mount returned success
+	// and nothing was fsynced. The bytes may be in the kernel page cache, in
+	// the mount's delegated write buffer, or applied to the authority's XFS
+	// page cache - and every one of those is exactly what a power cut
+	// discards. Presence after a cut is therefore permitted, not required.
 	Acknowledged Durability = "acknowledged"
 )
 
-// Instrument names which harness produced a ledger. The two instruments prove
-// different things and are verified differently, so the ledger says which one
-// it came from rather than letting the verifier guess from whether marks
-// happen to be present.
+// Instrument names which Linux-mount instrument produced an fsync ledger. The
+// two prove different things and are verified differently, so the ledger says
+// which one it came from rather than letting the verifier guess from whether
+// marks happen to be present. The FSKit instrument keeps a MutationLedger
+// instead (mutations.go).
 type Instrument string
 
 const (
@@ -67,10 +69,10 @@ type Checkpoint struct {
 	Durability Durability `json:"durability"`
 }
 
-// Ledger is the workload's record of what must be true after a cut. It is
-// written by the driver process that ran on the mount and read by the verifier
-// that inspects a replayed image, so it is the only channel between them and
-// is deliberately plain JSON.
+// Ledger is the fsync workload's record of what must be true after a cut. It
+// is written by the driver process that ran on the Linux mount and read by the
+// verifier that inspects a replayed image, so it is the only channel between
+// them and is deliberately plain JSON.
 type Ledger struct {
 	// Volume is the volume directory name inside the XFS cell. A replayed
 	// image is mounted at an arbitrary path, so the verifier joins its own
@@ -191,61 +193,101 @@ func (l *Ledger) Validate() error {
 
 func validateRelative(relative string) error {
 	if relative == "" {
-		return errors.New("checkpoint path is empty")
+		return errors.New("path is empty")
 	}
 	if path.IsAbs(relative) {
-		return fmt.Errorf("checkpoint path %q is absolute", relative)
+		return fmt.Errorf("path %q is absolute", relative)
 	}
 	if path.Clean(relative) != relative {
-		return fmt.Errorf("checkpoint path %q is not in clean form", relative)
+		return fmt.Errorf("path %q is not in clean form", relative)
 	}
 	for _, element := range strings.Split(relative, "/") {
 		if element == ".." || element == "." || element == "" {
-			return fmt.Errorf("checkpoint path %q escapes the volume", relative)
+			return fmt.Errorf("path %q escapes the volume", relative)
 		}
 	}
 	return nil
 }
 
-// Save writes the ledger durably. The driver is killed on purpose while this
-// harness runs, so the ledger is written to a temporary name, fsynced, renamed
-// and the directory fsynced - a truncated ledger would make the verifier
-// report a product failure that is really a harness failure.
+func (l *Ledger) markedPoints() []markedPoint {
+	if l == nil {
+		return nil
+	}
+	points := make([]markedPoint, 0, len(l.Checkpoints))
+	for _, checkpoint := range l.Checkpoints {
+		if checkpoint.Mark == "" {
+			continue
+		}
+		points = append(points, markedPoint{
+			mark:   checkpoint.Mark,
+			owner:  fmt.Sprintf("checkpoint %d", checkpoint.Index),
+			reason: fmt.Sprintf("cut at the mark taken immediately after checkpoint %d (%s) reached %s", checkpoint.Index, checkpoint.Path, checkpoint.Durability),
+		})
+	}
+	return points
+}
+
+// Save writes the ledger durably; see saveJSON.
 func (l *Ledger) Save(pathname string) error {
 	if err := l.Validate(); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(l, "", "  ")
+	return saveJSON(pathname, l, "ledger")
+}
+
+// saveJSON writes a ledger durably. Drivers are killed on purpose while this
+// harness runs, so the ledger is written to a temporary name, fsynced, renamed
+// and the directory fsynced - a truncated ledger would make the verifier
+// report a product failure that is really a harness failure. Ledgers live in
+// the harness's scratch directory, never on the device under test, so these
+// fsyncs do not appear in the write log.
+func saveJSON(pathname string, value any, what string) error {
+	encoded, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return fmt.Errorf("powerloss: encode ledger: %w", err)
+		return fmt.Errorf("powerloss: encode %s: %w", what, err)
 	}
 	encoded = append(encoded, '\n')
 	pending := pathname + ".pending"
 	file, err := os.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("powerloss: create ledger: %w", err)
+		return fmt.Errorf("powerloss: create %s: %w", what, err)
 	}
 	if _, err := file.Write(encoded); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("powerloss: write ledger: %w", err)
+		return fmt.Errorf("powerloss: write %s: %w", what, err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("powerloss: sync ledger: %w", err)
+		return fmt.Errorf("powerloss: sync %s: %w", what, err)
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("powerloss: close ledger: %w", err)
+		return fmt.Errorf("powerloss: close %s: %w", what, err)
 	}
 	if err := os.Rename(pending, pathname); err != nil {
-		return fmt.Errorf("powerloss: publish ledger: %w", err)
+		return fmt.Errorf("powerloss: publish %s: %w", what, err)
 	}
 	directory, err := os.Open(dirOf(pathname))
 	if err != nil {
-		return fmt.Errorf("powerloss: open ledger directory: %w", err)
+		return fmt.Errorf("powerloss: open %s directory: %w", what, err)
 	}
 	defer func() { _ = directory.Close() }()
 	if err := directory.Sync(); err != nil {
-		return fmt.Errorf("powerloss: sync ledger directory: %w", err)
+		return fmt.Errorf("powerloss: sync %s directory: %w", what, err)
+	}
+	return nil
+}
+
+// loadJSON decodes a ledger strictly: a field this harness does not
+// understand is an error, never silently dropped.
+func loadJSON(pathname string, value any, what string) error {
+	raw, err := os.ReadFile(pathname)
+	if err != nil {
+		return fmt.Errorf("powerloss: read %s: %w", what, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return fmt.Errorf("powerloss: decode %s: %w", what, err)
 	}
 	return nil
 }
@@ -261,15 +303,9 @@ func dirOf(pathname string) string {
 // a hard error rather than an empty result: the verifier must never proceed
 // with fewer expectations than the driver recorded.
 func LoadLedger(pathname string) (*Ledger, error) {
-	raw, err := os.ReadFile(pathname)
-	if err != nil {
-		return nil, fmt.Errorf("powerloss: read ledger: %w", err)
-	}
 	ledger := &Ledger{}
-	decoder := json.NewDecoder(strings.NewReader(string(raw)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(ledger); err != nil {
-		return nil, fmt.Errorf("powerloss: decode ledger: %w", err)
+	if err := loadJSON(pathname, ledger, "ledger"); err != nil {
+		return nil, err
 	}
 	if err := ledger.Validate(); err != nil {
 		return nil, err

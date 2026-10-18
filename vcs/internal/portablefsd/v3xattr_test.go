@@ -101,38 +101,3 @@ func TestV3XattrStaticRefusalKeepsLocalErrorPrecedence(t *testing.T) {
 
 // Sets are refused locally with exactly the authority's answer, after the
 // frozen local validation order, and never enter mutation machinery.
-func TestV3XattrSetIsRefusedLocallyWithTheAuthorityErrno(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	file, handle := openTestV3File(t, d, false)
-	stale := file
-	stale.ItemID += 1000
-	refusal := linuxToDarwin(errnos.EOPNOTSUPP)
-	for index, test := range []struct {
-		name    string
-		request *pfslocal.XattrSetRequest
-		errno   int32
-	}{
-		{name: "portable-user", request: &pfslocal.XattrSetRequest{Item: file, Name: "user.note", Value: []byte("v")}, errno: refusal},
-		{name: "with-handle", request: &pfslocal.XattrSetRequest{Item: file, Handle: handle, Name: "user.note", Value: []byte("v"), CreateOnly: true}, errno: refusal},
-		{name: "forbidden-namespace", request: &pfslocal.XattrSetRequest{Item: file, Name: "com.apple.FinderInfo"}, errno: refusal},
-		{name: "stale-item", request: &pfslocal.XattrSetRequest{Item: stale, Name: "user.note"}, errno: darwinESTALE},
-		{name: "foreign-handle", request: &pfslocal.XattrSetRequest{Item: d.resolveReply().Root, Handle: handle, Name: "user.note"}, errno: darwinEBADF},
-		{name: "empty-name", request: &pfslocal.XattrSetRequest{Item: file, Name: ""}, errno: darwinEINVAL},
-		{name: "create-and-replace", request: &pfslocal.XattrSetRequest{Item: file, Name: "user.note", CreateOnly: true, ReplaceOnly: true}, errno: darwinEINVAL},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			before := len(client.mutationRequests())
-			operationID := uint64(700 + index)
-			if _, errno := dispatchV3Test(d, context.Background(), operationID, test.request); errno != test.errno {
-				t.Fatalf("setxattr errno=%d, want %d", errno, test.errno)
-			}
-			if sent := len(client.mutationRequests()) - before; sent != 0 {
-				t.Fatalf("setxattr sent %d authority mutations", sent)
-			}
-		})
-	}
-	if refusal != darwinENOTSUP || d.terminalError() != nil {
-		t.Fatalf("set refusal=%d terminal=%v", refusal, d.terminalError())
-	}
-}

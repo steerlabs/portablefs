@@ -8,27 +8,42 @@ boundary without adding isolation. The `opensteer-production` branch contains
 only reviewed promotion merges whose source tree exactly matches a commit on
 `main`; the deployment workflow verifies that invariant again before building.
 
-## Protocol 7 release 0.4.1
+## Protocol 8 requirements
 
-Follow the [coherence v2 rollout](coherence-v2/rollout.md) for this wire reset
-and the [OpenSteer pin sheet](coherence-v2/opensteer-pins.md) for consumer edits.
-Major 7 refuses major 6. Authorities, Linux mounts, the files gateway, and
-Mac clients on each volume move together while admissions remain closed.
-The coordinator drains metadata-identified E2B sandboxes; it does not stop
-external mounts, replace the files gateway, update Mac apps, or lock product
-admissions. Complete those steps through their release owners.
+The authority major is exact. Every authority, Linux mount, files gateway, and
+Mac client that serves one volume implements protocol 8; an unequal major is
+refused at the handshake, and there is no mixed-major execution or fallback.
+Peers that implement the same major may carry different release versions. The
+Mac CLI, daemon, and extension remain one paired release (daemon control 2,
+`pfslocal` 2.0): build them from the same immutable commit and install the
+complete signed app.
 
-Require a pinned runner node kernel 5.10 or newer with FUSE 7.31 or newer and
-qualification on that exact kernel. The OpenSteer tree currently pins neither
-a node image nor a kernel. The Runner must retain a root-directory handle
-from run start and fsync it before declaring completion, exit, or detach.
-The current Authority metrics expose no active-delegation gauge; the rollout
-records that missing operational verification as a release prerequisite.
+The first protocol-8 deployment is not an ordinary promotion. Manager snapshot
+schema 3, signed cell plan version 3, cell helper state version 2, and the
+`PFS-MEMBERSHIP-1` membership file have no decoder for earlier formats, so
+Manager state and cells are provisioned fresh (see [Data](#data)).
 
-Build the Mac CLI, Go daemon, and Swift extension from the same immutable
-commit. Their shared pfslocal Resolve golden checks the production nested
-major-7 contract; a major-6 extension is incompatible despite the unchanged
-local protocol 1.15. Install the complete signed app.
+Pin the Runner node image and kernel: Linux 5.10 or newer with stock FUSE 7.31
+or newer, qualified on that exact kernel. Before promotion, run
+`portablefs mount-check --strategy fuse --probe-mount --json` on that node and
+require `kernelProbe.protocolMajor == 7` and `kernelProbe.protocolMinor >= 31`,
+the same check the candidate smoke makes. The coordinator does not pin or verify
+the node kernel itself.
+
+The Runner owns run completion. It opens the mount's root directory before the
+run and fsyncs that same handle before declaring completion, exit, or detach;
+that barrier fails if mount loss advanced since the open. Stock FUSE
+`syncfs(2)` is not a completion surface. The Runner also requires the client to
+advertise `hosted-automatic-mount-reauthorization-v2` before it reports a
+workspace mount ready. That string, and the `v1` literals in the external
+workspace integration (the Manager HTTP API prefix, the product-authorization
+format, and the mount capability envelope), are consumer contracts unrelated to
+the authority major; they are preserved
+([COMPATIBILITY.md](../COMPATIBILITY.md#external-hosted-contracts)).
+
+Active file delegations are visible per volume as
+`portablefs_authority_delegations{state="active"}`
+([deployment monitoring](./xfs-authority-deployment.md#monitoring)).
 
 Keep the previous verified artifact digests and the previous OpenSteer pin as
 a prepared revert commit. They are inputs for a reviewed forward recovery,
@@ -223,10 +238,10 @@ across unmount and remount. That dependency-tree phase is the concurrent-reader
 workload the merge gate deliberately does not run;
 `scripts/package-manager-matrix.sh` drives the same shape harder — real
 `npm`/`pnpm`/`yarn`/`bun` installs against two kernel FUSE mounts of one volume
-in a container — and is run on demand rather than in CI. That script also names the two things to watch on the authority while
-it runs — RecallBudget-exhaustion fences and uncertain-outcome revocations — a
-pass with either of those firing is a result the authority paid for, not a clean
-one.
+in a container — and is run on demand rather than in CI. While it runs, watch
+the authority's `lost` delegation recalls and fence events
+([deployment monitoring](./xfs-authority-deployment.md#monitoring)): a pass with
+either of those firing is a result the authority paid for, not a clean one.
 
 ## Data
 
@@ -236,10 +251,12 @@ loses only ephemeral processes and cache. PortableFS volume contents remain in
 place.
 
 Manager state and on-disk formats must remain readable by the promoted code.
-An intentionally incompatible persisted-format change is not an ordinary
-promotion: it needs its own reviewed migration runbook and must not be merged
-to `opensteer-production` until that runbook has completed. The workflow does
-not guess at or automatically manufacture data conversions.
+Each private format carries one exact marker and no historical decoder, so a
+change to any of them is not an ordinary promotion. The protocol-8 formats are
+provisioned fresh; a later incompatible persisted-format change needs its own
+reviewed upgrade runbook and must not be merged to `opensteer-production` until
+that runbook has completed. The workflow does not guess at or automatically
+manufacture data conversions.
 
 ## One-time setup
 

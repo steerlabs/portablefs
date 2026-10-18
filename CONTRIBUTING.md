@@ -21,8 +21,8 @@ those two languages and nothing to install:
 There is no Node project, no package manager, no lockfile, and no dependency
 install step. The two release-trust checkers the local gate runs are
 dependency-free single-file `.mjs` programs executed with `node`, and the
-stale-architecture scan uses `rg`; both are host tools, not project
-dependencies.
+current-architecture check is a standard-library `python3` program; both are
+host tools, not project dependencies.
 
 ## Everyday Commands
 
@@ -78,10 +78,14 @@ runner execute the same steps:
 7. **Workflow and release-trust policy** — the exact pinned `actionlint`, a
    `sh -n` syntax check of `scripts/install.sh`, the workflow action-pin
    checker, and the installer release-trust checker.
-8. **Stale-architecture scan** — an `rg` pass that fails the gate if the deleted
-   v2 journal-era architecture's API and package identifiers reappear anywhere
-   outside `docs/`, `CHANGELOG.md`, and the two scripts that legitimately name
-   them.
+8. **Current-architecture check** — `scripts/check-current-architecture.py`
+   (after its own parser tests) asserts the current shape positively: exact
+   protocol versions, the four frontend profiles, the handshake and private
+   frontend grammar, shared golden frames, paired version agreement, the single
+   membership codec, each frontend's profile wiring, the exact product
+   executables, command-line flags against their executables, the required-test
+   inventories, COMPATIBILITY.md agreeing with the code, and every relative
+   documentation link.
 
 Do not report a change as complete with a failing or skipped `verify-local.sh`.
 A skipped Swift suite means you ran the gate on a host that cannot prove the
@@ -94,12 +98,13 @@ protocol, or the mount lifecycle need more than the local gate:
 
 ```bash
 bash scripts/xfs-fuse-integration.sh    # privileged Linux: real XFS + kernel FUSE
-bash scripts/coherence-matrix-linux.sh  # 23-case two-mount black-box matrix
+bash scripts/coherence-matrix-linux.sh  # two-mount black-box matrix
 ```
 
 `xfs-fuse-integration.sh` needs Docker on the host and root inside a throwaway
 privileged container. It provisions a real XFS filesystem with project quotas
-and mounts real kernel FUSE, and it names 43 tests that must actually run and
+and mounts real kernel FUSE, and it requires every test named in the three
+package-owned lists `scripts/xfs-required-*-tests.txt` to actually run and
 pass — a renamed or deleted required test fails the job instead of quietly
 shrinking privileged coverage. The same script is the CI entry point and the
 local reproduction, so both execute byte-identical provisioning.
@@ -146,7 +151,7 @@ cannot be merged; fix up with `git commit --amend -s` or
 - **Tests are required.** Behavior changes come with tests that fail without the
   change. Bug fixes come with a regression test.
 - **Check the stability contract.** [COMPATIBILITY.md](./COMPATIBILITY.md) is the
-  v3 compatibility statement. If your change touches a surface it lists as
+  protocol-8 launch contract. If your change touches a surface it lists as
   frozen, say so explicitly in the PR description and explain the compatibility
   story. Silent changes to frozen surfaces are rejected.
 - **Run `bash scripts/verify-local.sh` locally.** CI runs the same suites; a

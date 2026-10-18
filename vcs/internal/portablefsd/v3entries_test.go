@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
-	"net"
 	"testing"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
@@ -231,63 +228,6 @@ func TestV3EnumerateEntriesRefusesMalformedEntries(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestV3MinorSixteenFrontendCannotUseItemOwningEnumerate(t *testing.T) {
-	d := testV3DataPlane(t, newFakeV3DataClient())
-	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
-	a := &attach{
-		ref: "minor16-enumerate", v3Data: d, v3Coherence: d.bridge,
-		conns: make(map[interface{ Close() error }]struct{}),
-	}
-	r.mu.Lock()
-	r.byRef[a.ref] = a
-	r.mu.Unlock()
-	s := NewServer(Config{Version: "portablefsd-minor16-test"})
-	s.registry = r
-
-	serve := func(t *testing.T) *pfsTestClient {
-		t.Helper()
-		serverConn, clientConn := net.Pipe()
-		fc := &frontendConn{srv: s, conn: serverConn}
-		done := make(chan struct{})
-		go func() { fc.serve(context.Background()); close(done) }()
-		t.Cleanup(func() {
-			_ = clientConn.Close()
-			<-done
-		})
-		return &pfsTestClient{t: t, conn: clientConn}
-	}
-
-	t.Run("minor-15-hello-refused", func(t *testing.T) {
-		client := serve(t)
-		refusal := client.callErr(&pfslocal.Hello{ProtocolMajor: pfslocal.ProtocolMajor, ProtocolMinor: pfslocal.ProtocolMinor - 1})
-		if refusal.Errno != darwinEINVAL {
-			t.Fatalf("minor-15 hello errno=%d, want EINVAL", refusal.Errno)
-		}
-		// net.Pipe refuses a deadline once the daemon end has closed, which is
-		// the outcome under test, so read straight to EOF.
-		_ = client.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		if envelope, err := pfslocal.ReadFrame(client.conn); !errors.Is(err, io.EOF) {
-			t.Fatalf("refused hello = (%+v, %v), want the connection closed", envelope, err)
-		}
-	})
-	t.Run("enumerate-request-closes-the-connection", func(t *testing.T) {
-		client := serve(t)
-		client.call(&pfslocal.Hello{ProtocolMajor: pfslocal.ProtocolMajor})
-		resolved := client.call(&pfslocal.ResolveRequest{AttachRef: a.ref}).(*pfslocal.ResolveReply)
-		if err := pfslocal.WriteFrame(client.conn, &pfslocal.Envelope{
-			RequestID: 3, OperationID: 3,
-			Body: &pfslocal.EnumerateRequest{Dir: resolved.Root, Handle: 1, MaxEntries: 1},
-		}); err != nil {
-			t.Fatal(err)
-		}
-		_ = client.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-		if envelope, err := pfslocal.ReadFrame(client.conn); !errors.Is(err, io.EOF) {
-			t.Fatalf("item-owning EnumerateRequest = (%+v, %v), want the connection closed as a protocol error", envelope, err)
-		}
-	})
 }
 
 // A snapshot carries no identity the frontend could check, so an entry that

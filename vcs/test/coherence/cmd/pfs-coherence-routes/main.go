@@ -130,7 +130,7 @@ func clientConfig(o options, token []byte, revision [32]byte, purpose authorityp
 		// revision from the refusal that carries it, so this tool declares the
 		// same frontend profile the real Linux mount declares. Anything else
 		// would be refused for the wrong reason and prove nothing about routing.
-		cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+		cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 		cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return administrativeAbsenceProof(), nil
 		}
@@ -220,7 +220,6 @@ func applyRoutes(o options, path string) error {
 	fmt.Printf("applied_revision=%x\n", reply.GetRevision())
 	fmt.Printf("applied_canonical_bytes=%d\n", len(reply.GetCanonical()))
 	fmt.Printf("applied_patterns=%v\n", rules.Patterns())
-	fmt.Printf("acknowledged_participants=%d\n", reply.GetAcknowledgedParticipants())
 	if got := hex.EncodeToString(reply.GetRevision()); got != rules.RevisionHex() {
 		return fmt.Errorf("the authority made %s active but the rules given hash to %s", got, rules.RevisionHex())
 	}

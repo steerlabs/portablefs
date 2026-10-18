@@ -1,10 +1,12 @@
 package portablefsd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -28,23 +30,13 @@ func (s *Server) ServeControl(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/v1/identity", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		writeJSON(w, http.StatusOK, daemonctl.Identity{
-			SchemaVersion:    daemonctl.IdentitySchemaVersion,
-			ControlProtocol:  daemonctl.ControlProtocolVersion,
-			DaemonVersion:    s.cfg.Version,
-			ExecutableSHA256: s.cfg.ExecutableSHA256,
-			PFSLocalMajor:    pfslocal.ProtocolMajor,
-			PFSLocalMinor:    pfslocal.ProtocolMinor,
-		})
-	})
-	mux.Handle("/v1/attaches", requireControlProtocol(http.HandlerFunc(s.handleAttaches)))
-	mux.Handle("/v1/attaches/", requireControlProtocol(http.HandlerFunc(s.handleAttach)))
-	mux.Handle("/v1/lifecycle/stop-if-idle", requireControlProtocol(http.HandlerFunc(s.handleStopIfIdle)))
+	mux.Handle("/v2/identity", requireControlProtocol(http.HandlerFunc(s.handleLifecycleIdentity)))
+	mux.Handle("/v2/attaches", requireControlProtocol(http.HandlerFunc(s.handleAttaches)))
+	mux.Handle("/v2/attaches/", requireControlProtocol(http.HandlerFunc(s.handleAttach)))
+
+	mux.HandleFunc(daemonctl.LifecycleIdentityRoute, s.handleLifecycleIdentity)
+	mux.HandleFunc(daemonctl.LifecycleInventoryRoute, s.handleLifecycleInventory)
+	mux.HandleFunc(daemonctl.LifecycleStopIfIdleRoute, s.handleStopIfIdle)
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
@@ -62,8 +54,17 @@ func (s *Server) ServeControl(ctx context.Context) error {
 }
 
 func (s *Server) handleStopIfIdle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeHTTPError(w, http.StatusBadRequest, "lifecycle requests do not accept a query")
+		return
+	}
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, daemonctl.MaxLifecycleBodyBytes+1))
+	if err != nil || daemonctl.DecodeStopIfIdleRequest(body) != nil {
+		writeHTTPError(w, http.StatusBadRequest, "stop-if-idle requires an empty body")
 		return
 	}
 	idle, attachCount, err := s.registry.quiesceIfIdle()
@@ -75,8 +76,12 @@ func (s *Server) handleStopIfIdle(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusConflict, fmt.Sprintf("daemon has %d attach(es); cleanly unmount all volumes before stopping it", attachCount))
 		return
 	}
+	// Publish the quiescence result before Run can exit and release singleton
+	// exclusion. The caller must receive the empty 204 before observing exit.
+	w.Header().Set("Connection", "close")
 	w.WriteHeader(http.StatusNoContent)
-	go s.stopOnce.Do(func() { close(s.stopCh) })
+	_ = http.NewResponseController(w).Flush()
+	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
 func requireControlProtocol(next http.Handler) http.Handler {
@@ -93,7 +98,7 @@ func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var req ensureAttachRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeControlRequest(r.Body, &req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -119,7 +124,7 @@ func (s *Server) handleAttaches(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/v1/attaches/")
+	rest := strings.TrimPrefix(r.URL.Path, "/v2/attaches/")
 	parts := strings.Split(rest, "/")
 	if len(parts) == 0 || parts[0] == "" {
 		writeHTTPError(w, http.StatusNotFound, "missing attach ref")
@@ -136,7 +141,7 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			a.marshalJSONStatus(w)
 		case http.MethodDelete:
-			writeHTTPError(w, http.StatusMethodNotAllowed, "DELETE cannot prove exact FSKit kernel teardown; use POST /v1/attaches/{ref}/unmount")
+			writeHTTPError(w, http.StatusMethodNotAllowed, "DELETE cannot prove exact FSKit kernel teardown; use POST /v2/attaches/{ref}/unmount")
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
@@ -153,16 +158,13 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	case "native-frontend-ready":
+	case "frontend-ready":
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if err := a.requireNativeFrontendReady(); err != nil {
+		if err := a.requireFrontendReady(); err != nil {
 			status := http.StatusServiceUnavailable
-			if errors.Is(err, errNativeFrontendWrongPolicy) {
-				status = http.StatusConflict
-			}
 			writeHTTPError(w, status, err.Error())
 			return
 		}
@@ -176,20 +178,13 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		// The HTTP request's context bounds only THIS waiter: a client that
 		// hangs up (or its own timeout) must never abandon a transaction that
 		// owns durable state.
-		found, jobID, err := s.registry.unmountFSKit(r.Context(), ref, force)
+		found, err := s.registry.unmountFSKit(r.Context(), ref, force)
 		if err != nil {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}
 		if !found {
 			writeHTTPError(w, http.StatusNotFound, "unknown attach")
-			return
-		}
-		if force || jobID != "" {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"forced":      force,
-				"recoveryJob": jobID,
-			})
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -204,14 +199,13 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			// this credential (unix ms). It is what bounds the UNPROVEN state:
 			// past it a credential no handshake ever accepted or refused
 			// hardens into the definite expired verdict instead of pending
-			// forever. OPTIONAL and additive — an older CLI omits it, the zero
-			// value states no deadline, and nothing hardens.
+			// forever. Zero states no deadline and supplies no expiry verdict.
 			AuthTokenExpiresAtMs int64  `json:"authTokenExpiresAtMs,omitempty"`
 			AuthSequence         uint64 `json:"authSequence,omitempty"`
 			ClientCertPEM        string `json:"clientCertPem,omitempty"`
 			OnlyIfPending        bool   `json:"onlyIfPending,omitempty"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeControlRequest(r.Body, &req); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -239,28 +233,6 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"authorizationDeadlineUnixMs": deadline,
 			})
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	case "bind-root":
-		// THE ROOT DESCRIPTOR IS BOUND WHILE THE MOUNT IS PROVEN HEALTHY, and
-		// never re-derived afterwards.
-		//
-		// Every path-based access to an FSKit mount is served by its
-		// extension. A repair actuation runs while the extension's publication
-		// barrier is closed for that exact repair, so opening the mount root
-		// by path AT THAT MOMENT asks the extension to serve a callback for
-		// the repair it is itself waiting on — a circular wait that spends the
-		// whole repair budget and fences the mount. Binding here breaks the
-		// cycle: `portablefs mount` calls this immediately after it has proven
-		// the kernel mount present and serving, when nothing is in flight, and
-		// the daemon keeps that descriptor for the attach's lifetime.
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if err := a.bindMountRoot(); err != nil {
-			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -292,6 +264,28 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+const maxControlRequestBytes = 8 << 20
+
+func decodeControlRequest(body io.Reader, value any) error {
+	data, err := io.ReadAll(io.LimitReader(body, maxControlRequestBytes+1))
+	if err != nil {
+		return fmt.Errorf("read control request: %w", err)
+	}
+	if len(data) > maxControlRequestBytes {
+		return errors.New("control request exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return errors.New("trailing control input")
+	}
+	return nil
+}
+
 func httpStatusForErr(eno int32) int {
 	switch eno {
 	case darwinENOENT:
@@ -303,4 +297,46 @@ func httpStatusForErr(eno int32) int {
 	default:
 		return http.StatusBadGateway
 	}
+}
+
+func (s *Server) handleLifecycleIdentity(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeHTTPError(w, http.StatusBadRequest, "lifecycle requests do not accept a query")
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := daemonctl.EncodeIdentity(daemonctl.Identity{SchemaVersion: daemonctl.IdentitySchemaVersion, ControlProtocol: daemonctl.ControlProtocolVersion, DaemonVersion: s.cfg.Version, ExecutableSHA256: s.cfg.ExecutableSHA256, PFSLocalMajor: pfslocal.ProtocolMajor, PFSLocalMinor: pfslocal.ProtocolMinor})
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+func (s *Server) handleLifecycleInventory(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeHTTPError(w, http.StatusBadRequest, "lifecycle requests do not accept a query")
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	inventory, err := s.registry.lifecycleInventory()
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	body, err := daemonctl.EncodeLifecycleInventory(inventory)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }

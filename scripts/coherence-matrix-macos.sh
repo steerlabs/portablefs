@@ -1,20 +1,31 @@
 #!/bin/bash
-# Cross-mount POSIX coherence matrix on macOS.
+# Cross-mount POSIX coherence matrix between a Mac and a Linux peer.
 #
-# This is the permanent, re-runnable form of the macOS-peer matrix that was
-# previously executed by hand. It runs exactly the same named cases as
-# scripts/coherence-matrix-linux.sh, using the same driver binary, so a macOS
-# result and a Linux result are directly comparable line for line.
-#
-#   scripts/coherence-matrix-macos.sh --mount-a /path/a --mount-b /path/b
-#       both mounts on this Mac
+# It runs exactly the same named cases as scripts/coherence-matrix-linux.sh,
+# using the same driver binary, so a macOS result and a Linux result are
+# directly comparable line for line. Mount A is the FSKit mount on this Mac;
+# mount B is a Linux kernel-FUSE mount of the same volume on a remote peer,
+# driven over ssh with a Linux-built driver:
 #
 #   scripts/coherence-matrix-macos.sh --mount-a /path/a \
-#       --remote user@mac-b.local --remote-mount /path/b
-#       one mount here, one on a remote peer, driven over ssh
+#       --remote user@linux-host --remote-mount /path/b \
+#       [--remote-binary /path/to/linux/pfs-coherence-matrix]
 #
-# The remote peer may also be Linux. Supply a Linux-built driver with
-# --remote-binary; the case bodies and authority contract are byte-identical.
+# While the Mac is attached it is the volume's only writer, so the driver runs
+# in --exclusive-writer mode: every shared case performs its mutations on the
+# Mac and its pathname observations on the Linux peer (a descriptor stays on the
+# mount that opened it), and the writer_exclusion_refuses_reader_mutations case
+# attempts every kind of Linux mutation and write-intent open, requires each to
+# fail with EBUSY, and requires both mounts to keep reading an unchanged
+# fixture. An unexpected error, a hang, or a failed observation fails the run;
+# no case is declared to fail.
+#
+# There is no Mac-to-Mac form. A second Mac mount of the volume - on this Mac or
+# another - is refused at activation by writer exclusion, so two Mac mounts of
+# one volume are not a configuration this matrix can measure. That refusal, and
+# a clean detach letting a new Mac mount activate, are not asserted here:
+# proving them requires attempting mounts, and this script never mounts
+# anything (see below).
 #
 # What this script will NOT do:
 #
@@ -25,29 +36,29 @@
 #   * it never runs the matrix against ordinary directories. A plain APFS
 #     directory is perfectly coherent with itself, so a run like that would
 #     report a wall of green that means nothing. Both paths must be real
-#     non-APFS mountpoints or the script exits without running a single case;
+#     PortableFS mountpoints or the script exits without running a single case;
 #   * it never reports a pass for a case it could not observe. Anything it
-#     cannot honestly assert - most importantly every case that needs a second
-#     real mount - is skipped with a loud message and a nonzero exit.
+#     cannot honestly assert - most importantly every case that needs the
+#     second, Linux mount - is skipped with a loud message and a nonzero exit.
 #
 # Env:
 #   PFS_MATRIX_BIN     prebuilt pfs-coherence-matrix (else built with go)
-#   PFS_EXPECT_FSTYPE  extended regex the mount type must match (default the
-#                      known PortableFS/FSKit types)
+#   PFS_EXPECT_FSTYPE  extended regex both mount types must match (default the
+#                      FSKit type pfs and the Linux type fuse.portablefs)
 #   PFS_ALT_GID        an alternate GID this user belongs to, for the
-#                      ownership case; without it that case skips
-#   PFS_FENCE_COMMAND  shell command that kills the second mount uncleanly;
-#                      without it the peer-loss case skips
+#                      ownership case; the single-principal volume refuses the
+#                      change, so that case skips either way
+#   PFS_FENCE_COMMAND  shell command, run on this Mac, that kills the remote
+#                      Linux mount uncleanly; without it the peer-loss case skips
 set -u
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 MOUNT_A=""
-MOUNT_B=""
 REMOTE=""
 REMOTE_MOUNT=""
 REMOTE_BIN="pfs-coherence-matrix"
 ROUNDS=20
-: "${PFS_EXPECT_FSTYPE:=^(pfs|fuse\.portablefs|portablefs|fskit|macfuse|osxfuse)$}"
+: "${PFS_EXPECT_FSTYPE:=^(pfs|fuse\.portablefs)$}"
 
 fail() { echo "FATAL: $*" >&2; exit 1; }
 
@@ -58,21 +69,20 @@ skip_loudly() {
   echo "#"
   for line in "$@"; do echo "# $line"; done
   echo "#"
-  echo "# No case was executed, so NOTHING about macOS cross-mount coherence"
+  echo "# No case was executed, so NOTHING about Mac/Linux cross-mount coherence"
   echo "# has been demonstrated by this invocation. Do not read this as a pass."
   echo "######################################################################"
   exit 78
 }
 
 usage() {
-  echo "usage: $0 --mount-a <path> (--mount-b <path> | --remote <user@host> --remote-mount <path>)" >&2
+  echo "usage: $0 --mount-a <path> --remote <user@linux-host> --remote-mount <path> [--remote-binary <path>]" >&2
   exit 64
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --mount-a) MOUNT_A="${2:-}"; shift 2 ;;
-    --mount-b) MOUNT_B="${2:-}"; shift 2 ;;
     --remote) REMOTE="${2:-}"; shift 2 ;;
     --remote-mount) REMOTE_MOUNT="${2:-}"; shift 2 ;;
     --remote-binary) REMOTE_BIN="${2:-}"; shift 2 ;;
@@ -97,15 +107,10 @@ if [ -z "$MOUNT_A" ]; then
     "portablefsd daemon and its state under ~/.opensteer, which is a separate" \
     "production system this harness must not touch." \
     "" \
-    "Mount the volume twice (or once here and once on a remote peer) with your own" \
-    "tooling, then re-run with the mountpoints."
+    "Mount the volume once here and once on a Linux peer with your own tooling," \
+    "then re-run with the mountpoints."
 fi
-
-REMOTE_PEER=0
-if [ -n "$REMOTE" ]; then
-  REMOTE_PEER=1
-  [ -n "$REMOTE_MOUNT" ] || fail "--remote requires --remote-mount"
-elif [ -z "$MOUNT_B" ]; then
+if [ -z "$REMOTE" ] || [ -z "$REMOTE_MOUNT" ]; then
   usage
 fi
 
@@ -140,63 +145,47 @@ verify_real_mount() {
 }
 
 verify_real_mount "$MOUNT_A" "mount-A"
-if [ $REMOTE_PEER -eq 0 ]; then
-  verify_real_mount "$MOUNT_B" "mount-B"
-  [ "$MOUNT_A" != "$MOUNT_B" ] || skip_loudly \
-    "mount-A and mount-B are the same path." \
-    "One mount cannot demonstrate cross-mount coherence with itself."
-else
-  echo "precondition: mount-B is remote ($REMOTE:$REMOTE_MOUNT); verifying reachability"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" true 2>/dev/null || skip_loudly \
-    "The remote peer $REMOTE is not reachable over ssh with BatchMode." \
-    "" \
-    "Every case in this matrix needs two live mounts. With only one reachable" \
-    "mount none of them can be asserted, so none of them ran." \
-    "" \
-    "Bring the peer up, or run the two-mount-on-one-Mac form instead and" \
-    "be aware that it does not exercise a second machine's kernel."
-  case "$REMOTE_MOUNT" in
-    *"'"*|*$'\n'*|*$'\r'*) fail "--remote-mount cannot contain quotes or newlines" ;;
-  esac
-  case "$REMOTE_BIN" in
-    ""|*[!A-Za-z0-9_./-]*) fail "--remote-binary must be a command name or path containing only letters, digits, '.', '/', '_', and '-'" ;;
-  esac
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "command -v '$REMOTE_BIN' >/dev/null || test -x '$REMOTE_BIN'" 2>/dev/null || skip_loudly \
-    "The remote peer $REMOTE does not have the matrix driver at '$REMOTE_BIN'." \
-    "" \
-    "Copy the pfs-coherence-matrix binary there (it links nothing but the Go" \
-    "standard library) and pass its path with --remote-binary."
-  remote_os=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" uname -s 2>/dev/null) || skip_loudly \
-    "The remote peer $REMOTE did not report its operating system."
-  case "$remote_os" in
-    Darwin)
-      remote_type=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "stat -f %T -- '$REMOTE_MOUNT'" 2>/dev/null) || skip_loudly \
-        "The remote macOS path $REMOTE:$REMOTE_MOUNT is not a live mount." \
-        "A reachable host and driver binary do not prove the path under test is PortableFS."
-      remote_version=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" sw_vers -productVersion 2>/dev/null) || remote_version="unknown"
-      remote_label="macOS $remote_version"
-      ;;
-    Linux)
-      remote_type=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "findmnt -n -r -o FSTYPE --target '$REMOTE_MOUNT'" 2>/dev/null) || skip_loudly \
-        "The remote Linux path $REMOTE:$REMOTE_MOUNT is not a live mount, or findmnt is unavailable." \
-        "A reachable host and driver binary do not prove the path under test is PortableFS."
-      remote_version=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" uname -r 2>/dev/null) || remote_version="unknown"
-      remote_label="Linux $remote_version"
-      ;;
-    *)
-      skip_loudly "The remote peer reports unsupported operating system '$remote_os'; expected Darwin or Linux."
-      ;;
-  esac
-  [ -n "$remote_type" ] || skip_loudly \
-    "The remote peer's path $REMOTE:$REMOTE_MOUNT did not report a filesystem type." \
-    "A reachable host and driver binary do not prove the path under test is PortableFS."
-  if ! printf '%s' "$remote_type" | grep -qiE "$PFS_EXPECT_FSTYPE"; then
-    skip_loudly \
-      "The remote peer's path $REMOTE:$REMOTE_MOUNT has filesystem type '$remote_type', which does not match '$PFS_EXPECT_FSTYPE'." \
-      "That is not a verified PortableFS peer mount; no cross-machine case ran."
-  fi
-  echo "precondition: remote mount-B $REMOTE:$REMOTE_MOUNT is a live '$remote_type' mount"
+echo "precondition: mount-B is remote ($REMOTE:$REMOTE_MOUNT); verifying reachability"
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" true 2>/dev/null || skip_loudly \
+  "The remote peer $REMOTE is not reachable over ssh with BatchMode." \
+  "" \
+  "Every case in this matrix needs two live mounts. With only one reachable" \
+  "mount none of them can be asserted, so none of them ran."
+case "$REMOTE_MOUNT" in
+  *"'"*|*$'\n'*|*$'\r'*) fail "--remote-mount cannot contain quotes or newlines" ;;
+esac
+case "$REMOTE_BIN" in
+  ""|*[!A-Za-z0-9_./-]*) fail "--remote-binary must be a command name or path containing only letters, digits, '.', '/', '_', and '-'" ;;
+esac
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "command -v '$REMOTE_BIN' >/dev/null || test -x '$REMOTE_BIN'" 2>/dev/null || skip_loudly \
+  "The remote peer $REMOTE does not have the matrix driver at '$REMOTE_BIN'." \
+  "" \
+  "Copy a Linux-built pfs-coherence-matrix binary there (it links nothing but" \
+  "the Go standard library) and pass its path with --remote-binary."
+remote_os=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" uname -s 2>/dev/null) || skip_loudly \
+  "The remote peer $REMOTE did not report its operating system."
+case "$remote_os" in
+  Linux) ;;
+  Darwin)
+    fail "the remote peer $REMOTE is a Mac. A second Mac mount of the volume is refused at activation by writer exclusion, so there is no Mac-to-Mac matrix; use a Linux peer"
+    ;;
+  *)
+    skip_loudly "The remote peer reports unsupported operating system '$remote_os'; expected Linux."
+    ;;
+esac
+remote_type=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" "findmnt -n -r -o FSTYPE --target '$REMOTE_MOUNT'" 2>/dev/null) || skip_loudly \
+  "The remote Linux path $REMOTE:$REMOTE_MOUNT is not a live mount, or findmnt is unavailable." \
+  "A reachable host and driver binary do not prove the path under test is PortableFS."
+remote_version=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" uname -r 2>/dev/null) || remote_version="unknown"
+[ -n "$remote_type" ] || skip_loudly \
+  "The remote peer's path $REMOTE:$REMOTE_MOUNT did not report a filesystem type." \
+  "A reachable host and driver binary do not prove the path under test is PortableFS."
+if ! printf '%s' "$remote_type" | grep -qiE "$PFS_EXPECT_FSTYPE"; then
+  skip_loudly \
+    "The remote peer's path $REMOTE:$REMOTE_MOUNT has filesystem type '$remote_type', which does not match '$PFS_EXPECT_FSTYPE'." \
+    "That is not a verified PortableFS peer mount; no cross-machine case ran."
 fi
+echo "precondition: remote mount-B $REMOTE:$REMOTE_MOUNT is a live '$remote_type' mount"
 
 # ---------------------------------------------------------------------------
 # Driver binary.
@@ -215,42 +204,48 @@ fi
 # ---------------------------------------------------------------------------
 # Declared expectations.
 #
-# Only genuine, explained platform limits belong here. The defects the hand-run
-# matrix found on macOS - a remote create that never became visible, atomic
-# replacement failing every round, a rename leaving both names on one inode, a
-# remotely deleted file that could still be reopened, stale mode bits - are NOT
-# declared. They are defects, and they must show up red until they are fixed.
+# Only cases whose premise this form cannot provide are declared, and only as
+# SKIP with the reason; each of them skips by itself with that same reason, so
+# a declaration can never hide a failure. No case is declared to FAIL: the
+# defects the hand-run matrix once found on macOS - a remote create that never
+# became visible, atomic replacement failing every round, a rename leaving both
+# names on one inode, a remotely deleted file that could still be reopened,
+# stale mode bits - must show up red until they are fixed.
 # ---------------------------------------------------------------------------
 EXPECT=(
-  --expect "concurrent_same_file_append_atomicity=FAIL:FSKit resolves the O_APPEND offset from the kernel's cached EOF before the extension sees the write, and FSVolumeOpenModes carries no append intent, so cross-mount append atomicity is not available on this platform"
+  --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal, so a chown to another principal is refused by the volume itself and there is no ownership change to observe"
 )
+# These cases drive Linux-side harness machinery this form does not supply: a
+# stale-revision routes client, the cacheless gateway, mount pause/resume for a
+# missed recall, authority replacement, and machine-local route backing (which
+# macOS does not serve at all).
+for case_name in \
+  routes_revision_mismatch \
+  gateway_reads_delegated_data_without_obstructing_writer \
+  recall_budget_loss_fails_barrier \
+  epoch_change_stales_handles_and_new_barrier_passes \
+  local_route_isolation; do
+  EXPECT+=(--expect "${case_name}=SKIP:requires Linux-side harness commands or machine-local routes that the Mac plus Linux-peer form does not provide")
+done
 
-ARGS=(--a "$MOUNT_A" --atomic-replace-rounds "$ROUNDS")
-if [ $REMOTE_PEER -eq 1 ]; then
-  ARGS+=(--b "$REMOTE_MOUNT" --b-ssh "$REMOTE" --b-ssh-binary "$REMOTE_BIN")
-  ARGS+=(--label "macOS $(sw_vers -productVersion) + $remote_label: two hosts, one volume")
-else
-  ARGS+=(--b "$MOUNT_B")
-  ARGS+=(--label "macOS $(sw_vers -productVersion): two mounts on one Mac, one volume")
-  echo
-  echo "NOTE: both mounts are on this Mac. Everything below is a real two-mount"
-  echo "NOTE: result, but it does not exercise a second machine's kernel. Use"
-  echo "NOTE: --remote for the cross-host macOS/macOS or macOS/Linux form."
-fi
+ARGS=(--a "$MOUNT_A" --exclusive-writer --atomic-replace-rounds "$ROUNDS")
+ARGS+=(--b "$REMOTE_MOUNT" --b-ssh "$REMOTE" --b-ssh-binary "$REMOTE_BIN")
+ARGS+=(--label "macOS $(sw_vers -productVersion) + Linux $remote_version: two hosts, one volume")
 if [ -n "${PFS_ALT_GID:-}" ]; then
   ARGS+=(--alt-gid "$PFS_ALT_GID")
 fi
 if [ -n "${PFS_FENCE_COMMAND:-}" ]; then
   ARGS+=(--fence-command "$PFS_FENCE_COMMAND")
 else
-  EXPECT+=(--expect "peer_loss_does_not_break_surviving_mount=SKIP:no PFS_FENCE_COMMAND was supplied, so nothing killed the second mount uncleanly. A local macOS mount is served by a system extension rather than a per-mount process, and a remote peer has host-specific fencing; this case therefore requires an operator-supplied exact fence command.")
+  EXPECT+=(--expect "peer_loss_does_not_break_surviving_mount=SKIP:no PFS_FENCE_COMMAND was supplied, so nothing killed the remote Linux mount uncleanly. Its mount process lives on another host, so this case requires an operator-supplied exact fence command.")
 fi
 
 echo
 "$MATRIX_BIN" "${ARGS[@]}" "${EXPECT[@]}" --json "${PFS_MATRIX_JSON:-/dev/null}"
 status=$?
 echo
-echo "The case names above are identical to scripts/coherence-matrix-linux.sh."
-echo "Compare the two matrices directly; a case that is green on Linux and red"
-echo "here is a macOS frontend defect, not a difference in what was measured."
+echo "Shared case names are comparable within each matrix's declared actor roles."
+echo "This mode has 30 cases versus Linux's 29, adding"
+echo "writer_exclusion_refuses_reader_mutations. Shared cases write through the Mac"
+echo "and observe from Linux; two-writer cross-mount behavior is measured by Linux."
 exit $status

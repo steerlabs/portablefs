@@ -11,7 +11,9 @@ type PointKind string
 
 const (
 	// PointCheckpoint is a cut at a mark the workload took immediately after a
-	// durability claim. These are the points that carry the fsync contract.
+	// durability claim - a returned fsync for the Linux workload, an
+	// acknowledged mutation for the FSKit one. These are the points that carry
+	// each instrument's contract.
 	PointCheckpoint PointKind = "checkpoint"
 	// PointBarrier is a cut at a flush or FUA the filesystem issued on its own.
 	// These carry no content expectation; they exist to prove XFS recovers.
@@ -30,18 +32,32 @@ type Point struct {
 	Reason   string    `json:"reason"`
 }
 
+// markedPoint is one mark a ledger says the write log carries, with the prose
+// a cut at it reports.
+type markedPoint struct {
+	mark   string
+	owner  string // names the claim for a missing-mark error, e.g. "step 4"
+	reason string
+}
+
+// markedLedger is a ledger whose marks name the cuts a run must replay. Both
+// the fsync Ledger and the MutationLedger are, so one point selector serves
+// both instruments.
+type markedLedger interface {
+	markedPoints() []markedPoint
+}
+
 // SelectPoints derives the cuts a run replays.
 //
-// Every checkpoint mark is always selected: those are the points the fsync
-// contract is asserted at, and dropping one to fit a budget would quietly
-// weaken the run. Barrier cuts are the sweep that looks for a cut position
+// Every ledger mark is always selected: those are the points the contract is
+// asserted at, and dropping one to fit a budget would quietly weaken the run. Barrier cuts are the sweep that looks for a cut position
 // nobody thought of, and only they are sampled, because their number scales
 // with the workload while their individual value does not. maxBarrierPoints
 // bounds the sweep; zero disables it.
 //
 // The returned points are ordered by entry and contain no duplicates, so a
 // caller replaying them in order does strictly increasing work.
-func SelectPoints(log *Log, ledger *Ledger, maxBarrierPoints int) ([]Point, error) {
+func SelectPoints(log *Log, ledger markedLedger, maxBarrierPoints int) ([]Point, error) {
 	if log == nil || ledger == nil {
 		return nil, fmt.Errorf("powerloss: SelectPoints needs both a log and a ledger")
 	}
@@ -52,24 +68,16 @@ func SelectPoints(log *Log, ledger *Ledger, maxBarrierPoints int) ([]Point, erro
 		return nil, fmt.Errorf("powerloss: the log has no entries; the device recorded nothing and no cut can be taken")
 	}
 	byEntry := make(map[int]Point)
-	for _, checkpoint := range ledger.Checkpoints {
-		if checkpoint.Mark == "" {
-			continue
-		}
-		index, found := log.MarkEntry(checkpoint.Mark)
+	for _, marked := range ledger.markedPoints() {
+		index, found := log.MarkEntry(marked.mark)
 		if !found {
 			// A mark the driver claims to have taken but the log does not
 			// carry means the mark channel was broken for part of the run.
 			// Every later expectation would then be evaluated at the wrong
-			// cut, so this fails the run instead of skipping the checkpoint.
-			return nil, fmt.Errorf("powerloss: checkpoint %d claims mark %q but the log does not carry it; the mark channel was broken and no cut can be trusted", checkpoint.Index, checkpoint.Mark)
+			// cut, so this fails the run instead of skipping the claim.
+			return nil, fmt.Errorf("powerloss: %s claims mark %q but the log does not carry it; the mark channel was broken and no cut can be trusted", marked.owner, marked.mark)
 		}
-		byEntry[index] = Point{
-			EndEntry: index,
-			Kind:     PointCheckpoint,
-			Mark:     checkpoint.Mark,
-			Reason:   fmt.Sprintf("cut at the mark taken immediately after checkpoint %d (%s) reached %s", checkpoint.Index, checkpoint.Path, checkpoint.Durability),
-		}
+		byEntry[index] = Point{EndEntry: index, Kind: PointCheckpoint, Mark: marked.mark, Reason: marked.reason}
 	}
 	if maxBarrierPoints > 0 {
 		barriers := make([]int, 0, len(log.Entries))

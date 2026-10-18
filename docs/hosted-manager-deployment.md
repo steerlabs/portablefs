@@ -1,6 +1,7 @@
 # Deploying the hosted manager
 
-Status: **single-manager reference deployment for hosted v1**
+Status: **single-manager reference deployment; fresh protocol-8 provisioning is
+not yet qualified**
 
 Read [hosted-control-plane.md](./hosted-control-plane.md) first. The manager is
 not in the filesystem data path, but compromise of its signing keys can admit
@@ -10,7 +11,7 @@ on a dedicated host; do not co-locate it with an authority or product backend.
 ## Host and network boundary
 
 - Use one small, dedicated Linux VM in the same private network and availability
-  zone as the v1 cells. It requires no public IP.
+  zone as the cells. It requires no public IP.
 - Admit TCP 8443 only from registered cell hosts and explicitly configured
   product or operator egress identities. Administrative SSH should use the
   cloud provider's identity-aware tunnel rather than a public SSH address.
@@ -22,6 +23,11 @@ on a dedicated host; do not co-locate it with an authority or product backend.
 The state file uses an adjacent, process-lifetime exclusive lock. The lock inode
 is deliberately separate from the compacted state inode, so atomic state-log
 replacement cannot admit a second writer.
+
+The state file carries exact snapshot schema 3 and the Manager signs exact cell
+plan version 3. Neither has a decoder for an earlier format: start a
+protocol-8 Manager on an empty state disk and register fresh cells, rather than
+pointing it at state written by an earlier build.
 
 ## Identities and keys
 
@@ -135,7 +141,8 @@ Before admitting a real product:
 6. Restore the state disk snapshot onto a replacement VM while the original is
    fenced, then reconcile without advancing an authority generation.
 7. Exercise block and inode quota exhaustion, authority crash, helper/agent
-   restart, certificate renewal, strict-fence refusal, and cross-tenant denial.
+   restart, certificate renewal, mount-fence (`strict-fence`) refusal, and
+   cross-tenant denial.
 8. Submit a burst of placement requests inside one cell poll interval. Prove
    each request receives a distinct durable reservation, the cell reconciles
    the newest complete plan, and mount issuance stays closed until that exact

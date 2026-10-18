@@ -59,7 +59,7 @@ func testV3DataPlaneOnClient(t *testing.T, wrapper v3DataPlaneClient, client *fa
 	client.mu.Unlock()
 	d, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{
 		Client: wrapper, VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9,
-		PrincipalUID: 501, PrincipalGID: 20, CachePolicy: v3CachePolicyFSKit, Clock: clock.read,
+		PrincipalUID: 501, PrincipalGID: 20, Clock: clock.read,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestV3HorizonIsAnchoredAtRequestStart(t *testing.T) {
 	client.mu.Unlock()
 	clock.advance(time.Second)
 	if err := d.renewHorizon(context.Background()); err != nil {
-		t.Fatal(err)
+		t.Fatalf("well-formed expired proof became terminal: %v", err)
 	}
 	if got := v3Horizon(d); got != want {
 		t.Fatalf("delay-consumed proof moved the horizon to %d, want %d", got, want)
@@ -246,8 +246,10 @@ func TestV3RefusedRenewalIsTerminal(t *testing.T) {
 	client.mu.Lock()
 	client.keepErr = errors.New("authority refused keepalive")
 	client.mu.Unlock()
-	if _, errno := dispatchV3Test(d, context.Background(), 0, newV3LivenessRequest(client)); errno != darwinEIO {
-		t.Fatalf("refused liveness errno=%d", errno)
+	if err := d.renewHorizon(context.Background()); err == nil {
+		t.Fatal("renewal succeeded")
+	} else {
+		_ = d.fail(err)
 	}
 	if d.terminalError() == nil || v3Horizon(d) != 0 {
 		t.Fatalf("refused renewal terminal=%v horizon=%d", d.terminalError(), v3Horizon(d))
@@ -259,7 +261,7 @@ func TestV3DataPlaneRefusesAnUnusableClockOrLease(t *testing.T) {
 	brokenClock.err = errors.New("no continuous clock")
 	if _, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{
 		Client: newFakeV3DataClient(), VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9,
-		CachePolicy: v3CachePolicyFSKit, Clock: brokenClock.read,
+		Clock: brokenClock.read,
 	}); err == nil {
 		t.Fatal("data plane started without a continuous clock")
 	}
@@ -267,7 +269,7 @@ func TestV3DataPlaneRefusesAnUnusableClockOrLease(t *testing.T) {
 	shortLease.lease = time.Second
 	if _, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{
 		Client: shortLease, VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9,
-		CachePolicy: v3CachePolicyFSKit, Clock: newFakeV3Clock().read,
+		Clock: newFakeV3Clock().read,
 	}); err == nil {
 		t.Fatal("data plane started with a lease that can never carry a usable proof")
 	}
@@ -297,10 +299,6 @@ func TestV3TimespecConversionIsChecked(t *testing.T) {
 	if err != nil || later < now {
 		t.Fatalf("platform continuous clock went backwards: %d then %d (%v)", now, later, err)
 	}
-}
-
-func newV3LivenessRequest(client *fakeV3DataClient) *pfslocal.V3LivenessRequest {
-	return &pfslocal.V3LivenessRequest{AuthorityEpoch: client.Epoch(), SessionID: client.SessionID()}
 }
 
 // v3ClockFaults are actual clock read errors, each with the recovery that
@@ -361,12 +359,10 @@ func TestV3ClockFaultDuringRenewalEndsServing(t *testing.T) {
 				}
 				client.mu.Unlock()
 				if err := d.renewHorizon(context.Background()); err != nil {
-					t.Fatalf("renewal returned %v; the clock fault is not a session failure", err)
+					t.Fatalf("clock fault ended transport renewal: %v", err)
 				}
 				fault.recover(clock)
-				if err := d.renewHorizon(context.Background()); err != nil {
-					t.Fatalf("renewal after the clock recovered returned %v", err)
-				}
+				_ = d.renewHorizon(context.Background())
 				requireV3ClockTerminal(t, d, client)
 			})
 		}

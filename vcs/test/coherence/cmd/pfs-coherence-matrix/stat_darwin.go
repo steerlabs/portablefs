@@ -21,6 +21,7 @@ func describe(info os.FileInfo) *statInfo {
 		out.Ino, out.Nlink = raw.Ino, uint64(raw.Nlink)
 		out.AtimeNs = raw.Atimespec.Sec*1e9 + raw.Atimespec.Nsec
 		out.MtimeNs = raw.Mtimespec.Sec*1e9 + raw.Mtimespec.Nsec
+		out.CtimeNs = raw.Ctimespec.Sec*1e9 + raw.Ctimespec.Nsec
 	}
 	return out
 }

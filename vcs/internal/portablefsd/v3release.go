@@ -48,7 +48,7 @@ func v3ReleaseLimit(maxWrite uint32) int {
 // token. A producer returns as soon as the owner has accepted its tokens and
 // waits only for room in the forming batch, so authority resources lag local
 // retirement by at most 2*limit accepted tokens plus the producers' bounded
-// pre-enqueue obligations (see v3DataPlane.abandonedDebt).
+// request reservations (see v3PendingBudget).
 //
 // Each token reaches the owner exactly once, after its last local owner let go,
 // so no request repeats a token. A failed or uncertain release is sticky: the
@@ -112,6 +112,9 @@ func (r *v3ReleaseOwner) reserve(ctx context.Context, n int) (*v3ReleaseReservat
 		return nil, errors.New("portablefsd: release reservation exceeds the batch bound")
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		r.mu.Lock()
 		switch {
 		case r.failure != nil:

@@ -1,503 +1,211 @@
 # Performance
 
-Status: **protocol-7 local engineering measurements; no production SLO**
+Status: **no protocol-8 measurement exists yet.** There is no production SLO
+and no numerical forecast for the LAN target below. Measurements taken under
+earlier protocols are not evidence for protocol 8 and are not reproduced here;
+git history holds them.
 
-## September 17, 2026 G4 final measurement
+## The target
 
-G4 removes the READDIRPLUS capability-cleanup regression while retaining zero
-Linux kernel entry and attribute validity. The final run uses the same shared
-Linux VM and full-size workload as the historical v6 and G samples.
+The acceptance workload is unchanged: an initial Git add of 1,200 files through
+a macOS mount over a LAN, inside its original 120-second subprocess deadline,
+followed by subsequent commits, `git fsck`, a clean status, the full workload,
+and integrity checks. Missing the deadline is reported with its measured cause.
+It is never met by deferring durability, guessing an OPEN success, widening the
+deadline, changing the corpus, or adding Git-specific routing.
 
-| Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| install, 1 worker | 386.762771 | 21.028568 | 21.089135 | 7.854381 | 7.480524 | 1.978286 |
-| install, 8 workers | 273.738199 | 15.706301 | 11.512895 | 7.561476 | 6.849524 | 1.976857 |
-| git-status-cold | 10.572948 | 1.379696 | 1.868078 | 1.040450 | 1.027400 | 1.027050 |
-| git-status-warm | 2.042038 | 1.195970 | 2.260461 | 0.027650 | 0.018600 | 0.018250 |
-| two-mount-write-list-read | 12.536042 | 2.644504 | 2.432345 | 7.877500 | 9.819500 | 8.127250 |
+## What the existing baseline shows
 
-Warm status over 20,000 files issues zero LOOKUP/GETATTR requests and one
-RECLAIM. The two-mount run issues 62 RECLAIMs for 229 READDIR pages. The
-per-opcode tables and the ten raw JSON observations are in
-[results.md](./coherence-v2/results.md#g4-final-baseline-and-qualification).
+A 32-file diagnostic probe taken before protocol 8 issued **426** foreground
+authority requests: Lookup 197, GetAttr 23, Open 43, Create 33, Write 33, Link
+32, Unlink 32, Mkdir 30, Rename 1, ReadDir 2. Its 4.279506-second subprocess
+divided by 426 is about 10.05 ms. That is an effective elapsed time per request
+in one small workload, already including local and storage time; it is not a
+measured RPC, network, or disk latency, and the 5.9 ms physical LAN RTT must not
+be added to it. The 141 background requests (76 Close, 63 Reclaim, 2 KeepAlive)
+are not serial foreground turns, although release pressure can put their waits
+on the critical path. The Lookup success counter includes stamped negative
+answers, so it does not prove 197 positive lookups. Close counts requests, not
+retired tokens.
 
-One 100-sample profile splits the one-worker CREATE syscall into mean stage
-latencies of 170 us kernel-to-daemon, 33 us daemon-to-Authority, 53 us inside
-the Authority handler, and 79 us from handler return to syscall return. This
-335 us CREATE mean, plus write, close, directory, and scheduling work, explains
-the measured install floor; G4 does not attempt another install optimization.
+The protocol cleanup itself removes no demonstrated foreground turn. Direct
+WRITE was already used; each successful small CREATE, WRITE, LINK, UNLINK,
+MKDIR, and RENAME is one durable foreground turn; CREATE already returns the
+real open description, so all 43 OPENs stay in the model. The durable mutation
+core is 161 requests per 32 files. The semantically available savings are cache
+answers that are valid after source effects settle, proven-absent names in
+directories this mount created, and the MKDIR search witness that can replace a
+directory's first permission-seeding lookup.
 
-The exact all-case soak passes in 1,052.64 seconds, including full-size Git at
-906.12 seconds and every fault case. `verify-local.sh --full` and the standalone
-matrix results are recorded in the integration record. These are local
-engineering observations, not a production latency claim.
+## Conditional model
 
-## September 17, 2026 G2 measurement
+This arithmetic is a sensitivity tool, not a forecast. For a diagnostic 32-file
+run, let `k` be unique Lookups eliminated by source caching and completeness,
+`g` unique eliminated GetAttrs, and `m` Lookups eliminated only by the MKDIR
+witness and not already in `k`. No operation appears in two categories:
 
-G2 preserves zero Linux kernel entry and attribute validity. Daemon LOOKUP and
-GETATTR hits allocate nothing and issue no Authority RPCs. New-directory
-completeness, local FULL FLUSH, implicit source progress and batched close reduce
-install traffic to one CREATE and one background WRITE per file plus amortized
-work. This table compares the preceding G result with final G2 on the same
-shared Linux VM; counts include filesystem and control traffic.
+`F32 = 426 - k - g - m`
 
-| Workload | G before (s) | G2 final (s) | G requests/op | G2 requests/op | G2 filesystem requests/op |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| install, 1 worker(s) | 21.028568 | 22.479856 | 7.480524 | 1.980643 | 1.966167 |
-| install, 8 worker(s) | 15.706301 | 11.717305 | 6.849524 | 1.979524 | 1.966929 |
-| git-status-cold | 1.379696 | 2.084653 | 1.027400 | 2.031300 | 1.026000 |
-| git-status-warm | 1.195970 | 2.372260 | 0.018600 | 1.023450 | 0.018100 |
-| two-mount-write-list-read | 2.644504 | 3.229293 | 9.819500 | 23.142500 | 3.170500 |
+`m` is not automatically 30; it depends on real child access, witness
+eligibility, and the baseline's first-child requests, and a false or
+invalidated witness saves nothing.
 
-One-worker install retains one CREATE and one background WRITE per file;
-LOOKUP, GETATTR, FLUSH, ChangeAck and additional control polling are all zero. Directory
-creation and close/release batches are amortized. Eight-worker misses and every
-control request remain visible in the linked full opcode table. The install denominator is
-42,000 operations (40,000 files plus 2,000 directories); opcode/file divides by
-40,000. These are different denominators.
+For the large workload, separate file-scaled, directory-scaled, and fixed work.
+With `N` source files, `D` actually created directories, and `a`, `b`, `c` the
+retained turns per file, per directory, and fixed:
 
-Cold and warm Git each issue 20,104 RECLAIMs;
-READDIRPLUS capability cleanup raises total RPC counts even though warm metadata
-is cached. The peer workload issues 69,257 RECLAIMs,
-performs 5 scans, observes 140 files during writing,
-and verifies all 2,000. G's preceding peer sample observed one file during
-writing; the overlap differs materially. These shared-VM timings are not an
-isolated speedup experiment, and Git/peer totals are explicit remaining costs.
+`F(N, D) = a*N + b*D + c`
 
-The exact kernel LOOKUP probe measures shared p50/p95 at 2.708/14.750 us and
-FULL-holder at 10.292/29.458 us. Both medians meet the below-20-us target; the
-holder tail does not. Each mode has 2,000 samples and zero Authority LOOKUP or
-GETATTR requests. The probe boundaries and overhead are stated in
-[results.md](./coherence-v2/results.md#g2-isolated-kernel-lookup-round-trip).
+`D` is about 254 for the acceptance corpus's object fanout, not 37.5 times the
+small run's 30. The witness reduces the directory term, not the per-file term.
+Chunking and callback attribution can break the linear model and must be
+reported. Two aggregate totals cannot identify `a`, `b`, and `c`; a third
+diagnostic size or a same-N, different-D corpus is needed.
 
-`bash scripts/verify-local.sh --full` passes at the measured production commit,
-including the XFS and coherence suites. Complete opcode counts, direct-XFS
-comparisons, barrier/drain timing, profiles and failed intermediate runs are
-preserved in [results.md](./coherence-v2/results.md#g2-final-baseline-and-qualification).
-The [G2 report](./coherence-v2/G2-report.md) lists the implementation, regressions,
-interfaces and remaining gaps. No production-network or live macOS performance
-claim follows from these local measurements.
+Elapsed time also depends on serialization, overlap, per-operation service
+time, and durability cost. About 2,655 handleless durability barriers would make
+each additional millisecond of non-overlapped barrier latency cost about 2.7
+seconds; that count and the lack of overlap need trace confirmation. On a
+shared cell, `syncfs` cost depends on other projects' dirty data, so mean and
+tail both need measuring. The earlier 95–120-second planning range is
+withdrawn.
 
-## September 16, 2026 protocol-7 measurement (before G2)
+## Correlated trace
 
-The same full-size harness as the protocol-6 reference runs on the shared
-4 CPU, 8 GiB Docker VM, kernel `6.8.0-100-generic`, loopback TLS, and real FUSE
-on loop-backed XFS stored on tmpfs. It is not an isolated speedup experiment or
-physical-disk benchmark. Install is 40,000 1 KiB files plus 2,000 directories;
-Git status covers 20,000 tracked files; the peer workload writes and verifies
-2,000 files. Request counts include control traffic, final root barrier, and
-close drain; workload wall time excludes barrier/drain, reported separately in
-[the complete results](./coherence-v2/results.md).
+Attribution comes from an explicit opt-in, bounded diagnostic trace, not from
+aggregate counters alone. `vcs/bench/lantrace` defines the stream and
+`vcs/bench/cmd/pfs-lan-trace` collects, reports, and reconciles it:
 
-| Workload | v6 wall (s) | v7 wall (s) | v6 requests/op | v7 requests/op |
-|---|---:|---:|---:|---:|
-| install (1 worker) | 386.763 | 21.029 | 7.8544 | 7.4805 |
-| install (8 workers) | 273.738 | 15.706 | 7.5615 | 6.8495 |
-| git-status-cold | 10.573 | 1.380 | 1.0405 | 1.0274 |
-| git-status-warm | 2.042 | 1.196 | 0.0277 | 0.0186 |
-| two-mount-write-list-read | 12.536 | 2.645 | 7.8775 | 9.8195 |
+- Each producer process (Swift frontend, Go daemon, authority, Linux client)
+  writes one JSON Lines stream: a header naming the run, layer, and process, a
+  bounded sequence of events with per-process monotonic timestamps, and a
+  trailer with emitted and lost counts. A stream without its trailer is
+  incomplete.
+- Every producer follows one sequence rule: each event it accepts consumes the
+  next sequence number whether it is written or lost, so every gap in a
+  stream's numbers is a counted loss. The collector flags a stream whose
+  numbers do not reconcile with its trailer, and the report refuses a
+  collection whose sequence history is internally inconsistent.
+- The grammar admits only allowlisted keys, enumerated categories, short
+  opaque labels and exact trace identifiers from a restricted alphabet,
+  bounded integers, and raw names as bounded hex. That excludes free-text fields; it does not establish where a
+  value came from. Keeping tokens, credentials, capabilities, file contents,
+  pointers, and arbitrary user paths out of the trace, and emitting raw names
+  only for the authorized synthetic corpus, is a content rule each producer
+  must enforce at its emission sites.
+- Producers emit through a bounded queue and byte budget that never block the
+  filesystem path; overflow increments the lost count. The collector merges one
+  run's streams into a bounded output and keeps bounded correlation state.
+- Daemon requests join authority turns by session label and authority request
+  ID. Every request-bearing frontend and daemon record carries `frontend_pid`
+  (the extension PID; the daemon reads it from the accepted socket's peer),
+  `attach_ref` from Resolve, `conn_role` equal to Hello's exact `client_name`,
+  and `request_id`. The analyzer derives the cross-process key from
+  `(run, frontend_pid, attach_ref, conn_role, request_id)`. Each producer's
+  `conn` stays local: a Swift UUID or a daemon origin counter, encoded as a
+  string and scoped by its producer stream. No diagnostic wire exchange is
+  needed, and those local IDs need not agree.
+- A bounded whole-run inventory (at most 256 tuples, never evicted) must prove
+  exactly one connection per producer for each PID/attach/role tuple. Duplicate
+  same-role connections, PID reuse in another process stream, a connection
+  changing its binding, pre-bind attempts, missing fields or inventory overflow
+  make the frontend/daemon join unavailable, with zero matches claimed even
+  for earlier candidates. These fields must appear on non-anchor request
+  records too. The pending-anchor join window remains bounded at 65,536 by
+  default. Matching anchors must agree on operation and on mount when both
+  provide one. Cross-host clocks are never subtracted.
+- The report separates candidate from exposed cache hits, positive from
+  stamped-negative Lookups, OPEN reasons (first open, expansion, reopen after
+  final close, directory cursor, CREATE description reuse) with emitted versus
+  avoided RPCs, barrier kind and syscall latency, coalesced waiters, reservation
+  and callback-window pressure, and close/reclaim batch counts versus released
+  tokens. Any lost, rejected, incomplete, inconsistent, evicted, unmatched,
+  unqualified, or conflicting record marks exact attribution invalid for the
+  run; it says nothing about filesystem correctness.
 
-Direct-XFS v7 times are 0.393/0.299 seconds for 1/8-worker install,
-0.0075/0.0072 for cold/warm Git, and 0.0361 for the peer workload. VM contention,
-cold-cache differences, and changed reader/writer overlap limit comparisons.
-The final mounted peer verifies one file during writing and all 2,000 overall,
-with no ESTALE retries; the v6 reference verified 467 during writing and retried
-203 ESTALE results. Independent churn tests retain stronger overlap assertions.
+The current diagnostic grammar is `pfs-lan-trace-2`; it replaces the previous
+unshipped grammar and has no alternate decoder. The trace format is internal
+and may change without notice. Producer
+instrumentation belongs to each component and is not yet complete.
 
-Fresh 20,000-file `git add` now succeeds at the shipping 65,536 cache capacity,
-commits, and passes its run barrier without disconnecting. The v6 reference
-failed ENOTCONN there and needed a setup-capacity workaround.
+Run order: the unchanged 32-file probe and a diagnostic 256-file probe with
+opcode breakdowns, a third size or same-N/different-D corpus, quiet
+dedicated-volume and shared-cell dirty-neighbor conditions on authorized test
+infrastructure, then the unchanged 1,200-file add and full workload. Record
+exact artifact revisions and configuration, reconcile trace totals against the
+counters, and report mean and tail critical-path contributions.
 
-Profiles of the Authority and daemon identify canonical field-slice allocation,
-CONTROL batch allocation, source wake channels, and background flush fan-out.
-Descriptor caching, bounded batch reuse, demand-allocated wakeups, single-worker
-background dispatch, and phased close cleanup reduce sampled allocation and
-mutex wait. Final wall times versus the first v7 run are mixed; eight-worker
-install is 15.706 seconds versus 12.856 initially. The full before/after record,
-raw request breakdown, profile commands, and failed ENFILE intermediate run are
-preserved in [results.md](./coherence-v2/results.md). A close admission budget
-now provides backpressure under the shipping open-table limit.
+Local request anchors must be emitted in strictly increasing `request_id`
+order per connection on each producer. Reuse or reordering makes the local
+join unavailable and clears even earlier matches; non-anchor stages may arrive
+out of order. Bounded per-connection high-water marks retain this evidence for
+the whole run.
 
-The protocol-4/5 sections below are historical evidence for retired builds and
-must not be quoted as protocol-7 performance.
+## The costs accepted on purpose
 
-## August 15, 2026 protocol-5 Linux measurement
+These are the price of the guarantees in
+[consistency-model.md](./consistency-model.md). A change that removes one has to
+say which guarantee it trades.
 
-This is the first byte-verified end-to-end measurement of the protocol-5
-transactional-write and post-VFS publication architecture. It is a local
-engineering baseline, not a service SLO: the kernel has generic KASAN, XFS
-debugging, lockdep/`PROVE_LOCKING`, and fault-injection support compiled in, and
-the authority and clients communicate over loopback TLS rather than a production
-network.
+**Namespace operations cross the wire.** The authority owns create, rename,
+unlink, and the other namespace operations. Independent requests run
+concurrently, but sequential namespace operations keep their round trip. An
+uncontended Linux delegated write can return from the daemon buffer; fsync,
+`O_SYNC`, and the root-directory run barrier wait for durable application.
 
-### Exact environment and workload
+**Every macOS mutation is durable before it returns.** FSKit has no fsync
+callback, so each acknowledged Mac mutation pays its barrier: a handle fsync, or
+a filesystem-wide syncfs for handleless mutations.
 
-- Isolated Lima VZ arm64 VM: 12 vCPU, 24 GiB RAM, running exactly
-  `6.12.100-pfs-strict`.
-- Kernel patch SHA-256 values: `096d01915824d909316498fdc9de9252730ac4292294fd421a7fa4b24fffa417`,
-  `2534c6889f73d02bd2166791298da6e1a8a7689e92166bbf6fd74945c19cc786`,
-  and `eb7cddd8726ecc40a0e8fa210aab9694f8e65dbda63f341dd9b2fe94d60bba9f`.
-- Dedicated 32 GiB XFS disk mounted with
-  `prjquota,nodev,nosuid,noexec,noatime`; the workload ran as uid/gid 200001 in
-  project 43001 with an 8 GiB block ceiling.
-- Each latency phase contains 200 sequential operations: create, 4 KiB write,
-  fsync, close, warm stat, open/read/close, rename, and unlink. The bulk phase
-  writes and reads 64 MiB in 1 MiB chunks and verifies SHA-256.
-- The direct case uses the same XFS project. The one-mount case uses one strict
-  kernel FUSE mount. In the two-mount case the peer first acquires the exact
-  negative dentry, positive dentry, file-data, and directory-name state affected
-  by each mutation; the mutator therefore includes real peer repair and ACK,
-  not an idle second session.
-- The table reports the median of five complete runs. The harness prints one
-  stable JSON record per observation and is opt-in as
-  `TestStrictPerformanceAgainstDirectXFS`; it is a measurement, never a noisy CI
-  timing threshold.
-
-### Result
-
-Latency values are milliseconds. Bulk values are MiB/s.
-
-| operation | direct XFS | strict, one mount | strict, active peer |
-| --- | ---: | ---: | ---: |
-| create p50 / p99 | 0.071 / 0.324 | 0.820 / 1.176 | 1.021 / 1.421 |
-| 4 KiB write p50 / p99 | 0.015 / 0.046 | 0.800 / 67.589 | 0.992 / 68.158 |
-| fsync p50 / p99 | 0.293 / 0.830 | 0.440 / 0.791 | 0.435 / 1.021 |
-| warm stat p50 / p99 | 0.004 / 0.014 | 0.185 / 0.424 | 0.216 / 0.519 |
-| open/read/close p50 / p99 | 0.018 / 0.046 | 0.715 / 1.056 | 0.783 / 0.991 |
-| rename p50 / p99 | 0.057 / 0.191 | 0.996 / 1.375 | 1.343 / 1.785 |
-| unlink p50 / p99 | 0.052 / 0.251 | 0.526 / 0.857 | 0.812 / 1.097 |
-| 64 MiB acknowledged write | 1,782.2 | 158.5 (136.9–238.0) | 170.6 (126.2–264.1) |
-| 64 MiB read | 2,228.9 | 105.9 (103.8–125.9) | 115.4 (112.7–123.1) |
-| complete workload wall time | 0.194 s | 2.472 s | 3.824 s |
-
-The two strict write-throughput ranges overlap; the higher two-mount median is
-measurement variance, not a claim that a peer makes writes faster. The stable
-comparison is semantic: both strict cases hash the same bytes, and the active
-peer has repaired them before the source syscall returns.
-
-Protocol-5 SHARED reads arrive from the authority as bounded in-memory
-`ReadResultData`; they are not descriptor-backed. The maintained go-fuse seam
-now classifies a result before acquiring or growing a splice pipe: in-memory
-results remain on the writer-stage `writev` path, while genuinely
-descriptor-backed results retain zero-copy splice. This removes the futile pipe
-grow/recovery (and its per-read warning at the 1 MiB pipe ceiling) without
-moving byte materialization onto the protocol goroutine or changing the wire
-and cache contracts.
-
-Against the immediately preceding protocol-5 measurement on this same VM, the
-lockless namespace-repair and internal sequenced-retry candidate reduced the
-one-mount p50 for the measured metadata operations by about 3–17%, reduced the
-complete one-mount workload by 5.3%, and raised its median acknowledged bulk
-write rate by 13.1%. Active-peer metadata p50 improved by about 2–10% and the
-complete workload by 1.1%. The active-peer write-throughput distributions
-overlap too broadly to call their median change an optimization result.
-
-The investigation also removed a real payload-sized client copy. Staged
-BEGIN/DATA/ABORT messages now use an explicit caller-owned idempotent API; the
-general read/idempotent API keeps its defensive-copy contract. The 1 MiB frame
-writer itself is already out-of-line and measures about 0.34 microseconds,
-24 B/op, and one allocation. The removed protobuf clone cost 29–46 microseconds,
-1,048,889 B/op, and five allocations per DATA fragment on the development
-machine. On the exact VM, post-change profiling reduced `runtime.memmove` from
-0.39 seconds to 0.04 seconds for the workload; TLS/kernel syscalls now dominate.
-
-The 4 KiB write tail is not hidden: the five runs observed one-mount p99 values
-of 45–79 ms and active-peer p99 values of 9–71 ms on this diagnostic kernel.
-System-call tracing found no
-corresponding 50–100 ms XFS operation, and Go scheduler/GC profiling did not
-show a stop-the-world pause of that size. Treat it as an open diagnostic-kernel
-tail investigation, not as a production tail SLO.
-
-### Directional Archil context
-
-No current Archil endpoint or test account was placed in scope, so no new
-Archil workload was provisioned or charged. The historical cross-cloud
-observation below remains the only comparison: Archil measured 71.5/107.8 MiB/s
-sequential writes and 102.9/232.5 MiB/s reads at 1/8 jobs. The protocol-5 local
-diagnostic run above measures 158.5 MiB/s acknowledged writes and 105.9 MiB/s
-reads at one strict mount, but hardware, network, concurrency, cache state, and
-success semantics differ. These numbers establish that the exact architecture
-is not intrinsically throughput-starved; they do not establish a vendor ranking.
-
-## August 16, 2026 mounted macOS 26 measurement
-
-The shipping FSKit composition was mounted on an 18-core Apple M5 Max MacBook
-Pro with 128 GiB RAM and macOS 26.5. It used protocol 5 over TLS to an XFS
-authority inside the exact Linux 6.12.100 VZ guest. A strict Linux mount was
-attached to the same volume throughout the measurement. Every bulk run verified
-SHA-256, and writes include `fsync` in the reported write rate. That `fsync`
-completed at authority application, not storage durability: FSKit delivers no
-fsync callback, and the authority did not then sync Mac mutations. Current
-FSKit mutation replies are storage-durable, so these rows are not a durable
-baseline.
-
-| operation | macOS FSKit median |
-| --- | ---: |
-| create | 15.430 ms |
-| 4 KiB write return | 0.010 ms |
-| fsync | 3.634 ms |
-| close | 1.656 ms |
-| warm stat | 0.001 ms |
-| negative lookup | 1.015 ms |
-| open/read/close | 2.344 ms |
-| rename | 16.743 ms |
-| mkdir / rmdir | 6.652 / 12.999 ms |
-| unlink | 16.053 ms |
-| 64 MiB write + fsync (authority-applied) | 128.2 MiB/s |
-| 64 MiB `F_NOCACHE` read | 71.1 MiB/s |
-
-The 4 KiB `write` timing is page-cache acceptance; the `fsync` and 64 MiB rows
-measured authority application, the completion boundary of that protocol.
-The final matching-client 64 MiB write runs were 117.8, 128.8, 128.2, 144.1,
-and 29.7 MiB/s; the low run is retained rather than discarded. Five earlier
-uncached reads were 55.6–75.5 MiB/s and all matched the expected digest.
-
-Before the compatibility writer lease was frozen, the strict Linux mount
-measured 100.8 MiB/s median for the same 64 MiB durable-write shape with the Mac
-attached. That number is retained as historical diagnostic evidence, not a
-supported current operation: Linux visible mutations now return `EBUSY` while
-a macOS 26 mount is active. After a clean Mac unmount transferred write
-ownership, the current Linux client measured 120.9 MiB/s median durable writes
-(103.3–127.1) and 135.3 MiB/s reads (112.3–161.6), with every digest matching.
-Direct XFS in that guest measured 3033.7 MiB/s. The direct number shows the cost
-is dominated by protocol, publication, VM forwarding, and client/framework
-crossings rather than the XFS device.
-
-Historical Archil measurements were 71.5/107.8 MiB/s sequential writes and
-102.9/232.5 MiB/s reads at 1/8 jobs. The Mac FSKit write median is in that
-historical range; the post-handoff Linux write median exceeds both historical
-Archil write observations, while its read median exceeds the single-job figure
-and is below the eight-job figure. Hardware, network, cache state, concurrency,
-and completion semantics differ, so this remains directional context rather
-than a vendor ranking.
-
-The mounted run also found the stated macOS 26 boundary: a Linux truncate of a
-Mac-cached file made FSKit reject the synchronous repair callback. PortableFS
-fenced rather than serving uncertain cache state. The compatibility writer
-lease now prevents that path before XFS apply: Linux readers may remain
-attached, but write ownership transfers only after the Mac cleanly unmounts.
-
-A high-churn namespace characterization ran 100 Mac atomic fsync+rename
-replacements while Linux repeatedly enumerated and read the target. Of 3,000
-Linux observations, 2,996 succeeded and four returned transient `ESTALE`
-(99.87% success); zero successful observations contained torn or mismatched
-bytes, both sessions remained healthy, and 1,000 subsequent observations
-passed. This is the measured macOS-26 best-effort edge, not a throughput or
-exact-coherence claim, and PortableFS does not hide it with an automatic retry.
-
-The lower-layer client-pipeline guardrail remains useful. The release-build
-`readWriteChunkingRoundTripsTwentyMiBFile` test performs an exact 20 MiB write
-and 20 MiB read through `VolumeCore`, production Unix-socket framing, and a mock
-data plane. Ten warm runs completed in 0.044–0.049 seconds, about 851 MiB/s of
-combined verified local framing. It excludes FSKit, authority TLS, XFS,
-durability, and peer publication, so it is not an end-to-end throughput claim.
-
-The first controlled v3/protocol-4 investigation was run on August 12-13, 2026.
-The results below are engineering measurements, not a published service SLO.
-Every older benchmark this project published measured the deleted v2 write-back
-engine; those figures remain invalid for this architecture.
-
-## August 2026 protocol-4 investigation
-
-### Environment and method
-
-- Isolated GCP test resources in zone `us-east4-a`.
-- Authority: `n2-standard-4`, the isolated `vol_gcp_v3_01` XFS project on its
-  existing `pd-balanced` cell disk.
-- Runners: `e2-small`; a second temporary VM was used for the genuine
-  two-machine strict-coherence matrix.
-- Candidate authority used isolated port `20255`. No public
-  `portablefs.com`, Railway, or hosted production data-plane endpoint was used
-  or modified.
-- Sequential figures are MiB/s with 1 MiB synchronous direct-I/O requests.
-  Random figures are 4 KiB synchronous direct-I/O IOPS. Repeated bulk results
-  report the median where a set exists. The shared read file was hot in the
-  authority page cache, so these are protocol/CPU measurements rather than
-  device-cold storage measurements.
-
-The runner is a shared-core VM and individual results vary materially. The
-numbers support comparisons within this run; they do not establish capacity or
-tail-latency SLOs.
-
-### Result
-
-| workload | pre-change PortableFS | protocol 4 candidate | change |
-| --- | ---: | ---: | ---: |
-| sequential read, 1 job | 192.9 MiB/s | 295.3 MiB/s median | +53% |
-| sequential read, 8 jobs | 314.1 MiB/s | 398 MiB/s | +27% |
-| strict sequential write, 1 job | 36.8 MiB/s | 40.5 MiB/s median | +10% |
-| strict sequential write, 8 jobs | about 35 MiB/s | 53.3 MiB/s | about +52% |
-| random read, 1 job | 1,105 IOPS | 1,990 IOPS | +80% |
-| random read, 16 jobs | 10,332 IOPS | 11,583 IOPS | +12% |
-| strict random write, 1 job | about 335 IOPS | 1,315 IOPS | +293% |
-| strict random write, 16 jobs | about 335 IOPS | 1,433 IOPS | +328% |
-| strict random-write p99, 16 jobs | 77.1 ms | 14.5 ms | -81% |
-
-The exact `fsops` comparison isolates the coherence-control change from the
-larger fio run: strict 4 KiB write p50 fell from 2.797 ms to 0.764 ms, and
-create p50 fell from 3.134 ms to 1.589 ms. With the second strict machine having
-already resolved the exact file, a 256 MiB overwrite sustained 32.5 MiB/s; the
-peer then verified every fio CRC successfully. That lower number is the honest
-cost of making an actively caching peer repair every write before return.
-
-Two root changes produced the result:
-
-1. Protocol 4 carries one schema-bound read/write body outside protobuf
-   metadata. A 1 MiB frame send now allocates 16 bytes in the framing benchmark;
-   receive holds one payload allocation under the server's global frame budget
-   through XFS apply. The client no longer hashes mutations: the authority
-   streams the canonical body once into a secret per-epoch keyed fingerprint,
-   which preserves exact altered-replay rejection without a second client-side
-   payload pass.
-2. Linux strict coherence atomically acknowledges a repaired visibility cursor
-   and long-polls its successor in one request. This removes an empty Ack reply
-   and separate Next request from every phase. PREPARE still precedes XFS,
-   peers still acknowledge COMPLETE before the mutator returns, and this
-   protocol-4 result still included the source self-phases that protocol 5 later
-   replaced with an exact local publication gate.
-
-### Correctness evidence for the measured candidate
-
-- Two different GCP VMs, two strict FUSE mounts: 19/19 selected black-box
-  cross-mount cases passed, including 100 atomic rename-over replacements,
-  append/overwrite integrity, open-after-unlink, and a same-directory mutation
-  storm with zero fenced participants.
-- Five additional stress rounds each passed 8/8 write/namespace cases, including
-  250 atomic replacements per round (1,250 total) and zero fencing in every
-  same-directory storm.
-- The repository's privileged strict and uncached coherence matrices passed,
-  including their disjoint/stale falsifiability controls and peer-loss case.
-- The XFS/FUSE integration suite, all Go tests, the full Go race suite, vet, and
-  module verification passed for this tree. The mandated
-  `scripts/verify-local.sh` release handoff gate passed as well.
-
-### Archil comparison from the same investigation
-
-The Archil mount was reached from the original GCP runner but its disk was in
-AWS `us-east-1`; PortableFS authority and clients were same-zone GCP. Caching,
-backend disk, cross-cloud path, and acknowledgment semantics differ, so the
-table is directional rather than an apples-to-apples product ranking.
-
-| workload | protocol 4 PortableFS | Archil observation |
-| --- | ---: | ---: |
-| sequential read, 1 / 8 jobs | 295.3 / 398 MiB/s | 102.9 / 232.5 MiB/s |
-| sequential write, 1 / 8 jobs | 40.5 / 53.3 MiB/s | 71.5 / 107.8 MiB/s |
-| random read, 1 / 16 jobs | 1,990 / 11,583 IOPS | 187 / 385 IOPS |
-| random write, 1 / 16 jobs | 1,315 / 1,433 IOPS | 5,183 / 2,863 IOPS |
-
-PortableFS was faster on reads in this setup; Archil remained substantially
-faster on writes. Archil also showed large maximum stalls, commit retries, and
-SQLite WAL failed with a disk-I/O error. PortableFS's rollback-journal SQLite,
-integrity, POSIX, and cross-mount tests passed; WAL remains explicitly
-unsupported because it requires shared memory mappings. Most importantly,
-PortableFS write success still means authority XFS accepted the bytes, and
-strict success still includes peer repair. A faster result obtained from
-different acknowledgment or cache semantics must not be presented as the same
-guarantee.
-
-## The costs v3 accepts on purpose
-
-These are not regressions to be optimised away later. They are the price of the
-guarantees in [consistency-model.md](./consistency-model.md), and a change that
-removes one of them has to explain which guarantee it is trading.
-
-**Namespace operations still cross the wire.** The Authority owns create,
-rename, unlink, and the other namespace operations. Independent requests can
-run concurrently, but sequential namespace operations retain round-trip cost.
-An uncontended delegated data write can return from the daemon buffer; fsync,
-O_SYNC, and the root-directory run barrier wait for durable application.
-Contended cached-handle cases force write-through. macOS retains synchronous
-repair and its separately declared host-cache behavior.
-
-**Cache coherence still needs withdrawal.** A volume subscription caches
-undelegated state. Change acknowledgment includes exact reply drain and kernel
-invalidation; a mutation or grant waits for acknowledgment or the subscriber's
-horizon. New peer reads of delegated data break the owner for read. A pre-existing
+**Cache coherence needs withdrawal.** A Linux subscription caches undelegated
+state; a mutation or grant waits for acknowledgment or the subscriber's horizon.
+New peer reads of delegated data break the owner for read, and a pre-existing
 cacheable peer handle requires per-commit invalidation. Shared kernel name
-validity remains zero, while the daemon caches bindings and attributes.
+validity stays zero; the daemon caches bindings and attributes.
 
-**Shared writable mmap is refused.** Read-only/private mappings are supported
-on cacheable handles. The implementation does not depend on direct-I/O mmap
-support, and the stalled-daemon resident-page residual remains explicit in
-[portable-coherence.md](./portable-coherence.md).
+**A shared cell shares barrier latency.** Filesystem-wide barriers wait for every
+project's dirty data in the cell. Separate filesystems are the only isolation.
 
-**SQLite WAL mode does not work across machines.** Its wal-index needs a shared
-`-shm` mapping and SQLite itself requires every WAL participant to be on one
-host. Rollback-journal mode is in the tested compatibility contract and is
-slower. A workload that needs WAL keeps that database on machine-local backing or
-uses a database service.
+**Shared writable mmap is refused**, and **SQLite WAL does not work across
+machines**: its wal-index needs a shared mapping and every participant on one
+host. Rollback-journal mode works and is slower.
 
-**Machine-local routing is the intended answer to dependency trees.** A
-`node_modules`, `.venv`, or `target` directory is thousands of small files with no
-cross-machine meaning. Routing it to machine-local disk removes it from every one
-of the costs above. This is the single largest performance lever the product
-offers, and it is a routing decision rather than a tuning knob. See
-[agents.md](./agents.md) and [graft-security.md](./graft-security.md).
+**Machine-local routing is the answer to dependency trees.** A `node_modules`,
+`.venv`, or `target` directory routed to local disk leaves every cost above. It
+is the largest performance lever the product offers. See [agents.md](./agents.md)
+and [graft-security.md](./graft-security.md).
 
-**One volume has one authority, and therefore one machine's ceiling.** Scale
-comes from placing volumes across cells, not from making one volume wider.
-Cross-region latency is not hidden; place the authority near its clients.
+**One volume has one authority**, and therefore one machine's ceiling. Scale
+comes from placing volumes across cells. Place the authority near its clients.
 
 ## What exists to measure with
 
-Five reusable command harnesses live under `vcs/bench/cmd`. The protocol-5
-Linux integration package additionally contains the opt-in, end-to-end
-direct-XFS/one-mount/active-peer measurement used above. None is a release SLO
-gate.
+None of these is a release SLO gate.
 
 | Tool | What it measures |
 | --- | --- |
-| `fsops` | Per-syscall latency distributions against a mounted workspace or a plain POSIX directory. Designed to be read against a measured network RTT: roughly one RTT means one round trip, and well under one RTT means the operation was served without the wire. Probe, enumeration, and bulk-write phases. |
-| `netprobe` | The protocol-free network floor to an authority endpoint: TCP connect RTT, TLS handshake cost, sustained upload throughput. This is the lower bound any protocol number must be attributed against. It writes nothing and holds no state. |
-| `tracestat` | Round trips per operation, derived from a `portablefsd` trace by subtracting daemon-side service time from observed wire round trips. Read-only. |
-| `pfs-mount-stress` | A cross-mount stress workload with hashed content and peer done-markers. Its parent-enumeration polling preserves a historical Mac experiment; it is not evidence of exact namespace invalidation on macOS 26. |
-| `zratio` | Compressibility and content-defined chunk dedup potential of a real agent corpus. It still runs, but its framing was written against the deleted write-back flusher's batch granularity, so read it as a corpus measurement rather than as a statement about any current code path. |
-| `TestStrictPerformanceAgainstDirectXFS` | Byte-identical syscall latency and 64 MiB throughput against direct XFS, one strict mount, and an actively repairing peer. Emits JSON observations and verifies source/peer SHA-256. Linux protocol-5 qualification only. |
+| `vcs/bench/cmd/pfs-lan-trace` | Collects, reports, and reconciles the bounded correlated trace above. |
+| `vcs/bench/cmd/fsops` | Per-syscall latency distributions against a mount or a plain directory, read against a measured RTT; probe, enumeration, and bulk-write phases. |
+| `vcs/bench/cmd/netprobe` | The protocol-free network floor to an authority endpoint: TCP connect RTT, TLS handshake cost, sustained upload throughput. |
+| `vcs/bench/cmd/coherence-bench` | The install, Git status, and two-mount workloads of `vcs/bench/coherencebench` against one or two POSIX paths. |
+| `vcs/bench/cmd/pfs-mount-stress` | A cross-mount stress workload with hashed content and peer done-markers. |
+| `vcs/bench/cmd/zratio` | Compressibility and content-defined chunk dedup potential of an agent corpus; a corpus measurement, not a statement about a code path. |
+| `TestStrictPerformanceAgainstDirectXFS`, `TestCoherenceBaseline`, `TestCachedLookupKernelRoundTrip` | Opt-in Linux measurements inside the privileged suite: syscall latency and 64 MiB throughput against direct XFS, the coherence baseline workloads with request metering, and the kernel LOOKUP round trip. |
 
-The v2 harness drivers (`vcs/bench/run.sh`, `prod-flush-rate.sh`, the weekly
-advisory `perf` workflow) and the frozen v2 result files were removed with the
-architecture they measured. The surviving tools above are the v3 measurement
-starting point. The provisional run above used `fsops`, fio, Linux `perf`, and
-the coherence matrix together.
-
-Outside `vcs/bench`, `scripts/package-manager-matrix.sh` is the closest thing to a
-realistic workload the repository can run on demand. It runs `npm`, `pnpm`,
-`yarn`, and `bun` installs on a shared volume path with no machine-local route,
-while a second mount enumerates and reads the same tree. It asserts exactly three
-things — the installer exited zero, the other mount sees the same entry count and
-the same bytes, and both mounts still serve — and it thresholds nothing. Wall time
-and authority work counters are recorded into a table for a human to read. That is
-deliberate: it is a correctness instrument that happens to produce timings, and
-treating its timings as a performance gate would make an unrelated slowdown look
-like a regression.
-
-It is not a merge gate and CI does not run it: a soak that takes an order of
-magnitude longer than every other lane belongs after the deploy, not in front of
-a merge. Run it by hand when the workload shape matters; phase 8 of
-`deploy/opensteer/staging-qualification.sh` drives the same concurrent-reader
-shape against a live staging cell.
+`scripts/package-manager-matrix.sh` runs npm, pnpm, yarn, and bun installs on a
+shared volume path while a second mount enumerates and reads the same tree. It
+asserts only that each installer exits zero, both mounts see the same entries
+and bytes, and both mounts keep serving; its timings are for a human to read,
+not a gate. Phase 8 of `deploy/opensteer/staging-qualification.sh` drives the
+same concurrent-reader shape against a live staging cell.
 
 ## What is missing before a number belongs here
 
-1. **A repeatable application-level v3 workload.** The new exact harness covers
-   filesystem syscalls and bulk bytes against the direct-XFS ceiling, but a
-   repository checkout, compiler run, and metadata-heavy package install still
-   need a reproducible production-network job.
-2. **Per-RPC observability at the authority.** Several claims one would want to
-   make — that a strict path walk avoids lookups, that a routed directory reaches
-   the authority zero times — are claims about work performed. The integration
-   handler now records exact request counts, but the production authority still
-   needs exported per-opcode counters and phase histograms.
-3. **Repeatable multi-participant barrier telemetry.** The exact active-peer
-   harness is repeatable, but the authority still needs exported
-   phase histograms and a repeatable several-machine load job before this cost
-   can become a capacity claim.
-4. **A macOS number of any kind.** The macOS path has open live-kernel gates
-   ([macos-26-coherence-contract.md](./macos-26-coherence-contract.md)); measuring
-   it before those are met would measure something that is not yet the product.
-
-Until those exist, the correct answer to "how fast is it" is the exact local
-protocol-5 table above plus the historical deployment evidence—not an inferred
-SLO. Run `netprobe`, `fsops`, the exact performance integration, and the
-coherence matrix against the intended deployment and read them against its own
-RTT and participant set.
+1. Producer instrumentation for the correlated trace in the frontend, daemon,
+   authority, and Linux client, reconciled against their counters.
+2. A protocol-8 run of the diagnostic probes and the unchanged acceptance
+   workload on authorized LAN infrastructure.
+3. Shared-cell barrier latency under a dirty neighbor, against a dedicated
+   filesystem control.
+4. A repeatable several-machine load job and exported authority phase
+   histograms before any capacity claim.

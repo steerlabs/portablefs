@@ -199,12 +199,9 @@ func (d *v3DataPlane) observeHeld(record *v3ItemRecord, attr *authoritypb.Attr, 
 	return d.observeLocked(record, attr, version, snapshot)
 }
 
-// applyMutation applies one whole validated mutation result in one
-// transaction: the cold floor first, then every held identity's attrs, then
-// the touched names directory by directory. A directory whose watermark is
-// newer than this snapshot drops the touched coordinates instead of installing
-// them, because an unrelated newer observation may have advanced W without
-// repairing this name. Unheld identities allocate nothing.
+// applyMutation installs one durable source effect at its authority snapshot.
+// Advancing the cold floor first prevents older in-flight reads from restoring
+// metadata or name knowledge contradicted by this settled effect.
 func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -350,6 +347,7 @@ type v3CachedReply struct {
 	revalidate func() bool
 	expired    bool
 	metric     int
+	accounted  bool
 }
 
 // serveCachedAttr is the GetAttr half of hit admission for currentAttr.
@@ -443,6 +441,7 @@ func (d *v3DataPlane) serveCached(
 		result = snapshot(conflict, collector)
 	})
 	if d.endOnClockFault() != nil {
+		result = v3CacheClock
 		receipt.Consume()
 		return true, darwinEIO
 	}
@@ -450,7 +449,7 @@ func (d *v3DataPlane) serveCached(
 		receipt.Consume()
 		return false, 0
 	}
-	if err := d.retainLocalPublication(collector, operationID, receipt); err != nil {
+	if err := d.retainLocalPublication(ctx, collector, operationID, receipt); err != nil {
 		result = v3CacheTerminal
 		d.revokeRetainedResponse(ctx, err)
 		return true, darwinEIO
@@ -464,8 +463,9 @@ func (d *v3DataPlane) serveCached(
 		if reason == v3CacheHit && !owned {
 			reason = v3CacheResource
 		}
-		if reason != v3CacheHit {
+		if reason != v3CacheHit && !candidate.accounted {
 			d.cacheCounters.reads[metric][reason]++
+			candidate.accounted = true
 		}
 		d.mu.Unlock()
 		return d.endOnClockFault() == nil && reason == v3CacheHit && owned
@@ -474,11 +474,11 @@ func (d *v3DataPlane) serveCached(
 	return true, 0
 }
 
-func (d *v3DataPlane) retainLocalPublication(collector *v3ReplyResourceCollector, operationID uint64, receipt authorityrpc.ResponseConsumption) error {
+func (d *v3DataPlane) retainLocalPublication(ctx context.Context, collector *v3ReplyResourceCollector, operationID uint64, receipt authorityrpc.ResponseConsumption) error {
 	if operationID == 0 {
 		return retainV3HandlerResponse(collector, receipt)
 	}
-	return d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, receipt)
+	return d.bridge.sourcePublication.retainFrontendResponseConsumption(v3Callback(ctx, operationID), receipt)
 }
 
 // settleNameErrno invalidates an affected name on a definite namespace

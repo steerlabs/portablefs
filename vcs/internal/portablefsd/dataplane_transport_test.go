@@ -95,17 +95,17 @@ func TestPersistedAttachRestartRejectsTransportFingerprintMismatch(t *testing.T)
 	stateDir := privateTestDir(t)
 	transport := daemonPrivateTransport(t)
 	entry := persistedAttachEntry{
-		Ref:                 "att_TTTTTTTTTTTTTTTTTTTTTT",
-		VolumeID:            "vol-transport",
-		Branch:              "main",
+		Ref:      "att_TTTTTTTTTTTTTTTTTTTTTT",
+		VolumeID: "vol-transport",
+
 		MountPath:           "/Volumes/Transport",
 		AuthorityURL:        "router.example:2050",
 		DataPlaneTransport:  transport.mode,
 		DataPlaneServerName: transport.serverName,
 		TLSCAPEM:            transport.caPEM,
 		TLSCASHA256:         transport.caSHA256,
-		Options:             AttachOptions{DiskCacheMB: 1},
-		IdentityEpoch:       1,
+
+		IdentityEpoch: 1, V3: &persistedV3Attach{RoutesRevision: strings.Repeat("ab", 32)},
 	}
 	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{entry}); err != nil {
 		t.Fatal(err)
