@@ -219,14 +219,111 @@ public enum PortableFSDServiceCoordinator {
 
     enum DaemonFenceWitness {
         case process(DaemonProcessWitness)
+        /// This app holds the state singleton, so no daemon can run.
+        case excluded(StateSingletonExclusion)
+        /// Departure is proven by finding the state singleton free.
         case unpublished
 
         func hasDeparted() throws -> Bool {
             switch self {
             case .process(let witness):
                 return try witness.hasExited()
+            case .excluded(let exclusion):
+                try exclusion.confirmHeld()
+                return true
             case .unpublished:
                 return try PortableFSDServiceCoordinator.stateSingletonIsUnlocked()
+            }
+        }
+
+        func releaseExclusion() {
+            if case .excluded(let exclusion) = self { exclusion.release() }
+        }
+    }
+
+    /// Ownership of the canonical daemon state singleton. portablefsd takes
+    /// this lock before anything else and exits without touching state when
+    /// it cannot, so while it is held no daemon can run.
+    final class StateSingletonExclusion {
+        private var directory: Int32
+        private var lock: Int32
+        private let pinnedLock: stat
+
+        init(directory: Int32, lock: Int32, pinnedLock: stat) {
+            self.directory = directory
+            self.lock = lock
+            self.pinnedLock = pinnedLock
+        }
+
+        deinit { release() }
+
+        /// Fails unless the canonical name still denotes the locked inode.
+        func confirmHeld() throws {
+            var current = stat()
+            guard lock >= 0,
+                  Darwin.fstatat(
+                    directory,
+                    PortableFSDServiceCoordinator.stateSingletonName,
+                    &current,
+                    AT_SYMLINK_NOFOLLOW
+                  ) == 0,
+                  current.st_dev == pinnedLock.st_dev,
+                  current.st_ino == pinnedLock.st_ino,
+                  current.st_mode == pinnedLock.st_mode,
+                  current.st_uid == pinnedLock.st_uid,
+                  current.st_nlink == pinnedLock.st_nlink else {
+                throw RegistrationError.invalidDaemonStateSingleton
+            }
+        }
+
+        /// Writes this process's owner record in portablefsd's schema 1:
+        /// pid plus the kernel start time that distinguishes it from a
+        /// recycled pid, formatted as the daemon formats it on Darwin.
+        func publishOwnerRecord(owner: String) throws {
+            struct Record: Encodable {
+                let schemaVersion: Int
+                let pid: Int32
+                let startIdentity: String
+                let version: String
+                let owner: String
+            }
+            let pid = getpid()
+            var info = kinfo_proc()
+            var size = MemoryLayout<kinfo_proc>.stride
+            var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+            guard Darwin.sysctl(&name, 4, &info, &size, nil, 0) == 0,
+                  info.kp_proc.p_pid == pid else {
+                throw RegistrationError.inspectDaemonStateSingleton(errno)
+            }
+            let start = info.kp_proc.p_un.__p_starttime
+            var body = try JSONEncoder().encode(Record(
+                schemaVersion: 1,
+                pid: pid,
+                startIdentity: "\(start.tv_sec):\(start.tv_usec)",
+                version: "",
+                owner: owner
+            ))
+            body.append(0x0A)
+            guard Darwin.ftruncate(lock, 0) == 0 else {
+                throw RegistrationError.inspectDaemonStateSingleton(errno)
+            }
+            let written = body.withUnsafeBytes { bytes in
+                Darwin.pwrite(lock, bytes.baseAddress, bytes.count, 0)
+            }
+            guard written == body.count, Darwin.fsync(lock) == 0 else {
+                throw RegistrationError.inspectDaemonStateSingleton(written < 0 ? errno : EIO)
+            }
+        }
+
+        func release() {
+            if lock >= 0 {
+                _ = portableFSFlock(lock, LOCK_UN)
+                Darwin.close(lock)
+                lock = -1
+            }
+            if directory >= 0 {
+                Darwin.close(directory)
+                directory = -1
             }
         }
     }
@@ -833,13 +930,16 @@ public enum PortableFSDServiceCoordinator {
         let processWitness = try replacementWitness(
             outgoing: outgoing,
             probe: { try probeLiveDaemon($0.releaseIdentity, bundle: $0.bundle) },
-            stateSingletonUnlocked: { try stateSingletonIsUnlocked() }
+            excludeDaemons: { try acquireStateSingletonExclusion() }
         )
+        defer { processWitness.releaseExclusion() }
         try unregisterAndWait(
             service: service,
             socketDirectory: socketDirectory,
             processWitness: processWitness
         )
+        // The incoming daemon takes the state singleton before anything else.
+        processWitness.releaseExclusion()
 
         try completeRegisteredRelease(
             operation: {
@@ -860,24 +960,30 @@ public enum PortableFSDServiceCoordinator {
         )
     }
 
-    /// Captures the execution a replacement must see depart, once mount
-    /// admission is closed. An authenticated outgoing daemon is re-proved
-    /// here; its identity comes from its signed owning app and live socket
-    /// peer, never a preference or the incoming release's version. Without a
-    /// published endpoint, a held state singleton means a daemon is still
-    /// starting or stopping. Nothing can authenticate it, so it is refused.
+    /// Captures what a replacement must see depart, once mount admission is
+    /// closed. An authenticated outgoing daemon is re-proved here; its
+    /// identity comes from its signed owning app and live socket peer, never
+    /// a preference or the incoming release's version.
+    ///
+    /// Without a published endpoint the proof of absence must outlive the
+    /// unregistration it authorizes: KeepAlive can start the registered
+    /// service at any moment, so a free-singleton snapshot would let an
+    /// unauthenticated execution start before it is stopped. The app instead
+    /// holds the state singleton across unregistration. A singleton already
+    /// held means a daemon is still starting or stopping; nothing can
+    /// authenticate it, so it is refused.
     static func replacementWitness(
         outgoing: RunningDaemon?,
         probe: (RunningDaemon) throws -> DaemonProcessWitness,
-        stateSingletonUnlocked: () throws -> Bool
+        excludeDaemons: () throws -> StateSingletonExclusion?
     ) throws -> DaemonFenceWitness {
         if let outgoing {
             return .process(try probe(outgoing))
         }
-        guard try stateSingletonUnlocked() else {
+        guard let exclusion = try excludeDaemons() else {
             throw RegistrationError.unauthenticatedServiceOwner(.occupiedStateSingleton)
         }
-        return .unpublished
+        return .excluded(exclusion)
     }
 
     /// A registration is never allowed to escape without either proving the
@@ -1208,20 +1314,110 @@ public enum PortableFSDServiceCoordinator {
     /// ServiceManagement reports `.notRegistered` is the exact no-publication
     /// fence for a service that never produced an authenticated control peer.
     private static func stateSingletonIsUnlocked() throws -> Bool {
-        try stateSingletonIsUnlocked(
-            at: controlSocketURL().deletingLastPathComponent()
-        )
+        try stateSingletonIsUnlocked(at: stateDirectoryURL())
     }
 
     static func stateSingletonIsUnlocked(
         at stateDirectory: URL,
         beforeFinalRecheck: (() throws -> Void)? = nil
     ) throws -> Bool {
+        switch try lockStateSingleton(
+            at: stateDirectory,
+            creating: false,
+            beforeFinalRecheck: beforeFinalRecheck
+        ) {
+        case .absent:
+            return true
+        case .held:
+            return false
+        case .owned(let exclusion):
+            exclusion.release()
+            return true
+        }
+    }
+
+    private static func acquireStateSingletonExclusion() throws -> StateSingletonExclusion? {
+        try acquireStateSingletonExclusion(at: stateDirectoryURL())
+    }
+
+    /// Takes and keeps the state singleton, creating the private directory
+    /// and lock exactly as portablefsd would when neither exists yet, so a
+    /// daemon starting at any later moment contends on this lock. Nil when a
+    /// daemon already holds it. The holder publishes its own owner record in
+    /// the daemon's format: a starting daemon that finds the lock held reads
+    /// that record, and must classify a live holder rather than prove the
+    /// previous daemon's stale record departed and take the lock over.
+    static func acquireStateSingletonExclusion(
+        at stateDirectory: URL,
+        beforeFinalRecheck: (() throws -> Void)? = nil
+    ) throws -> StateSingletonExclusion? {
+        switch try lockStateSingleton(
+            at: stateDirectory,
+            creating: true,
+            beforeFinalRecheck: beforeFinalRecheck
+        ) {
+        case .absent:
+            throw RegistrationError.invalidDaemonStateSingleton
+        case .held:
+            return nil
+        case .owned(let exclusion):
+            do {
+                try exclusion.publishOwnerRecord(owner: stateDirectory.path)
+            } catch {
+                exclusion.release()
+                throw error
+            }
+            return exclusion
+        }
+    }
+
+    private static func stateDirectoryURL() throws -> URL {
+        try controlSocketURL().deletingLastPathComponent()
+    }
+
+    enum StateSingletonLock {
+        /// Neither the directory nor the lock exists, and none was created.
+        case absent
+        /// Another process holds the lock.
+        case held
+        case owned(StateSingletonExclusion)
+    }
+
+    private static let stateSingletonName = ".portablefsd-state.lock"
+
+    /// The one secure boundary for the state singleton: the directory must be
+    /// this account's private 0700 directory and the lock this account's
+    /// single-link 0600 regular file, both pinned by descriptor and rechecked
+    /// by name after the lock is taken.
+    static func lockStateSingleton(
+        at stateDirectory: URL,
+        creating: Bool,
+        beforeFinalRecheck: (() throws -> Void)? = nil
+    ) throws -> StateSingletonLock {
         var namedDirectory = stat()
-        guard Darwin.lstat(stateDirectory.path, &namedDirectory) == 0 else {
+        if Darwin.lstat(stateDirectory.path, &namedDirectory) != 0 {
             let code = errno
-            if code == ENOENT { return true }
-            throw RegistrationError.inspectDaemonStateSingleton(code)
+            guard code == ENOENT else {
+                throw RegistrationError.inspectDaemonStateSingleton(code)
+            }
+            guard creating else { return .absent }
+            do {
+                try FileManager.default.createDirectory(
+                    at: stateDirectory,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                var code = EIO
+                if let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError,
+                   underlying.domain == NSPOSIXErrorDomain {
+                    code = Int32(underlying.code)
+                }
+                throw RegistrationError.inspectDaemonStateSingleton(code)
+            }
+            guard Darwin.lstat(stateDirectory.path, &namedDirectory) == 0 else {
+                throw RegistrationError.inspectDaemonStateSingleton(errno)
+            }
         }
         guard namedDirectory.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
               namedDirectory.st_uid == geteuid(),
@@ -1235,7 +1431,8 @@ public enum PortableFSDServiceCoordinator {
         guard directory >= 0 else {
             throw RegistrationError.inspectDaemonStateSingleton(errno)
         }
-        defer { Darwin.close(directory) }
+        var directoryOwned = false
+        defer { if !directoryOwned { Darwin.close(directory) } }
 
         var pinnedDirectory = stat()
         guard Darwin.fstat(directory, &pinnedDirectory) == 0,
@@ -1246,74 +1443,80 @@ public enum PortableFSDServiceCoordinator {
             throw RegistrationError.invalidDaemonStateSingleton
         }
 
-        let name = ".portablefsd-state.lock"
+        let name = stateSingletonName
+        let lock: Int32
         var namedLock = stat()
-        if Darwin.fstatat(
-            directory,
-            name,
-            &namedLock,
-            AT_SYMLINK_NOFOLLOW
-        ) != 0 {
-            let code = errno
-            if code == ENOENT {
-                try beforeFinalRecheck?()
-                try recheckPinnedDirectory(
-                    stateDirectory,
-                    expected: pinnedDirectory
-                )
-                return true
+        let lockExisted = Darwin.fstatat(directory, name, &namedLock, AT_SYMLINK_NOFOLLOW) == 0
+        if lockExisted {
+            // Validate before opening: a FIFO or device must never be opened.
+            guard namedLock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                  namedLock.st_uid == geteuid(),
+                  namedLock.st_mode & 0o777 == 0o600,
+                  namedLock.st_nlink == 1 else {
+                throw RegistrationError.invalidDaemonStateSingleton
             }
-            throw RegistrationError.inspectDaemonStateSingleton(code)
+            lock = Darwin.openat(directory, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        } else {
+            let code = errno
+            guard code == ENOENT else {
+                throw RegistrationError.inspectDaemonStateSingleton(code)
+            }
+            guard creating else {
+                try beforeFinalRecheck?()
+                try recheckPinnedDirectory(stateDirectory, expected: pinnedDirectory)
+                return .absent
+            }
+            lock = Darwin.openat(
+                directory,
+                name,
+                O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600
+            )
+            if lock >= 0, Darwin.fchmod(lock, 0o600) != 0 {
+                let failure = errno
+                Darwin.close(lock)
+                throw RegistrationError.inspectDaemonStateSingleton(failure)
+            }
         }
-        guard namedLock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              namedLock.st_uid == geteuid(),
-              namedLock.st_mode & 0o777 == 0o600,
-              namedLock.st_nlink == 1 else {
-            throw RegistrationError.invalidDaemonStateSingleton
-        }
-        let lock = Darwin.openat(
-            directory,
-            name,
-            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
-        )
         guard lock >= 0 else {
             throw RegistrationError.inspectDaemonStateSingleton(errno)
         }
-        defer { Darwin.close(lock) }
+        var lockOwned = false
+        defer { if !lockOwned { Darwin.close(lock) } }
         var pinnedLock = stat()
         guard Darwin.fstat(lock, &pinnedLock) == 0,
-              pinnedLock.st_dev == namedLock.st_dev,
-              pinnedLock.st_ino == namedLock.st_ino,
-              pinnedLock.st_mode == namedLock.st_mode,
-              pinnedLock.st_uid == namedLock.st_uid,
-              pinnedLock.st_nlink == namedLock.st_nlink else {
+              pinnedLock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              pinnedLock.st_uid == geteuid(),
+              pinnedLock.st_mode & 0o777 == 0o600,
+              pinnedLock.st_nlink == 1,
+              !lockExisted || (
+                pinnedLock.st_dev == namedLock.st_dev
+                    && pinnedLock.st_ino == namedLock.st_ino
+              ) else {
             throw RegistrationError.invalidDaemonStateSingleton
         }
 
         if portableFSFlock(lock, LOCK_EX | LOCK_NB) != 0 {
             let code = errno
-            if code == EWOULDBLOCK || code == EAGAIN { return false }
+            if code == EWOULDBLOCK || code == EAGAIN { return .held }
             throw RegistrationError.inspectDaemonStateSingleton(code)
         }
-        defer { _ = portableFSFlock(lock, LOCK_UN) }
-
-        try beforeFinalRecheck?()
-        var currentLock = stat()
-        guard Darwin.fstatat(
-            directory,
-            name,
-            &currentLock,
-            AT_SYMLINK_NOFOLLOW
-        ) == 0,
-              currentLock.st_dev == pinnedLock.st_dev,
-              currentLock.st_ino == pinnedLock.st_ino,
-              currentLock.st_mode == pinnedLock.st_mode,
-              currentLock.st_uid == pinnedLock.st_uid,
-              currentLock.st_nlink == pinnedLock.st_nlink else {
-            throw RegistrationError.invalidDaemonStateSingleton
+        let exclusion = StateSingletonExclusion(
+            directory: directory,
+            lock: lock,
+            pinnedLock: pinnedLock
+        )
+        directoryOwned = true
+        lockOwned = true
+        do {
+            try beforeFinalRecheck?()
+            try exclusion.confirmHeld()
+            try recheckPinnedDirectory(stateDirectory, expected: pinnedDirectory)
+        } catch {
+            exclusion.release()
+            throw error
         }
-        try recheckPinnedDirectory(stateDirectory, expected: pinnedDirectory)
-        return true
+        return .owned(exclusion)
     }
 
     private static func recheckPinnedDirectory(

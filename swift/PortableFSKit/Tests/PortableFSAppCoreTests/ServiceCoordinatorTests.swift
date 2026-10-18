@@ -574,9 +574,9 @@ private func ownProcessExecutablePath() throws -> String {
                 probed.append(daemon.releaseIdentity)
                 return try Coordinator.DaemonProcessWitness(pid: getpid(), pidVersion: 1)
             },
-            stateSingletonUnlocked: {
+            excludeDaemons: {
                 singletonConsulted = true
-                return true
+                return nil
             }
         )
         guard case .process = witness else {
@@ -606,9 +606,9 @@ private func ownProcessExecutablePath() throws -> String {
     }
 }
 
-/// A missing endpoint is replaced only when the state singleton proves that
-/// no daemon remains; the guard then adopts no daemon identity.
-@Test func liveOwnerDecisionReplacesAMissingEndpointOnlyWithAFreeSingleton() throws {
+/// A missing endpoint is replaced only while this app holds the state
+/// singleton, so no daemon can run; the guard then adopts no daemon identity.
+@Test func liveOwnerDecisionReplacesAMissingEndpointOnlyWhileHoldingTheSingleton() throws {
     try withOwnerFixtureDirectory { root in
         let owner = try Coordinator.inspectLiveServiceOwner(
             controlSocket: root.appendingPathComponent("control.sock"),
@@ -642,14 +642,18 @@ private func ownProcessExecutablePath() throws -> String {
                 Issue.record("an unpublished owner has no execution to probe")
                 throw POSIXError(.EINVAL)
             },
-            stateSingletonUnlocked: {
-                try Coordinator.stateSingletonIsUnlocked(at: stateDirectory)
+            excludeDaemons: {
+                try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
             }
         )
-        guard case .unpublished = witness else {
-            Issue.record("a free singleton must fence through the unpublished witness")
+        guard case .excluded = witness else {
+            Issue.record("a free singleton must be held across unregistration")
             return
         }
+        #expect(try witness.hasDeparted())
+        #expect(try !Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+        witness.releaseExclusion()
+        #expect(try Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
     }
 }
 
@@ -677,8 +681,8 @@ private func ownProcessExecutablePath() throws -> String {
                     Issue.record("an unpublished owner has no execution to probe")
                     throw POSIXError(.EINVAL)
                 },
-                stateSingletonUnlocked: {
-                    try Coordinator.stateSingletonIsUnlocked(at: root)
+                excludeDaemons: {
+                    try Coordinator.acquireStateSingletonExclusion(at: root)
                 }
             )
         }
@@ -788,6 +792,134 @@ private func ownProcessExecutablePath() throws -> String {
         }
         if owner != .exitedDuringProof {
             #expect(message.contains("only a daemon it can authenticate"))
+        }
+    }
+}
+
+// MARK: - State singleton exclusion
+
+/// What a starting portablefsd does first: open the canonical lock and try a
+/// nonblocking exclusive flock (`vcs/internal/portablefsd/run.go`
+/// tryAcquireLock). Returns whether this simulated daemon got the lock.
+private func simulatedDaemonAcquiresStateSingleton(in directory: URL) throws -> Bool {
+    let descriptor = Darwin.open(
+        directory.appendingPathComponent(".portablefsd-state.lock").path,
+        O_RDWR | O_NOFOLLOW | O_CLOEXEC
+    )
+    try #require(descriptor >= 0)
+    defer { Darwin.close(descriptor) }
+    if serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+        _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN)
+        return true
+    }
+    #expect(errno == EWOULDBLOCK)
+    return false
+}
+
+/// The fields portablefsd's readSingletonOwner requires before it will even
+/// consider a takeover, and the Darwin start-identity shape it compares.
+private func expectLiveOwnerRecord(in directory: URL) throws {
+    let body = try Data(contentsOf: directory.appendingPathComponent(".portablefsd-state.lock"))
+    let record = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+    #expect(record["schemaVersion"] as? Int == 1)
+    #expect(record["pid"] as? Int == Int(getpid()))
+    let start = try #require(record["startIdentity"] as? String)
+    let parts = start.split(separator: ":")
+    #expect(parts.count == 2 && parts.allSatisfy { Int($0) != nil })
+}
+
+/// The absence proof is held, not sampled. Between classification and the
+/// unregistration it authorizes, a daemon that KeepAlive starts cannot take
+/// the state singleton, so it cannot become an unauthenticated owner that the
+/// replacement then stops. Releasing the exclusion lets the incoming daemon
+/// start.
+@Test func stateSingletonExclusionBlocksADaemonStartUntilReleased() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: stateDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        // A previous daemon's record names a process that no longer exists.
+        // Left in place, it would let a starting daemon prove the holder
+        // departed and take the lock over.
+        let lock = stateDirectory.appendingPathComponent(".portablefsd-state.lock")
+        #expect(FileManager.default.createFile(
+            atPath: lock.path,
+            contents: Data(#"{"schemaVersion":1,"pid":2147483646,"startIdentity":"1:1","version":"","owner":"old"}"#.utf8),
+            attributes: [.posixPermissions: 0o600]
+        ))
+
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+        try expectLiveOwnerRecord(in: stateDirectory)
+        #expect(try !Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+        // A second replacement cannot take it either.
+        #expect(try Coordinator.acquireStateSingletonExclusion(at: stateDirectory) == nil)
+
+        exclusion.release()
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+    }
+}
+
+/// A missing directory or lock goes through the same boundary: the
+/// exclusion creates them exactly as portablefsd would (0700 directory,
+/// single-link 0600 lock) and holds the lock, so a daemon starting later
+/// contends on it instead of creating its own.
+@Test func stateSingletonExclusionCreatesAMissingDirectoryAndLock() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = root
+            .appendingPathComponent("state", isDirectory: true)
+            .appendingPathComponent("portablefsd", isDirectory: true)
+        #expect(try Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+        #expect(!FileManager.default.fileExists(atPath: stateDirectory.path))
+
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        var directory = stat()
+        #expect(Darwin.lstat(stateDirectory.path, &directory) == 0)
+        #expect(directory.st_mode & 0o777 == 0o700)
+        var lock = stat()
+        #expect(Darwin.lstat(
+            stateDirectory.appendingPathComponent(".portablefsd-state.lock").path,
+            &lock
+        ) == 0)
+        #expect(lock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG))
+        #expect(lock.st_mode & 0o777 == 0o600)
+        #expect(lock.st_nlink == 1)
+        #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+        try expectLiveOwnerRecord(in: stateDirectory)
+
+        exclusion.release()
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+    }
+}
+
+/// A held exclusion stops proving absence if its lock is replaced by name.
+@Test func stateSingletonExclusionDetectsAReplacedLock() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        defer { exclusion.release() }
+        try exclusion.confirmHeld()
+        let lock = stateDirectory.appendingPathComponent(".portablefsd-state.lock")
+        try FileManager.default.removeItem(at: lock)
+        #expect(FileManager.default.createFile(
+            atPath: lock.path,
+            contents: Data(),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        #expect(throws: (any Error).self) {
+            try exclusion.confirmHeld()
+        }
+        #expect(throws: (any Error).self) {
+            _ = try Coordinator.DaemonFenceWitness.excluded(exclusion).hasDeparted()
         }
     }
 }
