@@ -624,7 +624,17 @@ func (b *Buffer) schedule() {
 		cut := Cut{b.sequence, b.loss}
 		var pending []backgroundFlush
 		for _, f := range b.active {
-			if f.scheduled || f.flushing {
+			if f.scheduled {
+				continue
+			}
+			if f.flushing {
+				// An explicit owner can consume only an earlier cut or return
+				// without application. Hand this scan's work to its completion;
+				// a scheduled background owner already owns its wakeup and must
+				// not turn an ordinary failure into an endless retry loop.
+				if f.accepted != nil {
+					f.reschedule = true
+				}
 				continue
 			}
 			f.reschedule = false
