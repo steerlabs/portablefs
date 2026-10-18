@@ -39,6 +39,8 @@ func (f *fakeAuthority) Close() error {
 
 func (f *fakeAuthority) Err() error { return f.sessionErr }
 
+func (f *fakeAuthority) Done() <-chan struct{} { return f.closed }
+
 func (f *fakeAuthority) List(context.Context, string, int, *readonlyfs.Cursor) (readonlyfs.Page, error) {
 	return readonlyfs.Page{}, syscall.EIO
 }
@@ -79,12 +81,14 @@ func (d *fakeDialer) count() int {
 
 func newTestServer(t *testing.T, public ed25519.PublicKey, dial dialer) *server {
 	t.Helper()
-	return &server{
+	s := &server{
 		requestKey: public, issuer: "opensteer-host", identity: identity{keyID: "test", privatePEM: []byte("private")},
 		maxSessions: 8, dial: dial,
 		downloads: make(chan struct{}, maximumDownloads), operations: make(chan struct{}, maximumOperations),
 		sessions: make(map[string]*volumeSession), cursors: make(map[string]cursorRecord), fences: make(map[string]fenceRecord),
 	}
+	t.Cleanup(s.close)
+	return s
 }
 
 func testKeys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {

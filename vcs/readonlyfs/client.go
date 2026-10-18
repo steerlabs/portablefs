@@ -436,6 +436,9 @@ func (c *Client) sessionError() error {
 // as ENOENT do not poison the session and are not returned here.
 func (c *Client) Err() error { return c.sessionError() }
 
+// Done closes when the session becomes unusable, including explicit disposal.
+func (c *Client) Done() <-chan struct{} { return c.ctx.Done() }
+
 // detachBudget bounds authenticated departure from durable topology membership.
 const detachBudget = 10 * time.Second
 

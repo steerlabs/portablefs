@@ -114,8 +114,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	requests := make(chan os.Signal, 1)
+	signal.Notify(requests, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(requests)
+	ctx := context.Background()
 	attach := authorityrpc.ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
@@ -160,22 +162,18 @@ func run() error {
 	done := make(chan struct{})
 	go func() { mount.Wait(); close(done) }()
 	renewal, err := startCredentialRenewal(mount, *accessTokenFile, token)
+	var renewalFailed <-chan error
 	if err != nil {
-		return errors.Join(err, shutdown(mount, done, absoluteMount))
+		failed := make(chan error, 1)
+		failed <- err
+		renewalFailed = failed
+	} else {
+		defer renewal.Close()
+		renewalFailed = renewal.failed
 	}
-	defer renewal.Close()
-	select {
-	case <-done:
-		return mount.Close()
-	case err := <-renewal.failed:
-		// The mount still holds a valid authorization for the safety margin the
-		// renewer reserved. Withdrawing it now is the difference between an
-		// orderly unmount and every open file failing when the deadline passes.
-		log.Printf("automatic reauthorization failed closed: %v; unmounting %s", err, absoluteMount)
-		return errors.Join(err, shutdown(mount, done, absoluteMount))
-	case <-ctx.Done():
-		return shutdown(mount, done, absoluteMount)
-	}
+	return superviseMount(mount, done, requests, renewalFailed, func(err error) {
+		log.Printf("mount %s: %v", absoluteMount, err)
+	})
 }
 
 func releaseClientBeforeKernelMount(client *authorityrpc.Client, timeout time.Duration, cause error) error {
@@ -184,37 +182,34 @@ func releaseClientBeforeKernelMount(client *authorityrpc.Client, timeout time.Du
 	return errors.Join(cause, client.ReleaseBeforeMount(ctx))
 }
 
-// shutdown removes the kernel mount before this process exits.
-//
-// Exiting while the mount is still installed is strictly worse than waiting:
-// /dev/fuse would close, every process under the mountpoint would see ENOTCONN
-// with no way to recover, the stale mount would still be listed, and the
-// authority session would be dropped without a Detach. EBUSY simply means some
-// process still holds a file under the mountpoint, so the only correct answer
-// is to keep serving and try again.
-func shutdown(mount *fusev3.Mount, done <-chan struct{}, mountpoint string) error {
-	const (
-		firstRetry = 250 * time.Millisecond
-		maxRetry   = 30 * time.Second
-	)
-	for delay := firstRetry; ; delay = min(2*delay, maxRetry) {
-		err := mount.Unmount()
-		if err == nil {
-			<-done
-			return nil
-		}
+// The supervisor owns serving until the exact connection is terminal. Only an
+// explicit signal requests a normal unmount; a refusal leaves every serving
+// and enforcement owner alive. Renewal failure is diagnostic here: the mount's
+// authorization/session enforcement owner still withdraws expired authority.
+func superviseMount(mount interface {
+	UnmountKernel() error
+	Close() error
+}, done <-chan struct{}, requests <-chan os.Signal, renewalFailed <-chan error, report func(error)) error {
+	var renewalErr error
+	for {
+		// Prefer a terminal connection over another queued request. Close owns
+		// the identity/absence proof and must report its own cleanup result.
 		select {
 		case <-done:
-			// The kernel mount disappeared underneath us (an external
-			// fusermount -u, for example). Release the authority session.
-			return mount.Close()
+			return errors.Join(renewalErr, mount.Close())
 		default:
 		}
-		log.Printf("unmount %s: %v; the mount is still in use and remains served, retrying in %s", mountpoint, err, delay)
 		select {
 		case <-done:
-			return mount.Close()
-		case <-time.After(delay):
+			return errors.Join(renewalErr, mount.Close())
+		case <-requests:
+			if err := mount.UnmountKernel(); err != nil {
+				report(fmt.Errorf("normal unmount refused; mount remains supervised: %w", err))
+			}
+		case err := <-renewalFailed:
+			renewalFailed = nil
+			renewalErr = err
+			report(fmt.Errorf("automatic reauthorization failed; authorization enforcement remains active: %w", err))
 		}
 	}
 }

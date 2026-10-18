@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -768,42 +769,44 @@ func TestFullByteCapBlocksMetadataAdmissions(t *testing.T) {
 }
 
 func TestCapKickSkippedByExplicitFlushIsRetried(t *testing.T) {
-	entered := make(chan Entry, 2)
-	release := make(chan struct{}, 2)
-	var seq atomic.Uint64
-	flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
-		entered <- entry
-		select {
-		case <-release:
-			return seq.Add(1), nil
-		case <-ctx.Done():
-			return 0, ctx.Err()
+	synctest.Test(t, func(t *testing.T) {
+		entered := make(chan Entry, 2)
+		release := make(chan struct{}, 2)
+		var seq atomic.Uint64
+		flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
+			entered <- entry
+			select {
+			case <-release:
+				return seq.Add(1), nil
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		})
+		b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 2})
+		id := testIdentity(71)
+		firstCut := mustWrite(t, b, id, 0, "a")
+		firstDone := make(chan error, 1)
+		go func() { _, err := b.FlushIdentity(context.Background(), id, firstCut); firstDone <- err }()
+		await(t, entered, "explicit first flush")
+		mustWrite(t, b, id, 2, "c") // Reaching the cap kicks the scheduler.
+		// The explicit callback must own this identity before any background
+		// worker can compete for it. Otherwise the first callback could belong to
+		// the scheduler, leaving the explicit caller behind the blocked tail.
+		b.Start()
+		synctest.Wait()
+		if len(b.kick) != 0 {
+			t.Fatal("scheduler did not consume the cap kick")
 		}
+		release <- struct{}{}
+		if err := await(t, firstDone, "explicit first flush"); err != nil {
+			t.Fatal(err)
+		}
+		second := await(t, entered, "scheduler retry after skipped cap kick")
+		if second.First != 2 {
+			t.Fatalf("scheduler flushed sequence %d, want 2", second.First)
+		}
+		release <- struct{}{}
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 2})
-	b.Start()
-	id := testIdentity(71)
-	firstCut := mustWrite(t, b, id, 0, "a")
-	firstDone := make(chan error, 1)
-	go func() { _, err := b.FlushIdentity(context.Background(), id, firstCut); firstDone <- err }()
-	await(t, entered, "explicit first flush")
-	mustWrite(t, b, id, 2, "c") // Reaching the cap kicks the scheduler.
-	deadline := time.Now().Add(3 * time.Second)
-	for len(b.kick) != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if len(b.kick) != 0 {
-		t.Fatal("scheduler did not consume the cap kick")
-	}
-	release <- struct{}{}
-	if err := await(t, firstDone, "explicit first flush"); err != nil {
-		t.Fatal(err)
-	}
-	second := await(t, entered, "scheduler retry after skipped cap kick")
-	if second.First != 2 {
-		t.Fatalf("scheduler flushed sequence %d, want 2", second.First)
-	}
-	release <- struct{}{}
 }
 
 func TestRetirementFencesGenerationAndAdmissions(t *testing.T) {

@@ -131,7 +131,11 @@ func (ms *Server) RecordLatencies(l LatencyMap) {
 //	fusermount -u /path/to/real/mountpoint
 //
 // in this case.
-func (ms *Server) Unmount() (err error) {
+func (ms *Server) Unmount() error {
+	return ms.unmount(unmount)
+}
+
+func (ms *Server) unmount(attempt func(string, *MountOptions) error) (err error) {
 	ms.mountMu.Lock()
 	defer ms.mountMu.Unlock()
 	if ms.mountPoint == "" {
@@ -140,21 +144,8 @@ func (ms *Server) Unmount() (err error) {
 	if parseFuseFd(ms.mountPoint) >= 0 {
 		return fmt.Errorf("Cannot unmount magic mountpoint %q. Please use `fusermount -u REALMOUNTPOINT` instead.", ms.mountPoint)
 	}
-	delay := time.Duration(0)
-	for try := 0; try < 5; try++ {
-		err = unmount(ms.mountPoint, ms.opts)
-		if err == nil {
-			break
-		}
-
-		// Sleep for a bit. This is not pretty, but there is
-		// no way we can be certain that the kernel thinks all
-		// open files have already been closed.
-		delay = 2*delay + 5*time.Millisecond
-		time.Sleep(delay)
-	}
-	if err != nil {
-		return
+	if err = attempt(ms.mountPoint, ms.opts); err != nil {
+		return err
 	}
 	// Wait for event loops to exit.
 	ms.loops.Wait()
