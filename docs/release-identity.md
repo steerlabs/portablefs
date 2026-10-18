@@ -423,9 +423,6 @@ push would catch.
   probe, the `https://github.com/$REPO/releases/tag/` prefix requirement, and the
   stable-SemVer tag regex;
 - the macOS pre-extraction ZIP boundary checks are intact;
-- the embed phase writes the sealed service protocol record into the service
-  resources, and the macOS installer decodes it strictly and requires the
-  incoming target's exact control and `pfslocal` pairing;
 - the canonical Apple identity block contains all five expected values and
   contains no `PORTABLEFS_EXPECTED_` reference, failing with `canonical Apple
   identities remain environment-overridable` if it does;
