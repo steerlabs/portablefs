@@ -68,7 +68,7 @@ func TestSynchronousOpenPublishesGrantBeforeWaitingForVisibility(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("OPEN waited for visibility before registering its grant")
 	}
-	if err := m.Install(id, delegationTestToken(115, 1), response.GetOpen().Handle, response.GetOpen().Delegation); err != nil {
+	if err := m.install(id, delegationTestToken(115, 1), response.GetOpen().Handle, response.GetOpen().Delegation, response.GetAppliedSequence()); err != nil {
 		t.Fatal(err)
 	}
 	visible := make(chan error, 1)
@@ -125,7 +125,7 @@ func TestOpenedApplicationCutBelongsToItsReturnedGrant(t *testing.T) {
 	fake.id = delegationTestIdentity(119)
 	fake.grant = delegationTestGrant(152, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	response := &authoritypb.Response{AppliedSequence: 7, Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: delegationTestToken(119, 2), Delegation: fake.grant}}}
-	if err := m.Install(fake.id, delegationTestToken(119, 1), response.GetOpen().Handle, fake.grant); err != nil {
+	if err := m.install(fake.id, delegationTestToken(119, 1), response.GetOpen().Handle, fake.grant, response.GetAppliedSequence()); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())

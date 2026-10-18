@@ -38,10 +38,10 @@ func captureServedVersion(ctx context.Context, response *authoritypb.Response) {
 	}
 }
 
-func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation) error {
+func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation, applied uint64) error {
 	manager := n.mount.delegations
 	if grant != nil {
-		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil && !errors.Is(err, errDelegationRetired) {
+		if err := manager.install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant, applied); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
 	} else {

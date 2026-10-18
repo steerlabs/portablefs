@@ -1391,7 +1391,7 @@ func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T)
 			// The frontend preserves an Authority OPEN even if its local grant
 			// retired before registration; it closes as an ordinary handle.
 			n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: id, Token: delegationTestToken(22, 1)}}
-			if err := n.registerDelegatedHandle(&fileHandle{node: n, token: reader}, nil); err != nil {
+			if err := n.registerDelegatedHandle(&fileHandle{node: n, token: reader}, nil, 0); err != nil {
 				t.Fatalf("successful read OPEN failed registration: %v", err)
 			}
 		})

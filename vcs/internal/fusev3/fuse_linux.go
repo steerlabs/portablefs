@@ -1745,7 +1745,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	kernelFlags := portableOpenFlags(flags, response.GetOpen().GetCacheCapable())
 	handle := &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := n.registerDelegatedHandle(handle, response.GetOpen().GetDelegation()); err != nil {
+	if err := n.registerDelegatedHandle(handle, response.GetOpen().GetDelegation(), response.GetAppliedSequence()); err != nil {
 		return nil, 0, syscall.EIO
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response); err != nil {
@@ -2427,7 +2427,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
 	kernelFlags := portableOpenFlags(flags, created.GetCacheCapable())
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := child.registerDelegatedHandle(handle, created.GetDelegation()); err != nil {
+	if err := child.registerDelegatedHandle(handle, created.GetDelegation(), response.GetAppliedSequence()); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response); err != nil {
@@ -2499,7 +2499,7 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags}
-	if err := child.registerDelegatedHandle(handle, nil); err != nil {
+	if err := child.registerDelegatedHandle(handle, nil, 0); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	return item, handle, portableOpenFlags(flags, false), 0

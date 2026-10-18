@@ -464,6 +464,12 @@ func (m *delegationManager) incarnation() uint64 {
 // server capabilities used by later flushes; at least one live handle is
 // required for writes. Repeated installation of the exact grant is harmless.
 func (m *delegationManager) Install(identity, item, handle []byte, grant *authoritypb.Delegation) error {
+	return m.install(identity, item, handle, grant, 0)
+}
+
+// An allocating mutation can carry an application cut of its returned grant.
+// Publish both under admission before CONTROL can observe that generation.
+func (m *delegationManager) install(identity, item, handle []byte, grant *authoritypb.Delegation, applied uint64) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
 		return err
@@ -514,6 +520,9 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 		s.flushOrdinal = 0
 		s.meta.Unlock()
 	}
+	s.meta.Lock()
+	s.applied = max(s.applied, applied)
+	s.meta.Unlock()
 	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
 	close(s.grantChanged)
 	s.grantChanged = make(chan struct{})
@@ -1373,23 +1382,6 @@ func (m *delegationManager) openedVisibility(ctx context.Context, identity []byt
 	}
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
-	var grant *authoritypb.Delegation
-	if opened := response.GetOpen(); opened != nil {
-		grant = opened.GetDelegation()
-	} else if created := response.GetCreate(); created != nil {
-		grant = created.GetDelegation()
-	}
-	state := m.retainState(id, false)
-	defer m.releaseState(state)
-	if state != nil && grant != nil {
-		state.admission.RLock()
-		if sameDelegation(state.ref, &authoritypb.DelegationRef{Id: grant.Id, Generation: grant.Generation}) {
-			state.meta.Lock()
-			state.applied = max(state.applied, response.GetAppliedSequence())
-			state.meta.Unlock()
-		}
-		state.admission.RUnlock()
-	}
 	m.durabilityMu.Lock()
 	m.appliedHigh = max(m.appliedHigh, response.GetAppliedSequence())
 	m.durabilityMu.Unlock()
