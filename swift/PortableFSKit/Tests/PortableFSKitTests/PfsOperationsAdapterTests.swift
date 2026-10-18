@@ -886,61 +886,38 @@ private func adapterErrno(
     #expect(stats.publicationAcks >= baseline + 2)
 }
 
-/// The retraction contract at the FSKit boundary: a crossed operation's values
-/// must never reach the reply handler, because the reply handler IS the
-/// framework install. The daemon's gate is still released — retraction governs
-/// what the framework caches, not the daemon's bookkeeping.
-///
-/// What the FRAMEWORK sees is a REISSUE, not an interruption. Surfacing EINTR
-/// here assumed the kernel would restart the syscall against a frontend holding
-/// nothing; FSKit on macOS 26 does not restart rmdir(2), so that EINTR reached
-/// userspace and failed the application on an idle mount. The extension retries
-/// below userspace instead: the retracted attempt is acknowledged in full, the
-/// operation is reissued, and only the surviving attempt's values are installed.
+/// At the FSKit boundary a retraction-bearing reply is a protocol defect.
+/// The reply handler IS the framework install, so it must receive an error
+/// rather than the frame's values, and the callback must not be reissued
+/// below userspace.
 @available(macOS 26.0, *)
-@Test func operationsAdapterReissuesRetractedOperationAndAcknowledgesBoth() async throws {
+@Test func operationsAdapterFailsARetractionBearingReplyWithoutReissue() async throws {
     let harness = try await makeAdapterHarness()
     defer { harness.daemon.stop() }
-    let baseline = try await settledAckBaseline(harness.daemon, owed: 0)
+    _ = try await settledAckBaseline(harness.daemon, owed: 0)
     let baselineGetattrs = await harness.daemon.stats().getAttrRequests
 
-    await harness.daemon.retractNextPublications()
-
-    // The framework is handed the REISSUE's values. Nothing from the retracted
-    // attempt reaches it, and no EINTR reaches userspace: `delivered` is true
-    // and `failure` is nil.
+    await harness.daemon.transformNextReply { envelope in
+        guard case .getAttrReply? = envelope.body else { return nil }
+        var defective = envelope
+        defective.publicationRetracted = true
+        return defective
+    }
     let (delivered, failure): (Bool, Int32?) = await withCheckedContinuation { continuation in
         harness.volume.getAttributes(
             FSItem.GetAttributesRequest(),
             of: harness.root
         ) { attributes, error in
             if let error {
-                continuation.resume(returning: (false, Int32((error as NSError).code)))
+                continuation.resume(returning: (attributes != nil, Int32((error as NSError).code)))
                 return
             }
             continuation.resume(returning: (attributes != nil, nil))
         }
     }
-    #expect(failure == nil)
-    #expect(delivered)
-
-    // TWO daemon getattrs for ONE framework callback: the retracted attempt and
-    // the reissue. That count IS the proof the retry happened below userspace.
-    let stats = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 2)
-    #expect(stats.getAttrRequests == baselineGetattrs + 2)
-    // BOTH attempts are acknowledged. The retracted attempt still owes its ack —
-    // that ack is what releases the daemon's handoff gate — and it is sent
-    // BEFORE the reissue so the reissue cannot queue behind the handoff that is
-    // waiting for it.
-    #expect(stats.publicationAcks == baseline + 2)
-
-    // Only the retracted operation is affected; the next one publishes once.
-    _ = try await harness.volume.attributes(
-        FSItem.GetAttributesRequest(),
-        of: harness.root
-    )
-    let after = try await waitForPublicationAcks(harness.daemon, atLeast: baseline + 3)
-    #expect(after.publicationAcks == baseline + 3)
+    #expect(!delivered)
+    #expect(failure == EINVAL)
+    #expect(await harness.daemon.stats().getAttrRequests == baselineGetattrs + 1)
 }
 
 @available(macOS 26.0, *)
@@ -1291,6 +1268,34 @@ private func adapterErrno(
             #expect(collection.refusedPages > 0)
         }
     }
+}
+
+/// Rewriting an existing file through O_WRONLY (shell `>`, `cp` onto an
+/// existing file) is one FSKit open and one write. It must cost exactly one
+/// authority OPEN, for exactly the write access the open asked for.
+@available(macOS 26.0, *)
+@Test func operationsAdapterWriteOnlyOpenAndWriteCostOneOpen() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let item = try await createAdapterFile(
+        volume: harness.volume,
+        in: harness.root,
+        name: "rewrite",
+        contents: adapterBytes("old")
+    )
+    await harness.daemon.resetStats()
+
+    try await harness.volume.openItem(item, modes: [.write])
+    let written = try await harness.volume.write(contents: adapterBytes("new"), to: item, at: 0)
+    #expect(written == 3)
+    try await harness.volume.closeItem(item, modes: [])
+
+    let stats = await harness.daemon.stats()
+    #expect(stats.openModes == [.write])
+    #expect(stats.writeRequests == 1)
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 0)
+    #expect(try await readViaCore(harness.core, item: item, length: 3) == adapterBytes("new"))
 }
 
 @available(macOS 26.0, *)

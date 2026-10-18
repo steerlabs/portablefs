@@ -219,14 +219,111 @@ public enum PortableFSDServiceCoordinator {
 
     enum DaemonFenceWitness {
         case process(DaemonProcessWitness)
+        /// This app holds the state singleton, so no daemon can run.
+        case excluded(StateSingletonExclusion)
+        /// Departure is proven by finding the state singleton free.
         case unpublished
 
         func hasDeparted() throws -> Bool {
             switch self {
             case .process(let witness):
                 return try witness.hasExited()
+            case .excluded(let exclusion):
+                try exclusion.confirmHeld()
+                return true
             case .unpublished:
                 return try PortableFSDServiceCoordinator.stateSingletonIsUnlocked()
+            }
+        }
+
+        func releaseExclusion() {
+            if case .excluded(let exclusion) = self { exclusion.release() }
+        }
+    }
+
+    /// Ownership of the canonical daemon state singleton. portablefsd takes
+    /// this lock before anything else and exits without touching state when
+    /// it cannot, so while it is held no daemon can run.
+    final class StateSingletonExclusion {
+        private var directory: Int32
+        private var lock: Int32
+        private let pinnedLock: stat
+
+        init(directory: Int32, lock: Int32, pinnedLock: stat) {
+            self.directory = directory
+            self.lock = lock
+            self.pinnedLock = pinnedLock
+        }
+
+        deinit { release() }
+
+        /// Fails unless the canonical name still denotes the locked inode.
+        func confirmHeld() throws {
+            var current = stat()
+            guard lock >= 0,
+                  Darwin.fstatat(
+                    directory,
+                    PortableFSDServiceCoordinator.stateSingletonName,
+                    &current,
+                    AT_SYMLINK_NOFOLLOW
+                  ) == 0,
+                  current.st_dev == pinnedLock.st_dev,
+                  current.st_ino == pinnedLock.st_ino,
+                  current.st_mode == pinnedLock.st_mode,
+                  current.st_uid == pinnedLock.st_uid,
+                  current.st_nlink == pinnedLock.st_nlink else {
+                throw RegistrationError.invalidDaemonStateSingleton
+            }
+        }
+
+        /// Writes this process's owner record in portablefsd's schema 1:
+        /// pid plus the kernel start time that distinguishes it from a
+        /// recycled pid, formatted as the daemon formats it on Darwin.
+        func publishOwnerRecord(owner: String) throws {
+            struct Record: Encodable {
+                let schemaVersion: Int
+                let pid: Int32
+                let startIdentity: String
+                let version: String
+                let owner: String
+            }
+            let pid = getpid()
+            var info = kinfo_proc()
+            var size = MemoryLayout<kinfo_proc>.stride
+            var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+            guard Darwin.sysctl(&name, 4, &info, &size, nil, 0) == 0,
+                  info.kp_proc.p_pid == pid else {
+                throw RegistrationError.inspectDaemonStateSingleton(errno)
+            }
+            let start = info.kp_proc.p_un.__p_starttime
+            var body = try JSONEncoder().encode(Record(
+                schemaVersion: 1,
+                pid: pid,
+                startIdentity: "\(start.tv_sec):\(start.tv_usec)",
+                version: "",
+                owner: owner
+            ))
+            body.append(0x0A)
+            guard Darwin.ftruncate(lock, 0) == 0 else {
+                throw RegistrationError.inspectDaemonStateSingleton(errno)
+            }
+            let written = body.withUnsafeBytes { bytes in
+                Darwin.pwrite(lock, bytes.baseAddress, bytes.count, 0)
+            }
+            guard written == body.count, Darwin.fsync(lock) == 0 else {
+                throw RegistrationError.inspectDaemonStateSingleton(written < 0 ? errno : EIO)
+            }
+        }
+
+        func release() {
+            if lock >= 0 {
+                _ = portableFSFlock(lock, LOCK_UN)
+                Darwin.close(lock)
+                lock = -1
+            }
+            if directory >= 0 {
+                Darwin.close(directory)
+                directory = -1
             }
         }
     }
@@ -247,6 +344,11 @@ public enum PortableFSDServiceCoordinator {
         case requiresApproval
     }
 
+    /// Registers this sealed release as the account's daemon service. An
+    /// enabled service is replaced only after its live owner is either
+    /// authenticated as a signed release of this product or proven absent;
+    /// any other owner fails with an `UnauthenticatedServiceOwner` diagnosis
+    /// and is left running.
     public static func prepareAndRegister(bundle: Bundle = .main) throws -> State {
         let configuration = try validateHostAndConfiguration(bundle: bundle)
         let socketDirectory = try PortableFSAppGroupBootstrap.prepare(bundle: bundle)
@@ -258,19 +360,27 @@ public enum PortableFSDServiceCoordinator {
         let service = SMAppService.agent(plistName: configuration.plistName)
         switch service.status {
         case .enabled:
-            let running = try runningDaemon(configuration: configuration)
-            if running?.releaseIdentity == releaseIdentity,
-               running?.bundle.bundleURL.standardizedFileURL == bundle.bundleURL.standardizedFileURL {
+            let owner = try inspectLiveServiceOwner(
+                controlSocket: try controlSocketURL(),
+                configuration: configuration
+            )
+            switch registrationStep(
+                for: owner,
+                incoming: releaseIdentity,
+                bundleURL: bundle.bundleURL
+            ) {
+            case .keep:
+                return .enabled
+            case .replace(let outgoing):
+                try reregister(
+                    service: service,
+                    bundle: bundle,
+                    socketDirectory: socketDirectory,
+                    outgoing: outgoing,
+                    releaseIdentity: releaseIdentity
+                )
                 return .enabled
             }
-            try reregister(
-                service: service,
-                bundle: bundle,
-                socketDirectory: socketDirectory,
-                running: running,
-                releaseIdentity: releaseIdentity
-            )
-            return .enabled
         case .requiresApproval:
             SMAppService.openSystemSettingsLoginItems()
             return .requiresApproval
@@ -761,44 +871,75 @@ public enum PortableFSDServiceCoordinator {
         ).validated()
     }
 
-    private struct RunningDaemon {
+    /// A live daemon whose execution proved a signed release of this product
+    /// from the app it was started from.
+    struct RunningDaemon {
         let bundle: Bundle
         let releaseIdentity: PortableFSDReleaseIdentity
+    }
+
+    /// What the control endpoint proves about the service's live owner.
+    enum LiveServiceOwner {
+        /// No endpoint is published. Only the state singleton, inspected after
+        /// mount admission closes, can prove that no daemon remains.
+        case unpublished
+        case authenticated(RunningDaemon)
+    }
+
+    enum ServiceRegistrationStep {
+        /// This exact sealed release already runs from this bundle.
+        case keep
+        /// Replace the service. A non-nil outgoing daemon is the release the
+        /// empty-inventory guard and the departure fence are bound to.
+        case replace(outgoing: RunningDaemon?)
+    }
+
+    /// A valid older release, or this release running from another copy of
+    /// the app, is replaced through its authenticated identity. Only an
+    /// exact match of release and bundle is kept.
+    static func registrationStep(
+        for owner: LiveServiceOwner,
+        incoming: PortableFSDReleaseIdentity,
+        bundleURL: URL
+    ) -> ServiceRegistrationStep {
+        switch owner {
+        case .unpublished:
+            return .replace(outgoing: nil)
+        case .authenticated(let running):
+            if running.releaseIdentity == incoming,
+               running.bundle.bundleURL.standardizedFileURL == bundleURL.standardizedFileURL {
+                return .keep
+            }
+            return .replace(outgoing: running)
+        }
     }
 
     private static func reregister(
         service: SMAppService,
         bundle: Bundle,
         socketDirectory: URL,
-        running: RunningDaemon?,
+        outgoing: RunningDaemon?,
         releaseIdentity: PortableFSDReleaseIdentity
     ) throws {
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
-            runningIdentity: running?.releaseIdentity
+            runningIdentity: outgoing?.releaseIdentity
         )
         defer { updateGuard.release() }
 
-        // Reauthenticate after mount admission closes. The outgoing identity
-        // comes from its signed owning bundle and live socket peer, never a
-        // preference or the incoming release's version.
-        let processWitness: DaemonFenceWitness
-        if let running {
-            processWitness = .process(try probeLiveDaemon(
-                running.releaseIdentity,
-                bundle: running.bundle
-            ))
-        } else {
-            guard try stateSingletonIsUnlocked() else {
-                throw RegistrationError.daemonStateSingletonHeld
-            }
-            processWitness = .unpublished
-        }
+        let processWitness = try replacementWitness(
+            outgoing: outgoing,
+            probe: { try probeLiveDaemon($0.releaseIdentity, bundle: $0.bundle) },
+            excludeDaemons: { try acquireStateSingletonExclusion() }
+        )
+        defer { processWitness.releaseExclusion() }
         try unregisterAndWait(
             service: service,
             socketDirectory: socketDirectory,
             processWitness: processWitness
         )
+        // The incoming daemon takes the state singleton before anything else.
+        processWitness.releaseExclusion()
 
         try completeRegisteredRelease(
             operation: {
@@ -817,6 +958,32 @@ public enum PortableFSDServiceCoordinator {
                 )
             }
         )
+    }
+
+    /// Captures what a replacement must see depart, once mount admission is
+    /// closed. An authenticated outgoing daemon is re-proved here; its
+    /// identity comes from its signed owning app and live socket peer, never
+    /// a preference or the incoming release's version.
+    ///
+    /// Without a published endpoint the proof of absence must outlive the
+    /// unregistration it authorizes: KeepAlive can start the registered
+    /// service at any moment, so a free-singleton snapshot would let an
+    /// unauthenticated execution start before it is stopped. The app instead
+    /// holds the state singleton across unregistration. A singleton already
+    /// held means a daemon is still starting or stopping; nothing can
+    /// authenticate it, so it is refused.
+    static func replacementWitness(
+        outgoing: RunningDaemon?,
+        probe: (RunningDaemon) throws -> DaemonProcessWitness,
+        excludeDaemons: () throws -> StateSingletonExclusion?
+    ) throws -> DaemonFenceWitness {
+        if let outgoing {
+            return .process(try probe(outgoing))
+        }
+        guard let exclusion = try excludeDaemons() else {
+            throw RegistrationError.unauthenticatedServiceOwner(.occupiedStateSingleton)
+        }
+        return .excluded(exclusion)
     }
 
     /// A registration is never allowed to escape without either proving the
@@ -1001,6 +1168,25 @@ public enum PortableFSDServiceCoordinator {
         }
     }
 
+    /// The install-exclusive helper reads the attach inventory of exactly the
+    /// authenticated outgoing release. Without a published endpoint there is
+    /// no live identity to bind, and the helper proves the inventory empty
+    /// without adopting a daemon.
+    static func inventoryGuardArguments(
+        outgoing: PortableFSDReleaseIdentity?
+    ) -> [String] {
+        var arguments = ["lifecycle", "hold-install-exclusive", "--json"]
+        if let outgoing {
+            arguments += [
+                "--expected-daemon-version", outgoing.daemonVersion,
+                "--expected-daemon-sha256", outgoing.executableSHA256,
+                "--expected-pfslocal-major", String(outgoing.pfslocalMajor),
+                "--expected-pfslocal-minor", String(outgoing.pfslocalMinor),
+            ]
+        }
+        return arguments
+    }
+
     private static func acquireEmptyInventoryGuard(
         bundle: Bundle,
         runningIdentity: PortableFSDReleaseIdentity?
@@ -1017,18 +1203,7 @@ public enum PortableFSDServiceCoordinator {
         let output = Pipe()
         let errors = Pipe()
         process.executableURL = cliURL
-        var arguments = [
-            "lifecycle", "hold-install-exclusive", "--json"
-        ]
-        if let runningIdentity {
-            arguments += [
-                "--expected-daemon-version", runningIdentity.daemonVersion,
-                "--expected-daemon-sha256", runningIdentity.executableSHA256,
-                "--expected-pfslocal-major", String(runningIdentity.pfslocalMajor),
-                "--expected-pfslocal-minor", String(runningIdentity.pfslocalMinor),
-            ]
-        }
-        process.arguments = arguments
+        process.arguments = inventoryGuardArguments(outgoing: runningIdentity)
         process.standardInput = input
         process.standardOutput = output
         process.standardError = errors
@@ -1139,20 +1314,110 @@ public enum PortableFSDServiceCoordinator {
     /// ServiceManagement reports `.notRegistered` is the exact no-publication
     /// fence for a service that never produced an authenticated control peer.
     private static func stateSingletonIsUnlocked() throws -> Bool {
-        try stateSingletonIsUnlocked(
-            at: controlSocketURL().deletingLastPathComponent()
-        )
+        try stateSingletonIsUnlocked(at: stateDirectoryURL())
     }
 
     static func stateSingletonIsUnlocked(
         at stateDirectory: URL,
         beforeFinalRecheck: (() throws -> Void)? = nil
     ) throws -> Bool {
+        switch try lockStateSingleton(
+            at: stateDirectory,
+            creating: false,
+            beforeFinalRecheck: beforeFinalRecheck
+        ) {
+        case .absent:
+            return true
+        case .held:
+            return false
+        case .owned(let exclusion):
+            exclusion.release()
+            return true
+        }
+    }
+
+    private static func acquireStateSingletonExclusion() throws -> StateSingletonExclusion? {
+        try acquireStateSingletonExclusion(at: stateDirectoryURL())
+    }
+
+    /// Takes and keeps the state singleton, creating the private directory
+    /// and lock exactly as portablefsd would when neither exists yet, so a
+    /// daemon starting at any later moment contends on this lock. Nil when a
+    /// daemon already holds it. The holder publishes its own owner record in
+    /// the daemon's format: a starting daemon that finds the lock held reads
+    /// that record, and must classify a live holder rather than prove the
+    /// previous daemon's stale record departed and take the lock over.
+    static func acquireStateSingletonExclusion(
+        at stateDirectory: URL,
+        beforeFinalRecheck: (() throws -> Void)? = nil
+    ) throws -> StateSingletonExclusion? {
+        switch try lockStateSingleton(
+            at: stateDirectory,
+            creating: true,
+            beforeFinalRecheck: beforeFinalRecheck
+        ) {
+        case .absent:
+            throw RegistrationError.invalidDaemonStateSingleton
+        case .held:
+            return nil
+        case .owned(let exclusion):
+            do {
+                try exclusion.publishOwnerRecord(owner: stateDirectory.path)
+            } catch {
+                exclusion.release()
+                throw error
+            }
+            return exclusion
+        }
+    }
+
+    private static func stateDirectoryURL() throws -> URL {
+        try controlSocketURL().deletingLastPathComponent()
+    }
+
+    enum StateSingletonLock {
+        /// Neither the directory nor the lock exists, and none was created.
+        case absent
+        /// Another process holds the lock.
+        case held
+        case owned(StateSingletonExclusion)
+    }
+
+    private static let stateSingletonName = ".portablefsd-state.lock"
+
+    /// The one secure boundary for the state singleton: the directory must be
+    /// this account's private 0700 directory and the lock this account's
+    /// single-link 0600 regular file, both pinned by descriptor and rechecked
+    /// by name after the lock is taken.
+    static func lockStateSingleton(
+        at stateDirectory: URL,
+        creating: Bool,
+        beforeFinalRecheck: (() throws -> Void)? = nil
+    ) throws -> StateSingletonLock {
         var namedDirectory = stat()
-        guard Darwin.lstat(stateDirectory.path, &namedDirectory) == 0 else {
+        if Darwin.lstat(stateDirectory.path, &namedDirectory) != 0 {
             let code = errno
-            if code == ENOENT { return true }
-            throw RegistrationError.inspectDaemonStateSingleton(code)
+            guard code == ENOENT else {
+                throw RegistrationError.inspectDaemonStateSingleton(code)
+            }
+            guard creating else { return .absent }
+            do {
+                try FileManager.default.createDirectory(
+                    at: stateDirectory,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            } catch {
+                var code = EIO
+                if let underlying = (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError,
+                   underlying.domain == NSPOSIXErrorDomain {
+                    code = Int32(underlying.code)
+                }
+                throw RegistrationError.inspectDaemonStateSingleton(code)
+            }
+            guard Darwin.lstat(stateDirectory.path, &namedDirectory) == 0 else {
+                throw RegistrationError.inspectDaemonStateSingleton(errno)
+            }
         }
         guard namedDirectory.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
               namedDirectory.st_uid == geteuid(),
@@ -1166,7 +1431,8 @@ public enum PortableFSDServiceCoordinator {
         guard directory >= 0 else {
             throw RegistrationError.inspectDaemonStateSingleton(errno)
         }
-        defer { Darwin.close(directory) }
+        var directoryOwned = false
+        defer { if !directoryOwned { Darwin.close(directory) } }
 
         var pinnedDirectory = stat()
         guard Darwin.fstat(directory, &pinnedDirectory) == 0,
@@ -1177,74 +1443,80 @@ public enum PortableFSDServiceCoordinator {
             throw RegistrationError.invalidDaemonStateSingleton
         }
 
-        let name = ".portablefsd-state.lock"
+        let name = stateSingletonName
+        let lock: Int32
         var namedLock = stat()
-        if Darwin.fstatat(
-            directory,
-            name,
-            &namedLock,
-            AT_SYMLINK_NOFOLLOW
-        ) != 0 {
-            let code = errno
-            if code == ENOENT {
-                try beforeFinalRecheck?()
-                try recheckPinnedDirectory(
-                    stateDirectory,
-                    expected: pinnedDirectory
-                )
-                return true
+        let lockExisted = Darwin.fstatat(directory, name, &namedLock, AT_SYMLINK_NOFOLLOW) == 0
+        if lockExisted {
+            // Validate before opening: a FIFO or device must never be opened.
+            guard namedLock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                  namedLock.st_uid == geteuid(),
+                  namedLock.st_mode & 0o777 == 0o600,
+                  namedLock.st_nlink == 1 else {
+                throw RegistrationError.invalidDaemonStateSingleton
             }
-            throw RegistrationError.inspectDaemonStateSingleton(code)
+            lock = Darwin.openat(directory, name, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        } else {
+            let code = errno
+            guard code == ENOENT else {
+                throw RegistrationError.inspectDaemonStateSingleton(code)
+            }
+            guard creating else {
+                try beforeFinalRecheck?()
+                try recheckPinnedDirectory(stateDirectory, expected: pinnedDirectory)
+                return .absent
+            }
+            lock = Darwin.openat(
+                directory,
+                name,
+                O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600
+            )
+            if lock >= 0, Darwin.fchmod(lock, 0o600) != 0 {
+                let failure = errno
+                Darwin.close(lock)
+                throw RegistrationError.inspectDaemonStateSingleton(failure)
+            }
         }
-        guard namedLock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              namedLock.st_uid == geteuid(),
-              namedLock.st_mode & 0o777 == 0o600,
-              namedLock.st_nlink == 1 else {
-            throw RegistrationError.invalidDaemonStateSingleton
-        }
-        let lock = Darwin.openat(
-            directory,
-            name,
-            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
-        )
         guard lock >= 0 else {
             throw RegistrationError.inspectDaemonStateSingleton(errno)
         }
-        defer { Darwin.close(lock) }
+        var lockOwned = false
+        defer { if !lockOwned { Darwin.close(lock) } }
         var pinnedLock = stat()
         guard Darwin.fstat(lock, &pinnedLock) == 0,
-              pinnedLock.st_dev == namedLock.st_dev,
-              pinnedLock.st_ino == namedLock.st_ino,
-              pinnedLock.st_mode == namedLock.st_mode,
-              pinnedLock.st_uid == namedLock.st_uid,
-              pinnedLock.st_nlink == namedLock.st_nlink else {
+              pinnedLock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              pinnedLock.st_uid == geteuid(),
+              pinnedLock.st_mode & 0o777 == 0o600,
+              pinnedLock.st_nlink == 1,
+              !lockExisted || (
+                pinnedLock.st_dev == namedLock.st_dev
+                    && pinnedLock.st_ino == namedLock.st_ino
+              ) else {
             throw RegistrationError.invalidDaemonStateSingleton
         }
 
         if portableFSFlock(lock, LOCK_EX | LOCK_NB) != 0 {
             let code = errno
-            if code == EWOULDBLOCK || code == EAGAIN { return false }
+            if code == EWOULDBLOCK || code == EAGAIN { return .held }
             throw RegistrationError.inspectDaemonStateSingleton(code)
         }
-        defer { _ = portableFSFlock(lock, LOCK_UN) }
-
-        try beforeFinalRecheck?()
-        var currentLock = stat()
-        guard Darwin.fstatat(
-            directory,
-            name,
-            &currentLock,
-            AT_SYMLINK_NOFOLLOW
-        ) == 0,
-              currentLock.st_dev == pinnedLock.st_dev,
-              currentLock.st_ino == pinnedLock.st_ino,
-              currentLock.st_mode == pinnedLock.st_mode,
-              currentLock.st_uid == pinnedLock.st_uid,
-              currentLock.st_nlink == pinnedLock.st_nlink else {
-            throw RegistrationError.invalidDaemonStateSingleton
+        let exclusion = StateSingletonExclusion(
+            directory: directory,
+            lock: lock,
+            pinnedLock: pinnedLock
+        )
+        directoryOwned = true
+        lockOwned = true
+        do {
+            try beforeFinalRecheck?()
+            try exclusion.confirmHeld()
+            try recheckPinnedDirectory(stateDirectory, expected: pinnedDirectory)
+        } catch {
+            exclusion.release()
+            throw error
         }
-        try recheckPinnedDirectory(stateDirectory, expected: pinnedDirectory)
-        return true
+        return .owned(exclusion)
     }
 
     private static func recheckPinnedDirectory(
@@ -1304,35 +1576,197 @@ public enum PortableFSDServiceCoordinator {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    private static func runningDaemon(configuration: Configuration) throws -> RunningDaemon? {
+    /// Classifies whoever serves the account's daemon control endpoint. A
+    /// missing endpoint is not proof of absence by itself; see
+    /// `replacementWitness`. Every owner that cannot be authenticated as a
+    /// signed release of this product is refused and never stopped, because
+    /// only authentication identifies whose mount inventory the replacement
+    /// may trust. A refusal names a cause only where this probe observed it;
+    /// otherwise it reports the step that failed and the underlying error.
+    static func inspectLiveServiceOwner(
+        controlSocket: URL,
+        configuration: Configuration
+    ) throws -> LiveServiceOwner {
+        let socket = controlSocket.path
+        func refuse(_ owner: UnauthenticatedServiceOwner) -> RegistrationError {
+            .unauthenticatedServiceOwner(owner)
+        }
         let fd: Int32
         do {
-            fd = try PfsUnixSocket.connect(path: try controlSocketURL().path)
+            fd = try PfsUnixSocket.connect(path: socket)
         } catch PfsLocalClientError.system(let code, let operation)
-            where operation == "connect" && code == ENOENT {
-            return nil
+            where operation == "connect" {
+            if code == ENOENT { return .unpublished }
+            throw refuse(.unreachableEndpoint(socket: socket, errno: code))
         }
         defer { PfsUnixSocket.close(fd) }
-        let peer = try captureDaemonPeer(fd)
-        let bundleURL = try daemonOwningBundle(executableURL: peer.executableURL)
-        guard let bundle = Bundle(url: bundleURL) else {
-            throw RegistrationError.invalidHostBundle(bundleURL.path)
+
+        let peer: DaemonPeer
+        do {
+            peer = try captureDaemonPeer(fd)
+        } catch RegistrationError.unresolvableDaemonExecutable(let code) where code == ESRCH {
+            throw refuse(.exitedDuringProof)
+        } catch RegistrationError.inspectDaemonProcess(let code) where code == ESRCH {
+            throw refuse(.exitedDuringProof)
+        } catch RegistrationError.unresolvableDaemonExecutable(let code) {
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .executableResolution,
+                failure: String(cString: strerror(code))
+            ))
+        } catch RegistrationError.inspectDaemonProcess(let code) {
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .peerBinding,
+                failure: String(cString: strerror(code))
+            ))
+        } catch RegistrationError.invalidDaemonProcessWitness {
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .peerBinding,
+                failure: "its peer credentials, audit token, and process ID do not identify one execution owned by this account"
+            ))
         }
-        let owner = try validateHostAndConfiguration(bundle: bundle)
-        try validateServiceOwner(owner, expected: configuration)
-        let releaseIdentity = try validateSealedBundle(bundle: bundle, configuration: owner)
-        let witness = try authenticateDaemonPeer(
-            peer,
-            releaseIdentity: releaseIdentity,
-            configuration: owner,
-            bundle: bundle
-        )
-        let reported = try readDaemonIdentity(fd)
-        let runningIdentity = try reported.releaseIdentity(sealed: releaseIdentity)
+        let bundleURL: URL
+        do {
+            bundleURL = try daemonOwningBundle(executableURL: peer.executableURL)
+        } catch {
+            throw refuse(.foreignProcess(socket: socket, executable: peer.executableURL.path))
+        }
+        let app = bundleURL.path
+        let owner = try ownerApp(at: bundleURL, expected: configuration, controlSocket: socket)
+        let witness: DaemonProcessWitness
+        do {
+            witness = try authenticateDaemonPeer(
+                peer,
+                releaseIdentity: owner.releaseIdentity,
+                configuration: owner.configuration,
+                bundle: owner.bundle
+            )
+        } catch RegistrationError.invalidDaemonProcessWitness {
+            if try peer.processWitness.hasExited() { throw refuse(.exitedDuringProof) }
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .daemonSignature(app: app),
+                failure: "its running code does not satisfy that app's signing requirement, code directory hash, or entitlements"
+            ))
+        }
+        let reported: LiveDaemonIdentity
+        do {
+            reported = try readDaemonIdentity(fd)
+        } catch {
+            if try witness.hasExited() { throw refuse(.exitedDuringProof) }
+            throw refuse(.unauthenticated(
+                socket: socket,
+                step: .daemonIdentity,
+                failure: error.localizedDescription
+            ))
+        }
+        let runningIdentity: PortableFSDReleaseIdentity
+        do {
+            runningIdentity = try reported.releaseIdentity(sealed: owner.releaseIdentity)
+        } catch {
+            throw refuse(identityRefusal(
+                reported: reported,
+                sealed: owner.releaseIdentity,
+                app: app,
+                socket: socket,
+                failure: error
+            ))
+        }
         guard try !witness.hasExited() else {
-            throw RegistrationError.invalidDaemonProcessWitness
+            throw refuse(.exitedDuringProof)
         }
-        return RunningDaemon(bundle: bundle, releaseIdentity: runningIdentity)
+        return .authenticated(
+            RunningDaemon(bundle: owner.bundle, releaseIdentity: runningIdentity)
+        )
+    }
+
+    /// The code signature matched the app on disk, but the daemon's reported
+    /// identity did not. A different release or executable is direct
+    /// evidence that the app was replaced while the old executable kept
+    /// running; any other mismatch is only a failed identity proof.
+    static func identityRefusal(
+        reported: LiveDaemonIdentity,
+        sealed: PortableFSDReleaseIdentity,
+        app: String,
+        socket: String,
+        failure: Error
+    ) -> UnauthenticatedServiceOwner {
+        guard reported.daemonVersion != sealed.daemonVersion
+            || reported.executableSha256 != sealed.executableSHA256 else {
+            return .unauthenticated(
+                socket: socket,
+                step: .daemonIdentity,
+                failure: failure.localizedDescription
+            )
+        }
+        return .ownerAppReplaced(
+            app: app,
+            running: "\(reported.daemonVersion) (executable \(reported.executableSha256.prefix(12)))",
+            installed: "\(sealed.daemonVersion) (executable \(sealed.executableSHA256.prefix(12)))"
+        )
+    }
+
+    struct OwnerApp {
+        let bundle: Bundle
+        let configuration: Configuration
+        let releaseIdentity: PortableFSDReleaseIdentity
+    }
+
+    /// Authenticates the app a live daemon was started from, as it exists on
+    /// disk now. Only an absent path is reported as a missing app, and only a
+    /// valid bundle of another signed product as a foreign owner; any other
+    /// failure is reported as exactly that failure.
+    static func ownerApp(
+        at bundleURL: URL,
+        expected: Configuration,
+        controlSocket: String
+    ) throws -> OwnerApp {
+        let app = bundleURL.path
+        func refuse(_ owner: UnauthenticatedServiceOwner) -> RegistrationError {
+            .unauthenticatedServiceOwner(owner)
+        }
+        func refuse(_ step: AuthenticationStep, _ failure: String) -> RegistrationError {
+            refuse(.unauthenticated(socket: controlSocket, step: step, failure: failure))
+        }
+        var entry = stat()
+        guard Darwin.lstat(app, &entry) == 0 else {
+            let code = errno
+            if code == ENOENT || code == ENOTDIR {
+                throw refuse(.ownerAppMissing(app: app))
+            }
+            throw refuse(.ownerAppInspection(app: app), String(cString: strerror(code)))
+        }
+        guard entry.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              let bundle = Bundle(url: bundleURL) else {
+            throw refuse(.ownerAppSignature(app: app), "the path is not an app bundle")
+        }
+        let configuration: Configuration
+        do {
+            configuration = try validateHostAndConfiguration(bundle: bundle)
+        } catch {
+            throw refuse(.ownerAppSignature(app: app), error.localizedDescription)
+        }
+        do {
+            try validateServiceOwner(configuration, expected: expected)
+        } catch {
+            throw refuse(.foreignService(app: app))
+        }
+        let releaseIdentity: PortableFSDReleaseIdentity
+        do {
+            releaseIdentity = try validateSealedBundle(
+                bundle: bundle,
+                configuration: configuration
+            )
+        } catch {
+            throw refuse(.ownerAppSignature(app: app), error.localizedDescription)
+        }
+        return OwnerApp(
+            bundle: bundle,
+            configuration: configuration,
+            releaseIdentity: releaseIdentity
+        )
     }
 
     /// The kernel supplies the executing path; only the canonical nested
@@ -1541,7 +1975,7 @@ public enum PortableFSDServiceCoordinator {
             UInt32(path.count)
         )
         guard pathLength > 0 else {
-            throw RegistrationError.inspectDaemonProcess(errno)
+            throw RegistrationError.unresolvableDaemonExecutable(errno)
         }
         let pathBytes = path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
         let executableURL = URL(
@@ -1643,7 +2077,90 @@ public enum PortableFSDServiceCoordinator {
         return peer.processWitness
     }
 
-    private enum RegistrationError: LocalizedError {
+    /// The step of live-owner authentication that failed when no more
+    /// specific cause was observed.
+    enum AuthenticationStep: Equatable {
+        case peerBinding
+        case executableResolution
+        case ownerAppInspection(app: String)
+        case ownerAppSignature(app: String)
+        case daemonSignature(app: String)
+        case daemonIdentity
+
+        var action: String {
+            switch self {
+            case .peerBinding:
+                return "bind the process serving it to one execution in this account"
+            case .executableResolution:
+                return "resolve the executable of the process serving it"
+            case .ownerAppInspection(let app):
+                return "inspect \(app), the app that started its daemon"
+            case .ownerAppSignature(let app):
+                return "authenticate \(app), the app that started its daemon"
+            case .daemonSignature(let app):
+                return "authenticate its running daemon against \(app)"
+            case .daemonIdentity:
+                return "read its running daemon's release identity"
+            }
+        }
+    }
+
+    /// A live service owner, or the state singleton behind a missing
+    /// endpoint, that this app cannot authenticate. Each case states only
+    /// what the probe observed; the replacement is refused in every case.
+    enum UnauthenticatedServiceOwner: Equatable {
+        /// connect(2) to the endpoint failed with this errno.
+        case unreachableEndpoint(socket: String, errno: Int32)
+        /// No endpoint is published, but another process holds the state
+        /// singleton.
+        case occupiedStateSingleton
+        /// The endpoint is served by an executable outside the daemon service
+        /// nested in an app bundle.
+        case foreignProcess(socket: String, executable: String)
+        /// A validly signed app of another product, team, or app group owns
+        /// the endpoint.
+        case foreignService(app: String)
+        /// The kernel names the daemon's executable inside an app that no
+        /// longer exists at that path.
+        case ownerAppMissing(app: String)
+        /// The daemon reports a different release or executable than the
+        /// signed app at its path.
+        case ownerAppReplaced(app: String, running: String, installed: String)
+        /// An authentication step failed; nothing more is established.
+        case unauthenticated(socket: String, step: AuthenticationStep, failure: String)
+        /// The daemon exited while it was being authenticated.
+        case exitedDuringProof
+
+        var diagnosis: String {
+            let refusal = "PortableFS stops or replaces only a daemon it can authenticate, because authentication identifies the daemon whose mount inventory the replacement then proves empty."
+            let installer = "Update PortableFS only with its installer, which quiesces the running daemon before it replaces the app."
+            let orphanRecovery = "Unmount any PortableFS volumes, log out of macOS and back in to end that daemon, then reopen PortableFS. \(installer)"
+            let daemonLog = "~/.local/state/portablefs/portablefsd.log"
+            switch self {
+            case let .unreachableEndpoint(socket, code) where code == ECONNREFUSED:
+                return "A socket exists at \(socket), but no daemon accepted a connection on it (\(String(cString: strerror(code)))). \(refusal) Reopen PortableFS in a moment: a starting daemon replaces a socket left by one that stopped. If this persists, \(daemonLog) records why no daemon is listening."
+            case let .unreachableEndpoint(socket, code):
+                return "PortableFS could not connect to its daemon control socket at \(socket): \(String(cString: strerror(code))). \(refusal) PortableFS leaves that path unchanged; \(daemonLog) records the daemon's own view of it."
+            case .occupiedStateSingleton:
+                return "No PortableFS daemon has published its control socket, but another process holds the PortableFS state lock: a daemon that is starting or stopping, or another copy of PortableFS replacing the service. \(refusal) Reopen PortableFS once it settles. If this persists, quit every other copy of PortableFS; if it still persists, log out of macOS and back in."
+            case let .foreignProcess(socket, executable):
+                return "The PortableFS daemon control socket at \(socket) is served by \(executable), which is not the daemon service nested in a PortableFS app. \(refusal) Quit that program, then reopen PortableFS."
+            case let .foreignService(app):
+                return "The running PortableFS daemon belongs to \(app), a different signed PortableFS product; only one product can own this account's daemon. \(refusal) Quit that app and turn off its background item in System Settings > General > Login Items, then reopen this app."
+            case let .ownerAppMissing(app):
+                return "The running PortableFS daemon was started from \(app), which no longer exists at that path. \(refusal) \(orphanRecovery)"
+            case let .ownerAppReplaced(app, running, installed):
+                return "The running PortableFS daemon is release \(running), but \(app) now contains release \(installed): the app was replaced while its daemon ran. \(refusal) \(orphanRecovery)"
+            case let .unauthenticated(socket, step, failure):
+                let reason = failure.hasSuffix(".") ? failure : failure + "."
+                return "PortableFS could not \(step.action) for the daemon control socket at \(socket): \(reason) \(refusal) Quit any other copy of PortableFS and reopen this one. If the app that started the daemon was deleted or replaced while it ran, unmount any PortableFS volumes and log out of macOS and back in to end that daemon. \(installer)"
+            case .exitedDuringProof:
+                return "The PortableFS daemon exited while PortableFS was authenticating it. Reopen PortableFS."
+            }
+        }
+    }
+
+    enum RegistrationError: LocalizedError {
         case invalidHostBundle(String)
         case invalidHostSignature(String)
         case missingHelper(String)
@@ -1657,7 +2174,9 @@ public enum PortableFSDServiceCoordinator {
         case runtimePathPresent(String)
         case inspectRuntimePath(String, Int32)
         case inspectDaemonProcess(Int32)
+        case unresolvableDaemonExecutable(Int32)
         case invalidDaemonProcessWitness
+        case unauthenticatedServiceOwner(UnauthenticatedServiceOwner)
         case inspectDaemonStateSingleton(Int32)
         case invalidDaemonStateSingleton
         case daemonStateSingletonHeld
@@ -1689,7 +2208,7 @@ public enum PortableFSDServiceCoordinator {
             case .invalidPlist(let path):
                 return "The sealed app has an invalid PortableFS LaunchAgent property list at \(path)."
             case .inventoryPreflight(let detail):
-                return "PortableFS could not prove an empty mount and daemon-attach inventory before service replacement: \(detail)"
+                return "PortableFS could not prove an empty mount and daemon-attach inventory before service replacement (\(detail)). Unmount every PortableFS volume and quit any other copy of PortableFS, then try again."
             case .invalidControlSocketRoot(let path):
                 return "PortableFS could not resolve its canonical account control root from \(path)."
             case .runtimePathPresent(let path):
@@ -1698,8 +2217,12 @@ public enum PortableFSDServiceCoordinator {
                 return "PortableFS could not prove runtime path absence at \(path): \(String(cString: strerror(code)))"
             case .inspectDaemonProcess(let code):
                 return "PortableFS could not inspect the authenticated daemon process: \(String(cString: strerror(code)))"
+            case .unresolvableDaemonExecutable(let code):
+                return "PortableFS could not resolve the executable of the live daemon process: \(String(cString: strerror(code)))"
             case .invalidDaemonProcessWitness:
                 return "PortableFS could not bind the live daemon to its exact signed process execution."
+            case .unauthenticatedServiceOwner(let owner):
+                return owner.diagnosis
             case .inspectDaemonStateSingleton(let code):
                 return "PortableFS could not inspect the canonical daemon state singleton: \(String(cString: strerror(code)))"
             case .invalidDaemonStateSingleton:

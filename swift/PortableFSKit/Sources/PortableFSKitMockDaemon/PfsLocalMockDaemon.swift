@@ -108,7 +108,14 @@ private final class PfsMockWireControlCompletion: @unchecked Sendable {
 
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
+        /// Hello handshakes received. Each is one connection attempt, so a
+        /// client that retries a refused handshake is visible here.
+        public var helloRequests: Int
         public var openRequests: Int
+        /// The access each OPEN asked for, in arrival order. A frontend that
+        /// reuses or upgrades a description is judged by exactly which
+        /// descriptions it asked the authority for, not merely how many.
+        public var openModes: [PfsOpenMode]
         public var closeRequests: Int
         public var reclaimRequests: Int
         public var activeHandles: Int
@@ -323,32 +330,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     /// then closes that client connection before sending the reply.
     public func loseNextRetiredCloseReply(errno: Int32 = 0) async {
         await fileSystem.loseNextRetiredCloseReply(errno: errno)
-    }
-
-    /// Marks the next `count` publication-bearing replies as retracted,
-    /// modelling the daemon discovering that a delegation handoff crossed the
-    /// operation those replies belong to.
-    ///
-    /// The retraction rides an ordinary reply rather than arriving as its own
-    /// frame, which is the whole ordering argument: the frontend cannot see it
-    /// after the values it condemns. A mock that emitted a separate message
-    /// would be testing a protocol this one does not have.
-    public func retractNextPublications(count: Int = 1) async {
-        await fileSystem.retractNextPublications(count: count)
-    }
-
-    /// Retracts the next `count` publication-bearing requests AND refuses them
-    /// without executing, which is what the real daemon does once an operation
-    /// has been crossed: it fails every still-undispatched request of that
-    /// operation EINTR rather than running it.
-    ///
-    /// This is the production shape of a retraction. The bit rides the
-    /// refusal's own reply, so the frame that condemns the operation is
-    /// usually an ErrorReply rather than a successful one — and a mutation
-    /// that was waiting on the handoff never lands, which is what lets the
-    /// frontend answer EINTR without lying about what happened.
-    public func refuseNextPublicationsAsRetracted(count: Int = 1) async {
-        await fileSystem.refuseNextPublicationsAsRetracted(count: count)
     }
 
     public func delayNextOpen(nanoseconds: UInt64) async {
@@ -1051,15 +1032,27 @@ private actor MockFileSystem {
         var message: String
     }
 
+    /// One open file description. Its access is fixed when it is opened, as
+    /// it is for the authority's real descriptor: a later chmod neither
+    /// grants nor revokes it, and an I/O the description was not opened for
+    /// fails EBADF instead of being served.
+    private struct OpenDescription {
+        var nodeID: UInt64
+        var readable: Bool
+        var writable: Bool
+    }
+
     private let configuration: PfsLocalMockDaemon.Configuration
     private var nodes: [UInt64: Node] = [:]
-    private var handles: [UInt64: UInt64] = [:]
+    private var handles: [UInt64: OpenDescription] = [:]
     private var itemsByID: [UInt64: Node] = [:]
     private var acceptedItems: Set<UInt64> = [1]
     private var nextItemID: UInt64 = 2
     private var nextNodeID: UInt64 = 2
     private var nextHandle: UInt64 = 1
+    private var helloRequests = 0
     private var openRequests = 0
+    private var openModes: [PfsOpenMode] = []
     private var closeRequests = 0
     private var reclaimRequests = 0
     private var readRequests = 0
@@ -1085,8 +1078,6 @@ private actor MockFileSystem {
     private var visibilityAcks: [PfsVisibilityAckRequest] = []
     private var v3LivenessRequests: [PfsV3LivenessRequest] = []
     private var syncVolumeRequests = 0
-    private var pendingRetractions = 0
-    private var pendingRetractionRefusals = 0
     private var pendingCloseFailures = 0
     private var pendingRetiredCloseErrnos: [Int32] = []
     private var pendingLostRetiredCloseErrnos: [Int32] = []
@@ -1141,7 +1132,9 @@ private actor MockFileSystem {
 
     func stats() -> PfsLocalMockDaemon.Stats {
         PfsLocalMockDaemon.Stats(
+            helloRequests: helloRequests,
             openRequests: openRequests,
+            openModes: openModes,
             closeRequests: closeRequests,
             reclaimRequests: reclaimRequests,
             activeHandles: handles.count,
@@ -1191,7 +1184,9 @@ private actor MockFileSystem {
     }
 
     func resetStats() {
+        helloRequests = 0
         openRequests = 0
+        openModes.removeAll()
         closeRequests = 0
         reclaimRequests = 0
         readRequests = 0
@@ -1220,14 +1215,6 @@ private actor MockFileSystem {
         visibilityAcks.removeAll()
         v3LivenessRequests.removeAll()
         syncVolumeRequests = 0
-    }
-
-    func retractNextPublications(count: Int) {
-        pendingRetractions += count
-    }
-
-    func refuseNextPublicationsAsRetracted(count: Int) {
-        pendingRetractionRefusals += count
     }
 
     func failNextClose() {
@@ -1321,25 +1308,9 @@ private actor MockFileSystem {
             default:
                 reply.publicationAckRequired = false
             }
-            // Only a reply the frontend could publish can be retracted, and
-            // the retraction still leaves the acknowledgement owed: the
-            // daemon's handoff gate is released by the ack, not by whether
-            // the frontend kept the values.
-            if reply.publicationAckRequired && pendingRetractions > 0 {
-                pendingRetractions -= 1
-                reply.publicationRetracted = true
-            }
-            // The refusal arm must throw BEFORE the dispatch switch below, or
-            // the mock would be modelling a daemon that retracts an operation
-            // and mutates for it anyway — precisely the state the real
-            // daemon's pre-dispatch check exists to make unreachable.
-            if reply.publicationAckRequired && pendingRetractionRefusals > 0 {
-                pendingRetractionRefusals -= 1
-                reply.publicationRetracted = true
-                throw MockPOSIXError(errno: EINTR, message: "operation retracted before dispatch")
-            }
             switch body {
             case let .hello(request):
+                helloRequests += 1
                 var response = PfsHelloReply()
                 response.protocolMajor = request.protocolMajor
                 response.protocolMinor = configuration.protocolMinor ?? 16
@@ -1407,7 +1378,7 @@ private actor MockFileSystem {
                 guard directory.kind == .directory else {
                     throw MockPOSIXError(errno: ENOTDIR, message: "not a directory")
                 }
-                guard request.handle != 0, handles[request.handle] == directory.id else {
+                guard request.handle != 0, handles[request.handle]?.nodeID == directory.id else {
                     throw MockPOSIXError(errno: EBADF, message: "enumeration handle does not belong to directory")
                 }
                 let ordered = orderedChildren(of: directory)
@@ -1460,6 +1431,13 @@ private actor MockFileSystem {
                 if setFlags && !configuration.flagsSupported && !isGraftBacked(node) {
                     throw MockPOSIXError(errno: ENOTSUP, message: "authority does not persist BSD file flags")
                 }
+                // Like the authority, a truncate through a description needs
+                // one open for writing; without a description it is checked
+                // against the object.
+                if request.hasSize, request.handle != 0,
+                   handles[request.handle]?.writable != true {
+                    throw MockPOSIXError(errno: EINVAL, message: "truncate through a description not open for writing")
+                }
                 if request.hasMode { node.mode = request.mode }
                 if request.hasUid { node.uid = request.uid }
                 if request.hasGid { node.gid = request.gid }
@@ -1474,6 +1452,19 @@ private actor MockFileSystem {
             case let .open(request):
                 let node = try namespaceNode(for: request.item)
                 openRequests += 1
+                openModes.append(request.mode)
+                let readable = request.mode == .read || request.mode == .readWrite
+                let writable = request.mode == .write || request.mode == .readWrite
+                guard readable || writable else {
+                    throw MockPOSIXError(errno: EINVAL, message: "open requests no access")
+                }
+                // The authority opens under its own credentials, which own
+                // every object it stores, so the owner bits decide. This is
+                // what makes a mode-0200 file writable but unreadable.
+                guard !readable || node.mode & 0o400 != 0,
+                      !writable || node.mode & 0o200 != 0 else {
+                    throw MockPOSIXError(errno: EACCES, message: "open access denied by mode")
+                }
                 let handle: UInt64
                 if pendingOpenHandlesToOmit > 0 {
                     pendingOpenHandlesToOmit -= 1
@@ -1481,7 +1472,11 @@ private actor MockFileSystem {
                 } else {
                     handle = nextHandle
                     nextHandle += 1
-                    handles[handle] = node.id
+                    handles[handle] = OpenDescription(
+                        nodeID: node.id,
+                        readable: readable,
+                        writable: writable
+                    )
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
                     ProvisionalResource(handle: handle, itemCount: 0)
@@ -1506,7 +1501,7 @@ private actor MockFileSystem {
                     reply.body = .closeReply(response)
                     break
                 }
-                guard let nodeID = handles.removeValue(forKey: request.handle) else {
+                guard let nodeID = handles.removeValue(forKey: request.handle)?.nodeID else {
                     throw MockPOSIXError(errno: EINVAL, message: "unknown handle")
                 }
                 reapIfUnlinked(nodeID: nodeID)
@@ -1533,7 +1528,7 @@ private actor MockFileSystem {
                     let delay = pendingReadDelaysNanoseconds.removeFirst()
                     try await Task.sleep(nanoseconds: delay)
                 }
-                let node = try node(forHandle: request.handle)
+                let node = try node(forHandle: request.handle, reading: true)
                 let offset = min(Int(request.offset), node.data.count)
                 let end = min(node.data.count, offset + Int(request.length))
                 var response = PfsReadReply()
@@ -1550,7 +1545,7 @@ private actor MockFileSystem {
                 if let code = writeErrnoByIndex[writeIndex] {
                     throw MockPOSIXError(errno: code, message: "injected write failure")
                 }
-                let node = try node(forHandle: request.handle)
+                let node = try node(forHandle: request.handle, writing: true)
                 var payload = request.data
                 if !pendingWriteShortCounts.isEmpty {
                     let want = pendingWriteShortCounts.removeFirst()
@@ -1574,6 +1569,12 @@ private actor MockFileSystem {
                     guard existing.kind == .file else {
                         throw MockPOSIXError(errno: EISDIR, message: "not a regular file")
                     }
+                    // Opening an existing name creates nothing, so no creation
+                    // grant exists: the read/write description it returns
+                    // passes the ordinary OPEN access check.
+                    guard existing.mode & 0o600 == 0o600 else {
+                        throw MockPOSIXError(errno: EACCES, message: "open access denied by mode")
+                    }
                     node = existing
                     intern(node)
                 } else {
@@ -1588,7 +1589,14 @@ private actor MockFileSystem {
                 } else {
                     handle = nextHandle
                     nextHandle += 1
-                    handles[handle] = node.id
+                    // A new file's creator is granted read/write access by the
+                    // creation itself, whatever mode the file carries; an
+                    // existing name passed the OPEN access check above.
+                    handles[handle] = OpenDescription(
+                        nodeID: node.id,
+                        readable: true,
+                        writable: true
+                    )
                 }
                 provisionalResourcesByRequestID[envelope.requestID] =
                     ProvisionalResource(handle: handle, itemCount: 1, itemID: node.itemID)
@@ -1902,7 +1910,7 @@ private actor MockFileSystem {
                 resourceAbandons += 1
             }
             if resource.handle != 0, !request.acceptHandles,
-               let nodeID = handles.removeValue(forKey: resource.handle) {
+               let nodeID = handles.removeValue(forKey: resource.handle)?.nodeID {
                 reapIfUnlinked(nodeID: nodeID)
             }
             return .continueReading
@@ -1938,9 +1946,19 @@ private actor MockFileSystem {
         return node
     }
 
-    private func node(forHandle handle: UInt64) throws -> Node {
-        guard let id = handles[handle], let node = nodes[id] else {
+    private func node(
+        forHandle handle: UInt64,
+        reading: Bool = false,
+        writing: Bool = false
+    ) throws -> Node {
+        guard let description = handles[handle], let node = nodes[description.nodeID] else {
             throw MockPOSIXError(errno: EBADF, message: "bad handle")
+        }
+        guard !reading || description.readable else {
+            throw MockPOSIXError(errno: EBADF, message: "handle is not open for reading")
+        }
+        guard !writing || description.writable else {
+            throw MockPOSIXError(errno: EBADF, message: "handle is not open for writing")
         }
         return node
     }
@@ -1949,7 +1967,7 @@ private actor MockFileSystem {
         guard let node = nodes[nodeID], node.nlink == 0 else {
             return
         }
-        if handles.values.contains(nodeID) {
+        if handles.values.contains(where: { $0.nodeID == nodeID }) {
             return
         }
         nodes.removeValue(forKey: nodeID)
