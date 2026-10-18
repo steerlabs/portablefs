@@ -26,7 +26,11 @@ var ErrSubscriptionReset = errors.New("authorityrpc: uncertain control result re
 // identity set when both are present. The returned deadline is anchored at the
 // local request start. Callers must therefore treat it as a conservative cache
 // horizon even when the response spent time in transit.
-func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte) (result *authoritypb.SubscribeReply, deadlineResult time.Time, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return nil, time.Time{}, err
+	}
 	if !c.linuxSubscriptionProfile() {
 		return nil, time.Time{}, syscall.EOPNOTSUPP
 	}
@@ -79,7 +83,11 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 // RenewSubscription refreshes one exact incarnation. A late reply cannot
 // revive an expired subscription because the deadline is measured from the
 // request start rather than response receipt.
-func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (time.Time, error) {
+func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (result time.Time, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return time.Time{}, err
+	}
 	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
 		return time.Time{}, ErrSubscriptionReset
 	}
@@ -109,7 +117,11 @@ func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (tim
 // NextControlEvent long-polls for exactly the successor of afterSequence.
 // Client admission allows only one such poll at a time, while renewal and
 // acknowledgment requests retain independent CONTROL capacity.
-func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (*authoritypb.ControlEvent, error) {
+func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (result *authoritypb.ControlEvent, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return nil, err
+	}
 	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
 		return nil, ErrSubscriptionReset
 	}
@@ -137,7 +149,11 @@ func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequenc
 
 // AcknowledgeChanges advances the cumulative withdrawn change prefix. Position
 // zero is a legal no-op acknowledgment; incarnation zero is never valid.
-func (c *Client) AcknowledgeChanges(ctx context.Context, incarnation, position uint64) error {
+func (c *Client) AcknowledgeChanges(ctx context.Context, incarnation, position uint64) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	if !c.linuxSubscriptionProfile() {
 		return syscall.EOPNOTSUPP
 	}
@@ -159,7 +175,11 @@ func (c *Client) AcknowledgeChanges(ctx context.Context, incarnation, position u
 	return nil
 }
 
-func (c *Client) AcknowledgeDelegationRecall(ctx context.Context, incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef, appliedSequence uint64) error {
+func (c *Client) AcknowledgeDelegationRecall(ctx context.Context, incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef, appliedSequence uint64) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	if err := c.validateDelegationAck(incarnation, eventSequence, delegation); err != nil {
 		return err
 	}
@@ -181,7 +201,11 @@ func (c *Client) AcknowledgeDelegationRecall(ctx context.Context, incarnation, e
 	return nil
 }
 
-func (c *Client) AcknowledgeDelegationBreak(ctx context.Context, incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef, appliedSequence uint64) error {
+func (c *Client) AcknowledgeDelegationBreak(ctx context.Context, incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef, appliedSequence uint64) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	if err := c.validateDelegationAck(incarnation, eventSequence, delegation); err != nil {
 		return err
 	}
@@ -203,7 +227,11 @@ func (c *Client) AcknowledgeDelegationBreak(ctx context.Context, incarnation, ev
 	return nil
 }
 
-func (c *Client) AcknowledgeDelegationModeChange(ctx context.Context, incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef, appliedSequence uint64) error {
+func (c *Client) AcknowledgeDelegationModeChange(ctx context.Context, incarnation, eventSequence uint64, delegation *authoritypb.DelegationRef, appliedSequence uint64) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	if err := c.validateDelegationAck(incarnation, eventSequence, delegation); err != nil {
 		return err
 	}
@@ -227,7 +255,11 @@ func (c *Client) AcknowledgeDelegationModeChange(ctx context.Context, incarnatio
 
 // ReleaseDelegations sends an all-or-error sorted batch after the caller has
 // stopped admission and flushed each identity's cut.
-func (c *Client) ReleaseDelegations(ctx context.Context, incarnation uint64, releases []*authoritypb.DelegationRelease) error {
+func (c *Client) ReleaseDelegations(ctx context.Context, incarnation uint64, releases []*authoritypb.DelegationRelease) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	if !c.linuxSubscriptionProfile() {
 		return syscall.EOPNOTSUPP
 	}
@@ -265,7 +297,11 @@ func (c *Client) ReleaseDelegations(ctx context.Context, incarnation uint64, rel
 // Barrier durably covers the already-applied session ticket cut. Barrier is a
 // replay-retained DATA mutation, even though its result contains no filesystem
 // object, so a transport repair cannot duplicate or lose its exact outcome.
-func (c *Client) Barrier(ctx context.Context, cutSequence uint64) (*authoritypb.BarrierReply, error) {
+func (c *Client) Barrier(ctx context.Context, cutSequence uint64) (result *authoritypb.BarrierReply, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return nil, err
+	}
 	if !c.linuxSubscriptionProfile() {
 		return nil, syscall.EOPNOTSUPP
 	}
@@ -291,7 +327,11 @@ func (c *Client) Barrier(ctx context.Context, cutSequence uint64) (*authoritypb.
 
 // WaitVisibility joins peer withdrawal through an already-issued application
 // ticket. It performs no durability operation and is safe to retry.
-func (c *Client) WaitVisibility(ctx context.Context, cutSequence uint64) (*authoritypb.WaitVisibilityReply, error) {
+func (c *Client) WaitVisibility(ctx context.Context, cutSequence uint64) (result *authoritypb.WaitVisibilityReply, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return nil, err
+	}
 	if !c.linuxSubscriptionProfile() {
 		return nil, syscall.EOPNOTSUPP
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -199,7 +198,7 @@ func TestTerminalDetachPreservesExactAbsenceDelivery(t *testing.T) {
 			if _, err := c.Call(t.Context(), &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{MountAbsence: proof}}}); err != ErrAuthorityChanged {
 				t.Fatalf("raw terminal Detach = %v", err)
 			}
-			if err := c.DetachAfterUnmount(t.Context(), nil); err != syscall.EPERM {
+			if err := c.DetachAfterUnmount(t.Context(), nil); err != ErrAuthorityChanged {
 				t.Fatalf("evidence-free terminal Detach = %v", err)
 			}
 			done := make(chan error, 1)
