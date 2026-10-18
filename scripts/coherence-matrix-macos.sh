@@ -11,12 +11,16 @@
 #       --remote user@linux-host --remote-mount /path/b \
 #       [--remote-binary /path/to/linux/pfs-coherence-matrix]
 #
-# There is no Mac-to-Mac form. A volume admits exactly one FSKit writer, and a
-# second Mac mount of it - on this Mac or another - is refused at activation by
-# writer exclusion, so two Mac mounts of one volume are not a configuration this
-# matrix can measure. That refusal, and a clean detach letting a new Mac mount
-# activate, are not asserted here either: proving them requires attempting
-# mounts, and this script never mounts anything (see below).
+# While the Mac is attached it is the volume's only writer, so every case in
+# which mount B mutates is declared to FAIL (the Linux peer's mutation must be
+# refused with EBUSY), and the cases in which only the Mac mutates must PASS.
+#
+# There is no Mac-to-Mac form. A second Mac mount of the volume - on this Mac or
+# another - is refused at activation by writer exclusion, so two Mac mounts of
+# one volume are not a configuration this matrix can measure. That refusal, and
+# a clean detach letting a new Mac mount activate, are not asserted here:
+# proving them requires attempting mounts, and this script never mounts
+# anything (see below).
 #
 # What this script will NOT do:
 #
@@ -199,16 +203,64 @@ fi
 # replacement failing every round, a rename leaving both names on one inode, a
 # remotely deleted file that could still be reopened, stale mode bits - are NOT
 # declared. They are defects, and they must show up red until they are fixed.
+#
+# Writer exclusion is the protocol-8 macOS contract: while mount A (the Mac) is
+# attached it is the volume's only writer, and every visible mutation from
+# mount B (the Linux peer) is refused with EBUSY. Each case below makes mount B
+# mutate, so its expected result is FAIL; a PASS would mean the Linux peer
+# wrote underneath the Mac, which is exactly what the contract forbids, and the
+# driver reports an unexpected pass as a failure. The cases that remain
+# undeclared are the ones where only the Mac mutates and the Linux peer
+# observes, so they must PASS.
 # ---------------------------------------------------------------------------
+EXCLUSION="mount B is the Linux peer, a reader while the Mac holds writer exclusion; its mutation must be refused with EBUSY"
 EXPECT=(
-  --expect "concurrent_same_file_append_atomicity=FAIL:FSKit resolves the O_APPEND offset from the kernel's cached EOF before the extension sees the write, and FSVolumeOpenModes carries no append intent, so cross-mount append atomicity is not available on this platform"
+  --expect "concurrent_same_file_append_atomicity=FAIL:$EXCLUSION (FSKit also carries no append intent, so cross-mount append atomicity is not available on this platform)"
 )
+for case_name in \
+  remote_create_visible \
+  remote_unlink_name_gone \
+  remote_unlink_open_fd_posix \
+  atomic_replace_new_inode \
+  rename_old_gone_new_present_same_inode \
+  remote_chmod_visible \
+  remote_utimes_visible \
+  remote_truncate_grow_readable_eof \
+  remote_truncate_shrink_readable_eof \
+  dir_listing_reflects_remote_creates_and_deletes \
+  concurrent_writers_distinct_files \
+  concurrent_same_file_overwrite_integrity \
+  hardlink_visible_same_inode \
+  symlink_visible_and_resolves \
+  deep_nesting \
+  open_after_unlink_cross_mount_contents \
+  rename_over_open_fd \
+  same_dir_concurrent_mutations \
+  git_index_lock_protocol \
+  write_then_rename_flushes_before_visibility; do
+  EXPECT+=(--expect "${case_name}=FAIL:$EXCLUSION")
+done
+# These cases drive Linux-side harness machinery this script does not supply:
+# a stale-revision routes client, the cacheless gateway, mount pause/resume for
+# a missed recall, authority replacement, and machine-local route backing
+# (which macOS does not serve at all). They skip with a stated reason.
+for case_name in \
+  routes_revision_mismatch \
+  gateway_reads_delegated_data_without_obstructing_writer \
+  recall_budget_loss_fails_barrier \
+  epoch_change_stales_handles_and_new_barrier_passes \
+  local_route_isolation; do
+  EXPECT+=(--expect "${case_name}=SKIP:requires Linux-side harness commands or machine-local routes that the Mac plus Linux-peer form does not provide")
+done
 
 ARGS=(--a "$MOUNT_A" --atomic-replace-rounds "$ROUNDS")
 ARGS+=(--b "$REMOTE_MOUNT" --b-ssh "$REMOTE" --b-ssh-binary "$REMOTE_BIN")
 ARGS+=(--label "macOS $(sw_vers -productVersion) + Linux $remote_version: two hosts, one volume")
 if [ -n "${PFS_ALT_GID:-}" ]; then
   ARGS+=(--alt-gid "$PFS_ALT_GID")
+  EXPECT+=(--expect "remote_chown_visible=FAIL:$EXCLUSION")
+else
+  EXPECT+=(--expect "remote_chown_visible=SKIP:no PFS_ALT_GID was supplied, so there is no second group to change ownership to")
 fi
 if [ -n "${PFS_FENCE_COMMAND:-}" ]; then
   ARGS+=(--fence-command "$PFS_FENCE_COMMAND")
