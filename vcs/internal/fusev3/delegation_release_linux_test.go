@@ -35,7 +35,8 @@ func (f *releaseOutcomeRPC) CallMutation(ctx context.Context, request *authority
 	if request.GetBarrier() != nil {
 		// These cases inspect retained obligations after ownership transfer.
 		// A background durable prefix would race the assertion itself.
-		return nil, errors.New("durability withheld while checking retained records")
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	if batch := request.GetCloseBatch(); batch != nil && f.close != nil {
 		return f.close(batch)

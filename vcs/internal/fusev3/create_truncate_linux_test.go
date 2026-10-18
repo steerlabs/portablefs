@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"google.golang.org/protobuf/proto"
 )
@@ -282,12 +283,22 @@ func TestCloseAttemptsBarrierThroughHorizonAfterSessionEnd(t *testing.T) {
 	}
 }
 
+// Shutdown's admission test holds the flush before replay assignment. An
+// assigned request with no outcome has the distinct retained-data-loss contract.
+type unsentShutdownFlushRPC struct{ delegationFakeRPC }
+
+func (*unsentShutdownFlushRPC) CallMutationSegments(ctx context.Context, _ *authoritypb.Request, _ [][]byte, _ authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func TestCloseFencesCapacityWaitBeforeBarrier(t *testing.T) {
-	fake := &delegationFakeRPC{block: make(chan struct{})}
-	manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	fake := &unsentShutdownFlushRPC{}
+	manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.StartWriteback()
 	t.Cleanup(manager.Stop)
 	id := installDelegationForTest(t, manager, 93, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	if _, err := manager.Write(t.Context(), id, 0, []byte("dirty"), false); err != nil {

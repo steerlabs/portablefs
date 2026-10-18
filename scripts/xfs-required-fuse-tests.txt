@@ -83,3 +83,9 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNot
 # Required only when PORTABLEFS_PERFORMANCE_TEST=1 selects the performance
 # baseline.
 performance github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCoherenceBaseline
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReviewDeferredCloseRetryCannotAdoptSuccessorEpoch
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReviewCloseRetryCannotBlockOnItsOwnFullQueue
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDeferredCloseSurvivesColdSubscriptionWithoutOwningSuccessor
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDurabilityProgressCoalescesApplicationsWhileOwnerIsBusy
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSynchronousOperationAllowsRequiredControlBeforeItsReply
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSynchronousOpenPublishesGrantBeforeWaitingForVisibility

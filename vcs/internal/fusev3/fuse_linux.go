@@ -56,7 +56,6 @@ const (
 	// fixed fraction of the same budget rather than as an independent knob that
 	// could be configured out of proportion with it.
 	reclaimLaneDivisor = 4
-	reclaimRetryDelay  = 100 * time.Millisecond
 
 	// portableFuseMajor/minor are the stock-kernel semantic floor. Protocol
 	// 7.31 is Linux 5.10's FUSE contract and includes every mandatory primitive
@@ -576,6 +575,7 @@ func reclaimLaneWidth(maxInFlight int) int {
 }
 
 func (m *Mount) start(lease time.Duration) {
+	m.delegations.StartWriteback()
 	m.wg.Add(2 + m.reclaimWorkers)
 	go m.keepAlive(m.ctx, lease)
 	go m.watchSession(m.ctx, m.rpc.SessionEndPending())
@@ -815,10 +815,16 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 		m.recordFatalCause(errors.New("fusev3: reclaim worker requires the epoch RPC facade"))
 		return
 	}
+	var retained []queuedReclaim
 	for {
-		batch, ok := m.reclaim.popBatch(ctx, authorityrpc.MaxReclaimBatch)
-		if !ok {
-			return
+		batch := retained
+		retained = nil
+		if len(batch) == 0 {
+			var ok bool
+			batch, ok = m.reclaim.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+			if !ok {
+				return
+			}
 		}
 		transport := batch[0].transport
 		if transport != rpc.current() {
@@ -863,22 +869,8 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 				if waitErr := m.subscription.waitActive(ctx); waitErr != nil {
 					return
 				}
-				timer := time.NewTimer(reclaimRetryDelay)
-				select {
-				case <-timer.C:
-				case <-ctx.Done():
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					return
-				}
 				if transport == rpc.current() {
-					for _, entry := range batch {
-						m.reclaim.push(entry)
-					}
+					retained = batch
 				}
 			}
 			continue
@@ -1756,6 +1748,10 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	if err := n.registerDelegatedHandle(handle, response.GetOpen().GetDelegation()); err != nil {
 		return nil, 0, syscall.EIO
 	}
+	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response); err != nil {
+		_ = handle.closeForCleanup(ctx, 0, false)
+		return nil, 0, bufferErrno(err)
+	}
 	if openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
 			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
@@ -2433,6 +2429,10 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
 	if err := child.registerDelegatedHandle(handle, created.GetDelegation()); err != nil {
 		return nil, nil, 0, syscall.EIO
+	}
+	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response); err != nil {
+		_ = handle.closeForCleanup(ctx, 0, false)
+		return nil, nil, 0, bufferErrno(err)
 	}
 	object := postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleTarget)
 	if object == nil {

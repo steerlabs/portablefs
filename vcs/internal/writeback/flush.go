@@ -51,12 +51,11 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 	}
 	f.flushing = true
 	b.mu.Unlock()
-	completed := false
 	defer func() {
 		b.mu.Lock()
 		f.flushing = false
 		b.signal()
-		if completed && f.reschedule && f.accepted != nil {
+		if !f.scheduled && f.reschedule && f.accepted != nil {
 			f.reschedule = false
 			b.trigger()
 		}
@@ -80,7 +79,6 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		applied = max(applied, f.lastApplied)
 		p := b.batchLocked(f, cut)
 		if p == nil {
-			completed = true
 			b.mu.Unlock()
 			return applied, nil
 		}

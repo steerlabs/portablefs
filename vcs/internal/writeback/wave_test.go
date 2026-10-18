@@ -26,7 +26,7 @@ func entryPieces(e Entry) [][]byte {
 
 func TestFlushWaveBorrowsRecordsAndPreservesOverlapAndCut(t *testing.T) {
 	f := &waveTestFlusher{width: 4, payload: 8}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(1)
 	mustWrite(t, b, id, 0, "abcdefghijklmnopq")
 	mustWrite(t, b, id, 17, "rstuv")
@@ -104,7 +104,7 @@ func TestFlushWaveBorrowsRecordsAndPreservesOverlapAndCut(t *testing.T) {
 
 func TestFlushWaveRetryKeepsTokensAndPartiallyConsumedRecord(t *testing.T) {
 	f := &waveTestFlusher{width: 4, payload: 8}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(2)
 	cut := mustWrite(t, b, id, 0, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 	failure := errors.New("retryable wave refusal")
@@ -162,7 +162,7 @@ func TestFlushWaveRetryKeepsTokensAndPartiallyConsumedRecord(t *testing.T) {
 func TestFlushWaveDropDoesNotMutateBorrowedEntries(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	f := &waveTestFlusher{width: 4, payload: 4}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(3)
 	cut := mustWrite(t, b, id, 0, "abcdefghijklmnop")
 	f.call = func(entries []Entry) ([]uint64, error) {
@@ -188,7 +188,7 @@ func TestFlushWaveDropDoesNotMutateBorrowedEntries(t *testing.T) {
 
 func TestFlushWaveRejectsSequenceBelowPriorWave(t *testing.T) {
 	f := &waveTestFlusher{width: 2, payload: 4}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(4)
 	cut := mustWrite(t, b, id, 0, "abcd")
 	f.call = func([]Entry) ([]uint64, error) { return []uint64{10}, nil }
@@ -207,7 +207,7 @@ func TestFlushWaveRejectsSequenceBelowPriorWave(t *testing.T) {
 
 func TestFlushWaveCompletesPrefixBeforePartialRecord(t *testing.T) {
 	f := &waveTestFlusher{width: 1, payload: 4}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(5)
 	small := mustWrite(t, b, id, 0, "ab")
 	cut := mustWrite(t, b, id, 2, "cdefgh")
@@ -245,7 +245,7 @@ func TestFlushWaveAdmissionOrderModel(t *testing.T) {
 	rng := rand.New(rand.NewSource(192))
 	for trial := 0; trial < 100; trial++ {
 		f := &waveTestFlusher{width: 1 + rng.Intn(4), payload: 1 + rng.Intn(16)}
-		b := newTestBuffer(t, f, Options{FlushInterval: -1})
+		b := newTestBuffer(t, f, Options{})
 		id := testIdentity(6)
 		want, got := make([]byte, 256), make([]byte, 256)
 		for n := 0; n < 40; n++ {
@@ -289,7 +289,7 @@ func TestFileDurabilityCannotRetireAnotherIdentityOrLaterCut(t *testing.T) {
 		}
 		return r, nil
 	}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	one, two := testIdentity(7), testIdentity(8)
 	mustWrite(t, b, two, 0, "earlier")
 	cut := mustWrite(t, b, one, 0, "first")
@@ -325,12 +325,12 @@ func TestNewRefusesAnUnusableWaveShape(t *testing.T) {
 		{0, MaxPayload}, {-1, MaxPayload}, {MaxWaveWidth + 1, MaxPayload},
 		{1, 0}, {1, -1}, {1, MaxPayload + 1},
 	} {
-		if _, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{FlushInterval: -1}); !errors.Is(err, ErrInvalid) {
+		if _, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("New(width %d, payload %d) error = %v, want ErrInvalid", shape.width, shape.payload, err)
 		}
 	}
 	for _, shape := range []struct{ width, payload int }{{1, 1}, {MaxWaveWidth, MaxPayload}} {
-		b, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{FlushInterval: -1})
+		b, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{})
 		if err != nil {
 			t.Fatalf("New(width %d, payload %d): %v", shape.width, shape.payload, err)
 		}
@@ -361,7 +361,7 @@ func TestRetainedWaveRecursUntilAppliedAndNextWaveHasGreaterTokens(t *testing.T)
 		}
 		return sequences, nil
 	}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(9)
 	cut := mustWrite(t, b, id, 0, "abcd")
 	if _, err := b.FlushIdentity(t.Context(), id, cut); err == nil {

@@ -25,7 +25,7 @@ func TestPartialDurabilityAgainstNaiveFilesystem(t *testing.T) {
 				seq++
 				return seq, nil
 			})
-			b := newTestBuffer(t, flusher, Options{MaxBytes: 1 << 20, MaxEntries: 2048, FlushInterval: -1})
+			b := newTestBuffer(t, flusher, Options{MaxBytes: 1 << 20, MaxEntries: 2048})
 			for step := 0; step < 1000; step++ {
 				i := rng.Intn(2)
 				id := Identity{byte(i)}

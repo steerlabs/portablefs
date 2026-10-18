@@ -42,7 +42,7 @@ func TestFlushAllBoundsWorkersAndVisitsEveryTargetAfterFailure(t *testing.T) {
 				}
 				return uint64(id[0]) + 1, nil
 			})
-			b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 256, FlushInterval: -1, MaxFlushIdentities: limit})
+			b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 256, MaxFlushIdentities: limit})
 			var cut Cut
 			for i := 0; i < count; i++ {
 				cut = mustWrite(t, b, testIdentity(byte(i)), 0, "x")

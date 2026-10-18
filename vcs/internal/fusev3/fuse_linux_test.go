@@ -2451,45 +2451,6 @@ func TestReclaimWorkerRequiresEpochRPCFacade(t *testing.T) {
 	}
 }
 
-func TestPermanentReclaimRefusalIsBackedOff(t *testing.T) {
-	mount, rpc := testMount(t, 1)
-	var attempts []time.Time
-	rpc.mu.Lock()
-	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetReclaim() == nil {
-			return &authoritypb.Response{}, nil
-		}
-		attempts = append(attempts, time.Now())
-		return &authoritypb.Response{
-			Errno:   int32(syscall.EIO),
-			Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
-		}, nil
-	}
-	rpc.mu.Unlock()
-	mount.start(time.Hour)
-	defer func() {
-		mount.cancel()
-		mount.wg.Wait()
-	}()
-	mount.deferReclaim(testToken(72))
-	waitFor(t, "three backed-off reclaim attempts", func() bool {
-		rpc.mu.Lock()
-		defer rpc.mu.Unlock()
-		return len(attempts) >= 3
-	})
-	rpc.mu.Lock()
-	observed := append([]time.Time(nil), attempts[:3]...)
-	rpc.mu.Unlock()
-	for i := 1; i < len(observed); i++ {
-		if elapsed := observed[i].Sub(observed[i-1]); elapsed < reclaimRetryDelay*9/10 {
-			t.Fatalf("reclaim attempts %d and %d were separated by %s, want backoff near %s", i, i+1, elapsed, reclaimRetryDelay)
-		}
-	}
-	if mount.isRevoked() {
-		t.Fatal("permanent coherence reclaim refusal revoked the mount")
-	}
-}
-
 // --- the lease-backed cache contract --------------------------------------
 
 func (f *fakeRPC) SessionID() []byte { return cloneBytes(f.session) }

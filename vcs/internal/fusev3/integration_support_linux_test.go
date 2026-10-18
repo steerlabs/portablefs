@@ -187,18 +187,22 @@ type integrationConfig struct {
 // the client it is dialling.
 type recordingMembership struct {
 	mu      sync.Mutex
-	active  map[volumeserver.SessionID]struct{}
+	active  map[volumeserver.SessionID]volumeserver.MountMembershipProfile
 	ordered []volumeserver.SessionID
 }
 
 func newRecordingMembership() *recordingMembership {
-	return &recordingMembership{active: make(map[volumeserver.SessionID]struct{})}
+	return &recordingMembership{active: make(map[volumeserver.SessionID]volumeserver.MountMembershipProfile)}
 }
 
-func (m *recordingMembership) Activate(id volumeserver.SessionID) error {
+func (*recordingMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *recordingMembership) ActivateProfile(id volumeserver.SessionID, profile volumeserver.MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active[id] = struct{}{}
+	m.active[id] = profile
 	m.ordered = append(m.ordered, id)
 	return nil
 }
