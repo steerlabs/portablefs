@@ -104,8 +104,8 @@ func TestCachelessClientClosesWithAuthenticatedDetach(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Err(); err != nil {
-		t.Fatal(err)
+	if err := client.Err(); err == nil {
+		t.Fatal("closed client remains eligible for session reuse")
 	}
 	if got := rpc.releases.Load(); got != 1 {
 		t.Fatalf("authenticated detaches=%d", got)

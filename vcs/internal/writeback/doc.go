@@ -2,6 +2,10 @@
 // protocol, cgo, or platform dependency. One Buffer belongs to one attached
 // mount in one Authority epoch; it is not a persistent journal.
 //
+// Construct with New, install the owner's callbacks, then call Start. Every
+// accepted entry wakes the bounded application owner; arrivals while it is busy
+// coalesce into its next cut. Explicit barriers bypass the background queue.
+//
 // # Admission and ownership
 //
 // Write, Truncate, and SetAttr linearize under the admission mutex. Write copies

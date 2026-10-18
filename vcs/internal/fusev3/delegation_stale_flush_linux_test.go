@@ -134,10 +134,11 @@ func TestDelegationCapacityWaiterCannotBlockLoss(t *testing.T) {
 	for _, kind := range []string{"write", "metadata"} {
 		t.Run(kind, func(t *testing.T) {
 			fake := &staleFlushRPC{outcome: "capacity", entered: make(chan struct{}), resume: make(chan struct{})}
-			manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+			manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
+			manager.StartWriteback()
 			t.Cleanup(manager.Stop)
 			id := installDelegationForTest(t, manager, 50, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 			if _, err := manager.Write(t.Context(), id, 0, []byte("old"), false); err != nil {

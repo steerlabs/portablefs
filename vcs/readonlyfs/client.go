@@ -448,9 +448,15 @@ const detachBudget = 10 * time.Second
 func (c *Client) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
+		c.fatalMu.Lock()
+		live := c.fatal == nil
+		if live {
+			c.fatal = errors.New("readonlyfs: client closed")
+		}
 		c.stop()
+		c.fatalMu.Unlock()
 		<-c.done
-		if c.sessionError() == nil {
+		if live {
 			detachContext, cancel := context.WithTimeout(context.Background(), detachBudget)
 			closeErr = c.rpc.ReleaseBeforeMount(detachContext)
 			cancel()

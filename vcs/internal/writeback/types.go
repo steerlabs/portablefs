@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"syscall"
-	"time"
 )
 
 const (
@@ -143,9 +142,6 @@ type Options struct {
 	// MaxFlushIdentities bounds the worker pool used by FlushAll. Zero uses
 	// 16. Explicit identity flushes (recall/fsync) bypass that pool.
 	MaxFlushIdentities int
-	// Zero uses one second. A negative interval disables the timer for tests;
-	// cap-triggered and explicit flushing remain enabled.
-	FlushInterval time.Duration
 }
 
 type Stats struct {

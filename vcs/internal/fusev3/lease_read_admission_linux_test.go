@@ -54,7 +54,7 @@ func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
 	}
 }
 
-// lease protocol's read admission exists for. A blocking read(2) has no
+// Blocking read admission must survive a peer's ordinary rewrites. A read(2) has no
 // retryable errno: EAGAIN reaches the caller verbatim, where a Go runtime
 // registers the descriptor with its poller and never wakes. Every coherence
 // state a peer's write puts this mount into -- the authority coordinate closed
@@ -83,6 +83,7 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 	var readFailure atomic.Pointer[error]
 	var reads atomic.Int64
 	stop := make(chan struct{})
+	progress := make(chan struct{}, 1)
 	var readers sync.WaitGroup
 	for range 6 {
 		readers.Add(1)
@@ -100,9 +101,17 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 				if _, err := syscall.Pread(int(reader.Fd()), buf, 0); err != nil {
 					failure := fmt.Errorf("blocking pread during a peer write: %w", err)
 					readFailure.CompareAndSwap(nil, &failure)
+					select {
+					case progress <- struct{}{}:
+					default:
+					}
 					return
 				}
 				reads.Add(1)
+				select {
+				case progress <- struct{}{}:
+				default:
+				}
 				// Paced, not saturating. What opens the window this test is
 				// about is a read landing inside a recall, not raw throughput.
 				time.Sleep(50 * time.Microsecond)
@@ -117,7 +126,7 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 			readers.Wait()
 		}
 	}
-	t.Cleanup(stopReaders)
+	defer stopReaders()
 
 	payloads := [2][]byte{after, before}
 	for round := range 64 {
@@ -132,16 +141,19 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 		// Buffered writes can finish faster than the paced readers get CPU.
 		// Keep every rewrite round live until readers make progress, retaining
 		// the original minimum sample instead of relying on v6 write latency.
-		deadline := time.Now().Add(2 * time.Second)
+		watchdog := time.NewTimer(2 * time.Second)
 		for reads.Load()-startedReads < 8 {
 			if failure := readFailure.Load(); failure != nil {
+				watchdog.Stop()
 				t.Fatal(*failure)
 			}
-			if time.Now().After(deadline) {
+			select {
+			case <-progress:
+			case <-watchdog.C:
 				t.Fatal("blocking readers stopped making progress")
 			}
-			time.Sleep(time.Millisecond)
 		}
+		watchdog.Stop()
 	}
 	stopReaders()
 	if failure := readFailure.Load(); failure != nil {

@@ -286,7 +286,7 @@ func delegationTestGrant(seed byte, mode authoritypb.DelegationMode) *authorityp
 
 func newDelegationTestManager(t *testing.T, fake delegationRPC) *delegationManager {
 	t.Helper()
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestDelegationWritebackChunksAndOrdersOneFile(t *testing.T) {
 func TestDelegationWaveHonorsNegotiatedLimitAndResendsOnlyUnsentWrites(t *testing.T) {
 	const limit = 64 << 10
 	fake := &delegationLimitedRPC{delegationFakeRPC: delegationFakeRPC{maxWrite: limit}, waiting: make(chan struct{})}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestDelegationWaveHonorsNegotiatedLimitAndResendsOnlyUnsentWrites(t *testin
 
 func TestDelegationWritebackPipelinesDisjointFiles(t *testing.T) {
 	fake := &delegationPipelineRPC{started: make(chan byte, 2), release: make(chan struct{})}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -744,7 +744,7 @@ func TestDelegationModeChangeDowngradeAndUpgrade(t *testing.T) {
 
 func TestDelegationControlEventsPreservePerIdentityDeliveryOrder(t *testing.T) {
 	fake := &delegationOrderedControlRPC{firstStarted: make(chan struct{}), releaseFirst: make(chan struct{})}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,10 +860,11 @@ func TestDelegationSynchronousRetiresOverlayBeforeExternalMutation(t *testing.T)
 
 func TestDelegationDurabilityPumpReleasesCapacity(t *testing.T) {
 	fake := &delegationFakeRPC{}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.StartWriteback()
 	t.Cleanup(m.Stop)
 	id := installDelegationForTest(t, m, 12, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	if _, err := m.Write(context.Background(), id, 0, []byte("one"), false); err != nil {
@@ -921,7 +922,7 @@ func TestDelegationColdLookupsDoNotAllocateState(t *testing.T) {
 
 func TestDelegationEpochChangeDoesNotStarveSyncDurability(t *testing.T) {
 	fake := &delegationEpochSyncRPC{writeStarted: make(chan struct{}), releaseWrite: make(chan struct{})}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1305,7 +1306,7 @@ func BenchmarkDelegationOwns(b *testing.B) {
 		}
 		b.Run(name, func(b *testing.B) {
 			fake := &delegationFakeRPC{}
-			m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
+			m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -1390,7 +1391,7 @@ func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T)
 			// The frontend preserves an Authority OPEN even if its local grant
 			// retired before registration; it closes as an ordinary handle.
 			n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: id, Token: delegationTestToken(22, 1)}}
-			if err := n.registerDelegatedHandle(&fileHandle{node: n, token: reader}, nil); err != nil {
+			if err := n.registerDelegatedHandle(&fileHandle{node: n, token: reader}, nil, 0); err != nil {
 				t.Fatalf("successful read OPEN failed registration: %v", err)
 			}
 		})
@@ -1635,7 +1636,7 @@ func TestDeferredCloseBacklogBlocksNewHandleAdmissionUntilCleanup(t *testing.T) 
 
 func TestDeferredCloseBatchUsesRequestDeadline(t *testing.T) {
 	fake := &delegationFakeRPC{block: make(chan struct{})}
-	m, err := newDelegationManager(fake, 50*time.Millisecond, 7, writeback.Options{FlushInterval: -1})
+	m, err := newDelegationManager(fake, 50*time.Millisecond, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1810,10 +1811,11 @@ func TestUncertainCapacityRefusalLosesDelegation(t *testing.T) {
 func TestDelegationSubscriptionFenceWakesAdmissionParkedAtCapacity(t *testing.T) {
 	partition := make(chan struct{})
 	fake := &delegationFakeRPC{block: partition}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.StartWriteback()
 	t.Cleanup(m.Stop)
 	id := installDelegationForTest(t, m, 34, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	m.beginLossObserver(id)
@@ -1885,61 +1887,6 @@ func TestDelegationCoherenceRejectionLosesGrantAndAdvancesLoss(t *testing.T) {
 				t.Fatalf("rejected overlay survived=%+v", stats)
 			}
 		})
-	}
-}
-
-func TestDelegationDurabilityFallbackIsRateLimitedAndPrefersReplies(t *testing.T) {
-	start := time.Unix(100, 0)
-	var fallback durabilityFallback
-	if fallback.due(start, 0, 0) {
-		t.Fatal("clean buffer requested fallback")
-	}
-	if !fallback.due(start, 1, 0) {
-		t.Fatal("first stalled cut could not progress")
-	}
-	for i := 1; i <= 1000; i++ {
-		if fallback.due(start.Add(time.Duration(i)*time.Microsecond), uint64(i+1), 0) {
-			t.Fatal("application burst requested another Barrier inside one second")
-		}
-	}
-	if !fallback.due(start.Add(time.Second), 1001, 0) {
-		t.Fatal("stalled prefix did not retry after one second")
-	}
-	if fallback.due(start.Add(2*time.Second), 1001, 500) {
-		t.Fatal("reply prefix progress triggered fallback")
-	}
-	if fallback.due(start.Add(2500*time.Millisecond), 1001, 500) {
-		t.Fatal("fallback ignored recent reply progress")
-	}
-	if !fallback.due(start.Add(3*time.Second), 1001, 500) {
-		t.Fatal("remaining nondurable entries stopped progressing")
-	}
-	if fallback.due(start.Add(4*time.Second), 1001, 1001) {
-		t.Fatal("durable prefix requested fallback")
-	}
-}
-
-func TestDelegationThousandAppliedWritesDoNotIssuePerFileBarriers(t *testing.T) {
-	fake := &delegationFakeRPC{}
-	m := newDelegationTestManager(t, fake)
-	id := installDelegationForTest(t, m, 111, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	started := time.Now()
-	for i := 0; i < 1000; i++ {
-		if _, err := m.Write(t.Context(), id, int64(i), []byte{1}, false); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := m.FlushIdentity(t.Context(), id); err != nil {
-			t.Fatal(err)
-		}
-	}
-	fake.mu.Lock()
-	barriers := fake.barriers
-	fake.mu.Unlock()
-	// The elapsed-time bound remains valid on slow CI hosts; the policy test
-	// above proves the interval without relying on scheduler speed.
-	limit := 1 + int(time.Since(started)/durabilityFallbackInterval)
-	if barriers > limit {
-		t.Fatalf("1000 applied writes issued %d Barriers, rate limit=%d", barriers, limit)
 	}
 }
 

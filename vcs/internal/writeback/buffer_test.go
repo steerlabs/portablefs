@@ -81,7 +81,7 @@ func testIdentity(v byte) Identity {
 
 func newTestBuffer(t *testing.T, flusher Flusher, options ...Options) *Buffer {
 	t.Helper()
-	opts := Options{MaxBytes: 8 << 20, MaxEntries: 256, FlushInterval: -1}
+	opts := Options{MaxBytes: 8 << 20, MaxEntries: 256}
 	if len(options) != 0 {
 		opts = options[0]
 	}
@@ -183,7 +183,7 @@ func TestSetAttrResolvesNowOnceAtAdmission(t *testing.T) {
 }
 
 func TestInitialLossSequenceIsPreservedAndAdvanced(t *testing.T) {
-	b := newTestBuffer(t, &recordingFlusher{}, Options{InitialLossSequence: 41, MaxBytes: 1024, MaxEntries: 8, FlushInterval: -1})
+	b := newTestBuffer(t, &recordingFlusher{}, Options{InitialLossSequence: 41, MaxBytes: 1024, MaxEntries: 8})
 	if got := b.Snapshot(); got.LossSequence != 41 || got.Sequence != 0 {
 		t.Fatalf("initial cut = %+v, want sequence 0 and loss 41", got)
 	}
@@ -515,7 +515,7 @@ func TestFlushCoalescingRandomizedAgainstNaiveBytes(t *testing.T) {
 		t.Run(fmt.Sprintf("seed_%d", seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
 			recorder := &recordingFlusher{}
-			b := newTestBuffer(t, recorder, Options{MaxBytes: 1 << 20, MaxEntries: 128, FlushInterval: -1})
+			b := newTestBuffer(t, recorder, Options{MaxBytes: 1 << 20, MaxEntries: 128})
 			id := testIdentity(byte(seed + 62))
 			want := make([]byte, 256)
 			var cut Cut
@@ -571,7 +571,7 @@ func TestFlushChunksAndRetriesWithStableToken(t *testing.T) {
 		}
 		return uint64(10 + entry.Offset/MaxPayload), nil
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: int64(len(payload)) + 1, MaxEntries: 8, FlushInterval: -1})
+	b := newTestBuffer(t, flusher, Options{MaxBytes: int64(len(payload)) + 1, MaxEntries: 8})
 	cut, err := b.Write(context.Background(), id, 0, payload)
 	if err != nil {
 		t.Fatal(err)
@@ -646,7 +646,7 @@ func TestAdmissionBlocksAtCapsUntilDurableRetirement(t *testing.T) {
 	}{
 		{
 			name: "entry cap",
-			opts: Options{MaxBytes: 1024, MaxEntries: 2, FlushInterval: -1},
+			opts: Options{MaxBytes: 1024, MaxEntries: 2},
 			fill: func(t *testing.T, b *Buffer, id Identity) {
 				mustWrite(t, b, id, 0, "a")
 				mustWrite(t, b, id, 1, "b")
@@ -654,7 +654,7 @@ func TestAdmissionBlocksAtCapsUntilDurableRetirement(t *testing.T) {
 		},
 		{
 			name: "byte cap",
-			opts: Options{MaxBytes: 2, MaxEntries: 10, FlushInterval: -1},
+			opts: Options{MaxBytes: 2, MaxEntries: 10},
 			fill: func(t *testing.T, b *Buffer, id Identity) { mustWrite(t, b, id, 0, "ab") },
 		},
 	} {
@@ -671,6 +671,7 @@ func TestAdmissionBlocksAtCapsUntilDurableRetirement(t *testing.T) {
 				}
 			})
 			b := newTestBuffer(t, flusher, tt.opts)
+			b.Start()
 			id := testIdentity(8)
 			tt.fill(t, b, id)
 			await(t, started, "cap-triggered flush")
@@ -697,7 +698,10 @@ func TestAdmissionCancellationAtCap(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	flusher := flusherFunc(func(ctx context.Context, _ Identity, _ Entry) (uint64, error) {
-		started <- struct{}{}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		select {
 		case <-release:
 			return 1, nil
@@ -705,7 +709,8 @@ func TestAdmissionCancellationAtCap(t *testing.T) {
 			return 0, ctx.Err()
 		}
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: 1, MaxEntries: 4, FlushInterval: -1})
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 1, MaxEntries: 4})
+	b.Start()
 	id := testIdentity(9)
 	mustWrite(t, b, id, 0, "a")
 	await(t, started, "cap-triggered flush")
@@ -724,7 +729,10 @@ func TestFullByteCapBlocksMetadataAdmissions(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	flusher := flusherFunc(func(ctx context.Context, _ Identity, _ Entry) (uint64, error) {
-		started <- struct{}{}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		select {
 		case <-release:
 			return 12, nil
@@ -732,7 +740,8 @@ func TestFullByteCapBlocksMetadataAdmissions(t *testing.T) {
 			return 0, ctx.Err()
 		}
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: 1, MaxEntries: 8, FlushInterval: -1})
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 1, MaxEntries: 8})
+	b.Start()
 	id := testIdentity(70)
 	mustWrite(t, b, id, 0, "x")
 	await(t, started, "cap-triggered data flush")
@@ -771,7 +780,8 @@ func TestCapKickSkippedByExplicitFlushIsRetried(t *testing.T) {
 			return 0, ctx.Err()
 		}
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 2, FlushInterval: -1})
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 2})
+	b.Start()
 	id := testIdentity(71)
 	firstCut := mustWrite(t, b, id, 0, "a")
 	firstDone := make(chan error, 1)
@@ -1236,17 +1246,18 @@ func TestBarrierUsesCallTimeCutAndReportsObservedLoss(t *testing.T) {
 	}
 }
 
-func TestTimerFlushesAcceptedEntries(t *testing.T) {
+func TestAdmissionWakesBackgroundBelowCapacity(t *testing.T) {
 	called := make(chan Entry, 1)
 	flusher := flusherFunc(func(_ context.Context, _ Identity, entry Entry) (uint64, error) {
 		called <- entry
 		return 1, nil
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 16, FlushInterval: 5 * time.Millisecond})
-	mustWrite(t, b, testIdentity(22), 0, "timer")
-	entry := await(t, called, "timer flush")
-	if string(entry.Data) != "timer" {
-		t.Fatalf("timer flushed %q", entry.Data)
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 1024, MaxEntries: 16})
+	b.Start()
+	mustWrite(t, b, testIdentity(22), 0, "admission")
+	entry := await(t, called, "admission flush")
+	if string(entry.Data) != "admission" {
+		t.Fatalf("admission flushed %q", entry.Data)
 	}
 }
 
@@ -1395,7 +1406,7 @@ func FuzzBufferOverlayAgainstNaiveFile(f *testing.F) {
 		base := []byte("0123456789abcdefghijklmnopqrstuv")
 		model := bytes.Clone(base)
 		recorder := &recordingFlusher{}
-		b, err := New(recorder, Options{MaxBytes: 4096, MaxEntries: maxOps + 1, FlushInterval: -1})
+		b, err := New(recorder, Options{MaxBytes: 4096, MaxEntries: maxOps + 1})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1670,11 +1681,11 @@ func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) 
 			return 0, ctx.Err()
 		}
 	})
-	b := newTestBuffer(t, flusher, Options{MaxBytes: 8 << 20, MaxEntries: 256, FlushInterval: -1, MaxFlushIdentities: 2})
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 8 << 20, MaxEntries: 256, MaxFlushIdentities: 2})
 	for i := 0; i < 96; i++ {
 		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
 	}
-	b.trigger()
+	b.Start()
 	await(t, entered, "first background worker")
 	await(t, entered, "second background worker")
 	assertBlocked(t, entered, "background fanout beyond worker bound")
@@ -1687,7 +1698,7 @@ func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) 
 	// A coalesced kick during the active batch must preserve new work.
 	later := testIdentity(201)
 	mustWrite(t, b, later, 0, "later")
-	b.trigger()
+	b.Start()
 	close(release)
 	seen := false
 	for range 95 {
@@ -1710,7 +1721,7 @@ func TestStopCancelsBlockedBackgroundBatch(t *testing.T) {
 	for i := 0; i < 96; i++ {
 		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
 	}
-	b.trigger()
+	b.Start()
 	await(t, entered, "blocked worker")
 	done := make(chan struct{})
 	go func() { b.Stop(); close(done) }()
@@ -1809,5 +1820,39 @@ func TestDropAllReportsEveryRetainedIdentity(t *testing.T) {
 	}
 	if again := b.DropAll("again"); len(again) != 0 || b.LossSequence() != 3 {
 		t.Fatalf("duplicate shutdown loss=%+v", again)
+	}
+}
+
+func TestAdmissionDuringFailedExplicitFlushWakesRetainedWave(t *testing.T) {
+	entered := make(chan Entry, 3)
+	resume := make(chan struct{})
+	var calls atomic.Int32
+	b := newTestBuffer(t, flusherFunc(func(ctx context.Context, _ Identity, e Entry) (uint64, error) {
+		entered <- e
+		if calls.Add(1) == 1 {
+			select {
+			case <-resume:
+				return 0, context.Canceled
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}
+		return uint64(calls.Load()), nil
+	}))
+	id := testIdentity(231)
+	first := mustWrite(t, b, id, 0, "first")
+	finished := make(chan error, 1)
+	go func() { _, err := b.FlushIdentity(t.Context(), id, first); finished <- err }()
+	original := await(t, entered, "explicit retained wave")
+	mustWrite(t, b, id, 10, "later")
+	b.Start()
+	close(resume)
+	if err := await(t, finished, "explicit cancellation"); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	retry := await(t, entered, "retained wave retry after admission")
+	later := await(t, entered, "later accepted work")
+	if retry.Token != original.Token || later.Token <= retry.Token || later.Offset != 10 {
+		t.Fatalf("original=%+v retry=%+v later=%+v", original, retry, later)
 	}
 }

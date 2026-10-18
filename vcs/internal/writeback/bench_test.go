@@ -45,9 +45,8 @@ func (idleBenchmarkFlusher) FlushBatch(context.Context, Identity, []Entry) ([]ui
 func newAdmissionBenchmarkBuffer(b *testing.B, payloadSize, admissions int) (*Buffer, Identity) {
 	b.Helper()
 	buffer, err := New(idleBenchmarkFlusher{}, Options{
-		MaxBytes:      int64(payloadSize * (admissions + 1)),
-		MaxEntries:    admissions + 1,
-		FlushInterval: -1,
+		MaxBytes:   int64(payloadSize * (admissions + 1)),
+		MaxEntries: admissions + 1,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -117,9 +116,8 @@ func BenchmarkReadOverlay1000DirtyRanges(b *testing.B) {
 		readSize    = 1 << 20
 	)
 	buffer, err := New(idleBenchmarkFlusher{}, Options{
-		MaxBytes:      dirtyRanges*benchmarkPageSize + 1,
-		MaxEntries:    dirtyRanges + 1,
-		FlushInterval: -1,
+		MaxBytes:   dirtyRanges*benchmarkPageSize + 1,
+		MaxEntries: dirtyRanges + 1,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -168,9 +166,8 @@ func BenchmarkCapAdmissionUnderContention(b *testing.B) {
 	const capEntries = 64
 	flusher := new(benchmarkFlusher)
 	buffer, err := New(flusher, Options{
-		MaxBytes:      capEntries * benchmarkPageSize,
-		MaxEntries:    capEntries,
-		FlushInterval: -1,
+		MaxBytes:   capEntries * benchmarkPageSize,
+		MaxEntries: capEntries,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -212,7 +209,7 @@ func BenchmarkBackgroundFlushBurst(b *testing.B) {
 	for _, count := range []int{32, 4096} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
 			flusher := &benchmarkFlusher{}
-			buffer, err := New(flusher, Options{MaxEntries: count + 1, MaxBytes: int64(count + 1), FlushInterval: -1})
+			buffer, err := New(flusher, Options{MaxEntries: count + 1, MaxBytes: int64(count + 1)})
 			if err != nil {
 				b.Fatal(err)
 			}
