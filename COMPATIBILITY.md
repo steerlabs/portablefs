@@ -62,11 +62,12 @@ another, and none is bumped to match another.
 | Product generation | v3 | Product naming (`portablefs-mount-v3`); not a wire version. |
 | Linux kernel FUSE | protocol 7.31 or newer | Refused during FUSE INIT below 7.31. |
 | Authority host kernel | Linux 5.17 final or newer | Refused at storage startup below 5.17 and for 5.17 release candidates; later release candidates are accepted. |
-| `pfslocal` (daemon to FSKit extension) | 2.0 | Exact major and minor; paired by the sealed release. |
-| Daemon operational control | `2` | Exact; `X-PortableFS-Control-Protocol` header and `/v2/` paths; paired by the sealed release. |
+| `pfslocal` (daemon to FSKit extension) | 2.0 | Exact major and minor; paired within one signed release. |
+| Daemon operational control | `2` | Exact; `X-PortableFS-Control-Protocol` header and `/v2/` paths; paired within one signed release. |
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |
-| Sealed release protocol record | `PortableFSDService.app/Contents/Resources/PortableFSProtocol.json` | Signed with the service: `identitySchema` 1, `controlProtocol`, `pfslocalMajor`, `pfslocalMinor`; strict decoding. |
+| Mac release identity | daemon CodeDirectory hash, executable SHA-256, release version | Static release authentication; protocol numbers are not part of it. |
+| Lifecycle registry witness | `attaches.json` in the daemon state directory | Present only while the daemon has registered attachments; absent means none. |
 | Mount membership file | `mount.membership`, header `PFS-MEMBERSHIP-1` | Exact; one shared codec for authority and cell host. |
 | Signed cell plan | version `3` | Exact version, token prefix, and signing domain. |
 | Daemon attach registry, Manager snapshot | schema `3` | Exact; private. |
@@ -248,9 +249,22 @@ barrier, and replay never repeats apply or sync.
   write callbacks and reports their errors is host behavior that is not yet
   qualified. A forced unmount can discard pages the kernel never delivered.
 - `umount` makes one unforced attempt and returns the real `EBUSY` when
-  something holds the mount. Only an explicit `--force` requests forced
-  revocation. Kernel absence, delivery of the absence proof, and release
-  cleanup are reported as separate outcomes.
+  something holds the mount. Only an explicit user `--force` ever forces an
+  unmount: no daemon failure, terminal session, timeout, or proven daemon
+  death does, because none proves that FSKit delivered every dirty page. The
+  mount supervisor is not an authority-session health monitor; it waits for
+  signals and kernel mount-table change notifications and re-reads the exact
+  mount inventory on each. Daemon fencing and terminal publication do not
+  withdraw existing FSKit kernel cache state.
+- Detach reporting: the daemon answers a completed unmount with an empty 204
+  or with one combined error, and the CLI separately classifies the exact
+  kernel mount as absent, present, or unverified. A daemon error with the
+  kernel mount absent is reported as "kernel mount is absent; daemon unmount
+  completion is unconfirmed (absence-proof delivery or cleanup may be
+  incomplete)", with state and intent preserved and a failing exit; a lost or
+  timed-out reply is reported the same way. The CLI does not report
+  proof-delivery and cleanup as separate authoritative outcomes, and a later
+  204 or 404 is never an absence-accepted receipt.
 - Extended-attribute get, list, and remove are supported for portable
   `user.*` names; set is refused with `EOPNOTSUPP`, which prevents AppleDouble
   fallback files.
@@ -360,17 +374,22 @@ bundle identifier, app group, FSKit type `pfs`, resource scheme
 extension from one immutable commit, with exact executable and bundle matching.
 See [docs/release-identity.md](./docs/release-identity.md).
 
-The daemon's operational control and `pfslocal` interfaces are private and
-paired: the CLI and app require an exact identity match (daemon version,
-executable digest, control protocol, `pfslocal` major and minor) before any
-operational request, and never insert their own compiled numbers as the
-expected values of another release. A release's protocol values are sealed into
-its signed service bundle as `PortableFSProtocol.json`; an outgoing release is
-described by its own authenticated sealed values, and an incoming release's
-must equal the current build's. The executable digest is not part of that
-record, because a signed resource cannot contain the digest of its own signed
-code; it comes from the authenticated executable. Lifecycle v1 is the one cross-release
-surface on that socket:
+A Mac release is identified by exactly its daemon's CodeDirectory hash,
+executable SHA-256, and release version. Protocol numbers are not part of the
+release identity and are not sealed into the bundle: after a release and its
+running daemon are authenticated, the daemon reports its own live identity
+(schema 1, control protocol, `pfslocal` major and minor). Before any socket
+request, the CLI and the app authenticate the daemon peer identically: from
+the connection's kernel audit token they require the same user, the exact
+canonical daemon path inside the authenticated owning bundle, the running
+image's kernel CodeDirectory hash equal to the release's, and valid,
+hardened-runtime code (`CS_VALID` and `CS_RUNTIME`); any failure refuses the
+connection. Incoming activation and every ordinary operation then require the
+live schema, control protocol, and `pfslocal` version to equal the incoming
+build's exact constants. Quiescence of an outgoing release instead accepts
+that release's own reported numbers, and the incoming build's compiled
+numbers are never imposed on it. Lifecycle v1 is the one cross-release surface
+on that socket:
 
 | Route | Purpose |
 | --- | --- |
@@ -379,14 +398,25 @@ surface on that socket:
 | `POST /lifecycle/v1/stop-if-idle` | Empty body. Closes attach admission and atomically requires the same inventory to be empty before stopping: `204` with no body on success, `409` busy with no state change. |
 
 Any other status is a failure, never an empty-inventory or stopped proof. A
-host authenticates the outgoing executable, code signature, sealed release,
-and socket peer before it accepts that release's reported versions, and uses
-lifecycle v1 only to quiesce it. Ordinary mount and attach operations always
-require the incoming paired release. An inventory snapshot is not removal
-authority: process termination, kernel inventory, and the state singleton
-supply that proof. The state singleton is one canonical flock inode that is
-never unlinked or replaced to bypass a holder; a holder stuck in kernel exit
-blocks startup until the kernel releases it.
+host authenticates the outgoing release and its running daemon as above
+before it accepts that release's reported versions, and uses lifecycle v1
+only to quiesce it. Ordinary mount and attach operations always require the
+incoming paired release. An inventory snapshot is not removal authority:
+process termination, kernel inventory, and the state singleton supply that
+proof. The state singleton is one canonical flock inode that is never
+unlinked or replaced to bypass a holder; a holder stuck in kernel exit blocks
+startup until the kernel releases it.
+
+The upgrade invariant has two cases. A running outgoing daemon is quiesced
+only through its lifecycle v1 inventory and `stop-if-idle`; the incoming
+release never decodes the outgoing daemon's private registry. With no
+outgoing daemon running, and while the host holds the state singleton and the
+lifecycle exclusion, only the actual absence of `attaches.json` in the
+validated daemon state directory proves an empty registry. Any entry at that
+name blocks replacement, whatever its size, type, or contents. The daemon keeps
+that invariant by durably unlinking the file (with a parent-directory sync)
+when its registry becomes empty and writing it atomically while it is not;
+an empty registry is never written as a file.
 
 ## Private state
 
@@ -441,6 +471,11 @@ evidence for it.
   descriptor, one unforced unmount with real `EBUSY` under normal system
   indexing, explicit force, exact final inventories, and buffered-I/O
   delivery.
+- Native signed-app lifecycle: the CLI and the app accept the real shipping
+  daemon and refuse a substituted image renamed onto its path, a two-release
+  upgrade with different control and `pfslocal` numbers quiesces through
+  lifecycle v1, and the absent-daemon path proceeds only on `attaches.json`
+  absence.
 - FSKit-handler power-cut recovery around acknowledged mutations
   ([power-loss-testing.md](./docs/power-loss-testing.md)).
 - Shared-cell durability: a real two-project XFS writeback fault and dirty-

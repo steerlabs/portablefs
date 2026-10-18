@@ -72,10 +72,15 @@ withdrawn. A grant activates only after peer acknowledgment or horizon expiry.
 
 Shared kernel name validity stays zero. Positive and negative bindings,
 attributes, and directory pages are cached by the daemon under the subscription.
-Plain READDIR uses XFS continuation cookies. Concurrent mutation invalidates
+Directory reads use XFS continuation cookies. Concurrent mutation invalidates
 cached pages without abandoning the cursor: unchanged entries appear exactly
 once, changed entries may or may not appear, and the walk never returns ESTALE.
-READDIRPLUS and kernel directory caching are not used.
+A mount of a volume without machine-local routes serves READDIRPLUS: each
+Authority page carries entry attributes and capabilities (omitting ones the
+session already holds), and the daemon publishes those entries through the same
+exact physical-reply transaction as every other cache-installing reply. A mount
+of a volume that declares machine-local routes serves plain READDIR only.
+Kernel directory-page caching is not used.
 
 Forward pathname resolution and enumeration are covered. Reverse rendering of
 retained dentries (`getcwd`, `/proc/*/fd`, and `d_path`) is outside the contract.

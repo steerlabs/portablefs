@@ -646,4 +646,3 @@ loss for the affected state, without interpreting it as storage death. A
 stale-generation flush fails whole before apply. Ordinary storage errors keep
 their errno and partial-application reporting. The handler enforces
 these semantic refusals; structural frame refusals occur before dispatch.
-

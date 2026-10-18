@@ -702,10 +702,13 @@ by the signed layout and app-group identity; no environment variable selects
 them.
 
 `portablefs umount` makes one unforced attempt and returns the real `EBUSY` when
-Finder, Spotlight, or a process holds the mount. Only an explicit `--force`
-requests forced revocation, and it can discard pages the kernel accepted but
-never delivered. Kernel absence, delivery of the absence proof, and release
-cleanup are reported as separate outcomes.
+Finder, Spotlight, or a process holds the mount. Only an explicit user
+`--force` ever forces an unmount, and it can discard pages the kernel accepted
+but never delivered; no daemon failure or terminal session triggers one. The
+daemon answers with an empty 204 or one combined error, and the CLI reports
+the exact kernel mount as absent, present, or unverified alongside any daemon
+error, preserving state and intent on every error (see
+[fskit-mount.md](./fskit-mount.md#unmount-and-detach)).
 
 Native macOS 26 and 27 qualification of this profile has not been run; see
 [fskit-mount.md](./fskit-mount.md#verification).

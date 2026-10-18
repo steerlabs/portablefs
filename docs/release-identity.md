@@ -265,50 +265,63 @@ never enters the protected container. Packaging rejects either missing daemon
 privilege or accidental CLI privilege.
 
 **An exact paired-release identity.** The CLI, app, daemon, and extension are
-one paired release. Before any operational request the CLI and app require an
-exact match with the live daemon: daemon version, executable SHA-256, identity
-schema 1, daemon operational control 2, and `pfslocal` 2.0. The sealed service
-records its actual protocol numbers in
-`PortableFSDService.app/Contents/Resources/PortableFSProtocol.json`, written
-before the service is signed. Its exact content for this release is:
+one paired release. A release is identified by exactly three values: the
+daemon's CodeDirectory hash, its executable SHA-256, and the release version.
+Protocol numbers are not part of that identity and the bundle carries no
+protocol manifest; the authenticated daemon reports its own live identity
+(identity schema 1, operational control, `pfslocal` major and minor). Static
+release authentication still covers signatures, hardened runtime,
+entitlements, sealed resources, the fixed layout, exact executable matching,
+universal slices, notarization, and attestation.
 
-```json
-{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":0}
-```
-
-All four keys are required and case sensitive; an unknown, duplicate, null,
-missing, or trailing value, or an unequal identity schema, fails decoding.
-`scripts/package-macos-app.sh` regenerates the record from the exact build and
-refuses a packaged copy that differs, and a host trusts the record only after
-the service bundle's signature verifies. An incoming target must equal the
-current compiled pairing exactly. The executable's own digest is deliberately
-not stored in its signed resources, which would be a code-signing cycle; the
-executable SHA-256 and the release version are derived from the signed code
-and bundle metadata.
+**An authenticated daemon peer.** Before sending any request on a daemon
+socket, the CLI and the app authenticate the peer with the same rule, from that
+connection's kernel audit token: the same effective user, a consistent process
+incarnation, the token-bound process path equal to the canonical daemon path
+inside the already authenticated owning bundle, the running image's kernel
+CodeDirectory hash (`csops_audittoken`, `CS_OPS_CDHASH`) equal in all 20 bytes
+to the release's, and `CS_OPS_STATUS` showing valid, hardened-runtime code
+(`CS_VALID` and `CS_RUNTIME`). A substitute image renamed onto the daemon's
+path, the correct image at another path, a wrong hash, unsigned code, a
+departed execution, or any syscall failure refuses the connection before HTTP;
+there is no pathname-hash alternative and no unauthenticated mode. Every dial
+authenticates, including health checks, and a reused connection stays bound to
+the release it authenticated. Incoming activation and every ordinary
+operational request then require the live identity to equal the incoming
+build's exact constants (schema 1, control 2, `pfslocal` 2.0), together with
+version and executable SHA-256; a mismatch prevents activation.
 
 **An authenticated service update.** Replacing the service crosses releases, so
-the host never speaks the outgoing release's operational interface. Each
-outgoing and target service is bound by one tuple: service CodeDirectory hash,
-full executable SHA-256, daemon version, identity schema, control version, and
-`pfslocal` major/minor. The host first authenticates the outgoing service: the
-live socket peer's kernel-authenticated executable path identifies its owning
-signed app, the host validates that app's service layout, signing team,
-product, and app group, and it proves the live daemon against that sealed
-release. Only then does it accept that release's sealed and reported control
-and `pfslocal` versions, whatever they are; it never inserts the incoming
-build's compiled numbers as the outgoing release's expected values. It quiesces
-the authenticated outgoing release through the frozen lifecycle v1 routes and
+the host never speaks the outgoing release's operational interface and never
+decodes its private registry. Each outgoing and target service is bound by its
+release tuple (CodeDirectory hash, executable SHA-256, version). The host first
+authenticates the outgoing service: the live socket peer's kernel-authenticated
+path identifies its owning signed app, the host validates that app's service
+layout, signing team, product, and app group, and it authenticates the running
+daemon as above. Only then does it accept that release's reported control and
+`pfslocal` versions, whatever they are; it never inserts the incoming build's
+compiled numbers as the outgoing release's expected values, including when it
+verifies a restored outgoing release during rollback. It quiesces the
+authenticated outgoing release through the frozen lifecycle v1 routes and
 nothing else:
 `GET /lifecycle/v1/identity`, `GET /lifecycle/v1/inventory`, and
 `POST /lifecycle/v1/stop-if-idle`, which closes attach admission and atomically
 requires the complete inventory to be empty before stopping (`204`) or refuses
-with no state change (`409`). Any other status is a failure, never an
-empty-inventory or stopped proof. An inventory snapshot is not removal
-authority; process termination, Service Management unregistration, and the
-state singleton supply that proof. An unknown socket owner is refused before
-unregistration, preferences are not service identity authority, and every
-ordinary mount or attach operation requires the incoming release's exact
-pairing. The owner-private durable
+with no state change (`409`). Any other status, a nonzero count, a timeout, or
+an authentication failure is a refusal, never an empty-inventory or stopped
+proof. With no outgoing daemon running, the host holds the state singleton and
+the lifecycle exclusion and checks the validated, pinned daemon state directory
+for `attaches.json` with a no-follow, descriptor-relative existence check: only
+an actual absence proves an empty registry, and any entry at that name (a
+zero-byte or apparently empty file, any format, a symlink, a directory, a FIFO,
+or an unreadable parent) blocks replacement without being parsed. The daemon
+makes that rule hold by writing the file atomically while it has registered
+attachments and durably unlinking it, with a parent-directory sync, when its
+registry becomes empty. An inventory snapshot is not removal authority; process
+termination, Service Management unregistration, and the state singleton supply
+that proof. An unknown socket owner is refused before unregistration,
+preferences are not service identity authority, and every ordinary mount or
+attach operation requires the incoming release's exact pairing. The owner-private durable
 activation lease stores those tuples, a bounded phase/deadline, and only the
 SHA-256 of a random one-use token. The plaintext token crosses only
 credential-checked Unix-socket sessions and never appears in defaults, argv,

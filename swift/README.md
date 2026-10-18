@@ -63,11 +63,15 @@ The contract these implement, and what is not yet qualified, is
 
 `PortableFSAppCore` holds what the menu-bar app needs that is worth testing on
 its own: account-home resolution, mount-inventory row decoding, kernel
-mount-table parsing, and the service coordinator. The coordinator authenticates
-an outgoing daemon release (executable, code signature, sealed release, socket
-peer) before using lifecycle v1 to read its inventory and stop it only if idle,
-and holds the canonical state-singleton flock across unregistration. It owns
-no mount or recovery behavior; that belongs to the CLI.
+mount-table parsing, and the service coordinator. The coordinator
+authenticates a daemon peer from its socket's kernel audit token (exact
+canonical daemon path, kernel CodeDirectory hash equal to the release's,
+`CS_VALID` and `CS_RUNTIME`), the same rule the CLI applies. For an outgoing
+release it then accepts that release's own reported protocol numbers and uses
+lifecycle v1 to read its inventory and stop it only if idle; with no outgoing
+daemon running, it proceeds only if `attaches.json` is absent while it holds
+the canonical state-singleton flock, which it keeps across unregistration. It
+owns no mount or recovery behavior; that belongs to the CLI.
 
 ### Regenerating pfslocal Swift bindings
 

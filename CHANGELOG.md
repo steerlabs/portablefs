@@ -44,7 +44,15 @@ is not yet qualified.
 - The daemon is the only authority renewal owner and attests `frontend-ready`
   from a usable initial proof, an authenticated bound frontend, and the kernel
   mount identity, with no mounted-root I/O. Normal unmount makes one unforced
-  attempt.
+  attempt, and only an explicit user `--force` ever forces one; the mount
+  supervisor waits on signals and kernel mount-table notifications instead of
+  probing the daemon.
+- A Mac release is identified by its daemon CodeDirectory hash, executable
+  SHA-256 and version. The CLI and app authenticate a daemon socket from its
+  kernel audit token (canonical path, kernel CodeDirectory hash, valid
+  hardened-runtime code) and take protocol numbers from the authenticated live
+  daemon. With no daemon running, only the absence of `attaches.json` proves
+  an empty registry for an upgrade.
 - Mount membership is `mount.membership` (`PFS-MEMBERSHIP-1`) through one codec
   for the authority and the cell host. The signed cell plan is version 3; the
   daemon registry and Manager snapshot are schema 3.
@@ -63,5 +71,7 @@ is not yet qualified.
   blacklist of retired names.
 - Power-cut scenarios for the FSKit authority handler in the power-loss
   harness.
-- `vcs/bench/lantrace` and `pfs-lan-trace`, a bounded, credential-free,
-  correlated diagnostic trace for LAN workload attribution.
+- `vcs/bench/lantrace` and `pfs-lan-trace`, a bounded correlated diagnostic
+  trace for LAN workload attribution, with an allowlisted grammar, one
+  sequence rule for every producer, and a producer content rule that keeps
+  credentials and user content out.

@@ -220,19 +220,53 @@ performs no I/O on the mounted root and holds no mount-root descriptor.
 `portablefs umount` makes one unforced unmount attempt with the default mount
 options. A real reference from Finder, Spotlight, `fseventsd`, or a user process
 returns the actual `EBUSY`, and the mount stays usable or reports its existing
-terminal state. Only an explicit `--force` requests forced revocation, with the
-data-loss boundary above. A forced unmount parks no recovery job and keeps no
-replay record: the daemon acknowledges it with an empty response, and pages the
-kernel never delivered are gone.
+terminal state. Only an explicit user `--force` ever forces an unmount, with
+the data-loss boundary above. A forced unmount parks no recovery job and keeps
+no replay record, and pages the kernel never delivered are gone. No daemon
+failure, terminal authority session, slow reply, or proven daemon death forces
+an unmount: none of them proves that FSKit delivered every dirty page.
+
+The mount supervisor owns startup, readiness and its exact mount records, not
+the authority session's health. In steady state it waits for user signals and
+for Darwin's kernel mount-table notifications (`EVFILT_FS`, mount and unmount
+events), registered before its first inventory snapshot; each notification is
+only a wakeup, and the supervisor re-reads the exact mount inventory every time.
+It runs no periodic probe or timer. On SIGINT or SIGTERM it makes one normal
+daemon-owned unmount attempt; `EBUSY` leaves the mount and records in place. If
+it observes the exact kernel mount gone, it makes one authenticated daemon
+finalization attempt and, if that fails, reports kernel absence with the daemon
+error, preserves state and intent, and exits with failure for explicit
+reconciliation. If notification setup fails it reports supervision failure
+instead of polling. Daemon fencing and terminal publication stop PortableFS
+serving, but they do not withdraw names, attributes, or pages the macOS kernel
+already caches for the mount.
 
 After exact absence of the original kernel mount is observed, the daemon
 delivers the absence proof on the original CONTROL transport without first
-draining DATA, and hands unsent cleanup to session teardown. Kernel absence,
-proof delivery, and release cleanup are reported separately; a failed cleanup
-does not claim the mount is still live. A poisoned or lost session is never
-reconnected to submit evidence. An accepted proof clears durable membership and
-the session's cache-proof obligation; writer exclusion still waits for admitted
-storage work to drain.
+draining DATA, and hands unsent cleanup to session teardown; it keeps the
+proof-delivery and cleanup errors separately and attempts the proof even if
+release cleanup fails. Over operational control it answers with an empty 204
+for a completed unmount or with one combined error. The CLI independently
+classifies the exact kernel mount:
+
+- daemon error and kernel absent: "kernel mount is absent; daemon unmount
+  completion is unconfirmed (absence-proof delivery or cleanup may be
+  incomplete)", with the daemon error; a timed-out or lost reply is reported
+  the same way, because the daemon may have completed after the reply was lost;
+- daemon error and kernel present: "kernel mount remains present; daemon-owned
+  FSKit unmount failed or is incomplete", with the daemon error;
+- kernel query failure: "kernel mount presence is unverified", with any daemon
+  error, and nothing that could detach a replacement mount;
+- empty 204 and kernel absent: durable CLI cleanup completes and the mount is
+  reported unmounted;
+- empty 204 but the kernel mount present, or a malformed success: an error.
+
+Every daemon-error case preserves state and intent and exits with failure, and
+none triggers another automatic kernel action. A later 204 or a 404 is not a
+receipt that the authority accepted an earlier absence proof. A poisoned or
+lost session is never reconnected to submit evidence. An accepted proof clears
+durable membership and the session's cache-proof obligation; writer exclusion
+still waits for admitted storage work to drain.
 
 ## Local topology
 
@@ -244,7 +278,8 @@ FSKit extension <-------------------------------> macOS kernel
 
 The daemon owns authority credentials, sessions, and the metadata cache; the
 extension owns FSKit item identity and kernel callbacks and keeps no second
-metadata cache. `pfslocal` is exactly version 2.0, paired by the sealed release:
+metadata cache. `pfslocal` is exactly version 2.0, paired within one signed
+release:
 Hello carries the version, a diagnostic client name and version, and the
 daemon's required positive request deadline. Resolve binds a connection
 permanently to one attach; loss of that binding is terminal for its operations
@@ -287,17 +322,31 @@ answered, access to the volume waits. Full Disk Access is not required. See
 Apple's
 [TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
 
-The CLI and app require the daemon's exact paired release identity before any
-operational request; a foreign or stale daemon is left untouched and the command
-fails with clean-stop guidance. To replace a service, the host first
-authenticates the outgoing daemon's executable, code signature, sealed release,
-and socket peer, then uses lifecycle v1 to read its inventory and to stop it only
-if idle; it never assumes the outgoing release speaks the incoming operational
-protocol. An owner the host cannot authenticate is never stopped. The daemon
-state singleton is one canonical flock inode that is never unlinked or replaced;
-the host holds it across unregistration so no daemon can start between the
-absence proof and the stop. A holder stuck in kernel exit blocks startup until
-the kernel releases it.
+A release is identified by its daemon's CodeDirectory hash, executable SHA-256
+and version. Before any request on a daemon socket, the CLI and the app
+authenticate the peer the same way, from that connection's kernel audit token:
+same user, the exact canonical daemon path inside the authenticated owning
+bundle, the running image's kernel CodeDirectory hash equal to the release's,
+and valid hardened-runtime code (`CS_VALID`, `CS_RUNTIME`). A substitute image
+renamed onto the daemon's path therefore fails. Protocol numbers come from the
+authenticated daemon's live identity: ordinary operations and incoming
+activation require them to equal the incoming build's exact constants (schema
+1, control 2, `pfslocal` 2.0); a foreign or stale daemon is left untouched and
+the command fails with clean-stop guidance.
+
+To replace a service, the host authenticates the outgoing release and its
+running daemon, accepts that release's own reported numbers, and uses
+lifecycle v1 to read its complete inventory and to stop it only if idle; it
+never decodes the outgoing daemon's private registry or speaks its operational
+protocol. With no outgoing daemon running, the host holds the state singleton
+and lifecycle exclusion and proceeds only if `attaches.json` is absent from the
+validated daemon state directory; any entry at that name blocks. The daemon
+durably unlinks that file when its registry becomes empty. An owner the host
+cannot authenticate is never stopped. The daemon state singleton is one
+canonical flock inode that is never unlinked or replaced; the host holds it
+across unregistration so no daemon can start between the absence proof and the
+stop. A holder stuck in kernel exit blocks startup until the kernel releases
+it.
 
 An FSKit frontend loss immediately ends local serving; the terminal frontend
 cannot reconnect, and detach proceeds as above.
@@ -327,6 +376,9 @@ Not yet qualified on native macOS 26 and 27:
 - no product-owned mount-root descriptor, one unforced unmount with real
   `EBUSY` under normal Finder and Spotlight activity, and explicit force;
 - buffered-I/O delivery for `fsync`, `F_FULLFSYNC`, and unmount;
+- audit-token peer authentication refusing a substitute image renamed onto
+  the daemon path, the two-release lifecycle upgrade, and the supervisor's
+  mount-table notification handling;
 - power-cut recovery of the FSKit authority handler
   ([power-loss-testing.md](./power-loss-testing.md)) and suspend/resume;
 - the Mac plus Linux-peer matrix, run against already-mounted paths:
