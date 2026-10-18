@@ -12,6 +12,28 @@ public final class PfsCallbackTicket: Sendable {
 /// revokes publication before changing session state, even while the window
 /// or event consumer is occupied. The lock covers the reply itself, so no
 /// check/reply interval can admit a terminal transition.
+///
+/// Once the session is terminal, no FSKit callback that publishes data, metadata,
+/// namespace or durability reports success. Resource loading, volume activation
+/// and mounting are serving callbacks and obey the same rule. Session termination
+/// and each serving callback's final synchronous reply share one publication gate:
+/// a reply that wins the gate precedes termination; when termination wins, the
+/// final gate rejects publication with the first terminal cause. Earlier definite
+/// request refusals remain failures.
+///
+/// Volume deactivation and resource unloading acknowledge local teardown only.
+/// They must perform their local cleanup even after terminal failure and report
+/// success only after the cleanup they acknowledge has completed. An earlier
+/// session-terminal cause does not make completed cleanup fail. A genuine error
+/// in the teardown request or its local cleanup remains an error. Repeated
+/// completed teardown is idempotent. Unmount's errorless completion acknowledges
+/// the same local cleanup boundary.
+///
+/// A teardown acknowledgement does not certify durability, erase or replace the
+/// first terminal cause, revive a session, prove kernel mount absence, prove
+/// authority acceptance of absence, or certify daemon/CLI reconciliation. Mutation
+/// and synchronize failures retain their existing error paths. Every successful
+/// FSKit mutation reply still requires authority-storage durability before publication.
 final class PfsSessionPublicationGate: @unchecked Sendable {
     private let lock = NSLock()
     private var terminal: Error?

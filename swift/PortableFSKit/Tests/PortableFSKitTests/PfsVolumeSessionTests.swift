@@ -47,10 +47,12 @@ private func waitUntil(
 private final class SessionReplyBox<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: Value?
+    private var replies = 0
     private var waiters: [CheckedContinuation<Value, Never>] = []
 
     func set(_ value: Value) {
         lock.lock()
+        replies += 1
         stored = value
         let pending = waiters
         waiters.removeAll()
@@ -75,6 +77,12 @@ private final class SessionReplyBox<Value: Sendable>: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return stored
+    }
+
+    func count() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return replies
     }
 }
 
@@ -263,7 +271,7 @@ private func settle(_ window: PfsCallbackWindow, _ ticket: PfsCallbackTicket) as
 }
 
 /// Termination cannot split the final decision from a synchronous reply that
-/// already won. Conversely, every reply after revocation sees the first cause.
+/// already won. Conversely, every serving reply after revocation sees the first cause.
 @Test func sessionTerminationWaitsForTheWinningSynchronousReply() async {
     let gate = PfsSessionPublicationGate()
     let entered = SessionReplyBox<Bool>()
@@ -348,6 +356,297 @@ private func makeSessionHarness(
         volume: volume,
         root: try await core.rootItem()
     )
+}
+
+// MARK: - Native local-teardown contract
+
+private enum NativeTeardown: CaseIterable, Sendable {
+    case deactivate, forceDeactivate, unload, unmount
+}
+
+@available(macOS 26.0, *)
+private struct LoadedSession: @unchecked Sendable {
+    let harness: SessionHarness
+    let fileSystem: PortableFSFileSystem
+    let resource: FSGenericURLResource
+    let options: FSTaskOptions
+    let file: PortableFSItem
+    let factories: SessionReplyBox<Bool>
+
+    func teardown(_ entry: NativeTeardown) -> SessionReplyBox<Int> {
+        let reply = SessionReplyBox<Int>()
+        let operations: any FSVolume.Operations = harness.volume
+        switch entry {
+        case .deactivate, .forceDeactivate:
+            operations.deactivate(options: entry == .forceDeactivate ? .force : []) { error in
+                reply.set((error as NSError?)?.code ?? 0)
+            }
+        case .unload:
+            fileSystem.unloadResource(resource: resource, options: options) { error in
+                reply.set((error as NSError?)?.code ?? 0)
+            }
+        case .unmount:
+            operations.unmount { reply.set(0) }
+        }
+        return reply
+    }
+}
+
+@available(macOS 26.0, *)
+private func loadSession(
+    clientConfiguration: PfsLocalClient.Configuration = .init()
+) async throws -> LoadedSession {
+    let harness = try await makeSessionHarness(clientConfiguration: clientConfiguration)
+    let socketPath = harness.daemon.socketPath
+    let factories = SessionReplyBox<Bool>()
+    let fileSystem = PortableFSFileSystem(
+        moduleIdentity: PortableFSIdentity.moduleIdentity,
+        resolverFactory: { PfsSocketPathResolver(infoDictionary: ["PFSDaemonSocketPath": socketPath]) },
+        volumeFactory: { _, _, _ in
+            factories.set(true)
+            return harness.volume
+        }
+    )
+    let options = try #require(class_createInstance(FSTaskOptions.self, 0) as? FSTaskOptions)
+    let resource = FSGenericURLResource(url: try #require(URL(string: "dev.portablefs.oss://mock")))
+    let loaded = SessionReplyBox<Int>()
+    fileSystem.loadResource(resource: resource, options: options) { volume, error in
+        #expect(volume === harness.volume)
+        loaded.set((error as NSError?)?.code ?? 0)
+    }
+    #expect(await loaded.wait() == 0)
+    #expect(loaded.count() == 1)
+    let created = try await harness.core.createFile(in: harness.root, name: Data("owned".utf8), mode: 0o644)
+    #expect(await harness.core.testingDebugState().openHandleCount == 1)
+    return LoadedSession(
+        harness: harness, fileSystem: fileSystem, resource: resource, options: options,
+        file: created.item, factories: factories
+    )
+}
+
+@available(macOS 26.0, *)
+private func expectLocalCleanup(_ fixture: LoadedSession, cause: PfsLocalClientError) async {
+    let core = fixture.harness.core
+    #expect(fixture.harness.root.reclaimed)
+    #expect(fixture.file.reclaimed)
+    #expect(await core.testingDebugState() == VolumeCoreDebugState(
+        itemCount: 0, objectIdentityCount: 0, publishedItemCount: 0,
+        provisionalItemCount: 0, retiringItemCount: 0, retirementWaiterCount: 0, openHandleCount: 0
+    ))
+    #expect(await core.client.isDetachingOrStopped)
+    let client = await core.client
+    #expect(client.publicationGate.terminalError as? PfsLocalClientError == cause)
+    #expect(fixture.factories.count() == 1)
+}
+
+@available(macOS 26.0, *)
+private func expectNativeServingRefused(_ fixture: LoadedSession, errno: Int) async {
+    let operations: any FSVolume.Operations = fixture.harness.volume
+    let activate = SessionReplyBox<Int>()
+    operations.activate(options: fixture.options) { item, error in
+        #expect(item == nil)
+        activate.set((error as NSError?)?.code ?? 0)
+    }
+    let mount = SessionReplyBox<Int>()
+    operations.mount(options: fixture.options) { error in mount.set((error as NSError?)?.code ?? 0) }
+    let sync = SessionReplyBox<Int>()
+    operations.synchronize(flags: .wait) { error in sync.set((error as NSError?)?.code ?? 0) }
+    #expect(await activate.wait() == errno)
+    #expect(await mount.wait() == errno)
+    #expect(await sync.wait() == errno)
+    #expect(activate.count() == 1)
+    #expect(mount.count() == 1)
+    #expect(sync.count() == 1)
+}
+
+extension PfsLocalMockDaemonTests {
+/// Regression port of review-p5-r4-astra-probes/lifecycle.swift. r3d accepts
+/// ENXIO for serving and nil for completed local teardown; both keep ENXIO.
+/// Each entry point owns a fresh loaded fixture, including force deactivation.
+@available(macOS 26.0, *)
+@Test func nativeLifecycleProbeAcknowledgesCompletedCleanupAfterENXIO() async throws {
+    for first in [NativeTeardown.deactivate, .forceDeactivate, .unload] {
+        try await checkNativeLifecycleProbe(first: first)
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeLifecycleProbe(first: NativeTeardown) async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let cause = PfsLocalClientError.daemon(errno: ENXIO, message: "terminal before native lifecycle callbacks")
+    await fixture.harness.core.client.close(error: cause)
+    await expectNativeServingRefused(fixture, errno: Int(ENXIO))
+    let reply = fixture.teardown(first)
+    #expect(await reply.wait() == 0)
+    #expect(reply.count() == 1)
+    await expectLocalCleanup(fixture, cause: cause)
+    for entry in [first, .deactivate, .unload] {
+        let repeated = fixture.teardown(entry)
+        #expect(await repeated.wait() == 0)
+        #expect(repeated.count() == 1)
+    }
+    #expect(fixture.fileSystem.testingRegisteredVolume(attachRef: "mock") == nil)
+    await expectNativeServingRefused(fixture, errno: Int(ENXIO))
+    let stats = await fixture.harness.daemon.stats()
+    #expect(stats.helloRequests == 1)
+    #expect(stats.syncVolumeRequests == 0)
+    #expect(stats.closeRequests == 0)
+    #expect(stats.reclaimRequests == 0)
+}
+
+/// Native unmount's void completion and the error-bearing teardown replies
+/// certify the same local boundary. Repeat all completed entry points.
+@available(macOS 26.0, *)
+@Test func nativeOrdinaryTeardownAndRepeatsCompleteLocally() async throws {
+    for first in [NativeTeardown.unmount, .deactivate, .forceDeactivate, .unload] {
+        try await checkNativeOrdinaryTeardown(first: first)
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeOrdinaryTeardown(first: NativeTeardown) async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let firstReply = fixture.teardown(first)
+    #expect(await firstReply.wait() == 0)
+    #expect(firstReply.count() == 1)
+    await expectLocalCleanup(fixture, cause: .shutdown)
+    for entry in [first] + NativeTeardown.allCases + NativeTeardown.allCases {
+        let reply = fixture.teardown(entry)
+        #expect(await reply.wait() == 0)
+        #expect(reply.count() == 1)
+        await expectLocalCleanup(fixture, cause: .shutdown)
+    }
+    #expect(fixture.fileSystem.testingRegisteredVolume(attachRef: "mock") == nil)
+    await expectNativeServingRefused(fixture, errno: Int(EIO))
+    #expect(await fixture.harness.daemon.stats().helloRequests == 1)
+    #expect(await fixture.harness.daemon.stats().syncVolumeRequests == 0)
+}
+
+@available(macOS 26.0, *)
+@Test func nativeUnloadPreservesMalformedResourceError() async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let malformed = FSGenericURLResource(url: try #require(URL(string: "https://mock")))
+    let reply = SessionReplyBox<Int>()
+    fixture.fileSystem.unloadResource(resource: malformed, options: fixture.options) { error in
+        reply.set((error as NSError?)?.code ?? 0)
+    }
+    #expect(await reply.wait() == Int(ENXIO))
+    #expect(reply.count() == 1)
+    #expect(fixture.fileSystem.testingRegisteredVolume(attachRef: "mock") === fixture.harness.volume)
+    #expect(!fixture.harness.root.reclaimed)
+    #expect(await fixture.teardown(.unload).wait() == 0)
+}
+
+/// Hold the single owned cleanup and observe every caller joining it. No reply
+/// can run before release, even an overlapping unload or a cancelled requester.
+@available(macOS 26.0, *)
+@Test func nativeTeardownWaitsForCleanupDespiteOverlapAndCancellation() async throws {
+    for first in NativeTeardown.allCases {
+        try await checkNativeTeardownWaits(first: first)
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeTeardownWaits(first: NativeTeardown) async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let cleanup = SessionGate()
+    let joined = SessionGate()
+    let selected = SessionReplyBox<Task<Void, Never>>()
+    await joined.release()
+    fixture.harness.volume.testingShutdown(
+        beforeCleanup: { await cleanup.enter() },
+        onWait: { task in
+            selected.set(task)
+            await joined.enter()
+        }
+    )
+    let requested = SessionReplyBox<SessionReplyBox<Int>>()
+    let requester = Task {
+        let reply = fixture.teardown(first)
+        requested.set(reply)
+        return await reply.wait()
+    }
+    let firstReply = await requested.wait()
+    await cleanup.waitForEntries(1)
+    await joined.waitForEntries(1)
+    let firstCleanup = try #require(selected.get())
+    requester.cancel()
+    #expect(firstReply.get() == nil)
+    #expect(!fixture.harness.root.reclaimed)
+    #expect(fixture.fileSystem.testingRegisteredVolume(attachRef: "mock") === fixture.harness.volume)
+
+    let overlapping = fixture.teardown(.unload)
+    // Dictionary absence used to produce a synchronous early reply here.
+    // Record that regression without waiting for a join that never happens.
+    if overlapping.get() != nil {
+        Issue.record("overlapping unload replied before local cleanup completed")
+        await cleanup.release()
+        _ = await requester.value
+        return
+    }
+    await joined.waitForEntries(2)
+    // Both selections precede their join announcements. The held first task
+    // must be reused even if an independent second task has not finished yet.
+    #expect(selected.count() == 2)
+    #expect(selected.get() == firstCleanup)
+    #expect(firstReply.get() == nil)
+    #expect(overlapping.get() == nil)
+    await cleanup.release()
+    #expect(await firstReply.wait() == 0)
+    #expect(await overlapping.wait() == 0)
+    #expect(await requester.value == 0)
+    #expect(firstReply.count() == 1)
+    #expect(overlapping.count() == 1)
+    #expect(await cleanup.enteredCount() == 1)
+    #expect(fixture.fileSystem.testingRegisteredVolume(attachRef: "mock") == nil)
+    await expectLocalCleanup(fixture, cause: .shutdown)
+}
+
+/// Cancelling an async caller that is still awaiting owned cleanup cannot
+/// shorten that cleanup or strand the native completion joining it.
+@available(macOS 26.0, *)
+@Test func cancelledDeactivationStillWaitsForOwnedCleanup() async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let cleanup = SessionGate()
+    let joined = SessionGate()
+    let selected = SessionReplyBox<Task<Void, Never>>()
+    await joined.release()
+    fixture.harness.volume.testingShutdown(
+        beforeCleanup: { await cleanup.enter() },
+        onWait: { task in
+            selected.set(task)
+            await joined.enter()
+        }
+    )
+    let finished = SessionReplyBox<Int>()
+    let requester = Task {
+        do { try await fixture.harness.volume.deactivate(); finished.set(0) }
+        catch { finished.set((error as NSError).code) }
+    }
+    await cleanup.waitForEntries(1)
+    await joined.waitForEntries(1)
+    let firstCleanup = try #require(selected.get())
+    requester.cancel()
+    let nativeReply = fixture.teardown(.deactivate)
+    await joined.waitForEntries(2)
+    #expect(selected.count() == 2)
+    #expect(selected.get() == firstCleanup)
+    #expect(finished.get() == nil)
+    #expect(nativeReply.get() == nil)
+    #expect(!fixture.harness.root.reclaimed)
+    await cleanup.release()
+    await requester.value
+    #expect(await nativeReply.wait() == 0)
+    #expect(finished.get() == 0)
+    #expect(nativeReply.count() == 1)
+    await expectLocalCleanup(fixture, cause: .shutdown)
+    #expect(await fixture.teardown(.unload).wait() == 0)
+}
 }
 
 extension PfsLocalMockDaemonTests {
@@ -484,6 +783,153 @@ private func expectHeldCallbacksRevoked(
     let item = try #require(held.lookedUp.get())
     #expect(item.reclaimed)
     #expect(await harness.core.testingDebugState().provisionalItemCount == 0)
+}
+
+/// Teardown's successful cleanup acknowledgement cannot authorize successful
+/// publication by a read or provisional lookup already awaiting settlement.
+@available(macOS 26.0, *)
+@Test func nativeTeardownRevokesHeldServingResults() async throws {
+    for entry in [NativeTeardown.deactivate, .unload] {
+        try await checkNativeTeardownRevokesHeldServingResults(entry: entry)
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeTeardownRevokesHeldServingResults(entry: NativeTeardown) async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let held = try await holdCompletedCallbacks(fixture.harness)
+    let reply = fixture.teardown(entry)
+    #expect(await reply.wait() == 0)
+    await expectLocalCleanup(fixture, cause: .shutdown)
+    try await expectHeldCallbacksRevoked(held, fixture.harness, errno: EIO)
+    #expect(held.readReply.count() == 1)
+    #expect(held.lookupReply.count() == 1)
+    #expect(held.readSettled.count() == 1)
+    #expect(held.lookupSettled.count() == 1)
+    #expect(await fixture.teardown(.unload).wait() == 0)
+}
+
+/// Both authority operations have succeeded before this native synchronize
+/// reaches final settlement. Actual teardown wins the same gate afterwards.
+@available(macOS 26.0, *)
+@Test func nativeTeardownRevokesSuccessfulSynchronize() async throws {
+    for entry in [NativeTeardown.deactivate, .unload] {
+        try await checkNativeTeardownRevokesSuccessfulSynchronize(entry: entry)
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeTeardownRevokesSuccessfulSynchronize(entry: NativeTeardown) async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let settlement = SessionGate()
+    await fixture.harness.volume.window.testingBeforeSettlement { await settlement.enter() }
+    let reply = SessionReplyBox<Int>()
+    let operations: any FSVolume.Operations = fixture.harness.volume
+    operations.synchronize(flags: .wait) { error in reply.set((error as NSError?)?.code ?? 0) }
+    await settlement.waitForEntries(1)
+    #expect(await fixture.harness.daemon.stats().syncVolumeRequests == 1)
+    #expect(reply.get() == nil)
+    #expect(await fixture.teardown(entry).wait() == 0)
+    await expectLocalCleanup(fixture, cause: .shutdown)
+    #expect(reply.get() == nil)
+    await settlement.release()
+    #expect(await reply.wait() == Int(EIO))
+    #expect(reply.count() == 1)
+    #expect(await fixture.harness.volume.window.admittedCount() == 0)
+    #expect(await fixture.teardown(.unload).wait() == 0)
+}
+
+private enum TeardownTerminalSource: CaseIterable, Sendable {
+    case socketLoss, protocolDefect, explicitShutdown
+}
+
+/// Real socket and malformed-wire failures retain their exact first cause,
+/// as does explicit shutdown. Native serving remains refused after cleanup.
+@available(macOS 26.0, *)
+@Test func nativeTeardownPreservesEachTerminalSource() async throws {
+    for source in TeardownTerminalSource.allCases {
+        for entry in [NativeTeardown.deactivate, .unload] {
+            try await checkNativeTeardownPreservesTerminalSource(source: source, entry: entry)
+        }
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeTeardownPreservesTerminalSource(
+    source: TeardownTerminalSource, entry: NativeTeardown
+) async throws {
+    let fixture = try await loadSession()
+    defer { fixture.harness.daemon.stop() }
+    let ended = SessionReplyBox<Bool>()
+    await fixture.harness.volume.window.testingBeforeTerminalDrain { ended.set(true) }
+    let cause: PfsLocalClientError
+    switch source {
+    case .socketLoss:
+        cause = .connectionClosed
+        fixture.harness.daemon.dropConnections()
+    case .protocolDefect:
+        cause = .invalidFrame("envelope carries a field outside pfslocal 2.0")
+        await fixture.harness.daemon.transformNextReply { envelope in
+            guard case .statfsReply? = envelope.body,
+                  var bytes = try? envelope.serializedData() else { return nil }
+            bytes.append(contentsOf: [0x20, 0x01])
+            return try? PfsEnvelope(serializedBytes: bytes)
+        }
+        await #expect(throws: cause) { _ = try await fixture.harness.core.statfs() }
+    case .explicitShutdown:
+        cause = .shutdown
+        await fixture.harness.core.client.close()
+    }
+    _ = await ended.wait()
+    let reply = fixture.teardown(entry)
+    #expect(await reply.wait() == 0)
+    #expect(reply.count() == 1)
+    await expectLocalCleanup(fixture, cause: cause)
+    #expect(await fixture.teardown(.deactivate).wait() == 0)
+    #expect(await fixture.teardown(.unload).wait() == 0)
+    await expectNativeServingRefused(fixture, errno: Int(cause.posixErrno))
+    #expect(await fixture.harness.daemon.stats().helloRequests == 1)
+    #expect(await fixture.harness.daemon.stats().syncVolumeRequests == 0)
+}
+
+/// An unanswered remote reclaim and a local retirement waiter cannot hold
+/// local disposal hostage. Cleanup wakes both without issuing a remote drain.
+@available(macOS 26.0, *)
+@Test func nativeTeardownDoesNotAwaitRemoteReclaim() async throws {
+    for entry in [NativeTeardown.deactivate, .unload] {
+        try await checkNativeTeardownDoesNotAwaitRemoteReclaim(entry: entry)
+    }
+}
+
+@available(macOS 26.0, *)
+private func checkNativeTeardownDoesNotAwaitRemoteReclaim(entry: NativeTeardown) async throws {
+    let dispatched = SessionReplyBox<Bool>()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.traceObserver = { record in
+        if record.event == .dispatched, record.value("kind") == "reclaim" { dispatched.set(true) }
+    }
+    let fixture = try await loadSession(clientConfiguration: configuration)
+    defer { fixture.harness.daemon.stop() }
+    await fixture.harness.daemon.pauseReclaims()
+    let retiring = Task { try await fixture.harness.core.reclaim(item: fixture.file) }
+    _ = await dispatched.wait()
+    let waiting = Task { try await fixture.harness.core.reclaim(item: fixture.file) }
+    while await fixture.harness.core.testingDebugState().retirementWaiterCount != 1 { await Task.yield() }
+    #expect(await fixture.harness.core.testingDebugState().retiringItemCount == 1)
+    let reply = fixture.teardown(entry)
+    #expect(await reply.wait() == 0)
+    #expect(reply.count() == 1)
+    await expectLocalCleanup(fixture, cause: .shutdown)
+    if case .success = await retiring.result { Issue.record("unanswered reclaim unexpectedly succeeded") }
+    if case .success = await waiting.result { Issue.record("retirement waiter unexpectedly succeeded") }
+    // Resume only after the cleanup acknowledgement and local waiters settled.
+    await fixture.harness.daemon.resumeReclaims()
+    #expect(await fixture.teardown(.unload).wait() == 0)
+    await expectNativeServingRefused(fixture, errno: Int(EIO))
+    #expect(await fixture.harness.daemon.stats().syncVolumeRequests == 0)
+    #expect(await fixture.harness.daemon.stats().helloRequests == 1)
 }
 
 /// Degraded attach state is terminal: the client closes, a callback queued
