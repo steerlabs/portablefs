@@ -1431,6 +1431,13 @@ private actor MockFileSystem {
                 if setFlags && !configuration.flagsSupported && !isGraftBacked(node) {
                     throw MockPOSIXError(errno: ENOTSUP, message: "authority does not persist BSD file flags")
                 }
+                // Like the authority, a truncate through a description needs
+                // one open for writing; without a description it is checked
+                // against the object.
+                if request.hasSize, request.handle != 0,
+                   handles[request.handle]?.writable != true {
+                    throw MockPOSIXError(errno: EINVAL, message: "truncate through a description not open for writing")
+                }
                 if request.hasMode { node.mode = request.mode }
                 if request.hasUid { node.uid = request.uid }
                 if request.hasGid { node.gid = request.gid }

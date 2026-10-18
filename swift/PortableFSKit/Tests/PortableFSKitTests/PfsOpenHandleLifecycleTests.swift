@@ -173,7 +173,10 @@ extension PfsLocalMockDaemonTests {
     }
 }
 
-@Test func openUpgradePartialCloseAndFinalCloseAreBalanced() async throws {
+/// A read/write open on top of a read description acquires only the missing
+/// write access. A partial close retires exactly the description that no
+/// longer carries retained access, and the final close retires the rest.
+@Test func complementaryOpenPartialCloseAndFinalCloseAreBalanced() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -182,15 +185,17 @@ extension PfsLocalMockDaemonTests {
     try await core.open(item: file, mode: .read)
     try await core.open(item: file, mode: .readWrite)
     var stats = await daemon.stats()
-    #expect(stats.openRequests == 2)
-    #expect(stats.closeRequests == 1)
-    #expect(stats.activeHandles == 1)
+    #expect(stats.openModes == [.read, .write])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 2)
 
     try await core.close(item: file, retainingModes: .read)
     stats = await daemon.stats()
     #expect(stats.openRequests == 2)
     #expect(stats.closeRequests == 1)
     #expect(stats.activeHandles == 1)
+    #expect(try await core.read(item: file, offset: 0, length: 0).isEmpty)
+    #expect(await daemon.stats().openRequests == 2)
 
     try await core.close(item: file, retainingModes: .unspecified)
     stats = await daemon.stats()
@@ -243,7 +248,9 @@ extension PfsLocalMockDaemonTests {
     #expect(await core.testingDebugState().openHandleCount == 0)
 }
 
-@Test func modeChangeReopenClosesPriorDaemonHandle() async throws {
+/// Complementary opens keep their own descriptions; neither is reopened or
+/// closed until FSKit stops needing it.
+@Test func complementaryOpenKeepsBothDescriptions() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -252,14 +259,16 @@ extension PfsLocalMockDaemonTests {
     try await core.open(item: file, mode: .read)
     try await core.open(item: file, mode: .write)
     var stats = await daemon.stats()
-    #expect(stats.openRequests == 2)
-    #expect(stats.closeRequests == 1)
-    #expect(stats.activeHandles == 1)
+    #expect(stats.openModes == [.read, .write])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 2)
+    #expect(await core.testingDebugState().openHandleCount == 2)
 
     try await core.close(item: file, retainingModes: .unspecified)
     stats = await daemon.stats()
     #expect(stats.closeRequests == 2)
     #expect(stats.activeHandles == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
 }
 
 /// O_WRONLY installs a write-only description, and a write needs nothing
@@ -289,8 +298,8 @@ extension PfsLocalMockDaemonTests {
 }
 
 /// A mode-0200 file is writable and unreadable. Its write-only description
-/// must serve writes. A read cannot use it, and the mode refuses the
-/// read/write replacement; that refusal must leave the write description
+/// must serve writes. A read cannot use it and acquires a read description,
+/// which the mode refuses; that refusal must leave the write description
 /// installed and usable.
 @Test func writeOnlyOpenOfAnUnreadableFileWritesAndSurvivesARefusedRead() async throws {
     let daemon = try PfsLocalMockDaemon()
@@ -320,7 +329,7 @@ extension PfsLocalMockDaemonTests {
         _ = try await core.read(item: file, offset: 0, length: 6)
     } == EACCES)
     stats = await daemon.stats()
-    #expect(stats.openModes == [.read, .write, .readWrite])
+    #expect(stats.openModes == [.read, .write, .read])
     #expect(stats.closeRequests == 0)
     #expect(stats.activeHandles == 1)
     #expect(await core.testingDebugState().openHandleCount == 1)
@@ -328,7 +337,7 @@ extension PfsLocalMockDaemonTests {
     let appended = try await core.write(item: file, offset: 6, data: lifecycleBytes("!"))
     #expect(appended.attr.size == 7)
     stats = await daemon.stats()
-    #expect(stats.openModes == [.read, .write, .readWrite])
+    #expect(stats.openModes == [.read, .write, .read])
     #expect(stats.writeRequests == 2)
 
     try await core.close(item: file, retainingModes: .unspecified)
@@ -449,9 +458,10 @@ extension PfsLocalMockDaemonTests {
     #expect(await daemon.stats().activeHandles == 0)
 }
 
-/// An unlinked file is reachable only through descriptions that already
-/// exist. A write-only description must keep serving writes after the last
-/// name is gone; a replacement OPEN could not even address the item.
+/// After the last name is gone, a write-only description keeps serving
+/// writes without another OPEN. (The strict-namespace mock refuses to OPEN a
+/// detached item; the real authority could reopen the retained inode, but no
+/// reopen is needed.)
 @Test func writeOnlyDescriptionOfAnUnlinkedFileKeepsWriting() async throws {
     let daemon = try PfsLocalMockDaemon(configuration: .init(strictItemNamespace: true))
     defer { daemon.stop() }
@@ -481,17 +491,173 @@ extension PfsLocalMockDaemonTests {
     #expect(await core.testingDebugState().openHandleCount == 0)
 }
 
-@Test func failedUpgradeCloseRemainsTrackedUntilFinalClose() async throws {
+private func chmod(_ core: VolumeCore, _ file: PortableFSItem, _ mode: UInt32) async throws {
+    _ = try await core.setattr(item: file, attributes: PfsSetAttributes(mode: mode))
+}
+
+/// POSIX keeps an open description's access across chmod, and judges a new
+/// open by the current mode. Read-open under 0400, chmod 0200, write-open:
+/// the write open must acquire only write access as its own description.
+/// Reopening the union would re-check read under 0200 and fail EACCES.
+@Test func writeOpenAfterChmodKeepsTheEarlierReadDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "read-then-write")
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("before"))
+    try await core.close(item: file, retainingModes: .unspecified)
+    try await chmod(core, file, 0o400)
+    await daemon.resetStats()
+
+    try await core.open(item: file, mode: .read)
+    try await chmod(core, file, 0o200)
+    try await core.open(item: file, mode: .write)
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("after!"))
+    #expect(try await core.read(item: file, offset: 0, length: 6) == lifecycleBytes("after!"))
+    let stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 2)
+    try await core.close(item: file, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
+/// The symmetric order: write-open under 0200, chmod 0400, read-open.
+@Test func readOpenAfterChmodKeepsTheEarlierWriteDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "write-then-read")
+    try await chmod(core, file, 0o200)
+    await daemon.resetStats()
+
+    try await core.open(item: file, mode: .write)
+    try await chmod(core, file, 0o400)
+    try await core.open(item: file, mode: .read)
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("kept"))
+    #expect(try await core.read(item: file, offset: 0, length: 4) == lifecycleBytes("kept"))
+    let stats = await daemon.stats()
+    #expect(stats.openModes == [.write, .read])
+    #expect(stats.closeRequests == 0)
+    try await core.close(item: file, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
+/// I/O that needs a right no description grants acquires exactly that
+/// right, implicitly, and leaves the existing description in place.
+@Test func implicitIOAcquiresOnlyTheMissingAccess() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "implicit-write")
+    try await chmod(core, file, 0o400)
+    await daemon.resetStats()
+
+    try await core.open(item: file, mode: .read)
+    try await chmod(core, file, 0o200)
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("implicit"))
+    #expect(try await core.read(item: file, offset: 0, length: 8) == lifecycleBytes("implicit"))
+    let stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write])
+    #expect(stats.closeRequests == 0)
+    try await core.close(item: file, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
+/// A refused new open changes nothing: the description an earlier open was
+/// granted stays installed and serves I/O.
+@Test func refusedComplementaryOpenLeavesTheHeldDescriptionUsable() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "refused-write-open")
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("data"))
+    try await core.close(item: file, retainingModes: .unspecified)
+    try await chmod(core, file, 0o400)
+    await daemon.resetStats()
+
+    try await core.open(item: file, mode: .read)
+    #expect(await lifecycleErrno { try await core.open(item: file, mode: .write) } == EACCES)
+    #expect(await lifecycleErrno { try await core.open(item: file, mode: .readWrite) } == EACCES)
+    #expect(try await core.read(item: file, offset: 0, length: 4) == lifecycleBytes("data"))
+    let stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write, .write])
+    #expect(stats.closeRequests == 0)
+    #expect(stats.activeHandles == 1)
+    #expect(await core.testingDebugState().openHandleCount == 1)
+    try await core.close(item: file, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
+/// FSKit's partial close names the modes that stay open. Only the
+/// description carrying none of them is retired; reclaim retires the rest.
+@Test func partialCloseAndReclaimRetireMultiDescriptionItems() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "multi-description")
+
+    try await core.open(item: file, mode: .read)
+    try await core.open(item: file, mode: .write)
+    try await core.close(item: file, retainingModes: .write)
+    var stats = await daemon.stats()
+    #expect(stats.closeRequests == 1)
+    #expect(stats.activeHandles == 1)
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("still"))
+    #expect(await daemon.stats().openRequests == 2)
+
+    // A retained mode no description carries opens nothing at close; the
+    // next read acquires it.
+    try await core.close(item: file, retainingModes: .readWrite)
+    #expect(await daemon.stats().openRequests == 2)
+    #expect(try await core.read(item: file, offset: 0, length: 5) == lifecycleBytes("still"))
+    stats = await daemon.stats()
+    #expect(stats.openModes == [.read, .write, .read])
+    #expect(stats.activeHandles == 2)
+
+    try await core.reclaim(item: file)
+    stats = await daemon.stats()
+    #expect(stats.closeRequests == 3)
+    #expect(stats.activeHandles == 0)
+    #expect(await core.testingDebugState().openHandleCount == 0)
+    #expect(file.reclaimed)
+}
+
+/// A truncate goes through a description only if it is open for writing;
+/// the authority refuses one that is not. With only a read description the
+/// truncate is checked against the object instead.
+@Test func truncateUsesOnlyAWriteCapableDescription() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
+    let file = try await closedTestFile(core: core, daemon: daemon, name: "truncate-selection")
+    _ = try await core.write(item: file, offset: 0, data: lifecycleBytes("0123456789"))
+    try await core.close(item: file, retainingModes: .unspecified)
+
+    try await core.open(item: file, mode: .read)
+    var attr = try await core.setattr(item: file, attributes: PfsSetAttributes(size: 4))
+    #expect(attr.size == 4)
+
+    try await core.open(item: file, mode: .write)
+    try await chmod(core, file, 0o000)
+    attr = try await core.setattr(item: file, attributes: PfsSetAttributes(size: 2))
+    #expect(attr.size == 2)
+    try await core.close(item: file, retainingModes: .unspecified)
+    #expect(await daemon.stats().activeHandles == 0)
+}
+
+@Test func failedPartialCloseRemainsTrackedUntilFinalClose() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
     let file = try await closedTestFile(core: core, daemon: daemon, name: "failed-upgrade-close")
 
     try await core.open(item: file, mode: .read)
+    try await core.open(item: file, mode: .write)
     await daemon.failNextClose()
     do {
-        try await core.open(item: file, mode: .readWrite)
-        Issue.record("expected the injected prior-handle close failure")
+        try await core.close(item: file, retainingModes: .read)
+        Issue.record("expected the injected close failure")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EIO)
     }
@@ -501,9 +667,12 @@ extension PfsLocalMockDaemonTests {
     #expect(stats.closeRequests == 1)
     #expect(stats.activeHandles == 2)
     #expect(await core.testingDebugState().openHandleCount == 2)
+    // The retained read description is unaffected by its sibling's failure.
+    #expect(try await core.read(item: file, offset: 0, length: 0).isEmpty)
 
     try await core.close(item: file, retainingModes: .unspecified)
     stats = await daemon.stats()
+    #expect(stats.openRequests == 2)
     #expect(stats.closeRequests == 3)
     #expect(stats.activeHandles == 0)
     #expect(await core.testingDebugState().openHandleCount == 0)
@@ -540,16 +709,17 @@ extension PfsLocalMockDaemonTests {
     #expect(file.reclaimed)
 }
 
-@Test func retiredUpgradeCloseErrorRemovesOnlySupersededHandle() async throws {
+@Test func retiredPartialCloseErrorRemovesOnlyTheRetiredDescription() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
     let file = try await closedTestFile(core: core, daemon: daemon, name: "retired-upgrade-close")
 
     try await core.open(item: file, mode: .read)
+    try await core.open(item: file, mode: .write)
     await daemon.retireNextCloseWithError()
     do {
-        try await core.open(item: file, mode: .readWrite)
+        try await core.close(item: file, retainingModes: .read)
         Issue.record("expected the terminal retired-close error")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EIO)
@@ -614,17 +784,18 @@ extension PfsLocalMockDaemonTests {
     #expect(await daemon.stats().closeRequests == 2)
 }
 
-@Test func failedUpgradeCloseRemainsTrackedUntilReclaim() async throws {
+@Test func failedPartialCloseRemainsTrackedUntilReclaim() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
     let file = try await closedTestFile(core: core, daemon: daemon, name: "failed-upgrade-reclaim")
 
     try await core.open(item: file, mode: .read)
+    try await core.open(item: file, mode: .write)
     await daemon.failNextClose()
     do {
-        try await core.open(item: file, mode: .readWrite)
-        Issue.record("expected the injected prior-handle close failure")
+        try await core.close(item: file, retainingModes: .read)
+        Issue.record("expected the injected close failure")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EIO)
     }
@@ -637,7 +808,7 @@ extension PfsLocalMockDaemonTests {
     #expect(file.reclaimed)
 }
 
-@Test func concurrentFinalCloseCannotInterleaveDelayedUpgrade() async throws {
+@Test func concurrentFinalCloseCannotInterleaveDelayedComplementaryOpen() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
