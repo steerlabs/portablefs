@@ -168,7 +168,8 @@ func TestProtocol8LinuxServerRefusesInsufficientCapacity(t *testing.T) {
 		for limit := 2; limit < MinimumLinuxInFlight; limit++ {
 			t.Run(fmt.Sprintf("%s/%d", role, limit), func(t *testing.T) {
 				server := transportHelloTestServer(t, limit)
-				if err := exchangeTransportHello(t, server, role, ProtocolMajor); !errors.Is(err, ErrTransportBinding) || !strings.Contains(err.Error(), "bound is below 9") {
+				want := fmt.Sprintf("%v: Linux connection bound is below %d for %s", ErrTransportBinding, MinimumLinuxInFlight, role)
+				if err := exchangeTransportHello(t, server, role, ProtocolMajor); !errors.Is(err, ErrTransportBinding) || err.Error() != want {
 					t.Fatalf("insufficient Linux capacity accepted or refused for wrong reason: %v", err)
 				}
 				if len(server.registry.pairs) != 0 {

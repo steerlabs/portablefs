@@ -88,7 +88,7 @@ func (s *Server) acceptTransportHello(
 	response.GetHello().ConnectionSetId = append([]byte(nil), hello.GetConnectionSetId()...)
 	response.GetHello().FrontendProfile = hello.GetFrontendProfile()
 	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && response.GetHello().GetMaxInFlight() < MinimumLinuxInFlight {
-		return nil, nil, fmt.Errorf("%w: Linux DATA bound is below %d", ErrTransportBinding, MinimumLinuxInFlight)
+		return nil, nil, fmt.Errorf("%w: Linux connection bound is below %d for %s", ErrTransportBinding, MinimumLinuxInFlight, hello.GetRole())
 	}
 	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close)
 	if err != nil {
