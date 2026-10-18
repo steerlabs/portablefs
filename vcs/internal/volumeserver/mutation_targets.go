@@ -13,12 +13,15 @@ const (
 )
 
 // DurableMountMembership is outside the disposable authority runtime.
-// Activate must durably record a strict mount before attach returns. Deactivate
-// must durably record an authenticated clean detach or host fencing before the
-// authority drops the mount's barrier obligation.
+// ActivateProfile must durably record the exact mount profile before activation
+// returns. Deactivate must durably record an authenticated clean detach or host
+// fencing before the authority drops the mount's barrier obligation.
+// PriorCacheState separates prior Mac writer exclusion from Linux cache horizons;
+// neither result clears the durable topology or archive obligation.
 type DurableMountMembership interface {
-	Activate(SessionID) error
+	ActivateProfile(SessionID, MountMembershipProfile) error
 	Deactivate(SessionID) error
+	PriorCacheState() (PriorEpochDisposition, bool)
 }
 
 type SessionFencer interface {

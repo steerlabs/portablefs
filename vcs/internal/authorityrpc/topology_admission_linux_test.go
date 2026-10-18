@@ -42,9 +42,6 @@ type topologyMembership struct {
 	beforeActivate func(volumeserver.SessionID)
 }
 
-func (m *topologyMembership) Activate(id volumeserver.SessionID) error {
-	return m.ActivateProfile(id, volumeserver.MembershipFSKitExclusive)
-}
 func (m *topologyMembership) ActivateProfile(id volumeserver.SessionID, p volumeserver.MountMembershipProfile) error {
 	if m.beforeActivate != nil {
 		m.beforeActivate(id)
@@ -601,7 +598,7 @@ func TestTopologyRouteValidationAndNoOpPrecedenceOnXFS(t *testing.T) {
 				t.Fatal(err)
 			}
 			if state == "live" {
-				if err := f.h.Lifecycle.Activate(volumeserver.SessionID{7}, func() error { return nil }); err != nil {
+				if err := f.h.Lifecycle.ActivateProfile(volumeserver.SessionID{7}, volumeserver.MembershipFSKitExclusive, func() error { return nil }); err != nil {
 					t.Fatal(err)
 				}
 			}

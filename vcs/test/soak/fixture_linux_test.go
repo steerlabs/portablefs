@@ -183,23 +183,27 @@ type integrationConfig struct {
 
 // recordingMembership is the durable control-plane record the coordinator
 // requires, plus the one thing a test needs that production gets from its own
-// transport: the session ID the authority just registered. Activate is called
-// inside attach, before the reply is written, so the fixture can pair it with
-// the client it is dialling.
+// transport: the session ID the authority just registered. ActivateProfile runs
+// before the activation reply is written, so the fixture can pair the session
+// with the client it is dialling.
 type recordingMembership struct {
 	mu      sync.Mutex
-	active  map[volumeserver.SessionID]struct{}
+	active  map[volumeserver.SessionID]volumeserver.MountMembershipProfile
 	ordered []volumeserver.SessionID
 }
 
 func newRecordingMembership() *recordingMembership {
-	return &recordingMembership{active: make(map[volumeserver.SessionID]struct{})}
+	return &recordingMembership{active: make(map[volumeserver.SessionID]volumeserver.MountMembershipProfile)}
 }
 
-func (m *recordingMembership) Activate(id volumeserver.SessionID) error {
+func (*recordingMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *recordingMembership) ActivateProfile(id volumeserver.SessionID, profile volumeserver.MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active[id] = struct{}{}
+	m.active[id] = profile
 	m.ordered = append(m.ordered, id)
 	return nil
 }

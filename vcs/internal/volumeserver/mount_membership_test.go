@@ -88,14 +88,14 @@ func TestFileMountMembershipActivateRollsBackAfterPersistFailure(t *testing.T) {
 	}
 	id := SessionID{1}
 	registry.path = filepath.Join(dir, "missing", "mount.membership")
-	if err := registry.Activate(id); err == nil {
+	if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err == nil {
 		t.Fatal("activate succeeded without a durable membership path")
 	}
 	registry.path = path
 	if _, active := registry.active[id]; active {
 		t.Fatal("failed activation remained live in memory")
 	}
-	if err := registry.Activate(id); err != nil {
+	if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err != nil {
 		t.Fatalf("retry activation after restoring persistence: %v", err)
 	}
 	if err := registry.Close(); err != nil {
@@ -126,7 +126,7 @@ func TestFileMountMembershipSurvivesRestartUntilFencingProof(t *testing.T) {
 		t.Fatalf("open fresh membership = %v, %v", disposition, err)
 	}
 	id := SessionID{1}
-	if err := registry.Activate(id); err != nil {
+	if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err != nil {
 		t.Fatal(err)
 	}
 	if err := registry.Close(); err != nil {
@@ -174,7 +174,7 @@ func TestFileMountMembershipAuditsOperatorAssertedFencing(t *testing.T) {
 	}
 	first, second := SessionID{1}, SessionID{2}
 	for _, id := range []SessionID{first, second} {
-		if err := registry.Activate(id); err != nil {
+		if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -78,16 +78,20 @@ func testVolumeHandler() *VolumeHandler {
 
 type detachMembership struct {
 	mu     sync.Mutex
-	active map[volumeserver.SessionID]bool
+	active map[volumeserver.SessionID]volumeserver.MountMembershipProfile
 }
 
-func (m *detachMembership) Activate(id volumeserver.SessionID) error {
+func (*detachMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *detachMembership) ActivateProfile(id volumeserver.SessionID, profile volumeserver.MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.active == nil {
-		m.active = make(map[volumeserver.SessionID]bool)
+		m.active = make(map[volumeserver.SessionID]volumeserver.MountMembershipProfile)
 	}
-	m.active[id] = true
+	m.active[id] = profile
 	return nil
 }
 
@@ -101,7 +105,8 @@ func (m *detachMembership) Deactivate(id volumeserver.SessionID) error {
 func (m *detachMembership) contains(id volumeserver.SessionID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.active[id]
+	_, ok := m.active[id]
+	return ok
 }
 
 func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
@@ -131,7 +136,7 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 		if err := h.startSessionResources(credential.ID, xfsstore.Capability{byte(index + 1)}, 2, [32]byte{}); err != nil {
 			t.Fatal(err)
 		}
-		if err := lifecycle.Activate(credential.ID, func() error { return nil }); err != nil {
+		if err := lifecycle.ActivateProfile(credential.ID, volumeserver.MembershipFSKitExclusive, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1393,7 +1398,7 @@ func resourceAdmissionRequestHarnessForProfile(
 		t.Fatal(err)
 	}
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
-		if err := h.Lifecycle.Activate(cred.ID, func() error { return nil }); err != nil {
+		if err := h.Lifecycle.ActivateProfile(cred.ID, volumeserver.MembershipFSKitExclusive, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		registerTestWriter(t, h, cred)
@@ -2317,7 +2322,11 @@ type failingActivationMembership struct {
 	calls atomic.Uint32
 }
 
-func (m *failingActivationMembership) Activate(volumeserver.SessionID) error {
+func (*failingActivationMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *failingActivationMembership) ActivateProfile(volumeserver.SessionID, volumeserver.MountMembershipProfile) error {
 	m.calls.Add(1)
 	return m.err
 }
@@ -2330,7 +2339,11 @@ type blockingActivationMembership struct {
 	release   chan struct{}
 }
 
-func (m *blockingActivationMembership) Activate(volumeserver.SessionID) error {
+func (*blockingActivationMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *blockingActivationMembership) ActivateProfile(volumeserver.SessionID, volumeserver.MountMembershipProfile) error {
 	m.active.Store(true)
 	if m.activated != nil {
 		close(m.activated)

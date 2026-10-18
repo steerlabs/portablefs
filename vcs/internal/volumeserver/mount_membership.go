@@ -155,10 +155,6 @@ func (m *FileMountMembership) PriorCacheState() (PriorEpochDisposition, bool) {
 	return m.priorWriter, m.priorLinux
 }
 
-func (m *FileMountMembership) Activate(id SessionID) error {
-	return m.ActivateProfile(id, MembershipFSKitExclusive)
-}
-
 func (m *FileMountMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
 	if profile != MembershipFSKitExclusive && profile != MembershipLinux && profile != MembershipCacheless {
 		return errors.New("volumeserver: invalid membership profile")
@@ -214,8 +210,8 @@ func (m *FileMountMembership) Deactivate(id SessionID) error {
 }
 
 // SetQuiescing closes strict-attach admission and, under the same mutex that
-// serializes Activate and Deactivate, writes proof once the durable active set
-// is empty. A new nonce replaces a stale proof obligation. An empty nonce
+// serializes ActivateProfile and Deactivate, writes proof once the durable active
+// set is empty. A new nonce replaces a stale proof obligation. An empty nonce
 // reopens admission after a cancelled archive attempt.
 func (m *FileMountMembership) SetQuiescing(nonce string, writeProof func() error) error {
 	m.mu.Lock()

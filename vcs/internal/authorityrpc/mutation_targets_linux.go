@@ -55,7 +55,7 @@ func appendUniqueIdentities(dst, src [][16]byte) [][16]byte {
 func validateAuthorityMutationTarget(target volumeserver.MutationTarget) error {
 	zero := [16]byte{}
 	if target.Device == 0 {
-		return errors.New("visibility target carries no backing device")
+		return errors.New("mutation target carries no backing device")
 	}
 	switch target.Scope {
 	case volumeserver.MutationNamespace:
@@ -126,7 +126,7 @@ func validateAuthorityMutationTarget(target volumeserver.MutationTarget) error {
 			return errors.New("attributes target carries a size")
 		}
 	default:
-		return fmt.Errorf("visibility target carries scope %d", target.Scope)
+		return fmt.Errorf("mutation target carries scope %d", target.Scope)
 	}
 	return nil
 }

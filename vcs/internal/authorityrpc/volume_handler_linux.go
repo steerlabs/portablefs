@@ -2425,11 +2425,10 @@ func (h *VolumeHandler) newActivationReply(resources *sessionResources, rootAttr
 	}
 }
 
-// retainActivationReply runs before the infallible runtime commit. For a
-// strict session it is the visibility transaction's precommit step, after the
-// exact initial cursor exists but before either membership or runtime ACTIVE
-// can escape. Thus there is no state in which an active session exists without
-// the response needed to recover a lost Activate write.
+// retainActivationReply prepares the exact reply before infallible runtime
+// publication, so an ACTIVE session always has the response needed to recover a
+// lost Activate write. For mounts, durable membership precedes this preparation;
+// preparation failure rolls membership back before activation returns.
 func (h *VolumeHandler) retainActivationReply(id volumeserver.SessionID, resources *sessionResources, reply *authoritypb.ActivateReply) error {
 	if reply == nil {
 		return errInternal

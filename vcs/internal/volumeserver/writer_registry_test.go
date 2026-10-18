@@ -126,7 +126,7 @@ func TestWriterActivationFenceBetweenOwnerPublicationAndCommit(t *testing.T) {
 	defer releaseCommit()
 	done := make(chan error, 1)
 	go func() {
-		done <- lifecycle.Activate(cred.ID, func() error {
+		done <- lifecycle.ActivateProfile(cred.ID, MembershipFSKitExclusive, func() error {
 			return registry.Activate(cred.ID, terminal, exclusion, func() error { return nil }, func() { close(published); <-commit; a.CommitActivation(token) })
 		})
 	}()

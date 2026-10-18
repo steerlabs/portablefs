@@ -54,12 +54,7 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 	if err != nil {
 		return nil, err
 	}
-	writerPrior, priorLinux := cfg.Prior, false
-	if typed, ok := cfg.Membership.(interface {
-		PriorCacheState() (volumeserver.PriorEpochDisposition, bool)
-	}); ok {
-		writerPrior, priorLinux = typed.PriorCacheState()
-	}
+	writerPrior, priorLinux := cfg.Membership.PriorCacheState()
 	writers, err := volumeserver.NewWriterRegistry(volumeserver.WriterRegistryConfig{
 		Fencer: cfg.Fencer, Prior: writerPrior, ContinuousNow: cfg.ContinuousNow,
 	})

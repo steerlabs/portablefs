@@ -90,22 +90,10 @@ func (l *MountLifecycle) RequireCleanRouteAbsence() error {
 	return nil
 }
 
-// Activate records durable membership before the supplied infallible runtime
-// publication can escape. The caller already holds a topology read guard so a
-// route change cannot fit between revision admission and this registration.
-func (l *MountLifecycle) Activate(id SessionID, publish func() error) error {
-	return l.ActivateProfile(id, MembershipFSKitExclusive, publish)
-}
-
-func activateMembership(m DurableMountMembership, id SessionID, profile MountMembershipProfile) error {
-	if typed, ok := m.(interface {
-		ActivateProfile(SessionID, MountMembershipProfile) error
-	}); ok {
-		return typed.ActivateProfile(id, profile)
-	}
-	return m.Activate(id)
-}
-
+// ActivateProfile records durable membership before reply preparation and runtime
+// publication. Failed preparation rolls membership back. The caller already holds
+// a topology read guard so a route change cannot fit between revision admission
+// and this registration.
 func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipProfile, publish func() error) error {
 	if id == (SessionID{}) || publish == nil {
 		return ErrMountHolder
@@ -115,7 +103,7 @@ func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipPr
 	if _, exists := l.active[id]; exists {
 		return ErrMountHolder
 	}
-	if err := activateMembership(l.membership, id, profile); err != nil {
+	if err := l.membership.ActivateProfile(id, profile); err != nil {
 		return err
 	}
 	if err := publish(); err != nil {
@@ -153,7 +141,7 @@ func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remo
 		return err
 	}
 	if err := remove(); err != nil {
-		rollbackErr := activateMembership(l.membership, id, l.profiles[id])
+		rollbackErr := l.membership.ActivateProfile(id, l.profiles[id])
 		if rollbackErr != nil {
 			l.priorUnproven = true
 		}

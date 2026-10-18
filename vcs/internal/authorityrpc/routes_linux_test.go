@@ -69,7 +69,12 @@ func testRoutesController(t *testing.T, store *xfsstore.Volume) *RoutesControlle
 
 type noopMembership struct{}
 
-func (noopMembership) Activate(volumeserver.SessionID) error   { return nil }
+func (noopMembership) ActivateProfile(volumeserver.SessionID, volumeserver.MountMembershipProfile) error {
+	return nil
+}
+func (noopMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
 func (noopMembership) Deactivate(volumeserver.SessionID) error { return nil }
 
 type noopFencer struct{}

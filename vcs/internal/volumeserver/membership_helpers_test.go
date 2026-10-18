@@ -4,27 +4,31 @@ import "sync"
 
 type testDurableMountMembership struct {
 	mu     sync.Mutex
-	active map[SessionID]bool
+	active map[SessionID]MountMembershipProfile
 }
 
 type faultMountMembership struct {
 	mu            sync.Mutex
-	active        map[SessionID]bool
+	active        map[SessionID]MountMembershipProfile
 	activateErr   error
 	deactivateErr error
 }
 
 func newFaultMountMembership() *faultMountMembership {
-	return &faultMountMembership{active: make(map[SessionID]bool)}
+	return &faultMountMembership{active: make(map[SessionID]MountMembershipProfile)}
 }
 
-func (m *faultMountMembership) Activate(id SessionID) error {
+func (*faultMountMembership) PriorCacheState() (PriorEpochDisposition, bool) {
+	return PriorEpochStrictMountsFenced, false
+}
+
+func (m *faultMountMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.activateErr != nil {
 		return m.activateErr
 	}
-	m.active[id] = true
+	m.active[id] = profile
 	return nil
 }
 
@@ -41,17 +45,22 @@ func (m *faultMountMembership) Deactivate(id SessionID) error {
 func (m *faultMountMembership) contains(id SessionID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.active[id]
+	_, ok := m.active[id]
+	return ok
 }
 
 func newTestDurableMountMembership() *testDurableMountMembership {
-	return &testDurableMountMembership{active: make(map[SessionID]bool)}
+	return &testDurableMountMembership{active: make(map[SessionID]MountMembershipProfile)}
 }
 
-func (m *testDurableMountMembership) Activate(id SessionID) error {
+func (*testDurableMountMembership) PriorCacheState() (PriorEpochDisposition, bool) {
+	return PriorEpochStrictMountsFenced, false
+}
+
+func (m *testDurableMountMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active[id] = true
+	m.active[id] = profile
 	return nil
 }
 
@@ -65,7 +74,8 @@ func (m *testDurableMountMembership) Deactivate(id SessionID) error {
 func (m *testDurableMountMembership) contains(id SessionID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.active[id]
+	_, ok := m.active[id]
+	return ok
 }
 
 // testFencer stands in for the authority runtime: fencing a session ends it,
