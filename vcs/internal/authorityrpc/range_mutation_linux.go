@@ -259,6 +259,14 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		}, nil
 	}
 	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		// On the required noatime mount, CFR leaves a distinct source inode
+		// unchanged. Sample it under the complete storage turn before apply so
+		// a destination sync failure cannot fence away that exact observation.
+		var sourceErr error
+		sourceBefore, sourceErr = h.getattrOpen(input)
+		if sourceErr != nil {
+			return h.errorResponse(0, sourceErr, false), nil
+		}
 		copyLength := uint64(0)
 		if sourceBefore.Size > 0 && body.GetInputOffset() < uint64(sourceBefore.Size) {
 			copyLength = min(body.GetLength(), uint64(sourceBefore.Size)-body.GetInputOffset())
@@ -290,8 +298,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if applyErr != nil && !dispatched {
 			return h.errorResponse(0, applyErr, false), nil
 		}
-		zeroPostApply := copied == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
-			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
+		zeroPostApply := copied == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply)
 		if copied == 0 && !zeroPostApply {
 			if applyErr == nil {
 				resp := h.success(0)
@@ -306,8 +313,8 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			return response, nil
 		}
 		if copied > body.GetLength() || post.Kind != xfsstore.KindRegular || post.Size < 0 || sequence == 0 ||
-			errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			(errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) && !errors.Is(applyErr, xfsstore.ErrWritePostApply)) {
+			return h.errorResponse(0, errors.Join(syscall.EIO, applyErr), true), []volumeserver.VisibilityTarget{}
 		}
 		if copied != 0 && (body.GetOutputOffset() > math.MaxInt64-copied || uint64(post.Size) < body.GetOutputOffset()+copied) {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
@@ -317,9 +324,9 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			flags |= rangeReplyPostApply
 			resultErr = rangeResultError(applyErr)
 		}
-		sourcePost, sourceErr := h.getattrOpen(input)
-		if sourceErr != nil {
-			return h.errorResponse(0, sourceErr, true), []volumeserver.VisibilityTarget{}
+		sourcePost := sourceBefore
+		if sourceCoordinate.identity == destinationCoordinate.identity {
+			sourcePost = post
 		}
 		resp := h.success(0)
 		resp.PostState = h.mutationPostState(sequence,

@@ -3740,7 +3740,17 @@ func terminalReceiptCarriesExactAppliedState(response *authoritypb.Response) boo
 		!validPostStateShape(response.GetPostState(), true) {
 		return false
 	}
-	target := postStateTargetAttr(response.GetPostState())
+	role := postStateRoleTarget
+	if response.GetCopyFileRange() != nil {
+		role = postStateRoleDestination
+	}
+	var target *authoritypb.Attr
+	for _, object := range response.GetPostState().GetObjects() {
+		if object.GetRoles()&role != 0 {
+			target = object.GetAttr()
+			break
+		}
+	}
 	if target == nil || target.GetKind() != authoritypb.Attr_REGULAR || target.GetSize() < 0 {
 		return false
 	}

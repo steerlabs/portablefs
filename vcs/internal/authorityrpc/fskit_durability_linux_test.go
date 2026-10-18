@@ -580,3 +580,51 @@ func TestFskitCreatePreApplyRefusalsDoNotFence(t *testing.T) {
 		})
 	}
 }
+
+func TestFragmentedCommitLogicalSyncFailureRetainsExactAppliedReply(t *testing.T) {
+	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+		for _, dataOnly := range []bool{false, true} {
+			t.Run(cause.Error()+map[bool]string{false: "/sync", true: "/datasync"}[dataOnly], func(t *testing.T) {
+				h, cred, store, _ := newFskitWriteHarness(t)
+				h.Store = &fragmentedDurabilityFailureStore{fskitWriteTestStore: store}
+				h.OnStorageFailure = func(error) {}
+				failure := &xfsstore.DurabilityError{Cause: cause}
+				target := &fskitWriteTestTarget{commitErr: errors.Join(xfsstore.ErrWritePostApply, failure), sync: func() error { return failure }}
+				store.targets = append(store.targets, target)
+				payload := []byte("fragmented")
+				for index, phase := range []authoritypb.FskitWritePhase{authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA} {
+					req := fskitWritePhaseRequest(uint64(index+1), 1, phase, payload, 0)
+					req.GetFskitWrite().Flags = uint32(syscall.O_SYNC)
+					if dataOnly {
+						req.GetFskitWrite().Flags = uint32(syscall.O_DSYNC)
+					}
+					if response := h.handleFskitWrite(t.Context(), req, cred, req.GetFskitWrite()); response.GetErrno() != 0 {
+						t.Fatalf("staging=%v", response)
+					}
+				}
+				req := fskitWritePhaseRequest(3, 1, authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT, payload, uint64(len(payload)))
+				req.GetFskitWrite().Flags = uint32(syscall.O_SYNC)
+				if dataOnly {
+					req.GetFskitWrite().Flags = uint32(syscall.O_DSYNC)
+				}
+				reply := h.commitFskitWrite(t.Context(), req, cred, req.GetFskitWrite())
+				got := reply.GetFskitWrite()
+				if reply.GetErrno() != 0 || reply.GetUncertain() || got.GetCommittedSize() != uint64(len(payload)) || got.GetAssignedOffset() != 0 || got.GetPostSize() != uint64(len(payload)) || got.GetError() != -int32(syscall.EIO) || got.GetFlags() != fskitWriteReplyCommitted|fskitWriteReplyPostApply || reply.GetPostState() == nil || !terminalReceiptCarriesExactAppliedState(reply) {
+					t.Fatalf("logical sync COMMIT=%v", reply)
+				}
+				h.terminalFailureMu.Lock()
+				draining, receipts := h.terminalDraining, len(h.terminalReceiptFrames)
+				h.terminalFailureMu.Unlock()
+				if !draining || receipts == 0 {
+					t.Fatalf("no terminal delivery drain: %v/%d", draining, receipts)
+				}
+				req.RequestId++
+				replay := h.commitFskitWrite(t.Context(), req, cred, req.GetFskitWrite())
+				reply.RequestId = replay.RequestId
+				if !proto.Equal(reply, replay) || len(target.snapshot()) != 1 {
+					t.Fatalf("exact COMMIT replay=%v", replay)
+				}
+			})
+		}
+	}
+}

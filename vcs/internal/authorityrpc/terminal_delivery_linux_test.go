@@ -522,3 +522,24 @@ func TestFragmentedPostApplyReplyCarriesExactTerminalReceiptState(t *testing.T) 
 		})
 	}
 }
+
+func TestCopyFileRangeTerminalReceiptUsesDestinationPostState(t *testing.T) {
+	response := terminalFallocateResponse(9, 4)
+	response.PostState.Objects[0].Roles = postStateRoleDestination
+	response.Body = &authoritypb.Response_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeReply{ResultSize: 3, PostSize: 9, VisibilitySequence: 4, Flags: rangeReplyApplied | rangeReplyPostApply, Error: -int32(syscall.EIO)}}
+	if !terminalReceiptCarriesExactAppliedState(response) {
+		t.Fatal("exact CFR destination refused")
+	}
+	response.PostState.Objects[0].Roles = postStateRoleSource
+	if terminalReceiptCarriesExactAppliedState(response) {
+		t.Fatal("CFR source cannot substitute for destination")
+	}
+	response.PostState.Objects[0].Roles = postStateRoleSource | postStateRoleDestination
+	if !terminalReceiptCarriesExactAppliedState(response) {
+		t.Fatal("exact same-inode CFR refused")
+	}
+	response.GetCopyFileRange().PostSize++
+	if terminalReceiptCarriesExactAppliedState(response) {
+		t.Fatal("mismatched CFR post size accepted")
+	}
+}
