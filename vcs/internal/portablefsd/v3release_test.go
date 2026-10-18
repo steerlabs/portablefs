@@ -668,11 +668,11 @@ func TestV3SaturatedReleasesNeverBlockTheSerialReader(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the serial reader blocked on release capacity")
 	}
-	if debt := d.outstandingCleanup(); debt != 1 {
+	if debt := d.pending.metrics().Pending; debt != 1 {
 		t.Fatalf("pre-enqueue debt = %d, want the abandoned open still counted", debt)
 	}
 	release()
-	waitV3CleanupDebt(t, d, 0)
+	waitV3Pending(t, d, 0)
 	waitV3ReleasesIdle(t, d)
 	if client.liveTokens() != 1 {
 		t.Fatalf("live capabilities = %d, want only the root", client.liveTokens())
@@ -702,7 +702,7 @@ func TestV3ExactAbsenceTransfersLateAbandonmentToTheDetach(t *testing.T) {
 	if err := cleanup.finish(); err != nil {
 		t.Fatal(err)
 	}
-	if debt, after := d.outstandingCleanup(), len(client.mutationRequests()); debt != 0 || after != before || d.terminalError() != nil {
+	if debt, after := d.pending.metrics().Pending, len(client.mutationRequests()); debt != 0 || after != before || d.terminalError() != nil {
 		t.Fatalf("late abandonment debt=%d requests=%d terminal=%v, want settled by the detach", debt, after-before, d.terminalError())
 	}
 }

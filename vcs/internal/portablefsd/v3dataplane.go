@@ -11,7 +11,6 @@ import (
 	"math"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -152,6 +151,7 @@ type v3HandleRecord struct {
 }
 
 type v3ReplyResourceCollector struct {
+	reservation          *v3PendingReservation
 	d                    *v3DataPlane
 	items                []*v3ItemRecord
 	handles              []*v3HandleRecord
@@ -172,6 +172,8 @@ type v3ResponseConsumptionRevoker func(error)
 type v3ResponseConsumptionRevokerContextKey struct{}
 
 type v3ProvisionalResources struct {
+	reservation          *v3PendingReservation
+	settled              bool
 	d                    *v3DataPlane
 	items                []*v3ItemRecord
 	handles              []*v3HandleRecord
@@ -209,28 +211,10 @@ type v3DataPlane struct {
 	// Serialize release verdicts with the transfer to exact-absence teardown.
 	releaseMu           sync.Mutex
 	releaseSessionOwned bool
-	// abandonedDebt counts abandoned resources that left local ownership but
-	// have not yet been accepted by the release owner (or explicitly left to
-	// terminal session cleanup). Registration counts it against the
-	// provisional-reply bound as a terminal capacity guard: once pre-enqueue
-	// debt and provisional replies reach the bound, registration fails and the
-	// mount stops serving. It does not throttle capability acquisition.
-	//
-	// Together with tokens held by in-flight handlers, this is the pre-enqueue
-	// half of the release lag. Close and Reclaim reserve owner capacity before
-	// they detach, so they add none. A handler holds at most two tokens outside
-	// any index (a duplicate capability waiting for capacity, or the item and
-	// handle of a reply it is registering or abandoning), before and after its
-	// d.ops slot, and a connection admits at most maxFrontendRequestsInFlight
-	// handlers. Debt covers abandoned replies, including a closed connection's
-	// whole provisional table; each owns at most one item and one handle, and a
-	// connection registers at most maxProvisionalResourcesPerConnection. So,
-	// with the owner's 2*B accepted tokens, authority capabilities and
-	// descriptors lag local retirement by at most
-	//   2*B + maxFrontendConnections * 2 * (maxFrontendRequestsInFlight + maxProvisionalResourcesPerConnection)
-	// tokens. The authority's configured capacity must cover live owners plus
-	// the lag actually reachable by its mounts.
-	abandonedDebt atomic.Int64
+	// Pending requests, including abandoned cleanup, cover at most 2*1024
+	// tokens. The release owner's accepted batches add at most 2*B; accepted
+	// live items and descriptions remain independently charged to their owners.
+	pending       *v3PendingBudget
 	cacheCounters v3CacheCounters
 
 	mu              sync.Mutex
@@ -357,6 +341,7 @@ func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane
 		nameMax: 255, maxRead: maxRead, maxWrite: maxWrite,
 		authorizationDeadline: cfg.Client.AuthorizationDeadline(),
 	}
+	d.pending = newV3PendingBudget(v3PendingRequestLimit)
 	d.releases = newV3ReleaseOwner(v3ReleaseLimit(maxWrite), d.sendReleaseBatch)
 	bridge, err := newV3CoherenceBridge(cfg.Client, d.recordTerminal)
 	if err != nil {
@@ -460,6 +445,21 @@ func (d *v3DataPlane) dispatchFrontend(
 ) (any, int32) {
 	if ctx == nil || body == nil {
 		return nil, darwinEINVAL
+	}
+	if v3RequestProducesResources(body) {
+		collector, _ := ctx.Value(v3ReplyResourceContextKey{}).(*v3ReplyResourceCollector)
+		if collector == nil || collector.d != d || collector.taken || collector.reservation != nil {
+			return d.malformed("resource request has no unique reservation owner")
+		}
+		admissionCtx := ctx
+		if original, ok := ctx.Value(v3PendingAdmissionContextKey{}).(context.Context); ok {
+			admissionCtx = original
+		}
+		reservation, err := d.pending.reserve(admissionCtx)
+		if err != nil {
+			return nil, v3LocalErrno(err)
+		}
+		collector.reservation = reservation
 	}
 	if err := d.bridge.readyForOperations(); err != nil {
 		if errors.Is(err, syscall.EAGAIN) {
@@ -1310,7 +1310,7 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 	if err != nil {
 		return d.malformed("link " + err.Error())
 	}
-	if errno := d.adoptAlias(item, linked.GetItem()); errno != 0 {
+	if errno := d.adoptAlias(ctx, item, linked.GetItem()); errno != 0 {
 		return nil, errno
 	}
 	if err := d.applyMutation(effect); err != nil {
@@ -1628,12 +1628,14 @@ func (d *v3DataPlane) callRead(ctx context.Context, operationID uint64, request 
 		response, err := d.client.CallRead(ctx, request)
 		return d.classify(response, err, false)
 	}
+	traceV3Request(ctx, "authority_dispatch", 0)
 	response, consumption, callErr := d.client.CallReadRetained(ctx, request, func(cause error) {
 		d.revokeRetainedResponse(ctx, errors.Join(
 			errors.New("portablefsd: retained authority read crossed its frontend delivery bound"),
 			cause,
 		))
 	})
+	consumption = traceV3Consumption(ctx, consumption)
 	retained := false
 	defer func() {
 		if consumption != nil && !retained {
@@ -1727,6 +1729,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 	}
 	finish = lease.finishRequest
 	var assigned authorityrpc.MutationIdentity
+	traceV3Request(ctx, "authority_dispatch", 0)
 	response, consumption, callErr := d.client.CallMutationWithIdentityRetained(ctx, request, func(identity authorityrpc.MutationIdentity) error {
 		if err := lease.markAssigned(); err != nil {
 			return err
@@ -1742,6 +1745,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		cause = errors.Join(errors.New("portablefsd: retained authority response crossed its frontend delivery bound"), cause)
 		d.revokeRetainedResponse(ctx, cause)
 	})
+	consumption = traceV3Consumption(ctx, consumption)
 	retained := false
 	defer func() {
 		if consumption != nil && !retained {
@@ -1879,6 +1883,7 @@ func (d *v3DataPlane) callNonVisibleMutation(ctx context.Context, operationID ui
 	if operationID == 0 && collector == nil {
 		response, callErr = d.client.CallMutationWithIdentity(ctx, request, assignedCallback)
 	} else {
+		traceV3Request(ctx, "authority_dispatch", 0)
 		response, consumption, callErr = d.client.CallMutationWithIdentityRetained(
 			ctx, request, assignedCallback, func(cause error) {
 				d.revokeRetainedResponse(ctx, errors.Join(
@@ -1887,6 +1892,7 @@ func (d *v3DataPlane) callNonVisibleMutation(ctx context.Context, operationID ui
 				))
 			},
 		)
+		consumption = traceV3Consumption(ctx, consumption)
 		defer func() {
 			if consumption != nil && !retained {
 				consumption.Consume()
@@ -2003,7 +2009,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item) (
 	collector.items = append(collector.items, record)
 	d.mu.Unlock()
 	if duplicate {
-		if err := d.releases.submit(nil, [][]byte{parsed.token}); err != nil {
+		if err := d.submitPendingRelease(ctx, nil, [][]byte{parsed.token}); err != nil {
 			return nil, darwinEIO
 		}
 	}
@@ -2015,7 +2021,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item) (
 // must still be the one the callback named; the capability is either that
 // record's own or a duplicate the release owner retires. The new binding is
 // part of the mutation's cache application, not of adoption.
-func (d *v3DataPlane) adoptAlias(item *v3ItemRecord, linked *authoritypb.Item) int32 {
+func (d *v3DataPlane) adoptAlias(ctx context.Context, item *v3ItemRecord, linked *authoritypb.Item) int32 {
 	parsed, err := d.recordFromAuthority(linked, 0)
 	if err != nil {
 		_, errno := d.malformed(err.Error())
@@ -2031,7 +2037,7 @@ func (d *v3DataPlane) adoptAlias(item *v3ItemRecord, linked *authoritypb.Item) i
 	duplicate := !bytes.Equal(item.token, parsed.token)
 	d.mu.Unlock()
 	if duplicate {
-		if err := d.releases.submit(nil, [][]byte{parsed.token}); err != nil {
+		if err := d.submitPendingRelease(ctx, nil, [][]byte{parsed.token}); err != nil {
 			return darwinEIO
 		}
 	}
@@ -2412,8 +2418,10 @@ func (d *v3DataPlane) prepareReplyResources(collector *v3ReplyResourceCollector)
 		handles:              append([]*v3HandleRecord(nil), collector.handles...),
 		responseConsumptions: append([]authorityrpc.ResponseConsumption(nil), collector.responseConsumptions...),
 		visible:              collector.visible,
+		reservation:          collector.reservation,
 	}
 	collector.responseConsumptions = nil
+	collector.reservation = nil
 	return resources, collector.err
 }
 
@@ -2444,15 +2452,9 @@ type v3ResourceCleanup struct {
 	items          []*v3ItemRecord
 	handles        []*v3HandleRecord
 	terminalReason error
-	// debt is this cleanup's share of abandonedDebt until finish hands its
-	// resources to the release owner.
-	debt int64
-}
-
-// outstandingCleanup is the number of abandoned resources not yet accepted by
-// the release owner (or left to terminal session cleanup).
-func (d *v3DataPlane) outstandingCleanup() int {
-	return int(d.abandonedDebt.Load())
+	reservation    *v3PendingReservation
+	once           sync.Once
+	err            error
 }
 
 func (cleanup *v3ResourceCleanup) required() bool {
@@ -2484,12 +2486,18 @@ func (d *v3DataPlane) applyReplyResourceDisposition(
 		cleanup.terminalReason = errors.New("portablefsd: successful visible resource reply was not fully published to FSKit")
 	}
 	d.mu.Lock()
+	if resources.settled {
+		d.mu.Unlock()
+		return nil, errors.New("portablefsd: resource disposition settled twice")
+	}
 	for _, item := range resources.items {
 		if item.provisional == 0 {
 			d.mu.Unlock()
 			return nil, errors.New("portablefsd: provisional item ownership settled twice")
 		}
 	}
+	resources.settled = true
+	cleanup.reservation, resources.reservation = resources.reservation, nil
 	for index, item := range resources.items {
 		item.provisional--
 		acceptItem := uint32(index) < acceptedItemCount
@@ -2507,11 +2515,11 @@ func (d *v3DataPlane) applyReplyResourceDisposition(
 			}
 		}
 	}
-	// Abandoned resources are debt from the moment they leave their owner until
-	// the release owner accepts them.
-	cleanup.debt = int64(len(cleanup.items) + len(cleanup.handles))
-	d.abandonedDebt.Add(cleanup.debt)
 	d.mu.Unlock()
+	if !cleanup.required() {
+		cleanup.reservation.retire()
+		cleanup.reservation = nil
+	}
 	if cleanup.terminalReason != nil {
 		// Revoke local publication immediately. The original authority session
 		// still owns its capabilities until exact kernel-absence proof retires it.
@@ -2520,34 +2528,39 @@ func (d *v3DataPlane) applyReplyResourceDisposition(
 	return cleanup, nil
 }
 
-// finish transfers the abandoned resources to the release owner. It runs off
-// the serial frontend reader, which never waits for release capacity; the debt
-// it carries ends at accepted transfer, or at explicit transfer to terminal
-// session cleanup when the owner is closed or failed.
+// finish retains the pending reservation until every token is accepted by
+// the existing release owner, or exact/terminal teardown takes ownership.
+// It runs off the serial reader. Once guards both tokens and reservation.
 func (cleanup *v3ResourceCleanup) finish() error {
 	if cleanup == nil || cleanup.d == nil {
 		return nil
 	}
-	defer func() {
-		cleanup.d.abandonedDebt.Add(-cleanup.debt)
-		cleanup.debt = 0
-	}()
-	if len(cleanup.handles) == 0 && len(cleanup.items) == 0 {
-		return nil
-	}
-	closes := make([][]byte, 0, len(cleanup.handles))
-	for _, handle := range cleanup.handles {
-		// A call admitted before the abandonment holds the shared lock and keeps
-		// using the token until it unlocks; later calls fail revalidation.
-		handle.mu.Lock()
-		handle.mu.Unlock()
-		closes = append(closes, handle.token)
-	}
-	reclaims := make([][]byte, 0, len(cleanup.items))
-	for _, item := range cleanup.items {
-		reclaims = append(reclaims, item.token)
-	}
-	return cleanup.d.releases.submit(closes, reclaims)
+	cleanup.once.Do(func() {
+		started := time.Now()
+		defer func() {
+			if r := cleanup.reservation; r != nil {
+				elapsed := time.Since(started)
+				r.budget.mu.Lock()
+				r.budget.stats.CleanupWaitNS += uint64(elapsed)
+				r.budget.mu.Unlock()
+				r.trace.emit("cleanup_finished", v3TraceErrno(cleanup.err), elapsed)
+				r.retire()
+			}
+		}()
+		closes := make([][]byte, 0, len(cleanup.handles))
+		for _, handle := range cleanup.handles {
+			// Previously admitted I/O retains the token until it unlocks.
+			handle.mu.Lock()
+			handle.mu.Unlock()
+			closes = append(closes, handle.token)
+		}
+		reclaims := make([][]byte, 0, len(cleanup.items))
+		for _, item := range cleanup.items {
+			reclaims = append(reclaims, item.token)
+		}
+		cleanup.err = cleanup.d.releases.submit(closes, reclaims)
+	})
+	return cleanup.err
 }
 
 // sendReleaseBatch is the release owner's work batch: at most one CloseBatch,
@@ -2668,6 +2681,7 @@ func (d *v3DataPlane) transferReleases() error {
 	defer d.releaseMu.Unlock()
 	d.releaseSessionOwned = true
 	d.releases.abandon()
+	d.pending.takeForTeardown()
 	d.releases.mu.Lock()
 	defer d.releases.mu.Unlock()
 	if d.releases.failure != nil {
@@ -2716,6 +2730,9 @@ func (d *v3DataPlane) recordTerminal(err error) {
 		// data plane has not already put in flight.
 		if d.releases != nil {
 			d.releases.abandon()
+		}
+		if d.pending != nil {
+			d.pending.takeForTeardown()
 		}
 		d.cancel()
 	})

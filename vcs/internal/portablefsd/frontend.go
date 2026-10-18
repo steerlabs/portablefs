@@ -45,7 +45,19 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 			_ = c.Close()
 			continue
 		}
-		fc := &frontendConn{srv: s, conn: c}
+		peer, ok := c.(*net.UnixConn)
+		if !ok {
+			s.frontendConnections.Add(-1)
+			_ = c.Close()
+			continue
+		}
+		pid, err := frontendPeerPID(peer)
+		if err != nil || pid <= 0 {
+			s.frontendConnections.Add(-1)
+			_ = c.Close()
+			continue
+		}
+		fc := &frontendConn{srv: s, conn: c, frontendPID: pid}
 		go func() {
 			defer s.frontendConnections.Add(-1)
 			fc.serve(ctx)
@@ -54,9 +66,10 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 }
 
 type frontendConn struct {
-	srv    *Server
-	conn   net.Conn
-	origin uint64
+	srv         *Server
+	conn        net.Conn
+	origin      uint64
+	frontendPID int
 	// helloClientName is frozen by the one accepted Hello frame. It is used
 	// only to distinguish the shipping FSKit frontend from daemon self-probes;
 	// the app-group socket remains the peer authorization boundary.
@@ -117,7 +130,6 @@ const frontendRequestDeadlineFactor = 4
 const maxFrontendOperationsPerConnection = 4096
 const maxFrontendRequestsInFlight = 1024
 const maxFrontendConnections = 256
-const maxProvisionalResourcesPerConnection = maxFrontendRequestsInFlight
 
 type frontendProtocolState uint8
 
@@ -131,8 +143,10 @@ func (c *frontendConn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
 	c.connCtx = connCtx
 	c.cancel = cancel
+	// close owns cancellation after withdrawing publication admission. Waking
+	// an unallocated waiter first could expose a publishing error to a dead
+	// socket and turn this connection's harmless loss into mount-wide failure.
 	defer c.close()
-	defer cancel()
 	var lastRequestID uint64
 	state := frontendAwaitingHello
 	for {
@@ -148,6 +162,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				log.Printf("portablefsd frontend: closing connection: malformed resource reply disposition")
 				return
 			}
+			c.requestTrace(disposition.TargetRequestID, 0).emit("resource_disposition", 0, 0)
 			if !c.settleProvisionalResource(disposition) {
 				log.Printf(
 					"portablefsd frontend: closing connection: invalid resource disposition target=%d accept_handles=%t accepted_items=%d",
@@ -167,6 +182,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			req := env.Body.(*pfslocal.PublicationAck)
+			c.requestTrace(0, req.OperationID).emit("publication_ack", 0, 0)
 			if req.OperationID == 0 ||
 				(req.SemanticCommit != pfslocal.PublicationSemanticCommitPublished &&
 					req.SemanticCommit != pfslocal.PublicationSemanticCommitNotPublished) {
@@ -211,6 +227,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			c.helloClientName = req.ClientName
+			c.requestTrace(env.RequestID, env.OperationID).emit("request_arrival", 0, 0)
 			c.reply(env.RequestID, &pfslocal.HelloReply{
 				ProtocolMajor:     pfslocal.ProtocolMajor,
 				ProtocolMinor:     pfslocal.ProtocolMinor,
@@ -235,6 +252,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 			if !c.setAttach(a) {
 				return
 			}
+			c.requestTrace(env.RequestID, env.OperationID).emit("request_arrival", 0, 0)
 			state = frontendAttached
 			if c.reply(env.RequestID, &rep) &&
 				c.helloClientName == shippingFSKitFrontendClientName {
@@ -244,6 +262,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 			if state != frontendAttached {
 				return
 			}
+			c.requestTrace(env.RequestID, env.OperationID).emit("request_arrival", 0, 0)
 			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
 				c.inFlight.Add(-1)
 				return
@@ -307,6 +326,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 func (c *frontendConn) close() {
 	c.closeOnce.Do(func() {
 		c.connectionClosed.Store(true)
+		c.requestTrace(0, 0).emit("connection_close", 0, 0)
 		// A closing transport is not a live native FSKit witness. Retire the
 		// witness before any handler join or publication cleanup can block, so
 		// mount readiness never observes a connection whose teardown has begun.
@@ -354,7 +374,7 @@ func (c *frontendConn) close() {
 		if cleanups := abandonV3ProvisionalResources(orphanedResources); len(cleanups) != 0 {
 			go func() {
 				// Every orphaned cleanup finishes, even after one fails, so its
-				// share of the cleanup debt settles; a failure is terminal and
+				// pending reservation retires; a failure is terminal and
 				// the rest then send nothing.
 				for _, cleanup := range cleanups {
 					_ = cleanup.finish()
@@ -510,11 +530,9 @@ func (c *frontendConn) registerProvisionalResource(requestID uint64, resources *
 	}
 	c.resourceMu.Lock()
 	defer c.resourceMu.Unlock()
-	// Abandoned resources still awaiting authority cleanup share the bound. It
-	// is a terminal capacity guard, not backpressure: a refused registration
-	// makes the handler abandon the reply and stop serving the mount.
-	if c.resourceClosed ||
-		len(c.provisional)+resources.d.outstandingCleanup() >= maxProvisionalResourcesPerConnection {
+	// Capacity was reserved before dispatch. Only connection loss or an
+	// invalid duplicate request can refuse an allocated reply here.
+	if c.resourceClosed {
 		return false
 	}
 	if c.provisional == nil {
@@ -689,6 +707,8 @@ func (c *frontendConn) replyWithPublicationCommit(
 	lateDiscardable bool,
 	commit func() bool,
 ) (delivered bool, written bool, discarded bool, refused bool) {
+	trace := c.requestTrace(req, operationID)
+	trace.emit("reply_admission", 0, 0)
 	if ackRequired {
 		exposed, lateDiscarded := c.markPublicationReplyExposedForV3(operationID, lateDiscardable)
 		if !exposed {
@@ -706,13 +726,16 @@ func (c *frontendConn) replyWithPublicationCommit(
 		OperationID: operationID, Body: body,
 	}, commit)
 	if err != nil {
+		trace.emit("reply_write_failed", darwinENOTCONN, 0)
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
 		return false, false, false, false
 	}
 	if !admitted {
+		trace.emit("reply_refused", 0, 0)
 		return false, false, false, true
 	}
+	trace.emit("reply_written", 0, 0)
 	return true, true, false, false
 }
 
@@ -837,6 +860,7 @@ func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *fronten
 			// requests; finalization waits for every handler and PublicationAck.
 			bridge.releaseFrontendPublication(c.callback(operationID))
 			_ = bridge.finishFrontendPublication(c.callback(operationID))
+			c.requestTrace(0, operationID).emit("publication_retired", 0, 0)
 		}
 	}
 }
@@ -934,6 +958,9 @@ func (c *frontendConn) handleAttached(
 	initializeOperation bool,
 	body any,
 ) {
+	trace := c.requestTrace(requestID, operationID)
+	trace.emit("handler_start", 0, 0)
+	ctx = context.WithValue(ctx, v3RequestTraceContextKey{}, trace)
 	c.handleV3Attached(
 		ctx, a, requestID, operationID,
 		initializeOperation, body,
@@ -961,6 +988,7 @@ func (c *frontendConn) subscribeEvents(a *attach) error {
 	c.v3Events = true
 	go func() {
 		err := bridge.runBound(c.connCtx, func(event *pfslocal.Event) error {
+			c.requestTrace(0, 0).emit("event_delivery", 0, 0)
 			return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
 		})
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {

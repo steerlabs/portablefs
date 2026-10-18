@@ -32,9 +32,10 @@ type v3CacheCounters struct {
 }
 
 type v3CacheMetrics struct {
-	GetAttr        map[string]uint64 `json:"getattr"`
-	Lookup         map[string]uint64 `json:"lookup"`
-	LookupPolarity map[string]uint64 `json:"lookupPolarity"`
+	PendingResources v3PendingMetrics  `json:"pending_resources"`
+	GetAttr          map[string]uint64 `json:"getattr"`
+	Lookup           map[string]uint64 `json:"lookup"`
+	LookupPolarity   map[string]uint64 `json:"lookupPolarity"`
 }
 
 func (d *v3DataPlane) recordCacheResult(metric int, result v3CacheResult) {
@@ -62,7 +63,7 @@ func (d *v3DataPlane) cacheMetrics() *v3CacheMetrics {
 	d.mu.Lock()
 	counts := d.cacheCounters
 	d.mu.Unlock()
-	result := &v3CacheMetrics{GetAttr: make(map[string]uint64), Lookup: make(map[string]uint64), LookupPolarity: make(map[string]uint64)}
+	result := &v3CacheMetrics{PendingResources: d.pending.metrics(), GetAttr: make(map[string]uint64), Lookup: make(map[string]uint64), LookupPolarity: make(map[string]uint64)}
 	for i, name := range v3CacheResultNames {
 		result.GetAttr[name], result.Lookup[name] = counts.reads[0][i], counts.reads[1][i]
 	}

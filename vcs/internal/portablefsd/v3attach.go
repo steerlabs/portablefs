@@ -654,12 +654,15 @@ func (c *frontendConn) serveV3Attempt(
 	)
 	exposed := false
 	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
+	defer resources.retirePending()
+	traceV3Request(ctx, "dispatch", 0)
 	defer func() {
 		if resources.cached != nil && !resources.cached.accounted {
 			reason := v3CacheTerminal
 			if exposed {
 				reason = v3CacheHit
 			}
+			traceV3Request(ctx, "cache_"+v3CacheResultNames[reason], 0)
 			d.recordCacheResult(resources.cached.metric, reason)
 			resources.cached.accounted = true
 		}
@@ -675,6 +678,7 @@ func (c *frontendConn) serveV3Attempt(
 		resources.visible = true
 	}
 	dispatchCtx := context.WithValue(ctx, v3ReplyResourceContextKey{}, resources)
+	dispatchCtx = context.WithValue(dispatchCtx, v3PendingAdmissionContextKey{}, ctx)
 	// Once assigned, an authority request must settle on its original session
 	// even if the frontend disappears. Preserve the operation's absolute bound;
 	// cancellation still governs local admission and never extends this budget.
@@ -704,6 +708,10 @@ func (c *frontendConn) serveV3Attempt(
 			eno = darwinENOTCONN
 		}
 	}
+	traceV3Request(ctx, "dispatch_result", eno)
+	if resources.cached != nil {
+		traceV3Request(ctx, "cache_candidate", eno)
+	}
 	var commit func() bool
 	if resources.cached != nil {
 		commit = resources.cached.revalidate
@@ -715,7 +723,7 @@ func (c *frontendConn) serveV3Attempt(
 				_ = d.fail(prepareErr)
 			}
 			// finish always runs, even after a terminal verdict: it settles the
-			// abandoned resources' cleanup debt.
+			// abandoned reply's pending reservation.
 			if cleanup.required() {
 				go func() {
 					_ = cleanup.finish()
