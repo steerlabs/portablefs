@@ -10,11 +10,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/restorefixture"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"golang.org/x/sys/unix"
@@ -71,14 +73,17 @@ type observedFskitSyncTarget struct {
 
 func (s observedFskitSyncTarget) Sync() error { s.observe(); return s.SyncTarget.Sync() }
 
-// Exhaust only during the actual OPEN. Existing-name CREATE has no creation
-// grant, so this reaches the kernel's descriptor allocation before O_TRUNC.
+// Only the dedicated child test may exhaust descriptors. Existing-name CREATE
+// has no creation grant, so the real OPEN fails before reaching O_TRUNC.
 type reopenLimitStore struct {
 	*observedFskitDurabilityStore
 	calls int
 }
 
 func (s *reopenLimitStore) OpenFile(cap xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	if os.Getenv("PORTABLEFS_TEST_REOPEN_CHILD") != strconv.Itoa(os.Getppid()) {
+		panic("descriptor exhaustion requires the dedicated child test process")
+	}
 	s.calls++
 	var saved unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &saved); err != nil {
@@ -89,14 +94,46 @@ func (s *reopenLimitStore) OpenFile(cap xfsstore.Capability, flags xfsstore.Open
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limited); err != nil {
 		return xfsstore.Capability{}, err
 	}
-	handle, err := s.Volume.OpenFile(cap, flags)
-	if restoreErr := unix.Setrlimit(unix.RLIMIT_NOFILE, &saved); restoreErr != nil {
-		panic(restoreErr)
-	}
-	return handle, err
+	defer func() {
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &saved); err != nil {
+			panic(err)
+		}
+	}()
+	return s.Volume.OpenFile(cap, flags)
 }
 
 func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
+	root, project := fskitDurabilityXFSRoot(t)
+	// Start the limit-changing proof before opening the parent fixture. The
+	// child selects exactly one test and gets its own inherited-project root.
+	const childTest = "TestFskitCreateReopenEMFILEProcess"
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^"+childTest+"$", "-test.v")
+	command.Env = append(os.Environ(), "PORTABLEFS_TEST_REOPEN_CHILD="+strconv.Itoa(os.Getpid()))
+	output, err := command.CombinedOutput()
+	t.Logf("%s", output)
+	if err != nil {
+		t.Fatalf("isolated descriptor-limit fixture: %v", err)
+	}
+	for _, name := range []string{childTest, childTest + "/create-reopen/EMFILE/truncate=false", childTest + "/create-reopen/EMFILE/truncate=true"} {
+		if !strings.Contains(string(output), "--- PASS: "+name+" (") {
+			t.Fatalf("isolated descriptor-limit fixture did not pass %s", name)
+		}
+	}
+	runFskitDurabilityOnXFS(t, root, project, "EACCES")
+}
+
+// This entry point is selected only by the required durability test's child
+// process; the normal package test process must never lower its own limit.
+func TestFskitCreateReopenEMFILEProcess(t *testing.T) {
+	if os.Getenv("PORTABLEFS_TEST_REOPEN_CHILD") != strconv.Itoa(os.Getppid()) {
+		t.Skip("run through TestVolumeHandlerEndToEndOnXFSFskitDurability")
+	}
+	root, project := fskitDurabilityXFSRoot(t)
+	runFskitDurabilityOnXFS(t, root, project, "EMFILE")
+}
+
+func fskitDurabilityXFSRoot(t *testing.T) (string, uint32) {
+	t.Helper()
 	root, projectRaw := os.Getenv("PORTABLEFS_XFS_TEST_ROOT"), os.Getenv("PORTABLEFS_XFS_TEST_PROJECT")
 	if root == "" || projectRaw == "" {
 		if os.Getenv("PORTABLEFS_XFS_TEST_REQUIRED") == "1" {
@@ -107,24 +144,16 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Fatal("durability permission coverage requires the unprivileged volume owner")
 	}
-	resetXFSRouteDeclaration(t, root)
-	// Descriptor exhaustion changes a process-wide limit. Run this fixture in
-	// its own process so unrelated tests and their I/O cannot observe the cut.
-	if os.Getenv("PORTABLEFS_TEST_REOPEN_CHILD") != "1" {
-		command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestVolumeHandlerEndToEndOnXFSFskitDurability$", "-test.v")
-		command.Env = append(os.Environ(), "PORTABLEFS_TEST_REOPEN_CHILD=1")
-		output, err := command.CombinedOutput()
-		t.Logf("%s", output)
-		if err != nil {
-			t.Fatalf("isolated descriptor-limit fixture: %v", err)
-		}
-		return
-	}
 	project, err := strconv.ParseUint(projectRaw, 10, 32)
 	if err != nil {
 		t.Fatal(err)
 	}
-	volume, err := xfsstore.Open(root, xfsstore.Config{ExpectedProjectID: uint32(project), ExpectedOwnerUID: uint32(os.Geteuid()), ExpectedOwnerGID: uint32(os.Getegid())})
+	return restorefixture.Root(t), uint32(project)
+}
+
+func runFskitDurabilityOnXFS(t *testing.T, root string, project uint32, refusal string) {
+	t.Helper()
+	volume, err := xfsstore.Open(root, xfsstore.Config{ExpectedProjectID: project, ExpectedOwnerUID: uint32(os.Geteuid()), ExpectedOwnerGID: uint32(os.Getegid())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,9 +203,9 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item, Mode: proto.Uint32(0)}}}, "syncfs")
 	call(t, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item, Mode: proto.Uint32(0600)}}}, "syncfs")
 
-	for _, refusal := range []string{"EMFILE", "EACCES"} {
+	t.Run("create-reopen/"+refusal, func(t *testing.T) {
 		for _, truncate := range []bool{false, true} {
-			t.Run(fmt.Sprintf("create-reopen/%s/truncate=%v", refusal, truncate), func(t *testing.T) {
+			t.Run(fmt.Sprintf("truncate=%v", truncate), func(t *testing.T) {
 				want := syscall.EACCES
 				limited := &reopenLimitStore{observedFskitDurabilityStore: store}
 				if refusal == "EMFILE" {
@@ -219,6 +248,9 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 				}
 			})
 		}
+	})
+	if refusal == "EMFILE" {
+		return
 	}
 
 	for _, opened := range [][]byte{nil, handle} {
