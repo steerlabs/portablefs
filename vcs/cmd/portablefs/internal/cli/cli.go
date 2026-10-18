@@ -42,7 +42,7 @@ type cmdEnv struct {
 	mountHealthFn func(*mountState) string
 	// Test-only daemon inventory seam. Production proves the exact installed
 	// daemon identity before reading its live attaches.
-	daemonAttachStatusesFn func(*daemonctl.Identity) (map[string]cliAttachStatus, error)
+	daemonLifecycleInventoryFn func(*daemonctl.Identity) (int, error)
 	// Test-only daemon lifecycle seam. Production adopts the exact launchd
 	// agent or wakes the exact containing host through ensurePortablefsd.
 	ensurePortablefsdFn func(fskitConfig, string, string) (*fsdControl, error)
@@ -70,15 +70,6 @@ func (e *cmdEnv) ensureFskitDaemon(cfg fskitConfig, stateRoot string) (*fsdContr
 		return e.ensurePortablefsdFn(cfg, stateRoot, e.version)
 	}
 	return ensurePortablefsd(cfg, stateRoot, e.version)
-}
-
-func (e *cmdEnv) daemonAttachStatuses(
-	expected *daemonctl.Identity,
-) (map[string]cliAttachStatus, error) {
-	if e.daemonAttachStatusesFn != nil {
-		return e.daemonAttachStatusesFn(expected)
-	}
-	return fskitAttachStatusesForIdentity(e.getenv, e.version, expected)
 }
 
 func (e *cmdEnv) stdinReader() io.Reader {
@@ -151,7 +142,7 @@ func commands() []command {
 		{"install-linux-release", "atomically activate a verified Linux release", cmdInstallLinuxRelease},
 		{"version", "print the CLI version", cmdVersion},
 	}
-	return append(commands, qualificationCommands()...)
+	return commands
 }
 
 func findCommand(name string) (command, bool) {
@@ -235,4 +226,28 @@ func cmdVersion(e *cmdEnv, args []string) int {
 	}
 	fmt.Fprintf(e.stdout, "portablefs %s\n", e.version)
 	return 0
+}
+
+// Lifecycle inventory accepts arbitrary authenticated outgoing versions. Ordinary
+// attach inventory still requires this CLI's exact paired release.
+func (e *cmdEnv) daemonLifecycleInventory(expected *daemonctl.Identity) (int, error) {
+	if e.daemonLifecycleInventoryFn != nil {
+		return e.daemonLifecycleInventoryFn(expected)
+	}
+	cfg, err := fixedFSKitConfig()
+	if err != nil {
+		return 0, err
+	}
+	var ctl *fsdControl
+	if expected == nil {
+		ctl, err = connectCompatiblePortablefsd(cfg, e.version)
+	} else {
+		ctl = newFsdControl(cfg.controlSock)
+		err = ctl.requireOutgoingIdentityWithin(*expected, 3*time.Second)
+	}
+	if err != nil {
+		return 0, err
+	}
+	inventory, err := ctl.lifecycleInventory()
+	return inventory.AttachmentCount, err
 }

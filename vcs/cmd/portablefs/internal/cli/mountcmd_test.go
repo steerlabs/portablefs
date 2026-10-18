@@ -13,16 +13,14 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 func TestStartedChildIdentityFailurePreservesAdvancedIntent(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "mounts")
 	mountPath := filepath.Join(t.TempDir(), "mount")
-	operation, err := acquireMountOperation(stateDir, mountPath, "volume", "main", "fuse")
+	operation, err := acquireMountOperation(stateDir, mountPath, "volume", "fuse")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +31,7 @@ func TestStartedChildIdentityFailurePreservesAdvancedIntent(t *testing.T) {
 	}
 	operation.mountInstanceID = "mnt_AAAAAAAAAAAAAAAAAAAAAA"
 	operation.mountMechanism = "direct"
+	operation.engine = mountEngineFuseV3
 	if err := operation.writeIntent("mounting", os.Getpid(), identity); err != nil {
 		t.Fatal(err)
 	}
@@ -124,40 +123,6 @@ func TestFSKitReadinessProofFailsImmediatelyOnPostWitnessIdentityDrift(t *testin
 	}
 }
 
-func TestFSKitReadinessPolicyKeepsNativeAndLegacyChannelsDisjoint(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		policy     string
-		wantLegacy int
-		wantNative int
-	}{
-		{"macOS 26 v1", portablefsd.V3CachePolicyMacOS26V1, 1, 0},
-		{"macOS 26 v2", portablefsd.V3CachePolicyMacOS26, 1, 0},
-		{"native macOS 27", portablefsd.V3CachePolicyFSKit, 0, 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			legacy, native := 0, 0
-			probe, err := fskitReadinessProbeForPolicy(
-				tc.policy,
-				func() error { legacy++; return nil },
-				func() error { native++; return nil },
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := probe(); err != nil {
-				t.Fatal(err)
-			}
-			if legacy != tc.wantLegacy || native != tc.wantNative {
-				t.Fatalf("legacy/native calls = %d/%d, want %d/%d", legacy, native, tc.wantLegacy, tc.wantNative)
-			}
-		})
-	}
-	if _, err := fskitReadinessProbeForPolicy("automatic", func() error { return nil }, func() error { return nil }); err == nil {
-		t.Fatal("unknown cache policy selected a readiness channel")
-	}
-}
-
 // umountTestEnv is testEnv plus an isolated mount state dir, the setup every
 // umount test needs.
 func umountTestEnv(t *testing.T) (e *cmdEnv, stdout, stderr *bytes.Buffer, stateDir string) {
@@ -202,7 +167,7 @@ func serveFSKitReconcileControl(
 	t.Cleanup(func() { _ = ln.Close() })
 	calls := &fsKitReconcileCalls{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/attaches", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/attaches", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -217,14 +182,13 @@ func serveFSKitReconcileControl(
 		}
 		_, _ = fmt.Fprintf(
 			w,
-			`{"attaches":[{"attachRef":%q,"mountPath":%q,"volumeId":%q,"branch":%q,"state":"degraded"}]}`,
+			`{"attaches":[{"attachRef":%q,"mountPath":%q,"volumeId":%q,"state":"degraded"}]}`,
 			st.AttachRef,
 			st.MountPath,
 			volumeID,
-			st.Branch,
 		)
 	})
-	mux.HandleFunc("/v1/attaches/"+st.AttachRef+"/credential", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/attaches/"+st.AttachRef+"/credential", func(w http.ResponseWriter, r *http.Request) {
 		calls.credential.Add(1)
 		var request struct {
 			AuthToken     string `json:"authToken"`
@@ -238,13 +202,9 @@ func serveFSKitReconcileControl(
 		calls.token.Store(request.AuthToken)
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("/v1/attaches/"+st.AttachRef+"/unmount", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v2/attaches/"+st.AttachRef+"/unmount", func(w http.ResponseWriter, r *http.Request) {
 		calls.unmount.Add(1)
 		if unmountStatus >= 200 && unmountStatus < 300 {
-			if r.URL.Query().Get("force") == "1" {
-				_, _ = w.Write([]byte(`{"recoveryJob":""}`))
-				return
-			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -329,35 +289,6 @@ func TestUmountStaleFSKitNormalRefusalPreservesEvidenceAndGuidesForce(t *testing
 	}
 }
 
-func TestUnmountRecordedAttachReactivatesManagedLeaseBeforeDrain(t *testing.T) {
-	mountPath, err := canonicalMountPath(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := staleFSKitMountState(t, mountPath)
-	st.AccessLease = &leaseState{
-		AccessLeaseID: "pfal_restart",
-		AccessToken:   "lease_restart_token",
-		ExpiresAtMs:   time.Now().Add(time.Hour).UnixMilli(),
-		ControlSeq:    "7",
-	}
-	ctl, calls := serveFSKitReconcileControl(t, st, true, false, http.StatusNoContent)
-
-	if err := ctl.unmountRecordedAttach(&st); err != nil {
-		t.Fatalf("managed restart detach: %v", err)
-	}
-	if calls.credential.Load() != 1 || calls.unmount.Load() != 1 {
-		t.Fatalf("credential calls=%d unmount calls=%d, want one ordered lifecycle call each",
-			calls.credential.Load(), calls.unmount.Load())
-	}
-	if !calls.pendingOnly.Load() {
-		t.Fatal("managed restart used a non-atomic credential rotation instead of pending-only activation")
-	}
-	if token, _ := calls.token.Load().(string); token != st.AccessLease.AccessToken {
-		t.Fatalf("restored token=%q, want exact persisted access-lease credential", token)
-	}
-}
-
 func TestUmountStaleFSKitPreservesEvidenceOnMismatchOrParkFailure(t *testing.T) {
 	for _, test := range []struct {
 		name             string
@@ -373,7 +304,7 @@ func TestUmountStaleFSKitPreservesEvidenceOnMismatchOrParkFailure(t *testing.T) 
 			want:             "identity mismatch",
 		},
 		{
-			name:      "durable park refused",
+			name:      "daemon cleanup refused",
 			status:    http.StatusConflict,
 			want:      "normal detach requires an active credential",
 			wantCalls: 1,
@@ -443,7 +374,7 @@ func TestUmountStaleFSKitConvergesAfterDaemonAlreadyDetached(t *testing.T) {
 func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
 	e, _, _, stateDir := umountTestEnv(t)
 	e.kernelInventoryFn = func() ([]string, error) { return nil, nil }
-	cfg, err := fskitConfigFromEnv(e.getenv)
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +388,7 @@ func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := e.validateMountOwnership(stateDir, "vol_fresh", "main", mountPath); err != nil {
+	if err := e.validateMountOwnership(stateDir, "vol_fresh", mountPath); err != nil {
 		t.Fatalf("dead socket pathname was treated as a live daemon: %v", err)
 	}
 	if info, err := os.Lstat(cfg.controlSock); err != nil || info.Mode()&os.ModeSocket == 0 {
@@ -473,22 +404,17 @@ func writeMountOwnershipV3Attach(t *testing.T, stateDir, mountPath, volumeID str
 		t.Fatal(err)
 	}
 	registry, err := json.Marshal(map[string]any{
-		"version": 2,
+		"version": 3,
 		"attaches": []any{map[string]any{
 			"ref":                 attachRef,
 			"volumeId":            volumeID,
-			"branch":              "",
 			"mountPath":           mountPath,
 			"authorityUrl":        "127.0.0.1:2050",
 			"dataPlaneTransport":  dataPlaneTransportTLSSystemPKI,
 			"dataPlaneServerName": "authority.example",
-			"options":             map[string]any{},
 			"identityEpoch":       1,
 			"v3": map[string]any{
-				"cachedNameCapacity": uint64(1 << 16),
-				"repairBudgetMillis": uint64(15_000),
-				"cachePolicy":        portablefsd.V3CachePolicyMacOS26,
-				"routesRevision":     emptyRoutesRevision(),
+				"routesRevision": emptyRoutesRevision(),
 			},
 		}},
 	})
@@ -517,7 +443,7 @@ func TestMountOwnershipRejectsSamePathDurableAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = e.validateMountOwnership(stateDir, "vol_old", "", mountPath)
+	err = e.validateMountOwnership(stateDir, "vol_old", mountPath)
 	if err == nil {
 		t.Fatal("same-path durable daemon attach was accepted for remount")
 	}
@@ -566,95 +492,6 @@ func TestMountCommandRejectsSamePathAttachBeforeCreatingIntent(t *testing.T) {
 	}
 	if len(intents) != 0 {
 		t.Fatalf("same-path attach preflight created mount intents: %+v", intents)
-	}
-}
-
-// TestUmountOrphanedMountWithoutAttachRefFailsClosed is the production incident:
-// the platform mount was torn down externally (forced diskutil unmount,
-// extension crash) while the recorded daemon pid stayed alive. Without an
-// attachRef PortableFS cannot prove the drain and must preserve both daemon
-// and state.
-func TestUmountOrphanedMountWithoutAttachRefFailsClosed(t *testing.T) {
-	e, _, stderr, stateDir := umountTestEnv(t)
-	mountPath, err := canonicalMountPath(t.TempDir()) // ordinary directory: nothing mounted on it
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// A fake mount daemon that is genuinely alive. Reap it in the background
-	// so pidAlive flips false the moment it dies, like a real daemon that
-	// init/launchd reaps after reparenting.
-	daemon := exec.Command("sleep", "60")
-	if err := daemon.Start(); err != nil {
-		t.Fatal(err)
-	}
-	daemonDone := make(chan struct{})
-	go func() { _ = daemon.Wait(); close(daemonDone) }()
-	t.Cleanup(func() {
-		_ = daemon.Process.Kill()
-		<-daemonDone
-	})
-
-	daemonIdentity, err := processStartIdentity(daemon.Process.Pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalidState := mountState{
-		MountPath: mountPath, VolumeID: "vol_orphan", Branch: "main",
-		PID: daemon.Process.Pid, ProcessStartIdentity: daemonIdentity, Strategy: "fskit",
-	}
-	writeRawMountState(t, stateDir, invalidState)
-	statePath := mountStatePath(stateDir, mountPath)
-	before, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if rc := e.run([]string{"umount", mountPath}); rc == 0 {
-		t.Fatalf("umount unexpectedly succeeded, stderr: %q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "incomplete mount instance identity") ||
-		!strings.Contains(stderr.String(), "nothing was unmounted") {
-		t.Fatalf("fail-closed explanation missing: %q", stderr.String())
-	}
-	select {
-	case <-daemonDone:
-		t.Fatal("fail-closed unmount stopped the daemon")
-	case <-time.After(100 * time.Millisecond):
-	}
-	after, err := os.ReadFile(statePath)
-	if err != nil || !bytes.Equal(after, before) {
-		t.Fatalf("invalid mount-state evidence changed: err=%v before=%q after=%q", err, before, after)
-	}
-}
-
-// TestUmountDeadDaemonWithoutDrainProofFailsClosed pins stale-state handling.
-func TestUmountDeadDaemonWithoutDrainProofFailsClosed(t *testing.T) {
-	e, _, stderr, stateDir := umountTestEnv(t)
-	mountPath, err := canonicalMountPath(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalidState := mountState{
-		MountPath: mountPath, VolumeID: "vol_stale", Branch: "main",
-		PID: 4194000, ProcessStartIdentity: "dead-process", Strategy: "fuse",
-	}
-	writeRawMountState(t, stateDir, invalidState)
-	statePath := mountStatePath(stateDir, mountPath)
-	before, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rc := e.run([]string{"umount", mountPath, "--json"}); rc == 0 {
-		t.Fatalf("umount unexpectedly succeeded, stderr: %q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "incomplete mount instance identity") ||
-		!strings.Contains(stderr.String(), "nothing was unmounted") {
-		t.Fatalf("fail-closed detail missing: %q", stderr.String())
-	}
-	after, err := os.ReadFile(statePath)
-	if err != nil || !bytes.Equal(after, before) {
-		t.Fatalf("invalid mount-state evidence changed: err=%v before=%q after=%q", err, before, after)
 	}
 }
 

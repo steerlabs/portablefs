@@ -5,8 +5,11 @@ package hostctl
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"net"
 	"os"
@@ -14,8 +17,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 type Session struct {
@@ -657,4 +658,53 @@ func applyDeadline(ctx context.Context, conn *net.UnixConn) error {
 		deadline = time.Now().Add(20 * time.Second)
 	}
 	return conn.SetDeadline(deadline)
+}
+
+// AuthenticateSocketPeer binds a connected owner-private socket to one live
+// executable from an already authenticated sealed release. Claimed JSON
+// identity fields cannot substitute for the kernel audit-token witness.
+func AuthenticateSocketPeer(conn *net.UnixConn, expectedSHA256 string) error {
+	if !validLowerHex(expectedSHA256, 64) {
+		return fmt.Errorf("invalid expected socket peer digest")
+	}
+	witness, err := exactPeer(conn)
+	if err != nil {
+		return err
+	}
+	if err := witness.RequireCurrentExecutable(witness.ExecutablePath); err != nil {
+		return err
+	}
+	fd, err := unix.Open(witness.ExecutablePath, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open authenticated peer executable: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), witness.ExecutablePath)
+	if file == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("invalid peer executable descriptor")
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !before.Mode().IsRegular() || before.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("peer executable is not a protected regular file")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	named, err := os.Lstat(witness.ExecutablePath)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(before, after) || !os.SameFile(before, named) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+		return fmt.Errorf("socket peer executable differs from the authenticated release")
+	}
+	return witness.RequireCurrentExecutable(witness.ExecutablePath)
 }

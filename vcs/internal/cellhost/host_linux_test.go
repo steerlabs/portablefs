@@ -5,20 +5,12 @@ package cellhost
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
-	"golang.org/x/sys/unix"
 )
 
 type recordedCommand struct {

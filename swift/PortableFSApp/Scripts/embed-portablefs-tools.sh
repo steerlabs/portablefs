@@ -70,19 +70,6 @@ if [ "$actual_go_version" != "$required_go_version" ]; then
   exit 1
 fi
 
-native_qualification=${PORTABLEFS_NATIVE_QUALIFICATION:-}
-qualification_build_tags=
-case "$native_qualification" in
-  "") ;;
-  sdk27-live-qualification-only)
-    qualification_build_tags=portablefs_macos27_qualification
-    ;;
-  *)
-    echo "PORTABLEFS_NATIVE_QUALIFICATION has an unsupported value" >&2
-    exit 1
-    ;;
-esac
-
 : "${PORTABLEFS_APP_GROUP:?PORTABLEFS_APP_GROUP is required to build PortableFS helpers}"
 case "$PORTABLEFS_APP_GROUP" in
   *[!A-Za-z0-9.-]*)
@@ -109,23 +96,14 @@ build_universal() {
       *) echo "unsupported macOS architecture: $arch" >&2; exit 1 ;;
     esac
     binary="$work/$tool-$arch"
-    qualification_ldflag=
-    if [ "$tool" = portablefs ] && [ -n "$native_qualification" ]; then
-      qualification_ldflag=" -X github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli.nativeFSKitPolicyQualification=$native_qualification"
-    fi
     (
       cd "$vcs_root"
       # portablefs uses AppKit's exact-URL NSWorkspace launcher; portablefsd
       # uses Foundation's app-group resolver. Both shipped Darwin helpers
       # therefore require their real cgo platform boundary.
-      if [ -n "$qualification_build_tags" ]; then
-        set -- -tags "$qualification_build_tags"
-      else
-        set --
-      fi
-      GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" "$portablefs_go" build "$@" \
+      GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" "$portablefs_go" build \
         -trimpath \
-        -ldflags="-s -w -X main.version=$MARKETING_VERSION -X github.com/steerlabs/portablefs/vcs/internal/fskitidentity.AppGroup=$PORTABLEFS_APP_GROUP$qualification_ldflag" \
+        -ldflags="-s -w -X main.version=$MARKETING_VERSION -X github.com/steerlabs/portablefs/vcs/internal/fskitidentity.AppGroup=$PORTABLEFS_APP_GROUP" \
         -o "$binary" \
         "./cmd/$tool"
     )
@@ -184,6 +162,14 @@ service_info="$service_contents/Info.plist"
 /usr/bin/plutil -insert RunAtLoad -bool YES "$launch_agent_plist"
 /usr/bin/plutil -insert KeepAlive -bool YES "$launch_agent_plist"
 /usr/bin/plutil -lint "$launch_agent_plist" >/dev/null
+
+# The signed service resources bind actual protocol numbers and daemon
+# pairing for future authenticated cross-release lifecycle quiescence.
+mkdir -p "$service_contents/Resources"
+(
+  cd "$vcs_root"
+  GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 "$portablefs_go" run ./internal/daemonctl/seal
+) > "$service_contents/Resources/PortableFSProtocol.json"
 
 if [ "${CODE_SIGNING_ALLOWED:-NO}" != "NO" ] &&
    [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] &&

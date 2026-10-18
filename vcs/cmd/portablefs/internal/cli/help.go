@@ -74,7 +74,7 @@ macOS delivers it to portablefsd. The capability is accepted only through the
 environment so it never appears in process arguments, and is never persisted.
 
 This command does not mint credentials, broaden access, remount, or create a
-replacement authority session. A mount created by an older CLI without an
+replacement authority session. A mount without an
 authorizationSessionId must be mounted once with the current CLI. A mount
 created with automatic Manager enrollment has one internal sequencer and
 refuses this manual path.
@@ -114,10 +114,10 @@ mount intents, durable daemon attaches, and live daemon attaches, then reports
 one schema-1 ` + "`service-update`" + ` readiness frame. The macOS host keeps its
 stdin open across the exact ServiceManagement unregister/register transaction;
 closing stdin releases both guards.
-When replacing a previously registered release, the host supplies all four
-expected-daemon fields from its persisted, signature-validated registration
-identity. A healthy old daemon must match that complete tuple before the CLI
-reads its attach inventory. The four fields are all-or-none; omission is valid
+When replacing a release, the host derives all four expected-daemon fields
+from the authenticated live daemon and its signed executable and sealed release.
+The CLI authenticates the socket peer and reads lifecycle v1 inventory using
+that outgoing release's actual protocol values. The four fields are all-or-none; omission is valid
 only when no prior live daemon needs adoption.
 Identity prints the linker-stamped FSKit app group for packaging validation;
 portablefsd exposes the same JSON with ` + "`portablefsd -identity-json`" + `.
@@ -168,7 +168,6 @@ EXAMPLES
                     --manager-ca manager-ca.pem --mount-enrollment-id id
                     --mount-enrollment-cert enrollment.pem
                     --authority-generation n --auth-expires-at-ms ms]
-                   [--coherence strict] [--no-local-dirs]
                    [--strategy auto|fskit|fuse] [--foreground] [--json]
 
 Attach the live volume at mountPath through the v3 authority stack, then
@@ -187,39 +186,24 @@ mount. Standalone credentials may be supplied directly by the deployment. A
 hosted product may additionally pass the complete Manager enrollment group
 shown above. The Linux mount supervisor or macOS portablefsd then refreshes
 short-lived grants inside the same authority session. The group is all-or-none,
-has exactly one renewal owner, and never falls back to manual renewal. A v3
-volume is branchless: the retired --branch flag is an error.
+has exactly one renewal owner, and never falls back to manual renewal.
 
-Protocol 7 uses volume subscriptions and file write delegations on Linux.
+Protocol 8 uses volume subscriptions and ordered write delegations on Linux.
 Delegated writes can buffer locally; fsync and the root-directory barrier
-flush the accepted writes and wait for authoritative durability. On macOS,
-ordinary kernel page-cache writeback still applies: write(2) may return before
-FSKit sends the write, while fsync/synchronize waits through the authority's
-server descriptor. The authority fixes one frontend profile for the whole
-session at attach. Linux uses ordered changes and delegation control; a macOS
-FSKit mount runs the synchronous-repair stream and never receives Linux cache
-subscriptions or write delegations.
---coherence may only be strict; legacy uncached mounts are rejected. Linux
-implements the exact strict-cache contract. macOS 26 declares the named
-macos26-synchronous-vfs-repair-v2 best-effort cache tier: authority ordering,
-durability, source publication accounting, and terminal fencing remain exact,
-but current FSKit cannot guarantee exact peer namespace or attribute cache
-invalidation. While that Mac is mounted, it owns the compatibility writer lease;
-other clients may read but visible mutations return EBUSY until the Mac cleanly
-unmounts, and a second Mac compatibility writer is refused at attach. Under
-extreme cross-client rename churn, a reader may receive a
-transient ESTALE rather than torn data. The mount command reports the ownership
-boundary before mounting.
+flush accepted writes and wait for authoritative durability. macOS 26 and 27
+use one exclusive-writer FSKit profile. Every successful FSKit mutation reply
+is durable at the authority. A kernel write(2) may accept dirty pages before
+FSKit delivers its mutation callback; use the supported synchronization
+boundary for completion. Other clients may read while a Mac is mounted, but
+foreign visible mutations and a second Mac are refused. Terminal daemon
+fencing does not synchronously withdraw already retained FSKit kernel caches.
 
 Machine-local directories — node_modules, .venv, target — are served from
 machine-local disk instead of the volume. WHICH directories is declared by
 the volume in .portablefs/local-dirs (one directory rule per line,
 # comments): the mount adopts the declaration at attach and the authority
 refuses a mount whose routing revision is not the volume's active one, so
-every machine routes identically. --local-dir is refused unconditionally — a
-per-machine route would hide from this machine a directory its peers still
-treat as shared — and --no-local-dirs refuses a declaring volume instead of
-ignoring its topology. macOS does not yet join the route adoption protocol:
+every machine routes identically. macOS does not yet join the route adoption protocol:
 a volume that declares routes mounts from Linux.
 
 There is ONE transport per platform, with no fallbacks: macOS mounts through
@@ -230,11 +214,8 @@ extension), and Linux mounts through FUSE. A host that cannot serve its
 platform's transport fails with guidance instead of degrading to a weaker
 consistency model. The FSKit frontend is fixed by the release's signed
 app-group identity, while the unentitled CLI uses the fixed external private
-control socket; PORTABLEFS_FSKIT_SOCKET and
-PORTABLEFS_FSKIT_CONTROL_SOCKET are rejected. PORTABLEFS_FSKIT_TYPE may only
-assert the signed release type. The daemon is
-always the exact portablefsd sibling from the same installed release;
-PORTABLEFS_FSKIT_DAEMON is rejected.
+control socket. The filesystem type, socket layout and exact embedded
+portablefsd executable are fixed by the signed release.
 
 For authorities on your LAN, macOS also requires Local Network permission for
 PortableFS or PortableFSDService under System Settings > Privacy & Security >
@@ -254,31 +235,23 @@ EXAMPLES
     --data-plane-ca ca.pem --client-cert client.pem --client-key client.key
   portablefs mount my-workspace /mnt/w --addr 10.0.0.7:2050 \
     --data-plane-transport tls-system-pki --data-plane-server-name authority.example.com \
-    --client-cert client.pem --client-key client.key --coherence strict --foreground
+    --client-cert client.pem --client-key client.key --foreground
 `,
 		"umount": `USAGE
   portablefs umount <mountPath> [--force] [--discard-record] [--json]
 
-Unmount a portablefs mount and stop its daemon. On macOS authority-v3, a NORMAL
-unmount begins planned detach and first asks the kernel for an unforced unmount.
-That pass invokes FSKit synchronize and the authority durability boundary. The
-daemon accepts only success or the exact EBUSY produced after that sync pass;
-EBUSY authorizes a second MNT_FORCE pass to revoke the retained mount-root vnode.
-Exact mount-table absence is then delivered to the authority before local attach
-removal. Any other first-pass failure leaves the mount attached.
+Unmount a PortableFS mount and stop its supervisor. On macOS, normal unmount
+makes one unforced kernel attempt. EBUSY leaves the mount present and requires
+closing user or system references before retrying; PortableFS never escalates
+a normal request to force. Exact absence, authority proof delivery, and local
+cleanup are reported separately.
 
---force skips the trustworthy unforced sync pass and revokes the exact mount
-immediately. A v3 mount has no PortableFS-managed tail to park or replay, but
-macOS kernel pages may still need the normal synchronize boundary. Use --force
-only when that boundary is unavailable and the mount must be made unservable.
+--force requests immediate detach of the exact recorded mount. Kernel dirty
+pages may not have crossed the normal synchronization boundary.
 
-Legacy macOS attaches still use their frozen drain transaction. On Linux,
-unmount uses exactly the direct
-or pinned-helper mechanism recorded when that mount was created; it never
-switches mechanisms after a failure. The command then reconciles the exact
-recorded process, resources, and mount state.
-Missing state or missing absence proof fails closed; PortableFS never substitutes
-an unverified plain unmount.
+Linux uses the direct or pinned-helper mechanism recorded at mount creation.
+The command reconciles the exact process, resources and durable mount state.
+Missing or conflicting identity fails closed.
 
 --discard-record is the terminal for BOOKKEEPING, not for a mount. It unmounts
 nothing, signals nothing and parks nothing; it removes this path's mount record
@@ -386,9 +359,6 @@ Print the CLI version.
 	}
 	if t, ok := texts[name]; ok {
 		return t, true
-	}
-	if text, ok := qualificationCommandHelp(name); ok {
-		return text, true
 	}
 	if name == "help" {
 		return rootHelp(), true

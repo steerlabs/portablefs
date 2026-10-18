@@ -11,8 +11,8 @@ type macOSInstallResult struct {
 
 // cmdInstallMacOSApp is intentionally absent from root help. The verified
 // macOS installer invokes it from the CLI nested in the staged app so one
-// signed process owns account-path resolution, lifecycle exclusion, legacy
-// state refusal, and publication.
+// signed process owns account-path resolution, lifecycle exclusion, resource inventory,
+// and publication.
 func cmdInstallMacOSApp(e *cmdEnv, args []string) int {
 	fs := newFlagSet("install-macos-app")
 	sourceApp := fs.String("source-app", "", "absolute path to the staged PortableFS.app")

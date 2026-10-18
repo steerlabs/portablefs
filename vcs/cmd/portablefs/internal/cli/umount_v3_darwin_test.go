@@ -4,6 +4,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
-	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
 // These tests pin the two live-battery failures against the daemon-v3 umount
@@ -27,7 +27,6 @@ func v3FSKitMountState(t *testing.T, mountPath string) mountState {
 	t.Helper()
 	st := staleFSKitMountState(t, mountPath)
 	st.Engine = mountEngineDaemonV3
-	st.Branch = ""
 	return st
 }
 
@@ -215,8 +214,8 @@ func TestForcedRevocationDetachesTheExactRecordedMount(t *testing.T) {
 		// budget: one attempt is bounded to a third of the repair budget so
 		// a wedged /sbin/umount cannot blow through the fencing grace it
 		// exists to honor.
-		if budget != mountv3.RepairBudget/3 {
-			t.Errorf("forced revocation budget = %v, want %v", budget, mountv3.RepairBudget/3)
+		if budget != fskitForcedDetachTimeout {
+			t.Errorf("forced revocation budget = %v, want %v", budget, fskitForcedDetachTimeout)
 		}
 		return unmountOps{
 			goos: "darwin",
@@ -285,5 +284,33 @@ func TestCanonicalMountPathResolvesSymlinkedAncestorOfADeadMount(t *testing.T) {
 	}
 	if got != canonical {
 		t.Fatalf("canonical path = %q, want the kernel's recorded %q", got, canonical)
+	}
+}
+
+func TestFSKitUnmountErrorReportsIndependentKernelAbsence(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		t.Run(fmt.Sprint(present), func(t *testing.T) {
+			e, _, _, _ := umountTestEnv(t)
+			st := validFSKitMountState(t, filepath.Join(t.TempDir(), "mount"))
+			ctl, _ := serveFSKitReconcileControl(t, st, true, false, http.StatusConflict)
+			e.ensurePortablefsdFn = func(fskitConfig, string, string) (*fsdControl, error) { return ctl, nil }
+			stubMountIdentification(t, nil, func(path string) ([]kernelMountIdentity, error) {
+				if !present {
+					return nil, nil
+				}
+				return []kernelMountIdentity{{path: path, fsType: defaultFskitType, source: fskitidentity.ResourcePrefix + st.AttachRef}}, nil
+			})
+			detached, err := e.v3FSKitDaemonDetach(&st, false)
+			if err == nil || detached == present {
+				t.Fatalf("detach=%v error=%v", detached, err)
+			}
+			want := "kernel mount is absent"
+			if present {
+				want = "kernel mount remains present"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("wrong outcome: %v", err)
+			}
+		})
 	}
 }

@@ -136,7 +136,6 @@ set -- xcodebuild \
   MARKETING_VERSION="$version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   PORTABLEFS_APP_GROUP="$app_group" \
-  PORTABLEFS_NATIVE_QUALIFICATION= \
   PORTABLEFS_GO="$go_binary"
 
 if [ -n "${PORTABLEFS_APPLE_API_KEY_PATH:-}" ]; then
@@ -235,6 +234,16 @@ extension_executable="$extension/Contents/MacOS/PortableFSExt"
 [ -d "$extension" ] || { echo "packaged app has no FSKit extension" >&2; exit 1; }
 [ -x "$extension_executable" ] ||
   { echo "packaged app has no PortableFSExt executable" >&2; exit 1; }
+
+sealed_protocols="$service/Contents/Resources/PortableFSProtocol.json"
+[ -f "$sealed_protocols" ] && [ ! -L "$sealed_protocols" ] ||
+  { echo "packaged service has no regular sealed protocol identity" >&2; exit 1; }
+(
+  cd "$repo_root/vcs"
+  GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 "$go_binary" run ./internal/daemonctl/seal
+) > "$verify_tmp/current-protocols.json"
+cmp -s "$sealed_protocols" "$verify_tmp/current-protocols.json" ||
+  { echo "packaged service protocol identity differs from its exact build" >&2; exit 1; }
 
 for executable in "$app_executable" "$cli" "$daemon" "$extension_executable"; do
   for required_arch in arm64 x86_64; do

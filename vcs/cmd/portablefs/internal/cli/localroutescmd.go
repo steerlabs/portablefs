@@ -10,7 +10,6 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
-	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
@@ -27,21 +26,7 @@ func localBackingDir(mountsDir string) string {
 	return filepath.Join(filepath.Dir(mountsDir), "local")
 }
 
-// portablefsdStateDir is the daemon's independent durable state root. FSKit
-// grafts do not live in localBackingDir: the daemon keys them by
-// (volume, branch) beneath this tree.
-func portablefsdStateDir(mountsDir string) string {
-	return filepath.Join(filepath.Dir(mountsDir), "portablefsd")
-}
-
-func fskitBackingRoot(mountsDir, volumeID, branch string) string {
-	return portablefsd.LocalBackingRoot(portablefsdStateDir(mountsDir), volumeID, branch)
-}
-
 func mountBackingRoot(mountsDir string, st *mountState) string {
-	if st.Strategy == "fskit" {
-		return fskitBackingRoot(mountsDir, st.VolumeID, st.Branch)
-	}
 	if st.LocalBackingRoot != "" {
 		return st.LocalBackingRoot
 	}
@@ -50,24 +35,18 @@ func mountBackingRoot(mountsDir string, st *mountState) string {
 
 // routeAnswer is one resolved path, in the shape `portablefs route` prints.
 type routeAnswer struct {
-	Path        string `json:"path"`
-	MountPath   string `json:"mountPath"`
-	VolumeID    string `json:"volumeId"`
-	Branch      string `json:"branch"`
-	VolumePath  string `json:"volumePath"`
-	Storage     string `json:"storage"` // "machine-local" | "shared"
-	Rule        string `json:"rule,omitempty"`
-	RouteRoot   string `json:"routeRoot,omitempty"`
-	BackingPath string `json:"backingPath,omitempty"`
-	BackingLive bool   `json:"backingExists,omitempty"`
-	Bytes       int64  `json:"backingBytes,omitempty"`
-	// Revision is the VOLUME declaration's revision — what the authority
-	// pins the attach to. PerMachine reports the legacy case where this
-	// machine's --local-dir flags supplied the rules instead, which is
-	// possible only on a volume that declares nothing.
-	Revision   string   `json:"revision"`
-	PerMachine bool     `json:"perMachineRoutes,omitempty"`
-	Patterns   []string `json:"patterns,omitempty"`
+	Path        string   `json:"path"`
+	MountPath   string   `json:"mountPath"`
+	VolumeID    string   `json:"volumeId"`
+	VolumePath  string   `json:"volumePath"`
+	Storage     string   `json:"storage"` // "machine-local" | "shared"
+	Rule        string   `json:"rule,omitempty"`
+	RouteRoot   string   `json:"routeRoot,omitempty"`
+	BackingPath string   `json:"backingPath,omitempty"`
+	BackingLive bool     `json:"backingExists,omitempty"`
+	Bytes       int64    `json:"backingBytes,omitempty"`
+	Revision    string   `json:"revision"`
+	Patterns    []string `json:"patterns,omitempty"`
 }
 
 // cmdRoute explains one path: which mount serves it, whether it is served
@@ -109,11 +88,9 @@ func cmdRoute(e *cmdEnv, args []string) int {
 		Path:       target,
 		MountPath:  st.MountPath,
 		VolumeID:   st.VolumeID,
-		Branch:     st.Branch,
 		VolumePath: rel,
 		Storage:    "shared",
 		Revision:   st.LocalRouteRevision,
-		PerMachine: st.LocalRoutesPerMachine || (len(st.LocalRoutes) == 0 && len(st.LocalDirs) > 0 && !st.LocalDirsDeclared),
 		Patterns:   rules.Patterns(),
 	}
 	if root, rule, matched := rules.MatchRule(rel); matched {
@@ -133,7 +110,7 @@ func cmdRoute(e *cmdEnv, args []string) int {
 		return e.printJSON(ans)
 	}
 	fmt.Fprintf(e.stdout, "path         %s\n", ans.Path)
-	fmt.Fprintf(e.stdout, "mount        %s (volume %s, branch %s)\n", ans.MountPath, ans.VolumeID, ans.Branch)
+	fmt.Fprintf(e.stdout, "mount        %s (volume %s)\n", ans.MountPath, ans.VolumeID)
 	fmt.Fprintf(e.stdout, "volume path  %s\n", displayVolumePath(ans.VolumePath))
 	fmt.Fprintf(e.stdout, "storage      %s\n", ans.Storage)
 	if ans.Storage == "shared" {
@@ -153,10 +130,7 @@ func cmdRoute(e *cmdEnv, args []string) int {
 	} else {
 		fmt.Fprintf(e.stdout, "patterns     %s\n", strings.Join(ans.Patterns, " "))
 	}
-	if ans.PerMachine {
-		fmt.Fprintf(e.stdout, "warning      these rules come from this machine's --local-dir flags, not from the volume:\n")
-		fmt.Fprintf(e.stdout, "             peers still treat these paths as shared. Declare them in %s instead.\n", localdirs.VolumeConfigPath)
-	}
+
 	return 0
 }
 
@@ -188,23 +162,9 @@ func revisionPrefix(rev string) string {
 // record carries (empty for such a mount), because a revision it never
 // reported to the authority is not one to invent here.
 func mountRuleSet(st *mountState) (localroutes.RuleSet, error) {
-	if len(st.LocalRoutes) > 0 {
-		return localroutes.Parse([]byte(strings.Join(st.LocalRoutes, "\n")))
-	}
-	var text strings.Builder
-	for _, dir := range st.LocalDirs {
-		pattern, err := localroutes.LiteralPattern(dir)
-		if err != nil {
-			return localroutes.RuleSet{}, err
-		}
-		text.WriteString(pattern + "\n")
-	}
-	return localroutes.Parse([]byte(text.String()))
+	return localroutes.Parse([]byte(strings.Join(st.LocalRoutes, "\n")))
 }
 
-// mountContaining finds the mount that serves target and target's
-// volume-relative path within it. The longest mount path wins, so a mount
-// nested inside another mount's directory answers for its own subtree.
 func mountContaining(states []mountState, target string) (mountState, string, bool) {
 	best := -1
 	var rel string
@@ -318,15 +278,6 @@ func collectPruneRows(mountsDir, onlyVolume string, remove bool) ([]pruneRow, er
 	if err != nil {
 		return nil, err
 	}
-	// FSKit owns a separate (volume, branch)-keyed backing area. Its effective
-	// routes can change through the daemon control API without rewriting the
-	// CLI mount record, so this command never prunes inside a daemon-owned tree.
-	// Inventory it before touching FUSE backing: an unidentified hash may be a
-	// detached or legacy FSKit tree, and deletion must fail before any partial
-	// reclamation rather than guess which volume it belongs to.
-	if err := verifyFSKitPruneInventory(mountsDir, states); err != nil {
-		return nil, err
-	}
 	if len(entries) == 0 {
 		return nil, nil
 	}
@@ -393,10 +344,7 @@ func collectPruneRows(mountsDir, onlyVolume string, remove bool) ([]pruneRow, er
 			return nil, err
 		}
 		if remove && rules.Empty() {
-			// Nothing on this machine can reach the volume at all, so the now
-			// empty tree goes too. The sidecars beside it stay: a persisted
-			// --local-dir list is the user's configuration, and reclaiming
-			// storage is not a reason to forget it.
+			// Preserve the adjacent active-route record while reclaiming storage.
 			if err := os.Remove(tree); err != nil && !os.IsNotExist(err) {
 				return nil, fmt.Errorf("remove emptied backing tree %s: %w", tree, err)
 			}
@@ -422,74 +370,6 @@ func collectPruneRows(mountsDir, onlyVolume string, remove bool) ([]pruneRow, er
 	return rows, nil
 }
 
-type fskitBackingIdentity struct {
-	volumeID string
-	branch   string
-}
-
-// verifyFSKitPruneInventory proves that every daemon-owned storage hash is
-// attributable to a mount or durable daemon attach. Attributable trees remain
-// wholly protected: mount-state LocalDirs can lag a runtime control update,
-// so they are not sufficient authority for subtree deletion. An unattributed
-// hash makes every prune fail closed: even a volume-scoped command cannot
-// prove that the unidentified tree does not belong to the selected volume.
-func verifyFSKitPruneInventory(mountsDir string, states []mountState) error {
-	base := filepath.Join(portablefsdStateDir(mountsDir), "local")
-	entries, err := privatepath.ReadDir(base)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inventory FSKit backing %s: %w", base, err)
-	}
-	known := map[string]fskitBackingIdentity{}
-	note := func(volumeID, branch string) error {
-		if volumeID == "" || branch == "" {
-			return nil
-		}
-		identity := fskitBackingIdentity{volumeID: volumeID, branch: branch}
-		id := filepath.Base(fskitBackingRoot(mountsDir, volumeID, branch))
-		if prior, ok := known[id]; ok && prior != identity {
-			return fmt.Errorf("FSKit backing identity collision for %s: %s@%s and %s@%s", id,
-				prior.volumeID, prior.branch, volumeID, branch)
-		}
-		known[id] = identity
-		return nil
-	}
-	for i := range states {
-		if states[i].Strategy == "fskit" {
-			if err := note(states[i].VolumeID, states[i].Branch); err != nil {
-				return err
-			}
-		}
-	}
-	attaches, err := portablefsd.ReadPersistedAttachInventory(portablefsdStateDir(mountsDir))
-	if err != nil {
-		return fmt.Errorf("prove FSKit backing ownership from durable attach inventory: %w", err)
-	}
-	for _, attach := range attaches {
-		if err := note(attach.VolumeID, attach.Branch); err != nil {
-			return err
-		}
-	}
-	for _, ent := range entries {
-		name := ent.Name()
-		if !ent.IsDir() || len(name) != 32 || strings.Trim(name, "0123456789abcdef") != "" {
-			continue
-		}
-		if _, ok := known[name]; ok {
-			continue // possibly live; preserve the entire daemon-owned tree
-		}
-		return fmt.Errorf(
-			"refusing to prune: FSKit backing %s has no mount or durable daemon attach that proves its volume and branch; it was left untouched",
-			filepath.Join(base, name),
-		)
-	}
-	return nil
-}
-
-// readLocalRoutesRecordByStorage reads the active route record that sits
-// beside one backing tree, keyed by its storage id.
 func readLocalRoutesRecordByStorage(mountsDir, storageID string) (*localRoutesRecord, error) {
 	p := filepath.Join(localBackingDir(mountsDir), storageID+".routes.json")
 	data, err := privatepath.ReadFile(p)
@@ -514,11 +394,10 @@ func readLocalRoutesRecordByStorage(mountsDir, storageID string) (*localRoutesRe
 type localRouteStatusRow struct {
 	// Revision is the volume declaration's revision, the value every mount of
 	// the volume must agree on.
-	Revision   string           `json:"revision"`
-	Patterns   []string         `json:"patterns"`
-	PerMachine bool             `json:"perMachineRoutes,omitempty"`
-	Backing    string           `json:"backingRoot,omitempty"`
-	Roots      []localRouteRoot `json:"roots,omitempty"`
+	Revision string           `json:"revision"`
+	Patterns []string         `json:"patterns"`
+	Backing  string           `json:"backingRoot,omitempty"`
+	Roots    []localRouteRoot `json:"roots,omitempty"`
 }
 
 type localRouteRoot struct {
@@ -531,19 +410,18 @@ type localRouteRoot struct {
 // localRoutesOf reports this machine's active routing for a volume: the
 // revision and patterns a live mount activated (or the recorded active set
 // when nothing is mounted), plus every route root that actually holds bytes.
-func (e *cmdEnv) localRoutesOf(volumeID, branch string) *localRouteStatusRow {
+func (e *cmdEnv) localRoutesOf(volumeID string) *localRouteStatusRow {
 	dir, err := e.mountStateDir()
 	if err != nil {
 		return nil
 	}
-	patterns, revision, perMachine := []string(nil), "", false
+	patterns, revision := []string(nil), ""
 	backing := ""
-	fskitDirs := []string(nil)
 	mountAnswered := false
 	if states, err := listMountStates(dir); err == nil {
 		for i := range states {
 			st := &states[i]
-			if st.VolumeID != volumeID || st.Branch != branch {
+			if st.VolumeID != volumeID {
 				continue
 			}
 			if rules, err := mountRuleSet(st); err == nil {
@@ -552,17 +430,14 @@ func (e *cmdEnv) localRoutesOf(volumeID, branch string) *localRouteStatusRow {
 					break
 				}
 				patterns, revision = rules.Patterns(), st.LocalRouteRevision
-				perMachine = st.LocalRoutesPerMachine || (len(st.LocalRoutes) == 0 && len(st.LocalDirs) > 0 && !st.LocalDirsDeclared)
 				backing = mountBackingRoot(dir, st)
-				if st.Strategy == "fskit" {
-					fskitDirs = append([]string(nil), st.LocalDirs...)
-				}
+
 				break
 			}
 		}
 	}
 	if mountAnswered && len(patterns) == 0 {
-		// A current branch mount serving no routes outranks a stale
+		// A current mount serving no routes outranks a stale
 		// last-activated FUSE sidecar for the same volume.
 		return nil
 	}
@@ -571,7 +446,7 @@ func (e *cmdEnv) localRoutesOf(volumeID, branch string) *localRouteStatusRow {
 		if err != nil || rec == nil {
 			return nil
 		}
-		patterns, revision, perMachine = rec.Patterns, rec.Revision, rec.PerMachine
+		patterns, revision = rec.Patterns, rec.Revision
 		backing = localDirsBackingRoot(dir, volumeID)
 	}
 	if len(patterns) == 0 {
@@ -581,22 +456,7 @@ func (e *cmdEnv) localRoutesOf(volumeID, branch string) *localRouteStatusRow {
 	if err != nil {
 		return nil
 	}
-	row := &localRouteStatusRow{Revision: revision, Patterns: rules.Patterns(), PerMachine: perMachine, Backing: backing}
-	if fskitDirs != nil {
-		for _, root := range fskitDirs {
-			p := filepath.Join(backing, filepath.FromSlash(root))
-			fi, err := os.Lstat(p)
-			if err != nil || !fi.IsDir() {
-				continue
-			}
-			bytes, files, err := localdirs.BackingUsage(backing, root)
-			if err != nil {
-				continue
-			}
-			row.Roots = append(row.Roots, localRouteRoot{Path: root, Backing: p, Bytes: bytes, Files: files})
-		}
-		return row
-	}
+	row := &localRouteStatusRow{Revision: revision, Patterns: rules.Patterns(), Backing: backing}
 	g, err := localdirs.New(localdirs.Config{BackingRoot: backing, Rules: rules})
 	if err != nil || g == nil {
 		return row
@@ -629,9 +489,7 @@ func (e *cmdEnv) printLocalRoutes(row *localRouteStatusRow) {
 	}
 	fmt.Fprintf(e.stdout, "local routes %s declared in %s: %s\n",
 		revisionPrefix(row.Revision), localdirs.VolumeConfigPath, strings.Join(row.Patterns, " "))
-	if row.PerMachine {
-		fmt.Fprintf(e.stdout, "             (these rules are this machine's --local-dir flags, not the volume's: peers treat these paths as shared)\n")
-	}
+
 	if len(row.Roots) == 0 {
 		fmt.Fprintf(e.stdout, "             no route root has machine-local content yet (backing %s)\n", row.Backing)
 		return

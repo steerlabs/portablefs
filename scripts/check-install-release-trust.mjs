@@ -29,10 +29,6 @@ const appGroupBuildInputs = await Promise.all(
     "swift/PortableFSKitDev/PortableFSKitDev/PortableFSKitDev.entitlements",
     "swift/PortableFSKitDev/PortableFSDev/Info.plist",
     "swift/PortableFSKitDev/PortableFSDev/PortableFSDev.entitlements",
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev/Info.plist",
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev.entitlements",
-    "swift/PortableFSKitMacOS27Dev/PortableFSDev/Info.plist",
-    "swift/PortableFSKitMacOS27Dev/PortableFSDev/PortableFSDev.entitlements",
   ].map(async (relativePath) => ({
     relativePath,
     contents: await readFile(path.join(root, relativePath), "utf8"),
@@ -42,7 +38,6 @@ const appGroupBuildConfigs = await Promise.all(
   [
     "swift/PortableFSApp/Config/Development.xcconfig",
     "swift/PortableFSKitDev/Config/Development.xcconfig",
-    "swift/PortableFSKitMacOS27Dev/Config/Development.xcconfig",
   ].map(async (relativePath) => ({
     relativePath,
     contents: await readFile(path.join(root, relativePath), "utf8"),
@@ -51,29 +46,8 @@ const appGroupBuildConfigs = await Promise.all(
 const developmentProjects = await Promise.all(
   [
     "swift/PortableFSKitDev/PortableFSKitDev.xcodeproj/project.pbxproj",
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev.xcodeproj/project.pbxproj",
   ].map(async (relativePath) => ({
     relativePath,
-    contents: await readFile(path.join(root, relativePath), "utf8"),
-  }))
-);
-const qualificationPhaseProjects = await Promise.all(
-  [
-    {
-      relativePath: "swift/PortableFSApp/PortableFSApp.xcodeproj/project.pbxproj",
-      phaseValue: "PORTABLEFS_NATIVE_QUALIFICATION= ",
-    },
-    {
-      relativePath: "swift/PortableFSKitDev/PortableFSKitDev.xcodeproj/project.pbxproj",
-      phaseValue: "PORTABLEFS_NATIVE_QUALIFICATION= ",
-    },
-    {
-      relativePath: "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev.xcodeproj/project.pbxproj",
-      phaseValue: "PORTABLEFS_NATIVE_QUALIFICATION=sdk27-live-qualification-only ",
-    },
-  ].map(async ({ relativePath, phaseValue }) => ({
-    relativePath,
-    phaseValue,
     contents: await readFile(path.join(root, relativePath), "utf8"),
   }))
 );
@@ -87,27 +61,6 @@ const cliMacOSInstaller = await readFile(
 );
 const cliCommands = await readFile(
   path.join(root, "vcs/cmd/portablefs/internal/cli/cli.go"),
-  "utf8"
-);
-const macOS27QualificationCommand = await readFile(
-  path.join(
-    root,
-    "vcs/cmd/portablefs/internal/cli/installmacos_qualification_darwin.go"
-  ),
-  "utf8"
-);
-const macOS27QualificationLayout = await readFile(
-  path.join(
-    root,
-    "vcs/cmd/portablefs/internal/cli/installmacos_qualification_layout_darwin.go"
-  ),
-  "utf8"
-);
-const disabledQualificationLayout = await readFile(
-  path.join(
-    root,
-    "vcs/cmd/portablefs/internal/cli/installmacos_qualification_layout_disabled.go"
-  ),
   "utf8"
 );
 const darwinNativeBridge = await readFile(
@@ -161,38 +114,6 @@ const xcodeEvidenceTests = await readFile(
   "utf8"
 );
 const goreleaser = await readFile(path.join(root, ".goreleaser.yaml"), "utf8");
-const qualificationSource = await readFile(
-  path.join(
-    root,
-    "swift/PortableFSKitMacOS27Dev/IOQualification/QualificationApp.swift"
-  ),
-  "utf8"
-);
-const qualificationInfo = await readFile(
-  path.join(root, "swift/PortableFSKitMacOS27Dev/IOQualification/Info.plist"),
-  "utf8"
-);
-const qualificationProject = await readFile(
-  path.join(
-    root,
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev.xcodeproj/project.pbxproj"
-  ),
-  "utf8"
-);
-const qualificationScheme = await readFile(
-  path.join(
-    root,
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev.xcodeproj/xcshareddata/xcschemes/PortableFSKitMacOS27IOQualification.xcscheme"
-  ),
-  "utf8"
-);
-const macOS27HostScheme = await readFile(
-  path.join(
-    root,
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev.xcodeproj/xcshareddata/xcschemes/PortableFSKitMacOS27Dev.xcscheme"
-  ),
-  "utf8"
-);
 const productionProject = await readFile(
   path.join(root, "swift/PortableFSApp/PortableFSApp.xcodeproj/project.pbxproj"),
   "utf8"
@@ -205,14 +126,6 @@ const macOS26DevelopmentHost = await readFile(
   path.join(root, "swift/PortableFSKitDev/PortableFSKitDev/HostApp.swift"),
   "utf8"
 );
-const macOS27DevelopmentHost = await readFile(
-  path.join(
-    root,
-    "swift/PortableFSKitMacOS27Dev/PortableFSKitMacOS27Dev/HostApp.swift"
-  ),
-  "utf8"
-);
-
 const failures = [];
 const versionMatch = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\n$/.exec(
   versionFile
@@ -224,44 +137,13 @@ const requireText = (source, text, label) => {
   if (!source.includes(text)) failures.push(`missing ${label}`);
 };
 
-const qualificationName = "PortableFSKitMacOS27IOQualification";
-const qualificationBundleID = "dev.portablefs.oss.KitDev.IOQualification";
-for (const contract of [
-  "NSNetworkVolumesUsageDescription",
-  "qualification-only app to verify data I/O",
-]) {
-  requireText(qualificationInfo, contract, `qualification Info.plist ${contract}`);
-}
-for (const contract of [
-  "case basic",
-  'case dataRefresh = "data-refresh"',
-  "namespace and attribute cross-client qualification is intentionally unsupported",
-  'expectedFileSystemType = "pfs"',
-  'expectedSourcePrefix = "dev.portablefs.oss://"',
-  "same open file descriptor did not observe the expected refreshed data",
-  "kernel mount identity changed during qualification",
-]) {
-  requireText(qualificationSource, contract, `qualification boundary ${contract}`);
-}
-for (const forbidden of [
-  "com.apple.security.application-groups",
-  "CODE_SIGN_ENTITLEMENTS",
-  "portablefsd",
-  "bind-root",
-  "namespace-refresh",
-  "attribute-refresh",
-]) {
-  if (qualificationSource.includes(forbidden) || qualificationInfo.includes(forbidden)) {
-    failures.push(`qualification app gained forbidden product surface ${forbidden}`);
-  }
-}
 for (const contract of [
   "updateSession.HostProcessWitness()",
   "hostWitness.RequireCurrentExecutable(expectedHostExecutable)",
   "const darwinProcessNameLimit = len(unix.ExternProc{}.P_comm) - 1",
   "p_comm is only a conservative rejection filter",
 ]) {
-  requireText(cliMacOSInstaller, contract, `prepared host process witness ${contract}`);
+   requireText(cliMacOSInstaller, contract, `prepared host process witness ${contract}`);
 }
 for (const contract of [
   "type ProcessWitness struct",
@@ -279,57 +161,6 @@ for (const contract of [
 ]) {
   requireText(hostProcessWitnessNative, contract, `native process witness ${contract}`);
 }
-for (const contract of [
-  `name = ${qualificationName};`,
-  `productName = ${qualificationName};`,
-  `PRODUCT_BUNDLE_IDENTIFIER = ${qualificationBundleID};`,
-  "IOQualification/Info.plist",
-]) {
-  requireText(qualificationProject, contract, `isolated qualification target ${contract}`);
-}
-const qualificationSkips = qualificationProject.match(/SKIP_INSTALL = YES;/g) ?? [];
-if (qualificationSkips.length !== 4) {
-  failures.push("macOS 27 project must mark the extension and qualification app non-installable in both configurations");
-}
-for (const configID of [
-  "100000000000000000000771",
-  "100000000000000000000772",
-]) {
-  const start = qualificationProject.indexOf(`\t\t${configID} /*`);
-  const end = qualificationProject.indexOf("\n\t\t};", start);
-  const config = start >= 0 && end > start
-    ? qualificationProject.slice(start, end)
-    : "";
-  if (!config || config.includes("CODE_SIGN_ENTITLEMENTS") || config.includes("MARKETING_VERSION")) {
-    failures.push(`qualification configuration ${configID} gained entitlements or the shipping release version`);
-  }
-}
-for (const contract of [
-  `BlueprintName = "${qualificationName}"`,
-  'buildImplicitDependencies = "NO"',
-  'buildForArchiving = "NO"',
-  'buildForTesting = "NO"',
-  'buildForProfiling = "NO"',
-]) {
-  requireText(qualificationScheme, contract, `qualification-only scheme ${contract}`);
-}
-if (macOS27HostScheme.includes(qualificationName)) {
-  failures.push("macOS 27 development host scheme embeds or builds the qualification app");
-}
-for (const [label, contents] of [
-  ["installer", installer],
-  ["packager", packager],
-  ["release workflow", workflow],
-  ["CI workflow", ciWorkflow],
-  ["GoReleaser", goreleaser],
-  ["shipping Xcode project", productionProject],
-  ["macOS 26 development project", macOS26DevelopmentProject],
-]) {
-  if (contents.includes(qualificationName) || contents.includes(qualificationBundleID)) {
-    failures.push(`${label} references the qualification-only application`);
-  }
-}
-
 requireText(installer, "gh_version=2.93.0", "pinned GitHub CLI version");
 requireText(
   packager,
@@ -461,7 +292,7 @@ for (const { relativePath, contents } of appGroupBuildInputs) {
     "$(PORTABLEFS_APP_GROUP)",
     `${relativePath} exact app-group build setting`
   );
-  if (/\/(App|PortableFSKitDev|PortableFSKitMacOS27Dev)\/Info\.plist$/.test(relativePath)) {
+  if (/\/(App|PortableFSKitDev)\/Info\.plist$/.test(relativePath)) {
     requireText(contents, "<key>NSLocalNetworkUsageDescription</key>", `${relativePath} local network purpose`);
     requireText(contents, "<key>NSNetworkVolumesUsageDescription</key>", `${relativePath} network volume access purpose`);
   }
@@ -479,23 +310,6 @@ for (const { relativePath, contents } of appGroupBuildConfigs) {
     "PORTABLEFS_SERVICE_SIGN_IDENTITY = Developer ID Application: TrendUp AI, Inc. (B47U2LLKHW)",
     `${relativePath} explicit daemon Developer ID identity`
   );
-}
-for (const { relativePath, contents } of appGroupBuildConfigs) {
-  if (relativePath === "swift/PortableFSKitMacOS27Dev/Config/Development.xcconfig") {
-    const qualificationLines = contents.match(
-      /^PORTABLEFS_NATIVE_QUALIFICATION = sdk27-live-qualification-only$/gm
-    ) ?? [];
-    if (qualificationLines.length !== 1) {
-      failures.push(`${relativePath} must carry the one exact native qualification stamp`);
-    }
-  } else {
-    const emptyQualificationLines = contents.match(
-      /^PORTABLEFS_NATIVE_QUALIFICATION =$/gm
-    ) ?? [];
-    if (emptyQualificationLines.length !== 1 || contents.includes("sdk27-live-qualification-only")) {
-      failures.push(`${relativePath} must explicitly force an empty native qualification`);
-    }
-  }
 }
 for (const { relativePath, contents } of [
   {
@@ -539,20 +353,6 @@ for (const { relativePath, contents } of developmentProjects) {
     requireText(contents, contract, `${relativePath} sealed helper build ${contract}`);
   }
 }
-for (const { relativePath, phaseValue, contents } of qualificationPhaseProjects) {
-  const occurrences = contents.split(phaseValue).length - 1;
-  if (occurrences !== 1) {
-    failures.push(
-      `${relativePath} must seal its native qualification exactly once at the embed-phase command`
-    );
-  }
-  if (
-    phaseValue === "PORTABLEFS_NATIVE_QUALIFICATION= " &&
-    contents.includes("PORTABLEFS_NATIVE_QUALIFICATION=sdk27-live-qualification-only ")
-  ) {
-    failures.push(`${relativePath} contains the macOS 27 development qualification`);
-  }
-}
 for (const signedHelperContract of [
   'script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)',
   'repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)',
@@ -565,12 +365,6 @@ for (const signedHelperContract of [
   'required_go_version=$(/usr/bin/awk',
   'actual_go_version=$(printf \'%s\\n\' "$go_version" | /usr/bin/awk \'{ print $3 }\')',
   'GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" "$portablefs_go" build',
-  'case "$native_qualification" in',
-  "sdk27-live-qualification-only)",
-  'qualification_build_tags=portablefs_macos27_qualification',
-  'set -- -tags "$qualification_build_tags"',
-  'if [ "$tool" = portablefs ] && [ -n "$native_qualification" ]',
-  "github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli.nativeFSKitPolicyQualification=$native_qualification",
   "signed PortableFS builds require an explicit Developer ID Application identity for the daemon service",
   '"Developer ID Application: "*',
   '--sign "$PORTABLEFS_SERVICE_SIGN_IDENTITY"',
@@ -590,82 +384,32 @@ for (const signedHelperContract of [
 for (const contract of [
   "type macOSInstallCodeIdentityPolicy uint8",
   "macOSInstallDeveloperIDRelease",
-  "macOSInstallAppleDevelopmentQualification",
-  "macOSInstallAppleDevelopmentRecoverySource",
-  'appName:               macOSAppName',
-  'appExecutable:         macOSAppExecutable',
-  'extensionExecutable:   macOSExtensionExecutable',
-  'serviceMinimumOS:      "26.0"',
-  'codeIdentity:          macOSInstallDeveloperIDRelease',
-  'installedCodeIdentity: macOSInstallDeveloperIDRelease',
-  "installedMacOSCodeIdentityForHostHash(",
-  "hostCodeDirectoryHash == layout.installedRecovery.hostCodeDirectoryHash",
+  'appName:             macOSAppName',
+  'appExecutable:       macOSAppExecutable',
+  'extensionExecutable: macOSExtensionExecutable',
+  'serviceMinimumOS:    "26.0"',
+  'codeIdentity:        macOSInstallDeveloperIDRelease',
   "validateInstalledMacOSBundleForPublicationWithLayout(",
-  "layout.installedCodeIdentity",
-  "validateRecoveryCodeDirectoryIdentity(",
   "return runInstallMacOSAppWithLayout(",
   "validateMacOSInstallSourceWithLayout(sourceApp, layout)",
   "validateMacOSBundleForPublicationWithLayout(",
   "validateMacOSSigningAuthorities(",
   "decodeExactCodeEntitlements(entitlements, tempRoot)",
   'entitlements["com.apple.security.application-groups"]',
-  "validateExactEntitlementDictionary(observed, wanted, code)",
   "signed %s must carry no entitlements",
-  "currentMacOSProvisioningUDID()",
-  "validateQualificationProfileLayout(app, profilePath)",
-  "qualification app must contain exactly its extension profile",
-  "qualification extension profile does not authorize this exact Mac provisioning UDID",
-  'plistNativeExtract(profilePath, "Entitlements", "dictionary", "xml1")',
-  "result.DeveloperCertificates, err = plistNativeDataArray(",
-  'profilePath, "DeveloperCertificates",',
-  'plistNativeDate(profilePath, "CreationDate")',
-  'plistNativeDate(profilePath, "ExpirationDate")',
-  '"/usr/bin/codesign", "-d", "--extract-certificates="+prefix, code',
-  "qualification extension profile does not authorize its exact signing certificate",
 ]) {
-  requireText(cliMacOSInstaller, contract, `immutable macOS installer layout ${contract}`);
+   requireText(cliMacOSInstaller, contract, `immutable macOS installer layout ${contract}`);
 }
 for (const forbidden of [
   'plistStringArray(entitlementPath, "com.apple.security.application-groups")',
   'Print :com.apple.security.application-groups',
-  "convert qualification extension profile",
 ]) {
   if (cliMacOSInstaller.includes(forbidden)) {
     failures.push(`macOS installer parses literal dotted entitlement keys as paths: ${forbidden}`);
   }
 }
-for (const forbidden of [
-  "PORTABLEFS_INSTALL_LAYOUT",
-  "PORTABLEFS_APP_NAME",
-  "PORTABLEFS_EXTENSION_NAME",
-]) {
-  if (cliMacOSInstaller.includes(forbidden)) {
-    failures.push(`macOS installer layout became runtime-configurable through ${forbidden}`);
-  }
-}
-for (const contract of [
-  "//go:build darwin && portablefs_macos27_qualification",
-  'appName:               "PortableFSKitDev.app"',
-  'stagedAppName:         "PortableFSKitDev.next"',
-  'appExecutable:         "PortableFSKitDev"',
-  'extensionExecutable:   "PortableFSDev"',
-  'serviceMinimumOS:      "27.0"',
-  'requiredAppID:         "dev.portablefs.oss.KitDev"',
-  "codeIdentity:          macOSInstallAppleDevelopmentQualification",
-  "installedCodeIdentity: macOSInstallAppleDevelopmentQualification",
-  'hostCodeDirectoryHash:      "f09258ec96fa0e468b91c51005e6f76bee16a660"',
-  'extensionCodeDirectoryHash: "311e2cc459ec796bc88de293957dc3079a579d45"',
-  'cliCodeDirectoryHash:       "027789129c4e749ef4b89887abca1be097d49a56"',
-  'serviceCodeDirectoryHash:   "076636f6ffb95880c83d72fefe08e1a50b126f7d"',
-  'daemonExecutableSHA256:     "eb2d4f8225f11076ddc76bd6208503d5068dc8d7105ddb47b74e4d9748b63a84"',
-  'name:    "install-macos27-qualification-app"',
-  'func qualificationCommandHelp(name string) (string, bool)',
-]) {
-  requireText(macOS27QualificationLayout, contract, `macOS 27 qualification layout ${contract}`);
-}
 for (const [source, label] of [
   [macOS26DevelopmentHost, "macOS 26 development host"],
-  [macOS27DevelopmentHost, "macOS 27 development host"],
 ]) {
   for (const contract of [
     "resumeNormalLifecycle: { [weak self] in",
@@ -675,66 +419,6 @@ for (const [source, label] of [
   ]) {
     requireText(source, contract, `${label} resumed presentation ${contract}`);
   }
-}
-for (const contract of [
-  'UserDefaults.standard.set(state, forKey: "PFSLaunchAgentState")',
-  'UserDefaults.standard.set(detail, forKey: "PFSLaunchAgentDetail")',
-  "presentation-only diagnostics",
-]) {
-  requireText(macOS27DevelopmentHost, contract, `macOS 27 diagnostic presentation ${contract}`);
-}
-for (const forbiddenRead of [
-  'string(forKey: "PFSLaunchAgentState")',
-  'object(forKey: "PFSLaunchAgentState")',
-  'bool(forKey: "PFSLaunchAgentState")',
-]) {
-  if (macOS27DevelopmentHost.includes(forbiddenRead)) {
-    failures.push(`macOS 27 host treats presentation defaults as authority: ${forbiddenRead}`);
-  }
-}
-for (const contract of [
-  "//go:build darwin && portablefs_macos27_qualification",
-  "runInstallMacOSAppWithLayout(",
-  "macOS27QualificationInstallLayout",
-  "macOS27QualificationInstallerAdmitted(nativeFSKitPolicyQualification)",
-  "return stamp == sdk27QualificationStamp",
-]) {
-  requireText(macOS27QualificationCommand, contract, `tagged qualification installer ${contract}`);
-}
-requireText(
-  disabledQualificationLayout,
-  "//go:build !darwin || !portablefs_macos27_qualification",
-  "production qualification command exclusion build constraint"
-);
-requireText(
-  disabledQualificationLayout,
-  'func qualificationCommandHelp(string) (string, bool) { return "", false }',
-  "production qualification help exclusion"
-);
-requireText(
-  cliCommands,
-  "return append(commands, qualificationCommands()...)",
-  "compile-time qualification command registration"
-);
-for (const forbiddenSource of [installer, packager, workflow, ciWorkflow, goreleaser]) {
-  if (forbiddenSource.includes("portablefs_macos27_qualification")) {
-    failures.push("shipping/release lane can compile the macOS 27 qualification installer tag");
-  }
-}
-for (const canonicalDevOutput of [
-  "path = PortableFSKitDev.app;",
-  "productName = PortableFSKitDev;",
-  "PRODUCT_NAME = PortableFSKitDev;",
-]) {
-  requireText(
-    qualificationProject,
-    canonicalDevOutput,
-    `canonical macOS 27 development bundle ${canonicalDevOutput}`
-  );
-}
-if (qualificationProject.includes("path = PortableFSKitMacOS27Dev.app;") ||
-    qualificationProject.includes("PRODUCT_NAME = PortableFSKitMacOS27Dev;")) {
-  failures.push("macOS 27 development target still emits a noncanonical app or executable name");
 }
 if (helperEmbedder.includes('Contents/Helpers/portablefsd')) {
   failures.push("embedded daemon retained the obsolete raw Helpers path");
@@ -770,7 +454,6 @@ for (const unsignedBuildVerification of [
   '[ "$daemon_group" = "$app_group" ]',
   'PORTABLEFS_APP_GROUP="$app_group"',
   'PORTABLEFS_GO="$go_binary"',
-  "PORTABLEFS_NATIVE_QUALIFICATION=",
   'go_root=$(GOTOOLCHAIN=auto "$go_candidate" -C "$repo_root/vcs" env GOROOT)',
   '[ "$actual_go_version" = "$required_go_version" ]',
 ]) {
@@ -910,7 +593,7 @@ requireText(
 for (const cliControlContract of [
   'filepath.Join(home, ".local", "state", "portablefs", "portablefsd", "control.sock")',
   "apphost.LaunchContainingApp(executable)",
-  '"/v1/attaches/"+url.PathEscape(ref)+"/frontend-preflight"',
+  '"/v2/attaches/"+url.PathEscape(ref)+"/frontend-preflight"',
 ]) {
   requireText(cliFSKit, cliControlContract, `unentitled CLI control contract ${cliControlContract}`);
 }
@@ -1184,13 +867,12 @@ for (const forbiddenSwiftPMWorkaround of [
     failures.push(`Swift verification retains workaround ${forbiddenSwiftPMWorkaround}`);
   }
 }
-// The v3 tree publishes exactly two trust chains: the Linux archives (Sigstore
-// provenance) and the notarized macOS app. The journal-era control-plane
-// container images are gone, so the release workflow must not push any image.
-for (const retiredControlPlane of ["ghcr.io", "docker/build-push-action", "Dockerfile"]) {
-  if (workflow.includes(retiredControlPlane)) {
-    failures.push(`release workflow still publishes retired control-plane images (${retiredControlPlane})`);
-  }
+for (const contract of [
+  "run ./internal/daemonctl/seal",
+  '"$service_contents/Resources/PortableFSProtocol.json"',
+]) requireText(helperEmbedder, contract, `sealed protocol producer ${contract}`);
+for (const contract of ["daemonctl.DecodeSealedProtocols", "protocols.ControlProtocol", "protocols.PFSLocalMajor", "targetRelease.ControlProtocol != daemonctl.ControlProtocolVersion"]) {
+  requireText(cliMacOSInstaller, contract, `exact sealed protocol pairing ${contract}`);
 }
 
 if (failures.length > 0) {

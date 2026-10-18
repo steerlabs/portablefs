@@ -169,7 +169,6 @@ jobs:
             -derivedDataPath "$derived" \
             PORTABLEFS_APP_GROUP="$expected_group" \
             MARKETING_VERSION="$expected_version" \
-            PORTABLEFS_NATIVE_QUALIFICATION= \
             PORTABLEFS_GO="$(realpath "$(command -v go)")" \
             CODE_SIGNING_ALLOWED=NO \
             build

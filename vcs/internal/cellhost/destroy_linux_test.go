@@ -5,6 +5,7 @@ package cellhost
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,7 +148,7 @@ func (fixture *placementFixture) provision(t *testing.T) {
 	writeTestFile(t, filepath.Join(fixture.unitRoot, authorityServiceDropInDirectory(testVolumeID), "10-portablefs.conf"), "[Service]\n")
 	writeTestFile(t, filepath.Join(fixture.unitRoot, authoritySocketDropInDirectory(testVolumeID), "10-portablefs.conf"), "[Socket]\n")
 	writeTestFile(t, filepath.Join(fixture.configRoot, testVolumeID, "authority-1.csr"), "csr")
-	writeTestFile(t, filepath.Join(fixture.stateRoot, testVolumeID, visibilityMembershipName), membershipDocument(testVolumeID))
+	writeTestFile(t, filepath.Join(fixture.stateRoot, testVolumeID, mountmembership.Filename), membershipDocument(testVolumeID))
 }
 
 func (fixture *placementFixture) input() DestroyInput {

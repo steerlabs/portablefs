@@ -41,50 +41,6 @@ func TestLinuxReleaseInstallerActivatesImmutablePair(t *testing.T) {
 	assertLinuxInstallLayout(t, result2)
 }
 
-func TestLinuxReleaseInstallerRefusesValidatedLegacyPairWithoutMutation(t *testing.T) {
-	installer := testLinuxInstaller(t, "source-v1")
-	linkDir := filepath.Join(installer.home, ".local", "bin")
-	if err := os.MkdirAll(linkDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeTestInstallerBinary(t, filepath.Join(linkDir, "portablefs"), "legacy-cli")
-	writeTestInstallerBinary(t, filepath.Join(linkDir, "portablefsd"), "legacy-daemon")
-
-	_, err := installer.install()
-	if err == nil || !strings.Contains(err.Error(), "archive or remove those exact files explicitly") {
-		t.Fatalf("legacy pair refusal = %v", err)
-	}
-	for _, name := range []string{"portablefs", "portablefsd"} {
-		data, readErr := os.ReadFile(filepath.Join(linkDir, name))
-		if readErr != nil || !strings.Contains(string(data), "legacy") {
-			t.Fatalf("legacy %s was changed: %q, %v", name, data, readErr)
-		}
-	}
-}
-
-func TestLinuxReleaseInstallerRefusesLegacyDaemonBesideManagedActivation(t *testing.T) {
-	installer := testLinuxInstaller(t, "source-v1")
-	result, err := installer.install()
-	if err != nil {
-		t.Fatal(err)
-	}
-	orphan := filepath.Join(filepath.Dir(result.CLILink), "portablefsd")
-	writeTestInstallerBinary(t, orphan, "legacy-daemon")
-
-	second := testLinuxInstallerAt(t, installer.home, installer.stateDir, installer.sourceDir, "source-v1")
-	second.procRoot = installer.procRoot
-	second.mountInfoPath = installer.mountInfoPath
-	second.runBinary = fakeInstallerBinary
-	if _, err := second.install(); err == nil || !strings.Contains(err.Error(), "archive or remove that exact file explicitly") {
-		t.Fatalf("legacy sibling refusal = %v", err)
-	}
-	data, readErr := os.ReadFile(orphan)
-	if readErr != nil || string(data) != "legacy-daemon" {
-		t.Fatalf("legacy sibling changed: %q, %v", data, readErr)
-	}
-	assertLinuxInstallLayout(t, result)
-}
-
 func TestLinuxReleaseInstallerRejectsUnknownActivation(t *testing.T) {
 	installer := testLinuxInstaller(t, "source-v1")
 	linkDir := filepath.Join(installer.home, ".local", "bin")
@@ -96,7 +52,7 @@ func TestLinuxReleaseInstallerRejectsUnknownActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := installer.install()
-	if err == nil || !strings.Contains(err.Error(), "matching daemon") {
+	if err == nil || !strings.Contains(err.Error(), "must be a managed PortableFS symlink") {
 		t.Fatalf("unknown activation error = %v", err)
 	}
 	data, readErr := os.ReadFile(activation)
@@ -494,8 +450,6 @@ func fakeInstallerBinary(path string, args ...string) ([]byte, error) {
 			return nil, fmt.Errorf("unexpected CLI argument %q", args[0])
 		}
 		switch {
-		case strings.Contains(payload, "legacy"):
-			return []byte("portablefs 0.9.0\n"), nil
 		case strings.Contains(payload, "source"):
 			return []byte("portablefs 1.2.3\n"), nil
 		}
@@ -504,8 +458,6 @@ func fakeInstallerBinary(path string, args ...string) ([]byte, error) {
 			return nil, fmt.Errorf("unexpected daemon argument %q", args[0])
 		}
 		switch {
-		case strings.Contains(payload, "legacy"):
-			return []byte("0.9.0\n"), nil
 		case strings.Contains(payload, "source"):
 			return []byte("1.2.3\n"), nil
 		}

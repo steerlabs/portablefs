@@ -498,3 +498,13 @@ func TestEffectiveVolumePlanInheritsEnclosingTrust(t *testing.T) {
 		t.Fatal("effective host configuration did not inherit exact enclosing trust")
 	}
 }
+
+func TestHelperStateKeepsExactVersionTwoWithPlanThree(t *testing.T) {
+	state, err := loadState(filepath.Join(t.TempDir(), "helper.state"), "11111111-1111-4111-8111-111111111111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Version != 2 || state.PlanVersionApplied != 3 {
+		t.Fatalf("helper/plan versions = %d/%d", state.Version, state.PlanVersionApplied)
+	}
+}

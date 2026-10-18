@@ -4,37 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
-// The macOS 26 revocation watchdog.
-//
-// A strict mount commits to a repair budget: when that budget elapses without
-// an authority round trip, the mount must make its own kernel's cached state
-// unservable. Linux FUSE self-revokes — Mount.revoke withdraws every binding
-// and aborts the connection. macOS 26 FSKit exposes no API that proves
-// already-cached kernel state became unservable, so the Swift runner can only
-// detect and terminate; pages the kernel already holds keep answering reads
-// on open descriptors with no callback the extension could refuse.
-//
-// The one mechanism macOS does provide is forced unmount: revoking the
-// covered vnodes at the VFS layer dead-ends every cached page, which is
-// exactly the semantic the contract needs. The forced unmount cannot live in
-// portablefsd — a dead daemon cannot unmount anything — so it lives here, in
-// the per-mount supervisor process, which is already daemon-independent,
-// already owns the mount's state record, and already watches the kernel
-// mount table. The supervisor probes the daemon at one third of the repair
-// budget (the same ratio the coherence contract fixes for the frontend's
-// authority-contact watchdog) and force-unmounts the exact kernel mount when
-// the session is terminal, the daemon is gone, or the daemon no longer owns
-// the attach.
-//
-// What this bounds: the stale window of a cached read on an already-open
-// descriptor after the daemon dies is at most probe-confirmation time plus
-// one forced unmount, which fits inside the authority's one-budget fencing
-// grace. What it cannot bound — bytes a process already copied into its own
-// memory — no platform bounds; Linux cannot either.
+// The supervisor observes terminal daemon state independently of the daemon
+// process. Forced detach is best effort kernel enforcement after a confirmed
+// terminal/absent owner; it supplies no immediate cache-revocation guarantee.
+const fskitStatusProbeInterval = 5 * time.Second
+const fskitForcedDetachTimeout = 5 * time.Second
 
 // fskitRevocationProbeResult is one observation of the daemon and attach.
 type fskitRevocationProbeResult struct {
@@ -44,9 +20,6 @@ type fskitRevocationProbeResult struct {
 	sessionTerminal bool
 }
 
-// fskitRevocationConfirmations is how many consecutive failed probes prove
-// the daemon (or its ownership of the attach) is gone rather than briefly
-// busy. Two probes at a third of the budget keep detection under one budget.
 const fskitRevocationConfirmations = 2
 
 type fskitRevocationWatchdog struct {
@@ -63,7 +36,7 @@ type fskitRevocationWatchdog struct {
 func newFSKitRevocationWatchdog(probe func() fskitRevocationProbeResult) *fskitRevocationWatchdog {
 	return &fskitRevocationWatchdog{
 		probe:    probe,
-		interval: mountv3.RepairBudget / 3,
+		interval: fskitStatusProbeInterval,
 		lastResult: fskitRevocationProbeResult{
 			daemonHealthy: true, attachPresent: true,
 		},
@@ -97,11 +70,11 @@ func (w *fskitRevocationWatchdog) decide(result fskitRevocationProbeResult) (boo
 	switch {
 	case result.daemonHealthy && result.attachPresent && result.sessionTerminal:
 		// Definitive on one probe: the daemon itself reports the session can
-		// never repair the kernel's caches again.
+		// never serve this mount again.
 		w.unhealthy = 0
 		return true, fskitRevocationVerdict{
 			reason:   mountRevokedSessionTerminal,
-			sentence: "the v3 authority session is terminal and can never repair this kernel's caches again",
+			sentence: "the v3 authority session is terminal and can never serve this mount again",
 		}
 	case result.daemonHealthy && result.attachPresent:
 		// A detaching attach is owned by a running unmount transaction whose
@@ -116,12 +89,12 @@ func (w *fskitRevocationWatchdog) decide(result fskitRevocationProbeResult) (boo
 	if !w.lastResult.daemonHealthy {
 		return true, fskitRevocationVerdict{
 			reason:   mountRevokedDaemonUnreachable,
-			sentence: "portablefsd stopped answering; nothing can repair this kernel's caches",
+			sentence: "portablefsd stopped answering; no live daemon owns this mount",
 		}
 	}
 	return true, fskitRevocationVerdict{
 		reason:   mountRevokedAttachNotOwned,
-		sentence: "portablefsd no longer owns this attach; nothing can repair this kernel's caches",
+		sentence: "portablefsd no longer owns this attach; no live daemon owns this mount",
 	}
 }
 
@@ -153,7 +126,7 @@ func fskitRevocationProber(controlSock string, st *mountState) func() fskitRevoc
 		attach, err := recordedFskitAttachStatus(ctl, st)
 		switch {
 		case err != nil && errors.Is(err, errFskitAttachIdentityMismatch):
-			// The ref names somebody else's mount now; ours is unrepairable.
+			// The ref names somebody else's mount now; ours is terminal.
 			return fskitRevocationProbeResult{daemonHealthy: true}
 		case err != nil:
 			return fskitRevocationProbeResult{}
@@ -185,14 +158,7 @@ func forceRevokeFSKitKernelMount(st *mountState) error {
 	if !present {
 		return nil
 	}
-	// One attempt is bounded to a third of the repair budget — the watchdog's
-	// own probe interval — never the operator-scale platform budget: the
-	// revocation exists to fit inside the authority's one-budget fencing
-	// grace, and a helper allowed to block for 30 seconds would blow through
-	// the very bound it enforces. A wedged attempt is abandoned and retried
-	// at the next watchdog interval; a kernel that refuses forced unmount
-	// within the grace is the residual the coherence contract records.
-	ops := platformUnmountOpsSource(mountv3.RepairBudget / 3)
+	ops := platformUnmountOpsSource(fskitForcedDetachTimeout)
 	argv := []string{"/sbin/umount", "-f", st.MountPath}
 	out, err := ops.combinedOut(argv[0], argv[1:]...)
 	if err != nil {

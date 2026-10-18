@@ -185,7 +185,7 @@ func TestLifecycleHoldInstallExclusiveRejectsLiveDaemonAttach(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(controlSocket) })
 	expectedSHA256 := strings.Repeat("a", 64)
-	e.daemonAttachStatusesFn = func(expected *daemonctl.Identity) (map[string]cliAttachStatus, error) {
+	e.daemonLifecycleInventoryFn = func(expected *daemonctl.Identity) (int, error) {
 		if expected == nil ||
 			expected.DaemonVersion != "0.2.2" ||
 			expected.ExecutableSHA256 != expectedSHA256 ||
@@ -193,9 +193,7 @@ func TestLifecycleHoldInstallExclusiveRejectsLiveDaemonAttach(t *testing.T) {
 			expected.PFSLocalMinor != 13 {
 			t.Fatalf("expected old daemon identity = %+v", expected)
 		}
-		return map[string]cliAttachStatus{
-			"att_live": {AttachRef: "att_live"},
-		}, nil
+		return 1, nil
 	}
 	if rc := e.run([]string{
 		"lifecycle", "hold-install-exclusive", "--json",
@@ -274,7 +272,7 @@ func TestLifecycleHoldInstallExclusiveRejectsDurableDaemonAttach(t *testing.T) {
 	}
 	mountPath := filepath.Join(t.TempDir(), "mounted")
 	registry := fmt.Sprintf(
-		"{\"version\":2,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"branch\":\"main\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"options\":{},\"identityEpoch\":1}]}\n",
+		"{\"version\":3,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"identityEpoch\":1}]}\n",
 		attachRef,
 		mountPath,
 	)
@@ -308,7 +306,7 @@ func TestInstallerGateRejectsStartingIntent(t *testing.T) {
 	stateDir := t.TempDir()
 	mountDir := filepath.Join(stateDir, "mounts")
 	mountPath := filepath.Join(t.TempDir(), "mount")
-	operation, err := acquireMountOperation(mountDir, mountPath, "volume", "main", "fuse")
+	operation, err := acquireMountOperation(mountDir, mountPath, "volume", "fuse")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +330,7 @@ func TestInstallerGateRejectsPersistedAttachWithoutDaemon(t *testing.T) {
 	}
 	mountPath := filepath.Join(t.TempDir(), "mount")
 	registry := fmt.Sprintf(
-		"{\"version\":2,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"branch\":\"main\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"options\":{},\"identityEpoch\":1}]}\n",
+		"{\"version\":3,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"identityEpoch\":1}]}\n",
 		attachRef, mountPath,
 	)
 	if err := privatepath.WriteFileAtomic(filepath.Join(daemonStateDir, "attaches.json"), []byte(registry)); err != nil {

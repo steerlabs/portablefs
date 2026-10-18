@@ -163,10 +163,10 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	var expectedPFSLocalMajor uint
 	var expectedPFSLocalMinor uint
 	fs.BoolVar(&jsonOut, "json", false, "write the versioned service-update readiness handshake")
-	fs.StringVar(&expectedDaemonVersion, "expected-daemon-version", "", "previously registered daemon version")
-	fs.StringVar(&expectedDaemonSHA256, "expected-daemon-sha256", "", "previously registered daemon executable SHA-256")
-	fs.UintVar(&expectedPFSLocalMajor, "expected-pfslocal-major", 0, "previously registered daemon pfslocal major")
-	fs.UintVar(&expectedPFSLocalMinor, "expected-pfslocal-minor", 0, "previously registered daemon pfslocal minor")
+	fs.StringVar(&expectedDaemonVersion, "expected-daemon-version", "", "authenticated live daemon version")
+	fs.StringVar(&expectedDaemonSHA256, "expected-daemon-sha256", "", "authenticated live daemon executable SHA-256")
+	fs.UintVar(&expectedPFSLocalMajor, "expected-pfslocal-major", 0, "authenticated live daemon pfslocal major")
+	fs.UintVar(&expectedPFSLocalMinor, "expected-pfslocal-minor", 0, "authenticated live daemon pfslocal minor")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		return e.handleParseError("lifecycle", err)
@@ -248,7 +248,7 @@ func parseExpectedDaemonIdentity(
 	}
 	if !versionPresent || !sha256Present || !majorPresent || !minorPresent ||
 		version == "" || sha256 == "" || pfslocalMajor == 0 {
-		return nil, fmt.Errorf("the expected old daemon identity requires version, SHA-256, pfslocal major, and pfslocal minor together")
+		return nil, fmt.Errorf("the expected outgoing daemon identity requires version, SHA-256, pfslocal major, and pfslocal minor together")
 	}
 	if len(version) > 128 || strings.IndexFunc(version, func(r rune) bool {
 		return r < 0x21 || r > 0x7e
@@ -263,8 +263,8 @@ func parseExpectedDaemonIdentity(
 		return nil, fmt.Errorf("expected pfslocal version is outside uint32")
 	}
 	return &daemonctl.Identity{
-		SchemaVersion:    daemonctl.IdentitySchemaVersion,
-		ControlProtocol:  daemonctl.ControlProtocolVersion,
+		SchemaVersion: daemonctl.IdentitySchemaVersion,
+
 		DaemonVersion:    version,
 		ExecutableSHA256: sha256,
 		PFSLocalMajor:    uint32(pfslocalMajor),
@@ -320,16 +320,16 @@ func (e *cmdEnv) strictAccountInventory(
 			len(persisted), persisted[0].AttachRef, persisted[0].MountPath, persisted[0].MountPath, action,
 		)
 	}
-	cfg, err := fskitConfigFromEnv(e.getenv)
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return inventory, err
 	}
 	if _, err := os.Lstat(cfg.controlSock); err == nil {
-		statuses, listErr := e.daemonAttachStatuses(expectedIdentity)
+		count, listErr := e.daemonLifecycleInventory(expectedIdentity)
 		if listErr != nil {
 			return inventory, fmt.Errorf("strict daemon attach inventory: %w", listErr)
 		}
-		inventory.LiveAttaches = len(statuses)
+		inventory.LiveAttaches = count
 	} else if !os.IsNotExist(err) {
 		return inventory, fmt.Errorf("inspect daemon control socket: %w", err)
 	}
@@ -352,8 +352,8 @@ func rejectDurableMountAnchors(stateDir string) error {
 	if len(states) != 0 {
 		state := states[0]
 		return fmt.Errorf(
-			"%d mount record(s) remain (for example %s@%s at %s); run `portablefs umount %s` to reconcile them before installing",
-			len(states), state.VolumeID, state.Branch, state.MountPath, state.MountPath,
+			"%d mount record(s) remain (for example %s at %s); run `portablefs umount %s` to reconcile them before installing",
+			len(states), state.VolumeID, state.MountPath, state.MountPath,
 		)
 	}
 	intents, err := listMountIntents(mountStateDir)

@@ -459,7 +459,6 @@ func TestReauthorizeCommandDeliversCredentialToExactLiveFuseSupervisor(t *testin
 	defer control.Close()
 
 	state := validFuseMountState(t, mountPath)
-	state.Branch = ""
 	state.Engine = mountEngineFuseV3
 	state.DataPlaneTransport = dataPlaneTransportTLSSystemPKI
 	state.DataPlaneServerName = "authority.example"
@@ -515,7 +514,6 @@ func TestReauthorizeCommandRefusesAnAutomaticallyOwnedMountBeforeDelivery(t *tes
 		t.Fatal(err)
 	}
 	state := validFuseMountState(t, mountPath)
-	state.Branch = ""
 	state.Engine = mountEngineFuseV3
 	state.DataPlaneTransport = dataPlaneTransportTLSSystemPKI
 	state.DataPlaneServerName = "authority.example"

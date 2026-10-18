@@ -20,12 +20,10 @@ type fuseV3Config struct {
 	token                  string
 	transport              dataPlaneTransport
 	identity               *clientTLSIdentity
-	coherence              string
 	volumeID               string
 	mountPath              string
 	mountInstanceID        string
 	backingRoot            string
-	noLocalDirs            bool
 	requireMountEnrollment bool
 	onRevoked              func(mountRevocation)
 }

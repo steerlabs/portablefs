@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +9,7 @@ import (
 
 func seedMountIntent(t *testing.T, stateDir, mountPath, phase, strategy, attachRef string) {
 	t.Helper()
-	op, err := acquireMountOperation(stateDir, mountPath, "vol_intent", "main", strategy)
+	op, err := acquireMountOperation(stateDir, mountPath, "vol_intent", strategy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,8 +24,10 @@ func seedMountIntent(t *testing.T, stateDir, mountPath, phase, strategy, attachR
 	}
 	if strategy == "fuse" {
 		op.mountMechanism = "direct"
+		op.engine = mountEngineFuseV3
 	} else if strategy == "fskit" {
 		op.mountMechanism = "fskit-system"
+		op.engine = mountEngineDaemonV3
 		op.fsType = defaultFskitType
 	}
 	if err := op.writeIntent(phase, 0, ""); err != nil {
@@ -35,134 +36,6 @@ func seedMountIntent(t *testing.T, stateDir, mountPath, phase, strategy, attachR
 	}
 	if err := op.close(false); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestDetachFUSEPublishesPreparedAndDurablyAborts(t *testing.T) {
-	stateDir := filepath.Join(t.TempDir(), "mounts")
-	mountPath := t.TempDir()
-	op, err := acquireMountOperation(stateDir, mountPath, "vol-intent", "main", "fuse")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer op.close(false)
-	op.mountInstanceID = "mnt_AAAAAAAAAAAAAAAAAAAAAA"
-	op.kernelMountID = "42"
-	op.mountTarget = mountTargetIdentity{device: 1, inode: 2}
-	op.mountMechanism = "direct"
-	op.startedAtMs = 1
-	op.authorityURL = "127.0.0.1:1"
-	op.transportMode = dataPlaneTransportPlaintext
-	if err := op.writeIntent("live", 123, "owner-start"); err != nil {
-		t.Fatal(err)
-	}
-
-	called := 0
-	if err := detachFUSEWithPreparedIntent(op, 123, "owner-start", func() error {
-		called++
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	intent, err := readMountIntent(op.intentPath, mountPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if called != 1 || intent.Phase != "drain-prepared" {
-		t.Fatalf("called=%d intent=%+v", called, intent)
-	}
-
-	if err := op.writeIntent("live", 123, "owner-start"); err != nil {
-		t.Fatal(err)
-	}
-	detachErr := errors.New("injected exact detach refusal")
-	if err := detachFUSEWithPreparedIntent(op, 123, "owner-start", func() error {
-		return detachErr
-	}); !errors.Is(err, detachErr) {
-		t.Fatalf("detach error=%v", err)
-	}
-	intent, err = readMountIntent(op.intentPath, mountPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if intent.Phase != "live" {
-		t.Fatalf("failed detach did not durably restore prior phase: %+v", intent)
-	}
-
-	if err := op.writeIntent("force-prepared", 123, "owner-start"); err != nil {
-		t.Fatal(err)
-	}
-	if err := detachFUSEWithPreparedIntent(op, 123, "owner-start", func() error {
-		return detachErr
-	}); !errors.Is(err, detachErr) {
-		t.Fatalf("forced detach error=%v", err)
-	}
-	intent, err = readMountIntent(op.intentPath, mountPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if intent.Phase != "force-prepared" {
-		t.Fatalf("failed forced detach lost durable force proof: %+v", intent)
-	}
-
-	if err := op.writeIntent("live", 123, "owner-start"); err != nil {
-		t.Fatal(err)
-	}
-	durableIntentPath := op.intentPath
-	if err := detachFUSEWithPreparedIntent(op, 123, "owner-start", func() error {
-		// Simulate the durable intent directory becoming unavailable only
-		// after drain-prepared was published and exact detach failed.
-		op.intentPath = stateDir
-		return detachErr
-	}); err == nil {
-		t.Fatal("rollback persistence failure returned success")
-	} else {
-		var keepFrozen interface{ KeepWritebackFrozen() bool }
-		if !errors.As(err, &keepFrozen) || !keepFrozen.KeepWritebackFrozen() {
-			t.Fatalf("rollback persistence failure did not request a fail-frozen mutation gate: %v", err)
-		}
-	}
-	op.intentPath = durableIntentPath
-	intent, err = readMountIntent(durableIntentPath, mountPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if intent.Phase != "drain-prepared" {
-		t.Fatalf("failed rollback destroyed the durable prepared marker: %+v", intent)
-	}
-}
-
-func TestPreparedIntentRefusesResumeWhileExactOwnerLives(t *testing.T) {
-	identity, err := processStartIdentity(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-	intent := &mountIntent{
-		Phase:                       "drain-prepared",
-		OperationOwnerPID:           os.Getpid(),
-		OperationOwnerStartIdentity: identity,
-	}
-	if !mountIntentOperationOwnerMatches(intent) {
-		t.Fatal("live exact operation owner was treated as abandoned")
-	}
-	intent.OperationOwnerStartIdentity = "different-process-incarnation"
-	if mountIntentOperationOwnerMatches(intent) {
-		t.Fatal("stale operation-owner identity was treated as live")
-	}
-}
-
-func TestPreparedFUSELiveRetryDecision(t *testing.T) {
-	if _, err := preparedFUSERetryDecision("drain-prepared", true, false, false); err == nil {
-		t.Fatal("live fail-frozen drain resumed without explicit force")
-	}
-	if advance, err := preparedFUSERetryDecision("drain-prepared", true, true, false); err != nil || !advance {
-		t.Fatalf("explicit force did not advance live fail-frozen drain: advance=%v err=%v", advance, err)
-	}
-	if advance, err := preparedFUSERetryDecision("force-prepared", true, false, true); err != nil || advance {
-		t.Fatalf("acknowledged force-prepared retry was refused: advance=%v err=%v", advance, err)
-	}
-	if _, err := preparedFUSERetryDecision("force-prepared", true, true, false); err == nil {
-		t.Fatal("live force-prepared retry bypassed missing park acknowledgement")
 	}
 }
 
@@ -255,36 +128,6 @@ func TestDecidePostUnmount(t *testing.T) {
 	}
 }
 
-// TestOwnerlessForceRequestRequiresDurableForceIntent pins what survives of
-// the abandoned-owner force continuation: a v3 mount has no client-side
-// durability debt to park, so the continuation's whole precondition is the
-// DURABLE force authorization — it never acts on an intent it cannot read.
-func TestOwnerlessForceRequestRequiresDurableForceIntent(t *testing.T) {
-	e, _, _ := testEnv(t)
-	stateDir := filepath.Join(t.TempDir(), "mounts")
-	mountPath := t.TempDir()
-	op, err := acquireMountOperation(stateDir, mountPath, "vol-force-request", "main", "fuse")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer op.close(false)
-	state := validFuseMountState(t, mountPath)
-	state.PID = 4_194_000
-	state.ProcessStartIdentity = "dead-owner"
-	hydrateMountOperationFromState(op, &state)
-	if err := op.writeIntent("force-requested", state.PID, state.ProcessStartIdentity); err != nil {
-		t.Fatal(err)
-	}
-	intent, err := readMountIntent(op.intentPath, mountPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.reconcileMountIntent(intent, true); err == nil ||
-		!strings.Contains(err.Error(), "durable force-requested intent") {
-		t.Fatalf("ownerless force request bypassed its durable force authorization: %v", err)
-	}
-}
-
 func TestReconcileFSKitIntentStartsExactDaemon(t *testing.T) {
 	e, _, _, stateDir := umountTestEnv(t)
 	mountPath, err := canonicalMountPath(t.TempDir())
@@ -300,7 +143,6 @@ func TestReconcileFSKitIntentStartsExactDaemon(t *testing.T) {
 	st := mountState{
 		MountPath: intent.MountPath,
 		VolumeID:  intent.VolumeID,
-		Branch:    intent.Branch,
 		AttachRef: intent.AttachRef,
 	}
 	ctl, calls := serveFSKitReconcileControl(t, st, true, false, 200)
@@ -313,33 +155,8 @@ func TestReconcileFSKitIntentStartsExactDaemon(t *testing.T) {
 		return ctl, nil
 	}
 
-	if _, err := e.reconcileMountIntent(intent, true); err != nil {
+	if err := e.reconcileMountIntent(intent, true); err != nil {
 		t.Fatalf("reconcile FSKit intent: %v", err)
-	}
-	if ensures != 1 || calls.unmount.Load() != 1 {
-		t.Fatalf("ensure calls=%d force calls=%d, want 1 each", ensures, calls.unmount.Load())
-	}
-}
-
-func TestForceDetachForUnmountStartsExactDaemon(t *testing.T) {
-	e, _, _, stateDir := umountTestEnv(t)
-	mountPath, err := canonicalMountPath(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := validFSKitMountState(t, mountPath)
-	ctl, calls := serveFSKitReconcileControl(t, st, true, false, 200)
-	ensures := 0
-	e.ensurePortablefsdFn = func(_ fskitConfig, stateRoot, _ string) (*fsdControl, error) {
-		ensures++
-		if stateRoot != filepath.Dir(stateDir) {
-			t.Fatalf("state root=%q want %q", stateRoot, filepath.Dir(stateDir))
-		}
-		return ctl, nil
-	}
-
-	if _, err := e.forceDetachForUnmount(&st); err != nil {
-		t.Fatalf("force detach: %v", err)
 	}
 	if ensures != 1 || calls.unmount.Load() != 1 {
 		t.Fatalf("ensure calls=%d force calls=%d, want 1 each", ensures, calls.unmount.Load())
@@ -355,7 +172,7 @@ func TestNewMountRefusesPriorNonterminalIntent(t *testing.T) {
 				t.Fatal(err)
 			}
 			seedMountIntent(t, stateDir, mountPath, phase, "fskit", "att_AAAAAAAAAAAAAAAAAAAAAA")
-			if op, err := acquireMountOperation(stateDir, mountPath, "vol_new", "main", "fskit"); err == nil {
+			if op, err := acquireMountOperation(stateDir, mountPath, "vol_new", "fskit"); err == nil {
 				_ = op.close(false)
 				t.Fatal("new mount overwrote prior nonterminal intent")
 			} else if !strings.Contains(err.Error(), "portablefs umount") {
@@ -429,7 +246,7 @@ func TestMountOperationCloseSurfacesDurableIntentRemovalFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	op, err := acquireMountOperation(stateDir, mountPath, "vol", "main", "fuse")
+	op, err := acquireMountOperation(stateDir, mountPath, "vol", "fuse")
 	if err != nil {
 		t.Fatal(err)
 	}
