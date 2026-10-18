@@ -693,6 +693,11 @@ public actor PfsLocalClient {
         /// Receives every request-trace record; see `PfsTrace`. Nil in
         /// production, where only an attached signpost collector consumes it.
         var traceObserver: PfsTrace.Observer?
+        /// Tests control expiry independently of executor scheduling. The
+        /// request ID identifies the exact wait; production uses Task.sleep.
+        var requestDeadlineSleep: @Sendable (UInt64, UInt64) async throws -> Void = {
+            _, nanoseconds in try await Task.sleep(nanoseconds: nanoseconds)
+        }
 
         public init(
             maxFrameLength: Int = PfsFrameCodec.defaultMaxFrameLength,
@@ -1313,6 +1318,7 @@ public actor PfsLocalClient {
         let deadline = connection.requestDeadlineNanoseconds == 0
             ? configuration.handshakeDeadlineNanoseconds
             : connection.requestDeadlineNanoseconds
+        let deadlineSleep = configuration.requestDeadlineSleep
 
         let replyEnvelope: PfsEnvelope
         do {
@@ -1320,7 +1326,7 @@ public actor PfsLocalClient {
                 try await withCheckedThrowingContinuation { continuation in
                     let timeoutTask = Task.detached { [requestID, deadline] in
                         do {
-                            try await Task.sleep(nanoseconds: deadline)
+                            try await deadlineSleep(requestID, deadline)
                             await self.timeoutRequest(requestID)
                         } catch {}
                     }
