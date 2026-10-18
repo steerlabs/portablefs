@@ -11,14 +11,20 @@ import (
 )
 
 type dirPlusPageBoundary struct {
-	started    bool
-	finished   bool
-	generation uint64
-	stamp      subscriptionStamp
+	started     bool
+	finished    bool
+	generation  uint64
+	withdrawals uint64
+	stamp       subscriptionStamp
 }
 
+// changedLocked reports that the buffered page is no longer the one this reply
+// started from. One reply carries exactly one page's snapshot: a seek, a new
+// page, or any enumeration withdrawal since the reply's first entry ends it.
+// Withdrawals are compared directly because an overtaken page has no stamp to
+// distinguish it from another overtaken page.
 func (p *dirPlusPageBoundary) changedLocked(h *dirHandle) bool {
-	return p.started && (p.generation != h.cursorGeneration || p.stamp != h.pageStamp)
+	return p.started && (p.generation != h.cursorGeneration || p.withdrawals != h.withdrawals || p.stamp != h.pageStamp)
 }
 
 // takePlus transfers a fitting entry and its capability out of the buffered
@@ -53,7 +59,7 @@ func (h *dirHandle) takePlus(ctx context.Context, out *fuse.DirEntryList, page *
 		}
 		// A pooled kernel output buffer may contain a preceding request's metadata.
 		*entryOut = fuse.EntryOut{}
-		page.started, page.generation, page.stamp = true, h.cursorGeneration, h.pageStamp
+		page.started, page.generation, page.withdrawals, page.stamp = true, h.cursorGeneration, h.withdrawals, h.pageStamp
 		item := dirent.Item
 		dirent.Item = nil
 		stamp := h.pageStamp
