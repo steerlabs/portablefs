@@ -1,6 +1,16 @@
 import Foundation
 import FSKit
+import OSLog
 @preconcurrency import Darwin
+
+/// OPEN attribution for the measured LAN workload: whether an open or I/O
+/// reused a held description (including CREATE's creation description) or
+/// issued a real OPEN for missing access. Inactive unless a signpost
+/// collector is attached; it records file IDs and access modes only.
+private let volumeOpenSignposter = OSSignposter(
+    subsystem: "dev.portablefs.fskit",
+    category: "OpenAttribution"
+)
 
 /// Stable item identity carried by pfslocal and surfaced to FSKit.
 public struct PfsItemIdentity: Hashable, Sendable {
@@ -174,6 +184,9 @@ public actor VolumeCore {
         // daemon confirms each close. This prevents a failed close from
         // turning a live daemon descriptor into unreachable state.
         var pendingCloseHandles: [UInt64] = []
+        /// The read/write description CREATE returned, while it is held.
+        /// Attribution only: it never changes which description serves.
+        var creationHandle: UInt64?
 
         /// The one description that covers `mode`, if any.
         func handle(covering mode: PfsOpenMode) -> UInt64? {
@@ -223,6 +236,7 @@ public actor VolumeCore {
                 pendingCloseHandles.append(write)
                 writeHandle = nil
             }
+            forgetRetiredCreationHandle()
         }
 
         mutating func retireAll() {
@@ -230,6 +244,17 @@ public actor VolumeCore {
             if let write = writeHandle, write != readHandle { pendingCloseHandles.append(write) }
             readHandle = nil
             writeHandle = nil
+            creationHandle = nil
+        }
+
+        private mutating func forgetRetiredCreationHandle() {
+            if let creation = creationHandle, creation != readHandle, creation != writeHandle {
+                creationHandle = nil
+            }
+        }
+
+        var heldAccess: PfsOpenMode {
+            PfsOpenMode(read: readHandle != nil, write: writeHandle != nil)
         }
 
         var handleCount: Int {
@@ -469,7 +494,9 @@ public actor VolumeCore {
         try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
-            requestedMode: mode
+            requestedMode: mode,
+            origin: "open",
+            fileID: item.fileID
         )
     }
 
@@ -645,7 +672,8 @@ public actor VolumeCore {
         }
         openHandles[ObjectIdentifier(newItem)] = OpenState(
             readHandle: reply.handle,
-            writeHandle: reply.handle
+            writeHandle: reply.handle,
+            creationHandle: reply.handle
         )
         lease.acceptHandles()
         await lease.complete(itemsPublished: true)
@@ -1103,7 +1131,9 @@ public actor VolumeCore {
         try await reconcileOpenHandleLocked(
             objectID: objectID,
             identity: identity,
-            requestedMode: mode
+            requestedMode: mode,
+            origin: "io",
+            fileID: item.fileID
         )
         guard let handle = openHandles[objectID]?.handle(covering: mode) else {
             throw PfsLocalClientError.unexpectedReply("open did not produce a handle")
@@ -1119,9 +1149,18 @@ public actor VolumeCore {
     private func reconcileOpenHandleLocked(
         objectID: ObjectIdentifier,
         identity: PfsItemIdentity,
-        requestedMode: PfsOpenMode
+        requestedMode: PfsOpenMode,
+        origin: StaticString,
+        fileID: UInt64
     ) async throws {
-        let missing = (openHandles[objectID] ?? OpenState()).missing(requestedMode)
+        let held = openHandles[objectID] ?? OpenState()
+        let missing = held.missing(requestedMode)
+        if volumeOpenSignposter.isEnabled {
+            volumeOpenSignposter.emitEvent(
+                "OpenDecision",
+                "origin=\(origin) file=\(fileID) requested=\(requestedMode.rawValue) held=\(held.heldAccess.rawValue) creation=\(held.creationHandle != nil) opening=\(missing.rawValue)"
+            )
+        }
         guard missing != .unspecified else {
             return
         }

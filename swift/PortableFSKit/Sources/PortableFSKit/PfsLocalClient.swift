@@ -7,6 +7,45 @@ import os
 /// cause must reach the unified log with the error public.
 let pfsClientLogger = Logger(subsystem: "dev.portablefs.fskit", category: "PfsLocalClient")
 
+/// Correlation trace for the measured LAN workload: request and operation IDs
+/// of this connection, request kind, reply errno, ownership dispositions and
+/// publication verdicts. Inactive unless a signpost collector is attached.
+/// It records no names, contents, handles' meaning or credentials.
+private let pfsRequestSignposter = OSSignposter(
+    subsystem: "dev.portablefs.fskit",
+    category: "PfsLocalRequest"
+)
+
+private func pfsRequestKind(_ body: PfsEnvelope.OneOf_Body) -> String {
+    switch body {
+    case .hello: "hello"
+    case .resolve: "resolve"
+    case .lookup: "lookup"
+    case .getAttr: "getattr"
+    case .setAttr: "setattr"
+    case .open: "open"
+    case .close: "close"
+    case .read: "read"
+    case .write: "write"
+    case .create: "create"
+    case .mkdir: "mkdir"
+    case .remove: "remove"
+    case .rename: "rename"
+    case .symlink: "symlink"
+    case .readlink: "readlink"
+    case .xattrGet: "xattr-get"
+    case .xattrList: "xattr-list"
+    case .xattrRemove: "xattr-remove"
+    case .statfs: "statfs"
+    case .reclaim: "reclaim"
+    case .subscribeEvents: "subscribe"
+    case .hardLink: "link"
+    case .syncVolume: "sync-volume"
+    case .enumerateEntries: "enumerate"
+    default: "other"
+    }
+}
+
 /// The one event stream of a resolved connection. Buffering is unbounded
 /// because the daemon emits only rare attach-state transitions and dropping a
 /// terminal one would leave a degraded or detaching mount serving.
@@ -1080,6 +1119,14 @@ public actor PfsLocalClient {
             )
         }
 
+        if pfsRequestSignposter.isEnabled {
+            var errno: Int32 = 0
+            if case let .error(error)? = envelope.body { errno = error.errno }
+            pfsRequestSignposter.emitEvent(
+                "Replied",
+                "request=\(envelope.requestID) errno=\(errno) ack=\(envelope.publicationAckRequired)"
+            )
+        }
         if case let .error(error)? = envelope.body {
             request.continuation.resume(throwing: PfsLocalClientError.daemon(errno: error.errno, message: error.message))
         } else {
@@ -1209,6 +1256,12 @@ public actor PfsLocalClient {
         envelope.requestID = requestID
         envelope.operationID = operationID
         envelope.body = body
+        if pfsRequestSignposter.isEnabled {
+            pfsRequestSignposter.emitEvent(
+                "Dispatched",
+                "request=\(requestID) operation=\(operationID) kind=\(pfsRequestKind(body), privacy: .public)"
+            )
+        }
 
         let deadline = connection.requestDeadlineNanoseconds == 0
             ? configuration.handshakeDeadlineNanoseconds
@@ -1286,6 +1339,12 @@ public actor PfsLocalClient {
             disposition.targetRequestID = ticket.targetRequestID
             disposition.acceptHandles = ticket.acceptHandles
             disposition.acceptedItemCount = ticket.acceptedItemCount
+            if pfsRequestSignposter.isEnabled {
+                pfsRequestSignposter.emitEvent(
+                    "Disposition",
+                    "request=\(ticket.targetRequestID) handles=\(ticket.acceptHandles) items=\(ticket.acceptedItemCount)/\(ticket.itemCount)"
+                )
+            }
             var envelope = PfsEnvelope()
             envelope.requestID = 0
             envelope.body = .resourceReplyDisposition(disposition)
@@ -1327,6 +1386,12 @@ public actor PfsLocalClient {
             // below surfaces that through the existing terminal path.
             for receipt in ticket.stampedWrites {
                 try? await receipt.wait()
+            }
+            if pfsRequestSignposter.isEnabled {
+                pfsRequestSignposter.emitEvent(
+                    "PublicationAck",
+                    "operation=\(ticket.operationID) published=\(ticket.semanticCommit == .published)"
+                )
             }
             var ack = PfsPublicationAck()
             ack.operationID = ticket.operationID
