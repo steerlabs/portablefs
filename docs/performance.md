@@ -92,7 +92,10 @@ aggregate counters alone. `vcs/bench/lantrace` defines the stream and
 - Callbacks are correlated by (frontend connection incarnation, operation ID)
   and pfslocal request ID; daemon requests are correlated to authority turns by
   session label and authority request ID. Cross-host clocks are never
-  subtracted.
+  subtracted. The daemon allocates the connection incarnation and pfslocal 2.0
+  does not tell the frontend its value, so the frontend-to-daemon join needs a
+  shared label that is not yet decided; until it is, that join is reported as
+  not traced rather than guessed.
 - The report separates candidate from exposed cache hits, positive from
   stamped-negative Lookups, OPEN reasons (first open, expansion, reopen after
   final close, directory cursor, CREATE description reuse) with emitted versus
