@@ -84,6 +84,12 @@ private actor SessionGate {
     }
 }
 
+/// Settles a ticket whose reply the test does not inspect.
+@discardableResult
+private func settle(_ window: PfsCallbackWindow, _ ticket: PfsCallbackTicket) async -> Bool {
+    await window.settle(ticket) { _ in }
+}
+
 // MARK: - Window
 
 @Test func callbackWindowBoundsABurstToItsCapacity() async throws {
@@ -94,7 +100,7 @@ private actor SessionGate {
                 let ticket = try await window.admit()
                 let count = await window.admittedCount()
                 await Task.yield()
-                await window.published(ticket)
+                await settle(window, ticket)
                 return count
             }
         }
@@ -117,10 +123,10 @@ private actor SessionGate {
     #expect(PfsCallbackWindow.defaultCapacity == 128)
     let queued = Task { try await window.admit() }
     try await waitForWindowWaiters(window, count: 1)
-    await window.published(tickets.removeLast())
+    await settle(window, tickets.removeLast())
     tickets.append(try await queued.value)
     #expect(await window.admittedCount() == 128)
-    for ticket in tickets { await window.published(ticket) }
+    for ticket in tickets { await settle(window, ticket) }
     #expect(await window.admittedCount() == 0)
 }
 
@@ -134,11 +140,11 @@ private actor SessionGate {
         queued.append(Task {
             let ticket = try await window.admit()
             await progress.record(index)
-            await window.published(ticket)
+            await settle(window, ticket)
         })
         try await waitForWindowWaiters(window, count: index + 1)
     }
-    await window.published(first)
+    await settle(window, first)
     for task in queued { try await task.value }
     #expect(await progress.recorded() == [0, 1, 2, 3])
     #expect(await window.admittedCount() == 0)
@@ -152,9 +158,9 @@ private actor SessionGate {
     queued.cancel()
     await #expect(throws: PfsLocalClientError.cancelled) { _ = try await queued.value }
     #expect(await window.waiterCount() == 0)
-    await window.published(first)
+    await settle(window, first)
     let next = try await window.admit()
-    await window.published(next)
+    await settle(window, next)
     #expect(await window.admittedCount() == 0)
 }
 
@@ -164,17 +170,17 @@ private actor SessionGate {
         let first = try await window.admit()
         let cancelling = Task {
             let ticket = try await window.admit()
-            await window.published(ticket)
+            await settle(window, ticket)
         }
         try await waitForWindowWaiters(window, count: 1)
         let finished = WindowProgress()
         let following = Task {
             let ticket = try await window.admit()
-            await window.published(ticket)
+            await settle(window, ticket)
             await finished.mark()
         }
         try await waitForWindowWaiters(window, count: 2)
-        await window.published(first)
+        await settle(window, first)
         cancelling.cancel()
         let madeProgress = try await waitUntil { await finished.value() }
         if !madeProgress { await window.fail(PfsLocalClientError.timeout) }
@@ -190,15 +196,18 @@ private actor SessionGate {
 @Test func aTicketReleasesItsSlotExactlyOnce() async throws {
     let window = PfsCallbackWindow(capacity: 1)
     let first = try await window.admit()
-    await window.published(first)
+    #expect(await settle(window, first))
     let second = try await window.admit()
-    // A duplicate release of the first ticket must not free the second's slot.
-    await window.published(first)
+    // A duplicate settlement of the first ticket must neither reply again
+    // nor free the second's slot.
+    let duplicateReplies = SessionReplyBox<Int>()
+    #expect(!(await window.settle(first) { _ in duplicateReplies.set(1) }))
+    #expect(duplicateReplies.get() == nil)
     #expect(await window.admittedCount() == 1)
     let queued = Task { try await window.admit() }
     try await waitForWindowWaiters(window, count: 1)
-    await window.published(second)
-    await window.published(try await queued.value)
+    await settle(window, second)
+    await settle(window, try await queued.value)
     #expect(await window.admittedCount() == 0)
 }
 
@@ -215,7 +224,13 @@ private actor SessionGate {
     // A second terminal transition keeps the first cause.
     await window.fail(PfsLocalClientError.shutdown)
     await #expect(throws: PfsLocalClientError.connectionClosed) { _ = try await window.admit() }
-    await window.published(first)
+    // The admitted callback's publication lost to the terminal transition:
+    // it replies with the first terminal cause, not its own outcome.
+    let lateVerdict = SessionReplyBox<PfsLocalClientError>()
+    #expect(!(await window.settle(first) { terminal in
+        lateVerdict.set(terminal as? PfsLocalClientError ?? .timeout)
+    }))
+    #expect(lateVerdict.get() == .connectionClosed)
     #expect(await window.isFailed())
     #expect(await window.admittedCount() == 0)
     #expect(await window.waiterCount() == 0)
@@ -325,21 +340,93 @@ extension PfsLocalMockDaemonTests {
     #expect(await daemon.stats().helloRequests == 1)
 }
 
+/// The FSKit errno a callback reply carried, or zero for success.
+private func replyErrno<Value>(_ result: Result<Value, Error>) -> Int {
+    switch result {
+    case .success: 0
+    case let .failure(error): (error as NSError).code
+    }
+}
+
+/// Two admitted callbacks that already hold their daemon results and are
+/// parked before their FSKit reply: a cacheable read (getattr of the root)
+/// and a resource-bearing lookup whose fresh item is still provisional.
+@available(macOS 26.0, *)
+private struct HeldCallbacks {
+    let gate: SessionGate
+    let readReply: SessionReplyBox<Int>
+    let lookupReply: SessionReplyBox<Int>
+    let lookedUp: SessionReplyBox<PortableFSItem>
+}
+
+@available(macOS 26.0, *)
+private func holdCompletedCallbacks(_ harness: SessionHarness) async throws -> HeldCallbacks {
+    // The daemon keeps this file after the core reclaims its item, so the
+    // held lookup adopts a new provisional item rather than an interned one.
+    let (created, _) = try await harness.volume.createItem(
+        named: FSFileName(string: "held"),
+        type: .file,
+        inDirectory: harness.root,
+        attributes: FSItem.SetAttributesRequest()
+    )
+    try await harness.core.reclaim(item: try #require(created as? PortableFSItem))
+
+    let held = HeldCallbacks(
+        gate: SessionGate(),
+        readReply: SessionReplyBox(),
+        lookupReply: SessionReplyBox(),
+        lookedUp: SessionReplyBox()
+    )
+    let core = harness.core
+    let root = harness.root
+    harness.volume.testOnlyPublishAfterReply(operation: {
+        let attr = try await core.getattr(item: root)
+        await held.gate.enter()
+        return attr
+    }, reply: { result in held.readReply.set(replyErrno(result)) })
+    harness.volume.testOnlyPublishAfterReply(operation: {
+        let found = try await core.lookup(in: root, name: Data("held".utf8))
+        held.lookedUp.set(found.item)
+        await held.gate.enter()
+        return found.item
+    }, reply: { result in held.lookupReply.set(replyErrno(result)) })
+    #expect(try await waitUntil { await held.gate.enteredCount() == 2 })
+    #expect(await harness.core.testingDebugState().provisionalItemCount == 1)
+    return held
+}
+
+/// Releases held callbacks after the session's terminal transition and
+/// requires the terminal verdict: neither result reaches FSKit, the lookup's
+/// provisional item settles as unpublished, and every slot is released.
+@available(macOS 26.0, *)
+private func expectHeldCallbacksRevoked(
+    _ held: HeldCallbacks,
+    _ harness: SessionHarness,
+    errno expected: Int32
+) async throws {
+    #expect(await harness.volume.window.isFailed())
+    #expect(held.readReply.get() == nil)
+    #expect(held.lookupReply.get() == nil)
+    await held.gate.release()
+    #expect(try await waitUntil { held.readReply.get() != nil && held.lookupReply.get() != nil })
+    #expect(held.readReply.get() == Int(expected))
+    #expect(held.lookupReply.get() == Int(expected))
+    #expect(try await waitUntil { await harness.volume.window.admittedCount() == 0 })
+    let item = try #require(held.lookedUp.get())
+    #expect(try await waitUntil { item.reclaimed })
+    #expect(await harness.core.testingDebugState().provisionalItemCount == 0)
+}
+
 /// Degraded attach state is terminal: the client closes, a callback queued
-/// for a window slot wakes with the cause instead of waiting forever, and
-/// nothing later is admitted.
+/// for a window slot wakes with the cause instead of waiting forever, nothing
+/// later is admitted, and callbacks that already hold results lose their
+/// publication to the terminal decision.
 @available(macOS 26.0, *)
 @Test func degradedAttachStateEndsTheSessionAndWakesQueuedCallbacks() async throws {
-    let harness = try await makeSessionHarness(windowCapacity: 1)
+    let harness = try await makeSessionHarness(windowCapacity: 2)
     defer { harness.daemon.stop() }
-    let gate = SessionGate()
-    let heldReply = SessionReplyBox<Int>()
-    harness.volume.testOnlyPublishAfterReply(operation: {
-        await gate.enter()
-    }, reply: { result in
-        heldReply.set((try? result.get()) != nil ? 0 : 1)
-    })
-    #expect(try await waitUntil { await gate.enteredCount() == 1 })
+    let held = try await holdCompletedCallbacks(harness)
+    await harness.daemon.resetStats()
 
     let queuedReply = SessionReplyBox<Int>()
     harness.volume.getAttributes(FSItem.GetAttributesRequest(), of: harness.root) { _, error in
@@ -352,7 +439,7 @@ extension PfsLocalMockDaemonTests {
     #expect(try await waitUntil { queuedReply.get() != nil })
     #expect(queuedReply.get() == Int(EIO))
     #expect(await harness.volume.window.isFailed())
-    #expect(await harness.core.client.isDetachingOrStopped)
+    #expect(try await waitUntil { await harness.core.client.isDetachingOrStopped })
     #expect(await harness.daemon.stats().getAttrRequests == 0)
 
     let laterReply = SessionReplyBox<Int>()
@@ -362,9 +449,66 @@ extension PfsLocalMockDaemonTests {
     #expect(try await waitUntil { laterReply.get() != nil })
     #expect(laterReply.get() == Int(EIO))
 
-    await gate.release()
-    #expect(try await waitUntil { heldReply.get() != nil })
-    #expect(try await waitUntil { await harness.volume.window.admittedCount() == 0 })
+    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+}
+
+/// Loss of the bound socket revokes the publication of callbacks that
+/// already hold their results, exactly as a degraded attach does.
+@available(macOS 26.0, *)
+@Test func connectionLossRevokesCompletedCallbacksBeforeTheirReply() async throws {
+    let harness = try await makeSessionHarness(windowCapacity: 2)
+    defer { harness.daemon.stop() }
+    let held = try await holdCompletedCallbacks(harness)
+    harness.daemon.dropConnections()
+    #expect(try await waitUntil { await harness.volume.window.isFailed() })
+    #expect(try await waitUntil { await harness.core.client.isDetachingOrStopped })
+    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+}
+
+/// Volume teardown is the same terminal decision.
+@available(macOS 26.0, *)
+@Test func shutdownRevokesCompletedCallbacksBeforeTheirReply() async throws {
+    let harness = try await makeSessionHarness(windowCapacity: 2)
+    defer { harness.daemon.stop() }
+    let held = try await holdCompletedCallbacks(harness)
+    await harness.volume.shutdown()
+    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+}
+
+/// The terminal decision alone settles the losing callback's publication
+/// unit as unpublished. The window is failed here with the session still
+/// connected, so the daemon itself observes the verdicts: a not-published
+/// acknowledgement for each operation and zero accepted items for the
+/// provisional lookup result. A callback settled while the window is live
+/// publishes as before.
+@available(macOS 26.0, *)
+@Test func aPublicationThatLosesToTerminalFailureSettlesUnpublished() async throws {
+    let harness = try await makeSessionHarness(windowCapacity: 2)
+    defer { harness.daemon.stop() }
+    let core = harness.core
+    let root = harness.root
+
+    await harness.daemon.resetStats()
+    let liveReply = SessionReplyBox<Int>()
+    harness.volume.testOnlyPublishAfterReply(operation: {
+        try await core.getattr(item: root)
+    }, reply: { result in liveReply.set(replyErrno(result)) })
+    #expect(try await waitUntil { liveReply.get() != nil })
+    #expect(liveReply.get() == 0)
+    #expect(try await waitUntil { await harness.daemon.stats().publicationAcks == 1 })
+    #expect(await harness.daemon.stats().publishedPublicationAcks == 1)
+
+    let held = try await holdCompletedCallbacks(harness)
+    await harness.daemon.resetStats()
+    await harness.volume.window.fail(PfsLocalClientError.shutdown)
+    #expect(!(await harness.core.client.isDetachingOrStopped))
+    try await expectHeldCallbacksRevoked(held, harness, errno: EIO)
+
+    #expect(try await waitUntil { await harness.daemon.stats().publicationAcks == 2 })
+    let stats = await harness.daemon.stats()
+    #expect(stats.publishedPublicationAcks == 0)
+    #expect(stats.notPublishedPublicationAcks == 2)
+    #expect(stats.resourceAcceptedItemCounts == [0])
 }
 
 @available(macOS 26.0, *)

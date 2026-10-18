@@ -416,8 +416,9 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
 ///
 /// Every framework callback passes through `publishAfterReply`: it takes a
 /// slot in the bounded callback window, runs its pfslocal requests inside one
-/// publication unit, replies to FSKit, and only then releases the slot and
-/// sends the daemon its publication verdict. The volume holds exactly one
+/// publication unit, replies to FSKit through the window's serialized
+/// publication decision, and only then sends the daemon its publication
+/// verdict. The volume holds exactly one
 /// pfslocal session, bound to its attach at Resolve and to its attach-state
 /// events at construction; the end of that event binding is the volume's
 /// single terminal path.
@@ -598,8 +599,9 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         }
     }
 
-    /// Ends this volume: the window refuses every later callback and wakes
-    /// its waiters, then the core closes its session and forgets its items.
+    /// Ends this volume: the window refuses every later callback, wakes its
+    /// waiters and revokes every later publication, then the core closes its
+    /// session and forgets its items.
     public func shutdown() async {
         await window.fail(PfsLocalClientError.shutdown)
         eventMonitor.cancel()
@@ -611,8 +613,12 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     /// and before any publication unit exists, so its verdict can never
     /// enter ordered publication. The operation then runs under a window slot
     /// inside one publication unit. FSKit's reply is the publication
-    /// boundary: the slot is released and the publication verdict sent only
-    /// after the reply closure returned.
+    /// boundary, and the window decides it: the reply carries the callback's
+    /// own outcome only if the session was still live at that decision,
+    /// otherwise the terminal error. The publication verdict follows the
+    /// reply and is published only for a successful outcome that reached
+    /// FSKit; a revoked callback settles its operation and resources as
+    /// unpublished.
     private func publishAfterReply<Value>(
         callbackKind: StaticString = #function,
         preflight: @escaping @Sendable () async throws -> Void = {},
@@ -651,21 +657,32 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                     "callback operation failed before framework reply; kind=\(trace.kind, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code)"
                 )
             }
-            reply.value(result.mapError { PfsErrorMapper.fsKitError(for: $0) as Error })
+            let outcome = PfsUncheckedSendableBox(result)
+            let ownOutcomeReplied = await self.window.settle(ticket) { terminal in
+                if let terminal {
+                    reply.value(.failure(PfsErrorMapper.fsKitError(for: terminal)))
+                } else {
+                    reply.value(outcome.value.mapError {
+                        PfsErrorMapper.fsKitError(for: $0) as Error
+                    })
+                }
+            }
             trace.emit("FrameworkReplyReturned")
 
-            await self.window.published(ticket)
-            await complete(result.pfsIsSuccess)
-            trace.finish(outcome: result.pfsIsSuccess ? "success" : "failure")
+            let published = ownOutcomeReplied && result.pfsIsSuccess
+            await complete(published)
+            trace.finish(outcome: !ownOutcomeReplied
+                ? "revoked"
+                : (published ? "success" : "failure"))
         }
     }
 
     /// Deterministic seam for the window suite: the same callback path as
     /// every production entry point, with an injected operation.
-    func testOnlyPublishAfterReply(
+    func testOnlyPublishAfterReply<Value>(
         preflight: @escaping @Sendable () async throws -> Void = {},
-        operation: @escaping () async throws -> Void,
-        reply: @escaping (Result<Void, Error>) -> Void
+        operation: @escaping () async throws -> Value,
+        reply: @escaping (Result<Value, Error>) -> Void
     ) {
         publishAfterReply(
             callbackKind: "testOnlyCallback",

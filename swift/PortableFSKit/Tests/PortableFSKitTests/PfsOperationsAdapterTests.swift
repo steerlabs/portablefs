@@ -902,8 +902,23 @@ private func adapterErrno(
         }
     }
     #expect(!delivered)
-    #expect(failure == EINVAL)
+    // The defect also ends the session. The window decides the reply: the
+    // callback's own EINVAL if it settled first, the terminal EIO if the
+    // session's end won. Either is an error that installs nothing.
+    #expect(failure == EINVAL || failure == EIO)
+    #expect(try await waitForWindowFailure(harness.volume))
     #expect(await harness.daemon.stats().getAttrRequests == baselineGetattrs + 1)
+}
+
+@available(macOS 26.0, *)
+private func waitForWindowFailure(_ volume: PortableFSVolume) async throws -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(5))
+    while clock.now < deadline {
+        if await volume.window.isFailed() { return true }
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    return await volume.window.isFailed()
 }
 
 @available(macOS 26.0, *)
