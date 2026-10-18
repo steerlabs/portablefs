@@ -729,10 +729,15 @@ extension PfsLocalMockDaemonTests {
     defer { Task { await client.close() } }
 
     _ = try await client.subscribeEvents()
-    await #expect(throws: PfsLocalClientError.self) {
+    let refusal = PfsLocalClientError.unexpectedReply(
+        "strict-v3 resolve cannot adopt a legacy event subscription"
+    )
+    await #expect(throws: refusal) {
         _ = try await client.resolve(attachRef: "mock")
     }
-    await #expect(throws: PfsLocalClientError.connectionClosed) {
+    // The refusal is a protocol defect, so the client stays terminal and
+    // keeps reporting that cause instead of reconnecting.
+    await #expect(throws: refusal) {
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
 }

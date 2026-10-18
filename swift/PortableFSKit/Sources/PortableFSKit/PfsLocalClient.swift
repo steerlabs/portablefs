@@ -692,6 +692,11 @@ public actor PfsLocalClient {
     private var strictV3EventSink: PfsEventSink?
     private var strictV3ConnectionID: UUID?
     private var strictV3Terminal = false
+    /// The first protocol defect any connection reported. A peer that sent
+    /// one malformed frame is not trusted again: the client never reconnects
+    /// and every later request fails with this error, whether or not Resolve
+    /// had already selected strict mode.
+    private var protocolDefect: PfsLocalClientError?
     private var connection: PfsConnection?
     private var connectingTask: Task<Void, Error>?
     private var pending: [UInt64: PfsPendingRequest] = [:]
@@ -882,7 +887,7 @@ public actor PfsLocalClient {
     /// The operation runs exactly once. A daemon never withdraws a reply it
     /// has sent, so no outcome here is an instruction to reissue it; a frame
     /// claiming a retraction is a protocol defect that `receive` turns into
-    /// connection loss, failing this operation terminally.
+    /// terminal client loss, failing this operation.
     public nonisolated func withDeferredPublication<T>(
         _ operation: () async throws -> T
     ) async -> (Result<T, Error>, @Sendable (Bool) async -> Void) {
@@ -1074,6 +1079,9 @@ public actor PfsLocalClient {
         if isShutdown {
             throw PfsLocalClientError.shutdown
         }
+        if let protocolDefect {
+            throw protocolDefect
+        }
         if strictV3Terminal {
             throw PfsLocalClientError.connectionClosed
         }
@@ -1109,7 +1117,8 @@ public actor PfsLocalClient {
                 return
             } catch {
                 lastError = error
-                if attempt + 1 >= max(1, configuration.maxReconnectAttempts) {
+                if attempt + 1 >= max(1, configuration.maxReconnectAttempts)
+                    || !Self.isConnectionFailure(error) {
                     break
                 }
                 try await Task.sleep(nanoseconds: delay)
@@ -1118,6 +1127,18 @@ public actor PfsLocalClient {
         }
 
         throw lastError
+    }
+
+    /// Only a failure to reach or keep the peer is worth another connection.
+    /// A protocol defect, a daemon error reply, or a version mismatch would
+    /// repeat, and retrying it would hide the peer's actual answer.
+    private static func isConnectionFailure(_ error: Error) -> Bool {
+        switch error as? PfsLocalClientError {
+        case .system?, .connectionClosed?:
+            return true
+        default:
+            return false
+        }
     }
 
     private func establishConnectionOnce() async throws {
@@ -1166,7 +1187,8 @@ public actor PfsLocalClient {
             // frame defect, never an instruction to retry. The connection is
             // retired before any continuation resumes: the request it answers
             // and every other one in flight fail with the defect, no value
-            // the frame carries can be installed, and a strict mount ends.
+            // the frame carries can be installed, and the client is terminal
+            // even before Resolve.
             closeCurrentConnection(
                 connectionID,
                 error: PfsLocalClientError.invalidFrame(
@@ -1252,6 +1274,12 @@ public actor PfsLocalClient {
         pfsClientLogger.error(
             "pfslocal connection closed: \(String(describing: error), privacy: .public); strictV3=\(self.strictV3ConnectionID == connectionID) pending=\(self.pending.count)"
         )
+        if protocolDefect == nil,
+           let defect = error as? PfsLocalClientError,
+           defect.isProtocolDefect {
+            protocolDefect = defect
+            eventSink.finish()
+        }
         if strictV3ConnectionID == connectionID {
             strictV3Terminal = true
             strictV3EventSink?.finish()
@@ -1285,7 +1313,7 @@ public actor PfsLocalClient {
         hello.protocolMajor = 1
         // Protocol minor 6: Envelope.publication_retracted is never honoured
         // as an instruction. `receive` treats any envelope carrying it as a
-        // frame defect and retires the connection.
+        // frame defect that retires the connection and the client.
         //
         // Protocol minor 7: this frontend takes its per-request reply deadline
         // from HelloReply.request_deadline_ms instead of from a constant of its

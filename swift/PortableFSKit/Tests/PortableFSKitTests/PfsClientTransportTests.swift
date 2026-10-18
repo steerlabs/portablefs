@@ -992,8 +992,8 @@ private func settledAckBaseline(
 /// No daemon withdraws a publication it has sent, so an envelope claiming a
 /// retraction is a frame defect, never an instruction to reissue. The
 /// operation runs once and fails terminally, no value it carried reaches the
-/// caller, and the strict connection is retired: every other request in
-/// flight fails with the same defect and nothing reconnects.
+/// caller, and the client is retired: every other request in flight fails
+/// with the same defect and nothing reconnects.
 @Test func publicationRetractionIsAFrameDefectThatRetiresTheStrictConnection() async throws {
     var contract = PfsV3CoherenceContract()
     contract.authorityProtocolMajor = 7
@@ -1055,11 +1055,68 @@ private func settledAckBaseline(
             return
         }
     }
-    await #expect(throws: PfsLocalClientError.connectionClosed) {
-        try await client.request(.statfs(PfsStatfsRequest()))
+    // The client is terminal: a later request reports the same defect
+    // without connecting again.
+    let hellosBeforeFollowUp = await daemon.stats().helloRequests
+    do {
+        _ = try await client.request(.statfs(PfsStatfsRequest()))
+        Issue.record("a terminal client sent another request")
+    } catch let error as PfsLocalClientError {
+        guard case .invalidFrame = error else {
+            Issue.record("expected the original defect after termination, got \(error)")
+            return
+        }
     }
+    #expect(await daemon.stats().helloRequests == hellosBeforeFollowUp)
     #expect(await daemon.stats().getAttrRequests == baselineGetattrs + 1)
     #expect(await daemon.stats().publicationAcks == baseline)
+}
+
+/// Every client is pre-Resolve when it first connects, so a protocol defect
+/// during Hello must be terminal on its own terms. Connection backoff exists
+/// for failures to reach the daemon, not for a peer's malformed answer:
+/// retrying would consume the defect and hide it behind a later success.
+@Test func protocolDefectDuringHelloIsTerminalAndNeverRetried() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    await daemon.transformNextReply { envelope in
+        guard case .helloReply? = envelope.body else { return nil }
+        var defective = envelope
+        defective.publicationRetracted = true
+        return defective
+    }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxReconnectAttempts: 5, reconnectBaseDelayNanoseconds: 1_000_000)
+    )
+
+    for _ in 0..<2 {
+        do {
+            _ = try await client.resolve(attachRef: "mock")
+            Issue.record("a client resolved after a defective HelloReply")
+        } catch let error as PfsLocalClientError {
+            guard case .invalidFrame = error else {
+                Issue.record("expected the original frame defect, got \(error)")
+                return
+            }
+        }
+    }
+    #expect(await daemon.stats().helloRequests == 1)
+}
+
+/// A version mismatch is the daemon's definite answer, not a connection
+/// failure, so it surfaces after exactly one handshake.
+@Test func helloVersionMismatchIsNotRetried() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(protocolMinor: 15))
+    defer { daemon.stop() }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxReconnectAttempts: 5, reconnectBaseDelayNanoseconds: 1_000_000)
+    )
+    await #expect(throws: PfsLocalClientError.protocolMismatch(major: 1, minor: 15)) {
+        _ = try await client.resolve(attachRef: "mock")
+    }
+    #expect(await daemon.stats().helloRequests == 1)
 }
 
 @Test func publicationOperationDeliversValuesAndAcknowledgesOnce() async throws {

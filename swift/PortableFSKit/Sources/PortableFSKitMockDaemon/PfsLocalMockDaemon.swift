@@ -108,6 +108,9 @@ private final class PfsMockWireControlCompletion: @unchecked Sendable {
 
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
+        /// Hello handshakes received. Each is one connection attempt, so a
+        /// client that retries a refused handshake is visible here.
+        public var helloRequests: Int
         public var openRequests: Int
         /// The access each OPEN asked for, in arrival order. A frontend that
         /// reuses or upgrades a description is judged by exactly which
@@ -1047,6 +1050,7 @@ private actor MockFileSystem {
     private var nextItemID: UInt64 = 2
     private var nextNodeID: UInt64 = 2
     private var nextHandle: UInt64 = 1
+    private var helloRequests = 0
     private var openRequests = 0
     private var openModes: [PfsOpenMode] = []
     private var closeRequests = 0
@@ -1128,6 +1132,7 @@ private actor MockFileSystem {
 
     func stats() -> PfsLocalMockDaemon.Stats {
         PfsLocalMockDaemon.Stats(
+            helloRequests: helloRequests,
             openRequests: openRequests,
             openModes: openModes,
             closeRequests: closeRequests,
@@ -1179,6 +1184,7 @@ private actor MockFileSystem {
     }
 
     func resetStats() {
+        helloRequests = 0
         openRequests = 0
         openModes.removeAll()
         closeRequests = 0
@@ -1304,6 +1310,7 @@ private actor MockFileSystem {
             }
             switch body {
             case let .hello(request):
+                helloRequests += 1
                 var response = PfsHelloReply()
                 response.protocolMajor = request.protocolMajor
                 response.protocolMinor = configuration.protocolMinor ?? 16

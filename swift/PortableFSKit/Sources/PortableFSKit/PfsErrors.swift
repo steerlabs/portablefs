@@ -71,6 +71,18 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
         }
     }
 
+    /// A violation of the pfslocal framing or protocol contract. One such
+    /// frame means the peer speaks a contract this client does not, so it is
+    /// terminal for the client and never a reason to connect again.
+    public var isProtocolDefect: Bool {
+        switch self {
+        case .frameTooLarge, .invalidFrame, .protocolMismatch, .missingBody, .unexpectedReply:
+            return true
+        default:
+            return false
+        }
+    }
+
     public var posixErrno: Int32 {
         switch self {
         case let .daemon(errnoValue, _):
