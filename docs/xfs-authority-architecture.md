@@ -56,10 +56,10 @@ prefix. A run opens the mount root before work and fsyncs that same directory
 handle at completion; loss since open fails the barrier. Stock-FUSE syncfs is
 not this completion surface.
 
-FSKit exposes no fsync callback, so a Mac mutation reply is itself the
-durability point. Before an applied FSKit mutation's reply is sent or retained
-for replay, a handle-backed mutation retains its authoritative input or output
-file description and performs full fsync on it. This covers WRITE, CREATE,
+FSKit exposes no fsync callback, so a successful FSKit mutation reply is itself
+the durability point. Before an applied FSKit mutation's reply is sent or
+retained for replay, a handle-backed mutation retains its authoritative input
+or output file description and performs full fsync on it. This covers WRITE, CREATE,
 truncating OPEN, and handle-backed SETATTR. A mutation without such a
 description uses syncfs on the volume root directly, including namespace
 changes and item-backed metadata. The authority requires Linux 5.17 or newer

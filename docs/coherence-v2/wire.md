@@ -547,18 +547,20 @@ carriers. `append`, `sync`, `data_sync`, `delegation`, `flush_sequence`,
 refuses them with EINVAL before admission. FSKit sessions receive no
 application ticket or durable sequence.
 
-**Durability.** Every FSKit mutation that applied or may have applied is made
-durable before its reply is sent or retained for replay. A mutation with a
-retained syncable description (WRITE, CREATE, truncating OPEN, handle-backed
-SETATTR) full-fsyncs that description. A handleless mutation (namespace
-operations, item-backed metadata) uses syncfs on the volume's retained root
-description. The barrier is chosen from the operation; there is no post-apply
-reopen and no alternate barrier after an acquisition failure, and failure to
-retain a required handle after apply is terminal. Any persistence syscall
-failure is an uncertain EIO with `FAILURE_CLASS_STORAGE` and fences the epoch
-before waiters are released; the first failure survives an apparently
-successful later syscall. Linux withdrawal may precede durability; the reply
-may not. Cancellation after apply does not abandon the barrier.
+**Durability.** Every successful FSKit mutation reply certifies authority-storage
+durability before the reply is sent or retained for replay. Every mutation that
+applied or may have applied waits for its selected storage barrier, even if its
+eventual reply fails. A mutation with a retained syncable description (WRITE,
+CREATE, truncating OPEN, handle-backed SETATTR) full-fsyncs that description.
+A handleless mutation (namespace operations, item-backed metadata) uses syncfs
+on the volume's retained root description. The barrier is chosen from the
+operation; there is no post-apply reopen and no alternate barrier after an
+acquisition failure, and failure to retain a required handle after apply is
+terminal. Any persistence syscall failure is an uncertain EIO with
+`FAILURE_CLASS_STORAGE` and fences the epoch before waiters are released; the
+first failure survives an apparently successful later syscall. Linux withdrawal
+may precede durability; a successful reply may not. Cancellation after apply
+does not abandon the barrier.
 
 **Frontend publication and teardown.** No FSKit callback publishing data,
 metadata, namespace, or durability reports success after the session is

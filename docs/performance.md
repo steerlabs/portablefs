@@ -153,9 +153,9 @@ concurrently, but sequential namespace operations keep their round trip. An
 uncontended Linux delegated write can return from the daemon buffer; fsync,
 `O_SYNC`, and the root-directory run barrier wait for durable application.
 
-**Every macOS mutation is durable before it returns.** FSKit has no fsync
-callback, so each acknowledged Mac mutation pays its barrier: a handle fsync, or
-a filesystem-wide syncfs for handleless mutations.
+**Every successful FSKit mutation reply certifies authority-storage durability.**
+FSKit has no fsync callback, so each successful mutation pays its barrier: a
+handle fsync, or a filesystem-wide syncfs for handleless mutations.
 
 **Cache coherence needs withdrawal.** A Linux subscription caches undelegated
 state; a mutation or grant waits for acknowledgment or the subscriber's horizon.

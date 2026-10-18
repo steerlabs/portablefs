@@ -91,7 +91,7 @@ it. A profile is a behavioral contract, not a capability bundle.
 | --- | --- |
 | `FRONTEND_PROFILE_UNSPECIFIED` | Invalid for a mount. Valid only where the route-admin contract requires it. |
 | `FRONTEND_PROFILE_LINUX` | Stock kernel FUSE with a volume subscription, ordered change stream, and file write delegations. |
-| `FRONTEND_PROFILE_FSKIT_EXCLUSIVE` | The single macOS writer: positioned direct WRITE, durable mutation replies, coherent conservative metadata stamps, KeepAlive cache proofs, retained writer exclusion. No peer-actuation interface. |
+| `FRONTEND_PROFILE_FSKIT_EXCLUSIVE` | The single macOS writer: positioned direct WRITE, successful mutation replies durable on authority storage, coherent conservative metadata stamps, KeepAlive cache proofs, retained writer exclusion. No peer-actuation interface. |
 | `FRONTEND_PROFILE_CACHELESS_READER` | Exactly read access, no cache permission, no subscription, no writer exclusion. Reads break delegated data for read. The files gateway uses it. |
 
 There is one macOS profile on macOS 26 and 27. There is no cache-policy name,
@@ -216,12 +216,12 @@ volatile daemon buffer until a durability barrier; the Linux completion rules
 are above.
 
 FSKit delivers no fsync, directory-sync, or `F_FULLFSYNC` callback, so each
-mutation reply is the durability point. A mutation with a retained syncable
-description (WRITE, CREATE, truncating OPEN, handle-backed SETATTR) full-fsyncs
-that description. A handleless mutation (namespace changes, item-backed
-metadata) uses `syncfs` on the authority's retained XFS-root description. The
-barrier is selected from the operation, never by trying a reopen and falling
-back. Every failed fsync, fdatasync, or syncfs fences the store before any
+successful mutation reply is the durability point. A mutation with a retained
+syncable description (WRITE, CREATE, truncating OPEN, handle-backed SETATTR)
+full-fsyncs that description. A handleless mutation (namespace changes,
+item-backed metadata) uses `syncfs` on the authority's retained XFS-root
+description. The barrier is selected from the operation, never by trying a
+reopen and falling back. Every failed fsync, fdatasync, or syncfs fences the store before any
 affected waiter can succeed; the first failure is retained and no later
 barrier can certify durability. Cancellation after apply does not abandon the
 barrier, and replay never repeats apply or sync.
