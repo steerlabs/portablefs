@@ -7,15 +7,6 @@ import os
 /// cause must reach the unified log with the error public.
 let pfsClientLogger = Logger(subsystem: "dev.portablefs.fskit", category: "PfsLocalClient")
 
-/// Correlation trace for the measured LAN workload: request and operation IDs
-/// of this connection, request kind, reply errno, ownership dispositions and
-/// publication verdicts. Inactive unless a signpost collector is attached.
-/// It records no names, contents, handles' meaning or credentials.
-private let pfsRequestSignposter = OSSignposter(
-    subsystem: "dev.portablefs.fskit",
-    category: "PfsLocalRequest"
-)
-
 private func pfsRequestKind(_ body: PfsEnvelope.OneOf_Body) -> String {
     switch body {
     case .hello: "hello"
@@ -80,6 +71,8 @@ private final class PfsEventSink: @unchecked Sendable {
 
 private final class PfsConnection: @unchecked Sendable {
     let id = UUID()
+    /// The connection's opaque label in the request trace; see PfsTraceRecord.
+    var traceLabel: String { id.uuidString }
     let socket: PfsAsyncSocket
     let writer: PfsOrderedEnvelopeWriter
     var nextOperationID: UInt64 = 1
@@ -341,6 +334,8 @@ private struct PfsBoundaryTickets: Sendable {
 /// an ordered mutation. A client has exactly one established connection, so
 /// every stamp and verdict of a callback belongs to that connection.
 private final class PfsPublicationCollector: @unchecked Sendable {
+    /// Trace label of the FSKit callback this unit serves, or zero.
+    let callbackLabel: UInt64
     private let lock = NSLock()
     private var connection: PfsConnection?
     private var operationID: UInt64?
@@ -355,6 +350,10 @@ private final class PfsPublicationCollector: @unchecked Sendable {
         var settleLocalItems: (@Sendable (UInt32) async -> Void)?
     }
     private var resources: [UInt64: ResourceReplyState] = [:]
+
+    init(callbackLabel: UInt64 = 0) {
+        self.callbackLabel = callbackLabel
+    }
 
     /// Binds this callback's operation ID and RECORDS THE ACKNOWLEDGEMENT
     /// OBLIGATION IN THE SAME STEP.
@@ -673,6 +672,9 @@ public actor PfsLocalClient {
         /// it only to tell the shipping frontend from control self-probes.
         public var clientName: String
         public var clientVersion: String
+        /// Receives every request-trace record; see `PfsTrace`. Nil in
+        /// production, where only an attached signpost collector consumes it.
+        var traceObserver: PfsTrace.Observer?
 
         public init(
             maxFrameLength: Int = PfsFrameCodec.defaultMaxFrameLength,
@@ -695,6 +697,8 @@ public actor PfsLocalClient {
 
     private let socketPathProvider: @Sendable () async throws -> String
     private let configuration: Configuration
+    /// The request trace of this session and of the volume above it.
+    nonisolated let trace: PfsTrace
     /// The first protocol defect any connection reported. A peer that sent
     /// one malformed frame is not trusted again, even before Hello completed.
     private var protocolDefect: PfsLocalClientError?
@@ -724,9 +728,21 @@ public actor PfsLocalClient {
         PfsPublicationContext.collector != nil
     }
 
+    /// The trace label of the FSKit callback the current task serves, or zero.
+    nonisolated static var currentCallbackLabel: UInt64 {
+        PfsPublicationContext.collector?.callbackLabel ?? 0
+    }
+
+    /// The established connection's trace label. A session never changes
+    /// connections after Hello, so a bound caller may keep it.
+    var traceConnectionLabel: String {
+        connection?.traceLabel ?? ""
+    }
+
     public init(socketPath: String, configuration: Configuration = Configuration()) {
         self.socketPathProvider = { socketPath }
         self.configuration = configuration
+        self.trace = PfsTrace(observer: configuration.traceObserver)
     }
 
     public init(
@@ -735,6 +751,7 @@ public actor PfsLocalClient {
     ) {
         self.socketPathProvider = socketPathProvider
         self.configuration = configuration
+        self.trace = PfsTrace(observer: configuration.traceObserver)
     }
 
     deinit {
@@ -872,9 +889,10 @@ public actor PfsLocalClient {
     /// The operation runs exactly once. A daemon never withdraws a reply it
     /// has sent, so no outcome here is an instruction to reissue it.
     public nonisolated func withDeferredPublication<T>(
+        callbackLabel: UInt64 = 0,
         _ operation: () async throws -> T
     ) async -> (Result<T, Error>, @Sendable (Bool) async -> Void) {
-        let collector = PfsPublicationCollector()
+        let collector = PfsPublicationCollector(callbackLabel: callbackLabel)
         let outcome: Result<T, Error> = await PfsPublicationContext.$collector
             .withValue(collector) {
                 do {
@@ -1119,13 +1137,14 @@ public actor PfsLocalClient {
             )
         }
 
-        if pfsRequestSignposter.isEnabled {
+        trace.emit {
             var errno: Int32 = 0
             if case let .error(error)? = envelope.body { errno = error.errno }
-            pfsRequestSignposter.emitEvent(
-                "Replied",
-                "request=\(envelope.requestID) errno=\(errno) ack=\(envelope.publicationAckRequired)"
-            )
+            return PfsTraceRecord(.replied, connection: connectionID.uuidString, [
+                "request": envelope.requestID,
+                "errno": errno,
+                "ack": envelope.publicationAckRequired,
+            ])
         }
         if case let .error(error)? = envelope.body {
             request.continuation.resume(throwing: PfsLocalClientError.daemon(errno: error.errno, message: error.message))
@@ -1238,6 +1257,14 @@ public actor PfsLocalClient {
                         throw PfsLocalClientError.connectionClosed
                     }
                     connection.nextOperationID += 1
+                    if collector.callbackLabel != 0 {
+                        trace.emit {
+                            PfsTraceRecord(.callbackOperation, connection: connection.traceLabel, [
+                                "callback": collector.callbackLabel,
+                                "operation": binding.id,
+                            ])
+                        }
+                    }
                 }
             } else if let existing = collector.existingOperationID {
                 // Once a callback has published cacheable state, all later
@@ -1256,11 +1283,13 @@ public actor PfsLocalClient {
         envelope.requestID = requestID
         envelope.operationID = operationID
         envelope.body = body
-        if pfsRequestSignposter.isEnabled {
-            pfsRequestSignposter.emitEvent(
-                "Dispatched",
-                "request=\(requestID) operation=\(operationID) kind=\(pfsRequestKind(body), privacy: .public)"
-            )
+        trace.emit {
+            PfsTraceRecord(.dispatched, connection: connection.traceLabel, [
+                "request": requestID,
+                "operation": operationID,
+                "callback": collector?.callbackLabel ?? 0,
+                "kind": pfsRequestKind(body),
+            ])
         }
 
         let deadline = connection.requestDeadlineNanoseconds == 0
@@ -1339,11 +1368,12 @@ public actor PfsLocalClient {
             disposition.targetRequestID = ticket.targetRequestID
             disposition.acceptHandles = ticket.acceptHandles
             disposition.acceptedItemCount = ticket.acceptedItemCount
-            if pfsRequestSignposter.isEnabled {
-                pfsRequestSignposter.emitEvent(
-                    "Disposition",
-                    "request=\(ticket.targetRequestID) handles=\(ticket.acceptHandles) items=\(ticket.acceptedItemCount)/\(ticket.itemCount)"
-                )
+            trace.emit {
+                PfsTraceRecord(.disposition, connection: ticket.connection.traceLabel, [
+                    "request": ticket.targetRequestID,
+                    "handles": ticket.acceptHandles,
+                    "items": "\(ticket.acceptedItemCount)/\(ticket.itemCount)",
+                ])
             }
             var envelope = PfsEnvelope()
             envelope.requestID = 0
@@ -1387,11 +1417,11 @@ public actor PfsLocalClient {
             for receipt in ticket.stampedWrites {
                 try? await receipt.wait()
             }
-            if pfsRequestSignposter.isEnabled {
-                pfsRequestSignposter.emitEvent(
-                    "PublicationAck",
-                    "operation=\(ticket.operationID) published=\(ticket.semanticCommit == .published)"
-                )
+            trace.emit {
+                PfsTraceRecord(.publicationAck, connection: ticket.connection.traceLabel, [
+                    "operation": ticket.operationID,
+                    "published": ticket.semanticCommit == .published,
+                ])
             }
             var ack = PfsPublicationAck()
             ack.operationID = ticket.operationID

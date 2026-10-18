@@ -3,15 +3,6 @@ import FSKit
 import OSLog
 @preconcurrency import Darwin
 
-/// OPEN attribution for the measured LAN workload: whether an open or I/O
-/// reused a held description (including CREATE's creation description) or
-/// issued a real OPEN for missing access. Inactive unless a signpost
-/// collector is attached; it records file IDs and access modes only.
-private let volumeOpenSignposter = OSSignposter(
-    subsystem: "dev.portablefs.fskit",
-    category: "OpenAttribution"
-)
-
 /// A syntactically valid request to set a user xattr: the one validator
 /// for that grammar. It holds no item, so a caller can only obtain one by
 /// deciding the request's syntax before it converts or looks up the target:
@@ -178,6 +169,9 @@ public actor VolumeCore {
 
     public let client: PfsLocalClient
     public private(set) var resolvedVolume: PfsResolvedVolume?
+    /// The bound connection's request-trace label, kept from Resolve: a
+    /// session never changes connections after Hello.
+    private(set) var traceConnection = ""
 
     private var itemsByIdentity: [PfsItemIdentity: PortableFSItem] = [:]
     private var identitiesByObject: [ObjectIdentifier: PfsItemIdentity] = [:]
@@ -350,6 +344,7 @@ public actor VolumeCore {
             capabilities: reply.capabilities
         )
         resolvedVolume = resolved
+        traceConnection = await client.traceConnectionLabel
         return resolved
     }
 
@@ -1171,11 +1166,19 @@ public actor VolumeCore {
     ) async throws {
         let held = openHandles[objectID] ?? OpenState()
         let missing = held.missing(requestedMode)
-        if volumeOpenSignposter.isEnabled {
-            volumeOpenSignposter.emitEvent(
-                "OpenDecision",
-                "origin=\(origin) file=\(fileID) requested=\(requestedMode.rawValue) held=\(held.heldAccess.rawValue) creation=\(held.creationHandle != nil) opening=\(missing.rawValue)"
-            )
+        // OPEN attribution for the measured LAN workload: whether an open or
+        // I/O reused a held description, including CREATE's creation
+        // description, or issued a real OPEN for missing access.
+        client.trace.emit {
+            PfsTraceRecord(.openDecision, connection: traceConnection, [
+                "callback": PfsLocalClient.currentCallbackLabel,
+                "origin": origin,
+                "file": fileID,
+                "requested": requestedMode.rawValue,
+                "held": held.heldAccess.rawValue,
+                "creation": held.creationHandle != nil,
+                "opening": missing.rawValue,
+            ])
         }
         guard missing != .unspecified else {
             return

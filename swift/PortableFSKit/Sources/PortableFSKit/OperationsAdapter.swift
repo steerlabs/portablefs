@@ -6,50 +6,6 @@ import os
 @preconcurrency import Darwin
 @preconcurrency import Dispatch
 
-private struct PfsFSKitCallbackTrace: Sendable {
-    private static let signposter = OSSignposter(
-        subsystem: "dev.portablefs.fskit",
-        category: "CallbackLifecycle"
-    )
-
-    let kind: String
-    private let interval: (OSSignpostID, OSSignpostIntervalState)?
-
-    init(kind: StaticString) {
-        let kindDescription = String(describing: kind)
-        self.kind = kindDescription
-        guard Self.signposter.isEnabled else {
-            interval = nil
-            return
-        }
-        let id = Self.signposter.makeSignpostID()
-        let state = Self.signposter.beginInterval(
-            "FSKitCallback",
-            id: id,
-            "kind=\(kindDescription, privacy: .public)"
-        )
-        interval = (id, state)
-    }
-
-    func emit(_ name: StaticString, detail: String = "") {
-        guard let (id, _) = interval else { return }
-        Self.signposter.emitEvent(
-            name,
-            id: id,
-            "kind=\(kind, privacy: .public) \(detail, privacy: .public)"
-        )
-    }
-
-    func finish(outcome: String) {
-        guard let (_, state) = interval else { return }
-        Self.signposter.endInterval(
-            "FSKitCallback",
-            state,
-            "kind=\(kind, privacy: .public) outcome=\(outcome, privacy: .public)"
-        )
-    }
-}
-
 private final class PfsUncheckedSendableBox<Value>: @unchecked Sendable {
     let value: Value
 
@@ -427,6 +383,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     public let core: VolumeCore
     public let capabilities: PfsCapabilities
     let window: PfsCallbackWindow
+    /// The session connection's request-trace label; see PfsTraceRecord.
+    private let traceConnection: String
     private let logger = Logger(subsystem: "dev.portablefs.fskit", category: "PortableFSVolume")
     private let fileSystemTypeName: String
     private let statLock = NSLock()
@@ -473,6 +431,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 statReply: statReply,
                 moduleIdentity: moduleIdentity,
                 window: window,
+                traceConnection: await core.traceConnection,
                 eventMonitor: eventMonitor
             )
         } catch {
@@ -488,11 +447,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         statReply: PfsStatfsReply,
         moduleIdentity: PortableFSModuleIdentity,
         window: PfsCallbackWindow,
+        traceConnection: String,
         eventMonitor: Task<Void, Never>
     ) {
         self.core = core
         self.capabilities = resolved.capabilities
         self.window = window
+        self.traceConnection = traceConnection
         self.eventMonitor = eventMonitor
         self.fileSystemTypeName = moduleIdentity.fileSystemTypeName
         self.cachedStatistics = PfsFSKitMapping.statfs(
@@ -625,7 +586,11 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         _ operation: @escaping () async throws -> Value,
         reply: @escaping (Result<Value, Error>) -> Void
     ) {
-        let trace = PfsFSKitCallbackTrace(kind: callbackKind)
+        let trace = PfsCallbackTrace(
+            kind: callbackKind,
+            connection: traceConnection,
+            trace: core.client.trace
+        )
         let operation = PfsUncheckedSendableBox(operation)
         let reply = PfsUncheckedSendableBox(reply)
         Task(priority: .userInitiated) {
@@ -648,7 +613,9 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             }
             trace.emit("Admitted")
 
-            let (result, complete) = await self.core.client.withDeferredPublication {
+            let (result, complete) = await self.core.client.withDeferredPublication(
+                callbackLabel: trace.label
+            ) {
                 try await operation.value()
             }
             if case let .failure(error) = result {
