@@ -131,6 +131,8 @@ func clientConfig(o options, token []byte, revision [32]byte, purpose authorityp
 		// same frontend profile the real Linux mount declares. Anything else
 		// would be refused for the wrong reason and prove nothing about routing.
 		cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
+		cfg.MaxInFlight = authorityrpc.MinimumLinuxInFlight
+		cfg.ReplaySlots = uint32(cfg.MaxInFlight)
 		cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return administrativeAbsenceProof(), nil
 		}
