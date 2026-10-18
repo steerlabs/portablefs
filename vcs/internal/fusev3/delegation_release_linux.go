@@ -19,7 +19,6 @@ const (
 	delegationAcquire delegationLockMask = 1 << iota
 	delegationTransition
 	delegationOperation
-	delegationControl
 )
 
 type delegationFlight struct{ done chan struct{} }
@@ -53,9 +52,6 @@ func (s *delegationState) lockAfterRelease(ctx context.Context, mask delegationL
 			}
 		}
 		flight := s.releaseFlight
-		if flight == nil && mask&delegationControl == 0 {
-			flight = s.synchronousFlight
-		}
 		if flight == nil {
 			if mask&delegationTransition == 0 {
 				s.transition.Unlock()
@@ -162,10 +158,6 @@ func (m *delegationManager) prepareReleaseBatch(ctx context.Context, buf *writeb
 		for _, g := range groups {
 			if g.state.releaseFlight != nil {
 				previous = g.state.releaseFlight
-				break
-			}
-			if g.state.synchronousFlight != nil {
-				previous = g.state.synchronousFlight
 				break
 			}
 		}

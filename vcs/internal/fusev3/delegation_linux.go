@@ -104,7 +104,6 @@ type delegationState struct {
 
 	flushOrdinal      uint64            // meta; dense within the exact Authority grant
 	releaseFlight     *delegationFlight // protected by transition
-	synchronousFlight *delegationFlight // local operations wait; CONTROL must still drain
 	acquire           delegationMutex
 	grantChanged      chan struct{}
 	retiredGeneration uint64
@@ -1277,7 +1276,7 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	}()
 	s := m.retainState(id, true)
 	defer m.releaseState(s)
-	if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return nil, err
 	}
 	lockedState := s
@@ -1285,7 +1284,6 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	defer func() {
 		if operationLocked {
 			lockedState.operation.Unlock()
-			lockedState.transition.Unlock()
 		}
 	}()
 	s.admission.RLock()
@@ -1324,27 +1322,7 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	if err != nil {
 		return nil, err
 	}
-	// Authority visibility may depend on a peer read whose break/recall is
-	// addressed to us. Keep foreground ordering as a logical owner while
-	// CONTROL drains the grant without waiting for the RPC's physical lock.
-	flight := &delegationFlight{done: make(chan struct{})}
-	s.synchronousFlight = flight
-	s.operation.Unlock()
-	s.transition.Unlock()
-	operationLocked = false
-	finishFlight := func() {
-		if flight == nil {
-			return
-		}
-		s.synchronousFlight = nil
-		close(flight.done)
-		flight = nil
-	}
 	response, err := call(ref)
-	s.transition.Lock()
-	s.operation.Lock()
-	operationLocked = true
-	defer finishFlight()
 	if err != nil {
 		return response, err
 	}
@@ -1370,9 +1348,7 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	m.updateBaseFromResponse(s, response)
 	if response.GetAppliedSequence() != 0 {
 		cut := m.buf.Snapshot()
-		finishFlight()
 		lockedState.operation.Unlock()
-		lockedState.transition.Unlock()
 		operationLocked = false
 		m.frontend.RUnlock()
 		frontendLocked = false
@@ -1596,14 +1572,7 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 	// CONTROL may overtake the DATA reply carrying a newly activated grant.
 	// Wait without transition/operation locks: Install needs both to publish it.
 	for {
-		mask := delegationTransition | delegationOperation
-		if event.GetDelegationBreak() != nil {
-			// A read cut can name the prior applied floor while a synchronous
-			// mutation is in flight. Recall/mode transitions must instead join
-			// its application receipt before transferring ownership/admission.
-			mask |= delegationControl
-		}
-		if err := s.lockAfterRelease(ctx, mask); err != nil {
+		if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
 			m.retireTimedOutControl(s, ref)
 			return
 		}
