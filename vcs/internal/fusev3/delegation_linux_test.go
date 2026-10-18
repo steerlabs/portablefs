@@ -372,6 +372,9 @@ func TestDelegationWaveHonorsNegotiatedLimitAndResendsOnlyUnsentWrites(t *testin
 	if !m.Owns(id) || m.LossSequence() != 0 || m.buf.Stats().Bytes != int64(len(data)) {
 		t.Fatalf("an unsent write discarded the delegation: owns=%v loss=%d stats=%+v", m.Owns(id), m.LossSequence(), m.buf.Stats())
 	}
+	// Deliver durability before the retry, independently of the background
+	// worker: its timing must never decide whether the first write is resent.
+	m.DurableSequence(1)
 	if _, err := m.FlushIdentity(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}

@@ -337,3 +337,41 @@ func TestNewRefusesAnUnusableWaveShape(t *testing.T) {
 		b.Stop()
 	}
 }
+
+// The receipt rule flushers rely on: a failed wave is offered again with the
+// same tokens while later admissions wait behind it, and the identity's next
+// wave carries only strictly greater tokens.
+func TestRetainedWaveRecursUntilAppliedAndNextWaveHasGreaterTokens(t *testing.T) {
+	var calls [][]uint64
+	fail := true
+	f := &waveTestFlusher{width: 1, payload: 4}
+	f.call = func(entries []Entry) ([]uint64, error) {
+		tokens := make([]uint64, len(entries))
+		for i, entry := range entries {
+			tokens[i] = entry.Token
+		}
+		calls = append(calls, tokens)
+		if fail {
+			fail = false
+			return nil, errors.New("interrupted")
+		}
+		sequences := make([]uint64, len(entries))
+		for i := range sequences {
+			sequences[i] = uint64(len(calls)*10 + i)
+		}
+		return sequences, nil
+	}
+	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	id := testIdentity(9)
+	cut := mustWrite(t, b, id, 0, "abcd")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err == nil {
+		t.Fatal("interrupted wave reported success")
+	}
+	cut = mustWrite(t, b, id, 4, "efgh")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || len(calls[0]) != 1 || calls[1][0] != calls[0][0] || calls[2][0] <= calls[1][0] {
+		t.Fatalf("wave tokens by call = %v, want the retained wave again, then a greater token", calls)
+	}
+}

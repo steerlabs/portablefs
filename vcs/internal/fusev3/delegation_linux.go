@@ -142,9 +142,10 @@ type delegationState struct {
 }
 
 // delegationFlushProgress records an applied flush token so a retried wave
-// never applies a completed member twice.
+// never applies a completed member twice. A receipt lives exactly as long as
+// writeback can retry its wave. Success retires the wave immediately; a
+// dropped wave is retired by its next valid successor or quiescent collection.
 type delegationFlushProgress struct {
-	owner    *delegationState
 	sequence uint64
 	complete bool
 }
@@ -920,19 +921,10 @@ func (m *delegationManager) durableForBuffer(buffer *writeback.Buffer, sequence 
 	}
 	m.durableHigh = max(m.durableHigh, sequence)
 	m.durabilityMu.Unlock()
-	m.tokenMu.Lock()
-	for token, progress := range m.tokens {
-		if progress.complete && progress.sequence <= sequence {
-			delete(m.tokens, token)
-			if progress.owner != nil {
-				delete(progress.owner.flushTokens, token)
-				if len(progress.owner.flushTokens) == 0 {
-					progress.owner.flushTokens = nil
-				}
-			}
-		}
-	}
-	m.tokenMu.Unlock()
+	// Durability never retires an applied-token receipt: a retained wave that
+	// failed after some members applied is retried with the same tokens, and
+	// only the receipt keeps a durable member from being applied again. See
+	// retireFlushReceipts for when a receipt can no longer be needed.
 }
 
 func (m *delegationManager) visibleForBuffer(buffer *writeback.Buffer, sequence uint64) {
@@ -1143,7 +1135,7 @@ func (m *delegationManager) flushMetadata(ctx context.Context, id writeback.Iden
 	s.appliedCut = max(s.appliedCut, entry.Last)
 	s.meta.Unlock()
 	m.tokenMu.Lock()
-	m.tokens[entry.Token] = delegationFlushProgress{owner: s, sequence: sequence, complete: true}
+	m.tokens[entry.Token] = delegationFlushProgress{sequence: sequence, complete: true}
 	s.trackFlushTokenLocked(entry.Token)
 	m.tokenMu.Unlock()
 	m.durabilityMu.Lock()

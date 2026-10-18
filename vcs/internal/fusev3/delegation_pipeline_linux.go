@@ -42,6 +42,9 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 	}
 	if len(entries) == 1 && entries[0].Kind != writeback.Write {
 		seq, err := m.flushMetadata(ctx, id, entries[0])
+		if err == nil {
+			m.retireFlushReceipts(id, nil)
+		}
 		return []uint64{seq}, err
 	}
 	s := m.retainState(id, true)
@@ -101,6 +104,8 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 			Handle: handle, Position: uint64(e.Offset), Size: uint32(size), WriteFlags: e.WriteOptions.Flags, LockOwner: e.WriteOptions.LockOwner, Delegation: cloneDelegationRef(binding.ref),
 		}}}
 	}
+	// Validation and the exact-generation check precede receipt retirement.
+	m.retireFlushReceipts(id, entries)
 	var joined sync.WaitGroup
 	for i, request := range requests {
 		if request == nil {
@@ -191,7 +196,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		seq := response.GetAppliedSequence()
 		sequences[i] = seq
 		m.tokenMu.Lock()
-		m.tokens[e.Token] = delegationFlushProgress{owner: s, sequence: seq, complete: true}
+		m.tokens[e.Token] = delegationFlushProgress{sequence: seq, complete: true}
 		s.trackFlushTokenLocked(e.Token)
 		m.tokenMu.Unlock()
 		s.meta.Lock()
@@ -230,7 +235,40 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		// resends only the writes that never left this client.
 		return nil, unsent
 	}
+	// A successful wave cannot be retried, even if cancellation wins just
+	// after this return: writeback commits its result before checking context.
+	m.retireFlushReceipts(id, nil)
 	return sequences, nil
+}
+
+// retireFlushReceipts releases the applied-token receipts of every earlier
+// wave of this identity. Writeback retains one immutable pending wave per
+// identity and forms the next one, with fresh tokens, only after that wave
+// completed or was dropped; so once a wave reaches the flusher, no token
+// outside it can be retried and its receipt has no remaining owner. The
+// current wave's receipts stay, however much of it is already durable. An
+// empty entry list retires a successfully completed wave immediately.
+func (m *delegationManager) retireFlushReceipts(id writeback.Identity, entries []writeback.Entry) {
+	s := m.retainState(id, false)
+	if s == nil {
+		return
+	}
+	defer m.releaseState(s)
+	m.tokenMu.Lock()
+	defer m.tokenMu.Unlock()
+	for token := range s.flushTokens {
+		current := false
+		for _, entry := range entries {
+			current = current || entry.Token == token
+		}
+		if !current {
+			delete(m.tokens, token)
+			delete(s.flushTokens, token)
+		}
+	}
+	if len(s.flushTokens) == 0 {
+		s.flushTokens = nil
+	}
 }
 
 // assignFlushOrdinal gives one wave write the next dense ordinal of its exact

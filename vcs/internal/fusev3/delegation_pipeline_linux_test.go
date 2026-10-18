@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -295,5 +296,124 @@ func TestDelegationWaveShapeIsTheOrderedWindow(t *testing.T) {
 	entries := make([]writeback.Entry, volumeserver.OrderedFlushWindow+1)
 	if _, err := m.FlushBatch(t.Context(), writeback.Identity{1}, entries); !errors.Is(err, writeback.ErrInvalid) {
 		t.Fatalf("over-wide wave error = %v, want ErrInvalid", err)
+	}
+}
+
+// canceledWaveRPC applies every wave write except call number waitOn, which
+// waits before replay assignment until its caller gives up, as a saturated
+// flush lane would hold it. Call number durableOn carries a durable prefix
+// through its own reply. Barriers are refused, so durability arrives only
+// where a case delivers it.
+type canceledWaveRPC struct {
+	delegationFakeRPC
+	callMu    sync.Mutex
+	calls     int
+	waitOn    int
+	durableOn int
+	waiting   chan struct{}
+}
+
+func (f *canceledWaveRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetBarrier() != nil {
+		return nil, errors.New("durability is delivered by the test case")
+	}
+	return f.delegationFakeRPC.CallMutation(ctx, request)
+}
+
+func (f *canceledWaveRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	f.callMu.Lock()
+	f.calls++
+	call := f.calls
+	f.callMu.Unlock()
+	if call == f.waitOn {
+		close(f.waiting)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	response, err := waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+	if err == nil && call == f.durableOn {
+		response.GetWrite().DurableSequence = response.GetAppliedSequence()
+	}
+	return response, err
+}
+
+// A wave whose last member was never sent is retained with its tokens. Its
+// applied members' receipts must outlive any durability of those members, or
+// the retry applies a durable write twice and, when the resent member's
+// ticket follows a cached one, loses the delegation and every later accepted
+// write with it.
+func TestRetainedWaveKeepsAppliedReceiptsThroughDurability(t *testing.T) {
+	const limit = 8
+	for _, tc := range []struct {
+		name      string
+		waitOn    int
+		durableOn int
+		durable   uint64
+		tail      bool
+	}{
+		{name: "fully durable applied prefix", waitOn: 3, durable: 2},
+		{name: "partially durable multi-entry prefix", waitOn: 3, durable: 1},
+		{name: "durable prefix of one", waitOn: 2, durable: 1},
+		{name: "later accepted write", waitOn: 3, durable: 1, tail: true},
+		{name: "durable prefix carried by a member reply", waitOn: 3, durableOn: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &canceledWaveRPC{delegationFakeRPC: delegationFakeRPC{maxWrite: limit}, waitOn: tc.waitOn, durableOn: tc.durableOn, waiting: make(chan struct{})}
+			m := newDelegationTestManager(t, fake)
+			id := installDelegationForTest(t, m, 29, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			if _, err := m.Write(t.Context(), id, 0, bytes.Repeat([]byte{'x'}, 3*limit), false); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			go func() { <-fake.waiting; cancel() }()
+			if _, err := m.FlushIdentity(ctx, id); !errors.Is(err, context.Canceled) {
+				t.Fatalf("interrupted wave error = %v, want the caller's cancellation", err)
+			}
+			want := []uint64{0, limit, 2 * limit}
+			if tc.tail {
+				if _, err := m.Write(t.Context(), id, 3*limit, []byte("tail"), false); err != nil {
+					t.Fatal(err)
+				}
+				want = append(want, 3*limit)
+			}
+			if tc.durable != 0 {
+				m.DurableSequence(tc.durable)
+			}
+			m.tokenMu.Lock()
+			receipts := len(m.tokens)
+			m.tokenMu.Unlock()
+			if receipts != tc.waitOn-1 {
+				t.Fatalf("retained wave receipts = %d, want %d", receipts, tc.waitOn-1)
+			}
+			if _, err := m.FlushIdentity(t.Context(), id); err != nil {
+				t.Fatalf("retry of the retained wave failed: %v", err)
+			}
+			m.tokenMu.Lock()
+			receipts = len(m.tokens)
+			m.tokenMu.Unlock()
+			if receipts != 0 {
+				t.Fatalf("successful wave retained %d receipts", receipts)
+			}
+			if !m.Owns(id) || m.LossSequence() != 0 {
+				t.Fatalf("retry lost the delegation: owns=%v loss=%d", m.Owns(id), m.LossSequence())
+			}
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			var offsets, ordinals []uint64
+			for _, request := range fake.mutations {
+				if write := request.GetWrite(); write != nil {
+					offsets = append(offsets, write.GetPosition())
+					ordinals = append(ordinals, write.GetFlushSequence())
+				}
+			}
+			if fmt.Sprint(offsets) != fmt.Sprint(want) {
+				t.Fatalf("applied write offsets = %v, want each exactly once: %v", offsets, want)
+			}
+			for i, ordinal := range ordinals {
+				if ordinal != uint64(i+1) {
+					t.Fatalf("ordinals = %v, want dense from 1", ordinals)
+				}
+			}
+		})
 	}
 }

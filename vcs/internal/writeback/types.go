@@ -108,7 +108,11 @@ const MaxWaveWidth = 4
 // serialized; disjoint identities run concurrently. A returned error retains
 // the whole wave for retry with the same immutable tokens, so the
 // implementation must deduplicate Token (scoped to this Buffer/session) and
-// never apply a completed member twice. It must arrange eventual visibility
+// never apply a completed member twice, however much of the wave is already
+// durable. An identity has at most one retained wave; its next wave is formed
+// only after that one applied or was dropped, and carries strictly greater
+// tokens. Once a wave reaches FlushBatch, no token of an earlier wave of that
+// identity is offered again. It must arrange eventual visibility
 // and durability notifications, including when the buffer is full. Permanent
 // rejection must call Drop. Payloads and spans are borrowed until return; no
 // buffer lock is held while FlushBatch executes.
