@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 	"golang.org/x/sys/unix"
@@ -399,6 +400,27 @@ func Main(version string) int {
 	}
 	if daemonLog != nil {
 		defer daemonLog.Close()
+	}
+	if cfg.TraceFile != "" || cfg.TraceRun != "" {
+		if cfg.TraceFile == "" || cfg.TraceRun == "" {
+			log.Printf("portablefsd: -trace-file and -trace-run must be set together")
+			return 1
+		}
+		traceFile, err := os.OpenFile(cfg.TraceFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			log.Printf("portablefsd: create LAN trace: %v", err)
+			return 1
+		}
+		defer traceFile.Close()
+		cfg.Trace, err = lantrace.NewRecorder(traceFile, lantrace.Label(cfg.TraceRun), lantrace.LayerDaemon,
+			lantrace.Label(fmt.Sprintf("daemon-%d", os.Getpid())), lantrace.RecorderConfig{})
+		if err != nil {
+			log.Printf("portablefsd: configure LAN trace: %v", err)
+			return 1
+		}
+		// Only process exit drains the diagnostic stream. Request, connection,
+		// cleanup and mount teardown never call the recorder's blocking Close.
+		defer cfg.Trace.Close()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

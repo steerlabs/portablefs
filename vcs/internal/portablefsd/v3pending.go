@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -58,18 +59,18 @@ func (b *v3PendingBudget) reserve(ctx context.Context) (*v3PendingReservation, e
 	trace, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
 	b.mu.Lock()
 	waited := false
-	event := "budget_refused"
 	defer func() {
 		if waited {
 			b.stats.Waiters--
 			b.stats.AdmissionWaitNS += uint64(time.Since(started))
 		}
+		count := len(b.active)
 		b.mu.Unlock()
-		trace.emit(event, 0, time.Since(started))
+		trace.wait(lantrace.WaitReservation, time.Since(started))
+		trace.pending(count, b.limit)
 	}()
 	for {
 		if err := ctx.Err(); err != nil {
-			event = "budget_cancel"
 			return nil, err
 		}
 		if b.closed {
@@ -80,7 +81,6 @@ func (b *v3PendingBudget) reserve(ctx context.Context) (*v3PendingReservation, e
 			b.active[r] = struct{}{}
 			b.stats.Reserved++
 			b.stats.Peak = max(b.stats.Peak, len(b.active))
-			event = "budget_reserved"
 			return r, nil
 		}
 		firstWait := !waited
@@ -90,9 +90,6 @@ func (b *v3PendingBudget) reserve(ctx context.Context) (*v3PendingReservation, e
 		}
 		changed := b.changed
 		b.mu.Unlock()
-		if firstWait {
-			trace.emit("budget_wait", 0, 0)
-		}
 		select {
 		case <-changed:
 		case <-ctx.Done():
@@ -121,8 +118,9 @@ func (r *v3PendingReservation) retire() {
 	delete(b.active, r)
 	b.stats.Retired++
 	b.signalLocked()
+	count := len(b.active)
 	b.mu.Unlock()
-	r.trace.emit("budget_retired", 0, 0)
+	r.trace.pending(count, b.limit)
 }
 
 // takeForTeardown explicitly owns all pending tokens and records, including
@@ -144,7 +142,7 @@ func (b *v3PendingBudget) takeForTeardown() {
 	b.signalLocked()
 	b.mu.Unlock()
 	for _, trace := range traces {
-		trace.emit("budget_teardown", 0, 0)
+		trace.pending(0, b.limit)
 	}
 }
 
@@ -184,6 +182,6 @@ func (d *v3DataPlane) submitPendingRelease(ctx context.Context, closes, reclaims
 	d.pending.stats.CleanupWaitNS += uint64(elapsed)
 	d.pending.mu.Unlock()
 	t, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
-	t.emit("duplicate_cleanup_finished", v3TraceErrno(err), elapsed)
+	t.wait(lantrace.WaitReservation, elapsed)
 	return err
 }

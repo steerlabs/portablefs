@@ -435,7 +435,6 @@ func (d *v3DataPlane) serveCached(
 		result = v3CacheTerminal
 		return false, 0
 	}
-	receipt = traceV3Consumption(ctx, receipt)
 	d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
 		d.mu.Lock()
 		defer d.mu.Unlock()

@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
@@ -1628,14 +1629,12 @@ func (d *v3DataPlane) callRead(ctx context.Context, operationID uint64, request 
 		response, err := d.client.CallRead(ctx, request)
 		return d.classify(response, err, false)
 	}
-	traceV3Request(ctx, "authority_dispatch", 0)
 	response, consumption, callErr := d.client.CallReadRetained(ctx, request, func(cause error) {
 		d.revokeRetainedResponse(ctx, errors.Join(
 			errors.New("portablefsd: retained authority read crossed its frontend delivery bound"),
 			cause,
 		))
 	})
-	consumption = traceV3Consumption(ctx, consumption)
 	retained := false
 	defer func() {
 		if consumption != nil && !retained {
@@ -1729,7 +1728,6 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 	}
 	finish = lease.finishRequest
 	var assigned authorityrpc.MutationIdentity
-	traceV3Request(ctx, "authority_dispatch", 0)
 	response, consumption, callErr := d.client.CallMutationWithIdentityRetained(ctx, request, func(identity authorityrpc.MutationIdentity) error {
 		if err := lease.markAssigned(); err != nil {
 			return err
@@ -1745,7 +1743,6 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		cause = errors.Join(errors.New("portablefsd: retained authority response crossed its frontend delivery bound"), cause)
 		d.revokeRetainedResponse(ctx, cause)
 	})
-	consumption = traceV3Consumption(ctx, consumption)
 	retained := false
 	defer func() {
 		if consumption != nil && !retained {
@@ -1883,7 +1880,6 @@ func (d *v3DataPlane) callNonVisibleMutation(ctx context.Context, operationID ui
 	if operationID == 0 && collector == nil {
 		response, callErr = d.client.CallMutationWithIdentity(ctx, request, assignedCallback)
 	} else {
-		traceV3Request(ctx, "authority_dispatch", 0)
 		response, consumption, callErr = d.client.CallMutationWithIdentityRetained(
 			ctx, request, assignedCallback, func(cause error) {
 				d.revokeRetainedResponse(ctx, errors.Join(
@@ -1892,7 +1888,6 @@ func (d *v3DataPlane) callNonVisibleMutation(ctx context.Context, operationID ui
 				))
 			},
 		)
-		consumption = traceV3Consumption(ctx, consumption)
 		defer func() {
 			if consumption != nil && !retained {
 				consumption.Consume()
@@ -2543,7 +2538,7 @@ func (cleanup *v3ResourceCleanup) finish() error {
 				r.budget.mu.Lock()
 				r.budget.stats.CleanupWaitNS += uint64(elapsed)
 				r.budget.mu.Unlock()
-				r.trace.emit("cleanup_finished", v3TraceErrno(cleanup.err), elapsed)
+				r.trace.wait(lantrace.WaitReservation, elapsed)
 				r.retire()
 			}
 		}()

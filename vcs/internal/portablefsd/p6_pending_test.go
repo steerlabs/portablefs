@@ -6,11 +6,13 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
@@ -188,17 +190,24 @@ func TestP6CombinedPressurePreservesSuccessfulCreate(t *testing.T) {
 	}
 }
 
-func p6Frontend(t *testing.T, d *v3DataPlane) func(string) net.Conn {
+func p6Frontend(t *testing.T, d *v3DataPlane, recorders ...*lantrace.Recorder) func(string) net.Conn {
 	t.Helper()
 	a := newAttach(testFSKitAttachRef, "p6", ensureAttachRequest{VolumeID: "v", MountPath: "/Volumes/P6"}, privateTestDir(t))
 	a.v3Data, a.v3Coherence, a.v3Config = d, d.bridge, &v3AttachConfig{}
 	s := NewServer(Config{FrontendSocket: filepath.Join(shortDaemonSocketDir(t), "p.sock"), Version: "test"})
+	if len(recorders) != 0 {
+		s.cfg.Trace = recorders[0]
+	}
 	s.registry = newRegistry(privateTestDir(t))
 	s.registry.byRef[a.ref] = a
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- s.ServeFrontend(ctx) }()
-	t.Cleanup(func() { cancel(); <-done })
+	t.Cleanup(func() {
+		cancel()
+		<-done
+		waitV3PublicationCondition(t, func() bool { return s.frontendConnections.Load() == 0 })
+	})
 	waitUnix(t, s.cfg.FrontendSocket)
 	return func(role string) net.Conn {
 		conn, err := net.Dial("unix", s.cfg.FrontendSocket)
@@ -225,10 +234,15 @@ func p6Send(t *testing.T, conn net.Conn, env *pfslocal.Envelope) {
 }
 
 func TestP6WireSaturationKeepsReaderAckAndControlLive(t *testing.T) {
+	p6WireSaturation(t, nil)
+}
+
+func p6WireSaturation(t *testing.T, recorder *lantrace.Recorder) {
+	t.Helper()
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	d.pending = newV3PendingBudget(1)
-	dial := p6Frontend(t, d)
+	dial := p6Frontend(t, d, recorder)
 	first, second := dial("p6.data.one"), dial("p6.data.two")
 	lookup := &pfslocal.LookupRequest{Dir: d.resolveReply().Root, Name: []byte("file")}
 	p6Send(t, first, &pfslocal.Envelope{RequestID: 3, OperationID: 7, Body: lookup})
@@ -263,6 +277,37 @@ func TestP6WireSaturationKeepsReaderAckAndControlLive(t *testing.T) {
 	p6Wait(t, d, func(m v3PendingMetrics) bool { return m.Pending == 0 && m.Waiters == 0 })
 	if m := d.pending.metrics(); m.Reserved != 2 || m.Retired != 2 || m.Peak != 1 || d.terminalError() != nil {
 		t.Fatalf("connection-qualified ownership: %+v terminal=%v", m, d.terminalError())
+	}
+	// The reader must actually retire both PublicationAcks before close;
+	// otherwise an unread ack can turn a test cleanup into mount termination.
+	waitV3PublicationCondition(t, func() bool {
+		d.bridge.sourcePublication.mu.Lock()
+		defer d.bridge.sourcePublication.mu.Unlock()
+		return len(d.bridge.sourcePublication.operations) == 0
+	})
+	// Leave an OPEN without its disposition so close must run the existing
+	// asynchronous cleanup owner and return its pending reservation.
+	p6Send(t, first, &pfslocal.Envelope{RequestID: 6, Body: &pfslocal.OpenRequest{Item: reply.Body.(*pfslocal.LookupReply).Attr.Item, Mode: pfslocal.OpenModeRead}})
+	if _, ok := readPFSReply(t, first, 6).Body.(*pfslocal.OpenReply); !ok {
+		t.Fatal("OPEN failed")
+	}
+	_ = first.Close()
+	p6Wait(t, d, func(m v3PendingMetrics) bool { return m.Pending == 0 && m.Retired == 3 })
+	waitV3ReleasesIdle(t, d)
+	if d.terminalError() != nil {
+		t.Fatal(d.terminalError())
+	}
+	// A live reservation also exercises terminal transfer's trace sample.
+	reservation, err := d.pending.reserve(context.WithValue(t.Context(), v3RequestTraceContextKey{}, v3RequestTrace{recorder: recorder}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.fail(errors.New("test terminal transition")); err == nil {
+		t.Fatal("terminal transition did not record its cause")
+	}
+	reservation.retire()
+	if m := d.pending.metrics(); m.Pending != 0 || m.Teardown != 1 || m.Reserved != m.Retired {
+		t.Fatalf("terminal transfer: %+v", m)
 	}
 }
 
@@ -312,27 +357,54 @@ func TestP6ZeroAllocationRefusalsReturnReservation(t *testing.T) {
 }
 
 func TestP6KernelPeerPIDIsCapturedFromAcceptedSocket(t *testing.T) {
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(shortDaemonSocketDir(t), "pid.sock"), Net: "unix"})
+	const key = "P6_TEST_PEER_SOCKET"
+	if path := os.Getenv(key); path != "" {
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		var b [1]byte
+		_, _ = conn.Read(b[:])
+		return
+	}
+	path := filepath.Join(shortDaemonSocketDir(t), "pid-child.sock")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	connected := make(chan *net.UnixConn, 1)
-	go func() { c, _ := listener.AcceptUnix(); connected <- c }()
-	client, err := net.DialUnix("unix", nil, listener.Addr().(*net.UnixAddr))
+	_ = listener.SetDeadline(time.Now().Add(5 * time.Second))
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestP6KernelPeerPIDIsCapturedFromAcceptedSocket$")
+	cmd.Env = append(os.Environ(), key+"="+path, "GORACE=atexit_sleep_ms=0")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	server, err := listener.AcceptUnix()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
-	server := <-connected
 	defer server.Close()
 	pid, err := frontendPeerPID(server)
-	if err != nil || pid != os.Getpid() {
-		t.Fatalf("peer pid=%d want=%d err=%v", pid, os.Getpid(), err)
+	if err != nil || pid != cmd.Process.Pid || pid == os.Getpid() {
+		t.Fatalf("peer pid=%d child=%d daemon=%d err=%v", pid, cmd.Process.Pid, os.Getpid(), err)
 	}
-	trace := (&frontendConn{conn: server, frontendPID: pid, helloClientName: "exact Hello role", origin: 77, attach: &attach{ref: "resolve-ref"}}).requestTrace(9, 8)
-	if trace.FrontendPID != pid || trace.AttachRef != "resolve-ref" || trace.ConnRole != "exact Hello role" || trace.RequestID != 9 {
-		t.Fatalf("trace identity=%+v", trace)
+	var stream bytes.Buffer
+	recorder := p6Recorder(t, &stream, lantrace.LayerDaemon, lantrace.RecorderConfig{})
+	c := &frontendConn{srv: NewServer(Config{Trace: recorder}), conn: server, frontendPID: pid,
+		helloClientName: "P6.peer:Exact-1", origin: 77, attach: &attach{ref: "resolve-ref"}}
+	c.requestTrace(9, 8, &pfslocal.LookupRequest{}).local(lantrace.PhaseEnqueue, 0)
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report := p6TraceReport(t, stream.Bytes())
+	if report.Rejected != 0 || report.ProducerLost != 0 || report.InconsistentStreams != 0 {
+		t.Fatalf("serialized identity rejected: %+v", report)
+	}
+	events := p6TraceEvents(t, stream.Bytes())
+	if len(events) != 1 || events[0].FrontendPID != uint32(pid) || events[0].AttachRef != "resolve-ref" || events[0].ConnRole != "P6.peer:Exact-1" || events[0].Conn != "77" || events[0].RequestID != 9 || events[0].LocalOp != lantrace.LocalLookup {
+		t.Fatalf("serialized peer identity=%+v", events)
 	}
 }
 

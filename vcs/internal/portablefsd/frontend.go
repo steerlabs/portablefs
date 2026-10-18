@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -57,7 +58,13 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 			_ = c.Close()
 			continue
 		}
-		fc := &frontendConn{srv: s, conn: c, frontendPID: pid}
+		origin := allocateFrontendOrigin(&frontendOrigins)
+		if origin == 0 {
+			s.frontendConnections.Add(-1)
+			_ = c.Close()
+			continue
+		}
+		fc := &frontendConn{srv: s, conn: c, frontendPID: pid, origin: origin}
 		go func() {
 			defer s.frontendConnections.Add(-1)
 			fc.serve(ctx)
@@ -141,6 +148,15 @@ const (
 
 func (c *frontendConn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
+	// Socket fixtures also enter here directly; production allocates at accept.
+	if c.origin == 0 {
+		c.origin = allocateFrontendOrigin(&frontendOrigins)
+		if c.origin == 0 {
+			cancel()
+			_ = c.conn.Close()
+			return
+		}
+	}
 	c.connCtx = connCtx
 	c.cancel = cancel
 	// close owns cancellation after withdrawing publication admission. Waking
@@ -162,7 +178,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 				log.Printf("portablefsd frontend: closing connection: malformed resource reply disposition")
 				return
 			}
-			c.requestTrace(disposition.TargetRequestID, 0).emit("resource_disposition", 0, 0)
 			if !c.settleProvisionalResource(disposition) {
 				log.Printf(
 					"portablefsd frontend: closing connection: invalid resource disposition target=%d accept_handles=%t accepted_items=%d",
@@ -182,7 +197,11 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			req := env.Body.(*pfslocal.PublicationAck)
-			c.requestTrace(0, req.OperationID).emit("publication_ack", 0, 0)
+			publication := lantrace.PublicationNotPublished
+			if req.SemanticCommit == pfslocal.PublicationSemanticCommitPublished {
+				publication = lantrace.PublicationPublished
+			}
+			c.requestTrace(0, req.OperationID, nil).emit(lantrace.Event{Kind: lantrace.KindSource, Phase: lantrace.PhaseAck, Publication: publication})
 			if req.OperationID == 0 ||
 				(req.SemanticCommit != pfslocal.PublicationSemanticCommitPublished &&
 					req.SemanticCommit != pfslocal.PublicationSemanticCommitNotPublished) {
@@ -227,13 +246,16 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			c.helloClientName = req.ClientName
-			c.requestTrace(env.RequestID, env.OperationID).emit("request_arrival", 0, 0)
-			c.reply(env.RequestID, &pfslocal.HelloReply{
+			c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseEnqueue, 0)
+			written := c.reply(env.RequestID, &pfslocal.HelloReply{
 				ProtocolMajor:     pfslocal.ProtocolMajor,
 				ProtocolMinor:     pfslocal.ProtocolMinor,
 				DaemonVersion:     c.srv.cfg.Version,
 				RequestDeadlineMs: uint32(frontendRequestDeadline().Milliseconds()),
 			})
+			if written {
+				c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseReply, 0)
+			}
 			state = frontendAwaitingResolve
 		case *pfslocal.ResolveRequest:
 			if state != frontendAwaitingResolve {
@@ -252,17 +274,19 @@ func (c *frontendConn) serve(ctx context.Context) {
 			if !c.setAttach(a) {
 				return
 			}
-			c.requestTrace(env.RequestID, env.OperationID).emit("request_arrival", 0, 0)
+			c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseEnqueue, 0)
 			state = frontendAttached
-			if c.reply(env.RequestID, &rep) &&
-				c.helloClientName == shippingFSKitFrontendClientName {
-				a.registerFrontendWitness(c)
+			if c.reply(env.RequestID, &rep) {
+				c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseReply, 0)
+				if c.helloClientName == shippingFSKitFrontendClientName {
+					a.registerFrontendWitness(c)
+				}
 			}
 		default:
 			if state != frontendAttached {
 				return
 			}
-			c.requestTrace(env.RequestID, env.OperationID).emit("request_arrival", 0, 0)
+			c.requestTrace(env.RequestID, env.OperationID, req).local(lantrace.PhaseEnqueue, 0)
 			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
 				c.inFlight.Add(-1)
 				return
@@ -326,7 +350,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 func (c *frontendConn) close() {
 	c.closeOnce.Do(func() {
 		c.connectionClosed.Store(true)
-		c.requestTrace(0, 0).emit("connection_close", 0, 0)
 		// A closing transport is not a live native FSKit witness. Retire the
 		// witness before any handler join or publication cleanup can block, so
 		// mount readiness never observes a connection whose teardown has begun.
@@ -621,6 +644,9 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 	if resources == nil {
 		return false
 	}
+	if resources.reservation != nil {
+		resources.reservation.trace.local(lantrace.PhaseDisposition, 0)
+	}
 	cleanup, err := resources.d.applyReplyResourceDisposition(
 		resources, disposition.AcceptHandles, disposition.AcceptedItemCount,
 	)
@@ -707,8 +733,6 @@ func (c *frontendConn) replyWithPublicationCommit(
 	lateDiscardable bool,
 	commit func() bool,
 ) (delivered bool, written bool, discarded bool, refused bool) {
-	trace := c.requestTrace(req, operationID)
-	trace.emit("reply_admission", 0, 0)
 	if ackRequired {
 		exposed, lateDiscarded := c.markPublicationReplyExposedForV3(operationID, lateDiscardable)
 		if !exposed {
@@ -726,16 +750,13 @@ func (c *frontendConn) replyWithPublicationCommit(
 		OperationID: operationID, Body: body,
 	}, commit)
 	if err != nil {
-		trace.emit("reply_write_failed", darwinENOTCONN, 0)
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
 		return false, false, false, false
 	}
 	if !admitted {
-		trace.emit("reply_refused", 0, 0)
 		return false, false, false, true
 	}
-	trace.emit("reply_written", 0, 0)
 	return true, true, false, false
 }
 
@@ -860,7 +881,7 @@ func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *fronten
 			// requests; finalization waits for every handler and PublicationAck.
 			bridge.releaseFrontendPublication(c.callback(operationID))
 			_ = bridge.finishFrontendPublication(c.callback(operationID))
-			c.requestTrace(0, operationID).emit("publication_retired", 0, 0)
+			c.requestTrace(0, operationID, nil).emit(lantrace.Event{Kind: lantrace.KindSource, Phase: lantrace.PhaseRelease})
 		}
 	}
 }
@@ -958,8 +979,7 @@ func (c *frontendConn) handleAttached(
 	initializeOperation bool,
 	body any,
 ) {
-	trace := c.requestTrace(requestID, operationID)
-	trace.emit("handler_start", 0, 0)
+	trace := c.requestTrace(requestID, operationID, body)
 	ctx = context.WithValue(ctx, v3RequestTraceContextKey{}, trace)
 	c.handleV3Attached(
 		ctx, a, requestID, operationID,
@@ -988,7 +1008,6 @@ func (c *frontendConn) subscribeEvents(a *attach) error {
 	c.v3Events = true
 	go func() {
 		err := bridge.runBound(c.connCtx, func(event *pfslocal.Event) error {
-			c.requestTrace(0, 0).emit("event_delivery", 0, 0)
 			return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
 		})
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {

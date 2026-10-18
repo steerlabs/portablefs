@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
@@ -655,14 +656,18 @@ func (c *frontendConn) serveV3Attempt(
 	exposed := false
 	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
 	defer resources.retirePending()
-	traceV3Request(ctx, "dispatch", 0)
+	defer func() {
+		if exposed {
+			traceV3Request(ctx, lantrace.PhaseReply, eno)
+		}
+	}()
+	traceV3Request(ctx, lantrace.PhaseDispatch, 0)
 	defer func() {
 		if resources.cached != nil && !resources.cached.accounted {
 			reason := v3CacheTerminal
 			if exposed {
 				reason = v3CacheHit
 			}
-			traceV3Request(ctx, "cache_"+v3CacheResultNames[reason], 0)
 			d.recordCacheResult(resources.cached.metric, reason)
 			resources.cached.accounted = true
 		}
@@ -708,13 +713,23 @@ func (c *frontendConn) serveV3Attempt(
 			eno = darwinENOTCONN
 		}
 	}
-	traceV3Request(ctx, "dispatch_result", eno)
-	if resources.cached != nil {
-		traceV3Request(ctx, "cache_candidate", eno)
-	}
+	traceV3Request(ctx, lantrace.PhaseOutcome, eno)
 	var commit func() bool
 	if resources.cached != nil {
 		commit = resources.cached.revalidate
+	}
+	trace, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
+	if trace.recorder != nil {
+		validate := commit
+		commit = func() bool {
+			admitted := validate == nil || validate()
+			e := lantrace.Event{Kind: lantrace.KindLocal, Phase: lantrace.PhaseExposure, LocalOp: trace.localOp}
+			if !admitted {
+				e.Outcome = lantrace.OutcomeCancelled
+			}
+			trace.emit(e)
+			return admitted
+		}
 	}
 	if eno != 0 {
 		if d != nil && (len(resources.items) != 0 || len(resources.handles) != 0) {
