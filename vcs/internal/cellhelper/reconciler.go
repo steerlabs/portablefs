@@ -20,8 +20,8 @@ import (
 var ErrInvalid = errors.New("cellhelper: invalid reconciliation")
 
 type Host interface {
-	Apply(context.Context, cellplan.VolumePlan, Assignment) (controlplane.VolumeObservation, HostUpdate)
-	Observe(context.Context, cellplan.VolumePlan, Assignment) (controlplane.VolumeObservation, HostUpdate)
+	Apply(context.Context, cellplan.EffectiveVolumePlan, Assignment) (controlplane.VolumeObservation, HostUpdate)
+	Observe(context.Context, cellplan.EffectiveVolumePlan, Assignment) (controlplane.VolumeObservation, HostUpdate)
 	// ArchiveConfigured is a live cell capability, reported on every pass
 	// alongside the plan/state version capabilities: true only while the cell's
 	// archive-store credentials are actually usable.
@@ -325,13 +325,9 @@ func phaseApplied(volume cellplan.VolumePlan, observed controlplane.VolumeObserv
 	}
 }
 
-func effectiveVolumePlan(plan cellplan.Plan, volume cellplan.VolumePlan) cellplan.VolumePlan {
-	if plan.Version == cellplan.Version {
-		volume.AuthorityCAPEM = plan.AuthorityCAPEM
-		volume.ClientCAPEM = plan.ClientCAPEM
-		volume.CapabilityPublicKey = plan.CapabilityPublicKey
-	}
-	return volume
+func effectiveVolumePlan(plan cellplan.Plan, volume cellplan.VolumePlan) cellplan.EffectiveVolumePlan {
+	return cellplan.EffectiveVolumePlan{VolumePlan: volume, AuthorityCAPEM: plan.AuthorityCAPEM,
+		ClientCAPEM: plan.ClientCAPEM, CapabilityPublicKey: plan.CapabilityPublicKey}
 }
 
 func setObservationIdentity(observed *controlplane.VolumeObservation, volume cellplan.VolumePlan) {

@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	Version          = 2
+	Version          = 3
 	MaxPayloadBytes  = 3 << 20
 	MaxEnvelopeBytes = 4 << 20
-	domainV2         = "portablefs-cell-plan-v2\x00"
+	domainV3         = "portablefs-cell-plan-v3\x00"
 )
 
 var (
@@ -80,14 +80,20 @@ type VolumePlan struct {
 	QuotaInodes          uint64         `json:"quota_inodes"`
 	AuthorityServerName  string         `json:"authority_server_name"`
 	AuthorityCertificate string         `json:"authority_certificate_pem,omitempty"`
-	AuthorityCAPEM       string         `json:"authority_ca_pem,omitempty"`
-	ClientCAPEM          string         `json:"client_ca_pem,omitempty"`
-	CapabilityPublicKey  string         `json:"capability_public_key_pem,omitempty"`
 	PriorStrictFenced    bool           `json:"prior_strict_mounts_fenced"`
 	PlacementSequence    uint64         `json:"placement_sequence,omitempty"`
 	ArchiveTo            *ArchiveTarget `json:"archive_to,omitempty"`
 	RestoreFrom          *RestoreSource `json:"restore_from,omitempty"`
 	ReleaseProof         *ReleaseProof  `json:"release_proof,omitempty"`
+}
+
+// EffectiveVolumePlan carries verified plan-level trust to the host. It is not
+// a signed wire shape: a volume cannot override the enclosing plan's trust.
+type EffectiveVolumePlan struct {
+	VolumePlan
+	AuthorityCAPEM      string
+	ClientCAPEM         string
+	CapabilityPublicKey string
 }
 
 type ArchiveTarget struct {
@@ -130,8 +136,8 @@ func Sign(privateKey ed25519.PrivateKey, plan Plan) (Envelope, error) {
 	if len(payload) > MaxPayloadBytes {
 		return Envelope{}, fmt.Errorf("%w: plan exceeds payload bound", ErrInvalid)
 	}
-	signature := ed25519.Sign(privateKey, append([]byte(domainV2), payload...))
-	token := "v2." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature)
+	signature := ed25519.Sign(privateKey, append([]byte(domainV3), payload...))
+	token := "v3." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature)
 	if len(token) > MaxEnvelopeBytes {
 		return Envelope{}, fmt.Errorf("%w: plan exceeds envelope bound", ErrInvalid)
 	}
@@ -147,7 +153,7 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 	if len(parts) != 3 {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
-	if parts[0] != "v2" {
+	if parts[0] != "v3" {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -156,7 +162,7 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(signature) != ed25519.SignatureSize ||
-		!ed25519.Verify(publicKey, append([]byte(domainV2), payload...), signature) {
+		!ed25519.Verify(publicKey, append([]byte(domainV3), payload...), signature) {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -188,7 +194,7 @@ func Validate(plan Plan) error {
 		return ErrInvalid
 	}
 	if plan.AuthorityCAPEM == "" || plan.ClientCAPEM == "" || plan.CapabilityPublicKey == "" {
-		return fmt.Errorf("%w: v2 plan-level trust material", ErrInvalid)
+		return fmt.Errorf("%w: plan-level trust material", ErrInvalid)
 	}
 	seenVolume := make(map[string]struct{}, len(plan.Volumes))
 	seenProject := make(map[uint32]struct{}, len(plan.Volumes))
@@ -203,8 +209,8 @@ func Validate(plan Plan) error {
 			volume.AuthorityServerName == "" {
 			return fmt.Errorf("%w: incomplete volume %q", ErrInvalid, volume.VolumeID)
 		}
-		if volume.AuthorityCAPEM != "" || volume.ClientCAPEM != "" || volume.CapabilityPublicKey != "" || volume.PlacementSequence == 0 {
-			return fmt.Errorf("%w: v2 volume shape", ErrInvalid)
+		if volume.PlacementSequence == 0 {
+			return fmt.Errorf("%w: missing placement sequence", ErrInvalid)
 		}
 		switch volume.Phase {
 		case PhaseProvision, PhaseFence, PhaseQuiesce:

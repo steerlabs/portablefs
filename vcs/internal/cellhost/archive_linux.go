@@ -21,7 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func (host *Host) WriteArchiverConfig(plan cellplan.VolumePlan) error {
+func (host *Host) WriteArchiverConfig(plan cellplan.EffectiveVolumePlan) error {
 	if plan.ArchiveTo == nil || !cellplan.ValidID(plan.VolumeID) {
 		return ErrInvalid
 	}
@@ -31,7 +31,7 @@ func (host *Host) WriteArchiverConfig(plan cellplan.VolumePlan) error {
 	return host.writeLaunchConfig(plan.VolumeID, plan.ServiceGID, archiveConfigName, config)
 }
 
-func (host *Host) WriteHydratorConfig(plan cellplan.VolumePlan, mode HydratorMode) error {
+func (host *Host) WriteHydratorConfig(plan cellplan.EffectiveVolumePlan, mode HydratorMode) error {
 	if plan.RestoreFrom == nil || !validHydratorMode(mode) || !cellplan.ValidID(plan.VolumeID) {
 		return ErrInvalid
 	}
@@ -99,7 +99,7 @@ func (host *Host) stageArchiveCredentials(volumeID string, serviceGID uint32) (s
 	return staged, nil
 }
 
-func (host *Host) WriteArchiverDropIns(plan cellplan.VolumePlan) error {
+func (host *Host) WriteArchiverDropIns(plan cellplan.EffectiveVolumePlan) error {
 	if !cellplan.ValidID(plan.VolumeID) || plan.ServiceUID < 1000 || plan.ServiceGID < 1000 {
 		return ErrInvalid
 	}
@@ -117,7 +117,7 @@ func (host *Host) WriteArchiverDropIns(plan cellplan.VolumePlan) error {
 	return host.writeUnitDropIn(archiverUnit(plan.VolumeID), content)
 }
 
-func (host *Host) WriteHydratorDropIns(plan cellplan.VolumePlan, mode HydratorMode) error {
+func (host *Host) WriteHydratorDropIns(plan cellplan.EffectiveVolumePlan, mode HydratorMode) error {
 	if !cellplan.ValidID(plan.VolumeID) || plan.ServiceUID < 1000 || plan.ServiceGID < 1000 || !validHydratorMode(mode) {
 		return ErrInvalid
 	}
@@ -333,7 +333,7 @@ func readResult(path string, limit int64, absent error, target any) error {
 	return nil
 }
 
-func (host *Host) applyArchive(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *Host) applyArchive(ctx context.Context, plan cellplan.EffectiveVolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	observed, update := host.applyQuiesceFence(ctx, plan, previous)
 	if observed.Error != "" || !observed.AuthorityAbsent || !observed.QuiesceProven {
 		return observed, update
@@ -345,7 +345,7 @@ func (host *Host) applyArchive(ctx context.Context, plan cellplan.VolumePlan, pr
 	return archived, update
 }
 
-func (host *Host) observeArchive(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *Host) observeArchive(ctx context.Context, plan cellplan.EffectiveVolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	observed := host.observeQuiesceFence(ctx, plan, previous)
 	if observed.Error != "" {
 		return observed, cellhelper.HostUpdate{}
@@ -383,7 +383,7 @@ func (host *Host) observeArchive(ctx context.Context, plan cellplan.VolumePlan, 
 	return observed, cellhelper.HostUpdate{}
 }
 
-func (host *Host) applyRestore(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *Host) applyRestore(ctx context.Context, plan cellplan.EffectiveVolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	observed := controlplane.VolumeObservation{}
 	var err error
 	observed.Provisioned, observed.AuthorityCSRPEM, err = host.provision(ctx, plan,
@@ -448,7 +448,7 @@ func (host *Host) applyRestore(ctx context.Context, plan cellplan.VolumePlan, pr
 	return observed, cellhelper.HostUpdate{}
 }
 
-func (host *Host) observeRestore(ctx context.Context, plan cellplan.VolumePlan) controlplane.VolumeObservation {
+func (host *Host) observeRestore(ctx context.Context, plan cellplan.EffectiveVolumePlan) controlplane.VolumeObservation {
 	observed := controlplane.VolumeObservation{}
 	provisioned, csr, err := host.observeProvisioned(plan)
 	observed.Provisioned, observed.AuthorityCSRPEM = provisioned, csr
@@ -477,7 +477,7 @@ func (host *Host) observeRestore(ctx context.Context, plan cellplan.VolumePlan) 
 	return observed
 }
 
-func (host *Host) readRestoreStatus(plan cellplan.VolumePlan, observed *controlplane.VolumeObservation) {
+func (host *Host) readRestoreStatus(plan cellplan.EffectiveVolumePlan, observed *controlplane.VolumeObservation) {
 	if progress, err := host.ReadRestoreProgress(plan.VolumeID); err == nil {
 		observed.RestoreProgressPermille, observed.RestoreState = progress.ProgressPermille, progress.State
 	} else if !errors.Is(err, ErrRestoreProgressAbsent) {
@@ -495,7 +495,7 @@ func (host *Host) readRestoreStatus(plan cellplan.VolumePlan, observed *controlp
 	}
 }
 
-func (host *Host) cleanupConvergedHydrator(ctx context.Context, plan cellplan.VolumePlan) error {
+func (host *Host) cleanupConvergedHydrator(ctx context.Context, plan cellplan.EffectiveVolumePlan) error {
 	converged, err := host.ReadRestoreConverged(plan.VolumeID)
 	if err != nil {
 		return fmt.Errorf("cellhost: serve after restore lacks convergence proof: %w", err)
@@ -512,7 +512,7 @@ func (host *Host) cleanupConvergedHydrator(ctx context.Context, plan cellplan.Vo
 	return host.RemoveHydratorDropIns(ctx, plan.VolumeID)
 }
 
-func (host *Host) applyDestroy(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *Host) applyDestroy(ctx context.Context, plan cellplan.EffectiveVolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	observed := controlplane.VolumeObservation{AuthorityAbsent: true}
 	for _, check := range []func(context.Context, string) (bool, error){host.ArchiverAbsent, host.HydratorAbsent} {
 		absent, err := check(ctx, plan.VolumeID)
@@ -565,7 +565,7 @@ func (host *Host) unitActive(ctx context.Context, unit string) bool {
 	return err == nil
 }
 
-func placementSequenceOf(plan cellplan.VolumePlan) uint64 {
+func placementSequenceOf(plan cellplan.EffectiveVolumePlan) uint64 {
 	if plan.PlacementSequence == 0 {
 		return 1
 	}

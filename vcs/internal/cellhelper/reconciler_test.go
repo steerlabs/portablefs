@@ -18,8 +18,8 @@ import (
 type fakeHost struct {
 	absent            bool
 	archiveConfigured bool
-	calls             []cellplan.VolumePlan
-	observes          []cellplan.VolumePlan
+	calls             []cellplan.EffectiveVolumePlan
+	observes          []cellplan.EffectiveVolumePlan
 }
 
 func (host *fakeHost) ArchiveConfigured() bool { return host.archiveConfigured }
@@ -38,7 +38,7 @@ type scriptedHost struct {
 
 func (host *scriptedHost) ArchiveConfigured() bool { return host.archiveConfigured }
 
-func (host *scriptedHost) Apply(_ context.Context, _ cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
+func (host *scriptedHost) Apply(_ context.Context, _ cellplan.EffectiveVolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	if len(host.applies) == 0 {
 		return controlplane.VolumeObservation{Error: "unexpected apply"}, HostUpdate{}
 	}
@@ -47,7 +47,7 @@ func (host *scriptedHost) Apply(_ context.Context, _ cellplan.VolumePlan, _ Assi
 	return next.observation, next.update
 }
 
-func (host *scriptedHost) Observe(_ context.Context, _ cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
+func (host *scriptedHost) Observe(_ context.Context, _ cellplan.EffectiveVolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	if len(host.observes) == 0 {
 		return controlplane.VolumeObservation{Error: "unexpected observe"}, HostUpdate{}
 	}
@@ -56,7 +56,7 @@ func (host *scriptedHost) Observe(_ context.Context, _ cellplan.VolumePlan, _ As
 	return next.observation, next.update
 }
 
-func (host *fakeHost) Observe(_ context.Context, plan cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
+func (host *fakeHost) Observe(_ context.Context, plan cellplan.EffectiveVolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	host.observes = append(host.observes, plan)
 	return controlplane.VolumeObservation{
 		Provisioned: true, AuthorityRunning: plan.Phase == cellplan.PhaseServe,
@@ -64,7 +64,7 @@ func (host *fakeHost) Observe(_ context.Context, plan cellplan.VolumePlan, _ Ass
 	}, HostUpdate{}
 }
 
-func (host *fakeHost) Apply(_ context.Context, plan cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
+func (host *fakeHost) Apply(_ context.Context, plan cellplan.EffectiveVolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	host.calls = append(host.calls, plan)
 	return controlplane.VolumeObservation{
 		Provisioned: true, AuthorityRunning: plan.Phase == cellplan.PhaseServe,
@@ -487,5 +487,14 @@ func TestReconcilerReportsHostArchiveCapabilityEveryPass(t *testing.T) {
 	observation, err = reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, plan))
 	if err != nil || observation.ArchiveConfigured {
 		t.Fatalf("revoked helper observation = %+v, %v", observation, err)
+	}
+}
+
+func TestEffectiveVolumePlanInheritsEnclosingTrust(t *testing.T) {
+	plan := cellplan.Plan{AuthorityCAPEM: "authority", ClientCAPEM: "client", CapabilityPublicKey: "capability"}
+	volume := cellplan.VolumePlan{VolumeID: "22222222-2222-4222-8222-222222222222"}
+	effective := effectiveVolumePlan(plan, volume)
+	if effective.VolumePlan != volume || effective.AuthorityCAPEM != plan.AuthorityCAPEM || effective.ClientCAPEM != plan.ClientCAPEM || effective.CapabilityPublicKey != plan.CapabilityPublicKey {
+		t.Fatal("effective host configuration did not inherit exact enclosing trust")
 	}
 }
