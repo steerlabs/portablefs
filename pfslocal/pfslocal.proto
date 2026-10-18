@@ -1,14 +1,13 @@
-// pfslocal v1 — the local frontend protocol between portablefsd (Go daemon) and
+// pfslocal 2.0 — the local frontend protocol between portablefsd (Go daemon) and
 // filesystem frontends (the macOS FSKit extension today; anything else tomorrow).
 //
 // Transport: a SOCK_STREAM Unix domain socket. Every frame is a 4-byte
 // little-endian unsigned length N (N <= 16 MiB) followed by N bytes encoding one
 // Envelope. Client→daemon envelopes carry request bodies with a nonzero,
 // client-chosen request_id, strictly increasing WITHIN ITS ORDERING LANE.
-// There are two lanes: the reserved control lane (VisibilityAck and
-// V3Liveness), which the client writes ahead of everything else so a barrier
-// acknowledgment can never queue behind a request burst, and the ordinary
-// request lane for all other bodies. Each lane is FIFO with increasing IDs;
+// There are two lanes: the reserved control lane (V3Liveness), which the
+// client writes ahead of ordinary requests, and the ordinary request lane
+// for all other bodies. Each lane is FIFO with increasing IDs;
 // the two interleave on the wire, so a control frame may legally carry a
 // LOWER id than an already-received ordinary frame and the daemon keeps one
 // replay watermark per lane. PublicationAck and ResourceReplyDisposition are
@@ -28,77 +27,10 @@
 // successful Resolve; all filesystem requests and PublicationAck messages
 // follow that binding. A second Hello or Resolve is a protocol violation.
 //
-// Versioning: Hello/HelloReply negotiate {major, minor}. Same major = wire
-// compatible; unknown fields are ignored (proto3). Breaking changes bump major
-// and the daemon serves both during a deprecation window.
-// Protocol minor 4 makes an explicit daemon handle mandatory for retained
-// Item attribute/xattr operations after unlink or rename-over. Protocol minor
-// 5 adds frontend parent identity, BSD flags, and allocated size to Attr so
-// FSKit can satisfy its requested-attribute contract without inventing
-// metadata. Protocol minor 6 adds Envelope.publication_retracted, the
-// daemon's instruction that an operation's already-delivered results must
-// never be installed into the frontend's cache. Protocol minor 7 adds
-// HelloReply.request_deadline_ms, which moves ownership of the per-request
-// reply bound from a constant compiled into the frontend to the daemon that
-// actually owns the budgets it has to exceed.
-// Protocol minor 8 adds the macOS v3 coherence contract, exact two-phase
-// visibility events, and cursor acknowledgments. A frontend that ignores these
-// additions can continue serving stale kernel state, so pairing with an older
-// minor is a correctness failure rather than a feature downgrade.
-// Protocol minor 9 adds V3LivenessRequest/V3LivenessReply. Strict-v3
-// frontends use this as an end-to-end proof that the daemon can still reach
-// the exact authority epoch/session from Resolve; a live UDS alone is not a
-// coherence proof.
-// Protocol minor 10 makes EnumerateRequest.handle mandatory. Authority
-// directory cookies belong to the retained open handle that issued them; a
-// frontend or daemon that omits this field cannot resume a multi-page walk
-// without either truncating it or silently repositioning it.
-// Protocol minor 12 adds ResourceReplyDisposition. OpenReply and CreateReply
-// carry daemon handles whose ownership cannot be inferred from socket delivery:
-// the frontend may cancel before observing the reply, or reject an otherwise
-// successful callback at its final framework-publication boundary. The daemon
-// therefore keeps each returned resource provisional until the frontend sends
-// exactly one handle/item ownership disposition for the reply's request ID.
-// Protocol minor 13 adds VisibilityAckRequest.ordered_admission_contended. The
-// exact peer COMPLETE Ack may carry one optional, liveness-only hint for
-// measured ordered-callback contention. A pre-13 daemon would discard the hint
-// and cannot preserve the one-shot effective-FIFO compensation tied to it.
-// Protocol minor 14 adds VisibilityTarget.post_identity. It binds a namespace
-// coordinate to its exact authority post-mutation owner, allowing macOS to
-// inode-attest a new rename/hard-link repair source instead of reusing an old
-// pathname whose authority stability ended at a namespace event.
-// Protocol minor 15 is the coordinated source-publication cut. The current
-// frontend requires nested authority protocol 7, replaces source
-// PREPARE/COMPLETE with the daemon-owned source-publication gate, and makes the
-// callback's semantic publication verdict explicit. The authority session owns
-// mandatory DATA and CONTROL transports and becomes usable only after its
-// provisional attach is activated. A pre-15 frontend cannot implement these
-// ordering and failure-atomicity rules, so it must fail the minimum-minor gate.
-// Protocol minor 16 separates file identity from item ownership. Attr gains
-// file_id and parent_file_id, the filesystem object numbers FSKit reports;
-// Item stays a daemon-local ownership handle. EnumerateEntriesRequest and
-// EnumerateEntriesReply list a directory as non-owning entry snapshots: no
-// entry carries an Item or transfers item ownership, so listing retains no
-// authority capability. EnumerateRequest/EnumerateReply keep their item-owning
-// meaning and are not served to a minor-16 frontend.
-//
-// O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
-// is deliberately NOT gated behind a minor bump: the daemon rejects any
-// frontend whose minor is below its own, and these fields default to false,
-// which reproduces the previous positional-write behavior exactly. A frontend
-// that can express append opts in; one that cannot is unaffected.
-//
-// chflags(2) (SetAttrRequest.set_flags/flags plus Capabilities.flags_supported
-// and Capabilities.flags_understood) follows that SAME rule and is likewise
-// NOT gated behind a minor bump. set_flags defaults to false, which is
-// byte-for-byte the previous "this setattr changes no flags" meaning;
-// flags_supported defaults to false, which is the previous "this authority
-// does not persist a flag word" meaning; and flags_understood defaults to
-// false, which is exactly "the daemon on this connection predates set_flags
-// and would silently discard it". An older frontend is therefore unaffected,
-// and a newer one opts in. Note the daemon already rejects any frontend whose
-// minor is below its own, so a bump could only lock out frontends for no
-// semantic gain.
+// Versioning: daemon and frontend require exact major 2 and minor 0.
+// This private interface is paired by the sealed release identity. Unknown
+// fields and bodies are invalid; a grammar change requires a new exact version.
+// HelloReply.request_deadline_ms is required and positive.
 //
 // PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface per-write append
 // intent to a filesystem extension. FSVolumeOpenModes has only Read and Write,
@@ -112,7 +44,8 @@
 // Identity model: items are addressed by (item_id, item_generation), opaque
 // daemon-local ownership handles for authority capabilities. A handle names
 // one retained capability, not a file: after reclaim the same file can return
-// under a new handle. Attr.file_id is the file's identity as FSKit reports it. attach_ref is an opaque string minted by the daemon's
+// under a new handle. Attr.file_id is the file's identity as FSKit reports it.
+// attach_ref is an opaque string minted by the daemon's
 // control API (EnsureAttach); it carries no secrets and is safe to appear in a
 // mount URL / logs.
 
@@ -136,50 +69,14 @@ message Envelope {
   // callback first issues a cache-producing request. Earlier nonpublishing
   // requests carry zero; later requests from that callback carry the same
   // nonzero ID, making a multi-RPC callback one admission and publication unit
-  // across handoffs. Protocol minor 3 introduced this lazy allocation rule;
+  // for publication. This is a lazy allocation rule;
   // a fresh nonpublishing request with a nonzero ID is a protocol violation.
   uint64 operation_id = 3;
-  // Set on a daemon reply for an operation whose ALREADY-DELIVERED results
-  // must never be installed into the frontend's cache. The daemon retracts
-  // when a delegation handoff has crossed that operation: the frontend is
-  // holding pre-handoff values, a peer may already have acquired the
-  // delegation and mutated, and installing those values would let an
-  // application read a stale byte after a remote write it happens-after.
-  //
-  // WHY IT RIDES A REPLY FRAME rather than travelling as its own message:
-  // ordering is the entire mechanism. The crossing case only arises while
-  // the operation still has parked participants — requests in flight that
-  // WILL be answered — and a framework callback cannot return before its
-  // last request is answered. So at least one further reply for that
-  // operation is written AFTER the crossing, and a bit on that reply's
-  // envelope is therefore strictly ordered before the framework install. A
-  // standalone retraction message would carry no such ordering: frontends
-  // dispatch inbound frames concurrently (the FSKit extension hands each
-  // decoded frame to its own Task), so a separate frame can be observed
-  // after the reply it was meant to precede. Same frame, no reordering.
-  //
-  // A retracted operation still owes PublicationAck with NOT_PUBLISHED.
-  // Retraction governs what the FRONTEND installs. That explicit verdict
-  // retires an ordinary read/error publication, but is terminal if any visible
-  // authority mutation in the same logical operation already committed.
-  //
-  // UNLIKE the O_APPEND and chflags fields described below, this one IS
-  // gated behind a minor bump (5 -> 6), and deliberately so. Those fields
-  // default to a value that reproduces the previous behaviour exactly, so a
-  // frontend that ignores them is merely missing a feature. A frontend that
-  // ignores THIS bit installs state the daemon has retracted — a silent
-  // correctness failure, invisible to both ends, and not expressible as a
-  // missing feature. The daemon rejects any frontend whose minor is below
-  // its own, and that rejection IS the gate: it is the only mechanism that
-  // can guarantee no connected frontend ignores the bit.
-  bool publication_retracted = 4;
-  reserved 5;
   oneof body {
     // client → daemon
     Hello hello = 10;
     ResolveRequest resolve = 11;
     LookupRequest lookup = 12;
-    EnumerateRequest enumerate = 13;
     GetAttrRequest get_attr = 14;
     SetAttrRequest set_attr = 15;
     OpenRequest open = 16;
@@ -197,13 +94,11 @@ message Envelope {
     XattrListRequest xattr_list = 28;
     XattrRemoveRequest xattr_remove = 29;
     StatfsRequest statfs = 30;
-    FsyncRequest fsync = 31;
     ReclaimRequest reclaim = 32;
     SubscribeEventsRequest subscribe_events = 33;
     HardLinkRequest hard_link = 34;
     SyncVolumeRequest sync_volume = 35;
     PublicationAck publication_ack = 36;
-    VisibilityAckRequest visibility_ack = 37;
     V3LivenessRequest v3_liveness = 38;
     ResourceReplyDisposition resource_reply_disposition = 39;
     EnumerateEntriesRequest enumerate_entries = 40;
@@ -212,7 +107,6 @@ message Envelope {
     HelloReply hello_reply = 60;
     ResolveReply resolve_reply = 61;
     LookupReply lookup_reply = 62;
-    EnumerateReply enumerate_reply = 63;
     GetAttrReply get_attr_reply = 64;
     SetAttrReply set_attr_reply = 65;
     OpenReply open_reply = 66;
@@ -230,12 +124,10 @@ message Envelope {
     XattrListReply xattr_list_reply = 78;
     XattrRemoveReply xattr_remove_reply = 79;
     StatfsReply statfs_reply = 80;
-    FsyncReply fsync_reply = 81;
     ReclaimReply reclaim_reply = 82;
     SubscribeEventsReply subscribe_events_reply = 83;
     HardLinkReply hard_link_reply = 84;
     SyncVolumeReply sync_volume_reply = 85;
-    VisibilityAckReply visibility_ack_reply = 86;
     V3LivenessReply v3_liveness_reply = 87;
     EnumerateEntriesReply enumerate_entries_reply = 88;
 
@@ -248,8 +140,8 @@ message Envelope {
 // ---------- session ----------
 
 message Hello {
-  uint32 protocol_major = 1; // 1
-  uint32 protocol_minor = 2; // 8
+  uint32 protocol_major = 1; // 2
+  uint32 protocol_minor = 2; // 0
   string client_name = 3;    // e.g. "fskit-appex"
   string client_version = 4;
 }
@@ -266,9 +158,6 @@ enum PublicationSemanticCommit {
 // operation produced only a cacheable error/negative result. NOT_PUBLISHED is
 // safe only when no visible authority mutation in the operation committed.
 message PublicationAck {
-  // Retired request-scoped identifier from protocol minor 1. Protocol minor
-  // 15 is a coordinated one-version cut and reserves it permanently.
-  reserved 1;
   uint64 operation_id = 2;
   PublicationSemanticCommit semantic_commit = 3;
 }
@@ -293,22 +182,7 @@ message HelloReply {
   uint32 protocol_major = 1;
   uint32 protocol_minor = 2;
   string daemon_version = 3;
-  // How long a frontend must be willing to wait for ONE reply before it may
-  // conclude the daemon has stopped answering. The DAEMON owns this number
-  // because the daemon owns the budgets it is derived from.
-  //
-  // It exists because the two bounds used to be independent constants in two
-  // languages: the daemon gave one request a 50s admission budget, the
-  // extension gave one request a 60s reply deadline, and nothing anywhere
-  // related the two. Ten seconds of margin is not a margin — a single cold
-  // create that legitimately spent most of its admission budget tripped the
-  // extension's deadline first, and the extension answered by closing the
-  // WHOLE connection, which stranded every other in-flight operation's
-  // publication and cost the mount its kernel-coherence barrier permanently.
-  //
-  // Zero means the frontend keeps its own default: a daemon that predates
-  // this field cannot be paired with a frontend that requires it anyway (the
-  // minor gate below), so zero only ever appears in tests and fixtures.
+  // Required positive bound for one request, owned by the daemon.
   uint32 request_deadline_ms = 4;
 }
 
@@ -323,21 +197,17 @@ message ResolveReply {
   Item root = 1;
   Attr root_attr = 2;
   string volume_id = 3;
-  string branch = 4;
   string volume_name = 5;      // display name for the mounted volume
   Capabilities capabilities = 6;
   V3CoherenceContract v3_coherence = 7;
 }
 
-// Present exactly when the resolved attach is backed by the v3 authority and
-// the frontend must participate in its strict two-phase visibility protocol.
+// Mandatory exact mount incarnation and exclusive-writer cache contract.
 message V3CoherenceContract {
-  uint32 authority_protocol_major = 1;
   bytes authority_epoch = 2;
   bytes session_id = 3;
-  string cache_policy = 4;
-  uint64 repair_budget_millis = 5;
-  VisibilityCursor initial_cursor = 6;
+  string cache_policy = 4; // exactly fskit-exclusive-writer-v1
+  uint64 liveness_interval_millis = 7; // required and positive
 }
 
 // A strict-v3 frontend sends the exact authority identity from Resolve. A
@@ -370,47 +240,13 @@ message Capabilities {
   uint32 max_name_bytes = 5;    // e.g. 255
   uint64 max_file_size = 6;     // 0 = unlimited/unknown
   uint32 preferred_io_bytes = 7; // daemon's preferred read/write chunk, e.g. 1 MiB
-  // flags_supported is TRUE exactly when this attach's AUTHORITY durably
-  // stores BSD file flags (fsproto FeatureFlagPersistence). It is per-attach
-  // knowledge the frontend cannot derive on its own — a getattr flag word of 0
-  // is equally consistent with "no flags set" and "flags are not stored".
-  //
-  // It is INFORMATIONAL to the frontend and must NOT be used as a
-  // forwarding gate: it describes the authority only, and an attach's
-  // namespace is not all authority. A machine-local graft's backing IS a real
-  // host inode, so chflags(2) on it is the durable store and no authority
-  // feature is involved. Gating the whole volume on this field refuses
-  // chflags on grafts that would have worked. The daemon decides per target;
-  // see flags_understood for what the frontend may actually gate on.
-  bool flags_supported = 8;
-  // flags_understood is TRUE exactly when the daemon on the other end PARSES
-  // SetAttrRequest.set_flags/flags — a statement about protocol
-  // comprehension, not about any authority or any object.
-  //
-  // It exists because set_flags/flags are APPENDED fields at the same
-  // protocol minor: a daemon built before them proto3-discards both, applies
-  // the rest of the setattr and answers success — a chflags(2) that returns
-  // success while nothing changed, and a refusal only the frontend is
-  // positioned to make. Such a daemon also predates this field, so it decodes
-  // false and the frontend's gate closes on its own. Any daemon that reads
-  // set_flags sets this true unconditionally, and the frontend then forwards
-  // every flags change and lets the daemon answer per target (applied for a
-  // graft, ENOTSUP for an authority without FeatureFlagPersistence).
-  //
-  // This is also what a mount-time static volume capability
-  // (FSKit doesNotSupportImmutableFiles) must be answered from: a volume
-  // whose flags support is per-object cannot declare blanket non-support, or
-  // the kernel refuses changes that would have succeeded. Per-object refusal
-  // comes back as an errno on the request that asked for it.
-  bool flags_understood = 9;
   // xattr_set_supported is TRUE exactly when this daemon will accept an
   // XattrSetRequest for at least one ordinary volume object. Xattrs remains
   // the operation-family capability: get/list/remove can stay available while
   // this narrower mutation capability is FALSE. A frontend must validate the
   // caller's item and name first, then refuse set/create/replace/upsert locally
   // when this field is false so an unsupported user operation never enters the
-  // ordered-mutation/publication machinery. Process-local repair scratch is
-  // outside pfslocal and is therefore unaffected.
+  // ordered-mutation/publication machinery.
   bool xattr_set_supported = 10;
 }
 
@@ -420,7 +256,7 @@ message Item {
   uint64 item_id = 1;         // daemon-local opaque item handle
   uint64 item_generation = 2; // guards against daemon item reuse
   // Immutable authority stable identity, shared by every hard-link alias.
-  // Empty for legacy v2 backends; exactly 16 bytes for authority-v3.
+  // Exactly 16 nonzero bytes on owning Items.
   bytes stable_identity = 3;
 }
 
@@ -443,7 +279,7 @@ message Attr {
   int64 ctime_ms = 9;
   int64 atime_ms = 10;
   int64 birthtime_ms = 11;
-  uint64 content_version = 12; // coherence version; bumps on content change
+  uint64 content_version = 12; // conservative object version; may advance without change
   // Actual frontend identity of one live parent binding. Absent for the root,
   // for retained-but-unlinked Items, and whenever no live binding is known,
   // such as after the observed alias of a hard-linked Item was removed; the
@@ -459,7 +295,7 @@ message Attr {
   uint64 alloc_size = 15;
   // Filesystem object number, independent of the ownership handle in item.
   // The volume root is 1; every other authority-backed object is its XFS inode
-  // number, in [2, 2^63). Hard-link aliases share it, and it survives reclaim
+  // number, in [2, UInt64.max). Hard-link aliases share it, and it survives reclaim
   // and re-lookup of the same inode. It authorizes nothing.
   uint64 file_id = 16;
   // file_id of the live parent binding described by parent. Zero exactly when
@@ -484,26 +320,13 @@ message LookupReply {
   Attr attr = 1;
 }
 
-message EnumerateRequest {
-  Item dir = 1;
-  uint64 cookie = 2;      // 0 = start; else opaque continuation from prior reply
-  uint32 max_entries = 3; // daemon may return fewer
-  bool want_attrs = 4;    // readdir-plus
-  uint64 handle = 5;      // required retained read handle for this directory walk
-}
 message DirEntry {
   bytes name = 1;
   Attr attr = 2; // always has item+kind; full attrs when want_attrs
   uint64 cookie = 3; // resume enumeration AFTER this entry; 0 only for the final entry/end
 }
-message EnumerateReply {
-  repeated DirEntry entries = 1;
-  uint64 next_cookie = 2; // resume after the last returned entry (== last entry's cookie, 0 at end)
-  uint64 dir_version = 3; // directory coherence version at enumeration time
-}
-
-// Lists one page of a directory as non-owning entry snapshots. Field meanings
-// match EnumerateRequest, including the mandatory retained read handle.
+// Lists one page of a directory as non-owning entry snapshots, using the
+// mandatory retained read handle.
 message EnumerateEntriesRequest {
   Item dir = 1;
   uint64 cookie = 2;
@@ -542,22 +365,8 @@ message SetAttrRequest {
   optional int64 atime_ms = 7;
   // Exact daemon handle for ftruncate/fchmod/futimes-style operations.
   uint64 handle = 8;
-  // chflags(2). set_flags is the intent and flags is the ABSOLUTE new BSD
-  // file-flag word, not a delta. They are a bool+uint32 pair rather than an
-  // `optional uint32` because 0 is a legal value (clear every flag): the
-  // intent must be carried by something that survives a zero payload.
-  // set_flags=false (the default, and what every pre-flags frontend emits)
-  // means "this setattr changes no flags".
-  //
-  // The decision is PER TARGET and belongs to the daemon, which is the only
-  // layer that knows what backs the object: a machine-local graft applies the
-  // change to its real host inode (no authority feature involved), while an
-  // authority-backed object is answered ENOTSUP when that authority does not
-  // persist flags (fsproto FeatureFlagPersistence). A refusal takes the WHOLE
-  // setattr with it — a half-applied chflags is not a refusal.
-  //
-  // The frontend gates only on Capabilities.flags_understood, i.e. on whether
-  // the daemon parses these fields at all. See Capabilities.
+  // Selects an absolute BSD flag word, including clearing every flag to zero.
+  // Unsupported flags refuse the entire compound SetAttr before application.
   bool set_flags = 9;
   uint32 flags = 10;
 }
@@ -621,9 +430,6 @@ message WriteReply {
   uint32 written = 1;
   Attr attr = 2; // post-write size/mtime so the frontend can answer without a round-trip
 }
-
-message FsyncRequest { uint64 handle = 1; }
-message FsyncReply {}
 
 // ---------- namespace mutations ----------
 // All mutation replies return fresh Attrs so the frontend never guesses.
@@ -702,17 +508,10 @@ message XattrRemoveReply {}
 
 // ---------- volume sync / statfs / reclaim ----------
 
-// SyncVolume is the authority durability barrier behind FSKit's synchronize
-// and the CLI's pre-unmount durability call. V3 has no client or daemon
-// write-back tail: mutations are synchronous authority calls against raw XFS.
-// Success means all prior authority operations are applied and the authority's
-// `syncfs` cut completed. Cache-visible mutations retain their separate
-// two-phase repair boundary. There is no local-only success: an unreachable,
-// slow, or fenced authority fails the request. `degraded` is retired wire
-// ballast and is always false.
+// SyncVolume is the authority durability barrier behind FSKit synchronization.
+// There is no local-only success; authority failure fails the request.
 message SyncVolumeRequest {}
 message SyncVolumeReply {
-  bool degraded = 1;
 }
 
 message StatfsRequest {}
@@ -733,91 +532,17 @@ message ReclaimReply {}
 message SubscribeEventsRequest {}
 message SubscribeEventsReply {}
 
-enum VisibilityPhase {
-  VISIBILITY_PHASE_UNSPECIFIED = 0;
-  VISIBILITY_PHASE_PREPARE = 1;
-  VISIBILITY_PHASE_COMPLETE = 2;
-}
-
-enum VisibilityScope {
-  VISIBILITY_SCOPE_UNSPECIFIED = 0;
-  VISIBILITY_SCOPE_NAMESPACE = 1;
-  VISIBILITY_SCOPE_DATA = 2;
-  VISIBILITY_SCOPE_ATTRIBUTES = 3;
-}
-
-message VisibilityCursor {
-  uint64 sequence = 1;
-  VisibilityPhase phase = 2;
-}
-
-message VisibilityTarget {
-  VisibilityScope scope = 1;
-  bytes identity = 2;
-  bytes parent_identity = 3;
-  bytes name = 4;
-  int64 size = 5;
-  // Authority-attested post-mutation owner for a namespace coordinate.
-  bytes post_identity = 6;
-}
-
-message V3VisibilityEvent {
-  bytes authority_epoch = 1;
-  VisibilityCursor cursor = 2;
-  bytes initiator_session_id = 3;
-  uint32 mutation_slot = 4;
-  repeated VisibilityTarget targets = 5;
-  uint64 mutation_sequence = 6;
-  // 7 was routes: the retired FSKit routes barrier delivered a routing
-  // revision as a two-phase visibility phase. A route change now commits only
-  // at clean mount absence, so no visibility event can carry one.
-  reserved 7;
-  reserved "routes";
-  reserved 8;
-}
-
-message VisibilityAckRequest {
-  bytes authority_epoch = 1;
-  VisibilityCursor cursor = 2;
-  // 3 and 4 were blocked/reason: a frontend declaring it could not adopt the
-  // delivered phase. The only unadoptable phase was a routing revision, and
-  // that barrier is retired.
-  reserved 3, 4;
-  reserved "blocked", "reason";
-  // Liveness-only feedback carried on the exact peer COMPLETE Ack. It is false
-  // for PREPARE, terminal reports, and older minor peers.
-  bool ordered_admission_contended = 5;
-}
-
-message VisibilityAckReply {}
-
 // Emitted only after SubscribeEventsRequest on this connection.
 message Event {
   oneof kind {
-    Invalidation invalidation = 1;
     AttachState attach_state = 2;
-    V3VisibilityEvent visibility = 3;
   }
-}
-
-// Mirrors the authority's push-invalidation stream, item-addressed. On macOS
-// 26 the daemon performs an exact data-and-size refresh for known regular-file
-// items before acknowledging content invalidations. Cached namespace bindings
-// and other attributes remain advisory until the SDK exposes general cache
-// control.
-message Invalidation {
-  Item item = 1;
-  bool content_changed = 2;   // file data changed remotely
-  bool attrs_changed = 3;
-  bool namespace_changed = 4; // entries under this dir changed (create/remove/rename)
-  uint64 content_version = 5;
 }
 
 message AttachState {
   enum State {
     STATE_UNSPECIFIED = 0;
     STATE_ATTACHED = 1;   // healthy
-    STATE_WARMING = 2;    // prefetch running
     STATE_DEGRADED = 3;   // authority unreachable; ops may stall/fail
     STATE_DETACHING = 4;  // unmount in progress; fail new ops with ENXIO
   }

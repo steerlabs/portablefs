@@ -25,12 +25,12 @@ func readGolden(t *testing.T, name string) []byte {
 }
 
 func TestGoldenHelloRequestFrame(t *testing.T) {
-	env := &Envelope{RequestID: 1, Body: &Hello{ProtocolMajor: 1, ClientName: "swift", ClientVersion: "1.0"}}
+	env := &Envelope{RequestID: 1, Body: &Hello{ProtocolMajor: ProtocolMajor, ClientName: "swift", ClientVersion: "1.0"}}
 	got, err := EncodeFrame(env)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := readGolden(t, "hello_request.hex"); !bytes.Equal(got, want) {
+	if want := golden(t, "hello_request.hex", got); !bytes.Equal(got, want) {
 		t.Fatalf("hello request frame\n got %x\nwant %x", got, want)
 	}
 	dec, err := ReadFrame(bytes.NewReader(got))
@@ -38,18 +38,18 @@ func TestGoldenHelloRequestFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	hello, ok := dec.Body.(*Hello)
-	if !ok || dec.RequestID != 1 || hello.ProtocolMajor != 1 || hello.ClientName != "swift" || hello.ClientVersion != "1.0" {
+	if !ok || dec.RequestID != 1 || hello.ProtocolMajor != ProtocolMajor || hello.ClientName != "swift" || hello.ClientVersion != "1.0" {
 		t.Fatalf("decoded hello = %#v %#v", dec, dec.Body)
 	}
 }
 
 func TestGoldenHelloReplyFrame(t *testing.T) {
-	env := &Envelope{RequestID: 1, Body: &HelloReply{ProtocolMajor: 1, DaemonVersion: "portablefsd-test"}}
+	env := &Envelope{RequestID: 1, Body: &HelloReply{ProtocolMajor: ProtocolMajor, DaemonVersion: "portablefsd-test", RequestDeadlineMs: 60000}}
 	got, err := EncodeFrame(env)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := readGolden(t, "hello_reply.hex"); !bytes.Equal(got, want) {
+	if want := golden(t, "hello_reply.hex", got); !bytes.Equal(got, want) {
 		t.Fatalf("hello reply frame\n got %x\nwant %x", got, want)
 	}
 	dec, err := ReadFrame(bytes.NewReader(got))
@@ -57,7 +57,7 @@ func TestGoldenHelloReplyFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep, ok := dec.Body.(*HelloReply)
-	if !ok || dec.RequestID != 1 || rep.ProtocolMajor != 1 || rep.DaemonVersion != "portablefsd-test" {
+	if !ok || dec.RequestID != 1 || rep.ProtocolMajor != ProtocolMajor || rep.DaemonVersion != "portablefsd-test" {
 		t.Fatalf("decoded reply = %#v %#v", dec, dec.Body)
 	}
 }
@@ -102,7 +102,7 @@ func TestPublicationAckRequirementRoundTrip(t *testing.T) {
 	env := &Envelope{
 		RequestID:              42,
 		PublicationAckRequired: true,
-		Body:                   &GetAttrReply{},
+		Body:                   &GetAttrReply{Attr: Attr{Item: Item{ItemID: 1, ItemGeneration: 1, StableIdentity: [16]byte{1}}}},
 	}
 	frame, err := EncodeFrame(env)
 	if err != nil {
@@ -118,8 +118,8 @@ func TestPublicationAckRequirementRoundTrip(t *testing.T) {
 }
 
 func TestEnumerateRetainedHandleRoundTrip(t *testing.T) {
-	want := &EnumerateRequest{
-		Dir: Item{ItemID: 17, ItemGeneration: 19}, Cookie: 23,
+	want := &EnumerateEntriesRequest{
+		Dir: Item{ItemID: 17, ItemGeneration: 19, StableIdentity: [16]byte{1}}, Cookie: 23,
 		MaxEntries: 29, WantAttrs: true, Handle: 31,
 	}
 	frame, err := EncodeFrame(&Envelope{RequestID: 37, Body: want})
@@ -130,94 +130,9 @@ func TestEnumerateRetainedHandleRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok := decoded.Body.(*EnumerateRequest)
+	got, ok := decoded.Body.(*EnumerateEntriesRequest)
 	if !ok || decoded.RequestID != 37 || !reflect.DeepEqual(got, want) {
 		t.Fatalf("decoded enumerate = %#v body = %#v", decoded, decoded.Body)
-	}
-}
-
-// TestPublicationRetractionRoundTrip pins the field a delegation handoff uses to
-// tell a frontend that everything a crossed logical operation published must be
-// discarded rather than installed.
-func TestPublicationRetractionRoundTrip(t *testing.T) {
-	env := &Envelope{
-		RequestID:            42,
-		OperationID:          7,
-		PublicationRetracted: true,
-		Body:                 &RemoveReply{},
-	}
-	frame, err := EncodeFrame(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := ReadFrame(bytes.NewReader(frame))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decoded.RequestID != 42 || decoded.OperationID != 7 || !decoded.PublicationRetracted {
-		t.Fatalf("decoded envelope = %#v", decoded)
-	}
-}
-
-// TestGoldenPublicationRetractedFrame is the CROSS-LANGUAGE pin for the
-// retraction, and it is the only golden that fixes all four envelope scalars
-// ahead of the body oneof.
-//
-// Every other fixture would still round-trip if field 4 were silently dropped
-// on one side, which is exactly the drift these files exist to catch: a
-// frontend that decodes the retraction as absent installs state the daemon has
-// already withdrawn, and does it silently.
-func TestGoldenPublicationRetractedFrame(t *testing.T) {
-	env := &Envelope{
-		RequestID:              7,
-		PublicationAckRequired: true,
-		OperationID:            3,
-		PublicationRetracted:   true,
-		Body: &GetAttrReply{Attr: Attr{
-			Item: Item{ItemID: 23, ItemGeneration: 29}, Kind: ItemKindFile,
-		}},
-	}
-	got, err := EncodeFrame(env)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := readGolden(t, "publication_retracted.hex"); !bytes.Equal(got, want) {
-		t.Fatalf("publication retraction frame\n got %x\nwant %x", got, want)
-	}
-	dec, err := ReadFrame(bytes.NewReader(got))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rep, ok := dec.Body.(*GetAttrReply)
-	if !ok ||
-		dec.RequestID != 7 ||
-		!dec.PublicationAckRequired ||
-		dec.OperationID != 3 ||
-		!dec.PublicationRetracted ||
-		rep.Attr.Item != (Item{ItemID: 23, ItemGeneration: 29}) ||
-		rep.Attr.Kind != ItemKindFile {
-		t.Fatalf("decoded envelope = %#v body = %#v", dec, dec.Body)
-	}
-}
-
-// TestUnretractedEnvelopeIsByteIdenticalToTheOlderEncoding is the compatibility
-// half of the same field. The overwhelmingly common envelope is not retracted,
-// and it must not have grown a byte: the goldens are shared with the Swift
-// frontend, and a silent encoding drift is exactly the cross-language skew they
-// exist to catch.
-func TestUnretractedEnvelopeIsByteIdenticalToTheOlderEncoding(t *testing.T) {
-	plain, err := EncodeFrame(&Envelope{RequestID: 3, Body: &RemoveReply{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	explicit, err := EncodeFrame(&Envelope{
-		RequestID: 3, PublicationRetracted: false, Body: &RemoveReply{},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(plain, explicit) {
-		t.Fatalf("an unretracted envelope encoded differently\n got %x\nwant %x", explicit, plain)
 	}
 }
 
@@ -226,7 +141,7 @@ func TestExactObjectHandlesRoundTrip(t *testing.T) {
 	size := uint64(17)
 	mtime := int64(23)
 	atime := int64(29)
-	item := Item{ItemID: 31, ItemGeneration: 37}
+	item := Item{ItemID: 31, ItemGeneration: 37, StableIdentity: [16]byte{1}}
 	requests := []any{
 		&GetAttrRequest{Item: item, Handle: 41},
 		&SetAttrRequest{
@@ -257,9 +172,9 @@ func TestExactObjectHandlesRoundTrip(t *testing.T) {
 }
 
 func TestAttrParentAndFlagsRoundTrip(t *testing.T) {
-	parent := Item{ItemID: 17, ItemGeneration: 19}
+	parent := Item{ItemID: 17, ItemGeneration: 19, StableIdentity: [16]byte{1}}
 	want := &GetAttrReply{Attr: Attr{
-		Item:           Item{ItemID: 23, ItemGeneration: 29},
+		Item:           Item{ItemID: 23, ItemGeneration: 29, StableIdentity: [16]byte{1}},
 		Kind:           ItemKindFile,
 		Mode:           0o640,
 		Nlink:          2,
@@ -279,8 +194,8 @@ func TestAttrParentAndFlagsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if golden := readGolden(t, "attr_parent_flags.hex"); !bytes.Equal(frame, golden) {
-		t.Fatalf("attr frame\n got %x\nwant %x", frame, golden)
+	if want := golden(t, "attr_parent_flags.hex", frame); !bytes.Equal(frame, want) {
+		t.Fatalf("attr frame\n got %x\nwant %x", frame, want)
 	}
 	decoded, err := ReadFrame(bytes.NewReader(frame))
 	if err != nil {
@@ -295,7 +210,7 @@ func TestAttrParentAndFlagsRoundTrip(t *testing.T) {
 // the daemon can only ever see a frontend-computed absolute offset, which is
 // what let two machines' appends land on the same byte range.
 func TestAppendIntentRoundTrip(t *testing.T) {
-	item := Item{ItemID: 7, ItemGeneration: 11}
+	item := Item{ItemID: 7, ItemGeneration: 11, StableIdentity: [16]byte{1}}
 	for _, tc := range []struct {
 		name string
 		body any
@@ -303,7 +218,7 @@ func TestAppendIntentRoundTrip(t *testing.T) {
 	}{
 		{"open", &OpenRequest{Item: item, Mode: OpenModeWrite, Append: true},
 			func(b any) bool { r := b.(*OpenRequest); return r.Append && r.Mode == OpenModeWrite && r.Item == item }},
-		{"create", &CreateRequest{Name: []byte("log"), Mode: 0o644, Exclusive: true, Append: true},
+		{"create", &CreateRequest{Dir: item, Name: []byte("log"), Mode: 0o644, Exclusive: true, Append: true},
 			func(b any) bool { r := b.(*CreateRequest); return r.Append && r.Exclusive }},
 		{"write", &WriteRequest{Handle: 5, Data: []byte("rec\n"), Append: true},
 			func(b any) bool {
@@ -327,10 +242,7 @@ func TestAppendIntentRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAppendIntentDefaultsOffForOlderFrontends keeps the added fields
-// backward compatible: a frame minted without them decodes as a positional
-// write, exactly as before.
-func TestAppendIntentDefaultsOffForOlderFrontends(t *testing.T) {
+func TestPositionedWriteRoundTrip(t *testing.T) {
 	frame, err := EncodeFrame(&Envelope{RequestID: 4, Body: &WriteRequest{Handle: 9, Offset: 64, Data: []byte("x")}})
 	if err != nil {
 		t.Fatal(err)
@@ -341,7 +253,7 @@ func TestAppendIntentDefaultsOffForOlderFrontends(t *testing.T) {
 	}
 	w := decoded.Body.(*WriteRequest)
 	if w.Append || w.Offset != 64 {
-		t.Fatalf("legacy positional write changed meaning: %#v", w)
+		t.Fatalf("positional write changed meaning: %#v", w)
 	}
 }
 
@@ -349,7 +261,7 @@ func TestAppendIntentDefaultsOffForOlderFrontends(t *testing.T) {
 // a separate bool because 0 is a legal flag word (clear everything): a value
 // alone could never distinguish "clear" from "no change".
 func TestFlagIntentRoundTrip(t *testing.T) {
-	item := Item{ItemID: 7, ItemGeneration: 11}
+	item := Item{ItemID: 7, ItemGeneration: 11, StableIdentity: [16]byte{1}}
 	mode := uint32(0o600)
 	for _, tc := range []struct {
 		name string
@@ -382,15 +294,11 @@ func TestFlagIntentRoundTrip(t *testing.T) {
 	}
 }
 
-// TestFlagFieldsDefaultOffForOlderFrontends keeps the added fields backward
-// compatible without a protocol-minor bump: a frame minted without them decodes
-// as a setattr that changes no flags, exactly as before. Same rule the O_APPEND
-// intent fields follow.
-func TestFlagFieldsDefaultOffForOlderFrontends(t *testing.T) {
+func TestSetAttrWithoutFlagIntent(t *testing.T) {
 	mode := uint32(0o644)
 	frame, err := EncodeFrame(&Envelope{
 		RequestID: 4,
-		Body:      &SetAttrRequest{Item: Item{ItemID: 9, ItemGeneration: 2}, Mode: &mode},
+		Body:      &SetAttrRequest{Item: Item{ItemID: 9, ItemGeneration: 2, StableIdentity: [16]byte{1}}, Mode: &mode},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -401,94 +309,7 @@ func TestFlagFieldsDefaultOffForOlderFrontends(t *testing.T) {
 	}
 	s := decoded.Body.(*SetAttrRequest)
 	if s.SetFlags || s.Flags != 0 || s.Mode == nil || *s.Mode != 0o644 {
-		t.Fatalf("legacy setattr changed meaning: %#v", s)
-	}
-}
-
-// TestCapabilitiesFlagsSupportedRoundTrip: the resolve reply carries TWO
-// independent flag facts, and they must survive the wire independently.
-// FlagsSupported describes the attached authority's durable storage;
-// FlagsUnderstood describes whether the daemon parses set_flags at all. The
-// interesting combination is the one the graft regression turned on —
-// understood=true with supported=false — so every pairing is exercised.
-func TestCapabilitiesFlagsSupportedRoundTrip(t *testing.T) {
-	for _, want := range []Capabilities{
-		{FlagsSupported: false, FlagsUnderstood: false},
-		{FlagsSupported: false, FlagsUnderstood: true},
-		{FlagsSupported: true, FlagsUnderstood: false},
-		{FlagsSupported: true, FlagsUnderstood: true},
-	} {
-		reply := &ResolveReply{
-			Root:     Item{ItemID: 1, ItemGeneration: 1},
-			VolumeID: "vol",
-			Capabilities: Capabilities{
-				Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
-				MaxNameBytes: 255, PreferredIOSize: 1 << 20,
-				FlagsSupported:  want.FlagsSupported,
-				FlagsUnderstood: want.FlagsUnderstood,
-			},
-		}
-		frame, err := EncodeFrame(&Envelope{RequestID: 5, Body: reply})
-		if err != nil {
-			t.Fatal(err)
-		}
-		decoded, err := ReadFrame(bytes.NewReader(frame))
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := decoded.Body.(*ResolveReply)
-		if got.Capabilities.FlagsSupported != want.FlagsSupported {
-			t.Fatalf("flagsSupported = %v, want %v", got.Capabilities.FlagsSupported, want.FlagsSupported)
-		}
-		if got.Capabilities.FlagsUnderstood != want.FlagsUnderstood {
-			t.Fatalf("flagsUnderstood = %v, want %v", got.Capabilities.FlagsUnderstood, want.FlagsUnderstood)
-		}
-		if got.Capabilities.PreferredIOSize != 1<<20 || !got.Capabilities.Xattrs {
-			t.Fatalf("neighbouring capability fields disturbed: %+v", got.Capabilities)
-		}
-	}
-}
-
-// TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse: flags_understood is an
-// APPENDED field, so a resolve reply produced by a daemon that predates it
-// carries no field 9 at all. It must decode false — that is precisely the
-// signal "this daemon would silently discard a forwarded set_flags", and a
-// default of true would hand the frontend a licence to forward into a
-// silent no-op.
-func TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse(t *testing.T) {
-	// The capabilities an older daemon emits: every field it knew about, and
-	// literally no field 9 on the wire — a false bool is not encoded at all,
-	// so leaving FlagsUnderstood unset reproduces those bytes exactly.
-	old := Capabilities{
-		Symlinks: true, Xattrs: true, CaseSensitive: true,
-		MaxNameBytes: 255, PreferredIOSize: 1 << 20, FlagsSupported: true,
-	}
-	encoded := marshalCapabilities(&old)
-	if err := scan(encoded, func(num int, _ int, _ []byte) error {
-		if num == 9 {
-			t.Fatalf("a false flags_understood put field 9 on the wire: % x", encoded)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	reply := &ResolveReply{
-		Root: Item{ItemID: 1, ItemGeneration: 1}, VolumeID: "vol", Capabilities: old,
-	}
-	frame, err := EncodeFrame(&Envelope{RequestID: 7, Body: reply})
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := ReadFrame(bytes.NewReader(frame))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := decoded.Body.(*ResolveReply)
-	if got.Capabilities.FlagsUnderstood {
-		t.Fatal("an absent flags_understood decoded true; a pre-flags daemon would be forwarded to")
-	}
-	if !got.Capabilities.FlagsSupported || !got.Capabilities.Xattrs {
-		t.Fatalf("the fields the old daemon DID send were lost: %+v", got.Capabilities)
+		t.Fatalf("setattr changed meaning: %#v", s)
 	}
 }
 
@@ -499,22 +320,21 @@ func TestCapabilitiesFlagsUnderstoodAbsentDecodesFalse(t *testing.T) {
 func TestCapabilitiesXattrSetSupportedRoundTrip(t *testing.T) {
 	for _, supported := range []bool{false, true} {
 		want := Capabilities{
-			Xattrs: true, XattrSetSupported: supported, FlagsUnderstood: true,
+			Xattrs: true, XattrSetSupported: supported,
 		}
 		decoded, err := parseCapabilitiesField(wireBytes, marshalCapabilities(&want))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if decoded.Xattrs != want.Xattrs ||
-			decoded.XattrSetSupported != want.XattrSetSupported ||
-			decoded.FlagsUnderstood != want.FlagsUnderstood {
+			decoded.XattrSetSupported != want.XattrSetSupported {
 			t.Fatalf("xattr capabilities round trip: got %+v, want %+v", decoded, want)
 		}
 	}
 }
 
-func TestCapabilitiesXattrSetSupportedAbsentDecodesFalse(t *testing.T) {
-	old := Capabilities{Xattrs: true, FlagsUnderstood: true}
+func TestReadOnlyXattrCapabilities(t *testing.T) {
+	old := Capabilities{Xattrs: true}
 	encoded := marshalCapabilities(&old)
 	if err := scan(encoded, func(num int, _ int, _ []byte) error {
 		if num == 10 {
@@ -529,6 +349,20 @@ func TestCapabilitiesXattrSetSupportedAbsentDecodesFalse(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !decoded.Xattrs || decoded.XattrSetSupported {
-		t.Fatalf("legacy xattr capabilities changed meaning: %+v", decoded)
+		t.Fatalf("xattr capabilities changed meaning: %+v", decoded)
 	}
+}
+
+// Set UPDATE_GOLDENS=1 to regenerate both language fixture copies together.
+func golden(t *testing.T, name string, frame []byte) []byte {
+	t.Helper()
+	if os.Getenv("UPDATE_GOLDENS") == "1" {
+		for _, directory := range []string{"pfslocal/testdata", "swift/PortableFSKit/Tests/PortableFSKitTests/Goldens"} {
+			path := filepath.Join("..", "..", "..", directory, name)
+			if err := os.WriteFile(path, []byte(hex.EncodeToString(frame)+"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return readGolden(t, name)
 }

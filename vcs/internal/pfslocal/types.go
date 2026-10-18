@@ -1,99 +1,19 @@
-// Package pfslocal implements the frozen pfslocal v1 Unix-socket protocol used
+// Package pfslocal implements the exact pfslocal 2.0 Unix-socket protocol used
 // between portablefsd and local filesystem frontends.
 package pfslocal
 
 const (
-	ProtocolMajor = 1
-	// ProtocolMinor 6 adds Envelope.PublicationRetracted.
-	//
-	// It is a MINOR BUMP rather than a silently additive field, which breaks
-	// with the rule the O_APPEND and chflags fields follow (see pfslocal.proto:
-	// "deliberately NOT gated behind a minor bump ... these fields default to
-	// false, which reproduces the previous behavior exactly"). Defaulting to
-	// false does NOT reproduce the previous behaviour here: a frontend that
-	// ignores the flag installs, into the kernel, state the daemon has already
-	// retracted because a delegation handoff crossed it. That is a silent
-	// correctness failure, not a missing feature, so the two sides must not be
-	// able to pair at all. The daemon refuses any frontend whose minor is below
-	// its own (portablefsd/frontend.go), and that refusal IS the gate.
-	//
-	// ProtocolMinor 7 adds HelloReply.RequestDeadlineMs.
-	//
-	// It is a MINOR BUMP for the same reason: the default does not reproduce
-	// the previous behaviour, it reproduces the DEFECT. A frontend that ignores
-	// the field keeps its own compiled-in reply deadline, and the whole point of
-	// the field is that a frontend's compiled-in deadline has no relationship to
-	// the daemon's budgets and was observed live to expire FIRST — costing the
-	// mount its kernel-coherence barrier permanently. Pairing a daemon that
-	// knows its bound with a frontend that ignores it is precisely the pairing
-	// that broke, so the two must not be able to pair at all.
-	//
-	// ProtocolMinor 8 adds the macOS v3 coherence contract, exact two-phase
-	// visibility events, and cursor acknowledgments. Ignoring those fields can
-	// leave stale kernel state serving, so the existing minimum-minor gate is
-	// the compatibility boundary.
-	//
-	// ProtocolMinor 9 adds the strict-v3 end-to-end liveness proof. A frontend
-	// which only knows that its UDS is live cannot distinguish a responsive
-	// daemon from one that has lost its authority session.
-	//
-	// ProtocolMinor 10 makes EnumerateRequest.Handle mandatory. Directory
-	// cookies are scoped to the retained authority handle that issued them, so
-	// the zero-value behavior cannot reproduce a correct multi-page walk.
-	//
-	// ProtocolMinor 12 adds ResourceReplyDisposition. A successful resource
-	// reply can transfer handles to VolumeCore and a (possibly shorter) prefix
-	// of items to FSKit. Socket delivery proves neither ownership boundary, so
-	// the final disposition states both independently.
-	//
-	// ProtocolMinor 13 adds ordered-admission contention feedback on the exact
-	// peer COMPLETE Ack. Ignoring it is safe for coherence but silently loses
-	// the bounded FIFO compensation this daemon and frontend promise together.
-	//
-	// ProtocolMinor 14 carries an authority-attested post-binding identity on
-	// namespace targets. macOS needs the association to refresh a retained vnode
-	// through a new rename/hard-link coordinate without reusing a stale locator.
-	//
-	// ProtocolMinor 15 is the coordinated one-version authority-v5 cut. It
-	// requires failure-atomic DATA/CONTROL transport activation, replaces source
-	// visibility phases with daemon-owned source-publication gates, and makes
-	// every callback's PublicationAck semantic-commit verdict explicit.
-	//
-	// ProtocolMinor 16 separates file identity from item ownership: Attr gains
-	// FileID/ParentFileID, and EnumerateEntriesRequest lists a directory as
-	// non-owning entry snapshots. The item-owning EnumerateRequest is not
-	// served to a minor-16 frontend, so an older frontend that still sends it
-	// must fail the minimum-minor gate rather than lose its enumeration.
-	ProtocolMinor = 16
+	ProtocolMajor = 2
+	ProtocolMinor = 0
 	MaxFrameBytes = 16 << 20
+	CachePolicy   = "fskit-exclusive-writer-v1"
 )
 
 type Envelope struct {
 	RequestID              uint64
 	PublicationAckRequired bool
 	OperationID            uint64
-	// PublicationRetracted says that everything this envelope's LOGICAL
-	// OPERATION has published must not be installed. The frontend discards the
-	// operation's collected values and fails the framework callback rather than
-	// returning them, so nothing reaches the kernel; the syscall retries and
-	// reads state taken after the boundary that caused the retraction.
-	//
-	// ── WHY IT RIDES A REPLY AND IS NOT A MESSAGE OF ITS OWN ────────────────
-	//
-	// The retraction has to be observed BEFORE the framework installs the
-	// operation's results, and the install happens the instant the callback
-	// returns. A standalone message cannot promise that: the frontend dispatches
-	// received frames onto concurrent tasks, so a retraction written before the
-	// reply can still be PROCESSED after it. Riding the reply's own envelope
-	// removes the question — one frame, one delivery, no ordering to lose.
-	//
-	// And there is always such a reply. The only case that retracts is a handoff
-	// crossing an operation with participants left and all of them parked; a
-	// parked participant is a request in flight that will be answered, and the
-	// callback cannot return before its last request is answered. So a
-	// retraction always has a carrier that precedes the install.
-	PublicationRetracted bool
-	Body                 any
+	Body                   any
 }
 
 type Hello struct {
@@ -146,21 +66,16 @@ type ResolveReply struct {
 	Root         Item
 	RootAttr     Attr
 	VolumeID     string
-	Branch       string
 	VolumeName   string
 	Capabilities Capabilities
 	V3Coherence  *V3CoherenceContract
 }
 
 type V3CoherenceContract struct {
-	AuthorityProtocolMajor uint32
 	AuthorityEpoch         []byte
 	SessionID              []byte
 	CachePolicy            string
-	RepairBudgetMillis     uint64
-	// InitialCursor is absent for the genesis cut before the authority has
-	// emitted any visibility sequence. When present it is a positive COMPLETE.
-	InitialCursor *VisibilityCursor
+	LivenessIntervalMillis uint64
 }
 
 type V3LivenessRequest struct {
@@ -189,31 +104,6 @@ type Capabilities struct {
 	MaxNameBytes    uint32
 	MaxFileSize     uint64
 	PreferredIOSize uint32
-	// FlagsSupported is true exactly when this attach's AUTHORITY durably
-	// stores BSD file flags (fsproto.FeatureFlagPersistence). Per-attach,
-	// never hardcoded.
-	//
-	// It is informational to the frontend and is NOT a forwarding gate: an
-	// attach's namespace is not all authority. A machine-local graft's backing
-	// is a real host inode, so chflags(2) on it is the durable store and no
-	// authority feature is involved — gating the volume on this field would
-	// refuse graft chflags that would have worked. The daemon decides per
-	// target; the frontend gates on FlagsUnderstood.
-	FlagsSupported bool
-	// FlagsUnderstood is true exactly when the daemon serving this connection
-	// PARSES SetAttrRequest.SetFlags/Flags. It is a statement about protocol
-	// comprehension, not about any authority or any object, and every daemon
-	// that reads those fields sets it unconditionally.
-	//
-	// It exists because SetFlags/Flags are appended pfslocal fields at the
-	// same protocol minor: a daemon predating them discards both, applies the
-	// rest of the setattr and answers success — a chflags(2) that succeeds
-	// while nothing changed. Such a daemon also predates this field, so it
-	// decodes false and the frontend's gate closes on its own. The frontend
-	// forwards flags changes exactly when this is true, and answers its
-	// mount-time volume capability (FSKit doesNotSupportImmutableFiles) from
-	// it, because per-object refusal arrives as an errno on the request.
-	FlagsUnderstood bool
 	// XattrSetSupported is true exactly when this daemon accepts an
 	// XattrSetRequest for at least one ordinary volume object. Xattrs remains
 	// the operation-family capability: get/list/remove may remain available
@@ -244,23 +134,24 @@ const (
 )
 
 type Attr struct {
-	Item           Item
-	Kind           ItemKind
-	Mode           uint32
-	Nlink          uint32
-	UID            uint32
-	GID            uint32
-	Size           uint64
-	MtimeMs        int64
-	CtimeMs        int64
-	AtimeMs        int64
-	BirthtimeMs    int64
+	Item        Item
+	Kind        ItemKind
+	Mode        uint32
+	Nlink       uint32
+	UID         uint32
+	GID         uint32
+	Size        uint64
+	MtimeMs     int64
+	CtimeMs     int64
+	AtimeMs     int64
+	BirthtimeMs int64
+	// ContentVersion is conservative and may advance without a logical change.
 	ContentVersion uint64
 	Parent         *Item
 	Flags          uint32
 	AllocSize      uint64
 	// FileID is the filesystem object number FSKit reports: 1 for the volume
-	// root, the authority inode in [2, 2^63) for every other object. Hard-link
+	// root, the authority inode in [2, UInt64.max) for every other object. Hard-link
 	// aliases share it and it survives reclaim; it authorizes nothing.
 	FileID uint64
 	// ParentFileID is the FileID of the parent binding described by Parent,
@@ -279,29 +170,14 @@ type LookupRequest struct {
 }
 type LookupReply struct{ Attr Attr }
 
-type EnumerateRequest struct {
-	Dir        Item
-	Cookie     uint64
-	MaxEntries uint32
-	WantAttrs  bool
-	Handle     uint64
-}
-
 type DirEntry struct {
 	Name   []byte
 	Attr   Attr
 	Cookie uint64
 }
 
-type EnumerateReply struct {
-	Entries    []DirEntry
-	NextCookie uint64
-	DirVersion uint64
-}
-
 // EnumerateEntriesRequest lists one page of a directory as non-owning entry
-// snapshots. Its fields and field numbers match EnumerateRequest, including
-// the mandatory retained read handle.
+// snapshots, using the mandatory retained read handle.
 type EnumerateEntriesRequest struct {
 	Dir        Item
 	Cookie     uint64
@@ -335,13 +211,8 @@ type SetAttrRequest struct {
 	MtimeMs *int64
 	AtimeMs *int64
 	Handle  uint64
-	// SetFlags/Flags is the chflags(2) group: SetFlags is the intent and Flags
-	// is the ABSOLUTE new BSD file-flag word. A bool+value pair rather than a
-	// *uint32 because 0 is a legal value (clear every flag) — the intent has to
-	// survive a zero payload. SetFlags is false in every frame an older
-	// frontend mints, which is exactly the previous "no flag change" meaning,
-	// so the fields needed no protocol-minor bump (same rule as the O_APPEND
-	// intent fields; see pfslocal.proto).
+	// SetFlags selects an absolute BSD flags change, including clearing to zero.
+	// Unsupported flags refuse the entire compound SetAttr before application.
 	SetFlags bool
 	Flags    uint32
 }
@@ -396,9 +267,6 @@ type WriteReply struct {
 	Written uint32
 	Attr    Attr
 }
-
-type FsyncRequest struct{ Handle uint64 }
-type FsyncReply struct{}
 
 type CreateRequest struct {
 	Dir       Item
@@ -490,15 +358,10 @@ type XattrRemoveRequest struct {
 }
 type XattrRemoveReply struct{}
 
-// SyncVolumeRequest asks the daemon for the REAL volume barrier: success
-// means every accepted mutation is locally synced, durable and applied at the authority,
-// AND acknowledged by every live protocol subscriber at its supported
-// frontend boundary. There is no degraded local-only success — local WAL
-// failure or an unreachable/slow/fenced authority fails the op (EIO).
-// Degraded is retired wire ballast (always false) kept for frame
-// compatibility.
+// SyncVolumeRequest requests the authority's real durability barrier.
+// An unreachable or fenced authority fails the request.
 type SyncVolumeRequest struct{}
-type SyncVolumeReply struct{ Degraded bool }
+type SyncVolumeReply struct{}
 
 type StatfsRequest struct{}
 type StatfsReply struct {
@@ -515,63 +378,7 @@ type ReclaimReply struct{}
 type SubscribeEventsRequest struct{}
 type SubscribeEventsReply struct{}
 
-type VisibilityPhase int32
-
-const (
-	VisibilityPhaseUnspecified VisibilityPhase = 0
-	VisibilityPhasePrepare     VisibilityPhase = 1
-	VisibilityPhaseComplete    VisibilityPhase = 2
-)
-
-type VisibilityScope int32
-
-const (
-	VisibilityScopeUnspecified VisibilityScope = 0
-	VisibilityScopeNamespace   VisibilityScope = 1
-	VisibilityScopeData        VisibilityScope = 2
-	VisibilityScopeAttributes  VisibilityScope = 3
-)
-
-type VisibilityCursor struct {
-	Sequence uint64
-	Phase    VisibilityPhase
-}
-
-type VisibilityTarget struct {
-	Scope          VisibilityScope
-	Identity       []byte
-	ParentIdentity []byte
-	Name           []byte
-	Size           int64
-	PostIdentity   []byte
-}
-
-type V3VisibilityEvent struct {
-	AuthorityEpoch     []byte
-	Cursor             VisibilityCursor
-	InitiatorSessionID []byte
-	MutationSlot       uint32
-	Targets            []VisibilityTarget
-	MutationSequence   uint64
-}
-
-type VisibilityAckRequest struct {
-	AuthorityEpoch            []byte
-	Cursor                    VisibilityCursor
-	OrderedAdmissionContended bool
-}
-
-type VisibilityAckReply struct{}
-
 type Event struct{ Kind any }
-
-type Invalidation struct {
-	Item             Item
-	ContentChanged   bool
-	AttrsChanged     bool
-	NamespaceChanged bool
-	ContentVersion   uint64
-}
 
 type AttachState struct {
 	State  AttachStateState
@@ -583,7 +390,6 @@ type AttachStateState int32
 const (
 	AttachStateUnspecified AttachStateState = 0
 	AttachStateAttached    AttachStateState = 1
-	AttachStateWarming     AttachStateState = 2
 	AttachStateDegraded    AttachStateState = 3
 	AttachStateDetaching   AttachStateState = 4
 )

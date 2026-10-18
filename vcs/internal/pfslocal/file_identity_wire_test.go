@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// fileIdentityGoldenEnvelopes are the minor-16 frames shared with the Swift
+// fileIdentityGoldenEnvelopes are the current frames shared with the Swift
 // suite. They pin Attr.file_id/parent_file_id on a live owning Attr and on a
 // non-owning entry snapshot, and both EnumerateEntries bodies at their exact
 // envelope field numbers.
@@ -57,9 +57,7 @@ func TestFileIdentityGoldenFramesRoundTripExactly(t *testing.T) {
 	}
 }
 
-// The minor-16 fields are canonical proto3 scalars: zero is omitted, so every
-// pre-16 Attr frame keeps its exact bytes and the older goldens stay valid.
-func TestAttrFileIdentityFieldsAreCanonicalAndAdditive(t *testing.T) {
+func TestAttrFileIdentityScalarEncoding(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		attr   Attr
@@ -84,18 +82,13 @@ func TestAttrFileIdentityFieldsAreCanonicalAndAdditive(t *testing.T) {
 	}
 }
 
-// The non-owning listing has its own envelope slots. The frozen item-owning
-// EnumerateRequest keeps field 13 and its meaning; a decoder must never
-// confuse the two, because the daemon serves one and refuses the other.
 func TestEnumerateEntriesUsesDistinctEnvelopeFields(t *testing.T) {
 	for _, test := range []struct {
 		body  any
 		field byte
 	}{
-		{body: &EnumerateEntriesRequest{Cookie: 1, MaxEntries: 2, Handle: 3}, field: 40},
+		{body: &EnumerateEntriesRequest{Dir: Item{ItemID: 1, ItemGeneration: 1, StableIdentity: [16]byte{1}}, Cookie: 1, MaxEntries: 2, Handle: 3}, field: 40},
 		{body: &EnumerateEntriesReply{NextCookie: 1, DirVersion: 2}, field: 88},
-		{body: &EnumerateRequest{Cookie: 1, MaxEntries: 2, Handle: 3}, field: 13},
-		{body: &EnumerateReply{NextCookie: 1, DirVersion: 2}, field: 63},
 	} {
 		encoded, err := MarshalEnvelope(&Envelope{Body: test.body})
 		if err != nil {

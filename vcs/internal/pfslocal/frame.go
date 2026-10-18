@@ -35,17 +35,11 @@ func WriteFrame(w io.Writer, e *Envelope) error {
 	}
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(payload)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if err := writeAll(w, hdr[:]); err != nil {
 		return err
 	}
-	n, err := w.Write(payload)
-	if err != nil {
-		return err
-	}
-	if n != len(payload) {
-		return fmt.Errorf("pfslocal: short frame write")
-	}
-	return nil
+	return writeAll(w, payload)
+
 }
 
 func EncodeFrame(e *Envelope) ([]byte, error) {
@@ -60,4 +54,21 @@ func EncodeFrame(e *Envelope) ([]byte, error) {
 	binary.LittleEndian.PutUint32(out, uint32(len(payload)))
 	out = append(out, payload...)
 	return out, nil
+}
+
+func writeAll(w io.Writer, raw []byte) error {
+	for len(raw) > 0 {
+		n, err := w.Write(raw)
+		if n < 0 || n > len(raw) {
+			return io.ErrShortWrite
+		}
+		raw = raw[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("pfslocal: short frame write: %w", io.ErrShortWrite)
+		}
+	}
+	return nil
 }
