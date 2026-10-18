@@ -300,13 +300,26 @@ but it does not rewrite the configured lease bound.
 
 A Mac mount that did not end with a clean unmount leaves unproven
 compatibility membership. The restarted authority then refuses Linux visible
-mutations and write-intent opens for 61.06 seconds after it has exclusively
-taken over the volume root and membership file: the frozen 60-second maximum
-metadata-cache proof plus its clock margin, measured on `CLOCK_BOOTTIME`.
-Linux reads continue during that window. The wait restarts with every
-authority restart and is not shortened by configuration. Mac activation still
-requires the operator reconciliation described below; the timer never clears
-that membership.
+mutations and write-intent opens for a fresh 61.06 seconds on
+`CLOCK_BOOTTIME`: the frozen 60-second maximum metadata-cache proof plus its
+clock margin. The wait starts only after safe takeover: exclusive ownership of
+the volume root and membership file, irreversibly closed predecessor renewal,
+and completion of every predecessor storage apply. Linux reads continue during
+that window. Expiry clears only that prior-compatibility writer refusal;
+current exclusions, Linux subscription fencing, and topology obligations
+remain. The wait restarts with every authority restart and is not shortened by
+configuration. Mac activation still requires the operator reconciliation
+described below; the timer never clears that membership. Startup refuses an
+unusable continuous clock even when prior membership was reconciled, because
+the new epoch may grant proofs.
+
+These premises are part of the `fskit-versioned-metadata-v1` contract. An
+uncapped prototype is not a supported predecessor. Raising `MaxCacheProof`
+requires a transition that prevents an older restart binary from clearing its
+grace early. Rolling back to an authority without the feature requires clean
+Mac absence, or an externally enforced equivalent grace after stopping the
+grant issuer. The root flock does not fence another host; promoting a
+replacement authority on another host requires independent fencing first.
 
 ### Service hardening
 

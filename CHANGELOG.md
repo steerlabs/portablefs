@@ -37,8 +37,9 @@ this file is the human-curated summary.
 - FSKit Close and Reclaim complete locally. One background owner releases the
   authority descriptors and capabilities in batches through `CLOSE_BATCH`,
   which the authority now admits for FSKit under `batched-close-v1`, and
-  batched Reclaim. Unmount no longer costs one network round trip per retained
-  item. Current Mac clients require both features.
+  batched Reclaim, so a retained item no longer costs its own network round
+  trip; a callback waits only when the release queue is full. Current Mac
+  clients require both features.
 - When a Mac session ends without a clean unmount, the authority keeps
   excluding Linux writers until every cache proof it granted that session has
   expired and its admitted storage work has drained. After a restart with an

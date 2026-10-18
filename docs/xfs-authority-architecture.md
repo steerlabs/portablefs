@@ -73,10 +73,11 @@ for the frozen 60-second metadata-cache proof bound plus margin after safe
 takeover.
 
 Three owners keep the Mac writer exclusion distinct. An active FSKit
-participant excludes other writers while it serves. When it is fenced, an
-epoch-local obligation keeps excluding them until the latest KeepAlive cache
-proof granted to that session has expired and its admitted storage
-applications have drained; a clean detach discharges it at once. Durable mount
+participant excludes other writers while it serves. After it is fenced, an
+epoch-local obligation excludes writers and another Mac until every KeepAlive
+cache proof granted to that session has expired and its admitted storage
+applications have drained. An accepted clean absence proof discharges the time
+obligation, not the drain obligation. Durable mount
 membership records topology and survives restart until exact absence or
 operator reconciliation. Out-of-band edits to the backing XFS tree on the
 authority host are unsupported; they would bypass all three.

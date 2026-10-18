@@ -270,16 +270,15 @@ surfaced volume-wide.
 - **mtime preservation across hydration.** The restorer materializes every
   inode with its manifest ns-mtime. A hydration write (recall or drain) is
   invisible base-bytes movement, not a user mutation, so it must not
-  change the observed mtime: on an inode the user has not yet mutated, the
-  authority performs `pwrite` + `utimensat`(manifest mtime) as one
-  sequence under the inode's hydration lock, and every attribute sample of
-  a RESTORING inode (GetAttr, Lookup, enumeration, and mutation post-state)
-  honours that lock, so no reader observes the transient bump. After the
-  first user mutation the user's mtime wins: hydration then reads the
-  inode's current mtime before installing a chunk and restores exactly that
-  value before releasing the lock, so filling an unrelated cold chunk never
-  changes what the user set. A failed restoration is a storage failure that
-  fences the epoch, never a silently changed mtime. This is what keeps
+  change the observed mtime. Every hydration install captures the inode's
+  current mtime under its exclusive entry lock and restores that exact
+  value before unlocking, including after a partial-write error and
+  regardless of whether the user has modified the inode: before any user
+  change that value is the manifest mtime, afterwards it is the user's.
+  Every published attribute sample of a RESTORING inode (GetAttr, Lookup,
+  enumeration, and mutation post-state) honours that lock, so no reader
+  observes the transient bump. A failed restoration is a storage failure
+  that fences the epoch, never a silently changed mtime. This is what keeps
   `make` from rebuilding and `git status` clean across a wake, and what
   lets a Mac's metadata cache treat mtime as exact. ctime is explicitly
   outside the contract (pack-format.md).

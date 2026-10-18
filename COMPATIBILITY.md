@@ -119,9 +119,17 @@ establish these prerequisites before launching the mount.
   Activate) states that FSKit read replies carry coherent storage-sequence
   stamps, that hydration never changes logical mtime, that the authority
   retains compatibility-writer exclusion for every cache proof it granted, and
-  that a successful KeepAlive carries `Response.session_valid_for_nanos`. Every
-  such proof is capped at the frozen `MaxCacheProof` of 60 seconds; the cap is
-  part of the feature's meaning and is not configurable. `batched-close-v1` is
+  that a successful KeepAlive carries `Response.session_valid_for_nanos`. That
+  proof `R` is a positive whole-millisecond duration encoded in nanoseconds,
+  bounded by the advertised millisecond lease and the frozen `MaxCacheProof` of
+  60,000,000,000 ns; the cap is part of the feature's meaning and is not
+  configurable. With `R` in nanoseconds, `epsilon(R) = 1,000,000,000 +
+  ceil(R / 1000)`; clients require `R > epsilon(R)` and serve cached metadata
+  only before `t0 + R - epsilon(R)`, `t0` being the KeepAlive's local start on
+  a clock that advances across sleep. The margin assumes at most 1,000 ppm
+  aggregate relative clock-rate error and one second of measurement
+  uncertainty. Restart, rollback, and cross-host premises for this bound are
+  in docs/xfs-authority-deployment.md. `batched-close-v1` is
   also admitted for FSKit sessions. Current Mac clients require all four and
   refuse an older authority at the handshake; older Mac clients keep using the
   fragmented bodies and individual CLOSE, which the authority still serves, and

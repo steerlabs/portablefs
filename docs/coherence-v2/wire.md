@@ -601,25 +601,37 @@ change, and every attribute sample honours the hydration lock. Allocation
 
 A successful KeepAlive reply to a negotiated session carries
 `Response.session_valid_for_nanos` (tag 72): the remaining duration, sampled
-after renewal under the session admission lock and rounded down, of
-`min(lease remaining, authorization remaining, advertised lease, MaxCacheProof)`.
-`MaxCacheProof` is a frozen 60 seconds. A terminal session receives no
+after renewal under the session admission lock, of
+`min(lease remaining, authorization remaining, advertised lease, MaxCacheProof)`,
+rounded down to a whole millisecond and encoded in nanoseconds.
+`MaxCacheProof` is a frozen 60,000,000,000 ns. A terminal session receives no
 positive value, and no other reply or non-negotiated session carries the
-field. The client anchors the duration at the KeepAlive's local start on a
-clock that advances across sleep and serves cached metadata only until
-`t0 + R - (1 s + ceil(R / 1000))`; it rejects a value above the advertised
-lease or `MaxCacheProof` as a protocol defect.
+field. Both peers' frame validation refuses a zero, fractional-millisecond,
+or over-cap value and the field on anything but a plain successful envelope;
+a client additionally refuses a value above the advertised lease, a missing
+value on a negotiated KeepAlive, and the field on a reply to any other
+request. Any such reply is a protocol defect that ends the session.
+
+With `R` in nanoseconds, `epsilon(R) = 1,000,000,000 + ceil(R / 1000)`. The
+client anchors `R` at the KeepAlive's local start `t0` on a clock that advances
+across sleep, requires `R > epsilon(R)`, and serves cached metadata only
+before `t0 + R - epsilon(R)`. The margin assumes at most 1,000 ppm aggregate
+relative clock-rate error between the peers and one second of measurement
+uncertainty; it assumes no clock-offset agreement.
 
 The authority registers each proof before its reply can escape and retains
 the session's compatibility-writer exclusion until the latest granted proof
 has expired, even if the session is fenced earlier. An ordinary request that
-renews a longer session lease grants no cache permission. The exclusion is
-released at that deadline only after every admitted storage application of
-the old session has drained; an exact clean detach releases it at once.
-After a restart that finds unproven compatibility membership, foreign visible
-mutations and write-intent opens are refused for `MaxCacheProof + 1.06 s`
-after safe takeover of the store, measured on a clock that includes suspend.
-Mac activation against that membership still requires operator reconciliation.
+renews a longer session lease grants no cache permission. Exclusion ends
+after both the retained deadline and the drain of every admitted storage
+application of the old session; an accepted clean absence proof removes only
+the deadline requirement. After a restart that finds unproven compatibility
+membership, foreign visible mutations and write-intent opens are refused for
+`MaxCacheProof + epsilon(MaxCacheProof)` (61.06 s), measured on a clock that
+includes suspend, from safe takeover: exclusive root and membership
+ownership, irreversibly closed predecessor renewal, and no predecessor storage
+apply still able to run. Mac activation against that membership still requires
+operator reconciliation.
 
 ## Batched descriptor close
 

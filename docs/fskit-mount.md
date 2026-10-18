@@ -81,13 +81,17 @@ a correspondingly provisioned authority budget.
 Close and reclaim complete locally. The daemon retires the handle or item,
 transfers the authority release to one background owner, and replies; it does
 not wait a network round trip per callback, which matters because the kernel
-reclaims items one at a time at unmount. That owner sends at most one
-`CLOSE_BATCH` and one batched Reclaim per round trip, with one batch in flight
-and one forming, each of at most 128 tokens. The authority's counts therefore
-lag local state by at most those two batches plus releases still being
-handed over by in-flight callbacks. A failed release ends the mount; it is
-never retried item by item. Unmount drains the owner on the original session
-before the absence proof.
+reclaims items one at a time at unmount. Each work batch holds at most 128
+tokens and sends up to two sequential requests: one `CLOSE_BATCH`, then one
+batched Reclaim. The owner keeps one batch in flight and one forming, so
+accepted releases lag the authority by at most 256 tokens. Releases still
+being handed over add at most two tokens per in-flight request and per
+abandoned provisional reply on each frontend connection (1,024 of each per
+connection); authority capacity must cover the live items and handles plus
+that lag. A failed release ends the mount; it is never retried item by item.
+After observing exact kernel absence, unmount drains accepted releases on the
+original session before delivering that proof. A failed or timed-out drain
+still completes local teardown but returns failure.
 
 ## Metadata cache
 
@@ -199,12 +203,16 @@ own sealed service. Saved preferences do not identify the running release.
 An FSKit frontend loss immediately ends local serving. The daemon retains the
 original authenticated authority transport until the mount supervisor proves
 the exact kernel mount absent and delivers that proof through the existing
-detach operation. That proof releases the writer exclusion at once and clears
-the durable mount membership. The terminal frontend cannot reconnect. Without
-it, a lost authority transport or an unprovable unmount keeps the membership
-fenced against another Mac until operator reconciliation; Linux writers wait
-only until every metadata-cache proof granted to the old session has expired
-and its admitted storage work has drained.
+detach operation. An accepted proof clears the durable mount membership and
+the session's cache-proof obligation; writer exclusion still waits for the
+session's admitted storage work to drain. The terminal frontend cannot
+reconnect. Without an accepted proof, after a lost authority transport or an
+unprovable unmount, durable membership remains for topology safety. Within the
+same authority process, Linux writers and another Mac wait until every
+metadata-cache proof granted to the old session has expired and its admitted
+storage work has drained. After an authority restart only the Linux writer
+refusal expires, after the full 61.06-second grace; Mac activation requires
+operator reconciliation.
 
 The launchd-managed daemon appends to
 `~/.local/state/portablefs/portablefsd.log`; per-mount logs are separate, under
