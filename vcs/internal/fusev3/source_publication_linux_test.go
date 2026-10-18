@@ -766,8 +766,8 @@ func TestNamespaceSourceGateCoversEveryEmittedChangeKind(t *testing.T) {
 				t.Fatal(err)
 			}
 			dir.mu.Lock()
-			if len(dir.page) != 0 || dir.eof || dir.cursorGeneration != 1 {
-				t.Errorf("source enumeration retained page/EOF: page=%v eof=%v generation=%d", dir.page, dir.eof, dir.cursorGeneration)
+			if len(dir.page) != 0 || dir.eof || dir.withdrawals != 1 {
+				t.Errorf("source enumeration retained page/EOF: page=%v eof=%v withdrawals=%d", dir.page, dir.eof, dir.withdrawals)
 			}
 			dir.mu.Unlock()
 			f.raw.mu.Lock()

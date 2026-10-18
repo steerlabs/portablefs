@@ -1363,8 +1363,15 @@ type dirHandle struct {
 	pageMetadataClock uint64
 	index             int
 	cursorGeneration  uint64
-	fetching          bool
-	fetchDone         chan struct{}
+	// withdrawals counts enumeration withdrawals (a peer change entry or this
+	// mount's own mutation of the directory). A page whose fetch one overtook
+	// is still the exact continuation from its cookie but predates the change:
+	// pageWithdrawn marks it so it publishes nothing and retires at the next
+	// peek.
+	withdrawals   uint64
+	pageWithdrawn bool
+	fetching      bool
+	fetchDone     chan struct{}
 	// next is the kernel offset this handle will resume from. A READDIR that
 	// asks for exactly this offset continues out of the buffered page instead
 	// of discarding it and re-fetching from the authority.
@@ -1976,18 +1983,17 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 		h.discardPageItemsLocked()
 		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 		h.pageStamp = subscriptionStamp{}
+		h.pageWithdrawn = false
 		h.eof = false
 		h.cursorGeneration++
 	}
-	if h.pageStamp.incarnation != 0 {
-		identity, _ := publicationIdentityFromItem(h.node.item)
-		if h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: identity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0 {
-			h.discardPageItemsLocked()
-			h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
-			h.pageStamp = subscriptionStamp{}
-			h.eof = false
-			h.cursorGeneration++
-		}
+	if h.pageWithdrawn || h.pageStamp.incarnation != 0 && h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: h.enumerationIdentity()}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0 {
+		h.discardPageItemsLocked()
+		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
+		h.pageStamp = subscriptionStamp{}
+		h.pageWithdrawn = false
+		h.eof = false
+		h.cursorGeneration++
 	}
 	if len(boundary) != 0 && boundary[0].changedLocked(h) {
 		return nil, nil, 0
@@ -1999,6 +2005,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 		h.discardPageItemsLocked()
 		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 		h.pageStamp = subscriptionStamp{}
+		h.pageWithdrawn = false
 		h.eof = false
 		h.cursorGeneration++
 	}
@@ -2025,7 +2032,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 				h.mu.Lock()
 				continue
 			}
-			generation := h.cursorGeneration
+			generation, withdrawals := h.cursorGeneration, h.withdrawals
 			pageStamp := h.node.mount.subscription.stamp()
 			metadataClock := h.node.mount.delegations.metadataClock.Load()
 			requestCookie := cloneBytes(h.cookie)
@@ -2087,6 +2094,13 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			// reply stamp keeps the oldest version, but each buffered page owns
 			// its own RPC admission stamp and served version.
 			h.pageStamp = pageStamp.withVersion(response.GetVolumeVersion())
+			if h.pageWithdrawn = withdrawals != h.withdrawals; h.pageWithdrawn {
+				// A withdrawal overtook this fetch. This mount's own mutation
+				// advances no subscription coverage, so the stamp alone could
+				// still look current: drop it, so nothing from this page is
+				// cached, and serve it once from its unchanged cookie.
+				h.pageStamp = subscriptionStamp{}
+			}
 			h.pageMetadataClock = metadataClock
 			if wantItems && h.node.mount.raw != nil {
 				if err := h.node.mount.raw.stageDirectoryPageHint(ctx, directoryIdentity, requestCookie, h.pageStamp, h.page); err != nil {
@@ -2170,6 +2184,7 @@ func (h *dirHandle) consume(delivered *fuse.DirEntry) {
 		h.discardPageItemsLocked()
 		h.page, h.index, h.eof = nil, 0, false
 		h.pageStamp = subscriptionStamp{}
+		h.pageWithdrawn = false
 		h.cursorGeneration++
 	}
 	h.cookie = encodeCookie(delivered.Off)
@@ -2198,6 +2213,7 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.page, h.index, h.eof = nil, 0, false
 		h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
 		h.pageStamp = subscriptionStamp{}
+		h.pageWithdrawn = false
 	}
 	if off == h.next {
 		// The kernel is continuing from where this handle stopped. Keeping the
@@ -2218,6 +2234,7 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.localIndex = index
 		h.page, h.index, h.eof = nil, 0, true
 		h.pageStamp = subscriptionStamp{}
+		h.pageWithdrawn = false
 		h.cookie = nil
 		return 0
 	}
@@ -2235,21 +2252,28 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 }
 
 // invalidateEnumeration withdraws the buffered page after a change to this
-// directory. The stream position (h.cookie) is unchanged, so it deliberately
-// leaves cursorGeneration alone: a page whose fetch the change overtook is
-// still the exact continuation from that cookie, and because its admission
-// stamp predates the change it is served uncovered within its callback and
-// retired at the next one. Discarding it instead would refetch for as long as
-// changes arrive faster than one READDIR round trip, so a directory a peer
-// keeps changing could never be listed.
+// directory. The stream position (h.cookie) is unchanged, so it leaves
+// cursorGeneration alone and only counts the withdrawal: a page whose fetch
+// the change overtook is still the exact continuation from that cookie, so it
+// is served uncovered once and retired at the next peek. Discarding it instead
+// refetched for as long as changes arrived faster than one READDIR round trip,
+// so a directory being changed (by a peer or by this mount) could never be
+// listed.
 func (h *dirHandle) invalidateEnumeration() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.discardPageItemsLocked()
 	h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 	h.pageStamp = subscriptionStamp{}
+	h.pageWithdrawn = false
+	h.withdrawals++
 	h.eof = false
 	h.uncovered = false
+}
+
+func (h *dirHandle) enumerationIdentity() publicationIdentity {
+	identity, _ := publicationIdentityFromItem(h.node.item)
+	return identity
 }
 
 func (h *dirHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {

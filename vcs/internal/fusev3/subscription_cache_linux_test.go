@@ -650,57 +650,64 @@ func TestEnumerationRefetchUsesItsOwnAdmissionStampWithinCallback(t *testing.T) 
 
 // A directory change that overtakes an in-flight READDIR leaves the cursor's
 // position unchanged, so the page fetched from that cookie is still the exact
-// continuation. It is served uncovered rather than discarded: every fetch
-// delivers at least one entry, and the next fetch resumes from the delivered
-// cookie. Discarding it instead refetched for as long as changes arrived
-// faster than one round trip, so a peer churning a directory made it
-// unlistable.
+// continuation. It is served once, uncovered, rather than discarded: every
+// fetch delivers at least one entry and the next fetch resumes from the
+// delivered cookie. Discarding it instead refetched for as long as changes
+// arrived faster than one round trip, so a directory under change could never
+// be listed. This mount's own mutation advances no subscription coverage, so
+// the overtaken page must also lose its stamp or it would publish as current.
 func TestEnumerationChangeDuringFetchStillDeliversEntries(t *testing.T) {
-	frontend, _, rpc := testRawFileSystem(t, 8)
-	record, errno := frontend.intern(t.Context(), testItem(89, authoritypb.Attr_DIRECTORY, 89))
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	rpc.root = cloneItem(record.node.item)
-	first := testDirPage(2, false, func(i int) []byte { return encodeCookie(uint64(100 + i)) })
-	second := testDirPage(1, true, func(int) []byte { return encodeCookie(101) })
-	second.Entries[0].Name = []byte("b")
-	rpc.dirPages = []*authoritypb.ReadDirReply{first, second}
-	handle := &dirHandle{node: record.node, token: testToken(113)}
-	registry := frontend.mount.subscription
-	coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: record.identity}
-	changes := 0
-	rpc.hook = func(request *authoritypb.Request) {
-		if request.GetReadDir() == nil {
-			return
-		}
-		// Every fetch is overtaken by a change to the directory being listed.
-		changes++
-		registry.mu.Lock()
-		registry.generation++
-		registry.coordinates[coordinate] = subscriptionCoordinateState{generation: registry.generation, minVersion: uint64(100 + changes)}
-		registry.mu.Unlock()
-		handle.invalidateEnumeration()
-	}
-	ctx, finish := testMutationContext(t, frontend.mount)
-	defer finish(true)
-	entry, _, errno := handle.peek(ctx, false)
-	if errno != 0 || entry == nil || entry.Name != "a" || len(rpc.readdirs) != 1 {
-		t.Fatalf("overtaken first page = %v (%v) after %d READDIRs, want a after one", entry, errno, len(rpc.readdirs))
-	}
-	handle.mu.Lock()
-	uncovered := handle.uncovered
-	handle.mu.Unlock()
-	if !uncovered {
-		t.Fatal("a page sampled before the change was served as covered")
-	}
-	handle.consume(entry)
-	entry, _, errno = handle.peek(ctx, false)
-	if errno != 0 || entry == nil || entry.Name != "b" {
-		t.Fatalf("overtaken continuation = %v (%v), want b", entry, errno)
-	}
-	handle.consume(entry)
-	if changes != 2 || len(rpc.readdirs) != 2 || !bytes.Equal(rpc.readdirs[1].GetCookie(), encodeCookie(100)) {
-		t.Fatalf("READDIRs %d after %d overtaking changes, resume cookie %x; want 2, 2 and the delivered cookie %x", len(rpc.readdirs), changes, rpc.readdirs[len(rpc.readdirs)-1].GetCookie(), encodeCookie(100))
+	for _, peer := range []bool{true, false} {
+		t.Run(map[bool]string{true: "peer change entry", false: "own mutation"}[peer], func(t *testing.T) {
+			frontend, _, rpc := testRawFileSystem(t, 8)
+			record, errno := frontend.intern(t.Context(), testItem(89, authoritypb.Attr_DIRECTORY, 89))
+			if errno != 0 {
+				t.Fatal(errno)
+			}
+			rpc.root = cloneItem(record.node.item)
+			first := testDirPage(2, false, func(i int) []byte { return encodeCookie(uint64(100 + i)) })
+			second := testDirPage(1, true, func(int) []byte { return encodeCookie(101) })
+			second.Entries[0].Name = []byte("b")
+			rpc.dirPages = []*authoritypb.ReadDirReply{first, second}
+			handle := &dirHandle{node: record.node, token: testToken(113)}
+			registry := frontend.mount.subscription
+			coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: record.identity}
+			changes := 0
+			rpc.hook = func(request *authoritypb.Request) {
+				if request.GetReadDir() == nil {
+					return
+				}
+				// Every fetch is overtaken by a change to the directory.
+				changes++
+				if peer {
+					registry.mu.Lock()
+					registry.generation++
+					registry.coordinates[coordinate] = subscriptionCoordinateState{generation: registry.generation, minVersion: uint64(100 + changes)}
+					registry.mu.Unlock()
+				}
+				handle.invalidateEnumeration()
+			}
+			ctx, finish := testMutationContext(t, frontend.mount)
+			defer finish(true)
+			entry, _, errno := handle.peek(ctx, false)
+			if errno != 0 || entry == nil || entry.Name != "a" || len(rpc.readdirs) != 1 {
+				t.Fatalf("overtaken first page = %v (%v) after %d READDIRs, want a after one", entry, errno, len(rpc.readdirs))
+			}
+			handle.mu.Lock()
+			uncovered, stamp := handle.uncovered, handle.pageStamp
+			handle.mu.Unlock()
+			if !uncovered || stamp != (subscriptionStamp{}) {
+				t.Fatalf("overtaken page served with uncovered=%v stamp=%+v, want an uncovered page with no stamp", uncovered, stamp)
+			}
+			handle.consume(entry)
+			entry, _, errno = handle.peek(ctx, false)
+			if errno != 0 || entry == nil || entry.Name != "b" {
+				t.Fatalf("overtaken continuation = %v (%v), want b", entry, errno)
+			}
+			handle.consume(entry)
+			if changes != 2 || len(rpc.readdirs) != 2 || !bytes.Equal(rpc.readdirs[1].GetCookie(), encodeCookie(100)) {
+				t.Fatalf("READDIRs %d after %d overtaking changes, resume cookie %x; want 2, 2 and the delivered cookie %x", len(rpc.readdirs), changes, rpc.readdirs[len(rpc.readdirs)-1].GetCookie(), encodeCookie(100))
+			}
+		})
 	}
 }
