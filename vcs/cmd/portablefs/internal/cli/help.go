@@ -97,8 +97,8 @@ mutation; only the host-owned zero-mount update transaction may unregister it.
   portablefs lifecycle hold-install-exclusive --json \
     [--expected-daemon-version <version> \
      --expected-daemon-sha256 <lowercase-sha256> \
-     --expected-pfslocal-major <major> \
-     --expected-pfslocal-minor <minor>]
+     --expected-daemon-path <canonical-path> \
+     --expected-daemon-cdhash <lowercase-cdhash>]
   portablefs lifecycle identity --json
 
 Internal app/installer coordination protocol. Acquires the fixed per-user
@@ -110,15 +110,16 @@ attach inventory while held, then reports
 across atomic profile/config mutation.
 The install-exclusive form nonblockingly acquires both the account-session and
 mount-lifecycle exclusive guards, proves zero kernel mounts, mount records,
-mount intents, durable daemon attaches, and live daemon attaches, then reports
+mount intents, and daemon registrations, then reports
 one schema-1 ` + "`service-update`" + ` readiness frame. The macOS host keeps its
 stdin open across the exact ServiceManagement unregister/register transaction;
 closing stdin releases both guards.
 When replacing a release, the host derives all four expected-daemon fields
-from the authenticated live daemon and its signed executable and sealed release.
+from the authenticated owning bundle. The CLI revalidates that bundle and tuple.
 The CLI authenticates the socket peer and checks the outgoing release identity
 before reading the fixed lifecycle v1 inventory. The four fields are all-or-none; omission is valid
-only when no prior live daemon needs adoption.
+only when no prior live daemon needs adoption. This helper is preflight; the app
+rechecks registry-file absence under its retained singleton exclusion before replacement.
 Identity prints the linker-stamped FSKit app group for packaging validation;
 portablefsd exposes the same JSON with ` + "`portablefsd -identity-json`" + `.
 `,
@@ -297,7 +298,7 @@ A revoked mount is reported ahead of every liveness check, because it may
 still look alive: its owner process runs and, when the kernel refused to
 release it, its mount is still installed. --json carries the machine-readable
 class in statusReason — session-terminal, repair-budget-exceeded,
-routes-changed, coherence-violation, daemon-unreachable, attach-not-owned —
+routes-changed, coherence-violation, —
 with the engine's own sentence in statusDetail. Revocation is terminal: run
 portablefs umount on the path and mount again.
 `,

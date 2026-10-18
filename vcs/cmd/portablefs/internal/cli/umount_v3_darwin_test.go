@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -107,9 +108,7 @@ func TestUmountV3DetachesTerminalMountWhoseDaemonAttachIsGone(t *testing.T) {
 			if current, err := readMountState(stateDir, mountPath); err != nil || current != nil {
 				t.Fatalf("state after detach=%+v err=%v", current, err)
 			}
-			if !strings.Contains(stderr.String(), "identity-checked kernel detach") {
-				t.Fatalf("the fallback was silent: stderr=%q", stderr.String())
-			}
+
 		})
 	}
 }
@@ -130,14 +129,21 @@ func TestUmountV3ForceDetachesWhenTheDaemonIsUnreachable(t *testing.T) {
 		return nil, errors.New("daemon did not start")
 	}
 
-	if rc := e.run([]string{"umount", "--force", mountPath}); rc != 0 {
+	if rc := e.run([]string{"umount", "--force", mountPath}); rc == 0 {
 		t.Fatalf("rc=%d stderr=%q", rc, stderr.String())
 	}
 	if detaches.Load() != 1 {
 		t.Fatalf("direct kernel detaches=%d, want exactly 1", detaches.Load())
 	}
-	if current, err := readMountState(stateDir, mountPath); err != nil || current != nil {
-		t.Fatalf("state after detach=%+v err=%v", current, err)
+	if current, err := readMountState(stateDir, mountPath); err != nil || current == nil {
+		t.Fatalf("unconfirmed detach lost state=%+v err=%v", current, err)
+	}
+	if !strings.Contains(stderr.String(), "kernel mount is absent; daemon unmount completion is unconfirmed") || !strings.Contains(stderr.String(), "state and intent were preserved") {
+		t.Fatal(stderr.String())
+	}
+	_, intentPath := mountOperationPaths(stateDir, mountPath)
+	if _, err := os.Stat(intentPath); err != nil {
+		t.Fatal("unconfirmed force lost intent", err)
 	}
 }
 
@@ -163,8 +169,8 @@ func TestUmountV3NormalRequiresTheDaemonWhenItsAttachMayBeLive(t *testing.T) {
 	if detaches.Load() != 0 {
 		t.Fatalf("a refused normal unmount performed %d kernel detaches", detaches.Load())
 	}
-	if !strings.Contains(stderr.String(), "--force") {
-		t.Fatalf("refusal names no exit: stderr=%q", stderr.String())
+	if !strings.Contains(stderr.String(), "kernel mount remains present; daemon-owned FSKit unmount failed or is incomplete") {
+		t.Fatalf("refusal lost outcome: stderr=%q", stderr.String())
 	}
 	if current, err := readMountState(stateDir, mountPath); err != nil || current == nil {
 		t.Fatalf("refusal lost state: state=%+v err=%v", current, err)
@@ -197,53 +203,6 @@ func TestUmountV3NeverOverridesAnAttachIdentityMismatch(t *testing.T) {
 	}
 	if current, err := readMountState(stateDir, mountPath); err != nil || current == nil {
 		t.Fatalf("mismatch refusal lost state: state=%+v err=%v", current, err)
-	}
-}
-
-func TestForcedRevocationDetachesTheExactRecordedMount(t *testing.T) {
-	mountPath, err := canonicalMountPath(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := v3FSKitMountState(t, mountPath)
-	present := stubV3KernelMount(t, st)
-	var forced atomic.Int32
-	prior := platformUnmountOpsSource
-	platformUnmountOpsSource = func(budget time.Duration) unmountOps {
-		// The revocation must never inherit the operator-scale platform
-		// budget: one attempt is bounded to a third of the repair budget so
-		// a wedged /sbin/umount cannot blow through the fencing grace it
-		// exists to honor.
-		if budget != fskitForcedDetachTimeout {
-			t.Errorf("forced revocation budget = %v, want %v", budget, fskitForcedDetachTimeout)
-		}
-		return unmountOps{
-			goos: "darwin",
-			combinedOut: func(name string, args ...string) ([]byte, error) {
-				if name != "/sbin/umount" || len(args) != 2 || args[0] != "-f" || args[1] != st.MountPath {
-					t.Errorf("forced revocation ran %s %v; it must be exactly umount -f <recorded path>", name, args)
-				}
-				forced.Add(1)
-				present.Store(false)
-				return nil, nil
-			},
-		}
-	}
-	t.Cleanup(func() { platformUnmountOpsSource = prior })
-
-	if err := forceRevokeFSKitKernelMount(&st); err != nil {
-		t.Fatalf("forced revocation: %v", err)
-	}
-	if forced.Load() != 1 {
-		t.Fatalf("forced unmounts = %d, want exactly 1", forced.Load())
-	}
-	// Once the exact mount is absent, revocation is idempotently complete and
-	// must never run umount against whatever else is now at the path.
-	if err := forceRevokeFSKitKernelMount(&st); err != nil {
-		t.Fatalf("revocation of an absent mount: %v", err)
-	}
-	if forced.Load() != 1 {
-		t.Fatalf("an absent mount was force-unmounted again (%d total)", forced.Load())
 	}
 }
 
@@ -359,5 +318,106 @@ func TestFSKitSupervisorShutdownReportsKernelOutcome(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFSKitDetachPreservesUnconfirmedTransactionAnchors(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		for _, outcome := range []string{"lost reply absent", "lost reply present", "lost reply unverified", "malformed 204 absent", "204 present", "204 absent"} {
+			t.Run(fmt.Sprintf("force=%t/%s", force, outcome), func(t *testing.T) {
+				e, stdout, stderr, stateDir := umountTestEnv(t)
+				mountPath, err := canonicalMountPath(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				st := v3FSKitMountState(t, mountPath)
+				if err := writeMountState(stateDir, st); err != nil {
+					t.Fatal(err)
+				}
+				mounted, after := true, false
+				stubMountIdentification(t, nil, func(path string) ([]kernelMountIdentity, error) {
+					if after && strings.HasSuffix(outcome, "unverified") {
+						return nil, errors.New("kernel query failed")
+					}
+					if !mounted {
+						return nil, nil
+					}
+					return []kernelMountIdentity{{path: path, fsType: defaultFskitType, source: fskitidentity.ResourcePrefix + st.AttachRef}}, nil
+				})
+				forceCalls := 0
+				original := platformUnmountOpsSource
+				platformUnmountOpsSource = func(time.Duration) unmountOps {
+					return unmountOps{goos: "darwin", combinedOut: func(name string, args ...string) ([]byte, error) {
+						forceCalls++
+						if !force || name != "/sbin/umount" || len(args) != 2 || args[0] != "-f" || args[1] != mountPath {
+							t.Fatalf("unauthorized or inexact kernel force: %s %v", name, args)
+						}
+						mounted = false
+						return nil, nil
+					}}
+				}
+				t.Cleanup(func() { platformUnmountOpsSource = original })
+				ctl := &fsdControl{httpClient: &http.Client{Transport: lifecycleRoundTrip(func(r *http.Request) (*http.Response, error) {
+					status, body := http.StatusOK, fmt.Sprintf(`{"attaches":[{"attachRef":%q,"mountPath":%q,"volumeId":%q}]}`, st.AttachRef, mountPath, st.VolumeID)
+					if strings.Contains(r.URL.Path, "/unmount") {
+						if (r.URL.Query().Get("force") == "1") != force {
+							t.Fatal("wrong daemon force request")
+						}
+						after = true
+						if strings.HasSuffix(outcome, "absent") {
+							mounted = false
+						}
+						if strings.HasPrefix(outcome, "lost reply") {
+							return nil, io.EOF
+						}
+						status, body = http.StatusNoContent, ""
+						if strings.HasPrefix(outcome, "malformed") {
+							body = "unexpected"
+						}
+					}
+					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+				})}}
+				ctl.pairOnce.Do(func() {})
+				e.ensurePortablefsdFn = func(fskitConfig, string, string) (*fsdControl, error) { return ctl, nil }
+				args := []string{"umount", mountPath}
+				if force {
+					args = append(args, "--force")
+				}
+				rc := e.run(args)
+				success := outcome == "204 absent"
+				if (rc == 0) != success {
+					t.Fatalf("rc=%d stdout=%q stderr=%q", rc, stdout.String(), stderr.String())
+				}
+				current, err := readMountState(stateDir, mountPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if (current == nil) != success {
+					t.Fatalf("unconfirmed transaction lost state: %+v", current)
+				}
+				_, intentPath := mountOperationPaths(stateDir, mountPath)
+				_, intentErr := os.Stat(intentPath)
+				if !success && intentErr != nil {
+					t.Fatal("unconfirmed transaction lost intent", intentErr)
+				}
+				if !force && forceCalls != 0 {
+					t.Fatal("normal request escalated to force")
+				}
+				if !success && strings.Contains(stdout.String(), "unmounted ") {
+					t.Fatal("unconfirmed completion reported success")
+				}
+				if strings.Contains(outcome, "lost reply") {
+					want := "kernel mount is absent; daemon unmount completion is unconfirmed"
+					if strings.HasSuffix(outcome, "unverified") {
+						want = "kernel mount presence is unverified"
+					} else if mounted {
+						want = "kernel mount remains present; daemon-owned FSKit unmount failed or is incomplete"
+					}
+					if !strings.Contains(stderr.String(), want) || !strings.Contains(stderr.String(), "state and intent were preserved") {
+						t.Fatal(stderr.String())
+					}
+				}
+			})
+		}
 	}
 }

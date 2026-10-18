@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 )
 
 type lifecycleRoundTrip func(*http.Request) (*http.Response, error)
@@ -85,8 +86,7 @@ func TestOutgoingLifecycleUsesAuthenticatedActualVersions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expected := actual
-		expected.ControlProtocol = 0 // supplied fields carry no incoming compiled control number
+		expected := hostctl.ReleaseIdentity{DaemonVersion: actual.DaemonVersion, ExecutableSHA256: actual.ExecutableSHA256, CodeDirectoryHash: strings.Repeat("a", 40)}
 		ctl := lifecycleTestControl(t, 200, string(data), daemonctl.LifecycleIdentityPath)
 		if err := ctl.requireOutgoingIdentityWithin(expected, time.Second); err != nil {
 			t.Fatal(err)
@@ -107,5 +107,60 @@ func TestOutgoingLifecycleUsesAuthenticatedActualVersions(t *testing.T) {
 	}
 	if _, _, err := ctl.doContext(context.Background(), http.MethodGet, daemonctl.LifecycleIdentityPath, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnmountCompletionRequiresEmpty204(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		body   string
+		valid  bool
+	}{{204, "", true}, {204, " ", false}, {204, `{}`, false}, {200, "", false}, {202, "", false}, {404, "", false}} {
+		for _, force := range []bool{false, true} {
+			ctl := &fsdControl{httpClient: &http.Client{Transport: lifecycleRoundTrip(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: test.status, Body: io.NopCloser(strings.NewReader(test.body)), Header: make(http.Header)}, nil
+			})}}
+			ctl.pairOnce.Do(func() {})
+			var err error
+			if force {
+				err = ctl.forceDetach("att_AAAAAAAAAAAAAAAAAAAAAA")
+			} else {
+				err = ctl.unmountAttach("att_AAAAAAAAAAAAAAAAAAAAAA")
+			}
+			if (err == nil) != test.valid {
+				t.Fatalf("status=%d body=%q force=%t error=%v", test.status, test.body, force, err)
+			}
+		}
+	}
+}
+
+func TestExternalAbsenceRequiresAuthenticatedInventoryAfter404(t *testing.T) {
+	st := validFSKitMountState(t, "/test/mount")
+	for _, inventory := range []string{`{"attaches":[]}`, `{"attaches":[{"attachRef":"` + st.AttachRef + `","mountPath":"/test/mount","volumeId":"` + st.VolumeID + `"}]}`, `not-json`} {
+		ctl := &fsdControl{httpClient: &http.Client{Transport: lifecycleRoundTrip(func(r *http.Request) (*http.Response, error) {
+			status, body := 404, ""
+			if r.URL.Path == "/v2/attaches" {
+				status, body = 200, inventory
+			}
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+		})}}
+		ctl.pairOnce.Do(func() {})
+		err := finalizeExternallyAbsentFSKit(ctl, &st)
+		if (err == nil) != (inventory == `{"attaches":[]}`) {
+			t.Fatalf("inventory=%s error=%v", inventory, err)
+		}
+	}
+}
+
+func TestAttachInventoryCannotTurnMalformedRepliesIntoAbsence(t *testing.T) {
+	for _, body := range []string{`{}`, `null`, `{"unknown":[]}`, `{"attaches":[],"unknown":0}`, `{"attaches":[],"attaches":[]}`, `{"attaches":{}}`, `{"attaches":[null]}`, `{"attaches":[{}]}`, `{"attaches":[{"attachRef":null}]}`} {
+		if _, err := decodeAttachInventory([]byte(body)); err == nil {
+			t.Fatalf("malformed inventory proved absence: %s", body)
+		}
+	}
+	for _, body := range []string{`{"attaches":[]}`, `{"attaches":null}`} {
+		if inventory, err := decodeAttachInventory([]byte(body)); err != nil || len(inventory) != 0 {
+			t.Fatalf("paired empty inventory %s: %v", body, err)
+		}
 	}
 }

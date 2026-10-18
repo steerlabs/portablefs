@@ -7,6 +7,6 @@ import (
 	"net"
 )
 
-func authenticateFSDPeer(net.Conn, string) error {
+func authenticateFSDPeer(net.Conn, string, string) error {
 	return fmt.Errorf("authenticated FSKit daemon control requires macOS")
 }

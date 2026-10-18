@@ -310,6 +310,7 @@ func TestReconcileFSKitIntentWithAbsentKernelHonorsForce(t *testing.T) {
 						}
 						return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 					})}}
+					ctl.pairOnce.Do(func() {})
 					e.ensurePortablefsdFn = func(fskitConfig, string, string) (*fsdControl, error) { return ctl, nil }
 					args := []string{"umount", mountPath}
 					if force {

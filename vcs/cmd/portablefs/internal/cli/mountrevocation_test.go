@@ -9,7 +9,7 @@ import (
 
 // Revocation observability. These tests run on every platform on purpose: the
 // whole point of the shared vocabulary is that a Linux fusev3 self-revocation
-// and a macOS FSKit watchdog revocation produce the same record and the same
+// and an authenticated macOS terminal-session observation produce the same record and the same
 // `portablefs mounts --json` shape.
 
 func revokedStateDir(t *testing.T) (string, string) {
@@ -54,7 +54,7 @@ func TestRevocationRecordIsTerminalAndCannotBeDowngraded(t *testing.T) {
 	}
 	setMountRevoked(dir, mountPath, mountRevokedSessionTerminal, "session fenced", 1700000000000)
 	setMountStatus(dir, mountPath, mountStatusCredentialExpired, 1700000900000)
-	setMountRevoked(dir, mountPath, mountRevokedDaemonUnreachable, "later, weaker verdict", 1700000900000)
+	setMountRevoked(dir, mountPath, mountRevokedUnclassified, "later, weaker verdict", 1700000900000)
 
 	got, err := readMountState(dir, mountPath)
 	if err != nil || got == nil {
@@ -262,7 +262,7 @@ func TestMountsJSONRevocationShapeIsIdenticalForFSKitRecords(t *testing.T) {
 	// same way a Linux-recorded one does.
 	st := validFSKitMountState(t, "/tmp/fskit-revoked")
 	st.Status = mountStatusRevoked
-	st.StatusReason = mountRevokedDaemonUnreachable
+	st.StatusReason = mountRevokedUnclassified
 	st.StatusDetail = "portablefsd stopped answering"
 	st.StatusChangedAtMs = 1700000000000
 
@@ -270,7 +270,7 @@ func TestMountsJSONRevocationShapeIsIdenticalForFSKitRecords(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if rows[0]["health"] != mountStatusRevoked || rows[0]["statusReason"] != mountRevokedDaemonUnreachable {
+	if rows[0]["health"] != mountStatusRevoked || rows[0]["statusReason"] != mountRevokedUnclassified {
 		t.Fatalf("fskit revocation row: %v", rows[0])
 	}
 }

@@ -218,7 +218,7 @@ func serveFSKitReconcileControl(
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(ln) }()
 	t.Cleanup(func() { _ = server.Close() })
-	return newFsdControl(socketPath), calls
+	return newTestFsdControl(t, socketPath), calls
 }
 
 func staleFSKitMountState(t *testing.T, mountPath string) mountState {
@@ -375,7 +375,7 @@ func TestUmountStaleFSKitConvergesAfterDaemonAlreadyDetached(t *testing.T) {
 	}
 }
 
-func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
+func TestMountOwnershipRefusesUnconfirmedDaemonWithExistingSocket(t *testing.T) {
 	e, _, _, stateDir := umountTestEnv(t)
 	e.kernelInventoryFn = func() ([]string, error) { return nil, nil }
 	cfg, err := fixedFSKitConfig()
@@ -392,8 +392,8 @@ func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := e.validateMountOwnership(stateDir, "vol_fresh", mountPath); err != nil {
-		t.Fatalf("dead socket pathname was treated as a live daemon: %v", err)
+	if err := e.validateMountOwnership(stateDir, "vol_fresh", mountPath); err == nil {
+		t.Fatal("an unauthenticated or unavailable daemon proved empty ownership")
 	}
 	if info, err := os.Lstat(cfg.controlSock); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("ownership check mutated stale socket: mode=%v err=%v", info, err)
@@ -432,7 +432,7 @@ func writeMountOwnershipV3Attach(t *testing.T, stateDir, mountPath, volumeID str
 	return attachRef, registryPath
 }
 
-// A watchdog may remove an unresponsive FSKit kernel mount without retiring
+// An explicit external unmount may remove an FSKit kernel mount without retiring
 // the daemon-owned attach. The durable attach remains the recovery authority
 // for umount; it is not permission for mount to spend another capability.
 func TestMountOwnershipRejectsSamePathDurableAttach(t *testing.T) {

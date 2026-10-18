@@ -235,16 +235,6 @@ extension_executable="$extension/Contents/MacOS/PortableFSExt"
 [ -x "$extension_executable" ] ||
   { echo "packaged app has no PortableFSExt executable" >&2; exit 1; }
 
-sealed_protocols="$service/Contents/Resources/PortableFSProtocol.json"
-[ -f "$sealed_protocols" ] && [ ! -L "$sealed_protocols" ] ||
-  { echo "packaged service has no regular sealed protocol identity" >&2; exit 1; }
-(
-  cd "$repo_root/vcs"
-  GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 "$go_binary" run ./internal/daemonctl/seal
-) > "$verify_tmp/current-protocols.json"
-cmp -s "$sealed_protocols" "$verify_tmp/current-protocols.json" ||
-  { echo "packaged service protocol identity differs from its exact build" >&2; exit 1; }
-
 for executable in "$app_executable" "$cli" "$daemon" "$extension_executable"; do
   for required_arch in arm64 x86_64; do
     /usr/bin/lipo "$executable" -verify_arch "$required_arch"

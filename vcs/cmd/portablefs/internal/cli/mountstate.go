@@ -103,18 +103,13 @@ const mountStatusCredentialExpired = "credential-expired"
 // and still answers nothing.
 const mountStatusRevoked = "revoked"
 
-// The shared revocation vocabulary. These are the exact tokens both engines
-// produce — the Linux fusev3 frontend classifies its own fatal cause into the
-// first four (see fusev3's RevocationSessionTerminal and friends), the macOS
-// supervisor's watchdog produces the last three — so `portablefs mounts --json`
-// answers with one vocabulary regardless of which platform recorded it.
+// Linux records terminal frontend verdicts; unavailable FSKit control never
+// produces a permanent revocation record.
 const (
 	mountRevokedSessionTerminal      = "session-terminal"
 	mountRevokedRepairBudgetExceeded = "repair-budget-exceeded"
 	mountRevokedRoutesChanged        = "routes-changed"
 	mountRevokedCoherenceViolation   = "coherence-violation"
-	mountRevokedDaemonUnreachable    = "daemon-unreachable"
-	mountRevokedAttachNotOwned       = "attach-not-owned"
 	// mountRevokedUnclassified is what an unrecognized token becomes. An
 	// engine that grows a new reason must not be able to make a revocation
 	// unrecordable, and mislabelling it as one of the known classes would be
@@ -124,7 +119,7 @@ const (
 
 // mountRevocation is one platform's revocation verdict in the shape the
 // supervisor persists. It is deliberately platform-neutral: the Linux engine
-// reports a fusev3.RevocationReport and the macOS watchdog reports its own
+// reports a fusev3.RevocationReport
 // probe decision, but both reduce to the same three facts, and `portablefs
 // mounts` must not have to know which one produced a row.
 type mountRevocation struct {
@@ -140,7 +135,6 @@ func validMountRevocationReason(reason string) bool {
 	switch reason {
 	case mountRevokedSessionTerminal, mountRevokedRepairBudgetExceeded,
 		mountRevokedRoutesChanged, mountRevokedCoherenceViolation,
-		mountRevokedDaemonUnreachable, mountRevokedAttachNotOwned,
 		mountRevokedUnclassified:
 		return true
 	}
@@ -239,15 +233,8 @@ func setMountStatus(dir, mountPath, status string, atMs int64) bool {
 	return err == nil && updated
 }
 
-// setMountRevoked records the terminal self-revocation verdict: the status, the
-// machine-readable class, the engine's own sentence, and when it happened. It
-// is called by the mount supervisor on both platforms — the Linux one from the
-// fusev3 revocation observer, the macOS one from the FSKit revocation watchdog
-// — which is what makes `revoked` a first-class recorded status rather than a
-// message that only ever reached a log.
-//
-// The first revocation wins: escalation can observe the same terminal condition
-// more than once, and the earliest timestamp is the honest one.
+// setMountRevoked persists the Linux frontend's terminal revocation verdict.
+// The first verdict wins so repeated observations retain the original cause.
 func setMountRevoked(dir, mountPath, reason, detail string, atMs int64) bool {
 	updated, err := updateMountState(dir, mountPath, func(st *mountState) {
 		if st.Status == mountStatusRevoked {

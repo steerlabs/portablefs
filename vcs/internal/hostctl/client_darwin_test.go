@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"io"
 	"net"
 	"os"
@@ -832,50 +831,5 @@ func TestRequireLeaseRequiresPersistentExactCompletedMarker(t *testing.T) {
 		path, token, PhaseTargetComplete, oldRelease, targetRelease,
 	); err == nil {
 		t.Fatal("completed marker under a non-private directory was accepted")
-	}
-}
-
-func TestAuthenticateSocketPeerBindsTheLiveExecutable(t *testing.T) {
-	root, err := os.MkdirTemp("/private/tmp", "pfs-peer-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	path := filepath.Join(root, "peer.sock")
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	accepted := make(chan *net.UnixConn, 1)
-	go func() {
-		conn, err := listener.AcceptUnix()
-		if err == nil {
-			accepted <- conn
-		}
-	}()
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	server := <-accepted
-	defer server.Close()
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest, err := daemonctl.FileSHA256(executable)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := AuthenticateSocketPeer(conn, digest); err != nil {
-		t.Fatalf("actual peer: %v", err)
-	}
-	if err := AuthenticateSocketPeer(conn, strings.Repeat("a", 64)); err == nil {
-		t.Fatal("substituted executable accepted")
-	}
-	if err := AuthenticateSocketPeer(conn, ""); err == nil {
-		t.Fatal("missing peer identity accepted")
 	}
 }

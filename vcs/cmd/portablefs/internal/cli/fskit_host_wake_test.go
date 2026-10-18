@@ -74,7 +74,8 @@ func TestEnsurePortablefsdWakesExactHostWithoutSpawningDaemon(t *testing.T) {
 	ctl, err := ensurePortablefsd(fskitConfig{
 		controlSock:             control,
 		daemonPathForTest:       peer,
-		authenticatePeerForTest: func(net.Conn, string) error { return nil },
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version")
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +105,8 @@ func TestEnsurePortablefsdResolvesAmbiguousHostLaunchOnlyWithExactDaemonProof(t 
 	ctl, err := ensurePortablefsd(fskitConfig{
 		controlSock:             control,
 		daemonPathForTest:       peer,
-		authenticatePeerForTest: func(net.Conn, string) error { return nil },
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version")
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +130,8 @@ func TestEnsurePortablefsdRefusesRejectedHostLaunch(t *testing.T) {
 	_, err := ensurePortablefsd(fskitConfig{
 		controlSock:             control,
 		daemonPathForTest:       peer,
-		authenticatePeerForTest: func(net.Conn, string) error { return nil },
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version")
 	if !errors.Is(err, rejected) {
 		t.Fatalf("launch error = %v", err)
@@ -156,7 +159,8 @@ func TestEnsurePortablefsdAdoptsCompatibleAgentWithoutHostWake(t *testing.T) {
 	if _, err := ensurePortablefsd(fskitConfig{
 		controlSock:             control,
 		daemonPathForTest:       peer,
-		authenticatePeerForTest: func(net.Conn, string) error { return nil },
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version"); err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +186,7 @@ func TestControlIdentityRequiresExactPFSLocalMinor(t *testing.T) {
 	control := filepath.Join(root, "control.sock")
 	digest := strings.Repeat("a", 64)
 	serveCompatibleIdentityControl(t, control, "test-version", digest)
-	ctl := newFsdControl(control)
-	ctl.authenticatePeer = func(net.Conn, string) error { return nil }
+	ctl := newTestFsdControl(t, control)
 	err := ctl.requireExactIdentityWithin(daemonctl.Identity{
 		SchemaVersion:    daemonctl.IdentitySchemaVersion,
 		ControlProtocol:  daemonctl.ControlProtocolVersion,

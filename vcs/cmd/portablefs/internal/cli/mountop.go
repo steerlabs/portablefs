@@ -105,7 +105,7 @@ func acquireMountOperation(stateDir, mountPath, volumeID, strategy string) (*mou
 		_ = file.Close()
 		_ = dir.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, fmt.Errorf("another mount or unmount operation already owns %s", mountPath)
+			return nil, fmt.Errorf("another mount or unmount operation already owns %s: %w", mountPath, err)
 		}
 		return nil, fmt.Errorf("lock mount operation for %s: %w", mountPath, err)
 	}

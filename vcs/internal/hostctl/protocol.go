@@ -39,10 +39,6 @@ type ReleaseIdentity struct {
 	CodeDirectoryHash string `json:"codeDirectoryHash"`
 	ExecutableSHA256  string `json:"executableSHA256"`
 	DaemonVersion     string `json:"daemonVersion"`
-	IdentitySchema    int    `json:"identitySchema"`
-	ControlProtocol   int    `json:"controlProtocol"`
-	PFSLocalMajor     uint32 `json:"pfslocalMajor"`
-	PFSLocalMinor     uint32 `json:"pfslocalMinor"`
 }
 
 type PrepareRequest struct {
@@ -211,10 +207,6 @@ func ValidateReleaseIdentity(identity ReleaseIdentity) error {
 			return r < 0x21 || r > 0x7e
 		}) >= 0 {
 		return fmt.Errorf("daemon version is not bounded printable ASCII")
-	}
-	if identity.IdentitySchema <= 0 || identity.ControlProtocol <= 0 ||
-		identity.PFSLocalMajor == 0 {
-		return fmt.Errorf("release protocol identity is incomplete")
 	}
 	return nil
 }

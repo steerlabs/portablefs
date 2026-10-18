@@ -539,7 +539,7 @@ requireText(
 for (const ambiguousLaunchContract of [
   "ErrLaunchCompletionAmbiguous",
   "requestExactMacOSHostForProof(destinationApp)",
-  "requireLiveMacOSServiceRelease(targetRelease, 15*time.Second)",
+  "requireLiveMacOSServiceRelease(destinationApp, targetRelease, true, 15*time.Second)",
 ]) {
   requireText(
     ambiguousLaunchContract === "ErrLaunchCompletionAmbiguous"
@@ -877,14 +877,6 @@ for (const forbiddenSwiftPMWorkaround of [
     failures.push(`Swift verification retains workaround ${forbiddenSwiftPMWorkaround}`);
   }
 }
-for (const contract of [
-  "run ./internal/daemonctl/seal",
-  '"$service_contents/Resources/PortableFSProtocol.json"',
-]) requireText(helperEmbedder, contract, `sealed protocol producer ${contract}`);
-for (const contract of ["daemonctl.DecodeSealedProtocols", "protocols.ControlProtocol", "protocols.PFSLocalMajor", "targetRelease.ControlProtocol != daemonctl.ControlProtocolVersion"]) {
-  requireText(cliMacOSInstaller, contract, `exact sealed protocol pairing ${contract}`);
-}
-
 // Releases have two trust chains: attested Linux archives and the notarized
 // macOS app. Publishing an image would introduce an unreviewed third chain.
 for (const retiredControlPlane of ["ghcr.io", "docker/build-push-action", "Dockerfile"]) {

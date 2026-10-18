@@ -4,14 +4,15 @@ package cli
 
 import (
 	"fmt"
-	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"net"
+
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 )
 
-func authenticateFSDPeer(conn net.Conn, expectedSHA256 string) error {
+func authenticateFSDPeer(conn net.Conn, expectedPath, expectedCDHash string) error {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
 		return fmt.Errorf("daemon control connection is not a Unix stream")
 	}
-	return hostctl.AuthenticateSocketPeer(unixConn, expectedSHA256)
+	return hostctl.AuthenticateSocketPeer(unixConn, expectedPath, expectedCDHash)
 }

@@ -16,12 +16,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/apphost"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
@@ -87,7 +89,8 @@ type fskitConfig struct {
 	fsType                  string
 	controlSock             string
 	daemonPathForTest       string // tests inject a peer without adding a production override
-	authenticatePeerForTest func(net.Conn, string) error
+	authenticatePeerForTest func(net.Conn, string, string) error
+	releaseForTest          func(string, string) (daemonRelease, error)
 }
 
 func fixedFSKitConfig() (fskitConfig, error) {
@@ -102,41 +105,85 @@ func fixedFSKitConfig() (fskitConfig, error) {
 	return cfg, nil
 }
 
-// fsdControl is a minimal client for portablefsd's control socket (HTTP over
-// a Unix domain socket; see vcs/internal/portablefsd/control.go).
-type fsdControl struct {
-	socketPath         string
-	httpClient         *http.Client
-	expectedPeerSHA256 string
-	authenticatePeer   func(net.Conn, string) error
+// daemonRelease is derived from the authenticated owning bundle, never from
+// the socket's reported path or its JSON claims.
+type daemonRelease struct {
+	path     string
+	identity hostctl.ReleaseIdentity
 }
 
-func newFsdControl(socketPath string) *fsdControl {
-	ctl := &fsdControl{socketPath: socketPath, authenticatePeer: authenticateFSDPeer}
+func (release daemonRelease) validate() error {
+	if !filepath.IsAbs(release.path) || filepath.Clean(release.path) != release.path {
+		return fmt.Errorf("expected daemon path must be absolute and canonical")
+	}
+	return hostctl.ValidateReleaseIdentity(release.identity)
+}
+
+// fsdControl sends HTTP over the owner-private daemon Unix socket.
+type fsdControl struct {
+	socketPath string
+	httpClient *http.Client
+	expected   daemonRelease
+	pairOnce   sync.Once
+	pairErr    error
+}
+
+func newFsdControl(socketPath string, expected daemonRelease) (*fsdControl, error) {
+	return newFsdControlAuthenticated(socketPath, expected, authenticateFSDPeer)
+}
+
+func newFsdControlAuthenticated(socketPath string, expected daemonRelease, authenticate func(net.Conn, string, string) error) (*fsdControl, error) {
+	if err := expected.validate(); err != nil {
+		return nil, err
+	}
+	if authenticate == nil {
+		return nil, fmt.Errorf("daemon peer authenticator is required")
+	}
+	ctl := &fsdControl{socketPath: socketPath, expected: expected}
 	ctl.httpClient = &http.Client{
-		// Must exceed the daemon's detach/sync drain budget (30s): the
-		// sync and detach endpoints legitimately hold the request open
-		// for the whole bounded drain.
 		Timeout:       60 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
-		Transport: &http.Transport{DisableKeepAlives: true,
+		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				parent, err := privatepath.OpenExistingDir(filepath.Dir(socketPath))
+				if err != nil {
+					return nil, fmt.Errorf("pin daemon control directory: %w", err)
+				}
+				defer parent.Close()
 				var d net.Dialer
 				conn, err := d.DialContext(ctx, "unix", socketPath)
 				if err != nil {
 					return nil, err
 				}
-				if ctl.expectedPeerSHA256 != "" {
-					if err := ctl.authenticatePeer(conn, ctl.expectedPeerSHA256); err != nil {
-						_ = conn.Close()
-						return nil, err
-					}
+				// Capture immutable constructor values: changing release requires
+				// a new client and transport, including for the first health probe.
+				if err := authenticate(conn, expected.path, expected.identity.CodeDirectoryHash); err != nil {
+					_ = conn.Close()
+					return nil, err
 				}
 				return conn, nil
 			},
 		},
 	}
-	return ctl
+	return ctl, nil
+}
+
+func (c *fsdControl) close() { c.httpClient.CloseIdleConnections() }
+
+func (cfg fskitConfig) controlForRelease(path, version string) (*fsdControl, error) {
+	inspect := authenticateDaemonRelease
+	if cfg.releaseForTest != nil {
+		inspect = cfg.releaseForTest
+	}
+	expected, err := inspect(path, version)
+	if err != nil {
+		return nil, err
+	}
+	authenticate := authenticateFSDPeer
+	if cfg.authenticatePeerForTest != nil {
+		authenticate = cfg.authenticatePeerForTest
+	}
+	return newFsdControlAuthenticated(cfg.controlSock, expected, authenticate)
 }
 
 func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
@@ -144,6 +191,14 @@ func (c *fsdControl) do(method, path string, body any) (int, []byte, error) {
 }
 
 func (c *fsdControl) doContext(ctx context.Context, method, path string, body any) (int, []byte, error) {
+	if !strings.HasPrefix(path, "/lifecycle/") && path != "/healthz" {
+		c.pairOnce.Do(func() {
+			c.pairErr = c.requireCompatibleIdentity(c.expected.identity.DaemonVersion, c.expected.identity.ExecutableSHA256)
+		})
+		if c.pairErr != nil {
+			return 0, nil, c.pairErr
+		}
+	}
 	var reader io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
@@ -167,6 +222,9 @@ func (c *fsdControl) doContext(ctx context.Context, method, path string, body an
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent && (len(resp.TransferEncoding) != 0 || (resp.Header.Get("Content-Length") != "" && resp.Header.Get("Content-Length") != "0")) {
+		return resp.StatusCode, nil, fmt.Errorf("portablefsd returned malformed nonempty HTTP 204 framing")
+	}
 	limit := int64(1 << 20)
 	if strings.HasPrefix(path, "/lifecycle/") {
 		limit = daemonctl.MaxLifecycleBodyBytes
@@ -242,7 +300,6 @@ func (c *fsdControl) requireExactIdentityWithin(
 	expected daemonctl.Identity,
 	timeout time.Duration,
 ) error {
-	c.expectedPeerSHA256 = expected.ExecutableSHA256
 	identity, err := c.identityWithin(timeout)
 	if err != nil {
 		return fmt.Errorf(
@@ -271,8 +328,20 @@ func (c *fsdControl) requireExactIdentityWithin(
 	return nil
 }
 
+type fsdStatusError struct {
+	status int
+	err    error
+}
+
+func (e *fsdStatusError) Error() string { return e.err.Error() }
+func (e *fsdStatusError) Unwrap() error { return e.err }
+
 // controlError extracts the daemon's error envelope for bounded messages.
 func controlError(status int, body []byte) error {
+	return &fsdStatusError{status: status, err: controlErrorMessage(status, body)}
+}
+
+func controlErrorMessage(status int, body []byte) error {
 	var envelope struct {
 		Error string `json:"error"`
 	}
@@ -368,13 +437,12 @@ func (c *fsdControl) lifecycleInventory() (daemonctl.LifecycleInventory, error) 
 // Outgoing service quiescence uses its authenticated release coordinates.
 // The operational control version is reported by that release, never supplied
 // from this CLI's compiled pairing expectations.
-func (c *fsdControl) requireOutgoingIdentityWithin(expected daemonctl.Identity, timeout time.Duration) error {
-	c.expectedPeerSHA256 = expected.ExecutableSHA256
+func (c *fsdControl) requireOutgoingIdentityWithin(expected hostctl.ReleaseIdentity, timeout time.Duration) error {
 	actual, err := c.identityWithin(timeout)
 	if err != nil {
 		return err
 	}
-	if actual.SchemaVersion != expected.SchemaVersion || actual.DaemonVersion != expected.DaemonVersion || actual.ExecutableSHA256 != expected.ExecutableSHA256 || actual.PFSLocalMajor != expected.PFSLocalMajor || actual.PFSLocalMinor != expected.PFSLocalMinor {
+	if actual.DaemonVersion != expected.DaemonVersion || actual.ExecutableSHA256 != expected.ExecutableSHA256 {
 		return fmt.Errorf("outgoing portablefsd identity does not match the authenticated release")
 	}
 	return nil
@@ -385,10 +453,7 @@ func (c *fsdControl) forceDetach(ref string) error {
 	if err != nil {
 		return err
 	}
-	if status != http.StatusNoContent {
-		return controlError(status, body)
-	}
-	return nil
+	return validateUnmountResponse(status, body)
 }
 
 // cliAttachStatus is the slice of portablefsd's attach status the CLI reads
@@ -399,9 +464,8 @@ type cliAttachStatus struct {
 	VolumeID  string `json:"volumeId"`
 	State     string `json:"state"`
 	LastError string `json:"lastError"`
-	// SessionTerminal is the daemon's machine-readable verdict that this
-	// attach's v3 authority session ended permanently; the mount supervisor's
-	// revocation watchdog branches on it.
+	// SessionTerminal reports the daemon's permanent authority-session verdict.
+	// It does not authorize a kernel force unmount.
 	SessionTerminal           bool   `json:"sessionTerminal"`
 	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
 	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
@@ -459,16 +523,10 @@ func (c *fsdControl) listAttaches() ([]cliAttachStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status < 200 || status >= 300 {
+	if status != http.StatusOK {
 		return nil, controlError(status, body)
 	}
-	var out struct {
-		Attaches []cliAttachStatus `json:"attaches"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("unreadable attach list from portablefsd: %w", err)
-	}
-	return out.Attaches, nil
+	return decodeAttachInventory(body)
 }
 
 func (c *fsdControl) preflightAttach(ref string) error {
@@ -506,13 +564,7 @@ func (c *fsdControl) unmountAttach(ref string) error {
 	if err != nil {
 		return err
 	}
-	if status == http.StatusNotFound {
-		return nil
-	}
-	if status < 200 || status >= 300 {
-		return controlError(status, body)
-	}
-	return nil
+	return validateUnmountResponse(status, body)
 }
 
 func (c *fsdControl) reauthorizeCredential(ref, token string, expiresAtMs int64, sequence uint64, clientCertificatePEM string) (time.Time, error) {
@@ -724,14 +776,21 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 		return nil, err
 	}
 	defer daemon.close()
-	ctl := newFsdControl(cfg.controlSock)
-	if cfg.authenticatePeerForTest != nil {
-		ctl.authenticatePeer = cfg.authenticatePeerForTest
+	ctl, err := cfg.controlForRelease(daemon.path, cliVersion)
+	if err != nil {
+		return nil, err
 	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			ctl.close()
+		}
+	}()
 	if ctl.healthyWithin(time.Second) {
 		if err := ctl.requireCompatibleIdentityWithin(cliVersion, daemon.sha256, 2*time.Second); err != nil {
 			return nil, err
 		}
+		succeeded = true
 		return ctl, nil
 	}
 	if err := daemon.validate(); err != nil {
@@ -763,6 +822,7 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 			); err != nil {
 				return nil, err
 			}
+			succeeded = true
 			return ctl, nil
 		}
 		remaining = time.Until(deadline)
@@ -791,16 +851,23 @@ func connectCompatiblePortablefsd(cfg fskitConfig, cliVersion string) (*fsdContr
 		return nil, err
 	}
 	defer daemon.close()
-	ctl := newFsdControl(cfg.controlSock)
-	if cfg.authenticatePeerForTest != nil {
-		ctl.authenticatePeer = cfg.authenticatePeerForTest
+	ctl, err := cfg.controlForRelease(daemon.path, cliVersion)
+	if err != nil {
+		return nil, err
 	}
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			ctl.close()
+		}
+	}()
 	if !ctl.healthy() {
 		return nil, fmt.Errorf("portablefsd is not healthy on %s", cfg.controlSock)
 	}
 	if err := ctl.requireCompatibleIdentity(cliVersion, daemon.sha256); err != nil {
 		return nil, err
 	}
+	succeeded = true
 	return ctl, nil
 }
 
@@ -868,6 +935,16 @@ func mountFSKitPath(fsType, attachRef, mountPath string) error {
 	if err != nil {
 		return fskitMountHint(fsType, fmt.Errorf("mount -t %s %s: %w (output: %s)",
 			fsType, mountPath, err, strings.TrimSpace(string(out))))
+	}
+	return nil
+}
+
+func validateUnmountResponse(status int, body []byte) error {
+	if status != http.StatusNoContent {
+		return controlError(status, body)
+	}
+	if len(body) != 0 {
+		return fmt.Errorf("portablefsd unmount completion must be empty HTTP 204")
 	}
 	return nil
 }

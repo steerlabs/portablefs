@@ -1,23 +1,21 @@
 package cli
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
-	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 func (e *cmdEnv) mountLifecycleStateDir() (string, error) {
@@ -138,7 +136,8 @@ func (i lifecycleInventory) mountCount() int {
 }
 
 func (i lifecycleInventory) attachCount() int {
-	return i.DurableAttaches + i.LiveAttaches
+	// The running lifecycle count already includes persisted registrations.
+	return i.LiveAttaches
 }
 
 type installExclusiveReadiness struct {
@@ -160,13 +159,13 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	var jsonOut bool
 	var expectedDaemonVersion string
 	var expectedDaemonSHA256 string
-	var expectedPFSLocalMajor uint
-	var expectedPFSLocalMinor uint
+	var expectedDaemonPath string
+	var expectedDaemonCDHash string
 	fs.BoolVar(&jsonOut, "json", false, "write the versioned service-update readiness handshake")
 	fs.StringVar(&expectedDaemonVersion, "expected-daemon-version", "", "authenticated live daemon version")
 	fs.StringVar(&expectedDaemonSHA256, "expected-daemon-sha256", "", "authenticated live daemon executable SHA-256")
-	fs.UintVar(&expectedPFSLocalMajor, "expected-pfslocal-major", 0, "authenticated live daemon pfslocal major")
-	fs.UintVar(&expectedPFSLocalMinor, "expected-pfslocal-minor", 0, "authenticated live daemon pfslocal minor")
+	fs.StringVar(&expectedDaemonPath, "expected-daemon-path", "", "canonical daemon path in the authenticated owning bundle")
+	fs.StringVar(&expectedDaemonCDHash, "expected-daemon-cdhash", "", "authenticated running daemon CodeDirectory hash")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		return e.handleParseError("lifecycle", err)
@@ -181,12 +180,12 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	expectedIdentity, err := parseExpectedDaemonIdentity(
 		expectedDaemonVersion,
 		expectedDaemonSHA256,
-		expectedPFSLocalMajor,
-		expectedPFSLocalMinor,
+		expectedDaemonPath,
+		expectedDaemonCDHash,
 		present["expected-daemon-version"],
 		present["expected-daemon-sha256"],
-		present["expected-pfslocal-major"],
-		present["expected-pfslocal-minor"],
+		present["expected-daemon-path"],
+		present["expected-daemon-cdhash"],
 	)
 	if err != nil {
 		return e.usageError("lifecycle", err)
@@ -232,49 +231,35 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	return holdUntilInputOrSignal(e)
 }
 
-func parseExpectedDaemonIdentity(
-	version string,
-	sha256 string,
-	pfslocalMajor uint,
-	pfslocalMinor uint,
-	versionPresent bool,
-	sha256Present bool,
-	majorPresent bool,
-	minorPresent bool,
-) (*daemonctl.Identity, error) {
-	provided := versionPresent || sha256Present || majorPresent || minorPresent
-	if !provided {
+func parseExpectedDaemonIdentity(version, sha256, path, cdhash string, versionPresent, sha256Present, pathPresent, cdhashPresent bool) (*daemonRelease, error) {
+	if !versionPresent && !sha256Present && !pathPresent && !cdhashPresent {
 		return nil, nil
 	}
-	if !versionPresent || !sha256Present || !majorPresent || !minorPresent ||
-		version == "" || sha256 == "" || pfslocalMajor == 0 {
-		return nil, fmt.Errorf("the expected outgoing daemon identity requires version, SHA-256, pfslocal major, and pfslocal minor together")
+	if !versionPresent || !sha256Present || !pathPresent || !cdhashPresent {
+		return nil, fmt.Errorf("the expected outgoing daemon identity requires version, SHA-256, path, and CDHash together")
 	}
-	if len(version) > 128 || strings.IndexFunc(version, func(r rune) bool {
-		return r < 0x21 || r > 0x7e
-	}) >= 0 {
-		return nil, fmt.Errorf("expected daemon version must be 1-128 visible ASCII characters")
+	expected := daemonRelease{path: path, identity: hostctl.ReleaseIdentity{DaemonVersion: version, ExecutableSHA256: sha256, CodeDirectoryHash: cdhash}}
+	if err := expected.validate(); err != nil {
+		return nil, err
 	}
-	digest, err := hex.DecodeString(sha256)
-	if err != nil || len(digest) != 32 || strings.ToLower(sha256) != sha256 {
-		return nil, fmt.Errorf("expected daemon SHA-256 must be exactly 64 lowercase hexadecimal characters")
-	}
-	if pfslocalMajor > math.MaxUint32 || pfslocalMinor > math.MaxUint32 {
-		return nil, fmt.Errorf("expected pfslocal version is outside uint32")
-	}
-	return &daemonctl.Identity{
-		SchemaVersion: daemonctl.IdentitySchemaVersion,
+	return &expected, nil
+}
 
-		DaemonVersion:    version,
-		ExecutableSHA256: sha256,
-		PFSLocalMajor:    uint32(pfslocalMajor),
-		PFSLocalMinor:    uint32(pfslocalMinor),
-	}, nil
+// This helper is an early preflight only. The app repeats the decisive
+// descriptor-relative check under its retained singleton exclusion, including
+// after stopping a running outgoing owner. It must not take a second flock.
+func preflightAbsentDaemonRegistry(stateDir string) error {
+	parent, err := privatepath.OpenDir(stateDir)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return daemonctl.RequireRegistryAbsent(parent)
 }
 
 func (e *cmdEnv) strictAccountInventory(
 	action string,
-	expectedIdentity *daemonctl.Identity,
+	expectedIdentity *daemonRelease,
 ) (lifecycleInventory, error) {
 	var inventory lifecycleInventory
 	kernelMounts, err := e.kernelMountInventory()
@@ -309,29 +294,21 @@ func (e *cmdEnv) strictAccountInventory(
 			len(intents), intent.MountPath, intent.Phase, intent.MountPath, action,
 		)
 	}
-	persisted, err := portablefsd.ReadPersistedAttachInventory(filepath.Join(filepath.Dir(mountStateDir), "portablefsd"))
-	if err != nil {
-		return inventory, fmt.Errorf("strict durable daemon attach inventory: %w", err)
-	}
-	inventory.DurableAttaches = len(persisted)
-	if len(persisted) != 0 {
-		return inventory, fmt.Errorf(
-			"%d durable daemon attach(es) remain (for example %s at %s); run `portablefs umount %s` before %s",
-			len(persisted), persisted[0].AttachRef, persisted[0].MountPath, persisted[0].MountPath, action,
-		)
-	}
 	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return inventory, err
 	}
-	if _, err := os.Lstat(cfg.controlSock); err == nil {
+	_, socketErr := os.Lstat(cfg.controlSock)
+	if expectedIdentity != nil || socketErr == nil {
 		count, listErr := e.daemonLifecycleInventory(expectedIdentity)
 		if listErr != nil {
 			return inventory, fmt.Errorf("strict daemon attach inventory: %w", listErr)
 		}
 		inventory.LiveAttaches = count
-	} else if !os.IsNotExist(err) {
-		return inventory, fmt.Errorf("inspect daemon control socket: %w", err)
+	} else if !os.IsNotExist(socketErr) {
+		return inventory, fmt.Errorf("inspect daemon control socket: %w", socketErr)
+	} else if err := preflightAbsentDaemonRegistry(filepath.Join(filepath.Dir(mountStateDir), "portablefsd")); err != nil {
+		return inventory, fmt.Errorf("absent-daemon registry preflight before %s: %w", action, err)
 	}
 	if inventory.LiveAttaches != 0 {
 		return inventory, fmt.Errorf("%d daemon attach(es) remain; cleanly unmount them before %s", inventory.LiveAttaches, action)
@@ -340,9 +317,8 @@ func (e *cmdEnv) strictAccountInventory(
 }
 
 // rejectDurableMountAnchors is the common installer transaction gate. A
-// replacement may proceed only when every durable source used by explicit
-// reconciliation is empty. Stale records are refused just like live records:
-// only `portablefs umount` owns the proof and deletion protocol.
+// replacement preflight refuses all CLI anchors and any daemon registry entry.
+// The app still owns the final absence check under singleton exclusion.
 func rejectDurableMountAnchors(stateDir string) error {
 	mountStateDir := filepath.Join(stateDir, "mounts")
 	states, err := listMountStates(mountStateDir)
@@ -367,17 +343,10 @@ func rejectDurableMountAnchors(stateDir string) error {
 			len(intents), intent.MountPath, intent.Phase, intent.MountPath,
 		)
 	}
-	attaches, err := portablefsd.ReadPersistedAttachInventory(filepath.Join(stateDir, "portablefsd"))
-	if err != nil {
-		return fmt.Errorf("strict installer durable attach inventory: %w", err)
+	if err := preflightAbsentDaemonRegistry(filepath.Join(stateDir, "portablefsd")); err != nil {
+		return fmt.Errorf("installer absent-daemon registry preflight: %w; run `portablefs umount` with the owning release to reconcile", err)
 	}
-	if len(attaches) != 0 {
-		attach := attaches[0]
-		return fmt.Errorf(
-			"%d durable daemon attach(es) remain (for example %s at %s); run `portablefs umount %s` to reconcile them before installing",
-			len(attaches), attach.AttachRef, attach.MountPath, attach.MountPath,
-		)
-	}
+
 	return nil
 }
 

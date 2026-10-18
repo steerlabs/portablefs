@@ -14,8 +14,6 @@ import (
 	"os"
 	"runtime"
 	"time"
-
-	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 )
 
 const hostedMountReauthorizationFeature = "hosted-mount-reauthorization-v1"
@@ -42,7 +40,7 @@ type cmdEnv struct {
 	mountHealthFn func(*mountState) string
 	// Test-only daemon inventory seam. Production proves the exact installed
 	// daemon identity before reading its live attaches.
-	daemonLifecycleInventoryFn func(*daemonctl.Identity) (int, error)
+	daemonLifecycleInventoryFn func(*daemonRelease) (int, error)
 	// Test-only daemon lifecycle seam. Production adopts the exact launchd
 	// agent or wakes the exact containing host through ensurePortablefsd.
 	ensurePortablefsdFn func(fskitConfig, string, string) (*fsdControl, error)
@@ -230,7 +228,7 @@ func cmdVersion(e *cmdEnv, args []string) int {
 
 // Lifecycle inventory accepts arbitrary authenticated outgoing versions. Ordinary
 // attach inventory still requires this CLI's exact paired release.
-func (e *cmdEnv) daemonLifecycleInventory(expected *daemonctl.Identity) (int, error) {
+func (e *cmdEnv) daemonLifecycleInventory(expected *daemonRelease) (int, error) {
 	if e.daemonLifecycleInventoryFn != nil {
 		return e.daemonLifecycleInventoryFn(expected)
 	}
@@ -242,12 +240,25 @@ func (e *cmdEnv) daemonLifecycleInventory(expected *daemonctl.Identity) (int, er
 	if expected == nil {
 		ctl, err = connectCompatiblePortablefsd(cfg, e.version)
 	} else {
-		ctl = newFsdControl(cfg.controlSock)
-		err = ctl.requireOutgoingIdentityWithin(*expected, 3*time.Second)
+		var authenticated daemonRelease
+		authenticated, err = authenticateDaemonRelease(expected.path, expected.identity.DaemonVersion)
+		if err == nil && authenticated != *expected {
+			err = fmt.Errorf("supplied outgoing daemon tuple differs from its authenticated bundle")
+		}
+		if err == nil {
+			ctl, err = newFsdControl(cfg.controlSock, authenticated)
+		}
+		if ctl != nil {
+			defer ctl.close()
+		}
+		if err == nil {
+			err = ctl.requireOutgoingIdentityWithin(expected.identity, 3*time.Second)
+		}
 	}
 	if err != nil {
 		return 0, err
 	}
+	defer ctl.close()
 	inventory, err := ctl.lifecycleInventory()
 	return inventory.AttachmentCount, err
 }

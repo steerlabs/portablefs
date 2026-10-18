@@ -37,6 +37,7 @@ func TestFSKitReauthorizationReturnsDaemonInstalledDeadline(t *testing.T) {
 		}, nil
 	})}}
 
+	control.pairOnce.Do(func() {})
 	deadline, err := control.reauthorizeCredential(
 		"attach-ref", "capability", callerClaimedDeadline.UnixMilli(), 2, "certificate",
 	)

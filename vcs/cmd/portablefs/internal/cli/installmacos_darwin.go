@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -20,11 +21,9 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
 	"github.com/steerlabs/portablefs/vcs/internal/apphost"
-	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
-	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"golang.org/x/sys/unix"
 )
 
@@ -283,9 +282,6 @@ func runInstallMacOSAppWithLayout(
 		return macOSInstallResult{}, err
 	}
 	var updateSession *hostctl.Session
-	if targetRelease.IdentitySchema != daemonctl.IdentitySchemaVersion || targetRelease.ControlProtocol != daemonctl.ControlProtocolVersion || targetRelease.PFSLocalMajor != pfslocal.ProtocolMajor || targetRelease.PFSLocalMinor != pfslocal.ProtocolMinor {
-		return macOSInstallResult{}, fmt.Errorf("incoming service does not match this CLI's exact protocol pairing")
-	}
 	var oldRelease hostctl.ReleaseIdentity
 	updateCommitted := false
 	if prepared.appID.exists {
@@ -431,7 +427,7 @@ func runInstallMacOSAppWithLayout(
 		if err := requestExactMacOSHostForProof(destinationApp); err != nil {
 			return macOSInstallResult{}, fmt.Errorf("launch installed PortableFS host: %w", err)
 		}
-		if err := requireLiveMacOSServiceRelease(targetRelease, 15*time.Second); err != nil {
+		if err := requireLiveMacOSServiceRelease(destinationApp, targetRelease, true, 15*time.Second); err != nil {
 			return macOSInstallResult{}, fmt.Errorf(
 				"prove installed PortableFS service release after host launch: %w",
 				err,
@@ -1711,10 +1707,15 @@ func macOSServiceReleaseIdentity(
 		"LaunchAgents",
 		"PortableFSDService.app",
 	)
+	architecture, err := nativeCodeArchitecture()
+	if err != nil {
+		return hostctl.ReleaseIdentity{}, err
+	}
 	out, err := exec.Command(
 		"/usr/bin/codesign",
 		"-dv",
 		"--verbose=4",
+		"--arch", architecture,
 		serviceApp,
 	).CombinedOutput()
 	if err != nil {
@@ -1728,23 +1729,10 @@ func macOSServiceReleaseIdentity(
 	if err != nil {
 		return hostctl.ReleaseIdentity{}, err
 	}
-	protocolsPath := filepath.Join(serviceApp, filepath.FromSlash(daemonctl.SealedProtocolsRelativePath))
-	protocolsData, err := readBoundedRegularFile(protocolsPath, false)
-	if err != nil {
-		return hostctl.ReleaseIdentity{}, fmt.Errorf("read sealed daemon protocols: %w", err)
-	}
-	protocols, err := daemonctl.DecodeSealedProtocols(protocolsData)
-	if err != nil {
-		return hostctl.ReleaseIdentity{}, fmt.Errorf("decode sealed daemon protocols: %w", err)
-	}
 	identity := hostctl.ReleaseIdentity{
 		CodeDirectoryHash: codeDirectoryHash,
 		ExecutableSHA256:  daemon.sha256,
 		DaemonVersion:     version,
-		IdentitySchema:    protocols.IdentitySchema,
-		ControlProtocol:   protocols.ControlProtocol,
-		PFSLocalMajor:     protocols.PFSLocalMajor,
-		PFSLocalMinor:     protocols.PFSLocalMinor,
 	}
 	if err := hostctl.ValidateReleaseIdentity(identity); err != nil {
 		return hostctl.ReleaseIdentity{}, fmt.Errorf("invalid sealed daemon release identity: %w", err)
@@ -1850,7 +1838,7 @@ func reactivateUnpublishedOldMacOSRelease(
 		prepared.preserve = true
 		return fmt.Errorf("installation failed after old-host exit: %w; old activation deadline exhausted: %v", installFailure, timeoutErr)
 	}
-	if err := requireLiveMacOSServiceRelease(oldRelease, liveTimeout); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, oldRelease, false, liveTimeout); err != nil {
 		fenceErr := fenceReadyMacOSActivation(
 			rollbackContext, activation, updateSocket, macOSActivationFenceAndAbsenceTimeout,
 		)
@@ -1910,6 +1898,7 @@ func reactivateUnpublishedOldMacOSRelease(
 	err = completeOrResumeMacOSActivation(
 		rollbackContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2117,7 +2106,7 @@ func requireExactUnpublishedOldMacOSRelease(
 	if sealed != oldRelease {
 		return fmt.Errorf("installed old daemon release identity changed")
 	}
-	if err := requireLiveMacOSServiceRelease(oldRelease, 5*time.Second); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, oldRelease, false, 5*time.Second); err != nil {
 		return err
 	}
 	return hostctl.RequireLease(
@@ -2232,7 +2221,7 @@ func activatePublishedMacOSUpdate(
 	}
 	defer activation.Close()
 
-	if err := requireLiveMacOSServiceRelease(targetRelease, 5*time.Second); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, targetRelease, true, 5*time.Second); err != nil {
 		fenceErr := fenceReadyMacOSActivation(
 			transactionContext, activation, updateSocket, macOSActivationFenceAndAbsenceTimeout,
 		)
@@ -2287,6 +2276,7 @@ func activatePublishedMacOSUpdate(
 	accepted, fenced, err := acceptOrResumeMacOSActivation(
 		acceptContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2338,6 +2328,7 @@ func activatePublishedMacOSUpdate(
 	err = completeOrResumeMacOSActivation(
 		transactionContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2427,7 +2418,7 @@ func restorePreviousMacOSRelease(
 		prepared.preserve = true
 		return fmt.Errorf("replacement activation failed: %w; rollback activation deadline exhausted: %v", targetFailure, timeoutErr)
 	}
-	if err := requireLiveMacOSServiceRelease(oldRelease, liveTimeout); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, oldRelease, false, liveTimeout); err != nil {
 		fenceErr := fenceReadyMacOSActivation(
 			transactionContext, activation, updateSocket, macOSActivationFenceAndAbsenceTimeout,
 		)
@@ -2479,6 +2470,7 @@ func restorePreviousMacOSRelease(
 	err = completeOrResumeMacOSActivation(
 		transactionContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2688,7 +2680,7 @@ func acceptRollbackMacOSActivationRecoveringFence(
 			if timeoutErr != nil {
 				return nil, timeoutErr
 			}
-			if err := requireLiveMacOSServiceRelease(oldRelease, liveTimeout); err != nil {
+			if err := requireLiveMacOSServiceRelease(app, oldRelease, false, liveTimeout); err != nil {
 				fenceErr := fenceReadyMacOSActivation(
 					ctx, current, socketPath, macOSActivationFenceAndAbsenceTimeout,
 				)
@@ -2720,6 +2712,7 @@ func acceptRollbackMacOSActivationRecoveringFence(
 		accepted, fenced, err := acceptOrResumeMacOSActivation(
 			acceptContext,
 			current,
+			app,
 			socketPath,
 			leasePath,
 			token,
@@ -2844,7 +2837,7 @@ func boundedContextDuration(ctx context.Context, maximum time.Duration) (time.Du
 func acceptOrResumeMacOSActivation(
 	ctx context.Context,
 	activation *hostctl.ActivationSession,
-	socketPath, leasePath, token, kind string,
+	app, socketPath, leasePath, token, kind string,
 	activeRelease, oldRelease, targetRelease hostctl.ReleaseIdentity,
 ) (*hostctl.ActivationSession, bool, error) {
 	if kind != "target" && kind != "rollback" {
@@ -2868,7 +2861,7 @@ func acceptOrResumeMacOSActivation(
 			if err := hostctl.RequireLease(
 				leasePath, token, activePhase, oldRelease, targetRelease,
 			); err == nil {
-				if err := requireLiveMacOSServiceRelease(activeRelease, 2*time.Second); err != nil {
+				if err := requireLiveMacOSServiceRelease(app, activeRelease, kind == "target", 2*time.Second); err != nil {
 					activeErr = err
 				} else {
 					resumed, err := hostctl.ResumeActive(
@@ -2920,7 +2913,7 @@ func acceptOrResumeMacOSActivation(
 func completeOrResumeMacOSActivation(
 	ctx context.Context,
 	activation *hostctl.ActivationSession,
-	socketPath, leasePath, token, kind string,
+	app, socketPath, leasePath, token, kind string,
 	activeRelease, oldRelease, targetRelease hostctl.ReleaseIdentity,
 	reconcileCompleted func() error,
 ) error {
@@ -2956,7 +2949,7 @@ func completeOrResumeMacOSActivation(
 		if err := hostctl.RequireLease(
 			leasePath, token, activePhase, oldRelease, targetRelease,
 		); err == nil {
-			if err := requireLiveMacOSServiceRelease(activeRelease, 2*time.Second); err != nil {
+			if err := requireLiveMacOSServiceRelease(app, activeRelease, kind == "target", 2*time.Second); err != nil {
 				activeErr = err
 			} else {
 				resumeContext, resumeCancel, admissionErr := activationChildContext(
@@ -3012,23 +3005,77 @@ func completeOrResumeMacOSActivation(
 	}
 }
 
-func requireLiveMacOSServiceRelease(
-	release hostctl.ReleaseIdentity,
-	timeout time.Duration,
-) error {
+func requireLiveMacOSServiceRelease(app string, release hostctl.ReleaseIdentity, incoming bool, timeout time.Duration) error {
 	controlSocket, err := defaultFskitControlSocket()
 	if err != nil {
 		return err
 	}
-	expected := daemonctl.Identity{
-		SchemaVersion:    release.IdentitySchema,
-		ControlProtocol:  release.ControlProtocol,
-		DaemonVersion:    release.DaemonVersion,
-		ExecutableSHA256: release.ExecutableSHA256,
-		PFSLocalMajor:    release.PFSLocalMajor,
-		PFSLocalMinor:    release.PFSLocalMinor,
+	path := filepath.Join(app, "Contents", filepath.FromSlash(macOSPortableFSDRelativePath))
+	expected, err := authenticateDaemonRelease(path, release.DaemonVersion)
+	if err != nil {
+		return err
 	}
-	return newFsdControl(controlSocket).requireExactIdentityWithin(expected, timeout)
+	if expected.identity != release {
+		return fmt.Errorf("authenticated daemon release changed")
+	}
+	ctl, err := newFsdControl(controlSocket, expected)
+	if err != nil {
+		return err
+	}
+	defer ctl.close()
+	if incoming {
+		return ctl.requireCompatibleIdentityWithin(release.DaemonVersion, release.ExecutableSHA256, timeout)
+	}
+	return ctl.requireOutgoingIdentityWithin(release, timeout)
+}
+
+func nativeCodeArchitecture() (string, error) {
+	if runtime.GOARCH == "arm64" {
+		return "arm64", nil
+	}
+	if runtime.GOARCH != "amd64" {
+		return "", fmt.Errorf("unsupported native daemon architecture %s", runtime.GOARCH)
+	}
+	translated, err := unix.SysctlUint32("sysctl.proc_translated")
+	if errors.Is(err, syscall.ENOENT) {
+		return "x86_64", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect native daemon architecture: %w", err)
+	}
+	if translated == 1 {
+		return "arm64", nil
+	}
+	if translated == 0 {
+		return "x86_64", nil
+	}
+	return "", fmt.Errorf("invalid process translation status %d", translated)
+}
+
+// The exact bundle hierarchy, signatures, entitlements and executable digest
+// authorize the expected socket identity. Caller-supplied hashes cannot do so.
+func authenticateDaemonRelease(path, version string) (daemonRelease, error) {
+	suffix := "/Contents/" + macOSPortableFSDRelativePath
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.HasSuffix(path, suffix) {
+		return daemonRelease{}, fmt.Errorf("expected daemon must be at its canonical owning-bundle path")
+	}
+	app := strings.TrimSuffix(path, suffix)
+	resolved, err := filepath.EvalSymlinks(app)
+	if err != nil || resolved != app {
+		return daemonRelease{}, fmt.Errorf("daemon owning bundle path is not canonical: %v", err)
+	}
+	appID, err := sourceMacOSBundleIdentity(app)
+	if err != nil {
+		return daemonRelease{}, err
+	}
+	if err := validateInstalledMacOSBundleForPublicationWithLayout(app, version, appID, productionMacOSInstallLayout); err != nil {
+		return daemonRelease{}, err
+	}
+	identity, err := macOSServiceReleaseIdentity(app, version)
+	if err != nil {
+		return daemonRelease{}, err
+	}
+	return daemonRelease{path: path, identity: identity}, nil
 }
 
 // reconcileCompletedMacOSActivation is the only safe interpretation of a
@@ -3101,7 +3148,7 @@ func reconcileCompletedMacOSActivation(
 			return nil
 		},
 		requireLive: func() error {
-			return requireLiveMacOSServiceRelease(expected, 5*time.Second)
+			return requireLiveMacOSServiceRelease(destinationApp, expected, completedPhase == hostctl.PhaseTargetComplete, 5*time.Second)
 		},
 	}
 	return reconcileCompletedMacOSActivationProofs(proofs)
@@ -3977,39 +4024,6 @@ func validMacOSBundleIdentityJSON(data []byte) bool {
 	return identity == fskitidentity.Current()
 }
 
-func decodeExactJSONObject(data []byte) (map[string]json.RawMessage, bool) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') {
-		return nil, false
-	}
-	object := make(map[string]json.RawMessage)
-	for decoder.More() {
-		token, err := decoder.Token()
-		key, keyOK := token.(string)
-		if err != nil || !keyOK {
-			return nil, false
-		}
-		if _, duplicate := object[key]; duplicate {
-			return nil, false
-		}
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return nil, false
-		}
-		object[key] = value
-	}
-	token, err = decoder.Token()
-	if err != nil || token != json.Delim('}') {
-		return nil, false
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, false
-	}
-	return object, true
-}
-
 func plistValue(path, key string) (string, error) {
 	out, err := exec.Command("/usr/libexec/PlistBuddy", "-c", "Print :"+key, path).CombinedOutput()
 	if err != nil {
@@ -4364,4 +4378,17 @@ func pfsProviderConflict(appPath, extensionPath string) error {
 		target,
 		cleanup,
 	)
+}
+
+func connectInstalledPortablefsd(cfg fskitConfig) (*fsdControl, error) {
+	path, err := findPortablefsd("")
+	if err != nil {
+		return nil, err
+	}
+	app := strings.TrimSuffix(path, "/Contents/"+macOSPortableFSDRelativePath)
+	version, err := plistValue(filepath.Join(app, "Contents", "Info.plist"), "CFBundleShortVersionString")
+	if err != nil {
+		return nil, err
+	}
+	return connectCompatiblePortablefsd(cfg, version)
 }

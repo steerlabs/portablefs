@@ -163,14 +163,6 @@ service_info="$service_contents/Info.plist"
 /usr/bin/plutil -insert KeepAlive -bool YES "$launch_agent_plist"
 /usr/bin/plutil -lint "$launch_agent_plist" >/dev/null
 
-# The signed service resources bind actual protocol numbers and daemon
-# pairing for future authenticated cross-release lifecycle quiescence.
-mkdir -p "$service_contents/Resources"
-(
-  cd "$vcs_root"
-  GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 "$portablefs_go" run ./internal/daemonctl/seal
-) > "$service_contents/Resources/PortableFSProtocol.json"
-
 if [ "${CODE_SIGNING_ALLOWED:-NO}" != "NO" ] &&
    [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] &&
    [ "${EXPANDED_CODE_SIGN_IDENTITY:-}" != "-" ]; then

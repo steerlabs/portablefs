@@ -140,22 +140,39 @@ func TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Run("service-replaceable parent", func(t *testing.T) {
-		if err := os.Chmod(cellRoot, rootInfo.Mode().Perm()|0o022); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			if err := os.Chmod(cellRoot, rootInfo.Mode().Perm()); err != nil {
-				t.Error(err)
+	for _, test := range []struct {
+		name     string
+		uid, gid int
+		mode     os.FileMode
+	}{
+		{"service-replaceable parent", 0, 0, rootInfo.Mode().Perm() | 0o022},
+		{"non-root parent owner", int(plan.ServiceUID), 0, rootInfo.Mode().Perm()},
+		{"non-root parent group", 0, int(plan.ServiceGID), rootInfo.Mode().Perm()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.Chown(cellRoot, test.uid, test.gid); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(cellRoot, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.Chown(cellRoot, 0, 0); err != nil {
+					t.Error(err)
+				}
+				if err := os.Chmod(cellRoot, rootInfo.Mode().Perm()); err != nil {
+					t.Error(err)
+				}
+			})
+			if opened, err := host.openVolumeDirectory(plan.VolumeID, false); err == nil {
+				_ = unix.Close(opened)
+				t.Fatal("unsafe cell root accepted")
+			} else if !strings.Contains(err.Error(), "cell root must be root-owned") {
+				t.Fatal(err)
 			}
 		})
-		if opened, err := host.openVolumeDirectory(plan.VolumeID, false); err == nil {
-			_ = unix.Close(opened)
-			t.Fatal("service-replaceable volume parent accepted")
-		} else if !strings.Contains(err.Error(), "cell root must be root-owned") {
-			t.Fatal(err)
-		}
-	})
+	}
+
 	if err := verifyProvisionedVolume(fd, plan); err != nil {
 		t.Fatal(err)
 	}
