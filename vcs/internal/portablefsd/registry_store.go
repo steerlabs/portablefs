@@ -12,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
@@ -19,7 +20,7 @@ import (
 const attachRegistryVersion = 3
 
 func attachRegistryPath(stateDir string) string {
-	return filepath.Join(stateDir, "attaches.json")
+	return filepath.Join(stateDir, daemonctl.PersistedAttachesFilename)
 }
 
 type persistedAttachRegistry struct {
