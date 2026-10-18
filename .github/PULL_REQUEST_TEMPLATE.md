@@ -16,8 +16,8 @@ Thanks for contributing to PortableFS. Keep the description focused on WHY.
 
 <!-- How did you verify this? Paste the commands you ran. -->
 
-- [ ] `bash scripts/verify-local.sh` (darwin+linux build/vet, Go suite, Go race suite, Swift suite, policy checks)
-- [ ] `bash scripts/xfs-fuse-integration.sh` (if the XFS store or the FUSE frontend changed; Linux only)
+- [ ] `bash scripts/verify-local.sh` (darwin+linux build/vet, Go suite, Go race suite, Swift suite, release-trust and current-architecture checks)
+- [ ] `bash scripts/verify-local.sh --full` (required if the authority, a frontend, or the coherence protocol changed; adds the privileged XFS/FUSE suite and the Linux coherence matrix)
 - [ ] New or updated tests cover the change
 
 ## Checklist

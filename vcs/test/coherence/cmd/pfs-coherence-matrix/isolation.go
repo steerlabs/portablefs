@@ -32,21 +32,24 @@ const (
 // goroutine, an open descriptor, an ssh client, or a shell helper cannot survive
 // into a later case.
 type isolatedSpec struct {
-	Commands       v7Commands   `json:"v7_commands"`
-	Mode           isolatedMode `json:"mode"`
-	CaseName       string       `json:"case_name,omitempty"`
-	MountA         string       `json:"mount_a"`
-	MountB         string       `json:"mount_b"`
-	SSHTarget      string       `json:"ssh_target,omitempty"`
-	SSHBinary      string       `json:"ssh_binary,omitempty"`
-	StaleCheck     bool         `json:"stale_check,omitempty"`
-	ExpectDisjoint bool         `json:"expect_disjoint,omitempty"`
-	RunID          string       `json:"run_id"`
-	AltGID         int          `json:"alt_gid,omitempty"`
-	FenceCmd       string       `json:"fence_command,omitempty"`
-	Replaces       int          `json:"atomic_replace_rounds,omitempty"`
-	LocalRoute     string       `json:"local_route,omitempty"`
-	RoutesContract string       `json:"routes_contract_command,omitempty"`
+	Commands       controlCommands `json:"control_commands"`
+	Mode           isolatedMode    `json:"mode"`
+	CaseName       string          `json:"case_name,omitempty"`
+	MountA         string          `json:"mount_a"`
+	MountB         string          `json:"mount_b"`
+	SSHTarget      string          `json:"ssh_target,omitempty"`
+	SSHBinary      string          `json:"ssh_binary,omitempty"`
+	StaleCheck     bool            `json:"stale_check,omitempty"`
+	ExpectDisjoint bool            `json:"expect_disjoint,omitempty"`
+	RunID          string          `json:"run_id"`
+	AltGID         int             `json:"alt_gid,omitempty"`
+	FenceCmd       string          `json:"fence_command,omitempty"`
+	Replaces       int             `json:"atomic_replace_rounds,omitempty"`
+	LocalRoute     string          `json:"local_route,omitempty"`
+	RoutesContract string          `json:"routes_contract_command,omitempty"`
+	// ExclusiveWriter declares mount A the volume's only writer and mount B a
+	// reader; see routed.go.
+	ExclusiveWriter bool `json:"exclusive_writer,omitempty"`
 }
 
 type isolatedReply struct {
@@ -112,7 +115,7 @@ func errorString(err error) string {
 }
 
 func findCase(name string) (coherenceCase, bool) {
-	for _, entry := range allCases() {
+	for _, entry := range casesFor(true) {
 		if entry.name == name {
 			return entry, true
 		}
@@ -202,14 +205,23 @@ func runCaseInChild(entry coherenceCase, spec isolatedSpec) (outcome, error) {
 		return outcome{}, err
 	}
 	defer cleanup()
-	return executeCaseDirect(entry, first, second, spec.RunID, caseInputs{
+	inputs := caseInputs{
 		altGID:         spec.AltGID,
 		fenceCmd:       spec.FenceCmd,
 		replaces:       spec.Replaces,
 		localRoute:     spec.LocalRoute,
 		routesContract: spec.RoutesContract,
 		commands:       spec.Commands,
-	}), nil
+	}
+	a, b := first, second
+	if spec.ExclusiveWriter {
+		inputs.writer, inputs.reader = first, second
+		if !entry.writerReaderRoles {
+			routes := newRouter(first, second)
+			a, b = routes.view("mount-A(writer)"), routes.view("mount-B(reader)")
+		}
+	}
+	return executeCaseDirect(entry, a, b, spec.RunID, inputs), nil
 }
 
 // executeCaseDirect has no wall-clock goroutine. The process containing it is
@@ -220,6 +232,7 @@ func executeCaseDirect(entry coherenceCase, a, b actor, runID string, inputs cas
 		a: a, b: b, dir: runID + "/" + entry.name,
 		altGID: inputs.altGID, fenceCmd: inputs.fenceCmd, replaces: inputs.replaces,
 		localRoute: inputs.localRoute, routesContract: inputs.routesContract, commands: inputs.commands,
+		writer: inputs.writer, reader: inputs.reader,
 	}
 	result = outcome{Name: entry.name, What: entry.what}
 	started := time.Now()

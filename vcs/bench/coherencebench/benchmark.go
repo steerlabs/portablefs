@@ -1,7 +1,7 @@
-// Package coherencebench contains the filesystem workloads used to establish
-// the coherence-v2 baseline. The package deliberately knows nothing about
-// PortableFS: callers provide one or two POSIX paths and meter the Authority at
-// the transport boundary around each call.
+// Package coherencebench contains the coherence baseline filesystem workloads:
+// install, Git status and a two-mount write/list/read. The package deliberately
+// knows nothing about PortableFS: callers provide one or two POSIX paths and
+// meter the Authority at the transport boundary around each call.
 package coherencebench
 
 import (
@@ -25,15 +25,11 @@ const FileBytes = 1024
 // client. The integration harness adds Authority request counts from its
 // in-process transport meter.
 type WorkloadResult struct {
-	Scenario    string `json:"scenario"`
-	Operations  int    `json:"operations"`
-	Files       int    `json:"files,omitempty"`
-	Directories int    `json:"directories,omitempty"`
-	Workers     int    `json:"workers,omitempty"`
-	// TransientRetries is retained for comparison with the v6 JSON records.
-	// Protocol 7 treats every enumeration error as a workload failure, so a
-	// successful run reports zero.
-	TransientRetries         int64   `json:"transient_retries,omitempty"`
+	Scenario                 string  `json:"scenario"`
+	Operations               int     `json:"operations"`
+	Files                    int     `json:"files,omitempty"`
+	Directories              int     `json:"directories,omitempty"`
+	Workers                  int     `json:"workers,omitempty"`
 	DirectoryScans           int64   `json:"directory_scans,omitempty"`
 	IncompleteReadRetries    int64   `json:"incomplete_read_retries,omitempty"`
 	VanishedReadRetries      int64   `json:"vanished_read_retries,omitempty"`
@@ -314,9 +310,9 @@ func PeerWriteRead(rootA, rootB string, fileCount int) (WorkloadResult, error) {
 	}
 	return WorkloadResult{
 		Scenario: "two-mount-write-list-read", Operations: 2 * fileCount, Files: fileCount,
-		TransientRetries: stats.estale.Load(), DirectoryScans: stats.scans.Load(),
-		IncompleteReadRetries: stats.incomplete.Load(), VanishedReadRetries: stats.vanished.Load(),
-		FilesObservedDuringWrite: stats.observedDuringWrite.Load(), WallSeconds: time.Since(start).Seconds(),
+		DirectoryScans: stats.scans.Load(), IncompleteReadRetries: stats.incomplete.Load(),
+		VanishedReadRetries: stats.vanished.Load(), FilesObservedDuringWrite: stats.observedDuringWrite.Load(),
+		WallSeconds: time.Since(start).Seconds(),
 	}, nil
 }
 
@@ -330,8 +326,8 @@ func joinPeerReader(readerDone <-chan error, timeout time.Duration) error {
 }
 
 type peerStats struct {
-	estale, scans, incomplete, vanished, observedDuringWrite atomic.Int64
-	writerDone                                               atomic.Bool
+	scans, incomplete, vanished, observedDuringWrite atomic.Int64
+	writerDone                                       atomic.Bool
 }
 
 func readPublishedFiles(

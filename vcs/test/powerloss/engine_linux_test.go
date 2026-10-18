@@ -257,17 +257,55 @@ func TestXFSHonoursFsyncAtEveryCut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("truncating the log at the power cut: %v", err)
 	}
-	verifyEveryCut(t, gate.hostGate, log, ledger, playground.options, imageSize, 6)
+	verifyEveryCut(t, gate.hostGate, log, ledger, playground.options, imageSize, 6, fsyncContract(log, ledger))
+}
+
+// cutCheck verifies one recovered filesystem, mounted at mountpoint, against
+// an instrument's contract at the cut ending at endEntry, and summarizes a
+// conforming cut in one line.
+type cutCheck func(mountpoint string, endEntry int) (string, error)
+
+// fsyncContract is the Linux workload's contract: every checkpoint whose fsync
+// returned before the cut is present and exact, and nothing exposes stale data.
+func fsyncContract(log *Log, ledger *Ledger) cutCheck {
+	return func(mountpoint string, endEntry int) (string, error) {
+		expectations, err := Expectations(log, ledger, endEntry)
+		if err != nil {
+			return "", fmt.Errorf("deriving expectations: %w", err)
+		}
+		report := Verify(filepath.Join(mountpoint, ledger.Volume), expectations, endEntry)
+		if err := report.Err(); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%d checkpoints required durable and present, %d un-fsynced writes happened to survive", report.Durable, report.Surviving), nil
+	}
+}
+
+// acknowledgedContract is the FSKit contract: every mutation acknowledged
+// at the cut is present exactly. Only cuts strictly after an acknowledgement
+// mark admit the next mutation and its stated in-flight allowances.
+func acknowledgedContract(log *Log, ledger *MutationLedger) cutCheck {
+	return func(mountpoint string, endEntry int) (string, error) {
+		cut, err := MutationCutAt(log, ledger, endEntry)
+		if err != nil {
+			return "", err
+		}
+		report := VerifyMutationCut(filepath.Join(mountpoint, ledger.Volume), ledger, cut)
+		if err := report.Err(); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%d of %d acknowledged mutations present exactly; %s", report.Acknowledged, report.Steps, report.Outcome), nil
+	}
 }
 
 // verifyEveryCut replays each selected cut onto a fresh image, mounts it (which
-// is what runs XFS log recovery), checks the durability contract, unmounts and
-// then requires xfs_repair -n to find nothing to fix.
+// is what runs XFS log recovery), checks the instrument's contract, unmounts
+// and then requires xfs_repair -n to find nothing to fix.
 //
 // Both halves matter. Content that survives on a filesystem xfs_repair would
 // rebuild is not a durable filesystem, and a clean xfs_repair over content that
 // vanished is not a durable one either.
-func verifyEveryCut(t *testing.T, gate hostGate, log *Log, ledger *Ledger, mountOptions string, imageSize int64, barrierBudget int) {
+func verifyEveryCut(t *testing.T, gate hostGate, log *Log, ledger markedLedger, mountOptions string, imageSize int64, barrierBudget int, check cutCheck) {
 	t.Helper()
 	points, err := SelectPoints(log, ledger, barrierBudget)
 	if err != nil {
@@ -301,16 +339,10 @@ func verifyEveryCut(t *testing.T, gate hostGate, log *Log, ledger *Ledger, mount
 				// failure, not a skip: the filesystem was supposed to recover.
 				t.Fatalf("%s: the replayed filesystem does not mount, so it did not recover: %v", point.Reason, err)
 			}
-			expectations, err := Expectations(log, ledger, point.EndEntry)
-			if err != nil {
-				_ = unmount()
-				t.Fatalf("deriving expectations: %v", err)
-			}
-			report := Verify(filepath.Join(mountpoint, ledger.Volume), expectations, point.EndEntry)
-			verifyErr := report.Err()
+			summary, checkErr := check(mountpoint, point.EndEntry)
 			unmountErr := unmount()
-			if verifyErr != nil {
-				t.Fatalf("%s:\n%v", point.Reason, verifyErr)
+			if checkErr != nil {
+				t.Fatalf("%s:\n%v", point.Reason, checkErr)
 			}
 			if unmountErr != nil {
 				t.Fatalf("unmounting the replayed filesystem: %v", unmountErr)
@@ -318,11 +350,10 @@ func verifyEveryCut(t *testing.T, gate hostGate, log *Log, ledger *Ledger, mount
 			if err := CheckXFS(gate.runner, loop.Device); err != nil {
 				t.Fatalf("%s: %v", point.Reason, err)
 			}
-			t.Logf("%s: %d checkpoints required durable and present, %d un-fsynced writes happened to survive",
-				point.Reason, report.Durable, report.Surviving)
+			t.Logf("%s: %s", point.Reason, summary)
 		})
 	}
 	if checkpointCuts == 0 {
-		t.Fatal("no cut landed on a checkpoint mark; this run asserted nothing about the fsync contract")
+		t.Fatal("no cut landed on a ledger mark; this run asserted nothing about its contract")
 	}
 }

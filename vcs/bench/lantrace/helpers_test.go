@@ -1,0 +1,110 @@
+package lantrace
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+)
+
+const testRun Label = "run-test"
+
+// streamBuilder writes a producer stream line by line so tests control every
+// record, including invalid ones.
+type streamBuilder struct {
+	buf    bytes.Buffer
+	seq    uint64
+	events uint64
+}
+
+func newStream(layer Layer) *streamBuilder {
+	return newStreamFor(testRun, layer)
+}
+
+func newStreamFor(run Label, layer Layer) *streamBuilder {
+	s := &streamBuilder{}
+	s.buf.Write(encodeHeader(0, Header{Run: run, Layer: layer, Process: Label("proc-" + strings.ReplaceAll(string(layer), "_", "-")), Clock: "test-clock"}))
+	return s
+}
+
+func (s *streamBuilder) ev(t Nanos, e Event) *streamBuilder {
+	s.seq++
+	return s.evSeq(s.seq, t, e)
+}
+
+func (s *streamBuilder) evSeq(seq uint64, t Nanos, e Event) *streamBuilder {
+	body, err := json.Marshal(&e)
+	if err != nil {
+		panic(err)
+	}
+	s.buf.Write(appendEvent(nil, 0, seq, t, body))
+	s.events++
+	return s
+}
+
+func (s *streamBuilder) raw(line string) *streamBuilder {
+	s.buf.WriteString(line + "\n")
+	return s
+}
+
+// end writes a trailer that claims every ev call as emitted.
+func (s *streamBuilder) end(lost uint64) *streamBuilder {
+	s.buf.Write(encodeProducerTrailer(s.events, lost))
+	return s
+}
+
+func (s *streamBuilder) input(name string) Input {
+	return Input{Name: name, Reader: bytes.NewReader(s.buf.Bytes())}
+}
+
+func collectStreams(t *testing.T, cfg CollectConfig, streams ...*streamBuilder) ([]byte, Summary) {
+	t.Helper()
+	inputs := make([]Input, len(streams))
+	for i, s := range streams {
+		inputs[i] = s.input(string(rune('a' + i)))
+	}
+	var out bytes.Buffer
+	sum, err := Collect(&out, inputs, cfg)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	return out.Bytes(), sum
+}
+
+func reportOf(t *testing.T, collection []byte, cfg ReportConfig) *Report {
+	t.Helper()
+	rep, err := BuildReport(bytes.NewReader(collection), cfg)
+	if err != nil {
+		t.Fatalf("BuildReport: %v", err)
+	}
+	return rep
+}
+
+// The two producers deliberately have unrelated local connection IDs. The
+// argument selects an attach, never a supposedly shared daemon counter.
+func frontendSend(attach, request uint64, op LocalOp) Event {
+	return localAnchor(PhaseSend, "550e8400-e29b-41d4-a716-446655440000", attach, request, op)
+}
+
+func daemonEnqueue(attach, request uint64, op LocalOp) Event {
+	return localAnchor(PhaseEnqueue, "42", attach, request, op)
+}
+
+func localAnchor(phase Phase, conn TraceID, attach, request uint64, op LocalOp) Event {
+	return Event{Kind: KindLocal, Phase: phase, Conn: conn, FrontendPID: 1234,
+		AttachRef: TraceID(fmt.Sprintf("attach-%d", attach)), ConnRole: "portablefskit",
+		RequestID: request, LocalOp: op}
+}
+
+func authoritySend(session Label, id uint64, op AuthorityOp) Event {
+	return Event{Kind: KindAuthority, Phase: PhaseSend, Session: session, AuthorityRequest: id, AuthorityOp: op, Dispatch: DispatchOriginal}
+}
+
+func authorityReceive(session Label, id uint64, op AuthorityOp) Event {
+	return Event{Kind: KindAuthority, Phase: PhaseReceive, Session: session, AuthorityRequest: id, AuthorityOp: op}
+}
+
+func waitEvent(d Nanos) Event {
+	return Event{Kind: KindWait, Wait: WaitReservation, Duration: d}
+}

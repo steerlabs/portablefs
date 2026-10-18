@@ -89,8 +89,8 @@ pm_run_host() {
     -e "PORTABLEFS_PROJECT_ID=${PORTABLEFS_PROJECT_ID}" \
     -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
     -e "PORTABLEFS_AUTHORITY_PORT=${PORTABLEFS_AUTHORITY_PORT}" \
-    -e "PORTABLEFS_CACHED_NAME_CAPACITY=${PORTABLEFS_CACHED_NAME_CAPACITY}" \
-    -e "PORTABLEFS_REPAIR_BUDGET=${PORTABLEFS_REPAIR_BUDGET}" \
+    -e "PORTABLEFS_NAME_CACHE_CAPACITY=${PORTABLEFS_NAME_CACHE_CAPACITY}" \
+    -e "PORTABLEFS_WITHDRAWAL_TIMEOUT=${PORTABLEFS_WITHDRAWAL_TIMEOUT}" \
     -e "PORTABLEFS_NPM_BIN=${PORTABLEFS_NPM_BIN}" \
     -e "PORTABLEFS_PNPM_BIN=${PORTABLEFS_PNPM_BIN}" \
     -e "PORTABLEFS_YARN_BIN=${PORTABLEFS_YARN_BIN}" \
@@ -392,7 +392,7 @@ print_table() {
   echo
   echo "======================================================================"
   echo "package-manager matrix: shared volume path, no machine-local routes"
-  echo "kernel $(uname -r), strict coherence, two kernel FUSE mounts"
+  echo "kernel $(uname -r), two kernel FUSE mounts"
   echo "======================================================================"
   printf '%-6s %-8s %10s %14s %14s %14s %10s %12s  %s\n' \
     "mgr" "status" "wall(s)" "auth rchar" "auth wchar" "auth blocks" "entries" "rd rounds" "note"

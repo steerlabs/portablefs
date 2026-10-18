@@ -22,3 +22,7 @@ github.com/steerlabs/portablefs/vcs/internal/hydrator:TestMaterializeRestoresRes
 github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode
 github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator
 github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt
+# Required only when PORTABLEFS_PERFORMANCE_TEST=1: the busy-neighbor barrier
+# measurement against the second provisioned project on the same XFS cell.
+# It is a measurement, not an acceptance threshold.
+performance github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSharedXFSBarrierLatency

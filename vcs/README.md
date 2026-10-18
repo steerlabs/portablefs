@@ -19,15 +19,15 @@ OS kernel page caches remain part of each mount contract. For why, read
 
 | Command | What it is |
 | --- | --- |
-| `cmd/portablefs` | The user-facing CLI: mount, umount, mounts, route, prune-local, daemon, doctor, mount-check, version, and the installer and lifecycle coordination subcommands. Linux and macOS. |
+| `cmd/portablefs` | The user-facing CLI: mount, reauthorize, umount, mounts, mount-loss, route, prune-local, daemon, doctor, mount-check, version, and the installer and lifecycle coordination subcommands. Linux and macOS. |
 | `cmd/portablefs-authority` | The volume authority. Linux only. One process serves exactly one volume, refuses to run as root, and terminates its epoch on any storage failure. |
 | `cmd/portablefs-manager` | The product-neutral hosted manager. It owns desired state, placement, PKI, grants, and fencing generations, but never filesystem contents. |
-| `cmd/portablefs-files` | A private, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds bounded read-only authority sessions, pages directories, bounds previews, and streams downloads. |
 | `cmd/portablefs-cell-agent` | The unprivileged outbound reconciliation loop on each Linux storage cell. |
 | `cmd/portablefs-cell-helper` | The narrow root helper that applies only a verified, manager-signed cell plan. Linux only. |
 | `cmd/portablefs-authority-launcher` | The fixed-argument systemd launcher for an isolated per-volume authority. Linux only. |
-| `cmd/portablefs-files` | The bounded, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds strict cacheless read-only authority sessions, pages directories, bounds previews, and streams downloads. |
-| `cmd/portablefsd` | The per-user macOS registry, control daemon, and FSKit data plane. It declares the protocol-6 synchronous-repair profile and never claims Linux lease semantics. |
+| `cmd/portablefs-files` | The bounded, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds cacheless read-only authority sessions, pages directories, bounds previews, and streams downloads. |
+| `cmd/portablefs-archiver`, `cmd/portablefs-hydrator` | The tiered-storage archive writer and restore recall fetcher. Linux only; never write XFS while an authority serves it. |
+| `cmd/portablefsd` | The per-user macOS registry, control daemon, and FSKit data plane. It declares the FSKit exclusive-writer profile and never claims Linux subscription semantics. |
 | `cmd/portablefs-mount-v3` | A standalone Linux mount client. This is what the coherence harnesses drive; ordinary users go through `portablefs mount`. |
 
 ## Layout
@@ -41,13 +41,17 @@ internal/
                    RESOLVE_BENEATH, *at syscalls, device verification, stable
                    export-handle identity, xattr namespace restriction.
   volumeserver/    Epoch sessions, replay slots, cancellation, POSIX and flock
-                   lock tables, the N/A/D/E lease coordinator, durable mount
-                   lifecycle, and fail-closed fencing.
+                   lock tables, the Linux subscription/delegation coordinator,
+                   the FSKit writer registry and retained exclusion, durable
+                   mount lifecycle, and fail-closed fencing.
   authorityrpc/    The wire: TLS 1.3 mutual authentication, ALPN
-                   portablefs-authority-v6, mandatory DATA/CONTROL transports,
+                   portablefs-authority-v8, mandatory DATA/CONTROL transports,
                    provisional activation, schema-bound bulk framing,
-                   canonical replay fingerprinting, the XFS request handler, routing
-                   topology, and lease recall/renewal events.
+                   canonical replay fingerprinting, the XFS request handler,
+                   routing topology, and subscription/delegation control.
+  mountmembership/ The one mount-membership file codec (mount.membership,
+                   PFS-MEMBERSHIP-1) shared by the authority and the cell host.
+  pathcomponent/   The raw directory-entry name validator.
   authoritypb/     Generated protobuf bindings for proto/authority/v1.
   volumecap/       Ed25519 mount capabilities: signed, single-use, short-lived,
                    volume- and peer-bound.
@@ -60,13 +64,15 @@ internal/
   cellhelper/      Durable assignment pinning and the narrow root boundary.
   cellhost/        Closed XFS quota, local authority identity, and systemd host
                    operations derived only from signed volume assignments.
-  fusev3/          The Linux frontend. Stock FUSE 7.31, reply-local lease
-                   validity, daemon and kernel cache withdrawal, positioned
-                   write-through I/O, and machine-local route grafts.
-  portablefsd/     The macOS daemon registry, control API, FSKit data plane,
-                   synchronous-repair bridge, and evidence-bearing detach.
+  fusev3/          The Linux frontend. Stock FUSE 7.31, subscription and
+                   delegation coherence, daemon and kernel cache withdrawal,
+                   ordered delegated flush, and machine-local route grafts.
+  writeback/       The Linux delegated write buffer.
+  portablefsd/     The macOS daemon registry, control and lifecycle API, FSKit
+                   data plane, proof-checked metadata cache, and
+                   evidence-bearing detach.
   pfslocal/        The local protocol between the daemon and the FSKit
-                   extension. Major 1, currently minor 16, additive.
+                   extension: exact version 2.0, paired by the sealed release.
   mountv3/         The shared mount engine used by both the CLI and the
                    standalone mount binary.
   localdirs/       The .portablefs/local-dirs declaration: parsing,
@@ -78,7 +84,8 @@ internal/
                    RESOLVE_IN_ROOT, failing closed where it is unavailable.
   fskitidentity/   The signed macOS identity tuple: app group, filesystem type,
                    resource scheme.
-  daemonctl/       Daemon discovery, identity matching, and lifecycle control.
+  daemonctl/       Daemon identity (schema 1), operational control 2, and the
+                   cross-release lifecycle v1 API.
   mountlifecycle/  The per-user mount lifecycle guard.
   accountsession/  The per-user account session guard.
   accountpath/     The account record the state directory is resolved from,
@@ -86,16 +93,15 @@ internal/
   mountid/         O_NOFOLLOW walk that refuses foreign-owned or unsafe paths,
   mounthost/       and mount record identity.
   errnos/          Shared errno classification.
-  directstoremodel/     Concluded exploration substrate. Not on any product
-  directstoreharness/   path; see ../docs/direct-store-exploration.md.
 
 test/coherence/       The black-box cross-mount matrix and its driver commands
                       (pfs-coherence-matrix, pfs-coherence-routes,
                       pfs-coherence-credentials). Driven by
                       ../scripts/coherence-matrix-linux.sh.
-spikes/               Concluded measurement spikes.
-bench/                Measurement tools. See ../docs/performance.md, including
-                      which of them are currently broken.
+test/powerloss/       The dm-log-writes power-cut harness. Driven by
+                      ../scripts/run-powerloss.sh.
+bench/                Measurement tools and the bounded correlated trace
+                      collector. See ../docs/performance.md.
 ```
 
 ## Build and test
@@ -115,7 +121,8 @@ The native suite runs against real syscalls, sockets, and mounts, so it is only
 meaningful on the host platform. The parts that need real XFS, real project
 quotas, and a real kernel FUSE mount are gated behind
 `bash ../scripts/xfs-fuse-integration.sh`, which builds a disposable XFS
-filesystem in a privileged container and requires 43 named tests to pass. The
+filesystem in a privileged container and requires every test named in the
+three package-owned lists `../scripts/xfs-required-*-tests.txt` to pass. The
 cross-mount behaviour matrix is `bash ../scripts/coherence-matrix-linux.sh`.
 
 The single merge gate for the whole repository is `bash ../scripts/verify-local.sh`.
@@ -126,5 +133,5 @@ See [../docs/xfs-authority-deployment.md](../docs/xfs-authority-deployment.md).
 The short version: provision an XFS project directory with
 `scripts/provision-xfs-volume.sh`, then run `portablefs-authority` as the volume's
 service account with its TLS material, its capability verification key, and its
-strict-membership file. Every required flag is required for a reason and the
+mount-membership file. Every required flag is required for a reason and the
 process refuses to start without them.

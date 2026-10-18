@@ -1,6 +1,7 @@
 # Deploying a hosted storage cell
 
-Status: **Linux reference deployment for the hosted v2 tiered foundation**
+Status: **Linux reference deployment for the hosted tier under authority
+protocol 8; fresh protocol-8 cell provisioning is not yet qualified**
 
 Read [hosted-control-plane.md](./hosted-control-plane.md) first. This document
 only covers the host boundary. The standalone authority runbook remains in
@@ -12,8 +13,11 @@ only covers the host boundary. The standalone authority runbook remains in
 - One PortableFS cell identity per storage host. Volumes are the isolation unit
   inside that cell; do not run independent cell trust domains under one helper.
 - One dedicated encrypted XFS filesystem mounted at `/srv/portablefs` with
-  `prjquota,nodev,nosuid,noexec,noatime`.
-- `/usr/sbin/xfs_quota`, `/usr/bin/systemctl`, and
+  `prjquota,nodev,nosuid,noexec,noatime`. Every volume placed on the cell is a
+  project on that one filesystem and shares its writeback-error and latency
+  domain; see
+  [Shared-cell durability domain](./xfs-authority-deployment.md#shared-cell-durability-domain).
+- `/usr/sbin/xfs_quota`, `/usr/bin/systemctl`, `/usr/bin/systemd-run`, and
   `/usr/bin/systemd-sysusers` at the pinned paths, or explicit absolute
   overrides on the helper.
 - A stable unprivileged `portablefs-agent` account and group. Record its numeric
@@ -25,12 +29,11 @@ The reference paths are:
 | Path | Owner/mode | Purpose |
 | --- | --- | --- |
 | `/srv/portablefs` | root, not tenant-writable | XFS cell root |
-| `/srv/portablefs/.portablefs-control/<volume>/write-staging` | volume UID `0700`, root-pinned parent | unnamed transactional-write staging, charged to the volume's exact XFS project quota |
 | `/etc/portablefs/trust` | root | manager CA and plan public key |
 | `/etc/portablefs/cells` | root | cell mTLS identity and root-owned environment |
 | `/etc/portablefs/cells/<cell-uuid>-archive.env` | root `0600` | root-pinned archive endpoint, bucket, prefix, key version, and scoped credentials |
 | `/etc/portablefs/volumes` | root | generated per-volume authority config/keys/certs |
-| `/var/lib/portablefs/volumes` | per-volume UID | membership, restore hydration/convergence records, and runtime state |
+| `/var/lib/portablefs/volumes/<volume>` | per-volume UID | `mount.membership` and its lock and audit files, quiesce proof, restore hydration/convergence records, and runtime state |
 | `/var/lib/portablefs-cell-helper` | root `0700` | pinned assignments and plan generation |
 | `/var/lib/portablefs-cell-helper/sysusers.d` | root | persistent, exact per-volume service-account definitions |
 | `/run/portablefs-cell-helper` | root:agent `0750` | cell-specific local helper sockets |
@@ -68,13 +71,14 @@ root-owned regular file or is writable by group/other.
 
 A cell software activation restarts only the cell helper and agent. It never
 restarts an active authority: replacing the one XFS writer remains a manager
-restart request, a strict-mount fence proof, local process-absence observation,
-and a monotonic authority generation. The next generation starts from the new
+restart request, a quiesce proof or placement-bound mount fence evidence, local
+process-absence observation, and a monotonic authority generation. The next generation starts from the new
 release root.
 
 The release carries these seven units from `deploy/systemd/`:
 
 ```text
+portablefs-manager.service
 portablefs-cell-helper@.service
 portablefs-cell-agent@.service
 portablefs-authority@.socket
@@ -85,12 +89,16 @@ portablefs-hydrator@.service
 
 The helper generates only typed per-volume drop-ins. The service template gives
 an authority an empty capability set, `NoNewPrivileges`, private devices/tmp/
-network, a read-only system, syscall restrictions, and exactly four bind
-mounts: the served XFS project, read-only configuration, runtime state, and a
-separate write-staging directory under that same XFS project quota. The two
-control parents are root-owned and non-replaceable by the service identity.
-During RESTORING, the existing runtime-state bind exposes the hydrator socket;
-the authority gains no extra data-tree access. The hydrator receives network,
+network, a read-only system, syscall restrictions, and exactly three bind
+mounts: the served XFS project at `/srv/portablefs-volume`, read-only
+configuration at `/run/portablefs-volume`, and runtime state at
+`/var/lib/portablefs-volume`. The launcher passes
+`-mount-membership-file /var/lib/portablefs-volume/mount.membership`; there is
+no write-staging directory or bind. The cell helper reads the same file through
+the shared membership codec, under its private regular-file and no-follow
+checks, when it proves a quiesced authority absent. During RESTORING, the
+existing runtime-state bind exposes the hydrator socket; the authority gains no
+extra data-tree access. The hydrator receives network,
 read-scoped archive credentials, and that socket directory, but in serve mode
 no volume data-directory access. The archiver receives network, write-scoped
 credentials, and a read-only bind of one quiesced volume. Its sole capability
@@ -191,9 +199,11 @@ retirement because allocator identities are never reused.
 
 Each successful volume assignment also records the exact helper release that
 applied it. Installing a new helper release therefore re-applies an unchanged
-signed plan once before it can return to observation. This is how new mandatory
-host resources are migrated without weakening plan identity or requiring an
-operator to manufacture a semantically empty plan change.
+signed plan once before it can return to observation, so a release's mandatory
+host resources are applied without weakening plan identity or requiring an
+operator to manufacture a semantically empty plan change. This is not a format
+migration: helper state is exact version 2 and the signed plan exact version 3,
+and a cell holding an earlier format is reprovisioned, not converted.
 
 XFS project assignment and hard-limit changes also run as fixed short-lived
 systemd units in the host mount namespace. Do not add `PrivateDevices` or
@@ -217,12 +227,14 @@ the long-running helper does not hold that capability.
 - A cell heartbeat loss makes mount issuance fail closed after the configured
   freshness window. Existing authority sessions continue until their own
   liveness/authorization/fencing rules end them.
-- Archive, restore, destroy, and release run only through typed v2 plan phases
+- Archive, restore, destroy, and release run only through typed plan phases
   and their proofs; operator snapshots and device replacement remain offline
   runbooks.
 
 Before a production rollout, exercise the failure paths on a disposable real
 XFS host: kill/stop races, a `SIGSTOP`ed worker, cgroup population, full block
 and inode quota, manager/agent/helper restart, expired plans and certificates,
-same-generation CSR substitution, cell identity substitution, and strict-mount
-fence refusal.
+same-generation CSR substitution, cell identity substitution, and mount-fence
+refusal. Shared-cell fault and dirty-neighbor latency qualification is listed
+in [COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status) and has not
+been run.

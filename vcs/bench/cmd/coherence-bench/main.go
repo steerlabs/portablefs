@@ -1,5 +1,5 @@
-// Command coherence-bench runs the coherence-v2 baseline workloads against
-// POSIX paths. The privileged integration test uses the same package while it
+// Command coherence-bench runs the coherence baseline workloads against POSIX
+// paths. The privileged integration test uses the same package while it
 // owns the PortableFS Authority request meter.
 package main
 

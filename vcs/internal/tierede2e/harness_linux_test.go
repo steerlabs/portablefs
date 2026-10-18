@@ -321,17 +321,15 @@ type serving struct {
 	t         *testing.T
 	mountPath string
 
-	store          *xfsstore.Volume
-	writeAdmission *authorityrpc.WriteAdmission
-	writeStaging   string
-	listener       net.Listener
-	client         *authorityrpc.Client
-	mount          *fusev3.Mount
-	restore        *restoreWiring
-	stopServe      context.CancelFunc
-	served         chan error
-	stopped        bool
-	unmounted      bool
+	store     *xfsstore.Volume
+	listener  net.Listener
+	client    *authorityrpc.Client
+	mount     *fusev3.Mount
+	restore   *restoreWiring
+	stopServe context.CancelFunc
+	served    chan error
+	stopped   bool
+	unmounted bool
 }
 
 func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
@@ -356,17 +354,6 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 			restore = s.restore.mode
 		}
 	}
-	writeStaging, err := os.MkdirTemp(filepath.Dir(volumeRoot), ".portablefs-tiered-write-staging-")
-	if err != nil {
-		t.Fatalf("create write-admission directory: %v", err)
-	}
-	s.writeStaging = writeStaging
-	writeAdmission, err := authorityrpc.OpenWriteAdmission(writeStaging)
-	if err != nil {
-		t.Fatalf("open write admission: %v", err)
-	}
-	s.writeAdmission = writeAdmission
-
 	authority, err := volumeserver.New(volumeID, volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: harnessReplaySlots,
 		MaxSessions: 8, MaxLockRecords: 4096,
@@ -378,14 +365,13 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 	membership := newMembershipRecorder()
 	// The authority is the source of truth for the volume's machine-local
 	// routing revision and refuses every mount whose declared revision is not
-	// the active one — for both coherence profiles. This volume declares no
+	// the active one, whatever its frontend profile. This volume declares no
 	// routes, but it still has to install that declaration through the same
 	// barrier a live operator's change would use, and the mount still has to
 	// declare agreement with it.
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
@@ -409,15 +395,8 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 		MaxFrame: harnessMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        harnessServerInFlight,
 		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
-		MaxRetainedReplyBytes:         harnessBudget,
-		WriteAdmission:                writeAdmission,
-		MaxWriteBytesPerSession:       16 << 30,
-		MaxWriteBytesInFlight:         64 << 30,
-		MaxWritesPerSession:           8,
-		MaxWrites:                     4096,
-		WriteAdmissionProgressTimeout: 2 * time.Minute,
-		WriteAbsoluteTimeout:          30 * time.Minute,
-		TerminalDeliveryTimeout:       45 * time.Second,
+		MaxRetainedReplyBytes:   harnessBudget,
+		TerminalDeliveryTimeout: 45 * time.Second,
 	}
 	coordination.Bind(handler)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -454,7 +433,7 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 		Address: listener.Addr().String(), TLS: clientTLS.Clone(), VolumeID: volumeID,
 		AccessToken: []byte("tiered-e2e-capability"), ReplaySlots: harnessReplaySlots,
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		MaxFrame:        harnessMaxFrame, DialTimeout: 5 * time.Second,
 		CancelDrainTimeout: 5 * time.Second, MaxInFlight: harnessMaxInFlight,
 		RoutesRevision:                 rules.Revision(),
@@ -467,7 +446,7 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 	s.client = client
 	session, ok := membership.last()
 	if !ok {
-		t.Fatal("attach registered no visibility participant")
+		t.Fatal("attach recorded no mount membership")
 	}
 	mount, err := fusev3.MountVolume(context.Background(), s.mountPath, &transport{
 		Client: client, session: append([]byte(nil), session[:]...),
@@ -475,11 +454,11 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 		MountInstanceID: instance, RequestTimeout: harnessRequestTimeout,
 		MaxBackground: 64, ReclaimQueue: 1024, MaxInFlight: harnessMaxInFlight,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-		// Protocol 6 has one Linux cache contract. A newly restored inode starts
-		// without N/A/D/E grants, so the first cold read and getattr still reach
-		// the authority; later caching is governed by the same lease machinery
+		// A newly restored inode starts with no subscription or delegation, so
+		// the first cold read and getattr still reach the authority; later
+		// caching is governed by the same subscription and delegation machinery
 		// production uses.
-		Coherence: fusev3.CoherenceStrict, CachedNameCapacity: 4096, RepairBudget: time.Minute,
+		NameCacheCapacity: 4096, WithdrawalTimeout: time.Minute,
 		Routes: rules,
 	})
 	if err != nil {
@@ -551,18 +530,6 @@ func (s *serving) stop() {
 			}
 		}
 		s.restore = nil
-	}
-	if s.writeAdmission != nil {
-		if err := s.writeAdmission.Close(); err != nil {
-			s.t.Errorf("close write admission: %v", err)
-		}
-		s.writeAdmission = nil
-	}
-	if s.writeStaging != "" {
-		if err := os.RemoveAll(s.writeStaging); err != nil {
-			s.t.Errorf("remove write-admission directory: %v", err)
-		}
-		s.writeStaging = ""
 	}
 	if s.store != nil {
 		if err := s.store.Close(); err != nil {

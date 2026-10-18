@@ -99,11 +99,9 @@ d = os.pread(fd, 10, 0); os.close(fd)
 sys.exit(0 if d == b"data" else 1)
 EOF
 
-# The v2-era "cross-client visibility" case is gone: it drove a retired
-# daemon control-API write route against a hard-coded socket and attach ref,
-# so it could only ever fail. Cross-client visibility is a two-mount property
-# and is proven by the coherence matrix (scripts/coherence-matrix-*.sh), not
-# by a single-mount battery.
+# Cross-client visibility is a two-mount property, proven by the coherence
+# matrices (scripts/coherence-matrix-*.sh) rather than by this single-mount
+# battery.
 
 # 12. deep tree + enumerate
 mkdir -p "$T/deep/a/b/c" && for i in $(seq 1 60); do echo $i > "$T/deep/a/f$i"; done

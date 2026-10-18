@@ -23,7 +23,12 @@ type coherenceCase struct {
 	what string
 	// destructive marks a case that leaves a mount unusable. Those run last.
 	destructive bool
-	run         func(*caseRun)
+	// writerReaderRoles marks a case that already mutates only through mount A
+	// and observes mount B only to check A's effects, so exclusive-writer mode
+	// runs it on the real mounts instead of router views (the peer-loss case
+	// must observe the surviving writer itself after the reader is killed).
+	writerReaderRoles bool
+	run               func(*caseRun)
 }
 
 type caseRun struct {
@@ -50,14 +55,17 @@ type caseRun struct {
 	// by itself, so asserting the refusal needs a client that does not. Empty
 	// means the same loud skip.
 	routesContract string
-	commands       v7Commands
+	commands       controlCommands
+	// writer and reader are the two real mounts in exclusive-writer mode,
+	// where a and b are router views; both are nil otherwise.
+	writer, reader actor
 }
 
-// sameDirToleratedFencedMounts is deliberately zero. The frontend reports a
-// blocked repair only when its exact cached-binding and parked-directory
-// registries prove the i_rwsem cycle, and racing reads leave Stabilize at apply
-// rather than holding the directory lock until COMPLETE. Fencing either healthy
-// participant is therefore a regression, not a tolerated liveness outcome.
+// sameDirToleratedFencedMounts is deliberately zero. A responsive mount
+// completes every cache withdrawal and delegation recall it is sent, and no
+// current mechanism revokes a healthy participant for contending in one
+// directory. Fencing either mount during the storm is therefore a regression,
+// not a tolerated liveness outcome.
 const sameDirToleratedFencedMounts = 0
 
 // sameDirStormBound is how long the two storms get before the case calls it a
@@ -194,8 +202,9 @@ func parseSummary(text string) map[string]string {
 	return out
 }
 
-// mountFenced detects a lost kernel connection. Ordinary v7 recall, subscription
-// expiry and epoch changes must preserve that connection and report scoped EIO.
+// mountFenced detects a lost kernel connection. Ordinary delegation recall,
+// subscription expiry and epoch changes must preserve that connection and report
+// scoped EIO.
 func (c *caseRun) mountFenced(who actor) bool {
 	out := c.do(who, request{Op: "stat", Path: c.dir})
 	return out.Errno == int(syscall.ENOTCONN)
@@ -1236,9 +1245,10 @@ func baselineCases() []coherenceCase {
 			},
 		},
 		{
-			name:        "peer_loss_does_not_break_surviving_mount",
-			what:        "one mount dying uncleanly must not stop the other mount from serving",
-			destructive: true,
+			name:              "peer_loss_does_not_break_surviving_mount",
+			what:              "one mount dying uncleanly must not stop the other mount from serving",
+			destructive:       true,
+			writerReaderRoles: true,
 			run: func(c *caseRun) {
 				if c.fenceCmd == "" {
 					c.skipCase("no --fence-command supplied; this case must actually kill the second mount uncleanly, and asserting it without doing so would prove nothing")

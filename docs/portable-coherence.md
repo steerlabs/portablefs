@@ -1,12 +1,11 @@
-# PortableFS protocol 7 coherence
+# Linux coherence: subscriptions and delegations
 
-Protocol 7 uses a volume change subscription and per-file write delegations on
-stock Linux FUSE. The Authority owns the namespace and XFS is the durable truth.
-An uncontended writer may acknowledge data into its daemon buffer; completion
-requires a durability barrier. This replaces the protocol-6 N/A/E/D lease engine.
-There is no mixed-major execution or fallback. The exact wire contract is
-[wire.md](./coherence-v2/wire.md), with compatibility surfaces in
-[COMPATIBILITY.md](../COMPATIBILITY.md).
+The Linux profile (`FRONTEND_PROFILE_LINUX`) uses a volume change subscription
+and per-file write delegations on stock Linux FUSE. The Authority owns the
+namespace and XFS is the durable truth. An uncontended writer may acknowledge
+data into its daemon buffer; completion requires a durability barrier. The
+exact wire contract is [wire.md](./coherence-v2/wire.md), with compatibility
+surfaces in [COMPATIBILITY.md](../COMPATIBILITY.md).
 
 ## Visibility and cache permission
 
@@ -23,9 +22,17 @@ Cumulative acknowledgments certify withdrawal through that position, including
 kernel data/attribute invalidation and draining pending cache-installing replies.
 The Authority waits for the affected peer subscriber's acknowledgment or horizon
 before completing a mutation or activating a delegation.
-The source repairs its own publications through its exact-coordinate gate and
+The source updates its own publications through its exact-coordinate gate and
 the mutation's returned post-state; it does not acknowledge its own commit as
 a peer change.
+
+Object versions are conservative: `0 < v <= s`, strictly increasing on each
+logical change, and allowed to advance without one when the authority's bounded
+version map compacts. A client orders replies by version and publication cut
+but never treats a numerically higher version as a change event; invalidation
+comes only from explicit ChangeEntry positions, so version inflation creates no
+false withdrawal and never lets an older logical value through a newer
+invalidation.
 
 Shared names have zero kernel entry validity. Exact-coordinate daemon cache
 withdrawal proves forward lookup without reverse entry notifications that can
@@ -58,6 +65,11 @@ delegation covers data, size, and file attributes; write handles use direct I/O
 so every application write reaches the daemon. The daemon preserves per-file
 program order and overlays accepted data for reads on the owning mount.
 
+Delegated flushes are ordered: each delegation generation's WRITEs carry dense
+ordinals and share a window of four in-flight flushes on a dedicated DATA lane,
+which requires `max_in_flight >= 9` on both Linux connections. There is no
+serial or capacity-negotiated alternative.
+
 The buffer is bounded at 64 MiB retained write payload and 10,000 entries. It flushes on its
 one-second timer, cap pressure, file fsync, root-directory barrier, recall,
 unmount, and before a namespace operation naming the file. Admission blocks at
@@ -80,8 +92,8 @@ to independent identities retain independent delegation state.
 
 The files gateway is an authenticated `CACHELESS_READER`, with exactly read
 access and no subscription or kernel cache. Its reads break for read and see
-flushed data. It neither acquires Mac compatibility-writer membership nor
-excludes Linux writers.
+flushed data. It neither joins Mac writer exclusion nor excludes Linux
+writers.
 
 ## Namespace, enumeration, and locks
 
@@ -145,14 +157,31 @@ The session keeps bounded pending obligations, a reusable CONTROL batch, its
 exact CONTROL replay, and one delegation-release replay result. Issued-ticket
 history does not grow for the lifetime of a healthy session.
 
+## Authority coordinator bounds
+
+The authority's change log is a bounded ring, 65,536 entries by default. Each
+subscriber's delivered cursor is its outbox; a poll copies a bounded batch into
+a reusable buffer, and delivery, change acknowledgment, and delegation
+acknowledgment are separate proofs. A subscriber that falls behind the ring is
+fenced on its next request and its renewal is refused; its outstanding
+withdrawal obligation remains until its horizon or a cold resubscribe, so
+overrun never shortens an issued cache permission. Subscription fencing is
+recoverable through a cold Subscribe in a new incarnation, which cannot
+acknowledge old obligations. No coordinator mutex covers I/O or a wait, and
+delegation turns use their own instance of the mutation sequencer so flushes
+and CONTROL acknowledgments never wait behind grant arbitration.
+
 ## macOS boundary
 
-Every attached FSKit mount retains compatibility-writer exclusion, including
-read-only mounts. The shipping SDK cannot invalidate names and attributes, and
-the SDK 27 adapter covers data only. The existing FSKit synchronous repair,
-cache-policy names, and `pfslocal` interface remain; this integration does not
-claim Linux-equivalent Mac cache withdrawal, append, or advisory locks. The
-Linux mutation path no longer runs through the Mac repair coordinator.
+A mounted Mac is the volume's only writer (`FRONTEND_PROFILE_FSKIT_EXCLUSIVE`).
+Its activation takes profile admission exclusively, recalls Linux delegations
+and waits for their exact generations before publishing the writer; while it is
+attached, Linux visible mutations and write-intent opens return `EBUSY`. Mac
+mutations still publish ordered Linux change entries and wait for reader
+withdrawal, so Linux mounts read Mac changes coherently. Current FSKit cannot
+invalidate names, attributes, or enumerations or expose append intent or lock
+callbacks, so the reverse direction is excluded rather than approximated. See
+[fskit-mount.md](./fskit-mount.md).
 
 ## Known residuals
 
@@ -169,36 +198,24 @@ operation already pinned in the filesystem can outlive the five-second recall
 budget because cancellation cannot preempt the kernel operation. A synchronous
 reverse inode notification blocked in the kernel cannot be interrupted by the
 retry context; the context prevents another retry after the call returns. Mac
-FSKit activation globally excludes Linux writer admission while it recalls and
-activates the compatibility writer. Waiting to acquire that exclusion and the
-recalls issued under it use the activation authorization deadline, but an
-already-blocked kernel or local-storage operation retains the limits above.
+FSKit activation excludes Linux writer admission while it recalls and activates
+the writer; exact-generation recall flushes still drain under it. Waiting to
+acquire that exclusion and the recalls issued under it use the activation
+authorization deadline, but an already-blocked kernel or local-storage
+operation retains the limits above.
 
 ## Qualification and remaining work
 
-The real-mount inventory includes invalidation of resident and privately mapped
-pages, delivery of FSYNCDIR, overlapping peer reads/writes, exact cache
-publication, stable enumeration under churn, gateway reads, and loss recovery.
-The two-process matrix preserves the original 23 cases and adds six protocol-7
-cases; the owner-identity-dependent chown case retains its explicit skip.
-Commands and final gate results are recorded in
-[integration.md](./coherence-v2/integration.md). Measurements and profiling,
-including direct XFS and protocol 6 comparisons, are in
-[results.md](./coherence-v2/results.md).
+The privileged suite and the two-mount matrix cover invalidation of resident and
+privately mapped pages, delivery of FSYNCDIR, overlapping peer reads and writes,
+exact cache publication, stable enumeration under churn, ordered flush, gateway
+reads, and loss recovery; the owner-identity-dependent chown case keeps its
+declared skip. None of these has passed on the integrated protocol-8 tree yet,
+and measurements from earlier protocols are not carried forward
+([performance.md](./performance.md)).
 
-The final G4 baseline records 0.01825 Authority requests per file for warm Git
-status (zero LOOKUP/GETATTR and one RECLAIM) and 8.12725 requests per operation
-for the two-mount workload (62 RECLAIMs for 229 READDIR pages). The exact
-all-case soak passes, including the full 5,000-file/200-commit Git workload and
-all fault cases. The additive directory contract lets a client name page-local
-stable identities whose capabilities it already retains; the Authority omits a
-new Item only for those identities. Residual capabilities are reclaimed in
-batches of at most 4,096. Directory page construction owns the store read turn
-and never surfaces server-generated `EAGAIN` under peer mutation.
-
-These are local Docker/kernel qualification results, not a production SLO or a
-broader kernel certification. Production must pin and qualify its runner kernel
-and call the run-start/root-handle barrier at completion, sandbox exit, and
-detach. This workstream does not deploy that product integration or qualify a
-real macOS mount. Directory delegation, quota reservation, and transparent
-recovery of old handles remain outside this foundation.
+These are local Docker/kernel suites, not a production SLO or a broader kernel
+certification. Production must pin and qualify its runner kernel and call the
+run-start root-handle barrier at completion, sandbox exit, and detach.
+Directory delegation, quota reservation, and transparent recovery of old
+handles remain outside this design.

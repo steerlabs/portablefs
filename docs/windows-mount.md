@@ -5,10 +5,15 @@ Status: **unsupported, fail closed**
 PortableFS does not currently build or mount on Windows. There is no Windows
 release artifact, client installer, or driver install path. This is not just a
 packaging or UI gap: the available signed user-mode filesystem runtimes do not
-expose the exact kernel primitives needed to preserve the v3 multi-writer
+expose the exact kernel primitives needed to preserve the multi-writer
 contract. The pure platform selector records the fail-closed answer, and any
 future Windows client build must reach it before attach. There is no driver
 dependency, fallback transport, or local cache to install.
+
+Authority protocol 8 defines no Windows frontend profile. A profile is part of
+the exact wire grammar, so a Windows transport would arrive with a new exact
+authority major rather than by reusing the Linux, FSKit, or cacheless reader
+profile under different semantics.
 
 ## The two hard blockers
 
@@ -19,9 +24,11 @@ A Windows frontend must prove both properties at the same time:
    decided by the one XFS authority. A lock that exists only in one Windows
    kernel does not exclude a Linux, macOS, or second Windows writer.
 2. Ordinary reads and writes have no machine-local data truth, and file-backed
-   mappings are refused. Any metadata caching must participate in the same
-   synchronous PREPARE/COMPLETE visibility barrier as the other strict mounts.
-   An asynchronous notification is not a coherence acknowledgement.
+   mappings are refused. Any name, attribute, data, or directory caching must
+   be withdrawn exactly, and that withdrawal acknowledged, before a conflicting
+   mutation on another machine returns, as the Linux profile's subscription
+   and delegation recall require. An asynchronous notification is not a
+   withdrawal acknowledgement.
 
 Neither evaluated runtime meets both requirements.
 
@@ -63,7 +70,7 @@ Manager or disables oplocks. Its
 [documented operations](https://dokan-dev.github.io/dokany-doc/html/struct_d_o_k_a_n___o_p_e_r_a_t_i_o_n_s.html)
 explicitly support paging I/O from memory-mapped files, and the driver uses
 Cache Manager flush and purge paths. It therefore has no supported synchronous
-cache barrier on which PortableFS can base strict cross-machine visibility.
+cache barrier on which PortableFS can base exact cross-machine withdrawal.
 
 Dokany's driver, DLL, and installer are LGPL and its releases include signed
 drivers. Dynamic use may be compatible with an Apache-2.0 application when the
@@ -94,7 +101,8 @@ passes all of these gates; none may be emulated by a local write-back store:
 
 - uncached, write-through file I/O with shared file-backed mapping refused;
 - exact authority-forwarded byte-range locks and owner cleanup;
-- synchronous namespace and metadata repair before a peer mutation returns;
+- exact namespace, attribute, and data cache withdrawal, acknowledged before a
+  peer mutation returns;
 - authority-enforced Windows share/delete/open semantics across machines;
 - open-after-unlink and atomic rename tests against Linux and macOS peers;
 - an immutable, authority-enforced Windows-safe namespace profile. Windows

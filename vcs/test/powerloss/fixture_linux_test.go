@@ -16,11 +16,14 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
 )
 
-// The two-process fixture: a real portablefs-authority and a real
-// portablefs-mount-v3, started from binaries built out of this tree, over a
-// real XFS cell provisioned by the production provisioner.
+// The fixture: a real portablefs-authority, and either a real
+// portablefs-mount-v3 or the FSKit-profile driver, started from binaries built
+// out of this tree, over a real XFS cell provisioned by the production
+// provisioner.
 //
 // It is modelled on scripts/coherence-matrix-linux.sh and for the same reason:
 // nothing in this harness may be able to agree with itself. A kill has to
@@ -38,15 +41,22 @@ type cell struct {
 	root       string // the XFS cell mount point
 	volumeRoot string // the provisioned volume directory inside it
 	home       string // the service identity's scratch directory
-	staging    string // the write-staging bind mount the authority is given
-	// stagingBound is ownership, not a cached observation: the fixture sets it
-	// only after mount --bind succeeds and clears it only after exact absence is
-	// proved. The device instrument must discharge this ownership before it can
-	// claim the dm target is free for a cut.
-	stagingBound bool
-	logDir       string
-	ledgerDir    string // where the unprivileged driver writes its ledgers
+	logDir     string
+	ledgerDir  string // where the unprivileged drivers write their ledgers
 }
+
+// Capability tokens are single use, so every attach in the suite owns one
+// fixed index. scripts/run-powerloss.sh mints exactly 2 + 2*killRounds.
+const (
+	tokenLinuxPowerCut = 0
+	tokenFSKitPowerCut = 1
+)
+
+// killRoundTokens are the two tokens of one process-kill round: the mount it
+// kills and the mount it attaches after the restart.
+func killRoundTokens(round int) (killed, restarted int) { return 2 + 2*round, 3 + 2*round }
+
+func accessToken(index int) string { return fmt.Sprintf("access-%d.token", index) }
 
 // commandRunner is deliberately smaller than Runner so the teardown contract
 // can be unit tested without creating mounts. The privileged tests still pass
@@ -70,11 +80,10 @@ func provisionCell(t *testing.T, gate authorityGate, mountpoint string) *cell {
 		root:       mountpoint,
 		volumeRoot: filepath.Join(mountpoint, gate.volume),
 		home:       filepath.Join(gate.workDir, "service"),
-		staging:    filepath.Join(gate.workDir, "service", "write-staging"),
 		logDir:     filepath.Join(gate.workDir, "logs"),
 		ledgerDir:  filepath.Join(gate.workDir, "ledgers"),
 	}
-	for _, directory := range []string{c.home, c.staging, c.logDir, c.ledgerDir, filepath.Join(c.home, "tmp")} {
+	for _, directory := range []string{c.home, c.logDir, c.ledgerDir, filepath.Join(c.home, "tmp")} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatalf("creating %s: %v", directory, err)
 		}
@@ -86,21 +95,6 @@ func provisionCell(t *testing.T, gate authorityGate, mountpoint string) *cell {
 		fmt.Sprint(gate.projectID), fmt.Sprint(gate.serviceUID), fmt.Sprint(gate.serviceGID), "1g", "200000"); err != nil {
 		t.Fatalf("provisioning the volume: %v", err)
 	}
-	// The authority's staging root is a service-owned 0700 directory in
-	// production, presented through a bind mount out of the cell's root-owned
-	// control directory. privatepath opens every component and would refuse the
-	// 0711 control directory, so the harness reproduces the same bind rather
-	// than relaxing the layout the product validates.
-	source := filepath.Join(mountpoint, ".portablefs-control", gate.volume, "write-staging")
-	if _, err := gate.runner.Run("mount", "--bind", source, c.staging); err != nil {
-		t.Fatalf("binding the write-staging directory: %v", err)
-	}
-	c.stagingBound = true
-	t.Cleanup(func() {
-		if err := c.releaseWriteStaging(); err != nil {
-			t.Errorf("releasing the write-staging bind mount: %v", err)
-		}
-	})
 	return c
 }
 
@@ -305,9 +299,11 @@ func (c *cell) startAuthorityAfterFence(t *testing.T, label string, fence priorS
 	return c.startAuthorityEpoch(t, label, &fence)
 }
 
-// startAuthorityEpoch uses the same command shape as the coherence matrix.
-// The optional assertion is added only through a validated fencing receipt,
-// never because an authority happened to stop listening.
+// startAuthorityEpoch uses the protocol-8 launch shape. The durable mount
+// membership lives in the provisioner's private control directory beside the
+// volume, outside the volume root the verifier inspects. The optional
+// assertion is added only through a validated fencing receipt, never because
+// an authority happened to stop listening.
 func (c *cell) startAuthorityEpoch(t *testing.T, label string, fence *priorStrictMountsFenced) *process {
 	t.Helper()
 	gate := c.gate
@@ -324,8 +320,7 @@ func (c *cell) startAuthorityEpoch(t *testing.T, label string, fence *priorStric
 		"--tls-key", filepath.Join(gate.credsDir, "server.key"),
 		"--client-ca", filepath.Join(gate.credsDir, "ca.pem"),
 		"--capability-public-key", filepath.Join(gate.credsDir, "capability-public.pem"),
-		"--visibility-membership-file", filepath.Join(c.root, ".portablefs-control", gate.volume, "strict-membership"),
-		"--write-staging-dir", c.staging,
+		"--mount-membership-file", filepath.Join(c.root, ".portablefs-control", gate.volume, mountmembership.Filename),
 		// The bound the authority enforces must be strictly wider than the
 		// window the credential set was minted with, not equal to it: the
 		// minting tool back-dates not_before by a second, so a token asking for
@@ -377,7 +372,6 @@ func (c *cell) startMount(t *testing.T, name, token string) (*process, string) {
 		"--tls-key", filepath.Join(gate.credsDir, "client.key"),
 		"--tls-server-ca", filepath.Join(gate.credsDir, "ca.pem"),
 		"--tls-server-name", "authority.portablefs.test",
-		"--coherence", "strict",
 	)
 	// A dead mount holds its mountpoint, and a live server can keep descriptors
 	// into the cell after lazy detach. Every fallback teardown therefore reaps
@@ -392,13 +386,13 @@ func (c *cell) startMount(t *testing.T, name, token string) (*process, string) {
 	waitFor(45*time.Second, func() bool { return mount.exited() || isFUSE(c.gate.runner, mountpoint) })
 	if !isFUSE(c.gate.runner, mountpoint) {
 		// One reason a mount never appears is not a defect and not this
-		// harness's business: a strict mount pins one exact FUSE protocol
-		// version, and a kernel that offers another cannot carry it at all.
-		// That is a prerequisite of the machine, so it is reported through the
-		// same gate as every other prerequisite - which means the CI job, which
-		// sets the REQUIRED switch, still fails on it.
-		if reason := pinnedProtocolRefusal(mount.logPath); reason != "" {
-			skipOrFail(t, "this kernel cannot carry a strict mount: %s", reason)
+		// harness's business: the mount refuses, at FUSE INIT, a kernel below
+		// the stock FUSE protocol floor. That is a prerequisite of the machine,
+		// so it is reported through the same gate as every other prerequisite -
+		// which means the CI job, which sets the REQUIRED switch, still fails on
+		// it.
+		if reason := fuseFloorRefusal(mount.logPath); reason != "" {
+			skipOrFail(t, "this kernel cannot carry a PortableFS mount: %s", reason)
 		}
 		mount.dump(t)
 		t.Fatalf("the kernel never carried a FUSE mount at %s", mountpoint)
@@ -406,15 +400,15 @@ func (c *cell) startMount(t *testing.T, name, token string) (*process, string) {
 	return mount, mountpoint
 }
 
-// pinnedProtocolRefusal returns the mount's own words when it refused because
-// the kernel offers a FUSE protocol the strict contract does not pin, or "".
-func pinnedProtocolRefusal(logPath string) string {
+// fuseFloorRefusal returns the mount's own words when it refused a kernel
+// below the stock FUSE protocol floor, or "".
+func fuseFloorRefusal(logPath string) string {
 	content, err := os.ReadFile(logPath)
 	if err != nil {
 		return ""
 	}
 	for _, line := range strings.Split(string(content), "\n") {
-		if strings.Contains(line, "strict coherence requires the pinned FUSE protocol") {
+		if strings.Contains(line, "requires stock FUSE protocol") {
 			return strings.TrimSpace(line)
 		}
 	}
@@ -526,47 +520,26 @@ func releaseMount(runner commandRunner, mountpoint string) {
 	}
 }
 
-// releaseWriteStaging removes the bind mount whose source lies on the cell.
-// It must run before the cell filesystem is unmounted for a device cut; doing
-// it only in t.Cleanup leaves a live reference to the dm target.
-func (c *cell) releaseWriteStaging() error {
-	if c == nil || !c.stagingBound {
-		return nil
+// releaseForPowerCut establishes the complete device-release precondition for
+// the Linux instrument in one ordered operation. The authority is killed first
+// so it cannot dirty the XFS after the cut begins; the FUSE server is then
+// killed and its exact kernel mount detached and proved absent. Those are the
+// only service-side holders of the cell.
+func (c *cell) releaseForPowerCut(authority, mount processKiller, mountpoint string) (priorStrictMountsFenced, error) {
+	if err := releaseAuthorityForPowerCut(authority); err != nil {
+		return priorStrictMountsFenced{}, err
 	}
-	unmountErr := error(nil)
-	if _, err := c.runner.Run("umount", c.staging); err != nil {
-		unmountErr = fmt.Errorf("unmount %s: %w", c.staging, err)
-	}
-	present, err := exactMountPresent(c.runner, c.staging)
-	if err != nil {
-		return errors.Join(unmountErr, err)
-	}
-	if present {
-		return errors.Join(unmountErr, fmt.Errorf("write-staging bind mount %s remains installed", c.staging))
-	}
-	c.stagingBound = false
-	return nil
+	return forceFenceStrictMount(c.runner, mount, mountpoint)
 }
 
-// releaseForPowerCut establishes the complete device-release precondition in
-// one ordered operation. The authority is killed first so it cannot dirty the
-// XFS after the cut begins; the FUSE server is then killed and detached; only
-// then is the last service bind into the cell removed.
-func (c *cell) releaseForPowerCut(authority, mount processKiller, mountpoint string) (priorStrictMountsFenced, error) {
+// releaseAuthorityForPowerCut is the whole precondition for the FSKit
+// instrument: its driver reaches the authority over TCP and holds nothing on
+// the cell, so the reaped authority was the cell's only service-side holder.
+func releaseAuthorityForPowerCut(authority processKiller) error {
 	if authority == nil {
-		return priorStrictMountsFenced{}, errors.New("a power cut requires its authority process")
+		return errors.New("a power cut requires its authority process")
 	}
-	if err := authority.forceKill(30 * time.Second); err != nil {
-		return priorStrictMountsFenced{}, err
-	}
-	fence, err := forceFenceStrictMount(c.runner, mount, mountpoint)
-	if err != nil {
-		return priorStrictMountsFenced{}, err
-	}
-	if err := c.releaseWriteStaging(); err != nil {
-		return priorStrictMountsFenced{}, err
-	}
-	return fence, nil
+	return authority.forceKill(30 * time.Second)
 }
 
 // cleanlyDischargeMount preserves the other half of the membership contract:
@@ -587,12 +560,8 @@ func cleanlyDischargeMount(runner commandRunner, mount *process, mountpoint stri
 	return nil
 }
 
-// runDriver runs the workload driver as the service identity and services its
-// mark requests from this process, which has the privilege to take them.
-//
-// The pipe is the ordering guarantee. The driver blocks on the acknowledgement
-// before it issues the next write, so a mark always lands in the write log
-// after the fsync it belongs to and before anything that follows.
+// runDriver runs the Linux workload driver against a mount, as the service
+// identity, and services its mark requests.
 func (c *cell) runDriver(t *testing.T, mountpoint, ledgerPath string, instrument Instrument, mark func(string) error, arguments ...string) *process {
 	t.Helper()
 	base := []string{
@@ -601,12 +570,43 @@ func (c *cell) runDriver(t *testing.T, mountpoint, ledgerPath string, instrument
 		"--ledger", ledgerPath,
 		"--instrument", string(instrument),
 	}
+	return c.spawnMarkedDriver(t, "pfs-powerloss-driver", ledgerPath, mark, append(base, arguments...))
+}
+
+// runFSKitDriver runs the FSKit-profile driver as the service identity. It
+// dials the authority directly with the same client identity a mount uses and
+// one single-use capability, and records every acknowledged mutation.
+func (c *cell) runFSKitDriver(t *testing.T, ledgerPath string, token int, mark func(string) error, arguments ...string) *process {
+	t.Helper()
+	base := []string{
+		"--authority", fmt.Sprintf("127.0.0.1:%d", c.gate.port),
+		"--volume-id", c.gate.volume,
+		"--volume", c.gate.volume,
+		"--access-token-file", filepath.Join(c.gate.credsDir, accessToken(token)),
+		"--tls-cert", filepath.Join(c.gate.credsDir, "client.crt"),
+		"--tls-key", filepath.Join(c.gate.credsDir, "client.key"),
+		"--tls-server-ca", filepath.Join(c.gate.credsDir, "ca.pem"),
+		"--tls-server-name", "authority.portablefs.test",
+		"--ledger", ledgerPath,
+	}
+	return c.spawnMarkedDriver(t, "pfs-powerloss-fskit-driver", ledgerPath, mark, append(base, arguments...))
+}
+
+// spawnMarkedDriver starts a workload driver and services its mark requests
+// from this process, which has the privilege to take them.
+//
+// The pipe is the ordering guarantee. A driver blocks on the answer before it
+// issues anything else, so a mark always lands in the write log after the
+// durability claim it belongs to - a returned fsync, or an acknowledged FSKit
+// mutation - and before anything that follows.
+func (c *cell) spawnMarkedDriver(t *testing.T, binary, ledgerPath string, mark func(string) error, arguments []string) *process {
+	t.Helper()
 	logPath := filepath.Join(c.logDir, "driver-"+filepath.Base(ledgerPath)+".log")
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		t.Fatalf("creating the driver log: %v", err)
 	}
-	command := c.asService(filepath.Join(c.gate.binDir, "pfs-powerloss-driver"), append(base, arguments...)...)
+	command := c.asService(filepath.Join(c.gate.binDir, binary), arguments...)
 	requests, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatalf("opening the driver's mark request channel: %v", err)
@@ -617,9 +617,9 @@ func (c *cell) runDriver(t *testing.T, mountpoint, ledgerPath string, instrument
 	}
 	command.Stderr = logFile
 	if err := command.Start(); err != nil {
-		t.Fatalf("starting the workload driver: %v", err)
+		t.Fatalf("starting %s: %v", binary, err)
 	}
-	driver := &process{name: "driver", command: command, logPath: logPath, exit: make(chan struct{})}
+	driver := &process{name: binary, command: command, logPath: logPath, exit: make(chan struct{})}
 	go driver.reap(func() error {
 		defer func() { _ = logFile.Close() }()
 		return serviceMarks(requests, acks, mark, command)

@@ -25,7 +25,7 @@ import (
 // process is root, because root makes their DAC assertions vacuous. This
 // harness REQUIRES root, because it creates loop devices, a device-mapper
 // target and filesystem mounts. It keeps the data plane unprivileged the same
-// way the deployment does: the authority, the mount and the workload driver
+// way the deployment does: the authority, the mount and the workload drivers
 // are all spawned as the service identity, never as root.
 const (
 	envPowerLoss     = "PORTABLEFS_POWERLOSS_TEST"
@@ -112,8 +112,8 @@ func requireLogWrites(t *testing.T, gate hostGate) hostGate {
 	return gate
 }
 
-// authorityGate adds everything needed to run the real authority and mount
-// binaries on top of a provisioned cell.
+// authorityGate adds everything needed to run the real authority, the mount
+// and both workload drivers on top of a provisioned cell.
 type authorityGate struct {
 	hostGate
 	binDir      string
@@ -158,7 +158,7 @@ func requireAuthorityGate(t *testing.T) authorityGate {
 	if gate.serviceUID == 0 || gate.serviceGID == 0 {
 		t.Fatalf("%s/%s must name an unprivileged identity; the data plane never runs as root", envServiceUID, envServiceGID)
 	}
-	for _, binary := range []string{"portablefs-authority", "portablefs-mount-v3", "pfs-powerloss-driver"} {
+	for _, binary := range []string{"portablefs-authority", "portablefs-mount-v3", "pfs-powerloss-driver", "pfs-powerloss-fskit-driver"} {
 		if _, err := os.Stat(filepath.Join(gate.binDir, binary)); err != nil {
 			skipOrFail(t, "%s does not contain %s: %v", envBinDir, binary, err)
 		}
