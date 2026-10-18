@@ -177,7 +177,7 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 	}
 }
 
-func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
+func TestFskitSourceMutationWaitsForLinuxChangeWithdrawal(t *testing.T) {
 	runtime, err := volumeserver.New("mixed-profile-recall", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -1886,14 +1886,14 @@ func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
 	}
 }
 
-type readdirPostStabilizationChangeStore struct {
+type readdirPageChangeStore struct {
 	resourceAdmissionFaultStore
 	root, handle, child xfsstore.Capability
 	readDirCalls        atomic.Uint32
 	lookupCalls         atomic.Uint32
 }
 
-func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
+func (s *readdirPageChangeStore) ReadDirOpen(
 	open xfsstore.Capability,
 	_ uint64,
 	_ int,
@@ -1908,10 +1908,10 @@ func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
 	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), NextCookie: 1}}, 1, verifier, true, s.root, nil
 }
 
-func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+func (s *readdirPageChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
 	call := s.lookupCalls.Add(1)
 	mode := os.FileMode(0o600)
-	// Call two is the trailing read after the first stabilization cut. It
+	// Call two revalidates the first sampled page. It
 	// models a chmod completing in that window; every later read sees the new
 	// state, so the second whole-page transaction can commit.
 	if call >= 2 {
@@ -1925,37 +1925,37 @@ func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string
 
 // Readdir resolves every entry from the open directory handle, so this is the
 // call under test; it answers exactly as this store's Lookup does.
-func (s *readdirPostStabilizationChangeStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+func (s *readdirPageChangeStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
 	return s.Lookup(handle, name)
 }
 
-func (s *readdirPostStabilizationChangeStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+func (s *readdirPageChangeStore) Identity(item xfsstore.Capability) ([16]byte, error) {
 	return [16]byte{item[0]}, nil
 }
 
-func (s *readdirPostStabilizationChangeStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
+func (s *readdirPageChangeStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
 	if open != s.handle {
 		return [16]byte{}, syscall.EBADF
 	}
 	return [16]byte{s.root[0]}, nil
 }
 
-func (s *readdirPostStabilizationChangeStore) GetattrOpen(open xfsstore.Capability) (xfsstore.Attr, error) {
+func (s *readdirPageChangeStore) GetattrOpen(open xfsstore.Capability) (xfsstore.Attr, error) {
 	if open != s.handle {
 		return xfsstore.Attr{}, syscall.EBADF
 	}
 	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.root[0]), CTimeNS: 10, DeviceMinor: 1}, nil
 }
 
-func (s *readdirPostStabilizationChangeStore) Forget(xfsstore.Capability) error {
+func (s *readdirPageChangeStore) Forget(xfsstore.Capability) error {
 	s.forget.Add(1)
 	return nil
 }
 
-func (*readdirPostStabilizationChangeStore) CloseOpen(xfsstore.Capability) error { return nil }
+func (*readdirPageChangeStore) CloseOpen(xfsstore.Capability) error { return nil }
 
-func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing.T) {
-	store := &readdirPostStabilizationChangeStore{
+func TestReadDirPlusRetriesWholePageAfterSampledChildChange(t *testing.T) {
+	store := &readdirPageChangeStore{
 		root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 	}
 	h, ctx, credential, _ := resourceAdmissionFskitRequestHarness(t, store, 8, 4)
@@ -1992,7 +1992,7 @@ func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing
 func TestReadDirPlusOmitsCapabilitiesAlreadyHeldByTheSession(t *testing.T) {
 	for _, held := range []bool{false, true} {
 		t.Run(fmt.Sprintf("held=%v", held), func(t *testing.T) {
-			store := &readdirPostStabilizationChangeStore{
+			store := &readdirPageChangeStore{
 				root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 			}
 			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
@@ -3172,7 +3172,7 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	itemToken := created.GetCreate().GetItem().GetToken()
 
 	// Attach the waiter only after the seed create. A direct handler test has no
-	// frontend visibility loop to ACK a create repair, and the waiter is meant to
+	// frontend visibility loop to ACK a create withdrawal, and the waiter is meant to
 	// observe the already-created object before it parks on the lock.
 	waiter, _, waiterProof := attachSession(2)
 	// The waiter needs its own capability for the same object.

@@ -510,7 +510,7 @@ func TestLinuxMutationFenceBeforeApplyDoesNotCommitStorage(t *testing.T) {
 	}
 }
 
-func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {
+func TestLinuxPreparationCannotEscapeStorageDependencies(t *testing.T) {
 	h, cred, store := newWriteHarness(t)
 	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
 	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)

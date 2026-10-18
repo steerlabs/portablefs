@@ -268,8 +268,16 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				finishPin(0)
 				return h.coherenceError(0, err)
 			}
+			releaseCommit, err := h.reserveCoherenceCommit()
+			if err != nil {
+				releaseStorage()
+				releaseTurn()
+				finishPin(0)
+				return h.coherenceError(0, err)
+			}
 			applyUse, err := h.Runtime.Begin(cred)
 			if err != nil {
+				releaseCommit()
 				releaseStorage()
 				releaseTurn()
 				finishPin(0)
@@ -295,6 +303,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			var retainedGrantErr error
 
 			withdrawal := h.publishCoherenceCommitAdmitted(req, cred.ID, identity, response, changes, changed, &token, sourceCacheAdmission(gate, response))
+			releaseCommit()
 			stampMutationTargets(changes, response.GetPostState())
 			if changes != nil {
 				err = volumeserver.ValidateMutationCompletion(changes, prepared)
@@ -313,7 +322,9 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			releaseTurn()
 			finishPin(response.GetAppliedSequence())
 			if err != nil {
-				return h.errorResponse(0, fmt.Errorf("%w: %w", volumeserver.ErrMutationPoisoned, err), true)
+				failure := h.errorResponse(0, fmt.Errorf("%w: %w", volumeserver.ErrMutationPoisoned, err), true)
+				failure.PostState, failure.VolumeVersion = response.GetPostState(), response.GetVolumeVersion()
+				return failure
 			}
 			if retainedGrantErr != nil {
 				h.discardCoherenceOpenReply(cred.ID, response)

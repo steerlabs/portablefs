@@ -315,14 +315,6 @@ func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 	}
 }
 
-// The FSKit repair stream is barrier control, not filesystem work. The barrier
-// that installs a new routing revision still needs its participants'
-// acknowledgments and blocked reports after the commit point — refusing them
-// through the session-routes gate would convert every routing change into one
-// full repair-budget stall per strict participant. So after the revision
-// moves, an ordinary request is refused as stale (the control assertion), but
-// a visibility request must reach its own handler.
-
 // .portablefs/ decides what every machine can see, so no mount may change it
 // through the ordinary filesystem path - only ApplyRoutes, which runs the change
 // through the barrier. Reading stays open, because a mount cannot present the
@@ -1034,8 +1026,3 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 		t.Fatal("route writer did not resume after filesystem completion")
 	}
 }
-
-// The retired repair models keep their enum numbers reserved, so a peer can
-// still put those bytes on the wire. Reserving a number is not refusing it:
-// this asserts the decode refuses both, by number, without mapping either onto
-// an admitted model.

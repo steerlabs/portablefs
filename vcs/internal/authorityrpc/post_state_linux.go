@@ -4,9 +4,13 @@ package authorityrpc
 
 import (
 	"bytes"
+	"errors"
+	"math"
 	"sort"
+	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
@@ -126,14 +130,40 @@ func (h *VolumeHandler) finalizeMutationPostState(committed uint64, state *autho
 	return versions
 }
 
+// reserveCoherenceCommit guarantees space for every in-flight apply, including
+// the last representable commit. Reservation creates no sequence or gap: a
+// no-op returns its capacity, and real changes allocate at commit ordering.
+func (h *VolumeHandler) reserveCoherenceCommit() (func(), error) {
+	h.coherenceCommitMu.Lock()
+	defer h.coherenceCommitMu.Unlock()
+	if h.coherenceVersion == math.MaxUint64 {
+		return nil, errors.Join(volumeserver.ErrMutationPoisoned, syscall.EOVERFLOW)
+	}
+	if h.coherencePending >= math.MaxUint64-h.coherenceVersion {
+		// Pending operations may still be no-ops. Refuse new apply admission
+		// without poisoning the remaining representable commit capacity.
+		return nil, volumeserver.ErrAdmission
+	}
+	h.coherencePending++
+	return func() {
+		h.coherenceCommitMu.Lock()
+		h.coherencePending--
+		h.coherenceCommitMu.Unlock()
+	}, nil
+}
+
 // sampleVersions captures sequence, floor and every requested entry under one
 // commit cut. Callers still hold storage/hydration guards around their attrs.
 func (h *VolumeHandler) sampleVersions(identities ...[16]byte) (uint64, []uint64) {
 	h.coherenceCommitMu.Lock()
 	defer h.coherenceCommitMu.Unlock()
+	sequence := h.coherenceVersion
+	if h.afterVersionSequence != nil {
+		h.afterVersionSequence()
+	}
 	versions := make([]uint64, len(identities))
 	for i, identity := range identities {
 		versions[i] = max(uint64(1), h.objectVersionFloor, h.objectVersions[identity])
 	}
-	return h.coherenceVersion, versions
+	return sequence, versions
 }

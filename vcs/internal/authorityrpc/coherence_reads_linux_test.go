@@ -583,7 +583,7 @@ func TestCoherenceReadDirPublishesRevalidatedPageStamp(t *testing.T) {
 }
 
 type coherenceChurningDirectoryStore struct {
-	readdirPostStabilizationChangeStore
+	readdirPageChangeStore
 	lookupCalls atomic.Uint32
 	unstableFor uint32
 	eagainFor   uint32
@@ -617,7 +617,7 @@ func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := &coherenceChurningDirectoryStore{
-				readdirPostStabilizationChangeStore: readdirPostStabilizationChangeStore{
+				readdirPageChangeStore: readdirPageChangeStore{
 					root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 				},
 				unstableFor: test.unstable, eagainFor: test.eagain,

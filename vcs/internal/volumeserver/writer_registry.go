@@ -72,7 +72,8 @@ func (c *WriterRegistry) CheckOwner(source SessionID) error {
 
 // Activate runs inside durable membership publication and exclusive profile
 // admission. Preparing the exact reply can fail; runtime commit cannot. The
-// owner mutex prevents fence and a second publication from crossing this cut.
+// owner mutex serializes publication with fence. Runtime commit runs outside
+// it because deferred session teardown can synchronously re-enter the registry.
 func (c *WriterRegistry) Activate(id SessionID, terminal <-chan struct{}, exclusion *WriterExclusion, prepare func() error, commit func()) error {
 	if id == (SessionID{}) || terminal == nil || exclusion == nil || prepare == nil || commit == nil {
 		return ErrMountProfile
@@ -106,8 +107,8 @@ func (c *WriterRegistry) Activate(id SessionID, terminal <-chan struct{}, exclus
 	}
 	c.owner, c.exclusion, c.left = id, exclusion, make(chan struct{})
 	left := c.left
-	commit()
 	c.mu.Unlock()
+	commit()
 	go func() {
 		select {
 		case <-terminal:

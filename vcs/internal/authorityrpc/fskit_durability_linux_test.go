@@ -87,6 +87,38 @@ func directFskitRequest() *authoritypb.Request {
 	return req
 }
 
+func TestFskitPostApplyCompletionDefectKeepsExactPostState(t *testing.T) {
+	for _, structuredWrite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("write-receipt-%v", structuredWrite), func(t *testing.T) {
+			h, cred, store, _ := newDirectFskitHarness(t)
+			req := directFskitRequest()
+			var applied *authoritypb.Response
+			var committed *authoritypb.PostState
+			store.barrier = func() { committed = proto.Clone(applied.GetPostState()).(*authoritypb.PostState) }
+			response := h.mutateFskitCoherence(t.Context(), req, cred,
+				func(*operationResolutionContext) ([]volumeserver.MutationTarget, error) {
+					return []volumeserver.MutationTarget{{Scope: volumeserver.MutationData, Identity: [16]byte{0x41}}}, nil
+				},
+				func(sequence uint64, changed *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
+					attr := xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x41, Size: 4, Mode: 0600, Nlink: 1, DeviceMinor: 1}
+					applied = &authoritypb.Response{PostState: h.mutationPostState(changed, sequence, postStateSnapshot{identity: [16]byte{0x41}, attr: attr, roles: postStateRoleTarget, changed: true})}
+					if structuredWrite {
+						applied.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: 4, PostAttr: attrProto(attr)}}
+					}
+					// A completion outside the prepared footprint is an internal
+					// defect, after a real applied outcome has already been sampled.
+					return applied, []volumeserver.MutationTarget{{Scope: volumeserver.MutationData, Identity: [16]byte{0x42}}}
+				}, nil)
+			if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || response.GetErrno() == 0 && response.GetWrite().GetError() == 0 {
+				t.Fatalf("completion defect was not terminal: %v", response)
+			}
+			if committed == nil || !proto.Equal(committed, response.GetPostState()) || response.GetVolumeVersion() != committed.GetSnapshotSequence() || store.syncs.Load() != 1 {
+				t.Fatalf("defect lost exact applied state or durability: %v, committed=%v syncs=%d", response, committed, store.syncs.Load())
+			}
+		})
+	}
+}
+
 func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 	for _, test := range []struct {
 		name                string
@@ -277,14 +309,14 @@ func TestFskitNonWriteDurabilityFailureIsUncertainStorage(t *testing.T) {
 	}
 }
 
-type fragmentedDurabilityFailureStore struct {
+type durabilityFailureStore struct {
 	*fskitWriteTestStore
 	fences atomic.Int32
 }
 
-func (s *fragmentedDurabilityFailureStore) Fence(error) { s.fences.Add(1) }
-func (s *fragmentedDurabilityFailureStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	panic("fragmented COMMIT reacquired its handle")
+func (s *durabilityFailureStore) Fence(error) { s.fences.Add(1) }
+func (s *durabilityFailureStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
+	panic("direct WRITE reacquired its handle")
 }
 
 type partialSetAttrStore struct {

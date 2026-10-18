@@ -151,8 +151,6 @@ func TestVolumeHandlerEndToEndOnXFSFskitDurability(t *testing.T) {
 		req.Epoch = epoch
 		req.Session = proof
 		stampMutation(t, req, 0, sequence)
-		if opened := req.GetOpen(); opened == nil || opened.GetFlags().GetTruncate() {
-		}
 		before := len(store.calls)
 		reply := h.Handle(ctx, req)
 		if reply.GetErrno() != 0 || reply.GetUncertain() || reply.GetWrite().GetError() != 0 {

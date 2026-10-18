@@ -27,3 +27,4 @@ github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessProtec
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessReplayAndNewChildOrderingOnXFS
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessUnexpectedFailureIsAppliedAndSyncedOnXFS
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestHandlerProofRetainsWriterExclusionThroughApplyDrainOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestLinuxReplaySyncAndLocksSurviveMacWriterExclusionOnXFS

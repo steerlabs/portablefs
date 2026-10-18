@@ -113,9 +113,8 @@ func markWritePostApplyFailure(response *authoritypb.Response, cause error) bool
 }
 
 // handleWrite executes a complete one-frame write as one ordinary
-// replay-slot mutation. Capacity is charged to the same FIFO byte/count
-// budgets as staged transactions, but the retained frame payload is written
-// directly and no staging object or transaction ID exists.
+// replay-slot mutation. The charged inbound frame remains retained through
+// apply, durability and replay settlement; its payload is written directly.
 func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteRequest) *authoritypb.Response {
 	metadata, metadataErr := stockWriteMetadata(body, h.MaxWrite)
 	var target xfsstore.WriteTarget
@@ -264,9 +263,6 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 			inodeTarget(volumeserver.MutationAttributes, coordinate, 0),
 		}
 	}, func() error { return target.Sync() }, &releaseMutation)
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) && response != nil && response.GetErrno() == 0 && response.GetWrite() == nil {
-		return h.errorResponse(request.GetRequestId(), syscall.ETIMEDOUT, false)
-	}
 	if releaseMutation != nil {
 		releaseMutation()
 	}

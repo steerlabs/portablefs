@@ -77,11 +77,18 @@ func (h *VolumeHandler) mutateFskitCoherence(ctx context.Context, req *authority
 				release()
 				return h.errorResponse(0, err, false)
 			}
+			releaseCommit, err := h.reserveCoherenceCommit()
+			if err != nil {
+				releaseStorage()
+				release()
+				return h.errorResponse(0, err, false)
+			}
 			use, err := h.Runtime.Begin(cred)
 			if err == nil {
 				err = h.Writers.CheckOwner(cred.ID)
 			}
 			if err != nil {
+				releaseCommit()
 				if use != nil {
 					use.End()
 				}
@@ -98,6 +105,7 @@ func (h *VolumeHandler) mutateFskitCoherence(ctx context.Context, req *authority
 				response = h.errorResponse(0, errInternal, true)
 			}
 			position := h.publishCoherenceCommit(req, cred.ID, [16]byte{}, response, targets, changed)
+			releaseCommit()
 			stampMutationTargets(targets, response.GetPostState())
 			if targets != nil {
 				err = volumeserver.ValidateMutationCompletion(targets, prepared)
@@ -134,12 +142,22 @@ func (h *VolumeHandler) mutateFskitCoherence(ctx context.Context, req *authority
 						h.deferStorageFailure(response, syncErr)
 						return response
 					}
-					return h.errorResponse(0, syncErr, true)
+					failure := h.errorResponse(0, syncErr, true)
+					failure.PostState, failure.VolumeVersion = response.GetPostState(), response.GetVolumeVersion()
+					return failure
 				}
 			}
 			use.End()
 			if err != nil {
-				return h.errorResponse(0, errors.Join(volumeserver.ErrMutationPoisoned, err), targets != nil)
+				cause := errors.Join(volumeserver.ErrMutationPoisoned, err)
+				if markFskitMutationPostApplyFailure(response, cause) {
+					response.Failure = authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+					h.deferCoherenceFailure(response, cause)
+					return response
+				}
+				failure := h.errorResponse(0, cause, targets != nil)
+				failure.PostState, failure.VolumeVersion = response.GetPostState(), response.GetVolumeVersion()
+				return failure
 			}
 			return response
 		}

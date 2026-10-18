@@ -3,7 +3,9 @@
 package authorityrpc
 
 import (
+	"errors"
 	"math"
+	"sync"
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -11,6 +13,71 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestVersionExhaustionRefusesBeforeStorageApply(t *testing.T) {
+	for _, profile := range []string{"linux", "fskit"} {
+		t.Run(profile, func(t *testing.T) {
+			var h *VolumeHandler
+			var cred volumeserver.SessionCredential
+			var target *writeTestTarget
+			var syncs func() uint32
+			if profile == "fskit" {
+				var store *fskitDurabilityTestStore
+				h, cred, store, target = newDirectFskitHarness(t)
+				syncs = func() uint32 { return uint32(store.syncs.Load()) }
+			} else {
+				var store *writeTestStore
+				h, cred, store = newWriteHarness(t)
+				target = &writeTestTarget{}
+				prepareOneShotTarget(t, h, cred, store, target)
+				syncs = func() uint32 { return store.durableHandles.Load() }
+			}
+			h.initCoherence()
+			h.coherenceVersion = math.MaxUint64
+			req := directFskitRequest()
+			response := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+			if response.GetErrno() == 0 || response.GetUncertain() || response.GetPostState() != nil {
+				t.Fatalf("sequence exhaustion was not a pre-apply refusal: %v", response)
+			}
+			if calls, _ := target.directSnapshot(); calls != 0 || syncs() != 0 || h.coherenceVersion != math.MaxUint64 || h.coherencePending != 0 {
+				t.Fatalf("exhausted sequence applied/synced/wrapped: calls=%d syncs=%d version=%d pending=%d", calls, syncs(), h.coherenceVersion, h.coherencePending)
+			}
+		})
+	}
+}
+
+func TestLastCommitCapacityIsReservedAcrossConcurrentApplies(t *testing.T) {
+	h := testVolumeHandler()
+	h.initCoherence()
+	h.coherenceVersion = math.MaxUint64 - 1
+	var wg sync.WaitGroup
+	releases := make(chan func(), 2)
+	errorsSeen := make(chan error, 2)
+	for range 2 {
+		wg.Go(func() {
+			release, err := h.reserveCoherenceCommit()
+			if err == nil {
+				releases <- release
+			} else {
+				errorsSeen <- err
+			}
+		})
+	}
+	wg.Wait()
+	if len(releases) != 1 || len(errorsSeen) != 1 || !errors.Is(<-errorsSeen, volumeserver.ErrAdmission) {
+		t.Fatal("concurrent applies overbooked the last sequence")
+	}
+	(<-releases)() // A no-op does not consume its reserved sequence.
+	release, err := h.reserveCoherenceCommit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.publishCoherenceCommit(&authoritypb.Request{}, volumeserver.SessionID{}, [16]byte{}, &authoritypb.Response{}, []volumeserver.MutationTarget{}, &mutationChanges{})
+	release()
+	if _, err := h.reserveCoherenceCommit(); !errors.Is(err, volumeserver.ErrMutationPoisoned) || h.coherenceVersion != math.MaxUint64 || h.coherencePending != 0 {
+		t.Fatalf("last commit wrapped or leaked reservation: %v", err)
+	}
+}
 
 func TestConservativeVersionsStayBoundedAcrossCompaction(t *testing.T) {
 	h := testVolumeHandler()

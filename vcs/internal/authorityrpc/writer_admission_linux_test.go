@@ -4,6 +4,7 @@ package authorityrpc
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -12,7 +13,142 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/restorefixture"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
+	"google.golang.org/protobuf/proto"
 )
+
+type writerAdmissionCutStore struct {
+	*fskitDurabilityTestStore
+	cut func()
+}
+
+func (s *writerAdmissionCutStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	s.cut()
+	return s.fskitDurabilityTestStore.Identity(item)
+}
+
+func (s *writerAdmissionCutStore) PinWriteTarget(handle xfsstore.Capability) (xfsstore.WriteTarget, error) {
+	target, err := s.fskitDurabilityTestStore.PinWriteTarget(handle)
+	s.cut()
+	return target, err
+}
+
+func TestFskitRegistryFenceBeforeApplyRefusesMutationAndWriteOpen(t *testing.T) {
+	for _, action := range []string{"fence", "poison"} {
+		for _, operation := range []string{"write", "write-open"} {
+			t.Run(action+"/"+operation, func(t *testing.T) {
+				h, cred, store, target := newDirectFskitHarness(t)
+				// Leave the runtime live to prove the registry check itself is
+				// necessary, independently of Runtime.Begin's liveness check.
+				registry, err := volumeserver.NewWriterRegistry(volumeserver.WriterRegistryConfig{Prior: volumeserver.PriorEpochStrictMountsFenced})
+				if err != nil {
+					t.Fatal(err)
+				}
+				terminal, err := h.Runtime.SessionTerminal(cred.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// An independent exclusion prevents its closed bit from making
+				// Runtime.Begin mask a missing registry owner check.
+				exclusion := new(volumeserver.WriterExclusion)
+				if err := registry.Activate(cred.ID, terminal, exclusion, func() error { return nil }, func() {}); err != nil {
+					t.Fatal(err)
+				}
+				h.Writers = registry
+				cutReached := false
+				h.Store = &writerAdmissionCutStore{fskitDurabilityTestStore: store, cut: func() {
+					if cutReached {
+						return
+					}
+					cutReached = true
+					if action == "fence" {
+						registry.Fence(cred.ID)
+					} else {
+						registry.Poison(errors.New("test completion defect"))
+					}
+				}}
+				req := directFskitRequest()
+				var response *authoritypb.Response
+				if operation == "write" {
+					response = h.handleWrite(t.Context(), req, cred, req.GetWrite())
+				} else {
+					root := xfsstore.Capability{0x70}
+					req.Body = &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: root[:], Flags: &authoritypb.OpenFlags{Write: true}}}
+					response = h.coherenceOpen(t.Context(), req, cred)
+				}
+				if !cutReached || response.GetErrno() == 0 || response.GetPostState() != nil {
+					t.Fatalf("registry refusal=%v, cut=%v", response, cutReached)
+				}
+				if calls, _ := target.directSnapshot(); calls != 0 || store.open.Load() != 0 || store.syncs.Load() != 0 || h.coherencePending != 0 {
+					t.Fatalf("applies/opens/syncs=%d/%d/%d", calls, store.open.Load(), store.syncs.Load())
+				}
+				use, err := h.Runtime.Begin(cred)
+				if err != nil {
+					t.Fatalf("runtime hid a missing owner check: %v", err)
+				}
+				use.End()
+			})
+		}
+	}
+}
+
+func TestLinuxReplaySyncAndLocksSurviveMacWriterExclusionOnXFS(t *testing.T) {
+	store := openTakeoverTestStore(t, restorefixture.Root(t))
+	h, ctx, _, _ := newAuthorityTestHandler(t, nil)
+	h.Store = store
+	linux, epoch, linuxProof := attachAndActivateHandler(t, h, ctx, 1, &authoritypb.AttachRequest{VolumeId: "handler-fskit", AccessToken: []byte("test"), ReplaySlots: 9, Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT, FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX, RoutesRevision: emptyRoutesRevision(), AttachAttemptId: testAttachAttempt(1)})
+	subscribe := h.Handle(ctx, &authoritypb.Request{RequestId: 3, Epoch: epoch, Session: linuxProof, Body: &authoritypb.Request_Subscribe{Subscribe: &authoritypb.SubscribeRequest{}}})
+	if subscribe.GetErrno() != 0 {
+		t.Fatal(subscribe)
+	}
+	create := &authoritypb.Request{RequestId: 4, Epoch: epoch, Session: linuxProof, Mutation: &authoritypb.Mutation{Sequence: 1}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: linux.GetRoot().GetToken(), Name: []byte("replay-file"), Mode: 0600, Flags: &authoritypb.OpenFlags{Write: true}, Exclusive: true}}}
+	created := h.Handle(ctx, create)
+	if created.GetErrno() != 0 {
+		t.Fatal(created)
+	}
+	_, _, macProof := attachAndActivateHandler(t, h, ctx, 10, fskitAttachRequest(10).GetAttach())
+	var macID, linuxID volumeserver.SessionID
+	copy(macID[:], macProof.GetId())
+	copy(linuxID[:], linuxProof.GetId())
+	t.Cleanup(func() { h.Runtime.FenceSession(macID); h.Runtime.FenceSession(linuxID) })
+	proof := h.Handle(ctx, &authoritypb.Request{RequestId: 12, Epoch: epoch, Session: macProof, Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+	if proof.GetErrno() != 0 || proof.GetSessionValidForNanos() == 0 {
+		t.Fatal(proof)
+	}
+	for i, phase := range []string{"live", "retained"} {
+		t.Run(phase, func(t *testing.T) {
+			if i != 0 {
+				h.Writers.Fence(macID)
+			}
+			if err := h.Writers.CheckWriter(linuxID); !errors.Is(err, volumeserver.ErrWriterExcluded) {
+				t.Fatalf("fixture lacks writer exclusion: %v", err)
+			}
+			before := h.coherenceVersionNow()
+			create.RequestId++
+			replay := h.Handle(ctx, create)
+			want := proto.Clone(created).(*authoritypb.Response)
+			want.RequestId = replay.RequestId
+			if !proto.Equal(want, replay) || h.coherenceVersionNow() != before {
+				t.Fatalf("writer exclusion replaced or reapplied exact replay: %v", replay)
+			}
+			for slot, req := range []*authoritypb.Request{
+				{Body: &authoritypb.Request_SyncFs{SyncFs: &authoritypb.SyncFSRequest{}}},
+				{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: &authoritypb.LockSpec{Item: created.GetCreate().GetItem().GetToken(), Owner: 1, Write: true, Range: &authoritypb.LockRange{}}}}},
+			} {
+				req.RequestId, req.Epoch, req.Session = uint64(20+i*2+slot), epoch, linuxProof
+				req.Mutation = &authoritypb.Mutation{Slot: uint32(slot + 1), Sequence: uint64(i + 1)}
+				if response := h.Handle(ctx, req); response.GetErrno() != 0 {
+					t.Fatalf("%T refused under %s exclusion: %v", req.Body, phase, response)
+				}
+			}
+			write := stockWriteTestRequest(uint64(30+i), 3, 1, xfsstore.Capability{}, []byte("blocked"), 0, 0)
+			write.Epoch, write.Session, write.GetWrite().Handle = epoch, linuxProof, created.GetCreate().GetHandle()
+			if response := h.Handle(ctx, write); response.GetErrno() != int32(syscall.EBUSY) || response.GetMutation() != nil {
+				t.Fatalf("new writer bypassed exclusion: %v", response)
+			}
+		})
+	}
+}
 
 func TestFskitApplyDoesNotTakeSharedProfileAdmission(t *testing.T) {
 	h, cred, _, target := newDirectFskitHarness(t)

@@ -127,6 +127,7 @@ type VolumeHandler struct {
 	coherenceStorage     *volumeserver.StorageSequencer
 	coherenceCommitMu    sync.Mutex
 	coherenceVersion     uint64
+	coherencePending     uint64
 	coherenceDurability  coherenceDurability
 	coherenceRetiredMu   sync.Mutex
 	coherenceRetired     map[volumeserver.SessionID]struct{}
@@ -147,9 +148,11 @@ type VolumeHandler struct {
 	MaxOpensPerSession uint32
 	MaxItems           uint32
 	MaxOpens           uint32
-	objectVersions     map[[16]byte]uint64
-	objectVersionFloor uint64
-	objectVersionLimit int // tests may lower the fixed production cap, never below the atomic outcome bound
+	// afterVersionSequence is an optional test interleaving at the locked sample cut.
+	afterVersionSequence func()
+	objectVersions       map[[16]byte]uint64
+	objectVersionFloor   uint64
+	objectVersionLimit   int // tests may lower the fixed production cap, never below the atomic outcome bound
 	// MaxRetainedReplyBytes bounds the real quantity the replay cache consumes:
 	// the total encoded bytes retained across every live session's replay
 	// slots. Slot counts are not a proxy for it; one directory listing is five
@@ -2744,8 +2747,11 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		if profileErr != nil {
 			return profileErr
 		}
+		// SyncFS and advisory locks do not mutate storage and hold no shared
+		// profile admission. Only ordinary writes and write-capable OPENs need
+		// the exclusion check; generation-bound recall flushes drain separately.
 		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && coherenceFlushReference(req) == nil &&
-			(requestRequiresWrite(req) || req.GetOpen().GetWriteIntent()) {
+			(requestRequiresWrite(req) || req.GetOpen().GetWriteIntent()) && req.GetSyncFs() == nil && req.GetSetLock() == nil {
 			if err := h.Writers.CheckWriter(cred.ID); err != nil {
 				return err
 			}

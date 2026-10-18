@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func restartCompatibilityCoordinator(t *testing.T, clock *exclusionTestClock, membership DurableMountMembership) *WriterRegistry {
+func restartWriterRegistry(t *testing.T, clock *exclusionTestClock) *WriterRegistry {
 	t.Helper()
 	c, err := NewWriterRegistry(WriterRegistryConfig{Prior: PriorEpochUnproven, ContinuousNow: clock.continuous})
 	if err != nil {
@@ -51,7 +51,7 @@ func TestWriterRestartGraceOnlyReleasesWriters(t *testing.T) {
 			}
 			clock := &exclusionTestClock{}
 			clock.elapsed.Store(int64(100 * time.Second))
-			c := restartCompatibilityCoordinator(t, clock, m)
+			c := restartWriterRegistry(t, clock)
 			// No presumed process age or downtime establishes safe takeover.
 			if err := c.CheckWriter(SessionID{2}); !errors.Is(err, ErrWriterExcluded) {
 				t.Fatalf("unsampled takeover=%v", err)
@@ -95,7 +95,7 @@ func TestWriterRestartGraceOnlyReleasesWriters(t *testing.T) {
 			// A further restart, with a new boot clock and a shorter lease, owes
 			// the full grace again; no old clock or configured L is consulted.
 			clock.elapsed.Store(int64(time.Second))
-			next := restartCompatibilityCoordinator(t, clock, m)
+			next := restartWriterRegistry(t, clock)
 			if err := next.StartWriterGrace(); err != nil {
 				t.Fatal(err)
 			}
@@ -117,7 +117,7 @@ func TestWriterRestartClockFailuresStayFenced(t *testing.T) {
 			if fault == "overflow" {
 				clock.elapsed.Store(math.MaxInt64)
 			}
-			c := restartCompatibilityCoordinator(t, clock, newTestDurableMountMembership())
+			c := restartWriterRegistry(t, clock)
 			err := c.StartWriterGrace()
 			if fault == "initial failure" || fault == "overflow" {
 				if err == nil {
@@ -147,7 +147,7 @@ func TestWriterRestartClockFailuresStayFenced(t *testing.T) {
 func TestWriterRestartStillHonorsCurrentExclusionAndDrain(t *testing.T) {
 	clock := &exclusionTestClock{}
 	clock.elapsed.Store(int64(time.Second))
-	c := restartCompatibilityCoordinator(t, clock, newTestDurableMountMembership())
+	c := restartWriterRegistry(t, clock)
 	if err := c.StartWriterGrace(); err != nil {
 		t.Fatal(err)
 	}
