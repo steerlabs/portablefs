@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -107,7 +108,7 @@ func TestFSKitControlCancelDrainIsTerminal(t *testing.T) {
 				t.Fatalf("post-terminal KeepAlive = %v", err)
 			}
 			if calls.Load() != 1 || client.control.binding.Load() != controlGeneration || client.transportIsLive(client.control) {
-				t.Fatal("terminal CONTROL loss retried or rebound the request")
+				t.Fatal("terminal CONTROL cancellation sent another request or rebound CONTROL")
 			}
 			client.data.pendingMu.Lock()
 			sameData := client.data.conn == data
@@ -116,6 +117,109 @@ func TestFSKitControlCancelDrainIsTerminal(t *testing.T) {
 				t.Fatal("CONTROL failure replaced the original DATA transport")
 			}
 		})
+	}
+}
+
+func TestFSKitPendingControlLossDoesNotReplay(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	var calls atomic.Int32
+	handler := newFskitProofTestHandler()
+	handler.set(uint64(time.Second), func(*authoritypb.Response) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+	}, 0)
+	client, err := dialFskitProofTestClient(t, handler, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(unblock)
+	data := client.data.conn
+	control := client.control.conn
+	generation := client.control.binding.Load()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.KeepAlive(ctx)
+		done <- err
+	}()
+	<-started
+	if err := control.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unblock()
+	// The context remains live and a replay would receive an immediate success
+	// from the handler. Release the first handler after closing its socket so
+	// its active pin cannot block an erroneous reconnect and duplicate KeepAlive.
+	err = <-done
+	if ctx.Err() != nil || !errors.Is(err, ErrTransportUncertain) || client.LocalAdmissionOpen() || !errors.Is(client.SessionEndCause(), ErrTransportUncertain) {
+		t.Fatalf("pending CONTROL loss = %v, context=%v admission=%t cause=%v calls=%d", err, ctx.Err(), client.LocalAdmissionOpen(), client.SessionEndCause(), calls.Load())
+	}
+	if calls.Load() != 1 || client.control.binding.Load() != generation || client.transportIsLive(client.control) {
+		t.Fatalf("CONTROL loss replayed or rebound: calls=%d generation=%d, want %d", calls.Load(), client.control.binding.Load(), generation)
+	}
+	client.data.pendingMu.Lock()
+	sameData := client.data.conn == data
+	client.data.pendingMu.Unlock()
+	if !sameData {
+		t.Fatal("CONTROL loss replaced DATA")
+	}
+}
+
+func TestFSKitCanceledBeforeDispatchKeepsSessionUsable(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		for _, direct := range []bool{false, true} {
+			t.Run(fmt.Sprintf("deadline=%t/direct-dispatch=%t", deadline, direct), func(t *testing.T) {
+				var calls atomic.Int32
+				handler := newFskitProofTestHandler()
+				handler.set(uint64(time.Second), func(*authoritypb.Response) { calls.Add(1) }, 0)
+				client, err := dialFskitProofTestClient(t, handler, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				control := client.control.conn
+				requestID := client.control.nextID.Load()
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				if deadline {
+					ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+					defer cancel()
+				}
+				if direct {
+					// Bypass admission's select so a ready ctx.Done cannot hide a
+					// missing dispatch check by winning against the free permit.
+					request := &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
+					response, releaseFrame, dispatchErr := client.dispatchOwnedFrame(ctx, request)
+					if releaseFrame != nil {
+						releaseFrame()
+					}
+					err = dispatchErr
+					if response != nil || request.GetRequestId() != 0 || request.GetSession() != nil || len(request.GetEpoch()) != 0 {
+						t.Fatalf("canceled dispatch stamped or completed a request: request=%v response=%v", request, response)
+					}
+				} else {
+					_, err = client.KeepAlive(ctx)
+				}
+				if !errors.Is(err, ctx.Err()) || !client.LocalAdmissionOpen() || client.SessionEndCause() != nil {
+					t.Fatalf("pre-dispatch cancellation = %v, admission=%t cause=%v", err, client.LocalAdmissionOpen(), client.SessionEndCause())
+				}
+				if client.control.nextID.Load() != requestID || calls.Load() != 0 {
+					t.Fatal("pre-dispatch cancellation assigned or sent a request")
+				}
+				if proof, err := client.KeepAlive(t.Context()); err != nil || proof != time.Second || calls.Load() != 1 {
+					t.Fatalf("renewal after pre-dispatch cancellation = (%s, %v), calls=%d", proof, err, calls.Load())
+				}
+				client.control.pendingMu.Lock()
+				unchanged := client.control.conn == control && len(client.control.pending) == 0
+				client.control.pendingMu.Unlock()
+				if !unchanged {
+					t.Fatal("pre-dispatch cancellation changed CONTROL or left a pending request")
+				}
+			})
+		}
 	}
 }
 

@@ -1399,10 +1399,9 @@ func (c *Client) callFrame(ctx context.Context, request *authoritypb.Request) (*
 }
 
 // admitCall is the single shape and concurrency boundary for non-mutation
-// requests. Keeping it ahead of dispatch means a canceled caller never stamps or
-// serializes a request it did not submit. Mutation calls have their own
-// replay-slot admission because the permit and slot lifetime are intentionally
-// coupled.
+// requests. Dispatch rechecks cancellation after acquiring the permit, before
+// stamping or serializing the request. Mutation calls have their own replay-slot
+// admission because the permit and slot lifetime are intentionally coupled.
 func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*lane, error) {
 	if request == nil || request.GetHello() != nil || request.GetAttach() != nil || request.GetResume() != nil ||
 		request.GetActivate() != nil || request.GetAbortAttach() != nil || request.GetCancel() != nil {
@@ -1436,6 +1435,11 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 }
 
 func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
+	// Refuse an already-canceled attempt before stamping or touching a transport:
+	// an expired write deadline must not break a usable connection.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
 		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
 		return nil, nil, syscall.EOPNOTSUPP
@@ -1501,9 +1505,9 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 			return c.completeCall(request, completed)
 		case <-timer.C:
 			c.failConnection(transport, conn, ErrTransportUncertain)
-			// An unsettled transport loss can end the session even while this
-			// caller is draining cancellation. Preserve that terminal boundary
-			// rather than reporting a safely settled local context error.
+			// For every profile, a transport failure after session end reports
+			// the recorded cause, including cancellation during an epoch change.
+			// A local context error cannot replace that terminal verdict.
 			if err := c.SessionEndCause(); err != nil {
 				return nil, nil, err
 			}
@@ -1697,7 +1701,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		}()
 	}
 	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
-	if !errors.Is(err, ErrTransportUncertain) || c.poisoned.Load() {
+	if !errors.Is(err, ErrTransportUncertain) {
 		return response, releaseFrame, err
 	}
 	if releaseFrame != nil {
@@ -1709,9 +1713,6 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		return nil, nil, syscall.EINVAL
 	}
 	if err := c.reconnectTransport(ctx, role); err != nil {
-		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
-			c.signalSessionEnd(err)
-		}
 		return nil, nil, err
 	}
 	return c.dispatchOwnedFrame(ctx, request)
@@ -2016,7 +2017,7 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	transport.conn = nil
 	pending := transport.pending
 	transport.pending = make(map[uint64]chan callResult)
-	// Losing an idle DATA socket is only a transport event: the next safe read
+	// Losing a DATA socket is only a transport event: the next safe read
 	// or exact mutation replay lazily resumes that one role. FSKit CONTROL loss
 	// is terminal even with pending requests: poison admission before notifying
 	// their waiters, while retained replies and local enforcement keep their

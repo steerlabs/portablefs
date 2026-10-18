@@ -497,11 +497,16 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 	}
 	for {
 		err := c.reconnectTransportOnce(ctx, role)
+		// A session's terminal verdict applies to every admitted caller, even
+		// one whose context expired while its transport outcome was unsettled.
+		if err != nil && (c.closed.Load() || c.poisoned.Load()) {
+			return err
+		}
 		if ctx.Err() != nil {
 			return boundedError()
 		}
-		if err == nil || c.closed.Load() || c.poisoned.Load() {
-			return err
+		if err == nil {
+			return nil
 		}
 		var networkError *net.OpError
 		if !errors.As(err, &networkError) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, context.DeadlineExceeded) {
