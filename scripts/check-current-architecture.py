@@ -680,15 +680,18 @@ def check_control_lifecycle() -> None:
     finish(problems)
 
 
+# A readiness route segment appears either alone ("frontend-ready", as a daemon
+# dispatch case) or as a path suffix ("/frontend-ready", in a CLI request URL).
+READINESS_ROUTE = re.compile(r"\"/?([a-z-]*ready)\"")
+
+
 @check("readiness-wiring", "daemon and CLI agree on the one frontend-ready attestation route")
 def check_readiness_wiring() -> None:
     problems: List[str] = []
-    route = re.compile(r"\"([a-z-]*ready)\"")
-    daemon = {match for _, text in production_go("vcs/internal/portablefsd/") for match in route.findall(text)}
-    cli = {match for _, text in production_go("vcs/cmd/portablefs/") for match in route.findall(text)}
+    daemon = {match for _, text in production_go("vcs/internal/portablefsd/") for match in READINESS_ROUTE.findall(text)}
+    cli = {match for _, text in production_go("vcs/cmd/portablefs/") for match in READINESS_ROUTE.findall(text)}
     require(problems, "frontend-ready" in daemon, "portablefsd does not serve the frontend-ready attestation")
-    require(problems, "frontend-ready" in cli or "/frontend-ready" in "".join(cli),
-            "the CLI does not request the frontend-ready attestation")
+    require(problems, "frontend-ready" in cli, "the CLI does not request the frontend-ready attestation")
     readiness = {name for name in daemon | cli if name.endswith("frontend-ready")}
     require(problems, readiness == {"frontend-ready"}, f"readiness attestations named {sorted(readiness)}, want only frontend-ready")
     finish(problems)

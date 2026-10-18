@@ -150,6 +150,15 @@ class Markdown(unittest.TestCase):
         self.assertEqual(checker.LINK.findall("![alt](pic.png) [t](doc.md)"), ["doc.md"])
 
 
+class ReadinessRoutes(unittest.TestCase):
+    def test_dispatch_case_and_request_suffix(self) -> None:
+        text = 'case "frontend-ready":\n url := "/v2/attaches/" + ref + "/frontend-ready"\n s := "ready"'
+        self.assertEqual(checker.READINESS_ROUTE.findall(text), ["frontend-ready", "frontend-ready", "ready"])
+
+    def test_other_prefixes_are_reported(self) -> None:
+        self.assertEqual(checker.READINESS_ROUTE.findall('"/native-frontend-ready"'), ["native-frontend-ready"])
+
+
 class ProtocolMentions(unittest.TestCase):
     def pattern(self):
         import re
