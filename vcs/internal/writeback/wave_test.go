@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 )
 
@@ -280,12 +281,11 @@ func TestFlushWaveAdmissionOrderModel(t *testing.T) {
 
 func TestFileDurabilityCannotRetireAnotherIdentityOrLaterCut(t *testing.T) {
 	f := &waveTestFlusher{width: 4, payload: 8}
-	var seq uint64
+	var seq atomic.Uint64
 	f.call = func(e []Entry) ([]uint64, error) {
 		r := make([]uint64, len(e))
 		for i := range r {
-			seq++
-			r[i] = seq
+			r[i] = seq.Add(1)
 		}
 		return r, nil
 	}
