@@ -1083,6 +1083,8 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return h.coherenceError(0, err), createdTargets(item)
 			}
 
+			restoringTruncate := h.Restore != nil && h.Restore.Active() && existed && body.Create.GetFlags().GetTruncate()
+			var restorePost *authoritypb.PostState
 			var handle xfsstore.Capability
 			openCreated := func() error {
 				var openErr error
@@ -1095,9 +1097,22 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 						return &xfsstore.DurabilityError{Cause: openErr}
 					}
 				}
+				if openErr == nil && restoringTruncate {
+					// Capture in restore's apply interval, before its sync can
+					// fence storage and later attribute observations.
+					postAttr, postErr := h.Store.Getattr(item)
+					parentAttr, parentErr := h.Store.Getattr(parent)
+					if postErr != nil || parentErr != nil {
+						return &xfsstore.DurabilityError{Cause: errors.Join(postErr, parentErr)}
+					}
+					restorePost = h.mutationPostState(sequence,
+						postStateSnapshot{identity: existingCoordinate.identity, attr: postAttr, roles: postStateRoleTarget, changed: true},
+						postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent},
+					)
+				}
 				return openErr
 			}
-			if h.Restore != nil && h.Restore.Active() && existed && body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
+			if restoringTruncate {
 				err = h.truncateRestoring(ctx, existingCoordinate.identity, existingSize, 0, openCreated)
 			} else {
 				err = openCreated()
@@ -1107,14 +1122,15 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				// explicitly reports a post-apply outcome. New-name creation has
 				// already changed the namespace regardless of the open result.
 				var targets []volumeserver.VisibilityTarget
-				if !existed || errors.Is(err, xfsstore.ErrOutcomeUncertain) {
+				if restorePost != nil {
+					targets = []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
+				} else if !existed || errors.Is(err, xfsstore.ErrOutcomeUncertain) {
 					targets = createdTargets(item)
 				}
-				var post *authoritypb.PostState
+				post := restorePost
 				var durability *xfsstore.DurabilityError
-				if existed && handle != (xfsstore.Capability{}) && errors.As(err, &durability) {
-					// Existing-name CREATE also opens with O_TRUNC. Snapshot both
-					// records before the typed restore failure fences the store.
+				if existed && !restoringTruncate && handle != (xfsstore.Capability{}) && errors.As(err, &durability) {
+					// Retention failed after O_TRUNC, before restore persistence.
 					postAttr, postErr := h.getattrItem(item)
 					parentAttr, parentErr := h.getattrItem(parent)
 					if postErr == nil && parentErr == nil {
@@ -1692,11 +1708,19 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		}
 		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var resp *authoritypb.Response
+			var appliedAttr xfsstore.Attr
+			var attrErr error
 			if h.Restore != nil && h.Restore.Active() {
 				err := h.truncateRestoring(ctx, coordinate.identity, oldSize, 0, func() error {
 					resp = openApply(item)
 					if resp.GetErrno() != 0 {
 						return syscall.Errno(resp.GetErrno())
+					}
+					// Capture O_TRUNC in restore's apply interval, before its
+					// terminal persistence obligation.
+					appliedAttr, attrErr = h.Store.Getattr(item)
+					if attrErr != nil {
+						return &xfsstore.DurabilityError{Cause: attrErr}
 					}
 					return nil
 				})
@@ -1710,18 +1734,15 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					if resp == nil {
 						return h.errorResponse(0, err, false), nil
 					}
-					// Capture the applied truncate before errorResponse fences the
-					// store; a successful later sync cannot repair a failed map mark.
-					attr, attrErr := h.getattrItem(item)
 					cleanupOpenedHandle()
 					resp = h.errorResponse(0, errors.Join(err, attrErr), true)
 					if attrErr != nil {
 						return resp, []volumeserver.VisibilityTarget{}
 					}
 					resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
-						identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true,
+						identity: coordinate.identity, attr: appliedAttr, roles: postStateRoleTarget, changed: true,
 					})
-					return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
+					return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, appliedAttr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 				}
 			} else {
 				resp = openApply(item)
