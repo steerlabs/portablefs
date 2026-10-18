@@ -187,6 +187,8 @@ FLAG_CONSUMERS = {
 
 # Text that is not maintained by this repository.
 VENDORED = ("vcs/third_party/",)
+# This checker and its unit tests.
+SELF = {"scripts/check-current-architecture.py", "scripts/test_check_current_architecture.py"}
 
 
 class CheckFailure(Exception):
@@ -857,7 +859,9 @@ def check_contract_agreement() -> None:
     prose_protocol = re.compile(r"(?<![Ff][Uu][Ss][Ee] )\b[Pp]rotocol[- ]([0-9]+)\b(?![.0-9])")
     local = re.compile(r"\bpfslocal`?\s+([0-9]+)\.([0-9]+)\b")
     for name in files():
-        if not maintained(name) or not _is_text(name):
+        # This checker and its tests necessarily spell non-current versions as
+        # fixtures; every other maintained text file is held to the rule.
+        if not maintained(name) or not _is_text(name) or name in SELF:
             continue
         text = read(name)
         for line_number, line in enumerate(text.splitlines(), 1):
