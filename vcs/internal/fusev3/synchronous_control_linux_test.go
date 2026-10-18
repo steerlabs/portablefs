@@ -4,6 +4,10 @@ package fusev3
 
 import (
 	"context"
+	"errors"
+	"sync"
+
+	"google.golang.org/protobuf/proto"
 	"testing"
 	"time"
 
@@ -151,4 +155,215 @@ func TestOpenedApplicationCutBelongsToItsReturnedGrant(t *testing.T) {
 		}
 	}
 	t.Fatal("OPEN's visibility completed without a break")
+}
+
+// Done observes the select boundary without changing time or cancelling a
+// successful schedule. With uncontended locks it is the unreported-grant wait;
+// with a synchronous apply pinned it is the operation-lock wait.
+type allocatingControlContext struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (c *allocatingControlContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func allocatingResponse(create bool, id, handle []byte, grant *authoritypb.Delegation, ticket uint64) *authoritypb.Response {
+	response := &authoritypb.Response{AppliedSequence: ticket}
+	if create {
+		response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: &authoritypb.Item{StableIdentity: id}, Handle: handle, Delegation: grant}}
+	} else {
+		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: handle, Delegation: grant}}
+	}
+	return response
+}
+
+func awaitAllocatingControl(t *testing.T, done <-chan struct{}, boundary string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("did not reach %s", boundary)
+	}
+}
+
+func requireAllocatingBreak(t *testing.T, fake *delegationFakeRPC, grant *authoritypb.Delegation, ticket, event uint64) {
+	t.Helper()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	var found int
+	for _, req := range fake.controls {
+		if ack := req.GetDelegationBreakAck(); ack != nil && ack.EventSequence == event {
+			found++
+			if !sameDelegation(ack.Delegation, &authoritypb.DelegationRef{Id: grant.Id, Generation: grant.Generation}) || ack.AppliedSequence != ticket || ack.Incarnation != 7 {
+				t.Fatalf("break ack=%v, want exact grant, ticket %d, incarnation 7", ack, ticket)
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("event %d acknowledged %d times", event, found)
+	}
+}
+
+func TestAllocatingControlBeforeRegistrationInstallsExactApplicationCut(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		name := "OPEN"
+		if create {
+			name = "CREATE"
+		}
+		t.Run(name, func(t *testing.T) {
+			fake := &delegationFakeRPC{}
+			m := newDelegationTestManager(t, fake)
+			id, item, handle := delegationTestIdentity(120), delegationTestToken(120, 1), delegationTestToken(120, 2)
+			grant := delegationTestGrant(153, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			response := allocatingResponse(create, id, handle, grant, 7)
+			history, err := m.beginGrantRequest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.endGrantRequest(history)
+			parsed, _ := delegationIdentity(id)
+			state := m.retainState(parsed, true)
+			defer m.releaseState(state)
+			ctx := &allocatingControlContext{Context: t.Context(), waiting: make(chan struct{})}
+			done := make(chan struct{})
+			// The real event worker is invoked directly so its context exposes the
+			// precise wait, rather than only observing a goroutine launch.
+			go func() {
+				defer close(done)
+				m.handleControlEvent(ctx, controlBreakForTest(id, grant, 3), state, m.epochSerial)
+			}()
+			awaitAllocatingControl(t, ctx.waiting, "CONTROL waiting for DATA registration")
+			if !state.transition.TryLock() {
+				t.Fatal("unreported grant wait holds transition")
+			}
+			state.transition.Unlock()
+			if !state.operation.TryLock() {
+				t.Fatal("unreported grant wait holds operation")
+			}
+			state.operation.Unlock()
+			if fakeControlCount(fake, func(req *authoritypb.Request) bool { return req.GetDelegationBreakAck() != nil }) != 0 {
+				t.Fatal("unseen grant was acknowledged")
+			}
+			if err := m.install(id, item, handle, grant, response.AppliedSequence); err != nil {
+				t.Fatal(err)
+			}
+			awaitAllocatingControl(t, done, "exact application break")
+			requireAllocatingBreak(t, fake, grant, 7, 3)
+			if !m.Owns(id) || m.LossSequence() != 0 {
+				t.Fatal("healthy DATA/CONTROL reordering lost ownership")
+			}
+
+			recall := &authoritypb.ControlEvent{Incarnation: 7, Sequence: 4, Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{Identity: id, Delegation: &authoritypb.DelegationRef{Id: grant.Id, Generation: grant.Generation}, BudgetNanos: uint64(5 * time.Second)}}}
+			awaitAllocatingControl(t, m.HandleControlEvent(t.Context(), recall), "retirement before delayed DATA")
+			if err := m.install(id, item, handle, grant, response.AppliedSequence); !errors.Is(err, errDelegationRetired) {
+				t.Fatalf("delayed DATA install=%v", err)
+			}
+			if m.Owns(id) || m.LossSequence() != 0 {
+				t.Fatal("delayed DATA resurrected the retired grant or lost data")
+			}
+			successor := proto.Clone(grant).(*authoritypb.Delegation)
+			successor.Generation++
+			successor.Id = delegationTestIdentity(154)
+			if err := m.install(id, item, delegationTestToken(120, 3), successor, 0); err != nil {
+				t.Fatal(err)
+			}
+			awaitAllocatingControl(t, m.HandleControlEvent(t.Context(), controlBreakForTest(id, successor, 5)), "successor empty break")
+			requireAllocatingBreak(t, fake, successor, 0, 5)
+		})
+	}
+}
+
+type allocatingVisibilityRPC struct {
+	delegationFakeRPC
+	waiting   chan struct{}
+	withdrawn chan struct{}
+}
+
+func (f *allocatingVisibilityRPC) CallMutation(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
+	if req.GetBarrier() != nil {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return f.delegationFakeRPC.CallMutation(ctx, req)
+}
+func (f *allocatingVisibilityRPC) CallIdempotent(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
+	if req.GetWaitVisibility() != nil {
+		close(f.waiting)
+		select {
+		case <-f.withdrawn:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return f.delegationFakeRPC.CallIdempotent(ctx, req)
+}
+
+func TestPublicAllocatingApplicationServicesControlBeforeWithdrawal(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		name := "OPEN"
+		if create {
+			name = "CREATE"
+		}
+		t.Run(name, func(t *testing.T) {
+			fake := &allocatingVisibilityRPC{waiting: make(chan struct{}), withdrawn: make(chan struct{})}
+			m := newDelegationTestManager(t, fake)
+			id := installDelegationForTest(t, m, 121, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			grant := delegationTestGrant(153, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			parsed, _ := delegationIdentity(id)
+			state := m.retainState(parsed, false)
+			defer m.releaseState(state)
+			applying, apply := make(chan struct{}), make(chan struct{})
+			outcome := make(chan error, 1)
+			go func() {
+				response, err := m.Synchronous(t.Context(), id, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+					close(applying)
+					<-apply
+					return allocatingResponse(create, id, delegationTestToken(121, 3), grant, 7), nil
+				})
+				if err == nil {
+					err = m.install(id, delegationTestToken(121, 1), delegationTestToken(121, 3), grant, response.AppliedSequence)
+				}
+				if err == nil {
+					err = m.openedVisibility(t.Context(), id, response)
+				}
+				outcome <- err
+			}()
+			awaitAllocatingControl(t, applying, "synchronous application")
+			ctx := &allocatingControlContext{Context: t.Context(), waiting: make(chan struct{})}
+			cut := make(chan struct{})
+			go func() {
+				defer close(cut)
+				m.handleControlEvent(ctx, controlBreakForTest(id, grant, 6), state, m.epochSerial)
+			}()
+			awaitAllocatingControl(t, ctx.waiting, "CONTROL behind real application")
+			if fakeControlCount(&fake.delegationFakeRPC, func(req *authoritypb.Request) bool { return req.GetDelegationBreakAck() != nil }) != 0 {
+				t.Fatal("CONTROL bypassed pending application")
+			}
+			close(apply)
+			awaitAllocatingControl(t, cut, "application receipt releases CONTROL")
+			requireAllocatingBreak(t, &fake.delegationFakeRPC, grant, 7, 6)
+			awaitAllocatingControl(t, fake.waiting, "explicit visibility wait")
+			select {
+			case err := <-outcome:
+				t.Fatalf("allocation completed before withdrawal: %v", err)
+			default:
+			}
+			close(fake.withdrawn)
+			select {
+			case err := <-outcome:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("allocation did not finish after withdrawal")
+			}
+			if m.LossSequence() != 0 {
+				t.Fatal("application/visibility ordering lost ownership")
+			}
+		})
+	}
 }
