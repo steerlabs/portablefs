@@ -211,6 +211,9 @@ type v3DataPlane struct {
 	// rootIdentity is fixed before the data plane is shared.
 	rootIdentity [16]byte
 	releases     *v3ReleaseOwner
+	// Serialize release verdicts with the transfer to exact-absence teardown.
+	releaseMu           sync.Mutex
+	releaseSessionOwned bool
 	// abandonedDebt counts abandoned resources that left local ownership but
 	// have not yet been accepted by the release owner (or explicitly left to
 	// terminal session cleanup). Registration counts it against the
@@ -2660,23 +2663,95 @@ func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 		for index, token := range closes {
 			batch.Closes[index] = &authoritypb.CloseRequest{Handle: cloneBytesV3(token)}
 		}
-		response, errno := d.callNonVisibleMutation(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}})
-		if errno != 0 {
-			return d.fail(fmt.Errorf("portablefsd: batched close of %d handles failed with errno %d", len(closes), errno))
-		}
-		if err := v3CloseBatchSucceeded(response, len(closes)); err != nil {
-			return d.fail(err)
+		if err := d.sendRelease(ctx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}}, len(closes)); err != nil {
+			return err
 		}
 	}
 	if len(reclaims) != 0 {
-		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: reclaims}}}
-		response, errno := d.callNonVisibleMutation(ctx, 0, request)
-		if errno != 0 {
-			return d.fail(fmt.Errorf("portablefsd: batched reclaim of %d item capabilities failed with errno %d", len(reclaims), errno))
+		return d.sendRelease(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: reclaims}}}, 0)
+	}
+	return nil
+}
+
+// sendRelease preserves the original transport on a definite, well-formed
+// refusal. Once exact absence transfers ownership to session teardown, a late
+// DATA outcome cannot turn an accepted CONTROL Detach into a transport failure.
+func (d *v3DataPlane) sendRelease(ctx context.Context, request *authoritypb.Request, closes int) error {
+	d.releaseMu.Lock()
+	transferred := d.releaseSessionOwned
+	d.releaseMu.Unlock()
+	if transferred {
+		return errV3ReleaseClosed
+	}
+	var assigned authorityrpc.MutationIdentity
+	response, callErr := d.client.CallMutationWithIdentity(ctx, request, func(identity authorityrpc.MutationIdentity) error {
+		assigned = identity
+		return nil
+	})
+	d.releaseMu.Lock()
+	defer d.releaseMu.Unlock()
+	if d.releaseSessionOwned {
+		return errors.Join(errors.New("portablefsd: in-flight release transferred to session teardown"), callErr)
+	}
+	response, errno := d.classify(response, callErr, true)
+	if response == nil {
+		return d.terminalError()
+	}
+	state := response.GetMutation()
+	if assigned.Sequence == 0 || state == nil || state.GetSlot() != assigned.Slot || state.GetAcceptedSequence() != assigned.Sequence {
+		return d.fail(errors.New("portablefsd: release lost its exact replay assignment"))
+	}
+	if errno != 0 {
+		if response.GetBody() != nil || response.GetPostState() != nil || len(response.GetTerminalDeliveryToken()) != 0 {
+			return d.fail(errors.New("portablefsd: malformed release refusal"))
 		}
+		return d.stopServing(fmt.Errorf("portablefsd: authority release refused with errno %d", errno))
+	}
+	if closes == 0 {
 		if err := v3ReleaseSucceeded(response, false); err != nil {
-			return d.fail(fmt.Errorf("portablefsd: batched reclaim of %d item capabilities: %w", len(reclaims), err))
+			return d.fail(err)
 		}
+		return nil
+	}
+	if err := v3ReleaseSucceeded(response, true); err != nil {
+		return d.fail(err)
+	}
+	results := response.GetCloseBatch().GetResults()
+	if len(results) != closes {
+		return d.fail(fmt.Errorf("portablefsd: batched close of %d handles returned %d results", closes, len(results)))
+	}
+	var refusal error
+	for index, result := range results {
+		if result == nil || result.GetErrno() < 0 || !result.GetRetired() && result.GetErrno() == 0 ||
+			result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
+			result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
+			result.GetErrno() == 0 && result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED {
+			return d.fail(fmt.Errorf("portablefsd: malformed or terminal close result %d: %v", index, result))
+		}
+		if result.GetErrno() != 0 {
+			refusal = fmt.Errorf("portablefsd: batched close entry %d refused with errno %d", index, result.GetErrno())
+		}
+	}
+	if refusal != nil {
+		return d.stopServing(refusal)
+	}
+	return nil
+}
+
+// transferReleases closes admission without waiting on DATA. Session teardown
+// owns unsent tokens; the worker retains its in-flight request until it returns.
+func (d *v3DataPlane) transferReleases() error {
+	d.releaseMu.Lock()
+	defer d.releaseMu.Unlock()
+	d.releaseSessionOwned = true
+	d.releases.abandon()
+	d.releases.mu.Lock()
+	defer d.releases.mu.Unlock()
+	if d.releases.failure != nil {
+		return d.releases.failure
+	}
+	if d.releases.running {
+		return errors.New("portablefsd: in-flight authority releases transferred to session teardown")
 	}
 	return nil
 }
@@ -2702,28 +2777,6 @@ func v3ReleaseSucceeded(response *authoritypb.Response, closeBatch bool) error {
 		}
 	}
 	return fmt.Errorf("release outcome carried the wrong reply body %T", response.GetBody())
-}
-
-// v3CloseBatchSucceeded requires the whole CloseBatch success outcome and one
-// ordered result per close, each retired with no errno or failure class.
-// CloseBatch consumes descriptor ownership even when a close reports an error,
-// so an error is never retried; it is a release failure that ends the mount.
-func v3CloseBatchSucceeded(response *authoritypb.Response, closes int) error {
-	if err := v3ReleaseSucceeded(response, true); err != nil {
-		return fmt.Errorf("portablefsd: batched close of %d handles: %w", closes, err)
-	}
-	results := response.GetCloseBatch().GetResults()
-	if len(results) != closes {
-		return fmt.Errorf("portablefsd: batched close of %d handles returned %d results", closes, len(results))
-	}
-	for index, result := range results {
-		if result == nil || !result.GetRetired() || result.GetErrno() != 0 ||
-			result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED {
-			return fmt.Errorf("portablefsd: batched close entry %d of %d failed: retired=%t errno=%d failure=%d",
-				index, closes, result.GetRetired(), result.GetErrno(), result.GetFailure())
-		}
-	}
-	return nil
 }
 
 func (d *v3DataPlane) malformed(detail string) (any, int32) {

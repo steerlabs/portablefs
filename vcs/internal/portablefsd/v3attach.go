@@ -57,8 +57,7 @@ const (
 	v3DetachProofComponent = "portablefsd/getfsstat"
 )
 
-// v3DetachProofBudget bounds the release drain and the delivery of one
-// mount-absence proof together. Strictly under unmountTransactionBudget so the
+// v3DetachProofBudget bounds delivery of one mount-absence proof. Strictly under unmountTransactionBudget so the
 // transaction can still publish a verdict for the request that started it. A
 // variable only so tests can exercise its expiry.
 var v3DetachProofBudget = 15 * time.Second
@@ -816,9 +815,7 @@ func (c *frontendConn) serveV3Attempt(
 			// abandoned resources' cleanup debt.
 			if cleanup.required() {
 				go func() {
-					if err := cleanup.finish(); err != nil {
-						_ = d.fail(err)
-					}
+					_ = cleanup.finish()
 				}()
 			}
 			// Incomplete publication of a successful visible resource reply is
@@ -876,9 +873,7 @@ func (c *frontendConn) serveV3Attempt(
 			)
 			if cleanupErr == nil {
 				go func() {
-					if err := cleanup.finish(); err != nil {
-						_ = d.fail(err)
-					}
+					_ = cleanup.finish()
 				}()
 			} else {
 				prepareErr = errors.Join(prepareErr, cleanupErr)
@@ -899,9 +894,7 @@ func (c *frontendConn) serveV3Attempt(
 					provisional, false, 0,
 				); cleanupErr == nil {
 					go func() {
-						if finishErr := cleanup.finish(); finishErr != nil {
-							_ = d.fail(finishErr)
-						}
+						_ = cleanup.finish()
 					}()
 				} else {
 					err = errors.Join(err, cleanupErr)
@@ -919,9 +912,7 @@ func (c *frontendConn) serveV3Attempt(
 				c.stopV3FrontendPublication(a, err)
 			} else if cleanup.required() {
 				go func() {
-					if err := cleanup.finish(); err != nil {
-						_ = d.fail(err)
-					}
+					_ = cleanup.finish()
 				}()
 			}
 			if err == nil {
@@ -1089,46 +1080,31 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	session := a.v3Session
 	d := a.v3Data
 	a.mu.RUnlock()
-	var releaseErr error
+	var releaseErr, proofErr error
 	if session != nil && d != nil {
-		// Releases already accepted settle on the original session. Draining
-		// closes release admission, which explicitly hands every later token to
-		// the detach: ending the session releases every capability it still
-		// holds. A failed or unfinished drain is never a clean detach; local
-		// teardown still completes, and the failure is the detach's outcome.
+		releaseErr = d.transferReleases()
 		proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
-		releaseErr = d.releases.drain(proofCtx)
-		// Frontend loss is terminal locally, but the original authority
-		// transport can still accept this exact kernel-absence proof. A
-		// transport already lost or fenced must never be re-established here.
-		select {
-		case <-d.client.SessionDone():
-		default:
-			deliverErr := releaseErr
-			if deliverErr == nil {
-				deliverErr = session.DetachAfterUnmount(proofCtx, proof)
-			}
-			if deliverErr != nil {
-				// The proof exists but the authority did not accept it. Ending the
-				// session here is what keeps the detach honest: the authority
-				// fences this participant on its lease instead of carrying a
-				// barrier member whose mount silently vanished.
-				a.fenceV3(fmt.Errorf("deliver v3 mount-absence proof: %w", deliverErr))
-				log.Printf(
-					"portablefsd: attach %s: kernel mount at %s is exactly absent but the mount-absence proof could not be delivered (%v); the strict session ends fenced",
-					a.ref, a.mountPath, deliverErr,
-				)
-			}
+		// Call refuses poisoned/closed admission. Never create a new session to
+		// deliver evidence about the original incarnation.
+		if !d.client.LocalAdmissionOpen() {
+			proofErr = errors.New("authority session is closed or poisoned")
+		} else {
+			proofErr = session.DetachAfterUnmount(proofCtx, proof)
 		}
 		cancel()
+		if proofErr != nil {
+			proofErr = fmt.Errorf("deliver v3 mount-absence proof: %w", proofErr)
+			a.fenceV3(proofErr)
+			log.Printf("portablefsd: attach %s: exact kernel absence was not accepted: %v; session ends fenced", a.ref, proofErr)
+		}
 	}
 	if releaseErr != nil {
-		releaseErr = fmt.Errorf("v3 authority releases did not settle before detach: %w", releaseErr)
+		releaseErr = fmt.Errorf("v3 authority release cleanup: %w", releaseErr)
 	}
 	// Terminal either way: an already-fenced plane keeps its original cause.
 	a.fenceV3(errV3AttachDetached)
 	a.frontendSerial.Lock()
 	a.nsMu.Lock()
-	_, err = a.finishDetachWithNSLocked("", releaseErr)
+	_, err = a.finishDetachWithNSLocked("", errors.Join(proofErr, releaseErr))
 	return err
 }

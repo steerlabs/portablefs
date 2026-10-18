@@ -486,9 +486,7 @@ func (c *frontendConn) close() {
 				// share of the cleanup debt settles; a failure is terminal and
 				// the rest then send nothing.
 				for _, cleanup := range cleanups {
-					if err := cleanup.finish(); err != nil {
-						_ = cleanup.d.fail(err)
-					}
+					_ = cleanup.finish()
 				}
 			}()
 		}
@@ -740,9 +738,7 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 		consumeV3ProvisionalResponses(resources)
 		if abandonCleanup.required() {
 			go func() {
-				if finishErr := abandonCleanup.finish(); finishErr != nil {
-					_ = resources.d.fail(finishErr)
-				}
+				_ = abandonCleanup.finish()
 			}()
 		}
 		return false
@@ -750,9 +746,7 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 	consumeV3ProvisionalResponses(resources)
 	if cleanup.required() {
 		go func() {
-			if err := cleanup.finish(); err != nil {
-				_ = resources.d.fail(err)
-			}
+			_ = cleanup.finish()
 		}()
 	}
 	return true

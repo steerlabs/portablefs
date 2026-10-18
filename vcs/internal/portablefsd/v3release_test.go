@@ -691,6 +691,17 @@ func TestV3ReleaseBatchFailuresAreTerminal(t *testing.T) {
 			if err := d.releases.drain(context.Background()); err == nil {
 				t.Fatal("drain after a failed release claimed success")
 			}
+			definite := test.name == "first-entry-errno" || test.name == "envelope-errno" || test.name == "reclaim-errno"
+			select {
+			case <-client.SessionDone():
+				if definite {
+					t.Fatal("definite refusal closed the usable authority transport")
+				}
+			default:
+				if !definite {
+					t.Fatal("malformed release retained authority transport")
+				}
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if failedAt == 0 || sends != failedAt {
@@ -848,5 +859,38 @@ func TestV3HandleRevalidatesAfterAPausedPointerResolution(t *testing.T) {
 	client.mu.Unlock()
 	if reads != readsBefore {
 		t.Fatalf("a read of a closed handle reached the authority %d time(s)", reads-readsBefore)
+	}
+}
+
+// A late release outcome belongs to the original DATA request, but after exact
+// absence it must not overwrite Detach or poison its working CONTROL path.
+func TestV3ReleaseTransferRetainsInflightOwnerWithoutOverwritingDetach(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	entered, settle := make(chan struct{}), make(chan struct{})
+	client.mutation = func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error) {
+		close(entered)
+		<-settle
+		return nil, errors.New("DATA transport closed by successful Detach")
+	}
+	if err := d.releases.submit(v3ReleaseTokens("h"), nil); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	if err := d.transferReleases(); err == nil {
+		t.Fatal("in-flight release was reported as settled")
+	}
+	_ = d.stopServing(errV3AttachDetached)
+	close(settle)
+	if err := d.releases.drain(context.Background()); err == nil {
+		t.Fatal("unconfirmed release was reported as successful")
+	}
+	if !errors.Is(d.terminalError(), errV3AttachDetached) {
+		t.Fatalf("detach verdict replaced: %v", d.terminalError())
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("late DATA error closed the retained transport")
+	default:
 	}
 }
