@@ -599,6 +599,17 @@ def _dict_delta(label: str, got: Dict[str, int], want: Dict[str, int]) -> str:
     return f"{label} differs from the current grammar: unexpected {extra}, missing {missing}"
 
 
+def swift_version_literals(text: str, field: str) -> List[int]:
+    """Integer literals assigned to, compared with, or declared as field.
+
+    Covers `hello.protocolMajor = 2`, `reply.protocolMajor == 2`, and
+    `static let protocolMajor: UInt32 = 2`; a symbolic assignment such as
+    `= Self.protocolMajor` carries no literal and is covered by its declaration.
+    """
+    pattern = re.compile(rf"(?:\.|\b(?:let|var)\s+){field}\s*(?::\s*[A-Za-z0-9_]+)?\s*(?:==|=)\s*([0-9]+)\b")
+    return [int(match.group(1)) for match in pattern.finditer(text)]
+
+
 @check("local-pairing", "Go codec, Swift frontend and shared fixtures agree on exact pfslocal 2.0")
 def check_local_pairing() -> None:
     problems: List[str] = []
@@ -614,8 +625,8 @@ def check_local_pairing() -> None:
     for field, want in (("protocolMajor", major), ("protocolMinor", minor)):
         literals = []
         for name in swift_sources:
-            for match in re.finditer(rf"\.{field}\s*(?:=|==)\s*([0-9]+)\b", read(name)):
-                literals.append((name, int(match.group(1))))
+            for match in swift_version_literals(read(name), field):
+                literals.append((name, match))
         require(problems, any(value == want for _, value in literals),
                 f"no handwritten Swift source sets or checks {field} = {want}")
         for name, value in literals:

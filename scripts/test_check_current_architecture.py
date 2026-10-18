@@ -150,6 +150,21 @@ class Markdown(unittest.TestCase):
         self.assertEqual(checker.LINK.findall("![alt](pic.png) [t](doc.md)"), ["doc.md"])
 
 
+class SwiftVersionLiterals(unittest.TestCase):
+    def test_declaration_assignment_and_comparison(self) -> None:
+        text = "\n".join([
+            "public static let protocolMajor: UInt32 = 2",
+            "hello.protocolMajor = Self.protocolMajor",
+            "hello.protocolMajor = 2",
+            "guard reply.protocolMajor == 2 else {",
+            "let protocolMajorText = \"x\"",
+        ])
+        self.assertEqual(checker.swift_version_literals(text, "protocolMajor"), [2, 2, 2])
+
+    def test_stale_literal_is_reported(self) -> None:
+        self.assertEqual(checker.swift_version_literals("hello.protocolMinor = 16", "protocolMinor"), [16])
+
+
 class ReadinessRoutes(unittest.TestCase):
     def test_dispatch_case_and_request_suffix(self) -> None:
         text = 'case "frontend-ready":\n url := "/v2/attaches/" + ref + "/frontend-ready"\n s := "ready"'
