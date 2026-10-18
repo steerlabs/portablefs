@@ -155,10 +155,24 @@ Counters must not wrap or reuse values within their scope; retire that scope
 before exhaustion.
 
 `Response.applied_sequence` (tag 56) carries the ticket for successful changed
-WRITE, SETATTR, and FALLOCATE results. Other operations leave it zero. The
-handler retains this ticket with the replay outcome. A rejected flush gets no
-ticket; a partially applied result must describe its actual applied effects
-and cannot retire a rejected suffix as durable.
+WRITE, SETATTR, and FALLOCATE results, and for successful truncating write-intent
+OPEN and truncating write-intent existing-name CREATE under the exact
+identity-bound delegation pin. Truncating an already empty existing file still carries its
+ticket. Nontruncating OPEN and unchanged existing-name CREATE need no new
+ticket. A new empty-file CREATE with no preflight file pin may leave it zero;
+its namespace result waits synchronously for withdrawal. The handler retains
+the original ticket with the exact replay outcome, never allocating another
+on replay. A rejected flush gets no ticket; a partially applied result must
+describe its actual applied effects and cannot retire a rejected suffix as
+durable.
+
+The authority records `AppliedSequence` on the pinned delegation through
+`DelegationFlush.End(ticket)`. A delegation cut accepts its event floor or a
+ticket issued under that exact generation while the cut was pending, never
+another inode's session-wide high-water mark. The application ledger maps
+tickets to volume versions; the delegation record validates the generation's
+cut. Application, remote visibility, and durability prove different facts;
+none substitutes for another.
 
 `Response.volume_version` (67) names the version at which any cache-installing
 reply was served, including a negative LOOKUP and empty READDIR. The new
@@ -321,6 +335,15 @@ notification can otherwise wait on the initiating syscall's VFS locks and
 block acknowledgments needed by a concurrent peer mutation. Skipped internal
 positions do not create holes in the session's wire change positions.
 
+`WaitTargeted` captures the affected peer subscription incarnations at commit
+and waits for actual withdrawal: cumulative ChangeAck after cache-installing
+reply drain and kernel invalidation, or the existing cold-reset/horizon proof.
+DATA reply delivery, delegation acknowledgment, and mere session fencing do
+not prove withdrawal. The handler marks the application visible only after
+this wait succeeds; `VisibleSequence` remains a contiguous session prefix.
+Durability has its separate storage barrier and prefix, and neither visibility
+nor durability implies the other.
+
 ## Delegations and flushes
 
 `Delegation` contains opaque `id` (1), nonzero `generation` (2), and `mode` (3).
@@ -345,10 +368,40 @@ invalidate the old reference even if the same session later reacquires it.
 | `FsyncReply`; response 66 | `durable_sequence` (1). Success promises durability of the requested file's flushed cut. |
 | `SyncFSReply`; response 35 | `durable_sequence` (1), after the volume durability operation. It does not stand in for the root FSYNCDIR barrier. |
 
-CREATE reserves ownership before publishing the new binding; CREATE/OPEN return
-a grant only after withdrawal. FULL permits daemon buffering. WRITETHROUGH
-requires immediate authority application and peer invalidation for each write
-while another session retains a pre-existing cache-capable handle. A peer that
+CREATE reserves ownership before publishing the new binding. CREATE/OPEN have
+two grant paths:
+
+- **Existing public generation.** A synchronous mutation pins the exact
+  generation already eligible for a DATA reply. After apply, commit publication,
+  release of storage locks, and `End(ticket)`, the authority returns the
+  application receipt before targeted withdrawal. OPEN/CREATE return the real
+  allocated handle, retained exact grant, and operation ticket. The detached
+  authority wait retains the visibility obligation. Public does not mean DATA
+  has already reached the client.
+- **New private generation.** The client has never been offered this generation.
+  `RetainDelegation` returns it to `DelegationReserved`, opens reserved-reader
+  admission, and clears `ephemeral`. The handler releases the storage turn and
+  ends its apply pin, waits for mutation withdrawal while the grant stays
+  reserved, then calls `Grant`. Reserved peer reads may sample storage under a
+  reader pin; activation closes that admission and joins existing pins before
+  activating and returning the grant. No holder CONTROL may issue while the
+  generation is Reserved. This path also preserves reservation withdrawal and
+  reader drain for newly reserved nontruncating OPEN and new-name CREATE where
+  applicable. After activation CONTROL may overtake DATA.
+
+The client installs a returned grant, exact identity/ref, handle, and application
+ticket atomically before CONTROL can inspect that generation. It records a
+synchronous operation's actual application ticket before releasing its operation
+lock to CONTROL. A CONTROL handler that overtook DATA waits without holding
+locks needed by installation; grant registration wakes it. The client releases
+locks needed by CONTROL before waiting for visibility and must continue
+servicing CONTROL during that wait.
+The FUSE OPEN/CREATE success still waits for visibility, including source
+publication; an early authority application receipt is not filesystem success.
+
+FULL permits daemon buffering. WRITETHROUGH requires immediate authority
+application and peer invalidation for each write while another session retains
+a pre-existing cache-capable handle. A peer that
 opens an already delegated identity gets `cache_capable = false`. Requests
 express a preference; only the reply authorizes kernel caching. A write-intent
 handle is direct-IO. A separate holder read handle can be cache-capable if the
@@ -461,10 +514,15 @@ cannot contradict one another. Disjoint identities can progress concurrently.
 
 An ack must match incarnation, event sequence, event type, and grant reference.
 It certifies all accepted entries in the event's identity cut were applied;
-a ticket from some unrelated mutation is not a substitute. An exact repeated
-ack is idempotent; a conflicting ack for an already completed event is invalid.
-These acks do not acknowledge ChangeBatch positions. Conversely, ChangeAck
-does not discharge a recall, break, or mode change.
+a ticket from some unrelated mutation is not a substitute. A delegation
+acknowledgment proves application and the required local drain, not completion
+of a preceding ChangeAck or remote visibility. Peer withdrawal may depend on an
+in-flight READ that itself needs the holder's applied cut, so delivery,
+delegation acknowledgments, and cumulative withdrawal acknowledgments retain
+independent progress paths. An exact repeated ack is idempotent; a conflicting
+ack for an already completed event is invalid. These acks do not acknowledge
+ChangeBatch positions. Conversely, ChangeAck does not discharge a recall,
+break, or mode change.
 
 Release follows last-handle close and a completed flush of that identity. It
 stops admission under every listed reference, but does not discard applied
@@ -627,13 +685,13 @@ writer.
 
 ## Ordering across the profiles
 
-A new OPEN/CREATE grant stays reserved until the operation's synchronous
-withdrawal completes. Pending peer reads may sample storage under a
+A new private OPEN/CREATE generation stays reserved until the operation's
+synchronous withdrawal completes. Pending peer reads may sample storage under a
 reservation; grant activation drains those samples before the DATA reply.
 CONTROL may then overtake DATA, so the client handles that ordering. A
-synchronous mutation under an installed grant returns its application receipt
-before its visibility wait, so the holder can acknowledge a peer cut
-independently. Private synchronous generations exclude their source from
+synchronous mutation under an existing public generation returns its
+application receipt before its visibility wait, so the holder can acknowledge
+a peer cut independently. Private synchronous generations exclude their source from
 grant/release reverse notifications; its exact publication gate and post-state
 cover those coordinates. Client-visible grants remain broadcast to purge the
 holder's earlier cached pages.

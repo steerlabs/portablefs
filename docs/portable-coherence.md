@@ -20,8 +20,14 @@ orders conflicting identities and `(parent, name)` bindings; disjoint mutations
 can proceed concurrently. Committed peer changes stream over CONTROL in order.
 Cumulative acknowledgments certify withdrawal through that position, including
 kernel data/attribute invalidation and draining pending cache-installing replies.
-The Authority waits for the affected peer subscriber's acknowledgment or horizon
-before completing a mutation or activating a delegation.
+`WaitTargeted` captures the affected peer subscription incarnations at commit
+and waits for actual withdrawal through cumulative ChangeAck or the existing
+cold-reset/horizon proof. DATA reply delivery, a delegation acknowledgment, or
+mere session fencing cannot satisfy that obligation. The Authority marks the
+application visible only after the wait succeeds, preserving a contiguous
+`VisibleSequence` prefix. Filesystem mutation success and activation of a new
+delegation wait for the required withdrawal; an authority application receipt
+can precede it.
 The source updates its own publications through its exact-coordinate gate and
 the mutation's returned post-state; it does not acknowledge its own commit as
 a peer change.
@@ -65,6 +71,50 @@ delegation covers data, size, and file attributes; write handles use direct I/O
 so every application write reaches the daemon. The daemon preserves per-file
 program order and overlays accepted data for reads on the owning mount.
 
+Application, remote visibility, and durability prove different facts; none
+substitutes for another. `AppliedSequence` is the session ticket for applied
+storage work, recorded on the pinned delegation through
+`DelegationFlush.End(ticket)`. The application ledger maps tickets to volume
+versions; the delegation validates its cut using the event floor or a ticket
+issued under that exact generation while the cut was pending. Another inode's
+session-wide high-water mark cannot satisfy it. Visibility requires actual
+targeted withdrawal, while durability requires its separate storage barrier
+and prefix; neither visibility nor durability implies the other.
+
+Successful truncating write-intent OPEN and truncating write-intent existing-name
+CREATE under the exact delegation pin carry their application ticket, including a
+truncate of an already empty existing file. Exact replay retains the original
+handle, grant, and ticket without another application. Nontruncating OPEN and
+unchanged existing-name CREATE need no new ticket. A new empty-file CREATE
+without a preflight file pin may keep a zero ticket because its namespace
+result waits synchronously for withdrawal.
+
+The grant paths preserve different reply ordering:
+
+- **Existing public generation.** The synchronous mutation pins the exact
+  generation already eligible for a DATA reply. After apply, commit publication,
+  release of storage locks, and `End(ticket)`, the Authority returns the
+  application receipt before targeted withdrawal. OPEN/CREATE include the real
+  handle, retained grant, and operation ticket; the detached authority wait
+  retains the visibility obligation. Public does not assert DATA delivery.
+- **New private generation.** `RetainDelegation` returns the unoffered generation
+  to `DelegationReserved`, opens reserved-reader admission, and clears
+  `ephemeral`. The handler releases storage and ends the apply pin, completes
+  withdrawal while Reserved, then calls `Grant`. Activation closes reserved
+  reader admission and joins existing sample pins before returning the grant.
+  No holder CONTROL may issue while Reserved. Newly reserved nontruncating OPEN
+  and new-name CREATE retain reservation withdrawal and reader drain where
+  applicable; CONTROL may overtake DATA only after activation.
+
+The client installs the returned identity/ref, handle, grant, and ticket in one
+admission interval before CONTROL can inspect the generation. A synchronous
+operation records its actual application ticket before releasing its operation
+lock to CONTROL. A CONTROL handler that overtook DATA waits without holding
+locks needed by installation; grant registration wakes it. The client releases
+locks needed by CONTROL before waiting for visibility and continues servicing
+CONTROL during the wait. FUSE OPEN/CREATE success still waits for visibility
+and source publication.
+
 Delegated flushes are ordered: each delegation generation's WRITEs carry dense
 ordinals and share a window of four in-flight flushes on a dedicated DATA lane,
 which requires `max_in_flight >= 9` on both Linux connections. There is no
@@ -83,6 +133,13 @@ READDIR attributes, GETATTR, READ, FSYNC, and copy-source reads. A peer mutation
 recalls ownership before applying. Recall stops admission under the retiring
 generation, drains and flushes it, then acknowledges the exact applied cut.
 Generation-bound flushes cannot apply under stale ownership.
+
+A delegation acknowledgment proves application and the required local drain;
+it certifies neither remote visibility nor durability and need not wait for a
+preceding ChangeAck. Peer withdrawal may depend on an in-flight READ that needs
+the holder's applied cut. Event delivery, delegation acknowledgments, and
+cumulative withdrawal acknowledgments therefore retain independent progress
+paths.
 
 A peer cache-capable handle opened before the delegation forces write-through
 for as long as it remains open; each commit withdraws the peer's cached state.
