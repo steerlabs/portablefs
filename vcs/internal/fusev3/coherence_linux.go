@@ -572,11 +572,6 @@ type RevocationReport struct {
 // already lost the race it exists to win.
 const withdrawalRounds = 3
 
-// withdrawalRetryDelay is the first inter-round pause, doubled each round. It
-// is short: the kernel references a busy detach could not take back are
-// released by the abort in the same round, not by waiting.
-const withdrawalRetryDelay = 25 * time.Millisecond
-
 // withdrawalOutcome accumulates what the ladder did. installed records whether
 // there was a recorded kernel identity to withdraw at all, which is different
 // from having withdrawn one: a startup that failed before mountinfo yielded an
@@ -603,7 +598,6 @@ type kernelWithdrawal struct {
 	detach func(point string) error
 	abort  func(kernelMount) error
 	absent func(kernelMount) (MountAbsenceProof, error)
-	sleep  func(time.Duration)
 }
 
 func (m *Mount) productionKernelWithdrawal() kernelWithdrawal {
@@ -620,7 +614,6 @@ func (m *Mount) productionKernelWithdrawal() kernelWithdrawal {
 		},
 		abort:  func(k kernelMount) error { return k.abortKernelConnection() },
 		absent: func(k kernelMount) (MountAbsenceProof, error) { return k.absent() },
-		sleep:  time.Sleep,
 	}
 }
 
@@ -679,7 +672,6 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 			out.record(1, "data-withdrawal", errors.New(failure))
 		}
 	}
-	delay := withdrawalRetryDelay
 	for round := 1; ; round++ {
 		// Aborting is unconditional and comes first in every round. It unblocks
 		// any request still parked on an authority operation and terminates the
@@ -723,8 +715,8 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		if round >= withdrawalRounds || !time.Now().Before(deadline) {
 			return out
 		}
-		ops.sleep(delay)
-		delay *= 2
+		// Abort and detach are synchronous kernel progress edges. Recheck
+		// their result immediately; elapsed time cannot prove withdrawal.
 	}
 }
 

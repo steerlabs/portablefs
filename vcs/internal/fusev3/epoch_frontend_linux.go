@@ -76,26 +76,27 @@ func (m *Mount) recoverEpoch(ctx context.Context) error {
 		return err
 	}
 
-	// A failed reverse notification cannot be treated as a cold boundary. Keep
-	// the mount attached but stale and retry until the kernel confirms every
-	// cache withdrawal or the operator unmounts it.
-	for {
-		if err := m.subscription.invalidateAll(ctx); err == nil {
-			break
-		}
-		if err := waitEpochRecovery(ctx); err != nil {
-			return err
-		}
+	// invalidateAll owns one real withdrawal deadline. Restarting that budget
+	// after failure would turn a bounded kernel refusal into endless polling.
+	if err := m.subscription.invalidateAll(ctx); err != nil {
+		return err
 	}
 	transport, ok := m.rpc.(*epochRPC)
 	if !ok {
 		return errors.New("fusev3: transport cannot recover an epoch")
 	}
+	// A new network connection has no readiness event before Dial succeeds.
+	// Retry within the existing operation budget, never for the mount lifetime.
+	recoveryCtx, cancel := context.WithTimeout(ctx, m.requestTimeout)
+	defer cancel()
 	for {
-		if err := transport.recover(ctx); err == nil {
+		if err := recoveryCtx.Err(); err != nil {
+			return err
+		}
+		if err := transport.recover(recoveryCtx); err == nil {
 			break
 		}
-		if err := waitEpochRecovery(ctx); err != nil {
+		if err := waitEpochRecovery(recoveryCtx); err != nil {
 			return err
 		}
 	}
@@ -127,7 +128,11 @@ func (m *Mount) recoverEpoch(ctx context.Context) error {
 }
 
 func waitEpochRecovery(ctx context.Context) error {
-	timer := time.NewTimer(epochRecoveryRetryDelay)
+	delay := epochRecoveryRetryDelay
+	if deadline, ok := ctx.Deadline(); ok {
+		delay = min(delay, time.Until(deadline))
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -163,13 +168,9 @@ func (m *Mount) watchEpochSession(ctx context.Context, done <-chan struct{}) {
 			}
 			// A non-transient local recovery defect still cannot turn an epoch
 			// boundary into revocation. Leave every old handle stale until the
-			// operator unmounts; transient attach and invalidation failures are
-			// already retried inside recoverEpoch.
-			for ctx.Err() == nil {
-				if waitEpochRecovery(ctx) != nil {
-					return
-				}
-			}
+			// operator unmounts; attach and invalidation attempts have
+			// already exhausted their real operation budgets.
+			<-ctx.Done()
 			return
 		}
 		if ctx.Err() == nil {

@@ -782,6 +782,7 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 				m.failAsync(fmt.Errorf("fusev3: authority keepalive failed: %w", err))
 				return
 			}
+			m.subscription.madeProgress()
 		}
 	}
 }

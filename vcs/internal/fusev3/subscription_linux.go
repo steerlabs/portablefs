@@ -130,9 +130,10 @@ type subscriptionRegistry struct {
 	lastChangeSeen  uint64
 	lastChangeAck   uint64
 
-	horizonChanged chan struct{}
-	pauseChanged   chan struct{}
-	serveDone      chan struct{}
+	progressChanged chan struct{}
+	horizonChanged  chan struct{}
+	pauseChanged    chan struct{}
+	serveDone       chan struct{}
 }
 
 type mountSubscriptionInvalidator struct{ mount *Mount }
@@ -190,10 +191,11 @@ func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, contro
 	return &subscriptionRegistry{
 		mount: mount, rpc: rpc, control: control, config: config,
 		delegated: make(map[publicationIdentity]uint64), stale: make(map[publicationIdentity]struct{}),
-		coordinates:    make(map[publicationCoordinate]subscriptionCoordinateState),
-		horizonChanged: make(chan struct{}),
-		pauseChanged:   make(chan struct{}),
-		serveDone:      serveDone,
+		coordinates:     make(map[publicationCoordinate]subscriptionCoordinateState),
+		progressChanged: make(chan struct{}),
+		horizonChanged:  make(chan struct{}),
+		pauseChanged:    make(chan struct{}),
+		serveDone:       serveDone,
 	}
 }
 
@@ -353,6 +355,9 @@ func (s *subscriptionRegistry) resume() {
 func (s *subscriptionRegistry) retry(ctx context.Context, deadline time.Time, operation func() error) error {
 	var last error
 	for s.config.clock.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := operation(); err == nil {
 			return nil
 		} else {
@@ -550,6 +555,7 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 		}
 		_, _, _, active := s.currentIncarnation()
 		if !active {
+			progress := s.progress()
 			if err := s.subscribe(ctx); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -557,7 +563,7 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 				if errors.Is(err, errSubscriptionPaused) {
 					continue
 				}
-				if err := s.waitRetry(ctx); err != nil {
+				if err := s.waitProgress(ctx, progress); err != nil {
 					return err
 				}
 				continue
@@ -728,6 +734,7 @@ func (q *subscriptionChangeQueue) close() {
 func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64, changes *subscriptionChangeQueue) error {
 	var after uint64
 	for {
+		progress := s.progress()
 		event, err := s.rpc.NextControlEvent(ctx, incarnation, after, changes.completedThrough())
 		if err != nil {
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
@@ -736,7 +743,7 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err := s.waitRetry(ctx); err != nil {
+			if err := s.waitProgress(ctx, progress); err != nil {
 				return err
 			}
 			continue
@@ -766,17 +773,37 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 				}
 			}(event.GetSequence())
 		}
+		s.madeProgress()
 		after = event.GetSequence()
 	}
 }
 
-func (s *subscriptionRegistry) waitRetry(ctx context.Context) error {
-	timer := s.config.clock.NewTimer(s.config.retryDelay)
+// A retry waits for actual CONTROL contact or an epoch pause/resume edge.
+// Snapshot before the failed operation so concurrent progress cannot be lost.
+type subscriptionProgress struct {
+	contact, pause <-chan struct{}
+}
+
+func (s *subscriptionRegistry) progress() subscriptionProgress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return subscriptionProgress{s.progressChanged, s.pauseChanged}
+}
+
+func (s *subscriptionRegistry) madeProgress() {
+	s.mu.Lock()
+	close(s.progressChanged)
+	s.progressChanged = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *subscriptionRegistry) waitProgress(ctx context.Context, progress subscriptionProgress) error {
 	select {
-	case <-timer.C():
+	case <-progress.contact:
+		return nil
+	case <-progress.pause:
 		return nil
 	case <-ctx.Done():
-		timer.Stop()
 		return ctx.Err()
 	}
 }
@@ -938,13 +965,29 @@ func (s *subscriptionRegistry) ackChanges(ctx context.Context, incarnation, posi
 	s.mu.RLock()
 	deadline := s.cacheUntil
 	s.mu.RUnlock()
-	err := s.retry(ctx, deadline, func() error {
-		return s.rpc.AcknowledgeChanges(ctx, incarnation, position)
-	})
-	if err != nil {
-		return fmt.Errorf("fusev3: acknowledge changes through %d: %w", position, err)
+	// The horizon is the real bound. Renewal, polling and KeepAlive supply
+	// readiness after a failed CONTROL call; a 10 ms timer supplies none.
+	remaining := deadline.Sub(s.config.clock.Now())
+	if remaining <= 0 {
+		return errSubscriptionExpired
 	}
-	return nil
+	ackCtx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	for {
+		if err := ackCtx.Err(); err != nil {
+			return err
+		}
+		progress := s.progress()
+		if err := s.rpc.AcknowledgeChanges(ackCtx, incarnation, position); err == nil {
+			s.madeProgress()
+			return nil
+		} else if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+			return err
+		}
+		if err := s.waitProgress(ackCtx, progress); err != nil {
+			return fmt.Errorf("fusev3: acknowledge changes through %d: %w", position, err)
+		}
+	}
 }
 
 func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64) error {
@@ -963,6 +1006,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			}
 			continue
 		}
+		s.madeProgress()
 		if !s.acceptRenewal(incarnation, deadline, s.config.clock.Now()) {
 			s.mu.RLock()
 			current := s.active && s.incarnation == incarnation

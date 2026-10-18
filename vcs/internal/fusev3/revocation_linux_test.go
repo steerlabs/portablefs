@@ -37,7 +37,6 @@ type fakeWithdrawal struct {
 	detaches  int
 	aborts    int
 	absences  int
-	slept     []time.Duration
 }
 
 // terminalEnforcementRPC models authorityrpc's two terminal edges: pending is
@@ -99,11 +98,6 @@ func (f *fakeWithdrawal) ops() kernelWithdrawal {
 				return MountAbsenceProof{}, fmt.Errorf("fusev3: mount %s is still installed", k.id)
 			}
 			return MountAbsenceProof{ObservedUnixNanos: 1, Observation: []byte("absent"), Component: mountInfoPath}, nil
-		},
-		sleep: func(d time.Duration) {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			f.slept = append(f.slept, d)
 		},
 	}
 }
