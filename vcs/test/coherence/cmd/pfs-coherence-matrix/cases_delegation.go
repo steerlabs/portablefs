@@ -10,14 +10,18 @@ import (
 	"time"
 )
 
-type v7Commands struct {
+// controlCommands are the operator-supplied shell commands that change the
+// environment around the mounts: pausing and resuming mount B's process,
+// replacing the Authority, and running the cacheless gateway probe. A case
+// whose command is absent skips with that reason.
+type controlCommands struct {
 	Pause, Resume, Epoch, Gateway string
 }
 
 func allCases() []coherenceCase {
 	cases := baselineCases()
 	loss := cases[len(cases)-1]
-	cases = append(cases[:len(cases)-1], v7Cases()...)
+	cases = append(cases[:len(cases)-1], delegationCases()...)
 	return append(cases, loss)
 }
 
@@ -36,7 +40,10 @@ func (c *caseRun) errno(who actor, req request, want syscall.Errno) {
 
 func shellArgument(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 
-func v7Cases() []coherenceCase {
+// delegationCases exercise write delegation and its recall, ordered delegated
+// flush, the root-handle durability barrier, cacheless reads beside a delegated
+// writer, a holder that misses its recall budget, and Authority replacement.
+func delegationCases() []coherenceCase {
 	return []coherenceCase{
 		{name: "peer_cached_handle_forces_writethrough", what: "a preexisting cached read descriptor sees each peer write before that write returns", run: func(c *caseRun) {
 			target := c.p("cached")

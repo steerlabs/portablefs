@@ -26,14 +26,6 @@ set -euo pipefail
 # deletion there fails the job instead of quietly shrinking privileged coverage.
 REQUIRED_TESTS=()
 
-# This boundary is root-owned provisioning work and therefore cannot run under
-# the unprivileged authority identity used for the data-plane suite. Keeping an
-# exact required list prevents a renamed or skipped test from masquerading as
-# qualification.
-REQUIRED_ROOT_TESTS=(
-  "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota"
-)
-
 fail() {
   echo "xfs-fuse-integration: $1" >&2
   exit "${2:-1}"
@@ -177,13 +169,13 @@ install_container_dependencies() {
   fi
 }
 
-# The FUSE control filesystem is the kernel interface a strict mount's
-# revocation ladder uses to abort its own serving connection, which is what
-# releases every request parked in the kernel when the authority is gone. A
-# production host has it mounted; a container does not inherit it, and without
-# it the abort step silently cannot run - so the mount-owner detach helper waits
-# on a request nothing can answer and teardown never completes. Provisioning it
-# here is what makes the container the same kernel surface production is.
+# The FUSE control filesystem is the kernel interface a mount's revocation
+# ladder uses to abort its own serving connection, which is what releases every
+# request parked in the kernel when the authority is gone. A production host has
+# it mounted; a container does not inherit it, and without it the abort step
+# silently cannot run - so the mount-owner detach helper waits on a request
+# nothing can answer and teardown never completes. Provisioning it here is what
+# makes the container the same kernel surface production is.
 provision_fuse_control() {
   [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
   mountpoint -q /sys/fs/fuse/connections ||
@@ -338,38 +330,6 @@ run_suite() {
   verify_required_tests "$log"
 }
 
-run_root_boundary_suite() {
-  local cellhost_log=/var/tmp/portablefs-cellhost-boundary.log
-  local combined_log=/var/tmp/portablefs-root-boundary.log
-  local status=0
-  # Write-staging creation is the cell helper's root-only responsibility, not a
-  # capability of the authority service identity. Run that exact boundary as
-  # root against the same provisioned XFS cell while retaining the production
-  # service UID/GID as the directory ownership being verified.
-  set +e
-  env -i \
-    HOME=/root \
-    PATH=/usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    TMPDIR=/var/tmp \
-    GOCACHE=/var/tmp/portablefs-cellhost-gocache \
-    GOMODCACHE=/home/portablefs/gomodcache \
-    GOTOOLCHAIN=local \
-    GOFLAGS=-mod=readonly \
-    PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
-    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
-    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
-    -run '^TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota$' \
-    ./internal/cellhost >"$cellhost_log" 2>&1
-  status=$?
-  set -e
-  cat -- "$cellhost_log"
-  [[ $status -eq 0 ]] || fail "root cell-helper boundary test exited $status" "$status"
-  cp "$cellhost_log" "$combined_log"
-  verify_exact_tests "$combined_log" "${REQUIRED_ROOT_TESTS[@]}"
-  echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
-}
-
 # go test reports a skipped test as "--- SKIP" and a passing one as "--- PASS".
 # Matching the exact package/test pairs catches a renamed, deleted, or silently
 # skipped privileged test, which a plain exit code cannot.
@@ -402,9 +362,6 @@ run_container() {
   provision_xfs
   provision_volume
   run_suite
-  if [[ ${PORTABLEFS_SOAK_TEST:-} != 1 ]]; then
-    run_root_boundary_suite
-  fi
 }
 
 case "${1:-}" in

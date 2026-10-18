@@ -128,7 +128,7 @@ func runMatrix(arguments []string) error {
 		expectDisjoint = flags.Bool("expect-disjoint-namespace", false,
 			"control mode: the second root deliberately does not share the volume, so the shared-namespace probe must fail rather than pass")
 	)
-	var commands v7Commands
+	var commands controlCommands
 	flags.StringVar(&commands.Pause, "pause-command", "", "stop mount B and arrange automatic resume after recall budget")
 	flags.StringVar(&commands.Resume, "resume-command", "", "resume mount B after a failed recall experiment")
 	flags.StringVar(&commands.Epoch, "epoch-command", "", "restart only the Authority on the same endpoint and credentials")
@@ -267,7 +267,7 @@ type caseInputs struct {
 	replaces       int
 	localRoute     string
 	routesContract string
-	commands       v7Commands
+	commands       controlCommands
 }
 
 func printCase(result outcome) {

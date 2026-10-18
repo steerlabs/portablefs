@@ -32,21 +32,21 @@ const (
 // goroutine, an open descriptor, an ssh client, or a shell helper cannot survive
 // into a later case.
 type isolatedSpec struct {
-	Commands       v7Commands   `json:"v7_commands"`
-	Mode           isolatedMode `json:"mode"`
-	CaseName       string       `json:"case_name,omitempty"`
-	MountA         string       `json:"mount_a"`
-	MountB         string       `json:"mount_b"`
-	SSHTarget      string       `json:"ssh_target,omitempty"`
-	SSHBinary      string       `json:"ssh_binary,omitempty"`
-	StaleCheck     bool         `json:"stale_check,omitempty"`
-	ExpectDisjoint bool         `json:"expect_disjoint,omitempty"`
-	RunID          string       `json:"run_id"`
-	AltGID         int          `json:"alt_gid,omitempty"`
-	FenceCmd       string       `json:"fence_command,omitempty"`
-	Replaces       int          `json:"atomic_replace_rounds,omitempty"`
-	LocalRoute     string       `json:"local_route,omitempty"`
-	RoutesContract string       `json:"routes_contract_command,omitempty"`
+	Commands       controlCommands `json:"control_commands"`
+	Mode           isolatedMode    `json:"mode"`
+	CaseName       string          `json:"case_name,omitempty"`
+	MountA         string          `json:"mount_a"`
+	MountB         string          `json:"mount_b"`
+	SSHTarget      string          `json:"ssh_target,omitempty"`
+	SSHBinary      string          `json:"ssh_binary,omitempty"`
+	StaleCheck     bool            `json:"stale_check,omitempty"`
+	ExpectDisjoint bool            `json:"expect_disjoint,omitempty"`
+	RunID          string          `json:"run_id"`
+	AltGID         int             `json:"alt_gid,omitempty"`
+	FenceCmd       string          `json:"fence_command,omitempty"`
+	Replaces       int             `json:"atomic_replace_rounds,omitempty"`
+	LocalRoute     string          `json:"local_route,omitempty"`
+	RoutesContract string          `json:"routes_contract_command,omitempty"`
 }
 
 type isolatedReply struct {

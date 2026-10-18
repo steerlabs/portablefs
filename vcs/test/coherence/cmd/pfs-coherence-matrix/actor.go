@@ -18,9 +18,9 @@ import (
 // An actor performs POSIX operations against one mount of the volume under
 // test. Every case in the matrix is written against this interface alone, so
 // exactly the same case body runs when both mounts are on this machine (two
-// FUSE mounts of one authority, or two FSKit mounts of one volume) and when the
-// second mount lives on another machine reached over ssh. That is what makes a
-// Linux result and a macOS result directly comparable rather than two
+// FUSE mounts of one authority) and when the second mount lives on another
+// machine reached over ssh (a Linux peer of a Mac's FSKit mount). That is what
+// makes a Linux result and a macOS result directly comparable rather than two
 // independently written suites that happen to share vocabulary.
 type actor interface {
 	name() string

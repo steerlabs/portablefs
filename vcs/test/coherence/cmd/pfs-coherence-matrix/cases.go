@@ -50,14 +50,14 @@ type caseRun struct {
 	// by itself, so asserting the refusal needs a client that does not. Empty
 	// means the same loud skip.
 	routesContract string
-	commands       v7Commands
+	commands       controlCommands
 }
 
-// sameDirToleratedFencedMounts is deliberately zero. The frontend reports a
-// blocked repair only when its exact cached-binding and parked-directory
-// registries prove the i_rwsem cycle, and racing reads leave Stabilize at apply
-// rather than holding the directory lock until COMPLETE. Fencing either healthy
-// participant is therefore a regression, not a tolerated liveness outcome.
+// sameDirToleratedFencedMounts is deliberately zero. A responsive mount
+// completes every cache withdrawal and delegation recall it is sent, and no
+// current mechanism revokes a healthy participant for contending in one
+// directory. Fencing either mount during the storm is therefore a regression,
+// not a tolerated liveness outcome.
 const sameDirToleratedFencedMounts = 0
 
 // sameDirStormBound is how long the two storms get before the case calls it a
@@ -194,8 +194,9 @@ func parseSummary(text string) map[string]string {
 	return out
 }
 
-// mountFenced detects a lost kernel connection. Ordinary v7 recall, subscription
-// expiry and epoch changes must preserve that connection and report scoped EIO.
+// mountFenced detects a lost kernel connection. Ordinary delegation recall,
+// subscription expiry and epoch changes must preserve that connection and report
+// scoped EIO.
 func (c *caseRun) mountFenced(who actor) bool {
 	out := c.do(who, request{Op: "stat", Path: c.dir})
 	return out.Errno == int(syscall.ENOTCONN)
