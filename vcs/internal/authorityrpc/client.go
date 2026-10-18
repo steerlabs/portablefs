@@ -138,6 +138,7 @@ func (r *responseConsumption) revoke(cause error) {
 	if r == nil || r.force == nil {
 		return
 	}
+	r.client.reportSessionError(&cause)
 	r.forceOnce.Do(func() { r.force(cause) })
 }
 
@@ -668,7 +669,8 @@ func (opened *transportNegotiation) bindingGeneration() uint64 {
 // Reconnect restores whichever exact physical role is missing. A healthy role
 // is never churned as collateral damage, and a changed epoch remains a hard
 // mount boundary on either lane.
-func (c *Client) Reconnect(ctx context.Context) error {
+func (c *Client) Reconnect(ctx context.Context) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return err
 	}
@@ -690,11 +692,16 @@ func (c *Client) Reconnect(ctx context.Context) error {
 // returned client, subscribes cold, and closes the old client. Reusing the old
 // Client in place would let an operation admitted under an old handle race onto
 // the new session, where capabilities and replay slots have unrelated meaning.
-func (c *Client) RecoverEpoch(ctx context.Context) (*Client, error) {
+// A failed replacement still reports the old client's recorded terminal cause.
+func (c *Client) RecoverEpoch(ctx context.Context) (result *Client, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if c == nil || ctx == nil {
 		return nil, syscall.EINVAL
 	}
 	if !errors.Is(c.SessionEndCause(), ErrAuthorityChanged) {
+		if err := c.checkCallEntry(); err != nil {
+			return nil, err
+		}
 		return nil, errors.New("authorityrpc: epoch reattach requested without an observed epoch change")
 	}
 	c.lifecycle.Lock()
@@ -766,7 +773,8 @@ func (c *Client) SessionLease() time.Duration {
 // Reauthorize rotates the signed decision underneath an existing mount. The
 // manager assigns sequence and returns the same token for an idempotency key;
 // the authority accepts an exact retry and refuses gaps or broadened access.
-func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64) (time.Time, error) {
+func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64) (result time.Time, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return time.Time{}, err
 	}
@@ -805,7 +813,8 @@ func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64)
 // the certificate visible to a future transport resume. The exact current
 // connection performs Reauthorize under its still-valid identity; a failed
 // authority decision never changes the reconnect identity.
-func (c *Client) ReauthorizeWithCertificate(ctx context.Context, token []byte, sequence uint64, certificatePEM []byte, now time.Time) (time.Time, error) {
+func (c *Client) ReauthorizeWithCertificate(ctx context.Context, token []byte, sequence uint64, certificatePEM []byte, now time.Time) (result time.Time, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return time.Time{}, err
 	}
@@ -918,7 +927,8 @@ func (c *Client) AuthorizationDeadline() time.Time {
 // renewal and never exceeds the advertised lease. An overgrant is never
 // clamped. R is relative to the authority; the caller anchors it at its own
 // request start.
-func (c *Client) KeepAlive(ctx context.Context) (time.Duration, error) {
+func (c *Client) KeepAlive(ctx context.Context) (result time.Duration, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
 	if err != nil {
 		return 0, err
@@ -949,7 +959,8 @@ func (c *Client) KeepAlive(ctx context.Context) (time.Duration, error) {
 // exactly like a retained authority reply, with force revoking the frontend
 // serving boundary when the terminal drain bound expires. It carries no
 // terminal-delivery token, because no authority response exists to receipt.
-func (c *Client) BeginLocalPublication(force func(error)) (ResponseConsumption, error) {
+func (c *Client) BeginLocalPublication(force func(error)) (result ResponseConsumption, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	receipt, err := c.beginResponseConsumption(force)
 	if err != nil {
 		return nil, err
@@ -969,7 +980,8 @@ func (c *Client) LocalAdmissionOpen() bool {
 // replay slot because its identity is the compare-and-swap on expected, which
 // is a better answer to a retry than a retained reply - a caller that resubmits
 // an applied change is told which revision is active now.
-func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byte) (*authoritypb.ApplyRoutesReply, error) {
+func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byte) (result *authoritypb.ApplyRoutesReply, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	request := &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{ApplyRoutes: &authoritypb.ApplyRoutesRequest{
 		Rules:            append([]byte(nil), rules...),
 		ExpectedRevision: append([]byte(nil), expected[:]...),
@@ -1000,7 +1012,8 @@ func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byt
 // client deliberately cannot synthesize an observation. A strict caller that
 // cannot establish its platform's terminal conditions closes instead and lets
 // its session die fenced.
-func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.MountAbsenceProof) error {
+func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.MountAbsenceProof) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if !completeMountAbsenceProof(proof) {
 		return syscall.EPERM
 	}
@@ -1018,7 +1031,8 @@ func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.Moun
 // DetachRouteAdmin ends a restricted route-control session. It carries no
 // mount-absence proof because this purpose never joined durable mount or lease
 // membership and never received a filesystem root.
-func (c *Client) DetachRouteAdmin(ctx context.Context) error {
+func (c *Client) DetachRouteAdmin(ctx context.Context) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if c == nil || c.cfg.Purpose != authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
 		return syscall.EPERM
 	}
@@ -1046,7 +1060,8 @@ func completeMountAbsenceProof(proof *authoritypb.MountAbsenceProof) bool {
 // is idempotent: one caller owns the observation and wire transition; concurrent
 // or later callers observe that same result. It never substitutes AbortAttach
 // after ACTIVE and never manufactures evidence when observation fails.
-func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
+func (c *Client) ReleaseBeforeMount(ctx context.Context) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if ctx == nil {
 		return syscall.EINVAL
 	}
@@ -1140,11 +1155,11 @@ func (c *Client) signalSessionEnd(err error) {
 	if err == nil {
 		err = ErrTransportUncertain
 	}
-	c.poisoned.Store(true)
 	c.fatalMu.Lock()
 	if c.fatalErr == nil {
 		c.fatalErr = err
 	}
+	c.poisoned.Store(true)
 	if c.fatalPublished {
 		c.fatalMu.Unlock()
 		return
@@ -1178,10 +1193,23 @@ func (c *Client) signalSessionEnd(err error) {
 func (c *Client) checkCallEntry() error {
 	c.fatalMu.Lock()
 	defer c.fatalMu.Unlock()
-	return c.checkCallEntryLocked()
+	return c.sessionErrorLocked(nil)
 }
 
-func (c *Client) checkCallEntryLocked() error {
+// reportSessionError is the return boundary for session operations. Exact
+// responses and successful cleanup retain their result; every error, including
+// one produced after admission or by cleanup, uses the first session verdict.
+// Defer it before resource cleanup so a terminal edge during drain also wins.
+func (c *Client) reportSessionError(err *error) {
+	if c == nil || *err == nil {
+		return
+	}
+	c.fatalMu.Lock()
+	*err = c.sessionErrorLocked(*err)
+	c.fatalMu.Unlock()
+}
+
+func (c *Client) sessionErrorLocked(fallback error) error {
 	if c.poisoned.Load() || c.fatalPending || c.fatalPublished {
 		if c.fatalErr != nil {
 			return c.fatalErr
@@ -1191,13 +1219,13 @@ func (c *Client) checkCallEntryLocked() error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	return nil
+	return fallback
 }
 
 func (c *Client) beginResponseConsumption(force func(error)) (*responseConsumption, error) {
 	c.fatalMu.Lock()
 	defer c.fatalMu.Unlock()
-	if err := c.checkCallEntryLocked(); err != nil {
+	if err := c.sessionErrorLocked(nil); err != nil {
 		return nil, err
 	}
 	if force == nil {
@@ -1289,7 +1317,8 @@ func (c *Client) consumeResponse(receipt *responseConsumption) {
 // different process edge and falsely acknowledge delivery to the wrong owner.
 // Keeping this separate from Call also prevents terminal mode from becoming a
 // general exception to new-operation admission.
-func (c *Client) dispatchTerminalDeliveryReceipt(ctx context.Context, token []byte) (*authoritypb.Response, error) {
+func (c *Client) dispatchTerminalDeliveryReceipt(ctx context.Context, token []byte) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if !validTerminalDeliveryToken(token) || !c.poisoned.Load() {
 		return nil, syscall.EINVAL
 	}
@@ -1407,7 +1436,8 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 // caller already satisfies: each constructs a request for one synchronous call
 // and drops it. Copying that request first isolated nothing and made a maximal
 // write pay for a second megabyte.
-func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, releaseFrame, err := c.callFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
 }
@@ -1483,6 +1513,7 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 // delivered bytes. False settles only this attempt, never an earlier send of the
 // same replay identity. Request IDs alone do not establish submission.
 func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), submitted bool, err error) {
+	defer c.reportSessionError(&err)
 	// Refuse an already-canceled attempt before stamping or touching a transport:
 	// an expired write deadline must not break a usable connection.
 	if err := ctx.Err(); err != nil {
@@ -1522,14 +1553,7 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 		return nil, nil, false, net.ErrClosed
 	}
 	if transport.conn == nil {
-		terminal := c.poisoned.Load()
 		transport.pendingMu.Unlock()
-		if terminal {
-			if err := c.SessionEndCause(); err != nil {
-				return nil, nil, false, err
-			}
-			return nil, nil, false, ErrSessionEnded
-		}
 		// Nothing was written. Classifying this as a transport break lets the
 		// read and mutation wrappers safely establish the same epoch and submit
 		// the operation once, while their replay identity remains unchanged.
@@ -1555,12 +1579,6 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 			return
 		case <-timer.C:
 			c.failConnection(transport, conn, ErrTransportUncertain)
-			// For every profile, a transport failure after session end reports
-			// the recorded cause, including cancellation during an epoch change.
-			// A local context error cannot replace that terminal verdict.
-			if err := c.SessionEndCause(); err != nil {
-				return nil, nil, submitted, err
-			}
 			return nil, nil, submitted, ctx.Err()
 		}
 	case completed := <-result:
@@ -1693,12 +1711,14 @@ func (c *Client) CallReadRetained(
 // CallIdempotent retries one same-epoch operation whose protocol definition
 // makes duplicate delivery harmless. Mutations that apply filesystem state use
 // CallMutationWithIdentity and retain their exact replay result instead.
-func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Request) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, releaseFrame, err := c.callIdempotentFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
 }
 
 func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), err error) {
+	defer c.reportSessionError(&err)
 	admitted, err := c.admitCall(ctx, request)
 	if err != nil {
 		return nil, nil, err
@@ -1783,7 +1803,8 @@ func (c *Client) CallIdempotentRetained(
 func (c *Client) callRetained(
 	force func(error),
 	call func() (*authoritypb.Response, func(), error),
-) (*authoritypb.Response, ResponseConsumption, error) {
+) (result *authoritypb.Response, receipt ResponseConsumption, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	consumption, err := c.beginResponseConsumption(force)
 	if err != nil {
 		return nil, nil, err
@@ -1833,7 +1854,8 @@ type segmentedWrite struct {
 // CallMutationSegments sends retained WRITE spans without merging their bytes.
 // The caller owns the request and keeps every span immutable until return,
 // including reconnect/replay. Assignment observes the selected lane admission.
-func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned MutationAssigned) (*authoritypb.Response, error) {
+func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned MutationAssigned) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return nil, err
 	}
@@ -1858,7 +1880,8 @@ func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.
 // publication point. The callback is invoked exactly once, before the first
 // dispatch, and is not repeated if the same request is replayed after a
 // same-epoch reconnect.
-func (c *Client) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned MutationAssigned) (*authoritypb.Response, error) {
+func (c *Client) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned MutationAssigned) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, consumption, err := c.CallMutationWithIdentityRetained(ctx, request, assigned, func(error) {})
 	if consumption != nil {
 		consumption.Consume()
@@ -1877,7 +1900,8 @@ func (c *Client) CallMutationWithIdentityRetained(
 	request *authoritypb.Request,
 	assigned MutationAssigned,
 	force func(error),
-) (*authoritypb.Response, ResponseConsumption, error) {
+) (result *authoritypb.Response, receipt ResponseConsumption, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return nil, nil, err
 	}
@@ -1925,6 +1949,11 @@ func (c *Client) CallMutationWithIdentityRetained(
 			releaseFrame()
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
+			// Recovery may have returned the already-recorded verdict. Only a
+			// live session's establishment failure can become uncertainty.
+			if terminalErr := c.checkCallEntry(); terminalErr != nil {
+				return nil, nil, terminalErr
+			}
 			if !submitted && (errors.Is(reconnectErr, context.Canceled) || errors.Is(reconnectErr, context.DeadlineExceeded)) {
 				return nil, nil, reconnectErr
 			}
@@ -1944,7 +1973,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 	// even when the exact replay was refused before its own socket write.
 	if submitted && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		c.signalSessionEnd(ErrTransportUncertain)
-		return nil, nil, c.SessionEndCause()
+		return nil, nil, ErrTransportUncertain
 	}
 	if err != nil {
 		return nil, nil, err
@@ -2089,13 +2118,13 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	}
 }
 
-func (c *Client) Close() error {
+func (c *Client) Close() (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	err := c.closeTransports()
 	c.signalSessionEnd(net.ErrClosed)
-	return err
+	return c.closeTransports()
 }
 
 func (c *Client) closeTransports() error {

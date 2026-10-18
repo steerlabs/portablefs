@@ -423,6 +423,11 @@ func (c *Client) publishTransport(transport *clientTransport, opened *transportN
 		return err
 	}
 	transport.pendingMu.Lock()
+	if err := c.checkCallEntry(); err != nil {
+		transport.pendingMu.Unlock()
+		_ = opened.conn.Close()
+		return err
+	}
 	if c.closed.Load() || transport.conn != nil {
 		transport.pendingMu.Unlock()
 		_ = opened.conn.Close()
@@ -485,7 +490,8 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 // caller's replay identity and retry transport establishment until its deadline
 // or an authenticated Hello/Resume establishes the epoch and session verdict.
 // Even a caller without a deadline cannot retry beyond one subscription TTL.
-func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) error {
+func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, volumeserver.SubscriptionTTL)
 	defer cancel()
@@ -499,8 +505,8 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 		err := c.reconnectTransportOnce(ctx, role)
 		// A session's terminal verdict applies to every admitted caller, even
 		// one whose context expired while its transport outcome was unsettled.
-		if err != nil && (c.closed.Load() || c.poisoned.Load()) {
-			return err
+		if terminalErr := c.checkCallEntry(); terminalErr != nil {
+			return terminalErr
 		}
 		if ctx.Err() != nil {
 			return boundedError()
@@ -518,18 +524,19 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 	}
 }
 
-func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) error {
+func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	transport := c.transportForRole(role)
 	if transport == nil {
 		return ErrTransportBinding
 	}
-	if err := c.checkCallEntry(); err != nil {
-		return err
-	}
 	transport.lifecycle.Lock()
 	defer transport.lifecycle.Unlock()
-	if c.closed.Load() {
-		return net.ErrClosed
+	if err := c.checkCallEntry(); err != nil {
+		return err
 	}
 	transport.pendingMu.Lock()
 	live := transport.conn != nil

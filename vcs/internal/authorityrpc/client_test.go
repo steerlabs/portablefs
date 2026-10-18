@@ -2396,7 +2396,12 @@ func TestTerminalDeliveryReceiptFailureRevokesBeforeSessionDone(t *testing.T) {
 	go func() {
 		_, consumption, _ := client.CallMutationWithIdentityRetained(
 			context.Background(), terminalAppliedMutationRequest(), nil,
-			func(error) { revoked.Store(true) },
+			func(cause error) {
+				if cause != client.SessionEndCause() {
+					t.Errorf("receipt revocation = %v, recorded cause = %v", cause, client.SessionEndCause())
+				}
+				revoked.Store(true)
+			},
 		)
 		result <- consumption
 	}()
@@ -2459,7 +2464,12 @@ func TestMalformedTerminalDeliveryTokenRevokesBeforeLocalDrain(t *testing.T) {
 	go func() {
 		_, consumption, err := client.CallMutationWithIdentityRetained(
 			context.Background(), terminalAppliedMutationRequest(), nil,
-			func(error) { revoked.Store(true) },
+			func(cause error) {
+				if cause != client.SessionEndCause() {
+					t.Errorf("token revocation = %v, recorded cause = %v", cause, client.SessionEndCause())
+				}
+				revoked.Store(true)
+			},
 		)
 		result <- retainedResult{consumption: consumption, err: err}
 	}()
@@ -2471,7 +2481,7 @@ func TestMalformedTerminalDeliveryTokenRevokesBeforeLocalDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	completed := <-result
-	if completed.err == nil || completed.consumption == nil || !revoked.Load() {
+	if completed.err == nil || completed.err != client.SessionEndCause() || completed.consumption == nil || !revoked.Load() {
 		t.Fatalf("malformed terminal token = (receipt %T, err %v, revoked %t)", completed.consumption, completed.err, revoked.Load())
 	}
 	select {
