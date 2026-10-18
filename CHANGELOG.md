@@ -55,6 +55,10 @@ this file is the human-curated summary.
 
 ### Fixed
 
+- The macOS extension runs each FSKit callback once. It no longer reissues a
+  callback whose reply carries `publication_retracted`: no daemon withdraws a
+  sent publication, so that bit is a frame defect that retires the connection
+  and fails the callback.
 - An FSKit write through an O_WRONLY open uses that write-only description
   instead of replacing it with a second, read/write OPEN. Rewriting an existing
   file costs one authority OPEN, a writable but unreadable (0200) file accepts
