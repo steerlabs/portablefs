@@ -1595,7 +1595,14 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 	// CONTROL may overtake the DATA reply carrying a newly activated grant.
 	// Wait without transition/operation locks: Install needs both to publish it.
 	for {
-		if err := s.lockAfterRelease(ctx, delegationControl|delegationTransition|delegationOperation); err != nil {
+		mask := delegationTransition | delegationOperation
+		if event.GetDelegationBreak() != nil {
+			// A read cut can name the prior applied floor while a synchronous
+			// mutation is in flight. Recall/mode transitions must instead join
+			// its application receipt before transferring ownership/admission.
+			mask |= delegationControl
+		}
+		if err := s.lockAfterRelease(ctx, mask); err != nil {
 			m.retireTimedOutControl(s, ref)
 			return
 		}

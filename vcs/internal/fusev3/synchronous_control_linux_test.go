@@ -26,86 +26,74 @@ func (c *operationWaitContext) Done() <-chan struct{} {
 // our CONTROL cut. Neither CONTROL progress nor foreground exclusion may rely
 // on a timeout breaking that cycle.
 func TestSynchronousOperationAllowsRequiredControlBeforeItsReply(t *testing.T) {
-	for _, kind := range []string{"break", "recall", "mode"} {
-		t.Run(kind, func(t *testing.T) {
-			m := newDelegationTestManager(t, &delegationFakeRPC{})
-			id := installDelegationForTest(t, m, 114, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-			entered, resume := make(chan struct{}), make(chan struct{})
-			finished := make(chan error, 1)
-			go func() {
-				_, err := m.Synchronous(t.Context(), id, func(*authoritypb.DelegationRef) (*authoritypb.Response, error) {
-					close(entered)
-					select {
-					case <-resume:
-						return &authoritypb.Response{}, nil
-					case <-m.ctx.Done():
-						return nil, m.ctx.Err()
-					}
-				})
-				finished <- err
-			}()
-			<-entered
-			var once sync.Once
-			defer once.Do(func() { close(resume) })
-			parsed, _ := delegationIdentity(id)
-			state := m.retainState(parsed, false)
-			defer m.releaseState(state)
-			waitCtx := &operationWaitContext{Context: t.Context(), waiting: make(chan struct{})}
-			next := make(chan error, 1)
-			go func() {
-				err := state.lockAfterRelease(waitCtx, delegationOperation)
-				if err == nil {
-					state.operation.Unlock()
-				}
-				next <- err
-			}()
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	id := installDelegationForTest(t, m, 114, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	entered, resume := make(chan struct{}), make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		_, err := m.Synchronous(t.Context(), id, func(*authoritypb.DelegationRef) (*authoritypb.Response, error) {
+			close(entered)
 			select {
-			case <-waitCtx.waiting:
-			case <-time.After(time.Second):
-				t.Fatal("later local operation did not wait for the synchronous owner")
-			}
-			ref := &authoritypb.DelegationRef{Id: delegationTestGrant(146, authoritypb.DelegationMode_DELEGATION_MODE_FULL).Id, Generation: 1}
-			event := &authoritypb.ControlEvent{Incarnation: 7, Sequence: 1}
-			switch kind {
-			case "break":
-				event.Event = &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{Identity: id, Delegation: ref, BudgetNanos: uint64(5 * time.Second)}}
-			case "recall":
-				event.Event = &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{Identity: id, Delegation: ref, BudgetNanos: uint64(5 * time.Second)}}
-			case "mode":
-				event.Event = &authoritypb.ControlEvent_DelegationModeChange{DelegationModeChange: &authoritypb.DelegationModeChange{Identity: id, Delegation: ref, Mode: authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH, BudgetNanos: uint64(5 * time.Second)}}
-			}
-			done := m.HandleControlEvent(t.Context(), event)
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("CONTROL waited for the RPC that requires its acknowledgment")
-			}
-			if m.LossSequence() != 0 {
-				t.Fatal("CONTROL completed by losing the grant")
-			}
-			select {
-			case err := <-next:
-				t.Fatalf("foreground exclusion ended before synchronous reply: %v", err)
-			default:
-			}
-			once.Do(func() { close(resume) })
-			select {
-			case err := <-finished:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(time.Second):
-				t.Fatal("synchronous call did not complete")
-			}
-			select {
-			case err := <-next:
-				if err != nil {
-					t.Fatal(err)
-				}
-			case <-time.After(time.Second):
-				t.Fatal("foreground owner was stranded")
+			case <-resume:
+				return &authoritypb.Response{}, nil
+			case <-m.ctx.Done():
+				return nil, m.ctx.Err()
 			}
 		})
+		finished <- err
+	}()
+	<-entered
+	var once sync.Once
+	defer once.Do(func() { close(resume) })
+	parsed, _ := delegationIdentity(id)
+	state := m.retainState(parsed, false)
+	defer m.releaseState(state)
+	waitCtx := &operationWaitContext{Context: t.Context(), waiting: make(chan struct{})}
+	next := make(chan error, 1)
+	go func() {
+		err := state.lockAfterRelease(waitCtx, delegationOperation)
+		if err == nil {
+			state.operation.Unlock()
+		}
+		next <- err
+	}()
+	select {
+	case <-waitCtx.waiting:
+	case <-time.After(time.Second):
+		t.Fatal("later local operation did not wait for the synchronous owner")
+	}
+	ref := &authoritypb.DelegationRef{Id: delegationTestGrant(146, authoritypb.DelegationMode_DELEGATION_MODE_FULL).Id, Generation: 1}
+	event := &authoritypb.ControlEvent{Incarnation: 7, Sequence: 1, Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{Identity: id, Delegation: ref, BudgetNanos: uint64(5 * time.Second)}}}
+	done := m.HandleControlEvent(t.Context(), event)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CONTROL waited for the RPC that requires its acknowledgment")
+	}
+	if m.LossSequence() != 0 {
+		t.Fatal("CONTROL completed by losing the grant")
+	}
+	select {
+	case err := <-next:
+		t.Fatalf("foreground exclusion ended before synchronous reply: %v", err)
+	default:
+	}
+	once.Do(func() { close(resume) })
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("synchronous call did not complete")
+	}
+	select {
+	case err := <-next:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground owner was stranded")
 	}
 }
 
