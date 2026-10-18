@@ -14,7 +14,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
-func ownCacheRecord(t *testing.T, f *strictFixture) (*inodeRecord, uint64) {
+func ownCacheRecord(t *testing.T, f *stockFixture) (*inodeRecord, uint64) {
 	t.Helper()
 	entry := f.lookup(t, 1, "file")
 	record := f.raw.acquire(entry.NodeId)
@@ -23,14 +23,14 @@ func ownCacheRecord(t *testing.T, f *strictFixture) (*inodeRecord, uint64) {
 }
 
 func TestOwnWriteSkipsNeverCachedInode(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	record, inode := ownCacheRecord(t, f)
-	writer := openV7Writer(t, f, inode)
+	writer := openDelegatedWriter(t, f, inode)
 	f.notify.mu.Lock()
 	f.notify.calls = nil
 	f.notify.mu.Unlock()
 	for i := 0; i < 100; i++ {
-		writeV7(t, f, inode, writer.Fh, uint64(i*4), []byte("data"))
+		writeDelegated(t, f, inode, writer.Fh, uint64(i*4), []byte("data"))
 	}
 	if calls := f.notify.snapshot(); len(calls) != 0 {
 		t.Fatalf("writer-only notifications: %+v", calls)
@@ -47,19 +47,19 @@ func TestOwnWriteSkipsNeverCachedInode(t *testing.T) {
 func TestOwnWriteCoalescesClosedReaderRanges(t *testing.T) {
 	for _, boundary := range []string{"flush-cycle", "cached-open"} {
 		t.Run(boundary, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			record, inode := ownCacheRecord(t, f)
 			// Model a previously published KEEP_CACHE description whose RELEASE has
 			// finished. Its folios remain even after the local grant is released.
 			record.readCache.addReader()
 			record.readCache.removeReader()
-			writer := openV7Writer(t, f, inode)
+			writer := openDelegatedWriter(t, f, inode)
 			f.notify.mu.Lock()
 			f.notify.calls = nil
 			f.notify.mu.Unlock()
-			writeV7(t, f, inode, writer.Fh, 100, []byte("one"))
-			writeV7(t, f, inode, writer.Fh, 20, []byte("two"))
-			writeV7(t, f, inode, writer.Fh, 80, []byte("three"))
+			writeDelegated(t, f, inode, writer.Fh, 100, []byte("one"))
+			writeDelegated(t, f, inode, writer.Fh, 20, []byte("two"))
+			writeDelegated(t, f, inode, writer.Fh, 80, []byte("three"))
 			if calls := f.notify.snapshot(); len(calls) != 0 {
 				t.Fatalf("closed-reader immediate notifications: %+v", calls)
 			}
@@ -92,7 +92,7 @@ func TestOwnWriteCoalescesClosedReaderRanges(t *testing.T) {
 }
 
 func TestOwnWriteWaitsForNotificationAndIncludesConcurrentRange(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	record, _ := ownCacheRecord(t, f)
 	record.readCache.addReader()
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -139,7 +139,7 @@ func TestOwnWriteWaitsForNotificationAndIncludesConcurrentRange(t *testing.T) {
 }
 
 func TestOwnReadHandleCountIncludesClosingInFlightRead(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	record, _ := ownCacheRecord(t, f)
 	id, ok := f.raw.addHandle(record, &handleRecord{file: &fileHandle{node: record.node, buffered: true}})
 	if !ok {
@@ -194,7 +194,7 @@ func TestOwnCachePublicationFailureIsInodeLocal(t *testing.T) {
 				name = "persistent"
 			}
 			t.Run(operation+"/"+name, func(t *testing.T) {
-				f := newStrictFixture(t)
+				f := newStockFixture(t)
 				f.rpc.mu.Lock()
 				f.rpc.byName = map[string]*authoritypb.Item{
 					"file":  cloneItem(f.rpc.item),
@@ -262,10 +262,10 @@ func TestOwnCachePublicationFailureIsInodeLocal(t *testing.T) {
 }
 
 func TestOwnCacheWriteFailureReportsDiscardedBuffer(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	record, inode := ownCacheRecord(t, f)
 	record.readCache.addReader()
-	writer := openV7Writer(t, f, inode)
+	writer := openDelegatedWriter(t, f, inode)
 	f.mount.subscription.config.withdrawalLead = 30 * time.Millisecond
 	f.mount.subscription.config.retryDelay = 2 * time.Millisecond
 	f.notify.mu.Lock()

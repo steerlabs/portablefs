@@ -16,12 +16,9 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-// The protocol-6 lease test names remain as an explicit replacement ledger.
-// Each now exercises the stronger protocol-7 subscription rule that subsumes
-// the old per-family guarantee.
-
-func subscriptionExactCoordinateReplacement(t *testing.T) {
-	t.Helper()
+// A change entry withdraws exactly its own coordinate: a reply sampled before
+// it can no longer be cached, while a disjoint coordinate keeps its permission.
+func TestSubscriptionChangeClosesOnlyItsExactCoordinate(t *testing.T) {
 	registry, clock, _, _ := activeSubscriptionFixture(t, 11)
 	identityA, identityB := subscriptionIdentity(31), subscriptionIdentity(32)
 	coordinateA := publicationCoordinate{kind: publicationItemAttributes, item: identityA}
@@ -39,8 +36,9 @@ func subscriptionExactCoordinateReplacement(t *testing.T) {
 	}
 }
 
-func subscriptionMalformedBatchReplacement(t *testing.T) {
-	t.Helper()
+// A change batch with a position gap is refused whole; the delivery cursor
+// does not advance past entries it never validated.
+func TestSubscriptionRefusesNoncontiguousChangeBatchWithoutAdvancing(t *testing.T) {
 	registry, _, _, _ := activeSubscriptionFixture(t, 12)
 	identity := subscriptionIdentity(33)
 	valid := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 1, Kind: authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED, Identity: identity[:]}
@@ -56,8 +54,10 @@ func subscriptionMalformedBatchReplacement(t *testing.T) {
 	}
 }
 
-func subscriptionDelegationReplacement(t *testing.T) {
-	t.Helper()
+// A delegation grant excludes the identity's data from caching until the
+// ordered change worker applies its release; receipt of the release alone
+// does not reopen caching.
+func TestSubscriptionDelegationExcludesCachingUntilReleaseApplies(t *testing.T) {
 	registry, clock, _, _ := activeSubscriptionFixture(t, 13)
 	identity := subscriptionIdentity(34)
 	data := publicationCoordinate{kind: publicationItemData, item: identity}
@@ -86,7 +86,7 @@ func subscriptionDelegationReplacement(t *testing.T) {
 	}
 }
 
-func TestWireLeaseHorizonIsNotKernelCacheLifetime(t *testing.T) {
+func TestSubscriptionHorizonIsNotKernelCacheLifetime(t *testing.T) {
 	registry, clock, _, _ := activeSubscriptionFixture(t, 14)
 	coordinate := publicationCoordinate{kind: publicationItemData, item: subscriptionIdentity(35)}
 	stamp := registry.stamp()
@@ -97,7 +97,7 @@ func TestWireLeaseHorizonIsNotKernelCacheLifetime(t *testing.T) {
 }
 
 func TestRenewalSelectionIsFrameBounded(t *testing.T) {
-	// V7 renews one volume subscription in one constant-size request; change
+	// One volume subscription renews in one constant-size request; change
 	// volume no longer changes renewal frame size.
 	registry, _, _, _ := activeSubscriptionFixture(t, 15)
 	for index := uint64(1); index <= 4096; index++ {
@@ -115,12 +115,11 @@ func TestRenewalSelectionIsFrameBounded(t *testing.T) {
 	}
 }
 
-func TestLeaseHorizonWatchdogSurvivesSharedMountCancellation(t *testing.T) {
+func TestSubscriptionHorizonWorkerWithdrawsEveryCacheAtExpiry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// Protocol 7 has no hard-deadline mount-abort watchdog. Its stronger
-		// replacement is the subscription horizon worker, which retains its own
-		// progress while the CONTROL poll is parked and withdraws every cache before
-		// returning the incarnation for cold recovery.
+		// The subscription horizon worker keeps its own progress while the
+		// CONTROL poll is parked and withdraws every cache before returning the
+		// incarnation for cold recovery.
 		now := time.Now()
 		rpc := &subscriptionTestRPC{horizon: now.Add(time.Minute)}
 		invalidator := &subscriptionTestInvalidator{}
@@ -149,38 +148,18 @@ func TestLeaseHorizonWatchdogSurvivesSharedMountCancellation(t *testing.T) {
 	})
 }
 
-func TestLeaseCompleteValidatesExactPostStateBeforeDischarge(t *testing.T) {
-	subscriptionMalformedBatchReplacement(t)
-}
-
 func TestStockWriteTreatsTheAppendFlagAsPlacementNotRefusal(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	written, status := fixture.raw.writeStock(&fuse.WriteIn{Flags: uint32(syscall.O_APPEND)}, nil)
 	if written != 0 || status != fuse.EBADF {
 		t.Fatalf("append FUSE_WRITE on no handle = (%d, %v), want EBADF", written, status)
 	}
 }
 
-func TestLeaseRecallRejectsOlderGrantGeneration(t *testing.T) {
-	TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t)
-}
-
-func TestSuccessorDataEpochWaitsForOldPagesToPurge(t *testing.T) {
-	TestSubscriptionAckFollowsProvenWithdrawal(t)
-}
-
-func TestEnumerationPagesCannotBorrowSuccessorEpoch(t *testing.T) {
-	subscriptionExactCoordinateReplacement(t)
-}
-
-func TestEnumerationRecallDoesNotLeakTransientError(t *testing.T) {
-	TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing(t)
-}
-
 func TestSourceRenameNeverMovesCoordinateBoundNamePayloads(t *testing.T) {
 	for _, exchange := range []bool{false, true} {
 		t.Run(fmt.Sprintf("exchange=%t", exchange), func(t *testing.T) {
-			fixture := newStrictFixture(t)
+			fixture := newStockFixture(t)
 			oldParent := fixture.raw.acquire(fuse.FUSE_ROOT_ID)
 			if oldParent == nil {
 				t.Fatal("root")
@@ -218,14 +197,6 @@ func TestSourceRenameNeverMovesCoordinateBoundNamePayloads(t *testing.T) {
 	}
 }
 
-func TestReplyLeaseCannotBorrowLaterRegistryGrant(t *testing.T) {
-	TestSubscriptionColdPaginationWatermarkAndStaleReply(t)
-}
-
-func TestRecallDrainsFinalizedInstallingReplies(t *testing.T) {
-	TestSubscriptionAckFollowsProvenWithdrawal(t)
-}
-
 func TestEnumerationInvalidationDropsEveryBufferedHandle(t *testing.T) {
 	frontend, _, _ := testRawFileSystem(t, 8)
 	record, errno := frontend.intern(context.Background(), testItem(74, authoritypb.Attr_DIRECTORY, 74))
@@ -254,19 +225,7 @@ func TestEnumerationInvalidationDropsEveryBufferedHandle(t *testing.T) {
 	}
 }
 
-func TestSourceGrantFloorAllowsDisjointReverseCompletion(t *testing.T) {
-	subscriptionExactCoordinateReplacement(t)
-}
-
-func TestRecallSequencesAllowDisjointOvertake(t *testing.T) {
-	TestSubscriptionPollDeliversDelegationWhileWithdrawalBlocked(t)
-}
-
-func TestUnrelatedHighEpochDoesNotRejectFreshCoordinate(t *testing.T) {
-	subscriptionExactCoordinateReplacement(t)
-}
-
-func TestLeaseRegistryBoundsUniqueNameChurn(t *testing.T) {
+func TestSubscriptionRegistryBoundsUniqueNameChurn(t *testing.T) {
 	registry, _, _, _ := activeSubscriptionFixture(t, 16)
 	parent := subscriptionIdentity(40)
 	for position := uint64(1); position <= maxSubscriptionCoordinates+1024; position++ {
@@ -281,10 +240,6 @@ func TestLeaseRegistryBoundsUniqueNameChurn(t *testing.T) {
 	if count > maxSubscriptionCoordinates {
 		t.Fatalf("coordinate index grew with repeated churn: %d", count)
 	}
-}
-
-func TestBufferedHandleRefaultIsTrackedByNextRecall(t *testing.T) {
-	subscriptionDelegationReplacement(t)
 }
 
 func TestExpiredEnumerationPageIsNotServedAfterResume(t *testing.T) {
@@ -362,27 +317,7 @@ func TestEnumerationPageForAnItemWithoutAStableIdentityFailsClosed(t *testing.T)
 	}
 }
 
-func TestEnumerationLeaseExpiryPurgesBufferedPage(t *testing.T) {
-	TestEnumerationInvalidationDropsEveryBufferedHandle(t)
-}
-
-func TestLocalExpiryRacingRemoteRecallKeepsGateClosed(t *testing.T) {
-	TestSubscriptionFailedNotifyMarksIdentityStaleWithoutAck(t)
-}
-
-func TestWithdrawnRenewalExpiresCoordinateWithoutTerminalizingMount(t *testing.T) {
-	TestWireLeaseHorizonIsNotKernelCacheLifetime(t)
-}
-
-func TestSourceDischargeAcksWithoutPrivateNameBarrier(t *testing.T) {
-	TestSubscriptionAckFollowsProvenWithdrawal(t)
-}
-
-func TestSourcePublicationWaitsForOverlappingLeaseRecall(t *testing.T) {
-	TestSubscriptionAckFollowsProvenWithdrawal(t)
-}
-
-func TestSourceMutationReplyHasZeroCacheValidityWithoutSuccessorLease(t *testing.T) {
+func TestSourceMutationReplyHasZeroCacheValidityWithoutSubscriptionStamp(t *testing.T) {
 	registry, clock, _, _ := activeSubscriptionFixture(t, 19)
 	if registry.remaining(publicationCoordinate{kind: publicationNamespaceName}, subscriptionStamp{}, 1, clock.Now()) != 0 {
 		t.Fatal("reply without a subscription stamp had cache validity")
@@ -390,7 +325,7 @@ func TestSourceMutationReplyHasZeroCacheValidityWithoutSuccessorLease(t *testing
 }
 
 func TestDaemonNameCacheKeepsKernelValidityZero(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(90, authoritypb.Attr_REGULAR, 90)
 	item.Attr.Size = 11
 	fixture.rpc.byName = map[string]*authoritypb.Item{"hit": item}
@@ -412,7 +347,7 @@ func TestDaemonNameCacheKeepsKernelValidityZero(t *testing.T) {
 		t.Fatalf("warm positive reply = validity (%d,%d) size %d", second.EntryValid, second.EntryValidNsec, second.Attr.Size)
 	}
 
-	negative := newStrictFixture(t)
+	negative := newStockFixture(t)
 	negative.rpc.missingNames["missing"] = true
 	missing := negative.lookup(t, fuse.FUSE_ROOT_ID, "missing")
 	if missing.NodeId != 0 || missing.EntryValid != 0 || missing.EntryValidNsec != 0 {
@@ -431,7 +366,7 @@ func TestDaemonNameCacheKeepsKernelValidityZero(t *testing.T) {
 }
 
 func TestDaemonAttrCacheUsesFreshGrantBearingSnapshot(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(91, authoritypb.Attr_REGULAR, 91)
 	item.Attr.Size = 1
 	fixture.rpc.byName = map[string]*authoritypb.Item{"file": item}
@@ -479,7 +414,7 @@ func TestDaemonAttrCacheUsesFreshGrantBearingSnapshot(t *testing.T) {
 }
 
 func TestDaemonNamePayloadCannotBorrowReplacementGrant(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(92, authoritypb.Attr_REGULAR, 92)
 	fixture.rpc.byName = map[string]*authoritypb.Item{"stale": item}
 	entry := fixture.lookup(t, fuse.FUSE_ROOT_ID, "stale")
@@ -538,14 +473,10 @@ func TestRenewalPreservesDaemonPayloadForSameEpoch(t *testing.T) {
 	}
 }
 
-func TestSourceDischargeDoesNotRequirePostStateOrMatchingCommitSequence(t *testing.T) {
-	TestSubscriptionAckFollowsProvenWithdrawal(t)
-}
-
 func TestNamespaceWithdrawalRejectsPendingRepliesWithoutKernelNotify(t *testing.T) {
 	for _, negative := range []bool{false, true} {
 		t.Run(fmt.Sprint(negative), func(t *testing.T) {
-			fixture := newStrictFixture(t)
+			fixture := newStockFixture(t)
 			const name = "pending-name"
 			fixture.rpc.byName = map[string]*authoritypb.Item{name: testItem(94, authoritypb.Attr_REGULAR, 94)}
 			fixture.rpc.missingNames[name] = negative
@@ -601,7 +532,7 @@ func TestRenamePostBindingsSettleOnlyAtFreshReplyBoundary(t *testing.T) {
 		withdrawn, forgotten bool
 	}{{name: "fresh"}, {name: "withdrawn", withdrawn: true}, {name: "forgotten", forgotten: true}} {
 		t.Run(scenario.name, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			f.rpc.byName = map[string]*authoritypb.Item{"old": f.rpc.item}
 			f.rpc.missingNames["new"] = true
 			moved := f.lookup(t, 1, "old")

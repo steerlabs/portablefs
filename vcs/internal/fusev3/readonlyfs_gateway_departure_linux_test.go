@@ -22,8 +22,8 @@ import (
 // which means both departures are ordinary events, not faults: a graceful stop
 // closes the session, and a SIGKILL just stops answering. Neither may cost the
 // mounts sharing the volume their writes. The cacheless reader is never in a
-// subscription-withdrawal or compatibility-repair audience, even while its
-// authenticated session remains live after an abrupt departure.
+// subscription-withdrawal audience, even while its authenticated session
+// remains live after an abrupt departure.
 func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 	peer := fusev3.NewGatewayPeerFixture(t, 1)
 	const name = "served"
@@ -58,7 +58,7 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 	}
 
 	// A gateway departure must not make a writer wait for a reader horizon.
-	// Keep the bound well below the fixture's repair budget to catch accidental
+	// Keep the bound well below the fixture's withdrawal timeout to catch accidental
 	// compatibility-writer or subscription membership.
 	writeBound := 2 * time.Second
 	requireWrite := func(what string, content []byte) time.Duration {
@@ -69,7 +69,7 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 		}
 		elapsed := time.Since(start)
 		if elapsed > writeBound {
-			t.Fatalf("%s took %s, past the %s a departed reader may cost a writer; the fixture repair budget is %s (%s)",
+			t.Fatalf("%s took %s, past the %s a departed reader may cost a writer; the fixture withdrawal timeout is %s (%s)",
 				what, elapsed, writeBound, peer.WithdrawalTimeout(), peer.Diagnostics())
 		}
 		return elapsed

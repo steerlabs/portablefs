@@ -549,7 +549,7 @@ func TestSubscriptionHorizonInvalidatesAllCaches(t *testing.T) {
 }
 
 func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	root := fixture.raw.acquire(1)
 	if root == nil {
 		t.Fatal("root inode")
@@ -580,7 +580,7 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 		t.Fatal("cold subscription resurrected an old-epoch inode")
 	}
 	if staleRecord.stale.Load() || staleRecord.node.stale.Load() {
-		t.Fatal("cold subscription retained repairable coherence staleness")
+		t.Fatal("cold subscription retained clearable coherence staleness")
 	}
 	fixture.raw.mu.Lock()
 	_, retainedNegative := fixture.raw.cachedNegatives[negative]
@@ -602,7 +602,7 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 }
 
 func TestUnlicensedReadRemainsIndexedUntilPostWritePurge(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	record, errno := fixture.raw.intern(context.Background(), testItem(80, authoritypb.Attr_REGULAR, 80))
 	if errno != 0 {
 		t.Fatal(errno)
@@ -681,7 +681,7 @@ func TestUnlicensedReadRemainsIndexedUntilPostWritePurge(t *testing.T) {
 }
 
 func TestCancelledBufferedReadReleasesIdentityIndex(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	record, errno := fixture.raw.intern(context.Background(), testItem(81, authoritypb.Attr_REGULAR, 81))
 	if errno != 0 {
 		t.Fatal(errno)
@@ -814,7 +814,7 @@ func TestControlCompletionReceiptWaitsForEveryEarlierHandler(t *testing.T) {
 }
 
 func TestNamespaceWithdrawalPurgesBindingsWithoutEntryNotify(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	root := fixture.raw.acquire(1)
 	defer fixture.raw.release(root)
 	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: root.identity, name: "absent"}
@@ -842,7 +842,7 @@ func TestNamespaceWithdrawalPurgesBindingsWithoutEntryNotify(t *testing.T) {
 func TestCachedLookupWaitsForFinalizedReplyCacheSettlement(t *testing.T) {
 	for _, kind := range []string{"negative", "positive", "attributes", "revoked", "superseded"} {
 		t.Run(kind, func(t *testing.T) {
-			fixture := newStrictFixture(t)
+			fixture := newStockFixture(t)
 			parent := fixture.raw.acquire(fuse.FUSE_ROOT_ID)
 			defer fixture.raw.release(parent)
 			unique := fixture.unique.Add(2)

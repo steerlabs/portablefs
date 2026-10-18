@@ -96,7 +96,7 @@ func requireExactFile(t *testing.T, path string, want []byte, operation string) 
 	}
 }
 
-func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
+func TestKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	const payloadSize = 2*integrationMaxWriteBytes + 12345
 
@@ -205,15 +205,15 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	})
 }
 
-func TestStrictKernelSharedFallocateMutations(t *testing.T) {
+func TestKernelSharedFallocateMutations(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	var filesystem unix.Statfs_t
 	if err := unix.Statfs(f.mountPath(0), &filesystem); err != nil {
-		t.Fatalf("statfs strict mount: %v", err)
+		t.Fatalf("statfs mount: %v", err)
 	}
 	block := int(filesystem.Bsize)
 	if block <= 0 {
-		t.Fatalf("strict mount reported invalid filesystem block size %d", block)
+		t.Fatalf("mount reported invalid filesystem block size %d", block)
 	}
 
 	newFile := func(t *testing.T, name string, blocks int) (*os.File, []byte) {
@@ -280,7 +280,7 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 				err = unix.Fallocate(int(file.Fd()), test.mode, int64(2*block), int64(block))
 			})
 			if !errors.Is(err, syscall.EOPNOTSUPP) {
-				t.Fatalf("fallocate mode %#o through the strict mount = %v, want EOPNOTSUPP from the kernel", test.mode, err)
+				t.Fatalf("fallocate mode %#o through the mount = %v, want EOPNOTSUPP from the kernel", test.mode, err)
 			}
 			if requests != 0 {
 				t.Fatalf("the refused mode %#o still reached the authority %d times", test.mode, requests)
@@ -306,7 +306,7 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 	}
 }
 
-func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
+func TestKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Routes: "local/\n"})
 	sourceData := deterministicIntegrationData(3*4096+37, 67)
 	mustWrite(t, f.join(0, "source"), sourceData, 0o600)
@@ -378,7 +378,7 @@ func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
 	}
 }
 
-func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
+func TestKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	linkable, err := unix.Open(f.mountPath(0), unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
 	if err != nil {
@@ -460,18 +460,18 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	requireAbsent(t, f.join(1, "must-not-link"), "exclusive O_TMPFILE")
 }
 
-func TestStrictKernelSyncfsSucceeds(t *testing.T) {
+func TestKernelSyncfsSucceeds(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	root, err := unix.Open(f.mountPath(0), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		t.Fatalf("open strict mount root for syncfs: %v", err)
+		t.Fatalf("open mount root for syncfs: %v", err)
 	}
 	defer func() {
 		if err := unix.Close(root); err != nil {
-			t.Errorf("close strict mount root: %v", err)
+			t.Errorf("close mount root: %v", err)
 		}
 	}()
 	if err := unix.Syncfs(root); err != nil {
-		t.Fatalf("syncfs strict mount: %v", err)
+		t.Fatalf("syncfs mount: %v", err)
 	}
 }

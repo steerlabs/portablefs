@@ -227,7 +227,7 @@ func (m *recordingMembership) activeCount() int {
 
 // integrationTransport is the fixture's equivalent of the production mount
 // binary's adapter: it carries the session identity the frontend needs to
-// recognise its own mutations, and the mount-absence evidence a strict detach
+// recognise its own mutations, and the mount-absence evidence a clean detach
 // requires.
 type integrationTransport struct {
 	*authorityrpc.Client

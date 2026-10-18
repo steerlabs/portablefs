@@ -13,12 +13,12 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
-func dirtyHolderMetadataFixture(t *testing.T) (*strictFixture, *fuse.EntryOut) {
+func dirtyHolderMetadataFixture(t *testing.T) (*stockFixture, *fuse.EntryOut) {
 	t.Helper()
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 	// The first post-grant read installs a base from this grant's storage cut.
 	if status := f.rawCall(func(unique uint64) fuse.Status {
 		return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})

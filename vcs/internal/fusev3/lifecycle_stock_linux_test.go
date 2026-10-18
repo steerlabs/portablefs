@@ -11,16 +11,16 @@ import (
 	"time"
 )
 
-func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
-	fixture := newStrictFixture(t)
+func TestCleanDetachRequiresObservedMountAbsence(t *testing.T) {
+	fixture := newStockFixture(t)
 	if err := fixture.mount.detach(); err == nil {
-		t.Fatal("strict detach without a kernel mount identity succeeded")
+		t.Fatal("clean detach without a kernel mount identity succeeded")
 	}
 	fixture.rpc.mu.Lock()
 	proofs := len(fixture.rpc.detachProofs)
 	fixture.rpc.mu.Unlock()
 	if proofs != 0 {
-		t.Fatalf("strict mount detached with %d proofs and no exact observation", proofs)
+		t.Fatalf("mount detached with %d proofs and no exact observation", proofs)
 	}
 	fixture.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent-portablefs-mount", filesystem: "fuse.portablefs", source: "portablefs:unit-lifecycle"}
 	done := make(chan struct{})
@@ -40,8 +40,8 @@ func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 	}
 }
 
-func TestStrictDetachWaitsForTheExactFUSEConnection(t *testing.T) {
-	fixture := newStrictFixture(t)
+func TestCleanDetachWaitsForTheExactFUSEConnection(t *testing.T) {
+	fixture := newStockFixture(t)
 	fixture.mount.kernelMount = kernelMount{id: "999999998", device: "0:998", point: "/nonexistent-portablefs-lazy-mount", filesystem: "fuse.portablefs", source: "portablefs:unit-lifecycle"}
 	fixture.mount.kernelConnectionDone = make(chan struct{})
 	result := make(chan error, 1)
@@ -64,8 +64,8 @@ func TestStrictDetachWaitsForTheExactFUSEConnection(t *testing.T) {
 	}
 }
 
-func TestStrictClosePreservesDetachDeliveryFailure(t *testing.T) {
-	fixture := newStrictFixture(t)
+func TestClosePreservesDetachDeliveryFailure(t *testing.T) {
+	fixture := newStockFixture(t)
 	fixture.mount.kernelMount = kernelMount{id: "999999997", device: "0:997", point: "/nonexistent-portablefs-detach-failure", filesystem: "fuse.portablefs", source: "portablefs:unit-lifecycle"}
 	done := make(chan struct{})
 	close(done)
@@ -130,7 +130,7 @@ func TestPlannedMountSourceAbsenceRefusesAnInstalledSource(t *testing.T) {
 }
 
 func TestFailedHelperMountIsExactlyUnmountedBeforeSessionRelease(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	directory := t.TempDir()
 	mountInfo := directory + "/mountinfo"
 	fsName := "portablefs:11111111-1111-4111-8111-111111111111"
@@ -164,7 +164,7 @@ func TestFailedHelperMountIsExactlyUnmountedBeforeSessionRelease(t *testing.T) {
 }
 
 func TestFailedHelperMountCleanupRetainsSessionWhenUnmountDoesNotRemoveMount(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	mountInfo := t.TempDir() + "/mountinfo"
 	fsName := "portablefs:22222222-2222-4222-8222-222222222222"
 	mountpoint := "/workspaces/example"
@@ -202,7 +202,7 @@ func TestFailedHelperMountCleanupRefusesUnexpectedKernelIdentity(t *testing.T) {
 		{name: "malformed record without planned source", records: "1 0 0:1 / / rw - ext4 /dev/root rw\nmalformed\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newStrictFixture(t)
+			fixture := newStockFixture(t)
 			mountInfo := t.TempDir() + "/mountinfo"
 			if err := os.WriteFile(mountInfo, []byte(test.records), 0o600); err != nil {
 				t.Fatal(err)

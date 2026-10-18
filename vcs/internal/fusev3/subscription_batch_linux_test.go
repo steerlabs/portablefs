@@ -12,7 +12,7 @@ import (
 )
 
 func TestBatchWithdrawalClosesEveryCoordinateBeforeReplyDrain(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	unique := f.unique.Add(2)
 	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
@@ -56,7 +56,7 @@ func TestBatchWithdrawalClosesEveryCoordinateBeforeReplyDrain(t *testing.T) {
 }
 
 func TestBatchWithdrawalDropsEveryPayloadBeforeCoalescedNotification(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	f.lookup(t, 1, "alias")
 	identity := f.raw.nodesByID[entry.NodeId].identity
@@ -109,7 +109,7 @@ func TestRegisteredGrantCannotBeClearedByEarlierRelease(t *testing.T) {
 				name += "/release-last"
 			}
 			t.Run(name, func(t *testing.T) {
-				f := newStrictFixture(t)
+				f := newStockFixture(t)
 				identity := f.raw.nodesByID[1].identity
 				s := f.mount.subscription
 				incarnation := s.stamp().incarnation
@@ -164,7 +164,7 @@ func TestRegisteredGrantCannotBeClearedByEarlierRelease(t *testing.T) {
 }
 
 func TestCacheWithdrawalOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
 	first, err := f.raw.closeCacheCoordinate(t.Context(), coordinate)
@@ -204,12 +204,12 @@ func TestCacheWithdrawalOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
 	f.raw.mu.Lock()
 	defer f.raw.mu.Unlock()
 	if f.raw.withdrawingCoordinates[coordinate] || len(f.raw.withdrawalOwners) != 0 {
-		t.Fatal("settled repair owners leaked")
+		t.Fatal("settled withdrawal owners leaked")
 	}
 }
 
 func TestFailedColdProofRetiresOnlyItsOwnWithdrawalOwner(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
 	local, err := f.raw.closeCacheCoordinate(t.Context(), coordinate)

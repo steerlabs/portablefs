@@ -125,10 +125,10 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 		t.Fatalf("peer mount rewrite while the gateway is attached: %v (%s)", err, peer.Diagnostics())
 	}
 	writeElapsed := time.Since(writeStart)
-	// Keep a bound well below recall expiry so waiting for a nonexistent
-	// gateway repair worker cannot satisfy the test.
+	// Keep a bound well below recall expiry so waiting on the cacheless
+	// gateway for any withdrawal cannot satisfy the test.
 	if writeElapsed > peer.WithdrawalTimeout()/4 {
-		t.Fatalf("a rewrite beside the attached gateway took %s, more than a quarter of the %s recall budget: the gateway obstructed the writer (%s)",
+		t.Fatalf("a rewrite beside the attached gateway took %s, more than a quarter of the %s withdrawal timeout: the gateway obstructed the writer (%s)",
 			writeElapsed, peer.WithdrawalTimeout(), peer.Diagnostics())
 	}
 	requireGatewayContent(t, ctx, gateway, servedKey, mutated, "the gateway's read after the peer mutation")
@@ -213,7 +213,7 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	}
 	// Expiry must not be the mechanism that lets the writer proceed.
 	if perRound := loopElapsed / rounds; perRound > peer.WithdrawalTimeout()/4 {
-		t.Fatalf("%d rewrites beside a continuously reading gateway averaged %s each, more than a quarter of the %s recall budget (%s)",
+		t.Fatalf("%d rewrites beside a continuously reading gateway averaged %s each, more than a quarter of the %s withdrawal timeout (%s)",
 			rounds, perRound, peer.WithdrawalTimeout(), peer.Diagnostics())
 	}
 	if fenced := peer.FencedSessions(); fenced != 0 {

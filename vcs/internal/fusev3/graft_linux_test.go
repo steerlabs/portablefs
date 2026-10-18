@@ -251,7 +251,7 @@ func TestARouteRootIsCreatedAndServedWithoutOneAuthorityRequest(t *testing.T) {
 	}
 }
 
-func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) {
+func TestLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) {
 	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), true)
 	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
 	baseline := f.calls()
@@ -740,7 +740,7 @@ func decodeDirEntries(t *testing.T, buffer []byte) []fuse.DirEntry {
 	return entries
 }
 
-// --- the strict cache contract is not extended to grafted names ---
+// --- the cache contract is not extended to grafted names ---
 
 func TestGraftedNamesNeverEnterTheCachedNameRegistry(t *testing.T) {
 	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), true)
@@ -750,7 +750,7 @@ func TestGraftedNamesNeverEnterTheCachedNameRegistry(t *testing.T) {
 	f.raw.mu.Lock()
 	defer f.raw.mu.Unlock()
 	if len(f.raw.cachedNames) != 0 {
-		t.Fatalf("cachedNames holds %d machine-local bindings; the registry is the exact set of names this mount owes the AUTHORITY a repair for, and a graft can never be one", len(f.raw.cachedNames))
+		t.Fatalf("cachedNames holds %d machine-local bindings; the registry is the exact set of names this mount may have to withdraw for the AUTHORITY, and a graft can never be one", len(f.raw.cachedNames))
 	}
 	for key, record := range f.raw.nodesByKey {
 		if record.graft {

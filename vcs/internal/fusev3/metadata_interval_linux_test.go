@@ -67,7 +67,7 @@ func (r *delayedMetadataRPC) CallIdempotent(ctx context.Context, request *author
 	return r.RPC.CallIdempotent(ctx, request)
 }
 
-func installMetadataDelay(f *strictFixture, matches func(*authoritypb.Request) bool) *delayedMetadataRPC {
+func installMetadataDelay(f *stockFixture, matches func(*authoritypb.Request) bool) *delayedMetadataRPC {
 	rpc := &delayedMetadataRPC{RPC: f.rpc, matches: matches, started: make(chan struct{}), resume: make(chan struct{})}
 	epoch := f.mount.rpc.(*epochRPC)
 	epoch.mu.Lock()
@@ -89,7 +89,7 @@ func metadataPage(items ...*authoritypb.Item) *authoritypb.ReadDirReply {
 	return page
 }
 
-func applyMetadataTestStorage(f *strictFixture, size int64, version uint64) {
+func applyMetadataTestStorage(f *stockFixture, size int64, version uint64) {
 	// The general fake records WRITE calls but does not maintain a byte store.
 	f.rpc.mu.Lock()
 	f.rpc.item.Attr.Size, f.rpc.readSequence = size, version
@@ -97,7 +97,7 @@ func applyMetadataTestStorage(f *strictFixture, size int64, version uint64) {
 }
 
 func TestUnownedSetattrPublishesVersionedPostState(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "file")
 	// The fake records SETATTR and returns its stored attributes as post-state.
 	f.rpc.mu.Lock()
@@ -145,10 +145,10 @@ func TestMetadataReplyAcrossCleanOwnershipChange(t *testing.T) {
 				name = operation + "/successor"
 			}
 			t.Run(name, func(t *testing.T) {
-				f := newStrictFixture(t)
+				f := newStockFixture(t)
 				entry := f.lookup(t, 1, "index.lock")
-				opened := openV7Writer(t, f, entry.NodeId)
-				writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+				opened := openDelegatedWriter(t, f, entry.NodeId)
+				writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 				var dir uint64
 				if operation == "readdirplus" {
 					dir, _ = testDirHandle(t, f.raw, metadataPage(f.rpc.item))
@@ -232,11 +232,11 @@ func TestMetadataReplyPinsOwnershipUntilPhysicalWrite(t *testing.T) {
 			name = "holder-release"
 		}
 		t.Run(name, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			entry := f.lookup(t, 1, "index.lock")
 			if owned {
-				opened := openV7Writer(t, f, entry.NodeId)
-				writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+				opened := openDelegatedWriter(t, f, entry.NodeId)
+				writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 			} else {
 				f.raw.mu.Lock()
 				delete(f.raw.cachedAttrs, publicationIdentity(testIdentity(7)))
@@ -277,10 +277,10 @@ func TestMetadataReplyPinsOwnershipUntilPhysicalWrite(t *testing.T) {
 }
 
 func TestReadDirPlusBufferedMetadataRechecksOwnershipInterval(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "index.lock")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 	page := metadataPage(testItem(8, authoritypb.Attr_REGULAR, 8), f.rpc.item)
 	dir, _ := testDirHandle(t, f.raw, page)
 	installMetadataDelay(f, func(*authoritypb.Request) bool { return false })
@@ -325,10 +325,10 @@ func TestReadDirPlusBufferedMetadataRechecksOwnershipInterval(t *testing.T) {
 }
 
 func TestReadDirPlusAliasesSharePhysicalPinAndKeepIndependentNames(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "index.lock")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 	dir, _ := testDirHandle(t, f.raw, metadataPage(f.rpc.item, f.rpc.item, testItem(8, authoritypb.Attr_REGULAR, 8)))
 	buffer := make([]byte, 4096)
 	unique := f.unique.Add(2)
@@ -369,10 +369,10 @@ func TestReadDirPlusAliasesSharePhysicalPinAndKeepIndependentNames(t *testing.T)
 }
 
 func TestMetadataTimeoutRetiresRequestHistory(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "index.lock")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 	f.raw.requestTimeout = 20 * time.Millisecond
 	installMetadataDelay(f, func(request *authoritypb.Request) bool { return request.GetGetAttr() != nil })
 	unique := f.unique.Add(2)
@@ -394,7 +394,7 @@ func TestMetadataTimeoutRetiresRequestHistory(t *testing.T) {
 
 func TestMetadataSamplingAndSourceAdmissionAreAtomic(t *testing.T) {
 	f, entry := dirtyHolderMetadataFixture(t)
-	opened := openV7Writer(t, f, entry.NodeId)
+	opened := openDelegatedWriter(t, f, entry.NodeId)
 	state := f.mount.delegations.retainState(writeback.Identity(testIdentity(7)), false)
 	defer f.mount.delegations.releaseState(state)
 	state.meta.Lock()
@@ -417,7 +417,7 @@ func TestMetadataSamplingAndSourceAdmissionAreAtomic(t *testing.T) {
 		return true
 	})
 	written := make(chan struct{})
-	go func() { writeV7(t, f, entry.NodeId, opened.Fh, 8192, []byte("later")); close(written) }()
+	go func() { writeDelegated(t, f, entry.NodeId, opened.Fh, 8192, []byte("later")); close(written) }()
 	unlock()
 	if status := <-metadata; status != fuse.OK {
 		t.Fatal(status)
@@ -439,7 +439,7 @@ func TestMetadataSamplingAndSourceAdmissionAreAtomic(t *testing.T) {
 }
 
 func TestDirectoryMetadataSettlementReleasesAllPinsBeforeIndex(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	dir, _ := testDirHandle(t, f.raw, metadataPage(f.rpc.item, testItem(8, authoritypb.Attr_REGULAR, 8)))
 	unique := f.unique.Add(2)
 	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: dir}, fuse.NewDirEntryList(make([]byte, 4096), 0)); status != fuse.OK {
@@ -480,10 +480,10 @@ func TestDirectoryMetadataSettlementReleasesAllPinsBeforeIndex(t *testing.T) {
 }
 
 func TestDirectoryMetadataRefetchReleasesAllIdentityPins(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "index.lock")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 4096, []byte("dirty"))
 	unique := f.unique.Add(2)
 	ctx, finish, status := f.raw.mutationContext(unique)
 	if status != fuse.OK {

@@ -286,7 +286,7 @@ func TestRevocationReportClassifiesItsCause(t *testing.T) {
 		cause error
 		want  string
 	}{
-		{"repair budget", errors.New("fusev3: cache withdrawal deadline exceeded (15s)"), RevocationCoherenceViolation},
+		{"withdrawal timeout", errors.New("fusev3: cache withdrawal deadline exceeded (15s)"), RevocationCoherenceViolation},
 		{"routes changed", routesChangeCause(make([]byte, 32), make([]byte, 32)), RevocationRoutesChanged},
 		{"session ended", fmt.Errorf("fusev3: %w", authorityrpc.ErrSessionEnded), RevocationSessionTerminal},
 		{"anything else", errors.New("fusev3: publication lost its ownership"), RevocationCoherenceViolation},
@@ -367,7 +367,7 @@ func TestSuccessfulWithdrawalReportsCleanKernelState(t *testing.T) {
 // Stock FUSE does not expose the final page-purge result, so this test proves
 // notification ordering only; the retained-reference residual stays explicit.
 func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
 	f.openForData(t, entry.NodeId)
@@ -415,7 +415,7 @@ func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
 // the connection abort have both been attempted, even when the notification
 // itself reports failure.
 func TestSessionDoneWaitsForRetainedPageWithdrawalAttempt(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
 	f.openForData(t, entry.NodeId)
@@ -499,7 +499,7 @@ func TestSessionDoneWaitsForRetainedPageWithdrawalAttempt(t *testing.T) {
 // while a process inside it can still read pre-fence bytes has been told the
 // wrong thing.
 func TestWithdrawalReportsPagesTheLadderCouldNotDrop(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
 	f.openForData(t, entry.NodeId)

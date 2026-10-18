@@ -81,7 +81,7 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 	// retained page cache and got sharper: a writable shared mapping would
 	// dirty folios that never travel an authority WRITE RPC, and a dirty
 	// folio is the one thing invalidate_inode_pages2() cannot withdraw, so it
-	// would turn every later DATA repair on the inode into a revocation.
+	// would turn every later DATA withdrawal on the inode into a revocation.
 	// Accepting EINVAL or ENOSYS as well would let an unrelated mmap breakage,
 	// or a mount that stopped refusing shared mappings and instead failed for
 	// some other reason, pass as if the contract were being enforced.
@@ -341,8 +341,8 @@ func TestCreateWithAReadOnlyModeReturnsAWritableHandle(t *testing.T) {
 // invalidation when i_size was unchanged fails here, as does a mount that
 // stopped joining the barrier's audience for the inode.
 //
-// REQUIRES THE PRIVILEGED RUNNER: this test needs a real strict-coherence
-// kernel and two live mounts. It cannot be exercised by the unit fixtures,
+// REQUIRES THE PRIVILEGED RUNNER: this test needs a real kernel FUSE mount
+// pair on a live authority. It cannot be exercised by the unit fixtures,
 // which never populate a page cache at all.
 func TestCrossMountContentCoherence(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
@@ -914,7 +914,7 @@ func TestStockWriteRequestSplitting(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	path := f.join(0, "write-size-classes")
 	// Synchronous writes expose each kernel split at the authority. Ordinary
-	// v7 positioned writes can coalesce before background application.
+	// delegated positioned writes can coalesce before background application.
 	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR|syscall.O_SYNC, 0o600)
 	defer file.Close()
 
@@ -1310,15 +1310,15 @@ func TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach(t *testing.T)
 	f.mounts[0] = nil
 }
 
-// TestFailedKernelMountDischargesStrictMembership covers the startup boundary
-// where the authority has already admitted a strict session but fusermount3
+// TestFailedKernelMountDischargesDurableMembership covers the startup boundary
+// where the authority has already admitted a mount session but fusermount3
 // refuses before a kernel mount ID can be recorded. The unique planned FUSE
 // source is still exact evidence: once NewServer returns without a server and
 // mountinfo contains no such source, this session cannot retain kernel caches.
-func TestFailedKernelMountDischargesStrictMembership(t *testing.T) {
+func TestFailedKernelMountDischargesDurableMembership(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	if count := f.membership.activeCount(); count != 1 {
-		t.Fatalf("initial strict membership = %d, want 1", count)
+		t.Fatalf("initial durable membership = %d, want 1", count)
 	}
 
 	client, transport := f.dialClient()
@@ -1587,15 +1587,15 @@ func distinctBytes(value []byte) int {
 	return len(seen)
 }
 
-// --- the strict cache contract, against real kernel mounts ------------------
+// --- the cache contract, against real kernel mounts --------------------------
 
-// TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority is the whole point
+// TestMountAnswersRepeatedPathWalksWithoutTheAuthority is the whole point
 // of the change. A metadata-heavy workload re-walks the same names constantly;
 // with zero entry lifetimes every one of those walks costs one authority round
 // trip per component, which is the multiplier that made `git status` on a few
 // thousand files cost tens of thousands of RPCs. This fails on any frontend
 // that publishes nothing cacheable.
-func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
+func TestMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	const files = 64
 	directory := f.join(0, "tree")
@@ -1633,7 +1633,7 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	// is zero LOOKUPs. Allow a small margin for a dentry the kernel evicted
 	// under memory pressure, but nothing like a per-name round trip.
 	if second > files/8 || third > files/8 {
-		t.Fatalf("repeated walks cost %d and %d LOOKUPs for %d names; a strict mount must resolve a cached path without the authority", second, third, files)
+		t.Fatalf("repeated walks cost %d and %d LOOKUPs for %d names; a mount must resolve a cached path without the authority", second, third, files)
 	}
 }
 
@@ -1666,7 +1666,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			removeXattr: f.counter.count("remove-xattr"),
 		}
 		fn()
-		// v7 can answer the stat from the accepted overlay before application.
+		// A holder can answer the stat from the accepted overlay before application.
 		// Measure the authority operations after a durable cut while retaining
 		// the zero-follow-up-GETATTR assertion for the operation and its stat.
 		if err := f.mounts[0].delegations.Barrier(t.Context(), loss); err != nil {
@@ -2133,12 +2133,12 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
 }
 
-// TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's
+// TestRemoteRemovalIsWithdrawnBeforeTheMutatorsCallReturns is the barrier's
 // actual promise. The observing mount has the name cached with a one-minute
-// lifetime, so nothing but a synchronous repair can make it stop resolving --
+// lifetime, so nothing but a synchronous withdrawal can make it stop resolving --
 // and it must have stopped by the time the removing side's syscall returns,
 // with no polling, no retry, and no sleep anywhere in this test.
-func TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns(t *testing.T) {
+func TestRemoteRemovalIsWithdrawnBeforeTheMutatorsCallReturns(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	mustWrite(t, f.join(0, "cached"), []byte("payload"), 0o600)
 	f.waitForDelegationReleases(t)
@@ -2155,13 +2155,13 @@ func TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns(t *testing.T) {
 	if err := os.Remove(f.join(0, "cached")); err != nil {
 		t.Fatalf("remote unlink: %v", err)
 	}
-	// No waitUntil. The unlink has returned, so the repair has already happened.
+	// No waitUntil. The unlink has returned, so the withdrawal has already happened.
 	requireAbsent(t, f.join(1, "cached"), "immediately after the remote unlink returned")
 }
 
-// TestRemoteWriteIsRepairedBeforeTheWritersCallReturns is the same assertion
+// TestRemoteWriteIsWithdrawnBeforeTheWritersCallReturns is the same assertion
 // for inode state: a cached size must be wrong for zero time.
-func TestRemoteWriteIsRepairedBeforeTheWritersCallReturns(t *testing.T) {
+func TestRemoteWriteIsWithdrawnBeforeTheWritersCallReturns(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	mustWrite(t, f.join(0, "growing"), []byte("small"), 0o600)
 	requireSize(t, f.join(1, "growing"), 5, "establishing the cached size")
@@ -2172,9 +2172,9 @@ func TestRemoteWriteIsRepairedBeforeTheWritersCallReturns(t *testing.T) {
 }
 
 // TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation walks the shapes whose
-// repair would need the very VFS lock the initiating syscall holds. Every one
-// of them completes, and the mount is still usable afterwards; a frontend that
-// repaired its own mutation would hang here instead of failing.
+// withdrawal would need the very VFS lock the initiating syscall holds. Every
+// one of them completes, and the mount is still usable afterwards; a frontend
+// that withdrew its own mutation would hang here instead of failing.
 func TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	directory := f.join(0, "self")
@@ -2203,11 +2203,11 @@ func TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation(t *testing.T) {
 	requireDirectoryNames(t, f.join(1, "self"), nil, "observed from the second mount")
 }
 
-// TestVisibilityAcknowledgmentSurvivesSaturatedIO is the liveness assertion.
-// Acknowledging is what releases the mutating machine, so a visibility loop
-// queued behind bulk work converts local load on one host into a stall on
-// every other host in the volume.
-func TestVisibilityAcknowledgmentSurvivesSaturatedIO(t *testing.T) {
+// TestChangeAcknowledgmentSurvivesSaturatedIO is the liveness assertion.
+// Acknowledging is what releases the mutating machine, so a subscription
+// CONTROL loop queued behind bulk work converts local load on one host into a
+// stall on every other host in the volume.
+func TestChangeAcknowledgmentSurvivesSaturatedIO(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	mustMkdir(t, f.join(1, "load"))
 	payload := make([]byte, 256*1024)
@@ -2237,7 +2237,7 @@ func TestVisibilityAcknowledgmentSurvivesSaturatedIO(t *testing.T) {
 	t.Cleanup(func() { close(stop); loaders.Wait() })
 
 	// Mount 0 mutates while mount 1 is saturated. Every one of these blocks
-	// until mount 1 has acknowledged both phases.
+	// until mount 1 has acknowledged the change.
 	deadline := time.Now().Add(30 * time.Second)
 	for i := range 40 {
 		name := f.join(0, fmt.Sprintf("barrier-%02d", i))
@@ -2314,7 +2314,7 @@ func TestMetadataWorkloadRPCCost(t *testing.T) {
 // same offsets (reuse) and then asserts the payload flips after a same-length
 // remote overwrite (withdrawal).
 //
-// REQUIRES THE PRIVILEGED RUNNER: it needs a real strict-coherence kernel, two
+// REQUIRES THE PRIVILEGED RUNNER: it needs a real kernel FUSE mount, two
 // live mounts, and a real page cache.
 func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
@@ -2350,14 +2350,14 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 	}
 
 	// Same length, so nothing size-derived can withdraw the cache: only the
-	// sequence-ordered whole-mapping invalidation the DATA repair performs can.
+	// sequence-ordered whole-mapping invalidation the DATA withdrawal performs can.
 	rewritten := make([]byte, size)
 	for i := range rewritten {
 		rewritten[i] = byte('A' + i%26)
 	}
 	mustWrite(t, nameA, rewritten, 0o600)
 	if got := readExactlyAt(t, reader, 0, size, "re-read after a same-length remote rewrite"); !bytes.Equal(got, rewritten) {
-		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA repair did not withdraw them")
+		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA withdrawal did not withdraw them")
 	}
 	f.waitForDelegationReleases(t)
 	if got := readExactlyAt(t, reader, 0, size, "repopulate after delegation release"); !bytes.Equal(got, rewritten) {
@@ -2365,15 +2365,15 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 	}
 
 	// And the cache is repopulated rather than disabled: reuse must survive a
-	// repair, or the first remote write to a file would permanently cost every
+	// withdrawal, or the first remote write to a file would permanently cost every
 	// later reader a round trip.
 	repopulated := f.countRequests("read", func() {
 		for range 4 {
-			readExactlyAt(t, reader, 0, size, "cached re-read after repair")
+			readExactlyAt(t, reader, 0, size, "cached re-read after withdrawal")
 		}
 	})
 	if repopulated != 0 {
-		t.Fatalf("the page cache was not repopulated after a DATA repair: %d further authority READs", repopulated)
+		t.Fatalf("the page cache was not repopulated after a DATA withdrawal: %d further authority READs", repopulated)
 	}
 }
 
@@ -2381,7 +2381,7 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 // userspace hook can see. A MAP_PRIVATE page is served straight out of the page
 // tables with no request reaching this frontend at all, so the only thing that
 // can make it coherent is invalidate_inode_pages2() unmapping it inside the
-// DATA repair. If that stopped happening, every other assertion in this suite
+// DATA withdrawal. If that stopped happening, every other assertion in this suite
 // would still pass and executables and mapped data files would silently go
 // stale.
 //
@@ -2406,17 +2406,17 @@ func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
 	}
 
 	// Same length again. The mapping is faulted in and its page table entries
-	// are live; only unmap_mapping_folio() inside the repair can take them
+	// are live; only unmap_mapping_folio() inside the withdrawal can take them
 	// back, and if it does the next touch refaults through the authority.
 	after := bytes.Repeat([]byte{'n'}, page)
 	mustWrite(t, nameA, after, 0o600)
 	if view[0] != 'n' {
-		t.Fatalf("mapped byte after a same-length remote rewrite = %q; the DATA repair did not unmap the stale page", view[0])
+		t.Fatalf("mapped byte after a same-length remote rewrite = %q; the DATA withdrawal did not unmap the stale page", view[0])
 	}
 }
 
-// TestRevokedMountCannotServeRetainedPages preserves the retained-page proof
-// under the v7 withdrawal contract: the mount stays installed, resident bytes
+// TestRevokedMountCannotServeRetainedPages is the retained-page proof under the
+// subscription withdrawal contract: the mount stays installed, resident bytes
 // cannot satisfy reads after the horizon, and the same open handle recovers.
 func TestRevokedMountCannotServeRetainedPages(t *testing.T) {
 	testAuthorityHorizonWithdrawalAndRecovery(t, bytes.Repeat([]byte{'z'}, 8*1024))

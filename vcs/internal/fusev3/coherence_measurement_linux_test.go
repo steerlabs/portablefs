@@ -18,10 +18,9 @@ import (
 
 const envCoherenceProfileDir = "PORTABLEFS_PROFILE_DIR"
 
-// TestShippingCapacityGitAddCompletes preserves the exact untimed setup that
-// disconnected the protocol-6 mount. The fixture starts at the shipping name
-// cache and item-table capacities; it does not use the former 4,096-name setup
-// workaround before git add.
+// TestShippingCapacityGitAddCompletes runs git add untimed at the shipping
+// name-cache and item-table capacities, with no reduced-cache setup before it,
+// so a capacity regression that disconnects the mount fails here.
 func TestShippingCapacityGitAddCompletes(t *testing.T) {
 	if os.Getenv(envPerformance) != "1" {
 		t.Skipf("set %s=1 to run the shipping-capacity git-add regression", envPerformance)

@@ -47,7 +47,7 @@ func TestColdSubscriptionRejectsDelayedInodeMetadata(t *testing.T) {
 
 func testColdSubscriptionDrainsMetadataCallback(t *testing.T, operation string) {
 	t.Helper()
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	unique := f.unique.Add(2)
 	var call func() fuse.Status
 	var lookupRecord *inodeRecord
@@ -174,7 +174,7 @@ func testColdSubscriptionDrainsMetadataCallback(t *testing.T, operation string) 
 // through the physical edge. Reset may wait for those pins after callbacks
 // drain; settlement must release them all before reentering the state index.
 func TestColdSubscriptionJoinsPreparedDirectoryMetadataReply(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	dir, _ := testDirHandle(t, f.raw, plusTestPages(2)...)
 	sub := f.mount.subscription
 	sub.mu.Lock()

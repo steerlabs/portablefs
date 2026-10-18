@@ -871,17 +871,17 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 		t.Fatal("atomic open-truncate must be explicitly requested")
 	}
 	if options.DisabledCapabilities&fuse.CAP_AUTO_INVAL_DATA == 0 || !options.ExplicitDataCacheControl {
-		t.Fatal("a retained page cache must be withdrawn by this mount's own repair, never by an mtime heuristic")
+		t.Fatal("a retained page cache must be withdrawn by this mount's own withdrawal, never by an mtime heuristic")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HANDLE_KILLPRIV_V2 == 0 {
 		t.Fatal("HANDLE_KILLPRIV_V2 must be explicitly requested")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HAS_RESEND != 0 {
-		t.Fatal("strict mounts must not negotiate HAS_RESEND")
+		t.Fatal("mounts must not negotiate HAS_RESEND")
 	}
 	if options.DisabledCapabilities&(fuse.CAP_PASSTHROUGH|fuse.CAP_NO_OPEN_SUPPORT|fuse.CAP_NO_OPENDIR_SUPPORT) !=
 		fuse.CAP_PASSTHROUGH|fuse.CAP_NO_OPEN_SUPPORT|fuse.CAP_NO_OPENDIR_SUPPORT {
-		t.Fatal("strict mount did not disable passthrough and no-open shortcuts")
+		t.Fatal("mount did not disable passthrough and no-open shortcuts")
 	}
 	// The read-ahead window is paired with the authority read bound: reads are
 	// now served from the page cache, so the window is what decides how many
@@ -930,7 +930,7 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.ExtraCapabilities |= fuse.CAP_HAS_RESEND
 	if err := verifyMountDecisions(tampered); err == nil {
-		t.Fatal("a strict mount that requests HAS_RESEND must be refused")
+		t.Fatal("a mount that requests HAS_RESEND must be refused")
 	}
 	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.ExplicitDataCacheControl = false
@@ -975,7 +975,7 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 		in.Flags2 = uint32(flags >> 32)
 		return in
 	}
-	// A strict mount also needs a kernel that can receive invalidations, so
+	// A mount also needs a kernel that can receive invalidations, so
 	// every case here advertises a protocol new enough for them; the notify
 	// requirement has its own test.
 	notifying := func(in *fuse.InitIn) *fuse.InitIn {
@@ -1873,7 +1873,7 @@ func TestRenameValidatesFlagCombinations(t *testing.T) {
 		}
 	}
 	for _, flags := range []uint32{0, renameNoReplace, renameExchange} {
-		f := newStrictFixture(t)
+		f := newStockFixture(t)
 		f.rpc.byName = map[string]*authoritypb.Item{"a": testItem(77, authoritypb.Attr_REGULAR, 77)}
 		f.lookup(t, fuse.FUSE_ROOT_ID, "a")
 		if flags == renameExchange {

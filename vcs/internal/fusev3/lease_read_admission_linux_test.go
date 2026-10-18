@@ -33,8 +33,8 @@ func activeSubscriptionFixture(t *testing.T, incarnation uint64) (*subscriptionR
 	return registry, clock, rpc, invalidator
 }
 
-// TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled now covers the
-// equivalent protocol-7 race: a reply admitted before a change delivery may
+// TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled covers the race
+// in which a reply admitted before a change delivery may
 // complete after that delivery, but its exact-coordinate generation cannot be
 // installed and delegation exclusion must take effect immediately.
 func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
@@ -58,7 +58,7 @@ func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
 // retryable errno: EAGAIN reaches the caller verbatim, where a Go runtime
 // registers the descriptor with its poller and never wakes. Every coherence
 // state a peer's write puts this mount into -- the authority coordinate closed
-// from recall reservation to discharge, this mount repairing that coordinate,
+// from recall reservation to discharge, this mount withdrawing that coordinate,
 // and the recall catching a read already in flight -- used to refuse a read
 // with exactly that errno.
 //
@@ -198,7 +198,7 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 // actual lane and observing the publication registry proves the intended
 // ordering directly and deterministically.
 func TestSaturatedBulkLaneDoesNotStallASourcePurge(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(91, authoritypb.Attr_REGULAR, 91)
 	fixture.rpc.item = item
 	fixture.rpc.byName = map[string]*authoritypb.Item{"saturated": item}
@@ -285,7 +285,7 @@ func summarize(data []byte) string {
 // for that publication's physical reply, so an open admitted on the metadata
 // lane -- which parks for the entire barrier -- would be a reply the purge waits
 // on that is itself waiting on the purge's own transaction. That cycle is broken
-// only by the repair budget, which revokes the peer mount.
+// only by the withdrawal timeout, which revokes the peer mount.
 //
 // Unlike the other race tests here, every reader opens the file inside the write
 // loop rather than holding a descriptor across it. The openers are bounded per
