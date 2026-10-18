@@ -81,8 +81,8 @@ session-wide high-water mark cannot satisfy it. Visibility requires actual
 targeted withdrawal, while durability requires its separate storage barrier
 and prefix; neither visibility nor durability implies the other.
 
-Successful truncating write-intent OPEN and truncating existing-name CREATE
-under the exact delegation pin carry their application ticket, including a
+Successful truncating write-intent OPEN and truncating write-intent existing-name
+CREATE under the exact delegation pin carry their application ticket, including a
 truncate of an already empty existing file. Exact replay retains the original
 handle, grant, and ticket without another application. Nontruncating OPEN and
 unchanged existing-name CREATE need no new ticket. A new empty-file CREATE

@@ -156,8 +156,8 @@ before exhaustion.
 
 `Response.applied_sequence` (tag 56) carries the ticket for successful changed
 WRITE, SETATTR, and FALLOCATE results, and for successful truncating write-intent
-OPEN and truncating existing-name CREATE under the exact identity-bound
-delegation pin. Truncating an already empty existing file still carries its
+OPEN and truncating write-intent existing-name CREATE under the exact
+identity-bound delegation pin. Truncating an already empty existing file still carries its
 ticket. Nontruncating OPEN and unchanged existing-name CREATE need no new
 ticket. A new empty-file CREATE with no preflight file pin may leave it zero;
 its namespace result waits synchronously for withdrawal. The handler retains
