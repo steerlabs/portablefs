@@ -228,13 +228,18 @@ func TestAllocatingControlBeforeRegistrationInstallsExactApplicationCut(t *testi
 			parsed, _ := delegationIdentity(id)
 			state := m.retainState(parsed, true)
 			defer m.releaseState(state)
-			ctx := &allocatingControlContext{Context: t.Context(), waiting: make(chan struct{})}
+			controlCtx, cancelControl := context.WithCancel(t.Context())
+			ctx := &allocatingControlContext{Context: controlCtx, waiting: make(chan struct{})}
 			done := make(chan struct{})
 			// The real event worker is invoked directly so its context exposes the
 			// precise wait, rather than only observing a goroutine launch.
 			go func() {
 				defer close(done)
 				m.handleControlEvent(ctx, controlBreakForTest(id, grant, 3), state, m.epochSerial)
+			}()
+			defer func() {
+				cancelControl()
+				awaitAllocatingControl(t, done, "CONTROL worker cleanup")
 			}()
 			awaitAllocatingControl(t, ctx.waiting, "CONTROL waiting for DATA registration")
 			if !state.transition.TryLock() {
@@ -317,9 +322,16 @@ func TestPublicAllocatingApplicationServicesControlBeforeWithdrawal(t *testing.T
 			state := m.retainState(parsed, false)
 			defer m.releaseState(state)
 			applying, apply := make(chan struct{}), make(chan struct{})
+			applyCtx, cancelApply := context.WithCancel(t.Context())
+			var applyOnce, withdrawalOnce sync.Once
+			finishApply := func() { applyOnce.Do(func() { close(apply) }) }
+			withdraw := func() { withdrawalOnce.Do(func() { close(fake.withdrawn) }) }
+			defer cancelApply()
+			defer withdraw()
+			defer finishApply()
 			outcome := make(chan error, 1)
 			go func() {
-				response, err := m.Synchronous(t.Context(), id, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+				response, err := m.Synchronous(applyCtx, id, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
 					close(applying)
 					<-apply
 					return allocatingResponse(create, id, delegationTestToken(121, 3), grant, 7), nil
@@ -328,22 +340,29 @@ func TestPublicAllocatingApplicationServicesControlBeforeWithdrawal(t *testing.T
 					err = m.install(id, delegationTestToken(121, 1), delegationTestToken(121, 3), grant, response.AppliedSequence)
 				}
 				if err == nil {
-					err = m.openedVisibility(t.Context(), id, response)
+					err = m.openedVisibility(applyCtx, id, response)
 				}
 				outcome <- err
 			}()
 			awaitAllocatingControl(t, applying, "synchronous application")
-			ctx := &allocatingControlContext{Context: t.Context(), waiting: make(chan struct{})}
+			controlCtx, cancelControl := context.WithCancel(t.Context())
+			ctx := &allocatingControlContext{Context: controlCtx, waiting: make(chan struct{})}
 			cut := make(chan struct{})
 			go func() {
 				defer close(cut)
 				m.handleControlEvent(ctx, controlBreakForTest(id, grant, 6), state, m.epochSerial)
 			}()
+			defer func() {
+				finishApply()
+				cancelApply()
+				cancelControl()
+				awaitAllocatingControl(t, cut, "CONTROL worker cleanup")
+			}()
 			awaitAllocatingControl(t, ctx.waiting, "CONTROL behind real application")
 			if fakeControlCount(&fake.delegationFakeRPC, func(req *authoritypb.Request) bool { return req.GetDelegationBreakAck() != nil }) != 0 {
 				t.Fatal("CONTROL bypassed pending application")
 			}
-			close(apply)
+			finishApply()
 			awaitAllocatingControl(t, cut, "application receipt releases CONTROL")
 			requireAllocatingBreak(t, &fake.delegationFakeRPC, grant, 7, 6)
 			awaitAllocatingControl(t, fake.waiting, "explicit visibility wait")
@@ -352,7 +371,7 @@ func TestPublicAllocatingApplicationServicesControlBeforeWithdrawal(t *testing.T
 				t.Fatalf("allocation completed before withdrawal: %v", err)
 			default:
 			}
-			close(fake.withdrawn)
+			withdraw()
 			select {
 			case err := <-outcome:
 				if err != nil {
