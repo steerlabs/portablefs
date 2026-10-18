@@ -173,6 +173,7 @@ func BenchmarkCapAdmissionUnderContention(b *testing.B) {
 		b.Fatal(err)
 	}
 	flusher.buffer.Store(buffer)
+	buffer.Start()
 	b.Cleanup(buffer.Stop)
 	payload := make([]byte, benchmarkPageSize)
 	ctx := context.Background()
@@ -204,7 +205,7 @@ func BenchmarkCapAdmissionUnderContention(b *testing.B) {
 	}
 }
 
-// Timer/cap batches must not create a goroutine for each dirty identity.
+// Admission-driven batches use a bounded worker pool across dirty identities.
 func BenchmarkBackgroundFlushBurst(b *testing.B) {
 	for _, count := range []int{32, 4096} {
 		b.Run(fmt.Sprint(count), func(b *testing.B) {
@@ -214,6 +215,7 @@ func BenchmarkBackgroundFlushBurst(b *testing.B) {
 				b.Fatal(err)
 			}
 			flusher.buffer.Store(buffer)
+			buffer.Start()
 			b.Cleanup(buffer.Stop)
 			ctx := context.Background()
 			payload := []byte{1}
