@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
 )
 
 var ErrInvalid = errors.New("cellhost: invalid configuration or assignment")
@@ -90,8 +91,7 @@ func AuthorityArguments(config AuthorityConfig) []string {
 		"-cell-id", config.CellID,
 		"-authority-id", config.AuthorityID,
 		"-authority-generation", generation,
-		"-visibility-membership-file", "/var/lib/portablefs-volume/visibility.membership",
-		"-write-staging-dir", "/var/lib/portablefs-write-staging",
+		"-mount-membership-file", "/var/lib/portablefs-volume/" + mountmembership.Filename,
 	}
 	if config.PriorStrictMountsFenced {
 		arguments = append(arguments, "-prior-strict-mounts-fenced")

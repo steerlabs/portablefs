@@ -26,7 +26,7 @@ func (runner *workerRunner) Run(_ context.Context, executable string, arguments 
 }
 
 func TestQuotaDecisionRaisesEitherDimensionAndRefusesLowering(t *testing.T) {
-	plan := cellplan.VolumePlan{QuotaBytes: 2 << 20, QuotaInodes: 200}
+	plan := cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{QuotaBytes: 2 << 20, QuotaInodes: 200}}
 	first, raise, err := quotaDecision(plan, signedQuota{Bytes: plan.QuotaBytes, Inodes: plan.QuotaInodes}, appliedQuota{})
 	if err != nil || !first || !raise {
 		t.Fatalf("first quota decision = first:%t raise:%t err:%v", first, raise, err)
@@ -246,9 +246,9 @@ func archiveTestHost(t *testing.T) (*Host, archiveRoots) {
 	return host, roots
 }
 
-func archiveTestPlan() cellplan.VolumePlan {
-	return cellplan.VolumePlan{VolumeID: testVolumeID, AuthorityGeneration: 7, PlacementSequence: 2,
-		ServiceUID: 200001, ServiceGID: 200001, ArchiveTo: &cellplan.ArchiveTarget{Attempt: "33333333-3333-4333-8333-333333333333", KeyVersion: "default"}}
+func archiveTestPlan() cellplan.EffectiveVolumePlan {
+	return cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{VolumeID: testVolumeID, AuthorityGeneration: 7, PlacementSequence: 2,
+		ServiceUID: 200001, ServiceGID: 200001, ArchiveTo: &cellplan.ArchiveTarget{Attempt: "33333333-3333-4333-8333-333333333333", KeyVersion: "default"}}}
 }
 
 func writeJSONResult(t *testing.T, path string, value any) {

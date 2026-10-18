@@ -263,8 +263,7 @@ func (i *linuxReleaseInstaller) install() (result linuxInstallResult, resultErr 
 	}
 	stageOwned = false
 	// Compliant mount starts cannot cross the exclusive guard. Rechecking at
-	// the activation edge additionally narrows the legacy-client race for
-	// installs that predate lifecycle locking.
+	// the activation edge rechecks the same live-resource witnesses.
 	if err := i.assertReplacementIdle(); err != nil {
 		return linuxInstallResult{}, err
 	}
@@ -660,12 +659,6 @@ func inspectImmutableBinary(path string) ([sha256.Size]byte, error) {
 func (i *linuxReleaseInstaller) inspectActivation(activationPath, releasesRoot string) (activationState, error) {
 	info, err := os.Lstat(activationPath)
 	if os.IsNotExist(err) {
-		legacyDaemon := filepath.Join(i.linkDir, "portablefsd")
-		if _, daemonErr := os.Lstat(legacyDaemon); daemonErr == nil {
-			return activationState{}, fmt.Errorf("legacy daemon exists at %s without its matching CLI; refusing to guess ownership or remove it", legacyDaemon)
-		} else if !os.IsNotExist(daemonErr) {
-			return activationState{}, fmt.Errorf("inspect possible legacy daemon %s: %w", legacyDaemon, daemonErr)
-		}
 		return activationState{kind: activationAbsent}, nil
 	}
 	if err != nil {
@@ -692,61 +685,9 @@ func (i *linuxReleaseInstaller) inspectActivation(activationPath, releasesRoot s
 			kind:     activationManaged,
 			snapshot: snapshot,
 		}
-		legacyDaemon := filepath.Join(i.linkDir, "portablefsd")
-		daemonInfo, daemonErr := os.Lstat(legacyDaemon)
-		if daemonErr == nil {
-			if err := validateLegacyDaemon(legacyDaemon, daemonInfo, i.runBinary); err != nil {
-				return activationState{}, fmt.Errorf("managed activation has an unrecognized sibling at %s: %w", legacyDaemon, err)
-			}
-			return activationState{}, fmt.Errorf(
-				"legacy daemon remains at %s beside the managed activation; stop PortableFS, archive or remove that exact file explicitly, and retry",
-				legacyDaemon,
-			)
-		} else if !os.IsNotExist(daemonErr) {
-			return activationState{}, fmt.Errorf("inspect possible legacy daemon %s: %w", legacyDaemon, daemonErr)
-		}
 		return state, nil
 	}
-	if !info.Mode().IsRegular() {
-		return activationState{}, fmt.Errorf("activation path %s is neither a managed symlink nor a legacy PortableFS binary", activationPath)
-	}
-	if err := requireOwnedByEUID(activationPath, info); err != nil {
-		return activationState{}, err
-	}
-	daemonPath := filepath.Join(i.linkDir, "portablefsd")
-	daemonInfo, err := os.Lstat(daemonPath)
-	if err != nil {
-		return activationState{}, fmt.Errorf("legacy CLI exists at %s but its matching daemon cannot be inspected: %w", activationPath, err)
-	}
-	if err := validateLegacyDaemon(daemonPath, daemonInfo, i.runBinary); err != nil {
-		return activationState{}, err
-	}
-	for path, candidate := range map[string]os.FileInfo{activationPath: info} {
-		stat, ok := candidate.Sys().(*syscall.Stat_t)
-		if !ok || stat.Nlink != 1 {
-			return activationState{}, fmt.Errorf("legacy binary %s must have exactly one filesystem link", path)
-		}
-	}
-	cliOutput, err := i.runBinary(activationPath, "version")
-	if err != nil {
-		return activationState{}, fmt.Errorf("validate legacy CLI %s: %w", activationPath, err)
-	}
-	legacyVersion, ok := strings.CutPrefix(strings.TrimSpace(string(cliOutput)), "portablefs ")
-	if !ok || legacyVersion == "" || strings.ContainsAny(legacyVersion, "\r\n") {
-		return activationState{}, fmt.Errorf("legacy CLI %s returned an invalid product identity", activationPath)
-	}
-	daemonOutput, err := i.runBinary(daemonPath, "-version")
-	if err != nil {
-		return activationState{}, fmt.Errorf("validate legacy daemon %s: %w", daemonPath, err)
-	}
-	if strings.TrimSpace(string(daemonOutput)) != legacyVersion {
-		return activationState{}, fmt.Errorf("legacy CLI and daemon are a mixed-version pair (%q and %q); refusing replacement", legacyVersion, strings.TrimSpace(string(daemonOutput)))
-	}
-	return activationState{}, fmt.Errorf(
-		"legacy PortableFS CLI/daemon pair remains at %s and %s; stop PortableFS, archive or remove those exact files explicitly, and retry",
-		activationPath,
-		daemonPath,
-	)
+	return activationState{}, fmt.Errorf("activation path %s must be a managed PortableFS symlink", activationPath)
 }
 
 func validateManagedActivationTarget(target, releasesRoot string, runBinary func(string, ...string) ([]byte, error)) (string, error) {
@@ -970,28 +911,6 @@ func (i *linuxReleaseInstaller) activate(
 		)
 	}
 	return fmt.Errorf("activation path %s changed at the atomic exchange edge; concurrent state was restored exactly", activationPath)
-}
-
-func validateLegacyDaemon(path string, info os.FileInfo, runBinary func(string, ...string) ([]byte, error)) error {
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("legacy daemon %s is not a regular non-symlink file", path)
-	}
-	if err := requireOwnedByEUID(path, info); err != nil {
-		return err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Nlink != 1 {
-		return fmt.Errorf("legacy daemon %s must have exactly one filesystem link", path)
-	}
-	output, err := runBinary(path, "-version")
-	if err != nil {
-		return fmt.Errorf("validate legacy daemon %s: %w", path, err)
-	}
-	version := strings.TrimSpace(string(output))
-	if version == "" || strings.ContainsAny(version, "\r\n") {
-		return fmt.Errorf("legacy daemon %s returned an invalid product identity", path)
-	}
-	return nil
 }
 
 func (i *linuxReleaseInstaller) assertReplacementIdle() error {

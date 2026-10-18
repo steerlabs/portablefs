@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	StateSchemaVersion                              = 2
+	StateSchemaVersion                              = 3
 	MaxVolumesPerCell                               = 256
 	MaxActiveMountEnrollments                       = 2048
 	MaxActiveMountEnrollmentsPerAuthorizationDomain = 512
@@ -140,11 +140,6 @@ type Cell struct {
 	LastHelperRelease  string     `json:"last_helper_release,omitempty"`
 	Health             CellHealth `json:"health"`
 	QuarantineReason   string     `json:"quarantine_reason,omitempty"`
-	// These arrays remain in the durable schema so strict decoding accepts
-	// schema-v2 snapshots written before plan negotiation was removed.
-	PlanVersions        []uint32 `json:"plan_versions,omitempty"`
-	HelperPlanVersions  []uint32 `json:"helper_plan_versions,omitempty"`
-	HelperStateVersions []uint32 `json:"helper_state_versions,omitempty"`
 	// ArchiveConfigured is the cell's own report that its helper holds readable
 	// archive-store credentials. A cell without them can neither export nor
 	// hydrate, so archive and restore work is never placed on one. Absent in
@@ -639,7 +634,6 @@ func (state State) Validate() error {
 	ports := make(map[string]map[uint16]string)
 	var volumeCounts = make(map[string]int)
 	for id, cell := range state.Cells {
-		boundedAllocators := cell.LastProjectID != 0 || cell.LastServiceUID != 0 || cell.LastPort != 0
 		if id != cell.ID || !cellplan.ValidID(id) || !validIdentity(cell.AvailabilityZone) ||
 			net.ParseIP(cell.AuthorityHost) == nil && !validDNSName(cell.AuthorityHost) ||
 			!validDNSName(cell.AuthorityDNSZone) || cell.CapacityBytes == 0 || cell.CapacityInodes == 0 ||
@@ -651,10 +645,8 @@ func (state State) Validate() error {
 			cell.RegistrationSHA256 != "" && !validSHA256Hex(cell.RegistrationSHA256) {
 			return fmt.Errorf("%w: cell %q", ErrInvalid, id)
 		}
-		if boundedAllocators != cellAllocatorBounded(cell) ||
-			cellAllocatorBounded(cell) && cell.RegistrationSHA256 == "" ||
-			cellAllocatorBounded(cell) && (cell.LastProjectID == ^uint32(0) || cell.LastServiceUID == ^uint32(0) || cell.LastPort == ^uint16(0) ||
-				cell.NextProjectID > cell.LastProjectID+1 || cell.NextServiceUID > cell.LastServiceUID+1 || cell.NextPort > cell.LastPort+1) {
+		if !cellAllocatorBounded(cell) || cell.RegistrationSHA256 == "" || (cell.LastProjectID == ^uint32(0) || cell.LastServiceUID == ^uint32(0) || cell.LastPort == ^uint16(0) ||
+			cell.NextProjectID > cell.LastProjectID+1 || cell.NextServiceUID > cell.LastServiceUID+1 || cell.NextPort > cell.LastPort+1) {
 			return fmt.Errorf("%w: cell allocator bounds", ErrInvalid)
 		}
 		if cell.PlanIssuedUnix <= 0 || cell.PlanExpiresUnix <= cell.PlanIssuedUnix {

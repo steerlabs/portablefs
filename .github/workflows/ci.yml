@@ -44,6 +44,11 @@ jobs:
           set -euo pipefail
           sh -n scripts/install.sh
           node scripts/check-install-release-trust.mjs
+      - name: Verify current architecture and checker tests
+        run: |
+          set -euo pipefail
+          python3 scripts/test_check_current_architecture.py
+          python3 scripts/check-current-architecture.py
       - name: Verify the artifact-only staging publication boundary
         run: |
           set -euo pipefail
@@ -169,7 +174,6 @@ jobs:
             -derivedDataPath "$derived" \
             PORTABLEFS_APP_GROUP="$expected_group" \
             MARKETING_VERSION="$expected_version" \
-            PORTABLEFS_NATIVE_QUALIFICATION= \
             PORTABLEFS_GO="$(realpath "$(command -v go)")" \
             CODE_SIGNING_ALLOWED=NO \
             build

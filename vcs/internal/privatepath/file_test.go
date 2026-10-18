@@ -1,6 +1,7 @@
 package privatepath
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -100,5 +101,42 @@ func TestTruncatedLogRemainsAppendOnlyAcrossIndependentWriters(t *testing.T) {
 	}
 	if string(body) != "daemon\nsupervisor\n" {
 		t.Fatalf("append-only log = %q", body)
+	}
+}
+
+func TestRemoveFileDurableRetrySyncsAlreadyUnlinkedParent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private", "state")
+	if err := WriteFileAtomic(path, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("directory sync failed")
+	calls := 0
+	syncParent := func(parent *os.File) error {
+		calls++
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("sync preceded unlink: %v", err)
+		}
+		if calls == 1 {
+			return sentinel
+		}
+		// Revalidate the actual pinned parent identity on the retry too.
+		named, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pinned, err := parent.Stat()
+		if err != nil || !os.SameFile(named, pinned) {
+			t.Fatal("sync did not use pinned parent")
+		}
+		return parent.Sync()
+	}
+	if err := removeFileDurable(path, syncParent); !errors.Is(err, sentinel) {
+		t.Fatal(err)
+	}
+	if err := removeFileDurable(path, syncParent); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("parent sync calls=%d", calls)
 	}
 }

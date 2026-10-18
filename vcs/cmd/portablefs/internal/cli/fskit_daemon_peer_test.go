@@ -14,40 +14,12 @@ func writeExecutablePeer(t *testing.T, path, contents string) {
 	}
 }
 
-func TestFSKitConfigRejectsDaemonOverride(t *testing.T) {
-	_, err := fskitConfigFromEnv(func(name string) string {
-		if name == fskitDaemonEnv {
-			return "/tmp/untrusted-portablefsd"
-		}
-		return ""
-	})
-	if err == nil || !strings.Contains(err.Error(), fskitDaemonEnv+" is unsupported") {
-		t.Fatalf("expected unsupported daemon override error, got %v", err)
-	}
-}
-
-func TestFSKitConfigRejectsSocketOverrides(t *testing.T) {
-	for _, variable := range []string{fskitSocketEnv, fskitControlEnv} {
-		t.Run(variable, func(t *testing.T) {
-			_, err := fskitConfigFromEnv(func(name string) string {
-				if name == variable {
-					return "/tmp/untrusted.sock"
-				}
-				return ""
-			})
-			if err == nil || !strings.Contains(err.Error(), variable+" is unsupported") {
-				t.Fatalf("expected unsupported socket override error, got %v", err)
-			}
-		})
-	}
-}
-
 func TestFSKitConfigUsesOnlyCanonicalExternalControlState(t *testing.T) {
 	home, err := resolveFSKitAccountHome()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := fskitConfigFromEnv(func(string) string { return "" })
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		t.Fatal(err)
 	}

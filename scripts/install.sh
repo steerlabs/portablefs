@@ -416,7 +416,7 @@ the download is corrupt or has been tampered with; nothing was installed"
 
   # The signed command resolves the canonical account home through directory
   # services, validates the optional link directory, takes the exclusive
-  # lifecycle lock, refuses nonempty legacy runtime state without mutating it,
+  # lifecycle lock, checks durable and live resource inventories,
   # and atomically installs the complete app plus CLI symlink. The shell never
   # trusts HOME or performs a
   # check-then-copy replacement.

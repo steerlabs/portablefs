@@ -27,8 +27,7 @@ func TestAuthorityConfigIsStrictAndLauncherArgumentsUseOnlyFixedPaths(t *testing
 	for _, required := range []string{
 		"/srv/portablefs-volume",
 		"/run/portablefs-volume/authority-3.key",
-		"/var/lib/portablefs-volume/visibility.membership",
-		"/var/lib/portablefs-write-staging",
+		"/var/lib/portablefs-volume/mount.membership",
 	} {
 		if !slices.Contains(arguments, required) {
 			t.Fatalf("launcher arguments omit fixed path %q: %q", required, arguments)

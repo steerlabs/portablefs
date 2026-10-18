@@ -3,39 +3,16 @@
 package cellhost
 
 import (
-	"bufio"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
 	"golang.org/x/sys/unix"
-)
-
-// The durable strict-mount membership record is written and owned by the
-// authority; these constants mirror its on-disk format exactly as implemented
-// in vcs/internal/volumeserver/visibility_membership.go, with the session
-// identifier width from volumeserver/session.go.
-//
-// The helper deliberately re-implements the read side instead of importing
-// volumeserver: volumeserver is the authority's package, the authority is the
-// only writer of this file, and the helper must not gain a build-time
-// dependency on the serving process to answer a control-plane question. The
-// duplication is eight lines of parsing and it is pinned by a test that builds
-// the bytes in the writer's format.
-const (
-	visibilityMembershipName    = "visibility.membership"
-	visibilityMembershipHeader  = "PFS-VISIBILITY-2"
-	visibilityMembershipIDBytes = 16
-	// A profiled membership line is at most 47 bytes, so this admits over 22k
-	// concurrent strict mounts - orders of magnitude above any real volume -
-	// and refuses a file that has stopped being a membership record.
-	visibilityMembershipMaxBytes = 1 << 20
 )
 
 // StrictMembershipEmpty reports whether the volume's durable strict-mount
@@ -61,14 +38,27 @@ func (host *Host) StrictMembershipEmpty(volumeID string) (bool, error) {
 	if !cellplan.ValidID(volumeID) {
 		return false, ErrInvalid
 	}
-	path := filepath.Join(host.cfg.StateRoot, volumeID, visibilityMembershipName)
+	path := filepath.Join(host.cfg.StateRoot, volumeID, mountmembership.Filename)
 	if !safeRoot(path) {
 		return false, errors.New("cellhost: derived membership path failed validation")
 	}
-	// O_NOFOLLOW, like readPrivate: the helper runs as root, so a symlink
-	// planted in the volume's state directory by the service user would
-	// otherwise redirect this read to a file the service user does not own.
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	// Pin each service-controlled component. O_NOFOLLOW on the final file
+	// alone would still follow a substituted volume directory; O_NONBLOCK
+	// ensures a planted FIFO cannot block before the regular-file check.
+	rootFD, err := unix.Open(host.cfg.StateRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false, fmt.Errorf("cellhost: open membership state root: %w", err)
+	}
+	defer unix.Close(rootFD)
+	volumeFD, err := unix.Openat(rootFD, volumeID, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return true, nil
+		}
+		return false, fmt.Errorf("cellhost: open membership volume directory: %w", err)
+	}
+	defer unix.Close(volumeFD)
+	fd, err := unix.Openat(volumeFD, mountmembership.Filename, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			return true, nil
@@ -85,64 +75,16 @@ func (host *Host) StrictMembershipEmpty(volumeID string) (bool, error) {
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
 		return false, errors.New("cellhost: strict-mount membership must be a private regular file")
 	}
-	if info.Size() > visibilityMembershipMaxBytes {
+	if info.Size() > mountmembership.MaxBytes {
 		return false, errors.New("cellhost: strict-mount membership is implausibly large")
 	}
-	active, err := parseStrictMembership(file, volumeID)
+	data, err := io.ReadAll(io.LimitReader(file, mountmembership.MaxBytes+1))
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("cellhost: read mount membership: %w", err)
 	}
-	return active == 0, nil
-}
-
-// parseStrictMembership mirrors FileVisibilityMembership.load: header line,
-// then the hex encoding of the volume ID's own bytes (the identity binding -
-// the file names the volume it belongs to, so a record moved or copied between
-// volumes is rejected rather than believed), then one hex session ID per
-// active line. Every deviation is an error; nothing is skipped.
-func parseStrictMembership(reader io.Reader, volumeID string) (int, error) {
-	scanner := bufio.NewScanner(reader)
-	if !scanner.Scan() {
-		return 0, errors.New("cellhost: missing strict-mount membership header")
+	records, err := mountmembership.Decode(data, volumeID)
+	if err != nil {
+		return false, fmt.Errorf("cellhost: decode mount membership: %w", err)
 	}
-	legacy := scanner.Text() == "PFS-VISIBILITY-1"
-	if !legacy && scanner.Text() != visibilityMembershipHeader {
-		return 0, errors.New("cellhost: invalid strict-mount membership header")
-	}
-	if !scanner.Scan() || scanner.Text() != hex.EncodeToString([]byte(volumeID)) {
-		return 0, errors.New("cellhost: strict-mount membership belongs to a different volume")
-	}
-	seen := make(map[[visibilityMembershipIDBytes]byte]struct{})
-	for scanner.Scan() {
-		record := scanner.Text()
-		if !legacy {
-			fields := strings.Split(record, "\t")
-			if len(fields) != 2 {
-				return 0, errors.New("cellhost: invalid profiled membership record")
-			}
-			switch fields[1] {
-			case "compatibility", "linux-v7", "cacheless":
-			default:
-				return 0, errors.New("cellhost: unknown membership profile")
-			}
-			record = fields[0]
-		}
-		raw, err := hex.DecodeString(record)
-		if err != nil || len(raw) != visibilityMembershipIDBytes {
-			return 0, errors.New("cellhost: invalid strict-mount membership record")
-		}
-		var id [visibilityMembershipIDBytes]byte
-		copy(id[:], raw)
-		if id == ([visibilityMembershipIDBytes]byte{}) {
-			return 0, errors.New("cellhost: zero strict-mount membership record")
-		}
-		if _, duplicate := seen[id]; duplicate {
-			return 0, errors.New("cellhost: duplicate strict-mount membership record")
-		}
-		seen[id] = struct{}{}
-	}
-	if err := scanner.Err(); err != nil {
-		return 0, fmt.Errorf("cellhost: read strict-mount membership: %w", err)
-	}
-	return len(seen), nil
+	return len(records) == 0, nil
 }

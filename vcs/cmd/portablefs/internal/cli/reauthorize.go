@@ -65,7 +65,7 @@ func cmdReauthorize(e *cmdEnv, args []string) int {
 		return e.fail("reauthorize", fmt.Errorf("mount does not support hosted v3 reauthorization"))
 	}
 	if state.AuthorizationSessionID == "" {
-		return e.fail("reauthorize", fmt.Errorf("mount predates hosted reauthorization support and must be remounted once"))
+		return e.fail("reauthorize", fmt.Errorf("mount has no authority session identity; remount with a current volume capability"))
 	}
 	if state.MountEnrollmentID != "" {
 		return e.fail("reauthorize", fmt.Errorf("mount authorization is owned by its automatic Manager enrollment; manual reauthorization is refused"))
@@ -81,7 +81,7 @@ func cmdReauthorize(e *cmdEnv, args []string) int {
 	case "fuse":
 		deadline, err = reauthorizeFuseMount(ctx, state, token, o.authSequence, certificatePEM)
 	case "fskit":
-		cfg, configErr := fskitConfigFromEnv(e.getenv)
+		cfg, configErr := fixedFSKitConfig()
 		if configErr != nil {
 			err = configErr
 			break

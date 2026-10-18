@@ -24,9 +24,6 @@ func portableFSKernelInventory() ([]string, error) {
 		if !ok || fsType != "fuse.portablefs" {
 			continue
 		}
-		if source == "portablefs" {
-			return nil, fmt.Errorf("legacy PortableFS mount at %s has no unique mount instance identity", path)
-		}
 		id, ok := strings.CutPrefix(source, "portablefs:")
 		if !ok || !mountid.ValidMountInstance(id) {
 			return nil, fmt.Errorf("PortableFS mount at %s has invalid source identity %q", path, source)

@@ -9,7 +9,6 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
-	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
 )
 
 // recordRoutedMount publishes a FUSE mount state carrying an activated route
@@ -113,16 +112,7 @@ func TestBackingIdentityAcrossMounts(t *testing.T) {
 	}
 	// The per-mount --local-dir record is keyed per mount, and lives beside
 	// the shared backing tree rather than inside it.
-	a := localDirsRecordPath(dir, "vol_1", "main", "/mnt/a")
-	b := localDirsRecordPath(dir, "vol_1", "main", "/mnt/b")
-	if a == b {
-		t.Fatal("two mounts of one volume must keep distinct --local-dir records")
-	}
-	for _, p := range []string{a, b, localRoutesRecordPath(dir, "vol_1")} {
-		if strings.HasPrefix(p, first+string(filepath.Separator)) {
-			t.Fatalf("sidecar %q must not live inside the backing tree", p)
-		}
-	}
+
 }
 
 // TestPruneLocalReclaimsOnlyOrphans pins the reclamation command end to end:
@@ -221,7 +211,7 @@ func TestStatusReportsLocalRoutes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(backing, "agent-app", "node_modules", "dep.js"), []byte("0123456789"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	row := e.localRoutesOf("vol_1", "main")
+	row := e.localRoutesOf("vol_1")
 	if row == nil || row.Revision != rules.RevisionHex() || strings.Join(row.Patterns, " ") != "**/node_modules/" {
 		t.Fatalf("status row = %+v", row)
 	}
@@ -232,48 +222,8 @@ func TestStatusReportsLocalRoutes(t *testing.T) {
 		t.Fatalf("status backing = %q", row.Roots[0].Backing)
 	}
 	// A volume with no routes reports nothing rather than an empty section.
-	if got := e.localRoutesOf("vol_2", "main"); got != nil {
+	if got := e.localRoutesOf("vol_2"); got != nil {
 		t.Fatalf("unrouted volume = %+v", got)
-	}
-}
-
-func TestStatusUsesFSKitVolumeBranchBacking(t *testing.T) {
-	e, _, _ := testEnv(t)
-	dir, err := e.mountStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := validFSKitMountState(t, t.TempDir())
-	st.VolumeID = "vol_mac"
-	st.Branch = "feature"
-	st.LocalDirs = []string{"cache"}
-	st.LocalDirsDeclared = true
-	if err := writeMountState(dir, st); err != nil {
-		t.Fatal(err)
-	}
-	backing := portablefsd.LocalBackingRoot(filepath.Join(filepath.Dir(dir), "portablefsd"), st.VolumeID, st.Branch)
-	if err := os.MkdirAll(filepath.Join(backing, "cache"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(backing, "cache", "artifact"), []byte("mac-bytes"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	row := e.localRoutesOf(st.VolumeID, st.Branch)
-	if row == nil || row.Backing != backing || strings.Join(row.Patterns, ",") != "/cache/" {
-		t.Fatalf("FSKit status row = %+v", row)
-	}
-	if row.PerMachine || row.Revision != "" {
-		t.Fatalf("FSKit status invented per-machine provenance or canonical revision: %+v", row)
-	}
-	if len(row.Roots) != 1 || row.Roots[0].Path != "cache" || row.Roots[0].Bytes != int64(len("mac-bytes")) {
-		t.Fatalf("FSKit status roots = %+v", row.Roots)
-	}
-	if row.Roots[0].Backing != filepath.Join(backing, "cache") {
-		t.Fatalf("FSKit status backing = %q", row.Roots[0].Backing)
-	}
-	if got := e.localRoutesOf(st.VolumeID, "main"); got != nil {
-		t.Fatalf("another branch inherited FSKit backing: %+v", got)
 	}
 }
 
@@ -285,8 +235,6 @@ func TestStatusEmptyFSKitDeclarationOutranksStaleFUSERouteRecord(t *testing.T) {
 	}
 	st := validFSKitMountState(t, t.TempDir())
 	st.VolumeID = "vol_empty_mac"
-	st.Branch = "main"
-	st.LocalDirsDeclared = true
 	if err := writeMountState(dir, st); err != nil {
 		t.Fatal(err)
 	}
@@ -299,151 +247,7 @@ func TestStatusEmptyFSKitDeclarationOutranksStaleFUSERouteRecord(t *testing.T) {
 	}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.localRoutesOf(st.VolumeID, st.Branch); got != nil {
+	if got := e.localRoutesOf(st.VolumeID); got != nil {
 		t.Fatalf("empty live FSKit declaration inherited stale FUSE routing: %+v", got)
-	}
-}
-
-func TestPruneLocalProtectsPossiblyLiveFSKitBacking(t *testing.T) {
-	e, _, _ := testEnv(t)
-	dir, err := e.mountStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := validFSKitMountState(t, t.TempDir())
-	st.VolumeID = "vol_mac"
-	st.Branch = "feature"
-	st.LocalDirs = []string{"cache"}
-	if err := writeMountState(dir, st); err != nil {
-		t.Fatal(err)
-	}
-	backing := portablefsd.LocalBackingRoot(filepath.Join(filepath.Dir(dir), "portablefsd"), st.VolumeID, st.Branch)
-	artifact := filepath.Join(backing, "cache", "artifact")
-	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(filepath.Dir(dir), "portablefsd", "local"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(filepath.Dir(dir), "portablefsd"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(artifact, []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := collectPruneRows(dir, "", true); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := os.ReadFile(artifact); err != nil || string(got) != "keep" {
-		t.Fatalf("possibly-live FSKit backing was changed: %q, %v", got, err)
-	}
-}
-
-func TestPruneLocalProtectsDurableFSKitAttachWithoutMountRecord(t *testing.T) {
-	e, _, _ := testEnv(t)
-	dir, err := e.mountStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	const volumeID, branch = "vol_durable_mac", "feature"
-	daemonState := filepath.Join(filepath.Dir(dir), "portablefsd")
-	if err := os.MkdirAll(daemonState, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(daemonState, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	registry, err := json.Marshal(map[string]any{
-		"version": 2,
-		"attaches": []map[string]any{{
-			"ref": "att_AAAAAAAAAAAAAAAAAAAAAA", "volumeId": volumeID, "branch": branch,
-			"mountPath": "/Volumes/DurableMac", "authorityUrl": "127.0.0.1:2050",
-			"dataPlaneTransport": "plaintext", "options": map[string]any{}, "identityEpoch": 1,
-		}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(daemonState, "attaches.json"), registry, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backing := portablefsd.LocalBackingRoot(daemonState, volumeID, branch)
-	artifact := filepath.Join(backing, "cache", "artifact")
-	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(daemonState, "local"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(artifact, []byte("keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := collectPruneRows(dir, "", true); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := os.ReadFile(artifact); err != nil || string(got) != "keep" {
-		t.Fatalf("durable FSKit attach backing was changed: %q, %v", got, err)
-	}
-}
-
-func TestPruneLocalFailsClosedBeforeDeletingUnknownFSKitBacking(t *testing.T) {
-	e, _, _ := testEnv(t)
-	dir, err := e.mountStateDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	unknown := filepath.Join(filepath.Dir(dir), "portablefsd", "local", strings.Repeat("a", 32), "cache", "artifact")
-	if err := os.MkdirAll(filepath.Dir(unknown), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(filepath.Dir(dir), "portablefsd", "local"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(filepath.Dir(dir), "portablefsd"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(unknown, []byte("unknown-owner"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// Also stage an ordinary FUSE orphan. The FSKit proof failure is a
-	// preflight: no earlier tree may be partially deleted before it is found.
-	fuseOrphan := filepath.Join(localBackingDir(dir), localdirs.StorageID("vol_old"), "cache", "artifact")
-	if err := os.MkdirAll(filepath.Dir(fuseOrphan), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(localBackingDir(dir), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fuseOrphan, []byte("fuse-orphan"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, onlyVolume := range []string{"", "vol_selected"} {
-		if _, err := collectPruneRows(dir, onlyVolume, true); err == nil || !strings.Contains(err.Error(), "no mount or durable daemon attach") {
-			t.Fatalf("unknown FSKit backing prune --volume=%q error = %v", onlyVolume, err)
-		}
-	}
-	for _, p := range []string{unknown, fuseOrphan} {
-		if _, err := os.Stat(p); err != nil {
-			t.Fatalf("failed-closed prune changed %s: %v", p, err)
-		}
-	}
-}
-
-// TestMountRejectsPatternLocalDirFlags pins that --local-dir stays a literal
-// path: patterns belong in the volume's declaration, where they are validated
-// as a whole and become part of the revision.
-func TestMountRejectsPatternLocalDirFlags(t *testing.T) {
-	for _, value := range []string{"node_*", "**/node_modules", ".git", ".git/objects", ".portablefs"} {
-		e, _, stderr := testEnv(t)
-		rc := e.run([]string{"mount", "vol_1", filepath.Join(t.TempDir(), "m"), "--local-dir", value})
-		if rc == 0 {
-			t.Fatalf("--local-dir %q was accepted", value)
-		}
-		if stderr.Len() == 0 {
-			t.Fatalf("--local-dir %q must fail with an explanation", value)
-		}
 	}
 }

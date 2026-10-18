@@ -22,10 +22,15 @@ int portablefs_process_witness_matches(
 	const char *expected_path,
 	char **observed_path_out
 );
+int portablefs_running_image(
+    const uint32_t token_values[8], int pid, int pid_version,
+    unsigned char cdhash_out[20]
+);
 */
 import "C"
 
 import (
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"unsafe"
@@ -131,4 +136,32 @@ func (witness ProcessWitness) RequireCurrentExecutable(expectedPath string) erro
 	default:
 		return fmt.Errorf("re-prove audit-token host process witness: invalid native status %d", int(status))
 	}
+}
+
+func (witness ProcessWitness) requireRunningImage(expectedPath, expectedCDHash string) error {
+	if err := witness.RequireCurrentExecutable(expectedPath); err != nil {
+		return err
+	}
+	observed, err := witness.runningImageHash()
+	if err != nil {
+		return err
+	}
+	if observed != expectedCDHash {
+		return fmt.Errorf("socket peer running code directory differs from the authenticated release")
+	}
+	return witness.RequireCurrentExecutable(expectedPath)
+}
+
+func (witness ProcessWitness) runningImageHash() (string, error) {
+	var token [8]C.uint32_t
+	for index := range witness.auditToken {
+		token[index] = C.uint32_t(witness.auditToken[index])
+	}
+	var hash [20]C.uchar
+	status := C.portablefs_running_image(&token[0], C.int(witness.PID), C.int(witness.PIDVersion), &hash[0])
+	if status != 0 {
+		return "", fmt.Errorf("authenticate audit-token running image: errno %d", int(status))
+	}
+	observed := C.GoBytes(unsafe.Pointer(&hash[0]), 20)
+	return hex.EncodeToString(observed), nil
 }

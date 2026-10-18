@@ -136,7 +136,6 @@ set -- xcodebuild \
   MARKETING_VERSION="$version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   PORTABLEFS_APP_GROUP="$app_group" \
-  PORTABLEFS_NATIVE_QUALIFICATION= \
   PORTABLEFS_GO="$go_binary"
 
 if [ -n "${PORTABLEFS_APPLE_API_KEY_PATH:-}" ]; then

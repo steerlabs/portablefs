@@ -66,15 +66,3 @@ func TestValidateFSKitKernelIdentityRequiresExactProductAndSource(t *testing.T) 
 		t.Fatal("wrong attach source accepted as PortableFS mount")
 	}
 }
-
-func TestFSKitTypeOverrideCannotChangeSignedIdentity(t *testing.T) {
-	_, err := fskitConfigFromEnv(func(name string) string {
-		if name == fskitTypeEnv {
-			return "portablefs"
-		}
-		return ""
-	})
-	if err == nil || !strings.Contains(err.Error(), "signed FSKit identity") {
-		t.Fatalf("error = %v, want signed identity mismatch", err)
-	}
-}

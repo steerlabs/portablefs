@@ -110,6 +110,10 @@ func OpenFileAppend(path string) (*os.File, error) {
 }
 
 func RemoveFileDurable(path string) error {
+	return removeFileDurable(path, (*os.File).Sync)
+}
+
+func removeFileDurable(path string, syncParent func(*os.File) error) error {
 	dirPath, name, err := privateFileParts(path)
 	if err != nil {
 		return err
@@ -123,6 +127,11 @@ func RemoveFileDurable(path string) error {
 	}
 	defer parent.Close()
 	if err := validateExistingPrivateFileAt(parent, name, path); errors.Is(err, unix.ENOENT) {
+		// A previous unlink may have succeeded before its directory sync
+		// failed. Absence alone cannot finish that durability obligation.
+		if err := syncParent(parent); err != nil {
+			return fmt.Errorf("sync private directory after removing %s: %w", path, err)
+		}
 		return nil
 	} else if err != nil {
 		return err
@@ -141,7 +150,7 @@ func RemoveFileDurable(path string) error {
 		return fmt.Errorf("remove private file %s: %w", path, err)
 	}
 	_ = file.Close()
-	if err := parent.Sync(); err != nil {
+	if err := syncParent(parent); err != nil {
 		return fmt.Errorf("sync private directory after removing %s: %w", path, err)
 	}
 	return nil

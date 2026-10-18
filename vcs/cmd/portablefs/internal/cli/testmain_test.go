@@ -2,9 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -78,4 +81,24 @@ func leaveCLIStaleUnixSocket(t *testing.T, path string) {
 	if err := ln.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func testDaemonRelease(path, version, digest string) daemonRelease {
+	return daemonRelease{path: path, identity: hostctl.ReleaseIdentity{CodeDirectoryHash: strings.Repeat("a", 40), ExecutableSHA256: digest, DaemonVersion: version}}
+}
+
+func inspectTestDaemonRelease(path, version string) (daemonRelease, error) {
+	digest, err := daemonctl.FileSHA256(path)
+	return testDaemonRelease(path, version, digest), err
+}
+
+func newTestFsdControl(t *testing.T, path string) *fsdControl {
+	t.Helper()
+	ctl, err := newFsdControlAuthenticated(path, testDaemonRelease("/test/portablefsd", "test", strings.Repeat("a", 64)), func(net.Conn, string, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctl.pairOnce.Do(func() {})
+	t.Cleanup(ctl.close)
+	return ctl
 }

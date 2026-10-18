@@ -5,8 +5,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"strconv"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -23,11 +21,9 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
 	"github.com/steerlabs/portablefs/vcs/internal/apphost"
-	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
-	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"golang.org/x/sys/unix"
 )
 
@@ -67,10 +63,6 @@ type macOSInstallCodeIdentityPolicy uint8
 
 const (
 	macOSInstallDeveloperIDRelease macOSInstallCodeIdentityPolicy = iota + 1
-	macOSInstallAppleDevelopmentQualification
-	// This exact identity exists only as the installed side of the one-way
-	// macOS 27 recovery qualification crossing. It is never an incoming target.
-	macOSInstallAppleDevelopmentRecoverySource
 )
 
 // macOSInstallLayout is a compile-time product identity, not input. Every
@@ -78,33 +70,22 @@ const (
 // process admission, staging, rollback, and terminal reconciliation. A bundle
 // can never be accepted by trying multiple layouts.
 type macOSInstallLayout struct {
-	appName               string
-	stagedAppName         string
-	appExecutable         string
-	extensionExecutable   string
-	serviceMinimumOS      string
-	requiredAppID         string
-	codeIdentity          macOSInstallCodeIdentityPolicy
-	installedCodeIdentity macOSInstallCodeIdentityPolicy
-	installedRecovery     macOSInstalledRecoveryIdentity
-}
-
-type macOSInstalledRecoveryIdentity struct {
-	hostCodeDirectoryHash      string
-	extensionCodeDirectoryHash string
-	cliCodeDirectoryHash       string
-	serviceCodeDirectoryHash   string
-	daemonExecutableSHA256     string
+	appName             string
+	stagedAppName       string
+	appExecutable       string
+	extensionExecutable string
+	serviceMinimumOS    string
+	requiredAppID       string
+	codeIdentity        macOSInstallCodeIdentityPolicy
 }
 
 var productionMacOSInstallLayout = macOSInstallLayout{
-	appName:               macOSAppName,
-	stagedAppName:         macOSStagedAppName,
-	appExecutable:         macOSAppExecutable,
-	extensionExecutable:   macOSExtensionExecutable,
-	serviceMinimumOS:      "26.0",
-	codeIdentity:          macOSInstallDeveloperIDRelease,
-	installedCodeIdentity: macOSInstallDeveloperIDRelease,
+	appName:             macOSAppName,
+	stagedAppName:       macOSStagedAppName,
+	appExecutable:       macOSAppExecutable,
+	extensionExecutable: macOSExtensionExecutable,
+	serviceMinimumOS:    "26.0",
+	codeIdentity:        macOSInstallDeveloperIDRelease,
 }
 
 func (layout macOSInstallLayout) validate() error {
@@ -122,7 +103,7 @@ func (layout macOSInstallLayout) validate() error {
 	if !strings.HasSuffix(layout.appName, ".app") || strings.HasSuffix(layout.stagedAppName, ".app") {
 		return fmt.Errorf("invalid compiled macOS install app names")
 	}
-	if layout.serviceMinimumOS != "26.0" && layout.serviceMinimumOS != "27.0" {
+	if layout.serviceMinimumOS != "26.0" {
 		return fmt.Errorf("invalid compiled macOS service minimum system version %q", layout.serviceMinimumOS)
 	}
 	if layout.requiredAppID != "" &&
@@ -130,42 +111,10 @@ func (layout macOSInstallLayout) validate() error {
 			!strings.Contains(layout.requiredAppID, ".")) {
 		return fmt.Errorf("invalid compiled macOS install app identifier %q", layout.requiredAppID)
 	}
-	switch {
-	case layout.codeIdentity == macOSInstallDeveloperIDRelease &&
-		layout.installedCodeIdentity == macOSInstallDeveloperIDRelease &&
-		layout.installedRecovery == (macOSInstalledRecoveryIdentity{}):
-		return nil
-	case layout.codeIdentity == macOSInstallAppleDevelopmentQualification &&
-		layout.installedCodeIdentity == macOSInstallAppleDevelopmentQualification:
-		for name, value := range map[string]string{
-			"host code directory hash":      layout.installedRecovery.hostCodeDirectoryHash,
-			"extension code directory hash": layout.installedRecovery.extensionCodeDirectoryHash,
-			"CLI code directory hash":       layout.installedRecovery.cliCodeDirectoryHash,
-			"service code directory hash":   layout.installedRecovery.serviceCodeDirectoryHash,
-		} {
-			if !validCompiledLowerHex(value, 40) {
-				return fmt.Errorf("invalid compiled recovery %s", name)
-			}
-		}
-		if !validCompiledLowerHex(layout.installedRecovery.daemonExecutableSHA256, 64) {
-			return fmt.Errorf("invalid compiled recovery daemon executable SHA-256")
-		}
-		return nil
-	default:
-		return fmt.Errorf("invalid compiled macOS target/installed code identity policy")
+	if layout.codeIdentity != macOSInstallDeveloperIDRelease {
+		return fmt.Errorf("invalid compiled macOS signing policy")
 	}
-}
-
-func validCompiledLowerHex(value string, length int) bool {
-	if len(value) != length {
-		return false
-	}
-	for _, character := range value {
-		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
-			return false
-		}
-	}
-	return true
+	return nil
 }
 
 type preparedMacOSInstall struct {
@@ -323,9 +272,7 @@ func runInstallMacOSAppWithLayout(
 	if err := validateStagedBundleForPublicationWithLayout(prepared.stageApp, e.version, expectedAppID, layout); err != nil {
 		return macOSInstallResult{}, err
 	}
-	if err := rejectLegacyPortablefsdState(home); err != nil {
-		return macOSInstallResult{}, err
-	}
+
 	if err := makeStagedMacOSAppDurable(prepared.stageApp); err != nil {
 		return macOSInstallResult{}, err
 	}
@@ -472,9 +419,7 @@ func runInstallMacOSAppWithLayout(
 	if err := validateStagedBundleForPublicationWithLayout(prepared.stageApp, e.version, expectedAppID, layout); err != nil {
 		return macOSInstallResult{}, recoverUnpublished(err)
 	}
-	if err := rejectLegacyPortablefsdState(home); err != nil {
-		return macOSInstallResult{}, recoverUnpublished(err)
-	}
+
 	if updateSession == nil {
 		if err := commitMacOSInstall(prepared, destinationApp); err != nil {
 			return macOSInstallResult{}, err
@@ -482,7 +427,7 @@ func runInstallMacOSAppWithLayout(
 		if err := requestExactMacOSHostForProof(destinationApp); err != nil {
 			return macOSInstallResult{}, fmt.Errorf("launch installed PortableFS host: %w", err)
 		}
-		if err := requireLiveMacOSServiceRelease(targetRelease, 15*time.Second); err != nil {
+		if err := requireLiveMacOSServiceRelease(destinationApp, targetRelease, true, 15*time.Second); err != nil {
 			return macOSInstallResult{}, fmt.Errorf(
 				"prove installed PortableFS service release after host launch: %w",
 				err,
@@ -908,7 +853,6 @@ func validateExistingManagedMacOSAppWithLayout(
 		path,
 		version,
 		expectedAppID,
-		true,
 		layout,
 	); err != nil {
 		return fmt.Errorf(
@@ -1763,10 +1707,15 @@ func macOSServiceReleaseIdentity(
 		"LaunchAgents",
 		"PortableFSDService.app",
 	)
+	architecture, err := nativeCodeArchitecture()
+	if err != nil {
+		return hostctl.ReleaseIdentity{}, err
+	}
 	out, err := exec.Command(
 		"/usr/bin/codesign",
 		"-dv",
 		"--verbose=4",
+		"--arch", architecture,
 		serviceApp,
 	).CombinedOutput()
 	if err != nil {
@@ -1784,10 +1733,6 @@ func macOSServiceReleaseIdentity(
 		CodeDirectoryHash: codeDirectoryHash,
 		ExecutableSHA256:  daemon.sha256,
 		DaemonVersion:     version,
-		IdentitySchema:    daemonctl.IdentitySchemaVersion,
-		ControlProtocol:   daemonctl.ControlProtocolVersion,
-		PFSLocalMajor:     pfslocal.ProtocolMajor,
-		PFSLocalMinor:     pfslocal.ProtocolMinor,
 	}
 	if err := hostctl.ValidateReleaseIdentity(identity); err != nil {
 		return hostctl.ReleaseIdentity{}, fmt.Errorf("invalid sealed daemon release identity: %w", err)
@@ -1812,24 +1757,6 @@ func exactCodesignField(output, field string) (string, error) {
 		return "", fmt.Errorf("codesign output carries no %s", field)
 	}
 	return value, nil
-}
-
-func exactMacOSCodeDirectoryHash(code string) (string, error) {
-	out, err := exec.Command(
-		"/usr/bin/codesign",
-		"-dv",
-		"--verbose=4",
-		code,
-	).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf(
-			"inspect code directory for %s: %w (output: %s)",
-			code,
-			err,
-			strings.TrimSpace(string(out)),
-		)
-	}
-	return exactCodesignField(string(out), "CDHash")
 }
 
 func reactivateUnpublishedOldMacOSRelease(
@@ -1911,7 +1838,7 @@ func reactivateUnpublishedOldMacOSRelease(
 		prepared.preserve = true
 		return fmt.Errorf("installation failed after old-host exit: %w; old activation deadline exhausted: %v", installFailure, timeoutErr)
 	}
-	if err := requireLiveMacOSServiceRelease(oldRelease, liveTimeout); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, oldRelease, false, liveTimeout); err != nil {
 		fenceErr := fenceReadyMacOSActivation(
 			rollbackContext, activation, updateSocket, macOSActivationFenceAndAbsenceTimeout,
 		)
@@ -1971,6 +1898,7 @@ func reactivateUnpublishedOldMacOSRelease(
 	err = completeOrResumeMacOSActivation(
 		rollbackContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2164,7 +2092,6 @@ func requireExactUnpublishedOldMacOSRelease(
 		destinationApp,
 		oldRelease.DaemonVersion,
 		prepared.expectedAppID,
-		true,
 		prepared.layout,
 	); err != nil {
 		return err
@@ -2179,7 +2106,7 @@ func requireExactUnpublishedOldMacOSRelease(
 	if sealed != oldRelease {
 		return fmt.Errorf("installed old daemon release identity changed")
 	}
-	if err := requireLiveMacOSServiceRelease(oldRelease, 5*time.Second); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, oldRelease, false, 5*time.Second); err != nil {
 		return err
 	}
 	return hostctl.RequireLease(
@@ -2294,7 +2221,7 @@ func activatePublishedMacOSUpdate(
 	}
 	defer activation.Close()
 
-	if err := requireLiveMacOSServiceRelease(targetRelease, 5*time.Second); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, targetRelease, true, 5*time.Second); err != nil {
 		fenceErr := fenceReadyMacOSActivation(
 			transactionContext, activation, updateSocket, macOSActivationFenceAndAbsenceTimeout,
 		)
@@ -2349,6 +2276,7 @@ func activatePublishedMacOSUpdate(
 	accepted, fenced, err := acceptOrResumeMacOSActivation(
 		acceptContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2400,6 +2328,7 @@ func activatePublishedMacOSUpdate(
 	err = completeOrResumeMacOSActivation(
 		transactionContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2489,7 +2418,7 @@ func restorePreviousMacOSRelease(
 		prepared.preserve = true
 		return fmt.Errorf("replacement activation failed: %w; rollback activation deadline exhausted: %v", targetFailure, timeoutErr)
 	}
-	if err := requireLiveMacOSServiceRelease(oldRelease, liveTimeout); err != nil {
+	if err := requireLiveMacOSServiceRelease(destinationApp, oldRelease, false, liveTimeout); err != nil {
 		fenceErr := fenceReadyMacOSActivation(
 			transactionContext, activation, updateSocket, macOSActivationFenceAndAbsenceTimeout,
 		)
@@ -2541,6 +2470,7 @@ func restorePreviousMacOSRelease(
 	err = completeOrResumeMacOSActivation(
 		transactionContext,
 		activation,
+		destinationApp,
 		updateSocket,
 		leasePath,
 		token,
@@ -2750,7 +2680,7 @@ func acceptRollbackMacOSActivationRecoveringFence(
 			if timeoutErr != nil {
 				return nil, timeoutErr
 			}
-			if err := requireLiveMacOSServiceRelease(oldRelease, liveTimeout); err != nil {
+			if err := requireLiveMacOSServiceRelease(app, oldRelease, false, liveTimeout); err != nil {
 				fenceErr := fenceReadyMacOSActivation(
 					ctx, current, socketPath, macOSActivationFenceAndAbsenceTimeout,
 				)
@@ -2782,6 +2712,7 @@ func acceptRollbackMacOSActivationRecoveringFence(
 		accepted, fenced, err := acceptOrResumeMacOSActivation(
 			acceptContext,
 			current,
+			app,
 			socketPath,
 			leasePath,
 			token,
@@ -2906,7 +2837,7 @@ func boundedContextDuration(ctx context.Context, maximum time.Duration) (time.Du
 func acceptOrResumeMacOSActivation(
 	ctx context.Context,
 	activation *hostctl.ActivationSession,
-	socketPath, leasePath, token, kind string,
+	app, socketPath, leasePath, token, kind string,
 	activeRelease, oldRelease, targetRelease hostctl.ReleaseIdentity,
 ) (*hostctl.ActivationSession, bool, error) {
 	if kind != "target" && kind != "rollback" {
@@ -2930,7 +2861,7 @@ func acceptOrResumeMacOSActivation(
 			if err := hostctl.RequireLease(
 				leasePath, token, activePhase, oldRelease, targetRelease,
 			); err == nil {
-				if err := requireLiveMacOSServiceRelease(activeRelease, 2*time.Second); err != nil {
+				if err := requireLiveMacOSServiceRelease(app, activeRelease, kind == "target", 2*time.Second); err != nil {
 					activeErr = err
 				} else {
 					resumed, err := hostctl.ResumeActive(
@@ -2982,7 +2913,7 @@ func acceptOrResumeMacOSActivation(
 func completeOrResumeMacOSActivation(
 	ctx context.Context,
 	activation *hostctl.ActivationSession,
-	socketPath, leasePath, token, kind string,
+	app, socketPath, leasePath, token, kind string,
 	activeRelease, oldRelease, targetRelease hostctl.ReleaseIdentity,
 	reconcileCompleted func() error,
 ) error {
@@ -3018,7 +2949,7 @@ func completeOrResumeMacOSActivation(
 		if err := hostctl.RequireLease(
 			leasePath, token, activePhase, oldRelease, targetRelease,
 		); err == nil {
-			if err := requireLiveMacOSServiceRelease(activeRelease, 2*time.Second); err != nil {
+			if err := requireLiveMacOSServiceRelease(app, activeRelease, kind == "target", 2*time.Second); err != nil {
 				activeErr = err
 			} else {
 				resumeContext, resumeCancel, admissionErr := activationChildContext(
@@ -3074,23 +3005,77 @@ func completeOrResumeMacOSActivation(
 	}
 }
 
-func requireLiveMacOSServiceRelease(
-	release hostctl.ReleaseIdentity,
-	timeout time.Duration,
-) error {
-	controlSocket, err := defaultFskitControlSocket()
+func requireLiveMacOSServiceRelease(app string, release hostctl.ReleaseIdentity, incoming bool, timeout time.Duration) error {
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return err
 	}
-	expected := daemonctl.Identity{
-		SchemaVersion:    release.IdentitySchema,
-		ControlProtocol:  release.ControlProtocol,
-		DaemonVersion:    release.DaemonVersion,
-		ExecutableSHA256: release.ExecutableSHA256,
-		PFSLocalMajor:    release.PFSLocalMajor,
-		PFSLocalMinor:    release.PFSLocalMinor,
+	return requireLiveMacOSServiceReleaseWithConfig(cfg, app, release, incoming, timeout)
+}
+
+func requireLiveMacOSServiceReleaseWithConfig(cfg fskitConfig, app string, release hostctl.ReleaseIdentity, incoming bool, timeout time.Duration) error {
+	path := filepath.Join(app, "Contents", filepath.FromSlash(macOSPortableFSDRelativePath))
+	ctl, err := cfg.controlForRelease(path, release.DaemonVersion)
+	if err != nil {
+		return err
 	}
-	return newFsdControl(controlSocket).requireExactIdentityWithin(expected, timeout)
+	defer ctl.close()
+	if ctl.expected.identity != release {
+		return fmt.Errorf("authenticated daemon release changed")
+	}
+	if incoming {
+		return ctl.requireCompatibleIdentityWithin(release.DaemonVersion, release.ExecutableSHA256, timeout)
+	}
+	return ctl.requireOutgoingIdentityWithin(release, timeout)
+}
+
+func nativeCodeArchitecture() (string, error) {
+	if runtime.GOARCH == "arm64" {
+		return "arm64", nil
+	}
+	if runtime.GOARCH != "amd64" {
+		return "", fmt.Errorf("unsupported native daemon architecture %s", runtime.GOARCH)
+	}
+	translated, err := unix.SysctlUint32("sysctl.proc_translated")
+	if errors.Is(err, syscall.ENOENT) {
+		return "x86_64", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect native daemon architecture: %w", err)
+	}
+	if translated == 1 {
+		return "arm64", nil
+	}
+	if translated == 0 {
+		return "x86_64", nil
+	}
+	return "", fmt.Errorf("invalid process translation status %d", translated)
+}
+
+// The exact bundle hierarchy, signatures, entitlements and executable digest
+// authorize the expected socket identity. Caller-supplied hashes cannot do so.
+func authenticateDaemonRelease(path, version string) (daemonRelease, error) {
+	suffix := "/Contents/" + macOSPortableFSDRelativePath
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !strings.HasSuffix(path, suffix) {
+		return daemonRelease{}, fmt.Errorf("expected daemon must be at its canonical owning-bundle path")
+	}
+	app := strings.TrimSuffix(path, suffix)
+	resolved, err := filepath.EvalSymlinks(app)
+	if err != nil || resolved != app {
+		return daemonRelease{}, fmt.Errorf("daemon owning bundle path is not canonical: %v", err)
+	}
+	appID, err := sourceMacOSBundleIdentity(app)
+	if err != nil {
+		return daemonRelease{}, err
+	}
+	if err := validateInstalledMacOSBundleForPublicationWithLayout(app, version, appID, productionMacOSInstallLayout); err != nil {
+		return daemonRelease{}, err
+	}
+	identity, err := macOSServiceReleaseIdentity(app, version)
+	if err != nil {
+		return daemonRelease{}, err
+	}
+	return daemonRelease{path: path, identity: identity}, nil
 }
 
 // reconcileCompletedMacOSActivation is the only safe interpretation of a
@@ -3149,7 +3134,7 @@ func reconcileCompletedMacOSActivation(
 				validateDestination = validateInstalledMacOSBundleForPublicationWithLayout
 			}
 			if err := validateDestination(
-				destinationApp, expected.DaemonVersion, prepared.expectedAppID, true, prepared.layout,
+				destinationApp, expected.DaemonVersion, prepared.expectedAppID, prepared.layout,
 			); err != nil {
 				return err
 			}
@@ -3163,7 +3148,7 @@ func reconcileCompletedMacOSActivation(
 			return nil
 		},
 		requireLive: func() error {
-			return requireLiveMacOSServiceRelease(expected, 5*time.Second)
+			return requireLiveMacOSServiceRelease(destinationApp, expected, completedPhase == hostctl.PhaseTargetComplete, 5*time.Second)
 		},
 	}
 	return reconcileCompletedMacOSActivationProofs(proofs)
@@ -3240,7 +3225,7 @@ func rejectPreparedMacOSRuntime(
 			return fmt.Errorf("re-prove prepared PortableFS host: %w", err)
 		}
 	}
-	cfg, err := fskitConfigFromEnv(func(string) string { return "" })
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return err
 	}
@@ -3375,7 +3360,7 @@ func rejectLiveMacOSRuntimeWithLayout(
 			)
 		}
 	}
-	cfg, err := fskitConfigFromEnv(func(string) string { return "" })
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return err
 	}
@@ -3452,13 +3437,6 @@ func darwinMountTable() ([]darwinMount, error) {
 	}
 }
 
-type macOSBundleIdentityGeneration uint8
-
-const (
-	macOSBundleIdentityCurrent macOSBundleIdentityGeneration = iota + 1
-	macOSBundleIdentityImmediatePrior
-)
-
 func validateStagedBundleForPublication(app, version, expectedAppID string) error {
 	return validateStagedBundleForPublicationWithLayout(
 		app,
@@ -3478,66 +3456,39 @@ func validateStagedBundleForPublicationWithLayout(
 		app,
 		version,
 		expectedAppID,
-		false,
 		layout,
 	)
 }
 
 func validateMacOSBundleForPublication(
 	app, version, expectedAppID string,
-	allowImmediatePrior bool,
 ) error {
 	return validateMacOSBundleForPublicationWithLayout(
 		app,
 		version,
 		expectedAppID,
-		allowImmediatePrior,
 		productionMacOSInstallLayout,
 	)
 }
 
 func validateMacOSBundleForPublicationWithLayout(
 	app, version, expectedAppID string,
-	allowImmediatePrior bool,
 	layout macOSInstallLayout,
 ) error {
 	return validateMacOSBundleForPublicationWithPolicy(
-		app, version, expectedAppID, allowImmediatePrior, layout, layout.codeIdentity,
+		app, version, expectedAppID, layout, layout.codeIdentity,
 	)
 }
 
 func validateInstalledMacOSBundleForPublicationWithLayout(
 	app, version, expectedAppID string,
-	allowImmediatePrior bool,
 	layout macOSInstallLayout,
 ) error {
-	codeIdentity := layout.installedCodeIdentity
-	if layout.installedRecovery != (macOSInstalledRecoveryIdentity{}) {
-		hostCodeDirectoryHash, err := exactMacOSCodeDirectoryHash(app)
-		if err != nil {
-			return fmt.Errorf("classify installed macOS release: %w", err)
-		}
-		codeIdentity = installedMacOSCodeIdentityForHostHash(layout, hostCodeDirectoryHash)
-	}
-	return validateMacOSBundleForPublicationWithPolicy(
-		app, version, expectedAppID, allowImmediatePrior, layout, codeIdentity,
-	)
-}
-
-func installedMacOSCodeIdentityForHostHash(
-	layout macOSInstallLayout,
-	hostCodeDirectoryHash string,
-) macOSInstallCodeIdentityPolicy {
-	if layout.installedRecovery != (macOSInstalledRecoveryIdentity{}) &&
-		hostCodeDirectoryHash == layout.installedRecovery.hostCodeDirectoryHash {
-		return macOSInstallAppleDevelopmentRecoverySource
-	}
-	return layout.installedCodeIdentity
+	return validateMacOSBundleForPublicationWithPolicy(app, version, expectedAppID, layout, layout.codeIdentity)
 }
 
 func validateMacOSBundleForPublicationWithPolicy(
 	app, version, expectedAppID string,
-	allowImmediatePrior bool,
 	layout macOSInstallLayout,
 	codeIdentity macOSInstallCodeIdentityPolicy,
 ) error {
@@ -3727,15 +3678,14 @@ func validateMacOSBundleForPublicationWithPolicy(
 	if err != nil {
 		return err
 	}
-	generation, profileOK := classifyMacOSBundleIdentity(
+	profileOK := validMacOSBundleRegistration(
 		extensionFSName,
 		extensionPersonalityName,
 		supportsGenericURLResources,
 		extensionSchemes,
 	)
 	if extensionPoint != fskitExtensionType ||
-		!profileOK ||
-		generation == macOSBundleIdentityImmediatePrior && !allowImmediatePrior {
+		!profileOK {
 		return fmt.Errorf(
 			"staged extension registration mismatch: point %q fs type %q personality %q generic URL resources %q resource schemes %q",
 			extensionPoint,
@@ -3791,7 +3741,7 @@ func validateMacOSBundleForPublicationWithPolicy(
 		if err != nil {
 			return fmt.Errorf("read staged %s identity: %w", name, err)
 		}
-		if !validMacOSBundleIdentityJSON(out, generation) {
+		if !validMacOSBundleIdentityJSON(out) {
 			return fmt.Errorf(
 				"staged %s identity does not match release identity %+v",
 				name,
@@ -3878,132 +3828,7 @@ func validateMacOSBundleCodeIdentity(
 	if err := validateAbsentMacOSAppGroupEntitlement(cli, "CLI", filepath.Dir(app)); err != nil {
 		return err
 	}
-	if codeIdentity == macOSInstallAppleDevelopmentQualification ||
-		codeIdentity == macOSInstallAppleDevelopmentRecoverySource {
-		return validateQualificationCodeIdentity(
-			app,
-			extension,
-			serviceApp,
-			cli,
-			daemon,
-			expectedAppID,
-			teamID,
-			layout.extensionExecutable,
-			codeIdentity,
-			layout.installedRecovery,
-		)
-	}
-	return nil
-}
 
-func validateQualificationCodeIdentity(
-	app, extension, serviceApp, cli, daemon, expectedAppID, teamID, extensionExecutable string,
-	codeIdentity macOSInstallCodeIdentityPolicy,
-	recovery macOSInstalledRecoveryIdentity,
-) error {
-	group := fskitidentity.AppGroup
-	expected, err := qualificationExpectedEntitlements(
-		app, extension, serviceApp, cli, daemon,
-		expectedAppID, teamID, extensionExecutable, group, codeIdentity,
-	)
-	if err != nil {
-		return err
-	}
-	for code, wanted := range expected {
-		observed, err := exactCodeEntitlements(code, filepath.Dir(app))
-		if err != nil {
-			return err
-		}
-		if err := validateExactEntitlementDictionary(observed, wanted, code); err != nil {
-			return err
-		}
-	}
-	if codeIdentity == macOSInstallAppleDevelopmentRecoverySource {
-		if err := validateRecoveryCodeDirectoryIdentity(
-			app, extension, serviceApp, cli, daemon, recovery,
-		); err != nil {
-			return err
-		}
-	}
-	profilePath := filepath.Join(extension, "Contents", "embedded.provisionprofile")
-	if err := validateQualificationProfileLayout(app, profilePath); err != nil {
-		return err
-	}
-	return validateQualificationExtensionProfile(
-		profilePath,
-		extension,
-		filepath.Dir(app),
-		teamID,
-		expectedAppID+"."+extensionExecutable,
-	)
-}
-
-func qualificationExpectedEntitlements(
-	app, extension, serviceApp, cli, daemon, expectedAppID, teamID, extensionExecutable, group string,
-	codeIdentity macOSInstallCodeIdentityPolicy,
-) (map[string]map[string]any, error) {
-	expected := map[string]map[string]any{
-		app: {
-			"com.apple.security.application-groups": []any{group},
-			"com.apple.security.get-task-allow":     true,
-		},
-		extension: {
-			"com.apple.application-identifier":      teamID + "." + expectedAppID + "." + extensionExecutable,
-			"com.apple.developer.fskit.fsmodule":    true,
-			"com.apple.developer.team-identifier":   teamID,
-			"com.apple.security.app-sandbox":        true,
-			"com.apple.security.application-groups": []any{group},
-			"com.apple.security.get-task-allow":     true,
-		},
-		serviceApp: {
-			"com.apple.security.application-groups": []any{group},
-		},
-		cli: {},
-		daemon: {
-			"com.apple.security.application-groups": []any{group},
-		},
-	}
-	switch codeIdentity {
-	case macOSInstallAppleDevelopmentQualification:
-	case macOSInstallAppleDevelopmentRecoverySource:
-		expected[app] = map[string]any{
-			"com.apple.security.application-groups": []any{group},
-		}
-		expected[extension] = map[string]any{
-			"com.apple.application-identifier":      teamID + "." + expectedAppID + "." + extensionExecutable,
-			"com.apple.developer.fskit.fsmodule":    true,
-			"com.apple.developer.team-identifier":   teamID,
-			"com.apple.security.app-sandbox":        true,
-			"com.apple.security.application-groups": []any{group},
-			"keychain-access-groups":                []any{teamID + ".*"},
-		}
-	default:
-		return nil, fmt.Errorf("unsupported qualification code identity policy")
-	}
-	return expected, nil
-}
-
-func validateQualificationProfileLayout(app, expectedProfile string) error {
-	var profiles []string
-	err := filepath.WalkDir(app, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.Name() == "embedded.provisionprofile" {
-			profiles = append(profiles, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("walk qualification profile hierarchy: %w", err)
-	}
-	if len(profiles) != 1 || profiles[0] != expectedProfile {
-		return fmt.Errorf(
-			"qualification app must contain exactly its extension profile at %s, got %q",
-			expectedProfile,
-			profiles,
-		)
-	}
 	return nil
 }
 
@@ -4039,386 +3864,6 @@ func decodeExactCodeEntitlements(entitlements []byte, tempRoot string) (map[stri
 	return result, nil
 }
 
-func validateExactEntitlementDictionary(observed, expected map[string]any, name string) error {
-	if reflect.DeepEqual(observed, expected) {
-		return nil
-	}
-	observedJSON, observedErr := json.Marshal(observed)
-	expectedJSON, expectedErr := json.Marshal(expected)
-	if observedErr != nil || expectedErr != nil {
-		return fmt.Errorf("qualification code %s has a non-JSON entitlement dictionary", name)
-	}
-	return fmt.Errorf(
-		"qualification code %s has entitlements %s, expected %s",
-		name,
-		observedJSON,
-		expectedJSON,
-	)
-}
-
-func validateRecoveryCodeDirectoryIdentity(
-	app, extension, serviceApp, cli, daemon string,
-	expected macOSInstalledRecoveryIdentity,
-) error {
-	for _, code := range []struct {
-		name string
-		path string
-		hash string
-	}{
-		{"host", app, expected.hostCodeDirectoryHash},
-		{"extension", extension, expected.extensionCodeDirectoryHash},
-		{"CLI", cli, expected.cliCodeDirectoryHash},
-		{"daemon service", serviceApp, expected.serviceCodeDirectoryHash},
-		{"daemon", daemon, expected.serviceCodeDirectoryHash},
-	} {
-		out, err := exec.Command("/usr/bin/codesign", "-dv", "--verbose=4", code.path).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("inspect exact recovery %s code directory: %w", code.name, err)
-		}
-		observed, err := exactCodesignField(string(out), "CDHash")
-		if err != nil || observed != code.hash {
-			return fmt.Errorf(
-				"installed recovery %s code directory %q does not match frozen %q",
-				code.name, observed, code.hash,
-			)
-		}
-	}
-	daemonPeer, err := openPortablefsdPeer(daemon)
-	if err != nil {
-		return fmt.Errorf("pin installed recovery daemon: %w", err)
-	}
-	defer daemonPeer.close()
-	if daemonPeer.sha256 != expected.daemonExecutableSHA256 {
-		return fmt.Errorf(
-			"installed recovery daemon SHA-256 %q does not match frozen %q",
-			daemonPeer.sha256,
-			expected.daemonExecutableSHA256,
-		)
-	}
-	return nil
-}
-
-func validateQualificationExtensionProfile(
-	profilePath, extension, tempRoot, teamID, expectedExtensionID string,
-) error {
-	info, err := os.Lstat(profilePath)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("qualification extension has no exact embedded profile at %s", profilePath)
-	}
-	out, err := exec.Command("/usr/bin/security", "cms", "-D", "-i", profilePath).Output()
-	if err != nil {
-		return fmt.Errorf("decode qualification extension profile: %w", err)
-	}
-	profileFile, cleanup, err := writeEntitlementValidationFile(tempRoot, out)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	profile, err := parseQualificationProfileDocument(profileFile, tempRoot)
-	if err != nil {
-		return err
-	}
-	leafCertificate, err := exactCodeLeafCertificate(extension, tempRoot)
-	if err != nil {
-		return fmt.Errorf("read qualification extension signing certificate: %w", err)
-	}
-	provisioningUDID, err := currentMacOSProvisioningUDID()
-	if err != nil {
-		return err
-	}
-	return validateQualificationProfileDocument(
-		profile,
-		teamID,
-		expectedExtensionID,
-		provisioningUDID,
-		leafCertificate,
-		time.Now(),
-	)
-}
-
-type qualificationProfileDocument struct {
-	UUID                        string
-	ApplicationIdentifierPrefix []string
-	TeamIdentifier              []string
-	ProvisionedDevices          []string
-	DeveloperCertificates       [][]byte
-	Entitlements                map[string]any
-	CreationDate                time.Time
-	ExpirationDate              time.Time
-}
-
-func parseQualificationProfileDocument(
-	profilePath, tempRoot string,
-) (qualificationProfileDocument, error) {
-	var result qualificationProfileDocument
-	var err error
-	if result.UUID, err = plistNativeString(profilePath, "UUID"); err != nil {
-		return result, err
-	}
-	if result.ApplicationIdentifierPrefix, err = plistNativeStringArray(
-		profilePath, "ApplicationIdentifierPrefix",
-	); err != nil {
-		return result, err
-	}
-	if result.TeamIdentifier, err = plistNativeStringArray(profilePath, "TeamIdentifier"); err != nil {
-		return result, err
-	}
-	if result.ProvisionedDevices, err = plistNativeStringArray(
-		profilePath, "ProvisionedDevices",
-	); err != nil {
-		return result, err
-	}
-	if result.DeveloperCertificates, err = plistNativeDataArray(
-		profilePath, "DeveloperCertificates",
-	); err != nil {
-		return result, err
-	}
-	entitlements, err := plistNativeExtract(profilePath, "Entitlements", "dictionary", "xml1")
-	if err != nil {
-		return result, err
-	}
-	if result.Entitlements, err = decodeExactCodeEntitlements(entitlements, tempRoot); err != nil {
-		return result, fmt.Errorf("decode qualification profile entitlements: %w", err)
-	}
-	if result.CreationDate, err = plistNativeDate(profilePath, "CreationDate"); err != nil {
-		return result, err
-	}
-	if result.ExpirationDate, err = plistNativeDate(profilePath, "ExpirationDate"); err != nil {
-		return result, err
-	}
-	return result, nil
-}
-
-func validateQualificationProfileDocument(
-	profile qualificationProfileDocument,
-	teamID string,
-	expectedExtensionID string,
-	provisioningUDID string,
-	leafCertificate []byte,
-	now time.Time,
-) error {
-	expectedEntitlements := map[string]any{
-		"com.apple.application-identifier":    teamID + "." + expectedExtensionID,
-		"com.apple.developer.fskit.fsmodule":  true,
-		"com.apple.developer.team-identifier": teamID,
-		"keychain-access-groups":              []any{teamID + ".*"},
-	}
-	if !validCanonicalUUID(profile.UUID) ||
-		len(profile.ApplicationIdentifierPrefix) != 1 || profile.ApplicationIdentifierPrefix[0] != teamID ||
-		len(profile.TeamIdentifier) != 1 || profile.TeamIdentifier[0] != teamID ||
-		len(profile.ProvisionedDevices) == 0 || provisioningUDID == "" ||
-		!reflect.DeepEqual(profile.Entitlements, expectedEntitlements) ||
-		profile.CreationDate.IsZero() || profile.ExpirationDate.IsZero() ||
-		profile.CreationDate.After(profile.ExpirationDate) ||
-		now.Before(profile.CreationDate) || !now.Before(profile.ExpirationDate) {
-		return fmt.Errorf("qualification extension profile does not match its exact team, app, and FSKit identity")
-	}
-	seenDevices := make(map[string]struct{}, len(profile.ProvisionedDevices))
-	currentDevicePresent := false
-	for _, device := range profile.ProvisionedDevices {
-		if device == "" {
-			return fmt.Errorf("qualification extension profile contains an invalid provisioned device")
-		}
-		if _, duplicate := seenDevices[device]; duplicate {
-			return fmt.Errorf("qualification extension profile contains duplicate provisioned device %q", device)
-		}
-		seenDevices[device] = struct{}{}
-		if device == provisioningUDID {
-			currentDevicePresent = true
-		}
-	}
-	if !currentDevicePresent {
-		return fmt.Errorf(
-			"qualification extension profile does not authorize this exact Mac provisioning UDID",
-		)
-	}
-	if len(leafCertificate) == 0 || len(profile.DeveloperCertificates) == 0 {
-		return fmt.Errorf("qualification extension profile has no exact current signing certificate")
-	}
-	seenCertificates := make(map[string]struct{}, len(profile.DeveloperCertificates))
-	currentCertificatePresent := false
-	for _, certificateDER := range profile.DeveloperCertificates {
-		if _, err := x509.ParseCertificate(certificateDER); err != nil {
-			return fmt.Errorf("qualification extension profile contains an invalid developer certificate")
-		}
-		key := string(certificateDER)
-		if _, duplicate := seenCertificates[key]; duplicate {
-			return fmt.Errorf("qualification extension profile contains a duplicate developer certificate")
-		}
-		seenCertificates[key] = struct{}{}
-		if bytes.Equal(certificateDER, leafCertificate) {
-			currentCertificatePresent = true
-		}
-	}
-	if !currentCertificatePresent {
-		return fmt.Errorf("qualification extension profile does not authorize its exact signing certificate")
-	}
-	return nil
-}
-
-func plistNativeExtract(path, key, expectedType, format string) ([]byte, error) {
-	out, err := exec.Command(
-		"/usr/bin/plutil", "-extract", key, format, "-expect", expectedType, "-o", "-", path,
-	).CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf(
-			"read exact %s %s from qualification profile: %w (output: %s)",
-			expectedType, key, err, strings.TrimSpace(string(out)),
-		)
-	}
-	return out, nil
-}
-
-func plistNativeString(path, key string) (string, error) {
-	out, err := plistNativeExtract(path, key, "string", "raw")
-	if err != nil {
-		return "", err
-	}
-	value := strings.TrimSuffix(string(out), "\n")
-	if value == "" || strings.ContainsAny(value, "\r\n") {
-		return "", fmt.Errorf("qualification profile %s is not one exact string", key)
-	}
-	return value, nil
-}
-
-func plistNativeArrayCount(path, key string) (int, error) {
-	out, err := plistNativeExtract(path, key, "array", "raw")
-	if err != nil {
-		return 0, err
-	}
-	count, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil || count < 0 {
-		return 0, fmt.Errorf("qualification profile %s has an invalid array count", key)
-	}
-	return count, nil
-}
-
-func plistNativeStringArray(path, key string) ([]string, error) {
-	count, err := plistNativeArrayCount(path, key)
-	if err != nil {
-		return nil, err
-	}
-	values := make([]string, count)
-	for index := range count {
-		values[index], err = plistNativeString(path, fmt.Sprintf("%s.%d", key, index))
-		if err != nil {
-			return nil, err
-		}
-	}
-	return values, nil
-}
-
-func plistNativeDataArray(path, key string) ([][]byte, error) {
-	count, err := plistNativeArrayCount(path, key)
-	if err != nil {
-		return nil, err
-	}
-	values := make([][]byte, count)
-	for index := range count {
-		out, err := plistNativeExtract(
-			path, fmt.Sprintf("%s.%d", key, index), "data", "raw",
-		)
-		if err != nil {
-			return nil, err
-		}
-		values[index], err = base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
-		if err != nil || len(values[index]) == 0 {
-			return nil, fmt.Errorf("qualification profile %s contains invalid data", key)
-		}
-	}
-	return values, nil
-}
-
-func plistNativeDate(path, key string) (time.Time, error) {
-	out, err := plistNativeExtract(path, key, "date", "raw")
-	if err != nil {
-		return time.Time{}, err
-	}
-	value, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
-	if err != nil {
-		return time.Time{}, fmt.Errorf("qualification profile %s is not an exact date", key)
-	}
-	return value, nil
-}
-
-func validCanonicalUUID(value string) bool {
-	if len(value) != 36 {
-		return false
-	}
-	for index, character := range value {
-		switch index {
-		case 8, 13, 18, 23:
-			if character != '-' {
-				return false
-			}
-		default:
-			if !((character >= '0' && character <= '9') ||
-				(character >= 'a' && character <= 'f') ||
-				(character >= 'A' && character <= 'F')) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func exactCodeLeafCertificate(code, tempRoot string) ([]byte, error) {
-	directory, err := os.MkdirTemp(tempRoot, ".portablefs-signing-certificates-")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(directory)
-	prefix := filepath.Join(directory, "certificate")
-	if out, err := exec.Command(
-		"/usr/bin/codesign", "-d", "--extract-certificates="+prefix, code,
-	).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("extract exact code certificates: %w (output: %s)", err, strings.TrimSpace(string(out)))
-	}
-	leafPath := prefix + "0"
-	info, err := os.Lstat(leafPath)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() <= 0 {
-		return nil, fmt.Errorf("extracted code leaf certificate is absent or unsafe")
-	}
-	leaf, err := os.ReadFile(leafPath)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := x509.ParseCertificate(leaf); err != nil {
-		return nil, fmt.Errorf("parse exact code leaf certificate: %w", err)
-	}
-	return leaf, nil
-}
-
-func currentMacOSProvisioningUDID() (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(
-		ctx,
-		"/usr/sbin/system_profiler",
-		"SPHardwareDataType",
-		"-json",
-	).Output()
-	if err != nil {
-		return "", fmt.Errorf("read current Mac provisioning UDID: %w", err)
-	}
-	var document struct {
-		Hardware []struct {
-			ProvisioningUDID string `json:"provisioning_UDID"`
-		} `json:"SPHardwareDataType"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(out))
-	if err := decoder.Decode(&document); err != nil {
-		return "", fmt.Errorf("decode current Mac provisioning UDID: %w", err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return "", fmt.Errorf("decode current Mac provisioning UDID: %w", err)
-	}
-	if len(document.Hardware) != 1 || document.Hardware[0].ProvisioningUDID == "" {
-		return "", fmt.Errorf("system profiler did not return one exact Mac provisioning UDID")
-	}
-	return document.Hardware[0].ProvisioningUDID, nil
-}
-
 func requireJSONEOF(decoder *json.Decoder) error {
 	var trailing any
 	err := decoder.Decode(&trailing)
@@ -4446,22 +3891,6 @@ func validateMacOSSigningAuthorities(
 		for name, path := range map[string]string{
 			"host": app, "extension": extension, "daemon service": serviceApp,
 			"CLI": cli, "daemon": daemon,
-		} {
-			expected = append(expected, expectedAuthority{
-				name: name, path: path, prefix: "Authority=Developer ID Application: ",
-			})
-		}
-	case macOSInstallAppleDevelopmentQualification,
-		macOSInstallAppleDevelopmentRecoverySource:
-		for name, path := range map[string]string{
-			"host": app, "extension": extension, "CLI": cli,
-		} {
-			expected = append(expected, expectedAuthority{
-				name: name, path: path, prefix: "Authority=Apple Development: ",
-			})
-		}
-		for name, path := range map[string]string{
-			"daemon service": serviceApp, "daemon": daemon,
 		} {
 			expected = append(expected, expectedAuthority{
 				name: name, path: path, prefix: "Authority=Developer ID Application: ",
@@ -4566,111 +3995,33 @@ func writeEntitlementValidationFile(
 	return path, cleanup, nil
 }
 
-func classifyMacOSBundleIdentity(
+func validMacOSBundleRegistration(
 	fsName string,
 	personalityName string,
 	supportsGenericURLResources string,
 	resourceSchemes []string,
-) (macOSBundleIdentityGeneration, bool) {
-	if fsName != defaultFskitType ||
-		personalityName != defaultFskitType ||
-		supportsGenericURLResources != "true" ||
-		len(resourceSchemes) != 1 {
-		return 0, false
-	}
-	switch resourceSchemes[0] {
-	case fskitidentity.ResourceScheme:
-		return macOSBundleIdentityCurrent, true
-	case defaultFskitType:
-		return macOSBundleIdentityImmediatePrior, true
-	default:
-		return 0, false
-	}
-}
-
-func validMacOSBundleIdentityJSON(
-	data []byte,
-	generation macOSBundleIdentityGeneration,
 ) bool {
-	object, ok := decodeExactJSONObject(data)
-	if !ok {
-		return false
-	}
-	switch generation {
-	case macOSBundleIdentityCurrent:
-		if len(object) != 4 {
-			return false
-		}
-		var identity fskitidentity.Identity
-		if err := json.Unmarshal(data, &identity); err != nil {
-			return false
-		}
-		for _, key := range []string{
-			"schemaVersion",
-			"fsType",
-			"resourceScheme",
-			"appGroup",
-		} {
-			if _, ok := object[key]; !ok {
-				return false
-			}
-		}
-		return identity == fskitidentity.Current()
-	case macOSBundleIdentityImmediatePrior:
-		if len(object) != 2 {
-			return false
-		}
-		var legacy struct {
-			SchemaVersion int    `json:"schemaVersion"`
-			AppGroup      string `json:"appGroup"`
-		}
-		if err := json.Unmarshal(data, &legacy); err != nil {
-			return false
-		}
-		if _, ok := object["schemaVersion"]; !ok {
-			return false
-		}
-		if _, ok := object["appGroup"]; !ok {
-			return false
-		}
-		return legacy.SchemaVersion == 1 &&
-			legacy.AppGroup == fskitidentity.AppGroup
-	default:
-		return false
-	}
+	return fsName == defaultFskitType &&
+		personalityName == defaultFskitType &&
+		supportsGenericURLResources == "true" &&
+		len(resourceSchemes) == 1 && resourceSchemes[0] == fskitidentity.ResourceScheme
 }
 
-func decodeExactJSONObject(data []byte) (map[string]json.RawMessage, bool) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') {
-		return nil, false
+func validMacOSBundleIdentityJSON(data []byte) bool {
+	object, ok := decodeExactJSONObject(data)
+	if !ok || len(object) != 4 {
+		return false
 	}
-	object := make(map[string]json.RawMessage)
-	for decoder.More() {
-		token, err := decoder.Token()
-		key, keyOK := token.(string)
-		if err != nil || !keyOK {
-			return nil, false
+	var identity fskitidentity.Identity
+	if err := json.Unmarshal(data, &identity); err != nil {
+		return false
+	}
+	for _, key := range []string{"schemaVersion", "fsType", "resourceScheme", "appGroup"} {
+		if _, ok := object[key]; !ok {
+			return false
 		}
-		if _, duplicate := object[key]; duplicate {
-			return nil, false
-		}
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return nil, false
-		}
-		object[key] = value
 	}
-	token, err = decoder.Token()
-	if err != nil || token != json.Delim('}') {
-		return nil, false
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return nil, false
-	}
-	return object, true
+	return identity == fskitidentity.Current()
 }
 
 func plistValue(path, key string) (string, error) {
@@ -4805,21 +4156,6 @@ func runExactOutput(path string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-func rejectLegacyPortablefsdState(home string) error {
-	legacy := filepath.Join(home, "Library", "Application Support", "PortableFS", "portablefsd")
-	legacyNonempty, err := inspectedStateDirectory(legacy)
-	if err != nil {
-		return fmt.Errorf("inspect legacy portablefsd state: %w", err)
-	}
-	if !legacyNonempty {
-		return nil
-	}
-	return fmt.Errorf(
-		"legacy portablefsd runtime state remains at %s; nothing was changed. After every old PortableFS mount is cleanly unmounted and the old daemon is stopped, archive that directory for inspection and remove it explicitly, then retry",
-		legacy,
-	)
-}
-
 func syncInstallDirectory(path string) error {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -4883,27 +4219,6 @@ func makeStagedMacOSAppDurable(app string) error {
 		return fmt.Errorf("sync staged app parent before publication: %w", err)
 	}
 	return nil
-}
-
-func inspectedStateDirectory(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return false, fmt.Errorf("%s is not a real directory", path)
-	}
-	if err := requireOwnedByEUID(path, info); err != nil {
-		return false, err
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return false, err
-	}
-	return len(entries) > 0, nil
 }
 
 func rejectConflictingPFSProviders(home, canonicalApp string) error {
@@ -5063,4 +4378,17 @@ func pfsProviderConflict(appPath, extensionPath string) error {
 		target,
 		cleanup,
 	)
+}
+
+func connectInstalledPortablefsd(cfg fskitConfig) (*fsdControl, error) {
+	path, err := findPortablefsd("")
+	if err != nil {
+		return nil, err
+	}
+	app := strings.TrimSuffix(path, "/Contents/"+macOSPortableFSDRelativePath)
+	version, err := plistValue(filepath.Join(app, "Contents", "Info.plist"), "CFBundleShortVersionString")
+	if err != nil {
+		return nil, err
+	}
+	return connectCompatiblePortablefsd(cfg, version)
 }

@@ -33,7 +33,7 @@ func serveCompatibleIdentityControl(
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	mux.HandleFunc("/v1/identity", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/lifecycle/v1/identity", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(daemonctl.Identity{
 			SchemaVersion:    daemonctl.IdentitySchemaVersion,
 			ControlProtocol:  daemonctl.ControlProtocolVersion,
@@ -72,8 +72,10 @@ func TestEnsurePortablefsdWakesExactHostWithoutSpawningDaemon(t *testing.T) {
 	}
 
 	ctl, err := ensurePortablefsd(fskitConfig{
-		controlSock:       control,
-		daemonPathForTest: peer,
+		controlSock:             control,
+		daemonPathForTest:       peer,
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version")
 	if err != nil {
 		t.Fatal(err)
@@ -101,8 +103,10 @@ func TestEnsurePortablefsdResolvesAmbiguousHostLaunchOnlyWithExactDaemonProof(t 
 		return apphost.ErrLaunchCompletionAmbiguous
 	}
 	ctl, err := ensurePortablefsd(fskitConfig{
-		controlSock:       control,
-		daemonPathForTest: peer,
+		controlSock:             control,
+		daemonPathForTest:       peer,
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version")
 	if err != nil {
 		t.Fatal(err)
@@ -124,8 +128,10 @@ func TestEnsurePortablefsdRefusesRejectedHostLaunch(t *testing.T) {
 	rejected := errors.New("request rejected")
 	launchExactPortableFSHost = func() error { return rejected }
 	_, err := ensurePortablefsd(fskitConfig{
-		controlSock:       control,
-		daemonPathForTest: peer,
+		controlSock:             control,
+		daemonPathForTest:       peer,
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version")
 	if !errors.Is(err, rejected) {
 		t.Fatalf("launch error = %v", err)
@@ -151,8 +157,10 @@ func TestEnsurePortablefsdAdoptsCompatibleAgentWithoutHostWake(t *testing.T) {
 		return nil
 	}
 	if _, err := ensurePortablefsd(fskitConfig{
-		controlSock:       control,
-		daemonPathForTest: peer,
+		controlSock:             control,
+		daemonPathForTest:       peer,
+		releaseForTest:          inspectTestDaemonRelease,
+		authenticatePeerForTest: func(net.Conn, string, string) error { return nil },
 	}, stateRoot, "test-version"); err != nil {
 		t.Fatal(err)
 	}
@@ -178,14 +186,14 @@ func TestControlIdentityRequiresExactPFSLocalMinor(t *testing.T) {
 	control := filepath.Join(root, "control.sock")
 	digest := strings.Repeat("a", 64)
 	serveCompatibleIdentityControl(t, control, "test-version", digest)
-	ctl := newFsdControl(control)
+	ctl := newTestFsdControl(t, control)
 	err := ctl.requireExactIdentityWithin(daemonctl.Identity{
 		SchemaVersion:    daemonctl.IdentitySchemaVersion,
 		ControlProtocol:  daemonctl.ControlProtocolVersion,
 		DaemonVersion:    "test-version",
 		ExecutableSHA256: digest,
 		PFSLocalMajor:    pfslocal.ProtocolMajor,
-		PFSLocalMinor:    pfslocal.ProtocolMinor - 1,
+		PFSLocalMinor:    pfslocal.ProtocolMinor + 1,
 	}, 2*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "pfslocal") {
 		t.Fatalf("minor mismatch error = %v", err)

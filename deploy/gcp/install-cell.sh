@@ -37,6 +37,13 @@ for option in prjquota nodev nosuid noexec noatime; do
   }
 done
 
+cell_root_owner=$(stat -c '%u:%g' -- /srv/portablefs)
+cell_root_mode=$(stat -c '%a' -- /srv/portablefs)
+[[ $cell_root_owner == 0:0 ]] && (( (8#$cell_root_mode & 0022) == 0 )) || {
+  echo "/srv/portablefs must be root:root and not group/other-writable" >&2
+  exit 65
+}
+
 if ! getent group portablefs-agent >/dev/null; then
   groupadd --system --gid "$agent_gid" portablefs-agent
 fi

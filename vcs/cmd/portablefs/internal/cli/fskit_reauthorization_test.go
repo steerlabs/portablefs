@@ -21,7 +21,7 @@ func TestFSKitReauthorizationReturnsDaemonInstalledDeadline(t *testing.T) {
 	authorityDeadline := time.Now().UTC().Truncate(time.Second).Add(10 * time.Minute)
 	callerClaimedDeadline := authorityDeadline.Add(20 * time.Minute)
 	control := &fsdControl{httpClient: &http.Client{Transport: fsdReauthorizationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Method != http.MethodPost || request.URL.Path != "/v1/attaches/attach-ref/credential" {
+		if request.Method != http.MethodPost || request.URL.Path != "/v2/attaches/attach-ref/credential" {
 			t.Fatalf("request = %s %s", request.Method, request.URL.Path)
 		}
 		if got := request.Header.Get(daemonctl.ControlProtocolHeader); got == "" {
@@ -37,6 +37,7 @@ func TestFSKitReauthorizationReturnsDaemonInstalledDeadline(t *testing.T) {
 		}, nil
 	})}}
 
+	control.pairOnce.Do(func() {})
 	deadline, err := control.reauthorizeCredential(
 		"attach-ref", "capability", callerClaimedDeadline.UnixMilli(), 2, "certificate",
 	)

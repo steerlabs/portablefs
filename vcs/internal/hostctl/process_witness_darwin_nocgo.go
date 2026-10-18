@@ -21,3 +21,7 @@ func captureSocketPeerProcessWitness(int) (ProcessWitness, uint32, error) {
 func (ProcessWitness) RequireCurrentExecutable(string) error {
 	return fmt.Errorf("Darwin host process witnesses require cgo")
 }
+
+func (ProcessWitness) requireRunningImage(string, string) error {
+	return fmt.Errorf("Darwin running-image authentication requires cgo")
+}

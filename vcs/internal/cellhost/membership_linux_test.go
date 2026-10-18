@@ -8,26 +8,27 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
+	"golang.org/x/sys/unix"
 )
 
-// membershipDocument builds the record in the writer's exact format
-// (volumeserver/visibility_membership.go persistLocked): header line, the hex
-// of the volume ID's own bytes, then one hex session ID and profile per active line. The
-// helper's parser is tested against these bytes rather than against the
-// authority's code, because the file - not the package - is the interface.
+// Use the authority writer's shared encoder, not a second format fixture.
 func membershipDocument(volumeID string, sessions ...[16]byte) string {
-	var builder strings.Builder
-	builder.WriteString(visibilityMembershipHeader + "\n")
-	builder.WriteString(hex.EncodeToString([]byte(volumeID)) + "\n")
-	for _, session := range sessions {
-		builder.WriteString(hex.EncodeToString(session[:]) + "\tcompatibility\n")
+	records := make([]mountmembership.Record, len(sessions))
+	for i, session := range sessions {
+		records[i] = mountmembership.Record{SessionID: session, Profile: mountmembership.ProfileFSKitExclusive}
 	}
-	return builder.String()
+	data, err := mountmembership.Encode(volumeID, records)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 func writeMembership(t *testing.T, fixture *placementFixture, contents string, mode os.FileMode) string {
 	t.Helper()
-	path := filepath.Join(fixture.stateRoot, testVolumeID, visibilityMembershipName)
+	path := filepath.Join(fixture.stateRoot, testVolumeID, mountmembership.Filename)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -85,14 +86,14 @@ func TestStrictMembershipEmptyFailsClosedOnAnythingUnreadable(t *testing.T) {
 	session := hex.EncodeToString(make([]byte, 16))
 	cases := map[string]string{
 		"empty file":       "",
-		"wrong header":     "PFS-VISIBILITY-3\n" + hex.EncodeToString([]byte(testVolumeID)) + "\n",
-		"header only":      visibilityMembershipHeader + "\n",
+		"wrong header":     "INVALID\n" + hex.EncodeToString([]byte(testVolumeID)) + "\n",
+		"header only":      mountmembership.Header + "\n",
 		"another volume":   membershipDocument(other),
-		"plaintext volume": visibilityMembershipHeader + "\n" + testVolumeID + "\n",
-		"short session":    membershipDocument(testVolumeID) + hex.EncodeToString(make([]byte, 8)) + "\n",
-		"non-hex session":  membershipDocument(testVolumeID) + "not-hex\n",
-		"zero session":     membershipDocument(testVolumeID) + session + "\n",
-		"duplicate":        membershipDocument(testVolumeID, [16]byte{9}, [16]byte{9}),
+		"plaintext volume": mountmembership.Header + "\n" + testVolumeID + "\n",
+		"short session":    membershipDocument(testVolumeID) + hex.EncodeToString(make([]byte, 8)) + "\tfskit-exclusive\n",
+		"non-hex session":  membershipDocument(testVolumeID) + strings.Repeat("z", 32) + "\tfskit-exclusive\n",
+		"zero session":     membershipDocument(testVolumeID) + session + "\tfskit-exclusive\n",
+		"duplicate":        membershipDocument(testVolumeID, [16]byte{9}) + strings.TrimPrefix(membershipDocument(testVolumeID, [16]byte{9}), membershipDocument(testVolumeID)),
 	}
 	for name, contents := range cases {
 		fixture := newPlacementFixture(t)
@@ -130,20 +131,58 @@ func TestStrictMembershipEmptyFailsClosedOnAnythingUnreadable(t *testing.T) {
 	}
 }
 
-func TestStrictMembershipParsesLegacyAndEveryCurrentProfile(t *testing.T) {
-	id := [16]byte{1}
-	for _, profile := range []string{"compatibility", "linux-v7", "cacheless"} {
-		document := strings.ReplaceAll(membershipDocument(testVolumeID, id), "compatibility", profile)
-		if count, err := parseStrictMembership(strings.NewReader(document), testVolumeID); err != nil || count != 1 {
-			t.Fatalf("%s: %d %v", profile, count, err)
-		}
+func TestStrictMembershipReadsEveryCurrentProfile(t *testing.T) {
+	for _, profile := range []mountmembership.Profile{mountmembership.ProfileLinux, mountmembership.ProfileFSKitExclusive, mountmembership.ProfileCacheless} {
+		t.Run(string(profile), func(t *testing.T) {
+			fixture := newPlacementFixture(t)
+			data, err := mountmembership.Encode(testVolumeID, []mountmembership.Record{{SessionID: [16]byte{1}, Profile: profile}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeMembership(t, fixture, string(data), 0o600)
+			if empty, err := fixture.host.StrictMembershipEmpty(testVolumeID); err != nil || empty {
+				t.Fatalf("membership = %v, %v", empty, err)
+			}
+		})
 	}
-	legacy := "PFS-VISIBILITY-1\n" + hex.EncodeToString([]byte(testVolumeID)) + "\n" + hex.EncodeToString(id[:]) + "\n"
-	if count, err := parseStrictMembership(strings.NewReader(legacy), testVolumeID); err != nil || count != 1 {
-		t.Fatalf("legacy: %d %v", count, err)
-	}
-	invalid := strings.ReplaceAll(membershipDocument(testVolumeID, id), "compatibility", "unknown")
-	if _, err := parseStrictMembership(strings.NewReader(invalid), testVolumeID); err == nil {
-		t.Fatal("unknown profile accepted")
+}
+
+func TestStrictMembershipRejectsUnsafeFilesAndParents(t *testing.T) {
+	for _, kind := range []string{"directory", "fifo", "oversized", "volume symlink", "root symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newPlacementFixture(t)
+			path := writeMembership(t, fixture, membershipDocument(testVolumeID), 0o600)
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "directory":
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "fifo":
+				if err := unix.Mkfifo(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "oversized":
+				if err := os.WriteFile(path, []byte(strings.Repeat("x", mountmembership.MaxBytes+1)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				parent := filepath.Dir(path)
+				if kind == "root symlink" {
+					parent = fixture.stateRoot
+				}
+				if err := os.Rename(parent, parent+"-real"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(parent+"-real", parent); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if empty, err := fixture.host.StrictMembershipEmpty(testVolumeID); err == nil || empty {
+				t.Fatalf("unsafe membership = %v, %v", empty, err)
+			}
+		})
 	}
 }
