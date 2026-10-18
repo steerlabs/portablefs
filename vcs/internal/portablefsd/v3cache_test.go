@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -767,6 +768,8 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 			}
 		}},
 		{name: "immediate-poison", between: func(f *cachedV3Fixture, _ pfslocal.Item) { f.client.poisoned.Store(true) }},
+		{name: "clock-read-error", between: func(f *cachedV3Fixture, _ pfslocal.Item) { v3ClockFaults[0].fault(f.clock) }},
+		{name: "clock-regression", between: func(f *cachedV3Fixture, _ pfslocal.Item) { v3ClockFaults[1].fault(f.clock) }},
 	} {
 		for _, lookup := range []bool{false, true} {
 			name := test.name + "/getattr"
@@ -807,6 +810,22 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 					if err == nil || f.d.terminalError() == nil {
 						t.Fatalf("poisoned write boundary wrote %#v terminal=%v, want no frame and a terminal data plane", envelope, f.d.terminalError())
 					}
+					return
+				}
+				if strings.HasPrefix(test.name, "clock-") {
+					// The fault ends serving before the coherent retry runs, so
+					// neither the cached answer nor an authority answer is
+					// written.
+					if f.authorityCalls() != before {
+						t.Fatal("a clock fault at the write boundary fell back to the authority")
+					}
+					if err == nil {
+						switch envelope.Body.(type) {
+						case *pfslocal.GetAttrReply, *pfslocal.LookupReply:
+							t.Fatalf("a clock fault at the write boundary wrote %#v", envelope.Body)
+						}
+					}
+					requireV3ClockTerminal(t, f.d, f.client)
 					return
 				}
 				if f.authorityCalls() == before {

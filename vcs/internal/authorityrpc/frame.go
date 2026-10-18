@@ -271,7 +271,7 @@ func readFrameWithContext(ctx context.Context, r io.Reader, max uint32, budget *
 		return fail(err)
 	}
 	if err := (proto.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(metadata, message); err != nil {
-		return fail(fmt.Errorf("decode protobuf frame: %w", err))
+		return fail(fmt.Errorf("%w: decode protobuf frame: %v", ErrFrameEncoding, err))
 	}
 	carrier, err := frameBulkCarrier(message)
 	if err != nil {

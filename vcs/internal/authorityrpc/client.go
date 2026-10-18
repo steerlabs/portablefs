@@ -20,6 +20,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 var (
@@ -422,7 +423,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 
 	attachRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Attach{Attach: c.attachBody()}}
 	response, err := rawRoundTrip(data.conn, data.maxFrame, attachRequest)
-	for err != nil {
+	for err != nil && !frameDefect(err) {
 		// The provisional result is keyed by attach_attempt_id. Reconnect both
 		// roles with the same set and replay that exact Attach; this learns the
 		// credential instead of leaking it until its deadline or inventing a
@@ -433,6 +434,10 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 			return fail(fmt.Errorf("%w: provisional Attach recovery failed: %v", ErrTransportUncertain, err))
 		}
 		response, err = rawRoundTrip(data.conn, data.maxFrame, attachRequest)
+	}
+	if err != nil {
+		// A malformed reply is a protocol defect, never a lost one to replay.
+		return fail(err)
 	}
 	if !equalBytes(response.GetEpoch(), data.epoch) {
 		return fail(ErrAuthorityChanged)
@@ -471,7 +476,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	controlGeneration := provisional.GetControlBindingGeneration()
 	requestID := uint64(2)
 	activateResponse, err := rawRoundTrip(control.conn, control.maxFrame, activateRequest(requestID, dataGeneration, controlGeneration))
-	for err != nil {
+	for err != nil && !frameDefect(err) {
 		// Once any Activate frame may have reached the authority, Abort is
 		// forbidden. Rebind both roles with proof, because loss of DATA can be
 		// the reason CONTROL's activation response disappeared, then replay the
@@ -485,6 +490,12 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 		controlGeneration = control.bindingGeneration()
 		requestID = 3
 		activateResponse, err = rawRoundTrip(control.conn, control.maxFrame, activateRequest(requestID, dataGeneration, controlGeneration))
+	}
+	if err != nil {
+		// A malformed Activate reply proves a defect, not a lost outcome. Abort
+		// is still forbidden; the provisional or ACTIVE session is left to the
+		// authority's own expiry.
+		return fail(err)
 	}
 	if !equalBytes(activateResponse.GetEpoch(), data.epoch) {
 		return fail(ErrAuthorityChanged)
@@ -1029,14 +1040,29 @@ func (c *Client) KeepAlive(ctx context.Context) (time.Duration, error) {
 	return time.Duration(proof), nil
 }
 
-// keepAliveSucceeded is the one definition of a successful KeepAlive reply: a
-// plain success envelope with no errno, failure class, uncertainty, terminal or
-// route signal, replay state, post-state, terminal-delivery token, or body.
+// keepAliveSucceeded is the one definition of a successful KeepAlive reply,
+// used for both proof placement and consumption. The success envelope is
+// exactly the request ID, the epoch, and (when negotiated) the proof; any other
+// populated field marks a different outcome: an errno, uncertainty, failure
+// class, route record, replay state, post-state, terminal-delivery token,
+// repair retry, restore detail, application or visibility sequence, terminal
+// flag, retired lease state, a body, or an unknown field. Checking populated
+// fields rather than a list of known markers keeps a future non-success field
+// from passing.
 func keepAliveSucceeded(response *authoritypb.Response) bool {
-	return response != nil && response.GetErrno() == 0 && !response.GetUncertain() && !response.GetSessionTerminal() &&
-		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED &&
-		response.GetRoutesMismatch() == nil && response.GetMutation() == nil && response.GetPostState() == nil &&
-		len(response.GetTerminalDeliveryToken()) == 0 && response.GetBody() == nil
+	if response == nil || len(response.ProtoReflect().GetUnknown()) != 0 {
+		return false
+	}
+	succeeded := true
+	response.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		switch field.Name() {
+		case "request_id", "epoch", "session_valid_for_nanos":
+			return true
+		}
+		succeeded = false
+		return false
+	})
+	return succeeded
 }
 
 // BeginLocalPublication admits one frontend reply served from daemon state as
@@ -2130,6 +2156,14 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 		response := new(authoritypb.Response)
 		releaseFrame, err := readFrameRetained(conn, transport.frameMax.Load(), nil, 0, response)
 		if err != nil {
+			if frameDefect(err) {
+				// A proven protocol defect poisons the session before any
+				// pending caller can reconnect and replay past it.
+				defect := receivedFrameError(err)
+				c.signalSessionEnd(defect)
+				c.failConnection(transport, conn, defect)
+				return
+			}
 			c.failConnection(transport, conn, ErrTransportUncertain)
 			return
 		}

@@ -263,7 +263,8 @@ func (d *v3DataPlane) cacheAdmissibleLocked() bool {
 		return false
 	}
 	if now, err := d.readClockLocked(); err != nil || now >= d.horizon {
-		// A clock fault admits nothing here; the next renewal ends serving.
+		// A clock fault is latched by readClockLocked; the caller ends serving
+		// once it has released its locks.
 		return false
 	}
 	return d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)
@@ -383,6 +384,9 @@ func (d *v3DataPlane) serveCached(
 	d.mu.Lock()
 	admissible := d.cacheAdmissibleLocked()
 	d.mu.Unlock()
+	if d.endOnClockFault() != nil {
+		return true, darwinEIO
+	}
 	if !admissible {
 		return false, 0
 	}
@@ -401,6 +405,10 @@ func (d *v3DataPlane) serveCached(
 		defer d.mu.Unlock()
 		hit, generation = snapshot(conflict, collector), d.authGeneration
 	})
+	if d.endOnClockFault() != nil {
+		receipt.Consume()
+		return true, darwinEIO
+	}
 	if !hit {
 		receipt.Consume()
 		return false, 0
@@ -418,7 +426,9 @@ func (d *v3DataPlane) serveCached(
 			// a fresh proof now admits an identical answer.
 			admitted = d.authGeneration == generation && recheck(conflict)
 		})
-		return admitted
+		// A clock fault seen here ends serving before the coherent retry can
+		// run, so that retry fails closed instead of succeeding.
+		return d.endOnClockFault() == nil && admitted
 	}}
 	return true, 0
 }

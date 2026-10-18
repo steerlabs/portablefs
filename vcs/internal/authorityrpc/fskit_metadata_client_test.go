@@ -3,6 +3,7 @@ package authorityrpc
 import (
 	"context"
 	"errors"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -184,9 +185,9 @@ func TestFskitKeepAliveValidatesTheSessionProof(t *testing.T) {
 }
 
 // Only the complete KeepAlive success shape renews. A reply the frame layer
-// admits but that contradicts success (replay state, a route record, or, with
-// no proof to trip the frame grammar, a failure class or a body) ends the
-// session and never yields a proof.
+// admits but that contradicts success (replay state, a route record, a repair
+// retry, or, with no proof to trip the frame grammar, any other populated
+// outcome field) ends the session and never yields a proof.
 func TestKeepAliveRequiresTheCompleteSuccessShape(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -199,10 +200,16 @@ func TestKeepAliveRequiresTheCompleteSuccessShape(t *testing.T) {
 		{name: "negotiated-with-route-record", fskit: true, mutate: func(r *authoritypb.Response) {
 			r.RoutesMismatch = &authoritypb.RoutesMismatch{ActiveRevision: make([]byte, 32), PresentedRevision: make([]byte, 32)}
 		}},
+		{name: "negotiated-with-repair-retry", fskit: true, mutate: func(r *authoritypb.Response) { r.FskitRepairRetrySequence = 9 }},
 		{name: "linux-failure-class", mutate: func(r *authoritypb.Response) { r.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL }},
 		{name: "linux-body", mutate: func(r *authoritypb.Response) {
 			r.Body = &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{}}
 		}},
+		{name: "linux-repair-retry", mutate: func(r *authoritypb.Response) { r.FskitRepairRetrySequence = 9 }},
+		{name: "linux-restore-detail", mutate: func(r *authoritypb.Response) { r.RestoreDetail = "restored" }},
+		{name: "linux-applied-sequence", mutate: func(r *authoritypb.Response) { r.AppliedSequence = 1 }},
+		{name: "linux-visible-sequence", mutate: func(r *authoritypb.Response) { r.VisibleSequence = 1 }},
+		{name: "linux-volume-version", mutate: func(r *authoritypb.Response) { r.VolumeVersion = 1 }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var client *Client
@@ -219,6 +226,75 @@ func TestKeepAliveRequiresTheCompleteSuccessShape(t *testing.T) {
 			}
 			if proof, err := client.KeepAlive(t.Context()); err == nil || proof != 0 || client.LocalAdmissionOpen() {
 				t.Fatalf("contradicting keepalive = (%s,%v) admission=%t, want a terminal refusal", proof, err, client.LocalAdmissionOpen())
+			}
+		})
+	}
+}
+
+// A received frame outside the wire grammar is a proven authority defect, not
+// transport loss: it ends the session at once, so no reconnect can replay past
+// it, and a later request to the still-healthy authority cannot revive it.
+func TestMalformedAuthorityFrameEndsTheSession(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		proof time.Duration
+		bulk  []byte
+	}{
+		{name: "proof-beyond-max-cache-proof", proof: MaxCacheProof + time.Millisecond},
+		{name: "bulk-without-a-carrier", proof: time.Second, bulk: []byte{1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler := newFskitProofTestHandler()
+			handler.set(uint64(time.Second), nil, 0)
+			client, err := dialFskitProofTestClient(t, handler, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			local, peer := net.Pipe()
+			defer peer.Close()
+			client.control.pendingMu.Lock()
+			old := client.control.conn
+			client.control.conn = local
+			client.control.pendingMu.Unlock()
+			_ = old.Close()
+			go client.readLoop(client.control, local)
+
+			type result struct {
+				proof time.Duration
+				err   error
+			}
+			done := make(chan result, 1)
+			go func() {
+				proof, err := client.KeepAlive(t.Context())
+				done <- result{proof, err}
+			}()
+			request := new(authoritypb.Request)
+			if err := readFrame(peer, testMaxFrame, nil, 0, request); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := rawResponseFrame(&authoritypb.Response{
+				RequestId: request.GetRequestId(), Epoch: client.Epoch(), SessionValidForNanos: uint64(test.proof),
+			}, test.bulk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The client refuses an uncarried bulk before reading it, so the
+			// write of those bytes may find the pipe already closed.
+			_ = writeAll(peer, frame)
+			got := <-done
+			if got.err == nil || got.proof != 0 || client.LocalAdmissionOpen() {
+				t.Fatalf("malformed keepalive frame = (%s,%v) admission=%t, want a terminal refusal", got.proof, got.err, client.LocalAdmissionOpen())
+			}
+			select {
+			case <-client.SessionDone():
+			case <-time.After(5 * time.Second):
+				t.Fatal("a malformed authority frame did not end the session")
+			}
+			if err := client.SessionError(); !errors.Is(err, ErrTransportBinding) {
+				t.Fatalf("session error = %v, want a transport binding defect", err)
+			}
+			if proof, err := client.KeepAlive(t.Context()); err == nil || proof != 0 {
+				t.Fatalf("keepalive after the defect = (%s,%v), want the ended session", proof, err)
 			}
 		})
 	}

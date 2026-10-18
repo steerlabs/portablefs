@@ -84,7 +84,7 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 				}
 			}
 			closeNegotiations(opened)
-			if errors.Is(err, ErrAuthorityChanged) {
+			if errors.Is(err, ErrAuthorityChanged) || frameDefect(err) {
 				return nil, err
 			}
 		}
@@ -93,6 +93,26 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 			return nil, fmt.Errorf("%v: %w", last, err)
 		}
 	}
+}
+
+// frameDefect reports a received frame that is a proven protocol defect:
+// complete bytes outside the negotiated bounds, the exact wire grammar, or
+// the bulk carrier rules. Loss of the bytes themselves (EOF, truncation,
+// reset, timeout) is not a defect; TLS rules out corruption in transit, so no
+// defect is ever recovered by reconnecting and replaying.
+func frameDefect(err error) bool {
+	return errors.Is(err, ErrFrameEncoding) || errors.Is(err, ErrFramePayload) || errors.Is(err, ErrFrameBounds)
+}
+
+// receivedFrameError classifies a read error: a frame defect becomes a
+// transport-binding (protocol) failure, which every caller treats as
+// terminal; anything else is returned unchanged for the existing transport
+// recovery.
+func receivedFrameError(err error) error {
+	if frameDefect(err) {
+		return fmt.Errorf("%w: authority sent a malformed frame: %w", ErrTransportBinding, err)
+	}
+	return err
 }
 
 func waitTransportRetry(ctx context.Context) error {
@@ -211,7 +231,7 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	var response authoritypb.Response
 	releaseFrame, err := readFrameRetained(conn, c.cfg.MaxFrame, nil, 0, &response)
 	if err != nil {
-		return fail(err)
+		return fail(receivedFrameError(err))
 	}
 	defer releaseFrame()
 	hello := response.GetHello()
@@ -335,7 +355,7 @@ func (c *Client) reopenInitialPair(ctx context.Context) (*transportNegotiation, 
 				}
 			}
 			closeNegotiations(data, control)
-			if errors.Is(err, ErrAuthorityChanged) {
+			if errors.Is(err, ErrAuthorityChanged) || frameDefect(err) {
 				return nil, nil, err
 			}
 		}
@@ -379,7 +399,7 @@ func rawRoundTrip(conn net.Conn, frameMax uint32, request *authoritypb.Request) 
 	response := new(authoritypb.Response)
 	releaseFrame, err := readFrameRetained(conn, frameMax, nil, 0, response)
 	if err != nil {
-		return nil, err
+		return nil, receivedFrameError(err)
 	}
 	defer releaseFrame()
 	if response.GetRequestId() != request.GetRequestId() {

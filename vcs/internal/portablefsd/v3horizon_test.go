@@ -329,52 +329,117 @@ func newV3LivenessRequest(client *fakeV3DataClient) *pfslocal.V3LivenessRequest 
 	return &pfslocal.V3LivenessRequest{AuthorityEpoch: client.Epoch(), SessionID: client.SessionID()}
 }
 
-// A clock fault during renewal voids every horizon measured on that clock:
-// the horizon is cleared, no candidate is installed, and serving ends while
-// the authority transport stays for the exact absence proof.
-func TestV3ClockFaultDuringRenewalEndsServing(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		fault func(*fakeV3Clock)
-	}{
-		{name: "read-error", fault: func(c *fakeV3Clock) { c.fail(errors.New("timebase lost")) }},
-		{name: "regression", fault: func(c *fakeV3Clock) { c.rewind(2 * time.Minute) }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			clock := newFakeV3Clock()
-			client := newFakeV3DataClient()
-			d := testV3DataPlaneWithClock(t, client, clock)
-			if v3Horizon(d) == 0 {
-				t.Fatal("no initial horizon")
-			}
-			client.mu.Lock()
-			client.keepAlive = func(context.Context) (time.Duration, error) {
-				test.fault(clock) // between request start and receipt
-				return time.Minute, nil
-			}
-			client.mu.Unlock()
-			if err := d.renewHorizon(context.Background()); err != nil {
-				t.Fatalf("renewal returned %v; the clock fault is not a session failure", err)
-			}
-			if v3Horizon(d) != 0 || d.terminalError() == nil {
-				t.Fatalf("after a clock fault horizon=%d terminal=%v, want no horizon and no serving", v3Horizon(d), d.terminalError())
-			}
-			select {
-			case <-client.SessionDone():
-				t.Fatal("a clock fault closed the authority transport needed for the absence proof")
-			default:
-			}
-		})
+// v3ClockFaults are the two observable clock faults, each with the repair that
+// makes the clock readable again.
+var v3ClockFaults = []struct {
+	name    string
+	fault   func(*fakeV3Clock)
+	recover func(*fakeV3Clock)
+}{
+	{name: "read-error", fault: func(c *fakeV3Clock) { c.fail(errors.New("timebase lost")) }, recover: func(c *fakeV3Clock) { c.fail(nil) }},
+	{name: "regression", fault: func(c *fakeV3Clock) { c.rewind(time.Second) }, recover: func(c *fakeV3Clock) { c.advance(time.Second) }},
+}
+
+// requireV3ClockTerminal requires the state every observed clock fault leaves:
+// no horizon and no serving, even once the clock reads again, with the
+// authority transport kept for the exact absence proof.
+func requireV3ClockTerminal(t *testing.T, d *v3DataPlane, client *fakeV3DataClient) {
+	t.Helper()
+	if v3Horizon(d) != 0 || d.terminalError() == nil {
+		t.Fatalf("after a clock fault horizon=%d terminal=%v, want no horizon and no serving", v3Horizon(d), d.terminalError())
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("a clock fault closed the authority transport needed for the absence proof")
+	default:
 	}
 }
 
-// A regression observed at hit admission admits no hit, even before the next
-// renewal ends serving.
-func TestV3ClockRegressionAdmitsNoHit(t *testing.T) {
-	f := newCachedV3Fixture(t, v3FileObjects())
-	f.ns.bind(0x20, "file", 0x70)
-	file := f.lookup(f.root, "file")
-	f.requireServedLocally("GetAttr before the regression", func() { f.getattr(file.Item) })
-	f.clock.rewind(time.Second)
-	f.requireAuthority("GetAttr after the regression", func() { f.getattr(file.Item) })
+// A clock fault at either end of a renewal voids every horizon measured on
+// that clock: no candidate is installed and serving ends, at once when the
+// fault is seen at request start, while the renewal itself still runs on the
+// transport the absence proof needs.
+func TestV3ClockFaultDuringRenewalEndsServing(t *testing.T) {
+	for _, fault := range v3ClockFaults {
+		for _, atStart := range []bool{true, false} {
+			name := fault.name + "/receipt"
+			if atStart {
+				name = fault.name + "/start"
+			}
+			t.Run(name, func(t *testing.T) {
+				clock := newFakeV3Clock()
+				client := newFakeV3DataClient()
+				d := testV3DataPlaneWithClock(t, client, clock)
+				if v3Horizon(d) == 0 {
+					t.Fatal("no initial horizon")
+				}
+				if atStart {
+					fault.fault(clock)
+				}
+				client.mu.Lock()
+				client.keepAlive = func(context.Context) (time.Duration, error) {
+					if atStart && d.terminalError() == nil {
+						t.Error("a clock fault at renewal start still served while the renewal was in flight")
+					}
+					if !atStart {
+						fault.fault(clock)
+					}
+					return time.Minute, nil
+				}
+				client.mu.Unlock()
+				if err := d.renewHorizon(context.Background()); err != nil {
+					t.Fatalf("renewal returned %v; the clock fault is not a session failure", err)
+				}
+				fault.recover(clock)
+				if err := d.renewHorizon(context.Background()); err != nil {
+					t.Fatalf("renewal after the clock recovered returned %v", err)
+				}
+				requireV3ClockTerminal(t, d, client)
+			})
+		}
+	}
+}
+
+// A clock fault observed by a request (at hit admission, or at a namespace
+// mutation's request start) fails that request without reaching the
+// authority and ends serving for good; the recovered clock revives nothing.
+func TestV3ClockFaultObservedByARequestIsTerminal(t *testing.T) {
+	for _, fault := range v3ClockFaults {
+		for _, test := range []struct {
+			name    string
+			prepare func(*cachedV3Fixture) any
+		}{
+			{name: "hit-admission", prepare: func(f *cachedV3Fixture) any {
+				f.ns.bind(0x20, "file", 0x70)
+				file := f.lookup(f.root, "file")
+				f.requireServedLocally("GetAttr before the fault", func() { f.getattr(file.Item) })
+				return &pfslocal.GetAttrRequest{Item: file.Item}
+			}},
+			{name: "request-start", prepare: func(f *cachedV3Fixture) any {
+				f.getattr(f.root)
+				if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")}); errno != darwinENOENT {
+					f.t.Fatalf("negative lookup errno=%d", errno)
+				}
+				return &pfslocal.CreateRequest{Dir: f.root, Name: []byte("n"), Mode: 0o644, Exclusive: true}
+			}},
+		} {
+			t.Run(fault.name+"/"+test.name, func(t *testing.T) {
+				f := newCachedV3Fixture(t, v3FileObjects())
+				body := test.prepare(f)
+				fault.fault(f.clock)
+				before := f.authorityCalls()
+				if _, errno := f.dispatch(body); errno == 0 {
+					t.Fatal("a request succeeded across an observed clock fault")
+				}
+				if after := f.authorityCalls(); after != before {
+					t.Fatalf("a request that observed a clock fault reached the authority %d time(s)", after-before)
+				}
+				fault.recover(f.clock)
+				if _, errno := f.dispatch(body); errno == 0 {
+					t.Fatal("serving revived after the clock recovered")
+				}
+				requireV3ClockTerminal(t, f.d, f.client)
+			})
+		}
+	}
 }

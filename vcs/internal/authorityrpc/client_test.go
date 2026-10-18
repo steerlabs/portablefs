@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -1432,6 +1433,13 @@ func TestDefiniteActivationRefusalAbortsTheProvisionalAttempt(t *testing.T) {
 
 func startWrongHelloEchoServer(t *testing.T, mutate func(*authoritypb.HelloReply)) (string, *tls.Config, func()) {
 	t.Helper()
+	return startHelloResponseServer(t, func(response *authoritypb.Response) { mutate(response.GetHello()) })
+}
+
+// startHelloResponseServer answers one Hello with a reply the test may make
+// defective; the frame is written without the writer's grammar checks.
+func startHelloResponseServer(t *testing.T, mutate func(*authoritypb.Response)) (string, *tls.Config, func()) {
+	t.Helper()
 	serverTLS, clientTLS := testTLSConfigs(t)
 	serverTLS = serverTLS.Clone()
 	serverTLS.NextProtos = []string{protocolALPN}
@@ -1469,11 +1477,17 @@ func startWrongHelloEchoServer(t *testing.T, mutate func(*authoritypb.HelloReply
 			ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
 			FrontendProfile: helloRequest.GetFrontendProfile(),
 		}
-		mutate(hello)
-		done <- writeFrame(conn, testMaxFrame, &authoritypb.Response{
+		response := &authoritypb.Response{
 			RequestId: request.GetRequestId(), Epoch: bytes.Repeat([]byte{0x31}, 16),
 			Body: &authoritypb.Response_Hello{Hello: hello},
-		})
+		}
+		mutate(response)
+		frame, err := rawResponseFrame(response, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- writeAll(conn, frame)
 	}()
 	return listener.Addr().String(), clientTLS, func() {
 		_ = listener.Close()
@@ -1513,15 +1527,26 @@ func TestClientRefusesWrongHelloTransportEcho(t *testing.T) {
 	}
 }
 
-func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
-	address, clientTLS, stop := startWrongHelloEchoServer(t, func(reply *authoritypb.HelloReply) {
-		reply.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
-	})
-	defer stop()
+// rawResponseFrame encodes a response exactly as writeFrame does, but without
+// the writer's grammar checks, so a test authority can send a defective frame.
+func rawResponseFrame(response *authoritypb.Response, bulk []byte) ([]byte, error) {
+	metadata, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	frame := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata)+len(bulk))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(metadata)))
+	binary.BigEndian.PutUint32(frame[4:], uint32(len(bulk)))
+	return append(append(frame, metadata...), bulk...), nil
+}
+
+// newReconnectTestClient is a Linux mount client with no live transport, for
+// driving one reconnect handshake against a test authority.
+func newReconnectTestClient(address string, clientTLS *tls.Config) *Client {
 	tlsConfig := clientTLS.Clone()
 	tlsConfig.MinVersion = tls.VersionTLS13
 	tlsConfig.NextProtos = []string{protocolALPN}
-	client := &Client{
+	return &Client{
 		cfg: ClientConfig{
 			Address: address, TLS: tlsConfig, MaxFrame: testMaxFrame,
 			DialTimeout: time.Second, CancelDrainTimeout: time.Second,
@@ -1533,6 +1558,14 @@ func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
 		fatalDone:        make(chan struct{}),
 		fatalPendingDone: make(chan struct{}),
 	}
+}
+
+func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
+	address, clientTLS, stop := startWrongHelloEchoServer(t, func(reply *authoritypb.HelloReply) {
+		reply.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+	})
+	defer stop()
+	client := newReconnectTestClient(address, clientTLS)
 	if err := client.reconnectTransport(context.Background(), authoritypb.TransportRole_TRANSPORT_ROLE_DATA); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("reconnect profile mismatch = %v, want ErrTransportBinding", err)
 	}
@@ -1540,6 +1573,26 @@ func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
 	case <-client.SessionDone():
 	case <-time.After(time.Second):
 		t.Fatal("reconnect profile mismatch did not end the session")
+	}
+}
+
+// A Hello reply outside the wire grammar during recovery is a proven
+// authority defect, not transport loss: the session ends instead of retrying
+// the handshake.
+func TestReconnectMalformedHelloFrameEndsTheSession(t *testing.T) {
+	address, clientTLS, stop := startHelloResponseServer(t, func(response *authoritypb.Response) {
+		response.SessionValidForNanos = uint64(time.Second) // a proof is never legal beside a body
+	})
+	defer stop()
+	client := newReconnectTestClient(address, clientTLS)
+	err := client.reconnectTransport(context.Background(), authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
+	if !errors.Is(err, ErrTransportBinding) || !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("reconnect with a malformed Hello frame = %v, want a transport binding defect", err)
+	}
+	select {
+	case <-client.SessionDone():
+	case <-time.After(time.Second):
+		t.Fatal("a malformed Hello frame during recovery did not end the session")
 	}
 }
 

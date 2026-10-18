@@ -269,6 +269,7 @@ type v3DataPlane struct {
 	// wall-clock denial check (zero: none). All are protected by mu.
 	clock                 func() (uint64, error)
 	clockHigh             uint64
+	clockFault            error
 	horizon               uint64
 	authGeneration        uint64
 	authorizing           bool
@@ -1794,6 +1795,11 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		return nil, v3LocalErrno(err)
 	}
 	witness.capture(d, lease)
+	if d.endOnClockFault() != nil {
+		// Serving has ended; like a local withdrawal before assignment, no
+		// authority request owns this callback's outcome.
+		return nil, darwinEIO
+	}
 	request.FskitSourcePublication = gate
 	// Carry the exact pfslocal publication/callback identity into authority
 	// scheduling as retry-fairness metadata. Publication ownership itself is
@@ -2678,8 +2684,7 @@ func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 // v3ReleaseSucceeded requires the whole success outcome of one release request
 // before its batch counts as settled: no errno, failure class, uncertainty,
 // post-state, or terminal-delivery token, and exactly the operation's own
-// reply body (none for Reclaim, CloseBatch's for CloseBatch). Generic
-// classification admits some failure classes on errno zero; a release may not.
+// reply body (none for Reclaim, CloseBatch's for CloseBatch).
 func v3ReleaseSucceeded(response *authoritypb.Response, closeBatch bool) error {
 	if response == nil || response.GetErrno() != 0 || response.GetUncertain() ||
 		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED ||
@@ -2833,48 +2838,66 @@ func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
 	start, startErr := d.readClockLocked()
 	generation, authorizing := d.authGeneration, d.authorizing
 	d.mu.Unlock()
+	if startErr != nil {
+		// Serving ends at once; the renewal itself still runs, because liveness
+		// belongs to the transport the absence proof needs.
+		_ = d.endOnClockFault()
+	}
 	proof, err := d.client.KeepAlive(ctx)
 	if err != nil {
 		return err
 	}
 	d.mu.Lock()
 	now, nowErr := d.readClockLocked()
-	if clockErr := errors.Join(startErr, nowErr); clockErr != nil {
-		// Every horizon is measured on this clock, so a failed or regressed read
-		// voids them all. Serving ends (the transport stays for the exact
-		// absence proof); there is no uncached mode to continue in.
-		d.horizon = 0
-		d.mu.Unlock()
-		_ = d.stopServing(fmt.Errorf("portablefsd: continuous clock unusable during keepalive: %w", clockErr))
-		return nil
-	}
-	defer d.mu.Unlock()
 	candidate, usable := v3HorizonCandidate(start, proof)
 	// A legitimate proof consumed by delay supplies no horizon; it is not a
 	// protocol defect. A receipt of an older generation, or one arriving out of
 	// order, can neither resurrect a terminal data plane nor move the horizon
-	// backwards.
-	if usable && now < candidate && !authorizing && d.terminal == nil && !d.authorizing &&
+	// backwards. Either read's fault is latched in clockFault.
+	if d.clockFault == nil && usable && now < candidate && !authorizing && d.terminal == nil && !d.authorizing &&
 		d.authGeneration == generation && candidate > d.horizon {
 		d.horizon = candidate
+	}
+	d.mu.Unlock()
+	if nowErr != nil {
+		_ = d.endOnClockFault()
 	}
 	return nil
 }
 
 // readClockLocked reads the continuous clock and refuses a value below the
 // greatest one already observed: the horizon arithmetic assumes the clock
-// never runs backwards, so a regression is a clock fault, not a time. d.mu is
-// held.
+// never runs backwards, so a regression is a clock fault, not a time. Every
+// observed fault is latched and voids the horizon at once; the caller ends
+// serving with endOnClockFault after releasing its locks. d.mu is held.
 func (d *v3DataPlane) readClockLocked() (uint64, error) {
 	now, err := d.clock()
-	if err != nil {
-		return 0, err
+	if err == nil && now < d.clockHigh {
+		err = fmt.Errorf("continuous clock regressed from %d to %d", d.clockHigh, now)
 	}
-	if now < d.clockHigh {
-		return 0, fmt.Errorf("continuous clock regressed from %d to %d", d.clockHigh, now)
+	if err != nil {
+		if d.clockFault == nil {
+			d.clockFault = err
+		}
+		d.horizon = 0
+		return 0, err
 	}
 	d.clockHigh = now
 	return now, nil
+}
+
+// endOnClockFault ends serving if a clock fault has been latched. Every horizon
+// is measured on that clock, so a fault voids them all and there is no uncached
+// mode to continue in; the original transport stays for the exact absence
+// proof. It must run with no snapshot lock held, before any fallback.
+func (d *v3DataPlane) endOnClockFault() error {
+	d.mu.Lock()
+	fault := d.clockFault
+	d.mu.Unlock()
+	if fault != nil {
+		_ = d.stopServing(fmt.Errorf("portablefsd: continuous clock unusable: %w", fault))
+	}
+	return fault
 }
 
 // v3HorizonCandidate is start + R - epsilon(R) with
