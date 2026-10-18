@@ -86,6 +86,12 @@
 // even for earlier candidate pairs. The inventory is bounded and never evicted.
 // Missing identity fields remain readable so they report unavailable, not exact.
 //
+// Each producer emits its local/send or local/enqueue anchors in strictly
+// increasing request_id order per connection, as pfslocal requires on the wire.
+// Per-side high-water marks in the bounded connection inventory reject reuse
+// (including after a match) and reordering. Either makes the join unavailable
+// and clears all candidate matches. Non-anchor stages may arrive out of order.
+//
 // Frontend local/send and daemon local/enqueue anchors must agree on operation
 // and on mount when both name one; disagreement is a conflict, never a match.
 // DefaultJoinWindow bounds pending anchors independently of the connection

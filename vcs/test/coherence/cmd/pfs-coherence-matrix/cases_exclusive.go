@@ -49,11 +49,12 @@ type exclusionMetadata struct {
 }
 
 // Preserve the initial cross-mount checks for the common logical attributes.
-// The full per-mount comparisons below also cover platform-specific fields.
+// FSKit exposes authority inode + 1; Linux exposes the authority inode itself.
+// The full per-mount comparisons below retain each mount's own inode.
 func (s exclusionMetadata) sameFixture(o exclusionMetadata) bool {
-	return s.kept.Ino == o.kept.Ino && s.kept.Size == o.kept.Size && s.kept.Perm == o.kept.Perm &&
+	return s.kept.Size == o.kept.Size && s.kept.Perm == o.kept.Perm &&
 		s.kept.Nlink == o.kept.Nlink && s.kept.MtimeNs == o.kept.MtimeNs &&
-		s.keptdir.Ino == o.keptdir.Ino && s.keptdir.Perm == o.keptdir.Perm && s.keptdir.IsDir == o.keptdir.IsDir
+		s.keptdir.Perm == o.keptdir.Perm && s.keptdir.IsDir == o.keptdir.IsDir
 }
 
 func (s exclusionMetadata) String() string {

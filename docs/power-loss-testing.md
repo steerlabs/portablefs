@@ -50,9 +50,13 @@ must be present exactly:
 - every file has exactly its recorded bytes, size, mode and hard-link count,
   names recorded as hard links are one inode, and an explicitly set atime and
   mtime are exactly what was set;
-- every symlink has its recorded target and every directory its mode.
+- every symlink has its recorded target and every directory its mode; explicit
+  atime and mtime on either kind are checked as well.
 
-The driver may have sent step *k+1* before the cut. The cut must then match the
+At the exact mark of step *k*, only that marked state is admissible: the
+driver waits for the mark to complete before sending the next mutation.
+Strictly after that mark, the driver may have sent step *k+1*. The cut must
+then match the
 state after step *k* or the state after step *k+1* as a whole. A cut between
 step *k+1*'s reply and its mark cannot be told apart from one before the reply,
 so it is judged this way too; the mark is the earliest point the log can name.
@@ -70,6 +74,16 @@ acknowledged:
 
 Namespace changes are not relaxed: each is one XFS transaction, so a
 half-applied RENAME or LINK fails the cut even though no reply was sent.
+
+The fixed workload has 30 acknowledged steps, including item-backed chmod to
+mode 000 and timestamps on that file, MKDIR mode 0300 and timestamps on that
+unreadable directory, and explicit symlink timestamps. The authority and driver
+run as the unprivileged volume identity. Recovery verification runs as root on
+the replayed image so it can inspect those objects without changing permissions.
+It samples metadata for every candidate path before any file read, readlink or
+directory enumeration; both interpretations of an in-flight cut use that same
+sample. Only explicitly promised timestamps are asserted.
+
 
 ### Exactly what is asserted about bytes nothing promised
 

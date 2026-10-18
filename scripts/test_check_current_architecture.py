@@ -235,19 +235,33 @@ class ReadinessRoutes(unittest.TestCase):
         self.assertEqual(checker.READINESS_ROUTE.findall('"/native-frontend-ready"'), ["native-frontend-ready"])
 
 
-class ProtocolMentions(unittest.TestCase):
-    def pattern(self):
-        import re
-        return re.compile(r"(?<![Ff][Uu][Ss][Ee] )\b[Pp]rotocol[- ]([0-9]+)\b(?![.0-9])")
+class ContractAgreement(unittest.TestCase):
+    def test_independent_protocol_wording_is_valid(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
 
-    def test_generation_mentions(self) -> None:
-        pattern = self.pattern()
-        self.assertEqual(pattern.findall("protocol 8, protocol-7 and Protocol 6"), ["8", "7", "6"])
+        def read(relative: str) -> str:
+            text = original(relative)
+            if relative == "COMPATIBILITY.md":
+                text += "\nDaemon operational protocol 2 is paired with pfslocal 2.0.\n"
+            return text
 
-    def test_fuse_and_dotted_versions_are_not_generations(self) -> None:
-        pattern = self.pattern()
-        self.assertEqual(pattern.findall("FUSE protocol 7.31 and kernel protocol 7.31"), [])
-        self.assertEqual(pattern.findall("fuse protocol 7"), [])
+        with patch.object(checker, "read", side_effect=read):
+            checker.check_contract_agreement()
+
+    def test_missing_surface_contract_fails(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+
+        def read(relative: str) -> str:
+            text = original(relative)
+            if relative == "COMPATIBILITY.md":
+                text = text.replace("`portablefs-authority-v8`", "absent")
+            return text
+
+        with patch.object(checker, "read", side_effect=read):
+            with self.assertRaises(checker.CheckFailure):
+                checker.check_contract_agreement()
 
 
 if __name__ == "__main__":

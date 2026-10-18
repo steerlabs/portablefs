@@ -84,7 +84,9 @@ func newWorkload(v volume, marks *powerloss.MarkChannel, ledger *powerloss.Mutat
 // overwrite and extension (including a hole), MKDIR, hard LINK, SYMLINK,
 // RENAME within a directory, across directories and over an existing name,
 // truncation through both a handle and an item, chmod, explicit timestamps,
-// UNLINK of one of two names and of a symlink, and a directory removal. The
+// UNLINK of one of two names and of a symlink, and a directory removal. Item
+// metadata also targets a mode-000 file, an unreadable directory, and a symlink
+// without opening them for read. The
 // order is fixed so a failure names a reproducible step.
 func (w *workload) run(ctx context.Context) error {
 	top := w.ledger.Prefix
@@ -114,6 +116,12 @@ func (w *workload) run(ctx context.Context) error {
 		func() error { return w.unlink(ctx, docs+"/alpha-symlink", false) },
 		func() error { return w.mkdir(ctx, docs+"/scratch", "scratch", 0o755) },
 		func() error { return w.unlink(ctx, docs+"/scratch", true) },
+		func() error { return w.chmod(ctx, "alpha", 0) },
+		func() error { return w.setTimes(ctx, "alpha", explicitAtimeNs+1, explicitMtimeNs+1) },
+		func() error { return w.mkdir(ctx, docs+"/sealed", "sealed", 0o300) },
+		func() error { return w.setTimes(ctx, "sealed", explicitAtimeNs, explicitMtimeNs) },
+		func() error { return w.symlink(ctx, docs+"/metadata-link", "metadata-link", "../archive/alpha-link") },
+		func() error { return w.setTimes(ctx, "metadata-link", explicitAtimeNs, explicitMtimeNs) },
 	}
 	for _, step := range steps {
 		if err := ctx.Err(); err != nil {

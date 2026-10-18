@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/test/powerloss"
+	"golang.org/x/sys/unix"
 )
 
 // localVolume applies each workload mutation to a local directory with the
@@ -118,7 +118,7 @@ func (v *localVolume) Chmod(_ context.Context, item target, mode uint32) (observ
 }
 
 func (v *localVolume) SetTimes(_ context.Context, item target, atimeNs, mtimeNs int64) (observed, error) {
-	if err := os.Chtimes(v.local(item.path), time.Unix(0, atimeNs), time.Unix(0, mtimeNs)); err != nil {
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, v.local(item.path), []unix.Timespec{unix.NsecToTimespec(atimeNs), unix.NsecToTimespec(mtimeNs)}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return observed{}, err
 	}
 	return v.observe(item.path)
@@ -210,9 +210,48 @@ func TestWorkloadLedgerMatchesTheFilesystemAfterEveryAcknowledgedStep(t *testing
 		if last.Mark != label {
 			t.Errorf("mark %q requested for recorded step %d, whose mark is %q", label, last.Index, last.Mark)
 		}
-		cut := powerloss.MutationCut{EndEntry: last.Index, Acknowledged: len(w.ledger.Steps), Durable: last.State}
+		// The production recovery verifier runs as root on a replay image.
+		// This host test runs as the volume owner: assert every original
+		// attribute before giving this test permission to inspect contents.
+		readable := last.State.Clone()
+		for name, label := range last.State.Entries {
+			got, err := v.observe(name)
+			if err != nil {
+				return err
+			}
+			if err := matchObserved(last.State.Objects[label], got); err != nil {
+				return err
+			}
+		}
+		for name, label := range readable.Entries {
+			object := readable.Objects[label]
+			if object.Kind != powerloss.ObjectSymlink && object.Mode&0o400 == 0 {
+				mode := object.Mode | 0o400
+				if err := os.Chmod(v.local(name), os.FileMode(mode)); err != nil {
+					return err
+				}
+				object.Mode = mode
+				readable.Objects[label] = object
+			}
+		}
+		cut := powerloss.MutationCut{EndEntry: last.Index, Acknowledged: len(w.ledger.Steps), Durable: readable}
 		if err := powerloss.VerifyMutationCut(v.root, w.ledger, cut).Err(); err != nil {
 			t.Errorf("after step %d (%s): %v", last.Index, last.Description, err)
+		}
+		// Undo only this test's observations and permission changes before the
+		// next workload mutation checks its acknowledgement against the model.
+		for name, label := range last.State.Entries {
+			object := last.State.Objects[label]
+			if object.Kind != powerloss.ObjectSymlink {
+				if err := os.Chmod(v.local(name), os.FileMode(object.Mode)); err != nil {
+					return err
+				}
+			}
+			if object.AtimeNs != nil && object.MtimeNs != nil {
+				if _, err := v.SetTimes(t.Context(), target{label: label, path: name}, *object.AtimeNs, *object.MtimeNs); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	}
@@ -245,9 +284,21 @@ func TestWorkloadLedgerMatchesTheFilesystemAfterEveryAcknowledgedStep(t *testing
 			t.Errorf("the workload no longer performs a %s", kind)
 		}
 	}
+	if len(ledger.Steps) != 30 {
+		t.Fatalf("workload recorded %d steps, want 30", len(ledger.Steps))
+	}
 	final := ledger.Steps[len(ledger.Steps)-1].State
+	for _, label := range []string{"sealed", "metadata-link"} {
+		object := final.Objects[label]
+		if object.AtimeNs == nil || *object.AtimeNs != explicitAtimeNs || object.MtimeNs == nil || *object.MtimeNs != explicitMtimeNs {
+			t.Errorf("%s lacks its explicit timestamps: %+v", label, object)
+		}
+	}
+	if final.Objects["sealed"].Mode != 0o300 {
+		t.Error("the directory must remain unreadable")
+	}
 	alpha := final.Objects["alpha"]
-	if alpha.Links != 1 || alpha.MtimeNs == nil || *alpha.MtimeNs != explicitMtimeNs || alpha.Mode != 0o640 {
+	if alpha.Links != 1 || alpha.MtimeNs == nil || *alpha.MtimeNs != explicitMtimeNs+1 || alpha.Mode != 0 {
 		t.Errorf("alpha's final state lost a case the workload exists to cover: %+v", alpha)
 	}
 	if _, survived := final.Objects["beta"]; survived {
@@ -258,7 +309,7 @@ func TestWorkloadLedgerMatchesTheFilesystemAfterEveryAcknowledgedStep(t *testing
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	want := "fskit fskit/archive fskit/archive/alpha-link fskit/archive/beta fskit/docs"
+	want := "fskit fskit/archive fskit/archive/alpha-link fskit/archive/beta fskit/docs fskit/docs/metadata-link fskit/docs/sealed"
 	if got := strings.Join(names, " "); got != want {
 		t.Errorf("final namespace = %s, want %s", got, want)
 	}

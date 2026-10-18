@@ -135,6 +135,12 @@ infrastructure, then the unchanged 1,200-file add and full workload. Record
 exact artifact revisions and configuration, reconcile trace totals against the
 counters, and report mean and tail critical-path contributions.
 
+Local request anchors must be emitted in strictly increasing `request_id`
+order per connection on each producer. Reuse or reordering makes the local
+join unavailable and clears even earlier matches; non-anchor stages may arrive
+out of order. Bounded per-connection high-water marks retain this evidence for
+the whole run.
+
 ## The costs accepted on purpose
 
 These are the price of the guarantees in

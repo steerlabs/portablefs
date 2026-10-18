@@ -28,10 +28,13 @@ import (
 //   - every file has exactly its recorded bytes, size, mode and hard-link
 //     count, names sharing a label are one inode, and an explicitly set
 //     timestamp is exactly what was set;
-//   - every symlink has its recorded target, every directory its mode.
+//   - every symlink has its recorded target, every directory its mode, and
+//     explicit timestamps on either kind survive exactly.
 //
-// Between two marks the driver may have sent exactly one more mutation. It may
-// have reached storage not at all, wholly, or - for the parts XFS does not
+// At an exact acknowledgement mark, the driver is still waiting for that mark
+// to complete and cannot have sent the next mutation. Only the marked state
+// is admissible. Strictly between marks it may have sent one more mutation,
+// which may have reached storage not at all, wholly, or - for the parts XFS does not
 // apply in one logged transaction - partly. The cut must then match the
 // acknowledged state or the in-flight step's state as a whole, with two stated
 // allowances that are properties of an unacknowledged change, not of any
@@ -61,7 +64,8 @@ type MutationCut struct {
 	// (prefix absent) before the first.
 	Durable TreeState
 	// InFlight is the step after the last reached mark, which may have reached
-	// storage before the cut. Nil when the cut follows the final mark.
+	// storage before the cut. Nil at an exact acknowledgement mark or after
+	// the final mark.
 	InFlight *MutationStep
 }
 
@@ -74,7 +78,7 @@ func MutationCutAt(log *Log, ledger *MutationLedger, endEntry int) (MutationCut,
 		return MutationCut{}, errors.New("powerloss: MutationCutAt needs both a log and a ledger")
 	}
 	previous := -1
-	acknowledged := 0
+	acknowledged, lastMark := 0, -1
 	for position, step := range ledger.Steps {
 		entry, found := log.MarkEntry(step.Mark)
 		if !found {
@@ -85,14 +89,14 @@ func MutationCutAt(log *Log, ledger *MutationLedger, endEntry int) (MutationCut,
 		}
 		previous = entry
 		if entry <= endEntry {
-			acknowledged = position + 1
+			acknowledged, lastMark = position+1, entry
 		}
 	}
 	cut := MutationCut{EndEntry: endEntry, Acknowledged: acknowledged}
 	if acknowledged > 0 {
 		cut.Durable = ledger.Steps[acknowledged-1].State
 	}
-	if acknowledged < len(ledger.Steps) {
+	if acknowledged < len(ledger.Steps) && endEntry > lastMark {
 		cut.InFlight = &ledger.Steps[acknowledged]
 	}
 	return cut, nil
@@ -128,15 +132,20 @@ func (r MutationReport) Err() error {
 // <replay mountpoint>/<ledger.Volume> inside an already-recovered filesystem.
 func VerifyMutationCut(volumeRoot string, ledger *MutationLedger, cut MutationCut) MutationReport {
 	report := MutationReport{EndEntry: cut.EndEntry, Acknowledged: cut.Acknowledged, Steps: len(ledger.Steps)}
+	states := []TreeState{cut.Durable}
+	if cut.InFlight != nil {
+		states = append(states, cut.InFlight.State)
+	}
+	metadata := snapshotMetadata(volumeRoot, ledger.Prefix, states...)
 	if cut.InFlight == nil {
-		report.Mismatches = compareTree(volumeRoot, ledger.Prefix, cut.Durable, relaxation{})
-		report.Outcome = "every step acknowledged and present; nothing was in flight"
+		report.Mismatches = compareTree(volumeRoot, ledger.Prefix, cut.Durable, relaxation{}, metadata)
+		report.Outcome = "all acknowledged steps present; nothing was in flight"
 		return report
 	}
 	step := cut.InFlight
 	report.InFlight = fmt.Sprintf("step %d (%s)", step.Index, step.Description)
 	relaxed := inFlightRelaxation(step, cut.Durable)
-	before := compareTree(volumeRoot, ledger.Prefix, cut.Durable, relaxed)
+	before := compareTree(volumeRoot, ledger.Prefix, cut.Durable, relaxed, metadata)
 	if len(before) == 0 {
 		report.Outcome = "the in-flight step had not reached storage"
 		if step.Kind.changesData() {
@@ -144,7 +153,7 @@ func VerifyMutationCut(volumeRoot string, ledger *MutationLedger, cut MutationCu
 		}
 		return report
 	}
-	after := compareTree(volumeRoot, ledger.Prefix, step.State, relaxed)
+	after := compareTree(volumeRoot, ledger.Prefix, step.State, relaxed, metadata)
 	if len(after) == 0 {
 		report.Outcome = "the in-flight step had fully reached storage"
 		return report
@@ -204,17 +213,41 @@ func kindOf(info fs.FileInfo) ObjectKind {
 	}
 }
 
+// Snapshot every candidate path before content reads, readlink or readdir can
+// move an atime. Both interpretations of an in-flight cut use the same sample.
+type recoveredMetadata struct {
+	info fs.FileInfo
+	err  error
+}
+
+func snapshotMetadata(root, prefix string, states ...TreeState) map[string]recoveredMetadata {
+	result := make(map[string]recoveredMetadata)
+	capture := func(name string) {
+		if _, exists := result[name]; !exists {
+			info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(name)))
+			result[name] = recoveredMetadata{info, err}
+		}
+	}
+	capture(prefix)
+	for _, state := range states {
+		for name := range state.Entries {
+			capture(name)
+		}
+	}
+	return result
+}
+
 // compareTree reports every way the recovered subtree differs from tree.
 // Attributes are read before any content, so a read can never move an atime
 // before it is compared.
-func compareTree(root, prefix string, tree TreeState, relaxed relaxation) []string {
+func compareTree(root, prefix string, tree TreeState, relaxed relaxation, metadata map[string]recoveredMetadata) []string {
 	var mismatches []string
 	report := func(format string, arguments ...any) {
 		mismatches = append(mismatches, fmt.Sprintf(format, arguments...))
 	}
 	local := func(name string) string { return filepath.Join(root, filepath.FromSlash(name)) }
 	if _, present := tree.Entries[prefix]; !present {
-		if _, err := os.Lstat(local(prefix)); err == nil {
+		if err := metadata[prefix].err; err == nil {
 			report("%s exists, but no acknowledged step had created it", prefix)
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			report("%s cannot be inspected: %v", prefix, err)
@@ -238,7 +271,7 @@ func compareTree(root, prefix string, tree TreeState, relaxed relaxation) []stri
 	for _, name := range names {
 		label := tree.Entries[name]
 		object := tree.Objects[label]
-		info, err := os.Lstat(local(name))
+		info, err := metadata[name].info, metadata[name].err
 		if errors.Is(err, fs.ErrNotExist) {
 			report("%s is missing; the expected state has %s %q there", name, object.Kind, label)
 			continue
@@ -302,6 +335,17 @@ func compareObject(name, label string, object ObjectState, info fs.FileInfo, rel
 	report := func(format string, arguments ...any) {
 		mismatches = append(mismatches, fmt.Sprintf(format, arguments...))
 	}
+	raw, ok := rawStatOf(info)
+	if !ok {
+		return append(mismatches, "this platform exposes no mode, link count or atime to verify against")
+	}
+	states, loose := relaxed.data[label]
+	if !loose && object.MtimeNs != nil && info.ModTime().UnixNano() != *object.MtimeNs {
+		report("mtime is %d ns; the explicitly set value was %d ns", info.ModTime().UnixNano(), *object.MtimeNs)
+	}
+	if !loose && object.AtimeNs != nil && raw.atimeNs != *object.AtimeNs {
+		report("atime is %d ns; the explicitly set value was %d ns", raw.atimeNs, *object.AtimeNs)
+	}
 	if object.Kind == ObjectSymlink {
 		target, err := os.Readlink(name)
 		if err != nil {
@@ -311,10 +355,6 @@ func compareObject(name, label string, object ObjectState, info fs.FileInfo, rel
 		}
 		return mismatches
 	}
-	raw, ok := rawStatOf(info)
-	if !ok {
-		return append(mismatches, "this platform exposes no mode, link count or atime to verify against")
-	}
 	if !relaxed.created[label] && raw.mode != object.Mode {
 		report("mode is %#o; the expected state has %#o", raw.mode, object.Mode)
 	}
@@ -323,13 +363,6 @@ func compareObject(name, label string, object ObjectState, info fs.FileInfo, rel
 	}
 	if raw.links != uint64(object.Links) {
 		report("hard-link count is %d; the expected state has %d", raw.links, object.Links)
-	}
-	states, loose := relaxed.data[label]
-	if !loose && object.MtimeNs != nil && info.ModTime().UnixNano() != *object.MtimeNs {
-		report("mtime is %d ns; the explicitly set value was %d ns", info.ModTime().UnixNano(), *object.MtimeNs)
-	}
-	if !loose && object.AtimeNs != nil && raw.atimeNs != *object.AtimeNs {
-		report("atime is %d ns; the explicitly set value was %d ns", raw.atimeNs, *object.AtimeNs)
 	}
 	content, err := readNoAtime(name)
 	if err != nil {

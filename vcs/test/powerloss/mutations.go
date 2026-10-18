@@ -275,15 +275,14 @@ func (t TreeState) validate(prefix string) error {
 			return fmt.Errorf("object %q has mode %#o outside the permission bits", label, object.Mode)
 		}
 		hasFileFields := object.Size != 0 || len(object.Spans) != 0 || object.SHA256 != "" || object.Links != 0
-		hasTimes := object.AtimeNs != nil || object.MtimeNs != nil
 		switch object.Kind {
 		case ObjectDirectory:
-			if count != 1 || hasFileFields || hasTimes || object.Target != "" {
+			if count != 1 || hasFileFields || object.Target != "" {
 				return fmt.Errorf("directory %q must have exactly one name and no file or symlink state", label)
 			}
 		case ObjectSymlink:
 			if count != 1 || object.Target == "" || strings.ContainsRune(object.Target, 0) ||
-				object.Mode != 0 || hasFileFields || hasTimes {
+				object.Mode != 0 || hasFileFields {
 				return fmt.Errorf("symlink %q must have exactly one name, a target, and no mode or file state", label)
 			}
 		case ObjectFile:

@@ -282,8 +282,8 @@ func fsyncContract(log *Log, ledger *Ledger) cutCheck {
 }
 
 // acknowledgedContract is the FSKit contract: every mutation acknowledged
-// before the cut is present exactly, and the one in-flight mutation left only
-// its acknowledged or in-flight state.
+// at the cut is present exactly. Only cuts strictly after an acknowledgement
+// mark admit the next mutation and its stated in-flight allowances.
 func acknowledgedContract(log *Log, ledger *MutationLedger) cutCheck {
 	return func(mountpoint string, endEntry int) (string, error) {
 		cut, err := MutationCutAt(log, ledger, endEntry)

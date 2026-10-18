@@ -88,13 +88,15 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 // does, performs CREATE, positioned WRITE (overwrite, extension and a hole),
 // MKDIR, hard LINK, SYMLINK, RENAME (within a directory, across directories
 // and over an existing name), truncation through a handle and through an item,
-// chmod, explicit timestamps, UNLINK and a directory removal, and takes a mark
+// chmod to mode 000, MKDIR mode 0300, explicit timestamps on files, unreadable
+// directories and symlinks, UNLINK and a directory removal, and takes a mark
 // after every success reply arrives and before the next request is sent. At
 // each mark and at a sweep of the filesystem's own barriers, every mutation
 // acknowledged before the cut must be present exactly - bytes, size, mode,
 // set timestamps, symlink target, hard-link count and directory membership -
-// and the one mutation in flight may have left only its acknowledged or its
-// complete in-flight state (see mutations_verify.go for the two stated
+// with no future mutation allowed at an exact acknowledgement mark. Strictly
+// between marks the next mutation may have left its acknowledged or complete
+// in-flight state (see mutations_verify.go for the two stated
 // allowances). xfs_repair -n must then find nothing it would correct.
 //
 // This is power-loss evidence for the authority's FSKit durability claim

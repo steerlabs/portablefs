@@ -208,8 +208,6 @@ FLAG_CONSUMERS = {
 
 # Text that is not maintained by this repository.
 VENDORED = ("vcs/third_party/",)
-# This checker and its unit tests.
-SELF = {"scripts/check-current-architecture.py", "scripts/test_check_current_architecture.py"}
 
 
 class CheckFailure(Exception):
@@ -942,7 +940,7 @@ def check_required_tests_defined() -> None:
     finish(problems)
 
 
-@check("contract-agreement", "COMPATIBILITY.md and maintained text state the versions the code declares")
+@check("contract-agreement", "COMPATIBILITY.md states each surface version and the kernel floors match code")
 def check_contract_agreement() -> None:
     problems: List[str] = []
     contract = read("COMPATIBILITY.md")
@@ -969,36 +967,7 @@ def check_contract_agreement() -> None:
     require(problems, f"minor >= {AUTHORITY_KERNEL_FLOOR[1]}" in kernel and f"major == {AUTHORITY_KERNEL_FLOOR[0]}" in kernel,
             f"xfsstore must enforce the Linux {AUTHORITY_KERNEL_FLOOR[0]}.{AUTHORITY_KERNEL_FLOOR[1]} authority floor")
 
-    # Every mention of an authority ALPN, an authority protocol generation or
-    # a pfslocal version anywhere in maintained text names the current one.
-    alpn = re.compile(r"portablefs-authority-v([0-9]+)")
-    prose_protocol = re.compile(r"(?<![Ff][Uu][Ss][Ee] )\b[Pp]rotocol[- ]([0-9]+)\b(?![.0-9])")
-    local = re.compile(r"\bpfslocal`?\s+([0-9]+)\.([0-9]+)\b")
-    for name in files():
-        # This checker and its tests necessarily spell non-current versions as
-        # fixtures; every other maintained text file is held to the rule.
-        if not maintained(name) or not _is_text(name) or name in SELF:
-            continue
-        text = read(name)
-        for line_number, line in enumerate(text.splitlines(), 1):
-            for match in alpn.finditer(line):
-                require(problems, int(match.group(1)) == AUTHORITY_MAJOR,
-                        f"{name}:{line_number}: names portablefs-authority-v{match.group(1)}")
-            for match in local.finditer(line):
-                version = (int(match.group(1)), int(match.group(2)))
-                require(problems, version == PFSLOCAL_VERSION, f"{name}:{line_number}: names pfslocal {version[0]}.{version[1]}")
-            if name.endswith((".md", ".sh", ".proto", ".py")):
-                for match in prose_protocol.finditer(line):
-                    require(problems, int(match.group(1)) == AUTHORITY_MAJOR,
-                            f"{name}:{line_number}: names protocol {match.group(1)}; the authority protocol is {AUTHORITY_MAJOR}")
     finish(problems)
-
-
-TEXT_SUFFIXES = (".md", ".go", ".swift", ".sh", ".py", ".mjs", ".proto", ".yml", ".yaml", ".json", ".txt", ".plist", ".service", ".socket", ".hcl", ".bt")
-
-
-def _is_text(name: str) -> bool:
-    return name.endswith(TEXT_SUFFIXES) and not name.startswith("vcs/test/soak/testdata/")
 
 
 @check("doc-links", "every relative link in maintained Markdown resolves, including heading anchors")

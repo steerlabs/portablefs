@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // fileState builds a file object whose digest matches its spans.
@@ -130,11 +132,10 @@ func materialize(t *testing.T, state TreeState) string {
 	for index := len(names) - 1; index >= 0; index-- {
 		object := state.Objects[state.Entries[names[index]]]
 		local := filepath.Join(root, filepath.FromSlash(names[index]))
-		if object.Kind == ObjectSymlink {
-			continue
-		}
-		if err := os.Chmod(local, os.FileMode(object.Mode)); err != nil {
-			t.Fatal(err)
+		if object.Kind != ObjectSymlink {
+			if err := os.Chmod(local, os.FileMode(object.Mode)); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if object.MtimeNs != nil || object.AtimeNs != nil {
 			atime, mtime := time.Now(), time.Now()
@@ -144,7 +145,7 @@ func materialize(t *testing.T, state TreeState) string {
 			if object.MtimeNs != nil {
 				mtime = time.Unix(0, *object.MtimeNs)
 			}
-			if err := os.Chtimes(local, atime, mtime); err != nil {
+			if err := unix.UtimesNanoAt(unix.AT_FDCWD, local, []unix.Timespec{unix.NsecToTimespec(atime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -284,7 +285,7 @@ func TestMutationCutAtNamesTheAcknowledgedPrefixAndTheOneInFlightStep(t *testing
 		wantInFlight     int // -1 for none
 	}{
 		{"before the first mark", 0, 0, 0},
-		{"exactly at the first mark", markEntryOf(t, log, ledger.Steps[0].Mark), 1, 1},
+		{"exactly at the first mark", markEntryOf(t, log, ledger.Steps[0].Mark), 1, -1},
 		{"between the fourth and fifth marks", markEntryOf(t, log, ledger.Steps[3].Mark) + 1, 4, 4},
 		{"after the final mark", len(log.Entries) - 1, len(ledger.Steps), -1},
 	}
@@ -338,13 +339,13 @@ func TestMutationCutAtFailsClosedOnABrokenMarkChannel(t *testing.T) {
 
 // TestVerifyMutationCutAcceptsEitherSideOfTheInFlightStep is the boundary the
 // FSKit contract turns on: everything acknowledged is present, and the one
-// mutation sent after the last mark may be found wholly absent or wholly
-// applied.
+// mutation sent strictly after the last mark may be found wholly absent or
+// wholly applied. Exact marks are checked separately without that allowance.
 func TestVerifyMutationCutAcceptsEitherSideOfTheInFlightStep(t *testing.T) {
 	ledger := sampleMutationLedger(t)
 	log := mutationLog(t, ledger)
 	for k := range ledger.Steps {
-		endEntry := markEntryOf(t, log, ledger.Steps[k].Mark)
+		endEntry := markEntryOf(t, log, ledger.Steps[k].Mark) + 1
 		cut, err := MutationCutAt(log, ledger, endEntry)
 		if err != nil {
 			t.Fatalf("MutationCutAt: %v", err)
@@ -371,7 +372,7 @@ func TestVerifyMutationCutReportsAcknowledgedMutationsThatDidNotSurvive(t *testi
 	final := len(ledger.Steps) - 1
 	tests := []struct {
 		name    string
-		step    int // cut at this step's mark
+		step    int // cut at this step's mark, except the in-flight rename case
 		damage  func(t *testing.T, root string)
 		wantSub string
 	}{
@@ -435,7 +436,7 @@ func TestVerifyMutationCutReportsAcknowledgedMutationsThatDidNotSurvive(t *testi
 		},
 		{
 			name: "a rename was half applied", step: 3,
-			// Cut at the link's mark with the rename in flight, and leave both
+			// Cut strictly after the link's mark with the rename in flight, and leave both
 			// names: neither the acknowledged nor the renamed state has that.
 			damage: func(t *testing.T, root string) {
 				mustRun(t, os.Link(filepath.Join(root, "fskit", "b"), filepath.Join(root, "fskit", "c")))
@@ -455,6 +456,9 @@ func TestVerifyMutationCutReportsAcknowledgedMutationsThatDidNotSurvive(t *testi
 			endEntry, layout := 0, TreeState{}
 			if test.step >= 0 {
 				endEntry, layout = markEntryOf(t, log, ledger.Steps[test.step].Mark), ledger.Steps[test.step].State
+				if test.name == "a rename was half applied" {
+					endEntry++
+				}
 			}
 			root := materialize(t, layout)
 			test.damage(t, root)
@@ -541,7 +545,7 @@ func TestVerifyMutationCutAllowsOnlyPermittedTearsOfTheInFlightStep(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			root := materialize(t, ledger.Steps[test.step].State)
 			test.damage(t, root)
-			cut, err := MutationCutAt(log, ledger, markEntryOf(t, log, ledger.Steps[test.step].Mark))
+			cut, err := MutationCutAt(log, ledger, markEntryOf(t, log, ledger.Steps[test.step].Mark)+1)
 			if err != nil {
 				t.Fatalf("MutationCutAt: %v", err)
 			}
@@ -583,4 +587,115 @@ func writeKeepingTimes(t *testing.T, name string, content []byte) {
 	}
 	mustRun(t, os.WriteFile(name, content, 0o644))
 	mustRun(t, os.Chtimes(name, time.Unix(0, raw.atimeNs), info.ModTime()))
+}
+
+func TestReviewExactAcknowledgementMarkHasNoFutureMutation(t *testing.T) {
+	ledger := sampleMutationLedger(t)
+	log := mutationLog(t, ledger)
+	// Step 8 acknowledges mkdir d. Step 9 later unlinks a; it cannot have
+	// been sent at the exact mark for step 8 because the driver awaits its ack.
+	at := markEntryOf(t, log, ledger.Steps[8].Mark)
+	cut, err := MutationCutAt(log, ledger, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := VerifyMutationCut(materialize(t, ledger.Steps[9].State), ledger, cut)
+	if report.Err() == nil {
+		t.Fatalf("lost acknowledged name accepted at exact prior mark: acknowledged=%d outcome=%s", report.Acknowledged, report.Outcome)
+	}
+}
+
+func TestMutationExactMarksRequireOnlyAcknowledgedState(t *testing.T) {
+	ledger := sampleMutationLedger(t)
+	log := mutationLog(t, ledger)
+	for k, step := range ledger.Steps {
+		cut, err := MutationCutAt(log, ledger, markEntryOf(t, log, step.Mark))
+		mustRun(t, err)
+		if cut.InFlight != nil {
+			t.Fatalf("exact mark %d has a future step", k)
+		}
+		if err := VerifyMutationCut(materialize(t, step.State), ledger, cut).Err(); err != nil {
+			t.Fatal(err)
+		}
+		// A future SETATTR can agree on every currently promised field when
+		// the prior state did not promise timestamps; its absence is then
+		// observationally indistinguishable. No in-flight allowance is used.
+		if k+1 < len(ledger.Steps) && ledger.Steps[k+1].Kind != MutationSetTimes {
+			if err := VerifyMutationCut(materialize(t, ledger.Steps[k+1].State), ledger, cut).Err(); err == nil {
+				t.Fatalf("exact mark %d accepted the future step", k)
+			}
+		}
+	}
+}
+
+func TestMutationRecoveryChecksDirectoryAndSymlinkTimes(t *testing.T) {
+	for _, label := range []string{"d", "s"} {
+		for _, damage := range []string{"none", "atime", "mtime"} {
+			t.Run(label+"/"+damage, func(t *testing.T) {
+				ledger := sampleMutationLedger(t)
+				state := ledger.Steps[len(ledger.Steps)-1].State.Clone()
+				object := state.Objects[label]
+				object.AtimeNs, object.MtimeNs = int64Pointer(sampleAtime), int64Pointer(sampleMtime)
+				state.Objects[label] = object
+				ledger.Record(MutationSetTimes, "set metadata on "+label, "step-times", state)
+				mustRun(t, ledger.Validate())
+				root := materialize(t, state)
+				if damage != "none" {
+					atime, mtime := sampleAtime, sampleMtime
+					if damage == "atime" {
+						atime++
+					} else {
+						mtime++
+					}
+					name := "fskit/" + label
+					mustRun(t, unix.UtimesNanoAt(unix.AT_FDCWD, filepath.Join(root, name), []unix.Timespec{unix.NsecToTimespec(atime), unix.NsecToTimespec(mtime)}, unix.AT_SYMLINK_NOFOLLOW))
+				}
+				cut := MutationCut{Acknowledged: len(ledger.Steps), Durable: state}
+				err := VerifyMutationCut(root, ledger, cut).Err()
+				if damage == "none" {
+					mustRun(t, err)
+				} else if err == nil || !strings.Contains(err.Error(), damage+" is") {
+					t.Fatalf("lost %s: %v", damage, err)
+				}
+			})
+		}
+	}
+}
+
+func TestMutationRecoverySharesMetadataAcrossCandidateStates(t *testing.T) {
+	ledger := sampleMutationLedger(t)
+	after := ledger.Steps[len(ledger.Steps)-1].State.Clone()
+	for _, label := range []string{"d", "s"} {
+		object := after.Objects[label]
+		object.AtimeNs, object.MtimeNs = int64Pointer(sampleAtime), int64Pointer(sampleMtime)
+		after.Objects[label] = object
+	}
+	before := after.Clone()
+	object := before.Objects["s"]
+	object.Target = "different"
+	before.Objects["s"] = object
+	step := MutationStep{Kind: MutationSymlink, State: after}
+	cut := MutationCut{Durable: before, InFlight: &step}
+	mustRun(t, VerifyMutationCut(materialize(t, after), ledger, cut).Err())
+}
+
+func TestMutationRecoveryRetainsUnreadableObjectMetadata(t *testing.T) {
+	ledger := sampleMutationLedger(t)
+	state := ledger.Steps[len(ledger.Steps)-1].State.Clone()
+	for label, mode := range map[string]uint32{"a": 0, "d": 0o300} {
+		object := state.Objects[label]
+		object.Mode = mode
+		object.AtimeNs, object.MtimeNs = int64Pointer(sampleAtime), int64Pointer(sampleMtime)
+		state.Objects[label] = object
+	}
+	root := materialize(t, state)
+	metadata := snapshotMetadata(root, ledger.Prefix, state)
+	// Emulate root's content access for an unprivileged host test only after
+	// sampling the real mode-000 file and unreadable directory. Comparisons
+	// must continue to use those original attributes.
+	mustRun(t, os.Chmod(filepath.Join(root, "fskit/c"), 0o600))
+	mustRun(t, os.Chmod(filepath.Join(root, "fskit/d"), 0o700))
+	if mismatches := compareTree(root, ledger.Prefix, state, relaxation{}, metadata); len(mismatches) != 0 {
+		t.Fatalf("unreadable metadata: %v", mismatches)
+	}
 }

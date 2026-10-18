@@ -645,3 +645,35 @@ func TestReportJoinsDistinctRolesAndFrontendPIDs(t *testing.T) {
 		t.Fatalf("join %+v reasons %v", rep.Joins[0], rep.InvalidReasons)
 	}
 }
+
+func TestReviewRepeatedLocalRequestIdentity(t *testing.T) {
+	f, d := newStream(LayerFrontend), newStream(LayerDaemon)
+	f.ev(0, frontendSend(1, 1, LocalLookup)).ev(100, frontendSend(1, 1, LocalGetAttr))
+	d.ev(0, daemonEnqueue(1, 1, LocalLookup)).ev(100, daemonEnqueue(1, 1, LocalGetAttr))
+	out, _ := collectStreams(t, CollectConfig{}, f.end(0), d.end(0))
+	rep := reportOf(t, out, ReportConfig{})
+	if rep.AttributionValid || rep.Joins[0].Matched != 0 || rep.Joins[0].Status != JoinUnavailable {
+		t.Fatalf("same full key identifies Lookup and GetAttr but report certifies: join=%+v valid=%t", rep.Joins[0], rep.AttributionValid)
+	}
+}
+
+func TestReportLocalAnchorOrderProvesUniqueness(t *testing.T) {
+	for _, layer := range []Layer{LayerFrontend, LayerDaemon} {
+		for _, id := range []uint64{1, 2} {
+			for _, op := range []LocalOp{LocalLookup, LocalGetAttr} {
+				t.Run(fmt.Sprintf("%s/id-%d/%s", layer, id, op), func(t *testing.T) {
+					f, d := newStream(LayerFrontend), newStream(LayerDaemon)
+					f.ev(0, frontendSend(1, 2, LocalLookup))
+					d.ev(0, daemonEnqueue(1, 2, LocalLookup))
+					if layer == LayerFrontend {
+						f.ev(100, frontendSend(1, id, op))
+					} else {
+						d.ev(100, daemonEnqueue(1, id, op))
+					}
+					out, _ := collectStreams(t, CollectConfig{}, f.end(0), d.end(0))
+					assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+				})
+			}
+		}
+	}
+}

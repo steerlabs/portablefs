@@ -365,7 +365,7 @@ type aggregator struct {
 	counters    map[string]uint64
 	latencies   map[string]*histogram
 	joins       [2]*join
-	connections map[localConnectionKey][2]localConnectionWitness
+	connections map[localConnectionKey]localConnectionEvidence
 	bindings    map[localConnectionWitness]localConnectionKey
 }
 
@@ -558,6 +558,14 @@ type localConnectionWitness struct {
 	conn   TraceID
 }
 
+// pfslocal request IDs increase strictly on each connection. Producers emit
+// send/enqueue anchors in that order; one high-water mark per side proves
+// whole-run uniqueness without retaining every request or forgetting matches.
+type localConnectionEvidence struct {
+	witnesses  [2]localConnectionWitness
+	lastAnchor [2]uint64
+}
+
 // localIdentity proves that one tuple names exactly one connection per
 // producer. Local IDs are witnesses within a stream, never compared between
 // the frontend and daemon. Even a late ambiguity invalidates earlier matches.
@@ -577,7 +585,7 @@ func (a *aggregator) localIdentity(layer Layer, stream uint32, e *Event) bool {
 		side = 1
 	}
 	if a.connections == nil {
-		a.connections = make(map[localConnectionKey][2]localConnectionWitness)
+		a.connections = make(map[localConnectionKey]localConnectionEvidence)
 		a.bindings = make(map[localConnectionWitness]localConnectionKey)
 	}
 	if prior, exists := a.bindings[w]; exists && prior != k {
@@ -585,11 +593,18 @@ func (a *aggregator) localIdentity(layer Layer, stream uint32, e *Event) bool {
 		return false
 	}
 	seen, exists := a.connections[k]
-	if !exists && len(a.connections) >= MaxLocalConnections || seen[side].stream != 0 && seen[side] != w {
+	if !exists && len(a.connections) >= MaxLocalConnections || seen.witnesses[side].stream != 0 && seen.witnesses[side] != w {
 		j.unqualified()
 		return false
 	}
-	seen[side] = w
+	seen.witnesses[side] = w
+	if e.Kind == KindLocal && (layer == LayerFrontend && e.Phase == PhaseSend || layer == LayerDaemon && e.Phase == PhaseEnqueue) {
+		if e.RequestID <= seen.lastAnchor[side] {
+			j.unqualified()
+			return false
+		}
+		seen.lastAnchor[side] = e.RequestID
+	}
 	a.connections[k] = seen
 	a.bindings[w] = k
 	return true
@@ -625,8 +640,9 @@ type joinEntry struct {
 // unmatched anchor is evicted and counted, so memory does not grow with run
 // length and an eviction invalidates attribution instead of silently
 // lowering coverage. Collect's elapsed-time interleaving keeps partners close
-// enough that a correct run needs only a small window. Anchors are counted as
-// a multiset, so a resend that reuses an identity matches a second receive.
+// enough that a correct run needs only a small window. Authority anchors are a
+// multiset so replay dispatches can match repeated receives. Local anchors
+// are checked for uniqueness by localIdentity before entering this matcher.
 type join struct {
 	cov      JoinCoverage
 	capacity int

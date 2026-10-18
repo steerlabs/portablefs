@@ -328,3 +328,22 @@ func TestWriterExclusionChecksAtimeBeforeEitherMountReads(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewHealthyFSKitInodeMapping(t *testing.T) {
+	writer, reader := sharedVolume(t, refuseMutations)
+	writer.refuse = func(req request) (response, bool) {
+		out, err := writer.inner.exec(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Stat != nil {
+			out.Stat.Ino++
+		}
+		return out, true
+	}
+	routes := newRouter(writer, reader)
+	got := executeCaseDirect(exclusiveCases()[0], routes.view("a"), routes.view("b"), "run", caseInputs{writer: writer, reader: reader})
+	if got.Status != statusPass {
+		t.Fatalf("healthy per-mount file-ID mapping rejected: status=%s failures=%v", got.Status, got.Failures)
+	}
+}
