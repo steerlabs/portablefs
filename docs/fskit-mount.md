@@ -83,12 +83,16 @@ transfers the authority release to one background owner, and replies; it does
 not wait a network round trip per callback, which matters because the kernel
 reclaims items one at a time at unmount. Each work batch holds at most 128
 tokens and sends up to two sequential requests: one `CLOSE_BATCH`, then one
-batched Reclaim. The owner keeps one batch in flight and one forming, so
-accepted releases lag the authority by at most 256 tokens. Releases still
-being handed over add at most two tokens per in-flight request and per
-abandoned provisional reply on each frontend connection (1,024 of each per
-connection); authority capacity must cover the live items and handles plus
-that lag. A failed release ends the mount; it is never retried item by item.
+batched Reclaim. The owner keeps one batch in flight and one forming, so the
+authority retains at most 256 accepted-but-unsent tokens beyond local
+retirement. Releases still being handed over add at most two tokens per
+in-flight request and per abandoned provisional reply on each frontend
+connection, with 1,024 of each per connection and at most 256 connections:
+a conservative total of `256 + 256 * 2 * (1024 + 1024)` = 1,048,832 tokens. A
+mount normally has one frontend connection, so its reachable lag is far
+smaller; authority capacity must cover live items and handles plus the lag a
+deployment can reach. A failed release ends the mount; it is never retried
+item by item.
 After observing exact kernel absence, unmount drains accepted releases on the
 original session before delivering that proof. A failed or timed-out drain
 still completes local teardown but returns failure.

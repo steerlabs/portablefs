@@ -607,10 +607,12 @@ rounded down to a whole millisecond and encoded in nanoseconds.
 `MaxCacheProof` is a frozen 60,000,000,000 ns. A terminal session receives no
 positive value, and no other reply or non-negotiated session carries the
 field. Both peers' frame validation refuses a zero, fractional-millisecond,
-or over-cap value and the field on anything but a plain successful envelope;
-a client additionally refuses a value above the advertised lease, a missing
-value on a negotiated KeepAlive, and the field on a reply to any other
-request. Any such reply is a protocol defect that ends the session.
+or over-cap value, and the field alongside an errno, failure class, body,
+uncertain outcome, or terminal flag. The client additionally requires a
+negotiated KeepAlive reply to carry exactly the request ID, epoch, and a
+proof no larger than the advertised lease, and refuses the field on a reply
+to any other request or to a session that did not negotiate it. Any such
+reply is a protocol defect that ends the session.
 
 With `R` in nanoseconds, `epsilon(R) = 1,000,000,000 + ceil(R / 1000)`. The
 client anchors `R` at the KeepAlive's local start `t0` on a clock that advances
