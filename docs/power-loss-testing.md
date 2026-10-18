@@ -8,7 +8,7 @@ does not cover.
 
 ## The contracts under test
 
-### Linux mount: durable once `fsync` returned
+### Linux mount: durable after successful `fsync`
 
 `write(2)` through a Linux kernel FUSE mount can return while the bytes are in
 the kernel page cache, in the mount's delegated write buffer, or applied to the
@@ -24,10 +24,10 @@ only once an `fsync` or `fdatasync` through the mount has returned success:
   or `fsync` on the target descriptor.
 
 The harness therefore asserts presence only for writes whose `fsync` had
-returned, and asserts nothing about the survival of a write that `write(2)`
+returned success, and asserts nothing about the survival of a write that `write(2)`
 merely accepted.
 
-### FSKit: durable once acknowledged
+### FSKit: durable after a successful mutation reply
 
 FSKit has no fsync callback. The authority therefore makes every successful
 FSKit mutation reply durable on authority storage before the reply is sent or
@@ -232,7 +232,14 @@ requirement (`ExpectationsAfterRestart`).
 - It covers the authority's FSKit durability claim and nothing on the Mac side.
   What the daemon, the extension or the macOS kernel held and never delivered
   as a callback is outside the instrument; so are FSKit's own flush, fsync and
-  unmount semantics.
+  unmount semantics. Completed deactivation and resource unloading certify
+  local cleanup only; unmount's completion has no error or errno and supplies
+  no durability verdict. Successful mutation replies still require authority
+  durability, and synchronize still covers only its captured applied cut and
+  propagates errors through its serving publication gate. Exact kernel absence
+  and daemon/CLI reconciliation require independent evidence. Native
+  fsync/F_FULLFSYNC waiting and dirty-page drain remain separate
+  [qualification gates](./fskit-mount.md#verification).
 - It makes no crash claim for restore hydration's mtime restoration, which is
   not crash-atomic and is not in either workload.
 - It makes no per-volume isolation claim for `syncfs`. Every project on one XFS

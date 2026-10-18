@@ -220,7 +220,7 @@ unprivileged reference image.
 | Platform | Transport | Status |
 | --- | --- | --- |
 | Linux | stock kernel FUSE protocol 7.31+ (`vcs/internal/fusev3`) | `FRONTEND_PROFILE_LINUX`. Writable `O_APPEND` is exact: the authority places every append at the true EOF under its per-inode writer stripe. Stock FUSE does not forward the per-call `RWF_APPEND`/`RWF_NOAPPEND` flags; those two cases are disclosed deviations rather than guesses made from a cached offset. No private kernel capability or opcode is accepted. CI exercises one hosted Ubuntu stock kernel; the broader LTS matrix remains an open qualification gate. |
-| macOS 26 and 27 | FSKit (`swift/PortableFSKit`) | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`, the same product and profile on both releases. The Mac is the volume's only writer while mounted; mutation replies are durable; no exact namespace/attribute withdrawal, append intent, or distributed locks. Native qualification is pending. |
+| macOS 26 and 27 | FSKit (`swift/PortableFSKit`) | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`, the same product and profile on both releases. The Mac is the volume's only writer while mounted; successful mutation replies are durable on authority storage; no exact namespace/attribute withdrawal, append intent, or distributed locks. Native qualification is pending. |
 
 The macOS contract and its open gates are in [docs/fskit-mount.md](./docs/fskit-mount.md).
 

@@ -37,10 +37,11 @@ one device share device contention and media failure. See
 
 **macOS terminal enforcement does not withdraw kernel cache state.** When a
 Mac session ends, is fenced, or loses its daemon, PortableFS stops answering
-from its own caches, stops publishing replies into FSKit, and expires its
-proof-based cache eligibility. That does not synchronously remove names,
-attributes, or pages the macOS kernel already retains for the mount. FSKit
-documents no module-initiated namespace or inode-attribute invalidation, so
+from its own caches, stops publishing successful serving replies into FSKit,
+and expires its proof-based cache eligibility. That does not synchronously
+remove names, attributes, or pages the macOS kernel already retains for the
+mount. FSKit documents no module-initiated namespace or inode-attribute
+invalidation, so
 processes on that Mac may observe retained kernel state until the mount is
 unmounted. The authority's writer exclusion (below) keeps every other client
 from writing while that Mac's daemon could still serve; it does not revoke
@@ -90,7 +91,7 @@ it. A profile is a behavioral contract, not a capability bundle.
 | --- | --- |
 | `FRONTEND_PROFILE_UNSPECIFIED` | Invalid for a mount. Valid only where the route-admin contract requires it. |
 | `FRONTEND_PROFILE_LINUX` | Stock kernel FUSE with a volume subscription, ordered change stream, and file write delegations. |
-| `FRONTEND_PROFILE_FSKIT_EXCLUSIVE` | The single macOS writer: positioned direct WRITE, durable mutation replies, coherent conservative metadata stamps, KeepAlive cache proofs, retained writer exclusion. No peer-actuation interface. |
+| `FRONTEND_PROFILE_FSKIT_EXCLUSIVE` | The single macOS writer: positioned direct WRITE, successful mutation replies durable on authority storage, coherent conservative metadata stamps, KeepAlive cache proofs, retained writer exclusion. No peer-actuation interface. |
 | `FRONTEND_PROFILE_CACHELESS_READER` | Exactly read access, no cache permission, no subscription, no writer exclusion. Reads break delegated data for read. The files gateway uses it. |
 
 There is one macOS profile on macOS 26 and 27. There is no cache-policy name,
@@ -215,12 +216,12 @@ volatile daemon buffer until a durability barrier; the Linux completion rules
 are above.
 
 FSKit delivers no fsync, directory-sync, or `F_FULLFSYNC` callback, so each
-mutation reply is the durability point. A mutation with a retained syncable
-description (WRITE, CREATE, truncating OPEN, handle-backed SETATTR) full-fsyncs
-that description. A handleless mutation (namespace changes, item-backed
-metadata) uses `syncfs` on the authority's retained XFS-root description. The
-barrier is selected from the operation, never by trying a reopen and falling
-back. Every failed fsync, fdatasync, or syncfs fences the store before any
+successful mutation reply is the durability point. A mutation with a retained
+syncable description (WRITE, CREATE, truncating OPEN, handle-backed SETATTR)
+full-fsyncs that description. A handleless mutation (namespace changes,
+item-backed metadata) uses `syncfs` on the authority's retained XFS-root
+description. The barrier is selected from the operation, never by trying a
+reopen and falling back. Every failed fsync, fdatasync, or syncfs fences the store before any
 affected waiter can succeed; the first failure is retained and no later
 barrier can certify durability. Cancellation after apply does not abandon the
 barrier, and replay never repeats apply or sync.
@@ -264,12 +265,58 @@ barrier, and replay never repeats apply or sync.
   incomplete)", with state and intent preserved and a failing exit; a lost or
   timed-out reply is reported the same way. The CLI does not report
   proof-delivery and cleanup as separate authoritative outcomes, and a later
-  204 or 404 is never an absence-accepted receipt.
+  204 or 404 is never an absence-accepted receipt. A Swift teardown
+  acknowledgement neither authorizes the daemon's 204 nor removes a durable
+  registry record. Only a valid empty 204 plus independently proven exact
+  kernel absence permits durable CLI cleanup; presence, unverified kernel
+  state, or a malformed success remains an error and preserves state and intent.
 - Extended-attribute get, list, and remove are supported for portable
   `user.*` names; set is refused with `EOPNOTSUPP`, which prevents AppleDouble
   fallback files.
 - FSKit file IDs are the pfslocal file ID plus one; the volume root is FSKit
   ID 2. Zero and overflow are refused.
+
+### FSKit callback publication and teardown
+
+Once the session is terminal, no FSKit callback that publishes data, metadata,
+namespace or durability reports success. Resource loading, volume activation
+and mounting are serving callbacks and obey the same rule. Session termination
+and each serving callback's final synchronous reply share one publication gate:
+a reply that wins the gate precedes termination; when termination wins, the
+final gate rejects publication with the first terminal cause. Earlier definite
+request refusals remain failures.
+
+Volume deactivation and resource unloading acknowledge local teardown only.
+They must perform their local cleanup even after terminal failure and report
+success only after the cleanup they acknowledge has completed. An earlier
+session-terminal cause does not make completed cleanup fail. A genuine error
+in the teardown request or its local cleanup remains an error. Repeated
+completed teardown is idempotent. Unmount's errorless completion acknowledges
+the same local cleanup boundary.
+
+A teardown acknowledgement does not certify durability, erase or replace the
+first terminal cause, revive a session, prove kernel mount absence, prove
+authority acceptance of absence, or certify daemon/CLI reconciliation. Mutation
+and synchronize failures retain their existing error paths. Every successful
+FSKit mutation reply still requires authority-storage durability before
+publication.
+
+This exception names `deactivate`, `unloadResource`, and errorless `unmount`
+completion. Close, reclaim, release, cancellation, and other cleanup activity
+retain their existing publication and resource-settlement rules.
+`loadResource`, `activate`, `mount`, and `synchronize` remain gated. Closing the
+session cannot retract state already published into the kernel's caches.
+
+`synchronize` waits for the authority's SyncVolume barrier over its captured
+applied cut, then Statfs; barrier and Statfs errors propagate. Its final gate
+can still reject success after both requests succeed. This covers neither
+mutations outside the captured cut nor kernel pages not yet delivered as
+callbacks. Native `fsync`/`F_FULLFSYNC` waiting, dirty-page drain, and error
+propagation remain qualification boundaries. A real sync failure or busy
+reference can prevent ordinary unmount of a terminal writable mount; completed
+local teardown does not promise its removal. Only explicit user force
+authorizes force, whose completion still depends on the OS and never certifies
+undelivered writes as durable.
 
 ## Filesystem semantics
 
@@ -470,7 +517,14 @@ evidence for it.
   terminal enforcement, the 128-callback window, no product-owned mount-root
   descriptor, one unforced unmount with real `EBUSY` under normal system
   indexing, explicit force, exact final inventories, and buffered-I/O
-  delivery.
+  delivery. Isolated signed mounts must cover healthy and terminal sessions,
+  busy references, and undelivered dirty pages, recording callback results,
+  `/sbin/umount` status, exact kernel inventory, and PortableFS reconciliation.
+  Check ordinary refusal and explicit force independently, eventual cleanup,
+  and a fresh attach incarnation. Cleanup-only acknowledgements and errorless
+  unmount completion do not qualify durability or mount removal; native
+  fixtures and static framework inspection cannot prove these outcomes. See
+  [FSKit verification](./docs/fskit-mount.md#verification).
 - Native signed-app lifecycle: the CLI and the app accept the real shipping
   daemon and refuse a substituted image renamed onto its path, a two-release
   upgrade with different control and `pfslocal` numbers quiesces through

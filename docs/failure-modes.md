@@ -177,11 +177,15 @@ macOS 26 and 27 mount through `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`. Current FSKit
 cannot withdraw name or attribute caches, control per-reply metadata
 installation, or expose append intent or distributed locks, so a Mac mount is
 the volume's exclusive writer and a second Mac is refused. On Mac session loss,
-fence, or daemon failure, the daemon stops serving and the extension fails its
-waiting callbacks, but names, attributes, and pages already in the macOS kernel
-remain observable on that Mac until unmount; PortableFS does not force an
-unmount. A normal unmount makes one unforced attempt and reports a real
-`EBUSY`.
+fence, or daemon failure, the daemon stops serving and the extension rejects
+successful serving publication, but names, attributes, and pages already in
+the macOS kernel remain observable on that Mac until unmount; PortableFS does
+not force an unmount. A normal unmount makes one unforced attempt and reports a
+real `EBUSY`. Completed deactivation, resource unloading, and errorless unmount
+completion acknowledge local cleanup only, preserving the first terminal cause
+and every mutation/synchronize error. They prove neither durability nor kernel absence
+or daemon reconciliation. See
+[the FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown).
 
 Windows has no production frontend and is refused by its primitive gate.
 

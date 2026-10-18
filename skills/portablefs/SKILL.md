@@ -169,9 +169,10 @@ identity.
 
 - **A returned `write(2)` is accepted, not yet durable.** It may still sit in
   the macOS page cache or a Linux delegated write buffer, as on a local disk.
-  On macOS, each operation the kernel actually delivers to PortableFS is durable
-  when it completes; whether `fsync` forces delivery of every dirty page is not
-  yet qualified.
+  Every successful FSKit mutation reply certifies authority-storage durability.
+  Whether `fsync` forces delivery of every dirty page is not yet qualified.
+  [Teardown completion](../../docs/fskit-mount.md#callback-publication-and-local-teardown)
+  certifies only local cleanup.
 - **`close` is not `fsync`.** If you need durability across power loss, `fsync`
   the file and its parent directory, as you would locally.
 - **`syncfs(2)` does not reach the authority** on Linux FUSE. Use file and
