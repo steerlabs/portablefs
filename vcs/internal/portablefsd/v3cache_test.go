@@ -206,7 +206,7 @@ func TestV3CacheHitsStopAtImmediatePoisonAndTheAuthorizationDeadline(t *testing.
 		d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
 			d.mu.Lock()
 			defer d.mu.Unlock()
-			if _, hit := d.attrHitLocked(conflict, record, nil); hit {
+			if _, reason := d.attrHitLocked(conflict, record, nil); reason == v3CacheHit {
 				t.Fatal("a terminal data plane admitted a hit")
 			}
 		})
@@ -1096,7 +1096,7 @@ func TestV3RenameDelayedPastAHeldSetattrOfTheMovedObjectIsLegal(t *testing.T) {
 	if cachedSize != 42 || binding == nil || binding.name != "renamed" {
 		t.Fatalf("after the overlap size=%d binding=%+v, want the setattr's size and the rename's name", cachedSize, binding)
 	}
-	f.requireAuthority("GetAttr while both callbacks hold the coordinate", func() { f.getattr(file.Item) })
+	f.requireServedLocally("GetAttr after both handlers settle before either ack", func() { f.getattr(file.Item) })
 	for _, operationID := range []uint64{setattrOp, renameOp} {
 		if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished); err != nil {
 			t.Fatal(err)
@@ -1140,6 +1140,7 @@ func TestV3CacheSameCallbackWritesWithReversedReplies(t *testing.T) {
 	if _, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.WriteRequest{Handle: handle, Offset: 10, Data: []byte("fghij")}); errno != 0 {
 		t.Fatalf("second write errno=%d", errno)
 	}
+	f.requireAuthority("read with an overlapping source request still active", func() { f.getattr(file.Item) })
 	close(releaseFirst)
 	if errno := <-first; errno != 0 || f.d.terminalError() != nil {
 		t.Fatalf("older reply after newer = %d terminal=%v, want no fence", errno, f.d.terminalError())
@@ -1151,6 +1152,7 @@ func TestV3CacheSameCallbackWritesWithReversedReplies(t *testing.T) {
 	if size != 15 {
 		t.Fatalf("cached size=%d, want the newer write's 15", size)
 	}
+	f.requireServedLocally("read after all same-callback writes settle before ack", func() { f.getattr(file.Item) })
 }
 
 // Same-name namespace requests of one callback: create(n) commits first, an
@@ -1345,5 +1347,154 @@ func TestV3CachedPositiveReclaimThenSocketLossSettlesOnce(t *testing.T) {
 	f.d.mu.Unlock()
 	if provisional != 0 || live || f.d.terminalError() == nil {
 		t.Fatalf("after reclaim and socket loss provisional=%d live=%t terminal=%v", provisional, live, f.d.terminalError())
+	}
+}
+
+func TestV3SettledEffectsHitCacheBeforePublicationAck(t *testing.T) {
+	for _, name := range []string{"create-getattr", "link-lookup", "write-getattr", "unlink-negative"} {
+		t.Run(name, func(t *testing.T) {
+			f := newCachedV3Fixture(t, v3FileObjects())
+			f.ns.bind(0x20, "file", 0x70)
+			f.getattr(f.root)
+			file := f.lookup(f.root, "file")
+			var handle uint64
+			if name == "write-getattr" {
+				reply, errno := f.dispatch(&pfslocal.OpenRequest{Item: file.Item, Mode: pfslocal.OpenModeReadWrite})
+				if errno != 0 {
+					t.Fatal(errno)
+				}
+				handle = reply.(*pfslocal.OpenReply).Handle
+			}
+			const operationID = uint64(97501)
+			f.d.bridge.reserveFrontendPublication(operationID)
+			var body any
+			switch name {
+			case "create-getattr":
+				body = &pfslocal.CreateRequest{Dir: f.root, Name: []byte("new"), Exclusive: true, Mode: 0o644}
+			case "link-lookup":
+				body = &pfslocal.HardLinkRequest{Item: file.Item, Dir: f.root, Name: []byte("alias")}
+			case "write-getattr":
+				body = &pfslocal.WriteRequest{Handle: handle, Data: []byte("hello")}
+			case "unlink-negative":
+				body = &pfslocal.RemoveRequest{Dir: f.root, Name: []byte("file")}
+			}
+			reply, errno := dispatchV3Owned(f.d, context.Background(), operationID, body)
+			if errno != 0 {
+				t.Fatalf("mutation errno=%d", errno)
+			}
+			if name == "create-getattr" {
+				file = reply.(*pfslocal.CreateReply).Attr
+			}
+			lease := f.d.bridge.sourcePublication.operationLease(operationID)
+			lease.gate.mu.Lock()
+			active, claims, holds := lease.active, len(lease.names), len(lease.coordinates)
+			lease.gate.mu.Unlock()
+			if active != 0 || claims != 0 || holds == 0 {
+				t.Fatalf("settlement active=%d claims=%d holds=%d", active, claims, holds)
+			}
+			f.requireServedLocally("successor before ack", func() {
+				switch name {
+				case "create-getattr", "write-getattr":
+					f.getattr(file.Item)
+				case "link-lookup":
+					f.lookup(f.root, "alias")
+				case "unlink-negative":
+					if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("file")}); errno != darwinENOENT {
+						t.Fatal(errno)
+					}
+				}
+			})
+			// A callback can issue another request before its final ack. Its
+			// acquisition must make the same retained holds active again.
+			gate, _ := v3ItemSourceGate(file.Item, false)
+			if _, err := lease.gate.acquireSource(context.Background(), operationID, gate); err != nil {
+				t.Fatal(err)
+			}
+			lease.gate.cacheRead(func(conflict v3CacheConflict) {
+				if !conflict(v3AttributeCoordinate(f.record(file.Item))) {
+					t.Fatal("new request failed to reactivate retained holds")
+				}
+			})
+			lease.finishRequest()
+			if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitNotPublished); !errors.Is(err, errV3SourcePublicationNotPublished) {
+				t.Fatalf("committed NOT_PUBLISHED=%v", err)
+			}
+		})
+	}
+}
+
+func TestV3ActiveHandlerCoversPostStateValidation(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	const operationID = uint64(97502)
+	f.d.bridge.reserveFrontendPublication(operationID)
+	gate, _ := v3ItemSourceGate(file.Item, false)
+	item := f.record(file.Item)
+	mode := uint32(0o600)
+	response, errno, finish := f.d.callMutation(context.Background(), operationID, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: item.token, Mode: &mode}}}, gate, nil)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	lease := f.d.bridge.sourcePublication.operationLease(operationID)
+	lease.gate.cacheRead(func(conflict v3CacheConflict) {
+		if !conflict(v3AttributeCoordinate(item)) || lease.active != 1 {
+			t.Fatal("RPC return exposed idle cache eligibility before validation")
+		}
+	})
+	// Malformed PostState is terminal before handler settlement, so no idle
+	// interval can admit a cache read after the decrement.
+	response.PostState = nil
+	if _, _, err := v3TargetEffect(response.GetPostState(), item); err == nil {
+		t.Fatal("malformed PostState accepted")
+	}
+	_, _ = f.d.malformed("injected malformed PostState")
+	finish()
+	lease.gate.cacheRead(func(conflict v3CacheConflict) {
+		if !conflict(v3AttributeCoordinate(item)) || lease.active != 0 {
+			t.Fatal("malformed outcome opened cache admission")
+		}
+	})
+}
+
+func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	f.getattr(f.root)                // cold
+	file := f.lookup(f.root, "file") // unknown name
+	f.getattr(file.Item)             // hit
+	if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("missing")}); errno != darwinENOENT {
+		t.Fatal(errno)
+	}
+	if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("missing")}); errno != darwinENOENT {
+		t.Fatal(errno)
+	}
+	const operationID = uint64(97503)
+	f.d.bridge.reserveFrontendPublication(operationID)
+	gate, _ := v3ItemSourceGate(file.Item, false)
+	lease, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), operationID, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.getattr(file.Item) // held
+	lease.finishRequest()
+	f.clock.advance(10 * time.Minute)
+	f.getattr(file.Item) // horizon
+	f.d.mu.Lock()
+	f.d.authorizationDeadline = time.Now().Add(-time.Second)
+	f.d.mu.Unlock()
+	f.getattr(file.Item) // authorization
+	a := &attach{v3Data: f.d}
+	metrics := a.status().MetadataCache
+	if len(metrics.GetAttr) != int(v3CacheResultCount) || len(metrics.LookupPolarity) != 3 {
+		t.Fatalf("unbounded/absent metrics: %+v", metrics)
+	}
+	for _, reason := range []string{"cold", "hit", "held", "horizon", "authorization"} {
+		if metrics.GetAttr[reason] == 0 {
+			t.Errorf("missing getattr reason %s: %v", reason, metrics.GetAttr)
+		}
+	}
+	if metrics.Lookup["unknown_name"] != 2 || metrics.Lookup["hit"] != 1 || metrics.LookupPolarity["positive"] != 1 || metrics.LookupPolarity["negative"] != 2 {
+		t.Fatalf("lookup metrics: %+v", metrics)
 	}
 }

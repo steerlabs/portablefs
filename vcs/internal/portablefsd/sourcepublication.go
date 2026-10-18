@@ -225,6 +225,9 @@ type v3SourcePublicationLease struct {
 	unresolvedAttributes int
 	unresolvedData       int
 	assigned             uint32
+	// active counts whole source handlers, through validated cache application
+	// and claim settlement. PublicationAck retains ordering holds independently.
+	active uint32
 	// acquisitions counts this callback's admitted source acquisitions, so a
 	// namespace errno witness can prove no same-callback request was admitted
 	// after it.
@@ -597,6 +600,7 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 		if op.lease == nil {
 			op.lease = lease
 		}
+		lease.active++
 		lease.acquisitions++
 		for coordinate := range coordinates {
 			c.holdLocked(coordinate, lease)
@@ -646,8 +650,10 @@ func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 			return true
 		}
 		for _, coordinate := range coordinates {
-			if len(c.sourceHolds[coordinate]) != 0 {
-				return true
+			for holder := range c.sourceHolds[coordinate] {
+				if holder.active != 0 || holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
+					return true
+				}
 			}
 			switch coordinate.kind {
 			case v3PublicationItemAttributes:
@@ -681,6 +687,19 @@ func (c *v3SourcePublicationCoordinator) observeLease(lease *v3SourcePublication
 	exclusive := c.terminal == nil && !lease.released && held && len(c.sourceHolds[coordinate]) == 1 &&
 		claims.attributes == 1 && claims.data == 0
 	observe(lease.acquisitions, exclusive)
+}
+
+// finishRequest runs exactly once at the whole handler's return, never at RPC
+// return. A terminal outcome has already closed admission before this decrement.
+func (l *v3SourcePublicationLease) finishRequest() {
+	c := l.gate
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if l.active == 0 {
+		panic("portablefsd: source request settled twice")
+	}
+	l.active--
+	c.signalLocked()
 }
 
 func (l *v3SourcePublicationLease) markAssigned() error {

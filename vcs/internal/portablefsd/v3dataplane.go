@@ -236,6 +236,7 @@ type v3DataPlane struct {
 	// tokens. The authority's configured capacity must cover live owners plus
 	// the lag actually reachable by its mounts.
 	abandonedDebt atomic.Int64
+	cacheCounters v3CacheCounters
 
 	mu              sync.Mutex
 	terminal        error
@@ -508,7 +509,17 @@ func (d *v3DataPlane) dispatchFrontend(
 	}
 	switch request := body.(type) {
 	case *pfslocal.LookupRequest:
-		return d.lookup(ctx, operationID, request)
+		reply, errno := d.lookup(ctx, operationID, request)
+		polarity := 2
+		if errno == 0 {
+			polarity = 0
+		} else if errno == darwinENOENT {
+			polarity = 1
+		}
+		d.mu.Lock()
+		d.cacheCounters.lookup[polarity]++
+		d.mu.Unlock()
+		return reply, errno
 	case *pfslocal.EnumerateEntriesRequest:
 		return d.enumerateEntries(ctx, operationID, request)
 	case *pfslocal.GetAttrRequest:
@@ -754,7 +765,8 @@ func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: set}}, gate, nil)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: set}}, gate, nil)
+	defer finish()
 	if errno != 0 {
 		return nil, errno
 	}
@@ -940,10 +952,11 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 		Handle: cloneBytesV3(handle.token), Position: request.Offset, Size: uint32(size),
 		Data: request.Data, WriteFlags: v3WriteFlagKillSUIDGID,
 	}}}, gate, nil)
+	defer finish()
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1058,10 +1071,11 @@ func (d *v3DataPlane) create(ctx context.Context, operationID uint64, request *p
 		return d.malformed(err.Error())
 	}
 	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
 		Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode,
 		Flags: &authoritypb.OpenFlags{Read: true, Write: true, Append: request.Append}, Exclusive: request.Exclusive,
 	}}}, gate, witness)
+	defer finish()
 	if errno != 0 {
 		return nil, d.settleNameErrno(witness, errno)
 	}
@@ -1120,7 +1134,8 @@ func (d *v3DataPlane) mkdir(ctx context.Context, operationID uint64, request *pf
 		return d.malformed(err.Error())
 	}
 	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Mode: request.Mode}}}, gate, witness)
+	defer finish()
 	if errno != 0 {
 		return nil, d.settleNameErrno(witness, errno)
 	}
@@ -1148,7 +1163,8 @@ func (d *v3DataPlane) remove(ctx context.Context, operationID uint64, request *p
 		return d.malformed(err.Error())
 	}
 	witness := newV3NameWitness(parent, request.Name, darwinENOENT)
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Directory: request.Directory}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Directory: request.Directory}}}, gate, witness)
+	defer finish()
 	if errno != 0 {
 		return nil, d.settleNameErrno(witness, errno)
 	}
@@ -1187,9 +1203,10 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
 		OldParent: cloneBytesV3(from.token), OldName: cloneBytesV3(request.FromName), NewParent: cloneBytesV3(to.token), NewName: cloneBytesV3(request.ToName), NoReplace: request.NoReplace,
 	}}}, gate, nil)
+	defer finish()
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1295,7 +1312,8 @@ func (d *v3DataPlane) symlink(ctx context.Context, operationID uint64, request *
 		return d.malformed(err.Error())
 	}
 	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Target: cloneBytesV3(request.Target)}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name), Target: cloneBytesV3(request.Target)}}}, gate, witness)
+	defer finish()
 	if errno != 0 {
 		return nil, d.settleNameErrno(witness, errno)
 	}
@@ -1342,7 +1360,8 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 		return d.malformed(err.Error())
 	}
 	witness := newV3NameWitness(parent, request.Name, darwinEEXIST)
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytesV3(item.token), NewParent: cloneBytesV3(parent.token), NewName: cloneBytesV3(request.Name)}}}, gate, witness)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{ExistingItem: cloneBytesV3(item.token), NewParent: cloneBytesV3(parent.token), NewName: cloneBytesV3(request.Name)}}}, gate, witness)
+	defer finish()
 	if errno != 0 {
 		return nil, d.settleNameErrno(witness, errno)
 	}
@@ -1471,7 +1490,8 @@ func (d *v3DataPlane) xattrRemove(ctx context.Context, operationID uint64, reque
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	response, errno := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: query}}, gate, nil)
+	response, errno, finish := d.callMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: query}}, gate, nil)
+	defer finish()
 	if errno != 0 {
 		return nil, errno
 	}
@@ -1786,22 +1806,24 @@ func (d *v3DataPlane) revokeRetainedResponse(ctx context.Context, cause error) {
 // callMutation runs one visible mutation under its source-publication lease.
 // A namespace mutation passes the witness of the cached name it may
 // contradict; it is captured right after source admission.
-func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.FskitSourcePublication, witness *v3NameWitness) (*authoritypb.Response, int32) {
+func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.FskitSourcePublication, witness *v3NameWitness) (*authoritypb.Response, int32, func()) {
+	finish := func() {}
 	if operationID == 0 || request == nil {
-		return nil, darwinEINVAL
+		return nil, darwinEINVAL, finish
 	}
 	lease, err := d.bridge.sourcePublication.acquireSource(ctx, operationID, gate)
 	if err != nil {
 		if errors.Is(err, errV3SourcePublicationInterrupted) && d.cfg.CachePolicy == v3CachePolicyMacOS26 {
-			return nil, darwinECANCELED
+			return nil, darwinECANCELED, finish
 		}
-		return nil, v3LocalErrno(err)
+		return nil, v3LocalErrno(err), finish
 	}
+	finish = lease.finishRequest
 	witness.capture(d, lease)
 	if d.endOnClockFault() != nil {
 		// Serving has ended; like a local withdrawal before assignment, no
 		// authority request owns this callback's outcome.
-		return nil, darwinEIO
+		return nil, darwinEIO, finish
 	}
 	request.FskitSourcePublication = gate
 	// Carry the exact pfslocal publication/callback identity into authority
@@ -1836,24 +1858,24 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 	// refuse settles a definite pre-apply refusal: the call produced no
 	// binding, and its response stays retained only until the callback
 	// publishes the error.
-	refuse := func(errno int32) (*authoritypb.Response, int32) {
+	refuse := func(errno int32) (*authoritypb.Response, int32, func()) {
 		if err := lease.resolveNoBindings(gate); err != nil {
 			d.revokeRetainedResponse(ctx, err)
-			return nil, darwinEIO
+			return nil, darwinEIO, finish
 		}
 		if consumption != nil {
 			if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, consumption); err != nil {
 				d.revokeRetainedResponse(ctx, err)
-				return nil, darwinEIO
+				return nil, darwinEIO, finish
 			}
 			retained = true
 		}
-		return nil, errno
+		return nil, errno, finish
 	}
 	if assigned.Sequence == 0 && callErr != nil && d.terminalError() != nil {
 		// Local withdrawal can win between source admission and replay
 		// assignment. No authority request owns this callback's outcome yet.
-		return nil, darwinEIO
+		return nil, darwinEIO, finish
 	}
 	if assigned.Sequence != 0 {
 		if callErr != nil || response == nil || response.GetUncertain() ||
@@ -1871,7 +1893,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 				)
 			}
 			d.revokeRetainedResponse(ctx, callErr)
-			return nil, darwinEIO
+			return nil, darwinEIO, finish
 		}
 		if v3UnadmittedWrite(request, response) {
 			// Replay admission refused the WRITE before recording its identity:
@@ -1881,13 +1903,17 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		state := response.GetMutation()
 		if state == nil || state.GetSlot() != assigned.Slot || state.GetAcceptedSequence() != assigned.Sequence {
 			d.revokeRetainedResponse(ctx, errors.New("portablefsd: assigned source mutation changed its replay identity"))
-			return nil, darwinEIO
+			return nil, darwinEIO, finish
 		}
 	}
 	if response != nil && response.GetErrno() != 0 {
+		if response.GetBody() != nil || response.GetPostState() != nil {
+			d.revokeRetainedResponse(ctx, errors.New("portablefsd: definite source refusal carried an applied outcome"))
+			return nil, darwinEIO, finish
+		}
 		if err := lease.resolveNoBindings(gate); err != nil {
 			d.revokeRetainedResponse(ctx, err)
-			return nil, darwinEIO
+			return nil, darwinEIO, finish
 		}
 	}
 	// A parsed visible response is retained until the frontend publishes or
@@ -1905,36 +1931,36 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 			cause = errors.New("portablefsd: authority returned a terminal or malformed retained mutation outcome")
 		}
 		d.revokeRetainedResponse(ctx, cause)
-		return nil, darwinEIO
+		return nil, darwinEIO, finish
 	}
 	classified, errno := d.classify(response, nil, true)
 	if errno != 0 {
 		if consumption != nil {
 			if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, consumption); err != nil {
 				d.revokeRetainedResponse(ctx, err)
-				return nil, darwinEIO
+				return nil, darwinEIO, finish
 			}
 			retained = true
 		}
-		return classified, errno
+		return classified, errno, finish
 	}
 	if assigned.Sequence == 0 {
 		d.revokeRetainedResponse(ctx, errors.New("portablefsd: successful source mutation omitted replay assignment"))
-		return nil, darwinEIO
+		return nil, darwinEIO, finish
 	}
 	if errno, rejected := v3WriteRejection(request, classified); rejected {
 		return refuse(linuxToDarwin(errno))
 	}
 	if err := lease.markCommitted(); err != nil {
 		d.revokeRetainedResponse(ctx, err)
-		return nil, darwinEIO
+		return nil, darwinEIO, finish
 	}
 	if err := lease.retainResponseConsumption(consumption); err != nil {
 		d.revokeRetainedResponse(ctx, err)
-		return nil, darwinEIO
+		return nil, darwinEIO, finish
 	}
 	retained = true
-	return classified, 0
+	return classified, 0, finish
 }
 
 // callNonVisibleMutation keeps authority replay identity without inventing a

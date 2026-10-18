@@ -108,12 +108,13 @@ type ensureAttachRequest struct {
 }
 
 type attachStatus struct {
-	AttachRef string `json:"attachRef"`
-	VolumeID  string `json:"volumeId"`
-	Branch    string `json:"branch"`
-	MountPath string `json:"mountPath"`
-	State     string `json:"state"`
-	LastError string `json:"lastError,omitempty"`
+	MetadataCache *v3CacheMetrics `json:"metadataCache,omitempty"`
+	AttachRef     string          `json:"attachRef"`
+	VolumeID      string          `json:"volumeId"`
+	Branch        string          `json:"branch"`
+	MountPath     string          `json:"mountPath"`
+	State         string          `json:"state"`
+	LastError     string          `json:"lastError,omitempty"`
 	// Credential names WHICH credential verdict is behind a degraded state,
 	// because "degraded" plus a prose lastError is not something a program can
 	// branch on. Empty means no credential fault at all.
@@ -1890,7 +1891,9 @@ func (a *attach) status() attachStatus {
 	// revocation watchdog branches on it — "degraded" plus a prose lastError
 	// is not something a program can branch on (see Credential above).
 	sessionTerminal := false
+	var metadataCache *v3CacheMetrics
 	if d := a.v3Backend(); d != nil {
+		metadataCache = d.cacheMetrics()
 		if err := d.terminalError(); err != nil && !errors.Is(err, errV3AttachDetached) {
 			state = pfslocal.AttachStateDegraded
 			sessionTerminal = true
@@ -1901,7 +1904,7 @@ func (a *attach) status() attachStatus {
 	return attachStatus{
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
-		Credential: credential, SessionTerminal: sessionTerminal,
+		Credential: credential, SessionTerminal: sessionTerminal, MetadataCache: metadataCache,
 		MountEnrollmentID:         enrollmentID,
 		AuthorizationDeadlineAtMs: authorizationDeadlineAtMs, LastReauthorizationAtMs: lastReauthorizationAtMs,
 		NextReauthorizationAtMs: nextReauthorizationAtMs, ReauthorizationFailures: reauthorizationFailures,
