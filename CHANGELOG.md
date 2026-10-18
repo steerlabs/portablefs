@@ -55,6 +55,11 @@ this file is the human-curated summary.
 
 ### Fixed
 
+- When the macOS app cannot authenticate the live owner of its daemon
+  service, it leaves that owner running and reports the precise cause, such as
+  a deleted or replaced owning app, a foreign socket owner, or a state lock
+  held without an endpoint, together with the sanctioned recovery. It
+  previously surfaced a generic identity or witness error.
 - The macOS extension runs each FSKit callback once. It no longer reissues a
   callback whose reply carries `publication_retracted`: no daemon withdraws a
   sent publication, so that bit is a frame defect that retires the connection

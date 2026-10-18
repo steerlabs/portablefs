@@ -203,6 +203,14 @@ The host owns service replacement: it derives the outgoing release from the
 authenticated live daemon and its signed owning app, proves an empty mount and
 attach inventory, and unregisters that exact execution before registering its
 own sealed service. Saved preferences do not identify the running release.
+An owner the host cannot authenticate is never stopped, because only that
+proof shows it serves no mounts: a daemon whose app was deleted or replaced
+while it ran, a foreign process or another signed product on the control
+socket, an endpoint without a listener, or a held state lock without an
+endpoint. Startup fails with the cause and the sanctioned recovery: quit the
+other app, let a running installer finish, or unmount and log out to end an
+orphaned daemon. Updates go through the installer, which quiesces the running
+daemon before it replaces the app.
 
 An FSKit frontend loss immediately ends local serving. The daemon retains the
 original authenticated authority transport until the mount supervisor proves

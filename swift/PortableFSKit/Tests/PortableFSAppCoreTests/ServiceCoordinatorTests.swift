@@ -451,3 +451,343 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
         )
     }
 }
+
+// MARK: - Live service owner decision flow
+
+private typealias Coordinator = PortableFSDServiceCoordinator
+
+private func ownerTestConfiguration() throws -> Coordinator.Configuration {
+    try Coordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.4.2",
+        buildVersion: "42"
+    )
+}
+
+private func ownerTestRelease(
+    version: String,
+    digit: Character,
+    pfslocalMinor: UInt32 = 16
+) -> PortableFSDReleaseIdentity {
+    PortableFSDReleaseIdentity(
+        codeDirectoryHash: String(repeating: digit, count: 40),
+        executableSHA256: String(repeating: digit, count: 64),
+        daemonVersion: version,
+        identitySchema: 1,
+        controlProtocol: 1,
+        pfslocalMajor: 1,
+        pfslocalMinor: pfslocalMinor
+    )
+}
+
+/// Unix socket paths must fit sockaddr_un, so fixtures live under /tmp rather
+/// than the much longer per-user temporary directory.
+private func withOwnerFixtureDirectory(_ body: (URL) throws -> Void) throws {
+    var template = Array("/tmp/pfs-owner.XXXXXX".utf8CString)
+    guard let created = Darwin.mkdtemp(&template) else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let root = URL(fileURLWithPath: String(cString: created), isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try body(root)
+}
+
+private func makeOwnerBundle(at url: URL, identifier: String) throws -> Bundle {
+    let contents = url.appendingPathComponent("Contents", isDirectory: true)
+    try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+    let plist: [String: Any] = [
+        "CFBundleIdentifier": identifier,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": "0.4.1",
+        "CFBundleVersion": "41",
+        "PFSAppGroupIdentifier": "B47U2LLKHW.pfsoss",
+    ]
+    let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    try data.write(to: contents.appendingPathComponent("Info.plist"))
+    return try #require(Bundle(url: url))
+}
+
+private func ownerRefusal(
+    _ operation: () throws -> Void
+) -> Coordinator.UnauthenticatedServiceOwner? {
+    do {
+        try operation()
+    } catch Coordinator.RegistrationError.unauthenticatedServiceOwner(let owner) {
+        return owner
+    } catch {
+        Issue.record("expected an unauthenticated-owner refusal, got \(error.localizedDescription)")
+        return nil
+    }
+    Issue.record("expected an unauthenticated-owner refusal")
+    return nil
+}
+
+private func ownProcessExecutablePath() throws -> String {
+    var buffer = [CChar](repeating: 0, count: 4 * 1_024)
+    let length = proc_pidpath(getpid(), &buffer, UInt32(buffer.count))
+    guard length > 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+    return URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self)).standardizedFileURL.path
+}
+
+/// A valid older release, or this release from another copy of the app, is
+/// replaced, and every later step binds to its authenticated identity: the
+/// empty-inventory guard reads that exact daemon's attaches and the fence
+/// waits for that exact execution. The state singleton is never consulted.
+@Test func liveOwnerDecisionReplacesAValidOlderReleaseThroughItsOwnIdentity() throws {
+    try withOwnerFixtureDirectory { root in
+        let incoming = ownerTestRelease(version: "0.4.2", digit: "b")
+        let older = ownerTestRelease(version: "0.4.1", digit: "c", pfslocalMinor: 15)
+        let incomingURL = root.appendingPathComponent("New.app", isDirectory: true)
+        let oldBundle = try makeOwnerBundle(
+            at: root.appendingPathComponent("Old.app", isDirectory: true),
+            identifier: "dev.portablefs.oss.KitDev"
+        )
+        let running = Coordinator.RunningDaemon(bundle: oldBundle, releaseIdentity: older)
+
+        guard case .replace(let outgoing?) = Coordinator.registrationStep(
+            for: .authenticated(running),
+            incoming: incoming,
+            bundleURL: incomingURL
+        ) else {
+            Issue.record("a valid older release must be replaced through its identity")
+            return
+        }
+        #expect(outgoing.releaseIdentity == older)
+        #expect(Coordinator.inventoryGuardArguments(outgoing: outgoing.releaseIdentity) == [
+            "lifecycle", "hold-install-exclusive", "--json",
+            "--expected-daemon-version", "0.4.1",
+            "--expected-daemon-sha256", String(repeating: "c", count: 64),
+            "--expected-pfslocal-major", "1",
+            "--expected-pfslocal-minor", "15",
+        ])
+
+        var probed: [PortableFSDReleaseIdentity] = []
+        var singletonConsulted = false
+        let witness = try Coordinator.replacementWitness(
+            outgoing: outgoing,
+            probe: { daemon in
+                probed.append(daemon.releaseIdentity)
+                return try Coordinator.DaemonProcessWitness(pid: getpid(), pidVersion: 1)
+            },
+            stateSingletonUnlocked: {
+                singletonConsulted = true
+                return true
+            }
+        )
+        guard case .process = witness else {
+            Issue.record("an authenticated outgoing daemon must be fenced by its execution")
+            return
+        }
+        #expect(probed == [older])
+        #expect(!singletonConsulted)
+
+        let sameReleaseElsewhere = Coordinator.RunningDaemon(bundle: oldBundle, releaseIdentity: incoming)
+        guard case .replace(_?) = Coordinator.registrationStep(
+            for: .authenticated(sameReleaseElsewhere),
+            incoming: incoming,
+            bundleURL: incomingURL
+        ) else {
+            Issue.record("this release running from another app copy must be replaced")
+            return
+        }
+        guard case .keep = Coordinator.registrationStep(
+            for: .authenticated(sameReleaseElsewhere),
+            incoming: incoming,
+            bundleURL: oldBundle.bundleURL
+        ) else {
+            Issue.record("the exact release from this bundle must be kept")
+            return
+        }
+    }
+}
+
+/// A missing endpoint is replaced only when the state singleton proves that
+/// no daemon remains; the guard then adopts no daemon identity.
+@Test func liveOwnerDecisionReplacesAMissingEndpointOnlyWithAFreeSingleton() throws {
+    try withOwnerFixtureDirectory { root in
+        let owner = try Coordinator.inspectLiveServiceOwner(
+            controlSocket: root.appendingPathComponent("control.sock"),
+            configuration: try ownerTestConfiguration()
+        )
+        guard case .unpublished = owner else {
+            Issue.record("a missing endpoint must classify as unpublished")
+            return
+        }
+        guard case .replace(nil) = Coordinator.registrationStep(
+            for: owner,
+            incoming: ownerTestRelease(version: "0.4.2", digit: "b"),
+            bundleURL: root.appendingPathComponent("New.app", isDirectory: true)
+        ) else {
+            Issue.record("an unpublished owner must be replaced without an outgoing identity")
+            return
+        }
+        #expect(Coordinator.inventoryGuardArguments(outgoing: nil) == [
+            "lifecycle", "hold-install-exclusive", "--json",
+        ])
+
+        let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: stateDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let witness = try Coordinator.replacementWitness(
+            outgoing: nil,
+            probe: { _ in
+                Issue.record("an unpublished owner has no execution to probe")
+                throw POSIXError(.EINVAL)
+            },
+            stateSingletonUnlocked: {
+                try Coordinator.stateSingletonIsUnlocked(at: stateDirectory)
+            }
+        )
+        guard case .unpublished = witness else {
+            Issue.record("a free singleton must fence through the unpublished witness")
+            return
+        }
+    }
+}
+
+/// No endpoint, but a held state singleton: a daemon is starting or stopping
+/// and nothing can authenticate it, so replacement is refused.
+@Test func liveOwnerDecisionRefusesAnOccupiedStateSingleton() throws {
+    try withOwnerFixtureDirectory { root in
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        let lock = root.appendingPathComponent(".portablefsd-state.lock")
+        #expect(FileManager.default.createFile(
+            atPath: lock.path,
+            contents: Data(),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        let descriptor = Darwin.open(lock.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        try #require(descriptor >= 0)
+        defer { Darwin.close(descriptor) }
+        try #require(serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0)
+        defer { _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN) }
+
+        let refusal = ownerRefusal {
+            _ = try Coordinator.replacementWitness(
+                outgoing: nil,
+                probe: { _ in
+                    Issue.record("an unpublished owner has no execution to probe")
+                    throw POSIXError(.EINVAL)
+                },
+                stateSingletonUnlocked: {
+                    try Coordinator.stateSingletonIsUnlocked(at: root)
+                }
+            )
+        }
+        #expect(refusal == .occupiedStateSingleton)
+    }
+}
+
+/// The app a live daemon was started from was deleted, moved, or replaced
+/// out of band. The daemon cannot be authenticated, so it is refused rather
+/// than stopped.
+@Test func liveOwnerDecisionRefusesADeletedOrReplacedOwnerApp() throws {
+    try withOwnerFixtureDirectory { root in
+        let configuration = try ownerTestConfiguration()
+
+        let deleted = root.appendingPathComponent("Deleted.app", isDirectory: true)
+        #expect(ownerRefusal {
+            _ = try Coordinator.ownerApp(at: deleted, expected: configuration)
+        } == .ownerAppMissing(app: deleted.path))
+
+        // A bundle that is present but no longer carries a valid signature
+        // for the release the daemon runs.
+        let replaced = root.appendingPathComponent("Replaced.app", isDirectory: true)
+        _ = try makeOwnerBundle(at: replaced, identifier: "dev.portablefs.oss.KitDev")
+        #expect(ownerRefusal {
+            _ = try Coordinator.ownerApp(at: replaced, expected: configuration)
+        } == .ownerAppReplaced(app: replaced.path))
+
+        let overwritten = root.appendingPathComponent("Overwritten.app", isDirectory: false)
+        #expect(FileManager.default.createFile(atPath: overwritten.path, contents: Data("x".utf8)))
+        #expect(ownerRefusal {
+            _ = try Coordinator.ownerApp(at: overwritten, expected: configuration)
+        } == .ownerAppReplaced(app: overwritten.path))
+    }
+}
+
+/// Whatever serves the endpoint without being the daemon nested in a
+/// PortableFS app is a foreign owner. Here the test process itself listens
+/// on the endpoint, so its real kernel-reported executable is classified.
+@Test func liveOwnerDecisionRefusesAForeignSocketOwner() throws {
+    try withOwnerFixtureDirectory { root in
+        let configuration = try ownerTestConfiguration()
+        let socket = root.appendingPathComponent("control.sock")
+        let listener = try PfsUnixSocket.bindAndListen(path: socket.path)
+        defer { PfsUnixSocket.close(listener) }
+
+        let refusal = ownerRefusal {
+            _ = try Coordinator.inspectLiveServiceOwner(
+                controlSocket: socket,
+                configuration: configuration
+            )
+        }
+        #expect(refusal == .foreignProcess(
+            socket: socket.path,
+            executable: try ownProcessExecutablePath()
+        ))
+    }
+}
+
+/// A socket that exists but has no listener cannot be attributed to any
+/// owner. It is refused, not treated as an absent daemon.
+@Test func liveOwnerDecisionRefusesAnEndpointWithoutAListener() throws {
+    try withOwnerFixtureDirectory { root in
+        let socket = root.appendingPathComponent("control.sock")
+        PfsUnixSocket.close(try PfsUnixSocket.bindAndListen(path: socket.path))
+
+        let refusal = ownerRefusal {
+            _ = try Coordinator.inspectLiveServiceOwner(
+                controlSocket: socket,
+                configuration: try ownerTestConfiguration()
+            )
+        }
+        #expect(refusal == .unreachableEndpoint(socket: socket.path, errno: ECONNREFUSED))
+    }
+}
+
+/// Each refusal states what happened and the sanctioned recovery. None of
+/// them asks the app to stop the owner it could not authenticate.
+@Test func unauthenticatedOwnerDiagnosesStateTheCauseAndTheSanctionedRecovery() {
+    let socket = "/Users/example/.local/state/portablefs/portablefsd/control.sock"
+    let app = "/Applications/PortableFS.app"
+    let cases: [(Coordinator.UnauthenticatedServiceOwner, [String])] = [
+        (.unreachableEndpoint(socket: socket, errno: ECONNREFUSED),
+         [socket, "Connection refused", "Reopen PortableFS", "log out"]),
+        (.occupiedStateSingleton,
+         ["state lock", "starting or stopping", "installer finish", "log out"]),
+        (.foreignProcess(socket: socket, executable: "/usr/local/bin/portablefsd"),
+         [socket, "/usr/local/bin/portablefsd", "not the daemon service nested", "Quit that program"]),
+        (.foreignProcess(socket: socket, executable: nil),
+         [socket, "cannot bind", "Quit that program"]),
+        (.foreignService(app: "/Applications/PortableFSKitDev.app"),
+         ["/Applications/PortableFSKitDev.app", "different signed PortableFS product", "Quit that app", "Login Items"]),
+        (.ownerAppMissing(app: app),
+         [app, "deleted or moved", "Unmount", "log out", "installer", "quiesces"]),
+        (.ownerAppMissing(app: nil),
+         ["no longer on disk", "Unmount", "log out", "installer"]),
+        (.ownerAppReplaced(app: app),
+         [app, "modified or replaced", "Unmount", "log out", "installer", "quiesces"]),
+        (.exitedDuringProof,
+         ["exited", "Reopen PortableFS"]),
+    ]
+    for (owner, facts) in cases {
+        let message = Coordinator.RegistrationError
+            .unauthenticatedServiceOwner(owner)
+            .localizedDescription
+        for fact in facts {
+            #expect(message.contains(fact), "\(owner) diagnosis omits \"\(fact)\": \(message)")
+        }
+        if owner != .exitedDuringProof {
+            #expect(message.contains("only a daemon it can authenticate"))
+        }
+    }
+}
