@@ -1,5 +1,6 @@
 import Foundation
 import os
+import Synchronization
 @preconcurrency import Darwin
 
 /// Transport-layer diagnostics. Terminal events are logged at the layer that
@@ -75,6 +76,8 @@ private final class PfsConnection: @unchecked Sendable {
     var traceLabel: String { id.uuidString }
     let socket: PfsAsyncSocket
     let writer: PfsOrderedEnvelopeWriter
+    private let clientName: String
+    private let traceAttachRef = Mutex("")
     var nextOperationID: UInt64 = 1
     /// The per-request reply bound the daemon announced in HelloReply. It is
     /// a property of the peer, not of this process: a compiled-in constant
@@ -83,11 +86,26 @@ private final class PfsConnection: @unchecked Sendable {
     /// handshake deadline bounds.
     var requestDeadlineNanoseconds: UInt64 = 0
 
-    init(socket: PfsAsyncSocket) {
+    init(socket: PfsAsyncSocket, clientName: String) {
         self.socket = socket
+        self.clientName = clientName
         self.writer = PfsOrderedEnvelopeWriter { envelope in
             try await socket.write(envelope)
         }
+    }
+
+    func traceResolve(_ attachRef: String) {
+        traceAttachRef.withLock { $0 = attachRef }
+    }
+
+    /// Dispositions and acknowledgements can outlive the client actor's
+    /// current connection. Keep their daemon join context on that connection.
+    func traceRecord(_ event: PfsTraceRecord.Event, _ fields: KeyValuePairs<String, Any>) -> PfsTraceRecord {
+        PfsTraceRecord(event, connection: traceLabel, fields, context: [
+            .init(key: "frontend_pid", value: String(getpid())),
+            .init(key: "attach_ref", value: traceAttachRef.withLock { $0 }),
+            .init(key: "conn_role", value: clientName),
+        ])
     }
 }
 
@@ -921,6 +939,7 @@ public actor PfsLocalClient {
         }
         var request = PfsResolveRequest()
         request.attachRef = attachRef
+        connection?.traceResolve(attachRef)
         let envelope = try await sendRequestOnCurrentConnection(.resolve(request))
         guard case let .resolveReply(reply)? = envelope.body else {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
@@ -1052,7 +1071,7 @@ public actor PfsLocalClient {
     private func establishConnectionOnce() async throws {
         let path = try await socketPathProvider()
         let socket = try await PfsAsyncSocket.connect(path: path, maxFrameLength: configuration.maxFrameLength)
-        let newConnection = PfsConnection(socket: socket)
+        let newConnection = PfsConnection(socket: socket, clientName: configuration.clientName)
         connection = newConnection
         startReader(for: newConnection)
 
@@ -1082,7 +1101,7 @@ public actor PfsLocalClient {
     }
 
     private func receive(_ envelope: PfsEnvelope, from connectionID: UUID) {
-        guard connection?.id == connectionID else {
+        guard let connection, connection.id == connectionID else {
             return
         }
 
@@ -1111,7 +1130,7 @@ public actor PfsLocalClient {
             // is provisional and has no possible VolumeCore owner, so retire
             // it explicitly on this same connection instead of silently
             // dropping the frame and leaking capacity.
-            if pfsReplyResourceItemIDs(envelope.body) != nil, let connection {
+            if pfsReplyResourceItemIDs(envelope.body) != nil {
                 let ticket = PfsResourceReplyTicket(
                     connection: connection,
                     targetRequestID: envelope.requestID,
@@ -1129,7 +1148,7 @@ public actor PfsLocalClient {
             return
         }
         request.timeoutTask?.cancel()
-        if let itemIDs = pfsReplyResourceItemIDs(envelope.body), let connection {
+        if let itemIDs = pfsReplyResourceItemIDs(envelope.body) {
             request.publicationCollector?.appendResourceReply(
                 connection: connection,
                 targetRequestID: envelope.requestID,
@@ -1140,8 +1159,8 @@ public actor PfsLocalClient {
         trace.emit {
             var errno: Int32 = 0
             if case let .error(error)? = envelope.body { errno = error.errno }
-            return PfsTraceRecord(.replied, connection: connectionID.uuidString, [
-                "request": envelope.requestID,
+            return connection.traceRecord(.replied, [
+                "request_id": envelope.requestID,
                 "errno": errno,
                 "ack": envelope.publicationAckRequired,
             ])
@@ -1259,7 +1278,7 @@ public actor PfsLocalClient {
                     connection.nextOperationID += 1
                     if collector.callbackLabel != 0 {
                         trace.emit {
-                            PfsTraceRecord(.callbackOperation, connection: connection.traceLabel, [
+                            connection.traceRecord(.callbackOperation, [
                                 "callback": collector.callbackLabel,
                                 "operation": binding.id,
                             ])
@@ -1284,8 +1303,8 @@ public actor PfsLocalClient {
         envelope.operationID = operationID
         envelope.body = body
         trace.emit {
-            PfsTraceRecord(.dispatched, connection: connection.traceLabel, [
-                "request": requestID,
+            connection.traceRecord(.dispatched, [
+                "request_id": requestID,
                 "operation": operationID,
                 "callback": collector?.callbackLabel ?? 0,
                 "kind": pfsRequestKind(body),
@@ -1369,8 +1388,8 @@ public actor PfsLocalClient {
             disposition.acceptHandles = ticket.acceptHandles
             disposition.acceptedItemCount = ticket.acceptedItemCount
             trace.emit {
-                PfsTraceRecord(.disposition, connection: ticket.connection.traceLabel, [
-                    "request": ticket.targetRequestID,
+                ticket.connection.traceRecord(.disposition, [
+                    "request_id": ticket.targetRequestID,
                     "handles": ticket.acceptHandles,
                     "items": "\(ticket.acceptedItemCount)/\(ticket.itemCount)",
                 ])
@@ -1418,7 +1437,8 @@ public actor PfsLocalClient {
                 try? await receipt.wait()
             }
             trace.emit {
-                PfsTraceRecord(.publicationAck, connection: ticket.connection.traceLabel, [
+                ticket.connection.traceRecord(.publicationAck, [
+                    "request_id": 0,
                     "operation": ticket.operationID,
                     "published": ticket.semanticCommit == .published,
                 ])

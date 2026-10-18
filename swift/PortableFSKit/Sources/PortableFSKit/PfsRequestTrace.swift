@@ -8,10 +8,10 @@ import Synchronization
 /// their replies, ownership dispositions and publication verdicts, and its
 /// OPEN decisions by explicit labels, never by timing or thread:
 ///
-/// - Every record names its connection by an opaque label, the connection's
-///   UUID. Request IDs restart at 1 in every client and operation IDs at 1 on
-///   every connection, so when several volumes share one extension process
-///   only (connection, request) and (connection, operation) pairs are unique.
+/// - Request-bearing records join the daemon trace by frontend_pid,
+///   attach_ref, conn_role (the exact Hello client_name), and request_id.
+///   The connection UUID is a Swift-local label for callback/operation joins;
+///   it is never a cross-process join key.
 /// - Every FSKit callback carries a process-unique callback label. Its
 ///   requests and OPEN decisions repeat that label, and the operation it binds
 ///   is announced exactly once by a CallbackOperation record.
@@ -39,10 +39,15 @@ struct PfsTraceRecord: Sendable, Equatable {
     let connection: String
     let fields: [Field]
 
-    init(_ event: Event, connection: String, _ fields: KeyValuePairs<String, Any>) {
+    init(
+        _ event: Event,
+        connection: String,
+        _ fields: KeyValuePairs<String, Any>,
+        context: [Field] = []
+    ) {
         self.event = event
         self.connection = connection
-        self.fields = fields.map { Field(key: $0.key, value: String(describing: $0.value)) }
+        self.fields = context + fields.map { Field(key: $0.key, value: String(describing: $0.value)) }
     }
 
     func value(_ key: String) -> String? {

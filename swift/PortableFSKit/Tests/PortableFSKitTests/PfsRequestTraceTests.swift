@@ -99,18 +99,21 @@ extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func requestTraceJoinsCallbacksAcrossConcurrentSessionsWithOverlappingIDs() async throws {
     let log = TraceLog()
-    var configuration = PfsLocalClient.Configuration()
+    var configuration = PfsLocalClient.Configuration(clientName: "portablefskit-trace-test")
     configuration.traceObserver = { log.append($0) }
-    let daemons = try (0..<2).map { _ in try PfsLocalMockDaemon() }
+    let refs = ["trace-a", "trace-b"]
+    let daemons = try refs.map { ref in
+        try PfsLocalMockDaemon(configuration: .init(attachRef: ref))
+    }
     defer { for daemon in daemons { daemon.stop() } }
     var volumes: [PortableFSVolume] = []
-    for daemon in daemons {
+    for (daemon, ref) in zip(daemons, refs) {
         let core = try await VolumeCore.connect(
             socketPath: daemon.socketPath,
-            attachRef: "mock",
+            attachRef: ref,
             configuration: configuration
         )
-        volumes.append(try await PortableFSVolume.make(core: core, attachRef: "mock"))
+        volumes.append(try await PortableFSVolume.make(core: core, attachRef: ref))
     }
     let getattrs = 4
     let callbacksPerVolume = 2 + getattrs
@@ -145,12 +148,38 @@ extension PfsLocalMockDaemonTests {
 
     // The bare numbers collide across sessions, so only labels can join them.
     let dispatched = of(.dispatched)
+    // The daemon join is explicit and uses the exact Hello client_name.
+    // Hello precedes Resolve and therefore has no attach_ref yet. Resolve
+    // itself and every subsequent request carry the requested attachment.
+    let requestRecords = dispatched + of(.replied) + of(.disposition) + of(.publicationAck)
+    for record in requestRecords {
+        #expect(record.value("frontend_pid") == String(getpid()))
+        #expect(record.value("conn_role") == configuration.clientName)
+        #expect(record.value("request_id") != nil)
+        if record.value("attach_ref") == "" {
+            let hello = dispatched.first {
+                $0.connection == record.connection && $0.value("kind") == "hello"
+            }
+            #expect(record.value("request_id") == hello?.value("request_id"))
+        } else {
+            #expect(refs.contains(record.value("attach_ref") ?? ""))
+        }
+    }
+    let resolved = dispatched.filter { $0.value("kind") == "resolve" }
+    #expect(Set(resolved.compactMap { $0.value("attach_ref") }) == Set(refs))
+    // Ignore the pre-Resolve handshake when checking the cross-process key.
+    let daemonKeys = dispatched.filter { $0.value("attach_ref") != "" }.map { record in
+        ["frontend_pid", "attach_ref", "conn_role", "request_id"].map { key in
+            record.value(key) ?? ""
+        }.joined(separator: "/")
+    }
+    #expect(Set(daemonKeys).count == daemonKeys.count)
     func numbers(_ records: [PfsTraceRecord], _ key: String, on connection: String) -> Set<String> {
         Set(records.filter { $0.connection == connection }.compactMap { $0.value(key) })
     }
     let labels = Array(connections)
-    #expect(!numbers(dispatched, "request", on: labels[0])
-        .intersection(numbers(dispatched, "request", on: labels[1])).isEmpty)
+    #expect(!numbers(dispatched, "request_id", on: labels[0])
+        .intersection(numbers(dispatched, "request_id", on: labels[1])).isEmpty)
     #expect(!numbers(of(.callbackOperation), "operation", on: labels[0])
         .intersection(numbers(of(.callbackOperation), "operation", on: labels[1])).isEmpty)
 
@@ -158,11 +187,11 @@ extension PfsLocalMockDaemonTests {
     // join to exactly one of them.
     var requests: [RequestKey: PfsTraceRecord] = [:]
     for record in dispatched {
-        let key = RequestKey(connection: record.connection, id: record.value("request") ?? "")
+        let key = RequestKey(connection: record.connection, id: record.value("request_id") ?? "")
         #expect(requests.updateValue(record, forKey: key) == nil, "duplicate request \(key)")
     }
     for record in of(.replied) + of(.disposition) {
-        let key = RequestKey(connection: record.connection, id: record.value("request") ?? "")
+        let key = RequestKey(connection: record.connection, id: record.value("request_id") ?? "")
         #expect(requests[key] != nil, "unjoined \(record.message)")
     }
 
