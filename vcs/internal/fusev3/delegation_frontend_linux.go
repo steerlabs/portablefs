@@ -208,15 +208,15 @@ func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) erro
 	if offset >= 0 && length > 0 {
 		byteRange = &authoritypb.ByteRange{Offset: uint64(offset), Length: uint64(length)}
 	}
-	budget := n.mount.subscription.config.repairLead
+	budget := n.mount.subscription.config.withdrawalLead
 	if budget <= 0 {
 		budget = time.Second
 	}
-	repairCtx, cancel := context.WithTimeout(ctx, budget)
+	withdrawalCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	deadline := n.mount.subscription.config.clock.Now().Add(budget)
-	if err := n.mount.subscription.retry(repairCtx, deadline, func() error {
-		return r.invalidateCacheCoordinateContext(repairCtx, coordinate, byteRange)
+	if err := n.mount.subscription.retry(withdrawalCtx, deadline, func() error {
+		return r.invalidateCacheCoordinateContext(withdrawalCtx, coordinate, byteRange)
 	}); err != nil {
 		r.markIdentityStale(identity)
 		return err

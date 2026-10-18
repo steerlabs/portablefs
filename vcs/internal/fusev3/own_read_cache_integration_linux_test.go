@@ -111,7 +111,7 @@ func TestReopenNotificationFailureIsInodeLocal(t *testing.T) {
 
 			mount := f.mounts[0]
 			loss := mount.delegations.LossSequence()
-			mount.subscription.config.repairLead = 100 * time.Millisecond
+			mount.subscription.config.withdrawalLead = 100 * time.Millisecond
 			mount.subscription.config.retryDelay = 5 * time.Millisecond
 			original := mount.notifier()
 			failing := &failingOwnCacheNotifier{kernelNotifier: original, persistent: persistent}

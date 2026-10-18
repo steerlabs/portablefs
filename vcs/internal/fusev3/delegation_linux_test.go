@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"google.golang.org/protobuf/proto"
 )
 
 type delegationFakeRPC struct {
 	mu           sync.Mutex
+	waveOrder    sync.Map
 	sequence     uint64
 	mutations    []*authoritypb.Request
 	controls     []*authoritypb.Request
@@ -30,7 +32,34 @@ type delegationFakeRPC struct {
 	omitPostAttr bool
 }
 
-func (f *delegationFakeRPC) SupportsBatchedClose() bool { return true }
+// waveWrite delivers one ordered-wave WRITE through mutate the way the
+// authority's dense-ordinal gate applies it: the replay assignment that takes
+// the ordinal and the application share one lock per delegation, so a
+// successor never applies before its predecessor while disjoint files still
+// overlap.
+func waveWrite(ctx context.Context, order *sync.Map, mutate func(context.Context, *authoritypb.Request) (*authoritypb.Response, error), request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	write := request.GetWrite()
+	if write == nil || write.GetDelegation() == nil || len(write.GetData()) != 0 {
+		return nil, errors.New("ordered wave fake expected a segmented delegated write")
+	}
+	lock, _ := order.LoadOrStore(string(write.GetDelegation().GetId()), new(sync.Mutex))
+	lock.(*sync.Mutex).Lock()
+	defer lock.(*sync.Mutex).Unlock()
+	if assigned != nil {
+		if err := assigned(authorityrpc.MutationIdentity{Sequence: write.GetFlushSequence()}); err != nil {
+			return nil, err
+		}
+	}
+	if write.GetFlushSequence() == 0 {
+		return nil, errors.New("ordered wave write reached the authority without an ordinal")
+	}
+	write.Data = bytes.Join(segments, nil)
+	return mutate(ctx, request)
+}
+
+func (f *delegationFakeRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
 
 func (f *delegationFakeRPC) IOLimits() (uint32, uint32) {
 	if f.maxWrite == 0 {
@@ -66,23 +95,32 @@ type delegationBlockedBarrierRPC struct {
 	once           sync.Once
 }
 
+// delegationLimitedRPC holds its second wave write before the transport
+// lane admits it, the way a saturated flush lane holds a caller, and reports
+// that hold on waiting.
 type delegationLimitedRPC struct {
 	delegationFakeRPC
 	muCalls    sync.Mutex
 	writeCalls int
+	waiting    chan struct{}
 }
 
-func (f *delegationLimitedRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	if request.GetWrite() != nil {
-		f.muCalls.Lock()
-		f.writeCalls++
-		call := f.writeCalls
-		f.muCalls.Unlock()
-		if call == 2 {
-			return nil, errors.New("transient second chunk refusal")
-		}
+func (f *delegationLimitedRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	f.muCalls.Lock()
+	f.writeCalls++
+	call := f.writeCalls
+	f.muCalls.Unlock()
+	if call == 2 {
+		// Never admitted: no replay identity, no ordinal, no dispatch.
+		close(f.waiting)
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
-	return f.delegationFakeRPC.CallMutation(ctx, request)
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
+
+func (f *delegationBlockedBarrierRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
 }
 
 func (f *delegationBlockedBarrierRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -95,6 +133,10 @@ func (f *delegationBlockedBarrierRPC) CallMutation(ctx context.Context, request 
 		}
 	}
 	return f.delegationFakeRPC.CallMutation(ctx, request)
+}
+
+func (f *delegationEpochSyncRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
 }
 
 func (f *delegationEpochSyncRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -119,6 +161,10 @@ func (f *delegationOrderedControlRPC) CallIdempotent(ctx context.Context, reques
 		}
 	}
 	return f.delegationFakeRPC.CallIdempotent(ctx, request)
+}
+
+func (f *delegationPipelineRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
 }
 
 func (f *delegationPipelineRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -300,9 +346,14 @@ func TestDelegationWritebackChunksAndOrdersOneFile(t *testing.T) {
 	}
 }
 
-func TestDelegationWritebackHonorsNegotiatedLimitAndResumesToken(t *testing.T) {
+// A wave splits at the negotiated write bound. When its caller's context ends
+// while a successor waits for the flush lane, the applied predecessor keeps its
+// token and the never-sent writes keep their data: they consumed no ordinal,
+// so the retry resends exactly them with the next dense ordinals instead of
+// discarding the delegation.
+func TestDelegationWaveHonorsNegotiatedLimitAndResendsOnlyUnsentWrites(t *testing.T) {
 	const limit = 64 << 10
-	fake := &delegationLimitedRPC{delegationFakeRPC: delegationFakeRPC{maxWrite: limit}}
+	fake := &delegationLimitedRPC{delegationFakeRPC: delegationFakeRPC{maxWrite: limit}, waiting: make(chan struct{})}
 	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
 	if err != nil {
 		t.Fatal(err)
@@ -313,16 +364,24 @@ func TestDelegationWritebackHonorsNegotiatedLimitAndResumesToken(t *testing.T) {
 	if _, err := m.Write(context.Background(), id, 0, data, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.FlushIdentity(context.Background(), id); err == nil {
-		t.Fatal("first flush unexpectedly survived injected transient failure")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-fake.waiting; cancel() }()
+	if _, err := m.FlushIdentity(ctx, id); !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted wave error = %v, want the caller's cancellation", err)
 	}
+	if !m.Owns(id) || m.LossSequence() != 0 || m.buf.Stats().Bytes != int64(len(data)) {
+		t.Fatalf("an unsent write discarded the delegation: owns=%v loss=%d stats=%+v", m.Owns(id), m.LossSequence(), m.buf.Stats())
+	}
+	// Deliver durability before the retry, independently of the background
+	// worker: its timing must never decide whether the first write is resent.
+	m.DurableSequence(1)
 	if _, err := m.FlushIdentity(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	if len(fake.mutations) != 3 {
-		t.Fatalf("successful chunk mutations=%d, want 3", len(fake.mutations))
+		t.Fatalf("applied wave writes=%d, want 3 (the completed one never resent)", len(fake.mutations))
 	}
 	for i, request := range fake.mutations {
 		write := request.GetWrite()
@@ -331,8 +390,8 @@ func TestDelegationWritebackHonorsNegotiatedLimitAndResumesToken(t *testing.T) {
 		if i == 2 {
 			wantSize = 19
 		}
-		if write.GetPosition() != wantOffset || len(write.GetData()) != wantSize {
-			t.Fatalf("chunk %d=(offset %d, size %d), want (%d, %d)", i, write.GetPosition(), len(write.GetData()), wantOffset, wantSize)
+		if write.GetPosition() != wantOffset || len(write.GetData()) != wantSize || write.GetFlushSequence() != uint64(i+1) {
+			t.Fatalf("write %d=(offset %d, size %d, ordinal %d), want (%d, %d, %d)", i, write.GetPosition(), len(write.GetData()), write.GetFlushSequence(), wantOffset, wantSize, i+1)
 		}
 	}
 }
@@ -936,14 +995,32 @@ func TestDelegationReleaseBatchSortsAndFlushes(t *testing.T) {
 }
 
 func TestDelegationQueueCloseBatchesFinalHandles(t *testing.T) {
-	fake := &delegationFakeRPC{}
+	entered := make(chan *authoritypb.CloseBatchRequest, 2)
+	release := make(chan struct{})
+	fake := &releaseOutcomeRPC{}
+	fake.close = func(batch *authoritypb.CloseBatchRequest) (*authoritypb.Response, error) {
+		entered <- batch
+		<-release
+		return fake.delegationFakeRPC.CallMutation(t.Context(), &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}})
+	}
 	m := newDelegationTestManager(t, fake)
-	idHigh := installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	idLow := installDelegationForTest(t, m, 21, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if _, err := m.Write(context.Background(), idHigh, 0, []byte("high"), false); err != nil {
+	defer close(release)
+	// While the first batch owns the dispatcher, both final handles arrive.
+	// The next batch must drain them together without a collection timer.
+	if err := m.QueueClose(delegationTestIdentity(20), delegationTestToken(20, 2), 0, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Write(context.Background(), idLow, 0, []byte("low"), false); err != nil {
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("available close was not dispatched")
+	}
+	idHigh := installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	idLow := installDelegationForTest(t, m, 21, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), idHigh, 0, []byte("high"), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Write(t.Context(), idLow, 0, []byte("low"), false); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.QueueClose(idHigh, delegationTestToken(22, 2), 17, true); err != nil {
@@ -952,36 +1029,27 @@ func TestDelegationQueueCloseBatchesFinalHandles(t *testing.T) {
 	if err := m.QueueClose(idLow, delegationTestToken(21, 2), 19, false); err != nil {
 		t.Fatal(err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		fake.mu.Lock()
-		var release *authoritypb.DelegationReleaseRequest
-		closes := make([]*authoritypb.CloseRequest, 0, 2)
-		for _, request := range fake.controls {
-			if request.GetDelegationRelease() != nil {
-				release = request.GetDelegationRelease()
-			}
+	release <- struct{}{}
+	var batch *authoritypb.CloseBatchRequest
+	select {
+	case batch = <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued closes did not dispatch when the owner became free")
+	}
+	closes := batch.GetCloses()
+	if len(closes) != 2 || closes[0].GetLockOwner() != 17 || !closes[0].GetFlockUnlock() || closes[1].GetLockOwner() != 19 || closes[1].GetFlockUnlock() {
+		t.Fatalf("close requests = %+v", closes)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	var request *authoritypb.DelegationReleaseRequest
+	for _, control := range fake.controls {
+		if control.GetDelegationRelease() != nil {
+			request = control.GetDelegationRelease()
 		}
-		for _, request := range fake.mutations {
-			if request.GetCloseBatch() != nil {
-				closes = append(closes, request.GetCloseBatch().Closes...)
-			}
-		}
-		fake.mu.Unlock()
-		if release != nil && len(release.GetDelegations()) == 2 && len(closes) == 2 {
-			if bytes.Compare(release.GetDelegations()[0].GetDelegation().GetId(), release.GetDelegations()[1].GetDelegation().GetId()) >= 0 {
-				t.Fatal("queued release batch is not sorted by delegation id")
-			}
-			if closes[0].GetLockOwner() != 17 || !closes[0].GetFlockUnlock() || closes[1].GetLockOwner() != 19 || closes[1].GetFlockUnlock() {
-				t.Fatalf("close requests = %+v", closes)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("release=%+v closes=%+v", release, closes)
-		}
-		time.Sleep(time.Millisecond)
+	}
+	if request == nil || len(request.GetDelegations()) != 2 || bytes.Compare(request.GetDelegations()[0].GetDelegation().GetId(), request.GetDelegations()[1].GetDelegation().GetId()) >= 0 {
+		t.Fatalf("queued release batch is not sorted: %+v", request)
 	}
 }
 
@@ -989,11 +1057,12 @@ func TestDelegationQueuedCloseIsFencedByEpochChange(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
 	id := installDelegationForTest(t, m, 23, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if err := m.QueueClose(id, delegationTestToken(23, 2), 0, false); err != nil {
-		t.Fatal(err)
-	}
+	m.epoch.RLock()
+	pending := delegationClose{identity: id, handle: delegationTestToken(23, 2), epoch: m.epochSerial}
+	m.epoch.RUnlock()
 	m.EpochChanged("test epoch")
-	time.Sleep(30 * time.Millisecond)
+	m.changePendingCloses(1)
+	m.processCloseBatch([]delegationClose{pending})
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	for _, request := range fake.mutations {
@@ -1618,6 +1687,10 @@ func TestDeferredCloseShutdownJoinsRacingEnqueues(t *testing.T) {
 type delegationRefusalRPC struct {
 	delegationFakeRPC
 	refusal *authoritypb.Response
+}
+
+func (f *delegationRefusalRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
 }
 
 func (f *delegationRefusalRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {

@@ -14,7 +14,7 @@ import (
 )
 
 func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(81, authoritypb.Attr_REGULAR, 181)
 	item.Attr.Mode = 0o640
 	handleToken := testToken(281)
@@ -78,7 +78,7 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 
 func TestSharedTmpfileRejectsNoncanonicalNameAndReadOnlyOpen(t *testing.T) {
 	t.Run("name", func(t *testing.T) {
-		fixture := newStrictFixture(t)
+		fixture := newStockFixture(t)
 		fixture.rpc.mu.Lock()
 		baseline := fixture.rpc.calls
 		fixture.rpc.mu.Unlock()
@@ -98,7 +98,7 @@ func TestSharedTmpfileRejectsNoncanonicalNameAndReadOnlyOpen(t *testing.T) {
 	})
 
 	t.Run("read only", func(t *testing.T) {
-		fixture := newStrictFixture(t)
+		fixture := newStockFixture(t)
 		fixture.rpc.mu.Lock()
 		baseline := fixture.rpc.calls
 		fixture.rpc.mu.Unlock()

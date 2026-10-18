@@ -67,7 +67,7 @@ type Page struct {
 }
 
 type authorityClient interface {
-	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	Close() error
 	// ReleaseBeforeMount is the authenticated detach for an ACTIVE session that
@@ -85,6 +85,7 @@ type Client struct {
 	rpc            authorityClient
 	requestTimeout time.Duration
 	maxRead        uint32
+	ctx            context.Context
 	stop           context.CancelFunc
 	done           chan struct{}
 	fatalMu        sync.Mutex
@@ -105,8 +106,9 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("readonlyfs: client identity: %w", err)
 	}
-	// This peer owns no kernel cache and joins no mutation withdrawal barrier.
-	// The authority breaks active delegations before answering its reads.
+	// This peer owns no kernel cache and joins no mutation withdrawal: the
+	// cacheless profile has no subscription. The authority breaks active Linux
+	// write delegations before answering its reads, so every read is current.
 	rpc, _, err := mountv3.AttachWithRoutes(ctx, authorityrpc.ClientConfig{
 		AccessToken:        append([]byte(nil), config.Capability...),
 		Address:            config.Address,
@@ -145,7 +147,7 @@ func newClient(rpc authorityClient, timeout time.Duration) *Client {
 	}
 	maxRead, _ := rpc.IOLimits()
 	keepaliveContext, stop := context.WithCancel(context.Background())
-	client := &Client{rpc: rpc, requestTimeout: timeout, maxRead: maxRead, stop: stop, done: make(chan struct{})}
+	client := &Client{rpc: rpc, requestTimeout: timeout, maxRead: maxRead, ctx: keepaliveContext, stop: stop, done: make(chan struct{})}
 	client.workers.Add(1)
 	go func() {
 		defer client.workers.Done()
@@ -167,13 +169,13 @@ func (c *Client) OpenFile(ctx context.Context, pathKey string) (*File, error) {
 	attr, err := attrFromProto(item.GetAttr())
 	if err != nil {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
 		return nil, err
 	}
 	if attr.Kind != KindFile {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
 		return nil, syscall.EISDIR
 	}
@@ -183,20 +185,21 @@ func (c *Client) OpenFile(ctx context.Context, pathKey string) (*File, error) {
 	}}})
 	if err != nil {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
 		return nil, err
 	}
 	handle := response.GetOpen().GetHandle()
 	if len(handle) == 0 {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
-		return nil, errors.New("readonlyfs: authority returned an empty file handle")
+		err := errors.New("readonlyfs: authority returned an empty file handle")
+		c.fail(err)
+		return nil, err
 	}
 	if owned {
-		if err := c.reclaim(ctx, item.GetToken()); err != nil {
-			_ = c.closeHandle(ctx, handle)
+		if err := c.reclaim(item.GetToken()); err != nil {
 			return nil, err
 		}
 	}
@@ -218,12 +221,15 @@ func (c *Client) List(ctx context.Context, pathKey string, limit int, cursor *Cu
 	}
 	entries, eof, err := cursor.read(ctx, limit)
 	if err != nil {
-		_ = cursor.Close(context.Background())
+		if closeErr := cursor.Close(ctx); closeErr != nil {
+			c.fail(closeErr)
+		}
 		return Page{}, err
 	}
 	page := Page{Directory: cursor.directory, Entries: entries}
 	if eof {
 		if err := cursor.Close(ctx); err != nil {
+			c.fail(err)
 			return Page{}, err
 		}
 	} else {
@@ -240,13 +246,13 @@ func (c *Client) openDirectory(ctx context.Context, pathKey string) (*Cursor, er
 	attr, err := attrFromProto(item.GetAttr())
 	if err != nil {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
 		return nil, err
 	}
 	if attr.Kind != KindDirectory {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
 		return nil, syscall.ENOTDIR
 	}
@@ -256,20 +262,21 @@ func (c *Client) openDirectory(ctx context.Context, pathKey string) (*Cursor, er
 	}}})
 	if err != nil {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
 		return nil, err
 	}
 	handle := response.GetOpen().GetHandle()
 	if len(handle) == 0 {
 		if owned {
-			_ = c.reclaim(ctx, item.GetToken())
+			_ = c.reclaim(item.GetToken())
 		}
-		return nil, errors.New("readonlyfs: authority returned an empty directory handle")
+		err := errors.New("readonlyfs: authority returned an empty directory handle")
+		c.fail(err)
+		return nil, err
 	}
 	if owned {
-		if err := c.reclaim(ctx, item.GetToken()); err != nil {
-			_ = c.closeHandle(ctx, handle)
+		if err := c.reclaim(item.GetToken()); err != nil {
 			return nil, err
 		}
 	}
@@ -293,20 +300,22 @@ func (c *Client) resolve(ctx context.Context, pathKey string) (*authoritypb.Item
 		}}})
 		if lookupErr != nil {
 			if owned {
-				_ = c.reclaim(ctx, current.GetToken())
+				_ = c.reclaim(current.GetToken())
 			}
 			return nil, false, lookupErr
 		}
 		next := response.GetLookup().GetItem()
 		if next == nil || next.GetAttr() == nil || len(next.GetToken()) == 0 {
 			if owned {
-				_ = c.reclaim(ctx, current.GetToken())
+				_ = c.reclaim(current.GetToken())
 			}
-			return nil, false, errors.New("readonlyfs: authority returned a malformed lookup")
+			err := errors.New("readonlyfs: authority returned a malformed lookup")
+			c.fail(err)
+			return nil, false, err
 		}
 		if owned {
-			if err := c.reclaim(ctx, current.GetToken()); err != nil {
-				_ = c.reclaim(ctx, next.GetToken())
+			if err := c.reclaim(current.GetToken()); err != nil {
+				_ = c.reclaim(next.GetToken())
 				return nil, false, err
 			}
 		}
@@ -322,7 +331,20 @@ func (c *Client) mutate(ctx context.Context, request *authoritypb.Request) (*aut
 	}
 	callContext, cancel := c.operationContext(ctx)
 	defer cancel()
-	response, err := c.rpc.CallMutation(callContext, request)
+	assigned := false
+	response, err := c.rpc.CallMutationWithIdentity(callContext, request, func(authorityrpc.MutationIdentity) error {
+		assigned = true
+		return nil
+	})
+	// Before replay assignment a context error proves no dispatch. Afterwards
+	// an unresolved allocation or close must end the session; only the transport
+	// can replay the exact request, and it has already attempted that here.
+	if err != nil && (assigned || !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+		c.fail(err)
+	} else if err == nil && (response == nil || response.GetUncertain() || response.GetSessionTerminal()) {
+		err = errors.New("readonlyfs: authority mutation outcome is not settled")
+		c.fail(err)
+	}
 	return response, responseError(response, err)
 }
 
@@ -336,13 +358,23 @@ func (c *Client) read(ctx context.Context, request *authoritypb.Request) (*autho
 	return response, responseError(response, err)
 }
 
-func (c *Client) reclaim(ctx context.Context, item []byte) error {
-	_, err := c.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: append([]byte(nil), item...)}}})
+// reclaim returns one item capability as soon as the walk no longer needs it,
+// so a resolution holds at most the current and next capability whatever the
+// path depth. Each step has a distinct token, which keeps the one-entry
+// repeated list trivially duplicate-free.
+func (c *Client) reclaim(item []byte) error {
+	_, err := c.mutate(c.ctx, &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{append([]byte(nil), item...)}}}})
+	if err != nil {
+		c.fail(fmt.Errorf("readonlyfs: reclaim owned item: %w", err))
+	}
 	return err
 }
 
-func (c *Client) closeHandle(ctx context.Context, handle []byte) error {
-	_, err := c.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: append([]byte(nil), handle...)}}})
+// Cleanup belongs to the session after allocation, even if the foreground
+// request was canceled. mutate bounds it by requestTimeout and session shutdown.
+// A definite pre-dispatch failure leaves a description with its caller to retry.
+func (c *Client) closeHandle(handle []byte) error {
+	_, err := c.mutate(c.ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: append([]byte(nil), handle...)}}})
 	return err
 }
 
@@ -381,9 +413,9 @@ func (c *Client) keepalive(ctx context.Context) {
 	}
 }
 
-// A files reader keeps no kernel or userspace namespace cache. Protocol 5 has
-// one coherent session model, so this cacheless participant still joins the
-// visibility stream and acknowledges each phase only after it has observed it.
+// fail records the first terminal session cause. A files reader keeps no
+// kernel or userspace namespace cache, so ending the session is the whole
+// failure response; later calls report the recorded cause.
 func (c *Client) fail(err error) {
 	c.fatalMu.Lock()
 	if c.fatal == nil {
@@ -429,10 +461,11 @@ func (c *Client) Close() error {
 }
 
 type File struct {
-	client    *Client
-	attr      Attr
-	handle    []byte
-	closeOnce sync.Once
+	client  *Client
+	attr    Attr
+	handle  []byte
+	closed  bool
+	closeMu sync.Mutex
 }
 
 func (f *File) Attr() Attr { return f.attr }
@@ -468,10 +501,17 @@ func (f *File) ReadAt(ctx context.Context, destination []byte, offset uint64) (i
 	return written, nil
 }
 
-func (f *File) Close(ctx context.Context) error {
-	var closeErr error
-	f.closeOnce.Do(func() { closeErr = f.client.closeHandle(ctx, f.handle) })
-	return closeErr
+func (f *File) Close(_ context.Context) error {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	if f.closed {
+		return nil
+	}
+	if err := f.client.closeHandle(f.handle); err != nil {
+		return err
+	}
+	f.closed = true
+	return nil
 }
 
 type Cursor struct {
@@ -526,14 +566,17 @@ func (cursor *Cursor) read(ctx context.Context, limit int) ([]Entry, bool, error
 	return entries, false, nil
 }
 
-func (cursor *Cursor) Close(ctx context.Context) error {
+func (cursor *Cursor) Close(_ context.Context) error {
 	cursor.mu.Lock()
 	defer cursor.mu.Unlock()
 	if cursor.closed {
 		return nil
 	}
+	if err := cursor.client.closeHandle(cursor.handle); err != nil {
+		return err
+	}
 	cursor.closed = true
-	return cursor.client.closeHandle(ctx, cursor.handle)
+	return nil
 }
 
 func responseError(response *authoritypb.Response, err error) error {

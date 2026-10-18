@@ -15,7 +15,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const integrationWriteFragmentBytes = 1 << 20
+// integrationMaxWriteBytes is the fixture authority's write bound. A syscall
+// larger than it must still apply as one positioned write through the mount.
+const integrationMaxWriteBytes = 1 << 20
 
 func deterministicIntegrationData(size, seed int) []byte {
 	data := make([]byte, size)
@@ -53,9 +55,9 @@ func requireFallocate(t *testing.T, file *os.File, mode uint32, offset, length i
 // the only honest reference for what the mount must answer is what the local
 // filesystem underneath it answers to the identical call.
 //
-// The control runs against the write-staging root, which is ordinary backing
-// storage the volume never publishes, so it is not a mutation behind the
-// authority's back.
+// The control runs against the fixture's control root, which is ordinary
+// backing storage the volume never publishes, so it is not a mutation behind
+// the authority's back.
 func kernelPermitsEmptyPathLink(t *testing.T, backingDirectory string) bool {
 	t.Helper()
 	control, err := unix.Open(backingDirectory, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
@@ -94,9 +96,9 @@ func requireExactFile(t *testing.T, path string, want []byte, operation string) 
 	}
 }
 
-func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
+func TestKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	const payloadSize = 2*integrationWriteFragmentBytes + 12345
+	const payloadSize = 2*integrationMaxWriteBytes + 12345
 
 	t.Run("positioned", func(t *testing.T) {
 		const offset = 4093
@@ -105,7 +107,7 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 		mustWrite(t, path, initial, 0o600)
 		file := mustOpenFile(t, path, os.O_RDWR, 0)
 		payload := deterministicIntegrationData(payloadSize, 17)
-		requireSyscallWrite(t, "one positioned write larger than a transaction fragment", func() (int, error) {
+		requireSyscallWrite(t, "one positioned write larger than the authority write bound", func() (int, error) {
 			return unix.Pwrite(int(file.Fd()), payload, offset)
 		}, len(payload))
 
@@ -120,7 +122,7 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 		mustWrite(t, path, prefix, 0o600)
 		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
 		payload := deterministicIntegrationData(payloadSize, 31)
-		requireSyscallWrite(t, "one O_APPEND write larger than a transaction fragment", func() (int, error) {
+		requireSyscallWrite(t, "one O_APPEND write larger than the authority write bound", func() (int, error) {
 			return unix.Write(int(file.Fd()), payload)
 		}, len(payload))
 		want := append(append([]byte(nil), prefix...), payload...)
@@ -203,15 +205,15 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	})
 }
 
-func TestStrictKernelSharedFallocateMutations(t *testing.T) {
+func TestKernelSharedFallocateMutations(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	var filesystem unix.Statfs_t
 	if err := unix.Statfs(f.mountPath(0), &filesystem); err != nil {
-		t.Fatalf("statfs strict mount: %v", err)
+		t.Fatalf("statfs mount: %v", err)
 	}
 	block := int(filesystem.Bsize)
 	if block <= 0 {
-		t.Fatalf("strict mount reported invalid filesystem block size %d", block)
+		t.Fatalf("mount reported invalid filesystem block size %d", block)
 	}
 
 	newFile := func(t *testing.T, name string, blocks int) (*os.File, []byte) {
@@ -278,7 +280,7 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 				err = unix.Fallocate(int(file.Fd()), test.mode, int64(2*block), int64(block))
 			})
 			if !errors.Is(err, syscall.EOPNOTSUPP) {
-				t.Fatalf("fallocate mode %#o through the strict mount = %v, want EOPNOTSUPP from the kernel", test.mode, err)
+				t.Fatalf("fallocate mode %#o through the mount = %v, want EOPNOTSUPP from the kernel", test.mode, err)
 			}
 			if requests != 0 {
 				t.Fatalf("the refused mode %#o still reached the authority %d times", test.mode, requests)
@@ -288,7 +290,7 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 			// The control runs the same mode against the same XFS through a file
 			// the volume never publishes, so nothing here is a mutation behind the
 			// authority's back.
-			controlPath := filepath.Join(f.writeStagingRoot, name+"-control")
+			controlPath := filepath.Join(f.controlRoot, name+"-control")
 			control := mustOpenFile(t, controlPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 			defer func() {
 				_ = control.Close()
@@ -304,7 +306,7 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 	}
 }
 
-func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
+func TestKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Routes: "local/\n"})
 	sourceData := deterministicIntegrationData(3*4096+37, 67)
 	mustWrite(t, f.join(0, "source"), sourceData, 0o600)
@@ -376,7 +378,7 @@ func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
 	}
 }
 
-func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
+func TestKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	linkable, err := unix.Open(f.mountPath(0), unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
 	if err != nil {
@@ -423,7 +425,7 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	requireSyscallWrite(t, "write AT_EMPTY_PATH O_TMPFILE", func() (int, error) {
 		return unix.Write(emptyPath, emptyPathPayload)
 	}, len(emptyPathPayload))
-	permitted := kernelPermitsEmptyPathLink(t, f.writeStagingRoot)
+	permitted := kernelPermitsEmptyPathLink(t, f.controlRoot)
 	err = unix.Linkat(emptyPath, "", unix.AT_FDCWD, f.join(0, "empty-path-tmpfile"), unix.AT_EMPTY_PATH)
 	if permitted {
 		if err != nil {
@@ -458,18 +460,18 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	requireAbsent(t, f.join(1, "must-not-link"), "exclusive O_TMPFILE")
 }
 
-func TestStrictKernelSyncfsSucceeds(t *testing.T) {
+func TestKernelSyncfsSucceeds(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	root, err := unix.Open(f.mountPath(0), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		t.Fatalf("open strict mount root for syncfs: %v", err)
+		t.Fatalf("open mount root for syncfs: %v", err)
 	}
 	defer func() {
 		if err := unix.Close(root); err != nil {
-			t.Errorf("close strict mount root: %v", err)
+			t.Errorf("close mount root: %v", err)
 		}
 	}()
 	if err := unix.Syncfs(root); err != nil {
-		t.Fatalf("syncfs strict mount: %v", err)
+		t.Fatalf("syncfs mount: %v", err)
 	}
 }

@@ -7,17 +7,15 @@ import (
 )
 
 type batch struct {
-	wave                 bool
-	completedLast        *record
-	endOffset            int
-	entries              []Entry
-	next                 int
-	first, last, applied uint64
+	completedLast  *record
+	endOffset      int
+	entries        []Entry
+	first, applied uint64
 }
 
-// batchLocked coalesces only consecutive writes in one generation and cut.
-// Metadata and truncation are ordering barriers. Original acceptance records
-// remain retained: coalescing cannot erase a durability or loss obligation.
+// batchLocked returns the identity's retained wave, or forms the next one at
+// or below cut. A retained wave keeps its immutable tokens until it applies or
+// Drop discards it, so a retry never re-forms different operations.
 func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 	if f.pending != nil {
 		if f.pending.first > cut.Sequence {
@@ -25,53 +23,7 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 		}
 		return f.pending
 	}
-	if b.batcher != nil {
-		return b.waveLocked(f, cut)
-	}
-	r := f.accepted
-	if r == nil || r.seq > cut.Sequence {
-		return nil
-	}
-	last := r
-	lo := r.off
-	hi := lo + int64(len(r.data))
-	if r.kind == Write && len(r.data) <= MaxPayload {
-		for n := r.next; n != nil && n.seq <= cut.Sequence && n.state == Accepted && n.kind == Write && n.generation == r.generation && n.writeOptions == r.writeOptions; n = n.next {
-			end := n.off + int64(len(n.data))
-			a, z := min(lo, n.off), max(hi, end)
-			if n.off > hi || end < lo || z-a > MaxPayload {
-				break
-			}
-			lo, hi, last = a, z, n
-		}
-	}
-	p := &f.batchStorage
-	*p = batch{first: r.seq, last: last.seq, entries: f.entryStorage[:0]}
-	data := r.data
-	if last != r {
-		data = make([]byte, hi-lo)
-		for n := r; ; n = n.next {
-			copy(data[n.off-lo:], n.data)
-			if n == last {
-				break
-			}
-		}
-	}
-	if r.kind == Write {
-		for off := 0; off < len(data); off += MaxPayload {
-			end := min(len(data), off+MaxPayload)
-			b.token++
-			p.entries = append(p.entries, Entry{
-				Token: b.token, First: r.seq, Last: last.seq, Generation: r.generation,
-				Kind: Write, Offset: lo + int64(off), Data: data[off:end], WriteOptions: r.writeOptions,
-			})
-		}
-	} else {
-		b.token++
-		p.entries = append(p.entries, Entry{Token: b.token, First: r.seq, Last: r.seq, Generation: r.generation, Kind: r.kind, Attributes: r.attrs})
-	}
-	f.pending = p
-	return p
+	return b.waveLocked(f, cut)
 }
 
 // FlushIdentity waits for application (not durability) through cut and returns
@@ -132,35 +84,24 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 			b.mu.Unlock()
 			return applied, nil
 		}
-		entry := p.entries[p.next]
-		wave := p.wave
 		floor := max(p.applied, f.lastApplied)
-		var retained [4]Entry
-		entries := retained[:0]
-		if wave {
-			entries = retained[:len(p.entries)]
-			copy(entries, p.entries)
-		}
+		var retained [MaxWaveWidth]Entry
+		entries := retained[:len(p.entries)]
+		copy(entries, p.entries)
 		b.mu.Unlock()
 		seq := floor
-		var err error
-		if wave {
-			var sequences []uint64
-			sequences, err = b.batcher.FlushBatch(ctx, id, entries)
-			if err == nil {
-				if len(sequences) != len(entries) {
-					err = ErrInvalid
-				}
-				for _, next := range sequences {
-					if next == 0 || next < seq {
-						err = ErrInvalid
-						break
-					}
-					seq = next
-				}
+		sequences, err := b.flusher.FlushBatch(ctx, id, entries)
+		if err == nil {
+			if len(sequences) != len(entries) {
+				err = ErrInvalid
 			}
-		} else {
-			seq, err = b.flusher.Flush(ctx, id, entry)
+			for _, next := range sequences {
+				if next == 0 || next < seq {
+					err = ErrInvalid
+					break
+				}
+				seq = next
+			}
 		}
 		b.mu.Lock()
 		if f.pending != p {
@@ -174,7 +115,7 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		}
 		if err != nil {
 			b.mu.Unlock()
-			return applied, fmt.Errorf("flush %x token %d: %w", id, entry.Token, err)
+			return applied, fmt.Errorf("flush %x token %d: %w", id, entries[0].Token, err)
 		}
 		if seq == 0 || seq < p.applied || seq < f.lastApplied {
 			b.mu.Unlock()
@@ -183,33 +124,26 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		f.lastApplied = seq
 		p.applied = max(p.applied, seq)
 		applied = max(applied, seq)
-		p.next++
-		if p.wave {
-			p.next = len(p.entries)
+		// A write split across waves stays accepted until the wave carrying
+		// its final byte applies; completedLast is the last whole record.
+		var last uint64
+		if p.completedLast != nil {
+			last = p.completedLast.seq
 		}
-		if p.next == len(p.entries) {
-			last := p.last
-			if p.wave {
-				last = 0
-				if p.completedLast != nil {
-					last = p.completedLast.seq
-				}
-				f.flushOffset = p.endOffset
+		f.flushOffset = p.endOffset
+		for r := f.accepted; r != nil && r.seq <= last; r = r.next {
+			if r.seq >= p.first {
+				r.applied = p.applied
+				r.state = Applied
+				b.appliedHeap.push(r)
+				f.accepted = r.next
 			}
-			for r := f.accepted; r != nil && r.seq <= last; r = r.next {
-				if r.seq >= p.first {
-					r.applied = p.applied
-					r.state = Applied
-					b.appliedHeap.push(r)
-					f.accepted = r.next
-				}
-			}
-			f.pending = nil
-			*p = batch{}
-			clear(f.entryStorage[:])
-			b.advanceLocked()
-			b.signal()
 		}
+		f.pending = nil
+		*p = batch{}
+		clear(f.entryStorage[:])
+		b.advanceLocked()
+		b.signal()
 		b.mu.Unlock()
 	}
 }

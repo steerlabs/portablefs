@@ -96,8 +96,8 @@ type sourceNamespaceSpec struct {
 	data       bool
 }
 
-// sourcePublicationGate is daemon-local admission state. Protocol 6 derives
-// authority coordinates from the mutation itself; this footprint is never
+// sourcePublicationGate is daemon-local admission state. The authority derives
+// its own coordinates from the mutation itself; this footprint is never
 // serialized and exists only to close/drain this mount's local publications.
 type sourcePublicationGate struct {
 	items []sourceItemSpec
@@ -281,7 +281,7 @@ func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoor
 
 func (r *rawFileSystem) leaseRecallHeldLocked(coordinates map[publicationCoordinate]struct{}) bool {
 	for coordinate := range coordinates {
-		if r.repairingCoordinates[coordinate] {
+		if r.withdrawingCoordinates[coordinate] {
 			return true
 		}
 	}
@@ -304,7 +304,7 @@ func addBoundCoordinates(coordinates map[publicationCoordinate]struct{}, identit
 // guarantee. Once this mount's absence reply has physically reached the kernel,
 // a source mutation for the same name may complete the outer scope which owns
 // its deferred receipt. Foreign or not-yet-written replies stay ordered behind
-// the gate so a racing repair cannot expire an entry before it is installed.
+// the gate so a racing withdrawal cannot expire an entry before it is installed.
 func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negativeNamePublication, owner *sourcePublicationLease) bool {
 	if publication == nil || owner == nil || publication.owner != owner.r || publication.reply == nil {
 		return false
@@ -541,7 +541,7 @@ func (l *sourcePublicationLease) markDefiniteNoChange() error {
 // must never reach this edge: filesystem phases are peer-only, so the source
 // publication lease and its physically written callback reply are the sole
 // local commit boundary. Reopening early would leave old local state
-// serviceable with no later source repair phase.
+// serviceable with no later withdrawal to take it back.
 func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 	if l == nil {
 		return nil

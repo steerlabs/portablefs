@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
 func TestClientReadsByOpaqueLookupAndReleasesEveryAuthorityHandle(t *testing.T) {
@@ -201,11 +202,10 @@ func testItem(inode uint64, kind authoritypb.Attr_Kind, token []byte, size int64
 	}
 }
 
-// A session that leaves without an authenticated detach stays in the
-// authority's barrier audience. The next peer mutation then waits this
-// session's whole repair budget for a phase nobody will acknowledge, and a
-// further budget of post-fence grace after that -- so the writer pays two
-// budgets for a reader that has already exited. Close must not do that.
+// A session that leaves without an authenticated detach keeps its durable
+// mount membership until the authority retires it, so an authority restart in
+// the meantime cannot prove the prior epoch's mounts are gone. Close must
+// detach exactly once.
 func TestClientDetachesBeforeClosingTheTransport(t *testing.T) {
 	rpc := &fakeAuthority{root: testItem(1, authoritypb.Attr_DIRECTORY, []byte("root"), 0)}
 	client := newClient(rpc, time.Second)
@@ -223,4 +223,14 @@ func TestClientDetachesBeforeClosingTheTransport(t *testing.T) {
 	if released := rpc.releases.Load(); released != 1 {
 		t.Fatalf("a repeated close sent %d detaches, want the first one only", released)
 	}
+}
+
+func (f *fakeAuthority) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
+		return nil, err
+	}
+	return f.CallMutation(ctx, request)
 }

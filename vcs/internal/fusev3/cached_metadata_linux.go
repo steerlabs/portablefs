@@ -44,7 +44,7 @@ func (p *replyPublication) closeOriginalDoneLocked() {
 }
 
 func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoordinate, stamp subscriptionStamp, now time.Time) bool {
-	return len(r.cacheReservations[coordinate]) == 0 && !r.repairingCoordinates[coordinate] && r.sourcePublicationAllowedLocked(coordinate, nil) &&
+	return len(r.cacheReservations[coordinate]) == 0 && !r.withdrawingCoordinates[coordinate] && r.sourcePublicationAllowedLocked(coordinate, nil) &&
 		r.mount.subscription.remainingAfterOwnershipCheck(coordinate, stamp, stamp.version, now) > 0
 }
 

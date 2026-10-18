@@ -397,8 +397,9 @@ type rawFileSystem struct {
 	maxRead        uint32
 	maxWrite       uint32
 
-	// These lifetimes are local policy ceilings. Exact reply-local leases bound
-	// actual validity, and kernel entry validity is always zero.
+	// These lifetimes are local policy ceilings. The subscription stamp each
+	// reply carries bounds actual validity, and kernel entry validity is
+	// always zero.
 	entryTimeout time.Duration
 	attrTimeout  time.Duration
 	nameCapacity int
@@ -449,7 +450,7 @@ type rawFileSystem struct {
 	cachedNegativeStamps map[nameKey]subscriptionStamp
 	// cachedAttrs is the exact set of inode attributes this daemon has allowed
 	// its kernel to retain. It gives attribute candidates the same bounded,
-	// repairable accounting as positive and negative names.
+	// withdrawable accounting as positive and negative names.
 	cachedAttrs        map[publicationIdentity]*inodeRecord
 	cachedAttrPayloads map[publicationIdentity]cachedAttrPayload
 	// cachedData is the exact set of authority inodes whose file data this
@@ -463,12 +464,12 @@ type rawFileSystem struct {
 	// be able to name every inode whose pages must be dropped before a fenced
 	// mount is left running. Entries are added when an OPEN reply publishes
 	// cacheability and removed only by FORGET, because a live open description
-	// can refault at any moment after a repair.
+	// can refault at any moment after a withdrawal.
 	cachedData map[uint64]*inodeRecord
 	// publishingNames and publishingInodes count publications that were already
-	// admitted to the cache and have not finished being written. PREPARE waits
-	// them out so that no entry decided before admission closed can be
-	// installed after COMPLETE has repaired.
+	// admitted to the cache and have not finished being written. A withdrawal
+	// waits them out so that no entry decided before admission closed can be
+	// installed after the withdrawal has finished.
 	publishingNames  map[nameKey]int
 	publishingInodes map[uint64]int
 	pendingNames     int
@@ -494,8 +495,8 @@ type rawFileSystem struct {
 	sourcePublishing        map[publicationCoordinate]int
 	publishingNegativeNames map[publicationCoordinate]map[*negativeNamePublication]struct{}
 	sourceChanged           chan struct{}
-	repairingCoordinates    map[publicationCoordinate]bool
-	repairOwners            map[publicationCoordinate]map[*cacheRepairLease]struct{}
+	withdrawingCoordinates  map[publicationCoordinate]bool
+	withdrawalOwners        map[publicationCoordinate]map[*cacheWithdrawalLease]struct{}
 	cacheReservations       map[publicationCoordinate]map[*cacheInstallReservation]struct{}
 }
 
@@ -514,8 +515,8 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		requestTimeout:   root.requestTimeout,
 		maxRead:          root.maxRead,
 		maxWrite:         root.maxWrite,
-		entryTimeout:     strictEntryTimeout,
-		attrTimeout:      strictAttrTimeout,
+		entryTimeout:     cacheEntryTimeout,
+		attrTimeout:      cacheAttrTimeout,
 		nameCapacity:     mount.nameCapacity,
 		attrCapacity:     mount.nameCapacity,
 		// A declared capacity too small to divide still admits one absence:
@@ -551,8 +552,8 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		sourceHolds:             make(map[publicationCoordinate]*sourcePublicationLease),
 		sourcePublishing:        make(map[publicationCoordinate]int),
 		publishingNegativeNames: make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
-		repairingCoordinates:    make(map[publicationCoordinate]bool),
-		repairOwners:            make(map[publicationCoordinate]map[*cacheRepairLease]struct{}),
+		withdrawingCoordinates:  make(map[publicationCoordinate]bool),
+		withdrawalOwners:        make(map[publicationCoordinate]map[*cacheWithdrawalLease]struct{}),
 		cacheReservations:       make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}
 	for i := range r.cachedReplyArena {
@@ -687,7 +688,7 @@ func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationName
 	}
 	// Publication admission reserved capacity before the reply write. Replace
 	// an earlier binding only after the new reply has physically reached the
-	// kernel, preserving the old repair obligation if that write fails.
+	// kernel, preserving the old withdrawal obligation if that write fails.
 	r.removeCachedNameLocked(key, true)
 	if record.names == nil {
 		record.names = make(map[nameKey]struct{})
@@ -727,7 +728,7 @@ func cacheCandidateVersion(publication *replyPublication) (uint64, uint64) {
 
 func (r *rawFileSystem) reserveCacheCandidateLocked(publication *replyPublication, coordinate publicationCoordinate) (*cacheInstallReservation, bool) {
 	snapshot := cacheCandidateSnapshot(publication)
-	if snapshot == 0 || r.repairingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
+	if snapshot == 0 || r.withdrawingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
 		return nil, false
 	}
 	reservation := &cacheInstallReservation{
@@ -758,7 +759,7 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	// whether or not the binding itself turns out to be cacheable, so the
 	// negative registration is withdrawn here rather than at settle. It has to
 	// be: when the mutation that filled the name is this mount's own, the
-	// authority deliberately delivers this mount no repair phase for it, so
+	// authority deliberately sends this mount no change entry for it, so
 	// this is the only moment at which that absence can be taken back.
 	r.supersedeNegativeNameLocked(key, coordinate)
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
@@ -798,10 +799,10 @@ func (r *rawFileSystem) cachedNameTotalLocked() int {
 
 // admitNegativeNameLocked decides the lifetime one proven absence is published
 // with, and records it when it is cacheable. It is deliberately the same
-// decision as admitNameLocked -- the same PREPARE-time held cut, the same
-// source publication gate, the same declared capacity -- because an absence
-// this kernel serves from cache is exactly as much of a repair obligation as a
-// binding it serves from cache. There is no held-inode check because an absence
+// decision as admitNameLocked -- the same held subscription cut, the same
+// source publication gate, the same name-cache capacity -- because an absence
+// this kernel serves from cache is exactly as much of a withdrawal obligation
+// as a binding it serves from cache. There is no held-inode check because an absence
 // names no inode.
 func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *inodeRecord, name string) (time.Duration, replyNamePublication, bool) {
 	key := nameKey{parent: parent.key.inode, name: name}
@@ -1204,7 +1205,7 @@ func (r *rawFileSystem) abortDirPlusLookupTransaction(ctx context.Context) {
 
 // settleDirPlusLookupTransactionLocked transfers the staged lookup references
 // to the kernel only when a complete successful page reached /dev/fuse. Cache
-// validity is governed separately by the exact reply-local leases; lookup and
+// validity is governed separately by the reply's subscription stamp; lookup and
 // path ownership transfer as soon as the kernel accepts the page.
 func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyPublication, physicalWrite bool) dirPlusLookupCompletion {
 	if publication == nil || publication.dirPlusLookups == nil || publication.dirPlusLookups.settled {
@@ -1297,7 +1298,7 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
 		r.supersedeNegativeNameLocked(key, nameCoordinate)
 		if !r.sourcePublicationAllowedLocked(nameCoordinate, nil) || !r.sourcePublicationAllowedLocked(attrCoordinate, nil) ||
-			r.repairingCoordinates[nameCoordinate] || r.repairingCoordinates[attrCoordinate] {
+			r.withdrawingCoordinates[nameCoordinate] || r.withdrawingCoordinates[attrCoordinate] {
 			admissible = false
 		}
 		if _, exists := r.cachedNames[key]; !exists {
@@ -1854,8 +1855,8 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		// Do not expose originalDone until this post-write withdrawal finishes.
 		// Calling the raw notifier avoids draining our own still-indexed reply.
 		for _, candidate := range pending {
-			ctx, cancel := context.WithTimeout(r.mount.ctx, r.mount.repairBudget)
-			err := r.mount.subscription.retry(ctx, time.Now().Add(r.mount.repairBudget), func() error {
+			ctx, cancel := context.WithTimeout(r.mount.ctx, r.mount.withdrawalTimeout)
+			err := r.mount.subscription.retry(ctx, time.Now().Add(r.mount.withdrawalTimeout), func() error {
 				notify := r.mount.notifier()
 				if notify == nil {
 					return errors.New("fusev3: unlicensed read has no notifier")
@@ -1915,7 +1916,7 @@ func (r *rawFileSystem) Init(server *fuse.Server) {
 	r.mu.Unlock()
 	if !armed {
 		r.mount.revoked.Store(true)
-		r.mount.recordFatalCause(errors.New("fusev3: strict cache publication requires the post-/dev/fuse-reply lifecycle"))
+		r.mount.recordFatalCause(errors.New("fusev3: cache publication requires the post-/dev/fuse-reply lifecycle"))
 		if r.mount.cancel != nil {
 			r.mount.cancel()
 		}
@@ -1930,7 +1931,7 @@ func (r *rawFileSystem) replyLifecycleReady() bool {
 
 // unbindSelf records that this mount's own namespace mutation removed a
 // binding. The VFS drops the dentry from the same operation's reply, so there
-// is nothing left for a later repair to invalidate.
+// is nothing left for a later withdrawal to invalidate.
 func (r *rawFileSystem) unbindSelf(parent uint64, name string) {
 	r.mu.Lock()
 	key := nameKey{parent: parent, name: name}
@@ -2158,8 +2159,8 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 	record.names = nil
 	// FORGET also proves the kernel dropped this inode, and an inode it does
 	// not hold has no page cache. The data registry is released on exactly the
-	// same evidence as the name budget rather than on a repair, because a
-	// repair drops the pages a live open description can immediately refault.
+	// same evidence as the name capacity rather than on a withdrawal, because a
+	// withdrawal drops pages a live open description can immediately refault.
 	if r.cachedData[record.key.inode] == record {
 		delete(r.cachedData, record.key.inode)
 	}
@@ -2287,7 +2288,7 @@ func (r *rawFileSystem) unpin(record *inodeRecord) {
 		// identity index the first time anything opens and closes the mount
 		// directory would leave the mount unable to resolve any coordination
 		// identity rooted there -- silently turning every later namespace
-		// repair into a no-op.
+		// withdrawal into a no-op.
 		if index := r.identityIndexLocked(record); !record.root && record.lookups == 0 && record.pins == 0 && len(record.names) == 0 && index[record.key] == record {
 			delete(index, record.key)
 		}
@@ -2343,7 +2344,7 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 		if negative {
 			stamp = r.cachedNegativeStamps[key]
 		}
-		if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
+		if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.withdrawingCoordinates[coordinate] {
 			r.mu.Unlock()
 			return nil, nil, false
 		}
@@ -2374,11 +2375,11 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 				return false
 			}
 			if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
-				r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
+				r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.withdrawingCoordinates[coordinate] {
 				return false
 			}
 			payload := r.cachedAttrPayloads[record.identity]
-			if payload.attr == nil || r.cachedAttrs[record.identity] != record || r.repairingCoordinates[attrCoord] ||
+			if payload.attr == nil || r.cachedAttrs[record.identity] != record || r.withdrawingCoordinates[attrCoord] ||
 				r.mount.subscription.remainingAfterOwnershipCheck(attrCoord, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
 				return false
 			}
@@ -2429,11 +2430,12 @@ func (r *rawFileSystem) publishRenameBindings(ctx context.Context) {
 // publishPostStateAttrs records the exact applied attributes of every object a
 // mutation's own post-state describes, under the current subscription stamp the
 // authority issued with that reply. It runs after the callback has interned
-// every record it creates and after the source discharge purged the recalled
-// epoch, so the payload it installs is the applied state and nothing else.
+// every record it creates and after the source publication purged the
+// pre-mutation state, so the payload it installs is the applied state and
+// nothing else.
 //
 // Without it the mutating syscall's own follow-up stat -- of the parent
-// directory above all, whose attributes the source discharge just invalidated in
+// directory above all, whose attributes the source publication just invalidated in
 // the kernel -- costs a second authority round trip for state this reply already
 // carried exactly.
 func (r *rawFileSystem) publishPostStateAttrs(ctx context.Context) {
@@ -2507,7 +2509,7 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 				return false
 			}
 			payload := r.cachedAttrPayloads[record.identity]
-			if record.stale.Load() || record.reclaimed || payload.attr == nil || r.cachedAttrs[record.identity] != record || r.repairingCoordinates[coordinate] ||
+			if record.stale.Load() || record.reclaimed || payload.attr == nil || r.cachedAttrs[record.identity] != record || r.withdrawingCoordinates[coordinate] ||
 				r.mount.subscription.remainingAfterOwnershipCheck(coordinate, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
 				return false
 			}
@@ -2559,9 +2561,9 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	}
 	item, errno := parent.node.Lookup(ctx, name)
 	if errno != 0 {
-		// A strict shared ENOENT states a namespace fact which the daemon may
-		// retain under N-R. Other errors describe no
-		// namespace fact and remain ordinary unmarked replies.
+		// A shared ENOENT states a namespace fact which the daemon may retain
+		// under its subscription stamp. Other errors describe no namespace
+		// fact and remain ordinary unmarked replies.
 		if errno == syscall.ENOENT {
 			status, err := r.publishNegativeEntry(ctx, out, parent, name)
 			if err != nil {
@@ -2706,7 +2708,7 @@ func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *f
 // would make that purge wait on the lane it is competing for.
 //
 // It never refuses and never waits. A read that arrives while this mount is
-// repairing the coordinate is admitted and ordered by the authority instead: it
+// withdrawing the coordinate is admitted and ordered by the authority instead: it
 // is answered with the applied bytes, and the purge that follows the recall
 // waits for this reply before invalidating. Refusing here is not available --
 // the kernel holds the folio lock, so the only non-blocking answer is EAGAIN,
@@ -3332,7 +3334,7 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 	if errno == 0 {
 		// The VFS drops the dentry from this operation's own reply, under the
 		// parent's i_rwsem. The binding is gone from the kernel, so this
-		// frontend no longer owes a repair for it; its source-publication gate
+		// frontend no longer owes a withdrawal for it; its source-publication gate
 		// already retains the exact post-VFS boundary for peers.
 		r.unbindSelf(parent.key.inode, name)
 		r.unbindPath(parent, name)
@@ -4085,7 +4087,7 @@ func (m *Mount) scheduleAbort() {
 			m.cancel()
 		}
 		go func() {
-			// A strict mount owes the volume more than a tidy exit: it has
+			// A revoked mount owes the volume more than a tidy exit: it has
 			// published names and attributes that nothing can correct any more,
 			// so it withdraws them and makes itself unreachable before it even
 			// tries an ordinary unmount.
@@ -4115,7 +4117,7 @@ func (m *Mount) scheduleAbort() {
 			}
 			// Close runs the clean-detach absence proof (see Mount.detach). A
 			// proven withdrawal is what makes that proof obtainable, so a
-			// successful escalation discharges the authority's durable strict
+			// successful escalation discharges the authority's durable mount
 			// membership automatically instead of leaving it for an operator.
 			_ = m.Close()
 		}()

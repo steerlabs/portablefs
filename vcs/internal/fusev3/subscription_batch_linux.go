@@ -84,7 +84,7 @@ func (s *subscriptionRegistry) applyChangeBatch(ctx context.Context, incarnation
 }
 
 func (s *subscriptionRegistry) withdrawCoordinates(ctx context.Context, withdrawals []subscriptionWithdrawal) error {
-	deadline := s.config.clock.Now().Add(s.config.repairLead)
+	deadline := s.config.clock.Now().Add(s.config.withdrawalLead)
 	s.mu.RLock()
 	if s.cacheUntil.Before(deadline) {
 		deadline = s.cacheUntil
@@ -94,17 +94,17 @@ func (s *subscriptionRegistry) withdrawCoordinates(ctx context.Context, withdraw
 	if remaining <= 0 {
 		return errSubscriptionExpired
 	}
-	repairCtx, cancel := context.WithTimeout(ctx, remaining)
+	withdrawalCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 	coordinates := make([]publicationCoordinate, len(withdrawals))
 	for i, w := range withdrawals {
 		coordinates[i] = w.coordinate
 	}
-	lease, err := s.config.invalidator.CloseCacheCoordinates(repairCtx, coordinates)
+	lease, err := s.config.invalidator.CloseCacheCoordinates(withdrawalCtx, coordinates)
 	if err != nil {
 		return fmt.Errorf("fusev3: close cache coordinates: %w", err)
 	}
-	if err := s.retry(repairCtx, deadline, func() error { return s.config.invalidator.InvalidateCacheCoordinates(repairCtx, withdrawals) }); err != nil {
+	if err := s.retry(withdrawalCtx, deadline, func() error { return s.config.invalidator.InvalidateCacheCoordinates(withdrawalCtx, withdrawals) }); err != nil {
 		return fmt.Errorf("fusev3: invalidate cache coordinates: %w", err)
 	}
 	lease.Open()

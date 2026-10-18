@@ -27,7 +27,7 @@ type record struct {
 }
 type file struct {
 	batchStorage    batch
-	entryStorage    [4]Entry
+	entryStorage    [MaxWaveWidth]Entry
 	flushOffset     int
 	id              Identity
 	generation      uint64
@@ -56,7 +56,6 @@ type barrierState struct {
 	errno   syscall.Errno
 }
 type Buffer struct {
-	batcher                                 BatchFlusher
 	batchWidth, batchPayload                int
 	maxFlushIdentities                      int
 	waitingAdmissions                       int
@@ -112,14 +111,9 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 		flusher: flusher, interval: opts.FlushInterval,
 		kick: make(chan struct{}, 1), done: make(chan struct{}),
 	}
-	if batcher, ok := flusher.(BatchFlusher); ok {
-		width, payload := batcher.FlushBatchSize()
-		if width < 0 || width > 4 || width > 0 && (payload <= 0 || payload > MaxPayload) {
-			return nil, ErrInvalid
-		}
-		if width > 0 {
-			b.batcher, b.batchWidth, b.batchPayload = batcher, width, payload
-		}
+	b.batchWidth, b.batchPayload = flusher.FlushBatchSize()
+	if b.batchWidth <= 0 || b.batchWidth > MaxWaveWidth || b.batchPayload <= 0 || b.batchPayload > MaxPayload {
+		return nil, ErrInvalid
 	}
 	for i := range b.records {
 		b.records[i].next = b.free

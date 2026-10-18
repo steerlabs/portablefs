@@ -118,7 +118,7 @@ func (r *rawFileSystem) stageCompleteDirectoryAddition(ctx context.Context, pare
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: parent.identity}
-	if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid && r.mount.subscription.remaining(coordinate, proof.stamp, p.servedVersion, time.Now()) > 0 && !r.repairingCoordinates[coordinate] {
+	if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid && r.mount.subscription.remaining(coordinate, proof.stamp, p.servedVersion, time.Now()) > 0 && !r.withdrawingCoordinates[coordinate] {
 		if reservation, ok := r.reserveCacheCandidateLocked(p, coordinate); ok {
 			p.completeDirectories[p.completeDirectoryCount] = completeDirectoryPublication{identity: parent.identity, prior: proof, member: nameKey{parent: parent.key.inode, name: name}, child: child.identity, reservation: reservation}
 			p.completeDirectoryCount++
@@ -139,7 +139,7 @@ func (r *rawFileSystem) stageCompleteDirectoryAddition(ctx context.Context, pare
 func (r *rawFileSystem) settleCompleteDirectoriesLocked(p *replyPublication, successful bool) {
 	for _, candidate := range p.completeDirectories[:p.completeDirectoryCount] {
 		coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: candidate.identity}
-		valid := successful && candidate.reservation != nil && !candidate.reservation.revoked && !r.repairingCoordinates[coordinate] && r.sourcePublicationAllowedLocked(coordinate, p.source) && r.publicationRemaining(p, coordinate) > 0
+		valid := successful && candidate.reservation != nil && !candidate.reservation.revoked && !r.withdrawingCoordinates[coordinate] && r.sourcePublicationAllowedLocked(coordinate, p.source) && r.publicationRemaining(p, coordinate) > 0
 		// The source-owned addition advances the old set to this exact reply
 		// version; its prior generation still excludes every intervening peer cut.
 		if candidate.prior != nil {

@@ -374,7 +374,7 @@ func TestSharedPathsKeepTheirCoherenceWithRoutesConfigured(t *testing.T) {
 	}
 	mustMkdir(t, f.join(0, "src"))
 	mustWrite(t, f.join(0, "src", "main.go"), []byte("package main"), 0o644)
-	// Every one of these is the repaired-before-return guarantee: the mutating
+	// Every one of these is the withdrawn-before-return guarantee: the mutating
 	// syscall on mount 0 has already returned, so mount 1 must not be able to
 	// observe the previous state.
 	requireContent(t, f.join(1, "src", "main.go"), []byte("package main"), "cross-mount content with routes configured")

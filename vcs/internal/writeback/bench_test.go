@@ -21,16 +21,24 @@ type benchmarkFlusher struct {
 	seq    atomic.Uint64
 }
 
-func (f *benchmarkFlusher) Flush(_ context.Context, _ Identity, _ Entry) (uint64, error) {
-	seq := f.seq.Add(1)
-	f.buffer.Load().VisibleSequence(seq)
-	f.buffer.Load().DurableSequence(seq)
-	return seq, nil
+func (*benchmarkFlusher) FlushBatchSize() (int, int) { return MaxWaveWidth, MaxPayload }
+
+func (f *benchmarkFlusher) FlushBatch(_ context.Context, _ Identity, entries []Entry) ([]uint64, error) {
+	sequences := make([]uint64, len(entries))
+	for i := range entries {
+		sequences[i] = f.seq.Add(1)
+	}
+	last := sequences[len(sequences)-1]
+	f.buffer.Load().VisibleSequence(last)
+	f.buffer.Load().DurableSequence(last)
+	return sequences, nil
 }
 
 type idleBenchmarkFlusher struct{}
 
-func (idleBenchmarkFlusher) Flush(context.Context, Identity, Entry) (uint64, error) {
+func (idleBenchmarkFlusher) FlushBatchSize() (int, int) { return MaxWaveWidth, MaxPayload }
+
+func (idleBenchmarkFlusher) FlushBatch(context.Context, Identity, []Entry) ([]uint64, error) {
 	panic("unexpected flush in admission benchmark")
 }
 

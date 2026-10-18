@@ -103,7 +103,7 @@ func (n *fakeNotifier) snapshot() []recordedNotify {
 	return append([]recordedNotify(nil), n.calls...)
 }
 
-type strictFixture struct {
+type stockFixture struct {
 	t      *testing.T
 	raw    *rawFileSystem
 	mount  *Mount
@@ -112,14 +112,13 @@ type strictFixture struct {
 	unique atomic.Uint64
 }
 
-func newStrictFixture(t *testing.T) *strictFixture {
+func newStockFixture(t *testing.T) *stockFixture {
 	t.Helper()
 	rpc := newFakeRPC()
 	rpc.session = testSelfSession
 	cfg := testConfig(8)
-	cfg.Coherence = CoherenceStrict
-	cfg.CachedNameCapacity = 32
-	cfg.RepairBudget = 5 * time.Second
+	cfg.NameCacheCapacity = 32
+	cfg.WithdrawalTimeout = 5 * time.Second
 	mount := newMount(context.Background(), rpc, cfg)
 	t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
 	root := &node{mount: mount, item: testItem(1, authoritypb.Attr_DIRECTORY, 0), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
@@ -129,19 +128,25 @@ func newStrictFixture(t *testing.T) *strictFixture {
 	if err := mount.subscription.subscribe(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	fixture := &strictFixture{t: t, raw: raw, mount: mount, rpc: rpc, notify: notify}
+	fixture := &stockFixture{t: t, raw: raw, mount: mount, rpc: rpc, notify: notify}
 	fixture.unique.Store(2)
 	return fixture
 }
 
-func (f *strictFixture) rawCall(call func(unique uint64) fuse.Status) fuse.Status {
+func (f *stockFixture) rpcCalls() int {
+	f.rpc.mu.Lock()
+	defer f.rpc.mu.Unlock()
+	return f.rpc.calls
+}
+
+func (f *stockFixture) rawCall(call func(unique uint64) fuse.Status) fuse.Status {
 	unique := f.unique.Add(2)
 	status := call(unique)
 	completeTestReply(f.t, f.raw, unique, fuse.OK)
 	return status
 }
 
-func (f *strictFixture) lookup(t *testing.T, parentNode uint64, name string) *fuse.EntryOut {
+func (f *stockFixture) lookup(t *testing.T, parentNode uint64, name string) *fuse.EntryOut {
 	t.Helper()
 	out := &fuse.EntryOut{}
 	status := f.rawCall(func(unique uint64) fuse.Status {
@@ -153,13 +158,13 @@ func (f *strictFixture) lookup(t *testing.T, parentNode uint64, name string) *fu
 	return out
 }
 
-func (f *strictFixture) rename(oldParent, newParent uint64, oldName, newName string, flags uint32) fuse.Status {
+func (f *stockFixture) rename(oldParent, newParent uint64, oldName, newName string, flags uint32) fuse.Status {
 	return f.rawCall(func(unique uint64) fuse.Status {
 		return f.raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{Unique: unique, NodeId: oldParent}, Newdir: newParent, Flags: flags}, oldName, newName)
 	})
 }
 
-func (f *strictFixture) openForData(t *testing.T, node uint64) *fuse.OpenOut {
+func (f *stockFixture) openForData(t *testing.T, node uint64) *fuse.OpenOut {
 	t.Helper()
 	var out *fuse.OpenOut
 	for attempt := 0; attempt < 2; attempt++ {

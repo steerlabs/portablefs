@@ -177,7 +177,7 @@ func TestKernelMountRetainedAbortDistinguishesIdenticalReusedRecord(t *testing.T
 }
 
 func TestMountCloseJoinsWithdrawalBeforeClosingAbortDescriptor(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	a := fakeAbortFile(t)
 	f.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent", filesystem: "fuse.portablefs", source: "portablefs:unit-close", abortFile: a}
 	close(f.mount.kernelConnectionDone)
@@ -229,7 +229,7 @@ func TestKernelMountMissingControlPathCannotProveMatchingMountAbsent(t *testing.
 }
 
 func TestMountCloseReleasesAbortDescriptorOnDetachFailure(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	a := fakeAbortFile(t)
 	f.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent", filesystem: "fuse.portablefs", source: "portablefs:unit-close", abortFile: a}
 	close(f.mount.kernelConnectionDone)

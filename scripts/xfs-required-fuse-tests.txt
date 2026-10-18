@@ -31,16 +31,17 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDu
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestShippingCLIEpochReplacementRequiresFreshRenewedMount
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalHonorsRenewalsWhileControlDeliveryStalls
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach
-github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesDurableMembership
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts
-# Retained real-VFS regression coverage. Historical names remain required;
-# their assertions now exercise protocol 7 subscriptions and delegations.
-github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority
-github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns
-github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns
+# Real-VFS regression coverage of subscription withdrawal before the mutator
+# returns, change acknowledgment under load, daemon name and attribute caches,
+# delegated writes and their ordered flush, and cold READDIRPLUS listings.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMountAnswersRepeatedPathWalksWithoutTheAuthority
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsWithdrawnBeforeTheMutatorsCallReturns
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsWithdrawnBeforeTheWritersCallReturns
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation
-github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestChangeAcknowledgmentSurvivesSaturatedIO
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedMetadataKernelRoundTrip
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedLookupKernelRoundTrip
@@ -70,10 +71,10 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSharedPathsKeepTheirCohe
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority
-# The files gateway is a cacheless peer reader, never a compatibility writer.
-# Keep its real handshake with the real volume handler required: every other
-# readonlyfs test drives a fake, which cannot observe attach negotiation, a real
-# barrier, or whether a cacheless reader can stall a writing mount.
+# The files gateway is a cacheless peer reader, never a writer. Keep its real
+# handshake with the real volume handler required: every other readonlyfs test
+# drives a fake, which cannot observe real attach admission, a real barrier, or
+# whether a cacheless reader can stall a writing mount.
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer
 # The gateway is a sidecar, so it leaves whenever its pod restarts, and
 # leaving used to cost a writing mount its mutation. Keep the test that

@@ -15,7 +15,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-func openV7Writer(t *testing.T, f *strictFixture, node uint64) *fuse.OpenOut {
+func openDelegatedWriter(t *testing.T, f *stockFixture, node uint64) *fuse.OpenOut {
 	t.Helper()
 	out := &fuse.OpenOut{}
 	status := f.rawCall(func(unique uint64) fuse.Status {
@@ -30,7 +30,7 @@ func openV7Writer(t *testing.T, f *strictFixture, node uint64) *fuse.OpenOut {
 	return out
 }
 
-func writeV7(t *testing.T, f *strictFixture, node, handle uint64, offset uint64, data []byte) {
+func writeDelegated(t *testing.T, f *stockFixture, node, handle uint64, offset uint64, data []byte) {
 	t.Helper()
 	status := f.rawCall(func(unique uint64) fuse.Status {
 		count, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: node}, Fh: handle, Offset: offset, Size: uint32(len(data)), Flags: uint32(syscall.O_RDWR)}, data)
@@ -44,11 +44,11 @@ func writeV7(t *testing.T, f *strictFixture, node, handle uint64, offset uint64,
 	}
 }
 
-func TestV7FullWriteHolderReadAndGetattr(t *testing.T) {
-	f := newStrictFixture(t)
+func TestFullWriteHolderReadAndGetattr(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "file")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 4, []byte("new"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 4, []byte("new"))
 	f.rpc.snapshot(func(rpc *fakeRPC) {
 		if len(rpc.writes) != 0 {
 			t.Fatal("FULL admission dispatched an authority write")
@@ -78,13 +78,13 @@ func TestV7FullWriteHolderReadAndGetattr(t *testing.T) {
 	}
 }
 
-func TestV7F4RenameFlushesBeforeMutation(t *testing.T) {
+func TestRenameFlushesBufferedWritesBeforeMutation(t *testing.T) {
 	for _, kind := range []string{"rename", "unlink", "link", "evicted-unlink"} {
 		t.Run(kind, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			entry := f.lookup(t, 1, "before")
-			opened := openV7Writer(t, f, entry.NodeId)
-			writeV7(t, f, entry.NodeId, opened.Fh, 0, []byte("dirty"))
+			opened := openDelegatedWriter(t, f, entry.NodeId)
+			writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("dirty"))
 			if kind == "evicted-unlink" {
 				f.raw.mu.Lock()
 				parent := f.raw.nodesByID[1]
@@ -140,8 +140,8 @@ func TestV7F4RenameFlushesBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestV7RootDirectoryBarrierLossSinceOpen(t *testing.T) {
-	f := newStrictFixture(t)
+func TestRootDirectoryBarrierLossSinceOpen(t *testing.T) {
+	f := newStockFixture(t)
 	root := &fuse.OpenOut{}
 	if status := f.rawCall(func(unique uint64) fuse.Status {
 		return f.raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: 1}}, root)
@@ -149,8 +149,8 @@ func TestV7RootDirectoryBarrierLossSinceOpen(t *testing.T) {
 		t.Fatal(status)
 	}
 	entry := f.lookup(t, 1, "file")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 0, []byte("unrecoverable"))
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("unrecoverable"))
 	if err := f.mount.delegations.DropIdentity(f.rpc.item.GetStableIdentity(), "test forced loss"); err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +177,8 @@ func TestV7RootDirectoryBarrierLossSinceOpen(t *testing.T) {
 	}
 }
 
-func TestV7PeerOpenHonorsAuthorityCacheRefusal(t *testing.T) {
-	f := newStrictFixture(t)
+func TestPeerOpenHonorsAuthorityCacheRefusal(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "delegated")
 	f.rpc.mu.Lock()
 	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -197,15 +197,15 @@ func TestV7PeerOpenHonorsAuthorityCacheRefusal(t *testing.T) {
 	}
 }
 
-func TestV7AcceptedWriteInvalidatesLocalCacheableReadHandle(t *testing.T) {
-	f := newStrictFixture(t)
+func TestAcceptedWriteInvalidatesLocalCacheableReadHandle(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "file")
 	f.openForData(t, entry.NodeId)
-	writer := openV7Writer(t, f, entry.NodeId)
+	writer := openDelegatedWriter(t, f, entry.NodeId)
 	f.notify.mu.Lock()
 	f.notify.calls = nil
 	f.notify.mu.Unlock()
-	writeV7(t, f, entry.NodeId, writer.Fh, 5, []byte("abcd"))
+	writeDelegated(t, f, entry.NodeId, writer.Fh, 5, []byte("abcd"))
 	f.notify.mu.Lock()
 	defer f.notify.mu.Unlock()
 	matched := 0
@@ -219,10 +219,10 @@ func TestV7AcceptedWriteInvalidatesLocalCacheableReadHandle(t *testing.T) {
 	}
 }
 
-func TestV7SetattrUsesCurrentDelegationBase(t *testing.T) {
-	f := newStrictFixture(t)
+func TestSetattrUsesCurrentDelegationBase(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "file")
-	opened := openV7Writer(t, f, entry.NodeId)
+	opened := openDelegatedWriter(t, f, entry.NodeId)
 	f.rpc.mu.Lock()
 	f.rpc.item.Attr.Size = 41
 	f.rpc.mu.Unlock()
@@ -238,13 +238,13 @@ func TestV7SetattrUsesCurrentDelegationBase(t *testing.T) {
 	}
 }
 
-func TestV7BufferedWritePublishesImplicitTimesBeforeFlush(t *testing.T) {
-	f := newStrictFixture(t)
+func TestBufferedWritePublishesImplicitTimesBeforeFlush(t *testing.T) {
+	f := newStockFixture(t)
 	f.rpc.item.Attr.MtimeNs, f.rpc.item.Attr.CtimeNs = 11, 12
 	entry := f.lookup(t, 1, "file")
-	opened := openV7Writer(t, f, entry.NodeId)
+	opened := openDelegatedWriter(t, f, entry.NodeId)
 	before := time.Now().UnixNano()
-	writeV7(t, f, entry.NodeId, opened.Fh, 0, []byte("new"))
+	writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("new"))
 	after := time.Now().UnixNano()
 	out := &fuse.AttrOut{}
 	if status := f.rawCall(func(unique uint64) fuse.Status {
@@ -263,11 +263,11 @@ func TestV7BufferedWritePublishesImplicitTimesBeforeFlush(t *testing.T) {
 	})
 }
 
-func TestV7BufferedWritePreservesKernelFlagsAndLockOwner(t *testing.T) {
-	f := newStrictFixture(t)
+func TestBufferedWritePreservesKernelFlagsAndLockOwner(t *testing.T) {
+	f := newStockFixture(t)
 	f.rpc.item.Attr.Mode = 0o6755
 	entry := f.lookup(t, 1, "file")
-	opened := openV7Writer(t, f, entry.NodeId)
+	opened := openDelegatedWriter(t, f, entry.NodeId)
 	flags := uint32(fuse.WRITE_KILL_SUIDGID | fuse.WRITE_LOCKOWNER)
 	if status := f.rawCall(func(unique uint64) fuse.Status {
 		_, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 3, WriteFlags: flags, LockOwner: 91, Flags: uint32(syscall.O_RDWR)}, []byte("new"))
@@ -291,10 +291,10 @@ func TestV7BufferedWritePreservesKernelFlagsAndLockOwner(t *testing.T) {
 	})
 }
 
-func TestV7FallocateCarriesExactDelegationReference(t *testing.T) {
-	f := newStrictFixture(t)
+func TestFallocateCarriesExactDelegationReference(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "allocated")
-	opened := openV7Writer(t, f, entry.NodeId)
+	opened := openDelegatedWriter(t, f, entry.NodeId)
 	var captured *authoritypb.DelegationRef
 	f.rpc.mu.Lock()
 	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -325,10 +325,10 @@ func TestV7FallocateCarriesExactDelegationReference(t *testing.T) {
 	}
 }
 
-func TestV7CachedMetadataHasZeroValidityRPCsAndAllocations(t *testing.T) {
+func TestCachedMetadataHasZeroValidityRPCsAndAllocations(t *testing.T) {
 	for _, kind := range []string{"lookup", "getattr", "negative"} {
 		t.Run(kind, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			if kind == "negative" {
 				f.rpc.missingNames["cached"] = true
 			}
@@ -372,10 +372,10 @@ func TestV7CachedMetadataHasZeroValidityRPCsAndAllocations(t *testing.T) {
 	}
 }
 
-func TestV7CachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
+func TestCachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
 	for _, kind := range []string{"lookup", "getattr", "negative"} {
 		t.Run(kind, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			if kind == "negative" {
 				f.rpc.missingNames["cached"] = true
 			}
@@ -410,7 +410,7 @@ func TestV7CachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
 			// Observe the withdrawal's locked cut, including its installed receipt.
 			for {
 				f.raw.mu.Lock()
-				waiting := f.raw.repairingCoordinates[coordinate] && publication.originalDone != nil
+				waiting := f.raw.withdrawingCoordinates[coordinate] && publication.originalDone != nil
 				f.raw.mu.Unlock()
 				if waiting {
 					break
@@ -443,8 +443,8 @@ func TestV7CachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
 	}
 }
 
-func TestV7CachedReplyTerminalizationWaitsForPhysicalWrite(t *testing.T) {
-	f := newStrictFixture(t)
+func TestCachedReplyTerminalizationWaitsForPhysicalWrite(t *testing.T) {
+	f := newStockFixture(t)
 	f.lookup(t, 1, "cached")
 	unique := f.unique.Add(2)
 	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
@@ -471,8 +471,8 @@ func TestV7CachedReplyTerminalizationWaitsForPhysicalWrite(t *testing.T) {
 	}
 }
 
-func TestV7RootBootstrapAttributesRequireFreshGetattr(t *testing.T) {
-	f := newStrictFixture(t)
+func TestRootBootstrapAttributesRequireFreshGetattr(t *testing.T) {
+	f := newStockFixture(t)
 	// Activate's root metadata predates the subscription. It is not a cached
 	// attribute fact and must never satisfy the first kernel GETATTR.
 	f.raw.nodesByID[1].node.item.Attr.Mode = 0777

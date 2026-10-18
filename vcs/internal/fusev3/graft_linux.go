@@ -125,12 +125,12 @@ func fillGraftAttr(st *syscall.Stat_t, out *fuse.Attr, uid, gid uint32) {
 // publishGraftEntry hands one machine-local directory entry to the kernel.
 //
 // It deliberately does not pass through publishEntry. The cached-name registry
-// is the exact set of bindings this mount owes the authority a repair for, and
-// a grafted name is not one of them: no authority mutation can ever name it, no
-// visibility target can ever resolve to it, and self-revocation must not spend
-// its bounded budget withdrawing names nothing could have invalidated. Admitting
-// a grafted name there would make the registry an over-estimate, which is the
-// one property the repair path is built on it not being.
+// is the exact set of bindings this mount may have to withdraw, and a grafted
+// name is not one of them: no authority mutation can ever name it, no change
+// entry can ever resolve to it, and self-revocation must not spend its bounded
+// timeout withdrawing names nothing could have invalidated. Admitting a grafted
+// name there would make the registry an over-estimate, which is the one
+// property the withdrawal path is built on it not being.
 func (r *rawFileSystem) publishGraftEntry(out *fuse.EntryOut, record *inodeRecord, st *syscall.Stat_t) {
 	out.NodeId = record.id
 	out.Generation = 1
@@ -307,9 +307,9 @@ func (r *rawFileSystem) rebindRenamed(oldParent *inodeRecord, oldName string, ne
 // internGraft installs one kernel lookup reference for a machine-local object.
 //
 // Machine-local objects are interned in their own table. Nothing else may find
-// them: the visibility machinery resolves coordination identities against the
+// them: subscription withdrawal resolves coordination identities against the
 // authority table, and a graft that appeared there would be a candidate for an
-// invalidation it can never need and a repair it can never owe.
+// invalidation it can never need.
 func (r *rawFileSystem) internGraft(parent *inodeRecord, name string, st *syscall.Stat_t) (*inodeRecord, syscall.Errno) {
 	key := inodeKey{inode: localdirs.LocalIno(st.Ino), kind: graftKind(uint32(st.Mode))}
 	r.mu.Lock()
