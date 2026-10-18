@@ -236,6 +236,25 @@ class ReadinessRoutes(unittest.TestCase):
 
 
 class ContractAgreement(unittest.TestCase):
+    def test_changed_kernel_floor_fails(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+        for before, after in (
+            ("minor > 17", "minor > 18"),
+            ('!strings.Contains(parts[2], "-rc")', "true"),
+        ):
+            with self.subTest(after=after):
+                def read(relative: str) -> str:
+                    text = original(relative)
+                    if relative == "vcs/internal/xfsstore/kernel_linux.go":
+                        self.assertIn(before, text)
+                        text = text.replace(before, after)
+                    return text
+
+                with patch.object(checker, "read", side_effect=read):
+                    with self.assertRaises(checker.CheckFailure):
+                        checker.check_contract_agreement()
+
     def test_independent_protocol_wording_is_valid(self) -> None:
         from unittest.mock import patch
         original = checker.read
@@ -262,6 +281,34 @@ class ContractAgreement(unittest.TestCase):
         with patch.object(checker, "read", side_effect=read):
             with self.assertRaises(checker.CheckFailure):
                 checker.check_contract_agreement()
+
+
+class LifecycleWiring(unittest.TestCase):
+    def test_inventory_uses_the_paired_cli_guard(self) -> None:
+        checker.check_control_lifecycle()
+
+    def test_missing_inventory_handoff_fails(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+        for path, before, after in (
+            ("swift/PortableFSKit/Sources/PortableFSAppCore/ServiceCoordinator.swift",
+             '["lifecycle", "hold-install-exclusive", "--json"]', '["lifecycle", "identity"]'),
+            ("vcs/cmd/portablefs/internal/cli/lifecyclecmd.go",
+             "e.daemonLifecycleInventory(expectedIdentity)", "0, errorUnavailable"),
+            ("vcs/cmd/portablefs/internal/cli/fskitmount.go",
+             "daemonctl.LifecycleInventoryPath", '"/wrong/inventory"'),
+        ):
+            with self.subTest(path=path):
+                def read(relative: str) -> str:
+                    text = original(relative)
+                    if relative == path:
+                        self.assertIn(before, text)
+                        text = text.replace(before, after)
+                    return text
+
+                with patch.object(checker, "read", side_effect=read):
+                    with self.assertRaises(checker.CheckFailure):
+                        checker.check_control_lifecycle()
 
 
 if __name__ == "__main__":

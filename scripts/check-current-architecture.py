@@ -705,8 +705,18 @@ def check_control_lifecycle() -> None:
         read(name) for name in files()
         if name.startswith("swift/PortableFSKit/Sources/PortableFSAppCore/") and name.endswith(".swift")
     )
-    for path in LIFECYCLE_PATHS:
+    for path in (LIFECYCLE_PATHS[0], LIFECYCLE_PATHS[2]):
         require(problems, path in swift, f"the app's service coordinator does not use lifecycle route {path}")
+    # The app delegates inventory to its paired CLI while retaining the
+    # install guard; identity and stop remain direct authenticated requests.
+    require(problems, '["lifecycle", "hold-install-exclusive", "--json"]' in swift
+            and "process.arguments = inventoryGuardArguments(outgoing: outgoing)" in swift,
+            "the app does not invoke its lifecycle inventory guard")
+    cli = read("vcs/cmd/portablefs/internal/cli/lifecyclecmd.go")
+    control = read("vcs/cmd/portablefs/internal/cli/fskitmount.go")
+    require(problems, "e.daemonLifecycleInventory(expectedIdentity)" in cli
+            and "daemonctl.LifecycleInventoryPath" in control,
+            "the CLI inventory guard does not request the shared lifecycle inventory route")
     finish(problems)
 
 
@@ -964,7 +974,10 @@ def check_contract_agreement() -> None:
     require(problems, go_const(fuse, "portableFuseMajor") == str(FUSE_FLOOR[0]) and go_const(fuse, "portableFuseMinor") == str(FUSE_FLOOR[1]),
             f"fusev3 must declare the FUSE {FUSE_FLOOR[0]}.{FUSE_FLOOR[1]} floor")
     kernel = read("vcs/internal/xfsstore/kernel_linux.go")
-    require(problems, f"minor >= {AUTHORITY_KERNEL_FLOOR[1]}" in kernel and f"major == {AUTHORITY_KERNEL_FLOOR[0]}" in kernel,
+    floor_major, floor_minor = AUTHORITY_KERNEL_FLOOR
+    floor = (f'major > {floor_major} || major == {floor_major} && '
+             f'(minor > {floor_minor} || minor == {floor_minor} && !strings.Contains(parts[2], "-rc"))')
+    require(problems, floor in " ".join(kernel.split()),
             f"xfsstore must enforce the Linux {AUTHORITY_KERNEL_FLOOR[0]}.{AUTHORITY_KERNEL_FLOOR[1]} authority floor")
 
     finish(problems)
