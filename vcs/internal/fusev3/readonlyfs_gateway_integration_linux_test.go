@@ -230,13 +230,26 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	// returned observes what that write left.
 	requireGatewayContent(t, ctx, gateway, servedKey, payloads[(rounds-1)%2], "the gateway's read after the mutation loop")
 
-	// A clean authenticated detach leaves no terminal error.
+	// Authenticated detach succeeds, while the disposed client stays terminal
+	// so a supervisor cannot reuse it for a later request.
 	if err := gateway.Close(); err != nil {
 		t.Fatalf("close the gateway session: %v", err)
 	}
 	closed = true
-	if err := gateway.Err(); err != nil {
-		t.Fatalf("the gateway reported a terminal cause across a clean close: %v", err)
+	closedCause := gateway.Err()
+	if closedCause == nil {
+		t.Fatal("closed gateway remains eligible for session reuse")
+	}
+	reopened, err := gateway.OpenFile(ctx, servedKey)
+	if reopened != nil {
+		_ = reopened.Close(ctx)
+		t.Fatal("closed gateway allocated a new file description")
+	}
+	if !errors.Is(err, closedCause) {
+		t.Fatalf("closed gateway reuse = %v, want recorded cause %v", err, closedCause)
+	}
+	if count := peer.ActiveParticipants(); count != 1 {
+		t.Fatalf("clean detach retained %d participants, want only the mount", count)
 	}
 
 	// Departure must leave no outstanding reader obligation.
