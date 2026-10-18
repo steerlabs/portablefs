@@ -178,6 +178,14 @@ REQUIRED_TEST_LISTS = (
     "scripts/xfs-required-tiered-tests.txt",
 )
 
+# The device-level power-cut harness must cover both durability contracts:
+# fsync-gated Linux writes and every acknowledged FSKit mutation.
+POWERLOSS_REQUIRED = {
+    "TestFsyncedWritesSurvivePowerLoss",
+    "TestFSKitAcknowledgedMutationsSurvivePowerLoss",
+}
+MODULE_PREFIX = "github.com/steerlabs/portablefs/"
+
 # Executables whose command lines appear in scripts, docs and the launcher.
 # Every flag those command lines pass must be one the executable defines.
 FLAG_CONSUMERS = {
@@ -837,6 +845,63 @@ def check_required_inventories() -> None:
             f"scripts/xfs-fuse-integration.sh names required lists {sorted(lists_named)}")
     gate = read("scripts/verify-local.sh")
     require(problems, "scripts/check-current-architecture.py" in gate, "scripts/verify-local.sh does not run this check")
+    finish(problems)
+
+
+def shell_array(text: str, name: str) -> List[str]:
+    """Quoted or bare words of a top-level bash array assignment NAME=( ... )."""
+    match = re.search(rf"(?m)^{re.escape(name)}=\(\s*\n(.*?)^\)", text, re.DOTALL)
+    if not match:
+        return []
+    words = []
+    for line in match.group(1).splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            words.append(line.strip('"'))
+    return words
+
+
+def required_list_entries(text: str) -> List[str]:
+    """package:Test entries of a required-test list, without qualifiers."""
+    entries = []
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        entries.append(line.split(" ", 1)[1] if " " in line else line)
+    return entries
+
+
+def defined_tests(directory: str) -> Set[str]:
+    names: Set[str] = set()
+    for name in files():
+        if name.startswith(directory + "/") and name.endswith("_test.go") and "/" not in name[len(directory) + 1:]:
+            names.update(re.findall(r"(?m)^func (Test[A-Za-z0-9_]*)\(t \*testing\.T\)", read(name)))
+    return names
+
+
+@check("required-tests-defined", "every privileged and power-loss required test names a test that exists")
+def check_required_tests_defined() -> None:
+    problems: List[str] = []
+    entries: List[str] = []
+    for listed in REQUIRED_TEST_LISTS:
+        entries.extend(required_list_entries(read(listed)))
+    entries.extend(shell_array(read("scripts/xfs-fuse-integration.sh"), "REQUIRED_ROOT_TESTS"))
+    powerloss = shell_array(read("scripts/run-powerloss.sh"), "REQUIRED_TESTS")
+    require(problems, bool(powerloss), "scripts/run-powerloss.sh declares no REQUIRED_TESTS")
+    missing_contracts = POWERLOSS_REQUIRED - set(powerloss)
+    require(problems, not missing_contracts, f"scripts/run-powerloss.sh does not require {sorted(missing_contracts)}")
+    entries.extend(f"{MODULE_PREFIX}vcs/test/powerloss:{name}" for name in powerloss)
+    cache: Dict[str, Set[str]] = {}
+    for entry in entries:
+        package, _, test = entry.partition(":")
+        if not package.startswith(MODULE_PREFIX) or not test:
+            problems.append(f"required entry {entry!r} is not <module package>:<Test>")
+            continue
+        directory = package[len(MODULE_PREFIX):]
+        if directory not in cache:
+            cache[directory] = defined_tests(directory)
+        parent = test.split("/", 1)[0]
+        require(problems, parent in cache[directory], f"required test {entry} is not defined in {directory}")
     finish(problems)
 
 

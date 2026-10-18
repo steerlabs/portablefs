@@ -165,6 +165,17 @@ class SwiftVersionLiterals(unittest.TestCase):
         self.assertEqual(checker.swift_version_literals("hello.protocolMinor = 16", "protocolMinor"), [16])
 
 
+class RequiredInventories(unittest.TestCase):
+    def test_shell_array(self) -> None:
+        text = 'X=1\nREQUIRED_TESTS=(\n  TestA\n  "pkg:TestB" # why\n\n)\nREQUIRED_TESTS_OTHER=(\n  TestC\n)\n'
+        self.assertEqual(checker.shell_array(text, "REQUIRED_TESTS"), ["TestA", "pkg:TestB"])
+        self.assertEqual(checker.shell_array(text, "ABSENT"), [])
+
+    def test_list_entries_drop_qualifiers_and_comments(self) -> None:
+        text = "# comment\npkg:TestA\nperformance pkg:TestB\npkg:TestC/Sub\n"
+        self.assertEqual(checker.required_list_entries(text), ["pkg:TestA", "pkg:TestB", "pkg:TestC/Sub"])
+
+
 class ReadinessRoutes(unittest.TestCase):
     def test_dispatch_case_and_request_suffix(self) -> None:
         text = 'case "frontend-ready":\n url := "/v2/attaches/" + ref + "/frontend-ready"\n s := "ready"'
