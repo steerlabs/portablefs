@@ -254,10 +254,6 @@ func (c *v3SourcePublicationCoordinator) signalLocked() {
 	c.changed = make(chan struct{})
 }
 
-func v3PublicationCoordinatesOverlap(left, right v3PublicationCoordinate) bool {
-	return left == right
-}
-
 func (c *v3SourcePublicationCoordinator) reserve(operationID v3CallbackID) {
 	if !operationID.valid() {
 		return

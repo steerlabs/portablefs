@@ -1553,31 +1553,27 @@ func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
 }
 
 func TestV3CacheMetricsDistinguishTerminalCoordinatorFromSourceHolds(t *testing.T) {
-	for _, peerCut := range []bool{false} {
-		t.Run(map[bool]string{false: "terminal", true: "peer-cut"}[peerCut], func(t *testing.T) {
-			f := newCachedV3Fixture(t, v3FileObjects())
-			f.ns.bind(0x20, "file", 0x70)
-			file := f.lookup(f.root, "file")
-			record := f.record(file.Item)
-			coordinator := f.d.bridge.sourcePublication
-			// Withdraw between the initial admission check and the atomic
-			// snapshot, without a source holder to obscure the reason.
-			f.client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
-				coordinator.mu.Lock()
-				coordinator.terminal = errors.New("coordinator withdrawn")
-				coordinator.mu.Unlock()
-				return &fakeV3ResponseConsumption{consume: func() {}}
-			}
-			collector := &v3ReplyResourceCollector{d: f.d}
-			ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
-			if _, hit, errno := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
-				t.Fatalf("withdrawn coordinator: hit=%t errno=%d", hit, errno)
-			}
-			metrics := f.d.cacheMetrics()
-			if metrics.GetAttr["terminal"] != 1 || metrics.GetAttr["held"] != 0 || metrics.GetAttr["hit"] != 0 {
-				t.Fatalf("withdrawn coordinator metrics = %v", metrics.GetAttr)
-			}
-		})
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	record := f.record(file.Item)
+	coordinator := f.d.bridge.sourcePublication
+	// Withdraw between the initial admission check and the atomic
+	// snapshot, without a source holder to obscure the reason.
+	f.client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		coordinator.mu.Lock()
+		coordinator.terminal = errors.New("coordinator withdrawn")
+		coordinator.mu.Unlock()
+		return &fakeV3ResponseConsumption{consume: func() {}}
+	}
+	collector := &v3ReplyResourceCollector{d: f.d}
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
+	if _, hit, errno := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
+		t.Fatalf("withdrawn coordinator: hit=%t errno=%d", hit, errno)
+	}
+	metrics := f.d.cacheMetrics()
+	if metrics.GetAttr["terminal"] != 1 || metrics.GetAttr["held"] != 0 || metrics.GetAttr["hit"] != 0 {
+		t.Fatalf("withdrawn coordinator metrics = %v", metrics.GetAttr)
 	}
 }
 
