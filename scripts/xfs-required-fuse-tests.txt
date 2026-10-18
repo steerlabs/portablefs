@@ -1,0 +1,84 @@
+# Required privileged tests in fusev3. scripts/xfs-fuse-integration.sh requires
+# every entry of this list, xfs-required-authority-tests.txt and
+# xfs-required-tiered-tests.txt to run to a PASS; load_required_tests there
+# defines the line format and validation.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeCompletesInit
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelAbortCaptureBeforeServing
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelInvalidationProof
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestBarrierDeliveryProof
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTwoKernelMountsShareAuthoritativeXFS
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateWithAReadOnlyModeReturnsAWritableHandle
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountContentCoherence
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountSizeCoherence
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountAttributeCoherence
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountPositiveDentryInvalidation
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountNegativeDentryInvalidation
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountRenameCoherence
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountDirectoryListingCoherence
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDirectoryWithNonPortableInodeRemainsListable
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirReturnsEveryNameExactlyOnce
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirContinuesAcrossRemoteMutation
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestConcurrentCrossMountWritersToOneFile
+# A package-manager tree install (rename(2) publication into one directory)
+# racing concurrent enumerating readers. This is the exact shape that revoked
+# a live staging mount within seconds, and it is bounded rather than a soak:
+# unfixed it fails in under a second, three runs out of three.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAuthorityLossFailsCleanlyInsteadOfHanging
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTransportLossInterruptsWritebackCapacityWaitAtHorizon
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionExpiryReleasesABlockedLockWait
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestShippingCLIEpochReplacementRequiresFreshRenewedMount
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalHonorsRenewalsWhileControlDeliveryStalls
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts
+# Retained real-VFS regression coverage. Historical names remain required;
+# their assertions now exercise protocol 7 subscriptions and delegations.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedMetadataKernelRoundTrip
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedLookupKernelRoundTrip
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateUsesSubscribedNegativeWithoutLookupRPC
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestThousandFileInstallAmortizesDurabilityBarriers
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNewDirectoryInstallAvoidsLookupRPCs
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSameMountWritesInvalidateLiveAndReopenedCachedReaders
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReopenNotificationFailureIsInodeLocal
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestForegroundWritethroughWaitsForPeerVisibility
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDelegationPipelinePreservesOverlappingMountedWrites
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalWaitsOnlyForAffectedCacheHolders
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReadDirPlusColdListingAvoidsLookupRPCs
+# Machine-local routing must be proven against the real kernel and the real
+# authority transport. Keep the zero-RPC tests here in particular: the
+# cross-process matrix proves two-machine isolation, but intentionally does
+# not infer request counts from noisy whole-process I/O counters.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedSubtreeReachesTheAuthorityZeroTimes
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftDentriesRemainUsableAcrossRenameUnlinkAndHardlink
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAGraftIsInvisibleToTheOtherMachine
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheWholesaleRebuildShapeWorksUnderAFloatingPattern
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMkdirAtDepthInstantiatesARoute
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRenamingAnAncestorOfAnActiveGraftIsEBUSY
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheGraftBoundaryIsEXDEV
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateAtAnUncreatedRouteRootIsEISDIR
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARouteRootShadowsTheVolumeSubtreeOfTheSameName
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSharedPathsKeepTheirCoherenceWithRoutesConfigured
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority
+# The files gateway is a cacheless peer reader, never a compatibility writer.
+# Keep its real handshake with the real volume handler required: every other
+# readonlyfs test drives a fake, which cannot observe attach negotiation, a real
+# barrier, or whether a cacheless reader can stall a writing mount.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer
+# The gateway is a sidecar, so it leaves whenever its pod restarts, and
+# leaving used to cost a writing mount its mutation. Keep the test that
+# measures what a clean departure costs required.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNotStallAMutatingMount
+# Required only when PORTABLEFS_PERFORMANCE_TEST=1 selects the performance
+# baseline.
+performance github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCoherenceBaseline

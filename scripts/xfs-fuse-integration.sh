@@ -21,130 +21,10 @@ set -euo pipefail
 : "${PORTABLEFS_PROJECT_ID:=42001}"
 : "${PORTABLEFS_VOLUME_NAME:=ci-volume}"
 
-# Every test that must actually run and pass. A rename or deletion here fails
-# the job instead of quietly shrinking privileged coverage.
-REQUIRED_TESTS=(
-  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilityPriorMembershipMappingOnXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestHydrationPreservesCurrentMtimeOnXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSProjectGate"
-  "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSGateRefusesAForeignProjectID"
-  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFSFskitDurability"
-  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestBlockedLockWaitDoesNotHoldTheTopologyGuard"
-  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestRoutesControllerRefusesGitTrackedContentOnXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeCompletesInit"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelAbortCaptureBeforeServing"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelInvalidationProof"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestBarrierDeliveryProof"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTwoKernelMountsShareAuthoritativeXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateWithAReadOnlyModeReturnsAWritableHandle"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountContentCoherence"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountSizeCoherence"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountAttributeCoherence"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountPositiveDentryInvalidation"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountNegativeDentryInvalidation"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountRenameCoherence"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountDirectoryListingCoherence"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDirectoryWithNonPortableInodeRemainsListable"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirReturnsEveryNameExactlyOnce"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirContinuesAcrossRemoteMutation"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestConcurrentCrossMountWritersToOneFile"
-  # A package-manager tree install (rename(2) publication into one directory)
-  # racing concurrent enumerating readers. This is the exact shape that revoked
-  # a live staging mount within seconds, and it is bounded rather than a soak:
-  # unfixed it fails in under a second, three runs out of three.
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAuthorityLossFailsCleanlyInsteadOfHanging"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTransportLossInterruptsWritebackCapacityWaitAtHorizon"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionExpiryReleasesABlockedLockWait"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestShippingCLIEpochReplacementRequiresFreshRenewedMount"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalHonorsRenewalsWhileControlDeliveryStalls"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts"
-  # Retained real-VFS regression coverage. Historical names remain required;
-  # their assertions now exercise protocol 7 subscriptions and delegations.
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedMetadataKernelRoundTrip"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedLookupKernelRoundTrip"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateUsesSubscribedNegativeWithoutLookupRPC"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestThousandFileInstallAmortizesDurabilityBarriers"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNewDirectoryInstallAvoidsLookupRPCs"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSameMountWritesInvalidateLiveAndReopenedCachedReaders"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReopenNotificationFailureIsInodeLocal"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestForegroundWritethroughWaitsForPeerVisibility"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDelegationPipelinePreservesOverlappingMountedWrites"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalWaitsOnlyForAffectedCacheHolders"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReadDirPlusColdListingAvoidsLookupRPCs"
-  # Machine-local routing must be proven against the real kernel and the real
-  # authority transport. Keep the zero-RPC tests here in particular: the
-  # cross-process matrix proves two-machine isolation, but intentionally does
-  # not infer request counts from noisy whole-process I/O counters.
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedSubtreeReachesTheAuthorityZeroTimes"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftDentriesRemainUsableAcrossRenameUnlinkAndHardlink"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAGraftIsInvisibleToTheOtherMachine"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheWholesaleRebuildShapeWorksUnderAFloatingPattern"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMkdirAtDepthInstantiatesARoute"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRenamingAnAncestorOfAnActiveGraftIsEBUSY"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheGraftBoundaryIsEXDEV"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateAtAnUncreatedRouteRootIsEISDIR"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARouteRootShadowsTheVolumeSubtreeOfTheSameName"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSharedPathsKeepTheirCoherenceWithRoutesConfigured"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
-  # The tiered-storage lifecycle. This is the only place the archiver, the
-  # hydrator, authority-side restore mode and a real kernel FUSE mount are
-  # driven as one system on real XFS, so every stage of it is named here rather
-  # than only the parent test: a stage that is renamed away, or that starts
-  # skipping, must fail this job instead of quietly removing the proof that a
-  # restored volume serves the bytes that were archived. No stage of it is
-  # allowed to skip, restricted modes included - see run_tiered_suite.
-  # Every test that materializes a restore namespace needs real XFS export
-  # handles (restorefixture.Root), so the everywhere `go` lane skips them on
-  # its ext4 runner; this suite is where they must actually run, on the
-  # provisioned volume, and never skip.
-  "github.com/steerlabs/portablefs/vcs/internal/archiver:TestArchiveRestoreServeRoundTrip"
-  "github.com/steerlabs/portablefs/vcs/internal/hydrator:TestMaterializeRestoresRestrictiveModes"
-  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode"
-  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator"
-  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ArchiveAndVerify"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/InstantNamespaceOnANewPlacement"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ServeWhileCold"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestrictedModesAreCarried"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedIsUniformAndNonFatal"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedClearsWhenTheHydratorReturns"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ColdTreeMatchesTheArchive"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/Converge"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/PlainServingAfterConvergence"
-  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ManagerIndependentVerification"
-  # The files gateway is a cacheless peer reader, never a compatibility writer.
-  # Keep its real handshake with
-  # the real volume handler required: every other readonlyfs test drives a fake,
-  # which cannot observe attach negotiation, a real barrier, or whether a
-  # cacheless reader can stall a writing mount.
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer"
-  # The gateway is a sidecar, so it leaves whenever its pod restarts, and
-  # leaving used to cost a writing mount its mutation. Keep the test that
-  # measures what a clean departure costs required.
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNotStallAMutatingMount"
-)
-
-if [[ ${PORTABLEFS_PERFORMANCE_TEST:-} == 1 ]]; then
-  REQUIRED_TESTS+=(
-    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCoherenceBaseline"
-  )
-fi
+# Every test that must actually run and pass, loaded by load_required_tests
+# from the three package-owned inventories beside this script. A rename or
+# deletion there fails the job instead of quietly shrinking privileged coverage.
+REQUIRED_TESTS=()
 
 # This boundary is root-owned provisioning work and therefore cannot run under
 # the unprivileged authority identity used for the data-plane suite. Keeping an
@@ -163,7 +43,61 @@ repository_root() {
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd
 }
 
+# load_required_tests reads the union of scripts/xfs-required-authority-tests.txt,
+# xfs-required-fuse-tests.txt and xfs-required-tiered-tests.txt into
+# REQUIRED_TESTS. Each list may name only its owner's packages, which are
+# exactly the packages the two suite slices run. A line starting with `#` is a
+# comment; every other line must be exactly
+#
+#   github.com/steerlabs/portablefs/vcs/internal/<package>:Test<Name>[/<subtest>...]
+#
+# optionally prefixed by `performance `, which requires that entry only when
+# PORTABLEFS_PERFORMANCE_TEST=1. Anything else (a blank, indented, CRLF or
+# trailing-space line) is refused rather than skipped: a malformed entry that is
+# silently dropped is a required test that quietly stopped being required.
+#
+# Test names must be unique across the whole union, not merely as entries:
+# verify_exact_tests matches the PASS line by name, so two entries sharing a
+# name would both be satisfied by one PASS.
+load_required_tests() {
+  local scripts owner packages list pattern line number entries duplicates
+  local -a listed=()
+  scripts=$(repository_root)/scripts
+  REQUIRED_TESTS=()
+  for owner in authority fuse tiered; do
+    case $owner in
+      authority) packages='authorityrpc|xfsstore|archiver|hydrator|restoremode' ;;
+      fuse) packages='fusev3' ;;
+      tiered) packages='tierede2e' ;;
+    esac
+    list=$scripts/xfs-required-$owner-tests.txt
+    [[ -f $list ]] || fail "required test list is missing: $list"
+    pattern='^(performance )?(github\.com/steerlabs/portablefs/vcs/internal/('"$packages"'):(Test[A-Z0-9_][A-Za-z0-9_]*(/[A-Za-z0-9_.-]+)*))$'
+    number=0
+    entries=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      number=$((number + 1))
+      if [[ $line == '#'* ]]; then
+        continue
+      fi
+      [[ $line =~ $pattern ]] ||
+        fail "${list}:${number}: invalid required test entry '${line}' (packages here: ${packages//|/, })"
+      entries=$((entries + 1))
+      listed+=("${BASH_REMATCH[4]}")
+      if [[ -z ${BASH_REMATCH[1]} || ${PORTABLEFS_PERFORMANCE_TEST:-} == 1 ]]; then
+        REQUIRED_TESTS+=("${BASH_REMATCH[2]}")
+      fi
+    done <"$list"
+    [[ $entries -gt 0 ]] || fail "required test list names no tests: $list"
+  done
+  duplicates=$(printf '%s\n' "${listed[@]}" | LC_ALL=C sort | uniq -d)
+  [[ -z $duplicates ]] || fail "required test names listed more than once: ${duplicates//$'\n'/, }"
+}
+
 run_host() {
+  # Refuse a malformed inventory before spending a container run on it; the
+  # container validates its own read-only copy again before the suite.
+  load_required_tests
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
@@ -461,6 +395,7 @@ verify_exact_tests() {
 
 run_container() {
   [[ $EUID -eq 0 ]] || fail "container side must start as root to provision XFS" 77
+  load_required_tests
   install_container_dependencies
   create_service_identity
   provision_fuse_control

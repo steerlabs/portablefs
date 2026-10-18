@@ -1,0 +1,27 @@
+# Required privileged tests in tierede2e. scripts/xfs-fuse-integration.sh
+# requires every entry of this list, xfs-required-authority-tests.txt and
+# xfs-required-fuse-tests.txt to run to a PASS; load_required_tests there
+# defines the line format and validation.
+#
+# The tiered-storage lifecycle. This is the only place the archiver, the
+# hydrator, authority-side restore mode and a real kernel FUSE mount are driven
+# as one system on real XFS, so every stage of it is named here rather than only
+# the parent test: a stage that is renamed away, or that starts skipping, must
+# fail this job instead of quietly removing the proof that a restored volume
+# serves the bytes that were archived. No stage of it is allowed to skip,
+# restricted modes included - see run_tiered_suite. Every test that
+# materializes a restore namespace needs real XFS export handles
+# (restorefixture.Root), so the everywhere `go` lane skips them on its ext4
+# runner; this suite is where they must actually run, on the provisioned
+# volume, and never skip.
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ArchiveAndVerify
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/InstantNamespaceOnANewPlacement
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ServeWhileCold
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestrictedModesAreCarried
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedIsUniformAndNonFatal
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedClearsWhenTheHydratorReturns
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ColdTreeMatchesTheArchive
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/Converge
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/PlainServingAfterConvergence
+github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ManagerIndependentVerification

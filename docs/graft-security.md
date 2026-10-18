@@ -80,7 +80,8 @@ stock kernel interface at FUSE protocol 7.31 or newer:
 bash scripts/xfs-fuse-integration.sh
 ```
 
-Its `REQUIRED_TESTS` list names the graft tests explicitly, including
+Its required fusev3 inventory, `scripts/xfs-required-fuse-tests.txt`, names the
+graft tests explicitly, including
 `TestGraftedSubtreeReachesTheAuthorityZeroTimes`,
 `TestRenamingAnAncestorOfAnActiveGraftIsEBUSY`,
 `TestTheGraftBoundaryIsEXDEV` and

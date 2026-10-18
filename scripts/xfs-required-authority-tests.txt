@@ -1,0 +1,24 @@
+# Required privileged tests in authorityrpc, xfsstore, archiver, hydrator and
+# restoremode. scripts/xfs-fuse-integration.sh requires every entry of this
+# list, xfs-required-fuse-tests.txt and xfs-required-tiered-tests.txt to run to
+# a PASS; load_required_tests there defines the line format and validation.
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilityPriorMembershipMappingOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS
+github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestHydrationPreservesCurrentMtimeOnXFS
+github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSProjectGate
+github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSGateRefusesAForeignProjectID
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFSFskitDurability
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestBlockedLockWaitDoesNotHoldTheTopologyGuard
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestRoutesControllerRefusesGitTrackedContentOnXFS
+# The archiver, hydrator and restore-mode stages of the tiered-storage
+# lifecycle; xfs-required-tiered-tests.txt explains why each stage is named.
+# Every test that materializes a restore namespace needs real XFS export
+# handles (restorefixture.Root), so the everywhere `go` lane skips them on its
+# ext4 runner; this suite is where they must actually run, on the provisioned
+# volume, and never skip.
+github.com/steerlabs/portablefs/vcs/internal/archiver:TestArchiveRestoreServeRoundTrip
+github.com/steerlabs/portablefs/vcs/internal/hydrator:TestMaterializeRestoresRestrictiveModes
+github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode
+github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator
+github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt
