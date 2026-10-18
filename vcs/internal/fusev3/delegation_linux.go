@@ -166,15 +166,16 @@ type delegationManager struct {
 	mu       sync.RWMutex
 	// A CREATE may receive its stable identity only after CONTROL retires its grant.
 	// Keep tombstones until every such response has been registered.
-	grantRequests  map[uint64]struct{}
-	grantSerial    uint64
-	metadataClock  atomic.Uint64
-	reclaim        map[*delegationState]struct{}
-	retainedStates map[*delegationState]struct{}
-	reclaimKick    chan struct{}
-	observers      map[writeback.Identity]int
-	buf            *writeback.Buffer
-	byID           map[writeback.Identity]*delegationState
+	grantRequests     map[uint64]struct{}
+	grantSerial       uint64
+	retiredGrantFloor uint64 // mu; collection proved no earlier unreported grant can arrive
+	metadataClock     atomic.Uint64
+	reclaim           map[*delegationState]struct{}
+	retainedStates    map[*delegationState]struct{}
+	reclaimKick       chan struct{}
+	observers         map[writeback.Identity]int
+	buf               *writeback.Buffer
+	byID              map[writeback.Identity]*delegationState
 	// stateIndex mirrors creation, collection and both epoch resets of byID. Shared cache
 	// admission must not miss merely because another identity is being created.
 	stateIndex sync.Map // writeback.Identity -> *delegationState
@@ -1617,6 +1618,12 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 		if retired >= ref.GetGeneration() || live != nil && live.GetGeneration() > ref.GetGeneration() {
 			return
 		}
+		m.mu.RLock()
+		collected := ref.GetGeneration() <= m.retiredGrantFloor
+		m.mu.RUnlock()
+		if collected {
+			return
+		}
 		select {
 		case <-changed:
 		case <-ctx.Done():
@@ -2424,6 +2431,7 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	}
 	loss := old.LossSequence()
 	m.byID = make(map[writeback.Identity]*delegationState)
+	m.retiredGrantFloor = 0
 	m.stateIndex.Clear()
 	m.reclaim = make(map[*delegationState]struct{})
 	m.retainedStates = make(map[*delegationState]struct{})
@@ -2434,6 +2442,7 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	// only after every old callback is gone.
 	m.mu.Lock()
 	m.byID = make(map[writeback.Identity]*delegationState)
+	m.retiredGrantFloor = 0
 	m.stateIndex.Clear()
 	m.reclaim = make(map[*delegationState]struct{})
 	m.retainedStates = make(map[*delegationState]struct{})

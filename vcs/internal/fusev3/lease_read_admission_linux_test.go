@@ -126,7 +126,7 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 			readers.Wait()
 		}
 	}
-	t.Cleanup(stopReaders)
+	defer stopReaders()
 
 	payloads := [2][]byte{after, before}
 	for round := range 64 {

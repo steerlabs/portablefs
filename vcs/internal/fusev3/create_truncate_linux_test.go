@@ -20,8 +20,21 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type heldBackgroundDurabilityRPC struct{ delegationRPC }
+
+func (r heldBackgroundDurabilityRPC) CallMutation(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
+	if req.GetBarrier() != nil {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.delegationRPC.CallMutation(ctx, req)
+}
+
 func TestCreateTruncateRetiresExistingDelegatedOverlayBeforeDispatch(t *testing.T) {
 	mount, rpc := testMount(t, 32)
+	// Retention is this test's subject. Hold background completion outside the
+	// fake transport's dispatch lock so CREATE and its source reply can run.
+	mount.delegations.rpc = heldBackgroundDurabilityRPC{mount.delegations.rpc}
 	raw := mount.raw
 	root := raw.nodesByID[1].node
 	existing := cloneItem(rpc.item)
