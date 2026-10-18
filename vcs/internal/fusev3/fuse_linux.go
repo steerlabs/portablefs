@@ -1358,7 +1358,6 @@ type dirHandle struct {
 	token             []byte
 	mu                sync.Mutex
 	cookie            []byte
-	verifier          []byte
 	page              []*authoritypb.Dirent
 	pageStamp         subscriptionStamp
 	pageMetadataClock uint64
@@ -2096,7 +2095,6 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			}
 			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: directoryIdentity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
 			h.pageWantItems = wantItems
-			h.verifier = cloneBytes(page.GetVerifier())
 			if len(h.page) == 0 && !h.eof {
 				return nil, nil, syscall.EIO
 			}
@@ -2220,7 +2218,7 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.localIndex = index
 		h.page, h.index, h.eof = nil, 0, true
 		h.pageStamp = subscriptionStamp{}
-		h.cookie, h.verifier = nil, nil
+		h.cookie = nil
 		return 0
 	}
 	h.localIndex = 0
@@ -2230,23 +2228,28 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		// so there is nothing left for the uncovered mark to protect. A seek to
 		// any other offset keeps it: that offset is itself an authority cookie
 		// and resumes from the same XFS continuation offset.
-		h.verifier = nil
 		h.uncovered = false
 	}
 	h.page, h.index, h.eof = nil, 0, false
 	return 0
 }
 
+// invalidateEnumeration withdraws the buffered page after a change to this
+// directory. The stream position (h.cookie) is unchanged, so it deliberately
+// leaves cursorGeneration alone: a page whose fetch the change overtook is
+// still the exact continuation from that cookie, and because its admission
+// stamp predates the change it is served uncovered within its callback and
+// retired at the next one. Discarding it instead would refetch for as long as
+// changes arrive faster than one READDIR round trip, so a directory a peer
+// keeps changing could never be listed.
 func (h *dirHandle) invalidateEnumeration() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.discardPageItemsLocked()
 	h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 	h.pageStamp = subscriptionStamp{}
-	h.verifier = nil
 	h.eof = false
 	h.uncovered = false
-	h.cursorGeneration++
 }
 
 func (h *dirHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {
