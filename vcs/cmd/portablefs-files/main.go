@@ -483,7 +483,7 @@ func (s *server) handleEntries(writer http.ResponseWriter, request *http.Request
 	if knownRevision == revision {
 		switch {
 		case retainedCursor != "" && page.Next != nil && s.renewCursor(retainedCursor, volumeID, parentKey, session):
-			_ = page.Next.Close(context.Background())
+			disposeDescription(session, page.Next)
 			page.Next = nil
 			next = retainedCursor
 			unchanged = true
@@ -500,7 +500,7 @@ func (s *server) handleEntries(writer http.ResponseWriter, request *http.Request
 			key, keyErr := readonlyfs.AppendPath(parentKey, entry.Name)
 			if keyErr != nil {
 				if page.Next != nil {
-					_ = page.Next.Close(context.Background())
+					disposeDescription(session, page.Next)
 				}
 				s.handleFileError(writer, volumeID, session, keyErr)
 				return
@@ -519,7 +519,7 @@ func (s *server) handleEntries(writer http.ResponseWriter, request *http.Request
 		if page.Next != nil {
 			next, err = s.storeCursor(volumeID, parentKey, session, page.Next)
 			if err != nil {
-				_ = page.Next.Close(context.Background())
+				disposeDescription(session, page.Next)
 				writeError(writer, http.StatusServiceUnavailable, "cursor_capacity", err.Error())
 				return
 			}
@@ -575,7 +575,7 @@ func (s *server) handleContent(writer http.ResponseWriter, request *http.Request
 		s.handleFileError(writer, volumeID, session, err)
 		return
 	}
-	defer func() { _ = file.Close(context.Background()) }()
+	defer disposeDescription(session, file)
 	attr := file.Attr()
 	if offset > attr.Size {
 		writeError(writer, http.StatusRequestedRangeNotSatisfiable, "invalid_range", "content offset exceeds file size")
@@ -745,7 +745,7 @@ func (s *server) takeCursor(token, volumeID, parentKey string, session *volumeSe
 	}
 	delete(s.cursors, token)
 	if !time.Now().Before(record.expiresAt) {
-		go func() { _ = record.cursor.Close(context.Background()) }()
+		go disposeDescription(session, record.cursor)
 		return nil, false
 	}
 	return record.cursor, true
@@ -763,7 +763,7 @@ func (s *server) renewCursor(token, volumeID, parentKey string, session *volumeS
 		delete(s.cursors, token)
 		stale = record.cursor
 		s.mu.Unlock()
-		_ = stale.Close(context.Background())
+		disposeDescription(session, stale)
 		return false
 	}
 	record.expiresAt = time.Now().Add(cursorLifetime)
@@ -781,7 +781,7 @@ func (s *server) dropCursor(token, volumeID, parentKey string, session *volumeSe
 	}
 	s.mu.Unlock()
 	if dropped != nil {
-		_ = dropped.Close(context.Background())
+		disposeDescription(session, dropped)
 	}
 }
 
@@ -858,9 +858,18 @@ func (s *server) close() {
 	}
 }
 
+// Disposal gives up the last retryable description owner. If its bounded close
+// cannot settle, the session must retire every resource before that owner goes.
+// Explicit library callers may instead retain a failed Close and retry it.
+func disposeDescription(session *volumeSession, description interface{ Close(context.Context) error }) {
+	if err := description.Close(context.Background()); err != nil {
+		_ = session.client.Close()
+	}
+}
+
 func closeCursors(records []cursorRecord) {
 	for _, record := range records {
-		_ = record.cursor.Close(context.Background())
+		disposeDescription(record.session, record.cursor)
 	}
 }
 
