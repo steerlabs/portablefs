@@ -16,9 +16,6 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
-// Nonzero request IDs share one FIFO sequence; one-way callback acknowledgments
-// and resource dispositions retain reader-side progress with request ID zero.
-
 func publicationTestOperation(
 	t *testing.T,
 	c *frontendConn,
@@ -269,8 +266,7 @@ func TestPublishingReplyAfterCallbackAcknowledgementFencesBeforeExposure(t *test
 
 // The socket can disappear after the daemon pinned a publishing reply but
 // before FSKit's PublicationAck. Teardown must first retire the publication
-// gate (waking any handoff cycle), then synchronously fence the v3 session; it
-// must not park forever waiting for handlers or invent a later repair.
+// gate, then synchronously fence the v3 session without waiting for handlers.
 func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T) {
 	const operationID = uint64(302)
 	a, d := publicationTestAttach(t)

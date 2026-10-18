@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -103,32 +102,46 @@ func TestFSKitIdentityMismatchPreservesAttach(t *testing.T) {
 	}
 }
 func TestRegistryRestoresDetachedRecordAfterRemovalPersistenceFailure(t *testing.T) {
-	dir := privateTestDir(t)
-	writeFSKitDetachFixture(t, dir)
-	r := newRegistry(dir)
-	a := r.get(testFSKitAttachRef)
-	bad := filepath.Join(dir, "not-directory")
-	if err := os.WriteFile(bad, nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	r.stateDir = bad
-	ops := fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }}
-	found, err := r.unmountFSKitWith(a.ref, false, ops)
-	if !found || err == nil || !a.isDetached() || r.get(a.ref) != a || r.byKey[a.key] != a {
-		t.Fatalf("failed removal lost exact detached owner: %v", err)
-	}
-	r.stateDir = dir
-	ops.present = func(string, string) (bool, error) {
-		t.Error("completed teardown repeated kernel observation")
-		return false, nil
-	}
-	found, err = r.unmountFSKitWith(a.ref, false, ops)
-	if !found || err != nil || r.get(a.ref) != nil {
-		t.Fatalf("retry=%v", err)
-	}
-	entries, err := loadPersistedAttaches(dir)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("persisted removal=%v %v", entries, err)
+	for _, afterUnlink := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unlink", true: "directory-sync"}[afterUnlink], func(t *testing.T) {
+			dir := privateTestDir(t)
+			writeFSKitDetachFixture(t, dir)
+			r := newRegistry(dir)
+			a := r.get(testFSKitAttachRef)
+			failure := injectRegistryRemovalFailure(t, r, afterUnlink)
+			ops := fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }}
+			found, err := r.unmountFSKitWith(a.ref, false, ops)
+			if !found || !errors.Is(err, failure) || !a.isDetached() || r.get(a.ref) != a || r.byKey[a.key] != a {
+				t.Fatalf("failed removal lost exact detached owner: %v", err)
+			}
+			_, statErr := os.Lstat(attachRegistryPath(dir))
+			if afterUnlink && !errors.Is(statErr, os.ErrNotExist) || !afterUnlink && statErr != nil {
+				t.Fatalf("injected removal phase afterUnlink=%t: %v", afterUnlink, statErr)
+			}
+			inventory, err := r.lifecycleInventory()
+			if err != nil || inventory.AttachmentCount != 1 {
+				t.Fatalf("failed removal inventory=%+v err=%v", inventory, err)
+			}
+			if idle, count, err := r.quiesceIfIdle(); idle || count != 1 || err != nil || r.quiescing {
+				t.Fatalf("failed removal allowed stop: idle=%t count=%d err=%v", idle, count, err)
+			}
+			r.writeAttaches = writePersistedAttaches
+			ops.present = func(string, string) (bool, error) {
+				t.Error("completed teardown repeated kernel observation")
+				return false, nil
+			}
+			found, err = r.unmountFSKitWith(a.ref, false, ops)
+			if !found || err != nil || r.get(a.ref) != nil || r.byKey[a.key] != nil {
+				t.Fatalf("retry=%v", err)
+			}
+			if _, err := os.Lstat(attachRegistryPath(dir)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("empty registry file remains after retry: %v", err)
+			}
+			entries, err := loadPersistedAttaches(dir)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("persisted removal=%v %v", entries, err)
+			}
+		})
 	}
 }
 func TestFailedUnmountRetryNeverJoinsStaleCompletedOutcome(t *testing.T) {

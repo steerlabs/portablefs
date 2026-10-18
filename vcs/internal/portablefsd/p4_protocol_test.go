@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,14 +313,21 @@ func TestP4ExpiredHorizonUsesOriginalDataDuringRenewal(t *testing.T) {
 	f := newCachedV3Fixture(t, v3FileObjects())
 	f.ns.bind(0x20, "file", 0x70)
 	file := f.lookup(f.root, "file")
-	entered, release := make(chan struct{}), make(chan struct{})
+	entered, release := make(chan context.Context, 1), make(chan struct{})
 	f.client.mu.Lock()
-	f.client.keepAlive = func(context.Context) (time.Duration, error) { close(entered); <-release; return time.Minute, nil }
+	f.client.keepAlive = func(ctx context.Context) (time.Duration, error) {
+		entered <- ctx
+		<-release
+		return time.Minute, nil
+	}
 	f.client.mu.Unlock()
 	done := make(chan bool, 1)
 	go func() { done <- f.d.scheduledRenewal() }()
-	<-entered
+	renewalContext := <-entered
 	f.clock.advance(61 * time.Second)
+	if err := renewalContext.Err(); err != nil {
+		t.Fatalf("continuous-clock jump canceled the Go context budget: %v", err)
+	}
 	f.requireAuthority("expired H with CONTROL delayed", func() { f.getattr(file.Item) })
 	if f.d.terminalError() != nil {
 		t.Fatal("horizon expiry invented terminal session")
@@ -810,6 +818,8 @@ func TestP4RegistryHasOneStrictCurrentSchema(t *testing.T) {
 		},
 		func(s string) string { return strings.Replace(s, `"identityEpoch": 1`, `"identityEpoch": null`, 1) },
 		func(s string) string { return s + ` {}` },
+		func(string) string { return `{"version":3,"attaches":[]}` },
+		func(string) string { return `{"version":3,"attaches":null}` },
 	} {
 		changed := []byte(mutate(string(original)))
 		if err := os.WriteFile(path, changed, 0600); err != nil {
@@ -823,12 +833,14 @@ func TestP4RegistryHasOneStrictCurrentSchema(t *testing.T) {
 			t.Fatal("inventory rewrote invalid input")
 		}
 	}
-	if err := writePersistedAttaches(dir, nil); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || strings.Contains(string(data), "null") {
-		t.Fatalf("empty current inventory=%s err=%v", data, err)
+	for _, entries := range [][]persistedAttachEntry{nil, {}} {
+		writeFSKitDetachFixture(t, dir)
+		if err := writePersistedAttaches(dir, entries); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("empty current inventory must be absent: %v", err)
+		}
 	}
 	if entries, err := ReadPersistedAttachInventory(dir); err != nil || len(entries) != 0 {
 		t.Fatal(err)
@@ -858,40 +870,71 @@ func TestP4LookupMetricsCountOnlyExposedReplies(t *testing.T) {
 }
 
 func TestP4InventoryWaitsForDurableRemovalVerdict(t *testing.T) {
-	dir := privateTestDir(t)
-	writeFSKitDetachFixture(t, dir)
-	r := newRegistry(dir)
-	bad := filepath.Join(dir, "not-directory")
-	if err := os.WriteFile(bad, nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	r.stateDir = bad
-	r.persistMu.Lock()
-	removed := make(chan error, 1)
-	go func() {
-		_, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
-		removed <- err
-	}()
-	waitV3PublicationCondition(t, func() bool { return r.get(testFSKitAttachRef) == nil })
-	inventory := make(chan daemonctl.LifecycleInventory, 1)
-	go func() {
-		value, err := r.lifecycleInventory()
-		if err != nil {
-			t.Error(err)
-		}
-		inventory <- value
-	}()
-	select {
-	case <-inventory:
-		r.persistMu.Unlock()
-		t.Fatal("inventory observed uncommitted removal")
-	case <-time.After(10 * time.Millisecond):
-	}
-	r.persistMu.Unlock()
-	if err := <-removed; err == nil {
-		t.Fatal("removal unexpectedly persisted")
-	}
-	if value := <-inventory; value.AttachmentCount != 1 {
-		t.Fatalf("inventory lost persisted terminal record: %+v", value)
+	for _, afterUnlink := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unlink", true: "directory-sync"}[afterUnlink], func(t *testing.T) {
+			dir := privateTestDir(t)
+			writeFSKitDetachFixture(t, dir)
+			r := newRegistry(dir)
+			failure := injectRegistryRemovalFailure(t, r, afterUnlink)
+			write := r.writeAttaches
+			entered, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			defer unblock()
+			r.writeAttaches = func(dir string, entries []persistedAttachEntry) error {
+				err := write(dir, entries)
+				close(entered)
+				<-release
+				return err
+			}
+			removed := make(chan error, 1)
+			go func() {
+				_, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
+				removed <- err
+			}()
+			<-entered
+			if r.get(testFSKitAttachRef) != nil {
+				t.Fatal("removal never reached its persistence tail")
+			}
+			if _, err := os.Lstat(attachRegistryPath(dir)); afterUnlink && !errors.Is(err, os.ErrNotExist) || !afterUnlink && err != nil {
+				t.Fatalf("unexpected disk state before persistence verdict: %v", err)
+			}
+			inventory := make(chan daemonctl.LifecycleInventory, 1)
+			go func() {
+				value, err := r.lifecycleInventory()
+				if err != nil {
+					t.Error(err)
+				}
+				inventory <- value
+			}()
+			s := NewServer(Config{})
+			s.registry = r
+			stopped := make(chan int, 1)
+			go func() {
+				reply := httptest.NewRecorder()
+				s.handleStopIfIdle(reply, httptest.NewRequest(http.MethodPost, daemonctl.LifecycleStopIfIdlePath, nil))
+				stopped <- reply.Code
+			}()
+			var premature string
+			select {
+			case <-inventory:
+				premature = "inventory"
+			case <-stopped:
+				premature = "stop"
+			case <-time.After(10 * time.Millisecond):
+			}
+			unblock()
+			if premature != "" {
+				t.Fatalf("%s observed uncommitted removal", premature)
+			}
+			if err := <-removed; !errors.Is(err, failure) {
+				t.Fatalf("removal persistence error=%v, want %v", err, failure)
+			}
+			if value := <-inventory; value.AttachmentCount != 1 {
+				t.Fatalf("inventory lost persisted terminal record: %+v", value)
+			}
+			if status := <-stopped; status != http.StatusConflict || r.quiescing {
+				t.Fatalf("stop bypassed failed removal: status=%d quiescing=%t", status, r.quiescing)
+			}
+		})
 	}
 }

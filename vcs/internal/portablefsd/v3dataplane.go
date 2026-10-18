@@ -2790,8 +2790,8 @@ func v3KeepAliveInterval(lease time.Duration) time.Duration {
 	return min(lease/3, 5*time.Second, authorityrpc.MaxCacheProof/3).Truncate(time.Millisecond)
 }
 
-// renewHorizon anchors both the local budget and H before queueing. Cadence
-// never shortens this budget. Only a validated, still usable proof grants H.
+// renewHorizon bounds local waiting with a Go context and anchors H on the
+// continuous clock before client admission. Only a usable proof grants H.
 func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	d.renewalMu.Lock()
 	defer d.renewalMu.Unlock()
@@ -2808,14 +2808,8 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	}
 	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
-	waitDeadline, _ := ctx.Deadline()
-	stopBudget, err := startV3RenewalBudget(time.Until(waitDeadline), cancel)
-	if err != nil {
-		return err
-	}
-	defer stopBudget()
-	// The native wait budget is armed before t0. It remains bounded across
-	// sleep even if the cache clock fails; no proof uses a substitute clock.
+	// The context bounds local waiting on Go's monotonic clock.
+	// Only the continuous-clock sample below anchors the cache proof.
 	d.mu.Lock()
 	start, startErr := d.readClockLocked()
 	d.mu.Unlock()

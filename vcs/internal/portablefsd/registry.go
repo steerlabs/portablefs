@@ -107,15 +107,16 @@ type registry struct {
 	// unmountMu guards unmounting, the at-most-one-transaction-per-attach map
 	// that lets a second unmount request JOIN a running transaction instead of
 	// queueing another one behind it on mutationMu.
-	unmountMu   sync.Mutex
-	unmounting  map[string]*unmountTransaction
-	persistMu   sync.Mutex
-	stateDir    string
-	mountLogDir string
-	byRef       map[string]*attach
-	byKey       map[string]*attach
-	quiescing   bool
-	loadErr     error
+	unmountMu     sync.Mutex
+	unmounting    map[string]*unmountTransaction
+	persistMu     sync.Mutex
+	writeAttaches func(string, []persistedAttachEntry) error
+	stateDir      string
+	mountLogDir   string
+	byRef         map[string]*attach
+	byKey         map[string]*attach
+	quiescing     bool
+	loadErr       error
 }
 
 func newRegistry(stateDir string) *registry {
@@ -124,10 +125,11 @@ func newRegistry(stateDir string) *registry {
 
 func newRegistryWithMountLogDir(stateDir, mountLogDir string) *registry {
 	r := &registry{
-		stateDir:    stateDir,
-		mountLogDir: mountLogDir,
-		byRef:       map[string]*attach{},
-		byKey:       map[string]*attach{},
+		writeAttaches: writePersistedAttaches,
+		stateDir:      stateDir,
+		mountLogDir:   mountLogDir,
+		byRef:         map[string]*attach{},
+		byKey:         map[string]*attach{},
 	}
 	loaded, loadErr := loadAttachRegistry(stateDir)
 	if loadErr != nil {
@@ -349,38 +351,6 @@ func (r *registry) list() []*attach {
 		out = append(out, a)
 	}
 	return out
-}
-
-// delete retires the attach and then removes its registry record.
-func (r *registry) delete(ctx context.Context, ref string, force bool) (found bool, err error) {
-	r.mutationMu.Lock()
-	defer r.mutationMu.Unlock()
-	r.mu.RLock()
-	a := r.byRef[ref]
-	r.mu.RUnlock()
-	if a == nil {
-		return false, nil
-	}
-	err = a.detach(force)
-	if err != nil {
-		// Keep the record until its required detach transition completes.
-		return true, err
-	}
-	r.mu.Lock()
-	delete(r.byRef, ref)
-	delete(r.byKey, a.key)
-	r.mu.Unlock()
-	if perr := r.persist(); perr != nil {
-		// The durable entry still exists. Retain the exact detached record so
-		// a retry can converge the same deletion instead of returning a false
-		// 404 and reviving it on restart.
-		r.mu.Lock()
-		r.byRef[ref] = a
-		r.byKey[a.key] = a
-		r.mu.Unlock()
-		err = errors.Join(err, perr)
-	}
-	return true, err
 }
 
 func (r *registry) unmountFSKit(ctx context.Context, ref string, force bool) (bool, error) {
@@ -1323,19 +1293,27 @@ func (r *registry) lifecycleInventory() (daemonctl.LifecycleInventory, error) {
 func (r *registry) quiesceIfIdle() (bool, int, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
 	if r.loadErr != nil {
+		r.mu.RUnlock()
 		return false, 0, r.loadErr
 	}
 	count := len(r.byRef)
+	r.mu.RUnlock()
 	if err := (daemonctl.LifecycleInventory{AttachmentCount: count}).Validate(); err != nil {
 		return false, count, err
 	}
 	if count != 0 {
 		return false, count, nil
 	}
+	// Admission stays open unless the empty registry is durably established.
+	// mutationMu excludes attach/removal until both persistence and quiescence.
+	if err := r.persist(); err != nil {
+		return false, 0, err
+	}
+	r.mu.Lock()
 	r.quiescing = true
+	r.mu.Unlock()
 	return true, 0, nil
 }
 

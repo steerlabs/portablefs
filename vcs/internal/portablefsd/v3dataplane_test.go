@@ -1909,11 +1909,7 @@ func TestAuthorityIdentityNamesTheExactMalformedField(t *testing.T) {
 	}
 }
 
-// A negative lookup is a successful answer carrying no item. The authority
-// reports an absent name that way under FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
-// and this frontend used to intern the missing item as malformed, which turned
-// every absent name into EIO and killed the coherence stream with it. On an
-// empty volume that made mount-root attestation fail outright.
+// A negative lookup is a successful authority answer carrying no item.
 func TestV3LookupTranslatesTheNegativeAnswerToENOENT(t *testing.T) {
 	client := newFakeV3DataClient()
 	client.mutation = func(

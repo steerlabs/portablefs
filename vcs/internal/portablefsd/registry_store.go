@@ -58,8 +58,8 @@ type PersistedAttachIdentity struct {
 	MountPath string
 }
 
-// ReadPersistedAttachInventory is the strict read-only inventory boundary
-// used by installers and account mutation even when no daemon/socket exists.
+// ReadPersistedAttachInventory reads the exact private format for same-release
+// reconciliation. Cross-release lifecycle exclusion relies on file absence.
 func ReadPersistedAttachInventory(stateDir string) ([]PersistedAttachIdentity, error) {
 	entries, err := loadPersistedAttaches(stateDir)
 	if err != nil {
@@ -106,7 +106,7 @@ func loadAttachRegistry(stateDir string) (loadedAttachRegistry, error) {
 	if err := decoder.Decode(&trailing); err == nil || err != io.EOF {
 		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: trailing JSON", p)
 	}
-	if raw.Version != attachRegistryVersion || raw.Attaches == nil {
+	if raw.Version != attachRegistryVersion || len(raw.Attaches) == 0 {
 		return loadedAttachRegistry{}, fmt.Errorf("attach registry %s has invalid version or inventory", p)
 	}
 	seenRef := map[string]struct{}{}
@@ -250,7 +250,7 @@ func (r *registry) persist() error {
 	r.persistMu.Lock()
 	defer r.persistMu.Unlock()
 	entries := r.persistedEntries()
-	if err := writePersistedAttaches(r.stateDir, entries); err != nil {
+	if err := r.writeAttaches(r.stateDir, entries); err != nil {
 		return err
 	}
 	return nil
@@ -268,6 +268,13 @@ func (r *registry) persistedEntries() []persistedAttachEntry {
 }
 
 func writePersistedAttaches(stateDir string, entries []persistedAttachEntry) error {
+	// File absence is the format-independent empty witness used during upgrade.
+	if len(entries) == 0 {
+		if err := privatepath.RemoveFileDurable(attachRegistryPath(stateDir)); err != nil {
+			return fmt.Errorf("remove empty attach registry: %w", err)
+		}
+		return nil
+	}
 	seenRef, seenKey, seenStorage := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for i := range entries {
 		if err := validatePersistedAttach(&entries[i]); err != nil {
@@ -278,9 +285,6 @@ func writePersistedAttaches(stateDir string, entries []persistedAttachEntry) err
 			return fmt.Errorf("refuse duplicate persisted attach identity at entry %d", i)
 		}
 		seenRef[entries[i].Ref], seenKey[key], seenStorage[storage] = true, true, true
-	}
-	if entries == nil {
-		entries = []persistedAttachEntry{}
 	}
 	reg := persistedAttachRegistry{Version: attachRegistryVersion, Attaches: entries}
 	data, err := json.MarshalIndent(reg, "", "  ")

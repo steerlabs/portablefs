@@ -530,7 +530,9 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 	if _, handled, err := a.rotateLiveCredential(context.Background(), "manual", renewedDeadline.UnixMilli(), 2, pki.clientCertPEM, false); !handled || err == nil || !strings.Contains(err.Error(), "automatic reauthorization owner") {
 		t.Fatalf("manual fallback against automatic owner: handled=%t err=%v", handled, err)
 	}
-	if found, err := r.delete(context.Background(), a.ref, true); err != nil || !found {
+	if found, err := r.unmountFSKitWith(a.ref, true, fskitKernelOps{
+		present: func(string, string) (bool, error) { return false, nil },
+	}); err != nil || !found {
 		t.Fatalf("detach automatic renewal owner: found=%t err=%v", found, err)
 	}
 	select {
