@@ -45,7 +45,9 @@ func (h *VolumeHandler) mutateFskitCoherence(ctx context.Context, req *authority
 				return h.errorResponse(0, err, false)
 			}
 			deps := volumeserver.MutationDependenciesForFootprint(footprint)
+			finishPhase := beginMutationPhase(ctx, phaseStorageWait)
 			release, err := h.coherenceStorage.Acquire(ctx, deps)
+			finishPhase()
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -89,7 +91,9 @@ func (h *VolumeHandler) mutateFskitCoherence(ctx context.Context, req *authority
 			}
 			// Fence racing this cut either denies admission above or retains this pin.
 			changed := new(mutationChanges)
+			finishPhase = beginMutationPhase(ctx, phaseApply)
 			response, targets := apply(1, changed)
+			finishPhase()
 			if response == nil {
 				response = h.errorResponse(0, errInternal, true)
 			}
@@ -104,11 +108,22 @@ func (h *VolumeHandler) mutateFskitCoherence(ctx context.Context, req *authority
 			releaseStorage()
 			release()
 			if position != 0 {
+				finishPhase = beginMutationPhase(ctx, phaseWithdrawal)
 				err = errors.Join(err, h.Coherence.WaitWithdrawn(context.WithoutCancel(ctx), position, cred.ID))
+				finishPhase()
 			}
 			// A post-apply error never erases the persistence obligation.
 			if targets != nil {
-				if syncErr := h.syncFskitMutation(syncMutation); syncErr != nil {
+				if op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation); op != nil && op.measurement != nil {
+					op.measurement.DurabilityKind = "syncfs"
+					if syncMutation != nil {
+						op.measurement.DurabilityKind = "handle"
+					}
+				}
+				finishPhase = beginMutationPhase(ctx, phaseDurability)
+				syncErr := h.syncFskitMutation(syncMutation)
+				finishPhase()
+				if syncErr != nil {
 					use.End()
 					if response.GetUncertain() && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE {
 						h.deferStorageFailure(nil, syncErr)

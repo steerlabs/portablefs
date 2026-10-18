@@ -17,6 +17,7 @@ import (
 type coherenceOperationKey struct{}
 type coherenceOperation struct {
 	beforeAdmission func() error
+	measurement     *MutationObservation
 
 	reservation *volumeserver.DelegationReservation
 	delegation  volumeserver.Delegation
@@ -218,7 +219,9 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				}
 			}
 			dependencies := volumeserver.MutationDependenciesForFootprint(gate)
+			finishPhase := beginMutationPhase(ctx, phaseStorageWait)
 			releaseTurn, err := h.coherenceStorage.Acquire(ctx, dependencies)
+			finishPhase()
 			if err != nil {
 				finishPin(0)
 				return h.coherenceError(0, err)
@@ -280,10 +283,12 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			changed := new(mutationChanges)
 			var response *authoritypb.Response
 			var changes []volumeserver.MutationTarget
+			finishPhase = beginMutationPhase(ctx, phaseApply)
 			func() {
 				defer applyUse.End()
 				response, changes = apply(1, changed)
 			}()
+			finishPhase()
 			if response == nil {
 				response = h.errorResponse(0, errInternal, true)
 			}
@@ -330,9 +335,14 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				if response.GetAppliedSequence() != 0 && (coherenceFlushReference(req) != nil || op != nil && op.delegation.ID != 0) {
 					// The response is an application receipt. Holder cut acknowledgments must
 					// be able to pass a withdrawal of the holder's pending read publication.
+					if op != nil && op.measurement != nil {
+						op.measurement.DetachedWithdrawal = true
+					}
 					go wait()
 				} else {
+					finishPhase = beginMutationPhase(ctx, phaseWithdrawal)
 					wait()
+					finishPhase()
 				}
 			} else {
 				h.coherenceDurability.markVisible(cred.ID, applied)

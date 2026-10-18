@@ -109,7 +109,8 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 			target.err = test.applyErr
 			store.syncErr = test.errorSync
 			req := directFskitRequest()
-			response := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+			ctx := context.WithValue(t.Context(), coherenceOperationKey{}, &coherenceOperation{})
+			response := h.handleWrite(ctx, req, cred, req.GetWrite())
 			if response.GetErrno() != 0 || response.GetWrite() == nil || response.GetWrite().GetCommittedSize() != test.committed || response.GetWrite().GetAssignedOffset() != 0 || response.GetPostState() == nil {
 				t.Fatalf("WRITE=%v", response)
 			}
@@ -128,7 +129,7 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 				}
 			}
 			req.RequestId++
-			replayed := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+			replayed := h.handleWrite(ctx, req, cred, req.GetWrite())
 			response.RequestId = replayed.RequestId
 			if !proto.Equal(response, replayed) {
 				t.Fatalf("replay changed outcome: %v / %v", response, replayed)
@@ -138,6 +139,9 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 			}
 			if len(observations) != 2 || observations[0].Disposition != "executed" || observations[1].Disposition != "replayed" || observations[0].Sequence != observations[1].Sequence || observations[0].Session != cred.ID {
 				t.Fatalf("mutation trace lost exact replay identity: %v", observations)
+			}
+			if observations[0].StorageWait <= 0 || observations[0].ApplyDuration <= 0 || observations[0].DurabilityKind != "handle" || observations[0].DurabilityWait <= 0 || observations[1].DurabilityWait != 0 {
+				t.Fatalf("trace lost direct durability timing or charged replay: %v", observations)
 			}
 
 		})

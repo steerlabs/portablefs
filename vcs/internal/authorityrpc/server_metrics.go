@@ -29,13 +29,16 @@ const (
 // cost; production receives precomputed atomic handles and a monotonic latency
 // sample without building labels or consulting a map.
 type RPCObservation struct {
-	RequestID uint64
-	Session   [16]byte
-	Operation authoritymetrics.Operation
-	Outcome   authoritymetrics.Outcome
-	Started   time.Time
-	Duration  time.Duration
-	Errno     int32
+	RequestID         uint64
+	Session           [16]byte
+	Operation         authoritymetrics.Operation
+	Outcome           authoritymetrics.Outcome
+	Started           time.Time
+	Duration          time.Duration
+	Errno             int32
+	CommittedSequence uint64
+	VisibleSequence   uint64
+	LookupFound       bool
 }
 
 func (s *Server) dispatchRequest(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
@@ -52,7 +55,7 @@ func (s *Server) dispatchRequest(ctx context.Context, request *authoritypb.Reque
 		s.logRPC(request, response, operation, outcome, elapsed)
 	}
 	if s.OnRPC != nil {
-		observation := RPCObservation{RequestID: request.GetRequestId(), Operation: operation, Outcome: outcome, Started: started, Duration: elapsed, Errno: response.GetErrno()}
+		observation := RPCObservation{RequestID: request.GetRequestId(), Operation: operation, Outcome: outcome, Started: started, Duration: elapsed, Errno: response.GetErrno(), CommittedSequence: response.GetVolumeVersion(), VisibleSequence: response.GetVisibleSequence(), LookupFound: request.GetLookup() != nil && response.GetErrno() == 0 && response.GetLookup() != nil}
 		copy(observation.Session[:], request.GetSession().GetId())
 		s.OnRPC(observation)
 	}

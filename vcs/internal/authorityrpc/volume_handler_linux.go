@@ -2679,8 +2679,12 @@ func normalizeMutationTargets(targets []volumeserver.MutationTarget) ([]volumese
 
 func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, apply func(volumeserver.MutationID) *authoritypb.Response, executed *bool) *authoritypb.Response {
 	var started time.Time
+	observation := MutationObservation{}
 	if h.OnMutation != nil {
 		started = time.Now()
+		if op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation); op != nil {
+			op.measurement = &observation
+		}
 	}
 	didExecute, retained := false, false
 	defer func() {
@@ -2692,7 +2696,9 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		}
 		h.Metrics.ObserveMutation(disposition)
 		if h.OnMutation != nil {
-			h.OnMutation(MutationObservation{RequestID: req.GetRequestId(), Session: cred.ID, Slot: req.GetMutation().GetSlot(), Sequence: req.GetMutation().GetSequence(), Operation: requestOperation(req), Disposition: disposition, Started: started, Duration: time.Since(started)})
+			observation.RequestID, observation.Session, observation.Slot, observation.Sequence = req.GetRequestId(), cred.ID, req.GetMutation().GetSlot(), req.GetMutation().GetSequence()
+			observation.Operation, observation.Disposition, observation.Started, observation.Duration = requestOperation(req), disposition, started, time.Since(started)
+			h.OnMutation(observation)
 		}
 	}()
 	if executed != nil {
