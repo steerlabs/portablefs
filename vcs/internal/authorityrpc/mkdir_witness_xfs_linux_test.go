@@ -209,19 +209,22 @@ func TestMkdirWitnessProtectsNewChildThroughCommitOnXFS(t *testing.T) {
 	case <-store.observed:
 	case response := <-created:
 		t.Fatalf("mkdir did not reach its witness: %v", response)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("mkdir did not reach its witness")
 	}
-	go func() { lookedUp <- f.h.Handle(f.ctx, lookup) }()
+	wait := newAdmissionWaitContext(f.ctx)
+	go func() { lookedUp <- f.h.Handle(wait, lookup) }()
 	select {
+	case <-wait.waiting:
+		// Topology and replay admission are uncontended. Lookup has enqueued
+		// its storage turn behind MKDIR's still-held parent/name footprint.
 	case response := <-lookedUp:
-		close(store.release)
-		<-created
 		t.Fatalf("lookup exposed the child before witness/commit: %v", response)
-	case <-time.After(20 * time.Millisecond):
+	case <-time.After(5 * time.Second):
+		t.Fatal("lookup did not wait for storage admission")
 	}
 	close(store.release)
-	first, found := <-created, <-lookedUp
+	first, found := admissionReceive(t, created), admissionReceive(t, lookedUp)
 	if first.GetErrno() != 0 || found.GetErrno() != 0 || !first.GetMkdir().GetChildSearchPermitted() || found.GetLookup().GetItem().GetSnapshotSequence() < first.GetMkdir().GetItem().GetSnapshotSequence() {
 		t.Fatalf("inconsistent child publication: mkdir=%v lookup=%v", first, found)
 	}

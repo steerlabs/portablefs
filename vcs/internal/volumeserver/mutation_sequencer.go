@@ -308,6 +308,12 @@ func (s *mutationSequencer) insertGlobalLocked(w *mutationSequencerWaiter) {
 
 func (s *mutationSequencer) acquire(ctx context.Context, dependencies MutationDependencies) (*mutationSequencerWaiter, error) {
 	w := s.enqueue(dependencies)
+	// Evaluate the cancellation wait only when admission is actually blocked.
+	select {
+	case <-w.ready:
+		return w, nil
+	default:
+	}
 	select {
 	case <-w.ready:
 		return w, nil
