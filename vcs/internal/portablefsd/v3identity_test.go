@@ -78,8 +78,8 @@ func TestV3FileIDRangeIsEnforcedAtIngestion(t *testing.T) {
 		{name: "zero", inode: 0},
 		{name: "one", inode: 1},
 		{name: "first", inode: 2, ok: true},
-		{name: "last", inode: 1<<63 - 1, ok: true},
-		{name: "repair-partition", inode: 1 << 63},
+		{name: "last", inode: math.MaxUint64 - 1, ok: true},
+		{name: "high-half", inode: 1 << 63, ok: true},
 		{name: "max", inode: math.MaxUint64},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -135,11 +135,7 @@ func TestV3HardLinksShareFileIDWithDistinctParentBindings(t *testing.T) {
 	if live := client.liveTokens(); live != 3 {
 		t.Fatalf("live authority capabilities = %d, want root, dir, and one alias", live)
 	}
-	for _, request := range client.mutationRequests() {
-		if reclaim := request.GetReclaim(); reclaim != nil && len(reclaim.GetItem()) != 0 {
-			t.Fatal("duplicate retirement used the singular legacy Reclaim form")
-		}
-	}
+
 }
 
 func TestV3FileIDSurvivesReclaimAndRelookupUnderANewHandle(t *testing.T) {
@@ -232,7 +228,7 @@ func TestV3EveryLiveAttrCarriesFileIDs(t *testing.T) {
 				response := exactTestMutationReply(identity)
 				item := client.issueItem(31, authoritypb.Attr_DIRECTORY, 0x65)
 				response.PostState = testV3RootBinding(item, v3PostStateRoleCreated)
-				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
+				response.Body = &authoritypb.Response_Mkdir{Mkdir: &authoritypb.MkdirReply{Item: item}}
 				return response
 			},
 			attr:   func(reply any) pfslocal.Attr { return reply.(*pfslocal.MkdirReply).Attr },
@@ -735,7 +731,7 @@ func (ns *v3TestNamespace) mutateLocked(identity authorityrpc.MutationIdentity, 
 			ns.tokens[[16]byte(handle)] = created
 			response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: item, Handle: handle}}
 		} else {
-			response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
+			response.Body = &authoritypb.Response_Mkdir{Mkdir: &authoritypb.MkdirReply{Item: item, ChildSearchPermitted: true}}
 		}
 	case *authoritypb.Request_Link:
 		target, parent := ns.tokens[[16]byte(body.Link.GetExistingItem())], ns.tokens[[16]byte(body.Link.GetNewParent())]

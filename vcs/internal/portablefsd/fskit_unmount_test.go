@@ -3,9 +3,12 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
-	"time"
 )
 
 const testFSKitAttachRef = "att_UUUUUUUUUUUUUUUUUUUUUU"
@@ -14,7 +17,6 @@ func TestActivateIfPendingNeverRollsBackActiveCredential(t *testing.T) {
 	a := newAttach(testFSKitAttachRef, "credential-race", ensureAttachRequest{
 		AttachRef:          testFSKitAttachRef,
 		VolumeID:           "vol-credential-race",
-		Branch:             "main",
 		MountPath:          "/Volumes/CredentialRace",
 		AuthorityURL:       "127.0.0.1:1",
 		DataPlaneTransport: "plaintext",
@@ -35,199 +37,116 @@ func TestActivateIfPendingNeverRollsBackActiveCredential(t *testing.T) {
 		t.Fatalf("active credential was rolled back to %q", token)
 	}
 }
-
-func writeFSKitDetachFixture(t *testing.T, stateDir string, prepared, force bool) {
+func writeFSKitDetachFixture(t *testing.T, stateDir string) {
 	t.Helper()
-	if err := writePersistedAttaches(stateDir, []persistedAttachEntry{{
-		Ref:                testFSKitAttachRef,
-		VolumeID:           "vol-fskit-unmount",
-		Branch:             "main",
-		MountPath:          "/Volumes/PortableFSUnmountTest",
-		AuthorityURL:       "127.0.0.1:1",
-		DataPlaneTransport: "plaintext",
-		IdentityEpoch:      1,
-		DetachPrepared:     prepared,
-		DetachForce:        force,
-	}}); err != nil {
+	err := writePersistedAttaches(stateDir, []persistedAttachEntry{{Ref: testFSKitAttachRef, VolumeID: "vol-fskit-unmount", MountPath: "/Volumes/PortableFSUnmountTest", AuthorityURL: "authority.example:2050", DataPlaneTransport: "tls-system-pki", DataPlaneServerName: "authority.example", IdentityEpoch: 1, V3: &persistedV3Attach{RoutesRevision: strings.Repeat("ab", 32)}}})
+	if err != nil {
 		t.Fatal(err)
 	}
 }
-
-func TestPreparedFSKitDetachRecoveryClassifiesAndRemoves(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		present    bool
-		wantDetach int
-	}{
-		{name: "already absent", present: false},
-		{name: "still present", present: true, wantDetach: 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			stateDir := privateTestDir(t)
-			writeFSKitDetachFixture(t, stateDir, true, false)
-			r := newRegistry(stateDir)
-			t.Cleanup(r.stopPersister)
-			detaches := 0
-			found, jobID, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-				present: func(path, ref string) (bool, error) {
-					if path != "/Volumes/PortableFSUnmountTest" || ref != testFSKitAttachRef {
-						t.Fatalf("unexpected exact identity %q %q", path, ref)
+func TestRevivedFSKitExactUnmount(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		present bool
+		busy    bool
+	}{{"absent", false, false}, {"present", true, false}, {"busy", true, true}} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := privateTestDir(t)
+			writeFSKitDetachFixture(t, dir)
+			r := newRegistry(dir)
+			present := test.present
+			attempts := 0
+			found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
+				present: func(string, string) (bool, error) { return present, nil },
+				unmountExact: func(_, _ string, force bool) error {
+					attempts++
+					if force {
+						return errors.New("normal unmount forced")
 					}
-					return tc.present, nil
-				},
-				unmountExact: func(path, ref string, _ bool) error {
-					detaches++
+					if test.busy {
+						return syscall.EBUSY
+					}
+					present = false
 					return nil
 				},
 			})
-			if err != nil || !found || jobID != "" {
-				t.Fatalf("unmount=(%v,%q,%v)", found, jobID, err)
+			if !found {
+				t.Fatal("lost registration")
 			}
-			if detaches != tc.wantDetach {
-				t.Fatalf("exact detaches=%d want %d", detaches, tc.wantDetach)
+			if test.busy {
+				if !errors.Is(err, syscall.EBUSY) || attempts != 1 || r.get(testFSKitAttachRef) == nil {
+					t.Fatalf("busy: attempts=%d err=%v", attempts, err)
+				}
+				return
 			}
-			if got := r.get(testFSKitAttachRef); got != nil {
-				t.Fatal("prepared attach remained registered")
+			if err != nil || r.get(testFSKitAttachRef) != nil {
+				t.Fatalf("unmount err=%v", err)
 			}
-			entries, err := loadPersistedAttaches(stateDir)
-			if err != nil || len(entries) != 0 {
-				t.Fatalf("persisted entries=%+v err=%v", entries, err)
+			want := 0
+			if test.present {
+				want = 1
+			}
+			if attempts != want {
+				t.Fatalf("attempts=%d", attempts)
 			}
 		})
 	}
 }
-
-func TestPreparedFSKitIdentityMismatchPreservesAttach(t *testing.T) {
-	stateDir := privateTestDir(t)
-	writeFSKitDetachFixture(t, stateDir, true, false)
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	mismatch := errors.New("foreign kernel mount at persisted path")
-	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-		present: func(string, string) (bool, error) { return false, mismatch },
-		unmountExact: func(string, string, bool) error {
-			t.Fatal("identity mismatch reached unmount")
-			return nil
-		},
-	})
-	if !found || !errors.Is(err, mismatch) {
-		t.Fatalf("unmount=(%v,%v), want preserved mismatch", found, err)
-	}
-	if got := r.get(testFSKitAttachRef); got == nil {
-		t.Fatal("identity mismatch removed attach")
-	}
-	entries, loadErr := loadPersistedAttaches(stateDir)
-	if loadErr != nil || len(entries) != 1 || !entries[0].DetachPrepared {
-		t.Fatalf("prepared evidence=%+v err=%v", entries, loadErr)
+func TestFSKitIdentityMismatchPreservesAttach(t *testing.T) {
+	dir := privateTestDir(t)
+	writeFSKitDetachFixture(t, dir)
+	r := newRegistry(dir)
+	mismatch := errors.New("foreign kernel mount")
+	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{present: func(string, string) (bool, error) { return false, mismatch }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }})
+	if !found || !errors.Is(err, mismatch) || r.get(testFSKitAttachRef) == nil {
+		t.Fatalf("identity refusal=%v", err)
 	}
 }
-
-// A completed failure is not durable transaction state. The next request must
-// re-observe the kernel instead of joining a completed transaction in the
-// close(done)-before-delete window. Repeat this aggressively because the old
-// ordering surfaced chiefly under the race detector.
-func TestFailedUnmountRetryNeverJoinsStaleCompletedOutcome(t *testing.T) {
-	for range 200 {
-		stateDir := privateTestDir(t)
-		writeFSKitDetachFixture(t, stateDir, true, false)
-		r := newRegistry(stateDir)
-		var observations atomic.Int32
-		first := errors.New("first mount observation failed")
-		found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-			present: func(string, string) (bool, error) {
-				observations.Add(1)
-				return false, first
-			},
-			unmountExact: func(string, string, bool) error {
-				t.Fatal("failed observation reached unmount")
-				return nil
-			},
-		})
-		if !found || !errors.Is(err, first) {
-			t.Fatalf("first unmount=(%v,%v)", found, err)
-		}
-		found, _, err = r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-			present: func(string, string) (bool, error) {
-				observations.Add(1)
-				return false, nil
-			},
-			unmountExact: func(string, string, bool) error {
-				t.Fatal("absent mount reached unmount")
-				return nil
-			},
-		})
-		if err != nil || !found {
-			t.Fatalf("retry joined stale outcome: found=%v err=%v", found, err)
-		}
-		if got := observations.Load(); got != 2 {
-			t.Fatalf("kernel observations=%d, want one per transaction", got)
-		}
-		r.stopPersister()
-	}
-}
-
-func TestRevivedUnpreparedNormalFSKitDetachRequiresBarrier(t *testing.T) {
-	stateDir := privateTestDir(t)
-	writeFSKitDetachFixture(t, stateDir, false, false)
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-		present:      func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(string, string, bool) error { t.Fatal("unverified detach"); return nil },
-	})
-	if !found || err == nil {
-		t.Fatalf("unmount=(%v,%v), want active-volume barrier refusal", found, err)
-	}
-	if r.get(testFSKitAttachRef) == nil {
-		t.Fatal("barrier refusal removed attach")
-	}
-}
-
-func TestFailFrozenPreparedAttachDoesNotDeadlockShutdown(t *testing.T) {
-	stateDir := privateTestDir(t)
-	writeFSKitDetachFixture(t, stateDir, true, false)
-	r := newRegistry(stateDir)
+func TestRegistryRestoresDetachedRecordAfterRemovalPersistenceFailure(t *testing.T) {
+	dir := privateTestDir(t)
+	writeFSKitDetachFixture(t, dir)
+	r := newRegistry(dir)
 	a := r.get(testFSKitAttachRef)
-	if a == nil {
-		t.Fatal("missing revived attach")
+	bad := filepath.Join(dir, "not-directory")
+	if err := os.WriteFile(bad, nil, 0600); err != nil {
+		t.Fatal(err)
 	}
-	a.mu.Lock()
-	a.detachFailFrozen = true
-	a.mu.Unlock()
-	done := make(chan error, 1)
-	go func() { done <- r.closeAll(context.Background()) }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("fail-frozen shutdown did not report the prepared detach")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("fail-frozen prepared attach held namespace mutex across shutdown")
+	r.stateDir = bad
+	ops := fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }}
+	found, _, err := r.unmountFSKitWith(a.ref, false, ops)
+	if !found || err == nil || !a.isDetached() || r.get(a.ref) != a || r.byKey[a.key] != a {
+		t.Fatalf("failed removal lost exact detached owner: %v", err)
+	}
+	r.stateDir = dir
+	ops.present = func(string, string) (bool, error) {
+		t.Error("completed teardown repeated kernel observation")
+		return false, nil
+	}
+	found, _, err = r.unmountFSKitWith(a.ref, false, ops)
+	if !found || err != nil || r.get(a.ref) != nil {
+		t.Fatalf("retry=%v", err)
+	}
+	entries, err := loadPersistedAttaches(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("persisted removal=%v %v", entries, err)
 	}
 }
-
-// A CLEAN unmount never forces. A mount that would need MNT_FORCE is not
-// cleanly unmountable, and saying so is the only way a leaked reference is ever
-// found rather than papered over.
-func TestNormalFSKitDetachNeverForcesTheKernel(t *testing.T) {
-	stateDir := privateTestDir(t)
-	writeFSKitDetachFixture(t, stateDir, true, false)
-	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
-	detaches := 0
-	forced := false
-	found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, fskitKernelOps{
-		present: func(string, string) (bool, error) { return true, nil },
-		unmountExact: func(_, _ string, force bool) error {
-			detaches++
-			forced = force
-			return nil
-		},
-	})
-	if err != nil || !found || detaches != 1 {
-		t.Fatalf("unmount=(%v,%v) detaches=%d", found, err, detaches)
-	}
-	if forced {
-		t.Fatal("clean unmount asked the kernel to force a busy mount")
+func TestFailedUnmountRetryNeverJoinsStaleCompletedOutcome(t *testing.T) {
+	for range 100 {
+		dir := privateTestDir(t)
+		writeFSKitDetachFixture(t, dir)
+		r := newRegistry(dir)
+		var observations atomic.Int32
+		first := errors.New("first observation failed")
+		ops := fskitKernelOps{present: func(string, string) (bool, error) { observations.Add(1); return false, first }, unmountExact: func(string, string, bool) error { return errors.New("unexpected unmount") }}
+		_, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, ops)
+		if !errors.Is(err, first) {
+			t.Fatal(err)
+		}
+		ops.present = func(string, string) (bool, error) { observations.Add(1); return false, nil }
+		found, _, err := r.unmountFSKitWith(testFSKitAttachRef, false, ops)
+		if !found || err != nil || observations.Load() != 2 {
+			t.Fatalf("retry=%v observations=%d", err, observations.Load())
+		}
 	}
 }

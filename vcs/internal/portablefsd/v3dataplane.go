@@ -19,8 +19,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
+	"github.com/steerlabs/portablefs/vcs/internal/pathcomponent"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
-	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
@@ -29,18 +29,10 @@ import (
 const (
 	v3RootItemID  = uint64(1)
 	v3FirstItemID = uint64(2)
-	// The daemon owns the low half of the pfslocal item-handle space and the
-	// extension owns the high half for its synthetic macOS 26 repair items.
-	// Keep this boundary identical to
-	// PfsFSKitMapping.localRepairIdentifierFloor, which the extension uses to
-	// tell a daemon handle from one of its own.
-	v3RepairItemFloor = uint64(1) << 63
-	// File IDs are what FSKit reports (plus one): the root is 1 and every other
-	// object is its authority inode in [2, 2^63), below the extension's repair
-	// partition after that shift. They are independent of item handles.
+	// Item handles and file IDs are independent non-reusing UInt64 domains.
 	v3RootFileID   = uint64(1)
 	v3FirstFileID  = uint64(2)
-	v3FileIDLimit  = uint64(1) << 63
+	v3FileIDLimit  = uint64(math.MaxUint64)
 	v3CookieFloor  = uint64(1) << 63
 	v3MaxCookies   = 1 << 16
 	v3MaxLocalRead = pfslocal.MaxFrameBytes - 1024
@@ -53,12 +45,11 @@ const (
 // pfslocal adapter. Credentials and attach/resume state remain wholly inside
 // authorityrpc.Client and are never copied into the local socket protocol.
 type v3DataPlaneClient interface {
-	v3VisibilityClient
+	v3SessionClient
 	Root() *authoritypb.Item
 	IOLimits() (uint32, uint32)
 	SessionLease() time.Duration
 	DataPlaneOperationLimit() int
-	SupportsBatchedClose() bool
 	// KeepAlive renews the session and returns its validated relative cache
 	// proof (see authorityrpc.Client.KeepAlive).
 	KeepAlive(context.Context) (time.Duration, error)
@@ -78,11 +69,9 @@ type v3DataPlaneConfig struct {
 	Client         v3DataPlaneClient
 	VolumeID       string
 	VolumeName     string
-	Branch         string
 	ItemGeneration uint64
 	PrincipalUID   uint32
 	PrincipalGID   uint32
-	CachePolicy    string
 	// Clock reads the sleep-inclusive continuous clock in nanoseconds; nil is
 	// the platform clock. Tests inject a controlled one.
 	Clock func() (uint64, error)
@@ -121,10 +110,19 @@ type v3ItemRecord struct {
 	children  map[string]*v3ItemRecord
 	negatives map[string]struct{}
 	watermark uint64
+	// mkdirWitness retains only the evaluated permission and exact committed
+	// snapshot. It grants no absence until P7 validates certificate ordering.
+	mkdirWitness *v3MkdirWitness
 }
 
 // v3Binding is a record's one remembered name. Retiring the parent record
 // clears it, so a rendered parent is always live.
+type v3MkdirWitness struct {
+	identity        [16]byte
+	snapshot        uint64
+	searchPermitted bool
+}
+
 type v3Binding struct {
 	parent *v3ItemRecord
 	name   string
@@ -266,6 +264,7 @@ type v3DataPlane struct {
 	// means no usable proof.
 	// authorizationDeadline is the installed signed deadline, an additional
 	// wall-clock denial check (zero: none). All are protected by mu.
+	renewalMu             sync.Mutex
 	clock                 func() (uint64, error)
 	clockFault            error
 	horizon               uint64
@@ -326,7 +325,7 @@ func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence ui
 
 func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane, error) {
 	if parent == nil || cfg.Client == nil || cfg.VolumeID == "" || cfg.VolumeName == "" ||
-		cfg.ItemGeneration == 0 || cfg.Branch != "" {
+		cfg.ItemGeneration == 0 {
 		return nil, errors.New("portablefsd: complete branchless v3 data-plane configuration is required")
 	}
 	limit := cfg.Client.DataPlaneOperationLimit()
@@ -358,20 +357,12 @@ func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane
 		nameMax: 255, maxRead: maxRead, maxWrite: maxWrite,
 		authorizationDeadline: cfg.Client.AuthorizationDeadline(),
 	}
-	if !cfg.Client.SupportsBatchedClose() {
-		cancel()
-		return nil, errors.New("portablefsd: v3 authority did not negotiate batched-close-v1 for this FSKit session")
-	}
 	d.releases = newV3ReleaseOwner(v3ReleaseLimit(maxWrite), d.sendReleaseBatch)
-	bridge, err := newV3CoherenceBridge(cfg.Client, cfg.CachePolicy, d.recordTerminal)
+	bridge, err := newV3CoherenceBridge(cfg.Client, d.recordTerminal)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	// The versioned metadata cache rests on writer exclusion, under which no
-	// peer repair can be addressed to this session. One that arrives is an
-	// invariant violation, never something to actuate.
-	bridge.refusePeerRepair = true
 	d.bridge = bridge
 	root, err := d.installRoot(cfg.Client.Root())
 	if err != nil {
@@ -397,6 +388,18 @@ func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane
 		return nil, err
 	}
 	d.nameMax = response.GetStatFs().GetNameMax()
+	if err := d.renewHorizon(ctx); err != nil {
+		d.abandonBeforeMount(err)
+		return nil, fmt.Errorf("initial authority cache proof: %w", err)
+	}
+	d.mu.Lock()
+	usable := d.cacheAdmissionLocked() == v3CacheHit
+	d.mu.Unlock()
+	if !usable {
+		err := errors.New("initial authority proof is unusable")
+		d.abandonBeforeMount(err)
+		return nil, err
+	}
 	go d.keepAlive()
 	return d, nil
 }
@@ -443,13 +446,11 @@ func (d *v3DataPlane) resolveReply() *pfslocal.ResolveReply {
 	attr, _ := d.localAttr(root, rootAttr, nil)
 	return &pfslocal.ResolveReply{
 		Root: root.item, RootAttr: attr, VolumeID: d.cfg.VolumeID,
-		Branch: d.cfg.Branch, VolumeName: d.cfg.VolumeName,
+		VolumeName: d.cfg.VolumeName,
 		Capabilities: pfslocal.Capabilities{
-			Symlinks: true, HardLinks: true, Xattrs: true, CaseSensitive: true,
+
 			MaxNameBytes: nameMax, MaxFileSize: math.MaxInt64, PreferredIOSize: preferred,
-			FlagsSupported: false, FlagsUnderstood: true, XattrSetSupported: false,
 		},
-		V3Coherence: d.bridge.resolveContract(),
 	}
 }
 
@@ -466,13 +467,6 @@ func (d *v3DataPlane) dispatchFrontend(
 			return nil, darwinEAGAIN
 		}
 		return nil, darwinEIO
-	}
-	// Liveness is intentionally outside ordinary data-plane admission. The
-	// authority client routes KeepAlive onto its separately reserved liveness
-	// lane, so a saturated operation pool cannot make a healthy strict session
-	// look dead to FSKit.
-	if request, ok := body.(*pfslocal.V3LivenessRequest); ok {
-		return d.v3Liveness(ctx, request)
 	}
 	select {
 	case d.ops <- struct{}{}:
@@ -502,8 +496,6 @@ func (d *v3DataPlane) dispatchFrontend(
 		return d.read(ctx, operationID, request)
 	case *pfslocal.WriteRequest:
 		return d.write(ctx, operationID, request)
-	case *pfslocal.FsyncRequest:
-		return d.fsync(ctx, request)
 	case *pfslocal.CreateRequest:
 		return d.create(ctx, operationID, request)
 	case *pfslocal.MkdirRequest:
@@ -520,8 +512,6 @@ func (d *v3DataPlane) dispatchFrontend(
 		return d.hardlink(ctx, operationID, request)
 	case *pfslocal.XattrGetRequest:
 		return d.xattrGet(ctx, operationID, request)
-	case *pfslocal.XattrSetRequest:
-		return d.xattrSet(request)
 	case *pfslocal.XattrListRequest:
 		return d.xattrList(ctx, operationID, request)
 	case *pfslocal.XattrRemoveRequest:
@@ -539,28 +529,9 @@ func (d *v3DataPlane) dispatchFrontend(
 	}
 }
 
-func (d *v3DataPlane) v3Liveness(ctx context.Context, request *pfslocal.V3LivenessRequest) (any, int32) {
-	epoch, session := d.client.Epoch(), d.client.SessionID()
-	if request == nil || len(request.AuthorityEpoch) != 16 || len(request.SessionID) != 16 ||
-		!bytes.Equal(request.AuthorityEpoch, epoch) || !bytes.Equal(request.SessionID, session) {
-		return nil, darwinEINVAL
-	}
-	if d.terminalError() != nil {
-		return nil, darwinEIO
-	}
-	if err := d.renewHorizon(ctx); err != nil {
-		_ = d.fail(fmt.Errorf("portablefsd: authority liveness proof was refused: %w", err))
-		return nil, darwinEIO
-	}
-	return &pfslocal.V3LivenessReply{
-		AuthorityEpoch: cloneBytesV3(epoch),
-		SessionID:      cloneBytesV3(session),
-	}, 0
-}
-
 func (d *v3DataPlane) lookup(ctx context.Context, operationID uint64, request *pfslocal.LookupRequest) (any, int32) {
 	parent, errno := d.item(request.Dir)
-	if errno != 0 || !visibilitywire.ValidName(request.Name) {
+	if errno != 0 || !pathcomponent.ValidName(request.Name) {
 		if errno == 0 {
 			errno = darwinEINVAL
 		}
@@ -1012,26 +983,12 @@ func v3WriteCommitted(item *v3ItemRecord, position, size uint64, response *autho
 	return effect, postAttr, nil
 }
 
-func (d *v3DataPlane) fsync(ctx context.Context, request *pfslocal.FsyncRequest) (any, int32) {
-	handle, release, errno := d.acquireHandle(request.Handle, nil)
-	if errno != 0 {
-		return nil, errno
-	}
-	defer release()
-	response, errno := d.callRead(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: cloneBytesV3(handle.token)}}})
-	if errno != 0 {
-		return nil, errno
-	}
-	_ = response
-	return &pfslocal.FsyncReply{}, 0
-}
-
 func (d *v3DataPlane) create(ctx context.Context, operationID uint64, request *pfslocal.CreateRequest) (any, int32) {
 	parent, errno := d.item(request.Dir)
 	if errno != 0 {
 		return nil, errno
 	}
-	if !visibilitywire.ValidName(request.Name) {
+	if !pathcomponent.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	gate, err := v3NamespaceSourceGate(parent.item, request.Name, false)
@@ -1074,7 +1031,7 @@ func (d *v3DataPlane) create(ctx context.Context, operationID uint64, request *p
 	if err := d.applyMutation(effect); err != nil {
 		return d.malformed(err.Error())
 	}
-	if err := d.bridge.sourcePublication.operationLease(operationID).attachBinding(
+	if err := d.bridge.sourcePublication.operationLease(v3Callback(ctx, operationID)).attachBinding(
 		gate,
 		v3PublicationNamespace{parent: v3PublicationIdentity(parent.item.StableIdentity), name: string(request.Name)},
 		v3PublicationIdentity(identity),
@@ -1093,7 +1050,7 @@ func (d *v3DataPlane) mkdir(ctx context.Context, operationID uint64, request *pf
 	if errno != 0 {
 		return nil, errno
 	}
-	if !visibilitywire.ValidName(request.Name) {
+	if !pathcomponent.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	gate, err := v3NamespaceSourceGate(parent.item, request.Name, false)
@@ -1109,7 +1066,7 @@ func (d *v3DataPlane) mkdir(ctx context.Context, operationID uint64, request *pf
 	if errno != 0 {
 		return nil, errno
 	}
-	attr, err := d.localAttr(record, response.GetLookup().GetItem().GetAttr(), v3ParentOf(parent))
+	attr, err := d.localAttr(record, response.GetMkdir().GetItem().GetAttr(), v3ParentOf(parent))
 	if err != nil {
 		return d.malformed(err.Error())
 	}
@@ -1121,7 +1078,7 @@ func (d *v3DataPlane) remove(ctx context.Context, operationID uint64, request *p
 	if errno != 0 {
 		return nil, errno
 	}
-	if !visibilitywire.ValidName(request.Name) {
+	if !pathcomponent.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	gate, err := v3NamespaceSourceGate(parent.item, request.Name, false)
@@ -1143,7 +1100,7 @@ func (d *v3DataPlane) remove(ctx context.Context, operationID uint64, request *p
 	if err := d.applyMutation(effect); err != nil {
 		return d.malformed(err.Error())
 	}
-	if err := d.bridge.sourcePublication.operationLease(operationID).resolveNoBinding(
+	if err := d.bridge.sourcePublication.operationLease(v3Callback(ctx, operationID)).resolveNoBinding(
 		gate,
 		v3PublicationNamespace{parent: v3PublicationIdentity(parent.item.StableIdentity), name: string(request.Name)},
 	); err != nil {
@@ -1161,7 +1118,7 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 	if errno != 0 {
 		return nil, errno
 	}
-	if !visibilitywire.ValidName(request.FromName) || !visibilitywire.ValidName(request.ToName) {
+	if !pathcomponent.ValidName(request.FromName) || !pathcomponent.ValidName(request.ToName) {
 		return nil, darwinEINVAL
 	}
 	gate, err := v3RenameSourceGate(from.item, request.FromName, to.item, request.ToName)
@@ -1198,7 +1155,7 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 	if err := d.applyMutation(effect); err != nil {
 		return d.malformed(err.Error())
 	}
-	lease := d.bridge.sourcePublication.operationLease(operationID)
+	lease := d.bridge.sourcePublication.operationLease(v3Callback(ctx, operationID))
 	oldNamespace := v3PublicationNamespace{parent: v3PublicationIdentity(from.item.StableIdentity), name: string(request.FromName)}
 	newNamespace := v3PublicationNamespace{parent: v3PublicationIdentity(to.item.StableIdentity), name: string(request.ToName)}
 	if err := lease.attachBinding(gate, newNamespace, newIdentity); err != nil {
@@ -1226,13 +1183,16 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 func (d *v3DataPlane) adoptCreated(
 	ctx context.Context,
 	operationID uint64,
-	gate *authoritypb.FskitSourcePublication,
+	gate *v3SourceGate,
 	response *authoritypb.Response,
 	parent *v3ItemRecord,
 	name []byte,
 	kind authoritypb.Attr_Kind,
 ) (*v3ItemRecord, int32) {
 	created := response.GetLookup().GetItem()
+	if kind == authoritypb.Attr_DIRECTORY {
+		created = response.GetMkdir().GetItem()
+	}
 	identity, err := authorityIdentity(created)
 	if err != nil {
 		_, errno := d.malformed(fmt.Sprintf("%s reply: %v", kind, err))
@@ -1254,7 +1214,14 @@ func (d *v3DataPlane) adoptCreated(
 		_, errno := d.malformed(err.Error())
 		return nil, errno
 	}
-	if err := d.bridge.sourcePublication.operationLease(operationID).attachBinding(
+	if kind == authoritypb.Attr_DIRECTORY {
+		d.mu.Lock()
+		if d.itemsByID[record.item.ItemID] == record {
+			record.mkdirWitness = &v3MkdirWitness{identity: identity, snapshot: response.GetPostState().GetSnapshotSequence(), searchPermitted: response.GetMkdir().GetChildSearchPermitted()}
+		}
+		d.mu.Unlock()
+	}
+	if err := d.bridge.sourcePublication.operationLease(v3Callback(ctx, operationID)).attachBinding(
 		gate,
 		v3PublicationNamespace{parent: v3PublicationIdentity(parent.item.StableIdentity), name: string(name)},
 		v3PublicationIdentity(identity),
@@ -1270,7 +1237,7 @@ func (d *v3DataPlane) symlink(ctx context.Context, operationID uint64, request *
 	if errno != 0 {
 		return nil, errno
 	}
-	if !visibilitywire.ValidName(request.Name) || bytes.IndexByte(request.Target, 0) >= 0 {
+	if !pathcomponent.ValidName(request.Name) || bytes.IndexByte(request.Target, 0) >= 0 {
 		return nil, darwinEINVAL
 	}
 	gate, err := v3NamespaceSourceGate(parent.item, request.Name, false)
@@ -1317,7 +1284,7 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 	if errno != 0 {
 		return nil, errno
 	}
-	if !visibilitywire.ValidName(request.Name) {
+	if !pathcomponent.ValidName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	gate, err := v3NamespaceSourceGate(parent.item, request.Name, false, item.item)
@@ -1350,7 +1317,7 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 	if err := d.applyMutation(effect); err != nil {
 		return d.malformed(err.Error())
 	}
-	if err := d.bridge.sourcePublication.operationLease(operationID).attachBinding(
+	if err := d.bridge.sourcePublication.operationLease(v3Callback(ctx, operationID)).attachBinding(
 		gate,
 		v3PublicationNamespace{parent: v3PublicationIdentity(parent.item.StableIdentity), name: string(request.Name)},
 		v3PublicationIdentity(identity),
@@ -1395,17 +1362,6 @@ func (d *v3DataPlane) xattrGet(ctx context.Context, operationID uint64, request 
 // XattrSetSupported=false because XFS does not charge attribute blocks to the
 // project quota. The authority's EOPNOTSUPP crosses the same wire mapping a
 // round trip would use, and no mutation or publication gate is involved.
-func (d *v3DataPlane) xattrSet(request *pfslocal.XattrSetRequest) (any, int32) {
-	_, _, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
-	release()
-	if errno != 0 {
-		return nil, errno
-	}
-	if !validXattrName(request.Name) || request.CreateOnly && request.ReplaceOnly {
-		return nil, darwinEINVAL
-	}
-	return nil, linuxToDarwin(errnos.EOPNOTSUPP)
-}
 
 func (d *v3DataPlane) xattrList(ctx context.Context, operationID uint64, request *pfslocal.XattrListRequest) (any, int32) {
 	item, handle, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
@@ -1492,7 +1448,7 @@ func (d *v3DataPlane) syncVolume(ctx context.Context) (any, int32) {
 	if response.GetSyncFs() == nil {
 		return d.malformed("syncfs barrier omitted reply")
 	}
-	return &pfslocal.SyncVolumeReply{Degraded: false}, 0
+	return &pfslocal.SyncVolumeReply{}, 0
 }
 
 // reclaim retires the frontend's ownership of an item. The reply follows local
@@ -1600,7 +1556,7 @@ func (d *v3DataPlane) enumerateEntries(ctx context.Context, operationID uint64, 
 	positions := make([]v3CookieRecord, 0, len(page.GetEntries()))
 	entries := make([]*pfslocal.DirEntry, 0, len(page.GetEntries()))
 	for _, entry := range page.GetEntries() {
-		if entry == nil || !visibilitywire.ValidName(entry.GetName()) || len(entry.GetNextCookie()) == 0 || entry.GetAttr() == nil {
+		if entry == nil || !pathcomponent.ValidName(entry.GetName()) || len(entry.GetNextCookie()) == 0 || entry.GetAttr() == nil {
 			return d.malformed("readdir omitted name, cookie, or attributes")
 		}
 		if entry.GetItem() != nil {
@@ -1709,7 +1665,7 @@ func (d *v3DataPlane) callRead(ctx context.Context, operationID uint64, request 
 		}
 		retained = true
 	} else {
-		if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, consumption); err != nil {
+		if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(v3Callback(ctx, operationID), consumption); err != nil {
 			d.revokeRetainedResponse(ctx, err)
 			return nil, darwinEIO
 		}
@@ -1728,9 +1684,7 @@ func retainedV3ResponseTerminalCause(response *authoritypb.Response, callErr err
 	if response.GetUncertain() ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
-		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
 		v3SuccessCarriesFailure(response) ||
-		response.GetFskitRepairRetrySequence() != 0 ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		return errors.New("portablefsd: authority returned a terminal retained outcome")
 	}
@@ -1769,24 +1723,16 @@ func (d *v3DataPlane) revokeRetainedResponse(ctx context.Context, cause error) {
 
 // callMutation runs one visible mutation under its source-publication lease.
 // Its caller defers the returned settlement until the whole handler returns.
-func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.FskitSourcePublication) (*authoritypb.Response, int32, func()) {
+func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *v3SourceGate) (*authoritypb.Response, int32, func()) {
 	finish := func() {}
 	if operationID == 0 || request == nil {
 		return nil, darwinEINVAL, finish
 	}
-	lease, err := d.bridge.sourcePublication.acquireSource(ctx, operationID, gate)
+	lease, err := d.bridge.sourcePublication.acquireSource(ctx, v3Callback(ctx, operationID), gate)
 	if err != nil {
-		if errors.Is(err, errV3SourcePublicationInterrupted) && d.cfg.CachePolicy == v3CachePolicyMacOS26 {
-			return nil, darwinECANCELED, finish
-		}
 		return nil, v3LocalErrno(err), finish
 	}
 	finish = lease.finishRequest
-	request.FskitSourcePublication = gate
-	// Carry the exact pfslocal publication/callback identity into authority
-	// scheduling as retry-fairness metadata. Publication ownership itself is
-	// represented only by the canonical gate above; there is no source phase.
-	request.FskitFrontendOperationId = operationID
 	var assigned authorityrpc.MutationIdentity
 	response, consumption, callErr := d.client.CallMutationWithIdentityRetained(ctx, request, func(identity authorityrpc.MutationIdentity) error {
 		if err := lease.markAssigned(); err != nil {
@@ -1821,7 +1767,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 			return nil, darwinEIO, finish
 		}
 		if consumption != nil {
-			if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, consumption); err != nil {
+			if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(v3Callback(ctx, operationID), consumption); err != nil {
 				d.revokeRetainedResponse(ctx, err)
 				return nil, darwinEIO, finish
 			}
@@ -1893,7 +1839,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 	classified, errno := d.classify(response, nil, true)
 	if errno != 0 {
 		if consumption != nil {
-			if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, consumption); err != nil {
+			if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(v3Callback(ctx, operationID), consumption); err != nil {
 				d.revokeRetainedResponse(ctx, err)
 				return nil, darwinEIO, finish
 			}
@@ -1970,7 +1916,7 @@ func (d *v3DataPlane) callNonVisibleMutation(ctx context.Context, operationID ui
 				}
 				retained = true
 			} else {
-				if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(operationID, consumption); err != nil {
+				if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(v3Callback(ctx, operationID), consumption); err != nil {
 					d.revokeRetainedResponse(ctx, err)
 					return nil, darwinEIO
 				}
@@ -2002,30 +1948,11 @@ func (d *v3DataPlane) classify(response *authoritypb.Response, callErr error, mu
 		_ = d.fail(errors.New("portablefsd: authority returned a terminal or malformed outcome"))
 		return nil, darwinEIO
 	}
-	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY || response.GetFskitRepairRetrySequence() != 0 {
-		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only visibility retry to a callback-serialized frontend"))
-		return nil, darwinEIO
-	}
 	if v3SuccessCarriesFailure(response) {
 		_ = d.fail(fmt.Errorf("portablefsd: authority success carried failure class %d", response.GetFailure()))
 		return nil, darwinEIO
 	}
 	if response.GetErrno() != 0 {
-		if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED {
-			if response.GetErrno() != errnos.EINTR {
-				_ = d.fail(errors.New("portablefsd: authority returned a malformed visibility interruption"))
-				return nil, darwinEIO
-			}
-			// v1's frozen contract exposed the authority's definite-preapply
-			// EINTR unchanged. v2 translates the same proof to ECANCELED: the
-			// callback must release FSKit's namespace lane so the repair that
-			// caused the refusal can enter, but macOS 26 must not silently replay
-			// it as it does EINTR, EBUSY, and EAGAIN. Retrying inside this callback
-			// deadlocks because the nested repair uses that same lane.
-			if d.cfg.CachePolicy == v3CachePolicyMacOS26 {
-				return response, darwinECANCELED
-			}
-		}
 		return response, linuxToDarwin(response.GetErrno())
 	}
 	return response, 0
@@ -2062,7 +1989,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item) (
 		}
 		duplicate = !bytes.Equal(record.token, parsed.token)
 	} else {
-		if d.nextItemID >= v3RepairItemFloor {
+		if d.nextItemID == 0 {
 			d.mu.Unlock()
 			_, errno := d.malformed("local item handle space exhausted")
 			return nil, errno
@@ -2157,15 +2084,12 @@ func (d *v3DataPlane) representableEffect(effect *v3MutationEffect) error {
 	return nil
 }
 
-// fileIDFor maps an authority object to the file ID FSKit reports. The root is
-// 1 whatever its physical inode; every other object is its inode, which must
-// leave room for FSKit's shift by one below the extension's repair partition.
 func (d *v3DataPlane) fileIDFor(identity [16]byte, inode uint64) (uint64, error) {
 	if identity == d.rootIdentity {
 		return v3RootFileID, nil
 	}
 	if inode < v3FirstFileID || inode >= v3FileIDLimit {
-		return 0, fmt.Errorf("authority inode %d is outside the file-ID range [2, 2^63)", inode)
+		return 0, fmt.Errorf("authority inode %d is outside the file-ID range [2, UInt64.max)", inode)
 	}
 	return inode, nil
 }
@@ -2837,82 +2761,77 @@ func (d *v3DataPlane) stopServing(err error) error {
 	return err
 }
 
+// keepAlive is the sole periodic renewal owner. Completion starts the next
+// interval; slow requests never accumulate a ticker backlog or overlap.
 func (d *v3DataPlane) keepAlive() {
-	interval := v3KeepAliveInterval(d.client.SessionLease(), d.client.VisibilityRepairBudget())
+	interval := v3KeepAliveInterval(d.client.SessionLease())
 	if interval <= 0 {
-		_ = d.fail(errors.New("portablefsd: invalid authority liveness interval"))
+		_ = d.fail(errors.New("invalid authority renewal interval"))
 		return
 	}
-	// Local admission may already be terminal while the supervisor is proving
-	// kernel absence. Liveness belongs to this original authority transport
-	// until detach or a genuine transport failure closes it, and any refused
-	// renewal is terminal.
-	renew := func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), interval)
-		defer cancel()
-		if err := d.renewHorizon(ctx); err != nil {
-			_ = d.fail(err)
-			return false
-		}
-		return true
-	}
-	// The first proof is requested at once; no local hit is admitted before it.
-	if !renew() {
-		return
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
+		timer := time.NewTimer(interval)
 		select {
 		case <-d.client.SessionDone():
+			timer.Stop()
 			return
-		case <-ticker.C:
-			if !renew() {
-				return
-			}
+		case <-timer.C:
+		}
+		if !d.scheduledRenewal() {
+			return
 		}
 	}
 }
-
-// v3KeepAliveInterval renews at least three times per lease, per repair
-// budget, and per MaxCacheProof, so a large configured lease or budget cannot
-// schedule normal renewal beyond the frozen proof cap.
-func v3KeepAliveInterval(lease, repairBudget time.Duration) time.Duration {
-	if lease <= 0 || repairBudget <= 0 {
+func v3KeepAliveInterval(lease time.Duration) time.Duration {
+	if lease <= 0 {
 		return 0
 	}
-	return min(lease/3, repairBudget/3, authorityrpc.MaxCacheProof/3)
+	return min(lease/3, 5*time.Second, authorityrpc.MaxCacheProof/3).Truncate(time.Millisecond)
 }
 
-// renewHorizon issues one explicit KeepAlive and adopts its proof. The start
-// instant is captured before the request can queue, so queueing, transport,
-// and reply delay all consume the promise rather than extend it. Only these
-// explicit receipts advance the horizon; a refused renewal is the caller's
-// terminal error.
-func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
+// renewHorizon anchors both the local budget and H before queueing. Cadence
+// never shortens this budget. Only a validated, still usable proof grants H.
+func (d *v3DataPlane) renewHorizon(parent context.Context) error {
+	d.renewalMu.Lock()
+	defer d.renewalMu.Unlock()
+	wallStart := time.Now()
 	d.mu.Lock()
 	start, startErr := d.readClockLocked()
+	authorization := d.authorizationDeadline
 	d.mu.Unlock()
 	if startErr != nil {
-		// Serving ends at once; the renewal itself still runs, because liveness
-		// belongs to the transport the absence proof needs.
 		_ = d.endOnClockFault()
+		return startErr
 	}
+	if !authorization.IsZero() && !wallStart.Before(authorization) {
+		return errors.New("installed authority authorization expired")
+	}
+	deadline := wallStart.Add(d.client.SessionLease())
+	if !authorization.IsZero() && authorization.Before(deadline) {
+		deadline = authorization
+	}
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
 	proof, err := d.client.KeepAlive(ctx)
 	if err != nil {
 		return err
 	}
+	if proof <= 0 || proof%time.Millisecond != 0 || proof > authorityrpc.MaxCacheProof || proof > d.client.SessionLease() || (!authorization.IsZero() && proof > authorization.Sub(wallStart)) {
+		return errors.New("authority renewal returned an invalid proof")
+	}
 	d.mu.Lock()
 	now, nowErr := d.readClockLocked()
 	candidate, usable := v3HorizonCandidate(start, proof)
-	// Retained writer exclusion never shrinks on reauthorization. Only the
-	// installed deadline denies local permission; wall time grants no horizon.
-	if d.clockFault == nil && usable && now < candidate && d.terminal == nil && candidate > d.horizon {
+	if usable && nowErr == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
 		d.horizon = candidate
 	}
 	d.mu.Unlock()
 	if nowErr != nil {
 		_ = d.endOnClockFault()
+		return nowErr
+	}
+	if !usable || now >= candidate {
+		return errors.New("authority renewal returned an unusable delayed proof")
 	}
 	return nil
 }
@@ -3178,4 +3097,34 @@ func v3LocalErrno(err error) int32 {
 		return darwinEINTR
 	}
 	return darwinEIO
+}
+
+// scheduledRenewal distinguishes a definitively settled local timeout from a
+// refused or poisoned authority session. KeepAlive owns cancel-drain settlement.
+func (d *v3DataPlane) scheduledRenewal() bool {
+	err := d.renewHorizon(context.Background())
+	if err == nil {
+		return true
+	}
+	d.mu.Lock()
+	clockFault := d.clockFault
+	authorization := d.authorizationDeadline
+	d.mu.Unlock()
+	if clockFault != nil {
+		return false
+	}
+	if !authorization.IsZero() && !time.Now().Before(authorization) {
+		_ = d.fail(errors.New("installed authority authorization expired"))
+		return false
+	}
+	if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && d.client.SessionError() == nil && d.client.LocalAdmissionOpen() {
+		select {
+		case <-d.client.SessionDone():
+			return false
+		default:
+		}
+		return true
+	}
+	_ = d.fail(err)
+	return false
 }

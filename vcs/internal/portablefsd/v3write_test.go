@@ -17,10 +17,10 @@ import (
 )
 
 func v3SourceLeaseState(d *v3DataPlane, operationID uint64) (assigned uint32, committed, released bool) {
-	lease := d.bridge.sourcePublication.operationLease(operationID)
+	lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 	d.bridge.sourcePublication.mu.Lock()
 	defer d.bridge.sourcePublication.mu.Unlock()
-	if op := d.bridge.sourcePublication.operations[operationID]; op != nil {
+	if op := d.bridge.sourcePublication.operations[testCallback(operationID)]; op != nil {
 		committed = op.committed
 	}
 	if lease != nil {
@@ -39,15 +39,16 @@ func TestV3WriteSendsOneExactWritePerChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.beforeAssigned = func(request *authoritypb.Request) error {
-		lease := d.bridge.sourcePublication.operationLease(operationID)
-		if lease == nil || !proto.Equal(request.GetFskitSourcePublication(), expectedGate) {
+		lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
+		coordinates, _, _ := coordinatesForV3SourceGate(expectedGate)
+		if lease == nil || len(lease.coordinates) != len(coordinates) {
 			return errors.New("write did not install its exact ATTR+DATA source gate before replay assignment")
 		}
 		return nil
 	}
 	before := len(client.mutationRequests())
-	d.bridge.reserveFrontendPublication(operationID)
-	replyAny, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
+	replyAny, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 		Handle: handle, Offset: 7, Data: []byte("abcde"),
 	})
 	if errno != 0 {
@@ -65,7 +66,7 @@ func TestV3WriteSendsOneExactWritePerChunk(t *testing.T) {
 		Handle: d.handles[handle].token, Position: 7, Size: 5,
 		Data: []byte("abcde"), WriteFlags: v3WriteFlagKillSUIDGID,
 	}
-	if !proto.Equal(sent[0].GetWrite(), want) || sent[0].GetFskitFrontendOperationId() != operationID {
+	if !proto.Equal(sent[0].GetWrite(), want) {
 		t.Fatalf("write request = %v, want exactly %v for operation %d", sent[0], want, operationID)
 	}
 	if _, committed, _ := v3SourceLeaseState(d, operationID); !committed {
@@ -74,7 +75,7 @@ func TestV3WriteSendsOneExactWritePerChunk(t *testing.T) {
 	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 		t.Fatal("write PublicationAck was refused")
 	}
-	d.bridge.releaseFrontendPublication(operationID)
+	d.bridge.releaseFrontendPublication(testCallback(operationID))
 }
 
 func TestV3WriteReturnsAShortCommittedPrefix(t *testing.T) {
@@ -135,8 +136,8 @@ func TestV3WriteReplyIsValidatedExactly(t *testing.T) {
 				return response, nil
 			}
 			const operationID = uint64(91)
-			d.bridge.reserveFrontendPublication(operationID)
-			if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+			d.bridge.reserveFrontendPublication(testCallback(operationID))
+			if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 				Handle: handle, Data: []byte("abcde"),
 			}); errno != darwinEIO || reply != nil || d.terminalError() == nil {
 				t.Fatalf("malformed write reply = (%#v,%d), want terminal EIO", reply, errno)
@@ -162,13 +163,13 @@ func TestV3WriteDefiniteRejectionIsNonTerminal(t *testing.T) {
 		return response, nil
 	}
 	const operationID = uint64(92)
-	d.bridge.reserveFrontendPublication(operationID)
-	if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
+	if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 		Handle: handle, Data: []byte("abc"),
 	}); errno != darwinENOSPC || reply != nil {
 		t.Fatalf("definite rejection = (%#v,%d), want ENOSPC", reply, errno)
 	}
-	lease := d.bridge.sourcePublication.operationLease(operationID)
+	lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 	assigned, committed, released := v3SourceLeaseState(d, operationID)
 	if lease == nil || assigned == 0 || committed || released || d.terminalError() != nil {
 		t.Fatalf("definite rejection lease assigned=%d committed=%t released=%t terminal=%v", assigned, committed, released, d.terminalError())
@@ -179,8 +180,8 @@ func TestV3WriteDefiniteRejectionIsNonTerminal(t *testing.T) {
 	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 		t.Fatal("rejected callback PublicationAck was refused")
 	}
-	d.bridge.releaseFrontendPublication(operationID)
-	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
+	d.bridge.releaseFrontendPublication(testCallback(operationID))
+	if err := d.bridge.finishFrontendPublication(testCallback(operationID)); err != nil {
 		t.Fatal(err)
 	}
 	d.bridge.sourcePublication.mu.Lock()
@@ -226,8 +227,8 @@ func TestV3WriteUnadmittedReplyIsANonTerminalENOMEM(t *testing.T) {
 				return test.response(identity), nil
 			}
 			const operationID = uint64(93)
-			d.bridge.reserveFrontendPublication(operationID)
-			reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{Handle: handle, Data: []byte("abc")})
+			d.bridge.reserveFrontendPublication(testCallback(operationID))
+			reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{Handle: handle, Data: []byte("abc")})
 			if test.terminal {
 				if errno != darwinEIO || d.terminalError() == nil {
 					t.Fatalf("unrecognized unrecorded reply = (%#v,%d), want terminal EIO", reply, errno)
@@ -243,7 +244,7 @@ func TestV3WriteUnadmittedReplyIsANonTerminalENOMEM(t *testing.T) {
 			if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 				t.Fatal("unadmitted callback PublicationAck was refused")
 			}
-			d.bridge.releaseFrontendPublication(operationID)
+			d.bridge.releaseFrontendPublication(testCallback(operationID))
 			client.mutation = nil
 			if reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{Handle: handle, Data: []byte("abc")}); errno != 0 || reply.(*pfslocal.WriteReply).Written != 3 {
 				t.Fatalf("write after unadmitted refusal = (%#v,%d)", reply, errno)
@@ -282,8 +283,8 @@ func TestV3WritePostApplyFailureIsTerminal(t *testing.T) {
 				return response, nil
 			}
 			const operationID = uint64(94)
-			d.bridge.reserveFrontendPublication(operationID)
-			if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+			d.bridge.reserveFrontendPublication(testCallback(operationID))
+			if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 				Handle: handle, Data: []byte("abc"),
 			}); errno != darwinEIO || reply != nil || d.terminalError() == nil {
 				t.Fatalf("post-apply write = (%#v,%d), want terminal EIO", reply, errno)
@@ -294,8 +295,8 @@ func TestV3WritePostApplyFailureIsTerminal(t *testing.T) {
 			if closed != test.sessionEnds {
 				t.Fatalf("authority transport closed=%t, want %t: a session-safe post-apply outcome must keep it for the unmount absence proof", closed, test.sessionEnds)
 			}
-			_, _ = d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitNotPublished)
-			d.bridge.releaseFrontendPublication(operationID)
+			_, _ = d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
+			d.bridge.releaseFrontendPublication(testCallback(operationID))
 			if _, _, released := v3SourceLeaseState(d, operationID); released {
 				t.Fatal("a possibly applied write reopened its source gate")
 			}

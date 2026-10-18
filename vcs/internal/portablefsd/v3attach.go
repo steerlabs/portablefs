@@ -13,7 +13,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -23,35 +22,13 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
-// The daemon-owned authority-v3 attach mode.
-//
-// An authority-v3 attach serves the pfslocal operation surface from the
-// standalone v3 data plane (v3dataplane.go) over one strict authorityrpc
-// session, never from the legacy clientcore Volume. The two paths share
-// nothing: no WAL store, no write-back engine, no delegation handoffs, no
-// clientcore session. The daemon — not the FSKit extension — owns the
-// mutual-TLS identity and access capability, binds the exact authority
-// epoch/session and routes revision, and owns the evidence-bearing detach.
-// pfslocal carries only the derived coherence contract and ordered visibility
-// obligations.
-//
-// Failure is terminal for the attach. There is no fallback into the v2
-// clientcore path, no transport-mode probing, and no session re-establishment:
-// a replacement session cannot prove what the kernel cached before it, so a
-// dead session leaves exactly one exit — the exact unmount.
-
-// Dialing bounds for one v3 authority session. These mirror the Linux v3
-// frontend's contract decisions (cmd/portablefs-mount-v3): the numbers a
-// strict mount DECLARES (cached-name capacity, repair budget, routes revision)
-// come from the attach request because the authority reasons from them, while
-// these transport bounds are the daemon's own and negotiate downward against
-// the authority's advertised limits.
 const (
-	v3AttachReplaySlots        uint32 = 128
-	v3AttachMaxInFlight               = 128
-	v3AttachMaxFrame           uint32 = 4 << 20
-	v3AttachDialTimeout               = 10 * time.Second
-	v3AttachCancelDrainTimeout        = 10 * time.Second
+	v3ReauthorizationSafetyMargin        = 15 * time.Second
+	v3AttachReplaySlots           uint32 = 128
+	v3AttachMaxInFlight                  = 128
+	v3AttachMaxFrame              uint32 = 4 << 20
+	v3AttachDialTimeout                  = 10 * time.Second
+	v3AttachCancelDrainTimeout           = 10 * time.Second
 	// v3DetachProofComponent names the trusted local supervisor component that
 	// observed the kernel-mount absence.
 	v3DetachProofComponent = "portablefsd/getfsstat"
@@ -77,14 +54,7 @@ type v3AttachRequest struct {
 	// the FSKit extension sees only the derived pfslocal contract.
 	ClientCertPEM string `json:"clientCertPem"`
 	ClientKeyPEM  string `json:"clientKeyPem"`
-	// CachedNameCapacity and RepairBudgetMillis are the two numbers the
-	// authority sizes the visibility barrier from: how many resolutions this
-	// mount's kernel may hold, and how long it may take to withdraw one.
-	CachedNameCapacity uint64 `json:"cachedNameCapacity"`
-	RepairBudgetMillis uint64 `json:"repairBudgetMillis"`
-	// CachePolicy is the exact macOS coherence policy string the frontend and
-	// authority must agree on (see v3coherence.go).
-	CachePolicy string `json:"cachePolicy"`
+
 	// RoutesRevision is the 64-hex-digit digest of the canonical machine-local
 	// routing rules this mount runs. The authority refuses any mount whose
 	// topology is not the volume's active one.
@@ -107,21 +77,16 @@ type v3MountEnrollmentRequest struct {
 // with the daemon process and is never re-established from disk, so the only
 // thing a revived record supports is the exact unmount.
 type persistedV3Attach struct {
-	CachedNameCapacity uint64 `json:"cachedNameCapacity"`
-	RepairBudgetMillis uint64 `json:"repairBudgetMillis"`
-	CachePolicy        string `json:"cachePolicy"`
-	RoutesRevision     string `json:"routesRevision"`
+	RoutesRevision string `json:"routesRevision"`
 }
 
 // v3AttachConfig is the validated attach-side configuration. It is immutable
 // after construction; the mutable session state lives on attach.v3Data.
 type v3AttachConfig struct {
 	// identity is nil exactly when revived is true.
-	identityMu                   sync.RWMutex
-	identity                     *tls.Certificate
-	cachedNameCapacity           uint64
-	repairBudget                 time.Duration
-	cachePolicy                  string
+	identityMu sync.RWMutex
+	identity   *tls.Certificate
+
 	routesRevision               [32]byte
 	enrollmentClient             *mountenrollment.Client
 	enrollmentID                 string
@@ -235,10 +200,8 @@ func (c *v3AttachConfig) persisted() *persistedV3Attach {
 		return nil
 	}
 	return &persistedV3Attach{
-		CachedNameCapacity: c.cachedNameCapacity,
-		RepairBudgetMillis: uint64(c.repairBudget / time.Millisecond),
-		CachePolicy:        c.cachePolicy,
-		RoutesRevision:     hex.EncodeToString(c.routesRevision[:]),
+
+		RoutesRevision: hex.EncodeToString(c.routesRevision[:]),
 	}
 }
 
@@ -248,9 +211,6 @@ func (c *v3AttachConfig) persisted() *persistedV3Attach {
 // revision is a different mount contract and needs an explicit detach first.
 func (c *v3AttachConfig) matches(other *v3AttachConfig) bool {
 	return c != nil && other != nil &&
-		c.cachedNameCapacity == other.cachedNameCapacity &&
-		c.repairBudget == other.repairBudget &&
-		c.cachePolicy == other.cachePolicy &&
 		c.routesRevision == other.routesRevision &&
 		c.enrollmentID == other.enrollmentID
 }
@@ -272,14 +232,6 @@ func parseV3RoutesRevision(value string) ([32]byte, error) {
 }
 
 func validPersistedV3Attach(v3 *persistedV3Attach) error {
-	if v3.CachedNameCapacity == 0 || v3.RepairBudgetMillis == 0 {
-		return errors.New("v3 attach requires a positive cachedNameCapacity and repairBudgetMillis")
-	}
-	switch v3.CachePolicy {
-	case v3CachePolicyMacOS26V1, v3CachePolicyMacOS26, v3CachePolicyFSKit:
-	default:
-		return fmt.Errorf("unsupported v3 cache policy %q", v3.CachePolicy)
-	}
 	if _, err := parseV3RoutesRevision(v3.RoutesRevision); err != nil {
 		return err
 	}
@@ -295,35 +247,19 @@ func revivedV3AttachConfig(v3 *persistedV3Attach) (*v3AttachConfig, error) {
 		return nil, err
 	}
 	return &v3AttachConfig{
-		cachedNameCapacity: v3.CachedNameCapacity,
-		repairBudget:       time.Duration(v3.RepairBudgetMillis) * time.Millisecond,
-		cachePolicy:        v3.CachePolicy,
-		routesRevision:     revision,
-		revived:            true,
+
+		routesRevision: revision,
+		revived:        true,
 	}, nil
 }
 
-// v3ConfigForEnsure validates the v3 half of one ensure request against the
-// generic half it rides on. Every refusal here is definite: there is no
-// downgrade to the clientcore path and no permissive default for a field the
-// authority reasons from.
 func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 	v3 := req.V3
 	if v3 == nil {
-		return nil, nil
-	}
-	if req.Branch != "" {
-		return nil, errors.New("a v3 attach is branchless: branch must be empty")
+		return nil, errors.New("v3 attach configuration is required")
 	}
 	if req.AuthToken == "" {
 		return nil, errors.New("a v3 attach requires its access capability at ensure time; the strict session is admitted exactly once")
-	}
-	// The clientcore-only options have no v3 meaning. Accepting them silently
-	// would promise cache and graft behavior this attach cannot deliver.
-	if req.Options.Prefetch || req.Options.NegativeCache || req.Options.NoNegativeCache ||
-		req.Options.DiskCacheDir != "" || req.Options.DiskCacheMB != 0 ||
-		len(req.Options.LocalDirs) != 0 || req.Options.VolumeLocalDirs {
-		return nil, errors.New("v3 attach refuses clientcore-only options (prefetch, caches, local-dir grafts)")
 	}
 	// authorityrpc speaks only verified TLS 1.3 with a client identity, so the
 	// plaintext transport mode cannot carry a v3 session and is refused here
@@ -334,10 +270,8 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 		return nil, fmt.Errorf("v3 attach requires mutually authenticated TLS; transport %q is refused", req.DataPlaneTransport)
 	}
 	if err := validPersistedV3Attach(&persistedV3Attach{
-		CachedNameCapacity: v3.CachedNameCapacity,
-		RepairBudgetMillis: v3.RepairBudgetMillis,
-		CachePolicy:        v3.CachePolicy,
-		RoutesRevision:     v3.RoutesRevision,
+
+		RoutesRevision: v3.RoutesRevision,
 	}); err != nil {
 		return nil, err
 	}
@@ -371,35 +305,12 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 		initialAuthorizationDeadline = time.UnixMilli(enrollment.InitialAuthorizationExpiresAtMs)
 	}
 	return &v3AttachConfig{
-		identity: &identity, cachedNameCapacity: v3.CachedNameCapacity,
-		repairBudget: time.Duration(v3.RepairBudgetMillis) * time.Millisecond,
-		cachePolicy:  v3.CachePolicy, routesRevision: revision,
+		identity: &identity, routesRevision: revision,
+
 		enrollmentClient: enrollmentClient, enrollmentID: enrollmentID,
 		initialAuthorizationDeadline: initialAuthorizationDeadline,
 		preKernelMountAbsence:        req.observePreKernelMountAbsence,
 	}, nil
-}
-
-// v3NamespaceRepair is how this mount's kernel makes a cached name binding
-// unservable, declared per cache policy because the authority cannot observe a
-// remote kernel and the two policies repair through different mechanisms:
-// macOS 26 repairs synchronously through the VFS — the repair traverses the
-// same namespace locks an unanswered directory mutation can hold, which is the
-// CALLBACK_SERIALIZED contract — live macOS 26 FSKit also serializes disjoint
-// mutation and repair callbacks through shared execution capacity. The native
-// FSKit revocation API revokes kernel cache entries without re-entering the
-// namespace and therefore declares INDEPENDENT.
-func v3NamespaceRepair(cachePolicy string) authoritypb.NamespaceRepair {
-	switch cachePolicy {
-	case v3CachePolicyMacOS26V1:
-		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED
-	case v3CachePolicyMacOS26:
-		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED
-	case v3CachePolicyFSKit:
-		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT
-	default:
-		return authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
-	}
 }
 
 // v3AuthoritySession is the slice of authorityrpc.Client the attach lifecycle
@@ -411,7 +322,6 @@ type v3AuthoritySession interface {
 
 // isV3 is stable for the attach lifetime: v3Config is assigned before the
 // attach is registered and never mutated afterwards.
-func (a *attach) isV3() bool { return a.v3Config != nil }
 
 func (a *attach) v3Backend() *v3DataPlane {
 	a.mu.RLock()
@@ -439,11 +349,6 @@ func (a *attach) stopV3Serving(cause error) {
 	}
 }
 
-// startV3 activates a fresh v3 attach: it dials the authority under the exact
-// declared transport (no probing, no fallback between modes), attaches the
-// branchless strict session, constructs the data plane and coherence bridge,
-// and installs them on the attach. Any failure is the caller's definite error;
-// nothing here retries into the clientcore path.
 func (a *attach) startV3(ctx context.Context) error {
 	cfg := a.v3Config
 	if cfg == nil {
@@ -502,20 +407,18 @@ func (a *attach) startV3(ctx context.Context) error {
 		}
 	}
 	client, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
-		Purpose:                               authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile:                       authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
-		Address:                               a.authorityAddr,
-		TLS:                                   tlsCfg,
-		VolumeID:                              a.volumeID,
-		AccessToken:                           []byte(token),
-		ReplaySlots:                           v3AttachReplaySlots,
-		MaxFrame:                              v3AttachMaxFrame,
-		DialTimeout:                           v3AttachDialTimeout,
-		CancelDrainTimeout:                    v3AttachCancelDrainTimeout,
-		MaxInFlight:                           v3AttachMaxInFlight,
-		FskitCachedNameCapacity:               cfg.cachedNameCapacity,
-		FskitRepairBudget:                     cfg.repairBudget,
-		FskitNamespaceRepair:                  v3NamespaceRepair(cfg.cachePolicy),
+		Purpose:            authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:    authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
+		Address:            a.authorityAddr,
+		TLS:                tlsCfg,
+		VolumeID:           a.volumeID,
+		AccessToken:        []byte(token),
+		ReplaySlots:        v3AttachReplaySlots,
+		MaxFrame:           v3AttachMaxFrame,
+		DialTimeout:        v3AttachDialTimeout,
+		CancelDrainTimeout: v3AttachCancelDrainTimeout,
+		MaxInFlight:        v3AttachMaxInFlight,
+
 		RoutesRevision:                        cfg.routesRevision,
 		RequireMountEnrollmentReauthorization: cfg.enrollmentClient != nil,
 		ObservePreKernelMountAbsence:          preKernelMountAbsence,
@@ -538,7 +441,6 @@ func (a *attach) startV3(ctx context.Context) error {
 		ItemGeneration: a.identityEpoch,
 		PrincipalUID:   uint32(os.Getuid()),
 		PrincipalGID:   uint32(os.Getgid()),
-		CachePolicy:    cfg.cachePolicy,
 	})
 	if err != nil {
 		return releaseV3ClientBeforeKernelMount(client, fmt.Errorf("construct v3 data plane: %w", err))
@@ -581,7 +483,7 @@ func (a *attach) runAutomaticMountRenewal(cfg *v3AttachConfig, d *v3DataPlane, e
 		}
 	}()
 	renewer := &mountenrollment.Renewer{
-		Source: cfg.enrollmentClient, MinimumSafetyMargin: cfg.repairBudget,
+		Source: cfg.enrollmentClient, MinimumSafetyMargin: v3ReauthorizationSafetyMargin,
 		Observe: func(event mountenrollment.RenewalEvent) {
 			if err := events.WriteRenewal(event, nil); err != nil {
 				log.Printf("portablefsd: attach %s write renewal event: %v", a.ref, err)
@@ -636,13 +538,9 @@ func (a *attach) watchV3Terminal(d *v3DataPlane) {
 	))
 }
 
-// v3RootReply is Resolve for a v3 attach: the reply — including the
-// V3CoherenceContract with the exact authority epoch, session, protocol and
-// cache policy — comes wholly from the v3 data plane, never from the
-// clientcore item registry.
 func (a *attach) v3RootReply() (pfslocal.ResolveReply, int32) {
 	a.mu.RLock()
-	unavailable := a.detached || a.detachPrepared || a.detachForce
+	unavailable := a.detached
 	d := a.v3Data
 	a.mu.RUnlock()
 	if unavailable {
@@ -714,6 +612,7 @@ func (c *frontendConn) handleV3Attached(
 	if operationID != 0 {
 		defer c.finishLogicalRequest(operationID)
 	}
+	ctx = context.WithValue(ctx, v3CallbackContextKey{}, c.origin)
 	ctx, cancelOperation := withOperationDeadline(ctx)
 	defer cancelOperation()
 	publishes, err := c.beginLogicalOperation(
@@ -756,16 +655,30 @@ func (c *frontendConn) serveV3Attempt(
 	body any,
 	bypassCache bool,
 ) (retry bool) {
+	ctx = context.WithValue(ctx, v3CallbackContextKey{}, c.origin)
+
 	var (
 		reply any
 		eno   int32
 	)
+	exposed := false
+	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
 	defer func() {
+		if resources.cached != nil && !resources.cached.accounted {
+			reason := v3CacheTerminal
+			if exposed {
+				reason = v3CacheHit
+			}
+			d.recordCacheResult(resources.cached.metric, reason)
+			resources.cached.accounted = true
+		}
 		if d != nil && !retry {
+			if !exposed {
+				eno = darwinENOTCONN
+			}
 			d.recordLookupPolarity(body, eno)
 		}
 	}()
-	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
 	switch body.(type) {
 	case *pfslocal.CreateRequest, *pfslocal.MkdirRequest, *pfslocal.SymlinkRequest:
 		resources.visible = true
@@ -840,6 +753,7 @@ func (c *frontendConn) serveV3Attempt(
 		failure := &pfslocal.ErrorReply{Errno: eno, Message: errMessage(fmt.Sprintf("%T", body), eno)}
 		if !publishes {
 			_, written := c.replyWithPublicationWriteStatus(requestID, operationID, failure, false)
+			exposed = written
 			if written {
 				consumeV3ResponseConsumptions(resources.responseConsumptions)
 				resources.responseConsumptions = nil
@@ -865,9 +779,7 @@ func (c *frontendConn) serveV3Attempt(
 			}
 			return retry
 		}
-		if written && resources.cached != nil {
-			d.recordCacheResult(resources.cached.metric, v3CacheHit)
-		}
+		exposed = written
 		return false
 	}
 	resourceReply, resourceErr := resourceBearingV3Reply(reply, resources)
@@ -950,9 +862,7 @@ func (c *frontendConn) serveV3Attempt(
 		}
 		return retry
 	}
-	if written && resources.cached != nil {
-		d.recordCacheResult(resources.cached.metric, v3CacheHit)
-	}
+	exposed = written
 	if discarded && resourceReply {
 		// The callback already proved NOT_PUBLISHED, so no frontend can send a
 		// ResourceReplyDisposition for this unexposed frame. Withdraw the exact
@@ -1045,32 +955,19 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	}
 	if present {
 		bridge := a.v3CoherenceBridge()
-		if bridge == nil {
-			return errors.New("v3 FSKit detach has no live coherence bridge")
+		if bridge == nil && (a.v3Config == nil || !a.v3Config.revived) {
+			return errors.New("FSKit detach has no session owner")
 		}
-		if err := bridge.beginDetach(); err != nil {
-			return fmt.Errorf("begin v3 FSKit detach: %w", err)
+		if bridge != nil {
+			if err := bridge.beginDetach(); err != nil {
+				return fmt.Errorf("begin FSKit detach: %w", err)
+			}
 		}
 		detachErr := ops.unmountExact(a.mountPath, a.ref, force)
-		if detachErr != nil && !force && errors.Is(detachErr, syscall.EBUSY) {
-			// A normal v3 detach is deliberately two-phase on Darwin.
-			// dounmount without MNT_FORCE first runs ubc_umount and
-			// VFS_SYNC(MNT_WAIT), returning any sync error before it reaches
-			// vflush. That pass pushes dirty kernel pages as FSKit write
-			// callbacks, and the authority makes every FSKit mutation durable
-			// before replying, so a completed flush is a durable one; no
-			// separate authority sync is reached from VFS_SYNC. PortableFS
-			// itself retains the mount-root descriptor that macOS 26 repair
-			// actuation requires, so that flushed pass then answers EBUSY.
-			// Only that exact errno authorizes the second MNT_FORCE pass,
-			// which revokes the product-owned vnode and open user references
-			// but is not trusted as a flush barrier (XNU skips VFS_SYNC for
-			// forced unmounts). Any other first-pass error leaves the live
-			// mount attached.
-			detachErr = ops.unmountExact(a.mountPath, a.ref, true)
-		}
 		if detachErr != nil {
-			bridge.abortDetach(detachErr)
+			if bridge != nil {
+				bridge.abortDetach(detachErr)
+			}
 			// The kernel mount remains (or its state is still owned by an
 			// abandoned helper); the attach keeps serving and the caller
 			// retries or escalates.

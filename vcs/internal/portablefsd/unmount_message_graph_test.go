@@ -20,17 +20,16 @@ import (
 func TestForcedUnmountVerdictNeverPrescribesAnotherForce(t *testing.T) {
 	stateDir := privateTestDir(t)
 	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
 	req := ensureAttachRequest{
-		VolumeID:           "vol-forced",
-		Branch:             "main",
+		VolumeID: "vol-forced",
+
 		AuthorityURL:       "127.0.0.1:1",
 		DataPlaneTransport: "plaintext",
 		MountPath:          "/Volumes/Forced",
 	}
 	a, err := newRevivedAttach(
-		testFSKitAttachRef, attachKey(req.VolumeID, req.Branch, req.MountPath),
-		req, stateDir, 1, false, false, "",
+		testFSKitAttachRef, attachKey(req.VolumeID, req.MountPath),
+		req, stateDir, 1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -49,9 +48,9 @@ func TestForcedUnmountVerdictNeverPrescribesAnotherForce(t *testing.T) {
 		t.Fatalf("REPRO: the verdict for a FORCED transaction still prescribes a "+
 			"force as the next step, which is the command the caller just ran:\n%s", msg)
 	}
-	// It must say the force is already durable and running — that is the fact
+	// It must say the force is already authorized and running — that is the fact
 	// that makes re-running it pointless rather than merely redundant.
-	if !strings.Contains(msg, "already durable") {
+	if !strings.Contains(msg, "already authorized") {
 		t.Fatalf("the forced verdict does not say the force is already in flight:\n%s", msg)
 	}
 	// And it must name a next step that is genuinely different.

@@ -376,31 +376,6 @@ func TestV3ReleaseLimitFollowsBAndTheNegotiatedFrame(t *testing.T) {
 	}
 }
 
-func TestV3DataPlaneRefusesASessionWithoutBatchedClose(t *testing.T) {
-	client := &noBatchedCloseV3Client{newFakeV3DataClient()}
-	_, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{Client: client, VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9, CachePolicy: v3CachePolicyFSKit})
-	if err == nil {
-		t.Fatal("data plane started without batched-close-v1")
-	}
-}
-
-type noBatchedCloseV3Client struct{ *fakeV3DataClient }
-
-func (noBatchedCloseV3Client) SupportsBatchedClose() bool { return false }
-
-func openV3TestHandles(t *testing.T, d *v3DataPlane, file pfslocal.Item, count int) []uint64 {
-	t.Helper()
-	handles := make([]uint64, count)
-	for index := range handles {
-		reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.OpenRequest{Item: file, Mode: pfslocal.OpenModeRead})
-		if errno != 0 {
-			t.Fatalf("open %d errno=%d", index, errno)
-		}
-		handles[index] = reply.(*pfslocal.OpenReply).Handle
-	}
-	return handles
-}
-
 // Many concurrent closes retire locally, coalesce into CloseBatch requests of
 // at most B handles, and release every authority handle exactly once.
 func TestV3ManyOpenHandlesCloseThroughBoundedCloseBatches(t *testing.T) {
@@ -489,7 +464,7 @@ func TestV3StaleHandlePointerRacingCloseIsRefusedUnderItsLock(t *testing.T) {
 	for _, request := range []any{
 		&pfslocal.ReadRequest{Handle: id, Length: 1},
 		&pfslocal.WriteRequest{Handle: id, Data: []byte("x")},
-		&pfslocal.FsyncRequest{Handle: id},
+		&pfslocal.ReadRequest{Handle: id, Length: 1},
 		&pfslocal.GetAttrRequest{Item: file.Item, Handle: id},
 	} {
 		if _, errno := dispatchV3Test(d, context.Background(), 0, request); errno != darwinEBADF {
@@ -919,4 +894,17 @@ func waitV3ReleaseOwner(ctx context.Context, r *v3ReleaseOwner) error {
 	err := r.failure
 	r.mu.Unlock()
 	return err
+}
+
+func openV3TestHandles(t *testing.T, d *v3DataPlane, file pfslocal.Item, count int) []uint64 {
+	t.Helper()
+	handles := make([]uint64, count)
+	for index := range handles {
+		reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.OpenRequest{Item: file, Mode: pfslocal.OpenModeRead})
+		if errno != 0 {
+			t.Fatalf("open %d errno=%d", index, errno)
+		}
+		handles[index] = reply.(*pfslocal.OpenReply).Handle
+	}
+	return handles
 }

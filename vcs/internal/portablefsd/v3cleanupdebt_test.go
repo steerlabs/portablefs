@@ -138,7 +138,7 @@ func TestV3OrphanedProvisionalCleanupIsCountedUntilFinished(t *testing.T) {
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	if !c.registerProvisionalResource(9, resources) {
 		t.Fatal("provisional lookup was not registered")
 	}

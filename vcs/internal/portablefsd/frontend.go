@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -71,16 +70,15 @@ type frontendConn struct {
 	attach   *attach
 
 	eventsMu sync.Mutex
-	events   *eventSubscriber
 	v3Events bool
 
 	publicationMu     sync.Mutex
 	operations        map[uint64]*frontendOperationEntry
 	lastOperationID   uint64
 	publicationClosed bool
+	connectionClosed  atomic.Bool
 	closeOnce         sync.Once
 	inFlight          atomic.Int32
-	visibilityAckBusy atomic.Bool
 	handlerWG         sync.WaitGroup
 
 	resourceMu     sync.Mutex
@@ -105,65 +103,6 @@ var errFrontendPublicationUnprovable = errors.New(
 	"portablefsd: FSKit frontend publication is unprovable",
 )
 
-// frontendRequestDeadline is what the daemon TELLS a frontend to wait for one
-// reply, and it is derived from the daemon's own budgets rather than chosen.
-//
-// ── WHY THE FRONTEND MUST NOT PICK THIS NUMBER ──────────────────────────────
-//
-// It used to. The extension carried requestDeadlineNanoseconds = 60s; the
-// daemon gave one request an operationAdmissionBudget of 50s. Nothing related
-// the two, and 10s is not a margin: one request's ADMISSION may legitimately
-// consume most of its 50s, and admission is only part of a handler — the live
-// battery recorded a warm rmdir that took 80s and SUCCEEDED. So the frontend's
-// bound expired first on an operation the daemon was still going to answer
-// correctly, and a latency outlier was converted into a protocol event.
-//
-// ── WHY IT IS A MULTIPLE, NOT A SUM ─────────────────────────────────────────
-//
-// The daemon does not promise a total handler bound; it promises a definite
-// OUTCOME, and its internal budgets bound the waits it can be asked to make.
-// A frontend deadline exists only to notice a daemon that has stopped
-// answering at all, which is a different question from "is this slow". So the
-// number is deliberately far above anything a healthy handler can reach, and it
-// moves with operationAdmissionBudget so the two can never drift apart again.
-//
-// The remaining bound on a genuinely wedged request is the frontend's, and its
-// expiry is now REQUEST-LOCAL (see PfsLocalClient.timeoutRequest): it answers
-// that one request and leaves the connection — and therefore every other
-// operation's publication — alone.
-//
-// ── ROUND 17: WHY THIS NUMBER IS NOT A SAFETY MECHANISM, AND MUST NOT BE ────
-//
-// The obvious reading of "200s exceeds the ~60s FSKit reply envelope" is that
-// the multiplier is the defect and the advertised bound should be CLAMPED to
-// the kernel's own ceiling, so that an expiry would mean "the mutation did not
-// and will not commit". It cannot mean that, for two independent reasons, and
-// clamping would buy nothing while costing a certified property:
-//
-//  1. THE DAEMON PROMISES NO TOTAL HANDLER BOUND. operationAdmissionBudget is
-//     an absolute deadline on the WAITS a request may be asked to make, not on
-//     the request. A handler past every wait can still commit — the live
-//     battery's 80s warm rmdir SUCCEEDED against a 50s budget — so there is no
-//     instant T after which "has not committed" implies "will not commit".
-//     Advertising 60s instead of 200s changes when the extension gives up; it
-//     changes nothing about when the daemon can commit.
-//
-//  2. THE KERNEL'S CEILING IS EXTERNAL. Whatever this daemon advertises, FSKit
-//     abandons an upcall on its own schedule. A negotiated number can neither
-//     enlarge that ceiling nor make the extension's expiry coincide with it, so
-//     the extension's deadline can never be the mechanism that keeps the
-//     kernel's view correct.
-//
-// And clamping has a real cost: a 60s frontend bound against a 50s daemon
-// budget is exactly the pairing round 15 removed, on exactly the operation
-// (the 80s rmdir) that motivated removing it.
-//
-// So the deadline is demoted, deliberately, from a correctness mechanism to a
-// LIVENESS one — it exists to notice a daemon that has stopped answering. The
-// correctness boundary is the publication ledger itself: if a publishing reply
-// becomes ready after the callback has already acknowledged failure, or an
-// exposed reply loses its connection before acknowledgement, this incarnation
-// is fenced. There is no repair path that may guess what FSKit installed.
 func frontendRequestDeadline() time.Duration {
 	return frontendRequestDeadlineFactor * operationAdmissionBudgetValue()
 }
@@ -194,18 +133,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 	c.cancel = cancel
 	defer c.close()
 	defer cancel()
-	// Two watermarks, one per ordering lane. Request IDs are allocated in one
-	// strictly increasing sequence, but the frontend writes on two lanes: the
-	// reserved control lane (visibility acknowledgements, liveness) is
-	// dequeued ahead of ordinary requests precisely so a barrier ack can
-	// never queue behind a request burst. The lanes therefore interleave on
-	// the wire, and a single global watermark misreads that interleaving as
-	// replay: under a mutation storm the first visibility ack that overtook a
-	// queued ordinary request killed the connection — and with it the mount.
-	// Each lane is FIFO and increasing within itself, which is exactly the
-	// replay protection the check exists for.
 	var lastRequestID uint64
-	var lastControlRequestID uint64
 	state := frontendAwaitingHello
 	for {
 		env, err := pfslocal.ReadFrame(c.conn)
@@ -250,7 +178,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			if a := c.currentAttach(); a != nil {
 				if bridge := a.v3CoherenceBridge(); bridge != nil {
-					known, err := bridge.acknowledgePublication(req.OperationID, req.SemanticCommit)
+					known, err := bridge.acknowledgePublication(c.callback(req.OperationID), req.SemanticCommit)
 					if err != nil {
 						// The source coordinator made the terminal decision while it
 						// still owned the exact lease. Fence the attach before any
@@ -271,7 +199,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			continue
 		} else {
-			lane, ok := admitLaneRequestID(env.Body, env.RequestID, &lastRequestID, &lastControlRequestID)
+			lane, ok := admitRequestID(env.RequestID, &lastRequestID)
 			if !ok {
 				log.Printf("portablefsd frontend: closing connection: %s-lane request id %d violated its lane's strictly-increasing order", lane, env.RequestID)
 				return
@@ -280,11 +208,6 @@ func (c *frontendConn) serve(ctx context.Context) {
 		switch req := env.Body.(type) {
 		case *pfslocal.Hello:
 			if state != frontendAwaitingHello {
-				return
-			}
-			if req.ProtocolMajor != pfslocal.ProtocolMajor ||
-				req.ProtocolMinor < pfslocal.ProtocolMinor {
-				c.errorReply(env.RequestID, darwinEINVAL, "unsupported protocol version")
 				return
 			}
 			c.helloClientName = req.ClientName
@@ -314,41 +237,12 @@ func (c *frontendConn) serve(ctx context.Context) {
 			}
 			state = frontendAttached
 			if c.reply(env.RequestID, &rep) &&
-				c.helloClientName == nativeFSKitFrontendClientName {
-				a.registerNativeFrontendWitness(c)
+				c.helloClientName == shippingFSKitFrontendClientName {
+				a.registerFrontendWitness(c)
 			}
 		default:
 			if state != frontendAttached {
 				return
-			}
-			if _, itemOwning := req.(*pfslocal.EnumerateRequest); itemOwning {
-				// Minor 16 lists directories with non-owning entry snapshots. A
-				// frontend that passed the minimum-minor gate never sends the
-				// item-owning form, whose entries would have to be adopted.
-				log.Printf("portablefsd frontend: closing connection: item-owning EnumerateRequest is not served at pfslocal minor %d", pfslocal.ProtocolMinor)
-				return
-			}
-			// Visibility acknowledgement is the strict mount's reserved control
-			// lane. It bypasses ordinary admission and frontend namespace locks.
-			if ack, ok := req.(*pfslocal.VisibilityAckRequest); ok {
-				if env.OperationID != 0 {
-					return
-				}
-				// Exactly one visibility event can be outstanding, and a correct
-				// frontend waits for this request's reply before issuing another.
-				// Bound the reserved lane independently instead of permitting a
-				// local peer to create an unbounded set of goroutines parked on
-				// the source-publication barrier.
-				if !c.visibilityAckBusy.CompareAndSwap(false, true) {
-					return
-				}
-				c.handlerWG.Add(1)
-				go func(requestID uint64, request *pfslocal.VisibilityAckRequest) {
-					defer c.handlerWG.Done()
-					defer c.visibilityAckBusy.Store(false)
-					c.handleVisibilityAck(connCtx, requestID, request)
-				}(env.RequestID, ack)
-				continue
 			}
 			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
 				c.inFlight.Add(-1)
@@ -383,7 +277,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				// continuation without maintaining a second request classifier.
 				if a := c.currentAttach(); a != nil {
 					if bridge := a.v3CoherenceBridge(); bridge != nil {
-						bridge.reserveFrontendPublication(env.OperationID)
+						bridge.reserveFrontendPublication(c.callback(env.OperationID))
 					}
 				}
 			}
@@ -398,7 +292,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				defer c.handlerWG.Done()
 				defer c.inFlight.Add(-1)
 				c.handleAttached(
-					connCtx,
+					context.WithValue(connCtx, v3CallbackContextKey{}, c.origin),
 					a,
 					requestID,
 					operationID,
@@ -412,11 +306,12 @@ func (c *frontendConn) serve(ctx context.Context) {
 
 func (c *frontendConn) close() {
 	c.closeOnce.Do(func() {
+		c.connectionClosed.Store(true)
 		// A closing transport is not a live native FSKit witness. Retire the
 		// witness before any handler join or publication cleanup can block, so
 		// mount readiness never observes a connection whose teardown has begun.
 		if a := c.currentAttach(); a != nil {
-			a.removeNativeFrontendWitness(c)
+			a.removeFrontendWitness(c)
 		}
 		// A resource-bearing reply remains owned by this connection until the
 		// VolumeCore ownership disposition arrives. Once the connection is gone no
@@ -473,6 +368,11 @@ func (c *frontendConn) close() {
 		// PublicationAck was recorded. Closing the transport now unblocks handlers
 		// writing replies; admission and release waits observe the canceled
 		// connection context.
+		if a := c.currentAttach(); a != nil {
+			if b := a.v3CoherenceBridge(); b != nil {
+				b.frontendClosing(c.origin)
+			}
+		}
 		if c.cancel != nil {
 			c.cancel()
 		}
@@ -490,18 +390,19 @@ func (c *frontendConn) close() {
 		c.publicationMu.Unlock()
 		for operationID, entry := range pending {
 			<-entry.ready
+			// No byte of an unexposed callback reached FSKit. Retire its own
+			// nonpublication verdict; an applied mutation still terminals the mount.
+			if !entry.replyExposed && !entry.ackPending && entry.attach != nil {
+				if bridge := entry.attach.v3CoherenceBridge(); bridge != nil {
+					_, _ = bridge.acknowledgePublication(c.callback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
+				}
+			}
 			c.finishLogicalOperation(operationID, entry)
 		}
 		if a := c.currentAttach(); a != nil {
 			a.removeConn(c.conn)
 		}
 		c.eventsMu.Lock()
-		if c.events != nil {
-			if a := c.currentAttach(); a != nil {
-				a.unsubscribe(c.events)
-			}
-			c.events = nil
-		}
 		c.v3Events = false
 		c.eventsMu.Unlock()
 	})
@@ -528,10 +429,15 @@ func (c *frontendConn) setAttach(a *attach) bool {
 		c.attachMu.Unlock()
 		return false
 	}
-	c.attach = a
+
 	if c.origin == 0 {
 		c.origin = a.newOrigin()
+		if c.origin == 0 {
+			c.attachMu.Unlock()
+			return false
+		}
 	}
+	c.attach = a
 	c.attachMu.Unlock()
 	a.addConn(c.conn)
 	return true
@@ -869,20 +775,6 @@ func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32
 // increasing IDs within itself; that per-lane monotonicity is the replay
 // protection, and enforcing it globally once killed healthy mounts the
 // moment a barrier acknowledgment overtook a request burst.
-func admitLaneRequestID(body any, id uint64, lastRequest, lastControl *uint64) (lane string, ok bool) {
-	watermark := lastRequest
-	lane = "request"
-	switch body.(type) {
-	case *pfslocal.VisibilityAckRequest, *pfslocal.V3LivenessRequest:
-		watermark = lastControl
-		lane = "control"
-	}
-	if id == 0 || id <= *watermark {
-		return lane, false
-	}
-	*watermark = id
-	return lane, true
-}
 
 // acknowledgePublication retires the logical operation the frontend has
 // finished with.
@@ -952,8 +844,8 @@ func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *fronten
 		if bridge := entry.attach.v3CoherenceBridge(); bridge != nil {
 			// One reservation covers the entire callback, including gaps between
 			// requests; finalization waits for every handler and PublicationAck.
-			bridge.releaseFrontendPublication(operationID)
-			_ = bridge.finishFrontendPublication(operationID)
+			bridge.releaseFrontendPublication(c.callback(operationID))
+			_ = bridge.finishFrontendPublication(c.callback(operationID))
 		}
 	}
 }
@@ -1054,28 +946,6 @@ func (c *frontendConn) handleAttached(
 	)
 }
 
-func (c *frontendConn) handleVisibilityAck(ctx context.Context, requestID uint64, request *pfslocal.VisibilityAckRequest) {
-	a := c.currentAttach()
-	if a == nil {
-		c.errorReply(requestID, darwinENXIO, "v3 attach is unavailable")
-		return
-	}
-	bridge := a.v3CoherenceBridge()
-	if bridge == nil {
-		c.errorReply(requestID, darwinENOTSUP, "attach does not use v3 visibility")
-		return
-	}
-	if err := bridge.acknowledge(ctx, request); err != nil {
-		errno := darwinEIO
-		if errors.Is(err, syscall.EINVAL) {
-			errno = darwinEINVAL
-		}
-		c.errorReply(requestID, errno, err.Error())
-		return
-	}
-	c.reply(requestID, &pfslocal.VisibilityAckReply{})
-}
-
 func (c *frontendConn) subscribeEvents(a *attach) error {
 	c.eventsMu.Lock()
 	defer c.eventsMu.Unlock()
@@ -1086,9 +956,17 @@ func (c *frontendConn) subscribeEvents(a *attach) error {
 	if bridge == nil {
 		return fmt.Errorf("attach has no visibility stream")
 	}
+	if err := bridge.bind(); err != nil {
+		return err
+	}
+	bridge.mu.Lock()
+	if c.helloClientName == shippingFSKitFrontendClientName {
+		bridge.frontendOrigin = c.origin
+	}
+	bridge.mu.Unlock()
 	c.v3Events = true
 	go func() {
-		err := bridge.run(c.connCtx, func(event *pfslocal.Event) error {
+		err := bridge.runBound(c.connCtx, func(event *pfslocal.Event) error {
 			return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
 		})
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
@@ -1215,4 +1093,15 @@ func (l *publishedUnixListener) Close() error {
 		l.err = errors.Join(closeErr, statErr)
 	})
 	return l.err
+}
+
+func admitRequestID(id uint64, last *uint64) (string, bool) {
+	if id == 0 || id <= *last {
+		return "request", false
+	}
+	*last = id
+	return "request", true
+}
+func (c *frontendConn) callback(operation uint64) v3CallbackID {
+	return v3CallbackID{origin: c.origin, operation: operation}
 }

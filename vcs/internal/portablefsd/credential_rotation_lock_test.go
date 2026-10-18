@@ -153,7 +153,6 @@ func newLiveCredentialTestAttach(t *testing.T) *attach {
 		MountPath:           "/Volumes/PortableFSCredential",
 	}, privateTestDir(t))
 	a.persist = func() error { return nil }
-	a.schedulePersist = func() {}
 	a.v3Data = &v3DataPlane{}
 	return a
 }

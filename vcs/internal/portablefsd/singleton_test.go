@@ -2,6 +2,7 @@ package portablefsd
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -182,7 +183,7 @@ func TestLosingDaemonDoesNotInitializeOrMutateRegistry(t *testing.T) {
 		t.Fatalf("NewServer mutated shared state: before=%v after=%v", before, got)
 	}
 	err := loser.Run(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "another portablefsd owns") {
+	if err == nil || !errors.Is(err, errSingletonHeld) {
 		t.Fatalf("losing Run error = %v, want singleton refusal", err)
 	}
 	if loser.registry != nil {
@@ -443,7 +444,6 @@ func TestDaemonServesSeparatePinnedFrontendAndControlRoots(t *testing.T) {
 	go func() { done <- server.Run(ctx) }()
 	waitUnix(t, cfg.FrontendSocket)
 	waitUnix(t, cfg.ControlSocket)
-	waitUnix(t, filepath.Join(filepath.Dir(cfg.FrontendSocket), mountRootSocketName))
 	cancel()
 	select {
 	case err := <-done:
