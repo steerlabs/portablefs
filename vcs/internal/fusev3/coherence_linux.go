@@ -404,10 +404,10 @@ func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 	var failures []string
 	for index, inode := range work {
 		if time.Now().After(deadline) {
-			failures = append(failures, fmt.Sprintf("attribute withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-index))
+			failures = append(failures, fmt.Sprintf("attribute withdrawal exceeded the withdrawal timeout with %d inodes unwithdrawn", len(work)-index))
 			break
 		}
-		// Strict FUSE has no attribute-only invalidation. The exact terminal
+		// Stock FUSE has no attribute-only invalidation. The exact terminal
 		// primitive is whole-inode withdrawal: it drops retained pages and
 		// This record has no retained-data obligation, so the stock attribute-only
 		// shape is sufficient and avoids evicting unrelated clean pages.
@@ -450,7 +450,7 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 	var failures []string
 	for _, inode := range work {
 		if time.Now().After(deadline) {
-			failures = append(failures, fmt.Sprintf("data withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-len(failures)))
+			failures = append(failures, fmt.Sprintf("data withdrawal exceeded the withdrawal timeout with %d inodes unwithdrawn", len(work)-len(failures)))
 			return failures
 		}
 		// ENOENT is the strongest possible outcome: the kernel holds no inode
@@ -489,8 +489,8 @@ func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 
 // revoke makes this mount unusable immediately and permanently. It is the local
 // obligation that lets the authority stop freezing a whole volume because one
-// participant died: a strict mount that can no longer repair must stop serving
-// what it already cached rather than continue.
+// participant died: a mount that can no longer withdraw its caches must stop
+// serving what it already cached rather than continue.
 //
 // New requests are refused synchronously. The asynchronous ladder detaches the
 // namespace, attempts stock cache invalidations, and aborts the FUSE connection.
@@ -499,10 +499,10 @@ func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 // pages reachable through a preexisting fd or mapping are not claimed removed.
 func (m *Mount) revoke(cause error) {
 	if cause == nil {
-		cause = errors.New("fusev3: strict mount revoked")
+		cause = errors.New("fusev3: mount revoked")
 	}
-	// Synchronous, so that a caller which has just discovered it cannot repair
-	// does not serve one more request while teardown is being scheduled.
+	// Synchronous, so that a caller which has just discovered it cannot
+	// withdraw does not serve one more request while teardown is scheduled.
 	m.revoked.Store(true)
 	m.failAsync(cause)
 }
@@ -515,7 +515,7 @@ func (m *Mount) revoke(cause error) {
 // platforms even though the mechanisms behind them cannot be shared.
 const (
 	// RevocationSessionTerminal: the authority session ended permanently, so
-	// nothing can repair this kernel's caches again.
+	// nothing can withdraw this kernel's caches through it again.
 	RevocationSessionTerminal = "session-terminal"
 	// RevocationRoutesChanged: the volume's machine-local route declaration
 	// moved under a mount whose topology is fixed for its lifetime.
@@ -549,7 +549,7 @@ func classifyRevocationReason(cause error) string {
 // KernelStateWithdrawn is the load-bearing field. A revoked mount whose kernel
 // mount is still installed is not a tidy failure: the dead FUSE mount remains
 // in the namespace, no mount-absence proof can be produced, and the authority's
-// durable strict membership therefore stays active until an operator discharges
+// durable mount membership therefore stays active until an operator discharges
 // it by hand. Reporting false is what lets a supervisor say so instead of
 // showing the mount as live.
 type RevocationReport struct {
@@ -568,8 +568,8 @@ type RevocationReport struct {
 // withdrawalRounds bounds the escalation ladder. Three rounds is the smallest
 // number that expresses the whole escalation — detach, abort, re-detach — and
 // still leaves one round of margin; the ladder is additionally bounded by the
-// repair budget this mount declared, because a withdrawal that outlived the
-// budget has already lost the race it exists to win.
+// mount's withdrawal timeout, because a withdrawal that outlived it has
+// already lost the race it exists to win.
 const withdrawalRounds = 3
 
 // withdrawalRetryDelay is the first inter-round pause, doubled each round. It
@@ -637,12 +637,12 @@ func (m *Mount) withdrawalOps() kernelWithdrawal {
 //
 // Every step's error is checked. A discarded detach failure leaves a dead FUSE
 // mount installed in the namespace with the CLI still reporting it live and
-// the authority still holding this participant's strict membership. So the
+// the authority still holding this participant's durable mount membership. So the
 // steps are an escalation ladder instead: withdraw retained kernel state while
 // /dev/fuse is still a valid notification channel, abort the connection,
 // lazy-detach through the mount owner's fusermount helper, then prove absence
-// and repeat if necessary, bounded by withdrawalRounds and by the declared
-// repair budget. Whatever it proves is returned, so the caller can persist a
+// and repeat if necessary, bounded by withdrawalRounds and by the withdrawal
+// timeout. Whatever it proves is returned, so the caller can persist a
 // truthful verdict either way.
 func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	m.kernelWithdrawalMu.Lock()
@@ -655,9 +655,9 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	ops := m.withdrawalOps()
 	installed := m.kernelMount
 	out := withdrawalOutcome{installed: installed.point != ""}
-	// One repair budget covers the whole ladder rather than each step: it exists
-	// to fit inside the authority's fencing grace, and a per-step budget would
-	// let the rounds multiply it.
+	// One withdrawal timeout covers the whole ladder rather than each step: it
+	// exists to fit inside the authority's fencing grace, and a per-step bound
+	// would let the rounds multiply it.
 	deadline := time.Now().Add(m.withdrawalTimeout)
 	writersJoined := true
 	if m.raw != nil {
@@ -794,7 +794,7 @@ func (m *Mount) setNotifier(notify kernelNotifier) {
 	m.notify = notify
 }
 
-// detach releases the authority session. A strict mount may send a clean-detach
+// detach releases the authority session. A mount may send a clean-detach
 // statement only after both its exact mount identity is absent and its exact
 // FUSE serving connection is terminal. Linux lazy unmount makes either fact on
 // its own insufficient. A failed check is returned to the supervisor and the
@@ -809,18 +809,18 @@ func (m *Mount) detach() error {
 		// MountVolume never supplied that identity (as in raw unit fixtures), the
 		// session remains fenced.
 		if m.plannedFSName == "" || m.plannedMountpoint == "" {
-			return errors.New("fusev3: strict detach has no recorded or planned kernel mount identity")
+			return errors.New("fusev3: clean detach has no recorded or planned kernel mount identity")
 		}
 		if m.kernelConnectionStarted {
 			select {
 			case <-m.kernelConnectionDone:
 			case <-ctx.Done():
-				return fmt.Errorf("fusev3: strict detach waited for the failed-startup FUSE serving connection: %w", ctx.Err())
+				return fmt.Errorf("fusev3: clean detach waited for the failed-startup FUSE serving connection: %w", ctx.Err())
 			}
 		}
 		proof, err := observePlannedKernelMountAbsent(m.plannedFSName, m.plannedMountpoint)
 		if err != nil {
-			return fmt.Errorf("fusev3: strict detach cannot establish failed-startup mount absence: %w", err)
+			return fmt.Errorf("fusev3: clean detach cannot establish failed-startup mount absence: %w", err)
 		}
 		if err := m.rpc.DetachAfterUnmount(ctx, proof); err != nil {
 			return fmt.Errorf("fusev3: deliver authenticated failed-startup clean detach: %w", err)
@@ -830,24 +830,24 @@ func (m *Mount) detach() error {
 	// Refuse a live mount immediately. If it is absent because MNT_DETACH was
 	// used, wait below for retained references to release the old connection.
 	if _, err := m.kernelMount.absent(); err != nil {
-		return fmt.Errorf("fusev3: strict detach cannot establish exact mount absence: %w", err)
+		return fmt.Errorf("fusev3: clean detach cannot establish exact mount absence: %w", err)
 	}
 	if m.kernelConnectionDone == nil {
-		return errors.New("fusev3: strict detach cannot observe the FUSE serving connection")
+		return errors.New("fusev3: clean detach cannot observe the FUSE serving connection")
 	}
 	select {
 	case <-m.kernelConnectionDone:
 	case <-ctx.Done():
-		return fmt.Errorf("fusev3: strict detach waited for the exact FUSE serving connection: %w", ctx.Err())
+		return fmt.Errorf("fusev3: clean detach waited for the exact FUSE serving connection: %w", ctx.Err())
 	}
 	// Produce the statement after connection termination so its timestamp names
 	// the complete condition, not merely the earlier namespace detach.
 	proof, err := m.kernelMount.absent()
 	if err != nil {
-		return fmt.Errorf("fusev3: strict detach cannot re-establish exact mount absence: %w", err)
+		return fmt.Errorf("fusev3: clean detach cannot re-establish exact mount absence: %w", err)
 	}
 	if !proof.valid() {
-		return errors.New("fusev3: strict detach produced an incomplete mount-absence observation")
+		return errors.New("fusev3: clean detach produced an incomplete mount-absence observation")
 	}
 	if err := m.rpc.DetachAfterUnmount(ctx, proof); err != nil {
 		return fmt.Errorf("fusev3: deliver authenticated clean detach: %w", err)

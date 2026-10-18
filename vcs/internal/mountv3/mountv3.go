@@ -1,7 +1,7 @@
 // Package mountv3 is the v3 mount attach engine shared by `portablefs mount`
 // and the standalone portablefs-mount-v3 binary. Both frontends speak to the
-// same authority with the same declared contract, so the numbers a strict
-// mount declares, the one-capability attach flow, and the transport that joins
+// same authority with the same profile, so the transport bounds a Linux mount
+// attaches with, the one-capability attach flow, and the transport that joins
 // an authorityrpc session to the fusev3 frontend live here exactly once.
 //
 // The package is deliberately small: fusev3 owns the kernel mapping,

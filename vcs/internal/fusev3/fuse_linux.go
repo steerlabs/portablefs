@@ -386,11 +386,11 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		// must run once to release go-fuse's prepared request-loop reference.
 		m.cancel()
 		m.startKernelConnection()
-		return nil, m.abortMount(errors.New("fusev3: strict mount did not arm physical FUSE reply publication"))
+		return nil, m.abortMount(errors.New("fusev3: mount did not arm physical FUSE reply publication"))
 	}
 	// NewServer has installed the kernel mount, so it is now observable. Its
 	// identity is recorded before anything can use the mount: its later absence
-	// is the only thing that authorises a clean strict detach, and
+	// is the only thing that authorises a clean detach, and
 	// self-revocation needs its device to abort the connection.
 	installed, err := captureKernelMount(fsName, mountpoint)
 	if err != nil {
@@ -500,7 +500,7 @@ func observeExactPlannedKernelMount(fsName, mountpoint string) (kernelMount, err
 
 // releaseUninstalledSession discharges an authority session whose unique FUSE
 // source is proven absent before a kernel mount ID could be recorded. Closing
-// the connection alone is deliberately insufficient for strict membership:
+// the connection alone is deliberately insufficient for durable membership:
 // without this observation the authority must assume a failed startup may
 // still have installed a cache-bearing kernel mount.
 func releaseUninstalledSession(rpc RPC, fsName, mountpoint string) error {
@@ -513,7 +513,7 @@ func releaseUninstalledSession(rpc RPC, fsName, mountpoint string) error {
 	}
 	err = rpc.DetachAfterUnmount(ctx, proof)
 	if err != nil {
-		err = fmt.Errorf("fusev3: release failed-startup strict session: %w", err)
+		err = fmt.Errorf("fusev3: release failed-startup session: %w", err)
 	}
 	rpc.FinishLocalSessionEnforcement()
 	return errors.Join(err, rpc.Close())
@@ -641,10 +641,10 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		DisableReadDirPlus: !cfg.Routes.Empty(),
 		// Shared mmap is a decision of this mount, not an accident of which
 		// capabilities go-fuse happens to forward. A writable shared mapping
-		// would dirty pages that never travel the strict write transaction, and
-		// a dirty page is also the one thing invalidate_inode_pages2() cannot
-		// withdraw -- which would turn every later DATA repair on that inode
-		// into a revocation. The capability is disabled for the whole mount
+		// would dirty pages that never travel the delegated write path, and a
+		// dirty page is also the one thing invalidate_inode_pages2() cannot
+		// withdraw -- which would turn every later DATA withdrawal on that
+		// inode into a revocation. The capability is disabled for the whole mount
 		// even if a future kernel or library change starts offering it by
 		// default.
 		// Atomic truncate is required, not an optimization. Without it Linux
@@ -670,7 +670,7 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 func verifyMountDecisions(options *fuse.MountOptions) error {
 	if options.ExtraCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP != 0 ||
 		options.DisabledCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP == 0 {
-		return errors.New("fusev3: shared mmap must be disabled for the whole mount; a dirty page neither travels the strict write transaction nor survives a DATA repair")
+		return errors.New("fusev3: shared mmap must be disabled for the whole mount; a dirty page neither travels the delegated write path nor survives a DATA withdrawal")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HAS_INODE_DAX != 0 || options.DisabledCapabilities&fuse.CAP_HAS_INODE_DAX == 0 {
 		return errors.New("fusev3: inode DAX must be disabled; lease invalidation is defined over ordinary clean page-cache folios")
@@ -684,7 +684,7 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 	if options.DisabledCapabilities&fuse.CAP_PASSTHROUGH == 0 ||
 		options.DisabledCapabilities&fuse.CAP_NO_OPEN_SUPPORT == 0 ||
 		options.DisabledCapabilities&fuse.CAP_NO_OPENDIR_SUPPORT == 0 {
-		return errors.New("fusev3: passthrough and no-open shortcuts must be disabled; every strict handle requires an explicit classified OPEN/OPENDIR reply")
+		return errors.New("fusev3: passthrough and no-open shortcuts must be disabled; every handle requires an explicit classified OPEN/OPENDIR reply")
 	}
 	if !options.EnableLocks {
 		return errors.New("fusev3: file locks must be forwarded to the authority; the local kernel lock manager cannot exclude another machine")
@@ -693,7 +693,7 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 		return errors.New("fusev3: atomic open-truncate must be requested; splitting it into SETATTR then OPEN is not one filesystem operation")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HAS_RESEND != 0 {
-		return errors.New("fusev3: HAS_RESEND is incompatible with strict publication identity ownership and must not be requested")
+		return errors.New("fusev3: HAS_RESEND is incompatible with exact publication identity ownership and must not be requested")
 	}
 	return nil
 }
@@ -717,7 +717,7 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 		return fmt.Errorf("fusev3: kernel does not support atomic open-truncate (INIT flags %#x); PortableFS will not split one O_TRUNC syscall across SETATTR and OPEN mutations", offered)
 	}
 	if offered&fuse.CAP_EXPLICIT_INVAL_DATA == 0 {
-		return fmt.Errorf("fusev3: kernel cannot give this mount explicit data-cache control (INIT flags %#x); retained pages would be withdrawn by an mtime heuristic instead of by the ordered DATA repair", offered)
+		return fmt.Errorf("fusev3: kernel cannot give this mount explicit data-cache control (INIT flags %#x); retained pages would be withdrawn by an mtime heuristic instead of by the ordered DATA withdrawal", offered)
 	}
 	// InitIn reports what the kernel offers, not what the daemon selected.
 	// Linux advertises RESEND, passthrough, and no-open support for non-strict
@@ -727,13 +727,13 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 	if offered&fuse.CAP_POSIX_LOCKS == 0 || offered&fuse.CAP_FLOCK_LOCKS == 0 {
 		return fmt.Errorf("fusev3: kernel does not forward POSIX and BSD file locks (INIT flags %#x); cross-machine lock exclusion is unavailable", offered)
 	}
-	// A strict mount publishes names and attributes with a lifetime, and the
+	// The mount publishes names and attributes with a lifetime, and the
 	// only thing that makes that safe is being able to take them back. Both
 	// notifications are protocol 7.12; a kernel that cannot receive them cannot
 	// host this profile, and the mount must be refused rather than served with
 	// a cache nothing can revoke.
 	if !settings.SupportsNotify(fuse.NOTIFY_INVAL_ENTRY) || !settings.SupportsNotify(fuse.NOTIFY_INVAL_INODE) {
-		return fmt.Errorf("fusev3: kernel FUSE protocol %d.%d cannot receive entry and inode invalidations; strict coherence has no way to revoke what it caches",
+		return fmt.Errorf("fusev3: kernel FUSE protocol %d.%d cannot receive entry and inode invalidations; the mount would have no way to revoke what it caches",
 			settings.Major, settings.Minor)
 	}
 	if uint64(maxWrite) > uint64(kernelDefaultMaxPages)*uint64(syscall.Getpagesize()) && offered&fuse.CAP_MAX_PAGES == 0 {
@@ -1242,8 +1242,8 @@ func (m *Mount) Unmount() error {
 }
 
 // Close releases the authority session after the kernel mount has already
-// disappeared (for example, an administrator unmounted it externally). A
-// strict close also requires the exact FUSE connection to have terminated.
+// disappeared (for example, an administrator unmounted it externally). Close
+// also requires the exact FUSE connection to have terminated.
 func (m *Mount) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1462,7 +1462,7 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
 	if callback == nil || m.raw == nil {
-		return nil, errors.New("fusev3: strict mutation escaped its raw callback publication lifecycle")
+		return nil, errors.New("fusev3: visible mutation escaped its raw callback publication lifecycle")
 	}
 	if callback.operationID == 0 {
 		return nil, errors.New("fusev3: mutation carried an invalid frontend operation identity")
@@ -1564,7 +1564,7 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 // requestRequiresSourcePublication is the Linux-side grammar boundary for
 // filesystem-visible mutations. Keeping it next to callMutation makes a
 // missing gate an invariant failure before replay assignment or transport,
-// rather than a compatibility path which can apply without local ownership.
+// rather than a path which can apply without local ownership.
 func requestRequiresSourcePublication(request *authoritypb.Request) bool {
 	if request == nil {
 		return false

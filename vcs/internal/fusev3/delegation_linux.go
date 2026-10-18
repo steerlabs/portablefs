@@ -1895,7 +1895,7 @@ func (m *delegationManager) changeMode(ctx context.Context, event *authoritypb.C
 }
 
 // ReleaseBatch flushes and releases identities after their final local handle
-// closes. The wire batch is sorted by delegation id as required by protocol 7.
+// closes. The wire batch is sorted by delegation id as the authority requires.
 func (m *delegationManager) ReleaseBatch(ctx context.Context, identities [][]byte) error {
 	if len(identities) == 0 || len(identities) > 4096 {
 		return errors.New("fusev3: invalid delegation release batch size")

@@ -105,7 +105,7 @@ type subscriptionCoordinateState struct {
 	minVersion uint64
 }
 
-// subscriptionRegistry owns one volume-wide protocol-7 subscription. Its mutex
+// subscriptionRegistry owns the mount's one volume-wide subscription. Its mutex
 // covers cache admission state only and is never held across transport calls,
 // reverse notifications, or publication drains.
 type subscriptionRegistry struct {
@@ -1217,7 +1217,7 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	for _, record := range r.nodesByID {
 		if record != nil {
 			// Epoch staleness belongs to the old server handle, not to the
-			// subscription incarnation. A cold cache proof can repair an inode
+			// subscription incarnation. A cold cache proof can clear an inode
 			// invalidation failure, but it must never resurrect an old-epoch node.
 			if record.node == nil || !record.node.epochStale.Load() {
 				record.stale.Store(false)
