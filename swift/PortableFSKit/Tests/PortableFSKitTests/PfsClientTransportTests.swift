@@ -65,6 +65,58 @@ private actor PfsTestAsyncGate {
     }
 }
 
+/// Each deadline stays suspended until the test expires that request ID.
+/// AsyncStream cancellation retires successful setup requests' waits, even
+/// when their detached timer tasks start after the reply has arrived.
+private actor PfsTestRequestDeadlines {
+    private struct Wait {
+        let nanoseconds: UInt64
+        let continuation: AsyncStream<Void>.Continuation
+    }
+    private var waits: [UInt64: Wait] = [:]
+    private var observers: [UInt64: CheckedContinuation<Void, Never>] = [:]
+
+    func sleep(requestID: UInt64, nanoseconds: UInt64) async throws {
+        try Task.checkCancellation()
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        waits[requestID] = Wait(nanoseconds: nanoseconds, continuation: continuation)
+        observers.removeValue(forKey: requestID)?.resume()
+        for await _ in stream { break }
+        waits.removeValue(forKey: requestID)
+        try Task.checkCancellation()
+    }
+
+    func expire(_ requestID: UInt64) async throws -> UInt64 {
+        if waits[requestID] == nil {
+            await withCheckedContinuation { observers[requestID] = $0 }
+        }
+        let wait = try #require(waits[requestID])
+        wait.continuation.yield(())
+        wait.continuation.finish()
+        return wait.nanoseconds
+    }
+}
+
+private actor PfsTestHeldReply {
+    private let releaseGate = PfsTestAsyncGate()
+    private var reply: PfsEnvelope?
+    private var observer: CheckedContinuation<PfsEnvelope, Never>?
+
+    func hold(_ reply: PfsEnvelope) async {
+        self.reply = reply
+        observer?.resume(returning: reply)
+        observer = nil
+        await releaseGate.wait()
+    }
+
+    func waitUntilHeld() async -> PfsEnvelope {
+        if let reply { return reply }
+        return await withCheckedContinuation { observer = $0 }
+    }
+
+    func release() async { await releaseGate.release() }
+}
+
 extension PfsLocalMockDaemonTests {
 @Test func mockDaemonReleaseStopsAndJoinsItsRuntimeWithoutExplicitStop() throws {
     for _ in 0..<64 {
@@ -470,10 +522,12 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
     defer { server.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: server.socketPath,
-        configuration: .init(maxConnectAttempts: 1, handshakeDeadlineNanoseconds: 1_000_000_000)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration(
+        maxConnectAttempts: 1, handshakeDeadlineNanoseconds: 1_000_000_000
     )
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: server.socketPath, configuration: configuration)
 
     do {
         _ = try await client.resolve(attachRef: "mock")
@@ -493,10 +547,12 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
     defer { server.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: server.socketPath,
-        configuration: .init(maxFrameLength: 4096, maxConnectAttempts: 1, handshakeDeadlineNanoseconds: 1_000_000_000)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration(
+        maxFrameLength: 4096, maxConnectAttempts: 1, handshakeDeadlineNanoseconds: 1_000_000_000
     )
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: server.socketPath, configuration: configuration)
 
     do {
         _ = try await client.resolve(attachRef: "mock")
@@ -508,35 +564,54 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 
 @Test func requestTimesOutAndClearsPendingEntry() async throws {
     let daemon = try PfsLocalMockDaemon(configuration: .init(
-        lookupNoReplyNames: ["hung"],
         requestDeadlineMilliseconds: 50
     ))
     defer { daemon.stop() }
 
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: daemon.socketPath, configuration: configuration)
     let resolved = try await client.resolve(attachRef: "mock")
+
+    let heldReply = PfsTestHeldReply()
+    await daemon.holdNextReply { await heldReply.hold($0) }
 
     var request = PfsLookupRequest()
     request.dir = resolved.root
     request.name = transportBytes("hung")
 
+    let lookup = Task { try await client.request(.lookup(request)) }
+    let reply = await heldReply.waitUntilHeld()
+    #expect(await client.testingPendingRequestCount() == 1)
+    #expect(try await deadlines.expire(reply.requestID) == 50_000_000)
+    let outcome = await lookup.result
+    await heldReply.release()
+
     do {
-        _ = try await client.request(.lookup(request))
+        _ = try outcome.get()
         Issue.record("expected lookup timeout")
     } catch let error as PfsLocalClientError {
         #expect(error == .timeout)
     }
 
     #expect(await client.testingPendingRequestCount() == 0)
+    // The late reply and this per-request timeout leave the session usable.
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
 @Test func requestCancellationResumesPromptlyAndClearsPendingEntry() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(lookupNoReplyNames: ["hung"]))
+    let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: daemon.socketPath, configuration: configuration)
     let resolved = try await client.resolve(attachRef: "mock")
 
+    let heldReply = PfsTestHeldReply()
+    await daemon.holdNextReply { await heldReply.hold($0) }
     var request = PfsLookupRequest()
     request.dir = resolved.root
     request.name = transportBytes("hung")
@@ -544,18 +619,21 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     let lookup = Task {
         try await client.request(.lookup(request))
     }
-    try await Task.sleep(nanoseconds: 20_000_000)
-    let started = ContinuousClock.now
+    _ = await heldReply.waitUntilHeld()
+    #expect(await client.testingPendingRequestCount() == 1)
     lookup.cancel()
 
+    // Cancellation must complete while both the reply and deadline are held.
+    let outcome = await lookup.result
+    await heldReply.release()
+
     do {
-        _ = try await lookup.value
+        _ = try outcome.get()
         Issue.record("expected cancellation")
     } catch let error as PfsLocalClientError {
         #expect(error == .cancelled)
     }
 
-    #expect(started.duration(to: .now) < .milliseconds(250))
     #expect(await client.testingPendingRequestCount() == 0)
 }
 
@@ -661,7 +739,10 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 @Test func dispatchedMutationTimeoutEndsTheSessionAsUncertain() async throws {
     let daemon = try PfsLocalMockDaemon(configuration: .init(requestDeadlineMilliseconds: 20))
     defer { daemon.stop() }
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: daemon.socketPath, configuration: configuration)
     let resolved = try await client.resolve(attachRef: "mock")
 
     var create = PfsCreateRequest()
@@ -677,14 +758,28 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
         return
     }
 
-    await daemon.delayNextWrite(nanoseconds: 100_000_000)
+    let heldReply = PfsTestHeldReply()
+    await daemon.holdNextReply { await heldReply.hold($0) }
     var write = PfsWriteRequest()
     write.handle = createReply.handle
     write.data = Data("late".utf8)
-    do {
-        _ = try await client.withPublicationBoundary {
+    let mutation = Task {
+        try await client.withPublicationBoundary {
             try await client.request(.write(write))
         }
+    }
+    let reply = await heldReply.waitUntilHeld()
+    // The daemon has applied the mutation, but its exact outcome remains
+    // withheld. Expiry cannot race Resolve, CREATE, dispatch or reply delivery.
+    #expect(reply.publicationAckRequired)
+    #expect(reply.writeReply.written == 4)
+    #expect(await daemon.stats().writeRequests == 1)
+    #expect(await client.testingPendingRequestCount() == 1)
+    #expect(try await deadlines.expire(reply.requestID) == 20_000_000)
+    let outcome = await mutation.result
+    await heldReply.release()
+    do {
+        _ = try outcome.get()
         Issue.record("expected the mutation deadline to end the session")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EIO)

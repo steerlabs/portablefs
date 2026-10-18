@@ -400,6 +400,13 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.transformNextReply(transform)
     }
 
+    /// Holds a fully applied reply before the socket writer can expose it.
+    /// The test owns release, including before calling stop(), which joins
+    /// every request handler.
+    func holdNextReply(_ hold: @escaping @Sendable (PfsEnvelope) async -> Void) async {
+        await fileSystem.holdNextReply(hold)
+    }
+
     public func delayNextCreate(nanoseconds: UInt64) async {
         await fileSystem.delayNextCreate(nanoseconds: nanoseconds)
     }
@@ -1040,6 +1047,7 @@ private actor MockFileSystem {
     private var retiredCloseReplies: [UInt64: PfsCloseReply] = [:]
     private var pendingOpenDelaysNanoseconds: [UInt64] = []
     private var pendingReplyTransforms: [@Sendable (PfsEnvelope) -> PfsEnvelope?] = []
+    private var nextReplyHold: (@Sendable (PfsEnvelope) async -> Void)?
     private var pendingCreateDelaysNanoseconds: [UInt64] = []
     private var pendingCreateHandlesToOmit = 0
     private var pendingOpenHandlesToOmit = 0
@@ -1128,6 +1136,10 @@ private actor MockFileSystem {
 
     func transformNextReply(_ transform: @escaping @Sendable (PfsEnvelope) -> PfsEnvelope?) {
         pendingReplyTransforms.append(transform)
+    }
+
+    func holdNextReply(_ hold: @escaping @Sendable (PfsEnvelope) async -> Void) {
+        nextReplyHold = hold
     }
 
     func delayNextCreate(nanoseconds: UInt64) {
@@ -1725,6 +1737,10 @@ private actor MockFileSystem {
         if let transform = pendingReplyTransforms.first, let transformed = transform(reply) {
             pendingReplyTransforms.removeFirst()
             reply = transformed
+        }
+        if let hold = nextReplyHold {
+            nextReplyHold = nil
+            await hold(reply)
         }
         return reply
     }
