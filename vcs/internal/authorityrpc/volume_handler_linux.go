@@ -70,7 +70,7 @@ type volumeStore interface {
 	ReadAt(xfsstore.Capability, []byte, int64) (int, error)
 	WriteAt(xfsstore.Capability, []byte, int64) (int, error)
 	Truncate(xfsstore.Capability, int64) error
-	Fsync(xfsstore.Capability, bool) error
+	FsyncCoalesced(xfsstore.Capability, bool) (int, error)
 	PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error)
 	GetattrOpen(xfsstore.Capability) (xfsstore.Attr, error)
 	SyncFS() error
@@ -106,10 +106,6 @@ type writeStore interface {
 
 type writeTargetAttr interface {
 	Getattr() (xfsstore.Attr, error)
-}
-
-type coalescingFsyncStore interface {
-	FsyncCoalesced(xfsstore.Capability, bool) (int, error)
 }
 
 type tmpfileStore interface {
@@ -1811,12 +1807,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		group := 0
-		if store, ok := h.Store.(coalescingFsyncStore); ok {
-			group, err = store.FsyncCoalesced(handle, body.Fsync.GetDataOnly())
-		} else {
-			err = h.Store.Fsync(handle, body.Fsync.GetDataOnly())
-		}
+		group, err := h.Store.FsyncCoalesced(handle, body.Fsync.GetDataOnly())
 		if group != 0 && h.Metrics != nil {
 			h.Metrics.ObserveFsyncBatch(group)
 		}

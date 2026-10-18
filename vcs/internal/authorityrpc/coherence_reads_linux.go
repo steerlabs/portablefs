@@ -71,12 +71,7 @@ func (h *VolumeHandler) coherenceFsync(ctx context.Context, requestID uint64, se
 		return h.errorResponse(requestID, err, false)
 	}
 	defer release()
-	group := 0
-	if store, ok := h.Store.(coalescingFsyncStore); ok {
-		group, err = store.FsyncCoalesced(handle, request.GetDataOnly())
-	} else {
-		err = h.Store.Fsync(handle, request.GetDataOnly())
-	}
+	group, err := h.Store.FsyncCoalesced(handle, request.GetDataOnly())
 	if group != 0 && h.Metrics != nil {
 		h.Metrics.ObserveFsyncBatch(group)
 	}
