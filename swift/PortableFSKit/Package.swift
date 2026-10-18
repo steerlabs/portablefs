@@ -13,7 +13,7 @@ let package = Package(
         .library(name: "PortableFSAppCore", targets: ["PortableFSAppCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.38.1")
+        .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.39.0")
     ],
     targets: [
         .target(
