@@ -20,8 +20,8 @@
 // before admission. The stock frontend's maximum write is already 1 MiB.
 // Arenas reserve operation records and at most two extent boundaries per record
 // at construction. After identity initialization, uncontended Write allocates
-// only its data copy. Transport coalescing uses temporary scratch, bounded by
-// 1 MiB per flushing identity, in addition to the retained payload budget.
+// only its data copy. A flush wave borrows retained payload as scatter spans,
+// so coalescing needs no scratch copy beyond the retained payload budget.
 //
 // An AVL extent map provides O(log n + k) reads of k intersecting dirty ranges.
 // Later writes replace overlaps. Truncation removes covered data ranges and
@@ -29,9 +29,12 @@
 // The tree maintains a size aggregate; Size is O(1) after identity lookup.
 // Durability removes only the retiring record's surviving extents. Indexed
 // heaps process cumulative visibility/durability without scanning idle files.
-// Adjacent or overlapping consecutive writes coalesce at flush time within
-// one cut and generation, up to MaxPayload. Truncate and SetAttr preserve their
-// original position between writes; acceptance records never coalesce away.
+// Adjacent consecutive writes coalesce at flush time into one operation of at
+// most the flusher's payload bound, within one cut, generation and write
+// options; overlapping writes stay separate ordered operations of one wave.
+// A wave carries at most the flusher's width of operations. Truncate and
+// SetAttr preserve their original position between writes as waves of their
+// own; acceptance records never coalesce away.
 //
 // # Entry state and cuts
 //
@@ -72,12 +75,13 @@
 // the fence rather than failing. Cap backpressure uses the same atomic
 // admission boundary and cannot add operations to an already-captured cut.
 //
-// Flusher.Flush must respect the supplied positioned operation and generation,
-// serialize its Authority application in call order per identity, and be safe
-// for concurrent identities. Token is a mount/session-local idempotency key;
-// retry the same token and bytes after every uncertain result. Successful
-// earlier chunks are not resent. The flusher must not retain or mutate borrowed
-// Data after returning and must honor context cancellation. It must arrange
+// Flusher.FlushBatch must respect each supplied positioned operation and
+// generation, apply a wave in its order per identity, and be safe for
+// concurrent identities. Token is a mount/session-local idempotency key; a
+// failed wave is retried with the same tokens and bytes, and members that
+// already applied are not applied again. The flusher must not retain or mutate
+// borrowed Data or Segments after returning and must honor context
+// cancellation. It must arrange
 // fsync-group progress independently of new admissions, including while the
 // cap is full. Background transient errors retain the batch for the next timer
 // or explicit retry; explicit flushes return wrapped errors. A permanent
@@ -86,7 +90,7 @@
 // returns the recorded loss (ErrLost, or a preserved capacity errno) even when
 // that transport also failed: retryable transport status cannot describe data
 // whose retained generation no longer exists.
-// Never synchronously reenter a flush for the same identity from Flush.
+// Never synchronously reenter a flush for the same identity from FlushBatch.
 //
 // Drop fences results of an in-flight flush, reports retained bytes by identity,
 // advances mount and identity loss, and wakes cap/durability waiters. It does

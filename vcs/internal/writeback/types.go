@@ -95,22 +95,24 @@ type Entry struct {
 	WriteOptions WriteOptions
 }
 
-// Flusher applies one operation, returning its nonzero Authority sequence.
-// Calls for an identity are serialized; disjoint identities run concurrently.
-// The implementation must deduplicate Token (scoped to this Buffer/session),
-// including calls that return errors after applying. It must arrange eventual
-// visibility and durability notifications, including when the buffer is full.
-// A returned error retains the operation for retry; permanent rejection must
-// call Drop. No buffer lock is held while Flush executes.
-type Flusher interface {
-	Flush(context.Context, Identity, Entry) (uint64, error)
-}
+// MaxWaveWidth is the most operations one flush wave may carry.
+const MaxWaveWidth = 4
 
-// BatchFlusher joins a bounded accepted-order wave before returning. Its result
-// is index-aligned and nondecreasing. On retry the immutable tokens are the
-// same; completed members must not be applied twice. A zero width selects the
-// original serial path. Both payloads and spans are borrowed until return.
-type BatchFlusher interface {
+// Flusher applies accepted operations in bounded waves. New reads
+// FlushBatchSize once: width (1..MaxWaveWidth) bounds the operations in one
+// wave and payload (1..MaxPayload) the bytes of one write operation. A
+// metadata or truncation record is always a wave of its own.
+//
+// FlushBatch joins one accepted-order wave before returning index-aligned,
+// nonzero, nondecreasing Authority sequences. Calls for an identity are
+// serialized; disjoint identities run concurrently. A returned error retains
+// the whole wave for retry with the same immutable tokens, so the
+// implementation must deduplicate Token (scoped to this Buffer/session) and
+// never apply a completed member twice. It must arrange eventual visibility
+// and durability notifications, including when the buffer is full. Permanent
+// rejection must call Drop. Payloads and spans are borrowed until return; no
+// buffer lock is held while FlushBatch executes.
+type Flusher interface {
 	FlushBatchSize() (width, payload int)
 	FlushBatch(context.Context, Identity, []Entry) ([]uint64, error)
 }

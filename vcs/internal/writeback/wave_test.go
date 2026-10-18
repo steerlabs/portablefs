@@ -13,9 +13,6 @@ type waveTestFlusher struct {
 	call           func([]Entry) ([]uint64, error)
 }
 
-func (*waveTestFlusher) Flush(context.Context, Identity, Entry) (uint64, error) {
-	panic("batch flusher reached serial path")
-}
 func (f *waveTestFlusher) FlushBatchSize() (int, int) { return f.width, f.payload }
 func (f *waveTestFlusher) FlushBatch(_ context.Context, _ Identity, entries []Entry) ([]uint64, error) {
 	return f.call(entries)
@@ -317,5 +314,26 @@ func TestFileDurabilityCannotRetireAnotherIdentityOrLaterCut(t *testing.T) {
 	b.Drop(one, "fence")
 	if err := b.DurableIdentity(one, cut); !errors.Is(err, ErrLost) {
 		t.Fatalf("file sync erased intervening loss: %v", err)
+	}
+}
+
+// The wave shape is the only flush contract: a flusher that cannot carry at
+// least one operation, or would exceed the retained wave storage or the
+// payload bound, is refused at construction rather than served by another mode.
+func TestNewRefusesAnUnusableWaveShape(t *testing.T) {
+	for _, shape := range []struct{ width, payload int }{
+		{0, MaxPayload}, {-1, MaxPayload}, {MaxWaveWidth + 1, MaxPayload},
+		{1, 0}, {1, -1}, {1, MaxPayload + 1},
+	} {
+		if _, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{FlushInterval: -1}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("New(width %d, payload %d) error = %v, want ErrInvalid", shape.width, shape.payload, err)
+		}
+	}
+	for _, shape := range []struct{ width, payload int }{{1, 1}, {MaxWaveWidth, MaxPayload}} {
+		b, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{FlushInterval: -1})
+		if err != nil {
+			t.Fatalf("New(width %d, payload %d): %v", shape.width, shape.payload, err)
+		}
+		b.Stop()
 	}
 }

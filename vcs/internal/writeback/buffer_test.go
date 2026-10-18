@@ -15,10 +15,31 @@ import (
 	"time"
 )
 
+// flusherFunc applies one operation per wave. It is the Flusher for tests
+// whose subject is buffer bookkeeping rather than wave shape; it flattens the
+// operation's borrowed scatter spans into Data.
 type flusherFunc func(context.Context, Identity, Entry) (uint64, error)
 
-func (f flusherFunc) Flush(ctx context.Context, id Identity, entry Entry) (uint64, error) {
-	return f(ctx, id, entry)
+func (flusherFunc) FlushBatchSize() (int, int) { return 1, MaxPayload }
+
+func (f flusherFunc) FlushBatch(ctx context.Context, id Identity, entries []Entry) ([]uint64, error) {
+	return flushEachEntry(entries, func(entry Entry) (uint64, error) { return f(ctx, id, entry) })
+}
+
+// flushEachEntry applies a width-one wave through a per-operation function.
+func flushEachEntry(entries []Entry, apply func(Entry) (uint64, error)) ([]uint64, error) {
+	sequences := make([]uint64, len(entries))
+	for i, entry := range entries {
+		if entry.Segments != nil {
+			entry.Data, entry.Segments = bytes.Join(entry.Segments, nil), nil
+		}
+		seq, err := apply(entry)
+		if err != nil {
+			return nil, err
+		}
+		sequences[i] = seq
+	}
+	return sequences, nil
 }
 
 type flushCall struct {
@@ -32,14 +53,18 @@ type recordingFlusher struct {
 	calls []flushCall
 }
 
-func (f *recordingFlusher) Flush(_ context.Context, id Identity, entry Entry) (uint64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	copyEntry := entry
-	copyEntry.Data = bytes.Clone(entry.Data)
-	f.calls = append(f.calls, flushCall{id: id, entry: copyEntry})
-	f.next += 10
-	return f.next, nil
+func (*recordingFlusher) FlushBatchSize() (int, int) { return 1, MaxPayload }
+
+func (f *recordingFlusher) FlushBatch(_ context.Context, id Identity, entries []Entry) ([]uint64, error) {
+	return flushEachEntry(entries, func(entry Entry) (uint64, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		copyEntry := entry
+		copyEntry.Data = bytes.Clone(entry.Data)
+		f.calls = append(f.calls, flushCall{id: id, entry: copyEntry})
+		f.next += 10
+		return f.next, nil
+	})
 }
 
 func (f *recordingFlusher) snapshot() []flushCall {
@@ -341,20 +366,30 @@ func TestFlushCoalescingAndOrderingBarriers(t *testing.T) {
 			want: []Entry{{First: 1, Last: 2, Generation: 1, Kind: Write, Offset: 0, Data: []byte("abcdef")}},
 		},
 		{
-			name: "reverse adjacent",
+			// Coalescing only extends forward; a predecessor range stays its
+			// own operation in acceptance order.
+			name: "reverse adjacent stays ordered",
 			ops: func(t *testing.T, b *Buffer, id Identity) Cut {
 				mustWrite(t, b, id, 3, "def")
 				return mustWrite(t, b, id, 0, "abc")
 			},
-			want: []Entry{{First: 1, Last: 2, Generation: 1, Kind: Write, Offset: 0, Data: []byte("abcdef")}},
+			want: []Entry{
+				{First: 1, Last: 1, Generation: 1, Kind: Write, Offset: 3, Data: []byte("def")},
+				{First: 2, Last: 2, Generation: 1, Kind: Write, Offset: 0, Data: []byte("abc")},
+			},
 		},
 		{
-			name: "last overlapping write wins",
+			// Overlaps are separate ordered operations, so the last writer
+			// wins at the authority without a merged temporary payload.
+			name: "last overlapping write wins in order",
 			ops: func(t *testing.T, b *Buffer, id Identity) Cut {
 				mustWrite(t, b, id, 0, "abcdef")
 				return mustWrite(t, b, id, 2, "XYZ")
 			},
-			want: []Entry{{First: 1, Last: 2, Generation: 1, Kind: Write, Offset: 0, Data: []byte("abXYZf")}},
+			want: []Entry{
+				{First: 1, Last: 1, Generation: 1, Kind: Write, Offset: 0, Data: []byte("abcdef")},
+				{First: 2, Last: 2, Generation: 1, Kind: Write, Offset: 2, Data: []byte("XYZ")},
+			},
 		},
 		{
 			name: "gap stops coalescing",
