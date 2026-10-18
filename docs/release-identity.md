@@ -50,8 +50,9 @@ tree, and the repository's exact newline-terminated `VERSION` file. The checkout
 is `fetch-depth: 0` with `persist-credentials: false`, so the tag is resolved
 against real history rather than a shallow graft.
 
-`VERSION` is the local/Xcode authority: the production, macOS 26, and macOS 27
-projects must each contain exactly four matching `MARKETING_VERSION` settings;
+`VERSION` is the local/Xcode authority: the production project and the
+manual-registration development project (`swift/PortableFSKitDev`) must each
+contain exactly four matching `MARKETING_VERSION` settings;
 CI reads it directly; and the macOS packager rejects both environment overrides
 and positional arguments that do not equal it. The tag is the publication
 authority used by GoReleaser and artifact names. The equality gate makes these
@@ -263,17 +264,51 @@ process wakes the exact host and uses the external private control socket, and
 never enters the protected container. Packaging rejects either missing daemon
 privilege or accidental CLI privilege.
 
-**An exact service-update identity.** Before an installed host permits bundle
-replacement, both the old and target nested services are bound by the service
-CodeDirectory hash, full executable SHA-256, daemon version, control identity
-schema, control protocol, and `pfslocal` major/minor. The live socket peer's
-kernel-authenticated executable path identifies its owning signed app. The
-host validates that app's service layout, signing team, product, and app group,
-then proves the live daemon against that sealed release. Preferences are not
-service identity authority. Normal startup can replace an older release of the
-same service only after empty-inventory admission and a fresh process proof
-under that guard; an unknown socket owner is refused before unregistration.
-The owner-private durable
+**An exact paired-release identity.** The CLI, app, daemon, and extension are
+one paired release. Before any operational request the CLI and app require an
+exact match with the live daemon: daemon version, executable SHA-256, identity
+schema 1, daemon operational control 2, and `pfslocal` 2.0. The sealed service
+records its actual protocol numbers in
+`PortableFSDService.app/Contents/Resources/PortableFSProtocol.json`, written
+before the service is signed. Its exact content for this release is:
+
+```json
+{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocalMinor":0}
+```
+
+All four keys are required and case sensitive; an unknown, duplicate, null,
+missing, or trailing value, or an unequal identity schema, fails decoding.
+`scripts/package-macos-app.sh` regenerates the record from the exact build and
+refuses a packaged copy that differs, and a host trusts the record only after
+the service bundle's signature verifies. An incoming target must equal the
+current compiled pairing exactly. The executable's own digest is deliberately
+not stored in its signed resources, which would be a code-signing cycle; the
+executable SHA-256 and the release version are derived from the signed code
+and bundle metadata.
+
+**An authenticated service update.** Replacing the service crosses releases, so
+the host never speaks the outgoing release's operational interface. Each
+outgoing and target service is bound by one tuple: service CodeDirectory hash,
+full executable SHA-256, daemon version, identity schema, control version, and
+`pfslocal` major/minor. The host first authenticates the outgoing service: the
+live socket peer's kernel-authenticated executable path identifies its owning
+signed app, the host validates that app's service layout, signing team,
+product, and app group, and it proves the live daemon against that sealed
+release. Only then does it accept that release's sealed and reported control
+and `pfslocal` versions, whatever they are; it never inserts the incoming
+build's compiled numbers as the outgoing release's expected values. It quiesces
+the authenticated outgoing release through the frozen lifecycle v1 routes and
+nothing else:
+`GET /lifecycle/v1/identity`, `GET /lifecycle/v1/inventory`, and
+`POST /lifecycle/v1/stop-if-idle`, which closes attach admission and atomically
+requires the complete inventory to be empty before stopping (`204`) or refuses
+with no state change (`409`). Any other status is a failure, never an
+empty-inventory or stopped proof. An inventory snapshot is not removal
+authority; process termination, Service Management unregistration, and the
+state singleton supply that proof. An unknown socket owner is refused before
+unregistration, preferences are not service identity authority, and every
+ordinary mount or attach operation requires the incoming release's exact
+pairing. The owner-private durable
 activation lease stores those tuples, a bounded phase/deadline, and only the
 SHA-256 of a random one-use token. The plaintext token crosses only
 credential-checked Unix-socket sessions and never appears in defaults, argv,
@@ -298,10 +333,14 @@ That fence is not a system-wide PID scan. Before mutation, the host
 authenticates the control peer's exact audit token, PID version, executable,
 Developer ID code identity, and release CodeDirectory hash, then pins that
 execution with `EVFILT_PROC`. Completion requires `NOTE_EXIT`, Service
-Management `notRegistered`, and all three socket names absent. If registration
-failed before an authenticated control peer was published, the host instead
-proves the canonical state-singleton lock is safely pinned and free; the daemon
-acquires that lock first and releases it last.
+Management `notRegistered`, and all three socket names absent. The daemon state
+singleton is one canonical flock inode: it is never unlinked or replaced to
+bypass a holder, it carries no owner record, and there is no stale-holder
+takeover. The daemon acquires it first and releases it last. If registration
+failed before an authenticated control peer was published, the host proves
+departure by acquiring that same lock and holds it across unregistration, so no
+daemon can start between the proof and the stop. A holder stuck in kernel exit
+blocks startup until the kernel releases it.
 The host replaces the active phase with a durable `target-complete` or
 `rollback-complete` terminal marker before acknowledging completion. A lost
 activation-accept acknowledgement does not destroy the installer session: the
@@ -371,6 +410,9 @@ push would catch.
   probe, the `https://github.com/$REPO/releases/tag/` prefix requirement, and the
   stable-SemVer tag regex;
 - the macOS pre-extraction ZIP boundary checks are intact;
+- the embed phase writes the sealed service protocol record into the service
+  resources, and the macOS installer decodes it strictly and requires the
+  incoming target's exact control and `pfslocal` pairing;
 - the canonical Apple identity block contains all five expected values and
   contains no `PORTABLEFS_EXPECTED_` reference, failing with `canonical Apple
   identities remain environment-overridable` if it does;
@@ -404,7 +446,7 @@ allowed.
 State these plainly rather than reading the sections above as a description of a
 working pipeline.
 
-The release configuration now names only binaries that exist in the v3 tree.
+The release configuration names only binaries that exist in the tree.
 GoReleaser builds the exact two-binary Linux client archive (`portablefs` and
 `portablefsd`) plus a separate one-binary server archive containing
 `portablefs-authority`; the workflow independently verifies both archive
@@ -413,15 +455,24 @@ integration-harness binary rather than a published operator artifact: ordinary
 Linux users mount through `portablefs`, while operators deploy the authority
 from the server archive.
 
-Tags through `v0.2.3` point at commits that predate `dba5b8f`. `v0.2.4` marks
-the first tagged v3 tree but is not release authority: its draft pipeline
-correctly stopped before publication when archive signing had no independently
-modeled Apple Development identity. `v0.2.5` is the first releasable v3 tree.
-It is accepted only when its immutable tag runs this complete workflow
-successfully: exact source/version proof, Linux archive membership and
-attestations, native Xcode tests, exact isolated Apple Development archive
-signing, separately isolated Developer ID export, notarization, stapling, and
-final publication. Developer ID export is manual and locally rooted in the
-exact release identity plus the frozen FSKit direct-distribution profile; it
-must never fall back to cloud-managed certificate or profile creation. A tag or
-draft release alone is not release authority.
+No protocol-8 release has completed this workflow. A release is accepted only
+when its immutable tag runs the whole workflow successfully: exact
+source/version proof, Linux archive membership and attestations, native Xcode
+tests, exact isolated Apple Development archive signing, separately isolated
+Developer ID export, notarization, stapling, and final publication. A tag or
+draft release alone is not release authority, and the protocol-8 qualification
+gates in [COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status) are
+separate from this pipeline.
+
+Developer ID export is manual and locally rooted in the exact release identity
+plus the frozen FSKit direct-distribution profile; it must never fall back to
+cloud-managed certificate or profile creation. That manual step is outside the
+workflow's automated proof.
+
+The macOS path has no artifact attestation; its trust rests on the sidecar
+checksum, Developer ID signing, notarization, and the exact bundle identity.
+
+The authenticated cross-release service update has no signed predecessor
+release to update from yet. Its lifecycle v1 quiescence, spoofed-identity
+refusal, and arbitrary-distinct-release behavior are exercised by tests, not by
+replacing a published signed app in place on macOS 26 or 27.

@@ -3,7 +3,6 @@
 The distribution and mount-lifecycle architecture is implemented in the app,
 embedded CLI, and release pipeline. Remaining work is presentation-only:
 
-- Add a branch picker per volume.
 - Add an app icon and localizations.
 - Consider Keychain-backed control-plane credentials while retaining CLI/app
   interoperability.

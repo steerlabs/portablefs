@@ -1,26 +1,30 @@
 # Cross-mount coherence matrix
 
 PortableFS's central Linux claim is one authoritative volume mounted through
-several stock-kernel FUSE clients with protocol-7 subscriptions, file
-delegations, break-for-read, and directory-handle completion barriers.
-This is the black-box instrument that verifies it. macOS invocations are
-qualification runs and do not establish production FSKit support.
+several stock-kernel FUSE clients under `FRONTEND_PROFILE_LINUX`: a volume
+subscription, per-file write delegations, break-for-read, and directory-handle
+completion barriers ([portable-coherence.md](./portable-coherence.md)). This is
+the black-box instrument that verifies it. The macOS form runs a Mac FSKit mount
+against a Linux peer; it characterizes that pairing and is not native FSKit
+qualification.
 
 ```bash
 scripts/coherence-matrix-linux.sh                      # Linux, two kernel FUSE mounts
-scripts/coherence-matrix-macos.sh --mount-a A --mount-b B   # macOS, two mounts on one Mac
-scripts/coherence-matrix-macos.sh --mount-a A \
-  --remote user@second-mac --remote-mount B            # macOS/macOS
 scripts/coherence-matrix-macos.sh --mount-a A \
   --remote user@linux-peer --remote-mount B \
-  --remote-binary /path/to/linux/pfs-coherence-matrix  # mixed macOS/Linux
+  --remote-binary /path/to/linux/pfs-coherence-matrix  # Mac plus Linux peer
 ```
 
-Both scripts use the same driver (`vcs/test/coherence/cmd/pfs-coherence-matrix`)
-for the original 23 cases. The Linux harness adds six protocol-7 cases,
-including process pause and authority restart controls that require its
-lifecycle setup. Compare common cases across platforms under their declared
-contracts; a Linux lifecycle case is not evidence of FSKit qualification.
+Both scripts use the same driver (`vcs/test/coherence/cmd/pfs-coherence-matrix`;
+`--list` prints every case). It holds 29 cases: 23 shared cases and six Linux
+delegation and lifecycle cases that need the Linux harness's pause, Authority
+restart, and gateway commands. Compare shared cases across platforms under
+their declared contracts; a Linux lifecycle case is not evidence about FSKit.
+
+No protocol-8 result is recorded in this document. The Linux matrix is part of
+`bash scripts/verify-local.sh --full`, which has not yet passed on the
+integrated protocol-8 tree
+([COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status)).
 
 ## What it is
 
@@ -29,9 +33,9 @@ and nothing else: no access to the frontend's internals, no injected kernel, no
 in-process fixture. It cannot pass because a fake agreed with itself.
 
 The mounts are ordinary OS processes started by the script, which is what makes
-the last case possible at all. A mount that lives inside a test binary cannot be
-killed uncleanly, so "a dead participant must not break the survivor" can only
-be asserted when the mounts are separate processes.
+the lifecycle cases possible at all. A mount that lives inside a test binary
+cannot be paused or killed uncleanly, so "a dead participant must not break the
+survivor" can only be asserted when the mounts are separate processes.
 
 The Linux script provisions a real XFS cell with project quotas through the
 production provisioner, mints credentials with the production capability signer
@@ -51,8 +55,8 @@ production provisioner, mints credentials with the production capability signer
   answer. Fault-lifecycle cases separately wait for bounded recovery. Names,
   attributes, clean data, and directory enumerations may be cached only under
   a live subscription with no conflicting delegation; a namespace mutation
-  completes peer withdrawal before its result is published. A case that needed a settling delay
-  would be reporting a defect, not a timing artefact.
+  completes peer withdrawal before its result is published. A case that needed
+  a settling delay would be reporting a defect, not a timing artefact.
 
 ## Falsifiability
 
@@ -63,12 +67,12 @@ proves that before it reports anything. The Linux script runs three phases:
    is not the volume. Every case must fail. A case that can pass without the two
    roots sharing a filesystem is not measuring coherence.
 2. **First-success stale-view control.** One mount replays the first successful
-   `stat`, `lstat`, `readdir`, `readfile`, or `readlink` answer for each path --
-   exactly the defect class the hand-run macOS matrix found: mode bits that
-   never change, an atomic replacement that keeps resolving the old inode, or
-   an EOF that never moves. Every case declared pathname-stale-sensitive must
-   fail. Stateful descriptor behavior and the attach-time route contract are
-   intentionally outside this fault model and keep their direct assertions.
+   `stat`, `lstat`, `readdir`, `readfile`, or `readlink` answer for each path:
+   mode bits that never change, an atomic replacement that keeps resolving the
+   old inode, or an EOF that never moves. Every case declared
+   pathname-stale-sensitive must fail. Stateful descriptor behavior and the
+   attach-time route contract are intentionally outside this fault model and
+   keep their direct assertions.
 3. **The real matrix.**
 
 If a control does not produce a case's declared result, the job fails. A case
@@ -97,6 +101,8 @@ Exit status is zero only when every case reached its **declared** status.
 
 ## The cases
 
+The 23 shared cases:
+
 | case | what it asserts |
 | --- | --- |
 | `remote_create_visible` | a file created on one mount is visible and readable on the other with no polling |
@@ -111,40 +117,39 @@ Exit status is zero only when every case reached its **declared** status.
 | `remote_truncate_shrink_readable_eof` | a remote shrink is observed as a shorter readable EOF, not a stale tail |
 | `dir_listing_reflects_remote_creates_and_deletes` | an enumeration on one mount reflects creates and deletes performed on the other |
 | `concurrent_writers_distinct_files` | both mounts writing distinct files concurrently lose nothing and both see the full result |
-| `concurrent_same_file_append_atomicity` | exact cross-mount append: every record from both mounts lands whole, placed by the authority at the true EOF |
+| `concurrent_same_file_append_atomicity` | concurrent `O_APPEND` writers to one file lose no record and tear no record; the interleaving is free |
 | `concurrent_same_file_overwrite_integrity` | concurrent whole-record overwrites of one file leave one writer's record, never a mixture |
 | `hardlink_visible_same_inode` | a hard link made on one mount is observed on the other as the same inode with the right link count |
 | `symlink_visible_and_resolves` | a symlink created and atomically replaced on one mount is observed on the other with its exact current target and bytes |
 | `deep_nesting` | a deep tree created and rewritten on one mount is fully traversable and mutable from the other |
-| `open_after_unlink_cross_mount_contents` | a descriptor held across a remote unlink *and* a remote replacement keeps reading the original bytes, while the same mount's path resolves the replacement |
+| `open_after_unlink_cross_mount_contents` | a descriptor held across a remote unlink *and* a remote replacement keeps reading the original bytes, while the name resolves the replacement |
 | `rename_over_open_fd` | a remote rename-over leaves the open descriptor on the displaced inode's bytes and the name on the replacement's inode and bytes |
 | `same_dir_concurrent_mutations` | both mounts running create/rename/unlink storms in the *same* directory finish in bounded time, wedge no mount, and leave both mounts enumerating the identical surviving set |
-| `local_route_isolation` | a route-configured directory is machine-local: each mount resolves its own root inode, files created under it never cross mounts, one name holds different bytes on each machine, and shared siblings stay coherent across a peer's change |
-| `routes_revision_mismatch` | an attach carrying a stale routing revision is refused with both revisions and the volume's canonical rules, and adopting them lets the same capability attach on exactly the second attempt |
+| `local_route_isolation` | a route-configured directory is machine-local: files created under it on one mount are invisible on the other while shared siblings stay coherent |
+| `routes_revision_mismatch` | an attach carrying a stale routing revision is refused with both revisions and the volume's canonical rules, and adopting them lets the same capability attach on the second attempt |
 | `peer_loss_does_not_break_surviving_mount` | one mount dying uncleanly must not stop the other mount from serving |
 
-Protocol 7 retains these 23 cases and adds six Linux cases. The existing
-same-file overwrite and append cases also exercise delegation competition.
+The six Linux delegation and lifecycle cases. The same-file overwrite and
+append cases above also exercise delegation competition.
 
-| Protocol-7 case | Guarantee |
-|---|---|
-| `peer_cached_handle_forces_writethrough` | a pre-existing cached descriptor observes every completed peer write |
-| `git_index_lock_protocol` | exactly one exclusive index.lock winner; rename publishes complete index bytes |
-| `write_then_rename_flushes_before_visibility` | dirty data is flushed before the peer first reads the renamed binding |
-| `gateway_reads_delegated_data_without_obstructing_writer` | gateway list/read sees flushed data and excludes no Linux writer |
-| `recall_budget_loss_fails_barrier` | stopped holder misses recall; affected handles and old root barrier fail EIO while healthy work continues |
-| `epoch_change_stales_handles_and_new_barrier_passes` | same mounts survive Authority replacement; old handles fail and new work/barrier succeeds |
+| case | what it asserts |
+| --- | --- |
+| `peer_cached_handle_forces_writethrough` | a preexisting cached read descriptor sees each peer write before that write returns |
+| `git_index_lock_protocol` | cross-mount exclusive `index.lock` has one winner and publishes each index replacement to the peer |
+| `write_then_rename_flushes_before_visibility` | rename publishes buffered bytes to the peer while the writer fd stays open without prior fsync |
+| `gateway_reads_delegated_data_without_obstructing_writer` | an authenticated cacheless gateway lists and reads buffered data while the writer remains responsive |
+| `recall_budget_loss_fails_barrier` | a holder missing recall reports `EIO` and a failed old-root barrier while the peer and fresh handles keep serving |
+| `epoch_change_stales_handles_and_new_barrier_passes` | Authority replacement stales old file and root handles and admits fresh durable work without remounting |
 
 The Linux script exercises process stop/resume and Authority replacement for
-the lifecycle cases. Shared production code supplies the authenticated gateway.
-The existing chown skip remains explicit because a single-principal volume
-cannot produce an ownership change. Current results and controls are in
-[coherence-v2/integration.md](./coherence-v2/integration.md).
+the lifecycle cases, and the gateway case uses the production cacheless reader.
+The chown case skips explicitly because a single-principal volume cannot
+produce an ownership change.
 
 ### `same_dir_concurrent_mutations` permits no fencing
 
 Two mounts mutating one directory is the directory-inode-lock contention case.
-The subscription and exact publication paths must repair the affected
+The subscription and exact publication paths must withdraw the affected
 coordinates without aborting either mount. Namespace changes remain ordered at
 the Authority, and unrelated coordinates do not inherit a mount-wide gate.
 The case records participants that stop serving; the allowed count is zero.
@@ -161,7 +166,7 @@ mounting, through `pfs-coherence-routes --apply-file`. That is the only way it
 can arrive: the authority owns `.portablefs/local-dirs` and refuses mount
 mutation of it, so the declaration comes through the admin `ApplyRoutes` call
 under a capability minted with the `admin` claim. That capability is minted
-separately and never given to a mount — `admin` implies write, but write
+separately and never given to a mount: `admin` implies write, but write
 deliberately does not imply `admin`, because changing this file changes what
 every other machine can see.
 
@@ -177,11 +182,11 @@ nothing to do with routing.
 
 The separate privileged FUSE suite owns the exact zero-RPC assertion. Its
 server-side handler classifies every request that crosses the wire and excludes
-only clock-driven keepalive, visibility and reclaim traffic;
-`TestGraftedSubtreeReachesTheAuthorityZeroTimes` and the real-workload graft
-tests require a zero delta. The cross-process matrix does not infer that claim
-from whole-process `/proc` I/O, because unrelated keepalives can move that proxy
-during an otherwise entirely local routed window.
+only clock-driven keepalive, control-event, change-acknowledgment, and reclaim
+traffic; `TestGraftedSubtreeReachesTheAuthorityZeroTimes` and the real-workload
+graft tests require a zero delta. The cross-process matrix does not infer that
+claim from whole-process `/proc` I/O, because unrelated keepalives can move that
+proxy during an otherwise entirely local routed window.
 
 ### How a mount learns the routing it must declare
 
@@ -196,7 +201,7 @@ The authority breaks the circle on the refusal instead. The routing check runs
 no capability, and the refusal carries the volume's active canonical rules. So
 the flow is one attach and at most one more:
 
-1. attach with the empty rule set — which is also exactly what a volume with no
+1. attach with the empty rule set, which is also exactly what a volume with no
    declaration runs, so the common case is a single attach with no retry;
 2. on a routing refusal, adopt the rules the refusal carried, check that they
    hash to the revision the authority calls active, and attach again **on the
@@ -204,39 +209,56 @@ the flow is one attach and at most one more:
 3. a second refusal is a real disagreement and is surfaced verbatim.
 
 `routes_revision_mismatch` asserts exactly that contract, including the attempt
-count, using a client that does *not* adopt — because the mount binary adopts by
+count, using a client that does *not* adopt, because the mount binary adopts by
 itself, and a refusal nobody declines to adopt is a refusal nobody has observed.
 
-### The authority has no production per-RPC counter (unmet observability gate)
+### Request counting
 
-Nothing in the production authority exports a request count. The
-package-manager instrument therefore records clearly labelled whole-process
-`/proc` byte and scheduling proxies, but never uses them for pass/fail. Exact
-graft RPC assertions stay in the privileged server-side counting harness until
-the authority exports a request-class counter that is independent of keepalive
-and visibility traffic.
+The authority exports per-opcode request counters
+(`portablefs_authority_rpc_requests_total{opcode,outcome}`) on its admin
+listener ([deployment monitoring](./xfs-authority-deployment.md#monitoring)).
+The package-manager instrument does not scrape them: it records clearly labelled
+whole-process `/proc` byte and scheduling proxies, and uses neither for
+pass/fail. Exact graft RPC assertions stay in the privileged server-side
+counting harness.
 
-`remote_chown_visible` skips on PortableFS v3. The volume model is deliberately
+`remote_chown_visible` skips on PortableFS. The volume model is deliberately
 single-principal, so the volume itself refuses a chown to another principal with
 `EPERM` and there is no ownership change to observe. If multiple POSIX
 principals are ever supported, the case becomes assertable and must be enabled.
 
 ## macOS
 
-`scripts/coherence-matrix-macos.sh` does not mount anything itself. It accepts
-paths created by an explicitly stamped qualification build and stays out of the
-daemon lifecycle. A green run characterizes that adapter and OS only; it does
-not establish Linux-equivalent FSKit withdrawal or lift Mac writer exclusion.
+`scripts/coherence-matrix-macos.sh` runs the shared cases between mount A, an
+FSKit mount on this Mac, and mount B, a Linux kernel-FUSE mount of the same
+volume on a remote peer driven over ssh with a Linux-built driver. There is no
+Mac-to-Mac form: writer exclusion refuses a second Mac mount of a volume, on the
+same Mac or another, so two Mac mounts are not a configuration to measure. The
+script does not attempt that refusal or a clean-detach readmission either,
+because proving them requires mounting.
 
-It refuses to run against ordinary directories. A directory on the boot volume
-is perfectly coherent with itself, so a run like that would print a wall of
-green that means nothing.
+It does not mount anything itself and stays out of the daemon lifecycle. It
+refuses to run against ordinary directories: a directory on the boot volume is
+perfectly coherent with itself, so a run like that would print a wall of green
+that means nothing. It verifies the remote path's mount type with the peer's
+native mount inventory, refuses a Mac peer, and skips loudly, with a nonzero
+exit, when the Linux peer or its driver is unavailable. If the peer is
+unavailable, no case ran, so nothing was demonstrated, and the output says
+exactly that.
 
-Everything it cannot honestly assert is skipped with a loud message and a
-nonzero exit. The remote peer may be macOS or Linux; its driver must be built
-for that host, and its mount type is validated with the remote OS's native
-mount inventory. If the peer is unavailable, no case ran, so nothing was
-demonstrated, and the output says exactly that.
+Read a run under the exclusive-writer profile. While the Mac mount is attached
+it is the volume's only writer, and the Linux peer's visible mutations return
+`EBUSY` by contract. Every case whose mutation runs on mount B, for example
+`remote_create_visible`, or in which both mounts write, is therefore declared to
+FAIL with that reason: an unexpected pass would mean the Linux peer wrote
+underneath the Mac. The declared FAIL does not by itself check that the errno
+was `EBUSY`; the case output names the refusal. Cases that need Linux-side
+harness commands or machine-local routes are declared SKIP, and the peer-loss
+case skips when no fence command is supplied. The cases where only the Mac
+mutates and the Linux peer observes, such as
+`peer_cached_handle_forces_writethrough`, must pass. A green macOS run does not
+establish Linux-equivalent FSKit withdrawal, and it is not native macOS 26 or 27
+qualification ([fskit-mount.md](./fskit-mount.md#verification)).
 
 ## Configuration
 
@@ -246,14 +268,15 @@ Linux (`scripts/coherence-matrix-linux.sh`):
 | --- | --- | --- |
 | `PORTABLEFS_ATOMIC_REPLACE_ROUNDS` | `20` | rounds of the atomic replacement case |
 | `PORTABLEFS_ALT_GID` | `200002` | supplementary GID for the ownership case |
-| `PORTABLEFS_CACHED_NAME_CAPACITY` | `65536` | transitional admission bound used by both harness sides |
-| `PORTABLEFS_REPAIR_BUDGET` | `15s` | transitional recall/repair wall bound used by both harness sides |
+| `PORTABLEFS_NAME_CACHE_CAPACITY` | `65536` | each mount's `--name-cache-capacity` |
+| `PORTABLEFS_WITHDRAWAL_TIMEOUT` | `15s` | each mount's `--withdrawal-timeout` |
 | `PORTABLEFS_ROUTE_RULES` | `node_modules/` | the declaration installed through admin `ApplyRoutes` before either mount attaches |
 | `PORTABLEFS_LOCAL_ROUTE` | `node_modules` | the directory name `local_route_isolation` drives; must be matched by the rules above |
 | `PORTABLEFS_CASE_TIMEOUT` | `8m` | driver per-case wall bound; larger than `same_dir_concurrent_mutations`' own 3m storm bound so the case reports a deadlock rather than the outer guillotine |
 
 macOS (`scripts/coherence-matrix-macos.sh`): `PFS_MATRIX_BIN`,
-`PFS_EXPECT_FSTYPE`, `PFS_ALT_GID`, `PFS_FENCE_COMMAND`, `PFS_MATRIX_JSON`.
+`PFS_EXPECT_FSTYPE`, `PFS_ALT_GID`, `PFS_FENCE_COMMAND` (kills the remote Linux
+mount uncleanly for the peer-loss case), `PFS_MATRIX_JSON`.
 
 ## Package-manager reality check
 
@@ -263,8 +286,8 @@ one asks whether a real dependency installer survives the worst configuration a
 user can hand PortableFS.
 
 It runs `npm ci`, `pnpm install`, `yarn install` and `bun install` on a **shared**
-volume path with **no machine-local route** over `node_modules` — deliberately
-the shape the product asks users to avoid — while the second mount enumerates and
+volume path with **no machine-local route** over `node_modules`, deliberately
+the shape the product asks users to avoid, while the second mount enumerates and
 reads the same tree throughout.
 
 It asserts exactly three things and thresholds nothing:
@@ -274,17 +297,18 @@ It asserts exactly three things and thresholds nothing:
    same bytes;
 3. both mounts still serve afterwards.
 
-Wall time and the authority's work counters are **recorded into a table**, not
-gated. A timing threshold in CI turns a shared runner's bad afternoon into a red
-build, and a number nobody can act on gets raised until it never fires again.
+Wall time and the authority process's `/proc` work proxies are **recorded into a
+table**, not gated. A timing threshold in CI turns a shared runner's bad
+afternoon into a red build, and a number nobody can act on gets raised until it
+never fires again.
 
-**It is not part of the merge gate.** It is a workload soak: it ran in the
-`linux-coherence-matrix` lane once and made that lane an order of magnitude
-slower than every other job in the workflow, for coverage a merge does not need
-to wait on. Run it on demand — it provisions the same container as the matrix
-above — and read the table. The concurrent-reader shape it drives is qualified
-after deploy by phase 8 of `deploy/opensteer/staging-qualification.sh`, against
-a live cell rather than a container.
+**It is not part of the merge gate.** It is a workload soak that would make the
+Linux coherence lane an order of magnitude slower than every other job, for
+coverage a merge does not need to wait on. Run it on demand (it provisions the
+same container as the matrix above) and read the table. The concurrent-reader
+shape it drives is qualified after deploy by phase 8 of
+`deploy/opensteer/staging-qualification.sh`, against a live cell rather than a
+container.
 
 The fixture is hermetic: six tiny packages the script generates and `npm pack`s
 itself, installed from local tarballs, with no registry contacted and nothing
