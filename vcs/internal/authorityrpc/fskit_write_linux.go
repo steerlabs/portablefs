@@ -949,6 +949,12 @@ func (h *VolumeHandler) handleFskitWrite(ctx context.Context, ctxRequest *author
 // write-syscall outcome.
 func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
 	var transaction *fskitWrite
+	var durability xfsstore.WriteTarget
+	defer func() {
+		if durability != nil {
+			_ = durability.Close()
+		}
+	}()
 	var resources *sessionResources
 	var coordinate visibilityCoordinate
 	var releaseMutation func()
@@ -1006,6 +1012,10 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 			return h.errorResponse(0, h.fenceFskitWriteMismatch(credential.ID), false), nil
 		}
 		stage, target, staged := transaction.stage, transaction.target, transaction.staged
+		// Transfer the existing pin out of staging cleanup; completion owns it
+		// until the durability barrier and replay outcome are settled.
+		durability = target
+		transaction.target = nil
 		metadata := transaction.metadata
 
 		var scratch []byte
@@ -1069,8 +1079,7 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 		transaction.refs.Done()
 		cleanup.finish()
 
-		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
-			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
+		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply)
 		if committed == 0 && !zeroPostApply {
 			if applyErr == nil {
 				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
@@ -1115,7 +1124,9 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 		if metadata.mode == xfsstore.WritePositioned && assigned != metadata.position {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 		}
-		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
+		// ErrWritePostApply promises exact placement and attributes, including
+		// when the failed obligation is a terminal persistence syscall.
+		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
 		}
 		if applyErr != nil && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
@@ -1133,6 +1144,11 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
+	}, func() error {
+		if durability == nil {
+			return &xfsstore.DurabilityError{Cause: syscall.ESTALE}
+		}
+		return durability.Sync()
 	}, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()

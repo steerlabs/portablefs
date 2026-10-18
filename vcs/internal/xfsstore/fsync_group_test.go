@@ -25,7 +25,6 @@ func TestFsyncGroupRaceSafety(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			for iteration := range iterations {
-				state.applied()
 				if _, err := state.barrier(worker, (worker+iteration)%2 == 0, syncCall, syncCall); err != nil {
 					t.Errorf("barrier: %v", err)
 				}
@@ -38,67 +37,51 @@ func TestFsyncGroupRaceSafety(t *testing.T) {
 	}
 }
 
-func TestFsyncGroupDurabilityPolicySurvivesOrdinaryLeader(t *testing.T) {
-	var state inodeFsyncState
-	var calls, policies atomic.Int32
-	firstEntered, secondEntered := make(chan struct{}), make(chan struct{})
-	firstRelease, secondRelease := make(chan struct{}), make(chan struct{})
-	cause, fatal := errors.New("writeback ENOSPC"), errors.New("terminal durability failure")
+func TestSyncGroupFailureReleasesAllWaitersWithoutRetry(t *testing.T) {
+	var state syncGroup
+	var calls atomic.Int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	cause := errors.New("terminal writeback failure")
 	syncCall := func(int) error {
-		switch calls.Add(1) {
-		case 1:
-			close(firstEntered)
-			<-firstRelease
-		case 2:
-			close(secondEntered)
-			<-secondRelease
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
 			return cause
 		}
-		return nil
+		return nil // The kernel's error cursor would now appear successful.
 	}
-	failure := func(err error) error {
-		if !errors.Is(err, cause) {
-			t.Errorf("failure policy cause = %v", err)
+	first, followers := make(chan error, 1), make(chan error, 4)
+	go func() { _, err := state.barrier(1, true, syncCall, syncCall); first <- err }()
+	<-entered
+	for range 4 {
+		go func() { _, err := state.barrier(2, false, syncCall, syncCall); followers <- err }()
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		state.mu.Lock()
+		pending := len(state.pending)
+		state.mu.Unlock()
+		if pending == 4 {
+			break
 		}
-		policies.Add(1)
-		return fatal
-	}
-	waitPending := func(want int) {
-		t.Helper()
-		until := time.Now().Add(time.Second)
-		for time.Now().Before(until) {
-			state.mu.Lock()
-			got := len(state.pending)
-			state.mu.Unlock()
-			if got == want {
-				return
-			}
-			time.Sleep(time.Millisecond)
+		if time.Now().After(deadline) {
+			t.Fatal("waiters did not join the next batch")
 		}
-		t.Fatalf("pending waiters never reached %d", want)
+		time.Sleep(time.Millisecond)
 	}
-	initial, ordinary, required, later := make(chan error, 1), make(chan error, 1), make(chan error, 1), make(chan error, 1)
-	go func() { _, err := state.barrier(1, false, syncCall, syncCall); initial <- err }()
-	<-firstEntered
-	go func() { _, err := state.barrier(2, true, syncCall, syncCall); ordinary <- err }()
-	waitPending(1)
-	go func() { _, err := state.barrierWithFailure(3, false, syncCall, syncCall, failure); required <- err }()
-	waitPending(2)
-	close(firstRelease)
-	<-secondEntered
-	go func() { _, err := state.barrierWithFailure(4, false, syncCall, syncCall, failure); later <- err }()
-	waitPending(1)
-	close(secondRelease)
-	if err := <-initial; err != nil {
+	close(release)
+	if err := <-first; err != cause {
 		t.Fatal(err)
 	}
-	for _, result := range []chan error{ordinary, required, later} {
-		if err := <-result; !errors.Is(err, fatal) {
-			t.Fatalf("waiter escaped terminal batch failure: %v", err)
+	for range 4 {
+		if err := <-followers; err != cause {
+			t.Fatal(err)
 		}
 	}
-
-	if policies.Load() != 2 || calls.Load() != 3 {
-		t.Fatalf("failure policies/sync attempts=%d/%d", policies.Load(), calls.Load())
+	if _, err := state.barrier(3, false, syncCall, syncCall); err != cause {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("syscalls = %d", calls.Load())
 	}
 }

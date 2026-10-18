@@ -237,6 +237,7 @@ func (*WriteLimitError) Unwrap() error { return syscall.EFBIG }
 // syscall; CommitWriteData applies a complete retained-frame payload directly.
 // Exactly one primitive is selected by the negotiated max_write boundary.
 type WriteTarget interface {
+	Sync() error
 	Coordinate() ObjectCoordinate
 	CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (committedSize, assignedOffset uint64, post Attr, err error)
 	CommitWriteData(data []byte, spec WriteCommit) (committedSize, assignedOffset uint64, post Attr, err error)
@@ -280,6 +281,14 @@ type OpenFlags struct {
 	Truncate bool
 	Sync     bool
 	DataSync bool
+}
+
+// Validate runs before any CREATE side effect as well as before OPEN.
+func (f OpenFlags) Validate() error {
+	if !f.Read && !f.Write || (f.Append || f.Truncate) && !f.Write {
+		return fs.ErrInvalid
+	}
+	return nil
 }
 
 // RenameFlags map to renameat2's atomic behaviors.

@@ -57,7 +57,7 @@ func TestCoherenceStaleFlushRefusedWhole(t *testing.T) {
 				}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 					t.Fatal("stale SETATTR applied")
 					return nil, nil
-				})
+				}, nil)
 			case "fallocate":
 				req.Body = &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: handle[:], Length: 4, Delegation: stale}}
 				result = h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
@@ -66,7 +66,7 @@ func TestCoherenceStaleFlushRefusedWhole(t *testing.T) {
 				}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 					t.Fatal("stale FALLOCATE applied")
 					return nil, nil
-				})
+				}, nil)
 			}
 			if result.GetErrno() != int32(syscall.EIO) || result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || result.GetAppliedSequence() != 0 {
 				t.Fatalf("stale refusal = %v", result)
@@ -509,7 +509,7 @@ func TestLinuxV7MutationFenceBeforeApplyDoesNotCommitStorage(t *testing.T) {
 	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		applies.Add(1)
 		return &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}}, nil
-	})
+	}, nil)
 	if response.GetErrno() == 0 || response.GetAppliedSequence() != 0 {
 		t.Fatalf("fenced mutation response = %+v", response)
 	}
@@ -527,7 +527,7 @@ func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {
 	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		t.Fatal("uncovered preparation applied")
 		return nil, nil
-	})
+	}, nil)
 	if response.GetErrno() == 0 || response.GetAppliedSequence() != 0 {
 		t.Fatalf("uncovered preparation=%v", response)
 	}

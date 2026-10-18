@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"io"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -31,6 +32,9 @@ func (s *fskitWriteTestStore) PinWriteTarget(handle xfsstore.Capability) (xfssto
 		return nil, syscall.ESTALE
 	}
 	target := s.targets[0]
+	if target.sync == nil {
+		target.sync = func() error { s.durableHandles.Add(1); return nil }
+	}
 	s.targets = s.targets[1:]
 	return target, nil
 }
@@ -38,8 +42,11 @@ func (s *fskitWriteTestStore) PinWriteTarget(handle xfsstore.Capability) (xfssto
 func (*fskitWriteTestStore) CloseOpen(xfsstore.Capability) error { return nil }
 
 type fskitWriteTestTarget struct {
-	mu       sync.Mutex
-	payloads [][]byte
+	closed    atomic.Bool
+	commitErr error
+	sync      func() error
+	mu        sync.Mutex
+	payloads  [][]byte
 }
 
 func (*fskitWriteTestTarget) Coordinate() xfsstore.ObjectCoordinate {
@@ -57,14 +64,23 @@ func (t *fskitWriteTestTarget) CommitWrite(reader io.ReaderAt, spec xfsstore.Wri
 	assigned := spec.Position
 	return uint64(len(payload)), assigned, xfsstore.Attr{
 		Kind: xfsstore.KindRegular, Ino: 0x41, Mode: 0o600, Nlink: 1, Size: int64(assigned) + int64(len(payload)), DeviceMinor: 1,
-	}, nil
+	}, t.commitErr
 }
 
 func (*fskitWriteTestTarget) CommitWriteData([]byte, xfsstore.WriteCommit) (uint64, uint64, xfsstore.Attr, error) {
 	return 0, 0, xfsstore.Attr{}, syscall.EOPNOTSUPP
 }
 
-func (*fskitWriteTestTarget) Close() error { return nil }
+func (t *fskitWriteTestTarget) Sync() error {
+	if t.closed.Load() {
+		return xfsstore.ErrClosed
+	}
+	if t.sync != nil {
+		return t.sync()
+	}
+	return nil
+}
+func (t *fskitWriteTestTarget) Close() error { t.closed.Store(true); return nil }
 
 func (t *fskitWriteTestTarget) snapshot() [][]byte {
 	t.mu.Lock()

@@ -320,7 +320,7 @@ func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 					roles: postStateRoleTarget, changed: true,
 				})
 				return resp, targets
-			},
+			}, nil,
 		)
 	}()
 
@@ -339,7 +339,7 @@ func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 		t.Fatalf("mutation returned before change withdrawal: %+v", result)
 	default:
 	}
-	if store.durableObjects.Load() != 0 {
+	if store.durableVolumes.Load() != 0 {
 		t.Fatal("durability preceded withdrawal completion")
 	}
 	if err := h.Coherence.Ack(subscription.Token, events[0].Position); err != nil {
@@ -349,8 +349,8 @@ func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 	if result.GetErrno() != 0 || result.GetUncertain() {
 		t.Fatalf("mixed-profile mutation response = %+v", result)
 	}
-	if applyCalls != 1 || store.durableObjects.Load() != 1 {
-		t.Fatalf("storage apply/sync calls = %d/%d, want 1/1", applyCalls, store.durableObjects.Load())
+	if applyCalls != 1 || store.durableVolumes.Load() != 1 {
+		t.Fatalf("storage apply/sync calls = %d/%d, want 1/1", applyCalls, store.durableVolumes.Load())
 	}
 }
 
@@ -1091,17 +1091,13 @@ type resourceAdmissionFaultStore struct {
 	identityOpen   atomic.Uint32
 	lookupItem     xfsstore.Capability
 	durableHandles atomic.Uint32
-	durableObjects atomic.Uint32
 	durableVolumes atomic.Uint32
 }
 
 func (s *resourceAdmissionFaultStore) PinSyncHandle(xfsstore.Capability) (xfsstore.SyncTarget, error) {
 	return testNoopSyncTarget{&s.durableHandles}, nil
 }
-func (s *resourceAdmissionFaultStore) PinSyncObject(xfsstore.Capability) (xfsstore.SyncTarget, error) {
-	return testNoopSyncTarget{&s.durableObjects}, nil
-}
-func (s *resourceAdmissionFaultStore) SyncMutationFS() error { s.durableVolumes.Add(1); return nil }
+func (s *resourceAdmissionFaultStore) SyncFS() error { s.durableVolumes.Add(1); return nil }
 
 type testNoopSyncTarget struct{ calls *atomic.Uint32 }
 
@@ -1668,7 +1664,7 @@ func retiredMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.
 				changed:  true,
 			})
 			return resp, targets
-		},
+		}, nil,
 	)
 	if response.GetErrno() != 0 {
 		t.Fatalf("fallocate mutation = %+v", response)
@@ -1777,7 +1773,7 @@ func retiredMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *tes
 					},
 				)
 				return resp, mutationTargets
-			},
+			}, nil,
 		)
 	}()
 	select {

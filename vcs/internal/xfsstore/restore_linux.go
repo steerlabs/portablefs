@@ -238,6 +238,9 @@ func (v *Volume) openRestoreFile(pathFD int) (int, error) {
 }
 
 func (r *RestoreFiles) hold(entry uint32) (restoreFile, error) {
+	if err := r.volume.Health(); err != nil {
+		return restoreFile{}, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
@@ -307,7 +310,10 @@ func (r *RestoreFiles) Fdatasync(entry uint32) error {
 		return err
 	}
 	defer file.res.release()
-	return unix.Fdatasync(file.res.fd)
+	state := r.volume.fsyncState(file.identity)
+	defer r.volume.releaseFsyncState(state)
+	_, err = r.volume.syncInode(state, file.res.fd, true)
+	return err
 }
 
 func (r *RestoreFiles) Mtime(entry uint32) (int64, error) {

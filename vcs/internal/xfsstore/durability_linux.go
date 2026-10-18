@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DurabilityError denotes failed required post-apply persistence, including a
+// DurabilityError denotes failed persistence, including a
 // restore hydration-map transition, independent of its errno. Its cause is
 // diagnostic: ENOSPC from writeback cannot be mistaken for a pre-apply refusal.
 type DurabilityError struct{ Cause error }
@@ -19,8 +19,8 @@ func (e *DurabilityError) Error() string {
 }
 func (e *DurabilityError) Is(target error) bool { return target == ErrOutcomeUncertain }
 
-// SyncTarget owns a sync-capable description until Close. Acquisition errors
-// precede the durability syscall and may select the volume-wide barrier.
+// SyncTarget owns a sync-capable description until Close. Retaining a handle
+// takes a reference to its existing description; it never reopens the inode.
 type SyncTarget interface {
 	Sync() error
 	Close() error
@@ -51,27 +51,67 @@ func (t *syncTarget) Sync() error {
 	if t.closed {
 		return ErrClosed
 	}
-	if err := t.volume.Health(); err != nil {
-		return &DurabilityError{Cause: err}
-	}
-	if _, err := t.state.barrierWithFailure(t.fd, false, t.volume.fsync, t.volume.fsync, t.volume.failDurability); err != nil {
-		return err
-	}
-	// A concurrent sync can fence the volume while this syscall succeeds. No
-	// waiter may subsequently turn that terminal observation into success.
-	if err := t.volume.Health(); err != nil {
-		return &DurabilityError{Cause: err}
-	}
-	return nil
+	_, err := t.volume.syncInode(t.state, t.fd, false)
+	return err
 }
 
-// A coalesced barrier's policy may be called by another handle's leader.
-// Fence before releasing waiters. This store-local fence can precede the
-// handler's terminal drain; racing requests then fail without applying.
+// syncBarrier is the only persistence-syscall boundary. A group's error cursor
+// stays serialized until any failed syscall has fenced the volume. Checking
+// again after a successful call also observes failures on other descriptions.
+func (v *Volume) syncBarrier(group *syncGroup, fd int, dataOnly bool, fsync, fdatasync func(int) error) (int, error) {
+	if err := v.syncHealth(); err != nil {
+		return 0, err
+	}
+	persist := func(call func(int) error) func(int) error {
+		return func(fd int) error {
+			// A queued batch may have outlived a failure on another inode.
+			if err := v.syncHealth(); err != nil {
+				return err
+			}
+			if err := call(fd); err != nil {
+				return v.failDurability(err)
+			}
+			return v.syncHealth()
+		}
+	}
+	return group.barrier(fd, dataOnly, persist(fsync), persist(fdatasync))
+}
+
+func (v *Volume) syncInode(state *inodeFsyncState, fd int, dataOnly bool) (int, error) {
+	return v.syncBarrier(&state.syncGroup, fd, dataOnly, v.fsync, v.fdatasync)
+}
+
+func (v *Volume) syncHealth() error {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.syncHealthLocked()
+}
+
+func (v *Volume) syncHealthLocked() error {
+	if v.closed {
+		return ErrClosed
+	}
+	if v.durabilityFailure != nil {
+		return v.durabilityFailure
+	}
+	return v.fenced
+}
+
 func (v *Volume) failDurability(err error) error {
-	failure := &DurabilityError{Cause: err}
-	v.Fence(failure)
-	return failure
+	v.Fence(&DurabilityError{Cause: err})
+	// Different descriptions may fail concurrently; every barrier returns the
+	// first failure, independently of the lifetime of an inode's batch state.
+	return v.syncHealth()
+}
+
+func (t *writeTarget) Sync() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return ErrClosed
+	}
+	_, err := t.volume.syncInode(t.fsyncState, t.res.fd, false)
+	return err
 }
 
 func (v *Volume) PinSyncHandle(id Capability) (SyncTarget, error) {
@@ -104,44 +144,18 @@ func (v *Volume) PinSyncObject(id Capability) (SyncTarget, error) {
 	}}, nil
 }
 
-// SyncMutationFS has a dedicated root description from startup: ordinary
-// SyncFS callers cannot consume its superblock writeback error sequence.
-func (v *Volume) SyncMutationFS() error { return v.syncFS(true) }
-
-func (v *Volume) syncFS(required bool) error {
-	if required {
-		if err := v.Health(); err != nil {
-			return &DurabilityError{Cause: err}
-		}
-		// The dedicated description reports errseq once. Publish its fence
-		// before another required caller can consume a successful retry.
-		v.mutationSyncMu.Lock()
-		defer v.mutationSyncMu.Unlock()
-	}
-	failure := func(err error) error {
-		if err != nil && required {
-			return v.failDurability(err)
-		}
+// SyncFS uses the root description retained at startup. The shared cursor is
+// serialized through fencing; arrivals during a sync share the next syscall.
+func (v *Volume) SyncFS() error {
+	v.mu.RLock()
+	if err := v.syncHealthLocked(); err != nil {
+		v.mu.RUnlock()
 		return err
 	}
-	v.mu.RLock()
-	if v.closed || v.fenced != nil {
-		err := v.fenced
-		if v.closed {
-			err = ErrClosed
-		}
-		v.mu.RUnlock()
-		return failure(err)
-	}
 	root := v.objects[v.root].res
-	if required {
-		root = v.mutationRoot
-	}
 	root.acquire()
 	v.mu.RUnlock()
 	defer root.release()
-	if err := v.syncfs(root.fd); err != nil {
-		return failure(err)
-	}
-	return failure(v.Health())
+	_, err := v.syncBarrier(&v.volumeSync, root.fd, false, v.syncfs, nil)
+	return err
 }

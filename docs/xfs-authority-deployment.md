@@ -30,8 +30,14 @@ Two things an operator has to decide or accept before deploying:
 
 ## Host and disk
 
-Use a current Nitro EC2 instance on a supported Linux baseline with stock FUSE
-protocol 7.31 or newer (Linux 5.10 is the product floor). Attach a dedicated,
+Use a current Nitro EC2 instance with Linux 5.17 or newer for the authority.
+Startup refuses older kernels, including vendor kernels with a lower release
+number. Handleless FSKit mutations rely on syncfs reporting XFS log-force
+errors; mainline 5.17 includes both
+[the XFS error propagation](https://github.com/torvalds/linux/blob/v5.17/fs/xfs/xfs_super.c#L689-L707)
+and [the VFS sync_fs error propagation](https://github.com/torvalds/linux/blob/v5.17/fs/sync.c).
+The Linux mount client separately requires stock FUSE protocol 7.31 or newer
+(Linux 5.10 or newer). Attach a dedicated,
 encrypted EBS data volume with `DeleteOnTermination=false`. Choose gp3 or io2
 from measured IOPS, throughput, latency, and durability requirements; the
 architecture does not impose one capacity tier. Do not use EBS Multi-Attach: two
@@ -737,8 +743,8 @@ label.
 | `portablefs_authority_write_admission_blocks_total` | How often did a BEGIN find transaction-count or byte capacity unavailable? |
 | `portablefs_authority_write_admission_wait_seconds` | How long did blocked BEGIN requests remain in FIFO capacity admission? |
 | `portablefs_authority_fsync_barrier_handles_total` / `portablefs_authority_fsync_storage_syncs_total` | How many fsync barrier requests did each completed storage sync serve? The ratio is group-commit effectiveness. |
-| `portablefs_authority_fskit_durability_syncs_total{target}` | How many required FSKit mutation barriers ran, including failed attempts? `target` is `handle`, `object`, or `syncfs`. |
-| `portablefs_authority_fskit_durability_duration_seconds{target}` | How long did those barriers take, and how often is a cell-wide syncfs fallback affecting latency? |
+| `portablefs_authority_fskit_durability_syncs_total{target}` | How many required FSKit mutation barriers ran, including failed attempts? `target` is `handle` or `syncfs`. |
+| `portablefs_authority_fskit_durability_duration_seconds{target}` | How long did those barriers take, and how much does the direct volume syncfs barrier contribute to latency? |
 | `portablefs_authority_visibility_barrier_duration_seconds` | How long did PREPARE, XFS apply, and peer COMPLETE acknowledgment take end to end? |
 | `portablefs_authority_visibility_barrier_audience` | How many peer sessions had cache state to repair for each barrier? Routing changes count every strict participant. |
 | `portablefs_authority_fence_events_total{reason}` | Why was a participant told to revoke: `visibility_lost`, `repair_deadline`, `protocol_violation`, `write_transaction_mismatch`, or `other`? |

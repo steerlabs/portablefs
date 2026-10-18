@@ -21,7 +21,7 @@ func TestAuthorityMetricInventoryUpdates(t *testing.T) {
 	metrics.WriteAdmissionBlocked()
 	metrics.WriteAdmissionFinished(5 * time.Millisecond)
 	metrics.ObserveFsyncBatch(3)
-	for _, kind := range []string{"handle", "object", "syncfs"} {
+	for _, kind := range []string{"handle", "syncfs"} {
 		metrics.ObserveFskitDurability(kind, time.Millisecond)
 	}
 	metrics.ObserveVisibilityBarrier(10*time.Millisecond, 2)
@@ -47,10 +47,8 @@ func TestAuthorityMetricInventoryUpdates(t *testing.T) {
 		`portablefs_authority_fsync_barrier_handles_total{volume="volume-a"} 3`,
 		`portablefs_authority_fsync_storage_syncs_total{volume="volume-a"} 1`,
 		`portablefs_authority_fskit_durability_syncs_total{volume="volume-a",target="handle"} 1`,
-		`portablefs_authority_fskit_durability_syncs_total{volume="volume-a",target="object"} 1`,
 		`portablefs_authority_fskit_durability_syncs_total{volume="volume-a",target="syncfs"} 1`,
 		`portablefs_authority_fskit_durability_duration_seconds_count{volume="volume-a",target="handle"} 1`,
-		`portablefs_authority_fskit_durability_duration_seconds_count{volume="volume-a",target="object"} 1`,
 		`portablefs_authority_fskit_durability_duration_seconds_count{volume="volume-a",target="syncfs"} 1`,
 		`portablefs_authority_visibility_barrier_duration_seconds_count{volume="volume-a"} 1`,
 		`portablefs_authority_visibility_barrier_audience_count{volume="volume-a"} 1`,

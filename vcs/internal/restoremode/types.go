@@ -70,8 +70,8 @@ type Config struct {
 	MaxFrameBytes    uint32
 	Now              func() time.Time
 
-	// OnStorageFailure terminates the epoch after hydration cannot restore its
-	// logical timestamp. It must not wait for restore workers to stop.
+	// OnStorageFailure terminates the epoch after hydration persistence or
+	// timestamp restoration fails. It must not wait for restore workers to stop.
 	OnStorageFailure func(error)
 	// OnDurableMark is a test/diagnostic hook invoked after the map fsync. It
 	// never participates in correctness and production leaves it nil.

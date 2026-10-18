@@ -166,7 +166,7 @@ func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb
 	return pin, identity, err
 }
 
-func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error), apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget), releases ...*func()) *authoritypb.Response {
+func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error), apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget), syncMutation func() error, releases ...*func()) *authoritypb.Response {
 	h.initCoherence()
 	if err := h.Coherence.WaitPriorCacheHorizon(ctx); err != nil {
 		for _, release := range releases {
@@ -179,7 +179,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 	}
 	profile, _ := h.sessionFrontendProfile(cred.ID)
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return h.mutateFskitCoherence(ctx, req, cred, prepare, apply, releases...)
+		return h.mutateFskitCoherence(ctx, req, cred, prepare, apply, syncMutation, releases...)
 	}
 	if coherenceFlushReference(req) == nil {
 		if err := h.coherenceProfileAdmission.RLockContext(ctx); err != nil {

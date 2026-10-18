@@ -219,26 +219,25 @@ type Volume struct {
 	// descriptions of one inode therefore share the same EOF atomicity domain.
 	// A fixed stripe array avoids an unbounded lifecycle map. Append validation
 	// and every possible size-changing operation participate in this domain.
-	inodeMutation  [inodeMutationStripeCount]sync.RWMutex
-	closed         bool
-	fenced         error
-	objects        map[Capability]object
-	opens          map[Capability]*openFile
-	mutationSyncMu sync.Mutex
-	fsyncMu        sync.Mutex
-	fsyncStates    map[[16]byte]*inodeFsyncState
+	inodeMutation     [inodeMutationStripeCount]sync.RWMutex
+	closed            bool
+	fenced            error
+	durabilityFailure *DurabilityError
+	objects           map[Capability]object
+	opens             map[Capability]*openFile
+	volumeSync        syncGroup
+	fsyncMu           sync.Mutex
+	fsyncStates       map[[16]byte]*inodeFsyncState
 
 	// The fields below are written once, before the Volume is reachable by
 	// any other goroutine, and never again. That is what makes them safe to
 	// read without mu; it is not an accident of the current call graph.
-	// Separate open description preserves syncfs errseq for required barriers.
-	mutationRoot *resource
-	rootFD       int
-	root         Capability
-	device       uint64
-	ownerUID     uint32
-	ownerGID     uint32
-	projectID    uint32
+	rootFD    int
+	root      Capability
+	device    uint64
+	ownerUID  uint32
+	ownerGID  uint32
+	projectID uint32
 	// productionIdentity requires the exact XFS export handle shape
 	// (type 129, 12 opaque bytes containing inode+generation). Tests on a
 	// non-XFS filesystem may fall back to device+inode, but production never
@@ -371,12 +370,9 @@ func (v *Volume) releaseFsyncState(state *inodeFsyncState) {
 		v.fsyncMu.Unlock()
 		panic("xfsstore: fsync state released more times than acquired")
 	}
-	// A consumed writeback error remains evidence for this incarnation even
-	// after the last description closes. Only an epoch restart clears it.
-	state.mu.Lock()
-	failed := state.syncFailure != nil
-	state.mu.Unlock()
-	if state.refs == 0 && !failed && v.fsyncStates[state.identity] == state {
+	// The store fence retains terminal errors independently of inode-state
+	// lifetime, so the last description or pin releases this batch state.
+	if state.refs == 0 && v.fsyncStates[state.identity] == state {
 		delete(v.fsyncStates, state.identity)
 	}
 	v.fsyncMu.Unlock()
@@ -419,6 +415,9 @@ func openChildAt(parentFD int, name string) (int, error) {
 func Open(rootPath string, config Config) (*Volume, error) {
 	if config.ExpectedProjectID == 0 {
 		return nil, fmt.Errorf("%w: project ID must be nonzero", ErrProjectIsolation)
+	}
+	if err := checkAuthorityKernel(); err != nil {
+		return nil, err
 	}
 	return open(rootPath, true, config.ExpectedProjectID, &config)
 }
@@ -516,11 +515,6 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		_ = unix.Flock(fd, unix.LOCK_UN)
 		return fail(err)
 	}
-	mutationFD, err := unix.Openat(fd, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fail(fmt.Errorf("open required syncfs root: %w", err))
-	}
-	v.mutationRoot = newResource(mutationFD)
 	v.root = root
 	v.objects[root] = object{res: newResource(fd), kind: KindDirectory, coordinate: ObjectCoordinate{
 		Stable: rootIdentity, Ino: st.Ino,
@@ -558,8 +552,8 @@ func (v *Volume) Root() (Capability, error) {
 }
 
 // Fence permanently stops this authority epoch from touching filesystem
-// state. It is used after a storage EIO, where continuing could acknowledge
-// operations against a shut-down or detached filesystem. Only process restart
+// state. Every failed persistence syscall fences the store: continuing could
+// acknowledge operations against a shut-down or detached filesystem. Only process restart
 // after operator/storage recovery creates a new usable epoch.
 //
 // It takes the write lock for map-free bookkeeping only, so it completes
@@ -574,6 +568,7 @@ func (v *Volume) Fence(cause error) {
 	if cause == nil {
 		cause = syscall.EIO
 	}
+	errors.As(cause, &v.durabilityFailure)
 	v.fenced = fmt.Errorf("%w: %v", ErrFenced, cause)
 }
 
@@ -596,7 +591,7 @@ func (v *Volume) Close() error {
 	// Releasing the root's flock does not wait for in-flight operations: the
 	// unlock takes effect on the open file description immediately, while the
 	// descriptor itself survives until the last in-flight reference drops it.
-	result := errors.Join(unix.Flock(v.rootFD, unix.LOCK_UN), v.mutationRoot.release())
+	result := unix.Flock(v.rootFD, unix.LOCK_UN)
 	for id, opened := range v.opens {
 		result = errors.Join(result, opened.res.release())
 		v.releaseFsyncState(opened.fsyncState)
@@ -1028,11 +1023,8 @@ func (v *Volume) verifyProjectOf(fd int, kind Kind) error {
 }
 
 func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
-	if !flags.Read && !flags.Write {
-		return Capability{}, fs.ErrInvalid
-	}
-	if flags.Append && !flags.Write || flags.Truncate && !flags.Write {
-		return Capability{}, fs.ErrInvalid
+	if err := flags.Validate(); err != nil {
+		return Capability{}, err
 	}
 	obj, err := v.holdObject(id)
 	if err != nil {
@@ -1210,9 +1202,6 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	if end <= current.Size {
 		n, err := unix.Pwrite(f.fd(), src, off)
 		mutation.RUnlock()
-		if n > 0 {
-			f.fsyncState.applied()
-		}
 		return n, err
 	}
 	mutation.RUnlock()
@@ -1224,9 +1213,6 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	mutation.Lock()
 	defer mutation.Unlock()
 	n, err := unix.Pwrite(f.fd(), src, off)
-	if n > 0 {
-		f.fsyncState.applied()
-	}
 	return n, err
 }
 
@@ -1251,14 +1237,12 @@ func (v *Volume) PinWriteTarget(id Capability) (WriteTarget, error) {
 	}, nil
 }
 
-func (v *Volume) syncDescriptor(fd int, full, dataOnly bool) error {
-	if full {
-		return v.fsync(fd)
+func (v *Volume) syncDescriptor(state *inodeFsyncState, fd int, full, dataOnly bool) error {
+	if !full && !dataOnly {
+		return nil
 	}
-	if dataOnly {
-		return v.fdatasync(fd)
-	}
-	return nil
+	_, err := v.syncInode(state, fd, !full)
+	return err
 }
 
 type writeTargetApply func(limit, assigned uint64) (committed uint64, dispatched, invalidResult bool, err error)
@@ -1438,13 +1422,12 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		expectedPost = end
 	}
 	if dispatched {
-		t.fsyncState.applied()
 		if err := t.fsyncState.removeWritePrivileges(t.res.fd, uint32(before.Mode), spec.KillPrivileges, t.volume.removePinnedWritePrivileges); err != nil {
 			postApplyErr = err
 		}
 	}
 	if committed != 0 {
-		syncErr := t.volume.syncDescriptor(t.res.fd, spec.Sync, spec.DataSync)
+		syncErr := t.volume.syncDescriptor(t.fsyncState, t.res.fd, spec.Sync, spec.DataSync)
 		postApplyErr = errors.Join(postApplyErr, syncErr)
 	}
 	post, statErr := t.volume.postStat(t.res.fd)
@@ -1602,7 +1585,7 @@ func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
 	privilegeErr := v.removeWritePrivileges(f.fd(), uint32(before.Mode), spec.KillPrivileges)
 	var syncErr error
 	if applyErr == nil {
-		syncErr = v.syncDescriptor(f.fd(), f.sync, f.dataSync)
+		syncErr = v.syncDescriptor(f.fsyncState, f.fd(), f.sync, f.dataSync)
 	}
 	post, statErr := v.postStat(f.fd())
 	if statErr != nil {
@@ -1735,7 +1718,7 @@ func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec)
 	}
 	if copyErr == nil && !invalidResult {
 		postApplyErr = errors.Join(postApplyErr,
-			v.syncDescriptor(destination.fd(), source.sync || destination.sync, source.dataSync || destination.dataSync))
+			v.syncDescriptor(destination.fsyncState, destination.fd(), source.sync || destination.sync, source.dataSync || destination.dataSync))
 	}
 	post, statErr := v.postStat(destination.fd())
 	if statErr != nil {
@@ -1874,14 +1857,17 @@ func (v *Volume) Fsync(id Capability, dataOnly bool) error {
 
 // FsyncCoalesced returns the number of barrier requests served by the real
 // storage sync when this caller led a batch. Followers return zero. Every call
-// still waits for a completed sync whose generation and class cover it.
+// still waits for a completed sync whose arrival cut and class cover it.
 func (v *Volume) FsyncCoalesced(id Capability, dataOnly bool) (int, error) {
 	f, err := v.holdOpen(id)
 	if err != nil {
+		if errors.Is(err, ErrFenced) {
+			err = v.syncHealth()
+		}
 		return 0, err
 	}
 	defer f.release()
-	return f.fsyncState.barrier(f.fd(), dataOnly, v.fsync, v.fdatasync)
+	return v.syncInode(f.fsyncState, f.fd(), dataOnly)
 }
 
 func (v *Volume) GetattrOpen(id Capability) (Attr, error) {
@@ -1901,8 +1887,6 @@ func (v *Volume) SyncObject(id Capability) error {
 	defer target.Close()
 	return target.Sync()
 }
-
-func (v *Volume) SyncFS() error { return v.syncFS(false) }
 
 // rootCapability is safe without the lock: v.root is written once, before the
 // Volume is published.

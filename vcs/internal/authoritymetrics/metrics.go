@@ -158,8 +158,8 @@ type Metrics struct {
 	writeAdmissionWait      *Histogram
 	fsyncBarrierHandles     *Counter
 	fsyncStorageSyncs       *Counter
-	fskitDurabilitySyncs    [3]*Counter
-	fskitDurabilityDuration [3]*Histogram
+	fskitDurabilitySyncs    [2]*Counter
+	fskitDurabilityDuration [2]*Histogram
 	visibilityDuration      *Histogram
 	visibilityAudience      *Histogram
 	fences                  [fenceReasonCount]*Counter
@@ -244,7 +244,7 @@ func New(volume string) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
-	for index, kind := range []string{"handle", "object", "syncfs"} {
+	for index, kind := range []string{"handle", "syncfs"} {
 		labels := []Label{base, {Name: "target", Value: kind}}
 		metrics.fskitDurabilitySyncs[index], err = registry.RegisterCounter("portablefs_authority_fskit_durability_syncs_total", "Required FSKit mutation durability barriers by target kind.", labels...)
 		if err != nil {
@@ -391,10 +391,8 @@ func (m *Metrics) ObserveFskitDurability(kind string, elapsed time.Duration) {
 	switch kind {
 	case "handle":
 		index = 0
-	case "object":
-		index = 1
 	case "syncfs":
-		index = 2
+		index = 1
 	default:
 		return
 	}

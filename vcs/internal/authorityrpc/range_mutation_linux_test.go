@@ -16,6 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 )
 
 type rangeMutationTestStore struct {
@@ -27,6 +28,7 @@ type rangeMutationTestStore struct {
 	copyCount      uint64
 	copyPost       xfsstore.Attr
 	copyErr        error
+	fenceAfterCopy bool
 
 	lockTableMu sync.Mutex
 	lockTable   map[[16]byte]*sync.Mutex
@@ -36,7 +38,7 @@ type rangeMutationTestStore struct {
 
 	coordinateWhileLocked bool
 	copyUnderLock         bool
-	postSampleUnderLock   bool
+	sourceSampleUnderLock bool
 	copyEntered           chan struct{}
 	copyRelease           chan struct{}
 	copyEnteredOnce       sync.Once
@@ -130,11 +132,12 @@ func (s *rangeMutationTestStore) CopyFileRange(input, output xfsstore.Capability
 }
 
 func (s *rangeMutationTestStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
-	if s.copyCalls.Load() != 0 {
-		s.lockStateMu.Lock()
-		s.postSampleUnderLock = s.held[[16]byte{handle[0]}] != 0
-		s.lockStateMu.Unlock()
+	if s.fenceAfterCopy && s.copyCalls.Load() != 0 {
+		return xfsstore.Attr{}, xfsstore.ErrFenced
 	}
+	s.lockStateMu.Lock()
+	s.sourceSampleUnderLock = s.sourceSampleUnderLock || s.held[[16]byte{handle[0]}] != 0
+	s.lockStateMu.Unlock()
 	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: 64, Mode: 0o600, Nlink: 1}, nil
 }
 
@@ -402,11 +405,11 @@ func TestCopyFileRangeLocksResolvedIdentitiesThroughBothSnapshots(t *testing.T) 
 		t.Fatal("source mutation lock was not released")
 	}
 	store.lockStateMu.Lock()
-	postSampleUnderLock := store.postSampleUnderLock
+	sourceSampleUnderLock := store.sourceSampleUnderLock
 	held := len(store.held)
 	store.lockStateMu.Unlock()
-	if !postSampleUnderLock || held != 0 {
-		t.Fatalf("postSampleUnderLock=%v retainedLocks=%d", postSampleUnderLock, held)
+	if !sourceSampleUnderLock || held != 0 {
+		t.Fatalf("sourceSampleUnderLock=%v retainedLocks=%d", sourceSampleUnderLock, held)
 	}
 }
 
@@ -541,5 +544,49 @@ func TestRangePostApplyBarrierFailureRetainsAppliedResult(t *testing.T) {
 	rejected := copyFileRangeRejected(&VolumeHandler{}, errors.New("bad request"))
 	if markRangePostApplyFailure(rejected, syscall.EIO) {
 		t.Fatal("definite rejection was rewritten as applied")
+	}
+}
+
+func TestCopyFileRangeLogicalSyncFailureRetainsExactAppliedReply(t *testing.T) {
+	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			h, cred, store, input, output := newRangeMutationHarness(t)
+			h.OnStorageFailure = func(error) {}
+			store.copyCount = 5
+			store.copyPost = xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(output[0]), Size: 20, Mode: 0600, Nlink: 1}
+			store.copyErr = errors.Join(xfsstore.ErrWritePostApply, &xfsstore.DurabilityError{Cause: cause})
+			store.fenceAfterCopy = true
+			req := copyMutationRequest(1, input, output)
+			reply := h.handleCopyFileRange(t.Context(), req, cred, req.GetCopyFileRange())
+			got := reply.GetCopyFileRange()
+			if reply.GetErrno() != 0 || reply.GetUncertain() || got.GetResultSize() != 5 || got.GetPostSize() != 20 || got.GetError() != -int32(syscall.EIO) || got.GetFlags() != rangeReplyApplied|rangeReplyPostApply || reply.GetPostState() == nil || !terminalReceiptCarriesExactAppliedState(reply) {
+				t.Fatalf("logical sync CFR=%v", reply)
+			}
+			h.terminalFailureMu.Lock()
+			draining, receipts := h.terminalDraining, len(h.terminalReceiptFrames)
+			h.terminalFailureMu.Unlock()
+			if !draining || receipts == 0 {
+				t.Fatalf("no terminal delivery drain: %v/%d", draining, receipts)
+			}
+			req.RequestId++
+			replay := h.handleCopyFileRange(t.Context(), req, cred, req.GetCopyFileRange())
+			reply.RequestId = replay.RequestId
+			if !proto.Equal(reply, replay) || store.copyCalls.Load() != 1 {
+				t.Fatalf("exact CFR replay=%v calls=%d", replay, store.copyCalls.Load())
+			}
+		})
+	}
+}
+
+func TestCopyFileRangeSameInodeUsesExactDestinationPostState(t *testing.T) {
+	h, cred, store, input, _ := newRangeMutationHarness(t)
+	store.copyCount = 5
+	store.copyPost = xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(input[0]), Size: 80, Mode: 0600, Nlink: 1}
+	req := copyMutationRequest(1, input, input)
+	req.GetCopyFileRange().OutputOffset = 75
+	reply := h.handleCopyFileRange(t.Context(), req, cred, req.GetCopyFileRange())
+	objects := reply.GetPostState().GetObjects()
+	if reply.GetErrno() != 0 || reply.GetUncertain() || len(objects) != 1 || objects[0].GetRoles() != postStateRoleSource|postStateRoleDestination || objects[0].GetAttr().GetSize() != 80 {
+		t.Fatalf("same-inode CFR=%v", reply)
 	}
 }

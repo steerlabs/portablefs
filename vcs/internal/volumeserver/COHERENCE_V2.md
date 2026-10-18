@@ -119,9 +119,9 @@ and `CoherenceSessionHooks`; the coordinator implements all three.
    after apply so request cancellation cannot discharge a committed obligation.
    Read replies carry the sampled storage version; client publication still
    rejects stale replies and drains exact identities before cumulative ack.
-8. The fsync group calls `DurableSequence` only with a contiguous, proven durable
-   **volume** cut. Existing per-inode `appliedGeneration` is insufficient. Track
-   completed inode generations or establish a volume barrier before publication.
+8. The durability publisher calls `DurableSequence` only with a contiguous,
+   proven durable **volume** cut. A volume barrier establishes that cut;
+   per-inode fsync batches cannot.
    Include `LatestDurable` in the replies. This component does not implement the
    storage durability proof or the client's directory-handle barrier.
 9. Wire `Authority.OnSessionEnd` to `ExpireSession`; retain the old cache horizon.
