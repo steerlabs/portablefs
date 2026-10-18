@@ -230,6 +230,10 @@ func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Re
 	f.readCalls++
 	hook := f.read
 	f.mu.Unlock()
+	if f.poisoned.Load() {
+		// Like the real client, a poisoned session admits no new request.
+		return nil, authorityrpc.ErrTransportUncertain
+	}
 	if hook != nil {
 		return hook(ctx, request)
 	}
@@ -269,6 +273,9 @@ func (f *fakeV3DataClient) CallReadRetained(
 	return response, &fakeV3ResponseConsumption{consume: func() {}}, nil
 }
 func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	if f.poisoned.Load() {
+		return nil, authorityrpc.ErrTransportUncertain
+	}
 	f.mu.Lock()
 	f.sequence++
 	f.mutations = append(f.mutations, proto.Clone(request).(*authoritypb.Request))
@@ -779,20 +786,31 @@ func TestV3FrontendDisconnectAbandonsProvisionalOpen(t *testing.T) {
 func TestV3PostInternReplyBuildFailureRollsBackCollectedItem(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
+	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.GetAttrRequest{Item: d.resolveReply().Root}); errno != 0 {
+		t.Fatalf("root getattr errno=%d", errno)
+	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetLookup() == nil {
-			return nil, errors.New("expected lookup")
+		if request.GetMkdir() == nil {
+			return nil, errors.New("expected mkdir")
 		}
-		item := authorityTestItem(2, authoritypb.Attr_REGULAR, 0x38, 0x48)
-		item.Attr.Blocks = math.MaxUint64/512 + 1 // accepted by intern, rejected by localAttr
+		// The new directory is adopted first; the reply then contradicts the
+		// root's cached version 1, which is only discovered while applying.
+		item := authorityTestItem(2, authoritypb.Attr_DIRECTORY, 0x38, 0x48)
+		item.ObjectVersion, item.SnapshotSequence = 2, 2
 		response := exactTestMutationReply(identity)
+		response.PostState = testV3MutationState(2,
+			testV3PostObject{identity: 0x20, attr: testV3DirAttr(1, 3), version: 1, roles: v3PostStateRoleParent},
+			testV3PostObject{identity: 0x48, attr: item.GetAttr(), version: 2, roles: v3PostStateRoleCreated},
+		)
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
 		return response, nil
 	}
+	const operationID = uint64(7701)
+	d.bridge.reserveFrontendPublication(operationID)
 	collector := &v3ReplyResourceCollector{d: d}
 	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
-	if _, errno := d.lookup(ctx, 0, &pfslocal.LookupRequest{Dir: d.resolveReply().Root, Name: []byte("bad-attr")}); errno != darwinEIO {
-		t.Fatalf("lookup errno=%d, want %d", errno, darwinEIO)
+	if _, errno := d.dispatchFrontend(ctx, operationID, &pfslocal.MkdirRequest{Dir: d.resolveReply().Root, Name: []byte("bad-reply"), Mode: 0o755}); errno != darwinEIO {
+		t.Fatalf("mkdir errno=%d, want %d", errno, darwinEIO)
 	}
 	if len(collector.items) != 1 || collector.items[0].provisional != 1 {
 		t.Fatalf("collector did not retain post-intern item: %+v", collector)

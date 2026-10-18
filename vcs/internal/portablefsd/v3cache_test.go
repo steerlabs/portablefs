@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
-	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -180,7 +180,11 @@ func TestV3CacheHitsStopAtImmediatePoisonAndTheAuthorizationDeadline(t *testing.
 		f.ns.bind(0x20, "file", 0x70)
 		file := f.lookup(f.root, "file")
 		f.client.poisoned.Store(true)
-		f.requireAuthority("GetAttr on a poisoned session", func() { f.getattr(file.Item) })
+		// No hit is served; the authority path is refused by the poisoned
+		// session itself and the data plane ends.
+		if _, errno := f.dispatch(&pfslocal.GetAttrRequest{Item: file.Item}); errno == 0 || f.d.terminalError() == nil {
+			t.Fatalf("GetAttr on a poisoned session = %d terminal=%v, want a terminal refusal", errno, f.d.terminalError())
+		}
 	})
 	t.Run("authorization-deadline", func(t *testing.T) {
 		f := newCachedV3Fixture(t, v3FileObjects())
@@ -728,9 +732,10 @@ func TestV3CacheNamespaceErrnoWitness(t *testing.T) {
 }
 
 // A cached reply paused before its physical write is revalidated there: an
-// intervening mutation, horizon expiry, or poison refuses it, nothing stale
-// escapes, its provisional item settles once, and the same operation takes
-// the coherent authority path.
+// intervening mutation, horizon expiry, a new claim, or poison refuses it,
+// nothing stale escapes, its provisional item settles once, and the same
+// operation takes the coherent authority path (which a poisoned session then
+// refuses terminally).
 func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -796,12 +801,19 @@ func TestV3CachedReplyIsRevalidatedAtThePhysicalWriteBoundary(t *testing.T) {
 					close(done)
 				}()
 				envelope, err := pfslocal.ReadFrame(peer)
-				if err != nil {
-					t.Fatal(err)
-				}
 				<-done
+				if test.name == "immediate-poison" {
+					// The poisoned session refuses the coherent retry itself.
+					if err == nil || f.d.terminalError() == nil {
+						t.Fatalf("poisoned write boundary wrote %#v terminal=%v, want no frame and a terminal data plane", envelope, f.d.terminalError())
+					}
+					return
+				}
 				if f.authorityCalls() == before {
 					t.Fatal("the refused cached reply was not replaced by the authority path")
+				}
+				if err != nil {
+					t.Fatal(err)
 				}
 				var attr pfslocal.Attr
 				switch reply := envelope.Body.(type) {
@@ -889,4 +901,430 @@ func TestV3CachedLookupsSettleProvisionalOwnershipExactlyOnce(t *testing.T) {
 	}
 }
 
-var _ = authorityrpc.MaxCacheProof
+// Every PostState object must be representable before anything is applied,
+// held or not: an unheld REMOVED object with a negative size, an allocation
+// that overflows in bytes, or an inode outside the file-ID range is a
+// malformed outcome and terminal.
+func TestV3CacheRejectsUnrepresentableUnheldPostState(t *testing.T) {
+	for _, malformed := range []string{"negative-size", "allocation-overflow", "inode-out-of-range"} {
+		t.Run(malformed, func(t *testing.T) {
+			f := newCachedV3Fixture(t, v3FileObjects())
+			f.ns.bind(0x20, "file", 0x70)
+			f.getattr(f.root)
+			f.ns.hold = func(request *authoritypb.Request, response *authoritypb.Response) {
+				if request.GetUnlink() == nil {
+					return
+				}
+				for _, object := range response.GetPostState().GetObjects() {
+					if object.GetRoles() != v3PostStateRoleRemoved {
+						continue
+					}
+					switch malformed {
+					case "negative-size":
+						object.Attr.Size = -1
+					case "allocation-overflow":
+						object.Attr.Blocks = math.MaxUint64
+					case "inode-out-of-range":
+						object.Attr.Inode = uint64(1) << 63
+					}
+				}
+			}
+			f.d.mu.Lock()
+			floor := f.d.coldFloor
+			f.d.mu.Unlock()
+			if _, errno := f.dispatch(&pfslocal.RemoveRequest{Dir: f.root, Name: []byte("file")}); errno == 0 || f.d.terminalError() == nil {
+				t.Fatalf("unrepresentable unheld REMOVED accepted: errno=%d terminal=%v", errno, f.d.terminalError())
+			}
+			root := f.record(f.root)
+			f.d.mu.Lock()
+			defer f.d.mu.Unlock()
+			if f.d.coldFloor != floor || len(root.negatives) != 0 {
+				t.Fatal("a refused reply was partially applied")
+			}
+		})
+	}
+}
+
+// A mutation reply must have exactly its operation's shape: a SetAttr success
+// carrying an unexpected body (here a contradictory GetAttr) is malformed.
+func TestV3CacheRejectsAMutationReplyWithAnUnexpectedBody(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	f.ns.hold = func(request *authoritypb.Request, response *authoritypb.Response) {
+		if request.GetSetAttr() != nil {
+			response.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: testV3FileAttr(7, 999, 1), ObjectVersion: 1, SnapshotSequence: 1}}
+		}
+	}
+	size := uint64(42)
+	if _, errno := f.dispatch(&pfslocal.SetAttrRequest{Item: file.Item, Size: &size}); errno == 0 || f.d.terminalError() == nil {
+		t.Fatalf("setattr with a foreign body = %d terminal=%v, want terminal", errno, f.d.terminalError())
+	}
+}
+
+// A success that carries a failure class is contradictory and terminal on
+// both read and mutation paths.
+func TestV3CacheRejectsASuccessCarryingAFailureClass(t *testing.T) {
+	t.Run("lookup", func(t *testing.T) {
+		f := newCachedV3Fixture(t, v3FileObjects())
+		f.ns.bind(0x20, "file", 0x70)
+		f.ns.hold = func(request *authoritypb.Request, response *authoritypb.Response) {
+			if request.GetLookup() != nil {
+				response.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL
+			}
+		}
+		if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("file")}); errno == 0 || f.d.terminalError() == nil {
+			t.Fatalf("lookup success with a failure class = %d terminal=%v", errno, f.d.terminalError())
+		}
+	})
+	t.Run("setattr", func(t *testing.T) {
+		f := newCachedV3Fixture(t, v3FileObjects())
+		f.ns.bind(0x20, "file", 0x70)
+		file := f.lookup(f.root, "file")
+		f.ns.hold = func(request *authoritypb.Request, response *authoritypb.Response) {
+			if request.GetSetAttr() != nil {
+				response.Failure = authoritypb.FailureClass_FAILURE_CLASS_RESTORE
+			}
+		}
+		size := uint64(1)
+		if _, errno := f.dispatch(&pfslocal.SetAttrRequest{Item: file.Item, Size: &size}); errno == 0 || f.d.terminalError() == nil {
+			t.Fatalf("setattr success with a failure class = %d terminal=%v", errno, f.d.terminalError())
+		}
+	})
+}
+
+// A cached candidate admitted under one authorization generation is refused
+// at its write boundary after a reauthorization, even when the fresh proof
+// would admit an identical answer.
+func TestV3CachedReplyRejectsAChangedAuthorizationGeneration(t *testing.T) {
+	client := newFakeV3DataClient()
+	ns := newV3TestNamespace(client, v3FileObjects())
+	ns.bind(0x20, "file", 0x70)
+	wrapper := &reauthorizingV3Client{fakeV3DataClient: client, deadline: time.Now().Add(time.Hour)}
+	d := testV3DataPlaneOnClient(t, wrapper, client, newFakeV3Clock())
+	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
+	collector := &v3ReplyResourceCollector{d: d}
+	if _, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector), 0, &pfslocal.GetAttrRequest{Item: file.Item}); errno != 0 || collector.cached == nil {
+		t.Fatalf("getattr was not a cache hit: errno=%d", errno)
+	}
+	defer consumeV3ResponseConsumptions(collector.responseConsumptions)
+	if !collector.cached.revalidate() {
+		t.Fatal("an unchanged candidate was refused")
+	}
+	if _, err := d.reauthorize(context.Background(), []byte("token"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if v3Horizon(d) == 0 {
+		t.Fatal("reauthorization did not obtain a fresh proof")
+	}
+	if collector.cached.revalidate() {
+		t.Fatal("a candidate from before the reauthorization stayed admissible")
+	}
+}
+
+// A rename of X whose reply is delayed past another callback's committed
+// setattr(X), which still holds X's attribute coordinate awaiting its
+// PublicationAck, is legal concurrency: the rename's binding joins the
+// holders instead of fencing the mount, the older rename sample is discarded,
+// and peer repair and hits wait for both holders.
+func TestV3RenameDelayedPastAHeldSetattrOfTheMovedObjectIsLegal(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	f.getattr(f.root)
+	file := f.lookup(f.root, "file")
+	renameCommitted, releaseRename := make(chan struct{}), make(chan struct{})
+	f.ns.hold = func(request *authoritypb.Request, _ *authoritypb.Response) {
+		if request.GetRename() != nil {
+			close(renameCommitted)
+			<-releaseRename
+		}
+	}
+	const renameOp, setattrOp = uint64(97001), uint64(97002)
+	f.d.bridge.reserveFrontendPublication(renameOp)
+	f.d.bridge.reserveFrontendPublication(setattrOp)
+	renamed := make(chan int32, 1)
+	go func() {
+		_, errno := dispatchV3Owned(f.d, context.Background(), renameOp, &pfslocal.RenameRequest{
+			FromDir: f.root, FromName: []byte("file"), ToDir: f.root, ToName: []byte("renamed"),
+		})
+		renamed <- errno
+	}()
+	select {
+	case <-renameCommitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rename did not commit")
+	}
+	size := uint64(42)
+	if _, errno := dispatchV3Owned(f.d, context.Background(), setattrOp, &pfslocal.SetAttrRequest{Item: file.Item, Size: &size}); errno != 0 {
+		t.Fatalf("setattr errno=%d", errno)
+	}
+	close(releaseRename)
+	if errno := <-renamed; errno != 0 || f.d.terminalError() != nil {
+		t.Fatalf("legal rename/setattr overlap fenced: errno=%d terminal=%v", errno, f.d.terminalError())
+	}
+	attribute := v3AttributeCoordinate(f.record(file.Item))
+	coordinator := f.d.bridge.sourcePublication
+	coordinator.mu.Lock()
+	holders := len(coordinator.sourceHolds[attribute])
+	coordinator.mu.Unlock()
+	if holders != 2 {
+		t.Fatalf("moved object's attribute coordinate has %d holders, want both callbacks", holders)
+	}
+	record := f.record(file.Item)
+	f.d.mu.Lock()
+	cachedSize, binding := record.attr.GetSize(), record.binding
+	f.d.mu.Unlock()
+	if cachedSize != 42 || binding == nil || binding.name != "renamed" {
+		t.Fatalf("after the overlap size=%d binding=%+v, want the setattr's size and the rename's name", cachedSize, binding)
+	}
+	f.requireAuthority("GetAttr while both callbacks hold the coordinate", func() { f.getattr(file.Item) })
+	for _, operationID := range []uint64{setattrOp, renameOp} {
+		if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished); err != nil {
+			t.Fatal(err)
+		}
+		f.d.bridge.releaseFrontendPublication(operationID)
+		_ = f.d.bridge.finishFrontendPublication(operationID)
+	}
+	f.requireServedLocally("GetAttr after both publish", func() { f.getattr(file.Item) })
+}
+
+// r2 §5.1 through admission, reply validation, and publication: two writes of
+// one callback commit in one order and their replies are applied in the
+// other; the older result is discarded without a fence.
+func TestV3CacheSameCallbackWritesWithReversedReplies(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	opened, errno := f.dispatch(&pfslocal.OpenRequest{Item: file.Item, Mode: pfslocal.OpenModeReadWrite})
+	if errno != 0 {
+		t.Fatalf("open errno=%d", errno)
+	}
+	handle := opened.(*pfslocal.OpenReply).Handle
+	firstCommitted, releaseFirst := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	f.ns.hold = func(request *authoritypb.Request, _ *authoritypb.Response) {
+		if request.GetWrite() != nil && request.GetWrite().GetPosition() == 0 {
+			once.Do(func() {
+				close(firstCommitted)
+				<-releaseFirst
+			})
+		}
+	}
+	const operationID = uint64(97101)
+	f.d.bridge.reserveFrontendPublication(operationID)
+	first := make(chan int32, 1)
+	go func() {
+		_, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.WriteRequest{Handle: handle, Data: []byte("abcde")})
+		first <- errno
+	}()
+	<-firstCommitted
+	if _, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.WriteRequest{Handle: handle, Offset: 10, Data: []byte("fghij")}); errno != 0 {
+		t.Fatalf("second write errno=%d", errno)
+	}
+	close(releaseFirst)
+	if errno := <-first; errno != 0 || f.d.terminalError() != nil {
+		t.Fatalf("older reply after newer = %d terminal=%v, want no fence", errno, f.d.terminalError())
+	}
+	record := f.record(file.Item)
+	f.d.mu.Lock()
+	size := record.attr.GetSize()
+	f.d.mu.Unlock()
+	if size != 15 {
+		t.Fatalf("cached size=%d, want the newer write's 15", size)
+	}
+}
+
+// Same-name namespace requests of one callback: create(n) commits first, an
+// unlink(n) of the same callback commits second and is applied first; the
+// delayed create result is older than the directory watermark and drops the
+// coordinate instead of reinstalling the name.
+func TestV3CacheSameCallbackSameNameNamespaceRequests(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.getattr(f.root)
+	createCommitted, releaseCreate := make(chan struct{}), make(chan struct{})
+	f.ns.hold = func(request *authoritypb.Request, _ *authoritypb.Response) {
+		if request.GetMkdir() != nil {
+			close(createCommitted)
+			<-releaseCreate
+		}
+	}
+	const operationID = uint64(97201)
+	f.d.bridge.reserveFrontendPublication(operationID)
+	created := make(chan int32, 1)
+	go func() {
+		_, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.MkdirRequest{Dir: f.root, Name: []byte("n"), Mode: 0o755})
+		created <- errno
+	}()
+	<-createCommitted
+	if _, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.RemoveRequest{Dir: f.root, Name: []byte("n"), Directory: true}); errno != 0 {
+		t.Fatalf("unlink errno=%d", errno)
+	}
+	close(releaseCreate)
+	if errno := <-created; errno != 0 || f.d.terminalError() != nil {
+		t.Fatalf("delayed create = %d terminal=%v, want no fence", errno, f.d.terminalError())
+	}
+	root := f.record(f.root)
+	f.d.mu.Lock()
+	positive := root.children["n"]
+	_, negative := root.negatives["n"]
+	f.d.mu.Unlock()
+	if positive != nil || negative {
+		t.Fatalf("after reversed same-name results positive=%v negative=%t, want the coordinate dropped", positive, negative)
+	}
+	if _, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished); err != nil {
+		t.Fatal(err)
+	}
+	f.d.bridge.releaseFrontendPublication(operationID)
+	_ = f.d.bridge.finishFrontendPublication(operationID)
+	f.requireAuthority("lookup of the dropped coordinate", func() {
+		if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")}); errno != darwinENOENT {
+			t.Fatalf("lookup errno=%d", errno)
+		}
+	})
+}
+
+// An unresolved namespace claim owned by the very callback asking gates its
+// hits too: the identity it will bind is not known yet.
+func TestV3CacheSameCallbackUnresolvedNamespaceClaimGatesAHit(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	f.getattr(f.root)
+	file := f.lookup(f.root, "file")
+	const operationID = uint64(97301)
+	f.d.bridge.reserveFrontendPublication(operationID)
+	gate, err := v3NamespaceSourceGate(f.root, []byte("other"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), operationID, gate); err != nil {
+		t.Fatal(err)
+	}
+	f.requireAuthority("GetAttr under the same callback's unresolved claim", func() {
+		if _, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.GetAttrRequest{Item: file.Item}); errno != 0 {
+			t.Fatalf("getattr errno=%d", errno)
+		}
+	})
+}
+
+// A cached negative answer paused before its write is refused once a create
+// of the same name lands; the operation then answers coherently with the new
+// binding instead of a stale ENOENT.
+func TestV3CachedNegativeIsRevalidatedAtTheWriteBoundary(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.getattr(f.root)
+	if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")}); errno != darwinENOENT {
+		t.Fatalf("negative lookup errno=%d", errno)
+	}
+	a := &attach{ref: "negative-boundary", v3Data: f.d, v3Coherence: f.d.bridge}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	var once sync.Once
+	c.testAfterRetractionCapture = func(uint64) {
+		once.Do(func() {
+			if _, errno := f.dispatch(&pfslocal.CreateRequest{Dir: f.root, Name: []byte("n"), Mode: 0o644, Exclusive: true}); errno != 0 {
+				t.Errorf("create errno=%d", errno)
+			}
+		})
+	}
+	const operationID = uint64(97401)
+	initialize, ok := c.reserveLogicalOperation(operationID, true)
+	if !ok || !initialize {
+		t.Fatal("operation was not reserved")
+	}
+	f.d.bridge.reserveFrontendPublication(operationID)
+	done := make(chan struct{})
+	go func() {
+		c.handleV3Attached(context.Background(), a, 1, operationID, initialize, &pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")})
+		close(done)
+	}()
+	envelope, err := pfslocal.ReadFrame(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if _, positive := envelope.Body.(*pfslocal.LookupReply); !positive {
+		t.Fatalf("written reply = %#v, want the coherent positive answer, not the stale ENOENT", envelope.Body)
+	}
+}
+
+// A cached positive Lookup whose callback already acknowledged NOT_PUBLISHED
+// (FSKit cancellation) is discarded without a frame and its provisional
+// reference settles once; the item stays owned by its earlier acceptance.
+func TestV3CachedPositiveAfterNotPublishedAckSettlesOnce(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	f.getattr(f.root)
+	file := f.lookup(f.root, "file")
+	a := &attach{ref: "late-cached-lookup", v3Data: f.d, v3Coherence: f.d.bridge}
+	server, peer := net.Pipe()
+	defer server.Close()
+	defer peer.Close()
+	c := &frontendConn{conn: server, attach: a}
+	const operationID = uint64(97501)
+	initialize, ok := c.reserveLogicalOperation(operationID, true)
+	if !ok || !initialize {
+		t.Fatal("operation was not reserved")
+	}
+	f.d.bridge.reserveFrontendPublication(operationID)
+	if known, err := f.d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitNotPublished); !known || err != nil {
+		t.Fatalf("bridge NOT_PUBLISHED = (%t,%v)", known, err)
+	}
+	if !c.acknowledgePublication(operationID) {
+		t.Fatal("frontend NOT_PUBLISHED refused")
+	}
+	f.requireServedLocally("cached lookup of a canceled callback", func() {
+		c.handleV3Attached(context.Background(), a, 1, operationID, initialize, &pfslocal.LookupRequest{Dir: f.root, Name: []byte("file")})
+	})
+	_ = peer.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if envelope, err := pfslocal.ReadFrame(peer); err == nil {
+		t.Fatalf("a canceled callback received a frame: %+v", envelope)
+	}
+	record := f.record(file.Item)
+	f.d.mu.Lock()
+	provisional, accepted := record.provisional, record.accepted
+	f.d.mu.Unlock()
+	if provisional != 0 || !accepted || f.d.terminalError() != nil || len(c.provisional) != 0 {
+		t.Fatalf("after cancellation provisional=%d accepted=%t terminal=%v table=%d", provisional, accepted, f.d.terminalError(), len(c.provisional))
+	}
+}
+
+// An exposed cached positive Lookup whose item FSKit reclaims before the
+// disposition, followed by socket loss, settles the provisional reference
+// once, retires the record, and leaves its capability to session cleanup of
+// the now-terminal (unprovable-publication) data plane.
+func TestV3CachedPositiveReclaimThenSocketLossSettlesOnce(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	f.getattr(f.root)
+	file := f.lookup(f.root, "file")
+	a := &attach{ref: "cached-reclaim-loss", v3Data: f.d, v3Coherence: f.d.bridge}
+	server, peer := net.Pipe()
+	c := &frontendConn{conn: server, attach: a}
+	const operationID = uint64(97601)
+	initialize, ok := c.reserveLogicalOperation(operationID, true)
+	if !ok || !initialize {
+		t.Fatal("operation was not reserved")
+	}
+	f.d.bridge.reserveFrontendPublication(operationID)
+	go c.handleV3Attached(context.Background(), a, 1, operationID, initialize, &pfslocal.LookupRequest{Dir: f.root, Name: []byte("file")})
+	envelope, err := pfslocal.ReadFrame(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, positive := envelope.Body.(*pfslocal.LookupReply); !positive {
+		t.Fatalf("reply = %#v", envelope.Body)
+	}
+	if _, errno := f.d.reclaim(context.Background(), &pfslocal.ReclaimRequest{Item: file.Item}); errno != 0 {
+		t.Fatalf("reclaim errno=%d", errno)
+	}
+	record := f.record(file.Item)
+	_ = peer.Close()
+	c.close()
+	f.d.mu.Lock()
+	provisional, live := record.provisional, f.d.itemsByID[file.Item.ItemID] == record
+	f.d.mu.Unlock()
+	if provisional != 0 || live || f.d.terminalError() == nil {
+		t.Fatalf("after reclaim and socket loss provisional=%d live=%t terminal=%v", provisional, live, f.d.terminalError())
+	}
+}

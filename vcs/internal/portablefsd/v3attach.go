@@ -52,14 +52,16 @@ const (
 	v3AttachMaxFrame           uint32 = 4 << 20
 	v3AttachDialTimeout               = 10 * time.Second
 	v3AttachCancelDrainTimeout        = 10 * time.Second
-	// v3DetachProofBudget bounds delivery of one mount-absence proof. Strictly
-	// under unmountTransactionBudget so the transaction can still publish a
-	// verdict for the request that started it.
-	v3DetachProofBudget = 15 * time.Second
 	// v3DetachProofComponent names the trusted local supervisor component that
 	// observed the kernel-mount absence.
 	v3DetachProofComponent = "portablefsd/getfsstat"
 )
+
+// v3DetachProofBudget bounds the release drain and the delivery of one
+// mount-absence proof together. Strictly under unmountTransactionBudget so the
+// transaction can still publish a verdict for the request that started it. A
+// variable only so tests can exercise its expiry.
+var v3DetachProofBudget = 15 * time.Second
 
 // errV3AttachDetached is the terminal cause recorded on a v3 data plane whose
 // attach ended through an explicit detach rather than through a failure.
@@ -1013,6 +1015,15 @@ func (c *frontendConn) stopV3FrontendPublication(a *attach, cause error) {
 // the attach FENCED — the session is closed so the authority's lease sweep
 // fences this participant — never silently absent.
 func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
+	if a.isDetached() {
+		// An earlier detach completed the teardown and returned its outcome,
+		// including any release failure; only the registry removal it could not
+		// finish remains, so its drain and proof are not repeated.
+		a.frontendSerial.Lock()
+		a.nsMu.Lock()
+		_, err := a.finishDetachWithNSLocked("", nil)
+		return err
+	}
 	present, err := ops.present(a.mountPath, a.ref)
 	if err != nil {
 		// Nothing irreversible has happened: the mount may still be serving,
@@ -1078,23 +1089,25 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	session := a.v3Session
 	d := a.v3Data
 	a.mu.RUnlock()
+	var releaseErr error
 	if session != nil && d != nil {
+		// Releases already accepted settle on the original session. Draining
+		// closes release admission, which explicitly hands every later token to
+		// the detach: ending the session releases every capability it still
+		// holds. A failed or unfinished drain is never a clean detach; local
+		// teardown still completes, and the failure is the detach's outcome.
+		proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
+		releaseErr = d.releases.drain(proofCtx)
 		// Frontend loss is terminal locally, but the original authority
 		// transport can still accept this exact kernel-absence proof. A
 		// transport already lost or fenced must never be re-established here.
 		select {
 		case <-d.client.SessionDone():
 		default:
-			// Releases already accepted settle on the live session. Draining closes
-			// release admission, which explicitly hands every later token to this
-			// detach: ending the session releases every capability it still holds.
-			// A failed or unfinished drain must not become a clean detach.
-			proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
-			deliverErr := d.releases.drain(proofCtx)
+			deliverErr := releaseErr
 			if deliverErr == nil {
 				deliverErr = session.DetachAfterUnmount(proofCtx, proof)
 			}
-			cancel()
 			if deliverErr != nil {
 				// The proof exists but the authority did not accept it. Ending the
 				// session here is what keeps the detach honest: the authority
@@ -1107,11 +1120,15 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 				)
 			}
 		}
+		cancel()
+	}
+	if releaseErr != nil {
+		releaseErr = fmt.Errorf("v3 authority releases did not settle before detach: %w", releaseErr)
 	}
 	// Terminal either way: an already-fenced plane keeps its original cause.
 	a.fenceV3(errV3AttachDetached)
 	a.frontendSerial.Lock()
 	a.nsMu.Lock()
-	_, err = a.finishDetachWithNSLocked("", nil)
+	_, err = a.finishDetachWithNSLocked("", releaseErr)
 	return err
 }

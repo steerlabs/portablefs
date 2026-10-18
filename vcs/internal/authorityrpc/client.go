@@ -995,34 +995,48 @@ func (c *Client) AuthorizationDeadline() time.Time {
 }
 
 // KeepAlive renews this exact session. For a session that negotiated
-// fskit-versioned-metadata-v1 it returns the authority's validated relative
-// cache proof R: positive, in whole milliseconds, and no greater than either
-// the advertised session lease or MaxCacheProof. Every other session returns
-// zero. A refused renewal or a negotiated reply without a valid proof is an
-// error; a malformed proof also ends the session, because the authority broke
-// the negotiated contract (an overgrant is never clamped). R is relative to
-// the authority; the caller anchors it at its own request start.
+// fskit-versioned-metadata-v1 it returns the authority's relative cache proof
+// R; every other session returns zero. Only a reply of the complete success
+// shape renews: anything else ends the session and never yields a proof. The
+// frame layer owns the proof's own grammar (nonzero, whole milliseconds, at
+// most MaxCacheProof, only on a plain success envelope); this method owns what
+// depends on the session: the proof is present on every successful negotiated
+// renewal and never exceeds the advertised lease. An overgrant is never
+// clamped. R is relative to the authority; the caller anchors it at its own
+// request start.
 func (c *Client) KeepAlive(ctx context.Context) (time.Duration, error) {
 	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
 	if err != nil {
 		return 0, err
 	}
-	if response.GetUncertain() || response.GetErrno() != 0 || response.GetRoutesMismatch().GetSessionRefused() {
-		return 0, fmt.Errorf("authorityrpc: authority refused keepalive with errno %d", response.GetErrno())
+	if !keepAliveSucceeded(response) {
+		err := fmt.Errorf("authorityrpc: keepalive did not renew the session: errno=%d failure=%d uncertain=%t",
+			response.GetErrno(), response.GetFailure(), response.GetUncertain())
+		c.signalSessionEnd(err)
+		return 0, err
 	}
 	if !c.versionedMetadata.Load() {
+		// validateSessionProofPlacement already refused a proof here.
 		return 0, nil
 	}
-	proof := response.GetSessionValidForNanos()
-	lease := c.SessionLease()
-	if proof == 0 || proof%uint64(time.Millisecond) != 0 || lease <= 0 ||
-		proof > uint64(lease) || proof > uint64(MaxCacheProof) {
-		err := fmt.Errorf("%w: keepalive proof %dns is not a positive whole-millisecond duration within lease %s and %s",
-			ErrTransportBinding, proof, lease, MaxCacheProof)
+	proof, lease := response.GetSessionValidForNanos(), c.SessionLease()
+	if proof == 0 || lease <= 0 || proof > uint64(lease) {
+		err := fmt.Errorf("%w: negotiated keepalive proof %dns is missing or exceeds the advertised lease %s",
+			ErrTransportBinding, proof, lease)
 		c.signalSessionEnd(err)
 		return 0, err
 	}
 	return time.Duration(proof), nil
+}
+
+// keepAliveSucceeded is the one definition of a successful KeepAlive reply: a
+// plain success envelope with no errno, failure class, uncertainty, terminal or
+// route signal, replay state, post-state, terminal-delivery token, or body.
+func keepAliveSucceeded(response *authoritypb.Response) bool {
+	return response != nil && response.GetErrno() == 0 && !response.GetUncertain() && !response.GetSessionTerminal() &&
+		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED &&
+		response.GetRoutesMismatch() == nil && response.GetMutation() == nil && response.GetPostState() == nil &&
+		len(response.GetTerminalDeliveryToken()) == 0 && response.GetBody() == nil
 }
 
 // BeginLocalPublication admits one frontend reply served from daemon state as
@@ -1703,11 +1717,12 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 }
 
 // validateSessionProofPlacement admits session_valid_for_nanos only on a
-// successful KeepAlive to a session that negotiated it. Anywhere else it is an
+// successful KeepAlive to a session that negotiated it. The frame layer cannot
+// see the request or the negotiation; anywhere else the proof is an
 // unrequested promise the client must refuse rather than ignore.
 func (c *Client) validateSessionProofPlacement(request *authoritypb.Request, response *authoritypb.Response) error {
-	if response.GetSessionValidForNanos() != 0 && (!c.versionedMetadata.Load() || request.GetKeepAlive() == nil ||
-		response.GetErrno() != 0 || response.GetUncertain()) {
+	if response.GetSessionValidForNanos() != 0 &&
+		(!c.versionedMetadata.Load() || request.GetKeepAlive() == nil || !keepAliveSucceeded(response)) {
 		return fmt.Errorf("%w: session_valid_for_nanos outside a negotiated successful keepalive", ErrTransportBinding)
 	}
 	return nil

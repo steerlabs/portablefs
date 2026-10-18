@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -217,18 +218,20 @@ type v3DataPlane struct {
 	// debt and provisional replies reach the bound, registration fails and the
 	// mount stops serving. It does not throttle capability acquisition.
 	//
-	// Together with tokens held by active handlers, this is the pre-enqueue
+	// Together with tokens held by in-flight handlers, this is the pre-enqueue
 	// half of the release lag. Close and Reclaim reserve owner capacity before
-	// they detach, so they add none. An admitted operation holds a d.ops slot
-	// and at most two tokens before transfer (a duplicate capability, or the
-	// item and handle a failed reply abandons), so handlers add at most
-	// 2*DataPlaneOperationLimit. Each abandoned reply owns at most one item and
-	// one handle, and an attached connection registers at most
-	// maxProvisionalResourcesPerConnection provisional replies, so debt adds at
-	// most 2*maxProvisionalResourcesPerConnection per attached frontend
-	// connection. With the owner's 2*B accepted tokens, that bounds how far
-	// authority capabilities and descriptors can lag local retirement; the
-	// authority's configured capacity must cover live owners plus this lag.
+	// they detach, so they add none. A handler holds at most two tokens outside
+	// any index (a duplicate capability waiting for capacity, or the item and
+	// handle of a reply it is registering or abandoning), before and after its
+	// d.ops slot, and a connection admits at most maxFrontendRequestsInFlight
+	// handlers. Debt covers abandoned replies, including a closed connection's
+	// whole provisional table; each owns at most one item and one handle, and a
+	// connection registers at most maxProvisionalResourcesPerConnection. So,
+	// with the owner's 2*B accepted tokens, authority capabilities and
+	// descriptors lag local retirement by at most
+	//   2*B + maxFrontendConnections * 2 * (maxFrontendRequestsInFlight + maxProvisionalResourcesPerConnection)
+	// tokens. The authority's configured capacity must cover live owners plus
+	// the lag actually reachable by its mounts.
 	abandonedDebt atomic.Int64
 
 	mu              sync.Mutex
@@ -265,12 +268,17 @@ type v3DataPlane struct {
 	// authorizationDeadline is the installed signed deadline, an additional
 	// wall-clock denial check (zero: none). All are protected by mu.
 	clock                 func() (uint64, error)
+	clockHigh             uint64
 	horizon               uint64
 	authGeneration        uint64
 	authorizing           bool
 	authorizationDeadline time.Time
 
 	failOnce sync.Once
+
+	// testBeforeHandleLock runs between resolving a handle pointer and taking
+	// its shared lock, the window a competing Close can win. Nil in production.
+	testBeforeHandleLock func(*v3HandleRecord)
 }
 
 type v3ReauthorizingClient interface {
@@ -747,6 +755,9 @@ func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *
 		return nil, errno
 	}
 	effect, target, err := v3TargetEffect(response.GetPostState(), item)
+	if err == nil {
+		err = errors.Join(v3ReplyBody(response, nil), d.representableEffect(effect))
+	}
 	if err != nil {
 		return d.malformed("setattr " + err.Error())
 	}
@@ -946,6 +957,9 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 		return d.malformed("write reply carried an errno without a definite shape")
 	}
 	effect, postAttr, err := v3WriteCommitted(item, request.Offset, size, response)
+	if err == nil {
+		err = d.representableEffect(effect)
+	}
 	if err != nil {
 		return d.malformed(err.Error())
 	}
@@ -1057,6 +1071,9 @@ func (d *v3DataPlane) create(ctx context.Context, operationID uint64, request *p
 	}
 	effect, err := v3BindingEffect(response.GetPostState(), parent, request.Name, created.GetItem(), authoritypb.Attr_REGULAR,
 		v3PostStateRoleCreated, v3PostStateRoleTarget)
+	if err == nil {
+		err = d.representableEffect(effect)
+	}
 	if err != nil {
 		return d.malformed("create " + err.Error())
 	}
@@ -1132,6 +1149,9 @@ func (d *v3DataPlane) remove(ctx context.Context, operationID uint64, request *p
 		return nil, d.settleNameErrno(witness, errno)
 	}
 	effect, err := v3RemoveEffect(response.GetPostState(), parent, request.Name, request.Directory)
+	if err == nil {
+		err = errors.Join(v3ReplyBody(response, nil), d.representableEffect(effect))
+	}
 	if err != nil {
 		return d.malformed("unlink " + err.Error())
 	}
@@ -1182,6 +1202,9 @@ func (d *v3DataPlane) rename(ctx context.Context, operationID uint64, request *p
 		return d.malformed(err.Error())
 	}
 	effect, err := v3RenameEffect(response.GetPostState(), from, request.FromName, to, request.ToName, newIdentity, oldIdentity, oldBound)
+	if err == nil {
+		err = d.representableEffect(effect)
+	}
 	if err != nil {
 		return d.malformed(err.Error())
 	}
@@ -1229,6 +1252,9 @@ func (d *v3DataPlane) adoptCreated(
 		return nil, errno
 	}
 	effect, err := v3BindingEffect(response.GetPostState(), parent, name, created, kind, v3PostStateRoleCreated)
+	if err == nil {
+		err = d.representableEffect(effect)
+	}
 	if err != nil {
 		_, errno := d.malformed(fmt.Sprintf("%s %v", kind, err))
 		return nil, errno
@@ -1325,6 +1351,9 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 		return d.malformed("hard link changed stable identity")
 	}
 	effect, err := v3BindingEffect(response.GetPostState(), parent, request.Name, linked.GetItem(), item.kind, v3PostStateRoleTarget)
+	if err == nil {
+		err = d.representableEffect(effect)
+	}
 	if err != nil {
 		return d.malformed("link " + err.Error())
 	}
@@ -1443,6 +1472,9 @@ func (d *v3DataPlane) xattrRemove(ctx context.Context, operationID uint64, reque
 		return nil, errno
 	}
 	effect, _, err := v3TargetEffect(response.GetPostState(), item)
+	if err == nil {
+		err = errors.Join(v3ReplyBody(response, nil), d.representableEffect(effect))
+	}
 	if err != nil {
 		return d.malformed("removexattr " + err.Error())
 	}
@@ -1709,9 +1741,27 @@ func retainedV3ResponseTerminalCause(response *authoritypb.Response, callErr err
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
+		v3SuccessCarriesFailure(response) ||
 		response.GetFskitRepairRetrySequence() != 0 ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		return errors.New("portablefsd: authority returned a terminal retained outcome")
+	}
+	return nil
+}
+
+// v3SuccessCarriesFailure recognizes a contradictory outcome: no errno, yet a
+// failure class. The authority classifies failures only beside an errno or an
+// uncertain outcome, so a "success" that carries one is malformed.
+func v3SuccessCarriesFailure(response *authoritypb.Response) bool {
+	return response.GetErrno() == 0 && response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED
+}
+
+// v3ReplyBody requires a successful reply to carry exactly the operation's
+// body type: want is a typed nil of the expected oneof wrapper, or nil for an
+// operation whose success has no body.
+func v3ReplyBody(response *authoritypb.Response, want any) error {
+	if reflect.TypeOf(response.GetBody()) != reflect.TypeOf(want) {
+		return fmt.Errorf("reply carried body %T, want %T", response.GetBody(), want)
 	}
 	return nil
 }
@@ -1800,6 +1850,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		if callErr != nil || response == nil || response.GetUncertain() ||
 			response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 			response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
+			v3SuccessCarriesFailure(response) ||
 			response.GetRoutesMismatch().GetSessionRefused() {
 			if callErr == nil {
 				callErr = fmt.Errorf(
@@ -1838,6 +1889,7 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 	if callErr != nil || response == nil || response.GetUncertain() ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
+		v3SuccessCarriesFailure(response) ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		cause := callErr
 		if cause == nil {
@@ -1962,6 +2014,10 @@ func (d *v3DataPlane) classify(response *authoritypb.Response, callErr error, mu
 		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only visibility retry to a callback-serialized frontend"))
 		return nil, darwinEIO
 	}
+	if v3SuccessCarriesFailure(response) {
+		_ = d.fail(fmt.Errorf("portablefsd: authority success carried failure class %d", response.GetFailure()))
+		return nil, darwinEIO
+	}
 	if response.GetErrno() != 0 {
 		if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED {
 			if response.GetErrno() != errnos.EINTR {
@@ -2076,17 +2132,37 @@ func (d *v3DataPlane) recordFromAuthority(candidate *authoritypb.Item, itemID ui
 		return nil, err
 	}
 	attr := candidate.GetAttr()
-	if attr == nil || attr.GetInode() == 0 || attr.GetSize() < 0 || !validAuthorityKind(attr.GetKind()) {
-		return nil, errors.New("authority item has malformed attributes")
-	}
-	fileID, err := d.fileIDFor(identity, attr.GetInode())
+	fileID, err := d.representableAttr(identity, attr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("authority item: %w", err)
 	}
 	return &v3ItemRecord{
 		item:  pfslocal.Item{ItemID: itemID, ItemGeneration: d.cfg.ItemGeneration, StableIdentity: identity},
 		token: cloneBytesV3(candidate.GetToken()), fileID: fileID, inode: attr.GetInode(), kind: attr.GetKind(),
 	}, nil
+}
+
+// representableAttr is the one rule for attributes the daemon can own, cache,
+// or render: a known kind, a nonzero inode inside the file-ID range (the root
+// excepted), a nonnegative size, and an allocation that renders in bytes. Every
+// owning, read, and PostState path applies it before using a sample.
+func (d *v3DataPlane) representableAttr(identity [16]byte, attr *authoritypb.Attr) (uint64, error) {
+	if attr == nil || attr.GetInode() == 0 || attr.GetSize() < 0 || !validAuthorityKind(attr.GetKind()) ||
+		attr.GetBlocks() > math.MaxUint64/512 {
+		return 0, errors.New("authority attributes are malformed or unrepresentable")
+	}
+	return d.fileIDFor(identity, attr.GetInode())
+}
+
+// representableEffect applies representableAttr to every object of a whole
+// mutation result, held or not, before anything is adopted or applied.
+func (d *v3DataPlane) representableEffect(effect *v3MutationEffect) error {
+	for _, object := range effect.objects {
+		if _, err := d.representableAttr(object.identity, object.attr); err != nil {
+			return fmt.Errorf("mutation post-state object: %w", err)
+		}
+	}
+	return nil
 }
 
 // fileIDFor maps an authority object to the file ID FSKit reports. The root is
@@ -2133,12 +2209,9 @@ func (d *v3DataPlane) localAttr(record *v3ItemRecord, attr *authoritypb.Attr, pa
 // names, or negatives.
 func (d *v3DataPlane) entryAttr(identity [16]byte, entry *authoritypb.Dirent, dir *v3ItemRecord, full bool) (pfslocal.Attr, error) {
 	attr := entry.GetAttr()
-	if attr == nil || attr.GetInode() == 0 {
-		return pfslocal.Attr{}, errors.New("readdir entry has malformed attributes")
-	}
-	fileID, err := d.fileIDFor(identity, attr.GetInode())
+	fileID, err := d.representableAttr(identity, attr)
 	if err != nil {
-		return pfslocal.Attr{}, err
+		return pfslocal.Attr{}, fmt.Errorf("readdir entry: %w", err)
 	}
 	// A snapshot carries no identity for the frontend to check, so the daemon
 	// holds it to the same immutability rule as an owning reply.
@@ -2248,6 +2321,9 @@ func (d *v3DataPlane) acquireHandle(id uint64, owner *v3ItemRecord) (*v3HandleRe
 	handle, errno := d.handle(id, owner)
 	if errno != 0 {
 		return nil, nil, errno
+	}
+	if d.testBeforeHandleLock != nil {
+		d.testBeforeHandleLock(handle)
 	}
 	handle.mu.RLock()
 	d.mu.Lock()
@@ -2459,12 +2535,13 @@ type v3ResourceCleanup struct {
 	items          []*v3ItemRecord
 	handles        []*v3HandleRecord
 	terminalReason error
-	// debt is this cleanup's share of abandonedDebt until finish returns.
+	// debt is this cleanup's share of abandonedDebt until finish hands its
+	// resources to the release owner.
 	debt int64
 }
 
-// outstandingCleanup is the number of abandoned resources whose authority
-// cleanup has not finished.
+// outstandingCleanup is the number of abandoned resources not yet accepted by
+// the release owner (or left to terminal session cleanup).
 func (d *v3DataPlane) outstandingCleanup() int {
 	return int(d.abandonedDebt.Load())
 }
@@ -2587,20 +2664,51 @@ func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 	}
 	if len(reclaims) != 0 {
 		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: reclaims}}}
-		if _, errno := d.callNonVisibleMutation(ctx, 0, request); errno != 0 {
+		response, errno := d.callNonVisibleMutation(ctx, 0, request)
+		if errno != 0 {
 			return d.fail(fmt.Errorf("portablefsd: batched reclaim of %d item capabilities failed with errno %d", len(reclaims), errno))
+		}
+		if err := v3ReleaseSucceeded(response, false); err != nil {
+			return d.fail(fmt.Errorf("portablefsd: batched reclaim of %d item capabilities: %w", len(reclaims), err))
 		}
 	}
 	return nil
 }
 
-// v3CloseBatchSucceeded requires one ordered result per close, each retired
-// with no errno or failure class. CloseBatch consumes descriptor ownership even
-// when a close reports an error, so an error is never retried; it is a release
-// failure that ends the mount.
+// v3ReleaseSucceeded requires the whole success outcome of one release request
+// before its batch counts as settled: no errno, failure class, uncertainty,
+// post-state, or terminal-delivery token, and exactly the operation's own
+// reply body (none for Reclaim, CloseBatch's for CloseBatch). Generic
+// classification admits some failure classes on errno zero; a release may not.
+func v3ReleaseSucceeded(response *authoritypb.Response, closeBatch bool) error {
+	if response == nil || response.GetErrno() != 0 || response.GetUncertain() ||
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED ||
+		response.GetPostState() != nil || len(response.GetTerminalDeliveryToken()) != 0 {
+		return fmt.Errorf("release outcome is not a plain success: errno=%d failure=%d", response.GetErrno(), response.GetFailure())
+	}
+	switch response.GetBody().(type) {
+	case nil:
+		if !closeBatch {
+			return nil
+		}
+	case *authoritypb.Response_CloseBatch:
+		if closeBatch {
+			return nil
+		}
+	}
+	return fmt.Errorf("release outcome carried the wrong reply body %T", response.GetBody())
+}
+
+// v3CloseBatchSucceeded requires the whole CloseBatch success outcome and one
+// ordered result per close, each retired with no errno or failure class.
+// CloseBatch consumes descriptor ownership even when a close reports an error,
+// so an error is never retried; it is a release failure that ends the mount.
 func v3CloseBatchSucceeded(response *authoritypb.Response, closes int) error {
+	if err := v3ReleaseSucceeded(response, true); err != nil {
+		return fmt.Errorf("portablefsd: batched close of %d handles: %w", closes, err)
+	}
 	results := response.GetCloseBatch().GetResults()
-	if response.GetCloseBatch() == nil || len(results) != closes {
+	if len(results) != closes {
 		return fmt.Errorf("portablefsd: batched close of %d handles returned %d results", closes, len(results))
 	}
 	for index, result := range results {
@@ -2721,35 +2829,52 @@ func v3KeepAliveInterval(lease, repairBudget time.Duration) time.Duration {
 // explicit receipts advance the horizon; a refused renewal is the caller's
 // terminal error.
 func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
-	start, clockErr := d.clock()
 	d.mu.Lock()
+	start, startErr := d.readClockLocked()
 	generation, authorizing := d.authGeneration, d.authorizing
 	d.mu.Unlock()
 	proof, err := d.client.KeepAlive(ctx)
 	if err != nil {
 		return err
 	}
-	if clockErr != nil || authorizing {
-		return nil
-	}
-	candidate, usable := v3HorizonCandidate(start, proof)
-	if !usable {
-		return nil
-	}
-	now, err := d.clock()
-	if err != nil || now >= candidate {
-		// A legitimate proof consumed by delay supplies no horizon; it is not a
-		// protocol defect.
-		return nil
-	}
 	d.mu.Lock()
+	now, nowErr := d.readClockLocked()
+	if clockErr := errors.Join(startErr, nowErr); clockErr != nil {
+		// Every horizon is measured on this clock, so a failed or regressed read
+		// voids them all. Serving ends (the transport stays for the exact
+		// absence proof); there is no uncached mode to continue in.
+		d.horizon = 0
+		d.mu.Unlock()
+		_ = d.stopServing(fmt.Errorf("portablefsd: continuous clock unusable during keepalive: %w", clockErr))
+		return nil
+	}
 	defer d.mu.Unlock()
-	// A receipt of an older generation, or one arriving out of order, can
-	// neither resurrect a terminal data plane nor move the horizon backwards.
-	if d.terminal == nil && !d.authorizing && d.authGeneration == generation && candidate > d.horizon {
+	candidate, usable := v3HorizonCandidate(start, proof)
+	// A legitimate proof consumed by delay supplies no horizon; it is not a
+	// protocol defect. A receipt of an older generation, or one arriving out of
+	// order, can neither resurrect a terminal data plane nor move the horizon
+	// backwards.
+	if usable && now < candidate && !authorizing && d.terminal == nil && !d.authorizing &&
+		d.authGeneration == generation && candidate > d.horizon {
 		d.horizon = candidate
 	}
 	return nil
+}
+
+// readClockLocked reads the continuous clock and refuses a value below the
+// greatest one already observed: the horizon arithmetic assumes the clock
+// never runs backwards, so a regression is a clock fault, not a time. d.mu is
+// held.
+func (d *v3DataPlane) readClockLocked() (uint64, error) {
+	now, err := d.clock()
+	if err != nil {
+		return 0, err
+	}
+	if now < d.clockHigh {
+		return 0, fmt.Errorf("continuous clock regressed from %d to %d", d.clockHigh, now)
+	}
+	d.clockHigh = now
+	return now, nil
 }
 
 // v3HorizonCandidate is start + R - epsilon(R) with

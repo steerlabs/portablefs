@@ -71,7 +71,7 @@ func peerV3PublicationState(c *v3SourcePublicationCoordinator) (uint64, int) {
 func sourceV3PublicationHeld(c *v3SourcePublicationCoordinator, coordinate v3PublicationCoordinate) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.sourceHolds[coordinate] != nil
+	return len(c.sourceHolds[coordinate]) != 0
 }
 
 func TestV3SourcePublicationGateCanonicalizesExactStableCoordinates(t *testing.T) {

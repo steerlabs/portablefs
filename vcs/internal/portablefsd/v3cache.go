@@ -262,7 +262,8 @@ func (d *v3DataPlane) cacheAdmissibleLocked() bool {
 	if d.terminal != nil || d.horizon == 0 || !d.client.LocalAdmissionOpen() {
 		return false
 	}
-	if now, err := d.clock(); err != nil || now >= d.horizon {
+	if now, err := d.readClockLocked(); err != nil || now >= d.horizon {
+		// A clock fault admits nothing here; the next renewal ends serving.
 		return false
 	}
 	return d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)
@@ -319,9 +320,9 @@ func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRe
 
 // v3CachedReply is a reply computed from the cache but not yet exposed. Its
 // revalidation runs under the frontend's frame write lock immediately before
-// the physical write, so poison, horizon expiry, an intervening mutation, or a
-// new source hold between the hit and the write cannot let a stale unexposed
-// success escape.
+// the physical write, so poison, horizon expiry, a changed authorization
+// generation, an intervening mutation, or a new source hold between the hit
+// and the write cannot let a stale unexposed success escape.
 type v3CachedReply struct {
 	revalidate func() bool
 }
@@ -394,10 +395,11 @@ func (d *v3DataPlane) serveCached(
 		return false, 0
 	}
 	hit := false
+	var generation uint64
 	d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		hit = snapshot(conflict, collector)
+		hit, generation = snapshot(conflict, collector), d.authGeneration
 	})
 	if !hit {
 		receipt.Consume()
@@ -412,7 +414,9 @@ func (d *v3DataPlane) serveCached(
 		d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
 			d.mu.Lock()
 			defer d.mu.Unlock()
-			admitted = recheck(conflict)
+			// A reauthorization since the snapshot voids the candidate even if
+			// a fresh proof now admits an identical answer.
+			admitted = d.authGeneration == generation && recheck(conflict)
 		})
 		return admitted
 	}}

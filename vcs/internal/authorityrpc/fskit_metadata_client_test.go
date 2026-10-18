@@ -13,61 +13,55 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-// fskitProofTestHandler is a negotiated FSKit authority whose KeepAlive proof
+// fskitProofTestHandler is a negotiated FSKit authority whose KeepAlive reply
 // and per-request extras are controlled by the test.
 type fskitProofTestHandler struct {
 	fskitFeatureTestHandler
 	mu           *sync.Mutex
 	proof        *uint64
-	readProof    *uint64 // stamped on a non-KeepAlive reply
-	failProof    *bool   // stamp the proof on a refused KeepAlive
+	keepAlive    *func(*authoritypb.Response) // adjusts the KeepAlive reply
+	ackProof     *uint64                      // stamped on a bodyless repair acknowledgement
 	helloOffered *atomic.Value
-	dropEcho     *atomic.Bool // stop echoing the metadata feature in Hello
 	reauthorized int64
 }
 
 func newFskitProofTestHandler() fskitProofTestHandler {
-	proof, readProof, failProof := new(uint64), new(uint64), new(bool)
 	offered := &atomic.Value{}
 	offered.Store([]string(nil))
 	return fskitProofTestHandler{
 		fskitFeatureTestHandler: fskitFeatureTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 4}},
-		mu:                      &sync.Mutex{}, proof: proof, readProof: readProof, failProof: failProof, helloOffered: offered,
-		dropEcho: &atomic.Bool{},
+		mu:                      &sync.Mutex{}, proof: new(uint64), keepAlive: new(func(*authoritypb.Response)), ackProof: new(uint64),
+		helloOffered: offered,
 	}
 }
 
-func (h fskitProofTestHandler) set(proof, readProof uint64, failProof bool) {
+func (h fskitProofTestHandler) set(proof uint64, keepAlive func(*authoritypb.Response), ackProof uint64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	*h.proof, *h.readProof, *h.failProof = proof, readProof, failProof
+	*h.proof, *h.keepAlive, *h.ackProof = proof, keepAlive, ackProof
 }
 
 func (h fskitProofTestHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
 	h.mu.Lock()
-	proof, readProof, failProof := *h.proof, *h.readProof, *h.failProof
+	proof, keepAlive, ackProof := *h.proof, *h.keepAlive, *h.ackProof
 	h.mu.Unlock()
 	switch req.GetBody().(type) {
 	case *authoritypb.Request_Hello:
 		h.helloOffered.Store(append([]string(nil), req.GetHello().GetFeatures()...))
 	case *authoritypb.Request_KeepAlive:
 		response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch(), SessionValidForNanos: proof}
-		if failProof {
-			response.Errno = 5
+		if keepAlive != nil {
+			keepAlive(response)
 		}
 		return response
+	case *authoritypb.Request_AckFskitRepair:
+		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch(), SessionValidForNanos: ackProof}
 	case *authoritypb.Request_Reauthorize:
 		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch(), Body: &authoritypb.Response_Reauthorize{
 			Reauthorize: &authoritypb.ReauthorizeReply{Sequence: req.GetReauthorize().GetSequence(), AuthorizationDeadlineUnixNanos: h.reauthorized},
 		}}
-	case *authoritypb.Request_GetAttr:
-		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch(), SessionValidForNanos: readProof,
-			Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: testAuthorityRoot().GetAttr()}}}
 	}
 	response := h.fskitFeatureTestHandler.Handle(ctx, req)
-	if hello := response.GetHello(); hello != nil && h.dropEcho.Load() {
-		hello.Features = slices.DeleteFunc(hello.Features, func(feature string) bool { return feature == fskitVersionedMetadataFeature })
-	}
 	if h.mountEnrollment {
 		enrollment := []string{sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature}
 		if hello := response.GetHello(); hello != nil {
@@ -150,9 +144,12 @@ func (h recordingHelloHandler) Handle(ctx context.Context, req *authoritypb.Requ
 	return h.clientTestHandler.Handle(ctx, req)
 }
 
-// A negotiated KeepAlive must carry a positive whole-millisecond proof within
-// both the advertised lease and MaxCacheProof. An overgrant is a protocol
-// defect that ends the session; it is never clamped.
+// The client owns the session-dependent half of the proof: present and
+// positive on every successful negotiated renewal, and never beyond the
+// advertised lease. An overgrant ends the session; it is never clamped. The
+// proof's own grammar (whole milliseconds, at most MaxCacheProof, plain success
+// envelope) is the frame layer's and is covered by
+// TestKeepAliveProofCanonicalFrame.
 func TestFskitKeepAliveValidatesTheSessionProof(t *testing.T) {
 	const lease = 30 * time.Second // clientTestHandler's advertised lease
 	for _, test := range []struct {
@@ -162,90 +159,122 @@ func TestFskitKeepAliveValidatesTheSessionProof(t *testing.T) {
 	}{
 		{name: "lease", proof: uint64(lease), valid: true},
 		{name: "one-millisecond", proof: uint64(time.Millisecond), valid: true},
-		{name: "zero", proof: 0},
-		{name: "sub-millisecond", proof: uint64(lease) - 1},
+		{name: "missing", proof: 0},
 		{name: "beyond-lease", proof: uint64(lease + time.Millisecond)},
-		{name: "beyond-max-cache-proof", proof: uint64(MaxCacheProof + time.Millisecond)},
-		{name: "overflow", proof: ^uint64(0) &^ (uint64(time.Millisecond) - 1)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			handler := newFskitProofTestHandler()
-			handler.set(test.proof, 0, false)
+			handler.set(test.proof, nil, 0)
 			client, err := dialFskitProofTestClient(t, handler, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			proof, err := client.KeepAlive(t.Context())
 			if test.valid {
-				if err != nil || proof != time.Duration(test.proof) {
-					t.Fatalf("keepalive = (%s,%v), want %s", proof, err, time.Duration(test.proof))
-				}
-				if !client.LocalAdmissionOpen() {
-					t.Fatal("a valid proof closed admission")
+				if err != nil || proof != time.Duration(test.proof) || !client.LocalAdmissionOpen() {
+					t.Fatalf("keepalive = (%s,%v) admission=%t, want %s", proof, err, client.LocalAdmissionOpen(), time.Duration(test.proof))
 				}
 				return
 			}
-			if err == nil || proof != 0 {
-				t.Fatalf("keepalive with proof %d = (%s,%v), want a protocol refusal", test.proof, proof, err)
-			}
-			if client.LocalAdmissionOpen() {
-				t.Fatal("a malformed negotiated proof left the session admitting requests")
+			if !errors.Is(err, ErrTransportBinding) || proof != 0 || client.LocalAdmissionOpen() {
+				t.Fatalf("keepalive with proof %d = (%s,%v) admission=%t, want a terminal refusal", test.proof, proof, err, client.LocalAdmissionOpen())
 			}
 		})
 	}
 }
 
-// The authority caps every proof at MaxCacheProof even under a longer lease;
-// the client enforces the same frozen ceiling.
-func TestFskitKeepAliveRefusesAProofBeyondMaxCacheProofUnderALongLease(t *testing.T) {
-	handler := newFskitProofTestHandler()
-	handler.set(uint64(MaxCacheProof+time.Second), 0, false)
-	client, err := dialFskitProofTestClient(t, longLeaseHandler{handler}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lease := client.SessionLease(); lease <= MaxCacheProof+time.Second {
-		t.Fatalf("lease = %s, want longer than the proof", lease)
-	}
-	if _, err := client.KeepAlive(t.Context()); !errors.Is(err, ErrTransportBinding) {
-		t.Fatalf("keepalive beyond MaxCacheProof = %v, want a protocol refusal", err)
+// Only the complete KeepAlive success shape renews. A reply the frame layer
+// admits but that contradicts success (replay state, a route record, or, with
+// no proof to trip the frame grammar, a failure class or a body) ends the
+// session and never yields a proof.
+func TestKeepAliveRequiresTheCompleteSuccessShape(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		fskit  bool
+		mutate func(*authoritypb.Response)
+	}{
+		{name: "negotiated-with-replay-state", fskit: true, mutate: func(r *authoritypb.Response) {
+			r.Mutation = &authoritypb.MutationState{Slot: 1, AcceptedSequence: 1}
+		}},
+		{name: "negotiated-with-route-record", fskit: true, mutate: func(r *authoritypb.Response) {
+			r.RoutesMismatch = &authoritypb.RoutesMismatch{ActiveRevision: make([]byte, 32), PresentedRevision: make([]byte, 32)}
+		}},
+		{name: "linux-failure-class", mutate: func(r *authoritypb.Response) { r.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL }},
+		{name: "linux-body", mutate: func(r *authoritypb.Response) {
+			r.Body = &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{}}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var client *Client
+			var err error
+			if test.fskit {
+				handler := newFskitProofTestHandler()
+				handler.set(uint64(time.Second), test.mutate, 0)
+				client, err = dialFskitProofTestClient(t, handler, nil)
+			} else {
+				client, err = dialLinuxKeepAliveTestClient(t, test.mutate)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if proof, err := client.KeepAlive(t.Context()); err == nil || proof != 0 || client.LocalAdmissionOpen() {
+				t.Fatalf("contradicting keepalive = (%s,%v) admission=%t, want a terminal refusal", proof, err, client.LocalAdmissionOpen())
+			}
+		})
 	}
 }
 
-type longLeaseHandler struct{ fskitProofTestHandler }
+// keepAliveTestHandler is a Linux-profile authority whose KeepAlive reply the
+// test adjusts.
+type keepAliveTestHandler struct {
+	clientTestHandler
+	mutate func(*authoritypb.Response)
+}
 
-func (h longLeaseHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
-	response := h.fskitProofTestHandler.Handle(ctx, req)
-	if active := response.GetActivate(); active != nil {
-		active.SessionLeaseMilliseconds = uint64((10 * time.Minute) / time.Millisecond)
+func (h keepAliveTestHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
+	response := h.clientTestHandler.Handle(ctx, req)
+	if req.GetKeepAlive() != nil && h.mutate != nil {
+		h.mutate(response)
 	}
 	return response
 }
 
-// The proof field is admitted only on a successful negotiated KeepAlive: on
-// any other reply, or on a refused renewal, it is a terminal defect.
-func TestFskitSessionProofOutsideASuccessfulKeepAliveIsRefused(t *testing.T) {
-	t.Run("ordinary-read", func(t *testing.T) {
+func dialLinuxKeepAliveTestClient(t *testing.T, mutate func(*authoritypb.Response)) (*Client, error) {
+	t.Helper()
+	address, tls, stop := startTestServer(t, keepAliveTestHandler{clientTestHandler{epoch: make([]byte, 16), maxInFlight: 4}, mutate}, 4, time.Minute)
+	t.Cleanup(stop)
+	cfg := coherentTestClientConfig(address, tls, "linux", 4, 4)
+	cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+	client, err := DialClient(t.Context(), cfg)
+	if err == nil {
+		t.Cleanup(func() { _ = client.Close() })
+	}
+	return client, err
+}
+
+// The frame layer cannot see the request or the negotiation: a proof on a
+// reply to anything but KeepAlive, or to a session that never negotiated the
+// feature, is refused by the client as a terminal defect.
+func TestSessionProofOutsideANegotiatedKeepAliveIsRefused(t *testing.T) {
+	t.Run("non-keepalive-request", func(t *testing.T) {
 		handler := newFskitProofTestHandler()
-		handler.set(uint64(time.Second), uint64(time.Second), false)
+		handler.set(uint64(time.Second), nil, uint64(time.Second))
 		client, err := dialFskitProofTestClient(t, handler, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = client.CallRead(t.Context(), &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Item: make([]byte, 16)}}})
+		err = client.AckVisibility(t.Context(), &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE})
 		if !errors.Is(err, ErrTransportBinding) || client.LocalAdmissionOpen() {
-			t.Fatalf("proof on GetAttr = %v admission=%t, want terminal refusal", err, client.LocalAdmissionOpen())
+			t.Fatalf("proof on a repair acknowledgement = %v admission=%t, want terminal refusal", err, client.LocalAdmissionOpen())
 		}
 	})
-	t.Run("refused-keepalive", func(t *testing.T) {
-		handler := newFskitProofTestHandler()
-		handler.set(uint64(time.Second), 0, true)
-		client, err := dialFskitProofTestClient(t, handler, nil)
+	t.Run("non-negotiated-session", func(t *testing.T) {
+		client, err := dialLinuxKeepAliveTestClient(t, func(r *authoritypb.Response) { r.SessionValidForNanos = uint64(time.Second) })
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := client.KeepAlive(t.Context()); !errors.Is(err, ErrTransportBinding) || client.LocalAdmissionOpen() {
-			t.Fatalf("proof on refused keepalive = %v, want terminal refusal", err)
+			t.Fatalf("proof to a non-negotiated session = %v, want terminal refusal", err)
 		}
 	})
 }
@@ -309,25 +338,5 @@ func TestLocalPublicationParticipatesInTerminalRevocation(t *testing.T) {
 	}
 	if forced.Load() != 0 {
 		t.Fatal("a consumed local reply was force-revoked")
-	}
-}
-
-// Same-session transport recovery must renegotiate the identical contract: a
-// resumed transport whose Hello no longer echoes the metadata feature is
-// refused instead of silently continuing without it.
-func TestFskitTransportRecoveryRefusesAChangedMetadataContract(t *testing.T) {
-	handler := newFskitProofTestHandler()
-	client, err := dialFskitProofTestClient(t, handler, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler.dropEcho.Store(true)
-	client.data.pendingMu.Lock()
-	old := client.data.conn
-	client.data.pendingMu.Unlock()
-	client.failConnection(client.data, old, ErrTransportUncertain)
-	_, err = client.CallRead(t.Context(), &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Item: make([]byte, 16)}}})
-	if err == nil || !strings.Contains(err.Error(), fskitVersionedMetadataFeature) {
-		t.Fatalf("recovery with a changed contract = %v, want a refusal naming the feature", err)
 	}
 }

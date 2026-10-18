@@ -242,7 +242,7 @@ type v3SourcePublicationCoordinator struct {
 	changed              chan struct{}
 	terminal             error
 	operations           map[uint64]*v3SourcePublicationOperation
-	sourceHolds          map[v3PublicationCoordinate]*v3SourcePublicationLease
+	sourceHolds          map[v3PublicationCoordinate]map[*v3SourcePublicationLease]struct{} // every holder; see holdLocked
 	unresolvedAttributes map[*v3SourcePublicationLease]int
 	unresolvedData       map[*v3SourcePublicationLease]int
 	peerSequence         uint64
@@ -258,7 +258,7 @@ func newV3SourcePublicationCoordinator() *v3SourcePublicationCoordinator {
 	return &v3SourcePublicationCoordinator{
 		changed:              make(chan struct{}),
 		operations:           make(map[uint64]*v3SourcePublicationOperation),
-		sourceHolds:          make(map[v3PublicationCoordinate]*v3SourcePublicationLease),
+		sourceHolds:          make(map[v3PublicationCoordinate]map[*v3SourcePublicationLease]struct{}),
 		unresolvedAttributes: make(map[*v3SourcePublicationLease]int),
 		unresolvedData:       make(map[*v3SourcePublicationLease]int),
 		peerHolds:            make(map[v3PublicationCoordinate]struct{}),
@@ -435,12 +435,39 @@ func coordinatesForV3PeerTargets(targets []*authoritypb.VisibilityTarget) (map[v
 	return coordinates, nil
 }
 
+// heldByOtherLocked reports whether any lease other than owner holds the
+// exact coordinate (coordinates overlap only when equal).
+func (c *v3SourcePublicationCoordinator) heldByOtherLocked(coordinate v3PublicationCoordinate, owner *v3SourcePublicationLease) bool {
+	for holder := range c.sourceHolds[coordinate] {
+		if holder != owner {
+			return true
+		}
+	}
+	return false
+}
+
+// holdLocked records lease as a holder of coordinate. Acquisition admits one
+// holder per coordinate, but a namespace lease's unresolved claim can resolve
+// onto an identity an item-only lease already holds (the legal overlap of a
+// rename with a setattr of the renamed object); both then hold it until each
+// publishes.
+func (c *v3SourcePublicationCoordinator) holdLocked(coordinate v3PublicationCoordinate, lease *v3SourcePublicationLease) {
+	if _, exists := lease.coordinates[coordinate]; exists {
+		return
+	}
+	lease.coordinates[coordinate] = struct{}{}
+	holders := c.sourceHolds[coordinate]
+	if holders == nil {
+		holders = make(map[*v3SourcePublicationLease]struct{}, 1)
+		c.sourceHolds[coordinate] = holders
+	}
+	holders[lease] = struct{}{}
+}
+
 func (c *v3SourcePublicationCoordinator) sourceConflictLocked(coordinates map[v3PublicationCoordinate]struct{}, owner *v3SourcePublicationLease) bool {
 	for coordinate := range coordinates {
-		for heldCoordinate, held := range c.sourceHolds {
-			if held != owner && v3PublicationCoordinatesOverlap(coordinate, heldCoordinate) {
-				return true
-			}
+		if c.heldByOtherLocked(coordinate, owner) {
+			return true
 		}
 	}
 	return false
@@ -493,11 +520,9 @@ func (c *v3SourcePublicationCoordinator) unresolvedConflictsExistingLocked(names
 	if !attributes && !data {
 		return false
 	}
-	for coordinate, lease := range c.sourceHolds {
-		if lease == owner {
-			continue
-		}
-		if attributes && coordinate.kind == v3PublicationItemAttributes || data && coordinate.kind == v3PublicationItemData {
+	for coordinate := range c.sourceHolds {
+		if (attributes && coordinate.kind == v3PublicationItemAttributes || data && coordinate.kind == v3PublicationItemData) &&
+			c.heldByOtherLocked(coordinate, owner) {
 			return true
 		}
 	}
@@ -574,10 +599,7 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 		}
 		lease.acquisitions++
 		for coordinate := range coordinates {
-			if _, exists := lease.coordinates[coordinate]; !exists {
-				lease.coordinates[coordinate] = struct{}{}
-				c.sourceHolds[coordinate] = lease
-			}
+			c.holdLocked(coordinate, lease)
 		}
 		for namespace, bounds := range names {
 			claims := lease.names[namespace]
@@ -624,7 +646,7 @@ func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 			return true
 		}
 		for _, coordinate := range coordinates {
-			if _, held := c.sourceHolds[coordinate]; held {
+			if len(c.sourceHolds[coordinate]) != 0 {
 				return true
 			}
 			switch coordinate.kind {
@@ -655,7 +677,8 @@ func (c *v3SourcePublicationCoordinator) observeLease(lease *v3SourcePublication
 	}
 	coordinate := v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: namespace.parent, name: namespace.name}
 	claims := lease.names[namespace]
-	exclusive := c.terminal == nil && !lease.released && c.sourceHolds[coordinate] == lease &&
+	_, held := c.sourceHolds[coordinate][lease]
+	exclusive := c.terminal == nil && !lease.released && held && len(c.sourceHolds[coordinate]) == 1 &&
 		claims.attributes == 1 && claims.data == 0
 	observe(lease.acquisitions, exclusive)
 }
@@ -810,14 +833,15 @@ func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePu
 	if !l.hasNamespaceClaimLocked(namespace, bounds) {
 		return errors.New("portablefsd: definitive source binding was outside its declared namespace")
 	}
+	// The resolved identity's coordinates join this lease's holds. Another
+	// source lease may already hold them: an item-only mutation of the same
+	// object is never gated by this lease's unresolved claim, so both callbacks
+	// can be legally in flight and each keeps the coordinate held until it
+	// publishes. Peer repair and cache hits wait for every holder.
 	additional := make(map[v3PublicationCoordinate]struct{}, 2)
 	addV3BoundCoordinates(additional, identity, bounds)
-	if c.sourceConflictLocked(additional, l) {
-		return errors.New("portablefsd: source publication crossed an unresolved source binding")
-	}
 	for coordinate := range additional {
-		l.coordinates[coordinate] = struct{}{}
-		c.sourceHolds[coordinate] = l
+		c.holdLocked(coordinate, l)
 	}
 	l.consumeNamespaceClaimLocked(namespace, bounds)
 	l.updateUnresolvedIndexesLocked()
@@ -926,7 +950,9 @@ func (c *v3SourcePublicationCoordinator) releaseSourceLocked(lease *v3SourcePubl
 	delete(c.unresolvedAttributes, lease)
 	delete(c.unresolvedData, lease)
 	for coordinate := range lease.coordinates {
-		if c.sourceHolds[coordinate] == lease {
+		holders := c.sourceHolds[coordinate]
+		delete(holders, lease)
+		if len(holders) == 0 {
 			delete(c.sourceHolds, coordinate)
 		}
 	}

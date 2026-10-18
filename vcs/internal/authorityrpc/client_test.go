@@ -2501,6 +2501,8 @@ type replayHandler struct {
 	releaseFirst   chan struct{}
 	mutationCalls  atomic.Int32
 	applyCalls     atomic.Int32
+	// fskit serves the negotiated FSKit profile, including batched close.
+	fskit bool
 }
 
 func (h *replayHandler) Epoch() []byte {
@@ -2611,12 +2613,17 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if !ok {
 			return fail(int32(syscall.EINVAL))
 		}
-		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
+		reply := &authoritypb.HelloReply{
 			ProtocolMajor: ProtocolMajor, Features: features,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: uint32(bounds.MaxInFlight),
 			Role: helloRequest.GetRole(), ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
 			FrontendProfile: helloRequest.GetFrontendProfile(),
-		}}}
+		}
+		if h.fskit {
+			reply.Features = append(reply.Features, fskitDirectWriteFeature, fskitVersionedMetadataFeature)
+			reply.MaxFskitWriteBytes = RequiredFskitWriteBytes
+		}
+		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Hello{Hello: reply}}
 	case *authoritypb.Request_Attach:
 		cred, attempt, deadline, err := prepareFixtureAttach(ctx, h.runtime, req, h.access)
 		if err != nil {
@@ -2648,13 +2655,20 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if !token.Replay() {
 			h.runtime.CommitActivation(token)
 		}
-		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
+		active := &authoritypb.ActivateReply{
 			Root: testAuthorityRoot(), Features: append(append([]string(nil), requiredAttachFeatures...), requiredStrictAttachFeatures...),
 			SessionLeaseMilliseconds: uint64(h.runtime.SessionLease() / time.Millisecond),
 			RoutesRevision:           make([]byte, 32), State: authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		}}}
+		}
+		if h.fskit {
+			active.Features, _ = advertisedActivateFeatures(authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
+			active.Features = append(active.Features, fskitVersionedMetadataFeature)
+			active.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+			active.FskitRepairCursor = &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE}
+		}
+		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Activate{Activate: active}}
 	case *authoritypb.Request_Resume:
 		var cred volumeserver.SessionCredential
 		if len(req.GetEpoch()) != len(cred.Epoch) || req.GetSession() == nil {
@@ -2729,9 +2743,22 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	}
 	id := volumeserver.MutationID{Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Fingerprint: fingerprint}
 	mutationCall := h.mutationCalls.Add(1)
-	_, err = h.runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
+	outcome, err := h.runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
 		h.applyCalls.Add(1)
-		return volumeserver.Outcome{}
+		closes := req.GetCloseBatch().GetCloses()
+		if len(closes) == 0 {
+			return volumeserver.Outcome{}
+		}
+		// Each first-time close retires; the retained outcome is what replays.
+		results := make([]*authoritypb.CloseBatchResult, len(closes))
+		for index := range closes {
+			results[index] = &authoritypb.CloseBatchResult{Retired: true}
+		}
+		reply, err := proto.Marshal(&authoritypb.CloseBatchReply{Results: results})
+		if err != nil {
+			return volumeserver.Outcome{Errno: int32(syscall.EIO)}
+		}
+		return volumeserver.Outcome{Reply: reply}
 	})
 	if err != nil {
 		switch {
@@ -2745,7 +2772,14 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		close(h.afterExecution)
 		<-h.releaseFirst
 	}
-	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch}
+	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Errno: outcome.Errno}
+	if len(outcome.Reply) != 0 {
+		var retained authoritypb.CloseBatchReply
+		if err := proto.Unmarshal(outcome.Reply, &retained); err != nil {
+			return fail(int32(syscall.EIO))
+		}
+		response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &retained}
+	}
 	if !h.suppressState {
 		response.Mutation = &authoritypb.MutationState{Slot: id.Slot, AcceptedSequence: id.Sequence}
 	}
@@ -2801,6 +2835,77 @@ func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
 	}
 	if calls, applies := handler.mutationCalls.Load(), handler.applyCalls.Load(); calls != 2 || applies != 1 {
 		t.Fatalf("reclaim wire calls=%d apply calls=%d, want 2 and 1", calls, applies)
+	}
+}
+
+// FSKit releases descriptors only through CloseBatch, so a lost CloseBatch
+// reply must replay its exact retained per-handle outcome after same-session
+// recovery, with each close applied once and never retried item by item.
+func TestFskitCloseBatchLostReplyReplaysExactOutcome(t *testing.T) {
+	runtime, err := volumeserver.New("closebatch-replay-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &replayHandler{
+		runtime: runtime, access: volumeserver.AccessRead | volumeserver.AccessWrite, fskit: true,
+		afterExecution: make(chan struct{}), releaseFirst: make(chan struct{}),
+	}
+	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
+	defer stop()
+	cfg := coherentTestClientConfig(address, clientTLS, "closebatch-replay-volume", 4, 4)
+	cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+	cfg.FskitCachedNameCapacity = 16
+	cfg.FskitRepairBudget = time.Second
+	cfg.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED
+	client, err := DialClient(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if !client.SupportsBatchedClose() {
+		t.Fatal("negotiated FSKit session does not report batched close")
+	}
+
+	type result struct {
+		response *authoritypb.Response
+		err      error
+	}
+	completed := make(chan result, 1)
+	go func() {
+		batch := &authoritypb.CloseBatchRequest{}
+		for index := byte(1); index <= 3; index++ {
+			batch.Closes = append(batch.Closes, &authoritypb.CloseRequest{Handle: bytes.Repeat([]byte{0xa0 + index}, 16)})
+		}
+		response, err := client.CallMutation(context.Background(), &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}})
+		completed <- result{response: response, err: err}
+	}()
+	select {
+	case <-handler.afterExecution:
+	case <-time.After(time.Second):
+		t.Fatal("CloseBatch did not reach its recorded-outcome boundary")
+	}
+	client.data.pendingMu.Lock()
+	oldConn := client.data.conn
+	client.data.pendingMu.Unlock()
+	client.failConnection(client.data, oldConn, ErrTransportUncertain)
+	close(handler.releaseFirst)
+
+	select {
+	case got := <-completed:
+		results := got.response.GetCloseBatch().GetResults()
+		if got.err != nil || got.response.GetErrno() != 0 || got.response.GetMutation() == nil || len(results) != 3 {
+			t.Fatalf("replayed CloseBatch=(%v,%v)", got.response, got.err)
+		}
+		for index, entry := range results {
+			if !entry.GetRetired() || entry.GetErrno() != 0 {
+				t.Fatalf("replayed CloseBatch entry %d = %v, want the retained retirement", index, entry)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseBatch did not reconnect and replay after its lost reply")
+	}
+	if calls, applies := handler.mutationCalls.Load(), handler.applyCalls.Load(); calls != 2 || applies != 1 {
+		t.Fatalf("CloseBatch wire calls=%d apply calls=%d, want 2 and 1", calls, applies)
 	}
 }
 

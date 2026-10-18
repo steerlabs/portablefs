@@ -1178,3 +1178,66 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 		t.Fatal("revived v3 attach was not released by the exact unmount")
 	}
 }
+
+// A detach whose release drain fails or cannot settle completes local
+// teardown but never reports a clean unmount: no authenticated Detach claims
+// the unsettled releases, the failure is the unmount's outcome, and a retry
+// only finishes the registry removal.
+func TestV3DetachReportsAnUnsettledReleaseDrain(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		inject func(*v3ReleaseOwner)
+	}{
+		{name: "sticky-release-failure", inject: func(r *v3ReleaseOwner) {
+			r.failure = errors.New("injected release failure")
+		}},
+		{name: "drain-deadline", inject: func(r *v3ReleaseOwner) {
+			// Accepted work that never settles inside the detach budget.
+			r.running = true
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			previous := v3DetachProofBudget
+			v3DetachProofBudget = 100 * time.Millisecond
+			t.Cleanup(func() { v3DetachProofBudget = previous })
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			t.Cleanup(r.stopPersister)
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3DrainFailure"))
+			d := a.v3Backend()
+			d.releases.mu.Lock()
+			test.inject(d.releases)
+			d.releases.mu.Unlock()
+			var mu sync.Mutex
+			unmounted := false
+			ops := fskitKernelOps{
+				present: func(string, string) (bool, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					return !unmounted, nil
+				},
+				unmountExact: func(string, string, bool) error {
+					mu.Lock()
+					defer mu.Unlock()
+					unmounted = true
+					return nil
+				},
+			}
+			found, _, err := r.unmountFSKitWith(a.ref, false, ops)
+			if !found || err == nil || !strings.Contains(err.Error(), "releases did not settle") {
+				t.Fatalf("unmount with an unsettled drain = (%v,%v), want the release failure", found, err)
+			}
+			if handler.recordedDetach() != nil {
+				t.Fatal("an authenticated detach claimed releases that did not settle")
+			}
+			if !a.isDetached() || d.terminalError() == nil {
+				t.Fatal("local teardown did not complete")
+			}
+			if found, _, err := r.unmountFSKitWith(a.ref, false, ops); !found || err != nil || r.get(a.ref) != nil {
+				t.Fatalf("retried unmount = (%v,%v) registered=%t, want only the registry removal", found, err, r.get(a.ref) != nil)
+			}
+		})
+	}
+}

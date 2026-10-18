@@ -628,6 +628,16 @@ func TestV3ReleaseBatchFailuresAreTerminal(t *testing.T) {
 		{name: "reclaim-errno", reclaim: true, mutate: func(r *authoritypb.Response) {
 			r.Errno = errnos.ESTALE
 		}},
+		// Whole-outcome shapes generic classification would admit.
+		{name: "closebatch-top-level-failure-class", mutate: func(r *authoritypb.Response) {
+			r.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL
+		}},
+		{name: "reclaim-failure-class", reclaim: true, mutate: func(r *authoritypb.Response) {
+			r.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL
+		}},
+		{name: "reclaim-with-closebatch-body", reclaim: true, mutate: func(r *authoritypb.Response) {
+			r.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{}}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newFakeV3DataClient()
@@ -796,5 +806,47 @@ func TestV3AbandonmentAndCloseRaceReleaseOnce(t *testing.T) {
 	}
 	if total != 1 || d.terminalError() != nil {
 		t.Fatalf("handle released %d times terminal=%v, want once", total, d.terminalError())
+	}
+}
+
+// The pointer-to-lock window itself: a call resolves the handle, pauses before
+// taking its shared lock, a Close wins and retires the handle, and the call
+// must then refuse under its lock instead of using the released token.
+func TestV3HandleRevalidatesAfterAPausedPointerResolution(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
+	id := openV3TestHandles(t, d, file.Item, 1)[0]
+	resolved, resume := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	d.testBeforeHandleLock = func(*v3HandleRecord) {
+		once.Do(func() {
+			close(resolved)
+			<-resume
+		})
+	}
+	readsBefore := func() int {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.readCalls
+	}()
+	read := make(chan int32, 1)
+	go func() {
+		_, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReadRequest{Handle: id, Length: 1})
+		read <- errno
+	}()
+	<-resolved
+	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.CloseRequest{Handle: id}); errno != 0 {
+		t.Fatalf("close errno=%d", errno)
+	}
+	close(resume)
+	if errno := <-read; errno != darwinEBADF {
+		t.Fatalf("read that lost the race to Close errno=%d, want EBADF", errno)
+	}
+	client.mu.Lock()
+	reads := client.readCalls
+	client.mu.Unlock()
+	if reads != readsBefore {
+		t.Fatalf("a read of a closed handle reached the authority %d time(s)", reads-readsBefore)
 	}
 }

@@ -34,6 +34,18 @@ func (c *fakeV3Clock) advance(elapsed time.Duration) {
 	c.now += uint64(elapsed)
 }
 
+func (c *fakeV3Clock) rewind(elapsed time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now -= uint64(elapsed)
+}
+
+func (c *fakeV3Clock) fail(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = err
+}
+
 // testV3DataPlaneWithClock is testV3DataPlane on a controlled clock, returned
 // after its initial keepalive proof has been adopted (or refused).
 func testV3DataPlaneWithClock(t *testing.T, client *fakeV3DataClient, clock *fakeV3Clock) *v3DataPlane {
@@ -315,4 +327,54 @@ func TestV3TicksToNanosIsChecked(t *testing.T) {
 
 func newV3LivenessRequest(client *fakeV3DataClient) *pfslocal.V3LivenessRequest {
 	return &pfslocal.V3LivenessRequest{AuthorityEpoch: client.Epoch(), SessionID: client.SessionID()}
+}
+
+// A clock fault during renewal voids every horizon measured on that clock:
+// the horizon is cleared, no candidate is installed, and serving ends while
+// the authority transport stays for the exact absence proof.
+func TestV3ClockFaultDuringRenewalEndsServing(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		fault func(*fakeV3Clock)
+	}{
+		{name: "read-error", fault: func(c *fakeV3Clock) { c.fail(errors.New("timebase lost")) }},
+		{name: "regression", fault: func(c *fakeV3Clock) { c.rewind(2 * time.Minute) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newFakeV3Clock()
+			client := newFakeV3DataClient()
+			d := testV3DataPlaneWithClock(t, client, clock)
+			if v3Horizon(d) == 0 {
+				t.Fatal("no initial horizon")
+			}
+			client.mu.Lock()
+			client.keepAlive = func(context.Context) (time.Duration, error) {
+				test.fault(clock) // between request start and receipt
+				return time.Minute, nil
+			}
+			client.mu.Unlock()
+			if err := d.renewHorizon(context.Background()); err != nil {
+				t.Fatalf("renewal returned %v; the clock fault is not a session failure", err)
+			}
+			if v3Horizon(d) != 0 || d.terminalError() == nil {
+				t.Fatalf("after a clock fault horizon=%d terminal=%v, want no horizon and no serving", v3Horizon(d), d.terminalError())
+			}
+			select {
+			case <-client.SessionDone():
+				t.Fatal("a clock fault closed the authority transport needed for the absence proof")
+			default:
+			}
+		})
+	}
+}
+
+// A regression observed at hit admission admits no hit, even before the next
+// renewal ends serving.
+func TestV3ClockRegressionAdmitsNoHit(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	f.requireServedLocally("GetAttr before the regression", func() { f.getattr(file.Item) })
+	f.clock.rewind(time.Second)
+	f.requireAuthority("GetAttr after the regression", func() { f.getattr(file.Item) })
 }
