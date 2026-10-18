@@ -177,6 +177,7 @@ message Response {
     FsyncReply fsync = 66;
     CloseBatchReply close_batch = 68;
     WaitVisibilityReply wait_visibility = 71;
+    MkdirReply mkdir = 73;
   }
 }
 
@@ -531,6 +532,13 @@ message CreateReply {
   bool cache_capable = 4; // authority-admitted capability for this handle
 }
 message MkdirRequest { bytes parent = 1; bytes name = 2; uint32 mode = 3; }
+message MkdirReply {
+  Item item = 1;
+  // Kernel-evaluated child search access at the Item/PostState commit cut.
+  // False is an evaluated denial and does not fail the successful mkdir.
+  // Exact replay retains this observation; it never resamples permissions.
+  bool child_search_permitted = 2;
+}
 message UnlinkRequest { bytes parent = 1; bytes name = 2; bool directory = 3; }
 
 message RenameRequest {

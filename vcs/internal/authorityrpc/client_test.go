@@ -328,6 +328,12 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	case *authoritypb.Request_KeepAlive:
 		response.Errno = h.keepAliveErrno
 	case *authoritypb.Request_Cancel:
+	case *authoritypb.Request_Mkdir:
+		result := mkdirTestReply(false)
+		response.Body, response.PostState = result.Body, result.PostState
+		if mutation := req.GetMutation(); mutation != nil {
+			response.Mutation = &authoritypb.MutationState{Slot: mutation.GetSlot(), AcceptedSequence: mutation.GetSequence()}
+		}
 	case *authoritypb.Request_Write:
 		response.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(len(req.GetWrite().GetData()))}}
 	case *authoritypb.Request_StatFs:
@@ -2549,7 +2555,9 @@ type replayHandler struct {
 	releaseFirst   chan struct{}
 	mutationCalls  atomic.Int32
 	applyCalls     atomic.Int32
-	// fskit serves the negotiated FSKit profile, including batched close.
+	// mutationResult supplies a complete retained reply for result/replay tests.
+	mutationResult func() *authoritypb.Response
+	// fskit serves the FSKit profile, including batched close.
 	fskit bool
 }
 
@@ -2786,6 +2794,13 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	mutationCall := h.mutationCalls.Add(1)
 	outcome, err := h.runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
 		h.applyCalls.Add(1)
+		if h.mutationResult != nil {
+			reply, err := proto.MarshalOptions{Deterministic: true}.Marshal(h.mutationResult())
+			if err != nil {
+				return volumeserver.Outcome{Errno: int32(syscall.EIO)}
+			}
+			return volumeserver.Outcome{Reply: reply}
+		}
 		closes := req.GetCloseBatch().GetCloses()
 		if len(closes) == 0 {
 			return volumeserver.Outcome{}
@@ -2814,7 +2829,12 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		<-h.releaseFirst
 	}
 	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Errno: outcome.Errno}
-	if len(outcome.Reply) != 0 {
+	if req.GetMkdir() != nil && len(outcome.Reply) != 0 {
+		if err := proto.Unmarshal(outcome.Reply, response); err != nil {
+			return fail(int32(syscall.EIO))
+		}
+		response.RequestId, response.Epoch = req.GetRequestId(), epoch
+	} else if len(outcome.Reply) != 0 {
 		var retained authoritypb.CloseBatchReply
 		if err := proto.Unmarshal(outcome.Reply, &retained); err != nil {
 			return fail(int32(syscall.EIO))

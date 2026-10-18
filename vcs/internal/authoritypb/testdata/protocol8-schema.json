@@ -954,6 +954,15 @@
           "type_name": ".portablefs.authority.v1.WaitVisibilityReply",
           "oneof_index": 0,
           "json_name": "waitVisibility"
+        },
+        {
+          "name": "mkdir",
+          "number": 73,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.MkdirReply",
+          "oneof_index": 0,
+          "json_name": "mkdir"
         }
       ],
       "oneof_decl": [
@@ -2148,6 +2157,26 @@
           "label": 1,
           "type": 13,
           "json_name": "mode"
+        }
+      ]
+    },
+    {
+      "name": "MkdirReply",
+      "field": [
+        {
+          "name": "item",
+          "number": 1,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.Item",
+          "json_name": "item"
+        },
+        {
+          "name": "child_search_permitted",
+          "number": 2,
+          "label": 1,
+          "type": 8,
+          "json_name": "childSearchPermitted"
         }
       ]
     },

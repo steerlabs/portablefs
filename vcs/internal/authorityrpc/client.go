@@ -1515,6 +1515,9 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 		if err == nil {
 			err = c.validateSessionProofPlacement(request, completed.response)
 		}
+		if err == nil {
+			err = validateMkdirResult(request, completed.response)
+		}
 		if err != nil {
 			if completed.releaseFrame != nil {
 				completed.releaseFrame()
@@ -1628,10 +1631,8 @@ func (c *Client) CallReadRetained(
 }
 
 // CallIdempotent retries one same-epoch operation whose protocol definition
-// makes duplicate delivery harmless. In addition to reads, PortableFS write
-// BEGIN, DATA, and ABORT use this path: they mutate only bounded session-owned
-// staging and are idempotent by transaction identity. COMMIT must never use it;
-// COMMIT is replay-retained through CallMutationWithIdentity.
+// makes duplicate delivery harmless. Mutations that apply filesystem state use
+// CallMutationWithIdentity and retain their exact replay result instead.
 func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	response, releaseFrame, err := c.callIdempotentFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
@@ -1711,12 +1712,9 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 	return c.dispatchOwnedFrame(ctx, request)
 }
 
-// CallIdempotentRetained is the staged-write counterpart to
-// CallReadRetained. BEGIN/DATA/ABORT are transport-idempotent but their kernel
-// callback still owns any terminal response until its physical reply write.
-// A parsed response remains retained until the frontend physically exposes the
-// corresponding ordinary reply (or revokes that serving boundary). COMMIT
-// still uses the replay-slot mutation API.
+// CallIdempotentRetained retains the response until the frontend physically
+// exposes its reply or revokes that serving boundary. Applied filesystem
+// mutations use the replay-slot mutation API.
 func (c *Client) CallIdempotentRetained(
 	ctx context.Context,
 	request *authoritypb.Request,

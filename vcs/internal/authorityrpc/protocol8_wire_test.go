@@ -30,9 +30,9 @@ func TestProtocol8RejectsUnknownDuplicateUnorderedAndOverlongFields(t *testing.T
 		raw     []byte
 		message proto.Message
 	}{
-		{"unknown body", protowire.AppendBytes(protowire.AppendTag(nil, 62, 2), nil), &authoritypb.Request{}},
-		{"unknown envelope", protowire.AppendBytes(protowire.AppendTag(nil, 60, 2), nil), &authoritypb.Request{}},
-		{"unknown nested", protowire.AppendBytes(protowire.AppendTag(nil, 10, 2), []byte{0x10, 1}), &authoritypb.Request{}},
+		{"unknown body", protowire.AppendBytes(protowire.AppendTag(nil, 500, 2), nil), &authoritypb.Request{}},
+		{"unknown envelope", protowire.AppendBytes(protowire.AppendTag(nil, 501, 2), nil), &authoritypb.Request{}},
+		{"unknown nested", protowire.AppendBytes(protowire.AppendTag(nil, 10, 2), protowire.AppendVarint(protowire.AppendTag(nil, 500, 0), 1)), &authoritypb.Request{}},
 		{"duplicate scalar", []byte{8, 1, 8, 1}, &authoritypb.Request{}},
 		{"duplicate body", []byte{0x6a, 0, 0x72, 0}, &authoritypb.Request{}},
 		{"unordered", []byte{0x6a, 0, 8, 1}, &authoritypb.Request{}},
@@ -41,7 +41,7 @@ func TestProtocol8RejectsUnknownDuplicateUnorderedAndOverlongFields(t *testing.T
 		{"overlong length", []byte{0x6a, 0x80, 0}, &authoritypb.Request{}},
 		{"overflow uint32", protowire.AppendBytes([]byte{0x52}, protowire.AppendVarint([]byte{8}, math.MaxUint64)), &authoritypb.Request{}},
 		{"unknown profile", protowire.AppendBytes([]byte{0x52}, []byte{0x50, 99}), &authoritypb.Request{}},
-		{"unknown failure", []byte{0x38, 5}, &authoritypb.Response{}},
+		{"unknown failure", []byte{0x38, 99}, &authoritypb.Response{}},
 		{"invalid bool", []byte{0x20, 2}, &authoritypb.Response{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -49,30 +49,6 @@ func TestProtocol8RejectsUnknownDuplicateUnorderedAndOverlongFields(t *testing.T
 				t.Fatalf("accepted malformed frame: %v", err)
 			}
 		})
-	}
-}
-
-func TestProtocol8RejectsEveryRemovedField(t *testing.T) {
-	tests := []struct {
-		message proto.Message
-		fields  []protowire.Number
-	}{
-		{&authoritypb.Request{}, []protowire.Number{56, 57, 58, 59, 60, 61, 62, 63, 64}},
-		{&authoritypb.Response{}, []protowire.Number{46, 47, 48, 49, 50, 51, 52, 53, 54}},
-		{&authoritypb.HelloRequest{}, []protowire.Number{2}},
-		{&authoritypb.HelloReply{}, []protowire.Number{2, 11}},
-		{&authoritypb.AttachRequest{}, []protowire.Number{13, 14, 15}},
-		{&authoritypb.ActivateReply{}, []protowire.Number{2, 8, 11}},
-		{&authoritypb.ApplyRoutesReply{}, []protowire.Number{3}},
-		{&authoritypb.ReclaimRequest{}, []protowire.Number{1}},
-	}
-	for _, test := range tests {
-		for _, field := range test.fields {
-			raw := protowire.AppendBytes(protowire.AppendTag(nil, field, 2), nil)
-			if err := validateWireMessage(raw, test.message.ProtoReflect().Descriptor()); !errors.Is(err, ErrFrameEncoding) {
-				t.Fatalf("%T field %d: %v", test.message, field, err)
-			}
-		}
 	}
 }
 

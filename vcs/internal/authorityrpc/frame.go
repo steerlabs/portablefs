@@ -411,6 +411,9 @@ func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 			(proof > uint64(MaxCacheProof) || proof%uint64(time.Millisecond) != 0 || !keepAliveSucceeded(typed)) {
 			return nil, fmt.Errorf("%w: invalid KeepAlive validity proof", ErrFrameEncoding)
 		}
+		if _, mkdir := typed.GetBody().(*authoritypb.Response_Mkdir); mkdir && typed.GetErrno() == 0 && !typed.GetUncertain() && !validMkdirReply(typed) {
+			return nil, fmt.Errorf("%w: malformed mkdir result", ErrFrameEncoding)
+		}
 		if read := typed.GetRead(); read != nil {
 			return &read.Data, nil
 		}
