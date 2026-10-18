@@ -225,18 +225,15 @@ type v3SourcePublicationLease struct {
 	unresolvedAttributes int
 	unresolvedData       int
 	assigned             uint32
-	// acquisitions counts this callback's admitted source acquisitions, so a
-	// namespace errno witness can prove no same-callback request was admitted
-	// after it.
-	acquisitions uint64
-	released     bool
+	// active counts whole source handlers, through validated cache application
+	// and claim settlement. PublicationAck retains ordering holds independently.
+	active   uint32
+	released bool
 }
 
 // v3SourcePublicationCoordinator is the one local ordering point between
 // callback-owned source publication and authority-owned peer repair. It uses
-// stable identities only. The older mount-wide path handoff gate remains a
-// separate delegation mechanism and is never consulted for this correctness
-// cut.
+// stable identities only.
 type v3SourcePublicationCoordinator struct {
 	mu                   sync.Mutex
 	changed              chan struct{}
@@ -597,7 +594,7 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 		if op.lease == nil {
 			op.lease = lease
 		}
-		lease.acquisitions++
+		lease.active++
 		for coordinate := range coordinates {
 			c.holdLocked(coordinate, lease)
 		}
@@ -627,9 +624,9 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 	}
 }
 
-// v3CacheConflict reports whether any of the coordinates is held or claimed by
-// any source lease (the same callback's included) or by a peer cut.
-type v3CacheConflict func(coordinates ...v3PublicationCoordinate) bool
+// v3CacheConflict distinguishes live source holds from terminal admission or a
+// peer cut, which withdraws this session's cache service entirely.
+type v3CacheConflict func(coordinates ...v3PublicationCoordinate) v3CacheResult
 
 // cacheRead runs read under the coordinator mutex, the first lock of the short
 // coordinator → d.mu snapshot order used by cache hits. read may take d.mu and
@@ -641,46 +638,42 @@ type v3CacheConflict func(coordinates ...v3PublicationCoordinate) bool
 func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	read(func(coordinates ...v3PublicationCoordinate) bool {
+	read(func(coordinates ...v3PublicationCoordinate) v3CacheResult {
 		if c.terminal != nil || c.peerSequence != 0 {
-			return true
+			return v3CacheTerminal
 		}
 		for _, coordinate := range coordinates {
-			if len(c.sourceHolds[coordinate]) != 0 {
-				return true
+			for holder := range c.sourceHolds[coordinate] {
+				if holder.active != 0 || holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
+					return v3CacheHeld
+				}
 			}
 			switch coordinate.kind {
 			case v3PublicationItemAttributes:
 				if len(c.unresolvedAttributes) != 0 {
-					return true
+					return v3CacheHeld
 				}
 			case v3PublicationItemData:
 				if len(c.unresolvedData) != 0 {
-					return true
+					return v3CacheHeld
 				}
 			}
 		}
-		return false
+		return v3CacheHit
 	})
 }
 
-// observeLease reports, under the coordinator mutex, how many acquisitions
-// the lease's callback has made and whether namespace is held only by this
-// lease with exactly one unresolved claim, the caller's own. observe may take
-// d.mu and nothing else.
-func (c *v3SourcePublicationCoordinator) observeLease(lease *v3SourcePublicationLease, namespace v3PublicationNamespace, observe func(acquisitions uint64, exclusive bool)) {
+// finishRequest runs exactly once at the whole handler's return, never at RPC
+// return. A terminal outcome has already closed admission before this decrement.
+func (l *v3SourcePublicationLease) finishRequest() {
+	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if lease == nil || lease.gate != c {
-		observe(0, false)
-		return
+	if l.active == 0 {
+		panic("portablefsd: source request settled twice")
 	}
-	coordinate := v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: namespace.parent, name: namespace.name}
-	claims := lease.names[namespace]
-	_, held := c.sourceHolds[coordinate][lease]
-	exclusive := c.terminal == nil && !lease.released && held && len(c.sourceHolds[coordinate]) == 1 &&
-		claims.attributes == 1 && claims.data == 0
-	observe(lease.acquisitions, exclusive)
+	l.active--
+	c.signalLocked()
 }
 
 func (l *v3SourcePublicationLease) markAssigned() error {

@@ -108,12 +108,13 @@ type ensureAttachRequest struct {
 }
 
 type attachStatus struct {
-	AttachRef string `json:"attachRef"`
-	VolumeID  string `json:"volumeId"`
-	Branch    string `json:"branch"`
-	MountPath string `json:"mountPath"`
-	State     string `json:"state"`
-	LastError string `json:"lastError,omitempty"`
+	MetadataCache *v3CacheMetrics `json:"metadataCache,omitempty"`
+	AttachRef     string          `json:"attachRef"`
+	VolumeID      string          `json:"volumeId"`
+	Branch        string          `json:"branch"`
+	MountPath     string          `json:"mountPath"`
+	State         string          `json:"state"`
+	LastError     string          `json:"lastError,omitempty"`
 	// Credential names WHICH credential verdict is behind a degraded state,
 	// because "degraded" plus a prose lastError is not something a program can
 	// branch on. Empty means no credential fault at all.
@@ -573,10 +574,7 @@ func (r *registry) list() []*attach {
 	return out
 }
 
-// delete detaches ref. A NORMAL delete runs the full drain barrier first and
-// FAILS — with the attach fully alive and registered — when the tail cannot
-// reach the authority; only an explicit force detaches with an unshipped
-// tail, parking it as a durable recovery job whose ID is returned.
+// delete retires the attach and then removes its registry record.
 func (r *registry) delete(ctx context.Context, ref string, force bool) (found bool, jobID string, err error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
@@ -588,9 +586,7 @@ func (r *registry) delete(ctx context.Context, ref string, force bool) (found bo
 	}
 	jobID, err = a.detach(ctx, force)
 	if err != nil {
-		// No detach mode may unregister an attach whose required durability
-		// transition failed. In particular, force is permission to park a
-		// tail, not permission to discard a failed parking transaction.
+		// Keep the record until its required detach transition completes.
 		return true, jobID, err
 	}
 	r.mu.Lock()
@@ -658,22 +654,8 @@ type unmountOutcome struct {
 // every later request — including a --force — joins it rather than queueing a
 // second one behind it.
 //
-// ── FORCE ESCALATES, IT DOES NOT RACE ───────────────────────────────────────
-//
-// Force used to start a SEPARATE transaction. Both transactions then took the
-// registry's global mutationMu, and the normal one holds it across the whole
-// authority drain barrier and the exact kernel detach. So --force — the escape
-// hatch from precisely that wait — parked behind it, burned the full request
-// budget, and returned having fenced nothing, parked nothing, and started no
-// recovery job. The one command whose entire purpose is to preempt the drain
-// could not preempt it.
-//
-// Force is now an ESCALATION of the running transaction, applied atomically:
-// the transaction is marked forced and its drain is CANCELLED, and the
-// transaction — which already owns the mutation lock — takes the journal-first
-// park/fence path itself, before anything irreversible. The park/fence phase is
-// therefore reachable without ever waiting on the normal drain's mutex, because
-// it runs on the goroutine that holds it.
+// Force escalates the running transaction and cancels its drain wait. The
+// goroutine that owns the transaction also owns the transition to fencing.
 func (r *registry) unmountFSKitWithContext(
 	ctx context.Context,
 	ref string,
@@ -791,19 +773,7 @@ func (r *registry) unmountInProgressVerdict(ref string, forced bool, waiterErr e
 		)
 	}
 	detail := "the authority visibility barrier"
-	// NEVER PRESCRIBE THE COMMAND THE CALLER IS ALREADY RUNNING.
-	//
-	// This message used to end with "or `portablefs umount --force` to park the
-	// unshipped tail" unconditionally — including when it was answering a
-	// --force. Live, that produced seven identical --force invocations over four
-	// minutes, each told to run --force. A progress report that prescribes the
-	// caller's own command is not advice; it is a loop with a delay in it.
-	//
-	// A force ALREADY escalated has exactly one honest next step that is
-	// different from re-running it: the escalation is durable and running, so
-	// joining it is what "wait" means, and if it never completes the exit is the
-	// abandoned-store path (kill the daemon, then --force again, and resolve any
-	// terminal recovery job it names). That is stated instead of a self-loop.
+	// A forced request can only rejoin the existing transaction.
 	if forced {
 		return fmt.Errorf(
 			"forced unmount is still running after %s, waiting on %s; the force is "+
@@ -817,8 +787,7 @@ func (r *registry) unmountInProgressVerdict(ref string, forced bool, waiterErr e
 	return fmt.Errorf(
 		"unmount is still running after %s, waiting on %s; it continues in the "+
 			"background — re-run `portablefs umount` to join it, or "+
-			"`portablefs umount --force` to park the unshipped tail as a durable "+
-			"recovery job%s",
+			"`portablefs umount --force` to revoke the kernel mount%s",
 		unmountTransactionBudget, detail, waiterSuffix(waiterErr),
 	)
 }
@@ -886,6 +855,7 @@ func (r *registry) runUnmountTransaction(
 	if failFrozen {
 		return true, jobID, fmt.Errorf("attach admissions are fail-frozen because the prepared-detach abort could not be persisted; restart portablefsd to reconcile the durable marker")
 	}
+	var detachErr error
 	switch {
 	case a.isV3():
 		// The evidence-bearing v3 detach: exact kernel detach, getfsstat
@@ -896,9 +866,12 @@ func (r *registry) runUnmountTransaction(
 		// kernel pass, which flushes dirty kernel pages through those
 		// callbacks, is the durability boundary; detachV3 alone owns that
 		// v3-specific sequence.
-		if err := r.detachV3(a, forceAuthorized || force, ops); err != nil {
-			return true, "", err
+		detachErr = r.detachV3(a, forceAuthorized || force, ops)
+		if detachErr != nil && !a.isDetached() {
+			return true, "", detachErr
 		}
+		// A completed local teardown has a final verdict. Remove its record
+		// while preserving that verdict for every transaction joiner.
 	case prepared:
 		present, err := ops.present(a.mountPath, ref)
 		if err != nil {
@@ -935,7 +908,7 @@ func (r *registry) runUnmountTransaction(
 		// THE DRAIN IS CANCELLABLE BY ESCALATION. A --force arriving while this
 		// barrier is running closes tx.escalate; the drain then unwinds
 		// promptly and this same goroutine — which already owns mutationMu —
-		// takes the journal-first park/fence path, so force never queues behind
+		// takes the forced-detach path, so force never queues behind
 		// the wait it exists to escape.
 		drainCtx, cancelDrain := context.WithCancel(context.Background())
 		drainDone := make(chan struct{})
@@ -992,8 +965,8 @@ func (r *registry) runUnmountTransaction(
 		cancelDrain()
 		if err != nil {
 			// An ESCALATION that aborted this drain is not a failed unmount: it
-			// is the same transaction changing decision. Take the journal-first
-			// park/fence path now, on the goroutine that already holds
+			// is the same transaction changing decision. Take the forced-detach
+			// path now, on the goroutine that already holds
 			// mutationMu, before anything irreversible has happened. Any other
 			// error is the normal transaction's own definite failure.
 			if r.escalated(tx) {
@@ -1007,7 +980,7 @@ func (r *registry) runUnmountTransaction(
 			}
 		}
 		// If the drain WON the race with an escalation, the normal detach is
-		// complete and durable — strictly stronger than parking the tail — and
+		// complete and durable, and
 		// that is the outcome every joiner, force or not, is given.
 	}
 	r.mu.Lock()
@@ -1020,9 +993,9 @@ func (r *registry) runUnmountTransaction(
 		r.byRef[ref] = a
 		r.byKey[a.key] = a
 		r.mu.Unlock()
-		return true, jobID, err
+		return true, jobID, errors.Join(detachErr, err)
 	}
-	return true, jobID, nil
+	return true, jobID, detachErr
 }
 
 // preparedDetachAbortDurabilityError means the exact unmount failed and the
@@ -1111,8 +1084,7 @@ func (r *registry) forceUnmountFSKit(
 
 // closeAll is the cooperative daemon-termination path. Every attach must pass
 // its normal authority durability barrier. A failed drain remains a visible
-// shutdown failure; this path never changes semantics by force-detaching or
-// parking a recovery job.
+// shutdown failure; this path never escalates to force.
 func (r *registry) closeAll(ctx context.Context) error {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
@@ -1160,30 +1132,6 @@ type attach struct {
 	persist             func() error
 	// schedulePersist requests a debounced background persist.
 	schedulePersist func()
-
-	// frontendGate extends a handoff through FSKit's explicit publication
-	// acknowledgement. Admission is scope-aware: disjoint subtrees continue
-	// concurrently, while overlapping replies complete before Checkin.
-	frontendGateMu   sync.Mutex
-	frontendGateCond *sync.Cond
-	frontendActive   map[*frontendOperation]struct{}
-	frontendHandoffs map[string]int
-	// frontendGateProgress counts every RETRACTION from the active publication
-	// set. It is the publication gate's progress clock: a handoff's settle
-	// window (publicationSettleWindow) is measured from the last time this
-	// advanced, so a gate that keeps clearing operations never reaches a stall
-	// verdict however long it is busy, while a gate that has stopped clearing
-	// them reaches a definite one. Guarded by frontendGateMu.
-	frontendGateProgress uint64
-	// frontendGateErr is the terminal correctness verdict observed by
-	// handoffs while they hold frontendGateMu. It wakes and aborts a handoff
-	// that was already waiting when the attach failed closed.
-	frontendGateErr error
-	// frontendPathEpoch changes whenever an FSItem/handle path binding can
-	// change. Publication operations snapshot it with their resolved aliases;
-	// a mismatch at handoff is conservatively mount-wide, closing the narrow
-	// race where a namespace mutation moves an in-flight operation.
-	frontendPathEpoch atomic.Uint64
 
 	credMu sync.RWMutex
 	token  string
@@ -1259,7 +1207,7 @@ type attach struct {
 	// daemon shutdown/restart can perform the required recovery.
 	detachFailFrozen bool
 	// Retained across a registry-persist failure so retrying the exact forced
-	// delete returns the same durable recovery handle.
+	// delete retains the same recorded detach outcome.
 	detachJobID string
 }
 
@@ -1617,30 +1565,11 @@ func (a *attach) authorizationDeadline() int64 {
 	return a.authorizationDeadlineAtMs
 }
 
-// detach tears the attach down. NORMAL (force=false): the full drain barrier
-// runs FIRST and a failure aborts the detach with the attach fully alive —
-// a normal unmount can never succeed with an unshipped acknowledged tail.
-// FORCED (force=true): the tail parks as a durable recovery job (registered
-// in the WAL store, outside the attach lifetime) and its ID is returned for
-// the caller to surface.
+// detach terminally fences the attach. Force does so before waiting for
+// namespace locks, so an in-flight handler cannot withhold its own revocation.
 func (a *attach) detach(ctx context.Context, force bool) (jobID string, err error) {
 	_ = ctx
 	if force {
-		// FORCED DETACH TAKES NO NAMESPACE LOCK UNTIL IT HAS FENCED.
-		//
-		// The whole purpose of --force is to abandon in-flight work, so queueing
-		// it behind that work is a contradiction — and it was a live one: with a
-		// delegation release parked in an unbounded drain, one 12-minute nsMu
-		// writer had ~100 frontend goroutines behind it, and every `umount
-		// --force` joined the same queue. The escape hatch could not break into
-		// the mount it exists to abandon; only killing the daemon recovered it.
-		//
-		// So the fence comes first. CloseJournalDurable parks the acknowledged
-		// tail as a durable recovery job and fences the engine, which is what
-		// gives every operation still inside the namespace locks a definite
-		// outcome (ErrFenced). The terminal transition then takes those locks
-		// against work that is already converging rather than against work that
-		// is waiting on an authority which has stopped answering.
 		return a.forcedDetach()
 	}
 	// Quiesce every namespace/handle operation through the complete drain
@@ -1682,8 +1611,7 @@ var errPreparedDetachPending = errors.New(
 		"operation that can complete or discharge it",
 )
 
-// forcedDetach parks the acknowledged tail and fences the engine BEFORE it takes
-// the namespace locks. See detach for why the order is the whole point.
+// forcedDetach fences the session before taking namespace locks.
 func (a *attach) forcedDetach() (jobID string, err error) {
 	a.mu.RLock()
 	alreadyDetached := a.detached
@@ -1890,7 +1818,9 @@ func (a *attach) status() attachStatus {
 	// revocation watchdog branches on it — "degraded" plus a prose lastError
 	// is not something a program can branch on (see Credential above).
 	sessionTerminal := false
+	var metadataCache *v3CacheMetrics
 	if d := a.v3Backend(); d != nil {
+		metadataCache = d.cacheMetrics()
 		if err := d.terminalError(); err != nil && !errors.Is(err, errV3AttachDetached) {
 			state = pfslocal.AttachStateDegraded
 			sessionTerminal = true
@@ -1901,7 +1831,7 @@ func (a *attach) status() attachStatus {
 	return attachStatus{
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
-		Credential: credential, SessionTerminal: sessionTerminal,
+		Credential: credential, SessionTerminal: sessionTerminal, MetadataCache: metadataCache,
 		MountEnrollmentID:         enrollmentID,
 		AuthorizationDeadlineAtMs: authorizationDeadlineAtMs, LastReauthorizationAtMs: lastReauthorizationAtMs,
 		NextReauthorizationAtMs: nextReauthorizationAtMs, ReauthorizationFailures: reauthorizationFailures,

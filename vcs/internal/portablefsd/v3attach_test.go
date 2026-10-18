@@ -30,6 +30,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/mountrecord"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -163,6 +164,10 @@ type v3TestAuthority struct {
 	omitVersionedMetadata        bool
 	initialAuthorizationDeadline int64
 	renewedAuthorizationDeadline int64
+	releaseStarted               chan struct{}
+	releaseFinish                chan struct{}
+	releaseErrno                 int32
+	detachErrno                  int32
 
 	mu               sync.Mutex
 	keepAliveErrno   int32
@@ -355,7 +360,27 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		// poll parks until the session ends.
 		<-ctx.Done()
 		response.Errno = 4
+	case *authoritypb.Request_CloseBatch:
+		if h.releaseStarted != nil {
+			close(h.releaseStarted)
+		}
+		if h.releaseFinish != nil {
+			select {
+			case <-h.releaseFinish:
+			case <-ctx.Done():
+			}
+		}
+		response.Mutation = &authoritypb.MutationState{Slot: req.GetMutation().GetSlot(), AcceptedSequence: req.GetMutation().GetSequence()}
+		response.Errno = h.releaseErrno
+		if response.Errno == 0 {
+			results := make([]*authoritypb.CloseBatchResult, len(req.GetCloseBatch().GetCloses()))
+			for i := range results {
+				results[i] = &authoritypb.CloseBatchResult{Retired: true}
+			}
+			response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}
+		}
 	case *authoritypb.Request_Detach:
+		response.Errno = h.detachErrno
 		h.mu.Lock()
 		h.detach = req.GetDetach()
 		h.mu.Unlock()
@@ -1017,11 +1042,11 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 		present:      func(_, _ string) (bool, error) { return false, nil },
 		unmountExact: func(_, _ string, _ bool) error { return errors.New("nothing to detach") },
 	}
-	if found, _, err := r.unmountFSKitWith(a.ref, false, absent); err != nil || !found {
+	if found, _, err := r.unmountFSKitWith(a.ref, false, absent); err == nil || !found {
 		t.Fatalf("fenced v3 detach retry = (%v, %v)", found, err)
 	}
-	if r.get(a.ref) != nil {
-		t.Fatal("fenced v3 attach was not released after the exact absence observation")
+	if r.get(a.ref) != nil || !a.isDetached() {
+		t.Fatal("completed fenced teardown remained registered")
 	}
 	if handler.recordedDetach() != nil {
 		t.Fatal("a fenced session delivered detach evidence")
@@ -1179,27 +1204,26 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 	}
 }
 
-// A detach whose release drain fails or cannot settle completes local
-// teardown but never reports a clean unmount: no authenticated Detach claims
-// the unsettled releases, the failure is the unmount's outcome, and a retry
-// only finishes the registry removal.
-func TestV3DetachReportsAnUnsettledReleaseDrain(t *testing.T) {
+// Only a release failure recorded before transfer is a separate diagnostic.
+// Accepted exact absence also retires forming and in-flight release obligations.
+func TestV3DetachSeparatesReleaseDiagnosticsFromAcceptedAbsence(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		inject func(*v3ReleaseOwner)
+		name    string
+		wantErr bool
+		inject  func(*v3ReleaseOwner)
 	}{
-		{name: "sticky-release-failure", inject: func(r *v3ReleaseOwner) {
+		{name: "sticky-release-failure", wantErr: true, inject: func(r *v3ReleaseOwner) {
 			r.failure = errors.New("injected release failure")
 		}},
-		{name: "drain-deadline", inject: func(r *v3ReleaseOwner) {
-			// Accepted work that never settles inside the detach budget.
+		{name: "in-flight", inject: func(r *v3ReleaseOwner) {
+			// DATA ownership does not delay or fail exact absence.
 			r.running = true
+		}},
+		{name: "forming", inject: func(r *v3ReleaseOwner) {
+			r.forming = &v3ReleaseBatch{reclaims: v3ReleaseTokens("item")}
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			previous := v3DetachProofBudget
-			v3DetachProofBudget = 100 * time.Millisecond
-			t.Cleanup(func() { v3DetachProofBudget = previous })
 			pki := newV3TestPKI(t)
 			handler := newV3TestAuthority()
 			address := startV3TestAuthority(t, handler, pki.serverTLS)
@@ -1226,17 +1250,85 @@ func TestV3DetachReportsAnUnsettledReleaseDrain(t *testing.T) {
 				},
 			}
 			found, _, err := r.unmountFSKitWith(a.ref, false, ops)
-			if !found || err == nil || !strings.Contains(err.Error(), "releases did not settle") {
-				t.Fatalf("unmount with an unsettled drain = (%v,%v), want the release failure", found, err)
+			if !found || (err != nil) != test.wantErr || err != nil && !strings.Contains(err.Error(), "authority release cleanup") {
+				t.Fatalf("unmount = (%v,%v), want release diagnostic=%t", found, err, test.wantErr)
 			}
-			if handler.recordedDetach() != nil {
-				t.Fatal("an authenticated detach claimed releases that did not settle")
+			if handler.recordedDetach().GetMountAbsence() == nil {
+				t.Fatal("release cleanup withheld the exact absence proof")
 			}
 			if !a.isDetached() || d.terminalError() == nil {
 				t.Fatal("local teardown did not complete")
 			}
-			if found, _, err := r.unmountFSKitWith(a.ref, false, ops); !found || err != nil || r.get(a.ref) != nil {
-				t.Fatalf("retried unmount = (%v,%v) registered=%t, want only the registry removal", found, err, r.get(a.ref) != nil)
+			if r.get(a.ref) != nil {
+				t.Fatal("completed teardown remained registered")
+			}
+			reloaded := newRegistry(r.stateDir)
+			t.Cleanup(reloaded.stopPersister)
+			if reloaded.loadErr != nil || reloaded.get(a.ref) != nil {
+				t.Fatalf("registry removal was not durable: load=%v attach=%v", reloaded.loadErr, reloaded.get(a.ref))
+			}
+		})
+	}
+}
+
+func TestV3ExactAbsenceUsesControlDespiteReleaseFailure(t *testing.T) {
+	for _, name := range []string{"definite-refusal", "stalled-data", "proof-refused"} {
+		t.Run(name, func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			handler.releaseStarted = make(chan struct{})
+			if name == "definite-refusal" {
+				handler.releaseErrno = errnos.EINVAL
+			} else {
+				handler.releaseFinish = make(chan struct{})
+			}
+			if name == "proof-refused" {
+				handler.detachErrno = errnos.EPERM
+			}
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			t.Cleanup(r.stopPersister)
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSReleaseControl"))
+			d := a.v3Backend()
+			if err := d.releases.submit(v3ReleaseTokens("h"), nil); err != nil {
+				t.Fatal(err)
+			}
+			<-handler.releaseStarted
+			if name == "definite-refusal" {
+				waitV3ReleasesIdle(t, d)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := r.unmountFSKitWith(a.ref, true, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if name == "stalled-data" {
+					if err != nil {
+						t.Fatalf("accepted absence with transferred DATA release: %v", err)
+					}
+				} else {
+					want := "authority release cleanup"
+					if name == "proof-refused" {
+						want = "deliver v3 mount-absence proof"
+					}
+					if err == nil || !strings.Contains(err.Error(), want) {
+						t.Fatalf("detach result = %v, want %q", err, want)
+					}
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("CONTROL absence proof waited for stalled DATA release")
+			}
+			if handler.recordedDetach().GetMountAbsence() == nil {
+				t.Fatal("exact absence withheld")
+			}
+			if handler.releaseFinish != nil {
+				close(handler.releaseFinish)
+			}
+			waitV3ReleasesIdle(t, d)
+			if r.get(a.ref) != nil || !a.isDetached() {
+				t.Fatal("completed detach remained registered")
 			}
 		})
 	}

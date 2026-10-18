@@ -57,8 +57,7 @@ const (
 	v3DetachProofComponent = "portablefsd/getfsstat"
 )
 
-// v3DetachProofBudget bounds the release drain and the delivery of one
-// mount-absence proof together. Strictly under unmountTransactionBudget so the
+// v3DetachProofBudget bounds delivery of one mount-absence proof. Strictly under unmountTransactionBudget so the
 // transaction can still publish a verdict for the request that started it. A
 // variable only so tests can exercise its expiry.
 var v3DetachProofBudget = 15 * time.Second
@@ -702,9 +701,8 @@ func v3LatePublishingReplyDiscardable(body any, errno int32) bool {
 // handleV3Attached serves one frontend request of a v3 attach. It keeps the
 // connection's logical-operation ledger — reservation, exposure, and the one
 // post-callback PublicationAck — because the coherence bridge's source
-// COMPLETE barrier is built on exactly that acknowledgement, but it never
-// enters the clientcore admission, mirror, or delegation machinery: the v3
-// data plane owns its own ordering and concurrency bounds.
+// publication lifetime is built on that acknowledgement. The data plane
+// owns mutation ordering and concurrency bounds.
 func (c *frontendConn) handleV3Attached(
 	ctx context.Context,
 	a *attach,
@@ -718,15 +716,12 @@ func (c *frontendConn) handleV3Attached(
 	}
 	ctx, cancelOperation := withOperationDeadline(ctx)
 	defer cancelOperation()
-	gateCtx, participant, participates, publishes, err := c.beginLogicalOperation(
+	publishes, err := c.beginLogicalOperation(
 		ctx, a, operationID, initializeOperation, body,
 	)
 	if err != nil {
 		_ = c.conn.Close()
 		return
-	}
-	if participates {
-		defer a.finishFrontendParticipant(participant)
 	}
 	if _, ok := body.(*pfslocal.SubscribeEventsRequest); ok {
 		// Subscription binds the one lossless visibility consumer for this
@@ -743,10 +738,8 @@ func (c *frontendConn) handleV3Attached(
 	// A reply served from the metadata cache is revalidated at the physical
 	// write boundary. If that refuses it, nothing was exposed: the candidate is
 	// settled and the same operation takes the coherent authority path once.
-	for bypassCache := false; ; bypassCache = true {
-		if !c.serveV3Attempt(ctx, gateCtx, a, d, requestID, operationID, publishes, body, bypassCache) {
-			return
-		}
+	if c.serveV3Attempt(ctx, a, d, requestID, operationID, publishes, body, false) {
+		c.serveV3Attempt(ctx, a, d, requestID, operationID, publishes, body, true)
 	}
 }
 
@@ -754,7 +747,7 @@ func (c *frontendConn) handleV3Attached(
 // retry only when a cached reply's revalidation refused it before any byte was
 // written.
 func (c *frontendConn) serveV3Attempt(
-	ctx, gateCtx context.Context,
+	ctx context.Context,
 	a *attach,
 	d *v3DataPlane,
 	requestID uint64,
@@ -767,12 +760,17 @@ func (c *frontendConn) serveV3Attempt(
 		reply any
 		eno   int32
 	)
+	defer func() {
+		if d != nil && !retry {
+			d.recordLookupPolarity(body, eno)
+		}
+	}()
 	resources := &v3ReplyResourceCollector{d: d, bypassCache: bypassCache}
 	switch body.(type) {
 	case *pfslocal.CreateRequest, *pfslocal.MkdirRequest, *pfslocal.SymlinkRequest:
 		resources.visible = true
 	}
-	dispatchCtx := context.WithValue(gateCtx, v3ReplyResourceContextKey{}, resources)
+	dispatchCtx := context.WithValue(ctx, v3ReplyResourceContextKey{}, resources)
 	// Once assigned, an authority request must settle on its original session
 	// even if the frontend disappears. Preserve the operation's absolute bound;
 	// cancellation still governs local admission and never extends this budget.
@@ -816,9 +814,7 @@ func (c *frontendConn) serveV3Attempt(
 			// abandoned resources' cleanup debt.
 			if cleanup.required() {
 				go func() {
-					if err := cleanup.finish(); err != nil {
-						_ = d.fail(err)
-					}
+					_ = cleanup.finish()
 				}()
 			}
 			// Incomplete publication of a successful visible resource reply is
@@ -856,14 +852,21 @@ func (c *frontendConn) serveV3Attempt(
 		}
 		// A cached negative answer is revalidated at the write boundary like
 		// any other cached reply.
-		_, _, _, refused := c.replyWithPublicationCommit(
+		_, written, _, refused := c.replyWithPublicationCommit(
 			requestID, operationID, failure, true,
 			v3LatePublishingReplyDiscardable(body, eno), commit,
 		)
 		if refused {
 			consumeV3ResponseConsumptions(resources.responseConsumptions)
 			resources.responseConsumptions = nil
-			return true
+			retry = c.expiredV3CacheCandidate(a, resources)
+			if !retry {
+				eno = darwinENOTCONN
+			}
+			return retry
+		}
+		if written && resources.cached != nil {
+			d.recordCacheResult(resources.cached.metric, v3CacheHit)
 		}
 		return false
 	}
@@ -876,9 +879,7 @@ func (c *frontendConn) serveV3Attempt(
 			)
 			if cleanupErr == nil {
 				go func() {
-					if err := cleanup.finish(); err != nil {
-						_ = d.fail(err)
-					}
+					_ = cleanup.finish()
 				}()
 			} else {
 				prepareErr = errors.Join(prepareErr, cleanupErr)
@@ -899,9 +900,7 @@ func (c *frontendConn) serveV3Attempt(
 					provisional, false, 0,
 				); cleanupErr == nil {
 					go func() {
-						if finishErr := cleanup.finish(); finishErr != nil {
-							_ = d.fail(finishErr)
-						}
+						_ = cleanup.finish()
 					}()
 				} else {
 					err = errors.Join(err, cleanupErr)
@@ -919,9 +918,7 @@ func (c *frontendConn) serveV3Attempt(
 				c.stopV3FrontendPublication(a, err)
 			} else if cleanup.required() {
 				go func() {
-					if err := cleanup.finish(); err != nil {
-						_ = d.fail(err)
-					}
+					_ = cleanup.finish()
 				}()
 			}
 			if err == nil {
@@ -947,7 +944,14 @@ func (c *frontendConn) serveV3Attempt(
 		}
 		consumeV3ResponseConsumptions(resources.responseConsumptions)
 		resources.responseConsumptions = nil
-		return true
+		retry = c.expiredV3CacheCandidate(a, resources)
+		if !retry {
+			eno = darwinENOTCONN
+		}
+		return retry
+	}
+	if written && resources.cached != nil {
+		d.recordCacheResult(resources.cached.metric, v3CacheHit)
 	}
 	if discarded && resourceReply {
 		// The callback already proved NOT_PUBLISHED, so no frontend can send a
@@ -972,6 +976,14 @@ func (c *frontendConn) serveV3Attempt(
 			resources.responseConsumptions = nil
 		}
 	}
+	return false
+}
+
+func (c *frontendConn) expiredV3CacheCandidate(a *attach, resources *v3ReplyResourceCollector) bool {
+	if resources.cached != nil && resources.cached.expired {
+		return true
+	}
+	c.stopV3FrontendPublication(a, errors.New("portablefsd: cached reply lost eligibility or ownership before exposure"))
 	return false
 }
 
@@ -1007,7 +1019,8 @@ func (c *frontendConn) stopV3FrontendPublication(a *attach, cause error) {
 
 // detachV3 is the evidence-bearing unmount of one v3 attach. The caller owns
 // registry.mutationMu (it runs inside runUnmountTransaction) and the shared
-// registry-removal tail runs after it returns nil.
+// registry-removal tail runs once local teardown completes, preserving any
+// final proof-delivery or release diagnostic returned here.
 //
 // Order is the contract: exact kernel detach first, then the getfsstat
 // absence observation, then delivery of that proof to the authority, and only
@@ -1017,8 +1030,8 @@ func (c *frontendConn) stopV3FrontendPublication(a *attach, cause error) {
 func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	if a.isDetached() {
 		// An earlier detach completed the teardown and returned its outcome,
-		// including any release failure; only the registry removal it could not
-		// finish remains, so its drain and proof are not repeated.
+		// including any release failure; only durable registry removal remains,
+		// so its release transfer and proof are not repeated.
 		a.frontendSerial.Lock()
 		a.nsMu.Lock()
 		_, err := a.finishDetachWithNSLocked("", nil)
@@ -1089,46 +1102,31 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 	session := a.v3Session
 	d := a.v3Data
 	a.mu.RUnlock()
-	var releaseErr error
+	var releaseErr, proofErr error
 	if session != nil && d != nil {
-		// Releases already accepted settle on the original session. Draining
-		// closes release admission, which explicitly hands every later token to
-		// the detach: ending the session releases every capability it still
-		// holds. A failed or unfinished drain is never a clean detach; local
-		// teardown still completes, and the failure is the detach's outcome.
+		releaseErr = d.transferReleases()
 		proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
-		releaseErr = d.releases.drain(proofCtx)
-		// Frontend loss is terminal locally, but the original authority
-		// transport can still accept this exact kernel-absence proof. A
-		// transport already lost or fenced must never be re-established here.
-		select {
-		case <-d.client.SessionDone():
-		default:
-			deliverErr := releaseErr
-			if deliverErr == nil {
-				deliverErr = session.DetachAfterUnmount(proofCtx, proof)
-			}
-			if deliverErr != nil {
-				// The proof exists but the authority did not accept it. Ending the
-				// session here is what keeps the detach honest: the authority
-				// fences this participant on its lease instead of carrying a
-				// barrier member whose mount silently vanished.
-				a.fenceV3(fmt.Errorf("deliver v3 mount-absence proof: %w", deliverErr))
-				log.Printf(
-					"portablefsd: attach %s: kernel mount at %s is exactly absent but the mount-absence proof could not be delivered (%v); the strict session ends fenced",
-					a.ref, a.mountPath, deliverErr,
-				)
-			}
+		// Call refuses poisoned/closed admission. Never create a new session to
+		// deliver evidence about the original incarnation.
+		if !d.client.LocalAdmissionOpen() {
+			proofErr = errors.New("authority session is closed or poisoned")
+		} else {
+			proofErr = session.DetachAfterUnmount(proofCtx, proof)
 		}
 		cancel()
+		if proofErr != nil {
+			proofErr = fmt.Errorf("deliver v3 mount-absence proof: %w", proofErr)
+			a.fenceV3(proofErr)
+			log.Printf("portablefsd: attach %s: exact kernel absence was not accepted: %v; session ends fenced", a.ref, proofErr)
+		}
 	}
 	if releaseErr != nil {
-		releaseErr = fmt.Errorf("v3 authority releases did not settle before detach: %w", releaseErr)
+		releaseErr = fmt.Errorf("v3 authority release cleanup: %w", releaseErr)
 	}
 	// Terminal either way: an already-fenced plane keeps its original cause.
 	a.fenceV3(errV3AttachDetached)
 	a.frontendSerial.Lock()
 	a.nsMu.Lock()
-	_, err = a.finishDetachWithNSLocked("", releaseErr)
+	_, err = a.finishDetachWithNSLocked("", errors.Join(proofErr, releaseErr))
 	return err
 }
