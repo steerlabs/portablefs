@@ -109,3 +109,48 @@ func TestEndedSessionRetiresFromItsOwnEvent(t *testing.T) {
 		}
 	})
 }
+
+func TestRemovingTheLastRecordReselectsBeforeItsDeadline(t *testing.T) {
+	for _, removal := range []string{"session", "take cursor", "drop cursor", "remove volume cursors"} {
+		t.Run(removal, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := newTestServer(t, nil, nil)
+				session := &volumeSession{client: newFakeAuthority(), expiresAt: time.Now().Add(time.Hour)}
+				session.lastUsedUnix.Store(time.Now().UnixNano())
+				if removal == "session" {
+					s.sessions[testVolume] = session
+				} else {
+					// The removal paths under test do not dispose a nil cursor.
+					s.cursors["cursor"] = cursorRecord{volumeID: testVolume, parentKey: "parent", session: session, expiresAt: time.Now().Add(time.Hour)}
+				}
+				startTestExpiryOwner(t, s)
+				s.mu.Lock()
+				selected := s.expiryChanged
+				s.mu.Unlock()
+				before := time.Now()
+				switch removal {
+				case "session":
+					s.retireSession(testVolume, session)
+				case "take cursor":
+					if _, ok := s.takeCursor("cursor", testVolume, "parent", session); !ok {
+						t.Fatal("cursor was not taken")
+					}
+				case "drop cursor":
+					s.dropCursor("cursor", testVolume, "parent", session)
+				case "remove volume cursors":
+					s.mu.Lock()
+					_ = s.removeVolumeCursorsLocked(testVolume)
+					s.mu.Unlock()
+				}
+				synctest.Wait()
+				s.mu.Lock()
+				reselected := s.expiryChanged != nil && s.expiryChanged != selected
+				remaining := len(s.sessions) + len(s.cursors)
+				s.mu.Unlock()
+				if !reselected || remaining != 0 || time.Now() != before {
+					t.Fatalf("removal retained the old deadline: reselected=%t, records=%d, elapsed=%s", reselected, remaining, time.Since(before))
+				}
+			})
+		})
+	}
+}

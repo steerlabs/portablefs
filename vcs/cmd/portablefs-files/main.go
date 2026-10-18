@@ -351,6 +351,7 @@ func (s *server) handleSessionInstall(writer http.ResponseWriter, request *http.
 			if record.session == evicted {
 				stale = append(stale, record)
 				delete(s.cursors, token)
+				s.signalExpiryChangedLocked()
 			}
 		}
 	}
@@ -423,6 +424,7 @@ func (s *server) evictSession(volumeID string) bool {
 		return false
 	}
 	delete(s.sessions, volumeID)
+	s.signalExpiryChangedLocked()
 	stale := s.removeVolumeCursorsLocked(volumeID)
 	s.mu.Unlock()
 	closeCursors(stale)
@@ -699,6 +701,7 @@ func (s *server) retireSession(volumeID string, target *volumeSession) {
 		return
 	}
 	delete(s.sessions, volumeID)
+	s.signalExpiryChangedLocked()
 	stale := s.removeVolumeCursorsLocked(volumeID)
 	s.mu.Unlock()
 	closeCursors(stale)
@@ -756,6 +759,7 @@ func (s *server) takeCursor(token, volumeID, parentKey string, session *volumeSe
 		return nil, false
 	}
 	delete(s.cursors, token)
+	s.signalExpiryChangedLocked()
 	if !time.Now().Before(record.expiresAt) {
 		go disposeDescription(session, record.cursor)
 		return nil, false
@@ -773,6 +777,7 @@ func (s *server) renewCursor(token, volumeID, parentKey string, session *volumeS
 	}
 	if !time.Now().Before(record.expiresAt) {
 		delete(s.cursors, token)
+		s.signalExpiryChangedLocked()
 		stale = record.cursor
 		s.mu.Unlock()
 		disposeDescription(session, stale)
@@ -790,6 +795,7 @@ func (s *server) dropCursor(token, volumeID, parentKey string, session *volumeSe
 	s.mu.Lock()
 	if record, ok := s.cursors[token]; ok && record.volumeID == volumeID && record.parentKey == parentKey && record.session == session {
 		delete(s.cursors, token)
+		s.signalExpiryChangedLocked()
 		dropped = record.cursor
 	}
 	s.mu.Unlock()
@@ -804,6 +810,7 @@ func (s *server) removeVolumeCursorsLocked(volumeID string) []cursorRecord {
 		if record.volumeID == volumeID {
 			removed = append(removed, record)
 			delete(s.cursors, token)
+			s.signalExpiryChangedLocked()
 		}
 	}
 	return removed
@@ -821,6 +828,7 @@ func (s *server) close() {
 	}
 	s.cursors = make(map[string]cursorRecord)
 	s.sessions = make(map[string]*volumeSession)
+	s.signalExpiryChangedLocked()
 	s.mu.Unlock()
 	closeCursors(cursors)
 	for _, session := range sessions {
