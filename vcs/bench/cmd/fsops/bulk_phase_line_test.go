@@ -10,11 +10,11 @@ import (
 	"testing"
 )
 
-// TestBulkEmitsPhaseSplitLine pins the machine-readable contract that
-// bench/prod-flush-rate.sh consumes: fsops reports the write(2) acknowledgement
-// phase and the fsync barrier that follows it as SEPARATE timings, so no
-// harness has to re-derive an "ack rate" from process exit (which folds the
-// barrier into the write phase and calls a durable rate an ack rate).
+// TestBulkEmitsPhaseSplitLine pins the machine-readable `fsops-bulk` line:
+// fsops reports the write(2) acknowledgement phase and the fsync barrier that
+// follows it as SEPARATE timings, so no harness has to re-derive an "ack rate"
+// from process exit (which folds the barrier into the write phase and calls a
+// durable rate an ack rate).
 func TestBulkEmitsPhaseSplitLine(t *testing.T) {
 	work, cleanup, err := provisionWorkDir(t.TempDir(), false)
 	if err != nil {
