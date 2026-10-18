@@ -253,9 +253,13 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         let reply = PfsUnloadResourceReply(reply)
         do {
             let attachRef = try attachRef(from: resource)
-            if let volume = removeVolume(attachRef: attachRef) {
+            if let volume = registeredVolume(attachRef: attachRef) {
                 Task(priority: .userInitiated) {
+                    // Acknowledge local cleanup only, including after terminal
+                    // failure. Keep the registration until that cleanup completes
+                    // so overlapping unloads join it rather than replying early.
                     await volume.shutdown()
+                    removeVolume(volume, attachRef: attachRef)
                     reply.call(nil)
                 }
             } else {
@@ -276,11 +280,20 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
         volumeLock.unlock()
     }
 
-    private func removeVolume(attachRef: String) -> PortableFSVolume? {
+    private func registeredVolume(attachRef: String) -> PortableFSVolume? {
         volumeLock.lock()
-        let volume = volumes.removeValue(forKey: attachRef)
-        volumeLock.unlock()
-        return volume
+        defer { volumeLock.unlock() }
+        return volumes[attachRef]
+    }
+
+    private func removeVolume(_ volume: PortableFSVolume, attachRef: String) {
+        volumeLock.lock()
+        defer { volumeLock.unlock() }
+        if volumes[attachRef] === volume { volumes.removeValue(forKey: attachRef) }
+    }
+
+    func testingRegisteredVolume(attachRef: String) -> PortableFSVolume? {
+        registeredVolume(attachRef: attachRef)
     }
 
     private final class PfsLoadResourceReply: @unchecked Sendable {
@@ -377,7 +390,7 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
 
 /// One exclusive-writer FSKit volume.
 ///
-/// Every framework callback passes through `publishAfterReply`: it takes a
+/// Serving volume callbacks pass through `publishAfterReply`: it takes a
 /// slot in the bounded callback window, runs its pfslocal requests inside one
 /// publication unit, replies to FSKit through the window's serialized
 /// publication decision, and only then sends the daemon its publication
@@ -397,6 +410,10 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     private let statLock = NSLock()
     private var cachedStatistics: FSStatFSResult
     private let eventMonitor: Task<Void, Never>
+    private let shutdownLock = NSLock()
+    private var shutdownTask: Task<Void, Never>?
+    private var beforeShutdownCleanup: (@Sendable () async -> Void)?
+    private var onShutdownWait: (@Sendable () async -> Void)?
 
     /// Installs a volume around a resolved core. The connection's event
     /// binding is established before the volume can be returned to FSKit:
@@ -556,8 +573,9 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     public func deactivate(options: FSDeactivateOptions = []) async throws {
-        // Teardown acknowledges completed cleanup; it cannot publish an item
-        // or certify a live session after shutdown.
+        // This native async bridge acknowledges local cleanup, even after a
+        // terminal failure. It makes no serving or durability claim; neither
+        // ordinary nor force deactivation initiates a kernel unmount here.
         await shutdown()
     }
 
@@ -581,6 +599,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     }
 
     public func unmount() async {
+        // The native completion has no error argument. It acknowledges local
+        // cleanup only, not durability, kernel absence or daemon reconciliation.
         await shutdown()
     }
 
@@ -616,14 +636,44 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         })
     }
 
-    /// Ends this volume: the window refuses every later callback, wakes its
-    /// waiters and revokes every later publication, then the core closes its
-    /// session and forgets its items.
+    /// Revokes later serving success before suspending, then joins the volume's
+    /// one local cleanup. Teardown acknowledgements await this same completion,
+    /// including overlapping callers and callers whose tasks were cancelled.
     public func shutdown() async {
         core.client.publicationGate.revoke(PfsLocalClientError.shutdown)
-        await window.sessionEnded(PfsLocalClientError.shutdown)
-        eventMonitor.cancel()
-        await core.shutdown()
+        let (cleanup, onWait) = localShutdown()
+        await onWait?()
+        await cleanup.value
+    }
+
+    private func localShutdown() -> (Task<Void, Never>, (@Sendable () async -> Void)?) {
+        shutdownLock.lock()
+        defer { shutdownLock.unlock() }
+        if let shutdownTask { return (shutdownTask, onShutdownWait) }
+        let beforeCleanup = beforeShutdownCleanup
+        beforeShutdownCleanup = nil
+        // Unstructured ownership cleanup does not inherit caller cancellation.
+        // Capture the owned resources rather than retaining the volume in its task.
+        let cleanup = Task { [window, eventMonitor, core] in
+            await window.sessionEnded(PfsLocalClientError.shutdown)
+            eventMonitor.cancel()
+            await beforeCleanup?()
+            await core.shutdown()
+        }
+        shutdownTask = cleanup
+        return (cleanup, onShutdownWait)
+    }
+
+    /// Continuation seams outside the publication gate for teardown ordering tests.
+    func testingShutdown(
+        beforeCleanup: @escaping @Sendable () async -> Void,
+        onWait: @escaping @Sendable () async -> Void = {}
+    ) {
+        shutdownLock.lock()
+        defer { shutdownLock.unlock() }
+        precondition(shutdownTask == nil)
+        beforeShutdownCleanup = beforeCleanup
+        onShutdownWait = onWait
     }
 
     /// Runs one FSKit callback. `preflight` holds refusals that depend only
