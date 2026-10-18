@@ -2,44 +2,51 @@ import Darwin
 import Foundation
 
 /// Decodes one strict JSON object with exactly `keys`: no missing, unknown,
-/// duplicate (including escaped spellings) or null member, no trailing data,
-/// and no body larger than `maximumBytes`. Values are returned as Foundation
-/// decoded them; the integer accessor below refuses fractions, exponents,
-/// booleans and anything outside Int64.
+/// duplicate (including escaped spellings) or null member, no nested value,
+/// no trailing data, and no body larger than `maximumBytes`.
+///
+/// Numbers are judged on their token text with the grammar Go's
+/// encoding/json applies to the peer field's type, so the Swift and Go
+/// decoders of one sealed resource or lifecycle identity accept exactly the
+/// same bodies. An unsigned field accepts only digits: `-0` is refused, as Go
+/// refuses it for uint32. A signed field also takes an optional minus sign.
+/// Fractions, exponents and out-of-range values are refused for both.
 enum PortableFSDStrictObject {
     static func decode(
         _ data: Data,
         maximumBytes: Int,
         keys: Set<String>
-    ) throws -> [String: Any] {
+    ) throws -> [String: PortableFSDStrictJSON.Scalar] {
         guard data.count <= maximumBytes else { throw PortableFSDStrictJSONError.invalid }
-        try PortableFSDStrictJSON.validate(data, maximumDepth: 1)
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(object.keys) == keys,
-              !object.values.contains(where: { $0 is NSNull }) else {
+        let members = try PortableFSDStrictJSON.flatObject(data)
+        guard Set(members.keys) == keys,
+              !members.values.contains(.null) else {
             throw PortableFSDStrictJSONError.invalid
         }
-        return object
+        return members
     }
 
-    static func integer(_ value: Any?) -> Int64? {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID(),
-              !CFNumberIsFloatType(number) else {
+    static func string(_ value: PortableFSDStrictJSON.Scalar?) -> String? {
+        guard case let .string(string)? = value else { return nil }
+        return string
+    }
+
+    /// Go `uint32`: an unsigned integer token, never signed.
+    static func uint32(_ value: PortableFSDStrictJSON.Scalar?) -> UInt32? {
+        guard case let .number(token)? = value,
+              let first = token.utf8.first,
+              (0x30...0x39).contains(first) else {
             return nil
         }
-        return number.int64Value
+        return UInt32(token)
     }
 
-    static func uint32(_ value: Any?) -> UInt32? {
-        guard let integer = integer(value), integer >= 0, integer <= Int64(UInt32.max) else {
-            return nil
-        }
-        return UInt32(integer)
-    }
-
-    static func positiveInt(_ value: Any?) -> Int? {
-        guard let integer = integer(value), integer > 0, integer <= Int64(Int.max) else {
+    /// Go `int` (64-bit), then required positive. `-0` decodes to zero and
+    /// is refused by the positivity rule, as in Go.
+    static func positiveInt(_ value: PortableFSDStrictJSON.Scalar?) -> Int? {
+        guard case let .number(token)? = value,
+              let integer = Int64(token),
+              integer > 0 else {
             return nil
         }
         return Int(integer)
@@ -116,10 +123,10 @@ struct PortableFSDLiveIdentity: Equatable, Sendable {
         guard let schemaVersion = PortableFSDStrictObject.positiveInt(object["schemaVersion"]),
               schemaVersion == PortableFSDLifecycle.identitySchemaVersion,
               let controlProtocol = PortableFSDStrictObject.positiveInt(object["controlProtocol"]),
-              let daemonVersion = object["daemonVersion"] as? String,
+              let daemonVersion = PortableFSDStrictObject.string(object["daemonVersion"]),
               (1...128).contains(daemonVersion.utf8.count),
               daemonVersion.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
-              let executableSha256 = object["executableSha256"] as? String,
+              let executableSha256 = PortableFSDStrictObject.string(object["executableSha256"]),
               executableSha256.utf8.count == 64,
               executableSha256.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }),
               let pfslocalMajor = PortableFSDStrictObject.uint32(object["pfslocalMajor"]),

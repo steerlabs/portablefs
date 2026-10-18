@@ -349,6 +349,71 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     }
 }
 
+/// Parity vectors with Go's `daemonctl.DecodeSealedProtocols` and
+/// `DecodeIdentity`, which decode through encoding/json into `int` and
+/// `uint32` fields. Each value replaces one member of an otherwise valid
+/// body, and the verdict is Go's: an unsigned field takes digits only (Go
+/// refuses `-0` for uint32), a signed field takes an optional minus sign and
+/// must then be positive, and neither takes a fraction, an exponent or an
+/// out-of-range value. The same table was run against the Go decoders.
+private let sealedNumberParityVectors: [(key: String, value: String, accepted: Bool)] = [
+    ("pfslocalMinor", "0", true),
+    ("pfslocalMinor", "4294967295", true),
+    ("pfslocalMinor", "-0", false),
+    ("pfslocalMinor", "-1", false),
+    ("pfslocalMinor", "0.0", false),
+    ("pfslocalMinor", "0e0", false),
+    ("pfslocalMinor", "0E+0", false),
+    ("pfslocalMinor", "4294967296", false),
+    ("pfslocalMinor", "00", false),
+    ("pfslocalMinor", "+0", false),
+    ("pfslocalMinor", "-", false),
+    ("pfslocalMajor", "-0", false),
+    ("pfslocalMajor", "-2", false),
+    ("pfslocalMajor", "2.0", false),
+    ("controlProtocol", "-0", false),
+    ("controlProtocol", "-2", false),
+    ("controlProtocol", "9223372036854775807", true),
+    ("controlProtocol", "9223372036854775808", false),
+    ("controlProtocol", "2.5", false),
+    ("identitySchema", "-1", false),
+    ("identitySchema", "1.0", false),
+]
+
+@Test func sealedAndLiveProtocolNumbersFollowGoFieldGrammar() throws {
+    let sealed = ["identitySchema": "1", "controlProtocol": "2", "pfslocalMajor": "2", "pfslocalMinor": "0"]
+    func sealedBody(_ key: String, _ value: String) -> String {
+        "{" + ["identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"].map {
+            #"""# + $0 + #"":"# + ($0 == key ? value : sealed[$0]!)
+        }.joined(separator: ",") + "}"
+    }
+    for vector in sealedNumberParityVectors {
+        let body = sealedBody(vector.key, vector.value)
+        let decoded = try? PortableFSDSealedProtocols.decode(Data(body.utf8))
+        #expect((decoded != nil) == vector.accepted, "sealed \(body)")
+    }
+    // An escaped key spelling is the same key in both decoders.
+    #expect(try PortableFSDSealedProtocols.decode(Data(
+        #"{"identitySchema":1,"controlProtocol":2,"pfslocalMajor":2,"pfslocal\u004dinor":0}"#.utf8
+    )).pfslocalMinor == 0)
+
+    // The live identity shares the accessor and therefore the grammar.
+    let digest = String(repeating: "d", count: 64)
+    let live = [
+        "schemaVersion": "1", "controlProtocol": "2", "daemonVersion": #""0.9.1""#,
+        "executableSha256": #"""# + digest + #"""#, "pfslocalMajor": "2", "pfslocalMinor": "0",
+    ]
+    let liveKeys = ["schemaVersion", "controlProtocol", "daemonVersion", "executableSha256", "pfslocalMajor", "pfslocalMinor"]
+    for vector in sealedNumberParityVectors {
+        let key = vector.key == "identitySchema" ? "schemaVersion" : vector.key
+        let body = "{" + liveKeys.map {
+            #"""# + $0 + #"":"# + ($0 == key ? vector.value : live[$0]!)
+        }.joined(separator: ",") + "}"
+        let decoded = try? PortableFSDLiveIdentity.decode(Data(body.utf8))
+        #expect((decoded != nil) == vector.accepted, "live \(body)")
+    }
+}
+
 private func lifecycleResponse(_ status: String, headers: [String] = [], body: String = "") -> Data {
     var text = "HTTP/1.1 \(status)\r\n"
     for header in headers { text += header + "\r\n" }
