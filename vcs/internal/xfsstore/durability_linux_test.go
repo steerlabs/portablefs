@@ -275,7 +275,7 @@ func TestPersistenceFailuresFenceEveryLaterBarrier(t *testing.T) {
 						t.Fatal(err)
 					}
 					defer opened.release()
-					restore := &RestoreFiles{volume: v, files: map[uint32]restoreFile{1: {res: opened.res}}}
+					restore := &RestoreFiles{volume: v, files: map[uint32]restoreFile{1: {res: opened.res, identity: opened.coordinate.Stable}}}
 					first = restore.Fdatasync(1)
 				}
 				var fatal *DurabilityError
@@ -512,6 +512,107 @@ func TestConcurrentPersistenceFailurePreservesFirstCause(t *testing.T) {
 			var fatal *DurabilityError
 			if !errors.As(second, &fatal) || fatal.Cause != syscall.ENOSPC {
 				t.Fatalf("cause=%v", second)
+			}
+		})
+	}
+}
+
+// Both paths used to call persistence outside the shared inode group. Model a
+// consumed error by pausing the first syscall after it has chosen its result;
+// a concurrent call must queue until that error has fenced the volume.
+func TestSameDescriptionPersistenceCannotConsumeErrorThenSucceed(t *testing.T) {
+	for _, kind := range []string{"logical sync", "logical datasync", "restore hydration chunks"} {
+		for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+			t.Run(kind+"/"+cause.Error(), func(t *testing.T) {
+				v, handle, state := fsyncTestHandle(t)
+				opened, err := v.holdOpen(handle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer opened.release()
+				restore := &RestoreFiles{volume: v, files: map[uint32]restoreFile{1: {res: opened.res, identity: opened.coordinate.Stable}}}
+				entered, release := make(chan struct{}), make(chan struct{})
+				var calls atomic.Int32
+				call := func(fd int) error {
+					if fd != opened.fd() {
+						t.Errorf("description changed: %d / %d", fd, opened.fd())
+					}
+					if calls.Add(1) == 1 {
+						close(entered)
+						<-release
+						return cause
+					}
+					return nil
+				}
+				v.fsync, v.fdatasync = call, call
+				barrier := func() error {
+					return v.syncDescriptor(state, opened.fd(), kind == "logical sync", kind == "logical datasync")
+				}
+				if kind == "restore hydration chunks" {
+					barrier = func() error { return restore.Fdatasync(1) }
+				}
+				first, second := make(chan error, 1), make(chan error, 1)
+				go func() { first <- barrier() }()
+				<-entered
+				go func() { second <- barrier() }()
+				waitFsyncPending(t, state, 1)
+				if calls.Load() != 1 {
+					t.Fatalf("overlapping persistence syscalls: %d", calls.Load())
+				}
+				close(release)
+				a, b := <-first, <-second
+				var failure *DurabilityError
+				if a != b || !errors.As(a, &failure) || failure.Cause != cause || calls.Load() != 1 || !errors.Is(v.Health(), ErrFenced) {
+					t.Fatalf("first=%v second=%v calls=%d health=%v", a, b, calls.Load(), v.Health())
+				}
+				if err := restore.PWrite(1, 0, []byte("forbidden")); !errors.Is(err, ErrFenced) {
+					t.Fatalf("restore wrote after fence: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestFenceDoesNotExposeCauseClassification(t *testing.T) {
+	v := openTestVolume(t)
+	cause := &DurabilityError{Cause: ErrStaleObject}
+	v.Fence(cause)
+	if !errors.Is(v.Health(), ErrFenced) || errors.Is(v.Health(), ErrOutcomeUncertain) || errors.Is(v.Health(), ErrStaleObject) {
+		t.Fatalf("fence leaked cause classification: %v", v.Health())
+	}
+	if err := v.SyncFS(); err != cause {
+		t.Fatalf("barrier lost durability cause: %v", err)
+	}
+}
+
+func TestLogicalSyncThenFullBarrierUsesTwoSyscalls(t *testing.T) {
+	for _, dataOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "sync", true: "datasync"}[dataOnly], func(t *testing.T) {
+			v, handle, _ := fsyncTestHandle(t)
+			target, err := v.PinWriteTarget(handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer target.Close()
+			full, data := 0, 0
+			v.fsync = func(int) error { full++; return nil }
+			v.fdatasync = func(int) error { data++; return nil }
+			_, _, _, err = target.CommitWriteData([]byte("x"), WriteCommit{
+				RequestedSize: 1, RLimitSize: ^uint64(0), FileMaxSize: 1<<63 - 1,
+				Mode: WritePositioned, Sync: !dataOnly, DataSync: dataOnly,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := target.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			wantFull, wantData := 2, 0
+			if dataOnly {
+				wantFull, wantData = 1, 1
+			}
+			if full != wantFull || data != wantData {
+				t.Fatalf("sequential barriers: fsync=%d fdatasync=%d; want %d/%d", full, data, wantFull, wantData)
 			}
 		})
 	}

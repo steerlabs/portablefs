@@ -219,14 +219,15 @@ type Volume struct {
 	// descriptions of one inode therefore share the same EOF atomicity domain.
 	// A fixed stripe array avoids an unbounded lifecycle map. Append validation
 	// and every possible size-changing operation participate in this domain.
-	inodeMutation [inodeMutationStripeCount]sync.RWMutex
-	closed        bool
-	fenced        error
-	objects       map[Capability]object
-	opens         map[Capability]*openFile
-	volumeSync    syncGroup
-	fsyncMu       sync.Mutex
-	fsyncStates   map[[16]byte]*inodeFsyncState
+	inodeMutation     [inodeMutationStripeCount]sync.RWMutex
+	closed            bool
+	fenced            error
+	durabilityFailure *DurabilityError
+	objects           map[Capability]object
+	opens             map[Capability]*openFile
+	volumeSync        syncGroup
+	fsyncMu           sync.Mutex
+	fsyncStates       map[[16]byte]*inodeFsyncState
 
 	// The fields below are written once, before the Volume is reachable by
 	// any other goroutine, and never again. That is what makes them safe to
@@ -564,7 +565,8 @@ func (v *Volume) Fence(cause error) {
 	if cause == nil {
 		cause = syscall.EIO
 	}
-	v.fenced = fmt.Errorf("%w: %w", ErrFenced, cause)
+	errors.As(cause, &v.durabilityFailure)
+	v.fenced = fmt.Errorf("%w: %v", ErrFenced, cause)
 }
 
 func (v *Volume) Health() error {
@@ -1235,14 +1237,12 @@ func (v *Volume) PinWriteTarget(id Capability) (WriteTarget, error) {
 	}, nil
 }
 
-func (v *Volume) syncDescriptor(fd int, full, dataOnly bool) error {
-	if full {
-		return v.persist(fd, v.fsync)
+func (v *Volume) syncDescriptor(state *inodeFsyncState, fd int, full, dataOnly bool) error {
+	if !full && !dataOnly {
+		return nil
 	}
-	if dataOnly {
-		return v.persist(fd, v.fdatasync)
-	}
-	return nil
+	_, err := v.syncInode(state, fd, !full)
+	return err
 }
 
 type writeTargetApply func(limit, assigned uint64) (committed uint64, dispatched, invalidResult bool, err error)
@@ -1427,7 +1427,7 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		}
 	}
 	if committed != 0 {
-		syncErr := t.volume.syncDescriptor(t.res.fd, spec.Sync, spec.DataSync)
+		syncErr := t.volume.syncDescriptor(t.fsyncState, t.res.fd, spec.Sync, spec.DataSync)
 		postApplyErr = errors.Join(postApplyErr, syncErr)
 	}
 	post, statErr := t.volume.postStat(t.res.fd)
@@ -1585,7 +1585,7 @@ func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
 	privilegeErr := v.removeWritePrivileges(f.fd(), uint32(before.Mode), spec.KillPrivileges)
 	var syncErr error
 	if applyErr == nil {
-		syncErr = v.syncDescriptor(f.fd(), f.sync, f.dataSync)
+		syncErr = v.syncDescriptor(f.fsyncState, f.fd(), f.sync, f.dataSync)
 	}
 	post, statErr := v.postStat(f.fd())
 	if statErr != nil {
@@ -1718,7 +1718,7 @@ func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec)
 	}
 	if copyErr == nil && !invalidResult {
 		postApplyErr = errors.Join(postApplyErr,
-			v.syncDescriptor(destination.fd(), source.sync || destination.sync, source.dataSync || destination.dataSync))
+			v.syncDescriptor(destination.fsyncState, destination.fd(), source.sync || destination.sync, source.dataSync || destination.dataSync))
 	}
 	post, statErr := v.postStat(destination.fd())
 	if statErr != nil {
@@ -1861,6 +1861,9 @@ func (v *Volume) Fsync(id Capability, dataOnly bool) error {
 func (v *Volume) FsyncCoalesced(id Capability, dataOnly bool) (int, error) {
 	f, err := v.holdOpen(id)
 	if err != nil {
+		if errors.Is(err, ErrFenced) {
+			err = v.syncHealth()
+		}
 		return 0, err
 	}
 	defer f.release()

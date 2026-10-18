@@ -3,7 +3,6 @@
 package xfsstore
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 
@@ -56,44 +55,53 @@ func (t *syncTarget) Sync() error {
 	return err
 }
 
-// persist is the only persistence-syscall boundary. Linux reports writeback
-// errors once per description, so every failure must fence before another
-// barrier or waiter can consume an apparently successful retry.
-func (v *Volume) persist(fd int, call func(int) error) error {
-	if err := v.Health(); err != nil {
-		return durabilityError(err)
+// syncBarrier is the only persistence-syscall boundary. A group's error cursor
+// stays serialized until any failed syscall has fenced the volume. Checking
+// again after a successful call also observes failures on other descriptions.
+func (v *Volume) syncBarrier(group *syncGroup, fd int, dataOnly bool, fsync, fdatasync func(int) error) (int, error) {
+	if err := v.syncHealth(); err != nil {
+		return 0, err
 	}
-	if err := call(fd); err != nil {
-		return v.failDurability(err)
+	persist := func(call func(int) error) func(int) error {
+		return func(fd int) error {
+			// A queued batch may have outlived a failure on another inode.
+			if err := v.syncHealth(); err != nil {
+				return err
+			}
+			if err := call(fd); err != nil {
+				return v.failDurability(err)
+			}
+			return v.syncHealth()
+		}
 	}
-	if err := v.Health(); err != nil {
-		return durabilityError(err)
-	}
-	return nil
+	return group.barrier(fd, dataOnly, persist(fsync), persist(fdatasync))
 }
 
 func (v *Volume) syncInode(state *inodeFsyncState, fd int, dataOnly bool) (int, error) {
-	if err := v.Health(); err != nil {
-		return 0, durabilityError(err)
-	}
-	return state.barrier(fd, dataOnly,
-		func(fd int) error { return v.persist(fd, v.fsync) },
-		func(fd int) error { return v.persist(fd, v.fdatasync) })
+	return v.syncBarrier(&state.syncGroup, fd, dataOnly, v.fsync, v.fdatasync)
 }
 
-func durabilityError(err error) error {
-	var failure *DurabilityError
-	if errors.As(err, &failure) {
-		return failure
+func (v *Volume) syncHealth() error {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.syncHealthLocked()
+}
+
+func (v *Volume) syncHealthLocked() error {
+	if v.closed {
+		return ErrClosed
 	}
-	return err
+	if v.durabilityFailure != nil {
+		return v.durabilityFailure
+	}
+	return v.fenced
 }
 
 func (v *Volume) failDurability(err error) error {
 	v.Fence(&DurabilityError{Cause: err})
-	// Fence preserves the first failure, including when different descriptions
-	// fail concurrently. Return that same terminal observation to every caller.
-	return durabilityError(v.Health())
+	// Different descriptions may fail concurrently; every barrier returns the
+	// first failure, independently of the lifetime of an inode's batch state.
+	return v.syncHealth()
 }
 
 func (t *writeTarget) Sync() error {
@@ -139,19 +147,15 @@ func (v *Volume) PinSyncObject(id Capability) (SyncTarget, error) {
 // SyncFS uses the root description retained at startup. The shared cursor is
 // serialized through fencing; arrivals during a sync share the next syscall.
 func (v *Volume) SyncFS() error {
-	if err := v.Health(); err != nil {
-		return durabilityError(err)
-	}
 	v.mu.RLock()
-	if v.closed || v.fenced != nil {
+	if err := v.syncHealthLocked(); err != nil {
 		v.mu.RUnlock()
-		return durabilityError(v.Health())
+		return err
 	}
 	root := v.objects[v.root].res
 	root.acquire()
 	v.mu.RUnlock()
 	defer root.release()
-	_, err := v.volumeSync.barrier(root.fd, false,
-		func(fd int) error { return v.persist(fd, v.syncfs) }, nil)
+	_, err := v.syncBarrier(&v.volumeSync, root.fd, false, v.syncfs, nil)
 	return err
 }

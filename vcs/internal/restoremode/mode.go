@@ -421,7 +421,7 @@ func (m *Mode) Truncate(ctx context.Context, identity [16]byte, oldSize, newSize
 		m.entryLocks[entry].Unlock()
 		return err
 	}
-	if err := m.cfg.Store.Fdatasync(entry); err != nil {
+	if err := m.syncFile(entry); err != nil {
 		m.entryLocks[entry].Unlock()
 		return err
 	}
@@ -489,7 +489,7 @@ func (m *Mode) hydrateLocked(ctx context.Context, key chunkKey, durable, demand 
 		return 0, nil
 	}
 	if m.hmap.isHydrated(key) {
-		if err := m.cfg.Store.Fdatasync(key.entry); err != nil {
+		if err := m.syncFile(key.entry); err != nil {
 			return 0, err
 		}
 		return 0, m.hmap.markDurable([]chunkKey{key}, nil)
@@ -555,25 +555,13 @@ func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool
 	// PWrite may have moved mtime even when it reports a partial failure. The
 	// inode stays exclusively locked until the exact pre-install value is back.
 	if err := m.cfg.Store.RestoreMtime(key.entry, mtime); err != nil {
-		failure := fmt.Errorf("restoremode: restore hydration mtime: %w", errors.Join(syscall.EIO, installErr, err))
-		m.stateMu.Lock()
-		first := m.storageFailure == nil
-		if first {
-			m.storageFailure = failure
-			m.state, m.stateDetail = StateCorrupt, failure.Error()
-		}
-		failure = m.storageFailure
-		m.stateMu.Unlock()
-		if first && m.cfg.OnStorageFailure != nil {
-			m.cfg.OnStorageFailure(failure)
-		}
-		return failure
+		return m.failStorage(fmt.Errorf("restoremode: restore hydration mtime: %w", errors.Join(syscall.EIO, installErr, err)))
 	}
 	if installErr != nil {
 		return installErr
 	}
 	if durable {
-		if err := m.cfg.Store.Fdatasync(key.entry); err != nil {
+		if err := m.syncFile(key.entry); err != nil {
 			return err
 		}
 		if err := m.hmap.markDurable([]chunkKey{key}, nil); err != nil {
@@ -585,8 +573,36 @@ func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool
 	return nil
 }
 
-// StorageError is sticky: a failed timestamp restoration makes even otherwise
-// successful metadata samples unsafe for the remainder of this epoch.
+// syncFile failures are terminal even when hydration runs without a request.
+// The callback fences storage and stops serving; drain must never retry a
+// consumed writeback error or record a durable chunk after one.
+func (m *Mode) syncFile(entry uint32) error {
+	if err := m.StorageError(); err != nil {
+		return err
+	}
+	if err := m.cfg.Store.Fdatasync(entry); err != nil {
+		return m.failStorage(fmt.Errorf("restoremode: sync hydration: %w", errors.Join(syscall.EIO, err)))
+	}
+	return nil
+}
+
+func (m *Mode) failStorage(failure error) error {
+	m.stateMu.Lock()
+	first := m.storageFailure == nil
+	if first {
+		m.storageFailure = failure
+		m.state, m.stateDetail = StateCorrupt, failure.Error()
+	}
+	failure = m.storageFailure
+	m.stateMu.Unlock()
+	if first && m.cfg.OnStorageFailure != nil {
+		m.cfg.OnStorageFailure(failure)
+	}
+	return failure
+}
+
+// StorageError is sticky: failed hydration persistence or timestamp restoration
+// makes this storage epoch unusable, including otherwise successful samples.
 func (m *Mode) StorageError() error {
 	if m == nil {
 		return nil
