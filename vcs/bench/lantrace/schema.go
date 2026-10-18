@@ -11,7 +11,7 @@ import (
 
 // Schema is the stream grammar version carried by every header. A change that
 // alters the meaning of an existing key gets a new schema string.
-const Schema = "pfs-lan-trace-1"
+const Schema = "pfs-lan-trace-2"
 
 const (
 	// MaxLineBytes bounds one record including its newline. The largest legal
@@ -47,6 +47,23 @@ func (l Label) valid() bool {
 		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z':
 		case i > 0 && (c >= '0' && c <= '9' || c == '.' || c == '_' || c == ':' || c == '-'):
 		default:
+			return false
+		}
+	}
+	return true
+}
+
+// TraceID preserves an exact non-secret local connection ID, Resolve attach_ref
+// or Hello client_name. Unlike Label it admits UUIDs and decimal counters that
+// start with a digit. Producers must not normalize or hash shared join fields.
+type TraceID string
+
+func (v TraceID) valid() bool {
+	if len(v) == 0 || len(v) > MaxLabelBytes {
+		return false
+	}
+	for _, c := range []byte(v) {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == ':' || c == '-') {
 			return false
 		}
 	}
@@ -794,11 +811,13 @@ type Event struct {
 
 	// Run-local identities.
 	Mount            Label   `json:"mount,omitempty"`             // run-local mount label
-	Conn             uint64  `json:"conn,omitempty"`              // daemon frontend-connection incarnation, never reused
-	ConnNS           Label   `json:"conn_ns,omitempty"`           // run-unique namespace of conn, held identically by frontend and daemon
+	Conn             TraceID `json:"conn,omitempty"`              // producer-local connection: daemon origin counter or Swift UUID; never joined across processes
+	FrontendPID      uint32  `json:"frontend_pid,omitempty"`      // extension PID; daemon obtains it from the accepted socket peer
+	AttachRef        TraceID `json:"attach_ref,omitempty"`        // exact Resolve attach_ref
+	ConnRole         TraceID `json:"conn_role,omitempty"`         // exact Hello client_name
 	Callback         uint64  `json:"callback,omitempty"`          // frontend-local callback ID, unique per frontend process
 	Operation        uint64  `json:"operation,omitempty"`         // pfslocal operation_id, scoped by conn
-	Request          uint64  `json:"request,omitempty"`           // pfslocal request_id (or disposition target), scoped by conn
+	RequestID        uint64  `json:"request_id,omitempty"`        // pfslocal request_id (or disposition target), scoped by conn
 	Successor        uint64  `json:"successor,omitempty"`         // operation a delayed ack is correlated to, scoped by conn
 	Session          Label   `json:"session,omitempty"`           // run-local authority session label
 	AuthorityRequest uint64  `json:"authority_request,omitempty"` // authority request_id, scoped by session
@@ -888,37 +907,37 @@ var ruleSpecs = map[Kind]rule{
 		layers:   []Layer{LayerFrontend, LayerLinuxClient},
 		phases:   []Phase{PhaseEntry, PhaseReply, PhasePublicationComplete},
 		required: "callback callback_kind",
-		optional: "mount conn conn_ns operation origin item parent name_hex outcome errno publication",
+		optional: "mount conn frontend_pid attach_ref conn_role request_id operation origin item parent name_hex outcome errno publication",
 	},
 	KindLocal: {
 		layers: []Layer{LayerFrontend, LayerDaemon},
 		phases: []Phase{PhaseSend, PhaseEnqueue, PhaseDispatch, PhaseOutcome, PhaseExposure,
 			PhaseReply, PhaseDisposition},
-		required: "conn request local_op",
-		optional: "conn_ns mount callback operation origin item parent name_hex outcome errno count",
+		required: "local_op",
+		optional: "conn frontend_pid attach_ref conn_role request_id mount callback operation origin item parent name_hex outcome errno count",
 	},
 	KindCache: {
 		layers:   []Layer{LayerDaemon},
 		phases:   []Phase{PhaseCandidate, PhaseFinal},
-		required: "conn request candidate cache_result",
-		optional: "conn_ns mount operation item parent name_hex coordinate miss_reason proof proof_age_ns source_state cert cert_drop search exposure",
+		required: "candidate cache_result",
+		optional: "conn frontend_pid attach_ref conn_role request_id mount operation item parent name_hex coordinate miss_reason proof proof_age_ns source_state cert cert_drop search exposure",
 	},
 	KindSource: {
 		layers: []Layer{LayerDaemon},
 		phases: []Phase{PhaseAcquire, PhaseActiveInc, PhaseActiveDec, PhasePostState,
 			PhaseClaimSettled, PhaseAck, PhaseRelease},
 		required: "conn operation",
-		optional: "conn_ns mount request successor count publication",
+		optional: "frontend_pid attach_ref conn_role mount request_id successor count publication",
 	},
 	KindOpen: {
 		layers:   []Layer{LayerFrontend, LayerDaemon, LayerLinuxClient},
 		required: "item open_reason mode rpc",
-		optional: "mount conn conn_ns callback operation request live_mode flags",
+		optional: "mount conn frontend_pid attach_ref conn_role callback operation request_id live_mode flags",
 	},
 	KindRelease: {
 		layers:   []Layer{LayerFrontend, LayerDaemon, LayerLinuxClient},
 		required: "item release_kind",
-		optional: "mount conn conn_ns batch",
+		optional: "mount conn frontend_pid attach_ref conn_role batch",
 	},
 	KindReleaseBatch: {
 		layers:   []Layer{LayerDaemon, LayerLinuxClient},
@@ -930,7 +949,7 @@ var ruleSpecs = map[Kind]rule{
 		layers:   []Layer{LayerDaemon, LayerLinuxClient, LayerAuthority},
 		phases:   []Phase{PhaseSend, PhaseReceive, PhaseReply},
 		required: "session authority_request authority_op",
-		optional: "mount conn conn_ns operation request dispatch outcome errno lookup committed_seq visible_seq dur_ns",
+		optional: "mount conn frontend_pid attach_ref conn_role operation request_id dispatch outcome errno lookup committed_seq visible_seq dur_ns",
 	},
 	KindBarrier: {
 		layers:   []Layer{LayerAuthority},
@@ -945,7 +964,7 @@ var ruleSpecs = map[Kind]rule{
 	KindWait: {
 		layers:   allLayers,
 		required: "wait dur_ns",
-		optional: "mount conn conn_ns callback operation request session authority_request count",
+		optional: "mount conn frontend_pid attach_ref conn_role callback operation request_id session authority_request count",
 	},
 	KindOccupancy: {
 		layers:   allLayers,
@@ -956,7 +975,7 @@ var ruleSpecs = map[Kind]rule{
 	KindMkdirWitness: {
 		layers:   []Layer{LayerDaemon},
 		required: "item witness seed",
-		optional: "mount conn conn_ns request session authority_request parent cut_seq",
+		optional: "mount conn frontend_pid attach_ref conn_role request_id session authority_request parent cut_seq",
 	},
 	KindRenewal: {
 		layers:   []Layer{LayerDaemon},

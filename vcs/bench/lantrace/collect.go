@@ -13,8 +13,7 @@ const (
 	DefaultMaxEvents = 4 << 20
 	// DefaultMaxBytes is the default bound on event bytes in one collection.
 	DefaultMaxBytes = 1 << 30
-	// MaxDistinctLabels bounds the distinct mount, connection-namespace,
-	// session and superblock labels of one run. Labels name a handful of
+	// MaxDistinctLabels bounds the distinct mount, session and superblock labels of one run. Labels name a handful of
 	// run-local objects; a run that needs more is using them as per-file or
 	// per-request identities, which the content rule forbids, so further new
 	// labels are rejected.
@@ -300,7 +299,7 @@ func (s *inputStream) advance(labels map[Label]struct{}) error {
 // event that would introduce a new label beyond MaxDistinctLabels.
 func admitLabels(labels map[Label]struct{}, e *Event) bool {
 	var added []Label
-	for _, l := range [...]Label{e.Mount, e.ConnNS, e.Session, e.Superblock} {
+	for _, l := range [...]Label{e.Mount, e.Session, e.Superblock} {
 		if l == "" {
 			continue
 		}

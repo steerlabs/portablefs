@@ -36,8 +36,8 @@ type StreamInfo struct {
 }
 
 // Join statuses. A join is exact only when both layers were traced, every
-// anchor carried the identity namespace the key requires, and every anchor
-// matched exactly one partner with the same operation metadata.
+// request-bearing record carried the identity fields the key requires, and
+// every anchor matched exactly one partner with the same operation metadata.
 const (
 	JoinNotTraced   = "not_traced"
 	JoinUnavailable = "unavailable"
@@ -58,8 +58,8 @@ type JoinCoverage struct {
 	UnmatchedRight uint64 `json:"unmatched_right"`
 	EvictedLeft    uint64 `json:"evicted_left"`
 	EvictedRight   uint64 `json:"evicted_right"`
-	// Unqualified counts anchors that lacked the key's namespace and so could
-	// not be joined at all; any makes the join unavailable.
+	// Unqualified counts request-bearing records with missing or ambiguous
+	// connection identities; any makes the join unavailable with no matches.
 	Unqualified uint64 `json:"unqualified"`
 	// Conflicts counts identities whose anchors disagreed on operation
 	// metadata: two anchors with one identity that describe different
@@ -164,7 +164,7 @@ func BuildReport(r io.Reader, cfg ReportConfig) (*Report, error) {
 	}
 
 	a := &aggregator{counters: rep.Counters, latencies: map[string]*histogram{}}
-	a.joins[0] = newJoin(JoinCoverage{Name: joinFrontendDaemon, Key: "(conn_ns, conn, request)",
+	a.joins[0] = newJoin(JoinCoverage{Name: joinFrontendDaemon, Key: "(run, frontend_pid, attach_ref, conn_role, request_id)",
 		Left: "frontend local/send", Right: "daemon local/enqueue",
 		Applicable: present[LayerFrontend] && present[LayerDaemon]}, cfg.JoinWindow)
 	a.joins[1] = newJoin(JoinCoverage{Name: joinClientAuthority, Key: "(session, authority_request)",
@@ -201,7 +201,7 @@ func BuildReport(r io.Reader, cfg ReportConfig) (*Report, error) {
 			lastSeq[rec.Stream-1] = rec.Seq
 			counted[rec.Stream-1]++
 			rep.Events++
-			a.add(layer, &rec.Event)
+			a.add(layer, rec.Stream, &rec.Event)
 		case recordTrailer:
 			trailers++
 			if rec.Stream != uint32(trailers) || trailers > len(rep.Streams) {
@@ -362,9 +362,11 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 type aggregator struct {
-	counters  map[string]uint64
-	latencies map[string]*histogram
-	joins     [2]*join
+	counters    map[string]uint64
+	latencies   map[string]*histogram
+	joins       [2]*join
+	connections map[localConnectionKey][2]localConnectionWitness
+	bindings    map[localConnectionWitness]localConnectionKey
 }
 
 func key(parts ...string) string { return strings.Join(parts, ".") }
@@ -392,7 +394,11 @@ func isClient(l Layer) bool { return l == LayerDaemon || l == LayerLinuxClient }
 // the client send or authority receive, Lookup polarity at the reply, cache
 // exposure and miss reasons at the single final decision, released tokens at
 // the batch acknowledgement.
-func (a *aggregator) add(layer Layer, e *Event) {
+func (a *aggregator) add(layer Layer, stream uint32, e *Event) {
+	qualified := true
+	if (layer == LayerFrontend || layer == LayerDaemon) && (e.RequestID != 0 || e.Kind == KindLocal || e.Kind == KindCache) {
+		qualified = a.localIdentity(layer, stream, e)
+	}
 	L := string(layer)
 	switch e.Kind {
 	case KindCallback:
@@ -412,14 +418,9 @@ func (a *aggregator) add(layer Layer, e *Event) {
 			if layer == LayerDaemon {
 				side = 1
 			}
-			// conn is unique only within one daemon process, so the key is
-			// qualified by the run-unique namespace both sides must hold.
-			// An anchor without it cannot be joined: the join is unavailable
-			// rather than matched on a number another daemon also uses.
-			if e.ConnNS == "" {
-				a.joins[0].unqualified()
-			} else {
-				a.joins[0].add(side, joinKey{label: e.ConnNS, scope: e.Conn, id: e.Request}, joinMeta{op: string(e.LocalOp), mount: e.Mount})
+			if qualified {
+				a.joins[0].add(side, joinKey{local: localConnectionKey{e.FrontendPID, e.AttachRef, e.ConnRole}, id: e.RequestID},
+					joinMeta{op: string(e.LocalOp), mount: e.Mount})
 			}
 		}
 	case KindCache:
@@ -543,10 +544,61 @@ func (a *aggregator) finish(rep *Report) {
 	a.counters["trace.lost_events"] = satAdd(satAdd(rep.ProducerLost, rep.Dropped), rep.Rejected)
 }
 
+// MaxLocalConnections bounds the whole-run uniqueness inventory. It is never
+// evicted: forgetting a connection could let later PID or same-role reuse join.
+const MaxLocalConnections = 256
+
+type localConnectionKey struct {
+	pid          uint32
+	attach, role TraceID
+}
+
+type localConnectionWitness struct {
+	stream uint32
+	conn   TraceID
+}
+
+// localIdentity proves that one tuple names exactly one connection per
+// producer. Local IDs are witnesses within a stream, never compared between
+// the frontend and daemon. Even a late ambiguity invalidates earlier matches.
+func (a *aggregator) localIdentity(layer Layer, stream uint32, e *Event) bool {
+	j := a.joins[0]
+	if !j.cov.Applicable {
+		return false
+	}
+	if e.FrontendPID == 0 || e.AttachRef == "" || e.ConnRole == "" || e.RequestID == 0 || e.Conn == "" {
+		j.unqualified()
+		return false
+	}
+	k := localConnectionKey{e.FrontendPID, e.AttachRef, e.ConnRole}
+	w := localConnectionWitness{stream, e.Conn}
+	side := 0
+	if layer == LayerDaemon {
+		side = 1
+	}
+	if a.connections == nil {
+		a.connections = make(map[localConnectionKey][2]localConnectionWitness)
+		a.bindings = make(map[localConnectionWitness]localConnectionKey)
+	}
+	if prior, exists := a.bindings[w]; exists && prior != k {
+		j.unqualified()
+		return false
+	}
+	seen, exists := a.connections[k]
+	if !exists && len(a.connections) >= MaxLocalConnections || seen[side].stream != 0 && seen[side] != w {
+		j.unqualified()
+		return false
+	}
+	seen[side] = w
+	a.connections[k] = seen
+	a.bindings[w] = k
+	return true
+}
+
 type joinKey struct {
-	label Label  // conn_ns for pfslocal identities, session for authority identities
-	scope uint64 // conn, for pfslocal identities
-	id    uint64 // request or authority request
+	label Label // authority session; run scope is fixed by the collection
+	local localConnectionKey
+	id    uint64 // request_id or authority_request
 }
 
 // joinMeta is what both anchors of one identity must agree on. A mount label
@@ -586,7 +638,7 @@ func newJoin(cov JoinCoverage, capacity int) *join {
 	return &join{cov: cov, capacity: capacity, pending: map[joinKey]*joinEntry{}}
 }
 
-// unqualified counts an anchor that lacks the key's namespace.
+// unqualified counts a missing, ambiguous or untrackable local identity.
 func (j *join) unqualified() {
 	if j.cov.Applicable {
 		j.cov.Unqualified++
@@ -644,6 +696,9 @@ func (j *join) finish() {
 	case !c.Applicable:
 		c.Status = JoinNotTraced
 	case c.Unqualified > 0:
+		// The entire run's connection uniqueness must be proven before any
+		// frontend/daemon match can be claimed, including earlier candidates.
+		c.Matched = 0
 		c.Status = JoinUnavailable
 	case c.Conflicts+c.UnmatchedLeft+c.UnmatchedRight+c.EvictedLeft+c.EvictedRight > 0:
 		c.Status = JoinIncomplete

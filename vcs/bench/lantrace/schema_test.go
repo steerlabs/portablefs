@@ -44,7 +44,7 @@ func TestParseRejectsOutsideTheGrammar(t *testing.T) {
 		{"hex odd length", ev(`,"name_hex":"abc"`), LayerFrontend, "invalid value"},
 		{"hex not hex", ev(`,"name_hex":"zz"`), LayerFrontend, "invalid value"},
 		{"hex oversized", ev(`,"name_hex":"` + strings.Repeat("ab", MaxNameBytes+1) + `"`), LayerFrontend, "invalid value"},
-		{"explicit zero integer", ev(`,"conn":0`), LayerFrontend, "explicit zero"},
+		{"explicit zero integer", ev(`,"item":0`), LayerFrontend, "explicit zero"},
 		{"explicit empty string", ev(`,"mount":""`), LayerFrontend, "explicit zero"},
 		{"negative integer", ev(`,"item":-1`), LayerFrontend, "wrong type"},
 		{"fractional integer", ev(`,"item":1.5`), LayerFrontend, "wrong type"},
@@ -70,9 +70,9 @@ func TestParseRejectsOutsideTheGrammar(t *testing.T) {
 		{"missing record", `{"kind":"callback"}`, LayerFrontend, "unknown or missing record"},
 		{"event key in trailer", `{"record":"trailer","emitted":1,"lost":0,"kind":"callback"}`, LayerFrontend, "unknown key"},
 		{"header bad schema", `{"record":"header","schema":"pfs-lan-trace-0","run":"r","layer":"daemon","process":"p","clock":"c"}`, LayerFrontend, "unsupported schema"},
-		{"header bad layer", `{"record":"header","schema":"pfs-lan-trace-1","run":"r","layer":"kernel","process":"p","clock":"c"}`, LayerFrontend, "layer"},
-		{"header bad run", `{"record":"header","schema":"pfs-lan-trace-1","run":"a run","layer":"daemon","process":"p","clock":"c"}`, LayerFrontend, "run"},
-		{"header missing clock", `{"record":"header","schema":"pfs-lan-trace-1","run":"r","layer":"daemon","process":"p"}`, LayerFrontend, `missing key "clock"`},
+		{"header bad layer", `{"record":"header","schema":"pfs-lan-trace-2","run":"r","layer":"kernel","process":"p","clock":"c"}`, LayerFrontend, "layer"},
+		{"header bad run", `{"record":"header","schema":"pfs-lan-trace-2","run":"a run","layer":"daemon","process":"p","clock":"c"}`, LayerFrontend, "run"},
+		{"header missing clock", `{"record":"header","schema":"pfs-lan-trace-2","run":"r","layer":"daemon","process":"p"}`, LayerFrontend, `missing key "clock"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -120,6 +120,7 @@ func longestValues() map[reflect.Type]string {
 		reg(strs(e))
 	}
 	reg(reflect.TypeOf(Label("")), []string{"L" + strings.Repeat("x", MaxLabelBytes-1)})
+	reg(reflect.TypeOf(TraceID("")), []string{"0" + strings.Repeat("x", MaxLabelBytes-1)})
 	reg(reflect.TypeOf(NameHex("")), []string{strings.Repeat("ff", MaxNameBytes)})
 	return m
 }
@@ -261,6 +262,24 @@ func TestOpaqueLabelIsRunLocalAndDeterministic(t *testing.T) {
 	}{{"", "r", id}, {"toolongpre", "r", id}, {"s", "bad run", id}, {"s", "r", nil}} {
 		if _, err := OpaqueLabel(tc.prefix, tc.run, tc.id); err == nil {
 			t.Errorf("OpaqueLabel(%q, %q, %d bytes) accepted", tc.prefix, tc.run, len(tc.id))
+		}
+	}
+}
+
+func TestTraceIDs(t *testing.T) {
+	for _, tc := range []struct {
+		id    TraceID
+		valid bool
+	}{
+		{"550e8400-e29b-41d4-a716-446655440000", true},
+		{"42", true},
+		{"portablefskit-events", true},
+		{TraceID(strings.Repeat("0", MaxLabelBytes)), true},
+		{TraceID(strings.Repeat("0", MaxLabelBytes+1)), false},
+		{"", false}, {"some role", false}, {"a/b", false}, {"é", false},
+	} {
+		if got := tc.id.valid(); got != tc.valid {
+			t.Errorf("TraceID(%q).valid() = %t, want %t", tc.id, got, tc.valid)
 		}
 	}
 }

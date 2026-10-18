@@ -297,7 +297,7 @@ func TestRecorderConcurrentEmitKeepsOrderAndCounts(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := range each {
-				e := Event{Kind: KindLocal, Phase: PhaseEnqueue, Conn: uint64(w + 1), Request: uint64(i + 1), LocalOp: LocalLookup}
+				e := Event{Kind: KindLocal, Phase: PhaseEnqueue, Conn: TraceID(fmt.Sprint(w + 1)), RequestID: uint64(i + 1), LocalOp: LocalLookup}
 				if err := r.Emit(e); err != nil {
 					t.Error(err)
 				}
@@ -355,6 +355,6 @@ func ExampleRecorder() {
 	fmt.Println(lines[0])
 	fmt.Println(lines[2])
 	// Output:
-	// {"record":"header","schema":"pfs-lan-trace-1","run":"probe-32","layer":"authority","process":"authority","clock":"go-monotonic"}
+	// {"record":"header","schema":"pfs-lan-trace-2","run":"probe-32","layer":"authority","process":"authority","clock":"go-monotonic"}
 	// {"record":"trailer","emitted":1,"lost":0}
 }

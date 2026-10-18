@@ -3,6 +3,7 @@ package lantrace
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -20,6 +21,14 @@ func scenario(t *testing.T) []byte {
 			t.Fatal(err)
 		}
 		for _, e := range events {
+			if (layer == LayerFrontend || layer == LayerDaemon) && e.RequestID != 0 && e.FrontendPID == 0 {
+				e.FrontendPID, e.AttachRef, e.ConnRole = 1234, "attach-1", "portablefskit"
+				if layer == LayerFrontend {
+					e.Conn = "550e8400-e29b-41d4-a716-446655440000"
+				} else {
+					e.Conn = "42"
+				}
+			}
 			if err := r.Emit(e); err != nil {
 				t.Fatalf("%s emit %+v: %v", layer, e, err)
 			}
@@ -37,10 +46,10 @@ func scenario(t *testing.T) []byte {
 		Event{Kind: KindCallback, Phase: PhaseEntry, Callback: 1, CallbackKind: CallbackLookup, Parent: 2, NameHex: name},
 		frontendSend(1, 1, LocalLookup),
 		Event{Kind: KindCallback, Phase: PhaseReply, Callback: 1, CallbackKind: CallbackLookup, Outcome: OutcomeError, Errno: 2},
-		Event{Kind: KindCallback, Phase: PhasePublicationComplete, Callback: 1, CallbackKind: CallbackLookup, Conn: 1, Operation: 9, Publication: PublicationPublished},
+		Event{Kind: KindCallback, Phase: PhasePublicationComplete, Callback: 1, CallbackKind: CallbackLookup, Conn: "550e8400-e29b-41d4-a716-446655440000", Operation: 9, Publication: PublicationPublished},
 		Event{Kind: KindCallback, Phase: PhaseEntry, Callback: 2, CallbackKind: CallbackGetAttr, Origin: OriginFramework},
 		frontendSend(1, 2, LocalGetAttr),
-		Event{Kind: KindLocal, Phase: PhaseSend, ConnNS: testConnNS, Conn: 1, Request: 3, LocalOp: LocalGetAttr, Origin: OriginSyntheticEnumeration},
+		func() Event { e := frontendSend(1, 3, LocalGetAttr); e.Origin = OriginSyntheticEnumeration; return e }(),
 		Event{Kind: KindOpen, Item: 10, OpenReason: OpenCreateReuse, Mode: ModeWrite, RPC: RPCAvoided, LiveMode: LiveWrite},
 		Event{Kind: KindRelease, Item: 10, ReleaseKind: ReleaseClose},
 	)
@@ -48,12 +57,12 @@ func scenario(t *testing.T) []byte {
 		daemonEnqueue(1, 1, LocalLookup),
 		daemonEnqueue(1, 2, LocalGetAttr),
 		daemonEnqueue(1, 3, LocalGetAttr),
-		Event{Kind: KindCache, Phase: PhaseCandidate, Conn: 1, Request: 1, Candidate: CandidateCompleteness, CacheResult: CacheNegative, Parent: 2, NameHex: name, Cert: CertPresent, Search: SearchPermitted},
-		Event{Kind: KindCache, Phase: PhaseFinal, Conn: 1, Request: 1, Candidate: CandidateCompleteness, CacheResult: CacheNegative, Exposure: ExposureAccepted, Coordinate: CoordinateFirst},
-		Event{Kind: KindCache, Phase: PhaseCandidate, Conn: 1, Request: 2, Candidate: CandidateAttrCache, CacheResult: CacheMiss, MissReason: MissCold},
-		Event{Kind: KindCache, Phase: PhaseFinal, Conn: 1, Request: 2, Candidate: CandidateAttrCache, CacheResult: CacheMiss, Exposure: ExposureOrdinaryRead, MissReason: MissCold},
-		Event{Kind: KindCache, Phase: PhaseCandidate, Conn: 1, Request: 3, Candidate: CandidateAttrCache, CacheResult: CachePositive, Proof: ProofValid, ProofAge: 1000, SourceState: SourceSettled},
-		Event{Kind: KindCache, Phase: PhaseFinal, Conn: 1, Request: 3, Candidate: CandidateAttrCache, CacheResult: CachePositive, Exposure: ExposureOrdinaryRead, MissReason: MissTerminal},
+		Event{Kind: KindCache, Phase: PhaseCandidate, Conn: "42", RequestID: 1, Candidate: CandidateCompleteness, CacheResult: CacheNegative, Parent: 2, NameHex: name, Cert: CertPresent, Search: SearchPermitted},
+		Event{Kind: KindCache, Phase: PhaseFinal, Conn: "42", RequestID: 1, Candidate: CandidateCompleteness, CacheResult: CacheNegative, Exposure: ExposureAccepted, Coordinate: CoordinateFirst},
+		Event{Kind: KindCache, Phase: PhaseCandidate, Conn: "42", RequestID: 2, Candidate: CandidateAttrCache, CacheResult: CacheMiss, MissReason: MissCold},
+		Event{Kind: KindCache, Phase: PhaseFinal, Conn: "42", RequestID: 2, Candidate: CandidateAttrCache, CacheResult: CacheMiss, Exposure: ExposureOrdinaryRead, MissReason: MissCold},
+		Event{Kind: KindCache, Phase: PhaseCandidate, Conn: "42", RequestID: 3, Candidate: CandidateAttrCache, CacheResult: CachePositive, Proof: ProofValid, ProofAge: 1000, SourceState: SourceSettled},
+		Event{Kind: KindCache, Phase: PhaseFinal, Conn: "42", RequestID: 3, Candidate: CandidateAttrCache, CacheResult: CachePositive, Exposure: ExposureOrdinaryRead, MissReason: MissTerminal},
 		authoritySend(session, 1, AuthorityGetAttr),
 		Event{Kind: KindAuthority, Phase: PhaseReceive, Session: session, AuthorityRequest: 1, AuthorityOp: AuthorityGetAttr, Outcome: OutcomeOK, Duration: 6000},
 		authoritySend(session, 2, AuthorityLookup),
@@ -67,10 +76,10 @@ func scenario(t *testing.T) []byte {
 		Event{Kind: KindReleaseBatch, Phase: PhaseAcked, ReleaseKind: ReleaseClose, Batch: 1, Tokens: 5},
 		Event{Kind: KindReleaseBatch, Phase: PhaseSent, ReleaseKind: ReleaseReclaim, Batch: 2, Count: 2},
 		Event{Kind: KindReleaseBatch, Phase: PhaseAcked, ReleaseKind: ReleaseReclaim, Batch: 2, Tokens: 2},
-		Event{Kind: KindSource, Phase: PhaseAcquire, Conn: 1, Operation: 9},
-		Event{Kind: KindSource, Phase: PhaseAck, Conn: 1, Operation: 9, Successor: 10, Publication: PublicationPublished},
-		Event{Kind: KindOpen, Item: 11, OpenReason: OpenFirst, Mode: ModeRead, RPC: RPCEmitted, Conn: 1, Request: 3},
-		Event{Kind: KindWait, Wait: WaitReservation, Duration: 100, Conn: 1, Request: 2},
+		Event{Kind: KindSource, Phase: PhaseAcquire, Conn: "42", Operation: 9},
+		Event{Kind: KindSource, Phase: PhaseAck, Conn: "42", Operation: 9, Successor: 10, Publication: PublicationPublished},
+		Event{Kind: KindOpen, Item: 11, OpenReason: OpenFirst, Mode: ModeRead, RPC: RPCEmitted, Conn: "42", RequestID: 3},
+		Event{Kind: KindWait, Wait: WaitReservation, Duration: 100, Conn: "42", RequestID: 2},
 		Event{Kind: KindWait, Wait: WaitReservation, Duration: 300},
 		Event{Kind: KindOccupancy, Phase: PhaseSample, Resource: ResourcePendingReservations, Count: 5, Limit: 1024},
 		Event{Kind: KindOccupancy, Phase: PhaseFinal, Resource: ResourcePendingReservations},
@@ -240,11 +249,17 @@ func TestReportCorrelationCoverage(t *testing.T) {
 		{"matched", fiveFrontendThenDaemon, 16, joinFrontendDaemon, cov{matched: 5, status: JoinExact}, true},
 		{"evicted by a small window", fiveFrontendThenDaemon, 2, joinFrontendDaemon,
 			cov{unmatchedRight: 2, evictedLeft: 5, evictedRight: 3, status: JoinIncomplete}, false},
-		{"same request on another connection does not match",
+		{"same request on another attach does not match",
 			pair(frontendSend(1, 7, LocalLookup), daemonEnqueue(2, 7, LocalLookup)),
 			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
-		{"same connection and request in another namespace does not match",
-			pair(frontendSend(1, 1, LocalLookup), inNamespace("cns-other", daemonEnqueue(1, 1, LocalLookup))),
+		{"same attach and request in another role does not match",
+			pair(frontendSend(1, 1, LocalLookup), func() Event { e := daemonEnqueue(1, 1, LocalLookup); e.ConnRole = "portablefskit-events"; return e }()),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
+		{"same request on another frontend PID does not match",
+			pair(frontendSend(1, 1, LocalLookup), func() Event { e := daemonEnqueue(1, 1, LocalLookup); e.FrontendPID++; return e }()),
+			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
+		{"different request IDs do not match",
+			pair(frontendSend(1, 1, LocalLookup), daemonEnqueue(1, 2, LocalLookup)),
 			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unmatchedRight: 1, status: JoinIncomplete}, false},
 		{"conflicting operation is not a match",
 			pair(frontendSend(1, 1, LocalLookup), daemonEnqueue(1, 1, LocalGetAttr)),
@@ -253,13 +268,12 @@ func TestReportCorrelationCoverage(t *testing.T) {
 			pair(func() Event { e := frontendSend(1, 1, LocalLookup); e.Mount = "mount-a"; return e }(),
 				func() Event { e := daemonEnqueue(1, 1, LocalLookup); e.Mount = "mount-b"; return e }()),
 			16, joinFrontendDaemon, cov{unmatchedLeft: 1, conflicts: 1, status: JoinIncomplete}, false},
-		// The review's reproduction: two daemons each allocate connection 1,
-		// and nothing proves the frontend and daemon share one namespace.
-		{"anchors without the shared namespace leave the join unavailable",
-			pair(inNamespace("", frontendSend(1, 1, LocalLookup)), inNamespace("", daemonEnqueue(1, 1, LocalGetAttr))),
+		// A daemon-local counter alone supplies no shared identity.
+		{"anchors without the shared tuple leave the join unavailable",
+			pair(func() Event { e := frontendSend(1, 1, LocalLookup); e.FrontendPID = 0; return e }(), func() Event { e := daemonEnqueue(1, 1, LocalGetAttr); e.FrontendPID = 0; return e }()),
 			16, joinFrontendDaemon, cov{unqualified: 2, status: JoinUnavailable}, false},
-		{"one side without the namespace leaves the join unavailable",
-			pair(frontendSend(1, 1, LocalLookup), inNamespace("", daemonEnqueue(1, 1, LocalLookup))),
+		{"one side without an attach leaves the join unavailable",
+			pair(frontendSend(1, 1, LocalLookup), func() Event { e := daemonEnqueue(1, 1, LocalLookup); e.AttachRef = ""; return e }()),
 			16, joinFrontendDaemon, cov{unmatchedLeft: 1, unqualified: 1, status: JoinUnavailable}, false},
 		{"unmatched authority receive", func() []*streamBuilder {
 			return []*streamBuilder{
@@ -511,5 +525,123 @@ func TestReconcile(t *testing.T) {
 				t.Fatalf("lines=%+v ok=%t, want status %s", lines, ok, tc.status)
 			}
 		})
+	}
+}
+
+// A complete tuple and each producer's own connection witness are required
+// throughout the run, including records after an otherwise matching pair.
+func TestReportRefusesUnprovableLocalConnections(t *testing.T) {
+	for _, field := range []string{"frontend_pid", "attach_ref", "conn_role", "request_id", "conn"} {
+		t.Run("missing "+field, func(t *testing.T) {
+			f, d := frontendSend(1, 1, LocalLookup), daemonEnqueue(1, 1, LocalLookup)
+			switch field {
+			case "frontend_pid":
+				d.FrontendPID = 0
+			case "attach_ref":
+				d.AttachRef = ""
+			case "conn_role":
+				d.ConnRole = ""
+			case "request_id":
+				d.RequestID = 0
+			case "conn":
+				d.Conn = ""
+			}
+			out, _ := collectStreams(t, CollectConfig{}, newStream(LayerFrontend).ev(0, f).end(0), newStream(LayerDaemon).ev(0, d).end(0))
+			assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+		})
+	}
+	for _, layer := range []Layer{LayerFrontend, LayerDaemon} {
+		t.Run("duplicate same-role connection on "+string(layer), func(t *testing.T) {
+			f, d := newStream(LayerFrontend), newStream(LayerDaemon)
+			f.ev(0, frontendSend(1, 1, LocalLookup))
+			d.ev(0, daemonEnqueue(1, 1, LocalLookup))
+			// The first pair has already matched before another connection
+			// appears, with a disjoint request ID. It must erase that match.
+			if layer == LayerFrontend {
+				e := frontendSend(1, 2, LocalLookup)
+				e.Conn = "111e8400-e29b-41d4-a716-446655440000"
+				f.ev(100, e)
+			} else {
+				e := daemonEnqueue(1, 2, LocalLookup)
+				e.Conn = "99"
+				d.ev(100, e)
+			}
+			out, _ := collectStreams(t, CollectConfig{}, f.end(0), d.end(0))
+			assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+		})
+	}
+	t.Run("PID reuse across producer processes", func(t *testing.T) {
+		// Even equal daemon-local counters in different producer streams
+		// are distinct connections. A recycled PID cannot reconnect them.
+		out, _ := collectStreams(t, CollectConfig{},
+			newStream(LayerFrontend).ev(0, frontendSend(1, 1, LocalLookup)).end(0),
+			newStream(LayerDaemon).ev(0, daemonEnqueue(1, 1, LocalLookup)).end(0),
+			newStream(LayerDaemon).ev(0, daemonEnqueue(1, 2, LocalLookup)).end(0))
+		assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+	})
+	t.Run("pre-bind record cannot be repaired by a later Resolve", func(t *testing.T) {
+		prebind := frontendSend(1, 1, LocalLookup)
+		prebind.AttachRef = ""
+		out, _ := collectStreams(t, CollectConfig{},
+			newStream(LayerFrontend).ev(0, prebind).ev(100, frontendSend(1, 2, LocalLookup)).end(0),
+			newStream(LayerDaemon).ev(0, daemonEnqueue(1, 2, LocalLookup)).end(0))
+		assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+	})
+	t.Run("request-bearing non-anchor cannot hide a second connection", func(t *testing.T) {
+		late := daemonEnqueue(1, 2, LocalLookup)
+		late.Phase = PhaseReply
+		late.Conn = "99"
+		out, _ := collectStreams(t, CollectConfig{},
+			newStream(LayerFrontend).ev(0, frontendSend(1, 1, LocalLookup)).end(0),
+			newStream(LayerDaemon).ev(0, daemonEnqueue(1, 1, LocalLookup)).ev(100, late).end(0))
+		assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+	})
+	t.Run("local witness cannot change its binding", func(t *testing.T) {
+		out, _ := collectStreams(t, CollectConfig{},
+			newStream(LayerFrontend).ev(0, frontendSend(1, 1, LocalLookup)).ev(100, frontendSend(2, 1, LocalLookup)).end(0),
+			newStream(LayerDaemon).ev(0, daemonEnqueue(1, 1, LocalLookup)).ev(100, daemonEnqueue(2, 1, LocalLookup)).end(0))
+		assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+	})
+	t.Run("whole-run uniqueness inventory is bounded without eviction", func(t *testing.T) {
+		f, d := newStream(LayerFrontend), newStream(LayerDaemon)
+		for i := uint64(1); i <= MaxLocalConnections+1; i++ {
+			front, daemon := frontendSend(i, 1, LocalLookup), daemonEnqueue(i, 1, LocalLookup)
+			front.Conn, daemon.Conn = front.AttachRef, daemon.AttachRef+"-daemon"
+			f.ev(Nanos(i), front)
+			d.ev(Nanos(i), daemon)
+		}
+		out, _ := collectStreams(t, CollectConfig{}, f.end(0), d.end(0))
+		assertLocalJoinUnavailable(t, reportOf(t, out, ReportConfig{}))
+	})
+}
+
+func assertLocalJoinUnavailable(t *testing.T, rep *Report) {
+	t.Helper()
+	j := rep.Joins[0]
+	if j.Status != JoinUnavailable || j.Matched != 0 || j.Unqualified == 0 || rep.AttributionValid {
+		t.Fatalf("join %+v validity %t reasons %v", j, rep.AttributionValid, rep.InvalidReasons)
+	}
+}
+
+func TestReportJoinsDistinctRolesAndFrontendPIDs(t *testing.T) {
+	f, d := newStream(LayerFrontend), newStream(LayerDaemon)
+	for i := uint32(0); i < 3; i++ {
+		front, daemon := frontendSend(1, 1, LocalLookup), daemonEnqueue(1, 1, LocalLookup)
+		if i == 1 {
+			front.ConnRole, daemon.ConnRole = "portablefskit-events", "portablefskit-events"
+		}
+		if i == 2 {
+			front.FrontendPID++
+			daemon.FrontendPID++
+		}
+		front.Conn = TraceID(fmt.Sprintf("uuid-%d", i))
+		daemon.Conn = TraceID(fmt.Sprintf("%d", i+42))
+		f.ev(Nanos(i), front)
+		d.ev(Nanos(i), daemon)
+	}
+	out, _ := collectStreams(t, CollectConfig{}, f.end(0), d.end(0))
+	rep := reportOf(t, out, ReportConfig{})
+	if !rep.AttributionValid || rep.Joins[0].Matched != 3 || rep.Joins[0].Status != JoinExact {
+		t.Fatalf("join %+v reasons %v", rep.Joins[0], rep.InvalidReasons)
 	}
 }

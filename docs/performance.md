@@ -87,8 +87,8 @@ aggregate counters alone. `vcs/bench/lantrace` defines the stream and
   numbers do not reconcile with its trailer, and the report refuses a
   collection whose sequence history is internally inconsistent.
 - The grammar admits only allowlisted keys, enumerated categories, short
-  opaque labels from a restricted alphabet, bounded integers, and raw names as
-  bounded hex. That excludes free-text fields; it does not establish where a
+  opaque labels and exact trace identifiers from a restricted alphabet,
+  bounded integers, and raw names as bounded hex. That excludes free-text fields; it does not establish where a
   value came from. Keeping tokens, credentials, capabilities, file contents,
   pointers, and arbitrary user paths out of the trace, and emitting raw names
   only for the authorized synthetic corpus, is a content rule each producer
@@ -96,16 +96,24 @@ aggregate counters alone. `vcs/bench/lantrace` defines the stream and
 - Producers emit through a bounded queue and byte budget that never block the
   filesystem path; overflow increments the lost count. The collector merges one
   run's streams into a bounded output and keeps bounded correlation state.
-- Daemon requests are correlated to authority turns by session label and
-  authority request ID. Frontend callbacks would be correlated to daemon
-  requests by (connection namespace, connection incarnation, pfslocal request
-  ID), and matched anchors must name the same operation. The connection
-  incarnation is unique only within one daemon process, and pfslocal 2.0 does
-  not tell the frontend its value, so no producer can yet prove the shared,
-  run-unique connection namespace that join needs; until one can, the report
-  marks that join unavailable and exact attribution invalid rather than
-  matching on numbers another daemon could reuse. Cross-host clocks are never
-  subtracted.
+- Daemon requests join authority turns by session label and authority request
+  ID. Every request-bearing frontend and daemon record carries `frontend_pid`
+  (the extension PID; the daemon reads it from the accepted socket's peer),
+  `attach_ref` from Resolve, `conn_role` equal to Hello's exact `client_name`,
+  and `request_id`. The analyzer derives the cross-process key from
+  `(run, frontend_pid, attach_ref, conn_role, request_id)`. Each producer's
+  `conn` stays local: a Swift UUID or a daemon origin counter, encoded as a
+  string and scoped by its producer stream. No diagnostic wire exchange is
+  needed, and those local IDs need not agree.
+- A bounded whole-run inventory (at most 256 tuples, never evicted) must prove
+  exactly one connection per producer for each PID/attach/role tuple. Duplicate
+  same-role connections, PID reuse in another process stream, a connection
+  changing its binding, pre-bind attempts, missing fields or inventory overflow
+  make the frontend/daemon join unavailable, with zero matches claimed even
+  for earlier candidates. These fields must appear on non-anchor request
+  records too. The pending-anchor join window remains bounded at 65,536 by
+  default. Matching anchors must agree on operation and on mount when both
+  provide one. Cross-host clocks are never subtracted.
 - The report separates candidate from exposed cache hits, positive from
   stamped-negative Lookups, OPEN reasons (first open, expansion, reopen after
   final close, directory cursor, CREATE description reuse) with emitted versus
@@ -115,7 +123,9 @@ aggregate counters alone. `vcs/bench/lantrace` defines the stream and
   unqualified, or conflicting record marks exact attribution invalid for the
   run; it says nothing about filesystem correctness.
 
-The trace format is internal and may change without notice. Producer
+The current diagnostic grammar is `pfs-lan-trace-2`; it replaces the previous
+unshipped grammar and has no alternate decoder. The trace format is internal
+and may change without notice. Producer
 instrumentation belongs to each component and is not yet complete.
 
 Run order: the unchanged 32-file probe and a diagnostic 256-file probe with

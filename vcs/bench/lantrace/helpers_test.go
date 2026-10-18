@@ -3,15 +3,12 @@ package lantrace
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
 
 const testRun Label = "run-test"
-
-// testConnNS is the shared connection namespace both sides of the test
-// frontend/daemon joins carry.
-const testConnNS Label = "cns-test"
 
 // streamBuilder writes a producer stream line by line so tests control every
 // record, including invalid ones.
@@ -84,19 +81,20 @@ func reportOf(t *testing.T, collection []byte, cfg ReportConfig) *Report {
 	return rep
 }
 
-func frontendSend(conn, request uint64, op LocalOp) Event {
-	return Event{Kind: KindLocal, Phase: PhaseSend, ConnNS: testConnNS, Conn: conn, Request: request, LocalOp: op}
+// The two producers deliberately have unrelated local connection IDs. The
+// argument selects an attach, never a supposedly shared daemon counter.
+func frontendSend(attach, request uint64, op LocalOp) Event {
+	return localAnchor(PhaseSend, "550e8400-e29b-41d4-a716-446655440000", attach, request, op)
 }
 
-func daemonEnqueue(conn, request uint64, op LocalOp) Event {
-	return Event{Kind: KindLocal, Phase: PhaseEnqueue, ConnNS: testConnNS, Conn: conn, Request: request, LocalOp: op}
+func daemonEnqueue(attach, request uint64, op LocalOp) Event {
+	return localAnchor(PhaseEnqueue, "42", attach, request, op)
 }
 
-// inNamespace returns e with its connection namespace replaced; an empty
-// namespace models a producer that cannot prove the shared identity.
-func inNamespace(ns Label, e Event) Event {
-	e.ConnNS = ns
-	return e
+func localAnchor(phase Phase, conn TraceID, attach, request uint64, op LocalOp) Event {
+	return Event{Kind: KindLocal, Phase: phase, Conn: conn, FrontendPID: 1234,
+		AttachRef: TraceID(fmt.Sprintf("attach-%d", attach)), ConnRole: "portablefskit",
+		RequestID: request, LocalOp: op}
 }
 
 func authoritySend(session Label, id uint64, op AuthorityOp) Event {

@@ -40,12 +40,12 @@ func TestCollectRefusesInvalidInputs(t *testing.T) {
 func TestCollectCountsRejectedRecordsAndIncompleteStreams(t *testing.T) {
 	front := newStream(LayerFrontend).
 		ev(10, frontendSend(1, 1, LocalLookup)).
-		raw(`{"record":"event","seq":2,"t_ns":11,"kind":"local","phase":"send","conn":1,"request":2,"local_op":"lookup","path":"/x"}`).
+		raw(`{"record":"event","seq":2,"t_ns":11,"kind":"local","phase":"send","conn":"uuid-test","request_id":2,"local_op":"lookup","path":"/x"}`).
 		raw(strings.Repeat("y", MaxLineBytes+10)).
-		raw(`{"record":"header","schema":"pfs-lan-trace-1","run":"run-test","layer":"frontend","process":"p","clock":"c"}`).
+		raw(`{"record":"header","schema":"pfs-lan-trace-2","run":"run-test","layer":"frontend","process":"p","clock":"c"}`).
 		evSeq(3, 12, frontendSend(1, 3, LocalLookup)).
 		evSeq(3, 13, frontendSend(1, 4, LocalLookup)). // repeated seq
-		evSeq(5, 14, Event{Kind: KindCache, Phase: PhaseFinal, Conn: 1, Request: 3, Candidate: CandidateEntryCache, CacheResult: CacheMiss}).
+		evSeq(5, 14, Event{Kind: KindCache, Phase: PhaseFinal, Conn: "1", RequestID: 3, Candidate: CandidateEntryCache, CacheResult: CacheMiss}).
 		end(0).
 		raw(`{"record":"trailer","emitted":2,"lost":0}`)
 	// Two valid events read, but the trailer claims all four ev calls.
