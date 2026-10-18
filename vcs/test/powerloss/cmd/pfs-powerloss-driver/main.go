@@ -1,6 +1,6 @@
-// Command pfs-powerloss-driver writes the workload the power-loss harness
-// makes claims about, through a real PortableFS mount, and records exactly
-// what it is entitled to claim.
+// Command pfs-powerloss-driver writes the fsync-gated workload the power-loss
+// harness makes claims about, through a real Linux PortableFS mount, and
+// records exactly what it is entitled to claim.
 //
 // It is a separate process from the harness for a reason that is not
 // stylistic: the harness runs as root because it drives loop devices, a
@@ -9,15 +9,13 @@
 // it. So the harness spawns this driver as the unprivileged volume identity.
 //
 // The driver cannot take device-mapper marks itself - that needs root - so it
-// asks. Every mark request goes out on stdout as one line, and the harness
-// replies on stdin. That ordering is the whole point: the mark must land in
-// the write log after the fsync returned and before the next write starts, or
-// a later replay would cut in the wrong place. Human-readable progress goes to
-// stderr, which is never part of the protocol.
+// asks over powerloss.MarkChannel: requests on stdout, answers on stdin. The
+// mark must land in the write log after the fsync returned and before the next
+// write starts, or a later replay would cut in the wrong place. Human-readable
+// progress goes to stderr, which is never part of the protocol.
 package main
 
 import (
-	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,7 +23,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/test/powerloss"
@@ -92,51 +89,24 @@ func run(arguments []string, acks io.Reader, requests io.Writer, progress io.Wri
 	default:
 		return fmt.Errorf("--instrument must be %q or %q", powerloss.InstrumentDevice, powerloss.InstrumentProcess)
 	}
-	channel := &markChannel{requests: requests, acks: bufio.NewReader(acks), enabled: instrument == powerloss.InstrumentDevice}
-	return drive(opts, instrument, channel, progress)
-}
-
-// markChannel is the driver's half of the mark protocol.
-type markChannel struct {
-	requests io.Writer
-	acks     *bufio.Reader
-	enabled  bool
-}
-
-// take asks the harness to insert a mark and blocks until it confirms. A
-// failure here is fatal to the run rather than skippable: continuing without
-// the mark would leave every later checkpoint asserted at the wrong cut.
-func (c *markChannel) take(label string) error {
-	if !c.enabled {
-		return nil
-	}
-	if _, err := fmt.Fprintf(c.requests, "mark %s\n", label); err != nil {
-		return fmt.Errorf("requesting mark %q: %w", label, err)
-	}
-	reply, err := c.acks.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("waiting for mark %q to be taken: %w", label, err)
-	}
-	reply = strings.TrimSpace(reply)
-	if reply != "ok" {
-		return fmt.Errorf("the harness could not take mark %q: %s", label, reply)
-	}
-	return nil
+	return drive(opts, instrument, powerloss.NewMarkChannel(requests, acks), progress)
 }
 
 // drive writes the workload. Each round writes two files:
 //
 //   - one that is written, fsynced, and only then marked. That is the file the
-//     product contract covers, and the only one presence is ever demanded of.
-//   - one that is written and closed but never fsynced. The authority
-//     acknowledges its write transaction once the bytes are applied to the XFS
-//     inode, so it is in the page cache and nowhere else. It exists so that a
-//     replayed cut has something the contract deliberately promises nothing
-//     about, and so the stale-data check has material to work on.
+//     Linux contract covers, and the only one presence is ever demanded of.
+//   - one that is written and closed but never fsynced. write(2) returning
+//     only means the bytes reached a page cache or buffer somewhere between
+//     the kernel mount and the authority's XFS, all of which a power cut
+//     discards. It exists so that a replayed cut has something the contract
+//     deliberately promises nothing about, and so the stale-data check has
+//     material to work on.
 //
 // The fsynced file is written first and the un-fsynced one second, so at every
 // mark there is always at least one write in flight that the cut may discard.
-func drive(opts options, instrument powerloss.Instrument, channel *markChannel, progress io.Writer) error {
+// The process instrument has no device log, so it takes no marks at all.
+func drive(opts options, instrument powerloss.Instrument, channel *powerloss.MarkChannel, progress io.Writer) error {
 	ledger := &powerloss.Ledger{Volume: opts.volume, Instrument: instrument, Label: opts.label}
 	deadline := time.Time{}
 	if opts.duration > 0 {
@@ -167,9 +137,9 @@ func drive(opts options, instrument powerloss.Instrument, channel *markChannel, 
 		mark := ""
 		if instrument == powerloss.InstrumentDevice {
 			mark = fmt.Sprintf("ckpt-%04d", round)
-		}
-		if err := channel.take(mark); err != nil {
-			return err
+			if err := channel.Take(mark); err != nil {
+				return err
+			}
 		}
 		ledger.Add(durable, content, mark, powerloss.Fsynced)
 

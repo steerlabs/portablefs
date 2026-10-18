@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"io"
 	"os"
@@ -15,14 +14,14 @@ import (
 // newChannel builds the driver's half of the mark protocol with a canned
 // answer, so a test can assert the request sequence the harness would have
 // seen without a device mapper anywhere in sight.
-func newChannel(t *testing.T, reply string, rounds int) (*markChannel, *bytes.Buffer) {
+func newChannel(t *testing.T, reply string, rounds int) (*powerloss.MarkChannel, *bytes.Buffer) {
 	t.Helper()
 	requests := &bytes.Buffer{}
 	acks := strings.Repeat(reply+"\n", rounds)
-	return &markChannel{requests: requests, acks: bufio.NewReader(strings.NewReader(acks)), enabled: true}, requests
+	return powerloss.NewMarkChannel(requests, strings.NewReader(acks)), requests
 }
 
-func driveInto(t *testing.T, mount string, channel *markChannel, instrument powerloss.Instrument, checkpoints int) (string, error) {
+func driveInto(t *testing.T, mount string, channel *powerloss.MarkChannel, instrument powerloss.Instrument, checkpoints int) (string, error) {
 	t.Helper()
 	ledgerPath := filepath.Join(t.TempDir(), "ledger.json")
 	opts := options{
@@ -102,10 +101,16 @@ func TestDriveStopsWhenAMarkCannotBeTaken(t *testing.T) {
 }
 
 func TestDriveInProcessInstrumentTakesNoMarks(t *testing.T) {
-	channel := &markChannel{requests: &bytes.Buffer{}, acks: bufio.NewReader(strings.NewReader("")), enabled: false}
+	// An empty answer stream would fail the first mark request, so a pass here
+	// proves the process instrument never asked for one.
+	requests := &bytes.Buffer{}
+	channel := powerloss.NewMarkChannel(requests, strings.NewReader(""))
 	ledgerPath, err := driveInto(t, t.TempDir(), channel, powerloss.InstrumentProcess, 2)
 	if err != nil {
 		t.Fatalf("drive: %v", err)
+	}
+	if requests.Len() != 0 {
+		t.Fatalf("the process instrument requested marks: %q", requests.String())
 	}
 	ledger, err := powerloss.LoadLedger(ledgerPath)
 	if err != nil {

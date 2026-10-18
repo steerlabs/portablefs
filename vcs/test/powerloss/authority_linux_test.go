@@ -9,11 +9,13 @@ import (
 	"time"
 )
 
-// The product-level instruments. Both drive a real portablefs-mount-v3 against
-// a real portablefs-authority over a real XFS cell, and both assert the same
-// contract in the same words. They differ only in what they take away.
+// The product-level instruments, all against a real portablefs-authority over
+// a real XFS cell. Two drive a real portablefs-mount-v3 and assert the Linux
+// contract - durable once fsync returned. The third drives the authority's
+// FSKit handler directly and asserts the FSKit contract - durable once
+// acknowledged.
 
-// TestFsyncedWritesSurvivePowerLoss is the test the harness exists for.
+// TestFsyncedWritesSurvivePowerLoss is the Linux power-cut instrument.
 //
 // It stacks dm-log-writes under the XFS the authority serves, drives the mount
 // with a workload that fsyncs at known points, kills the authority and the
@@ -24,8 +26,8 @@ import (
 // and byte-exact, that no un-fsynced write left stale data behind, and that
 // xfs_repair -n finds nothing it would correct.
 //
-// What it does not do is claim anything about a write that was merely
-// acknowledged. See Expectations for why that line is where it is.
+// What it does not do is claim anything about a Linux write that was merely
+// accepted by write(2). See Expectations for why that line is where it is.
 func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 	gate := requireAuthorityGate(t)
 	requireLogWrites(t, gate.hostGate)
@@ -33,7 +35,7 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 	playground := newDevicePlayground(t, gate.hostGate, gate.imageSize)
 	cell := provisionCell(t, gate, playground.mountpoint)
 	authority := cell.startAuthority(t, "power-cut")
-	mount, mountpoint := cell.startMount(t, "power-cut", "access-0.token")
+	mount, mountpoint := cell.startMount(t, "power-cut", accessToken(tokenLinuxPowerCut))
 
 	ledgerPath := filepath.Join(cell.ledgerDir, "ledger.json")
 	driver := cell.runDriver(t, mountpoint, ledgerPath, InstrumentDevice, playground.device.Mark,
@@ -50,8 +52,8 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 
 	// Power loss takes everything at once. releaseForPowerCut proves the data
 	// plane cannot still pin or dirty the cell: authority reaped, mount server
-	// reaped, exact FUSE mount absent, and write-staging bind absent. Only then
-	// may the filesystem and dm target be released to finalize the write log.
+	// reaped, exact FUSE mount absent. Only then may the filesystem and dm
+	// target be released to finalize the write log.
 	if _, err := cell.releaseForPowerCut(authority, mount, mountpoint); err != nil {
 		t.Fatalf("releasing the data plane for the power cut: %v", err)
 	}
@@ -71,7 +73,73 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 		t.Fatalf("reading the workload's ledger: %v", err)
 	}
 	t.Logf("the workload recorded %d checkpoints; the device recorded %d writes up to the cut", len(ledger.Checkpoints), len(log.Entries))
-	verifyEveryCut(t, gate.hostGate, log, ledger, playground.options, gate.imageSize, gate.barriers)
+	verifyEveryCut(t, gate.hostGate, log, ledger, playground.options, gate.imageSize, gate.barriers, fsyncContract(log, ledger))
+}
+
+// TestFSKitAcknowledgedMutationsSurvivePowerLoss is the FSKit power-cut
+// instrument: the real authority FSKit handler on XFS, with nothing between it
+// and the driver.
+//
+// FSKit has no fsync callback, so the authority makes every successful FSKit
+// mutation reply durable before sending it - a full fsync of the retained
+// description for WRITE, CREATE and handle-backed SETATTR, and syncfs on the
+// retained XFS root for namespace and item-backed metadata changes. The driver
+// attaches a FRONTEND_PROFILE_FSKIT_EXCLUSIVE session exactly as portablefsd
+// does, performs CREATE, positioned WRITE (overwrite, extension and a hole),
+// MKDIR, hard LINK, SYMLINK, RENAME (within a directory, across directories
+// and over an existing name), truncation through a handle and through an item,
+// chmod, explicit timestamps, UNLINK and a directory removal, and takes a mark
+// after every success reply arrives and before the next request is sent. At
+// each mark and at a sweep of the filesystem's own barriers, every mutation
+// acknowledged before the cut must be present exactly - bytes, size, mode,
+// set timestamps, symlink target, hard-link count and directory membership -
+// and the one mutation in flight may have left only its acknowledged or its
+// complete in-flight state (see mutations_verify.go for the two stated
+// allowances). xfs_repair -n must then find nothing it would correct.
+//
+// This is power-loss evidence for the authority's FSKit durability claim
+// alone. It says nothing about the Mac side: the daemon, the extension and
+// whatever the macOS kernel buffered but never delivered as a callback are not
+// in the path.
+func TestFSKitAcknowledgedMutationsSurvivePowerLoss(t *testing.T) {
+	gate := requireAuthorityGate(t)
+	requireLogWrites(t, gate.hostGate)
+
+	playground := newDevicePlayground(t, gate.hostGate, gate.imageSize)
+	cell := provisionCell(t, gate, playground.mountpoint)
+	authority := cell.startAuthority(t, "fskit-power-cut")
+
+	ledgerPath := filepath.Join(cell.ledgerDir, "fskit-ledger.json")
+	driver := cell.runFSKitDriver(t, ledgerPath, tokenFSKitPowerCut, playground.device.Mark,
+		"--prefix", "fskit",
+		"--label", "power cut under a live authority serving one FSKit-exclusive session",
+	)
+	if err := driver.wait(t, 10*time.Minute); err != nil {
+		driver.dump(t)
+		authority.dump(t)
+		t.Fatalf("the FSKit workload driver failed: %v", err)
+	}
+
+	if err := releaseAuthorityForPowerCut(authority); err != nil {
+		t.Fatalf("releasing the authority for the power cut: %v", err)
+	}
+
+	fullLog, closeLog := playground.cut(t, "power-cut")
+	defer func() { _ = closeLog() }()
+	cutEntry, found := fullLog.MarkEntry("power-cut")
+	if !found {
+		t.Fatal("the power-cut mark is not in the write log; the mark channel was broken and no cut can be trusted")
+	}
+	log, err := fullLog.Through(cutEntry)
+	if err != nil {
+		t.Fatalf("truncating the write log at the power cut: %v", err)
+	}
+	ledger, err := LoadMutationLedger(ledgerPath)
+	if err != nil {
+		t.Fatalf("reading the FSKit workload's ledger: %v", err)
+	}
+	t.Logf("the workload recorded %d acknowledged mutations; the device recorded %d writes up to the cut", len(ledger.Steps), len(log.Entries))
+	verifyEveryCut(t, gate.hostGate, log, ledger, playground.options, gate.imageSize, gate.barriers, acknowledgedContract(log, ledger))
 }
 
 // TestAuthorityKillDuringWritesKeepsFsyncedData is the weaker, cheaper
@@ -79,7 +147,7 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 //
 // SIGKILL removes the authority process but not the kernel's dirty page cache,
 // so this is NOT a power-loss test and does not stand in for one. What it
-// covers instead is the half of the story the device instrument cannot reach:
+// covers instead is the half of the story the device instruments cannot reach:
 // that the authority restarts over a volume it was killed in the middle of
 // writing, that a fresh mount attaches to it, that the volume serves again,
 // and that nothing an fsync had already promised was lost along the way. The
@@ -120,9 +188,10 @@ func TestAuthorityKillDuringWritesKeepsFsyncedData(t *testing.T) {
 		if passed := t.Run(fmt.Sprintf("killed-after-%s", delay), func(t *testing.T) {
 			runKillRound(t, gate, cell, round, delay)
 		}); !passed {
-			// A failed round may have died before it could discharge its strict
-			// membership. Starting another epoch would then add a secondary
-			// 30-second gate refusal that says nothing new about durability.
+			// A failed round may have died before it could discharge its mount
+			// membership. Another epoch started over that leftover record would
+			// hold conflicting mutations for a subscription horizon and report
+			// this round's failure again under a different symptom.
 			return
 		}
 	}
@@ -130,8 +199,9 @@ func TestAuthorityKillDuringWritesKeepsFsyncedData(t *testing.T) {
 
 func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay time.Duration) {
 	t.Helper()
+	killedToken, restartedToken := killRoundTokens(round)
 	authority := cell.startAuthority(t, fmt.Sprintf("kill-%d", round))
-	mount, mountpoint := cell.startMount(t, fmt.Sprintf("kill-%d", round), fmt.Sprintf("access-%d.token", 1+2*round))
+	mount, mountpoint := cell.startMount(t, fmt.Sprintf("kill-%d", round), accessToken(killedToken))
 	ledgerPath := filepath.Join(cell.ledgerDir, fmt.Sprintf("process-ledger-%d.json", round))
 	driver := cell.runDriver(t, mountpoint, ledgerPath, InstrumentProcess, nil,
 		// Every round writes into its own subtree: checkpoint files are
@@ -181,9 +251,16 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 	}
 
 	// Restart over the volume the authority was killed in the middle of
-	// writing, and attach a new mount to it.
+	// writing, and attach a new mount to it. The replacement is told, through
+	// the audited operator assertion, that the killed mount is fenced; that
+	// assertion clears the killed session's durable membership record, so the
+	// replacement owes it no prior-cache wait. Without it, a replacement that
+	// finds prior Linux membership grants no writer delegation and applies no
+	// conflicting mutation for a full subscription horizon. This round
+	// observes neither path's timing, only that the fenced restart serves
+	// again.
 	restarted := cell.startAuthorityAfterFence(t, fmt.Sprintf("restart-%d", round), fence)
-	freshMount, freshMountpoint := cell.startMount(t, fmt.Sprintf("restart-%d", round), fmt.Sprintf("access-%d.token", 2+2*round))
+	freshMount, freshMountpoint := cell.startMount(t, fmt.Sprintf("restart-%d", round), accessToken(restartedToken))
 
 	expectations, err := ExpectationsAfterRestart(ledger)
 	if err != nil {

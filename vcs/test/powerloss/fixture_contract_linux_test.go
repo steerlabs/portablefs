@@ -55,61 +55,88 @@ func (process recordingKiller) forceKill(time.Duration) error {
 	return process.err
 }
 
+// TestReleaseForPowerCutDischargesEveryDeviceHolderInOrder pins the device
+// release precondition: authority reaped first, then the mount server, then
+// the exact FUSE mount detached and proved absent. Any failure stops the
+// release before the next holder is touched and yields no fencing receipt.
 func TestReleaseForPowerCutDischargesEveryDeviceHolderInOrder(t *testing.T) {
-	var timeline []string
-	runner := &contractRunner{timeline: &timeline, mounts: map[string]string{
-		"/mount":   "fuse.portablefs",
-		"/staging": "none",
-	}}
-	cell := &cell{runner: runner, staging: "/staging", stagingBound: true}
-
-	fence, err := cell.releaseForPowerCut(
-		recordingKiller{name: "authority", events: &timeline},
-		recordingKiller{name: "mount", events: &timeline},
-		"/mount",
-	)
-	if err != nil {
-		t.Fatalf("releaseForPowerCut: %v", err)
+	tests := []struct {
+		name         string
+		authorityErr error
+		mountRemains bool
+		wantErr      bool
+		wantEvents   []string
+	}{
+		{
+			name:       "every holder released",
+			wantEvents: []string{"kill authority", "kill mount", "fusermount3 -uz /mount"},
+		},
+		{
+			name:         "the authority survives its kill",
+			authorityErr: errors.New("authority survived SIGKILL"),
+			wantErr:      true,
+			wantEvents:   []string{"kill authority"},
+		},
+		{
+			name:         "the FUSE mount stays installed",
+			mountRemains: true,
+			wantErr:      true,
+			wantEvents:   []string{"kill authority", "kill mount", "fusermount3 -uz /mount", "umount -l /mount"},
+		},
 	}
-	if err := fence.validate(); err != nil {
-		t.Fatalf("fencing receipt: %v", err)
-	}
-	if cell.stagingBound {
-		t.Fatal("the cell still owns its write-staging bind after release")
-	}
-
-	var releaseEvents []string
-	for _, event := range timeline {
-		if strings.HasPrefix(event, "kill ") || strings.HasPrefix(event, "fusermount3 ") || strings.HasPrefix(event, "umount ") {
-			releaseEvents = append(releaseEvents, event)
-		}
-	}
-	want := []string{"kill authority", "kill mount", "fusermount3 -uz /mount", "umount /staging"}
-	if !reflect.DeepEqual(releaseEvents, want) {
-		t.Fatalf("device-holder release order = %v, want %v (all events %v)", releaseEvents, want, timeline)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var timeline []string
+			runner := &contractRunner{timeline: &timeline, mounts: map[string]string{"/mount": "fuse.portablefs"}}
+			if test.mountRemains {
+				runner.fail = map[string]error{
+					"fusermount3 -uz /mount": errors.New("forced detach refused"),
+					"umount -l /mount":       errors.New("lazy detach refused"),
+				}
+			}
+			cell := &cell{runner: runner}
+			fence, err := cell.releaseForPowerCut(
+				recordingKiller{name: "authority", events: &timeline, err: test.authorityErr},
+				recordingKiller{name: "mount", events: &timeline},
+				"/mount",
+			)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("releaseForPowerCut error = %v, want error %v", err, test.wantErr)
+			}
+			if test.wantErr && fence.validate() == nil {
+				t.Fatal("a failed release produced a valid prior-mount assertion")
+			}
+			if !test.wantErr {
+				if err := fence.validate(); err != nil {
+					t.Fatalf("fencing receipt: %v", err)
+				}
+			}
+			var releaseEvents []string
+			for _, event := range timeline {
+				if strings.HasPrefix(event, "kill ") || strings.HasPrefix(event, "fusermount3 ") || strings.HasPrefix(event, "umount ") {
+					releaseEvents = append(releaseEvents, event)
+				}
+			}
+			if !reflect.DeepEqual(releaseEvents, test.wantEvents) {
+				t.Fatalf("device-holder release order = %v, want %v (all events %v)", releaseEvents, test.wantEvents, timeline)
+			}
+		})
 	}
 }
 
-func TestReleaseForPowerCutRefusesAStillBoundStagingDirectory(t *testing.T) {
+func TestReleaseAuthorityForPowerCutRequiresTheAuthorityReaped(t *testing.T) {
 	var timeline []string
-	runner := &contractRunner{
-		mounts: map[string]string{
-			"/mount":   "fuse.portablefs",
-			"/staging": "none",
-		},
-		fail: map[string]error{"umount /staging": errors.New("target is busy")},
+	if err := releaseAuthorityForPowerCut(recordingKiller{name: "authority", events: &timeline}); err != nil {
+		t.Fatalf("releaseAuthorityForPowerCut: %v", err)
 	}
-	cell := &cell{runner: runner, staging: "/staging", stagingBound: true}
-
-	if _, err := cell.releaseForPowerCut(
-		recordingKiller{name: "authority", events: &timeline},
-		recordingKiller{name: "mount", events: &timeline},
-		"/mount",
-	); err == nil {
-		t.Fatal("the cut was released while write-staging still held the cell")
+	if !reflect.DeepEqual(timeline, []string{"kill authority"}) {
+		t.Fatalf("events = %v", timeline)
 	}
-	if !cell.stagingBound {
-		t.Fatal("a failed staging unmount was recorded as released")
+	if err := releaseAuthorityForPowerCut(recordingKiller{name: "authority", events: &timeline, err: errors.New("still running")}); err == nil {
+		t.Fatal("the FSKit cut was released while its authority could still write")
+	}
+	if err := releaseAuthorityForPowerCut(nil); err == nil {
+		t.Fatal("the FSKit cut was released with no authority to reap")
 	}
 }
 
