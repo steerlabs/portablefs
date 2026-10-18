@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pathcomponent"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -514,6 +515,17 @@ type v3CacheConflict func(coordinates ...v3PublicationCoordinate) v3CacheResult
 // Unresolved post-binding claims conflict with every attribute or data read,
 // because the identity they will bind is not known yet.
 func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
+	c.cacheReadTraced(read, nil)
+}
+
+// The optional trace captures the same conflict verdict under the same lock;
+// it changes neither admission nor the source's lifetime.
+func (c *v3SourcePublicationCoordinator) cacheReadTraced(read func(v3CacheConflict), state *lantrace.SourceState) {
+	record := func(value lantrace.SourceState) {
+		if state != nil {
+			*state = value
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	read(func(coordinates ...v3PublicationCoordinate) v3CacheResult {
@@ -522,17 +534,25 @@ func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 		}
 		for _, coordinate := range coordinates {
 			for holder := range c.sourceHolds[coordinate] {
-				if holder.active != 0 || holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
+				if holder.active != 0 {
+					record(lantrace.SourceActive)
 					return v3CacheHeld
 				}
+				if holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
+					record(lantrace.SourceClaimPending)
+					return v3CacheHeld
+				}
+				record(lantrace.SourceSettled)
 			}
 			switch coordinate.kind {
 			case v3PublicationItemAttributes:
 				if len(c.unresolvedAttributes) != 0 {
+					record(lantrace.SourceClaimPending)
 					return v3CacheHeld
 				}
 			case v3PublicationItemData:
 				if len(c.unresolvedData) != 0 {
+					record(lantrace.SourceClaimPending)
 					return v3CacheHeld
 				}
 			}

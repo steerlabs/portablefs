@@ -663,6 +663,10 @@ func (c *frontendConn) serveV3Attempt(
 	}()
 	traceV3Request(ctx, lantrace.PhaseDispatch, 0)
 	defer func() {
+		if resources.cached != nil {
+			trace, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
+			resources.cached.traceFinal(trace, exposed)
+		}
 		if resources.cached != nil && !resources.cached.accounted {
 			reason := v3CacheTerminal
 			if exposed {

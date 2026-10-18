@@ -94,6 +94,12 @@ func TestP6TraceCollectorReceivesTwoWireConnections(t *testing.T) {
 		if e.RequestID == 0 {
 			continue
 		}
+		if e.Kind == lantrace.KindCache {
+			if e.Parent == 0 && e.Item == 0 || e.CacheResult == "" || e.Candidate == "" {
+				t.Fatalf("incomplete cache decision: %+v", e)
+			}
+			continue
+		}
 		if e.Kind != lantrace.KindLocal || e.FrontendPID != uint32(os.Getpid()) || e.Conn == "" || e.ConnRole == "" || e.LocalOp == "" {
 			t.Fatalf("incomplete request identity: %+v", e)
 		}
