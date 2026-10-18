@@ -45,7 +45,7 @@ func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
 	}
 	_, managerKey, _ := ed25519.GenerateKey(rand.Reader)
 	_, productKey, _ := ed25519.GenerateKey(rand.Reader)
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, skipMounts: true, CachedNameCapacity: 1 << 16, authorizer: func() authorityrpc.Authorizer {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, skipMounts: true, NameCacheCapacity: 1 << 16, authorizer: func() authorityrpc.Authorizer {
 		return &volumecap.Authorizer{PublicKey: managerKey.Public().(ed25519.PublicKey), ProductPublicKey: productKey.Public().(ed25519.PublicKey), ProductIssuer: "test-host", ProductAudience: "portablefs", AuthorizationDomain: "test-domain", Owner: "test-owner", CellID: "test-cell", AuthorityID: "test-authority", AuthorityGeneration: 1, MaxLifetime: time.Hour, MaxRetainedNonces: 100}
 	}})
 	f.cfg.listenAddress = f.listener.Addr().String()

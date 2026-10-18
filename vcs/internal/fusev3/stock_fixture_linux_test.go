@@ -117,9 +117,8 @@ func newStrictFixture(t *testing.T) *strictFixture {
 	rpc := newFakeRPC()
 	rpc.session = testSelfSession
 	cfg := testConfig(8)
-	cfg.Coherence = CoherenceStrict
-	cfg.CachedNameCapacity = 32
-	cfg.RepairBudget = 5 * time.Second
+	cfg.NameCacheCapacity = 32
+	cfg.WithdrawalTimeout = 5 * time.Second
 	mount := newMount(context.Background(), rpc, cfg)
 	t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
 	root := &node{mount: mount, item: testItem(1, authoritypb.Attr_DIRECTORY, 0), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}

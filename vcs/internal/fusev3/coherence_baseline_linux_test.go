@@ -123,7 +123,7 @@ func TestCoherenceBaseline(t *testing.T) {
 		if fixture.mounts[0].isRevoked() || fixture.clients[0].SessionEndCause() != nil || !isMounted(t, fixture.mountPath(0)) {
 			t.Fatalf("fresh 20000-file git lost mount: %s", fixture.sessionDiagnostics())
 		}
-		t.Logf("PORTABLEFS_GIT_ADD_REGRESSION files=%d cached_name_capacity=%d committed=true barrier=PASS mount=LIVE", baselineGitFiles, fixture.cfg.CachedNameCapacity)
+		t.Logf("PORTABLEFS_GIT_ADD_REGRESSION files=%d name_cache_capacity=%d committed=true barrier=PASS mount=LIVE", baselineGitFiles, fixture.cfg.NameCacheCapacity)
 		fixture.remount()
 		enableBaselineOpenTracking(fixture.counter)
 		for _, temperature := range []string{"cold", "warm"} {
@@ -162,7 +162,7 @@ func TestCoherenceBaseline(t *testing.T) {
 func baselineIntegrationConfig(mounts int) integrationConfig {
 	return integrationConfig{
 		Mounts: mounts, MaxItemsPerSession: baselineItemLimit, MaxItems: baselineItemLimit,
-		CachedNameCapacity: baselineNameCapacity,
+		NameCacheCapacity: baselineNameCapacity,
 	}
 }
 

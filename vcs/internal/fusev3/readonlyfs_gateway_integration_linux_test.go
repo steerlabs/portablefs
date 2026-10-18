@@ -127,9 +127,9 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	writeElapsed := time.Since(writeStart)
 	// Keep a bound well below recall expiry so waiting for a nonexistent
 	// gateway repair worker cannot satisfy the test.
-	if writeElapsed > peer.RepairBudget()/4 {
+	if writeElapsed > peer.WithdrawalTimeout()/4 {
 		t.Fatalf("a rewrite beside the attached gateway took %s, more than a quarter of the %s recall budget: the gateway obstructed the writer (%s)",
-			writeElapsed, peer.RepairBudget(), peer.Diagnostics())
+			writeElapsed, peer.WithdrawalTimeout(), peer.Diagnostics())
 	}
 	requireGatewayContent(t, ctx, gateway, servedKey, mutated, "the gateway's read after the peer mutation")
 
@@ -212,9 +212,9 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 		t.Fatalf("only %d gateway reads overlapped %d peer rewrites; the window this test exists for was not entered", completed, rounds)
 	}
 	// Expiry must not be the mechanism that lets the writer proceed.
-	if perRound := loopElapsed / rounds; perRound > peer.RepairBudget()/4 {
+	if perRound := loopElapsed / rounds; perRound > peer.WithdrawalTimeout()/4 {
 		t.Fatalf("%d rewrites beside a continuously reading gateway averaged %s each, more than a quarter of the %s recall budget (%s)",
-			rounds, perRound, peer.RepairBudget(), peer.Diagnostics())
+			rounds, perRound, peer.WithdrawalTimeout(), peer.Diagnostics())
 	}
 	if fenced := peer.FencedSessions(); fenced != 0 {
 		t.Fatalf("%d session(s) were fenced while the gateway read beside a mutating mount; a recall budget was exhausted (%s)", fenced, peer.Diagnostics())
@@ -244,7 +244,7 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	if err := os.WriteFile(peer.Join(0, name), initial, 0o600); err != nil {
 		t.Fatalf("peer mount write after the gateway detached: %v (%s)", err, peer.Diagnostics())
 	}
-	if elapsed := time.Since(afterDetach); elapsed > peer.RepairBudget()/4 {
+	if elapsed := time.Since(afterDetach); elapsed > peer.WithdrawalTimeout()/4 {
 		t.Fatalf("the first write after the gateway detached took %s; the gateway left an undischarged obligation (%s)", elapsed, peer.Diagnostics())
 	}
 	got, err := os.ReadFile(peer.Join(0, name))

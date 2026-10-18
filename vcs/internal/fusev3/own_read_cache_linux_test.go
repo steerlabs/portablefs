@@ -207,7 +207,7 @@ func TestOwnCachePublicationFailureIsInodeLocal(t *testing.T) {
 				pins, handles := record.pins, len(f.raw.handles)
 				f.raw.mu.Unlock()
 				loss := f.mount.delegations.LossSequence()
-				f.mount.subscription.config.repairLead = 30 * time.Millisecond
+				f.mount.subscription.config.withdrawalLead = 30 * time.Millisecond
 				f.mount.subscription.config.retryDelay = 2 * time.Millisecond
 
 				attempts := 0
@@ -266,7 +266,7 @@ func TestOwnCacheWriteFailureReportsDiscardedBuffer(t *testing.T) {
 	record, inode := ownCacheRecord(t, f)
 	record.readCache.addReader()
 	writer := openV7Writer(t, f, inode)
-	f.mount.subscription.config.repairLead = 30 * time.Millisecond
+	f.mount.subscription.config.withdrawalLead = 30 * time.Millisecond
 	f.mount.subscription.config.retryDelay = 2 * time.Millisecond
 	f.notify.mu.Lock()
 	f.notify.inodeST = fuse.EIO

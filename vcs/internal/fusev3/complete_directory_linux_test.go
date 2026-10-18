@@ -190,7 +190,7 @@ func TestMkdirCompletenessCandidateIsRevocableBeforePhysicalReply(t *testing.T) 
 		t.Fatal("candidate not finalized")
 	}
 	done := make(chan error, 1)
-	var lease *cacheRepairLease
+	var lease *cacheWithdrawalLease
 	go func() { var err error; lease, err = raw.closeCacheCoordinate(t.Context(), coordinate); done <- err }()
 	select {
 	case err := <-done:

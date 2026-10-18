@@ -70,7 +70,7 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 		elapsed := time.Since(start)
 		if elapsed > writeBound {
 			t.Fatalf("%s took %s, past the %s a departed reader may cost a writer; the fixture repair budget is %s (%s)",
-				what, elapsed, writeBound, peer.RepairBudget(), peer.Diagnostics())
+				what, elapsed, writeBound, peer.WithdrawalTimeout(), peer.Diagnostics())
 		}
 		return elapsed
 	}

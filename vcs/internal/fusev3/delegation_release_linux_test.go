@@ -3,10 +3,10 @@
 package fusev3
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -27,6 +27,10 @@ func (f *releaseOutcomeRPC) CallIdempotent(ctx context.Context, request *authori
 	}
 	return f.delegationFakeRPC.CallIdempotent(ctx, request)
 }
+func (f *releaseOutcomeRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
+
 func (f *releaseOutcomeRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if request.GetBarrier() != nil {
 		// These cases inspect retained obligations after ownership transfer.
@@ -209,6 +213,8 @@ func TestDelegationCloseFailureRetainsAppliedRecords(t *testing.T) {
 			if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
 				t.Fatal(err)
 			}
+			var reported atomic.Bool
+			m.SetCleanupFailureReporter(func(error) { reported.Store(true) })
 			if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: delegationTestToken(86, 2)}}); err == nil {
 				t.Fatal("cleanup error hidden")
 			}
@@ -216,6 +222,11 @@ func TestDelegationCloseFailureRetainsAppliedRecords(t *testing.T) {
 			s := m.state(parsed)
 			if delegationStateOwned(s) || m.LossSequence() != 0 || m.buf.Stats().Entries != 1 {
 				t.Fatal("cleanup failure lost applied data or reopened grant")
+			}
+			// An unknown batch outcome owns its descriptors until terminal
+			// session cleanup, so it must reach the mount's terminal policy.
+			if reported.Load() != !retired {
+				t.Fatalf("terminal cleanup report=%v, want %v", reported.Load(), !retired)
 			}
 			if got := len(s.handles) == 0; got != retired {
 				t.Fatalf("retired handle removal=%v want=%v", got, retired)
@@ -299,7 +310,8 @@ func TestMountDeferredCoherenceCloseUsesReplacementSubscription(t *testing.T) {
 		if request.GetDelegationRelease() != nil {
 			return releaseSuccess(), nil
 		}
-		if request.GetClose() == nil {
+		batch := request.GetCloseBatch()
+		if batch == nil {
 			return &authoritypb.Response{}, nil
 		}
 		closeCalls++
@@ -309,7 +321,11 @@ func TestMountDeferredCoherenceCloseUsesReplacementSubscription(t *testing.T) {
 				Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
 			}, nil
 		}
-		return &authoritypb.Response{}, nil
+		results := make([]*authoritypb.CloseBatchResult, len(batch.GetCloses()))
+		for i := range results {
+			results[i] = &authoritypb.CloseBatchResult{}
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
 	}
 	rpc.mu.Unlock()
 
@@ -403,84 +419,5 @@ func TestCloseBatchEpochChangeLeavesMountRecoveryInCharge(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-type serialCloseRPC struct {
-	releaseOutcomeRPC
-	closeErr error
-}
-
-func (*serialCloseRPC) SupportsBatchedClose() bool { return false }
-func (f *serialCloseRPC) CallMutation(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
-	if req.GetClose() != nil && f.closeErr != nil {
-		return nil, f.closeErr
-	}
-	return f.releaseOutcomeRPC.CallMutation(ctx, req)
-}
-
-func TestDelegationCloseFallsBackToOrderedSerialRequests(t *testing.T) {
-	fake := &serialCloseRPC{}
-	m := newDelegationTestManager(t, fake)
-	var closes []delegationClose
-	for _, seed := range []byte{92, 93} {
-		id := installDelegationForTest(t, m, seed, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-		closes = append(closes, delegationClose{identity: id, handle: delegationTestToken(seed, 2), lockOwner: uint64(seed), flockUnlock: true})
-	}
-	if err := m.CloseHandles(t.Context(), closes); err != nil {
-		t.Fatal(err)
-	}
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	if len(fake.controls) != 1 || len(fake.controls[0].GetDelegationRelease().GetDelegations()) != 2 || len(fake.mutations) != 2 {
-		t.Fatal("serial cleanup did not batch release then close both handles")
-	}
-	for i, req := range fake.mutations {
-		close := req.GetClose()
-		if close == nil || !bytes.Equal(close.Handle, closes[i].handle) || close.LockOwner != closes[i].lockOwner || !close.FlockUnlock {
-			t.Fatalf("serial close %d lost ordered capability/lock state: %v", i, req)
-		}
-		id, _ := delegationIdentity(closes[i].identity)
-		if len(m.state(id).handles) != 0 {
-			t.Fatal("serial success retained handle debt")
-		}
-	}
-}
-
-func TestSerialCloseUncertaintyKeepsAppliedRecordsForTerminalCleanup(t *testing.T) {
-	fake := &serialCloseRPC{closeErr: authorityrpc.ErrTransportUncertain}
-	m := newDelegationTestManager(t, fake)
-	id := installDelegationForTest(t, m, 94, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
-		t.Fatal(err)
-	}
-	var reported bool
-	m.SetCleanupFailureReporter(func(error) { reported = true })
-	if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: delegationTestToken(94, 2)}}); err == nil {
-		t.Fatal("unknown CLOSE succeeded")
-	}
-	parsed, _ := delegationIdentity(id)
-	if !reported || len(m.state(parsed).handles) != 1 || m.buf.Stats().Entries != 1 || m.LossSequence() != 0 {
-		t.Fatal("serial uncertainty erased cleanup or data obligations")
-	}
-}
-
-type closeCapabilityRPC struct {
-	*fakeRPC
-	enabled bool
-}
-
-func (f *closeCapabilityRPC) SupportsBatchedClose() bool { return f.enabled }
-func TestEpochRPCReadsCloseCapabilityFromCurrentTransport(t *testing.T) {
-	_, rpc := testMount(t, 8)
-	e := newEpochRPC(&closeCapabilityRPC{fakeRPC: rpc})
-	if e.SupportsBatchedClose() {
-		t.Fatal("old transport acquired absent capability")
-	}
-	e.mu.Lock()
-	e.rpc = &closeCapabilityRPC{fakeRPC: rpc, enabled: true}
-	e.mu.Unlock()
-	if !e.SupportsBatchedClose() {
-		t.Fatal("replacement capability was not observed")
 	}
 }

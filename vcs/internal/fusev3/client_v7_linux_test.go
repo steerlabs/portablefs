@@ -410,7 +410,7 @@ func TestV7CachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
 			// Observe the withdrawal's locked cut, including its installed receipt.
 			for {
 				f.raw.mu.Lock()
-				waiting := f.raw.repairingCoordinates[coordinate] && publication.originalDone != nil
+				waiting := f.raw.withdrawingCoordinates[coordinate] && publication.originalDone != nil
 				f.raw.mu.Unlock()
 				if waiting {
 					break

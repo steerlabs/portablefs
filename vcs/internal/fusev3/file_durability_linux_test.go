@@ -6,11 +6,16 @@ import (
 	"context"
 	"errors"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"testing"
 	"time"
 )
 
 type fileDurabilityRPC struct{ delegationFakeRPC }
+
+func (f *fileDurabilityRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
 
 func (f *fileDurabilityRPC) CallMutation(ctx context.Context, r *authoritypb.Request) (*authoritypb.Response, error) {
 	if r.GetBarrier() != nil {

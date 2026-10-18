@@ -494,8 +494,8 @@ type rawFileSystem struct {
 	sourcePublishing        map[publicationCoordinate]int
 	publishingNegativeNames map[publicationCoordinate]map[*negativeNamePublication]struct{}
 	sourceChanged           chan struct{}
-	repairingCoordinates    map[publicationCoordinate]bool
-	repairOwners            map[publicationCoordinate]map[*cacheRepairLease]struct{}
+	withdrawingCoordinates  map[publicationCoordinate]bool
+	withdrawalOwners        map[publicationCoordinate]map[*cacheWithdrawalLease]struct{}
 	cacheReservations       map[publicationCoordinate]map[*cacheInstallReservation]struct{}
 }
 
@@ -514,8 +514,8 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		requestTimeout:   root.requestTimeout,
 		maxRead:          root.maxRead,
 		maxWrite:         root.maxWrite,
-		entryTimeout:     strictEntryTimeout,
-		attrTimeout:      strictAttrTimeout,
+		entryTimeout:     cacheEntryTimeout,
+		attrTimeout:      cacheAttrTimeout,
 		nameCapacity:     mount.nameCapacity,
 		attrCapacity:     mount.nameCapacity,
 		// A declared capacity too small to divide still admits one absence:
@@ -551,8 +551,8 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		sourceHolds:             make(map[publicationCoordinate]*sourcePublicationLease),
 		sourcePublishing:        make(map[publicationCoordinate]int),
 		publishingNegativeNames: make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
-		repairingCoordinates:    make(map[publicationCoordinate]bool),
-		repairOwners:            make(map[publicationCoordinate]map[*cacheRepairLease]struct{}),
+		withdrawingCoordinates:  make(map[publicationCoordinate]bool),
+		withdrawalOwners:        make(map[publicationCoordinate]map[*cacheWithdrawalLease]struct{}),
 		cacheReservations:       make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}
 	for i := range r.cachedReplyArena {
@@ -727,7 +727,7 @@ func cacheCandidateVersion(publication *replyPublication) (uint64, uint64) {
 
 func (r *rawFileSystem) reserveCacheCandidateLocked(publication *replyPublication, coordinate publicationCoordinate) (*cacheInstallReservation, bool) {
 	snapshot := cacheCandidateSnapshot(publication)
-	if snapshot == 0 || r.repairingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
+	if snapshot == 0 || r.withdrawingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
 		return nil, false
 	}
 	reservation := &cacheInstallReservation{
@@ -1297,7 +1297,7 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
 		r.supersedeNegativeNameLocked(key, nameCoordinate)
 		if !r.sourcePublicationAllowedLocked(nameCoordinate, nil) || !r.sourcePublicationAllowedLocked(attrCoordinate, nil) ||
-			r.repairingCoordinates[nameCoordinate] || r.repairingCoordinates[attrCoordinate] {
+			r.withdrawingCoordinates[nameCoordinate] || r.withdrawingCoordinates[attrCoordinate] {
 			admissible = false
 		}
 		if _, exists := r.cachedNames[key]; !exists {
@@ -1854,8 +1854,8 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		// Do not expose originalDone until this post-write withdrawal finishes.
 		// Calling the raw notifier avoids draining our own still-indexed reply.
 		for _, candidate := range pending {
-			ctx, cancel := context.WithTimeout(r.mount.ctx, r.mount.repairBudget)
-			err := r.mount.subscription.retry(ctx, time.Now().Add(r.mount.repairBudget), func() error {
+			ctx, cancel := context.WithTimeout(r.mount.ctx, r.mount.withdrawalTimeout)
+			err := r.mount.subscription.retry(ctx, time.Now().Add(r.mount.withdrawalTimeout), func() error {
 				notify := r.mount.notifier()
 				if notify == nil {
 					return errors.New("fusev3: unlicensed read has no notifier")
@@ -2343,7 +2343,7 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 		if negative {
 			stamp = r.cachedNegativeStamps[key]
 		}
-		if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
+		if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.withdrawingCoordinates[coordinate] {
 			r.mu.Unlock()
 			return nil, nil, false
 		}
@@ -2374,11 +2374,11 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 				return false
 			}
 			if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
-				r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
+				r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.withdrawingCoordinates[coordinate] {
 				return false
 			}
 			payload := r.cachedAttrPayloads[record.identity]
-			if payload.attr == nil || r.cachedAttrs[record.identity] != record || r.repairingCoordinates[attrCoord] ||
+			if payload.attr == nil || r.cachedAttrs[record.identity] != record || r.withdrawingCoordinates[attrCoord] ||
 				r.mount.subscription.remainingAfterOwnershipCheck(attrCoord, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
 				return false
 			}
@@ -2507,7 +2507,7 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 				return false
 			}
 			payload := r.cachedAttrPayloads[record.identity]
-			if record.stale.Load() || record.reclaimed || payload.attr == nil || r.cachedAttrs[record.identity] != record || r.repairingCoordinates[coordinate] ||
+			if record.stale.Load() || record.reclaimed || payload.attr == nil || r.cachedAttrs[record.identity] != record || r.withdrawingCoordinates[coordinate] ||
 				r.mount.subscription.remainingAfterOwnershipCheck(coordinate, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
 				return false
 			}

@@ -256,7 +256,7 @@ func subscriptionIdentityBytes(value byte) []byte {
 
 func newSubscriptionTestRegistry(clock *subscriptionTestClock, rpc *subscriptionTestRPC, invalidator *subscriptionTestInvalidator, control subscriptionControlHandler) *subscriptionRegistry {
 	return newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
-		clock: clock, retryDelay: time.Millisecond, repairLead: time.Second,
+		clock: clock, retryDelay: time.Millisecond, withdrawalLead: time.Second,
 		maxPages: 16, invalidator: invalidator,
 	})
 }
@@ -385,7 +385,7 @@ func TestSubscriptionFailedNotifyMarksIdentityStaleWithoutAck(t *testing.T) {
 	rpc := &subscriptionTestRPC{horizon: clock.Now().Add(time.Second)}
 	invalidator := &subscriptionTestInvalidator{fail: errors.New("notify busy")}
 	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: 5 * time.Millisecond,
+		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: 5 * time.Millisecond,
 		maxPages: 2, invalidator: invalidator,
 	})
 	registry.mu.Lock()
@@ -513,7 +513,7 @@ func TestSubscriptionHorizonInvalidatesAllCaches(t *testing.T) {
 		invalidator := &subscriptionTestInvalidator{}
 		control := &subscriptionTestControl{}
 		registry := newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
-			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
+			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: time.Millisecond,
 			maxPages: 2, invalidator: invalidator,
 		})
 		registry.mu.Lock()
@@ -563,15 +563,15 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 	if errno != 0 {
 		t.Fatal(errno)
 	}
-	repairableRecord, errno := fixture.raw.intern(context.Background(), testItem(79, authoritypb.Attr_REGULAR, 79))
+	staleRecord, errno := fixture.raw.intern(context.Background(), testItem(79, authoritypb.Attr_REGULAR, 79))
 	if errno != 0 {
 		t.Fatal(errno)
 	}
 	epochRecord.stale.Store(true)
 	epochRecord.node.stale.Store(true)
 	epochRecord.node.epochStale.Store(true)
-	repairableRecord.stale.Store(true)
-	repairableRecord.node.stale.Store(true)
+	staleRecord.stale.Store(true)
+	staleRecord.node.stale.Store(true)
 
 	if err := fixture.raw.invalidateAllCaches(context.Background()); err != nil {
 		t.Fatalf("cold invalidation: %v", err)
@@ -579,7 +579,7 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 	if !epochRecord.stale.Load() || !epochRecord.node.stale.Load() || !epochRecord.node.epochStale.Load() {
 		t.Fatal("cold subscription resurrected an old-epoch inode")
 	}
-	if repairableRecord.stale.Load() || repairableRecord.node.stale.Load() {
+	if staleRecord.stale.Load() || staleRecord.node.stale.Load() {
 		t.Fatal("cold subscription retained repairable coherence staleness")
 	}
 	fixture.raw.mu.Lock()

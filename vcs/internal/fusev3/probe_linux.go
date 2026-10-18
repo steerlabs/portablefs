@@ -35,6 +35,10 @@ type KernelProbe struct {
 // pass on a kernel that cannot carry the request size a real mount negotiates.
 const probeMaxIO = 1 << 20
 
+// probeMaxBackground is the probe's FUSE background bound. The probe serves no
+// requests, so any small positive bound negotiates the same INIT.
+const probeMaxBackground = 8
+
 // ProbeKernelFUSE installs one real FUSE mount on a private, empty temporary
 // directory, completes the kernel INIT handshake against this binary's own
 // mount options, verifies the same kernel guarantees a live mount requires,
@@ -54,7 +58,7 @@ const probeMaxIO = 1 << 20
 func ProbeKernelFUSE() (KernelProbe, error) {
 	options := mountOptions(Config{
 		MountInstanceID: "fuse-probe",
-		MaxBackground:   minMaxInFlight,
+		MaxBackground:   probeMaxBackground,
 	}, probeMaxIO, probeMaxIO)
 	// The probe must not be able to pass by asking for a weaker interface than
 	// a live mount asks for.

@@ -281,7 +281,7 @@ func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoor
 
 func (r *rawFileSystem) leaseRecallHeldLocked(coordinates map[publicationCoordinate]struct{}) bool {
 	for coordinate := range coordinates {
-		if r.repairingCoordinates[coordinate] {
+		if r.withdrawingCoordinates[coordinate] {
 			return true
 		}
 	}

@@ -88,7 +88,7 @@ func newGraftFixture(t *testing.T, routes localroutes.RuleSet, strict bool) *gra
 	rpc.byName = map[string]*authoritypb.Item{}
 	cfg := testConfig(8)
 	if strict {
-		cfg.Coherence, cfg.CachedNameCapacity, cfg.RepairBudget = CoherenceStrict, 32, 5*time.Second
+		cfg.NameCacheCapacity, cfg.WithdrawalTimeout = 32, 5*time.Second
 	}
 	mount := newMount(context.Background(), rpc, cfg)
 	t.Cleanup(mount.cancel)

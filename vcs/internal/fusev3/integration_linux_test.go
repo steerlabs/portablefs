@@ -1343,8 +1343,8 @@ func TestFailedKernelMountDischargesStrictMembership(t *testing.T) {
 		MountInstanceID: mountInstanceID, RequestTimeout: integrationRequestTimeout,
 		MaxBackground: 64, MaxInFlight: integrationMaxInFlight, ReclaimQueue: 1024,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-		Coherence: CoherenceStrict, CachedNameCapacity: integrationCachedNames,
-		RepairBudget: integrationRepairBudget, Routes: f.cfg.rules, LocalBacking: backing,
+		NameCacheCapacity: integrationNameCacheCapacity,
+		WithdrawalTimeout: integrationWithdrawalTimeout, Routes: f.cfg.rules, LocalBacking: backing,
 	})
 	if err == nil || mount != nil {
 		if mount != nil {

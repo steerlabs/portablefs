@@ -124,7 +124,7 @@ func revokingMount(t *testing.T, fake *fakeWithdrawal) *Mount {
 	mount.withdrawal = fake.ops()
 	// The raw table's cached-name withdrawal walks a real notifier; the tests
 	// here are about the kernel-mount ladder, so leave it unhooked.
-	mount.repairBudget = 5 * time.Second
+	mount.withdrawalTimeout = 5 * time.Second
 	return mount
 }
 
@@ -262,7 +262,7 @@ func TestWithdrawalWithNoRecordedKernelMountProvesNothing(t *testing.T) {
 	}
 }
 
-func TestWithdrawalStopsAtTheDeclaredRepairBudget(t *testing.T) {
+func TestWithdrawalStopsAtTheWithdrawalTimeout(t *testing.T) {
 	fake := &fakeWithdrawal{
 		installed:  true,
 		detachErrs: []error{syscall.EPERM, syscall.EPERM, syscall.EPERM, syscall.EPERM},
@@ -270,7 +270,7 @@ func TestWithdrawalStopsAtTheDeclaredRepairBudget(t *testing.T) {
 	mount := revokingMount(t, fake)
 	// A budget already spent: the withdrawal exists to fit inside the
 	// authority's fencing grace, so it must not outlive it retrying.
-	mount.repairBudget = 0
+	mount.withdrawalTimeout = 0
 	out := mount.withdrawKernelState()
 	if out.withdrawn {
 		t.Fatal("withdrawal claimed success with every primitive refusing")
@@ -384,7 +384,7 @@ func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
 	}
 	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
 	f.mount.withdrawal = ops
-	f.mount.repairBudget = 5 * time.Second
+	f.mount.withdrawalTimeout = 5 * time.Second
 
 	out := f.mount.withdrawKernelState()
 	if !out.withdrawn {
@@ -463,7 +463,7 @@ func TestSessionDoneWaitsForRetainedPageWithdrawalAttempt(t *testing.T) {
 	f.mount.rpc = rpc
 	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
 	f.mount.withdrawal = fake.ops()
-	f.mount.repairBudget = time.Second
+	f.mount.withdrawalTimeout = time.Second
 	close(f.mount.kernelConnectionDone)
 
 	f.mount.wg.Add(1)
@@ -508,7 +508,7 @@ func TestWithdrawalReportsPagesTheLadderCouldNotDrop(t *testing.T) {
 	fake := &fakeWithdrawal{installed: true}
 	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
 	f.mount.withdrawal = fake.ops()
-	f.mount.repairBudget = 5 * time.Second
+	f.mount.withdrawalTimeout = 5 * time.Second
 
 	out := f.mount.withdrawKernelState()
 	found := false

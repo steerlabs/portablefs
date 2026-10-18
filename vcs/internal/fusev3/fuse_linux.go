@@ -1,7 +1,8 @@
 //go:build linux
 
 // Package fusev3 is the branchless PortableFS v3 Linux mount frontend. It is
-// backed by the protocol-7 subscription and daemon write delegation buffer.
+// backed by the authority's change subscription and the daemon's write
+// delegation buffer.
 package fusev3
 
 import (
@@ -58,14 +59,6 @@ const (
 	reclaimBatchDelay  = 50 * time.Millisecond
 	reclaimRetryDelay  = 100 * time.Millisecond
 
-	// livenessReserve is the number of authority in-flight slots that only
-	// session keepalive may occupy.
-	livenessReserve = 1
-
-	// minMaxInFlight is the smallest authority in-flight budget from which a
-	// cleanup lane, a liveness slot, and a usable bulk lane can all be carved.
-	minMaxInFlight = 8
-
 	// portableFuseMajor/minor are the stock-kernel semantic floor. Protocol
 	// 7.31 is Linux 5.10's FUSE contract and includes every mandatory primitive
 	// used by the portable client, including explicit data invalidation. Newer
@@ -93,7 +86,8 @@ func portableOpenFlags(flags uint32, cacheCapable bool) uint32 {
 // RPC is the exact authority contract required by the mount. Keeping this
 // interface narrow makes kernel mapping independently fault-testable.
 //
-// Subscription CONTROL and exact detach are mandatory for every protocol-7 mount.
+// Subscription CONTROL, ordered delegated flush, batched close and exact detach
+// are mandatory for every Linux mount; none of them is an optional capability.
 type RPC interface {
 	Root() *authoritypb.Item
 	IOLimits() (uint32, uint32)
@@ -110,6 +104,9 @@ type RPC interface {
 	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
 	CallMutationWithIdentityRetained(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
+	// CallMutationSegments sends one delegated WRITE of an ordered flush wave
+	// from borrowed payload segments on the transport's dedicated flush lane.
+	CallMutationSegments(context.Context, *authoritypb.Request, [][]byte, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
 	Close() error
 
 	// SessionID is this mount's authority session identity. Subscription CONTROL must
@@ -148,22 +145,21 @@ type Config struct {
 	RequestTimeout time.Duration
 	MaxBackground  int
 	// MaxInFlight must be the same concurrent-call bound the RPC transport was
-	// configured with. The frontend subtracts its liveness and cleanup lanes
-	// from this number and admits bulk kernel work only against the remainder,
-	// which is what makes those two lanes genuinely reserved rather than merely
-	// hopeful.
+	// configured with, and at least authorityrpc.MinimumLinuxInFlight. The
+	// frontend runs its cleanup workers outside the bulk admission that
+	// bounds kernel-driven calls, so saturated kernel I/O cannot also occupy
+	// every reclaim worker.
 	MaxInFlight  int
 	ReclaimQueue int
 	PresentedUID uint32
 	PresentedGID uint32
-	// Coherence validates the retained CLI spelling for protocol 7's one local
-	// kernel-cache contract.
-	Coherence CoherenceProfile
-	// CachedNameCapacity bounds daemon subscription name payloads. Kernel dentry validity
-	// is always zero. Zero selects defaultCachedNameCapacity.
-	CachedNameCapacity int
-	// RepairBudget bounds local recall repair. Zero selects defaultRepairBudget.
-	RepairBudget time.Duration
+	// NameCacheCapacity bounds the names, proven absences and attributes the
+	// daemon caches under its subscription. Kernel dentry and attribute
+	// validity is always zero. Zero selects defaultNameCacheCapacity.
+	NameCacheCapacity int
+	// WithdrawalTimeout bounds one withdrawal of kernel cache state before the
+	// mount revokes itself. Zero selects defaultWithdrawalTimeout.
+	WithdrawalTimeout time.Duration
 
 	// Routes is the activated machine-local route set: the volume's
 	// .portablefs/local-dirs declaration unioned with whatever the command line
@@ -257,10 +253,10 @@ type Mount struct {
 	// cached-name registry and the publication gate; kernelMount is the
 	// installed mount's identity, which is what makes both self-revocation and
 	// a mount-absence proof exact rather than path-shaped guesses.
-	nameCapacity int
-	repairBudget time.Duration
-	raw          *rawFileSystem
-	kernelMount  kernelMount
+	nameCapacity      int
+	withdrawalTimeout time.Duration
+	raw               *rawFileSystem
+	kernelMount       kernelMount
 	// The withdrawal ladder must finish before its owned abort descriptor closes.
 	kernelWithdrawalMu     sync.Mutex
 	kernelWithdrawalClosed bool
@@ -308,9 +304,9 @@ func (m *Mount) publishAttr(ctx context.Context, out *fuse.AttrOut, item *author
 	m.raw.publishAttr(ctx, out, identity, attr)
 }
 
-// MountVolume mounts one protocol-7 subscription and delegation buffer.
-// Kernel writeback remains disabled: FULL writes are accepted by the daemon
-// buffer, while read caching follows explicit subscription permission.
+// MountVolume mounts one Linux subscription and delegation buffer. Kernel
+// writeback remains disabled: FULL writes are accepted by the daemon buffer,
+// while read caching follows explicit subscription permission.
 func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
@@ -319,12 +315,6 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		rpc.FinishLocalSessionEnforcement()
 		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
-	if cfg.Coherence != CoherenceStrict {
-		// Zero is the legacy uncached wire value. It must fail closed: translating
-		// it would let an old sender attach with semantics it did not request.
-		rpc.FinishLocalSessionEnforcement()
-		return nil, errors.Join(errors.New("fusev3: strict coherence is required"), rpc.Close())
-	}
 	fsName := "portablefs:" + cfg.MountInstanceID
 	failBeforeKernelMount := func(cause error) (*Mount, error) {
 		if err := releaseUninstalledSession(rpc, fsName, mountpoint); err != nil {
@@ -332,11 +322,17 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		}
 		return nil, markCleanStartupFailure(cause)
 	}
-	if cfg.RequestTimeout <= 0 || cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.MaxInFlight < minMaxInFlight {
-		return failBeforeKernelMount(fmt.Errorf("fusev3: complete mount configuration is required with at least %d authority in-flight slots", minMaxInFlight))
+	if cfg.RequestTimeout <= 0 || cfg.MaxBackground <= 0 || cfg.ReclaimQueue <= 0 || cfg.NameCacheCapacity < 0 || cfg.WithdrawalTimeout < 0 {
+		return failBeforeKernelMount(errors.New("fusev3: complete mount configuration is required"))
+	}
+	if cfg.MaxInFlight < authorityrpc.MinimumLinuxInFlight {
+		// The transport refuses this bound before Activate; a frontend
+		// configured below it would disagree with the session it serves about
+		// the four-slot ordered-flush lane every delegated wave depends on.
+		return failBeforeKernelMount(fmt.Errorf("fusev3: max-in-flight %d is below the Linux minimum of %d authority slots", cfg.MaxInFlight, authorityrpc.MinimumLinuxInFlight))
 	}
 	if len(rpc.SessionID()) == 0 {
-		return failBeforeKernelMount(errors.New("fusev3: strict coherence requires the authority session identity; without it this mount cannot recognise -- and would deadlock against -- its own mutations"))
+		return failBeforeKernelMount(errors.New("fusev3: the mount requires its authority session identity; without it this mount cannot recognise -- and would deadlock against -- its own mutations"))
 	}
 	rootItem := rpc.Root()
 	if !validItem(rootItem) {
@@ -526,26 +522,29 @@ func releaseUninstalledSession(rpc RPC, fsName, mountpoint string) error {
 func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	ctx, cancel := context.WithCancel(parent)
 	workers := reclaimLaneWidth(cfg.MaxInFlight)
-	if cfg.CachedNameCapacity <= 0 {
-		cfg.CachedNameCapacity = defaultCachedNameCapacity
+	if cfg.NameCacheCapacity <= 0 {
+		cfg.NameCacheCapacity = defaultNameCacheCapacity
 	}
-	if cfg.RepairBudget <= 0 {
-		cfg.RepairBudget = defaultRepairBudget
+	if cfg.WithdrawalTimeout <= 0 {
+		cfg.WithdrawalTimeout = defaultWithdrawalTimeout
 	}
-	// Subscription CONTROL owns a transport slot no bulk request can take. Recall ACKs
-	// release conflicting mutations on other participants.
-	reserved := livenessReserve + subscriptionControlReserve
+	// Keepalive, subscription CONTROL and its acknowledgements ride the
+	// transport's own CONTROL lanes, and ordered flushes its DATA flush lane,
+	// so none of them needs a frontend reservation. Cleanup workers stay
+	// outside bulk admission: they share only the transport's ordinary lane,
+	// whose permits are each held for one RPC, so cleanup keeps its turn
+	// however long kernel requests wait for bulk slots.
 	mount := &Mount{
 		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel,
 		kernelConnectionDone: make(chan struct{}),
 		reclaim:              newReclaimQueue(cfg.ReclaimQueue),
 		reclaimWorkers:       workers,
-		bulk:                 make(chan struct{}, cfg.MaxInFlight-workers-reserved),
+		bulk:                 make(chan struct{}, cfg.MaxInFlight-workers),
 		requestTimeout:       cfg.RequestTimeout,
 		uid:                  cfg.PresentedUID,
 		gid:                  cfg.PresentedGID,
-		nameCapacity:         cfg.CachedNameCapacity,
-		repairBudget:         cfg.RepairBudget,
+		nameCapacity:         cfg.NameCacheCapacity,
+		withdrawalTimeout:    cfg.WithdrawalTimeout,
 		routesRevision:       cfg.Routes.Revision(),
 		onRevoked:            cfg.OnRevoked,
 
@@ -745,7 +744,7 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 
 func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 	defer m.wg.Done()
-	interval := keepAliveInterval(lease, m.repairBudget)
+	interval := keepAliveInterval(lease)
 	timer := time.NewTicker(interval)
 	defer timer.Stop()
 	for {
@@ -754,8 +753,8 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 			return
 		case <-timer.C:
 			callCtx, cancel := context.WithTimeout(ctx, interval)
-			// Renewal never passes through the bulk lane: livenessReserve keeps
-			// one transport slot that only this call can occupy.
+			// Renewal never passes through bulk admission: the transport
+			// carries it on its dedicated CONTROL liveness lane.
 			response, err := m.rpc.CallRead(callCtx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
 			cancel()
 			if ctx.Err() != nil {
@@ -789,13 +788,11 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 }
 
 // keepAliveInterval reserves regular contact for runtime session and signed
-// authorization checks. Subscription horizons, not heartbeat transport errors,
-// govern Linux cache withdrawal.
-func keepAliveInterval(lease time.Duration, repairBudget time.Duration) time.Duration {
+// authorization checks: three renewals per lease. Subscription horizons, not
+// heartbeat cadence, govern Linux cache withdrawal, so the withdrawal timeout
+// has no say in it.
+func keepAliveInterval(lease time.Duration) time.Duration {
 	interval := lease / 3
-	if strict := repairBudget / 3; strict < interval {
-		interval = strict
-	}
 	if interval <= 0 {
 		// Mount admission already requires positive bounds. This floor merely
 		// keeps sub-nanosecond integer division from reaching NewTicker.
@@ -1262,12 +1259,12 @@ func (m *Mount) closeLocked() error {
 	m.cancel()
 	var replyOwnershipErr error
 	if m.raw != nil {
-		if !m.raw.terminalizeReplyCacheOwnership(time.Now().Add(m.repairBudget)) {
-			deadline := time.Now().Add(m.repairBudget)
+		if !m.raw.terminalizeReplyCacheOwnership(time.Now().Add(m.withdrawalTimeout)) {
+			deadline := time.Now().Add(m.withdrawalTimeout)
 			_, absenceErr := m.kernelMount.absent()
 			if absenceErr != nil || !m.kernelConnectionAbsentBy(deadline) {
 				replyOwnershipErr = errors.Join(
-					fmt.Errorf("fusev3: terminal reply writer did not report inside the repair budget"),
+					fmt.Errorf("fusev3: terminal reply writer did not report inside the withdrawal timeout"),
 					absenceErr,
 				)
 			} else {
@@ -2570,7 +2567,10 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32) (*authorityp
 	if errno != 0 {
 		return nil, errno
 	}
-	item := response.GetLookup().GetItem()
+	// Search permission on this mount is the kernel's default_permissions
+	// check against the presented attributes, so the authority's child-search
+	// observation in the mkdir reply has no consumer here.
+	item := response.GetMkdir().GetItem()
 	if item == nil || item.GetAttr() == nil {
 		return nil, syscall.EIO
 	}

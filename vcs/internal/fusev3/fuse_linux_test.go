@@ -67,7 +67,8 @@ func exactTestPostState(sequence uint64, objects ...struct {
 // request shape the frontend issues, so the real mount path -- including
 // MountVolume -- is reachable without a kernel.
 type fakeRPC struct {
-	mu sync.Mutex
+	mu        sync.Mutex
+	waveOrder sync.Map
 
 	writes        []*authoritypb.WriteRequest
 	writeRequests []*authoritypb.Request
@@ -261,6 +262,10 @@ func (f *fakeRPC) CallMutation(ctx context.Context, request *authoritypb.Request
 	return f.CallMutationWithIdentity(ctx, request, nil)
 }
 
+func (f *fakeRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
+
 func (f *fakeRPC) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.mutationCalls++
@@ -417,9 +422,6 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 			return &authoritypb.Response{Errno: int32(f.keepAliveErr)}, nil
 		}
 	case request.GetReclaim() != nil:
-		if item := request.GetReclaim().GetItem(); len(item) != 0 {
-			f.reclaims = append(f.reclaims, cloneBytes(item))
-		}
 		for _, item := range request.GetReclaim().GetItems() {
 			f.reclaims = append(f.reclaims, cloneBytes(item))
 		}
@@ -473,7 +475,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		delete(f.missingNames, string(name))
 		created := f.namedItem(name)
 		return &authoritypb.Response{
-			Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: created}},
+			Body: &authoritypb.Response_Mkdir{Mkdir: &authoritypb.MkdirReply{Item: created, ChildSearchPermitted: true}},
 			PostState: exactTestPostState(2,
 				struct {
 					item  *authoritypb.Item
@@ -681,7 +683,7 @@ func testConfig(watermark int) Config {
 	return Config{
 		MountInstanceID: "mnt_AAAAAAAAAAAAAAAAAAAAAA", RequestTimeout: 2 * time.Second,
 		MaxBackground: 8, MaxInFlight: 16, ReclaimQueue: watermark,
-		PresentedUID: 501, PresentedGID: 20, Coherence: CoherenceStrict,
+		PresentedUID: 501, PresentedGID: 20,
 	}
 }
 
@@ -942,17 +944,24 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	}
 }
 
-func TestMountVolumeRejectsRetiredZeroCoherenceBeforeKernelMount(t *testing.T) {
+// The transport refuses a Linux session below the minimum before Activate. A
+// frontend handed a smaller bound would disagree with that session about the
+// four-slot ordered-flush lane, so it releases the session with exact absence
+// evidence before any kernel mount exists.
+func TestMountVolumeRefusesMaxInFlightBelowTheLinuxMinimumBeforeKernelMount(t *testing.T) {
 	rpc := newFakeRPC()
 	cfg := testConfig(8)
-	cfg.Coherence = 0
+	cfg.MaxInFlight = authorityrpc.MinimumLinuxInFlight - 1
 	_, err := MountVolume(context.Background(), t.TempDir(), rpc, cfg)
-	if err == nil || !strings.Contains(err.Error(), "strict coherence is required") {
-		t.Fatalf("legacy zero coherence error = %v, want an explicit strict-only refusal", err)
+	if err == nil || !strings.Contains(err.Error(), "below the Linux minimum") {
+		t.Fatalf("undersized max-in-flight error = %v, want the Linux minimum refusal", err)
+	}
+	if !FailedStartupClean(err) {
+		t.Fatalf("undersized max-in-flight left recoverable state: %v", err)
 	}
 	rpc.snapshot(func(f *fakeRPC) {
-		if f.calls != 0 || f.closes != 1 {
-			t.Fatalf("retired coherence reached authority/kernel setup: calls=%d closes=%d", f.calls, f.closes)
+		if f.calls != 0 || f.closes != 1 || len(f.detachProofs) != 1 {
+			t.Fatalf("undersized mount reached authority I/O or skipped exact release: calls=%d closes=%d detaches=%d", f.calls, f.closes, len(f.detachProofs))
 		}
 	})
 }
@@ -1144,8 +1153,8 @@ func TestReclaimDrainBatchesTimerResidue(t *testing.T) {
 	}()
 	select {
 	case request := <-reached:
-		if len(request.GetItem()) != 0 || len(request.GetItems()) != 100 {
-			t.Fatalf("reclaim request = legacy:%x batch:%d, want one 100-token batch", request.GetItem(), len(request.GetItems()))
+		if len(request.GetItems()) != 100 {
+			t.Fatalf("reclaim request batch = %d, want one 100-token batch", len(request.GetItems()))
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("reclaim residue was not sent at the timer")
@@ -1309,13 +1318,13 @@ func TestGenericTerminalCauseCannotMaskAnExistingRouteCause(t *testing.T) {
 	}
 }
 
-// --- Defect 5: liveness and cleanup have reserved capacity -----------------
+// --- Defect 5: liveness and cleanup progress beside saturated kernel I/O ----
 
-func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
+func TestLivenessAndCleanupProgressWhileBulkIsSaturated(t *testing.T) {
 	cfg := testConfig(8)
 	mount, rpc := testMount(t, 8)
-	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+subscriptionControlReserve != cfg.MaxInFlight {
-		t.Fatalf("bulk %d + cleanup %d + liveness %d + lease control %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, subscriptionControlReserve, cfg.MaxInFlight)
+	if cap(mount.bulk)+mount.reclaimWorkers != cfg.MaxInFlight || mount.reclaimWorkers < 2 {
+		t.Fatalf("bulk %d + cleanup %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, cfg.MaxInFlight)
 	}
 	for range cap(mount.bulk) {
 		mount.bulk <- struct{}{}
@@ -1512,12 +1521,12 @@ func TestMountVolumeRequiresACompleteConfiguration(t *testing.T) {
 	cfg = testConfig(8)
 	cfg.MaxInFlight = 0
 	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
-		t.Fatal("a mount without the authority in-flight budget cannot reserve a liveness lane and must be refused")
+		t.Fatal("a mount without the authority in-flight budget must be refused")
 	}
 	cfg = testConfig(8)
-	cfg.MaxInFlight = minMaxInFlight - 1
+	cfg.MaxInFlight = authorityrpc.MinimumLinuxInFlight - 1
 	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
-		t.Fatal("an in-flight budget too small to carve lanes from must be refused")
+		t.Fatal("an in-flight budget below the Linux ordered-flush minimum must be refused")
 	}
 	rpc = newFakeRPC()
 	rpc.root = nil
@@ -1539,7 +1548,6 @@ func TestFailedStartupCleanRequiresExactSessionRelease(t *testing.T) {
 			rpc := newFakeRPC()
 			rpc.detachErr = test.detachErr
 			cfg := testConfig(8)
-			cfg.Coherence = CoherenceStrict
 			cfg.MaxInFlight = 0
 			_, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg)
 			if err == nil {
@@ -2276,16 +2284,16 @@ func TestKeepAliveFailureAbortsSession(t *testing.T) {
 	}
 }
 
-func TestStrictKeepAliveIsBoundedByTheRepairBudget(t *testing.T) {
-	const (
-		lease  = 2 * time.Minute
-		budget = 15 * time.Second
-	)
-	if got, want := keepAliveInterval(lease, budget), budget/3; got != want {
-		t.Fatalf("strict keepalive interval = %s, want %s", got, want)
+// Keepalive renews the session three times per lease. Cache withdrawal is
+// bounded by subscription horizons, so the withdrawal timeout is not an input.
+func TestKeepAliveRenewsThreeTimesPerLease(t *testing.T) {
+	for _, lease := range []time.Duration{9 * time.Second, 2 * time.Minute} {
+		if got, want := keepAliveInterval(lease), lease/3; got != want {
+			t.Fatalf("keepalive interval for lease %s = %s, want %s", lease, got, want)
+		}
 	}
-	if got, want := keepAliveInterval(9*time.Second, time.Minute), 3*time.Second; got != want {
-		t.Fatalf("short-lease keepalive interval = %s, want %s", got, want)
+	if got := keepAliveInterval(2); got != time.Nanosecond {
+		t.Fatalf("degenerate lease interval = %s, want the positive ticker floor", got)
 	}
 }
 

@@ -406,11 +406,11 @@ func TestUnresolvedCreateIgnoresUnrelatedRecallAndAllowsUnrelatedPublication(t *
 		t.Fatal(err)
 	}
 	unrelated := publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(112))}
-	repairLease, err := fixture.raw.closeCacheCoordinate(context.Background(), unrelated)
+	withdrawalLease, err := fixture.raw.closeCacheCoordinate(context.Background(), unrelated)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer repairLease.Open()
+	defer withdrawalLease.Open()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -583,11 +583,11 @@ func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	repairLease, err := fixture.raw.closeCacheCoordinate(ctx, coordinate)
+	withdrawalLease, err := fixture.raw.closeCacheCoordinate(ctx, coordinate)
 	if err != nil {
 		t.Fatalf("subscription withdrawal waited for an existing source gate: %v", err)
 	}
-	repairLease.Open()
+	withdrawalLease.Open()
 	fixture.raw.mu.Lock()
 	openedEarly := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
 	fixture.raw.mu.Unlock()

@@ -8,7 +8,7 @@
 // authorityrpc owns the wire, and the caller owns credentials, lifecycle
 // records, and teardown. What is shared is the part where disagreement
 // between the two binaries would be a product bug — two mounts of the same
-// volume must declare identical barrier obligations and adopt routing through
+// volume must attach with identical transport bounds and adopt routing through
 // the identical refusal protocol.
 package mountv3
 
@@ -24,27 +24,32 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
-// The transport and declaration defaults every v3 frontend starts from.
+// The transport and local cache defaults every v3 frontend starts from.
 //
 // Transport bounds negotiate downward against the authority's advertised
-// limits. CachedNameCapacity and RepairBudget are local resource and recall
-// bounds under protocol 7's bounded cache profile.
+// limits; a Linux mount needs at least authorityrpc.MinimumLinuxInFlight so its
+// DATA connection carries the mandatory ordered-flush lane beside ordinary and
+// blocking work. NameCacheCapacity and WithdrawalTimeout are local memory and
+// kernel-withdrawal bounds. Neither is declared to the authority.
 const (
 	ReplaySlots  uint32 = 128
 	MaxInFlight         = 128
 	MaxFrame     uint32 = 4 << 20
 	ReclaimQueue        = 4096
 
-	// CachedNameCapacity bounds daemon-held name leases and cached resolutions.
-	CachedNameCapacity = 1 << 16
+	// NameCacheCapacity bounds the names, attributes and proven absences the
+	// mount's daemon caches under its subscription.
+	NameCacheCapacity = 1 << 16
 )
 
 const (
 	DialTimeout        = 10 * time.Second
 	CancelDrainTimeout = 10 * time.Second
 	RequestTimeout     = 45 * time.Second
-	// RepairBudget bounds local recall repair before the mount revokes itself.
-	RepairBudget = 15 * time.Second
+	// WithdrawalTimeout bounds one withdrawal of kernel cache state (entry,
+	// attribute and page invalidation plus the replies it must drain) before
+	// the mount revokes itself rather than serve a cache it cannot take back.
+	WithdrawalTimeout = 15 * time.Second
 )
 
 // AttachWithRoutes attaches one mount and returns the routing it was admitted
@@ -81,10 +86,10 @@ const (
 // that declares routes is then refused outright rather than served with its
 // topology ignored.
 func AttachWithRoutes(ctx context.Context, attach authorityrpc.ClientConfig, adopt bool) (*authorityrpc.Client, localroutes.RuleSet, error) {
-	// This package hands the session to the strict Linux FUSE frontend. Its
+	// This package hands a Linux session to the kernel FUSE frontend. Its
 	// public terminal edge must certify that the bounded kernel withdrawal has
 	// finished, rather than racing ahead and triggering that withdrawal.
-	attach.RequireLocalSessionEnforcement = attach.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+	attach.RequireLocalSessionEnforcement = attach.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX
 	rules := localroutes.RuleSet{}
 	attach.RoutesRevision = rules.Revision()
 	client, err := dialOnce(ctx, attach)

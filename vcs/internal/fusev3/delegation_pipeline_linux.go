@@ -15,33 +15,34 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
-type orderedDelegationRPC interface {
-	SupportsOrderedFlush() bool
-	CallMutationSegments(context.Context, *authoritypb.Request, [][]byte, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
-}
+// errFlushOrdinalExhausted is returned from the replay-assignment callback when
+// the exact grant has no ordinal left. The wave then loses the delegation.
+var errFlushOrdinalExhausted = errors.New("fusev3: delegated flush ordinal exhausted")
 
+// FlushBatchSize is fixed: every Linux session carries the ordered flush lane,
+// so a wave is always up to OrderedFlushWindow writes of at most one
+// negotiated write each.
 func (m *delegationManager) FlushBatchSize() (int, int) {
-	if rpc, ok := m.rpc.(orderedDelegationRPC); ok && rpc.SupportsOrderedFlush() {
-		return volumeserver.OrderedFlushWindow, m.maxWrite
-	}
-	return 0, 0
+	return volumeserver.OrderedFlushWindow, m.maxWrite
 }
 
 // FlushBatch admits each predecessor to the dedicated transport lane before
 // launching its successor. Server arrival may reorder them; the dense ordinal
 // and exact replay outcome gate application. Every started RPC is joined before
 // one wave-wide capacity/loss decision changes local ownership.
+//
+// An ordinal is consumed only when the transport assigns the write its replay
+// identity, immediately before dispatch. A write that never reached that point
+// (its caller's context ended while it waited for the lane) therefore leaves
+// the grant's dense sequence without a hole and provably never applied, so the
+// wave is retained for retry instead of discarding the delegation's data.
 func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identity, entries []writeback.Entry) ([]uint64, error) {
 	if len(entries) == 0 || len(entries) > volumeserver.OrderedFlushWindow {
 		return nil, writeback.ErrInvalid
 	}
 	if len(entries) == 1 && entries[0].Kind != writeback.Write {
-		seq, err := m.Flush(ctx, id, entries[0])
+		seq, err := m.flushMetadata(ctx, id, entries[0])
 		return []uint64{seq}, err
-	}
-	rpc, ok := m.rpc.(orderedDelegationRPC)
-	if !ok || !rpc.SupportsOrderedFlush() {
-		return nil, writeback.ErrInvalid
 	}
 	s := m.retainState(id, true)
 	defer m.releaseState(s)
@@ -61,11 +62,13 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		err      error
 		size     int
 		cached   uint64
+		// sent is set once the transport assigned a replay identity and the
+		// write took its ordinal; only then can it have been applied.
+		sent bool
 	}
 	results := make([]callResult, len(entries))
 	requests := make([]*authoritypb.Request, len(entries))
 	spans := make([][][]byte, len(entries))
-	missing := 0
 	for i, e := range entries {
 		if e.Kind != writeback.Write || e.Generation != entries[0].Generation {
 			return nil, writeback.ErrInvalid
@@ -94,32 +97,10 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 			results[i].cached = progress.sequence
 			continue
 		}
-		missing++
 		requests[i] = &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 			Handle: handle, Position: uint64(e.Offset), Size: uint32(size), WriteFlags: e.WriteOptions.Flags, LockOwner: e.WriteOptions.LockOwner, Delegation: cloneDelegationRef(binding.ref),
 		}}}
 	}
-	s.admission.Lock()
-	if !sameDelegation(s.ref, binding.ref) {
-		s.admission.Unlock()
-		return nil, writeback.ErrLost
-	}
-	s.meta.Lock()
-	if uint64(missing) > math.MaxUint64-s.flushOrdinal {
-		s.meta.Unlock()
-		report := m.loseDelegationLocked(s, "delegated flush ordinal exhausted")
-		s.admission.Unlock()
-		m.reportDrop(report)
-		return nil, writeback.ErrLost
-	}
-	for _, request := range requests {
-		if request != nil {
-			s.flushOrdinal++
-			request.GetWrite().FlushSequence = s.flushOrdinal
-		}
-	}
-	s.meta.Unlock()
-	s.admission.Unlock()
 	var joined sync.WaitGroup
 	for i, request := range requests {
 		if request == nil {
@@ -130,24 +111,32 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		go func(i int, request *authoritypb.Request) {
 			defer joined.Done()
 			defer close(done)
-			results[i].response, results[i].err = rpc.CallMutationSegments(ctx, request, spans[i], func(authorityrpc.MutationIdentity) error { close(assigned); return nil })
+			results[i].response, results[i].err = m.rpc.CallMutationSegments(ctx, request, spans[i], func(authorityrpc.MutationIdentity) error {
+				if err := m.assignFlushOrdinal(s, binding.ref, request.GetWrite()); err != nil {
+					return err
+				}
+				close(assigned)
+				return nil
+			})
 		}(i, request)
-		admitted := true
 		select {
 		case <-assigned:
 		case <-done:
 			select {
 			case <-assigned:
 			default:
-				admitted = false
 			}
 		}
-		if !admitted {
-			if results[i].err == nil {
-				results[i].err = errors.New("fusev3: ordered transport omitted replay assignment")
-			}
-			break
+		select {
+		case <-assigned:
+			results[i].sent = true
+			continue
+		default:
 		}
+		if results[i].err == nil {
+			results[i].err = errors.New("fusev3: ordered transport omitted replay assignment")
+		}
+		break
 	}
 	joined.Wait()
 	s.admission.Lock()
@@ -159,11 +148,28 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 	defer m.finishFlushResult(s, &completion)
 	sequences := make([]uint64, len(entries))
 	var capacity syscall.Errno
+	var unsent error
 	lost := false
+	lostReason := "ordered delegated wave outcome unprovable"
 	for i, result := range results {
 		e := entries[i]
 		if result.cached != 0 {
 			sequences[i] = result.cached
+			continue
+		}
+		if !result.sent {
+			switch {
+			case errors.Is(result.err, errFlushOrdinalExhausted):
+				lost, lostReason = true, "delegated flush ordinal exhausted"
+			case result.err == nil || ctx.Err() != nil && (errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded)):
+				// Never launched, or its context ended before the lane
+				// admitted it: no ordinal, no dispatch, no application.
+				if unsent == nil {
+					unsent = result.err
+				}
+			default:
+				lost = true
+			}
 			continue
 		}
 		response := result.response
@@ -208,7 +214,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		}
 	}
 	if lost {
-		completion.dropped = m.loseDelegationLocked(s, "ordered delegated wave outcome unprovable")
+		completion.dropped = m.loseDelegationLocked(s, lostReason)
 		return nil, writeback.ErrLost
 	}
 	if capacity != 0 {
@@ -219,5 +225,31 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 	case m.durableKick <- struct{}{}:
 	default:
 	}
+	if unsent != nil {
+		// The applied prefix keeps its completed tokens; the retained wave
+		// resends only the writes that never left this client.
+		return nil, unsent
+	}
 	return sequences, nil
+}
+
+// assignFlushOrdinal gives one wave write the next dense ordinal of its exact
+// grant. It runs inside the transport's replay assignment, before dispatch;
+// the grant check and the increment share the admission and metadata locks
+// that install a successor grant and reset its sequence, so a write of a
+// replaced grant can never consume a successor's ordinal.
+func (m *delegationManager) assignFlushOrdinal(s *delegationState, ref *authoritypb.DelegationRef, write *authoritypb.WriteRequest) error {
+	s.admission.RLock()
+	defer s.admission.RUnlock()
+	if !sameDelegation(s.ref, ref) {
+		return writeback.ErrLost
+	}
+	s.meta.Lock()
+	defer s.meta.Unlock()
+	if s.flushOrdinal == math.MaxUint64 {
+		return errFlushOrdinalExhausted
+	}
+	s.flushOrdinal++
+	write.FlushSequence = s.flushOrdinal
+	return nil
 }

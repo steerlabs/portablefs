@@ -89,7 +89,7 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 			unlock()
 			return false, false, syscall.EIO
 		}
-		blocked := len(r.cacheReservations[coordinate]) != 0 || r.repairingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, source)
+		blocked := len(r.cacheReservations[coordinate]) != 0 || r.withdrawingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, source)
 		first, second, count := coordinate, publicationCoordinate{}, 1
 		if parent != nil {
 			key := nameKey{parent: parent.key.inode, name: name}
@@ -297,7 +297,7 @@ func (r *rawFileSystem) publishDirectoryMetadata(ctx context.Context, candidates
 		for _, row := range rows {
 			coordinate := publicationCoordinate{kind: publicationItemAttributes, item: row.record.identity}
 			invalid = invalid || row.record.stale.Load() || row.record.reclaimed
-			blocked = blocked || len(r.cacheReservations[coordinate]) != 0 || r.repairingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, p.source)
+			blocked = blocked || len(r.cacheReservations[coordinate]) != 0 || r.withdrawingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, p.source)
 		}
 		if invalid {
 			r.mu.Unlock()

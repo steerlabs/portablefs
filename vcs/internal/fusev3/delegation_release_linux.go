@@ -364,44 +364,6 @@ func (m *delegationManager) SetCleanupRetryWaiter(wait func(context.Context) err
 	m.hookMu.Unlock()
 }
 
-// Peers without the optional capability retain the original CLOSE wire. The
-// release flight owns local transition state, without holding physical locks.
-func (m *delegationManager) closeSerial(ctx context.Context, epochSerial uint64, buf *writeback.Buffer, current []delegationClose, requests []*authoritypb.CloseRequest, groups map[writeback.Identity]*delegationReleaseGroup) error {
-	var first error
-	for i, request := range requests {
-		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: request}})
-		if !m.epochCurrent(epochSerial, buf) {
-			return writeback.ErrLost
-		}
-		if err != nil || response == nil || response.GetUncertain() {
-			if err == nil {
-				err = errors.New("fusev3: CLOSE has no definite outcome")
-			}
-			return m.unknownCloseOutcome(err)
-		}
-		if err := successfulDelegationResponse(response); err != nil {
-			if first == nil {
-				first = delegationCleanupError{cause: err, failure: response.GetFailure()}
-			}
-			continue
-		}
-		id, _ := delegationIdentity(current[i].identity)
-		s := groups[id].state
-		s.admission.Lock()
-		delete(s.handles, string(current[i].handle))
-		delete(s.writers, string(current[i].handle))
-		s.admission.Unlock()
-	}
-	if first != nil {
-		var cleanup delegationCleanupError
-		if errors.As(first, &cleanup) {
-			return cleanup
-		}
-		return delegationCleanupError{cause: first}
-	}
-	return nil
-}
-
 // A failed deferred close is consumed after its transition flight has ended.
 // Keep the original ownership alongside the error so a newly opened grant is
 // never charged for the old descriptor's refusal or lost response.

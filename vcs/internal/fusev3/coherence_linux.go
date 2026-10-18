@@ -16,56 +16,38 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
-// CoherenceProfile is the retained local spelling of protocol 7's one exact
-// subscription kernel-cache contract. Zero remains invalid so a caller cannot
-// accidentally mount with unspecified local semantics.
-type CoherenceProfile uint8
-
-const CoherenceStrict CoherenceProfile = 1
-
-func (p CoherenceProfile) String() string {
-	if p == CoherenceStrict {
-		return "strict"
-	}
-	return "invalid"
-}
-
 const (
-	// These policy ceilings bound daemon cache reuse. Protocol 7 publishes
-	// zero kernel entry and attribute validity; subscription horizons supply
-	// the shorter daemon lifetime. Warm path walks still cross FUSE, but the
-	// daemon can answer them without another Authority metadata RPC.
-	strictEntryTimeout = 60 * time.Second
-	strictAttrTimeout  = 60 * time.Second
+	// These policy ceilings bound daemon cache reuse. The kernel always sees
+	// zero entry and attribute validity; subscription horizons supply the
+	// shorter daemon lifetime. Warm path walks still cross FUSE, but the
+	// daemon can answer them without another authority metadata RPC.
+	cacheEntryTimeout = 60 * time.Second
+	cacheAttrTimeout  = 60 * time.Second
 
-	// defaultCachedNameCapacity bounds daemon (parent, name) resolutions,
-	// including proven absences. It is declared to the Authority because
-	// every retained name is a targeted repair obligation.
-	defaultCachedNameCapacity = 1 << 16
+	// defaultNameCacheCapacity bounds daemon (parent, name) resolutions,
+	// including proven absences, and the attributes cached beside them. It is
+	// local memory only: subscription change entries, not a per-name
+	// obligation, are what withdraw a cached name.
+	defaultNameCacheCapacity = 1 << 16
 
 	// negativeNameShare bounds the part of that capacity spent on absences.
 	// The sub-bound exists because nothing reclaims a negative entry the way
 	// FORGET reclaims a binding: the kernel holds no inode for a name that does
 	// not exist, so it never tells this frontend that it dropped the dentry,
-	// and an absence therefore leaves the registry only through a repair or
-	// through self-revocation. Without a share, a workload that probes for
-	// absent names -- an interpreter walking a search path, a linker trying
-	// every -L directory -- could fill the whole declared budget with absences
+	// and an absence therefore leaves the registry only through a change
+	// withdrawal or through self-revocation. Without a share, a workload that
+	// probes for absent names -- an interpreter walking a search path, a linker
+	// trying every -L directory -- could fill the whole capacity with absences
 	// and stop the mount caching the names that do exist. A quarter is far more
 	// than any real probe set needs (SQLite probes two names per database) and
-	// leaves the majority of the declared state for real bindings.
+	// leaves the majority of the capacity for real bindings.
 	negativeNameShare = 4
 
-	// defaultRepairBudget is the per-phase deadline a strict mount commits to.
-	// A phase is a handful of write(2) calls on /dev/fuse; the only thing that
-	// can make one slow is a kernel lock held by an unrelated local process, so
-	// the budget is sized for lock hand-off, not for I/O.
-	defaultRepairBudget = 15 * time.Second
-
-	// subscriptionControlReserve is the authority in-flight slot that only the subscription
-	// CONTROL loop may occupy. Acknowledging is what releases the mutating
-	// machine, so this loop must never queue behind bulk kernel I/O.
-	subscriptionControlReserve = 1
+	// defaultWithdrawalTimeout bounds one withdrawal of kernel cache state. A
+	// withdrawal is a handful of write(2) calls on /dev/fuse; the only thing
+	// that can make one slow is a kernel lock held by an unrelated local
+	// process, so the bound is sized for lock hand-off, not for I/O.
+	defaultWithdrawalTimeout = 15 * time.Second
 )
 
 // MountAbsenceProof is the official supervisor's local observation that this
@@ -676,7 +658,7 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	// One repair budget covers the whole ladder rather than each step: it exists
 	// to fit inside the authority's fencing grace, and a per-step budget would
 	// let the rounds multiply it.
-	deadline := time.Now().Add(m.repairBudget)
+	deadline := time.Now().Add(m.withdrawalTimeout)
 	writersJoined := true
 	if m.raw != nil {
 		writersJoined = m.raw.terminalizeReplyCacheOwnership(deadline)

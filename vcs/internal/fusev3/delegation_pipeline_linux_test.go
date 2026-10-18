@@ -28,7 +28,6 @@ type orderedFlushFake struct {
 	errno        map[uint64]syscall.Errno
 }
 
-func (*orderedFlushFake) SupportsOrderedFlush() bool { return true }
 func (f *orderedFlushFake) CallMutation(ctx context.Context, r *authoritypb.Request) (*authoritypb.Response, error) {
 	if r.GetBarrier() != nil {
 		return nil, errors.New("durability held for pipeline test")
@@ -50,13 +49,14 @@ func (f *orderedFlushFake) CallMutationSegments(ctx context.Context, r *authorit
 		}
 	}
 	w := r.GetWrite()
+	// The client takes the ordinal inside replay assignment, before dispatch.
+	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
+		return nil, err
+	}
 	ordinal := w.GetFlushSequence()
 	f.muOrder.Lock()
 	f.assigned = append(f.assigned, ordinal)
 	f.muOrder.Unlock()
-	if err := assigned(authorityrpc.MutationIdentity{Sequence: ordinal}); err != nil {
-		return nil, err
-	}
 	f.entered <- ordinal
 	select {
 	case <-f.release:

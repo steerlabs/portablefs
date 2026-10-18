@@ -15,7 +15,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const integrationWriteFragmentBytes = 1 << 20
+// integrationMaxWriteBytes is the fixture authority's write bound. A syscall
+// larger than it must still apply as one positioned write through the mount.
+const integrationMaxWriteBytes = 1 << 20
 
 func deterministicIntegrationData(size, seed int) []byte {
 	data := make([]byte, size)
@@ -53,9 +55,9 @@ func requireFallocate(t *testing.T, file *os.File, mode uint32, offset, length i
 // the only honest reference for what the mount must answer is what the local
 // filesystem underneath it answers to the identical call.
 //
-// The control runs against the write-staging root, which is ordinary backing
-// storage the volume never publishes, so it is not a mutation behind the
-// authority's back.
+// The control runs against the fixture's control root, which is ordinary
+// backing storage the volume never publishes, so it is not a mutation behind
+// the authority's back.
 func kernelPermitsEmptyPathLink(t *testing.T, backingDirectory string) bool {
 	t.Helper()
 	control, err := unix.Open(backingDirectory, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
@@ -96,7 +98,7 @@ func requireExactFile(t *testing.T, path string, want []byte, operation string) 
 
 func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	const payloadSize = 2*integrationWriteFragmentBytes + 12345
+	const payloadSize = 2*integrationMaxWriteBytes + 12345
 
 	t.Run("positioned", func(t *testing.T) {
 		const offset = 4093
@@ -105,7 +107,7 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 		mustWrite(t, path, initial, 0o600)
 		file := mustOpenFile(t, path, os.O_RDWR, 0)
 		payload := deterministicIntegrationData(payloadSize, 17)
-		requireSyscallWrite(t, "one positioned write larger than a transaction fragment", func() (int, error) {
+		requireSyscallWrite(t, "one positioned write larger than the authority write bound", func() (int, error) {
 			return unix.Pwrite(int(file.Fd()), payload, offset)
 		}, len(payload))
 
@@ -120,7 +122,7 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 		mustWrite(t, path, prefix, 0o600)
 		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
 		payload := deterministicIntegrationData(payloadSize, 31)
-		requireSyscallWrite(t, "one O_APPEND write larger than a transaction fragment", func() (int, error) {
+		requireSyscallWrite(t, "one O_APPEND write larger than the authority write bound", func() (int, error) {
 			return unix.Write(int(file.Fd()), payload)
 		}, len(payload))
 		want := append(append([]byte(nil), prefix...), payload...)
@@ -288,7 +290,7 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 			// The control runs the same mode against the same XFS through a file
 			// the volume never publishes, so nothing here is a mutation behind the
 			// authority's back.
-			controlPath := filepath.Join(f.writeStagingRoot, name+"-control")
+			controlPath := filepath.Join(f.controlRoot, name+"-control")
 			control := mustOpenFile(t, controlPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 			defer func() {
 				_ = control.Close()
@@ -423,7 +425,7 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	requireSyscallWrite(t, "write AT_EMPTY_PATH O_TMPFILE", func() (int, error) {
 		return unix.Write(emptyPath, emptyPathPayload)
 	}, len(emptyPathPayload))
-	permitted := kernelPermitsEmptyPathLink(t, f.writeStagingRoot)
+	permitted := kernelPermitsEmptyPathLink(t, f.controlRoot)
 	err = unix.Linkat(emptyPath, "", unix.AT_FDCWD, f.join(0, "empty-path-tmpfile"), unix.AT_EMPTY_PATH)
 	if permitted {
 		if err != nil {

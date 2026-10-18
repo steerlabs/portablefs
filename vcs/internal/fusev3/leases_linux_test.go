@@ -125,7 +125,7 @@ func TestLeaseHorizonWatchdogSurvivesSharedMountCancellation(t *testing.T) {
 		rpc := &subscriptionTestRPC{horizon: now.Add(time.Minute)}
 		invalidator := &subscriptionTestInvalidator{}
 		registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
-			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
+			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: time.Millisecond,
 			maxPages: 2, invalidator: invalidator,
 		})
 		registry.mu.Lock()

@@ -93,11 +93,11 @@ func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
 func (t wallSubscriptionTimer) Stop() bool          { return t.timer.Stop() }
 
 type subscriptionConfig struct {
-	clock       subscriptionClock
-	retryDelay  time.Duration
-	repairLead  time.Duration
-	maxPages    int
-	invalidator subscriptionInvalidator
+	clock          subscriptionClock
+	retryDelay     time.Duration
+	withdrawalLead time.Duration
+	maxPages       int
+	invalidator    subscriptionInvalidator
 }
 
 type subscriptionCoordinateState struct {
@@ -159,12 +159,12 @@ func (i mountSubscriptionInvalidator) MarkIdentityStale(identity publicationIden
 }
 
 func newSubscriptionRegistry(mount *Mount, rpc subscriptionRPC, control subscriptionControlHandler) *subscriptionRegistry {
-	repairLead := time.Second
-	if mount != nil && mount.repairBudget > 0 && mount.repairBudget < repairLead {
-		repairLead = mount.repairBudget
+	withdrawalLead := time.Second
+	if mount != nil && mount.withdrawalTimeout > 0 && mount.withdrawalTimeout < withdrawalLead {
+		withdrawalLead = mount.withdrawalTimeout
 	}
 	return newSubscriptionRegistryWithConfig(mount, rpc, control, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: subscriptionRetryDelay, repairLead: repairLead,
+		clock: wallSubscriptionClock{}, retryDelay: subscriptionRetryDelay, withdrawalLead: withdrawalLead,
 		maxPages: maxSubscriptionPages, invalidator: mountSubscriptionInvalidator{mount: mount},
 	})
 }
@@ -176,8 +176,8 @@ func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, contro
 	if config.retryDelay <= 0 {
 		config.retryDelay = subscriptionRetryDelay
 	}
-	if config.repairLead <= 0 {
-		config.repairLead = time.Second
+	if config.withdrawalLead <= 0 {
+		config.withdrawalLead = time.Second
 	}
 	if config.maxPages <= 0 {
 		config.maxPages = maxSubscriptionPages
@@ -382,10 +382,10 @@ func (s *subscriptionRegistry) retry(ctx context.Context, deadline time.Time, op
 
 func (s *subscriptionRegistry) invalidateAll(ctx context.Context) error {
 	s.deactivate()
-	deadline := s.config.clock.Now().Add(s.config.repairLead)
-	repairCtx, cancel := context.WithTimeout(ctx, s.config.repairLead)
+	deadline := s.config.clock.Now().Add(s.config.withdrawalLead)
+	withdrawalCtx, cancel := context.WithTimeout(ctx, s.config.withdrawalLead)
 	defer cancel()
-	return s.retry(repairCtx, deadline, func() error { return s.config.invalidator.InvalidateAllCaches(repairCtx) })
+	return s.retry(withdrawalCtx, deadline, func() error { return s.config.invalidator.InvalidateAllCaches(withdrawalCtx) })
 }
 
 func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
@@ -461,7 +461,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 		}
 		next := reply.GetNextAfterIdentity()
 		if len(next) == 0 {
-			cacheUntil := horizon.Add(-s.config.repairLead)
+			cacheUntil := horizon.Add(-s.config.withdrawalLead)
 			if !cacheUntil.After(s.config.clock.Now()) {
 				return fmt.Errorf("%w: snapshot completed too near its horizon", errSubscriptionExpired)
 			}
@@ -976,7 +976,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 }
 
 func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline, now time.Time) bool {
-	cacheUntil := deadline.Add(-s.config.repairLead)
+	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.active || s.paused || s.incarnation != incarnation {
@@ -1227,9 +1227,9 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 			}
 		}
 	}
-	for coordinate := range r.repairingCoordinates {
-		delete(r.repairingCoordinates, coordinate)
-		delete(r.repairOwners, coordinate)
+	for coordinate := range r.withdrawingCoordinates {
+		delete(r.withdrawingCoordinates, coordinate)
+		delete(r.withdrawalOwners, coordinate)
 	}
 	reclaims := make([][]byte, 0)
 	for _, record := range r.nodesByID {
