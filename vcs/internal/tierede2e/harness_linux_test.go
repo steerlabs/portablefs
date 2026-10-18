@@ -253,18 +253,22 @@ func (authorizer) Authorize(context.Context, string, []byte) (volumeserver.Autho
 
 type membershipRecorder struct {
 	mu      sync.Mutex
-	active  map[volumeserver.SessionID]struct{}
+	active  map[volumeserver.SessionID]volumeserver.MountMembershipProfile
 	ordered []volumeserver.SessionID
 }
 
 func newMembershipRecorder() *membershipRecorder {
-	return &membershipRecorder{active: map[volumeserver.SessionID]struct{}{}}
+	return &membershipRecorder{active: map[volumeserver.SessionID]volumeserver.MountMembershipProfile{}}
 }
 
-func (m *membershipRecorder) Activate(id volumeserver.SessionID) error {
+func (*membershipRecorder) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (m *membershipRecorder) ActivateProfile(id volumeserver.SessionID, profile volumeserver.MountMembershipProfile) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active[id] = struct{}{}
+	m.active[id] = profile
 	m.ordered = append(m.ordered, id)
 	return nil
 }

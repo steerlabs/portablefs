@@ -240,7 +240,13 @@ func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 
 type noMembership struct{}
 
-func (noMembership) Activate(volumeserver.SessionID) error   { return nil }
+func (noMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (noMembership) ActivateProfile(volumeserver.SessionID, volumeserver.MountMembershipProfile) error {
+	return nil
+}
 func (noMembership) Deactivate(volumeserver.SessionID) error { return nil }
 
 func randomSuffix(t *testing.T) string {
