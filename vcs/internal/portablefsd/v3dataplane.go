@@ -111,18 +111,23 @@ type v3ItemRecord struct {
 	negatives map[string]struct{}
 	watermark uint64
 	// mkdirWitness retains only the evaluated permission and exact committed
-	// snapshot. It grants no absence until P7 validates certificate ordering.
-	mkdirWitness *v3MkdirWitness
+	// snapshot; completeness consumes it only at an unsuperseded cut.
+	mkdirWitness    *v3MkdirWitness
+	complete        *v3DirectoryCertificate
+	certificateDrop lantrace.CertDrop
+	permissionCut   uint64
+	search          lantrace.SearchState
 }
 
-// v3Binding is a record's one remembered name. Retiring the parent record
-// clears it, so a rendered parent is always live.
+// v3MkdirWitness is the authority's evaluated observation at creation.
 type v3MkdirWitness struct {
 	identity        [16]byte
 	snapshot        uint64
 	searchPermitted bool
 }
 
+// v3Binding is a record's one remembered name. Retiring the parent record
+// clears it, so a rendered parent is always live.
 type v3Binding struct {
 	parent *v3ItemRecord
 	name   string
@@ -231,6 +236,9 @@ type v3DataPlane struct {
 	negativeDirs    map[*v3ItemRecord]struct{}
 	negativeNames   int
 	negativeBytes   int
+	completeDirs    int
+	completeNames   int
+	completeBytes   int
 	nextItemID      uint64
 	handles         map[uint64]*v3HandleRecord
 	nextHandleID    uint64
@@ -249,10 +257,14 @@ type v3DataPlane struct {
 	// means no usable proof.
 	// authorizationDeadline is the installed signed deadline, an additional
 	// wall-clock denial check (zero: none). All are protected by mu.
-	renewalMu             sync.Mutex
-	clock                 func() (uint64, error)
-	clockFault            error
-	horizon               uint64
+	renewalMu  sync.Mutex
+	clock      func() (uint64, error)
+	clockFault error
+	horizon    uint64
+	// Diagnostics retain the winning proof's request start and the latest
+	// existing clock sample. Neither participates in cache permission.
+	horizonStart          uint64
+	clockSample           uint64
 	authorizationDeadline time.Time
 
 	failOnce sync.Once
@@ -542,7 +554,7 @@ func (d *v3DataPlane) lookup(ctx context.Context, operationID uint64, request *p
 	}
 	response, errno := d.callNonVisibleMutation(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: cloneBytesV3(parent.token), Name: cloneBytesV3(request.Name)}}})
 	if errno != 0 {
-		return nil, errno
+		return nil, d.settleNameErrno(parent, request.Name, errno)
 	}
 	if response.GetLookup() == nil {
 		return d.malformed("lookup omitted reply")
@@ -715,6 +727,9 @@ func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *
 	}
 	if err != nil {
 		return d.malformed("setattr " + err.Error())
+	}
+	if set.Mode != nil || set.Uid != nil || set.Gid != nil {
+		effect.permissionTarget = item
 	}
 	if err := d.applyMutation(effect); err != nil {
 		return d.malformed(err.Error())
@@ -1210,16 +1225,13 @@ func (d *v3DataPlane) adoptCreated(
 	if errno != 0 {
 		return nil, errno
 	}
+	if kind == authoritypb.Attr_DIRECTORY {
+		effect.mkdir = record
+		effect.mkdirWitness = &v3MkdirWitness{identity: identity, snapshot: response.GetPostState().GetSnapshotSequence(), searchPermitted: response.GetMkdir().GetChildSearchPermitted()}
+	}
 	if err := d.applyMutation(effect); err != nil {
 		_, errno := d.malformed(err.Error())
 		return nil, errno
-	}
-	if kind == authoritypb.Attr_DIRECTORY {
-		d.mu.Lock()
-		if d.itemsByID[record.item.ItemID] == record {
-			record.mkdirWitness = &v3MkdirWitness{identity: identity, snapshot: response.GetPostState().GetSnapshotSequence(), searchPermitted: response.GetMkdir().GetChildSearchPermitted()}
-		}
-		d.mu.Unlock()
 	}
 	if err := d.bridge.sourcePublication.operationLease(v3Callback(ctx, operationID)).attachBinding(
 		gate,
@@ -1498,6 +1510,7 @@ func (d *v3DataPlane) detachItemLocked(record *v3ItemRecord) {
 	}
 	record.binding = nil
 	d.forgetNamesLocked(record)
+	d.dropCompletenessLocked(record, lantrace.CertDropNamespaceCut)
 	for batchID, batch := range d.cookieBatches {
 		if batch.dirID == record.item.ItemID {
 			d.removeCookieBatchLocked(batchID)
@@ -2720,6 +2733,9 @@ func (d *v3DataPlane) recordTerminal(err error) {
 		// cache eligibility for this data plane.
 		d.terminal = err
 		d.horizon = 0
+		for _, record := range d.itemsByID {
+			d.dropCompletenessLocked(record, lantrace.CertDropTerminal)
+		}
 		d.mu.Unlock()
 		// Session cleanup, not item-by-item replay, owns every release this
 		// data plane has not already put in flight.
@@ -2842,6 +2858,7 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	candidate, usable := v3HorizonCandidate(start, proof)
 	if usable && d.clockFault == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
 		d.horizon = candidate
+		d.horizonStart = start
 	}
 	d.mu.Unlock()
 	if nowErr != nil {
@@ -2865,6 +2882,7 @@ func (d *v3DataPlane) readClockLocked() (uint64, error) {
 		d.horizon = 0
 		return 0, err
 	}
+	d.clockSample = now
 	return now, nil
 }
 

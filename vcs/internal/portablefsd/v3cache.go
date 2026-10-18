@@ -7,6 +7,8 @@ import (
 	"math"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/bench/lantrace"
+
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -87,10 +89,9 @@ func (d *v3DataPlane) observeLocked(record *v3ItemRecord, attr *authoritypb.Attr
 	previous := record.attr
 	record.attr = cloneAuthorityAttr(attr)
 	record.valid, record.version, record.snapshot = true, version, snapshot
-	if record.kind == authoritypb.Attr_DIRECTORY && !v3LookupPermissionsEqual(previous, attr) {
+	if record.kind == authoritypb.Attr_DIRECTORY && previous != nil && !v3LookupPermissionsEqual(previous, attr) {
 		// Every name below was observed under the previous permission state.
-		d.forgetNamesLocked(record)
-		record.watermark = max(record.watermark, version)
+		d.permissionChangedLocked(record, version)
 	}
 	return nil
 }
@@ -176,6 +177,14 @@ func (d *v3DataPlane) fillLookupLocked(parent *v3ItemRecord, name string, target
 	if d.terminal != nil || d.itemsByID[parent.item.ItemID] != parent || snapshot < parent.watermark {
 		return
 	}
+	if c := parent.complete; c != nil {
+		_, present := c.names[name]
+		if present != (target != nil) {
+			d.dropCompletenessLocked(parent, lantrace.CertDropNamespaceCut)
+		} else if snapshot >= parent.permissionCut {
+			parent.search = lantrace.SearchPermitted
+		}
+	}
 	parent.watermark = snapshot
 	switch {
 	case target == nil:
@@ -205,9 +214,13 @@ func (d *v3DataPlane) observeHeld(record *v3ItemRecord, attr *authoritypb.Attr, 
 func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.coldFloor = max(d.coldFloor, effect.snapshot)
 	if d.terminal != nil {
 		return nil
+	}
+	seed := d.mkdirSeedEligibleLocked(effect)
+	d.coldFloor = max(d.coldFloor, effect.snapshot)
+	if dir := effect.permissionTarget; dir != nil && dir.kind == authoritypb.Attr_DIRECTORY && d.itemsByID[dir.item.ItemID] == dir {
+		d.permissionChangedLocked(dir, effect.snapshot)
 	}
 	for _, object := range effect.objects {
 		if record := d.itemsByIdentity[object.identity]; record != nil {
@@ -216,6 +229,7 @@ func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 			}
 		}
 	}
+	d.applyCompletenessLocked(effect)
 	for start := 0; start < len(effect.names); {
 		parent := effect.names[start].parent
 		end := start
@@ -246,6 +260,9 @@ func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 			parent.watermark = effect.snapshot
 		}
 	}
+	if seed {
+		d.seedMkdirLocked(effect.mkdir)
+	}
 	return nil
 }
 
@@ -255,18 +272,26 @@ func (d *v3DataPlane) applyMutation(effect *v3MutationEffect) error {
 // extra local denial. H expiry alone does not end the session; it only makes
 // every read take the authority path. d.mu is held.
 func (d *v3DataPlane) cacheAdmissionLocked() v3CacheResult {
+	// Sample a retained proof even when another denial wins the miss reason,
+	// so diagnostics describe its age and expiry independently of that reason.
+	var now uint64
+	var clockErr error
+	if d.horizon != 0 {
+		now, clockErr = d.readClockLocked()
+	}
 	if d.terminal != nil || !d.client.LocalAdmissionOpen() {
 		return v3CacheTerminal
 	}
 	if !d.authorizationDeadline.IsZero() && !time.Now().Before(d.authorizationDeadline) {
 		return v3CacheAuthorization
 	}
+	if clockErr != nil {
+		return v3CacheClock
+	}
 	if d.horizon == 0 {
 		return v3CacheHorizon
 	}
-	if now, err := d.readClockLocked(); err != nil {
-		return v3CacheClock
-	} else if now >= d.horizon {
+	if now >= d.horizon {
 		return v3CacheHorizon
 	}
 	return v3CacheHit
@@ -338,22 +363,33 @@ func (d *v3DataPlane) lookupHitLocked(conflict v3CacheConflict, parent *v3ItemRe
 	if _, absent := parent.negatives[name]; absent {
 		return nil, darwinENOENT, v3CacheHit
 	}
+	if c := parent.complete; c != nil {
+		if _, present := c.names[name]; present {
+			return nil, 0, v3CacheResource
+		}
+		if parent.search != lantrace.SearchPermitted {
+			return nil, 0, v3CacheSearchPermission
+		}
+		return nil, darwinENOENT, v3CacheHit
+	}
 	return nil, 0, v3CacheUnknownName
 }
 
 // v3CachedReply owns an unexposed snapshot. Proof or authorization expiry admits
 // one authority miss; terminal admission or lost ownership never substitutes a reply.
 type v3CachedReply struct {
-	revalidate func() bool
-	expired    bool
-	metric     int
-	accounted  bool
+	revalidate  func() bool
+	expired     bool
+	metric      int
+	accounted   bool
+	trace       lantrace.Event
+	finalReason v3CacheResult
 }
 
 // serveCachedAttr is the GetAttr half of hit admission for currentAttr.
 func (d *v3DataPlane) serveCachedAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, bool, int32) {
 	var attr pfslocal.Attr
-	hit, errno := d.serveCached(ctx, operationID, 0, func(conflict v3CacheConflict, _ *v3ReplyResourceCollector) v3CacheResult {
+	hit, errno := d.serveCached(ctx, operationID, 0, item, "", func(conflict v3CacheConflict, _ *v3ReplyResourceCollector) v3CacheResult {
 		var reason v3CacheResult
 		attr, reason = d.attrHitLocked(conflict, item, handle)
 		return reason
@@ -370,7 +406,7 @@ func (d *v3DataPlane) serveCachedLookup(ctx context.Context, operationID uint64,
 		errno  int32
 		target *v3ItemRecord
 	)
-	hit, localErrno := d.serveCached(ctx, operationID, 1, func(conflict v3CacheConflict, collector *v3ReplyResourceCollector) v3CacheResult {
+	hit, localErrno := d.serveCached(ctx, operationID, 1, parent, name, func(conflict v3CacheConflict, collector *v3ReplyResourceCollector) v3CacheResult {
 		var reason v3CacheResult
 		reply, errno, reason = d.lookupHitLocked(conflict, parent, name, collector)
 		if reason == v3CacheHit && reply != nil {
@@ -397,10 +433,14 @@ func (d *v3DataPlane) serveCached(
 	ctx context.Context,
 	operationID uint64,
 	metric int,
+	item *v3ItemRecord,
+	name string,
 	snapshot func(v3CacheConflict, *v3ReplyResourceCollector) v3CacheResult,
 	owns func() bool,
 ) (bool, int32) {
 	result := v3CacheBypass
+	var decision lantrace.Event
+	trace, _ := ctx.Value(v3RequestTraceContextKey{}).(v3RequestTrace)
 	collector, _ := ctx.Value(v3ReplyResourceContextKey{}).(*v3ReplyResourceCollector)
 	// An exposure-expired candidate already records the miss that caused its
 	// one authority attempt; that attempt is not a second cache decision.
@@ -408,6 +448,21 @@ func (d *v3DataPlane) serveCached(
 		return false, 0
 	}
 	defer func() {
+		if trace.recorder != nil {
+			if decision.Kind == "" {
+				d.mu.Lock()
+				decision = d.cacheDecisionLocked(metric, item, name, result)
+				d.mu.Unlock()
+			}
+			trace.emit(decision)
+			if collector != nil && collector.cached != nil {
+				collector.cached.trace = decision
+			} else {
+				decision = v3CacheTraceResult(decision, result)
+				decision.Phase, decision.Exposure = lantrace.PhaseFinal, lantrace.ExposureOrdinaryRead
+				trace.emit(decision)
+			}
+		}
 		if result != v3CacheHit {
 			d.recordCacheResult(metric, result)
 		}
@@ -435,11 +490,19 @@ func (d *v3DataPlane) serveCached(
 		result = v3CacheTerminal
 		return false, 0
 	}
-	d.bridge.sourcePublication.cacheRead(func(conflict v3CacheConflict) {
+	sourceState := lantrace.SourceNone
+	d.bridge.sourcePublication.cacheReadTraced(func(conflict v3CacheConflict) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		result = snapshot(conflict, collector)
-	})
+		if trace.recorder != nil {
+			decision = d.cacheDecisionLocked(metric, item, name, result)
+			decision.SourceState = sourceState
+			if result == v3CacheHit && metric == 1 && len(collector.items) == 0 {
+				decision.CacheResult = lantrace.CacheNegative
+			}
+		}
+	}, &sourceState)
 	if d.endOnClockFault() != nil {
 		result = v3CacheClock
 		receipt.Consume()
@@ -454,7 +517,7 @@ func (d *v3DataPlane) serveCached(
 		d.revokeRetainedResponse(ctx, err)
 		return true, darwinEIO
 	}
-	candidate := &v3CachedReply{metric: metric}
+	candidate := &v3CachedReply{metric: metric, finalReason: v3CacheTerminal}
 	candidate.revalidate = func() bool {
 		d.mu.Lock()
 		reason := d.cacheAdmissionLocked()
@@ -463,6 +526,8 @@ func (d *v3DataPlane) serveCached(
 		if reason == v3CacheHit && !owned {
 			reason = v3CacheResource
 		}
+		candidate.finalReason = reason
+		candidate.trace = d.cacheProofTraceLocked(candidate.trace)
 		if reason != v3CacheHit && !candidate.accounted {
 			d.cacheCounters.reads[metric][reason]++
 			candidate.accounted = true
@@ -487,6 +552,12 @@ func (d *v3DataPlane) settleNameErrno(parent *v3ItemRecord, name []byte, errno i
 	if errno == darwinEEXIST || errno == darwinENOENT {
 		d.mu.Lock()
 		if d.itemsByID[parent.item.ItemID] == parent {
+			if c := parent.complete; c != nil {
+				_, present := c.names[string(name)]
+				if errno == darwinENOENT && present || errno == darwinEEXIST && !present {
+					d.dropCompletenessLocked(parent, lantrace.CertDropNamespaceCut)
+				}
+			}
 			d.dropNameLocked(parent, string(name))
 		}
 		d.mu.Unlock()

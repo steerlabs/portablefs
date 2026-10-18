@@ -18,10 +18,11 @@ const (
 	v3CacheTerminal
 	v3CacheClock
 	v3CacheBypass
+	v3CacheSearchPermission
 	v3CacheResultCount
 )
 
-var v3CacheResultNames = [...]string{"hit", "cold", "held", "horizon", "authorization", "unknown_name", "resource", "terminal", "clock", "bypass"}
+var v3CacheResultNames = [...]string{"hit", "cold", "held", "horizon", "authorization", "unknown_name", "resource", "terminal", "clock", "bypass", "search_permission"}
 
 type v3CacheCounters struct {
 	// Hits count physically written replies. Misses count the initial cache

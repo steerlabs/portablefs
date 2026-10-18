@@ -35,6 +35,7 @@ type v3Observation struct {
 	identity [16]byte
 	attr     *authoritypb.Attr
 	version  uint64
+	roles    uint32
 }
 
 // v3NameEffect is the authoritative post-binding of one touched coordinate:
@@ -50,9 +51,13 @@ type v3NameEffect struct {
 // identity and touched coordinate is applied in one data-plane transaction,
 // ordered by the PostState snapshot, never by PARENT.object_version.
 type v3MutationEffect struct {
-	snapshot uint64
-	objects  []v3Observation
-	names    []v3NameEffect
+	snapshot         uint64
+	objects          []v3Observation
+	names            []v3NameEffect
+	namesComplete    bool
+	permissionTarget *v3ItemRecord
+	mkdir            *v3ItemRecord
+	mkdirWitness     *v3MkdirWitness
 }
 
 // v3ReadStamp validates the coherent storage stamp of one read sample: an
@@ -110,7 +115,7 @@ func v3ObjectIdentity(object *authoritypb.ObjectPostState) [16]byte {
 func newV3MutationEffect(state *authoritypb.PostState, objects []*authoritypb.ObjectPostState) *v3MutationEffect {
 	effect := &v3MutationEffect{snapshot: state.GetSnapshotSequence(), objects: make([]v3Observation, len(objects))}
 	for index, object := range objects {
-		effect.objects[index] = v3Observation{identity: v3ObjectIdentity(object), attr: object.GetAttr(), version: object.GetObjectVersion()}
+		effect.objects[index] = v3Observation{identity: v3ObjectIdentity(object), attr: object.GetAttr(), version: object.GetObjectVersion(), roles: object.GetRoles()}
 	}
 	return effect
 }
@@ -195,6 +200,7 @@ func v3BindingEffect(
 		return nil, err
 	}
 	effect := newV3MutationEffect(state, objects)
+	effect.namesComplete = true
 	effect.names = []v3NameEffect{{parent: parent, name: string(name), bound: true, identity: v3ObjectIdentity(bound)}}
 	return effect, nil
 }
@@ -220,6 +226,7 @@ func v3RemoveEffect(state *authoritypb.PostState, parent *v3ItemRecord, name []b
 		}
 	}
 	effect := newV3MutationEffect(state, objects)
+	effect.namesComplete = true
 	effect.names = []v3NameEffect{{parent: parent, name: string(name)}}
 	return effect, nil
 }
@@ -278,6 +285,7 @@ func v3RenameEffect(
 		}
 	}
 	effect := newV3MutationEffect(state, objects)
+	effect.namesComplete = true
 	effect.names = []v3NameEffect{
 		{parent: from, name: string(fromName), bound: oldBound, identity: [16]byte(moved)},
 		{parent: to, name: string(toName), bound: true, identity: [16]byte(moved)},
