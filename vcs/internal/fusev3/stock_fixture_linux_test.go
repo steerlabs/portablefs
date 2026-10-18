@@ -133,6 +133,12 @@ func newStockFixture(t *testing.T) *stockFixture {
 	return fixture
 }
 
+func (f *stockFixture) rpcCalls() int {
+	f.rpc.mu.Lock()
+	defer f.rpc.mu.Unlock()
+	return f.rpc.calls
+}
+
 func (f *stockFixture) rawCall(call func(unique uint64) fuse.Status) fuse.Status {
 	unique := f.unique.Add(2)
 	status := call(unique)

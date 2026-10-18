@@ -421,3 +421,49 @@ func TestCloseBatchEpochChangeLeavesMountRecoveryInCharge(t *testing.T) {
 		})
 	}
 }
+
+// Release pressure: a burst of deferred closes larger than one batch is
+// carried only in CLOSE_BATCH requests of at most MaxCloseBatch descriptors,
+// each descriptor closed exactly once and none through an individual CLOSE.
+func TestDeferredCloseBurstIsCarriedInBoundedBatches(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	const closes = 2*authorityrpc.MaxCloseBatch + 37
+	identity := delegationTestIdentity(40)
+	for i := range closes {
+		if err := m.QueueClose(identity, delegationTestToken(40, byte(i>>8), byte(i)), 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitUntil(t, 5*time.Second, "every queued close to retire", func() bool {
+		m.closeMu.Lock()
+		defer m.closeMu.Unlock()
+		return m.closePending == 0
+	})
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	seen := make(map[string]int, closes)
+	for _, request := range fake.mutations {
+		if request.GetClose() != nil {
+			t.Fatal("a deferred close used an individual CLOSE")
+		}
+		batch := request.GetCloseBatch()
+		if batch == nil {
+			continue
+		}
+		if n := len(batch.GetCloses()); n == 0 || n > authorityrpc.MaxCloseBatch {
+			t.Fatalf("close batch carried %d descriptors, bound %d", n, authorityrpc.MaxCloseBatch)
+		}
+		for _, close := range batch.GetCloses() {
+			seen[string(close.GetHandle())]++
+		}
+	}
+	if len(seen) != closes {
+		t.Fatalf("closed %d distinct descriptors, want %d", len(seen), closes)
+	}
+	for handle, count := range seen {
+		if count != 1 {
+			t.Fatalf("descriptor %x closed %d times", handle, count)
+		}
+	}
+}
