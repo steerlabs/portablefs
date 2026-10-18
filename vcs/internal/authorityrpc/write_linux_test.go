@@ -39,6 +39,9 @@ func (s *writeTestStore) PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarg
 		return nil, syscall.ESTALE
 	}
 	target := s.targets[0]
+	if target.sync == nil {
+		target.sync = func() error { s.durableHandles.Add(1); return nil }
+	}
 	s.targets = s.targets[1:]
 	return target, nil
 }
@@ -46,6 +49,7 @@ func (s *writeTestStore) PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarg
 func (*writeTestStore) CloseOpen(xfsstore.Capability) error { return nil }
 
 type writeTestTarget struct {
+	sync       func() error
 	mu         sync.Mutex
 	coordinate xfsstore.ObjectCoordinate
 	committed  uint64
@@ -80,6 +84,12 @@ func (t *writeTestTarget) CommitWriteData(data []byte, spec xfsstore.WriteCommit
 	t.payloads = append(t.payloads, bytes.Clone(data))
 	t.specs = append(t.specs, spec)
 	return t.committed, t.assigned, t.post, t.err
+}
+func (t *writeTestTarget) Sync() error {
+	if t.sync != nil {
+		return t.sync()
+	}
+	return nil
 }
 func (t *writeTestTarget) Close() error { return nil }
 func (t *writeTestTarget) setCommitResult(committed, assigned uint64, post xfsstore.Attr, err error) {

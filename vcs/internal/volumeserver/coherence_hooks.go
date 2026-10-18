@@ -23,9 +23,8 @@ type CoherenceCommitHooks interface {
 }
 
 // CoherenceDurabilityHooks is implemented by the coordinator and called by the
-// fsync group. seq must be a contiguous VOLUME storage cut. The existing inode
-// fsync group's appliedGeneration is not this cut; the integration stream must
-// track completed per-inode generations or perform a volume barrier first.
+// durability publisher. seq must be a contiguous VOLUME storage cut proven
+// by a volume barrier; a completed inode fsync batch cannot establish it.
 type CoherenceDurabilityHooks interface {
 	DurableSequence(uint64)
 	LatestDurable() uint64

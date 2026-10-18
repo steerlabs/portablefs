@@ -949,6 +949,12 @@ func (h *VolumeHandler) handleFskitWrite(ctx context.Context, ctxRequest *author
 // write-syscall outcome.
 func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
 	var transaction *fskitWrite
+	var durability xfsstore.WriteTarget
+	defer func() {
+		if durability != nil {
+			_ = durability.Close()
+		}
+	}()
 	var resources *sessionResources
 	var coordinate visibilityCoordinate
 	var releaseMutation func()
@@ -1006,6 +1012,10 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 			return h.errorResponse(0, h.fenceFskitWriteMismatch(credential.ID), false), nil
 		}
 		stage, target, staged := transaction.stage, transaction.target, transaction.staged
+		// Transfer the existing pin out of staging cleanup; completion owns it
+		// until the durability barrier and replay outcome are settled.
+		durability = target
+		transaction.target = nil
 		metadata := transaction.metadata
 
 		var scratch []byte
@@ -1133,6 +1143,11 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
+	}, func() error {
+		if durability == nil {
+			return &xfsstore.DurabilityError{Cause: syscall.ESTALE}
+		}
+		return durability.Sync()
 	}, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()

@@ -21,6 +21,7 @@ func (h *VolumeHandler) mutateFskitCoherence(
 	cred volumeserver.SessionCredential,
 	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
 	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+	syncMutation func() error,
 	releases ...*func(),
 ) *authoritypb.Response {
 	releaseStorage := func() {
@@ -198,7 +199,7 @@ func (h *VolumeHandler) mutateFskitCoherence(
 			}
 		}
 		if changes != nil {
-			if err := h.syncFskitMutation(req, result); err != nil {
+			if err := h.syncFskitMutation(syncMutation); err != nil {
 				// A restore barrier may already have failed and fenced the store.
 				// Keep its first terminal outcome and exact applied post-state if
 				// this later sync also fails (including on that existing fence).

@@ -55,13 +55,20 @@ not this completion surface.
 
 FSKit exposes no fsync callback, so a Mac mutation reply is itself the
 durability point. Before an applied FSKit mutation's reply is sent or retained
-for replay, the authority forces its last storage transaction: full fsync of
-the written, truncated, or attribute-changed inode, of a created file or
-directory, or of the changed parent for symlink, link, unlink, and rename. XFS
-orders its log, so that force also persists the operation's earlier
-transactions. An object with no syncable descriptor, such as one its owner
-cannot read or a symlink, uses syncfs on the volume root. The sync runs after
-storage locks are released; a sync error fences the epoch.
+for replay, a handle-backed mutation retains its authoritative input or output
+file description and performs full fsync on it. This covers WRITE, CREATE,
+truncating OPEN, and handle-backed SETATTR. A mutation without such a
+description uses syncfs on the volume root directly, including namespace
+changes and item-backed metadata. Durability never reopens an object or changes
+strategy after a descriptor acquisition failure. The sync runs after storage
+locks are released; exact replay repeats neither apply nor sync.
+
+Every failed fsync, fdatasync, or syncfs fences the store before releasing its
+waiters. The first failure is retained, including ENOSPC and EDQUOT writeback
+errors; later barriers cannot certify durability or advance a durable cut.
+Inode barriers preserve full-fsync versus data-only coverage. The volume has
+one retained syncfs description and one serialized error cursor. Concurrent
+arrivals during a syscall share the next batch, without a timer or delay.
 
 Runtime subscriptions, delegations, connections, locks, handles, and replay
 outcomes are epoch-local. Restart permanently stales old handles; cold

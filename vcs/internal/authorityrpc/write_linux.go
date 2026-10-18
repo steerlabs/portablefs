@@ -285,7 +285,7 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
-	}, &releaseMutation)
+	}, func() error { return target.Sync() }, &releaseMutation)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) && response != nil && response.GetErrno() == 0 && response.GetWrite() == nil {
 		return h.errorResponse(request.GetRequestId(), syscall.ETIMEDOUT, false)
 	}

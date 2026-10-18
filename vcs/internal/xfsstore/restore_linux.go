@@ -307,7 +307,7 @@ func (r *RestoreFiles) Fdatasync(entry uint32) error {
 		return err
 	}
 	defer file.res.release()
-	return unix.Fdatasync(file.res.fd)
+	return r.volume.persist(file.res.fd, r.volume.fdatasync)
 }
 
 func (r *RestoreFiles) Mtime(entry uint32) (int64, error) {

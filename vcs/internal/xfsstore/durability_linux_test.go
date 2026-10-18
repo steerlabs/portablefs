@@ -5,6 +5,7 @@ package xfsstore
 import (
 	"errors"
 	"io/fs"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -143,7 +144,7 @@ func TestDurabilityTargetPinsAndFences(t *testing.T) {
 				v.fdatasync = func(int) error { t.Error("fdatasync used"); return nil }
 				var sync func() error
 				if kind == "syncfs" {
-					sync = v.SyncMutationFS
+					sync = v.SyncFS
 				} else {
 					var target SyncTarget
 					if kind == "handle" {
@@ -223,96 +224,87 @@ func TestDurabilityFailureCannotReleaseLaterCoalescerSuccess(t *testing.T) {
 	}
 }
 
-func TestOrdinarySyncErrorRemainsStickyForRequiredBarrier(t *testing.T) {
-	for _, failure := range []error{syscall.ENOSPC, syscall.EDQUOT} {
-		t.Run(failure.Error(), func(t *testing.T) {
-			v := openTestVolume(t)
-			root, _ := v.Root()
-			item, _, err := v.Create(root, "consumed-error", 0600, true)
-			if err != nil {
-				t.Fatal(err)
-			}
-			handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			calls := 0
-			v.fsync = func(int) error {
-				calls++
-				if calls == 1 {
-					return failure
+func TestPersistenceFailuresFenceEveryLaterBarrier(t *testing.T) {
+	for _, kind := range []string{"fsync", "fdatasync", "syncfs", "handle", "object", "write sync", "write datasync", "restore"} {
+		for _, failure := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+			t.Run(kind+"/"+failure.Error(), func(t *testing.T) {
+				v, handle, _ := fsyncTestHandle(t)
+				root, _ := v.Root()
+				item, _, err := v.Lookup(root, "fsync-group")
+				if err != nil {
+					t.Fatal(err)
 				}
-				return nil // errseq was consumed by the ordinary caller.
-			}
-			if err := v.Fsync(handle, false); !errors.Is(err, failure) {
-				t.Fatalf("ordinary fsync = %v", err)
-			}
-			if err := v.Fsync(handle, false); err != nil {
-				t.Fatalf("ordinary retry = %v", err)
-			}
-			other, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := v.CloseOpen(handle); err != nil {
-				t.Fatal(err)
-			}
-			if err := v.CloseOpen(other); err != nil {
-				t.Fatal(err)
-			}
-			// Even closing every description must not erase a consumed error.
-			other, err = v.OpenFile(item, OpenFlags{Read: true, Write: true})
-			if err != nil {
-				t.Fatal(err)
-			}
-			pinned, err := v.PinSyncHandle(other)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer pinned.Close()
-			var fatal *DurabilityError
-			if err := pinned.Sync(); !errors.As(err, &fatal) || !errors.Is(fatal.Cause, failure) {
-				t.Fatalf("required barrier = %v", err)
-			}
-			if calls != 2 || v.Health() == nil {
-				t.Fatalf("sync calls/health = %d/%v", calls, v.Health())
-			}
-		})
+				pin, err := v.PinSyncHandle(handle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer pin.Close()
+				write, err := v.PinWriteTarget(handle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer write.Close()
+				calls := 0
+				call := func(int) error {
+					calls++
+					if calls == 1 {
+						return failure
+					}
+					return nil
+				}
+				v.fsync, v.fdatasync, v.syncfs = call, call, call
+				var first error
+				switch kind {
+				case "fsync":
+					first = v.Fsync(handle, false)
+				case "fdatasync":
+					first = v.Fsync(handle, true)
+				case "syncfs":
+					first = v.SyncFS()
+				case "handle":
+					first = pin.Sync()
+				case "object":
+					first = v.SyncObject(item)
+				case "write sync", "write datasync":
+					_, _, _, first = write.CommitWriteData([]byte("x"), WriteCommit{
+						RequestedSize: 1, RLimitSize: ^uint64(0), FileMaxSize: 1<<63 - 1,
+						Mode: WritePositioned, Sync: kind == "write sync", DataSync: kind == "write datasync"})
+				case "restore":
+					opened, err := v.holdOpen(handle)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer opened.release()
+					restore := &RestoreFiles{volume: v, files: map[uint32]restoreFile{1: {res: opened.res}}}
+					first = restore.Fdatasync(1)
+				}
+				var fatal *DurabilityError
+				if !errors.As(first, &fatal) || fatal.Cause != failure || !errors.Is(v.Health(), ErrFenced) {
+					t.Fatalf("first error=%v; health=%v", first, v.Health())
+				}
+				health := v.Health()
+				for _, barrier := range []func() error{v.SyncFS, pin.Sync, write.Sync, func() error { return v.Fsync(handle, false) }, func() error { return v.Fsync(handle, true) }} {
+					err := barrier()
+					if !errors.As(err, &fatal) || fatal.Cause != failure {
+						t.Fatalf("lost first failure: %v", err)
+					}
+				}
+				v.Fence(syscall.EDQUOT)
+				if v.Health() != health || calls != 1 {
+					t.Fatalf("first failure changed or retry ran: health=%v calls=%d", v.Health(), calls)
+				}
+			})
+		}
 	}
 }
 
-func TestSyncFSDescriptionsAndFencedFastFailure(t *testing.T) {
+func TestInvalidSyncHandlesDoNotFence(t *testing.T) {
 	v := openTestVolume(t)
-	var descriptors []int
-	v.syncfs = func(fd int) error {
-		descriptors = append(descriptors, fd)
-		if fd == v.rootFD {
-			return syscall.ENOSPC
-		}
-		return nil
+	if err := v.Fsync(Capability{99}, false); !errors.Is(err, ErrStaleOpen) || v.Health() != nil {
+		t.Fatalf("invalid sync=%v health=%v", err, v.Health())
 	}
-	if err := v.SyncFS(); !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("ordinary syncfs = %v", err)
-	}
-	if err := v.SyncMutationFS(); err != nil {
+	if err := v.SyncFS(); err != nil {
 		t.Fatal(err)
-	}
-	if len(descriptors) != 2 || descriptors[0] == descriptors[1] {
-		t.Fatalf("syncfs descriptions = %v", descriptors)
-	}
-	// A separate open, rather than dup, also has independent file status flags.
-	if _, err := unix.FcntlInt(uintptr(v.rootFD), unix.F_SETFL, unix.O_NONBLOCK); err != nil {
-		t.Fatal(err)
-	}
-	if flags, err := unix.FcntlInt(uintptr(descriptors[1]), unix.F_GETFL, 0); err != nil || flags&unix.O_NONBLOCK != 0 {
-		t.Fatalf("required root shares open description: flags=%#x err=%v", flags, err)
-	}
-	v.Fence(syscall.EIO)
-	if err := v.SyncMutationFS(); !errors.Is(err, ErrOutcomeUncertain) {
-		t.Fatalf("fenced syncfs = %v", err)
-	}
-	if len(descriptors) != 2 {
-		t.Fatal("fenced barrier ran syncfs")
 	}
 }
 
@@ -369,23 +361,158 @@ func TestFencedSyncFSDoesNotWaitForAnActiveStorageSync(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	v.syncfs = func(int) error { close(entered); <-release; return nil }
 	first := make(chan error, 1)
-	go func() { first <- v.SyncMutationFS() }()
+	go func() { first <- v.SyncFS() }()
 	<-entered
 	t.Cleanup(func() {
 		close(release)
-		if err := <-first; !errors.Is(err, ErrOutcomeUncertain) {
+		if err := <-first; !errors.Is(err, ErrFenced) {
 			t.Errorf("in-flight fenced syncfs = %v", err)
 		}
 	})
 	v.Fence(syscall.EIO)
 	second := make(chan error, 1)
-	go func() { second <- v.SyncMutationFS() }()
+	go func() { second <- v.SyncFS() }()
 	select {
 	case err := <-second:
-		if !errors.Is(err, ErrOutcomeUncertain) {
+		if !errors.Is(err, ErrFenced) {
 			t.Fatalf("fenced syncfs = %v", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("fenced syncfs waited for an active storage sync")
+	}
+}
+
+func TestSyncFSCoalescesArrivalsIntoNextBatch(t *testing.T) {
+	v := openTestVolume(t)
+	entered := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var calls atomic.Int32
+	v.syncfs = func(fd int) error {
+		if fd != v.rootFD {
+			t.Errorf("syncfs description=%d want root=%d", fd, v.rootFD)
+		}
+		n := int(calls.Add(1)) - 1
+		if n >= 2 {
+			return syscall.EIO
+		}
+		close(entered[n])
+		<-release[n]
+		return nil
+	}
+	first, next := make(chan error, 1), make(chan error, 5)
+	go func() { first <- v.SyncFS() }()
+	<-entered[0]
+	for range 5 {
+		go func() { next <- v.SyncFS() }()
+	}
+	waitSyncPending(t, &v.volumeSync, 5)
+	close(release[0])
+	<-entered[1]
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-next:
+		t.Fatalf("next waiter escaped its syscall: %v", err)
+	default:
+	}
+	close(release[1])
+	for range 5 {
+		if err := <-next; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("syncfs calls=%d want 2", calls.Load())
+	}
+}
+
+func waitSyncPending(t *testing.T, state *syncGroup, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		state.mu.Lock()
+		pending := len(state.pending)
+		state.mu.Unlock()
+		if pending == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending=%d want %d", pending, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestPersistenceFailureFencesBeforeReleasingPendingWaiters(t *testing.T) {
+	for _, kind := range []string{"fsync", "fdatasync", "syncfs"} {
+		for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+			t.Run(kind+"/"+cause.Error(), func(t *testing.T) {
+				v, handle, state := fsyncTestHandle(t)
+				entered, release := make(chan struct{}), make(chan struct{})
+				var calls atomic.Int32
+				fail := func(int) error {
+					if calls.Add(1) == 1 {
+						close(entered)
+						<-release
+						return cause
+					}
+					return nil
+				}
+				v.fsync, v.fdatasync, v.syncfs = fail, fail, fail
+				barrier := func() error { return v.Fsync(handle, kind == "fdatasync") }
+				group := &state.syncGroup
+				if kind == "syncfs" {
+					barrier = v.SyncFS
+					group = &v.volumeSync
+				}
+				first, next := make(chan error, 1), make(chan error, 4)
+				go func() { first <- barrier() }()
+				<-entered
+				for range 4 {
+					go func() { next <- barrier() }()
+				}
+				waitSyncPending(t, group, 4)
+				close(release)
+				for _, ch := range []chan error{first, next, next, next, next} {
+					err := <-ch
+					var fatal *DurabilityError
+					if !errors.As(err, &fatal) || fatal.Cause != cause || !errors.Is(v.Health(), ErrFenced) {
+						t.Fatalf("waiter=%v health=%v", err, v.Health())
+					}
+				}
+				if calls.Load() != 1 {
+					t.Fatalf("syscalls=%d", calls.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestConcurrentPersistenceFailurePreservesFirstCause(t *testing.T) {
+	for _, laterError := range []error{nil, syscall.EDQUOT} {
+		name := "successful in-flight syscall"
+		if laterError != nil {
+			name = laterError.Error()
+		}
+		t.Run(name, func(t *testing.T) {
+			v, handle, _ := fsyncTestHandle(t)
+			entered, release := make(chan struct{}), make(chan struct{})
+			v.syncfs = func(int) error { close(entered); <-release; return laterError }
+			later := make(chan error, 1)
+			go func() { later <- v.SyncFS() }()
+			<-entered
+			v.fsync = func(int) error { return syscall.ENOSPC }
+			first := v.Fsync(handle, false)
+			close(release)
+			second := <-later
+			if first != second {
+				t.Fatalf("first failure replaced: %v / %v", first, second)
+			}
+			var fatal *DurabilityError
+			if !errors.As(second, &fatal) || fatal.Cause != syscall.ENOSPC {
+				t.Fatalf("cause=%v", second)
+			}
+		})
 	}
 }
