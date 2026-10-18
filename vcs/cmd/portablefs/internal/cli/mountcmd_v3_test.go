@@ -313,7 +313,7 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 		DataPlaneTransport:  dataPlaneTransportTLSSystemPKI,
 		DataPlaneServerName: "authority.example",
 		MountPath:           "/tmp/v3",
-		V3: &fskitV3AttachRequest{
+		V3: fskitV3AttachRequest{
 			ClientCertPEM:  "CERT",
 			ClientKeyPEM:   "KEY",
 			RoutesRevision: emptyRoutesRevision(),
@@ -327,9 +327,15 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
+	if deadline, present := decoded["authTokenExpiresAtMs"]; !present || deadline != float64(0) {
+		t.Fatalf("standalone deadline must be explicit zero: %s", data)
+	}
 	v3, ok := decoded["v3"].(map[string]any)
 	if !ok {
 		t.Fatalf("ensure request carries no v3 block: %s", data)
+	}
+	if len(v3) != 3 {
+		t.Fatalf("unexpected current attach fields: %s", data)
 	}
 	for key, want := range map[string]any{
 		"clientCertPem": "CERT",

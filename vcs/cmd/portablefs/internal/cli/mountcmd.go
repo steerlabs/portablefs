@@ -1622,7 +1622,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			TLSCAPEM:             transport.CAPEM,
 			TLSCASHA256:          transport.CASHA256,
 			MountPath:            mountPath,
-			V3: &fskitV3AttachRequest{
+			V3: fskitV3AttachRequest{
 				ClientCertPEM: string(clientIdentity.certPEM),
 				ClientKeyPEM:  string(clientIdentity.keyPEM),
 				// The daemon does not join the route adoption protocol, so the

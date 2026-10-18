@@ -294,20 +294,18 @@ type fskitEnsureAttachRequest struct {
 	VolumeID     string `json:"volumeId"`
 	AuthorityURL string `json:"authorityUrl"`
 	AuthToken    string `json:"authToken"`
-	// AuthTokenExpiresAtMs is the access lease's own stated expiry for
-	// AuthToken (unix ms), the deadline that bounds the daemon-side UNPROVEN
-	// credential state. Omitted (0) states no deadline.
-	AuthTokenExpiresAtMs int64  `json:"authTokenExpiresAtMs,omitempty"`
+	// The caller always states the initial authorization deadline. Zero is
+	// explicit for a standalone capability; automatic enrollment requires its
+	// positive signed deadline before attach.
+	AuthTokenExpiresAtMs int64  `json:"authTokenExpiresAtMs"`
 	DataPlaneTransport   string `json:"dataPlaneTransport"`
 	DataPlaneServerName  string `json:"dataPlaneServerName,omitempty"`
 	TLSCAPEM             string `json:"tlsCaPem,omitempty"`
 	TLSCASHA256          string `json:"tlsCaSha256,omitempty"`
 	MountPath            string `json:"mountPath"`
-	// V3 selects the daemon-owned authority-v3 attach (portablefsd's
-	// v3AttachRequest; see vcs/internal/portablefsd/v3attach.go). The daemon —
-	// never the FSKit extension — receives the mutual-TLS identity and dials
-	// the authority with it.
-	V3 *fskitV3AttachRequest `json:"v3,omitempty"`
+	// The daemon owns the current authority attach and receives the TLS
+	// identity. Every request carries this shape; there is no engine selector.
+	V3 fskitV3AttachRequest `json:"v3"`
 }
 
 // The daemon receives mutual-TLS identity and the exact route revision.
