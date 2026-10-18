@@ -540,24 +540,27 @@ func TestFskitDirectWriteDoesNotReacquireHandle(t *testing.T) {
 
 func TestFskitCreatePreApplyRefusalsDoNotFence(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		flags     *authoritypb.OpenFlags
-		parentErr error
+		name                  string
+		flags                 *authoritypb.OpenFlags
+		parentErr             error
+		writeIntent, existing bool
 	}{
-		{"nil flags", nil, nil}, {"empty flags", &authoritypb.OpenFlags{}, nil},
-		{"read truncate", &authoritypb.OpenFlags{Read: true, Truncate: true}, nil},
-		{"read append", &authoritypb.OpenFlags{Read: true, Append: true}, nil},
-		{"no-op parent getattr", &authoritypb.OpenFlags{Read: true, Write: true}, syscall.EACCES},
+		{"nil flags", nil, nil, false, false}, {"empty flags", &authoritypb.OpenFlags{}, nil, false, false},
+		{"read truncate", &authoritypb.OpenFlags{Read: true, Truncate: true}, nil, false, false},
+		{"read append", &authoritypb.OpenFlags{Read: true, Append: true}, nil, false, false},
+		{"no-op parent getattr", &authoritypb.OpenFlags{Read: true, Write: true}, syscall.EACCES, false, true},
+		{"new write intent", &authoritypb.OpenFlags{Read: true, Write: true}, nil, true, false},
+		{"existing write intent", &authoritypb.OpenFlags{Read: true, Write: true, Truncate: true}, nil, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h, cred, base, _ := newDirectFskitHarness(t)
 			store := &fskitAcquisitionStore{fskitDurabilityTestStore: base, parentErr: test.parentErr}
 			h.Store = store
-			if test.parentErr != nil {
+			if test.existing {
 				base.lookupItem = xfsstore.Capability{0x42}
 			}
 			parent := xfsstore.Capability{0x70}
-			req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: test.flags}}}
+			req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: parent[:], Name: []byte("existing"), Mode: 0600, Flags: test.flags, WriteIntent: test.writeIntent}}}
 			stampMutation(t, req, 0, 1)
 			stampResolvedFskitPublication(t, h, cred.ID, req)
 			ctx := context.WithValue(t.Context(), peerIdentityKey{}, [32]byte{1})

@@ -56,7 +56,7 @@ func (h *VolumeHandler) coherenceCloseAccounting(id volumeserver.SessionID, hand
 }
 
 func (h *VolumeHandler) coherenceCreateCapacity(id volumeserver.SessionID, request *authoritypb.CreateRequest, existed bool) (*volumeserver.DelegationCapacity, error) {
-	if existed || !request.GetWriteIntent() {
+	if !request.GetWriteIntent() {
 		return nil, nil
 	}
 	profile, err := h.sessionFrontendProfile(id)
@@ -65,6 +65,9 @@ func (h *VolumeHandler) coherenceCreateCapacity(id volumeserver.SessionID, reque
 	}
 	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || !request.GetFlags().GetWrite() {
 		return nil, syscall.EINVAL
+	}
+	if existed {
+		return nil, nil
 	}
 	token, err := h.coherenceToken(id)
 	if err != nil {
@@ -76,13 +79,6 @@ func (h *VolumeHandler) coherenceCreateCapacity(id volumeserver.SessionID, reque
 func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability, request *authoritypb.CreateRequest, existed bool, capacity *volumeserver.DelegationCapacity) error {
 	if !request.GetWriteIntent() {
 		return nil
-	}
-	profile, _ := h.sessionFrontendProfile(id)
-	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return syscall.EINVAL
-	}
-	if !request.GetFlags().GetWrite() {
-		return syscall.EINVAL
 	}
 	if existed {
 		return nil
