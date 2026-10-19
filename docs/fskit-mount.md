@@ -9,6 +9,21 @@ Attach. The profile is the same on both releases; there is no cache-policy
 name, selector, or separately built macOS 27 variant. An unsupported OS fails
 before Attach through the platform-support check.
 
+Both releases use the existing `FSVolume.Operations` and
+`FSVolume.ReadWriteOperations` boundary. macOS 27's separate
+`FSVolume.DataCacheHandler` owns the package B/C cache lifecycle and writeBack
+work; it does not imply adoption of `FSVolume.Handler` or
+`FSVolume.ReadWriteHandler`. Package D part 1 is the selected implementation,
+and part 2 is cancelled for protocol 8.
+
+READ and READLINK retain their existing bodies and chunking. Authority READ
+returns data and `volume_version`, READLINK returns target bytes, and their
+`pfslocal` replies carry only data or target bytes. Neither read reply promises
+same-sample attributes. Authority mutation `PostState` feeds the daemon's
+metadata cache; local replies retain their operation-specific fields rather
+than a full set of native mutation-operand results. Later metadata callbacks
+remain part of this boundary.
+
 ## Platform contract
 
 Linux gets exact cache withdrawal from authority subscriptions and per-file

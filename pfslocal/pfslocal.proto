@@ -29,6 +29,14 @@
 // fields and bodies are invalid; a grammar change requires a new exact version.
 // HelloReply.request_deadline_ms is required and positive.
 //
+// Retained reply contract: ReadReply carries only data and ReadlinkReply only
+// target bytes, with existing chunking and no same-sample attribute promise.
+// Authority mutation PostState remains daemon-owned. Local replies carry their
+// operation-specific attributes and identities, not a full mutation-operand
+// result set for FSVolume.Handler publication. Both supported macOS releases
+// retain FSVolume.Operations and FSVolume.ReadWriteOperations; macOS 27's
+// separate DataCacheHandler lifecycle does not adopt Handler result objects.
+//
 // PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface per-write append
 // intent to a filesystem extension. FSVolumeOpenModes has only Read and Write,
 // and writeContents:toFile:atOffset: hands down an off_t the KERNEL already
@@ -390,7 +398,8 @@ message WriteReply {
 }
 
 // ---------- namespace mutations ----------
-// All mutation replies return fresh Attrs so the frontend never guesses.
+// Replies carry fresh attributes or exact binding identities where declared;
+// they do not expose the authority's complete mutation PostState.
 
 message CreateRequest {
   Item dir = 1;

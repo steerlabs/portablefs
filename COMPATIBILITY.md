@@ -143,6 +143,13 @@ There is one macOS profile on macOS 26 and 27. There is no cache-policy name,
 selector, registry field, or CLI option. Platform eligibility is checked
 against supported macOS releases before Attach.
 
+Both macOS releases retain `FSVolume.Operations` and
+`FSVolume.ReadWriteOperations` as the native operation boundary. macOS 27
+adopts `FSVolume.DataCacheHandler` separately for the package B/C cache
+lifecycle and writeBack work, with the qualification limits above. It does
+not adopt `FSVolume.Handler` or `FSVolume.ReadWriteHandler`. Package D part 1
+is the selected implementation; part 2 is cancelled for protocol 8.
+
 ## The authority wire
 
 **Transport.** Mutually authenticated TLS 1.3. Each session owns exactly one
@@ -190,6 +197,14 @@ Neither side infers a changed identity, namespace effect, permission change,
 or durable outcome from `v == s`. Allocated blocks and restore-mode ctime
 remain observational, and restore hydration preserves logical mtime. Mutation
 replies carry the complete post-state of every affected object.
+
+**Read and local reply grammar.** Authority `ReadReply` carries data and
+`volume_version`; `ReadlinkReply` carries target bytes. Neither promises
+same-sample attributes. The paired `pfslocal` replies carry only data and
+target bytes, respectively, with existing chunking. Authority mutation
+`PostState` remains daemon-owned; local replies retain their existing
+operation-specific attributes and identities, without a full mutation-operand
+result set for native Handler publication.
 
 **MKDIR.** A successful MKDIR returns `MkdirReply`: the owning `Item` and
 `child_search_permitted`, a kernel effective-credential search check on the

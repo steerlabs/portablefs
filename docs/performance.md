@@ -38,6 +38,23 @@ repeating on 26; bulk with 1 MiB application writes and SQLite's ordered flushes
 do not cover many tiny writes to one open file. Keep bounded mode, callback
 size/count, durable-reply and final-close traces separate from unpaused timing.
 
+## Metadata callback local work
+
+Package D part 1 is the selected implementation; part 2 is cancelled for
+protocol 8. Part 1 removes IPC for fixed-refusal xattr callbacks, removes one
+frame-receive continuation resumption, and waits for held GETATTR work to
+settle before rechecking ordinary cache and publication admission. A settled
+cache hit avoids the authority GETATTR; a real miss still fetches attributes.
+Bounded callback traces retain operand identities, wanted masks and
+process-local name tokens for diagnosis.
+
+Callback multiplicity remains under the existing Operations/ReadWriteOperations
+boundary on both macOS releases. macOS 27 retains DataCacheHandler separately;
+there is no Handler result publication to remove later metadata callbacks.
+No speedup is recorded until native runs establish one. The 25–35-second local
+forecast is withdrawn for this retained scope; adding median callback costs
+does not establish an elapsed-time forecast.
+
 ## The target
 
 The acceptance workload is unchanged: an initial Git add of 1,200 files through

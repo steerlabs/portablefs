@@ -46,6 +46,20 @@ remote mutation. The files gateway is an authenticated cacheless reader and
 never excludes writers. No profile is silently promoted to another's
 semantics.
 
+The native Mac operation boundary remains `FSVolume.Operations` and
+`FSVolume.ReadWriteOperations` on macOS 26 and 27. macOS 27 separately retains
+package B/C's `FSVolume.DataCacheHandler` cache lifecycle and writeBack work,
+with the limits in [fskit-mount.md](./fskit-mount.md). Neither
+`FSVolume.Handler` nor `FSVolume.ReadWriteHandler` is adopted. Package D part 1
+is selected; part 2 is cancelled for protocol 8.
+
+Authority READ carries data and `volume_version`; READLINK carries target
+bytes. Their local replies contain only data or target bytes, with existing
+chunking and no same-sample attribute promise. Authority mutation `PostState`
+remains owned by the daemon's metadata cache. The local grammar retains its
+operation-specific attributes and identities, without a full native
+mutation-operand result set.
+
 ## Source of truth and durability
 
 XFS is durable filesystem truth. The sole delegated holder can accept bytes

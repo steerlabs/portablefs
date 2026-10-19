@@ -182,6 +182,19 @@ in-flight cache-installing replies before acknowledging a withdrawal and
 tracks the local publication generation: a version comparison alone cannot
 reject an equal-version reply that predates delegation withdrawal.
 
+### READ and READLINK results
+
+`ReadReply` contains data (tag 1) and `volume_version` (tag 2).
+`ReadlinkReply` contains only target bytes (tag 1). Neither body carries an
+attribute sample or promises same-sample read attributes. Existing read
+chunking remains in place; a separate GETATTR is a separate observation.
+
+Authority mutation `PostState` supplies the daemon's metadata cache. The
+paired `pfslocal` grammar retains its operation-specific attributes and
+identities rather than forwarding a full mutation-operand result set for
+native `FSVolume.Handler` publication. Its READ and READLINK replies contain
+only data and target bytes, respectively.
+
 ## Object versions, post-state, and MKDIR
 
 Every Item, GetAttr reply, Dirent, and mutation post-state object carries an
@@ -649,9 +662,11 @@ independently checks exact kernel absence and daemon completion under
 [the detach reporting contract](../fskit-mount.md#unmount-and-detach). No new
 wire outcome or typed teardown receipt follows from these local callbacks.
 
-**Stamps.** FSKit read and mutation replies carry the conservative versions
-above. The authority samples existence, attributes, `v`, and `s` under one
-storage read dependency set; every attribute sample honours the hydration lock.
+**Stamps.** FSKit Lookup, GetAttr, directory entries and mutation post-state
+carry the conservative versions above. The authority samples existence,
+attributes, `v`, and `s` under one storage read dependency set; every attribute
+sample honours the hydration lock. READ and READLINK retain the result bodies
+specified above and carry no same-sample attributes.
 
 **Cache proof.** A successful KeepAlive reply carries
 `Response.session_valid_for_nanos` (tag 72): the remaining duration, sampled
