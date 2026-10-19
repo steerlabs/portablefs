@@ -5,6 +5,26 @@ and no qualified performance result for the LAN targets below. Measurements take
 earlier protocols are not evidence for protocol 8 and are not reproduced here;
 git history holds them.
 
+macOS 27 writeBack buffers ordinary writes in the kernel like V2. Every
+successful delivered FSKit mutation callback remains durable on authority
+storage; coalescing can reduce callbacks, not their durability cost. Native
+fsync must cover buffered data and callback errors, pending native proof;
+writeBack is not qualified until those proofs pass. Writer loss may lose
+undelivered dirty data, as on V2 and a local disk without fsync. Linux peers see
+delivered state only. Namespace publication pushes earlier dirty data, and
+ordinary unmount drains before ownership release.
+
+`scripts/diagnose-small-writes.py` is a supplemental diagnostic for separate
+review, leaving the fixed acceptance runner unchanged: exactly 10,000
+unbuffered 100-byte O_APPEND writes and 64 MiB in 4 KiB chunks on precreated
+files, no barrier/close inside either loop. It records loop/write latency,
+final fsync and close separately, complete write+drain time, and an immediate
+independent authority length/hash check. Run the close-only variant separately
+on fresh files. Compare V2/V3 on the same authorized 27 host/path before
+repeating on 26; bulk with 1 MiB application writes and SQLite's ordered flushes
+do not cover many tiny writes to one open file. Keep bounded mode, callback
+size/count, durable-reply and final-close traces separate from unpaused timing.
+
 ## The target
 
 The acceptance workload is unchanged: an initial Git add of 1,200 files through
@@ -12,8 +32,9 @@ a macOS mount over a LAN, inside its original 120-second subprocess deadline,
 followed by subsequent commits, `git fsck`, a clean status, the full workload,
 and integrity checks. A missed deadline stays a failure; report elapsed time
 and measured aggregates, with causal attribution unresolved.
-It is never met by deferring durability, guessing an OPEN success, widening the
-deadline, changing the corpus, or adding Git-specific routing.
+It is never met by acknowledging a delivered FSKit mutation before durability,
+guessing an OPEN success, widening the deadline, changing the corpus, or adding
+Git-specific routing.
 
 The approved qualification target, separately for each supported OS, including macOS 26 and 27, is the
 unchanged 1,200-small-file initial `git add .` within 120 seconds at established

@@ -43,9 +43,16 @@ Visibility does not imply power-loss durability.
   their ordinary file-and-directory fsync discipline.
 - FSKit has no fsync callback. Each successful FSKit mutation reply waits for
   its storage effect to be durable, covering data, attributes, and namespace
-  changes. On macOS 26, `write(2)` can return at kernel page-cache acceptance; whether a
-  native fsync waits for the resulting write callbacks and reports their
-  errors is host behavior that remains unproven pending native qualification.
+  changes. macOS 27 writeBack buffers ordinary writes in the kernel like V2;
+  `write(2)` may return before delivery. Native fsync must cover buffered data,
+  await every covered durable callback and report errors, pending native proof.
+  writeBack is not qualified until those proofs pass. Writer loss may lose
+  undelivered dirty data, as on V2 and a local disk without fsync; an
+  unacknowledged in-flight write may already have applied. Linux peers see
+  delivered state only, not newer bytes held solely in Mac pages. Mac link,
+  rename and unlink push the earlier dirty cut before namespace dispatch;
+  usable proof expiry and ordinary unmount drain before releasing cache/owner
+  rights. Terminal loss revokes without pushing into another owner/session/epoch.
 - Filesystem-wide barriers (FSKit handleless mutations, the Linux root barrier,
   SYNCFS) use syncfs on the cell filesystem. On a shared multi-project cell an
   unrelated project's writeback failure can fail and fence them, and unrelated
@@ -109,13 +116,19 @@ live; a second Mac attach is refused. The cacheless files gateway holds no
 exclusion and its reads break for read without blocking Linux writers.
 
 On macOS 27, the extension controls retained kernel data through
-`FSVolume.DataCacheHandler`, granting only `readCache` with valid
-writer/authorization proof and an owned read description. Proof expiry
-invalidates and downgrades clean data; terminal ownership or authorization loss
-revokes retained items. Calls run without module locks and retain ownership
-through completion; a failed withdrawal leaves kernel cache state unchanged
-and ends serving. Ordinary open-unlinked files remain accessible. Writes use
-durable direct authority callbacks, with no `writeThrough` or `writeBack` grant.
+`FSVolume.DataCacheHandler`. A compatible readWriteWithCache request can
+receive writeBack with live writer/authorization proof and legitimately
+retained read/write rights; read requests/rights can receive readCache, while
+no-cache requests and only write rights receive noCache. Cache fills never
+acquire unauthorized read rights, including existing-file O_WRONLY/O_APPEND
+and mode 0200. Usable proof expiry completes pushInvalidate before downgrade;
+ordinary unmount drains before ownership release. Terminal ownership or
+authorization loss revokes and fails pending work without pushing old pages
+into another owner/session/epoch. Calls run without module locks or gates
+needed by reentrant writes, pin descriptions through completion and revalidate
+ownership. Failed actions leave kernel state unchanged and fail/fence.
+Ordinary open-unlinked files remain accessible. Every delivered successful
+mutation callback remains authority-durable; native writeBack is unqualified.
 
 A stopped extension cannot revoke, and cached reads can race wake before the
 extension executes. Per-item control does not prove exact negative-name,
@@ -188,8 +201,9 @@ per-reply metadata installation, or expose exact append intent or advisory-lock
 callbacks. macOS therefore mounts through `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`: a
 mounted Mac writes and every other client reads, so the missing invalidation is
 never asked to serve a concurrent remote mutation. A second Mac is refused at
-activation. Mac mutations publish ordered changes and wait for Linux reader
-withdrawal, so Linux readers observe them coherently. Ending or fencing a Mac
+activation. Delivered Mac mutations publish ordered changes and wait for Linux
+reader withdrawal, so Linux readers observe delivered state coherently; newer
+bytes may remain solely in Mac kernel pages. Ending or fencing a Mac
 session stops PortableFS from serving that Mac. macOS 27 also withdraws retained
 item caches within the limits stated above; macOS 26 may continue exposing
 retained kernel names, attributes and pages until unmount. Cross-machine `fcntl`/`flock` exclusion and cross-client atomic

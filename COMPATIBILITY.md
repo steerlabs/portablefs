@@ -36,14 +36,32 @@ one device share device contention and media failure. See
 [xfs-authority-deployment.md](./docs/xfs-authority-deployment.md#shared-cell-durability-domain).
 
 **macOS cache withdrawal has platform and execution limits.** On macOS 27,
-PortableFS adopts `FSVolume.DataCacheHandler` and grants only `readCache`, under
-an owned read description and the daemon's valid writer/authorization proof.
-Writes bypass this cache and retain durable authority callbacks. Cache-proof
-expiry invalidates and downgrades clean retained data to `noCache`; terminal
-ownership or authorization loss, including daemon death, revokes retained items.
-A failed `setCacheState` leaves kernel state unchanged and ends serving; it is
-never a successful withdrawal. The extension retains item ownership through
-each synchronous kernel call and calls without module locks.
+PortableFS adopts `FSVolume.DataCacheHandler`. A compatible
+`readWriteWithCache` request receives `writeBack` only with live exclusive-writer
+and authorization proof and legitimately retained read/write descriptions.
+Read-only requests/rights receive `readCache`; no-cache requests and write-only
+rights receive `noCache`. Existing-file `O_WRONLY`/`O_APPEND` and mode 0200 do
+not acquire unauthorized read rights to fill a cache. A legitimate read/write
+creation description can supply those rights until final close.
+
+macOS 27 buffers ordinary writes in the kernel like V2; every delivered FSKit
+mutation callback still waits for authority-storage durability. Native fsync
+must cover buffered data and callback errors, pending native proof; `writeBack`
+is **unqualified until those proofs pass**. Writer loss may lose undelivered
+dirty data, as on V2 and a local disk without fsync. A failed in-flight write
+may already have applied. Linux peers see delivered state only, not newer
+bytes retained solely in Mac kernel pages.
+
+Usable-session cache-proof expiry stops grants and completes `pushInvalidate`
+before downgrade to `noCache`; ordinary unmount drains before ownership is
+released. Link, rename and unlink push the earlier dirty cut of the named items
+before namespace dispatch. Direct durable WRITE callbacks remain admissible
+during these drains. Terminal ownership or authorization loss, including daemon
+death, revokes retained items without pushing old dirty pages into another
+owner, session or epoch. A failed `setCacheState` leaves kernel state unchanged
+and fails/fences; it never certifies withdrawal. Descriptions remain pinned
+through each synchronous call and ownership is revalidated afterward. No
+module lock, lifecycle/source gate or needed callback slot crosses a push.
 
 A stopped extension cannot execute withdrawal, and cached reads can race resume
 after sleep before extension code runs. The per-item API does not establish
@@ -258,11 +276,12 @@ barrier, and replay never repeats apply or sync.
   observation; overflow or uncertainty discards the record. These daemon
   metadata caches are separate from macOS 27 kernel data-cache control; its
   limits are stated at the top of this document.
-- On macOS 26, buffered `write(2)` can return at kernel page-cache acceptance.
-  macOS 27 grants only `readCache`, whose writes bypass that cache. Whether a native
-  `fsync`, `F_FULLFSYNC`, or ordinary unmount delivers every dirty page as
-  write callbacks and reports their errors is host behavior that is not yet
-  qualified. A forced unmount can discard pages the kernel never delivered.
+- On macOS 27, writeBack buffers ordinary writes in the kernel like V2 on
+  macOS 26. Delivered callbacks remain durable. Native `fsync`, `F_FULLFSYNC`
+  and ordinary unmount must cover buffered pages and callback errors, pending
+  native proof; writeBack is unqualified until those proofs pass. Writer loss
+  or forced unmount may lose undelivered dirty data, as on V2 and a local disk
+  without fsync. Linux peers see delivered state only.
 - `umount` makes one unforced attempt and returns the real `EBUSY` when
   something holds the mount. Only an explicit user `--force` ever forces an
   unmount: no daemon failure, terminal session, timeout, or proven daemon

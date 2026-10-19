@@ -235,3 +235,72 @@ func TestV3DisjointOneTripCallbacksOverlap(t *testing.T) {
 		t.Fatalf("operations=%v", got)
 	}
 }
+
+// The kernel chooses the batching, not the daemon. Each delivered writeBack
+// chunk still needs exactly one durable positioned WRITE reply; the later
+// namespace callback adds its own single trip, with no OPEN or extra barrier.
+func TestV3WriteBackDeliveredCutAuthorityTrips(t *testing.T) {
+	for _, namespace := range []string{"link", "rename", "unlink"} {
+		t.Run(namespace, func(t *testing.T) {
+			f := newCachedV3Fixture(t, v3FileObjects())
+			f.ns.bind(0x20, "file", 0x70)
+			file := f.lookup(f.root, "file")
+			opened, errno := f.dispatch(&pfslocal.OpenRequest{Item: file.Item, Mode: pfslocal.OpenModeReadWrite})
+			if errno != 0 {
+				t.Fatal(errno)
+			}
+			handle := opened.(*pfslocal.OpenReply).Handle
+			entered, release := make(chan struct{}), make(chan struct{})
+			defer close(release)
+			f.client.mu.Lock()
+			original := f.client.mutation
+			f.client.mutation = func(ctx context.Context, id authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+				response, err := original(ctx, id, request)
+				if request.GetWrite() != nil {
+					close(entered)
+					<-release
+				}
+				return response, err
+			}
+			f.client.mu.Unlock()
+			completed := make(chan int32, 1)
+			before := len(f.operations())
+			go func() {
+				_, errno := f.dispatch(&pfslocal.WriteRequest{Handle: handle, Data: make([]byte, 4096)})
+				completed <- errno
+			}()
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("delivered WRITE did not reach authority")
+			}
+			select {
+			case <-completed:
+				t.Fatal("delivered WRITE succeeded before its authority reply")
+			default:
+			}
+			release <- struct{}{}
+			if errno := <-completed; errno != 0 {
+				t.Fatal(errno)
+			}
+			f.client.mu.Lock()
+			f.client.mutation = original
+			f.client.mu.Unlock()
+			var body any
+			switch namespace {
+			case "link":
+				body = &pfslocal.HardLinkRequest{Item: file.Item, Dir: f.root, Name: []byte("alias")}
+			case "rename":
+				body = &pfslocal.RenameRequest{FromDir: f.root, FromName: []byte("file"), ToDir: f.root, ToName: []byte("renamed")}
+			case "unlink":
+				body = &pfslocal.RemoveRequest{Dir: f.root, Name: []byte("file")}
+			}
+			if _, errno := f.dispatch(body); errno != 0 {
+				t.Fatal(errno)
+			}
+			if got := f.operations()[before:]; !reflect.DeepEqual(got, []string{"write", namespace}) {
+				t.Fatalf("delivered cut and publication operations=%v", got)
+			}
+		})
+	}
+}

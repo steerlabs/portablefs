@@ -483,10 +483,27 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
                 kernelCache: cache
             )
             if #available(macOS 27, *), let volume = volume as? PortableFSVolumeV3, let cache {
-                cache.install { [weak volume] item, action in
+                cache.install { [weak volume] item, transition in
                     guard let volume else { return POSIXError(.ENXIO) }
-                    return volume.setCacheState(for: item, cacheMode: .none, coherencyType: .noCache,
-                                                action: action == .revoke ? .revoke : .invalidate)
+                    let mode: FSVolume.DataCacheMode
+                    switch transition.mode {
+                    case .none: mode = .none
+                    case .readWithCache: mode = .readWithCache
+                    case .readWriteWithCache: mode = .readWriteWithCache
+                    }
+                    let coherency: FSVolume.KernelCacheCoherencyType
+                    switch transition.coherency {
+                    case .noCache: coherency = .noCache
+                    case .readCache: coherency = .readCache
+                    case .writeBack: coherency = .writeBack
+                    }
+                    let action: FSVolume.KernelCacheCoherencyAction
+                    switch transition.action {
+                    case .push: action = .push
+                    case .pushInvalidate: action = .pushInvalidate
+                    case .revoke: action = .revoke
+                    }
+                    return volume.setCacheState(for: item, cacheMode: mode, coherencyType: coherency, action: action)
                 }
             }
             volume.eventMonitor = Task.detached(priority: .userInitiated) {
@@ -633,6 +650,11 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
     public func unmount() async {
         // The native completion has no error argument. It acknowledges local
         // cleanup only, not durability, kernel absence or daemon reconciliation.
+        // Keep serving durable WRITE callbacks while the healthy kernel drains.
+        // Failure fences the session; this errorless completion cannot certify
+        // durability or turn failed dirty writeback into successful withdrawal.
+        do { try await kernelCache?.drainForUnmount() }
+        catch { logger.error("unmount drain failed: \(String(describing: error), privacy: .public)") }
         await shutdown()
     }
 
@@ -1061,9 +1083,14 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
 
     @nonobjc
     public func createLink(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem) async throws -> FSFileName {
+        try await core.pushDirtyData([try portableItem(item)])
+        return try await createLinkAfterPush(to: item, named: name, inDirectory: directory)
+    }
+
+    private func createLinkAfterPush(to item: FSItem, named name: FSFileName, inDirectory directory: FSItem) async throws -> FSFileName {
         try await core.client.withPublicationBoundary {
             do {
-                let result = try await core.hardLink(
+                let result = try await core.hardLinkAfterPush(
                     item: try portableItem(item),
                     in: try portableItem(directory),
                     name: name.data
@@ -1081,8 +1108,11 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         inDirectory directory: FSItem,
         replyHandler reply: @escaping (FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply({
-            try await self.createLink(to: item, named: name, inDirectory: directory)
+        let pushedItems = PfsUncheckedSendableBox([item])
+        publishAfterReply(preflight: {
+            try await self.core.pushDirtyData(try pushedItems.value.map { try self.portableItem($0) })
+        }, {
+            try await self.createLinkAfterPush(to: item, named: name, inDirectory: directory)
         }, reply: { result in
             switch result {
             case let .success(canonicalName): reply(canonicalName, nil)
@@ -1093,10 +1123,15 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
 
     @nonobjc
     public func removeItem(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem) async throws {
+        try await core.pushDirtyData([try portableItem(item)])
+        try await removeItemAfterPush(item, named: name, fromDirectory: directory)
+    }
+
+    private func removeItemAfterPush(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem) async throws {
         try await core.client.withPublicationBoundary {
             do {
                 let portable = try portableItem(item)
-                try await core.remove(
+                try await core.removeAfterPush(
                     item: portable,
                     named: name.data,
                     from: try portableItem(directory),
@@ -1114,8 +1149,11 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         fromDirectory directory: FSItem,
         replyHandler reply: @escaping (Error?) -> Void
     ) {
-        publishAfterReply({
-            try await self.removeItem(item, named: name, fromDirectory: directory)
+        let pushedItems = PfsUncheckedSendableBox([item])
+        publishAfterReply(preflight: {
+            try await self.core.pushDirtyData(try pushedItems.value.map { try self.portableItem($0) })
+        }, {
+            try await self.removeItemAfterPush(item, named: name, fromDirectory: directory)
         }, reply: { result in
             switch result {
             case .success: reply(nil)
@@ -1133,6 +1171,14 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         inDirectory destinationDirectory: FSItem,
         overItem: FSItem?
     ) async throws -> FSFileName {
+        try await core.pushDirtyData(try [item, overItem].compactMap { $0 }.map { try portableItem($0) })
+        return try await renameItemAfterPush(item, inDirectory: sourceDirectory, named: sourceName,
+                                             to: destinationName, inDirectory: destinationDirectory, overItem: overItem)
+    }
+
+    private func renameItemAfterPush(_ item: FSItem, inDirectory sourceDirectory: FSItem, named sourceName: FSFileName,
+                                     to destinationName: FSFileName, inDirectory destinationDirectory: FSItem,
+                                     overItem: FSItem?) async throws -> FSFileName {
         try await core.client.withPublicationBoundary {
             do {
                 let sourceItem = try portableItem(item)
@@ -1142,7 +1188,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
                     // Identity validation belongs before the authority mutation.
                     try await core.recordRenameReplacement(replacedItem: replacedItem)
                 }
-                _ = try await core.rename(
+                _ = try await core.renameAfterPush(
                     item: sourceItem,
                     from: sourceParent,
                     sourceName: sourceName.data,
@@ -1166,8 +1212,11 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         overItem: FSItem?,
         replyHandler reply: @escaping (FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply({
-            try await self.renameItem(
+        let pushedItems = PfsUncheckedSendableBox([item, overItem].compactMap { $0 })
+        publishAfterReply(preflight: {
+            try await self.core.pushDirtyData(try pushedItems.value.map { try self.portableItem($0) })
+        }, {
+            try await self.renameItemAfterPush(
                 item,
                 inDirectory: sourceDirectory,
                 named: sourceName,
@@ -1631,10 +1680,11 @@ final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @un
     func cacheOpen(_ item: FSItem, modes: FSVolume.OpenModes?, cacheMode: FSVolume.DataCacheMode,
                    reply: @escaping (FSVolume.KernelCacheCoherencyType?, Error?) -> Void) {
         publishAfterReply({
-            let requested: Bool
+            let requested: PfsKernelCache.Mode
             switch cacheMode {
-            case .none: requested = false
-            case .readWithCache, .readWriteWithCache: requested = true
+            case .none: requested = .none
+            case .readWithCache: requested = .readWithCache
+            case .readWriteWithCache: requested = .readWriteWithCache
             @unknown default: throw POSIXError(.EINVAL)
             }
             guard let item = item as? PortableFSItem else { throw POSIXError(.EINVAL) }
@@ -1642,12 +1692,16 @@ final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @un
                 guard !modes.isEmpty, modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
                 try await self.core.open(item: item, mode: PfsFSKitMapping.openMode(from: modes))
             }
-            return (item, try await self.core.ownsReadDescription(item), requested)
+            return (item, requested)
         }, finalize: { value -> FSVolume.KernelCacheCoherencyType in
-            let (item, read, requested) = value
-            let grant = try self.kernelCache?.grant(item, requested: requested, ownsRead: read) ?? false
-            self.logger.debug("cache grant file=\(item.fileID) read_cache=\(grant)")
-            return grant ? .readCache : .noCache
+            let (item, requested) = value
+            let grant = try self.kernelCache?.grant(item, requested: requested) ?? .noCache
+            self.logger.debug("cache grant file=\(item.fileID) requested=\(String(describing: requested), privacy: .public) granted=\(String(describing: grant), privacy: .public)")
+            switch grant {
+            case .noCache: return .noCache
+            case .readCache: return .readCache
+            case .writeBack: return .writeBack
+            }
         }, reply: { result in
             switch result {
             case let .success(grant): reply(grant, nil)

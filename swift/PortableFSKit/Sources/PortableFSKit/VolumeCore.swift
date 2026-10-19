@@ -198,9 +198,12 @@ public actor VolumeCore {
         }
     }
 
-    func ownsReadDescription(_ item: PortableFSItem) throws -> Bool {
-        _ = try identity(for: item)
-        return openHandles[ObjectIdentifier(item)]?.readHandle != nil
+    func pushDirtyData(_ items: [PortableFSItem]) async throws {
+        for item in items { _ = try identity(for: item) }
+        try await kernelCache?.push(items)
+        // The kernel call can reenter final close, reclaim or terminal loss.
+        try client.publicationGate.check()
+        for item in items { _ = try identity(for: item) }
     }
 
     private var stopped = false
@@ -766,6 +769,11 @@ public actor VolumeCore {
     }
 
     public func remove(item: PortableFSItem, named name: Data, from directory: PortableFSItem, isDirectory: Bool) async throws {
+        try await pushDirtyData([item])
+        try await removeAfterPush(item: item, named: name, from: directory, isDirectory: isDirectory)
+    }
+
+    func removeAfterPush(item: PortableFSItem, named name: Data, from directory: PortableFSItem, isDirectory: Bool) async throws {
         _ = try identity(for: item)
         var request = PfsRemoveRequest()
         request.dir = try identity(for: directory).proto
@@ -787,6 +795,13 @@ public actor VolumeCore {
         destinationName: Data,
         noReplace: Bool
     ) async throws -> Bool {
+        try await pushDirtyData([item])
+        return try await renameAfterPush(item: item, from: sourceDirectory, sourceName: sourceName,
+                                         to: destinationDirectory, destinationName: destinationName, noReplace: noReplace)
+    }
+
+    func renameAfterPush(item: PortableFSItem, from sourceDirectory: PortableFSItem, sourceName: Data,
+                         to destinationDirectory: PortableFSItem, destinationName: Data, noReplace: Bool) async throws -> Bool {
         let sourceIdentity = try identity(for: item)
         var request = PfsRenameRequest()
         request.fromDir = try identity(for: sourceDirectory).proto
@@ -864,6 +879,11 @@ public actor VolumeCore {
         in directory: PortableFSItem,
         name: Data
     ) async throws -> PfsHardLinkResult {
+        try await pushDirtyData([item])
+        return try await hardLinkAfterPush(item: item, in: directory, name: name)
+    }
+
+    func hardLinkAfterPush(item: PortableFSItem, in directory: PortableFSItem, name: Data) async throws -> PfsHardLinkResult {
         var request = PfsHardLinkRequest()
         request.item = try identity(for: item).proto
         request.dir = try identity(for: directory).proto

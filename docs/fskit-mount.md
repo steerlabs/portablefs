@@ -50,14 +50,17 @@ releases. Construction selects the native lifecycle adapter once with
 macOS 27 adopts `FSVolume.DataCacheHandler` as its only open/upgrade/final-close
 owner. A macOS 27 error never retries through the macOS 26 adapter.
 
-On macOS 27, a requested cache mode may receive `readCache` only while the
-daemon's writer/authorization proof is valid and an owned read description
-remains available. Otherwise authorized access receives `noCache`; terminal or
-authorization loss fails the operation. `writeThrough` and `writeBack` are not
-granted. Writes continue directly to durable authority callbacks. Descriptions
-retain their granted access until V3's one final item close, after kernel cache
-management; new opens acquire only missing access with authority permission
-checks. Final close cannot return an error, so cleanup failure ends serving.
+On macOS 27, `readWriteWithCache` receives `writeBack` only with live
+exclusive-writer/authorization proof and legitimately retained read/write
+rights. `readWithCache` and read-only rights can receive `readCache`; `none`
+and write-only rights receive `noCache`. Existing-file `O_WRONLY`/`O_APPEND`
+and mode 0200 never trigger a read OPEN merely to fill a cache. CREATE's
+legitimate read/write description remains reusable, including on a newly
+created 0200 inode. Upgrades change cache permission, not descriptor access.
+Terminal or authorization loss fails access. Descriptions retain their rights
+until V3's final item close, after kernel cache management; new opens acquire
+only missing access through authority checks. Final close cannot return an
+error, so cleanup failure ends serving.
 On 27, reclaim settles pending item publications and checks `FSItem.tryReclaim`
 under the shared publication gate; a retained kernel reference restores the
 canonical item without releasing authority ownership. Reentrant failure replies
@@ -65,10 +68,18 @@ complete before the shutdown owner waits for cache withdrawal.
 
 The existing pfslocal event binding carries the daemon's proof horizon on the
 shared sleep-inclusive boot clock and the installed signed authorization
-deadline. A proof-expiry task invalidates clean data and downgrades it to
-`noCache` while the session remains usable. Terminal ownership or authorization
-loss, including daemon death, revokes retained items. An ordinary open-unlinked
-inode remains accessible and is not revoked merely because its link count is
+deadline. Usable-session proof expiry stops new grants and completes
+`pushInvalidate` before certifying `noCache`. Plain invalidate would discard
+healthy dirty data. Direct durable WRITE callbacks remain admissible during
+the drain. Ordinary unmount drains before closing the connection and releasing
+ownership. Link, rename and unlink push the relevant earlier dirty cut,
+including a rename replacement, before namespace dispatch. These pushes run
+before callback-window admission and source publication, outside lifecycle
+gates; descriptions are pinned through completion and ownership is revalidated.
+A concurrent renewal cannot grant caching while the drain is in flight.
+Terminal ownership or authorization loss, including daemon death, revokes
+retained items and fails pending work; it never pushes old dirty pages into
+another owner/session/epoch. An ordinary open-unlinked inode remains accessible and is not revoked merely because its link count is
 zero. `setCacheState` runs outside module locks, with ownership retained through
 completion, including reentrant close/reclaim. A failure leaves the kernel state
 unchanged and is terminal; it never certifies withdrawal. Kernel-call results
@@ -163,21 +174,28 @@ fails the callback with the first terminal cause. This barrier cannot cover
 mutations outside that cut or dirty kernel pages not yet delivered as
 callbacks. Successful local teardown supplies no second durability verdict.
 
-Writes are direct: each callback chunk of up to the negotiated maximum write is
-one positioned authority WRITE, without append, sync, delegation, flush
+Delivered writes are direct: each callback chunk of up to the negotiated
+maximum write is one positioned authority WRITE, without append, sync, delegation, flush
 sequence, or lock owner. There is no fragmented or staged write.
 
-On macOS 26, `write(2)` can return at kernel page-cache acceptance, as POSIX
-permits. The kernel pushes those dirty pages as write callbacks on fsync,
-close, unmount, or memory pressure. A forced unmount can discard pages the
-kernel accepted but never delivered. macOS 27 grants no dirty-data cache mode:
-`readCache` writes bypass the kernel data cache.
+On macOS 27, writeBack buffers ordinary writes in the kernel like V2 on
+macOS 26. `write(2)` can return at kernel page-cache acceptance; every delivered
+FSKit callback remains durable at the authority before successful reply. The
+kernel pushes pages for barriers, close, unmount or memory pressure. Writer
+loss or forced unmount may lose undelivered dirty data, as on V2 and a local
+disk without fsync. An unacknowledged in-flight write may already have applied;
+this does not imply prefix-atomic recovery. Linux peers see delivered state
+only while newer bytes remain solely in Mac pages. Neither longer deferred
+retention nor close timing is qualified as exactly equivalent to V2.
 
-A native `fsync` or `F_FULLFSYNC` is durable only if macOS delivers all preceding
-writes as callbacks, waits for every reply, and reports their errors; ordinary
-unmount needs the same drain. That host-kernel behavior is not yet qualified on
-either release. Per-callback durability is necessary for the guarantee but does
-not prove it.
+A native `fsync` or `F_FULLFSYNC` must cover buffered data by delivering every
+covered callback, waiting for all durable replies and reporting errors. That
+host-kernel contract is pending native proof on both releases; writeBack is
+**not qualified until those proofs pass**. Per-callback durability alone does
+not prove it. `scripts/test-macos27-writeback.py` collects two held-WRITE
+barrier proofs, faults and close/reopen error delivery on an exact signed
+artifact. The kernel-cache observer separately records page geometry and
+stopped/sleep/wake residuals. Neither collector claims an automatic pass.
 
 ## CREATE and OPEN
 

@@ -18,7 +18,7 @@ withdrawal. A SIGBUS is an observed revoke result, not a script crash: mapped
 readers run in separate subprocesses.
 
 A proof-expiry-only case must keep the authority session authorized/usable while
-withholding renewal replies past the actual proof horizon. Verify an invalidate
+withholding renewal replies past the actual proof horizon. Verify a pushInvalidate
 success, a noCache reopen and actual post-expiry READ/miss evidence, then let
 renewal recover. For writer/authorization
 loss and daemon death require revoke results. Extension stall and sleep/wake
@@ -208,7 +208,7 @@ def loss_procedure(case, relative_path, processes, evidence):
         return
     checkpoint(f"Inject {case}; record actual proof horizon/authorization deadline and setCacheState outcomes", evidence)
     if case == "proof-expiry":
-        checkpoint("Keep session authorized/usable while withholding renewal past the recorded horizon. Require successful invalidate and noCache grant; record fixture READ/miss counters BEFORE the following post-expiry samples", evidence)
+        checkpoint("Keep session authorized/usable while withholding renewal past the recorded horizon. Require successful pushInvalidate and noCache grant; record fixture READ/miss counters BEFORE the following post-expiry samples", evidence)
         sample(processes, "proof-expired", evidence)
         ranges = " and ".join(f"[{offset}, {offset + PAGE_SIZE})" for offset in PAGE_OFFSETS)
         checkpoint(f"Retain actual POST-EXPIRY fixture READ/miss trace and authority READ counter delta, with timestamps and ranges correlated to both Mac VM pages {ranges}. Read-ahead may cover both pages in one authority READ; two requests are not required. Unchanged byte 65, noCache and setCacheState success alone do not prove invalidation", evidence)
@@ -344,7 +344,7 @@ def main():
                         evidence.flush()
                         if "ready" not in json.loads(ready):
                             raise RuntimeError(f"{mode} reader failed to initialize")
-                    checkpoint("Require cache grant read_cache=true for the fixture and retain authority cold/warm READ counts; warm fd/mapped pages must actually use readCache", evidence)
+                    checkpoint("Require cache grant requested=readWithCache granted=readCache for the fixture and retain authority cold/warm READ counts; warm fd/mapped pages must actually use readCache", evidence)
                     healthy_probes(path, alias, processes, evidence)
                     loss_procedure(case, path.relative_to(args.mount), processes, evidence)
                     checkpoint("Inspect page-by-page fd/mapped artifacts, independent fstat outcomes, exits/SIGBUS and all withdrawal errors; record residual stale reads honestly", evidence)
