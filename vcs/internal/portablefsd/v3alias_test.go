@@ -25,6 +25,9 @@ func requireV3Bindings(t *testing.T, d *v3DataPlane) {
 			t.Fatal("directory membership disagrees")
 		}
 		for name, child := range parent.children {
+			if _, negative := parent.negatives[name]; negative {
+				t.Fatal("positive binding retained a negative answer")
+			}
 			if d.itemsByID[child.item.ItemID] != child {
 				t.Fatal("binding retained a retired child")
 			}
@@ -203,6 +206,44 @@ func TestV3AliasLifecycle(t *testing.T) {
 			requireV3Bindings(t, f.d)
 		})
 	}
+}
+
+func TestV3NegativeLookupThenLinkReclaimRelookup(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	f.getattr(f.root)
+	file := f.lookup(f.root, "file")
+	f.requireOperations([]string{"lookup"}, func() {
+		if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("alias")}); errno != darwinENOENT {
+			t.Fatalf("negative lookup errno=%d", errno)
+		}
+	})
+	root := f.record(f.root)
+	if _, negative := root.negatives["alias"]; !negative {
+		t.Fatal("lookup did not retain absence")
+	}
+	requireV3Bindings(t, f.d)
+	f.requireOperations([]string{"link"}, func() {
+		if _, errno := f.dispatch(&pfslocal.HardLinkRequest{Item: file.Item, Dir: f.root, Name: []byte("alias")}); errno != 0 {
+			t.Fatalf("link errno=%d", errno)
+		}
+	})
+	requireV3Bindings(t, f.d)
+	f.requireOperations(nil, func() {
+		if got := f.lookup(f.root, "alias"); got.Item != file.Item {
+			t.Fatal("alias duplicated canonical item")
+		}
+	})
+	if _, errno := f.dispatch(&pfslocal.ReclaimRequest{Item: file.Item}); errno != 0 {
+		t.Fatalf("reclaim errno=%d", errno)
+	}
+	requireV3Bindings(t, f.d)
+	f.requireOperations([]string{"lookup"}, func() {
+		if got := f.lookup(f.root, "alias"); got.Item == file.Item || got.FileID != file.FileID {
+			t.Fatalf("relookup=%+v", got)
+		}
+	})
+	requireV3Bindings(t, f.d)
 }
 
 func TestV3AliasCapacityEvictionOnlyForgetsAnswers(t *testing.T) {

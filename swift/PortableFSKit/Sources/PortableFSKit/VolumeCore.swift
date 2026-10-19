@@ -188,6 +188,7 @@ public actor VolumeCore {
     private var retirementWaiters: [PfsItemIdentity: [CheckedContinuation<Void, Never>]] = [:]
     private var settlementWaiters: [ObjectIdentifier: [CheckedContinuation<Void, Never>]] = [:]
     private var kernelCache: PfsKernelCache?
+    private var testingNativeReclaim: (@Sendable (PortableFSItem, () -> Void) -> Bool)?
 
     func installKernelCache(_ cache: PfsKernelCache) {
         kernelCache = cache
@@ -1045,7 +1046,9 @@ public actor VolumeCore {
                         return (false, true)
                     }
                     if nativeKernelCheck, #available(macOS 27, *) {
-                        if !item.tryReclaim({ self.retireReclaimedItem(item, objectID: objectID) }) {
+                        let retire = { self.retireReclaimedItem(item, objectID: objectID) }
+                        let reclaimed = self.testingNativeReclaim?(item, retire) ?? item.tryReclaim(retire)
+                        if !reclaimed {
                             self.itemsByIdentity[identity] = item
                             self.canonicalItemsByFileID[item.fileID, default: [:]][identity] = item
                             self.kernelCache?.retiring(item, false)
@@ -1180,6 +1183,13 @@ public actor VolumeCore {
         settlementWaiters.removeAll()
         for waiter in waiters { waiter.resume() }
         openHandles.removeAll()
+    }
+
+    // Direct callback tests cannot construct FSKit's kernel return counts.
+    // Replace only that synchronous decision; retirement, close, IPC and
+    // publication still follow the production path under the same gate.
+    func testingNativeReclaimCheck(_ check: @escaping @Sendable (PortableFSItem, () -> Void) -> Bool) {
+        testingNativeReclaim = check
     }
 
     func testingAdoptAttributes(_ attr: PfsAttr) throws -> PortableFSItem {

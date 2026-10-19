@@ -1089,12 +1089,21 @@ public actor PfsLocalClient {
 
     private func startReader(for connection: PfsConnection) {
         let connectionID = connection.id
-        connection.socket.startReading { [weak self] envelope in
-            Task(priority: .userInitiated) {
-                await self?.receive(envelope, from: connectionID)
-            }
-        } onClose: { [weak self] error in
-            Task(priority: .userInitiated) {
+        // Socket callbacks arrive serially. One consumer preserves that order
+        // across the actor hop, including the final close. Independent tasks
+        // can otherwise install an older proof after a newer proof or terminal.
+        let (frames, continuation) = AsyncThrowingStream<PfsEnvelope, Error>.makeStream()
+        connection.socket.startReading { envelope in
+            continuation.yield(envelope)
+        } onClose: { error in
+            continuation.finish(throwing: error)
+        }
+        Task(priority: .userInitiated) { [weak self] in
+            do {
+                for try await envelope in frames {
+                    await self?.receive(envelope, from: connectionID)
+                }
+            } catch {
                 await self?.connectionDidClose(connectionID, error: error)
             }
         }

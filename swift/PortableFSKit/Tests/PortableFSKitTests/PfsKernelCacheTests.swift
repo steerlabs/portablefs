@@ -368,7 +368,7 @@ extension PfsLocalMockDaemonTests {
     let client = PfsLocalClient(socketPath: daemon.socketPath)
     _ = try await client.resolve(attachRef: "mock")
     let events = try await client.subscribeEvents()
-    for horizon in UInt64(1)...10 { daemon.emitCacheProof(horizon: horizon) }
+    for horizon in UInt64(1)...128 { daemon.emitCacheProof(horizon: horizon) }
     // The reply follows every emitted proof on this one socket.
     _ = try await client.request(.statfs(PfsStatfsRequest()))
     daemon.emitAttachState(.degraded)
@@ -385,7 +385,7 @@ extension PfsLocalMockDaemonTests {
         }
     }
     #expect(count == 2)
-    #expect(horizons == [10])
+    #expect(horizons == [128])
     #expect(terminal)
 }
 }

@@ -427,6 +427,22 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         moduleIdentity: PortableFSModuleIdentity = PortableFSIdentity.moduleIdentity,
         windowCapacity: Int = PfsCallbackWindow.defaultCapacity
     ) async throws -> PortableFSVolume {
+        let adapter: PortableFSVolume.Type
+        if #available(macOS 27, *) { adapter = PortableFSVolumeV3.self }
+        else { adapter = PortableFSVolumeV2.self }
+        return try await make(core: core, attachRef: attachRef, adapter: adapter,
+                              moduleIdentity: moduleIdentity, windowCapacity: windowCapacity)
+    }
+
+    // Internal construction seam exercises both lifecycle adapters on one host.
+    // Production selects exactly once above; there is no runtime fallback.
+    static func make(
+        core: VolumeCore,
+        attachRef: String,
+        adapter: PortableFSVolume.Type,
+        moduleIdentity: PortableFSModuleIdentity = PortableFSIdentity.moduleIdentity,
+        windowCapacity: Int = PfsCallbackWindow.defaultCapacity
+    ) async throws -> PortableFSVolume {
         guard let resolved = await core.resolvedVolume else {
             await core.shutdown()
             throw PfsLocalClientError.unresolved
@@ -446,18 +462,15 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
             }
             try client.publicationGate.check()
             let cache: PfsKernelCache?
-            let volumeType: PortableFSVolume.Type
-            if #available(macOS 27, *) {
-                volumeType = PortableFSVolumeV3.self
+            if #available(macOS 27, *), adapter == PortableFSVolumeV3.self {
                 cache = PfsKernelCache(gate: client.publicationGate) { error in
                     await client.close(error: error)
                 }
             } else {
-                volumeType = PortableFSVolumeV2.self
                 cache = nil
             }
             if let cache { await core.installKernelCache(cache) }
-            let volume = volumeType.init(
+            let volume = adapter.init(
                 core: core,
                 attachRef: attachRef,
                 resolved: resolved,
@@ -1352,11 +1365,23 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         })
     }
 
+    // The native buffer callback and the trace tests share all request-issuing
+    // READ work. FSKit alone constructs FSMutableFileDataBuffer; copying stays
+    // in the adapter and needs no fabricated framework buffer in tests.
+    func readData(from item: FSItem, at offset: off_t, length: Int) async throws -> Data {
+        try await core.client.withPublicationBoundary {
+            do {
+                return try await core.read(item: try portableItem(item), offset: UInt64(offset), length: UInt32(clamping: length))
+            } catch {
+                throw PfsErrorMapper.fsKitError(for: error)
+            }
+        }
+    }
+
     @nonobjc
     public func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> Int {
         try await core.client.withPublicationBoundary {
-          do {
-            let data = try await core.read(item: try portableItem(item), offset: UInt64(offset), length: UInt32(clamping: length))
+            let data = try await readData(from: item, at: offset, length: length)
             let copied = min(data.count, buffer.length)
             data.withUnsafeBytes { source in
                 buffer.withUnsafeMutableBytes { destination in
@@ -1366,9 +1391,6 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
                 }
             }
             return copied
-          } catch {
-              throw PfsErrorMapper.fsKitError(for: error)
-          }
         }
     }
 

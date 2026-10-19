@@ -270,7 +270,7 @@ private final class CallbackTripFixture {
     let volume: PortableFSVolume
     let root: FSItem
 
-    init() async throws {
+    init(adapter: PortableFSVolume.Type = PortableFSVolumeV2.self) async throws {
         let log = TraceLog()
         var configuration = PfsLocalClient.Configuration(clientName: "callback-trips")
         configuration.traceObserver = { log.append($0) }
@@ -280,7 +280,10 @@ private final class CallbackTripFixture {
         let core = try await VolumeCore.connect(
             socketPath: daemon.socketPath, attachRef: "callback-trips", configuration: configuration
         )
-        volume = try await PortableFSVolume.make(core: core, attachRef: "callback-trips")
+        volume = try await PortableFSVolume.make(core: core, attachRef: "callback-trips", adapter: adapter)
+        // No mounted kernel participates in this socket test. Withdrawal calls
+        // are covered separately by PfsKernelCacheTests.
+        volume.kernelCache?.install { _, _ in nil }
         root = try await core.rootItem()
     }
 
@@ -333,16 +336,27 @@ private final class CallbackTripFixture {
 
     func open(_ item: FSItem, expected: [String]) async throws {
         try await step(expected) { finish in
-            volume.openItem(item, modes: [.read]) { error in
-                finish(error.map { .failure($0) } ?? .success(()))
+            if #available(macOS 27, *), let v3 = volume as? PortableFSVolumeV3 {
+                v3.cacheOpen(item, modes: [.read], cacheMode: .none) { grant, error in
+                    #expect(grant == .noCache)
+                    finish(error.map { .failure($0) } ?? .success(()))
+                }
+            } else {
+                volume.openItem(item, modes: [.read]) { error in
+                    finish(error.map { .failure($0) } ?? .success(()))
+                }
             }
         }
     }
 
-    func close(_ item: FSItem) async throws {
-        try await step(["close"]) { finish in
-            volume.closeItem(item, modes: []) { error in
-                finish(error.map { .failure($0) } ?? .success(()))
+    func close(_ item: FSItem, expected: [String] = ["close"]) async throws {
+        try await step(expected) { finish in
+            if #available(macOS 27, *), let v3 = volume as? PortableFSVolumeV3 {
+                v3.finalClose(item) { finish(.success(())) }
+            } else {
+                volume.closeItem(item, modes: []) { error in
+                    finish(error.map { .failure($0) } ?? .success(()))
+                }
             }
         }
     }
@@ -351,7 +365,18 @@ private final class CallbackTripFixture {
 extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func callbackTripCountsAndGitObjectChain() async throws {
-    let f = try await CallbackTripFixture()
+    try await checkCallbackTripCountsAndGitObjectChain(adapter: PortableFSVolumeV2.self)
+}
+
+@available(macOS 27.0, *)
+@Test func v3CallbackTripCountsAndGitObjectChain() async throws {
+    try await checkCallbackTripCountsAndGitObjectChain(adapter: PortableFSVolumeV3.self)
+}
+
+@available(macOS 26.0, *)
+private func checkCallbackTripCountsAndGitObjectChain(adapter: PortableFSVolume.Type) async throws {
+    let f = try await CallbackTripFixture(adapter: adapter)
+    #expect(type(of: f.volume) == adapter)
     defer { f.daemon.stop() }
     let item = try await f.create("temporary")
     // CREATE's description covers this open; no request of any kind is allowed.
@@ -369,12 +394,11 @@ extension PfsLocalMockDaemonTests {
         }
     }
     #expect(written == 3)
-    // FSKit constructs FSMutableFileDataBuffer (its init is unavailable).
-    // Use the existing callback-window seam for the same core READ and socket
-    // dispatch, without fabricating a framework-owned buffer.
+    // Exercise the adapter's shared request body and publication path; only
+    // copying into FSKit's unconstructible buffer stays outside this seam.
     let read: Data = try await f.step(["read"]) { finish in
         f.volume.testOnlyPublishAfterReply(operation: {
-            try await f.volume.core.read(item: try #require(item as? PortableFSItem), offset: 0, length: 3)
+            try await f.volume.readData(from: item, at: 0, length: 3)
         }, reply: finish)
     }
     #expect(read == Data("abc".utf8))
@@ -396,7 +420,7 @@ extension PfsLocalMockDaemonTests {
     _ = try await f.lookup("object")
     // No retained description after close: exactly one real OPEN is required.
     try await f.open(alias, expected: ["open"])
-    try await f.close(alias)
+    if f.volume.kernelCache == nil { try await f.close(alias) }
     try await f.step(["rename"]) { finish in
         f.volume.renameItem(alias, inDirectory: f.root, named: FSFileName(string: "object"),
                             to: FSFileName(string: "renamed"), inDirectory: f.root, overItem: nil) { _, error in
@@ -409,19 +433,68 @@ extension PfsLocalMockDaemonTests {
             finish(error.map { .failure($0) } ?? .success(()))
         }
     }
+    let portable = try #require(alias as? PortableFSItem)
+    if #available(macOS 27, *), f.volume is PortableFSVolumeV3 {
+        // Direct callbacks do not pass through FSKit's kernel-count bookkeeping.
+        // The real tryReclaim refuses this attempt. It must retain canonical
+        // identity and the open description, with no CLOSE or RECLAIM request.
+        try await f.step([]) { finish in
+            f.volume.reclaimItem(alias) { error in
+                finish(error.map { .failure($0) } ?? .success(()))
+            }
+        }
+        #expect(!portable.reclaimed)
+        #expect(await f.volume.core.testingDebugState().openHandleCount == 1)
+        #expect(try await f.lookup("renamed") === alias)
+        let retained: Data = try await f.step(["read"]) { finish in
+            f.volume.testOnlyPublishAfterReply(operation: {
+                try await f.volume.readData(from: alias, at: 0, length: 3)
+            }, reply: finish)
+        }
+        #expect(retained == Data("abc".utf8))
+        // Final close releases the retained description exactly once, even if
+        // cleanup is reentered. The item capability still awaits agreed reclaim.
+        try await f.close(alias)
+        try await f.close(alias, expected: [])
+        #expect(await f.volume.core.testingDebugState().openHandleCount == 0)
+        #expect(!portable.reclaimed)
+        // Model the later kernel/user count agreement at the sole SDK seam.
+        // All core retirement and real socket requests remain under test.
+        await f.volume.core.testingNativeReclaimCheck { item, retire in
+            #expect(item === portable)
+            #expect(!item.reclaimed)
+            retire()
+            return true
+        }
+    }
     try await f.step(["reclaim"]) { finish in
         f.volume.reclaimItem(alias) { error in
             finish(error.map { .failure($0) } ?? .success(()))
         }
     }
+    #expect(portable.reclaimed)
+    #expect(await f.daemon.stats().closeRequests == 2)
+    #expect(await f.daemon.stats().reclaimRequests == 1)
     await f.volume.shutdown()
+    #expect(await f.daemon.stats().closeRequests == 2)
+    #expect(await f.daemon.stats().reclaimRequests == 1)
 }
 }
 
 extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func disjointCallbackTripsReachDaemonBeforeEitherReply() async throws {
-    let f = try await CallbackTripFixture()
+    try await checkDisjointCallbackTrips(adapter: PortableFSVolumeV2.self)
+}
+
+@available(macOS 27.0, *)
+@Test func v3DisjointCallbackTripsReachDaemonBeforeEitherReply() async throws {
+    try await checkDisjointCallbackTrips(adapter: PortableFSVolumeV3.self)
+}
+
+@available(macOS 26.0, *)
+private func checkDisjointCallbackTrips(adapter: PortableFSVolume.Type) async throws {
+    let f = try await CallbackTripFixture(adapter: adapter)
     defer { f.daemon.stop() }
     let a = try #require(try await f.create("a") as? PortableFSItem)
     let b = try #require(try await f.create("b") as? PortableFSItem)
@@ -431,7 +504,7 @@ extension PfsLocalMockDaemonTests {
     let replies = [TraceReplyBox<Result<Data, Error>>(), TraceReplyBox<Result<Data, Error>>()]
     for (item, reply) in zip([a, b], replies) {
         f.volume.testOnlyPublishAfterReply(operation: {
-            try await f.volume.core.read(item: item, offset: 0, length: 3)
+            try await f.volume.readData(from: item, at: 0, length: 3)
         }, reply: { reply.set($0) })
     }
     let deadline = ContinuousClock.now.advanced(by: .seconds(5))
