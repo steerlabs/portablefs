@@ -2,6 +2,9 @@ package authoritymetrics
 
 import (
 	"bytes"
+	"math"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -52,31 +55,200 @@ portablefs_test_duration_seconds_count{kind="rpc"} 3
 	}
 }
 
-func TestHistogramBucketing(t *testing.T) {
+func TestHistogramExposition(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		bounds       []float64
+		observations []float64
+		buckets      []uint64
+		sum          float64
+	}{
+		{"empty", []float64{1, 2, 5}, nil, []uint64{0, 0, 0, 0}, 0},
+		{"inclusive bounds", []float64{1, 2, 5}, []float64{-1, 1, 1.5, 2, 5, 6}, []uint64{2, 4, 5, 6}, 14.5},
+		{"negative bounds", []float64{-2, -1, 0}, []float64{-3, -2, -1.5, -1, -0.5, 0, 1}, []uint64{2, 4, 6, 7}, -7},
+		{"NaN ignored", []float64{1}, []float64{math.NaN(), 1, math.NaN()}, []uint64{1, 1}, 1},
+		{"positive infinity", []float64{1}, []float64{math.Inf(1)}, []uint64{0, 1}, math.Inf(1)},
+		{"negative infinity", []float64{1}, []float64{math.Inf(-1)}, []uint64{1, 1}, math.Inf(-1)},
+		{"opposite infinities", []float64{1}, []float64{math.Inf(-1), math.Inf(1)}, []uint64{1, 2}, math.NaN()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := NewRegistry()
+			histogram, err := registry.RegisterHistogram("portablefs_test_values", "Values.", tc.bounds)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range tc.observations {
+				histogram.Observe(value)
+			}
+			got := scrapeHistogram(t, registry)
+			if !slices.Equal(got.buckets, tc.buckets) || got.count != tc.buckets[len(tc.buckets)-1] ||
+				got.sum != tc.sum && !(math.IsNaN(got.sum) && math.IsNaN(tc.sum)) {
+				t.Fatalf("snapshot = %+v, want buckets=%v count=%d sum=%v", got, tc.buckets, tc.buckets[len(tc.buckets)-1], tc.sum)
+			}
+		})
+	}
+}
+
+type histogramExposition struct {
+	buckets []uint64
+	count   uint64
+	sum     float64
+}
+
+func scrapeHistogram(t *testing.T, registry *Registry) histogramExposition {
+	t.Helper()
+	var output bytes.Buffer
+	if err := registry.WritePrometheus(&output); err != nil {
+		t.Fatal(err)
+	}
+	return parseHistogram(t, output.String())
+}
+
+func parseHistogram(t *testing.T, output string) histogramExposition {
+	t.Helper()
+	var result histogramExposition
+	var haveCount, haveSum bool
+	for _, line := range strings.Split(output, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("invalid sample %q", line)
+		}
+		switch {
+		case strings.Contains(fields[0], "_bucket{"):
+			count, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result.buckets = append(result.buckets, count)
+		case strings.HasSuffix(fields[0], "_count"):
+			count, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result.count, haveCount = count, true
+		case strings.HasSuffix(fields[0], "_sum"):
+			sum, err := strconv.ParseFloat(fields[1], 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result.sum, haveSum = sum, true
+		default:
+			t.Fatalf("unexpected sample %q", line)
+		}
+	}
+	if len(result.buckets) == 0 || !haveCount || !haveSum {
+		t.Fatalf("incomplete histogram:\n%s", output)
+	}
+	return result
+}
+
+func TestHistogramConcurrentExposition(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values []float64
+		min    float64
+		max    float64
+	}{
+		{"constant", []float64{1}, 1, 1},
+		{"mixed", []float64{-1, 0, 0.5, 1, 1.5, 2, 3, 4, 5}, -1, 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bounds := []float64{0, 1, 2, 4}
+			registry := NewRegistry()
+			histogram, err := registry.RegisterHistogram("portablefs_test_values", "Values.", bounds)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stop := make(chan struct{})
+			var workers, ready sync.WaitGroup
+			ready.Add(16)
+			for worker := range 16 {
+				workers.Go(func() {
+					histogram.Observe(tc.values[worker%len(tc.values)])
+					ready.Done()
+					for i := worker; ; i++ {
+						select {
+						case <-stop:
+							return
+						default:
+							histogram.Observe(tc.values[i%len(tc.values)])
+						}
+					}
+				})
+			}
+			defer func() {
+				close(stop)
+				workers.Wait()
+			}()
+			ready.Wait()
+			for range 500 {
+				got := scrapeHistogram(t, registry)
+				if len(got.buckets) != len(bounds)+1 || got.buckets[len(bounds)] != got.count {
+					t.Fatalf("+Inf != count: %+v", got)
+				}
+				var previous uint64
+				var lowerSum, upperSum float64
+				for i, cumulative := range got.buckets {
+					if cumulative < previous {
+						t.Fatalf("nonmonotone cumulative buckets: %+v", got)
+					}
+					lower, upper := tc.min, tc.max
+					if i > 0 {
+						lower = max(lower, bounds[i-1])
+					}
+					if i < len(bounds) {
+						upper = min(upper, bounds[i])
+					}
+					count := float64(cumulative - previous)
+					lowerSum += count * lower
+					upperSum += count * upper
+					previous = cumulative
+				}
+				// All test values are binary fractions, so these sums are exact.
+				if math.IsNaN(got.sum) || got.sum < lowerSum || got.sum > upperSum {
+					t.Fatalf("sum outside bucket bounds [%v, %v]: %+v", lowerSum, upperSum, got)
+				}
+			}
+		})
+	}
+}
+
+type observingWriter struct {
+	bytes.Buffer
+	observe func()
+}
+
+func (w *observingWriter) Write(p []byte) (int, error) {
+	n, err := w.Buffer.Write(p)
+	if w.observe != nil {
+		observe := w.observe
+		w.observe = nil
+		observe()
+	}
+	return n, err
+}
+
+func TestHistogramSnapshotBeforeWriting(t *testing.T) {
 	registry := NewRegistry()
-	histogram, err := registry.RegisterHistogram("portablefs_test_values", "Values.", []float64{1, 2, 5})
+	histogram, err := registry.RegisterHistogram("portablefs_test_values", "Values.", []float64{1, 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, observation := range []float64{-1, 1, 1.5, 2, 5, 6} {
-		histogram.Observe(observation)
-	}
-	if histogram.Count() != 6 || histogram.Sum() != 14.5 {
-		t.Fatalf("count=%d sum=%v, want 6 and 14.5", histogram.Count(), histogram.Sum())
-	}
-	var rendered bytes.Buffer
-	if err := registry.WritePrometheus(&rendered); err != nil {
+	histogram.Observe(1)
+	// Force another observation after the first bucket is formatted. This also
+	// proves that formatting does not retain the observation mutex.
+	writer := observingWriter{observe: func() { histogram.Observe(1) }}
+	if err := histogram.writeTo(&writer, "portablefs_test_values"); err != nil {
 		t.Fatal(err)
 	}
-	for _, sample := range []string{
-		`portablefs_test_values_bucket{le="1"} 2`,
-		`portablefs_test_values_bucket{le="2"} 4`,
-		`portablefs_test_values_bucket{le="5"} 5`,
-		`portablefs_test_values_bucket{le="+Inf"} 6`,
-	} {
-		if !strings.Contains(rendered.String(), sample+"\n") {
-			t.Errorf("rendered metrics omit %q:\n%s", sample, rendered.String())
-		}
+	if got := parseHistogram(t, writer.String()); !slices.Equal(got.buckets, []uint64{1, 1, 1}) || got.count != 1 || got.sum != 1 {
+		t.Fatalf("snapshot changed during formatting: %+v", got)
+	}
+	if got := scrapeHistogram(t, registry); !slices.Equal(got.buckets, []uint64{2, 2, 2}) || got.count != 2 || got.sum != 2 {
+		t.Fatalf("next scrape omitted observation: %+v", got)
 	}
 }
 
@@ -110,8 +282,15 @@ func TestConcurrentAtomicUpdates(t *testing.T) {
 	}
 	workers.Wait()
 	want := uint64(goroutines * iterations)
-	if counter.Value() != want || gauge.Value() != int64(want) || histogram.Count() != want || histogram.Sum() != float64(want) {
-		t.Fatalf("counter=%d gauge=%d histogram=(%d,%v), want %d", counter.Value(), gauge.Value(), histogram.Count(), histogram.Sum(), want)
+	if counter.Value() != want || gauge.Value() != int64(want) {
+		t.Fatalf("counter=%d gauge=%d, want %d", counter.Value(), gauge.Value(), want)
+	}
+	var output bytes.Buffer
+	if err := histogram.writeTo(&output, "portablefs_test_concurrent_histogram"); err != nil {
+		t.Fatal(err)
+	}
+	if got := parseHistogram(t, output.String()); got.count != want || got.sum != float64(want) || !slices.Equal(got.buckets, []uint64{0, want, want}) {
+		t.Fatalf("histogram=%+v, want %d observations of 1", got, want)
 	}
 }
 
