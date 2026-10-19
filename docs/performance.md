@@ -1,7 +1,7 @@
 # Performance
 
 Status: **no protocol-8 measurement exists yet.** There is no production SLO
-and no numerical forecast for the LAN target below. Measurements taken under
+and no qualified performance result for the LAN targets below. Measurements taken under
 earlier protocols are not evidence for protocol 8 and are not reproduced here;
 git history holds them.
 
@@ -14,6 +14,29 @@ and integrity checks. A missed deadline stays a failure; report elapsed time
 and measured aggregates, with causal attribution unresolved.
 It is never met by deferring durability, guessing an OPEN success, widening the
 deadline, changing the corpus, or adding Git-specific routing.
+
+The approved qualification target, separately for each supported OS, including macOS 26 and 27, is the
+unchanged 1,200-small-file initial `git add .` within 120 seconds at established
+authority DATA-path network RTT <= 10 ms, including maximum latency and tails
+during the run, with serial non-network work `B <= 15 s`. B includes storage
+durability, peer withdrawal, CPU and local IPC; storage is not counted again
+as network RTT. Qualify one benchmark job against a healthy authority, without
+restore, reconnect or memory pressure, with storage and other-cell load bounded
+by B. Peer-reader withdrawal must fit B. Measure cold source reads and warm
+retention separately; V3 retention does not prove every source starts warm.
+The later 31-commit/fsck workload remains a separate correctness gate.
+
+SQLite's qualification target is four same-process connections, each running
+200 transactions with DELETE journaling and FULL synchronization, timeout=60,
+all 800 rows present and `integrity_check` passing. Under the same network/load
+envelope, target <= 80 ms per serialized commit, including storage and local
+work. Record the initialized database/cache state, same-file identity, and each
+connection's waits and progress. This is not a cross-host locking promise or a
+fairness proof.
+
+These are qualification targets, not yet qualified on either OS. Report
+p50/p95/p99/max as observations; average ping, connection setup or p99 alone
+does not establish the RTT bound. Earlier failures remain failures.
 
 ## What the existing baseline shows
 

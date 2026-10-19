@@ -908,3 +908,51 @@ func openV3TestHandles(t *testing.T, d *v3DataPlane, file pfslocal.Item, count i
 	}
 	return handles
 }
+
+// V3's final item close retains the same daemon release boundary as V2: local
+// acceptance, not a wait for the authority's CLOSE_BATCH response.
+func TestV3FSKitFinalCloseDoesNotAwaitAuthorityRelease(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
+	handle := openV3TestHandles(t, d, file.Item, 1)[0]
+	waitV3ReleasesIdle(t, d)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	client.mu.Lock()
+	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetCloseBatch() == nil {
+			return nil, errors.New("unexpected final-close authority operation")
+		}
+		entered <- struct{}{}
+		<-release
+		return client.closeBatch(identity, request), nil
+	}
+	client.mu.Unlock()
+	done := make(chan int32, 1)
+	go func() {
+		_, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.CloseRequest{Handle: handle})
+		done <- errno
+	}()
+	select {
+	case errno := <-done:
+		if errno != 0 {
+			t.Fatalf("final close errno=%d", errno)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("final close waited for authority release")
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted release never reached authority")
+	}
+	unblock()
+	waitV3ReleasesIdle(t, d)
+	if got := len(client.closedBatches()); got != 1 {
+		t.Fatalf("close batches=%d", got)
+	}
+}

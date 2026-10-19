@@ -338,3 +338,17 @@ private func goldenRootItem() -> PfsItem {
     expectedEnvelope.body = .enumerateEntriesReply(expectedReply)
     try assertFrameRoundTrip(expectedEnvelope, golden: frame)
 }
+
+@Test func cacheProofSharesTheDaemonContinuousClockAndAuthorizationFixture() throws {
+    let frame = try goldenFrame("cache_proof.hex")
+    let envelope = try decodeSingleGoldenEnvelope(frame)
+    guard case let .event(event)? = envelope.body,
+          case let .cacheProof(proof)? = event.kind else {
+        Issue.record("expected cache proof event")
+        return
+    }
+    #expect(envelope.requestID == 0)
+    #expect(proof.horizonNanos == 123456789)
+    #expect(proof.authorizationDeadlineUnixNanos == 1900000000000000000)
+    try assertFrameRoundTrip(envelope, golden: frame)
+}

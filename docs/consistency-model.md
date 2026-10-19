@@ -43,7 +43,7 @@ Visibility does not imply power-loss durability.
   their ordinary file-and-directory fsync discipline.
 - FSKit has no fsync callback. Each successful FSKit mutation reply waits for
   its storage effect to be durable, covering data, attributes, and namespace
-  changes. Mac `write(2)` returns at kernel page-cache acceptance; whether a
+  changes. On macOS 26, `write(2)` can return at kernel page-cache acceptance; whether a
   native fsync waits for the resulting write callbacks and reports their
   errors is host behavior that remains unproven pending native qualification.
 - Filesystem-wide barriers (FSKit handleless mutations, the Linux root barrier,
@@ -107,6 +107,22 @@ An attached Mac mount holds writer exclusion, including a Mac mount whose
 access is read-only. Linux mutations are refused EBUSY while that exclusion is
 live; a second Mac attach is refused. The cacheless files gateway holds no
 exclusion and its reads break for read without blocking Linux writers.
+
+On macOS 27, the extension controls retained kernel data through
+`FSVolume.DataCacheHandler`, granting only `readCache` with valid
+writer/authorization proof and an owned read description. Proof expiry
+invalidates and downgrades clean data; terminal ownership or authorization loss
+revokes retained items. Calls run without module locks and retain ownership
+through completion; a failed withdrawal leaves kernel cache state unchanged
+and ends serving. Ordinary open-unlinked files remain accessible. Writes use
+durable direct authority callbacks, with no `writeThrough` or `writeBack` grant.
+
+A stopped extension cannot revoke, and cached reads can race wake before the
+extension executes. Per-item control does not prove exact negative-name,
+inode-attribute or directory-enumeration invalidation. macOS 26 retains the
+existing residual: after terminal publication stops new serving, retained
+kernel names, attributes and pages can remain observable until unmount. Neither
+OS has a qualified guarantee of zero stale access after failover.
 
 ## Append
 
@@ -174,9 +190,9 @@ mounted Mac writes and every other client reads, so the missing invalidation is
 never asked to serve a concurrent remote mutation. A second Mac is refused at
 activation. Mac mutations publish ordered changes and wait for Linux reader
 withdrawal, so Linux readers observe them coherently. Ending or fencing a Mac
-session stops PortableFS from serving that Mac but does not withdraw names,
-attributes, or pages its kernel already holds; they can be observed on that Mac
-until unmount. Cross-machine `fcntl`/`flock` exclusion and cross-client atomic
+session stops PortableFS from serving that Mac. macOS 27 also withdraws retained
+item caches within the limits stated above; macOS 26 may continue exposing
+retained kernel names, attributes and pages until unmount. Cross-machine `fcntl`/`flock` exclusion and cross-client atomic
 append need Linux mounts with no Mac writer attached.
 
 Windows has no admitted transport. A future frontend must prove exact cache
@@ -190,7 +206,8 @@ withdrawal, lock forwarding, and cache behavior before it can participate.
 - Symmetric multi-writer coherence with a macOS mount attached: while a Mac
   is the writer, every Linux peer is a reader whose visible mutations are
   refused `EBUSY`, and a second Mac cannot mount.
-- Synchronous withdrawal of macOS kernel cache state on fence or session loss.
+- Complete synchronous withdrawal of macOS kernel state on fence or loss,
+  including a stopped extension, sleep/wake races and exact namespace state.
 - Durability-error or latency isolation between volumes in one XFS cell.
 - Multiple POSIX principals inside one volume.
 - Writable extended attributes.

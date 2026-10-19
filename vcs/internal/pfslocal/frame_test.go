@@ -343,3 +343,21 @@ func golden(t *testing.T, name string, frame []byte) []byte {
 	}
 	return readGolden(t, name)
 }
+
+func TestGoldenCacheProofFrame(t *testing.T) {
+	env := &Envelope{Body: &Event{Kind: &CacheProof{HorizonNanos: 123456789, AuthorizationDeadlineUnixNanos: 1900000000000000000}}}
+	got, err := EncodeFrame(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := golden(t, "cache_proof.hex", got); !bytes.Equal(got, want) {
+		t.Fatalf("got %x want %x", got, want)
+	}
+	decoded, err := ReadFrame(bytes.NewReader(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(decoded, env) {
+		t.Fatalf("round trip: %+v", decoded)
+	}
+}

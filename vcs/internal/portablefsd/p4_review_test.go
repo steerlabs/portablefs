@@ -220,7 +220,12 @@ func TestP4DegradedEventRequiresTerminalServingState(t *testing.T) {
 	events := make(chan *pfslocal.Event, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- d.bridge.runBound(context.Background(), func(event *pfslocal.Event) error { events <- event; return nil })
+		done <- d.bridge.runBound(context.Background(), func(event *pfslocal.Event) error {
+			if _, terminal := event.Kind.(*pfslocal.AttachState); terminal {
+				events <- event
+			}
+			return nil
+		})
 	}()
 	c.mu.Lock()
 	c.keepAlive = func(context.Context) (time.Duration, error) { return 0, context.DeadlineExceeded }

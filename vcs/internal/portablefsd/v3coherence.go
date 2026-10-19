@@ -39,6 +39,9 @@ type v3CoherenceBridge struct {
 	terminal            error
 	terminalDone        chan struct{}
 	failOnce            sync.Once
+	cacheHorizon        uint64
+	cacheAuthorization  uint64
+	cacheChanged        chan struct{}
 	onFailure           func(error)
 }
 
@@ -46,7 +49,7 @@ func newV3CoherenceBridge(client v3SessionClient, onFailure func(error)) (*v3Coh
 	if client == nil || len(client.Epoch()) != 16 || len(client.SessionID()) != 16 {
 		return nil, errors.New("portablefsd: authority omitted epoch or session identity")
 	}
-	b := &v3CoherenceBridge{client: client, sourcePublication: newV3SourcePublicationCoordinator(), terminalDone: make(chan struct{}), onFailure: onFailure}
+	b := &v3CoherenceBridge{client: client, sourcePublication: newV3SourcePublicationCoordinator(), terminalDone: make(chan struct{}), cacheChanged: make(chan struct{}, 1), onFailure: onFailure}
 	go b.watchSession()
 	return b, nil
 }
@@ -233,21 +236,33 @@ func (b *v3CoherenceBridge) run(ctx context.Context, deliver func(*pfslocal.Even
 }
 func (b *v3CoherenceBridge) runBound(ctx context.Context, deliver func(*pfslocal.Event) error) error {
 	defer b.unbind()
-	select {
-	case <-ctx.Done():
-		if b.acceptPlannedDetachCancellation(ctx.Err()) {
-			return ctx.Err()
-		}
-		return b.stopServing(ctx.Err())
-	case <-b.client.SessionDone():
+	for {
 		b.mu.Lock()
-		detaching := b.detaching
+		horizon := b.cacheHorizon
+		authorization := b.cacheAuthorization
 		b.mu.Unlock()
-		if detaching {
-			return nil
+		if err := deliver(&pfslocal.Event{Kind: &pfslocal.CacheProof{HorizonNanos: horizon, AuthorizationDeadlineUnixNanos: authorization}}); err != nil {
+			return err
 		}
-		_ = b.fail(sessionFailure(b.client))
-	case <-b.terminalDone:
+		select {
+		case <-b.cacheChanged:
+			continue
+		case <-ctx.Done():
+			if b.acceptPlannedDetachCancellation(ctx.Err()) {
+				return ctx.Err()
+			}
+			return b.stopServing(ctx.Err())
+		case <-b.client.SessionDone():
+			b.mu.Lock()
+			detaching := b.detaching
+			b.mu.Unlock()
+			if detaching {
+				return nil
+			}
+			_ = b.fail(sessionFailure(b.client))
+		case <-b.terminalDone:
+		}
+		break
 	}
 	if err := deliver(&pfslocal.Event{Kind: &pfslocal.AttachState{State: pfslocal.AttachStateDegraded}}); err != nil {
 		return err
@@ -272,4 +287,16 @@ func (b *v3CoherenceBridge) frontendClosing(origin uint64) {
 	}
 	b.mu.Unlock()
 	_ = b.stopServing(errors.New("FSKit event owner disconnected"))
+}
+
+// Retain only the latest proof. Renewal never waits for a frontend socket.
+func (b *v3CoherenceBridge) publishCacheHorizon(horizon, authorization uint64) {
+	b.mu.Lock()
+	b.cacheHorizon = horizon
+	b.cacheAuthorization = authorization
+	b.mu.Unlock()
+	select {
+	case b.cacheChanged <- struct{}{}:
+	default:
+	}
 }

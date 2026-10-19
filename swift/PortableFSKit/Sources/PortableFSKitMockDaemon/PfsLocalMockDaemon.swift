@@ -362,6 +362,17 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.shortenNextWrite(to: written)
     }
 
+    public func emitCacheProof(horizon: UInt64, authorization: UInt64 = 0) {
+        var proof = PfsCacheProof()
+        proof.horizonNanos = horizon
+        proof.authorizationDeadlineUnixNanos = authorization
+        var event = PfsEvent()
+        event.kind = .cacheProof(proof)
+        var envelope = PfsEnvelope()
+        envelope.body = .event(event)
+        for session in runtime.sessionSnapshot() where session.isSubscribed { session.send(envelope) }
+    }
+
     public func emitAttachState(_ state: PfsAttachState.State, detail: String = "") {
         var attachState = PfsAttachState()
         attachState.state = state

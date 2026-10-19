@@ -337,6 +337,11 @@ type SubscribeEventsReply struct{}
 
 type Event struct{ Kind any }
 
+type CacheProof struct {
+	HorizonNanos                   uint64
+	AuthorizationDeadlineUnixNanos uint64
+}
+
 type AttachState struct {
 	State  AttachStateState
 	Detail string

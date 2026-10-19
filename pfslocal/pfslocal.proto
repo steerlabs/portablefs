@@ -492,6 +492,7 @@ message SubscribeEventsReply {}
 message Event {
   oneof kind {
     AttachState attach_state = 2;
+    CacheProof cache_proof = 3;
   }
 }
 
@@ -504,4 +505,12 @@ message AttachState {
   }
   State state = 1;
   string detail = 2;
+}
+
+// The daemon's existing cache horizon, in CLOCK_MONOTONIC_RAW nanoseconds on
+// this Mac. Both processes use the same sleep-inclusive boot clock. Zero denies
+// caching without ending otherwise authorized access. This is not a new lease.
+message CacheProof {
+  uint64 horizon_nanos = 1;
+  uint64 authorization_deadline_unix_nanos = 2; // signed installed deadline; zero only without a deadline
 }

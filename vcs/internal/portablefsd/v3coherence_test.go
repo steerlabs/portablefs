@@ -219,3 +219,81 @@ func TestV3CoherenceBridgeReactivatesSequentialContinuationBeforeEarlyAck(t *tes
 		t.Fatalf("sequential continuation leaked %d operation(s)", operations)
 	}
 }
+
+func TestV3CacheProofBindingDeliversInitialRenewedAndTerminalState(t *testing.T) {
+	client := newFakeV3SessionClient()
+	defer client.Close()
+	bridge, err := newV3CoherenceBridge(client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.publishCacheHorizon(100, 900)
+	events := make(chan *pfslocal.Event, 8)
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.run(context.Background(), func(event *pfslocal.Event) error { events <- event; return nil })
+	}()
+	receive := func(want uint64) {
+		t.Helper()
+		deadline := time.After(time.Second)
+		for {
+			select {
+			case event := <-events:
+				proof, ok := event.Kind.(*pfslocal.CacheProof)
+				if !ok {
+					t.Fatalf("expected proof: %+v", event)
+				}
+				if proof.HorizonNanos == want {
+					if proof.AuthorizationDeadlineUnixNanos != 900 {
+						t.Fatalf("authorization = %d", proof.AuthorizationDeadlineUnixNanos)
+					}
+					return
+				}
+			case <-deadline:
+				t.Fatal("missing cache horizon")
+			}
+		}
+	}
+	receive(100)
+	bridge.publishCacheHorizon(200, 900)
+	receive(200)
+	cause := errors.New("authorization lost")
+	bridge.stopServing(cause)
+	for {
+		select {
+		case event := <-events:
+			if state, ok := event.Kind.(*pfslocal.AttachState); ok {
+				if state.State != pfslocal.AttachStateDegraded {
+					t.Fatal(state)
+				}
+				if err := <-done; !errors.Is(err, cause) {
+					t.Fatal(err)
+				}
+				return
+			}
+		case <-time.After(time.Second):
+			t.Fatal("missing terminal event")
+		}
+	}
+}
+
+func TestV3CacheProofRenewalDoesNotWaitForEventDelivery(t *testing.T) {
+	client := newFakeV3SessionClient()
+	defer client.Close()
+	bridge, err := newV3CoherenceBridge(client, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The one-slot notification coalesces arbitrarily many renewals even when
+	// no socket reader can progress. Binding later receives the latest value.
+	for horizon := uint64(1); horizon <= 10000; horizon++ {
+		bridge.publishCacheHorizon(horizon, 900)
+	}
+	bridge.mu.Lock()
+	horizon := bridge.cacheHorizon
+	queued := len(bridge.cacheChanged)
+	bridge.mu.Unlock()
+	if horizon != 10000 || queued != 1 {
+		t.Fatalf("horizon=%d queued=%d", horizon, queued)
+	}
+}

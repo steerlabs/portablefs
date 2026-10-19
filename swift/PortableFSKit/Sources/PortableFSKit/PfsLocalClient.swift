@@ -38,9 +38,10 @@ private func pfsRequestKind(_ body: PfsEnvelope.OneOf_Body) -> String {
     }
 }
 
-/// The one event stream of a resolved connection. Buffering is unbounded
-/// because the daemon emits only rare attach-state transitions and dropping a
-/// terminal one would leave a degraded or detaching mount serving.
+/// The one event stream of a resolved connection. Proofs describe current
+/// state, so retain only the newest proof and the terminal transition. Receipt
+/// of a terminal event revokes publication and closes the connection before
+/// any later event can replace it. A stalled consumer cannot accumulate renewals.
 private final class PfsEventSink: @unchecked Sendable {
     let stream: AsyncStream<PfsEvent>
     private let lock = NSLock()
@@ -48,7 +49,7 @@ private final class PfsEventSink: @unchecked Sendable {
 
     init() {
         var captured: AsyncStream<PfsEvent>.Continuation?
-        stream = AsyncStream(PfsEvent.self, bufferingPolicy: .unbounded) { continuation in
+        stream = AsyncStream(PfsEvent.self, bufferingPolicy: .bufferingNewest(2)) { continuation in
             captured = continuation
         }
         continuation = captured

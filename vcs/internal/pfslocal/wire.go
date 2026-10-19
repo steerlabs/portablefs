@@ -1601,6 +1601,8 @@ func marshalEvent(m *Event) []byte {
 	switch k := m.Kind.(type) {
 	case *AttachState:
 		b = appendMsg(b, 2, marshalAttachState(k))
+	case *CacheProof:
+		b = appendMsg(b, 3, appendU64(appendU64(nil, 1, k.HorizonNanos), 2, k.AuthorizationDeadlineUnixNanos))
 	}
 	return b
 }
@@ -1614,6 +1616,23 @@ func unmarshalEvent(b []byte) (*Event, error) {
 			var st AttachState
 			st, err = parseAttachStateField(wt, raw)
 			m.Kind = &st
+		case 3:
+			if wt != wireBytes {
+				return ErrMalformed
+			}
+			proof := &CacheProof{}
+			err = scan(raw, func(n int, w int, value []byte) error {
+				var e error
+				v, err := scalarU64(w, value)
+				if n == 1 {
+					proof.HorizonNanos = v
+				} else {
+					proof.AuthorizationDeadlineUnixNanos = v
+				}
+				e = err
+				return e
+			})
+			m.Kind = proof
 		}
 		return err
 	})

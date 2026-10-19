@@ -187,7 +187,23 @@ public actor VolumeCore {
     private var retiringItems: [PfsItemIdentity: ObjectIdentifier] = [:]
     private var retirementWaiters: [PfsItemIdentity: [CheckedContinuation<Void, Never>]] = [:]
     private var settlementWaiters: [ObjectIdentifier: [CheckedContinuation<Void, Never>]] = [:]
+    private var kernelCache: PfsKernelCache?
+
+    func installKernelCache(_ cache: PfsKernelCache) {
+        kernelCache = cache
+        for item in itemsByObject.values {
+            cache.retain(item)
+            cache.ownership(item, access: openHandles[ObjectIdentifier(item)]?.heldAccess ?? .unspecified)
+        }
+    }
+
+    func ownsReadDescription(_ item: PortableFSItem) throws -> Bool {
+        _ = try identity(for: item)
+        return openHandles[ObjectIdentifier(item)]?.readHandle != nil
+    }
+
     private var stopped = false
+    private var shutdownTask: Task<Void, Never>?
     private var openHandles: [ObjectIdentifier: OpenState] = [:]
     private var lifecycleGates: [ObjectIdentifier: LifecycleGateState] = [:]
 
@@ -489,13 +505,13 @@ public actor VolumeCore {
 
         let envelope = try await client.request(.setAttr(request))
         guard case let .setAttrReply(reply)? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
         do {
             try validateAttributes(reply.attr, for: item)
         } catch {
-            await shutdown()
+            await stopForFailure()
             throw error
         }
         return reply.attr
@@ -524,6 +540,10 @@ public actor VolumeCore {
     }
 
     public func close(item: PortableFSItem, retainingModes: PfsOpenMode? = nil) async throws {
+        if kernelCache?.deferCleanup(item, { [self] in
+            do { try await self.close(item: item, retainingModes: retainingModes) }
+            catch { await self.client.close(error: error) }
+        }) == true { return }
         let objectID = ObjectIdentifier(item)
         try await withLifecycleGate(for: objectID) {
             try await closeLocked(
@@ -543,9 +563,21 @@ public actor VolumeCore {
         guard openHandles[objectID] != nil else {
             return
         }
-        // Closing never opens: access FSKit still reports open but no held
-        // description carries is acquired by the next I/O that needs it.
-        openHandles[objectID]?.retireDescriptions(notCarrying: retainingModes ?? .unspecified)
+        // V3 final close can have waited behind I/O while a cache-state call
+        // acquired a pin. Recheck at the actual descriptor-retirement boundary.
+        let retireDescriptions = {
+            if self.kernelCache?.deferCleanup(item, { [self] in
+                do { try await self.close(item: item, retainingModes: retainingModes) }
+                catch { await self.client.close(error: error) }
+            }) == true { return true }
+            // Closing never opens. A partially retained V2 description keeps
+            // its original rights, including an open-unlinked capability.
+            self.openHandles[objectID]?.retireDescriptions(notCarrying: retainingModes ?? .unspecified)
+            self.kernelCache?.ownership(item, access: self.openHandles[objectID]?.heldAccess ?? .unspecified)
+            return false
+        }
+        let deferred = kernelCache == nil ? retireDescriptions() : client.publicationGate.synchronized(retireDescriptions)
+        guard !deferred else { return }
         try await closePendingDaemonHandles(objectID: objectID)
     }
 
@@ -629,11 +661,11 @@ public actor VolumeCore {
                 do {
                     try validateAttributes(result.attr, for: item)
                 } catch {
-                    await shutdown()
+                    await stopForFailure()
                     throw error
                 }
                 guard result.written > 0, result.written <= chunk.count else {
-                    await shutdown()
+                    await stopForFailure()
                     throw PfsLocalClientError.invalidFrame("invalid committed write count")
                 }
                 totalWritten += Int(result.written)
@@ -654,7 +686,7 @@ public actor VolumeCore {
         request.data = data
         let envelope = try await client.request(.write(request))
         guard case let .writeReply(reply)? = envelope.body else {
-            if !data.isEmpty { await shutdown() }
+            if !data.isEmpty { await stopForFailure() }
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
         return (reply.written, reply.attr)
@@ -669,7 +701,7 @@ public actor VolumeCore {
         let lease = try await client.requestResource(.create(request))
         let envelope = lease.envelope
         guard case let .createReply(reply)? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
@@ -678,7 +710,7 @@ public actor VolumeCore {
             // accept_handles for zero would itself violate the disposition
             // contract; accepting only the item would publish a file whose
             // required open state was never installed. End the session.
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.connectionClosed
         }
         let newItem: PortableFSItem
@@ -690,7 +722,7 @@ public actor VolumeCore {
                 terminalOnAbandon: true
             )
         } catch {
-            await shutdown()
+            await stopForFailure()
             throw error
         }
         openHandles[ObjectIdentifier(newItem)] = OpenState(
@@ -698,6 +730,7 @@ public actor VolumeCore {
             writeHandle: reply.handle,
             creationHandle: reply.handle
         )
+        kernelCache?.ownership(newItem, access: .readWrite)
         lease.acceptHandles()
         await lease.complete(itemsPublished: true)
         return PfsCreateResult(item: newItem, attr: reply.attr, canonicalName: name)
@@ -711,7 +744,7 @@ public actor VolumeCore {
         let lease = try await client.requestResource(.mkdir(request))
         let envelope = lease.envelope
         guard case let .mkdirReply(reply)? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
@@ -724,7 +757,7 @@ public actor VolumeCore {
                 terminalOnAbandon: true
             )
         } catch {
-            await shutdown()
+            await stopForFailure()
             throw error
         }
         await lease.complete(itemsPublished: true)
@@ -739,7 +772,7 @@ public actor VolumeCore {
         request.directory = isDirectory
         let envelope = try await client.request(.remove(request))
         guard case .removeReply? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
     }
@@ -762,7 +795,7 @@ public actor VolumeCore {
         request.noReplace = noReplace
         let envelope = try await client.request(.rename(request))
         guard case let .renameReply(reply)? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
         guard reply.newPostIdentity.count == 16,
@@ -771,7 +804,7 @@ public actor VolumeCore {
                 reply.oldPostIdentity.count == 16
                     && reply.oldPostIdentity == sourceIdentity.stableIdentity
               ) else {
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.connectionClosed
         }
         return !reply.oldPostIdentity.isEmpty
@@ -795,7 +828,7 @@ public actor VolumeCore {
         let lease = try await client.requestResource(.symlink(request))
         let envelope = lease.envelope
         guard case let .symlinkReply(reply)? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             await lease.complete(itemsPublished: false)
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
@@ -808,7 +841,7 @@ public actor VolumeCore {
                 terminalOnAbandon: true
             )
         } catch {
-            await shutdown()
+            await stopForFailure()
             throw error
         }
         await lease.complete(itemsPublished: true)
@@ -836,13 +869,13 @@ public actor VolumeCore {
         request.name = name
         let envelope = try await client.request(.hardLink(request))
         guard case let .hardLinkReply(reply)? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
         do {
             try validateAttributes(reply.attr, for: item)
         } catch {
-            await shutdown()
+            await stopForFailure()
             throw error
         }
         return PfsHardLinkResult(
@@ -932,7 +965,7 @@ public actor VolumeCore {
         request.handle = openHandles[objectID]?.anyHandle ?? 0
         let envelope = try await client.request(.xattrRemove(request))
         guard case .xattrRemoveReply? = envelope.body else {
-            await shutdown()
+            await stopForFailure()
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
     }
@@ -960,35 +993,72 @@ public actor VolumeCore {
         }
     }
 
-    public func reclaim(item: PortableFSItem) async throws {
+    public func reclaim(item: PortableFSItem, nativeKernelCheck: Bool = false) async throws {
         let objectID = ObjectIdentifier(item)
         let identity = try identity(for: item)
         if retiringItems[identity] != nil {
+            // Native reentry acknowledges the existing cleanup owner. Ordinary
+            // core callers still wait for the exact retirement outcome.
+            if nativeKernelCheck || kernelCache?.isPinned(item) == true { return }
             await waitForRetirement(identity)
             guard !stopped else { throw PfsLocalClientError.connectionClosed }
             return
         }
+        if kernelCache?.deferCleanup(item, { [self] in
+            do { try await self.reclaim(item: item, nativeKernelCheck: nativeKernelCheck) }
+            catch { await self.client.close(error: error) }
+        }) == true { return }
         // Detach even before waiting for an in-flight descriptor operation.
         // Otherwise a lookup could republish this object while reclaim queued.
         beginRetirement(item, identity: identity, objectID: objectID)
+        kernelCache?.retiring(item, true)
         // Ownership cleanup must outlive caller cancellation, including while
         // waiting for the lifecycle gate. An unstructured task does not inherit
         // cancellation; awaiting its value still waits for the exact outcome.
         try await Task {
-            try await completeRetirement(item, identity: identity, objectID: objectID)
+            try await completeRetirement(item, identity: identity, objectID: objectID, nativeKernelCheck: nativeKernelCheck)
         }.value
     }
 
     private func completeRetirement(
         _ item: PortableFSItem,
         identity: PfsItemIdentity,
-        objectID: ObjectIdentifier
+        objectID: ObjectIdentifier,
+        nativeKernelCheck: Bool
     ) async throws {
-        defer { finishRetirement(identity: identity, objectID: objectID) }
+        var deferred = false
+        defer { if !deferred { finishRetirement(identity: identity, objectID: objectID) } }
         do {
             try await withLifecycleGate(for: objectID) {
                 await waitForSettlements(objectID: objectID)
                 guard !stopped else { throw PfsLocalClientError.connectionClosed }
+                // Settle every earlier lookup before checking FSKit's return
+                // count. Retirement blocks new adoptions, and the publication
+                // gate excludes concurrent framework replies and new pins.
+                let prepareRetirement = { () -> (reclaim: Bool, deferred: Bool) in
+                    if self.kernelCache?.deferCleanup(item, { [self] in
+                        do {
+                            try await self.completeRetirement(item, identity: identity, objectID: objectID,
+                                                              nativeKernelCheck: nativeKernelCheck)
+                        } catch { await self.client.close(error: error) }
+                    }) == true {
+                        return (false, true)
+                    }
+                    if nativeKernelCheck, #available(macOS 27, *) {
+                        if !item.tryReclaim({ self.retireReclaimedItem(item, objectID: objectID) }) {
+                            self.itemsByIdentity[identity] = item
+                            self.canonicalItemsByFileID[item.fileID, default: [:]][identity] = item
+                            self.kernelCache?.retiring(item, false)
+                            return (false, false)
+                        }
+                    } else {
+                        self.kernelCache?.forget(item)
+                    }
+                    return (true, false)
+                }
+                let decision = kernelCache == nil ? prepareRetirement() : client.publicationGate.synchronized(prepareRetirement)
+                deferred = decision.deferred
+                guard decision.reclaim else { return }
                 try await closeAllDaemonHandles(objectID: objectID)
                 var request = PfsReclaimRequest()
                 request.item = identity.proto
@@ -1000,7 +1070,7 @@ public actor VolumeCore {
             }
         } catch {
             if error is PfsDispatchedReclaimError {
-                await shutdown()
+                await stopForFailure()
             } else if !stopped {
                 if await client.isDetachingOrStopped {
                     // Whole-session cleanup owns remaining daemon resources.
@@ -1009,7 +1079,7 @@ public actor VolumeCore {
                     // Even a confirmed Close can leave the accepted daemon item
                     // owned. A serving mount must not depend on another lookup
                     // to finish retirement after any pre-Reclaim failure.
-                    await shutdown()
+                    await stopForFailure()
                 }
             }
             if let error = error as? PfsDispatchedReclaimError { throw error.cause }
@@ -1062,14 +1132,41 @@ public actor VolumeCore {
         let waiters = settlementWaiters.removeValue(forKey: objectID) ?? []
         for waiter in waiters { waiter.resume() }
         item.markReclaimed()
+        kernelCache?.forget(item)
         detachCanonicalItem(item)
     }
 
     public func shutdown() async {
+        await beginShutdown().value
+    }
+
+    /// A callback may be running on behalf of setCacheState. Fail publication
+    /// and transport immediately, but let the one cleanup owner wait for the
+    /// kernel call after this callback has returned its error.
+    private func stopForFailure() async {
+        let cleanup = beginShutdown()
+        await client.close()
+        if kernelCache == nil { await cleanup.value }
+    }
+
+    private func beginShutdown() -> Task<Void, Never> {
+        if let shutdownTask { return shutdownTask }
         client.publicationGate.revoke(PfsLocalClientError.shutdown)
         stopped = true
-        await client.close()
-        for item in itemsByObject.values { item.markReclaimed() }
+        let cleanup = Task { [self] in
+            await kernelCache?.withdraw(.revoke)
+            await client.close()
+            finishShutdown()
+        }
+        shutdownTask = cleanup
+        return cleanup
+    }
+
+    private func finishShutdown() {
+        for item in itemsByObject.values {
+            item.markReclaimed()
+            kernelCache?.forget(item)
+        }
         itemsByIdentity.removeAll()
         canonicalItemsByFileID.removeAll()
         identitiesByObject.removeAll()
@@ -1192,6 +1289,7 @@ public actor VolumeCore {
         var state = openHandles[objectID] ?? OpenState()
         state.install(opened.handle, granting: missing)
         openHandles[objectID] = state
+        if let item = itemsByObject[objectID] { kernelCache?.ownership(item, access: state.heldAccess) }
         opened.lease.acceptHandles()
         await opened.lease.complete(itemsPublished: true)
     }
@@ -1269,6 +1367,7 @@ public actor VolumeCore {
 
     private func closeAllDaemonHandles(objectID: ObjectIdentifier) async throws {
         openHandles[objectID]?.retireAll()
+        if let item = itemsByObject[objectID] { kernelCache?.ownership(item, access: .unspecified) }
         try await closePendingDaemonHandles(objectID: objectID)
     }
 
@@ -1509,6 +1608,7 @@ public actor VolumeCore {
             }
         }
         let item = PortableFSItem(identity: identity, fileID: attr.fileID, kind: attr.kind)
+        kernelCache?.retain(item)
         itemsByIdentity[identity] = item
         canonicalItemsByFileID[attr.fileID, default: [:]][identity] = item
         register(item: item, identity: identity)
@@ -1529,7 +1629,7 @@ public actor VolumeCore {
         lease.registerItemSettlement { [weak self, weak item] acceptedCount in
             guard let self, let item else { return }
             if acceptedCount == 0, terminalOnAbandon {
-                await self.shutdown()
+                await self.stopForFailure()
                 return
             }
             await self.settleProvisionalItem(item: item, published: acceptedCount > 0)
@@ -1585,7 +1685,7 @@ public actor VolumeCore {
     }
 }
 
-private extension PfsOpenMode {
+extension PfsOpenMode {
     var grantsRead: Bool { self == .read || self == .readWrite }
     var grantsWrite: Bool { self == .write || self == .readWrite }
 

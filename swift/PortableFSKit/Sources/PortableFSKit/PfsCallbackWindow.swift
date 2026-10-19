@@ -52,6 +52,12 @@ final class PfsSessionPublicationGate: @unchecked Sendable {
         return terminal ?? error
     }
 
+    func synchronized<T>(_ operation: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+
     func check() throws {
         if let error = terminalError { throw error }
     }
@@ -215,6 +221,8 @@ enum PfsAttachEventMonitor {
             case .unspecified, .UNRECOGNIZED:
                 return .invalidFrame("attach state event names no defined state")
             }
+        case .cacheProof?:
+            return nil
         case nil:
             return .invalidFrame("event has no body")
         }
@@ -226,10 +234,12 @@ enum PfsAttachEventMonitor {
     static func run(
         events: AsyncStream<PfsEvent>,
         client: PfsLocalClient,
-        window: PfsCallbackWindow
+        window: PfsCallbackWindow,
+        cache: PfsKernelCache? = nil
     ) async {
         var cause = PfsLocalClientError.connectionClosed
         for await event in events {
+            if case let .cacheProof(proof)? = event.kind { cache?.proof(proof.horizonNanos, authorization: proof.authorizationDeadlineUnixNanos) }
             if let terminal = terminalCause(of: event) {
                 cause = terminal
                 break
@@ -239,6 +249,7 @@ enum PfsAttachEventMonitor {
         pfsClientLogger.error(
             "FSKit volume session ended: \(String(describing: terminal), privacy: .public)"
         )
+        await cache?.withdraw(.revoke)
         await window.sessionEnded(terminal)
         await client.close(error: terminal)
     }

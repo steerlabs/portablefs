@@ -399,17 +399,18 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
 /// events at construction. The client revokes publication at each terminal
 /// source, before an event consumer can drain the window.
 @available(macOS 26.0, *)
-public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.OpenCloseOperations, FSVolume.ReadWriteOperations, FSVolume.XattrOperations, FSVolume.PathConfOperations, @unchecked Sendable {
+public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperations, FSVolume.XattrOperations, FSVolume.PathConfOperations, @unchecked Sendable {
     public let core: VolumeCore
     public let capabilities: PfsCapabilities
     let window: PfsCallbackWindow
     /// The session connection's request-trace label; see PfsTraceRecord.
-    private let traceConnection: String
-    private let logger = Logger(subsystem: "dev.portablefs.fskit", category: "PortableFSVolume")
+    let traceConnection: String
+    fileprivate let logger = Logger(subsystem: "dev.portablefs.fskit", category: "PortableFSVolume")
     private let fileSystemTypeName: String
     private let statLock = NSLock()
     private var cachedStatistics: FSStatFSResult
-    private let eventMonitor: Task<Void, Never>
+    private var eventMonitor: Task<Void, Never>?
+    let kernelCache: PfsKernelCache?
     private let shutdownLock = NSLock()
     private var shutdownTask: Task<Void, Never>?
     private var beforeShutdownCleanup: (@Sendable () async -> Void)?
@@ -436,13 +437,6 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             let window = PfsCallbackWindow(
                 capacity: windowCapacity, publicationGate: client.publicationGate
             )
-            let eventMonitor = Task.detached(priority: .userInitiated) {
-                await PfsAttachEventMonitor.run(
-                    events: events,
-                    client: client,
-                    window: window
-                )
-            }
             let statReply: PfsStatfsReply
             do {
                 statReply = try await core.statfs()
@@ -451,7 +445,19 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 throw error
             }
             try client.publicationGate.check()
-            return PortableFSVolume(
+            let cache: PfsKernelCache?
+            let volumeType: PortableFSVolume.Type
+            if #available(macOS 27, *) {
+                volumeType = PortableFSVolumeV3.self
+                cache = PfsKernelCache(gate: client.publicationGate) { error in
+                    await client.close(error: error)
+                }
+            } else {
+                volumeType = PortableFSVolumeV2.self
+                cache = nil
+            }
+            if let cache { await core.installKernelCache(cache) }
+            let volume = volumeType.init(
                 core: core,
                 attachRef: attachRef,
                 resolved: resolved,
@@ -459,15 +465,26 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
                 moduleIdentity: moduleIdentity,
                 window: window,
                 traceConnection: await core.traceConnection,
-                eventMonitor: eventMonitor
+                kernelCache: cache
             )
+            if #available(macOS 27, *), let volume = volume as? PortableFSVolumeV3, let cache {
+                cache.install { [weak volume] item, action in
+                    guard let volume else { return POSIXError(.ENXIO) }
+                    return volume.setCacheState(for: item, cacheMode: .none, coherencyType: .noCache,
+                                                action: action == .revoke ? .revoke : .invalidate)
+                }
+            }
+            volume.eventMonitor = Task.detached(priority: .userInitiated) {
+                await PfsAttachEventMonitor.run(events: events, client: client, window: window, cache: cache)
+            }
+            return volume
         } catch {
             await core.shutdown()
             throw error
         }
     }
 
-    private init(
+    required init(
         core: VolumeCore,
         attachRef: String,
         resolved: PfsResolvedVolume,
@@ -475,13 +492,13 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         moduleIdentity: PortableFSModuleIdentity,
         window: PfsCallbackWindow,
         traceConnection: String,
-        eventMonitor: Task<Void, Never>
+        kernelCache: PfsKernelCache?
     ) {
         self.core = core
         self.capabilities = resolved.capabilities
         self.window = window
         self.traceConnection = traceConnection
-        self.eventMonitor = eventMonitor
+        self.kernelCache = kernelCache
         self.fileSystemTypeName = moduleIdentity.fileSystemTypeName
         self.cachedStatistics = PfsFSKitMapping.statfs(
             from: statReply,
@@ -656,7 +673,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         // Capture the owned resources rather than retaining the volume in its task.
         let cleanup = Task { [window, eventMonitor, core] in
             await window.sessionEnded(PfsLocalClientError.shutdown)
-            eventMonitor.cancel()
+            eventMonitor?.cancel()
             await beforeCleanup?()
             await core.shutdown()
         }
@@ -689,7 +706,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     /// reply and is published only for a successful outcome that reached
     /// FSKit; a revoked callback settles its operation and resources as
     /// unpublished.
-    private func publishAfterReply<Value>(
+    func publishAfterReply<Value>(
         callbackKind: StaticString = #function,
         preflight: @escaping @Sendable () async throws -> Void = {},
         _ operation: @escaping () async throws -> Value,
@@ -861,7 +878,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
     public func reclaimItem(_ item: FSItem) async throws {
         try await core.client.withPublicationBoundary {
             do {
-                try await core.reclaim(item: try portableItem(item))
+                try await core.reclaim(item: try portableItem(item), nativeKernelCheck: kernelCache != nil)
             } catch {
                 throw PfsErrorMapper.fsKitError(for: error)
             }
@@ -1291,7 +1308,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         }
     }
 
-    public func openItem(
+    @objc(openItem:withModes:replyHandler:) public func openItem(
         _ item: FSItem,
         modes: FSVolume.OpenModes,
         replyHandler reply: @escaping (Error?) -> Void
@@ -1320,7 +1337,7 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
         }
     }
 
-    public func closeItem(
+    @objc(closeItem:keepingModes:replyHandler:) public func closeItem(
         _ item: FSItem,
         modes: FSVolume.OpenModes,
         replyHandler reply: @escaping (Error?) -> Void
@@ -1539,5 +1556,82 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
             throw PfsLocalClientError.daemon(errno: ESTALE, message: "unknown FSItem")
         }
         return portable
+    }
+}
+
+/// macOS 26 retains its per-mode lifecycle. The macOS 27 volume never adopts
+/// this protocol, so its deferred final close has exactly one owner.
+@available(macOS 26.0, *)
+final class PortableFSVolumeV2: PortableFSVolume, FSVolume.OpenCloseOperations, @unchecked Sendable {}
+
+@available(macOS 27.0, *)
+final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @unchecked Sendable {
+    func open(_ item: FSItem, modes: FSVolume.OpenModes, cacheMode: FSVolume.DataCacheMode,
+              context: FSContext, replyHandler reply: @escaping (FSOpenItemResult?, Error?) -> Void) {
+        cacheOpen(item, modes: modes, cacheMode: cacheMode) { grant, error in
+            reply(grant.map { FSOpenItemResult(grantedCoherency: $0) }, error)
+        }
+    }
+
+    func upgrade(_ item: FSItem, cacheMode: FSVolume.DataCacheMode, context: FSContext,
+                 replyHandler reply: @escaping (FSUpgradeItemResult?, Error?) -> Void) {
+        cacheOpen(item, modes: nil, cacheMode: cacheMode) { grant, error in
+            reply(grant.map { FSUpgradeItemResult(grantedCoherency: $0) }, error)
+        }
+    }
+
+    /// Upgrade changes cache permission, not descriptor access. New open modes
+    /// acquire missing rights through the same VolumeCore permission checks.
+    func cacheOpen(_ item: FSItem, modes: FSVolume.OpenModes?, cacheMode: FSVolume.DataCacheMode,
+                   reply: @escaping (FSVolume.KernelCacheCoherencyType?, Error?) -> Void) {
+        publishAfterReply({
+            let requested: Bool
+            switch cacheMode {
+            case .none: requested = false
+            case .readWithCache, .readWriteWithCache: requested = true
+            @unknown default: throw POSIXError(.EINVAL)
+            }
+            guard let item = item as? PortableFSItem else { throw POSIXError(.EINVAL) }
+            if let modes {
+                guard !modes.isEmpty, modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
+                try await self.core.open(item: item, mode: PfsFSKitMapping.openMode(from: modes))
+            }
+            return (item, try await self.core.ownsReadDescription(item), requested)
+        }, reply: { result in
+            do {
+                let (item, read, requested) = try result.get()
+                let grant = try self.kernelCache?.grant(item, requested: requested, ownsRead: read) ?? false
+                self.logger.debug("cache grant file=\(item.fileID) read_cache=\(grant)")
+                reply(grant ? .readCache : .noCache, nil)
+            } catch let failure as PfsKernelCache.AdmissionFailure {
+                let cause = failure.cause
+                // This reply already holds the publication lock. Close after
+                // replying; every cache admission independently checks expiry.
+                Task { await self.core.client.close(error: cause) }
+                reply(nil, PfsErrorMapper.fsKitError(for: cause))
+            } catch { reply(nil, PfsErrorMapper.fsKitError(for: error)) }
+        })
+    }
+
+    func close(_ item: FSItem, context: FSContext, replyHandler reply: @escaping () -> Void) {
+        finalClose(item, reply: reply)
+    }
+
+    /// Cleanup still runs after terminal publication. This callback has no
+    /// error channel; a cleanup failure ends the session instead of disappearing.
+    func finalClose(_ item: FSItem, reply: @escaping () -> Void) {
+        let reply = PfsUncheckedSendableBox(reply)
+        let trace = PfsCallbackTrace(kind: "finalClose", connection: traceConnection, trace: core.client.trace)
+        let item = PfsUncheckedSendableBox(item)
+        Task {
+            let (result, complete) = await self.core.client.withDeferredPublication(callbackLabel: trace.label) {
+                guard let item = item.value as? PortableFSItem else { throw POSIXError(.EINVAL) }
+                try await self.core.close(item: item)
+            }
+            if case let .failure(error) = result { await self.core.client.close(error: error) }
+            reply.value()
+            await complete(false)
+            trace.finish(outcome: result.pfsIsSuccess ? "success" : "failure")
+        }
     }
 }

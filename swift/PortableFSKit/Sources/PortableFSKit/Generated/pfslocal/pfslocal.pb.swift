@@ -2027,10 +2027,19 @@ public nonisolated struct PfsEvent: Sendable {
     set {kind = .attachState(newValue)}
   }
 
+  public var cacheProof: PfsCacheProof {
+    get {
+      if case .cacheProof(let v)? = kind {return v}
+      return PfsCacheProof()
+    }
+    set {kind = .cacheProof(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Kind: Equatable, Sendable {
     case attachState(PfsAttachState)
+    case cacheProof(PfsCacheProof)
 
   }
 
@@ -2095,6 +2104,24 @@ public nonisolated struct PfsAttachState: Sendable {
     ]
 
   }
+
+  public init() {}
+}
+
+/// The daemon's existing cache horizon, in CLOCK_MONOTONIC_RAW nanoseconds on
+/// this Mac. Both processes use the same sleep-inclusive boot clock. Zero denies
+/// caching without ending otherwise authorized access. This is not a new lease.
+public nonisolated struct PfsCacheProof: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var horizonNanos: UInt64 = 0
+
+  /// signed installed deadline; zero only without a deadline
+  public var authorizationDeadlineUnixNanos: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 }
@@ -5237,7 +5264,7 @@ nonisolated extension PfsSubscribeEventsReply: SwiftProtobuf.Message, SwiftProto
 
 nonisolated extension PfsEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Event"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{4}\u{2}attach_state\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{4}\u{2}attach_state\0\u{3}cache_proof\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5258,6 +5285,19 @@ nonisolated extension PfsEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
           self.kind = .attachState(v)
         }
       }()
+      case 3: try {
+        var v: PfsCacheProof?
+        var hadOneofValue = false
+        if let current = self.kind {
+          hadOneofValue = true
+          if case .cacheProof(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.kind = .cacheProof(v)
+        }
+      }()
       default: break
       }
     }
@@ -5268,9 +5308,17 @@ nonisolated extension PfsEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
     // allocates stack space for every if/case branch local when no optimizations
     // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
     // https://github.com/apple/swift-protobuf/issues/1182
-    try { if case .attachState(let v)? = self.kind {
+    switch self.kind {
+    case .attachState?: try {
+      guard case .attachState(let v)? = self.kind else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
-    } }()
+    }()
+    case .cacheProof?: try {
+      guard case .cacheProof(let v)? = self.kind else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 3)
+    }()
+    case nil: break
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -5318,4 +5366,39 @@ nonisolated extension PfsAttachState: SwiftProtobuf.Message, SwiftProtobuf._Mess
 
 nonisolated extension PfsAttachState.State: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0STATE_UNSPECIFIED\0\u{1}STATE_ATTACHED\0\u{2}\u{2}STATE_DEGRADED\0\u{1}STATE_DETACHING\0")
+}
+
+nonisolated extension PfsCacheProof: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".CacheProof"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}horizon_nanos\0\u{3}authorization_deadline_unix_nanos\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.horizonNanos) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.authorizationDeadlineUnixNanos) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.horizonNanos != 0 {
+      try visitor.visitSingularUInt64Field(value: self.horizonNanos, fieldNumber: 1)
+    }
+    if self.authorizationDeadlineUnixNanos != 0 {
+      try visitor.visitSingularUInt64Field(value: self.authorizationDeadlineUnixNanos, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: PfsCacheProof, rhs: PfsCacheProof) -> Bool {
+    if lhs.horizonNanos != rhs.horizonNanos {return false}
+    if lhs.authorizationDeadlineUnixNanos != rhs.authorizationDeadlineUnixNanos {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
 }

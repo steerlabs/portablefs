@@ -312,6 +312,9 @@ func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence ui
 	d.mu.Lock()
 	if err == nil {
 		d.authorizationDeadline = deadline
+		if d.bridge != nil {
+			d.bridge.publishCacheHorizon(d.horizon, uint64(deadline.UnixNano()))
+		}
 	}
 	d.mu.Unlock()
 	if err != nil {
@@ -2858,6 +2861,14 @@ func (d *v3DataPlane) renewHorizon(parent context.Context) error {
 	candidate, usable := v3HorizonCandidate(start, proof)
 	if usable && d.clockFault == nil && now < candidate && d.terminal == nil && (d.authorizationDeadline.IsZero() || time.Now().Before(d.authorizationDeadline)) && candidate > d.horizon {
 		d.horizon = candidate
+	}
+	horizon := d.horizon
+	var authorizationNanos uint64
+	if !d.authorizationDeadline.IsZero() {
+		authorizationNanos = uint64(d.authorizationDeadline.UnixNano())
+	}
+	if d.bridge != nil {
+		d.bridge.publishCacheHorizon(horizon, authorizationNanos)
 	}
 	d.mu.Unlock()
 	if nowErr != nil {

@@ -42,17 +42,48 @@ atomic append are not available while a Mac writer is attached; they need
 Linux mounts only. Single-writer append works because the Mac kernel supplies
 the offset.
 
-### Terminal enforcement does not withdraw kernel state
+### Kernel cache control and terminal enforcement
 
-When the Mac's session ends, is fenced, or loses its daemon, the daemon stops
-answering from its caches and the extension rejects successful serving
-publication through the gate below. That bounds what PortableFS serves. It
-does not synchronously remove names, attributes, or pages the macOS kernel
-already holds for the mount; processes on that Mac can observe retained kernel
-state until the mount is unmounted. PortableFS does not unmount automatically on
-fence. The authority's retained writer exclusion keeps every other client from
-writing while the old daemon could still serve; it does not revoke the old
-Mac's kernel caches.
+One shared VolumeCore, mapping, publication gate and daemon serve both OS
+releases. Construction selects the native lifecycle adapter once with
+`#available(macOS 27, *)`. macOS 26 keeps its per-mode open/close callbacks;
+macOS 27 adopts `FSVolume.DataCacheHandler` as its only open/upgrade/final-close
+owner. A macOS 27 error never retries through the macOS 26 adapter.
+
+On macOS 27, a requested cache mode may receive `readCache` only while the
+daemon's writer/authorization proof is valid and an owned read description
+remains available. Otherwise authorized access receives `noCache`; terminal or
+authorization loss fails the operation. `writeThrough` and `writeBack` are not
+granted. Writes continue directly to durable authority callbacks. Descriptions
+retain their granted access until V3's one final item close, after kernel cache
+management; new opens acquire only missing access with authority permission
+checks. Final close cannot return an error, so cleanup failure ends serving.
+On 27, reclaim settles pending item publications and checks `FSItem.tryReclaim`
+under the shared publication gate; a retained kernel reference restores the
+canonical item without releasing authority ownership. Reentrant failure replies
+complete before the shutdown owner waits for cache withdrawal.
+
+The existing pfslocal event binding carries the daemon's proof horizon on the
+shared sleep-inclusive boot clock and the installed signed authorization
+deadline. A proof-expiry task invalidates clean data and downgrades it to
+`noCache` while the session remains usable. Terminal ownership or authorization
+loss, including daemon death, revokes retained items. An ordinary open-unlinked
+inode remains accessible and is not revoked merely because its link count is
+zero. `setCacheState` runs outside module locks, with ownership retained through
+completion, including reentrant close/reclaim. A failure leaves the kernel state
+unchanged and is terminal; it never certifies withdrawal. Kernel-call results
+are logged with the item, action and error code for native observation. These
+rules follow Apple's [DataCacheHandler lifecycle](https://developer.apple.com/documentation/fskit/fsvolume/datacachehandler)
+and [setCacheState contract](https://developer.apple.com/documentation/fskit/fsvolume/setcachestate(for:cachemode:coherencytype:action:)).
+
+A stopped extension cannot revoke, and cached reads can race resume after
+sleep before the extension executes. The per-item API does not establish exact
+negative-name, inode-attribute or directory-enumeration withdrawal. Native loss
+and sleep qualification remain open. macOS 26 keeps today's residual: terminal
+publication stops new PortableFS serving, but retained kernel names, attributes
+and pages may remain observable until unmount. Authority exclusion does not
+revoke old kernel state after exclusion ends. Neither OS automatically unmounts
+on fence.
 
 ### Callback publication and local teardown
 
@@ -136,7 +167,9 @@ Writes are direct: each callback chunk of up to the negotiated maximum write is
 one positioned authority WRITE, without append, sync, delegation, flush
 sequence, or lock owner. There is no fragmented or staged write.
 
-`write(2)` still returns at kernel page-cache acceptance, as POSIX permits. The
+On macOS 26, `write(2)` can return at kernel page-cache acceptance, as POSIX
+permits. macOS 27 grants no dirty-data cache mode: `readCache` writes bypass
+the kernel data cache. The
 kernel pushes those pages as write callbacks on fsync, close, unmount, or memory
 pressure. A native `fsync` or `F_FULLFSYNC` is durable only if macOS pushes the
 file's dirty pages as callbacks, waits for every reply, and reports their
@@ -286,8 +319,9 @@ finalization attempt and, if that fails, reports kernel absence with the daemon
 error, preserves state and intent, and exits with failure for explicit
 reconciliation. If notification setup fails it reports supervision failure
 instead of polling. Daemon fencing and terminal publication stop PortableFS
-serving, but they do not withdraw names, attributes, or pages the macOS kernel
-already caches for the mount.
+serving. macOS 27 also withdraws retained item caches through DataCacheHandler,
+subject to the execution and namespace limits above; macOS 26 retains its
+kernel-cache residual.
 
 After exact absence of the original kernel mount is observed, the daemon
 delivers the absence proof on the original CONTROL transport without first
