@@ -9,9 +9,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("kernel_cache_observer", Path(__file__).with_name("test-macos27-kernel-cache.py"))
-observer = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(observer)
+def load_observer():
+    spec = importlib.util.spec_from_file_location("kernel_cache_observer", Path(__file__).with_name("test-macos27-kernel-cache.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+observer = load_observer()
 
 
 class FlushedOutput(io.StringIO):
@@ -24,6 +29,87 @@ class FlushedOutput(io.StringIO):
 
 
 class ObserverTests(unittest.TestCase):
+    def test_native_page_geometry_and_mapping_extent(self):
+        for page_size in (4096, 16384):
+            with self.subTest(page_size=page_size), patch.object(observer.mmap, "PAGESIZE", page_size):
+                runtime = load_observer()
+                extent = 2 * page_size
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "fixture"
+                    path.write_bytes(b"A" * page_size + b"B" * page_size)
+                    for mode in ("fd", "mapped"):
+                        with self.subTest(mode=mode):
+                            output = io.StringIO()
+                            with patch.object(runtime.sys, "stdout", output), patch.object(runtime.sys, "stdin", io.StringIO("geometry\nstop\n")), patch.object(runtime.selectors, "DefaultSelector"), patch.object(runtime.mmap, "mmap", wraps=runtime.mmap.mmap) as mapping:
+                                runtime.reader(path, mode)
+                            records = [json.loads(line) for line in output.getvalue().splitlines()]
+                            ready = records[0]
+                            self.assertTrue(all(record["page_size"] == page_size for record in records))
+                            self.assertEqual(ready["offsets"], [0, page_size])
+                            self.assertEqual(ready["fixture_size"], extent)
+                            reads = [record for record in records if record.get("operation") == "read"]
+                            offsets = [record["offset"] for record in reads]
+                            self.assertEqual(offsets, [0, page_size])
+                            self.assertEqual([offset // page_size for offset in offsets], [0, 1])
+                            self.assertEqual([record["bytes"] for record in reads], [[65], [66]])
+                            self.assertGreaterEqual(ready["fixture_size"], offsets[1] + page_size)
+                            if mode == "mapped":
+                                mapping.assert_called_once_with(unittest.mock.ANY, extent, access=runtime.mmap.ACCESS_READ)
+                                self.assertEqual(ready["mapping_length"], extent)
+                                self.assertGreaterEqual(ready["mapping_length"], offsets[1] + page_size)
+                            else:
+                                mapping.assert_not_called()
+                                self.assertEqual(ready["mapping_length"], 0)
+
+    def test_healthy_write_truncate_regrow_and_metadata_geometry(self):
+        for page_size in (4096, 16384):
+            with self.subTest(page_size=page_size), patch.object(observer.mmap, "PAGESIZE", page_size):
+                runtime = load_observer()
+                extent = 2 * page_size
+                snapshots = {
+                    "warm": b"A" * extent,
+                    "local-alias-write-expect-66": b"B" * extent,
+                    f"alias-truncate-expect-66-0-size{extent}": b"B" * page_size + b"\0" * page_size,
+                    "rewarm-expect-65": b"A" * extent,
+                }
+                sampled = []
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "fixture"
+                    alias = Path(directory) / "alias"
+                    path.write_bytes(snapshots["warm"])
+                    runtime.os.link(path, alias)
+                    with alias.open("rb", buffering=0) as file, runtime.mmap.mmap(file.fileno(), extent, access=runtime.mmap.ACCESS_READ) as mapping:
+                        def sample(_, label, evidence, expected):
+                            sampled.append(label)
+                            self.assertEqual(path.read_bytes(), snapshots[label])
+                            self.assertEqual(len(mapping), extent)
+                            for mode, retained_mapping in (("fd", None), ("mapped", mapping)):
+                                output = io.StringIO()
+                                with patch.object(runtime.sys, "stdout", output):
+                                    runtime.observe(file.fileno(), retained_mapping, label, mode)
+                                runtime.collect([(mode, None, io.StringIO(output.getvalue()))], label, evidence, expected)
+
+                        with patch.object(runtime, "sample", side_effect=sample):
+                            runtime.healthy_probes(path, alias, [], io.StringIO())
+                    self.assertEqual(sampled, list(snapshots))
+
+    def test_loss_instructions_cover_both_native_pages(self):
+        for page_size in (4096, 16384):
+            with patch.object(observer.mmap, "PAGESIZE", page_size):
+                runtime = load_observer()
+            for case in runtime.CASES:
+                with self.subTest(page_size=page_size, case=case):
+                    actions = self.procedure(case, runtime)
+                    mutation = next(action for action in actions if "IN PLACE" in action)
+                    self.assertIn(f"from offset 0 with {2 * page_size} bytes of 76", mutation)
+                    self.assertIn(f"two {page_size}-byte Mac VM pages", mutation)
+                    self.assertIn(f"offsets (0, {page_size})", mutation)
+                    self.assertIn("fsync and preserve its inode", mutation)
+                    if case == "proof-expiry":
+                        trace = next(action for action in actions if "POST-EXPIRY fixture READ/miss" in action)
+                        self.assertIn(f"[0, {page_size}) and [{page_size}, {2 * page_size})", trace)
+                        self.assertIn("two requests are not required", trace)
+
     def test_successful_reads_survive_later_fstat_failure(self):
         output = FlushedOutput()
 
@@ -58,10 +144,10 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual((records[1]["page"], records[1]["errno"]), (2, errno.EIO))
         self.assertEqual(records[2]["operation"], "fstat")
 
-    def procedure(self, case):
+    def procedure(self, case, runtime=observer):
         actions = []
-        with patch.object(observer, "checkpoint", side_effect=lambda label, _: actions.append(label)), patch.object(observer, "sample", side_effect=lambda _, label, __: actions.append("sample:" + label)), patch.object(observer, "command", side_effect=lambda _, label: actions.append("command:" + label)), patch.object(observer, "collect"):
-            observer.loss_procedure(case, "fixture", [], io.StringIO())
+        with patch.object(runtime, "checkpoint", side_effect=lambda label, _: actions.append(label)), patch.object(runtime, "sample", side_effect=lambda _, label, __: actions.append("sample:" + label)), patch.object(runtime, "command", side_effect=lambda _, label: actions.append("command:" + label)), patch.object(runtime, "collect"):
+            runtime.loss_procedure(case, "fixture", [], io.StringIO())
         return actions
 
     def test_stall_mutation_and_samples_precede_resume(self):

@@ -10,11 +10,12 @@ this script does not deploy, contact another host, or force-unmount anything.
 Keep the authority/daemon logs and exact signed build identity with the output.
 
 For each loss case, record authority exclusion ending before attempting the
-Linux write; an early write must fail EBUSY. Then Linux must overwrite BOTH the
-first and second 4096-byte pages of the named fixture with byte 76, fsync it,
-and preserve its inode. Existing Mac descriptors/mappings must not serve their
-old byte 65 after successful withdrawal. A SIGBUS is an observed revoke result,
-not a script crash: mapped readers run in separate subprocesses.
+Linux write; an early write must fail EBUSY. Then Linux must overwrite BOTH
+native VM pages of the named fixture with byte 76, using the observer's recorded
+page size and extent, fsync it, and preserve its inode. Existing Mac
+descriptors/mappings must not serve their old byte 65 after successful
+withdrawal. A SIGBUS is an observed revoke result, not a script crash: mapped
+readers run in separate subprocesses.
 
 A proof-expiry-only case must keep the authority session authorized/usable while
 withholding renewal replies past the actual proof horizon. Verify an invalidate
@@ -44,16 +45,19 @@ import time
 
 CASES = ("proof-expiry", "writer-loss", "authorization-loss", "daemon-death",
          "extension-stall", "sleep-wake")
+PAGE_SIZE = mmap.PAGESIZE
+PAGE_OFFSETS = (0, PAGE_SIZE)
+FIXTURE_SIZE = 2 * PAGE_SIZE
 
 
 def emit(value):
-    print(json.dumps({"time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(), **value}), flush=True)
+    print(json.dumps({"time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(), "page_size": PAGE_SIZE, **value}), flush=True)
 
 
 def observe(fd, mapping, label, mode):
     # Flush each completed read before touching another page or asking metadata.
     # A later errno or mapped SIGBUS must never erase an earlier readable page.
-    for page, offset in enumerate((0, 4096), start=1):
+    for page, offset in enumerate(PAGE_OFFSETS, start=1):
         record = {"sample": label, "mode": mode, "operation": "read", "page": page, "offset": offset}
         try:
             data = mapping[offset:offset + 1] if mapping is not None else os.pread(fd, 1, offset)
@@ -70,8 +74,9 @@ def observe(fd, mapping, label, mode):
 
 def reader(path, mode):
     fd = os.open(path, os.O_RDONLY)
-    mapping = mmap.mmap(fd, 8192, access=mmap.ACCESS_READ) if mode == "mapped" else None
-    emit({"ready": mode, "inode": os.fstat(fd).st_ino})
+    mapping = mmap.mmap(fd, FIXTURE_SIZE, access=mmap.ACCESS_READ) if mode == "mapped" else None
+    emit({"ready": mode, "inode": os.fstat(fd).st_ino, "offsets": PAGE_OFFSETS,
+          "fixture_size": FIXTURE_SIZE, "mapping_length": FIXTURE_SIZE if mapping is not None else 0})
     observing = None
     with selectors.DefaultSelector() as selector:
         selector.register(sys.stdin, selectors.EVENT_READ)
@@ -137,7 +142,7 @@ def collect(processes, label, evidence, expected=None, completion="complete"):
             if result.get("operation") == "read":
                 pages[result["page"]] = result
             if expected is not None and result.get("operation") == "fstat":
-                if result.get("size") != 8192:
+                if result.get("size") != FIXTURE_SIZE:
                     raise RuntimeError(f"{label}: {mode} metadata failed: {result}")
             if result.get("operation") == completion:
                 if expected is not None:
@@ -161,8 +166,26 @@ def sample(processes, label, evidence, expected=None):
     collect(processes, label, evidence, expected)
 
 
+def healthy_probes(path, alias, processes, evidence):
+    sample(processes, "warm", evidence, [65, 65])
+    with path.open("r+b", buffering=0) as file:
+        file.write(b"B" * FIXTURE_SIZE)
+        os.fsync(file.fileno())
+    sample(processes, "local-alias-write-expect-66", evidence, [66, 66])
+    with alias.open("r+b", buffering=0) as file:
+        file.truncate(PAGE_SIZE)
+        file.truncate(FIXTURE_SIZE)
+        os.fsync(file.fileno())
+    sample(processes, f"alias-truncate-expect-66-0-size{FIXTURE_SIZE}", evidence, [66, 0])
+    with path.open("r+b", buffering=0) as file:
+        file.write(b"A" * FIXTURE_SIZE)
+        os.fsync(file.fileno())
+    sample(processes, "rewarm-expect-65", evidence, [65, 65])
+
+
 def loss_procedure(case, relative_path, processes, evidence):
-    mutation = (f"Through Linux overwrite {relative_path} IN PLACE with 8192 bytes of 76, "
+    mutation = (f"Through Linux overwrite {relative_path} IN PLACE from offset 0 with {FIXTURE_SIZE} bytes of 76 "
+                f"(two {PAGE_SIZE}-byte Mac VM pages, sampled at offsets {PAGE_OFFSETS}), "
                 "fsync and preserve its inode; retain command output and timestamps")
     if case == "extension-stall":
         checkpoint("STOP the extension (SIGSTOP); record PID/status, last proof and exclusion deadline. Keep it stopped through the Linux mutation and Mac samples", evidence)
@@ -187,7 +210,8 @@ def loss_procedure(case, relative_path, processes, evidence):
     if case == "proof-expiry":
         checkpoint("Keep session authorized/usable while withholding renewal past the recorded horizon. Require successful invalidate and noCache grant; record fixture READ/miss counters BEFORE the following post-expiry samples", evidence)
         sample(processes, "proof-expired", evidence)
-        checkpoint("Retain actual POST-EXPIRY fixture READ/miss trace and authority READ counter delta for both pages, with timestamps. Unchanged byte 65, noCache and setCacheState success alone do not prove invalidation", evidence)
+        ranges = " and ".join(f"[{offset}, {offset + PAGE_SIZE})" for offset in PAGE_OFFSETS)
+        checkpoint(f"Retain actual POST-EXPIRY fixture READ/miss trace and authority READ counter delta, with timestamps and ranges correlated to both Mac VM pages {ranges}. Read-ahead may cover both pages in one authority READ; two requests are not required. Unchanged byte 65, noCache and setCacheState success alone do not prove invalidation", evidence)
         checkpoint("Restore renewal and require readCache eligibility", evidence)
         sample(processes, "proof-recovered", evidence)
         checkpoint("Now end writer ownership, retaining its terminal revoke results", evidence)
@@ -279,6 +303,9 @@ def main():
         parser.error("this native battery requires macOS 27")
     args.output.mkdir(parents=True, exist_ok=False)
     with (args.output / "operator.jsonl").open("w") as evidence, (args.output / "kernel-cache.jsonl").open("w") as kernel_log:
+        evidence.write(json.dumps({"time_ns": time.time_ns(), "page_size": PAGE_SIZE,
+                                   "offsets": PAGE_OFFSETS, "fixture_size": FIXTURE_SIZE}) + "\n")
+        evidence.flush()
         log = subprocess.Popen(["/usr/bin/log", "stream", "--style", "ndjson", "--level", "debug", "--predicate",
                                 'subsystem == "dev.portablefs.fskit" AND (category == "KernelCache" OR category == "PortableFSVolume")'], stdout=kernel_log, stderr=kernel_log)
         try:
@@ -291,7 +318,7 @@ def main():
                 alias_dir.mkdir()
                 alias = alias_dir / "alias"
                 with path.open("wb", buffering=0) as file:
-                    file.write(b"A" * 8192)
+                    file.write(b"A" * FIXTURE_SIZE)
                     os.fsync(file.fileno())
                 os.link(path, alias)
                 open_unlinked(directory)
@@ -318,20 +345,7 @@ def main():
                         if "ready" not in json.loads(ready):
                             raise RuntimeError(f"{mode} reader failed to initialize")
                     checkpoint("Require cache grant read_cache=true for the fixture and retain authority cold/warm READ counts; warm fd/mapped pages must actually use readCache", evidence)
-                    sample(processes, "warm", evidence, [65, 65])
-                    with path.open("r+b", buffering=0) as file:
-                        file.write(b"B" * 8192)
-                        os.fsync(file.fileno())
-                    sample(processes, "local-alias-write-expect-66", evidence, [66, 66])
-                    with alias.open("r+b", buffering=0) as file:
-                        file.truncate(4096)
-                        file.truncate(8192)
-                        os.fsync(file.fileno())
-                    sample(processes, "alias-truncate-expect-66-0-size8192", evidence, [66, 0])
-                    with path.open("r+b", buffering=0) as file:
-                        file.write(b"A" * 8192)
-                        os.fsync(file.fileno())
-                    sample(processes, "rewarm-expect-65", evidence, [65, 65])
+                    healthy_probes(path, alias, processes, evidence)
                     loss_procedure(case, path.relative_to(args.mount), processes, evidence)
                     checkpoint("Inspect page-by-page fd/mapped artifacts, independent fstat outcomes, exits/SIGBUS and all withdrawal errors; record residual stale reads honestly", evidence)
                     checkpoint("Review healthy open-unlinked probe: require no revoke caused solely by unlink; compare its timestamps with cache actions", evidence)
