@@ -201,7 +201,7 @@ func (r *rawFileSystem) publicationRemaining(p *replyPublication, coordinate pub
 	if p == nil {
 		return 0
 	}
-	return r.mount.subscription.remaining(coordinate, p.stamp, p.servedVersion, time.Now())
+	return r.mount.subscription.remaining(coordinate, p.stamp, p.servedVersion)
 }
 
 // waitFinalizedCacheCoordinateLocked closes the interval between the kernel

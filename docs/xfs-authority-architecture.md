@@ -206,7 +206,12 @@ handler releases the body.
 ## Subscription and delegation coherence
 
 A volume subscription has a ten-second Authority horizon, renewed every three
-seconds. Subscribe returns an atomic watermark and delegated-identity set.
+seconds. Subscription anchors, receipt/renewal validation, and all Linux cache
+and delegation eligibility checks use suspend-inclusive `CLOCK_BOOTTIME`,
+including checks before CONTROL or timers run after resume. The authority
+uses the same domain for subscription/delegation deadlines and session/lock
+leases. Expiry still requires cold withdrawal; timers only wake workers.
+Subscribe returns an atomic watermark and delegated-identity set.
 Acknowledging a change position certifies complete withdrawal through that
 position in the same incarnation. Grant activation and committed namespace
 responses wait for acknowledgments or the old horizon, without holding a

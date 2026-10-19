@@ -98,8 +98,10 @@ type Config struct {
 	// was admitted on. Raising it above the equal share deliberately
 	// over-commits the table and gives up that guarantee.
 	MaxLockRecordsPerSession uint32
-	Now                      func() time.Time
-	ContinuousNow            func() (time.Duration, error)
+	// Now checks absolute signed authorization and lifecycle timestamps.
+	Now func() time.Time
+	// ContinuousNow governs renewable leases and retained proof horizons.
+	ContinuousNow func() (time.Duration, error)
 	// Lifecycle observers run under the authority/session locks at the exact
 	// state transition. They must be nonblocking and must not call back into the
 	// Authority; production uses atomic gauges only.
@@ -159,6 +161,7 @@ type session struct {
 	access                Access
 	state                 SessionState
 	provisionalDeadline   time.Time
+	provisionalExpires    time.Time
 	leaseExpires          time.Time
 	authorizationDeadline time.Time
 	authorizationSequence uint64
@@ -374,7 +377,7 @@ func New(volumeID string, cfg Config) (*Authority, error) {
 	a := &Authority{
 		volumeID: volumeID, cfg: cfg,
 		sessions: make(map[SessionID]*session), attempts: make(map[AttachAttemptID]*attachAttempt),
-		locks: NewLockTable(cfg.MaxLockRecords, perSession, cfg.Now),
+		locks: NewLockTable(cfg.MaxLockRecords, perSession, func() time.Time { return continuousLeaseTime(cfg.ContinuousNow) }),
 	}
 	if _, err := rand.Read(a.epoch[:]); err != nil {
 		return nil, fmt.Errorf("generate authority epoch: %w", err)
@@ -497,6 +500,7 @@ func (a *Authority) PrepareAttach(
 		return SessionCredential{}, ErrAdmission
 	}
 	admissionDeadline := now.Add(a.cfg.SessionLease)
+	admissionExpires := a.leaseNow().Add(a.cfg.SessionLease)
 	attempt := &attachAttempt{
 		fingerprint: fingerprint, peer: peer, slots: slots,
 		deadline: admissionDeadline, ready: make(chan struct{}),
@@ -514,7 +518,7 @@ func (a *Authority) PrepareAttach(
 		return SessionCredential{}, err
 	}
 	provisionalDeadline := minTime(admissionDeadline, authorization.Deadline)
-	if !a.cfg.Now().Before(provisionalDeadline) {
+	if !a.cfg.Now().Before(provisionalDeadline) || !a.leaseNow().Before(admissionExpires) {
 		err = ErrSessionExpired
 		a.finishPreparedAttach(attemptID, attempt, provisionalDeadline, SessionCredential{}, nil, err)
 		return SessionCredential{}, err
@@ -531,8 +535,8 @@ func (a *Authority) PrepareAttach(
 	}
 	s := &session{
 		id: id, attempt: attemptID, secret: secret, peer: peer, access: authorization.Access,
-		state: SessionStateProvisional, provisionalDeadline: provisionalDeadline,
-		leaseExpires: provisionalDeadline, authorizationDeadline: authorization.Deadline,
+		state: SessionStateProvisional, provisionalDeadline: provisionalDeadline, provisionalExpires: admissionExpires,
+		leaseExpires: admissionExpires, authorizationDeadline: authorization.Deadline,
 		slots: make([]replaySlot, slots), terminal: make(chan struct{}),
 		mountEnrollmentID: authorization.MountEnrollmentID,
 	}
@@ -584,7 +588,7 @@ func (a *Authority) preparedAttachResult(attemptID AttachAttemptID) (SessionCred
 	s := attempt.session
 	s.mu.Lock()
 	cleanup := false
-	if s.state == SessionStateProvisional && s.activation == nil && !now.Before(s.provisionalDeadline) {
+	if s.state == SessionStateProvisional && s.activation == nil && (!now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires)) {
 		s.state = SessionStateAborted
 		cleanup = a.endSessionLocked(s.id, s)
 	}
@@ -641,7 +645,7 @@ func (a *Authority) PrepareActivation(ctx context.Context, cred SessionCredentia
 		switch s.state {
 		case SessionStateActive:
 			now := a.cfg.Now()
-			if !now.Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
+			if !a.leaseNow().Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
 				cleanup := a.endSessionLocked(s.id, s)
 				s.mu.Unlock()
 				a.mu.Unlock()
@@ -684,7 +688,7 @@ func (a *Authority) PrepareActivation(ctx context.Context, cred SessionCredentia
 			}
 		}
 		now := a.cfg.Now()
-		if !now.Before(s.provisionalDeadline) || !now.Before(s.authorizationDeadline) {
+		if !now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires) || !now.Before(s.authorizationDeadline) {
 			s.state = SessionStateAborted
 			cleanup := a.endSessionLocked(s.id, s)
 			s.mu.Unlock()
@@ -723,7 +727,7 @@ func (a *Authority) CommitActivation(token *ActivationToken) {
 	}
 	now := a.cfg.Now()
 	s.state = SessionStateActive
-	s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), s.authorizationDeadline)
+	s.leaseExpires = a.leaseNow().Add(min(a.cfg.SessionLease, s.authorizationDeadline.Sub(now)))
 	s.lockLease = a.locks.RegisterSession(s.id, s.leaseExpires)
 	if a.cfg.OnSessionActive != nil {
 		a.cfg.OnSessionActive(s.id)
@@ -948,7 +952,7 @@ func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authori
 	}
 	s := &session{
 		id: id, secret: secret, peer: peer, access: authorization.Access, state: SessionStateActive,
-		leaseExpires:          minTime(now.Add(a.cfg.SessionLease), authorization.Deadline),
+		leaseExpires:          a.leaseNow().Add(min(a.cfg.SessionLease, authorization.Deadline.Sub(now))),
 		authorizationDeadline: authorization.Deadline,
 		slots:                 make([]replaySlot, slots),
 		terminal:              make(chan struct{}),
@@ -1071,7 +1075,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 	}
 	now := a.cfg.Now()
 	if s.state == SessionStateProvisional {
-		if s.activation == nil && (!now.Before(s.provisionalDeadline) || !now.Before(s.authorizationDeadline)) {
+		if s.activation == nil && (!now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires) || !now.Before(s.authorizationDeadline)) {
 			s.state = SessionStateAborted
 			cleanup := a.endSessionLocked(cred.ID, s)
 			s.mu.Unlock()
@@ -1094,7 +1098,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		}
 		return nil, ErrSessionFenced
 	}
-	if !now.Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
+	if !a.leaseNow().Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
 		s.fenced = true
 		cleanup := a.endSessionLocked(cred.ID, s)
 		s.mu.Unlock()
@@ -1105,7 +1109,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		return nil, ErrSessionExpired
 	}
 	if renew {
-		s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), s.authorizationDeadline)
+		s.leaseExpires = a.leaseNow().Add(min(a.cfg.SessionLease, s.authorizationDeadline.Sub(now)))
 		if s.lockLease == nil {
 			s.mu.Unlock()
 			a.mu.Unlock()
@@ -1282,7 +1286,7 @@ func (a *Authority) Reauthorize(cred SessionCredential, authorization Authorizat
 	s.authorizationDeadline = authorization.Deadline
 	s.authorizationSequence = sequence
 	s.authorizationProof = proof
-	s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), authorization.Deadline)
+	s.leaseExpires = a.leaseNow().Add(min(a.cfg.SessionLease, authorization.Deadline.Sub(now)))
 	s.lockLease.Renew(s.leaseExpires)
 	s.mu.Unlock()
 	a.mu.Unlock()
@@ -1426,13 +1430,13 @@ func (a *Authority) Sweep() int {
 			// A concurrent fence is remembered by endSessionLocked and applied by
 			// whichever resolution owns the token.
 			expired := s.activation == nil &&
-				(!now.Before(s.provisionalDeadline) || !now.Before(s.authorizationDeadline))
+				(!now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires) || !now.Before(s.authorizationDeadline))
 			dead = dead || expired
 			if expired && !s.fenced && !s.ending {
 				s.state = SessionStateAborted
 			}
 		} else if s.state == SessionStateActive {
-			dead = dead || !now.Before(s.leaseExpires) || !now.Before(s.authorizationDeadline)
+			dead = dead || !a.leaseNow().Before(s.leaseExpires) || !now.Before(s.authorizationDeadline)
 		} else {
 			dead = true
 		}
@@ -1457,4 +1461,16 @@ func (a *Authority) Sweep() int {
 		hook()
 	}
 	return removed
+}
+
+// Signed authorization is checked against wall time separately. A renewable
+// session and its lock rights expire in the same continuous domain as coherence.
+func (a *Authority) leaseNow() time.Time { return continuousLeaseTime(a.cfg.ContinuousNow) }
+
+func continuousLeaseTime(read func() (time.Duration, error)) time.Time {
+	now, err := read()
+	if err != nil {
+		panic(err)
+	}
+	return time.Unix(0, int64(now))
 }

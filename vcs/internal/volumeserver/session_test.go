@@ -19,7 +19,7 @@ func testAuthority(t *testing.T) (*Authority, *time.Time) {
 	t.Helper()
 	now := time.Unix(1_000, 0)
 	a, err := New("volume-a", Config{
-		ContinuousNow: testContinuousNow,
+		ContinuousNow: func() (time.Duration, error) { return time.Duration(now.UnixNano()), nil },
 		SessionLease:  time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
 		Now: func() time.Time { return now },
 	})
@@ -37,7 +37,7 @@ func TestSessionLifecycleObserversTrackExactActiveBoundary(t *testing.T) {
 	var active, terminal atomic.Int64
 	now := time.Unix(1_000, 0)
 	authority, err := New("observed", Config{
-		ContinuousNow: testContinuousNow,
+		ContinuousNow: func() (time.Duration, error) { return time.Duration(now.UnixNano()), nil },
 		SessionLease:  time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
 		Now:               func() time.Time { return now },
 		OnSessionActive:   func(SessionID) { active.Add(1) },
@@ -226,7 +226,7 @@ func TestPrepareAttachConcurrentDuplicateAuthorizesExactlyOnce(t *testing.T) {
 func TestPrepareAttachReservesAdmissionBeforeAuthorization(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	a, err := New("bounded-prepare", Config{
-		ContinuousNow: testContinuousNow,
+		ContinuousNow: func() (time.Duration, error) { return time.Duration(now.UnixNano()), nil },
 		SessionLease:  time.Minute, MaxReplaySlots: 2, MaxSessions: 1, MaxLockRecords: 8,
 		Now: func() time.Time { return now },
 	})
@@ -262,7 +262,7 @@ func TestPrepareAttachReservesAdmissionBeforeAuthorization(t *testing.T) {
 func TestPrepareAttachPublishesAuthorizationDeadlineDuringConcurrentSweep(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	a, err := New("atomic-prepare-publication", Config{
-		ContinuousNow: testContinuousNow,
+		ContinuousNow: func() (time.Duration, error) { return time.Duration(now.UnixNano()), nil },
 		SessionLease:  time.Minute, MaxReplaySlots: 2, MaxSessions: 8, MaxLockRecords: 64,
 		Now: func() time.Time { return now },
 	})

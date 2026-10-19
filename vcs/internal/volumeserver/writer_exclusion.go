@@ -2,6 +2,7 @@ package volumeserver
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -35,7 +36,7 @@ func (e *WriterExclusion) grant(remaining time.Duration) error {
 		return ErrSessionFenced
 	}
 	now, err := e.now()
-	if e.clockFailed || err != nil || now < e.last || now < 0 || remaining < 0 || remaining > time.Duration(math.MaxInt64)-now {
+	if e.clockFailed || err != nil || now < e.last || now < 0 || now > time.Duration(math.MaxInt64)-MaxCacheProof || remaining < 0 || remaining > time.Duration(math.MaxInt64)-now {
 		e.clockFailed = true
 		return errors.New("volumeserver: invalid continuous exclusion clock")
 	}
@@ -111,9 +112,13 @@ func (a *Authority) WriterExclusion(id SessionID) (*WriterExclusion, error) {
 	return s.exclusion, nil
 }
 
-func (a *Authority) leaseRemainingLocked(s *session) time.Duration {
+func (a *Authority) leaseRemainingLocked(s *session) (time.Duration, error) {
 	now := a.cfg.Now()
-	return max(0, min(s.leaseExpires.Sub(now), s.authorizationDeadline.Sub(now), a.cfg.SessionLease))
+	elapsed, err := a.cfg.ContinuousNow()
+	if err != nil {
+		return 0, fmt.Errorf("sample continuous lease clock: %w", err)
+	}
+	return max(0, min(s.leaseExpires.Sub(time.Unix(0, int64(elapsed))), s.authorizationDeadline.Sub(now), a.cfg.SessionLease)), nil
 }
 
 // RenewalProof samples after renewal under session admission. Only KeepAlive
@@ -125,13 +130,20 @@ func (u *SessionUse) RenewalProof() (time.Duration, error) {
 	if s.fenced || s.ending || s.state != SessionStateActive || s.exclusion == nil {
 		return 0, ErrSessionFenced
 	}
-	remaining := min(u.authority.leaseRemainingLocked(s), u.authority.cfg.SessionLease/time.Millisecond*time.Millisecond, MaxCacheProof)
-	remaining = remaining / time.Millisecond * time.Millisecond
-	if remaining <= 0 {
-		return 0, ErrSessionExpired
+	remaining, err := u.authority.leaseRemainingLocked(s)
+	if err != nil {
+		s.exclusion.mu.Lock()
+		s.exclusion.clockFailed = true
+		s.exclusion.mu.Unlock()
+		return 0, err
 	}
+	remaining = min(remaining, u.authority.cfg.SessionLease/time.Millisecond*time.Millisecond, MaxCacheProof)
+	remaining = remaining / time.Millisecond * time.Millisecond
 	if err := s.exclusion.grant(remaining); err != nil {
 		return 0, err
+	}
+	if remaining <= 0 {
+		return 0, ErrSessionExpired
 	}
 	return remaining, nil
 }

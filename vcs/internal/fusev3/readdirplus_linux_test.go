@@ -326,7 +326,7 @@ func TestReadDirPlusWithdrawalStopsTheCurrentReplyPage(t *testing.T) {
 			subscription.mu.Lock()
 			cacheUntil := subscription.cacheUntil
 			if expiry {
-				subscription.cacheUntil = time.Now().Add(-time.Second)
+				subscription.cacheUntil = subscription.config.clock.Now().Add(-time.Second)
 			}
 			subscription.mu.Unlock()
 			if !expiry {

@@ -559,6 +559,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		mount.cleanupFailed("deferred close", err, nil)
 	})
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
+	mount.delegations.subscription = mount.subscription
 	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	return mount
 }
@@ -1978,7 +1979,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 		h.eof = false
 		h.cursorGeneration++
 	}
-	if h.pageWithdrawn || h.pageStamp.incarnation != 0 && h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: h.enumerationIdentity()}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0 {
+	if h.pageWithdrawn || h.pageStamp.incarnation != 0 && h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: h.enumerationIdentity()}, h.pageStamp, h.pageStamp.version) <= 0 {
 		h.discardPageItemsLocked()
 		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 		h.pageStamp = subscriptionStamp{}
@@ -2098,7 +2099,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 					return nil, nil, syscall.EIO
 				}
 			}
-			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: directoryIdentity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
+			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: directoryIdentity}, h.pageStamp, h.pageStamp.version) <= 0
 			h.pageWantItems = wantItems
 			if len(h.page) == 0 && !h.eof {
 				return nil, nil, syscall.EIO

@@ -1,6 +1,7 @@
 package volumeserver
 
 import (
+	"context"
 	"errors"
 	"math"
 	"sync/atomic"
@@ -243,5 +244,48 @@ func TestWriterUnprovenTimeExclusionEndsOnlyAfterApplyDrain(t *testing.T) {
 	apply.End()
 	if err := c.CheckWriter(SessionID{2}); err != nil {
 		t.Fatalf("unproven-time writer retained an ungranted time promise: %v", err)
+	}
+}
+
+func TestSessionAndLockLeaseExpireAcrossSuspend(t *testing.T) {
+	for _, operation := range []string{"request", "renew", "lock", "sweep", "provisional"} {
+		t.Run(operation, func(t *testing.T) {
+			a, cred, _, _, clock := writerSession(t, time.Minute, time.Hour)
+			if operation == "provisional" {
+				var err error
+				cred, err = a.PrepareAttach(t.Context(), AttachAttemptID{1}, AttachRequestFingerprint{1}, 1, PeerIdentity{1}, func(context.Context) (Authorization, error) {
+					return Authorization{Access: AccessRead, Deadline: clock.now().Add(time.Hour)}, nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			clock.elapsed.Add(int64(2 * time.Minute)) // wall/active-time seam stays frozen
+			switch operation {
+			case "request":
+				if use, err := a.Begin(cred); !errors.Is(err, ErrSessionExpired) {
+					if use != nil {
+						use.End()
+					}
+					t.Fatalf("request after suspend: %v", err)
+				}
+			case "renew":
+				if err := a.Resume(cred); !errors.Is(err, ErrSessionExpired) {
+					t.Fatalf("renew after suspend: %v", err)
+				}
+			case "lock":
+				if err := a.Locks().Set(writeLock(ObjectKey{1}, LockOwner{Session: cred.ID}, ToEOF(0))); !errors.Is(err, ErrSessionExpired) {
+					t.Fatalf("lock after suspend: %v", err)
+				}
+			case "sweep":
+				if a.Sweep() != 1 {
+					t.Fatal("sweep retained suspended session")
+				}
+			case "provisional":
+				if _, err := a.PrepareActivation(t.Context(), cred, AttachAttemptID{1}); !errors.Is(err, ErrSessionExpired) {
+					t.Fatalf("activation after suspend: %v", err)
+				}
+			}
+		})
 	}
 }

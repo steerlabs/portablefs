@@ -203,8 +203,13 @@ type replyDataPublication struct {
 // RawFileSystem method returns. They settle after their physical /dev/fuse
 // write, which is the stock-kernel publication edge available to userspace.
 type replyPublication struct {
-	cachedNext             *replyPublication
-	cachedArena            bool
+	cachedNext  *replyPublication
+	cachedArena bool
+	// A slow cache hit must stay tracked even without cache reservations.
+	cachedAnswer bool
+	// Callback refusal still has a successful physical write lifecycle.
+	cacheRejected          bool
+	cachedLookup           *inodeRecord
 	holderAdmission        *delegationState
 	holderAdmissions       []*delegationState
 	metadataSample         uint64
@@ -261,7 +266,7 @@ type replyPublication struct {
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 && p.cachedCount == 0 && p.holderAdmission == nil &&
-		p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
+		!p.cachedAnswer && p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
@@ -1683,6 +1688,16 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
+	if publication.cachedArena || publication.cachedAnswer {
+		live := r.mount.subscription.stamp()
+		if live.incarnation == 0 || live.incarnation != publication.stamp.incarnation {
+			publication.cacheRejected = true
+			r.mu.Unlock()
+			// Permission loss refuses this answer; the lifecycle and mount remain
+			// usable so the ordinary cold-withdrawal path can complete.
+			return 0, fuse.EIO, fuse.OK
+		}
+	}
 	if publication.cachedArena {
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
@@ -1856,7 +1871,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		// Calling the raw notifier avoids draining our own still-indexed reply.
 		for _, candidate := range pending {
 			ctx, cancel := context.WithTimeout(r.mount.ctx, r.mount.withdrawalTimeout)
-			err := r.mount.subscription.retry(ctx, time.Now().Add(r.mount.withdrawalTimeout), func() error {
+			err := r.mount.subscription.retry(ctx, r.mount.subscription.config.clock.Now().Add(r.mount.withdrawalTimeout), func() error {
 				notify := r.mount.notifier()
 				if notify == nil {
 					return errors.New("fusev3: unlicensed read has no notifier")
@@ -1884,11 +1899,15 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		r.releaseReplyCapacityLocked(publication)
 	}
 	r.signalSourceChangedLocked()
-	dirPlusCompletion := r.settleDirPlusLookupTransactionLocked(publication, status.Ok())
+	successful := status.Ok() && !publication.cacheRejected
+	dirPlusCompletion := r.settleDirPlusLookupTransactionLocked(publication, successful)
 	delete(r.replyPublications, unique)
-	responseConsumption := r.settleReplyPublicationLocked(publication, status.Ok())
+	responseConsumption := r.settleReplyPublicationLocked(publication, successful)
 	r.mu.Unlock()
 	r.finishDirPlusLookupCompletion(dirPlusCompletion)
+	if publication.cacheRejected && publication.cachedLookup != nil {
+		r.Forget(publication.cachedLookup.id, 1)
+	}
 	if publication.source != nil {
 		if status.Ok() {
 			publication.source.release()
@@ -2344,12 +2363,13 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 		if negative {
 			stamp = r.cachedNegativeStamps[key]
 		}
-		if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.withdrawingCoordinates[coordinate] {
+		if r.mount.subscription.remaining(coordinate, stamp, stamp.version) <= 0 || r.withdrawingCoordinates[coordinate] {
 			r.mu.Unlock()
 			return nil, nil, false
 		}
 		if negative {
 			p.servedVersion = stamp.version
+			p.cachedAnswer = true
 			r.mu.Unlock()
 			return nil, nil, true
 		}
@@ -2375,18 +2395,20 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 				return false
 			}
 			if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
-				r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.withdrawingCoordinates[coordinate] {
+				r.mount.subscription.remaining(coordinate, stamp, stamp.version) <= 0 || r.withdrawingCoordinates[coordinate] {
 				return false
 			}
 			payload := r.cachedAttrPayloads[record.identity]
 			if payload.attr == nil || r.cachedAttrs[record.identity] != record || r.withdrawingCoordinates[attrCoord] ||
-				r.mount.subscription.remainingAfterOwnershipCheck(attrCoord, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
+				r.mount.subscription.remainingAfterOwnershipCheck(attrCoord, payload.stamp, payload.stamp.version) <= 0 {
 				return false
 			}
 			record.lookups++
 			r.identityIndexLocked(record)[record.key] = record
 			attr = proto.Clone(payload.attr).(*authoritypb.Attr)
 			p.servedVersion = min(stamp.version, payload.stamp.version)
+			p.cachedAnswer = true
+			p.cachedLookup = record
 			p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
 			return true
 		})
@@ -2510,11 +2532,12 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 			}
 			payload := r.cachedAttrPayloads[record.identity]
 			if record.stale.Load() || record.reclaimed || payload.attr == nil || r.cachedAttrs[record.identity] != record || r.withdrawingCoordinates[coordinate] ||
-				r.mount.subscription.remainingAfterOwnershipCheck(coordinate, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
+				r.mount.subscription.remainingAfterOwnershipCheck(coordinate, payload.stamp, payload.stamp.version) <= 0 {
 				return false
 			}
 			attr = proto.Clone(payload.attr).(*authoritypb.Attr)
 			p.servedVersion = payload.stamp.version
+			p.cachedAnswer = true
 			p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
 			return true
 		})

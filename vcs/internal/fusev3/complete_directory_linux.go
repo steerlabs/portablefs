@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"sort"
-	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
@@ -50,7 +49,7 @@ func (r *rawFileSystem) heldDirectoryPageIdentities(directory publicationIdentit
 	identities := append([]publicationIdentity(nil), hint.identities...)
 	r.mu.RUnlock()
 	if !ok || r.mount.subscription.remaining(
-		publicationCoordinate{kind: publicationItemEnumeration, item: directory}, hint.stamp, hint.stamp.version, time.Now(),
+		publicationCoordinate{kind: publicationItemEnumeration, item: directory}, hint.stamp, hint.stamp.version,
 	) <= 0 {
 		return nil
 	}
@@ -118,7 +117,7 @@ func (r *rawFileSystem) stageCompleteDirectoryAddition(ctx context.Context, pare
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: parent.identity}
-	if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid && r.mount.subscription.remaining(coordinate, proof.stamp, p.servedVersion, time.Now()) > 0 && !r.withdrawingCoordinates[coordinate] {
+	if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid && r.mount.subscription.remaining(coordinate, proof.stamp, p.servedVersion) > 0 && !r.withdrawingCoordinates[coordinate] {
 		if reservation, ok := r.reserveCacheCandidateLocked(p, coordinate); ok {
 			p.completeDirectories[p.completeDirectoryCount] = completeDirectoryPublication{identity: parent.identity, prior: proof, member: nameKey{parent: parent.key.inode, name: name}, child: child.identity, reservation: reservation}
 			p.completeDirectoryCount++
@@ -144,7 +143,7 @@ func (r *rawFileSystem) settleCompleteDirectoriesLocked(p *replyPublication, suc
 		// version; its prior generation still excludes every intervening peer cut.
 		if candidate.prior != nil {
 			member := r.cachedNames[candidate.member]
-			valid = valid && candidate.prior.valid && r.completeDirectories[candidate.identity] == candidate.prior && member != nil && member.identity == candidate.child && r.mount.subscription.remaining(coordinate, candidate.prior.stamp, p.servedVersion, time.Now()) > 0
+			valid = valid && candidate.prior.valid && r.completeDirectories[candidate.identity] == candidate.prior && member != nil && member.identity == candidate.child && r.mount.subscription.remaining(coordinate, candidate.prior.stamp, p.servedVersion) > 0
 		} else {
 			valid = valid && r.cachedNameTotalLocked() < r.nameCapacity
 		}

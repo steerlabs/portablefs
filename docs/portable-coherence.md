@@ -13,7 +13,15 @@ Each Linux mount subscribes with a 10-second Authority horizon, renewed every
 three seconds. Subscribe returns an atomic volume-version watermark and the
 currently delegated identities. Cache publication checks the subscription
 incarnation and served version, so a delayed reply cannot reinstall state older
-than a completed withdrawal.
+than a completed withdrawal. Subscription request anchors, receipt and renewal
+validation, and every cache or delegation admission use Linux `CLOCK_BOOTTIME`,
+which advances across suspend. The authority uses that same local clock domain
+for subscription and delegation deadlines and renewable session/lock leases.
+Client horizons are anchored before request queueing; pagination retains the
+original anchor. Each admission checks the continuous horizon at the moment of
+use, even before CONTROL delivery or an active-time timer runs after resume.
+An expired horizon closes admission and requires cold cache withdrawal before
+resubscription; a late renewal cannot revive it. Timers only wake workers.
 
 Namespace operations execute synchronously at the Authority. Its sequencer
 orders conflicting identities and `(parent, name)` bindings; disjoint mutations
@@ -120,9 +128,10 @@ ordinals and share a window of four in-flight flushes on a dedicated DATA lane,
 which requires `max_in_flight >= 9` on both Linux connections. There is no
 serial or capacity-negotiated alternative.
 
-The buffer is bounded at 64 MiB retained write payload and 10,000 entries. It flushes on its
-one-second timer, cap pressure, file fsync, root-directory barrier, recall,
-unmount, and before a namespace operation naming the file. Admission blocks at
+The buffer is bounded at 64 MiB retained write payload and 10,000 entries.
+Background flush is event-driven by producer and completion progress. It also
+flushes on cap pressure, file fsync, root-directory barrier, recall, unmount,
+and before a namespace operation naming the file. Admission blocks at
 the cap. Accepted entries remain retained through application and visibility
 until the Authority confirms durability with a contiguous session ticket prefix.
 `O_SYNC` and `O_DSYNC` wait for that durability before returning.

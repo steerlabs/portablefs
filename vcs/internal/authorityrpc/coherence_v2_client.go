@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -40,7 +41,7 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 	if len(snapshotID) != 0 && (!validCoherenceIdentity(snapshotID) || !validCoherenceIdentity(afterIdentity)) {
 		return nil, time.Time{}, syscall.EINVAL
 	}
-	started := time.Now()
+	started := c.subscriptionTime()
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_Subscribe{
 		Subscribe: &authoritypb.SubscribeRequest{
 			SnapshotId:    append([]byte(nil), snapshotID...),
@@ -77,6 +78,9 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 		deadline = c.subscriptionDeadline
 	}
 	c.subscriptionMu.Unlock()
+	if !c.subscriptionTime().Before(deadline) {
+		return nil, time.Time{}, ErrSubscriptionReset
+	}
 	return proto.Clone(reply).(*authoritypb.SubscribeReply), deadline, nil
 }
 
@@ -97,7 +101,7 @@ func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (res
 	if incarnation == 0 {
 		return time.Time{}, syscall.EINVAL
 	}
-	started := time.Now()
+	started := c.subscriptionTime()
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{
 		RenewSubscription: &authoritypb.RenewSubscriptionRequest{Incarnation: incarnation},
 	}})
@@ -111,7 +115,11 @@ func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (res
 	if reply == nil || reply.GetIncarnation() != incarnation || !validHorizon(reply.GetHorizonNanos()) {
 		return time.Time{}, errors.New("authorityrpc: subscription renewal returned a malformed result")
 	}
-	return started.Add(time.Duration(reply.GetHorizonNanos())), nil
+	deadline := started.Add(time.Duration(reply.GetHorizonNanos()))
+	if !c.subscriptionTime().Before(deadline) {
+		return time.Time{}, ErrSubscriptionReset
+	}
+	return deadline, nil
 }
 
 // NextControlEvent long-polls for exactly the successor of afterSequence.
@@ -515,4 +523,14 @@ func cloneDelegationRef(ref *authoritypb.DelegationRef) *authoritypb.DelegationR
 		return nil
 	}
 	return &authoritypb.DelegationRef{Id: append([]byte(nil), ref.GetId()...), Generation: ref.GetGeneration()}
+}
+
+// subscriptionTime is shared with the Linux cache and authority permission
+// clocks. The per-client seam lets tests suspend elapsed time without firing
+// Go's active-time timers or delivering CONTROL.
+func (c *Client) subscriptionTime() time.Time {
+	if c.subscriptionNow != nil {
+		return c.subscriptionNow()
+	}
+	return continuous.Time()
 }

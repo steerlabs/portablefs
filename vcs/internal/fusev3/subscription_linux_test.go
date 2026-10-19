@@ -17,6 +17,15 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
+// testActiveSubscriptionClock binds deterministic active-time timer tests to
+// synctest's clock. Production always uses the suspend-inclusive host clock.
+type testActiveSubscriptionClock struct{}
+
+func (testActiveSubscriptionClock) Now() time.Time { return time.Now() }
+func (testActiveSubscriptionClock) NewTimer(d time.Duration) subscriptionTimer {
+	return wallSubscriptionTimer{timer: time.NewTimer(d)}
+}
+
 type subscriptionTestClock struct {
 	mu     sync.Mutex
 	now    time.Time
@@ -296,13 +305,13 @@ func TestSubscriptionColdPaginationWatermarkAndStaleReply(t *testing.T) {
 	identity := subscriptionIdentity(1)
 	attr := publicationCoordinate{kind: publicationItemAttributes, item: identity}
 	name := publicationCoordinate{kind: publicationNamespaceName, parent: identity, name: "file"}
-	if got := registry.remaining(attr, stamp, 10, clock.Now()); got != 0 {
+	if got := registry.remaining(attr, stamp, 10); got != 0 {
 		t.Fatalf("delegated attribute remained cacheable for %s", got)
 	}
-	if got := registry.remaining(name, stamp, 9, clock.Now()); got != 0 {
+	if got := registry.remaining(name, stamp, 9); got != 0 {
 		t.Fatalf("pre-watermark name remained cacheable for %s", got)
 	}
-	if got := registry.remaining(name, stamp, 10, clock.Now()); got <= 0 {
+	if got := registry.remaining(name, stamp, 10); got <= 0 {
 		t.Fatalf("watermark name was not cacheable: %s", got)
 	}
 
@@ -311,19 +320,19 @@ func TestSubscriptionColdPaginationWatermarkAndStaleReply(t *testing.T) {
 	if err := registry.registerChangeBatch(7, batch); err != nil {
 		t.Fatalf("register change: %v", err)
 	}
-	if got := registry.remaining(name, stamp, 11, clock.Now()); got != 0 {
+	if got := registry.remaining(name, stamp, 11); got != 0 {
 		t.Fatalf("pre-withdrawal stamp remained cacheable for %s", got)
 	}
 	fresh := registry.stamp()
-	if got := registry.remaining(name, fresh, 10, clock.Now()); got != 0 {
+	if got := registry.remaining(name, fresh, 10); got != 0 {
 		t.Fatalf("reply older than coordinate version remained cacheable for %s", got)
 	}
-	if got := registry.remaining(name, fresh, 11, clock.Now()); got <= 0 {
+	if got := registry.remaining(name, fresh, 11); got <= 0 {
 		t.Fatalf("fresh reply at change version was not cacheable: %s", got)
 	}
 
 	clock.advance(9 * time.Second)
-	if got := registry.remaining(name, fresh, 11, clock.Now()); got != 0 {
+	if got := registry.remaining(name, fresh, 11); got != 0 {
 		t.Fatalf("cache survived conservative horizon for %s", got)
 	}
 }
@@ -385,7 +394,7 @@ func TestSubscriptionFailedNotifyMarksIdentityStaleWithoutAck(t *testing.T) {
 	rpc := &subscriptionTestRPC{horizon: clock.Now().Add(time.Second)}
 	invalidator := &subscriptionTestInvalidator{fail: errors.New("notify busy")}
 	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: 5 * time.Millisecond,
+		clock: testActiveSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: 5 * time.Millisecond,
 		maxPages: 2, invalidator: invalidator,
 	})
 	registry.mu.Lock()
@@ -513,7 +522,7 @@ func TestSubscriptionHorizonInvalidatesAllCaches(t *testing.T) {
 		invalidator := &subscriptionTestInvalidator{}
 		control := &subscriptionTestControl{}
 		registry := newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
-			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: time.Millisecond,
+			clock: testActiveSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: time.Millisecond,
 			maxPages: 2, invalidator: invalidator,
 		})
 		registry.mu.Lock()
@@ -726,12 +735,11 @@ func BenchmarkSubscriptionCachePermission(b *testing.B) {
 	registry.mu.Unlock()
 	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: subscriptionIdentity(31), name: "benchmark"}
 	stamp := registry.stamp().withVersion(1)
-	now := clock.Now()
 	b.ReportAllocs()
 	b.ResetTimer()
 	var remaining time.Duration
 	for range b.N {
-		remaining = registry.remaining(coordinate, stamp, stamp.version, now)
+		remaining = registry.remaining(coordinate, stamp, stamp.version)
 	}
 	benchmarkSubscriptionDuration = remaining
 }
@@ -768,13 +776,13 @@ func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
 	coordinate := publicationCoordinate{kind: publicationItemAttributes}
 	copy(coordinate.item[:], identity)
 	stamp := mount.subscription.stamp()
-	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got <= 0 {
+	if got := mount.subscription.remaining(coordinate, stamp, 1); got <= 0 {
 		t.Fatalf("initial permission=%v", got)
 	}
 	if err := mount.delegations.Install(identity, []byte{24, 1}, []byte{24, 2}, delegationTestGrant(56, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
 		t.Fatal(err)
 	}
-	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got != 0 {
+	if got := mount.subscription.remaining(coordinate, stamp, 1); got != 0 {
 		t.Fatalf("locally owned identity retains cache permission=%v", got)
 	}
 
@@ -789,7 +797,7 @@ func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
 	state.admission.Lock()
 	state.clearGrantLocked()
 	state.admission.Unlock()
-	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got <= 0 {
+	if got := mount.subscription.remaining(coordinate, stamp, 1); got <= 0 {
 		t.Fatalf("released local grant retains cache exclusion=%v", got)
 	}
 }

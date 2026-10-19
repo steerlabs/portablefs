@@ -4,7 +4,6 @@ package fusev3
 
 import (
 	"math"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
@@ -43,9 +42,9 @@ func (p *replyPublication) closeOriginalDoneLocked() {
 	}
 }
 
-func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoordinate, stamp subscriptionStamp, now time.Time) bool {
+func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoordinate, stamp subscriptionStamp) bool {
 	return len(r.cacheReservations[coordinate]) == 0 && !r.withdrawingCoordinates[coordinate] && r.sourcePublicationAllowedLocked(coordinate, nil) &&
-		r.mount.subscription.remainingAfterOwnershipCheck(coordinate, stamp, stamp.version, now) > 0
+		r.mount.subscription.remainingAfterOwnershipCheck(coordinate, stamp, stamp.version) > 0
 }
 
 // The cache check and registration share the withdrawal lock. These answers
@@ -56,10 +55,15 @@ func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second p
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil || r.mount.revoked.Load() || r.cachedReplyFree == nil {
 		return false
 	}
+	stamp := r.mount.subscription.stamp()
+	if stamp.incarnation == 0 {
+		return false
+	}
 	p := r.cachedReplyFree
 	r.cachedReplyFree = p.cachedNext
 	p.cachedNext = nil
 	p.owner, p.requestUnique, p.originalFinalized, p.cachedArena = r, unique, true, true
+	p.stamp = stamp
 	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
 	r.replyPublications[unique] = p
 	return true
@@ -87,12 +91,11 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	if parent.stale.Load() || r.cachedNames[key] != record {
 		return false
 	}
-	now := time.Now()
 	nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: name}
 	if record == nil {
 		if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid {
 			enumeration := publicationCoordinate{kind: publicationItemEnumeration, item: parent.identity}
-			if r.cachedCoordinateAllowedLocked(nameCoordinate, proof.stamp, now) && r.cachedCoordinateAllowedLocked(enumeration, proof.stamp, now) && r.registerCachedReplyLocked(unique, nameCoordinate, enumeration, 2) {
+			if r.cachedCoordinateAllowedLocked(nameCoordinate, proof.stamp) && r.cachedCoordinateAllowedLocked(enumeration, proof.stamp) && r.registerCachedReplyLocked(unique, nameCoordinate, enumeration, 2) {
 				*out = fuse.EntryOut{}
 				return true
 			}
@@ -106,7 +109,7 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	} else {
 		nameCoordinate.name = r.cachedNameStable[key].name
 	}
-	if !r.cachedCoordinateAllowedLocked(nameCoordinate, stamp, now) {
+	if !r.cachedCoordinateAllowedLocked(nameCoordinate, stamp) {
 		return false
 	}
 	if negative {
@@ -121,13 +124,14 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	}
 	attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
 	payload := r.cachedAttrPayloads[record.identity]
-	if payload.attr == nil || r.cachedAttrs[record.identity] != record || !r.cachedCoordinateAllowedLocked(attrCoordinate, payload.stamp, now) {
+	if payload.attr == nil || r.cachedAttrs[record.identity] != record || !r.cachedCoordinateAllowedLocked(attrCoordinate, payload.stamp) {
 		return false
 	}
 	if !r.registerCachedReplyLocked(unique, nameCoordinate, attrCoordinate, 2) {
 		return false
 	}
 	record.lookups++
+	r.replyPublications[unique].cachedLookup = record
 	r.identityIndexLocked(record)[record.key] = record
 	*out = fuse.EntryOut{NodeId: record.id, Generation: 1, Attr: payload.fuseAttr}
 	return true
@@ -151,7 +155,7 @@ func (r *rawFileSystem) attrCachedReply(unique uint64, record *inodeRecord, out 
 	}
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
 	payload := r.cachedAttrPayloads[record.identity]
-	if payload.attr == nil || r.cachedAttrs[record.identity] != record || !r.cachedCoordinateAllowedLocked(coordinate, payload.stamp, time.Now()) {
+	if payload.attr == nil || r.cachedAttrs[record.identity] != record || !r.cachedCoordinateAllowedLocked(coordinate, payload.stamp) {
 		return false
 	}
 	if !r.registerCachedReplyLocked(unique, coordinate, publicationCoordinate{}, 1) {

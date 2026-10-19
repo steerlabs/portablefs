@@ -2209,7 +2209,8 @@ func TestCancelAcknowledgmentDoesNotRenewTheLease(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	runtime, err := volumeserver.New("cancel-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 2, MaxLockRecords: 8,
-		Now: func() time.Time { return now },
+		Now:           func() time.Time { return now },
+		ContinuousNow: func() (time.Duration, error) { return time.Duration(now.UnixNano()), nil },
 	})
 	if err != nil {
 		t.Fatal(err)

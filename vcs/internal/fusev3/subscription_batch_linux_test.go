@@ -277,7 +277,7 @@ func TestSubscriptionBatchAcknowledgesOnlyAfterAllWithdrawals(t *testing.T) {
 func TestSubscriptionBatchFailureLeavesEveryCoordinateClosedAndUnacknowledged(t *testing.T) {
 	rpc := &subscriptionTestRPC{horizon: time.Now().Add(time.Second)}
 	invalidator := &subscriptionTestInvalidator{fail: context.DeadlineExceeded}
-	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: 5 * time.Millisecond, maxPages: 2, invalidator: invalidator})
+	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{clock: testActiveSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: 5 * time.Millisecond, maxPages: 2, invalidator: invalidator})
 	registry.active, registry.incarnation = true, 9
 	registry.horizon, registry.cacheUntil = rpc.horizon, rpc.horizon
 	batch := &authoritypb.ChangeBatch{Incarnation: 9}

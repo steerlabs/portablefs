@@ -46,7 +46,7 @@ func TestSubscriptionRetriesRequireActualControlProgress(t *testing.T) {
 		t.Run(owner, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				rpc := &progressSubscriptionRPC{subscriptionTestRPC: &subscriptionTestRPC{horizon: time.Now().Add(10 * time.Second), pages: []*authoritypb.SubscribeReply{{Watermark: 1, Incarnation: 9, HorizonNanos: uint64(10 * time.Second), SnapshotId: []byte("snapshot")}}}}
-				s := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{invalidator: &subscriptionTestInvalidator{}})
+				s := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{clock: testActiveSubscriptionClock{}, invalidator: &subscriptionTestInvalidator{}})
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				done := make(chan error, 1)

@@ -43,3 +43,6 @@ github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCoherenceTruncatin
 # measurement against the second provisioned project on the same XFS cell.
 # It is a measurement, not an acceptance threshold.
 performance github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSharedXFSBarrierLatency
+# Subscription receipt checks retain the original continuous request anchor.
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSubscriptionReplyAfterSuspendIsRejected
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSubscriptionProofUsesContinuousRequestAnchor

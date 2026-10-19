@@ -290,22 +290,7 @@ func TestV3DataPlaneRefusesAnUnusableClockOrLease(t *testing.T) {
 	}
 }
 
-func TestV3TimespecConversionIsChecked(t *testing.T) {
-	for _, test := range []struct {
-		sec, nsec int64
-		want      uint64
-		valid     bool
-	}{
-		{0, 0, 0, true}, {3, 125, 3_000_000_125, true},
-		{18_446_744_073, 709_551_615, math.MaxUint64, true},
-		{-1, 0, 0, false}, {0, -1, 0, false}, {0, 1_000_000_000, 0, false},
-		{18_446_744_073, 709_551_616, 0, false}, {math.MaxInt64, 0, 0, false},
-	} {
-		got, err := v3TimespecNanos(test.sec, test.nsec)
-		if (err == nil) != test.valid || test.valid && got != test.want {
-			t.Errorf("timespec %d/%d = %d, %v", test.sec, test.nsec, got, err)
-		}
-	}
+func TestV3ContinuousClockIsMonotonic(t *testing.T) {
 	now, err := v3ContinuousNanos()
 	if err != nil {
 		t.Fatalf("platform continuous clock: %v", err)

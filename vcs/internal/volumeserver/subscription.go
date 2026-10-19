@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 )
 
 const (
@@ -21,7 +23,7 @@ var (
 	ErrCoherenceIdentity    = errors.New("volumeserver: invalid coherence identity")
 )
 
-// CoherenceClock must use one monotonic time domain. NewTimer must accept zero
+// CoherenceClock must use one suspend-inclusive monotonic time domain. NewTimer must accept zero
 // durations. Implementations must not call the coordinator from these methods.
 type CoherenceClock interface {
 	Now() time.Time
@@ -31,11 +33,11 @@ type CoherenceTimer interface {
 	C() <-chan time.Time
 	Stop() bool
 }
-type coherenceWallClock struct{}
+type coherenceContinuousClock struct{}
 type coherenceWallTimer struct{ *time.Timer }
 
-func (coherenceWallClock) Now() time.Time { return time.Now() }
-func (coherenceWallClock) NewTimer(d time.Duration) CoherenceTimer {
+func (coherenceContinuousClock) Now() time.Time { return continuous.Time() }
+func (coherenceContinuousClock) NewTimer(d time.Duration) CoherenceTimer {
 	return coherenceWallTimer{time.NewTimer(d)}
 }
 func (t coherenceWallTimer) C() <-chan time.Time { return t.Timer.C }
@@ -212,7 +214,7 @@ type CoherenceCoordinator struct {
 
 func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.Clock == nil {
-		cfg.Clock = coherenceWallClock{}
+		cfg.Clock = coherenceContinuousClock{}
 	}
 	if cfg.MaxCacheFootprint <= 0 {
 		cfg.MaxCacheFootprint = 65536
@@ -244,17 +246,18 @@ func (c *CoherenceCoordinator) WaitPriorCacheHorizon(ctx context.Context) error 
 	if ctx == nil {
 		return errors.New("volumeserver: prior-cache wait needs a context")
 	}
-	remaining := c.priorCacheUntil.Sub(c.clock.Now())
-	if remaining <= 0 {
-		return ctx.Err()
-	}
-	timer := c.clock.NewTimer(remaining)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C():
-		return ctx.Err()
+	for {
+		remaining := c.priorCacheUntil.Sub(c.clock.Now())
+		if remaining <= 0 {
+			return ctx.Err()
+		}
+		timer := c.clock.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C():
+		}
 	}
 }
 

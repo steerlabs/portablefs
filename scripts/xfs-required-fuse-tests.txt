@@ -102,3 +102,7 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestBlockingReadNeverFailsWh
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionRetriesRequireActualControlProgress
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionProgressCannotLoseAConcurrentContact
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestEpochRecoveryStopsAtOperationDeadline
+# Suspend-inclusive permission must be checked before CONTROL or timers run.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRefusesFreshCachedLookupAndGetattr
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRejectsAlreadyAdmittedCachePublication
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRejectsRenewalBeforeTimerRuns

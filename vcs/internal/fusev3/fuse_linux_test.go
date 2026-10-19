@@ -19,6 +19,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -190,10 +191,10 @@ func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*autho
 			return nil, time.Time{}, ctx.Err()
 		}
 	}
-	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, time.Now().Add(10 * time.Second), nil
+	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, continuous.Time().Add(10 * time.Second), nil
 }
 func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
-	return time.Now().Add(10 * time.Second), nil
+	return continuous.Time().Add(10 * time.Second), nil
 }
 func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after, completed uint64) (*authoritypb.ControlEvent, error) {
 	<-ctx.Done()
@@ -2322,7 +2323,7 @@ func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.
 	mount.subscription.mu.Lock()
 	mount.subscription.active = true
 	mount.subscription.incarnation = 7
-	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.cacheUntil = mount.subscription.config.clock.Now().Add(time.Minute)
 	mount.subscription.mu.Unlock()
 	coherence := resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
 	if retry := mount.cleanupFailed("object reclaim", coherence, nil); !retry {
@@ -2338,7 +2339,7 @@ func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.
 	mount.subscription.mu.Lock()
 	mount.subscription.active = true
 	mount.subscription.incarnation = 8
-	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.cacheUntil = mount.subscription.config.clock.Now().Add(time.Minute)
 	mount.subscription.mu.Unlock()
 	rpc.mu.Lock()
 	rpc.sessionEnd = authorityrpc.ErrAuthorityChanged
@@ -2524,7 +2525,7 @@ func TestReadDuringColdSubscriptionFailsWithoutRPC(t *testing.T) {
 			n := testNode(mount)
 			mount.subscription.mu.Lock()
 			if expired {
-				mount.subscription.cacheUntil = time.Now().Add(-time.Second)
+				mount.subscription.cacheUntil = mount.subscription.config.clock.Now().Add(-time.Second)
 			} else {
 				mount.subscription.active = false
 			}

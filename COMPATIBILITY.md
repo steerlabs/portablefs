@@ -215,7 +215,10 @@ succeeds. Replay returns the original bit without resampling.
 ### Linux profile
 
 - One volume subscription per mount: a 10-second authority horizon renewed
-  every 3 seconds, anchored conservatively at request start. Subscribe returns
+  every 3 seconds, anchored conservatively at request start on Linux
+  `CLOCK_BOOTTIME`. Receipt, renewal, cache and delegation admission compare
+  against that suspend-inclusive horizon at the moment of use; timers only
+  wake workers. Subscribe returns
   an atomic version watermark and the delegated identity set. Ordered change
   batches travel on CONTROL; an acknowledgment of position N proves complete
   local withdrawal through N in that incarnation. Expiry fences the subscriber

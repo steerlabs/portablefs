@@ -78,16 +78,22 @@ stock Linux FUSE 7.31+ mounts      macOS FSKit mount      files gateway
 ## Linux cache and I/O profile
 
 The volume subscription lasts ten seconds on the Authority clock and renews
-every three. The client anchors its horizon at request start and begins cache
-withdrawal early. Replies carry served versions and drain through exact
-identity/name publication gates before acknowledgment. Shared kernel names
+every three. The client anchors its horizon before request queueing and begins
+cache withdrawal early. Linux uses suspend-inclusive `CLOCK_BOOTTIME` for
+subscription anchors, receipt/renewal validation, every cache/delegation admission,
+and authority subscription/delegation and session/lock deadlines. Each admission
+checks the horizon even before CONTROL or timers run after resume; expiry closes
+permission and requires cold withdrawal. Timers only wake workers. Replies carry
+served versions and drain through exact identity/name publication gates before
+acknowledgment. Shared kernel names
 have zero validity; the daemon caches their bindings. Inode notifications
 withdraw clean pages and attributes. Directory iteration continues from XFS
 cookies across mutation, returning every unmodified entry once without ESTALE.
 
 Write-capable handles use direct I/O and kernel write-back stays off. The daemon
-buffer is bounded at 64 MiB and 10,000 entries; timer, cap, recall, fsync,
-namespace dependencies, and root-directory barriers trigger flushing. Entries
+buffer is bounded at 64 MiB and 10,000 entries; producer/completion events, cap
+pressure, recall, fsync, namespace dependencies, and root-directory barriers
+trigger flushing. Entries
 remain until durability is confirmed. A missed recall advances loss and stales
 the affected handles instead of aborting the mount. An epoch change stales all
 old handles; cold reattachment permits new opens, not recovery of old handles.

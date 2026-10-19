@@ -1,10 +1,10 @@
 package portablefsd
 
-import "errors"
+import "github.com/steerlabs/portablefs/vcs/internal/continuous"
 
-func v3TimespecNanos(sec, nsec int64) (uint64, error) {
-	if sec < 0 || nsec < 0 || nsec >= 1e9 || uint64(sec) > (^uint64(0)-uint64(nsec))/1e9 {
-		return 0, errors.New("portablefsd: continuous clock timespec is out of range")
-	}
-	return uint64(sec)*1e9 + uint64(nsec), nil
+// The daemon and Linux/authority permission owners share the qualified host
+// clock: CLOCK_MONOTONIC_RAW on Darwin and CLOCK_BOOTTIME on Linux.
+func v3ContinuousNanos() (uint64, error) {
+	now, err := continuous.Now()
+	return uint64(now), err
 }

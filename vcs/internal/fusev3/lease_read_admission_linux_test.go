@@ -38,7 +38,7 @@ func activeSubscriptionFixture(t *testing.T, incarnation uint64) (*subscriptionR
 // complete after that delivery, but its exact-coordinate generation cannot be
 // installed and delegation exclusion must take effect immediately.
 func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
-	registry, clock, _, _ := activeSubscriptionFixture(t, 1)
+	registry, _, _, _ := activeSubscriptionFixture(t, 1)
 	identity := subscriptionIdentity(21)
 	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
 	preWithdrawal := registry.stamp()
@@ -46,10 +46,10 @@ func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
 	if err := registry.registerChangeBatch(1, &authoritypb.ChangeBatch{Incarnation: 1, Entries: []*authoritypb.ChangeEntry{entry}}); err != nil {
 		t.Fatalf("register grant withdrawal: %v", err)
 	}
-	if got := registry.remaining(coordinate, preWithdrawal, 2, clock.Now()); got != 0 {
+	if got := registry.remaining(coordinate, preWithdrawal, 2); got != 0 {
 		t.Fatalf("reply admitted before delegation withdrawal survived for %s", got)
 	}
-	if got := registry.remaining(coordinate, registry.stamp(), 2, clock.Now()); got != 0 {
+	if got := registry.remaining(coordinate, registry.stamp(), 2); got != 0 {
 		t.Fatalf("delegated identity admitted data caching for %s", got)
 	}
 }

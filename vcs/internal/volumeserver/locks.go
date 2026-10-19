@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 )
 
 var (
@@ -363,7 +365,7 @@ func NewLockTable(maxRecords, maxPerSession uint32, now func() time.Time) *LockT
 		panic("volumeserver: lock table bounds must be positive with a per-session bound inside the global bound")
 	}
 	if now == nil {
-		now = time.Now
+		now = continuous.Time
 	}
 	return &LockTable{
 		objects:       make(map[ObjectKey]*objectLocks),

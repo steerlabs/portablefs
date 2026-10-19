@@ -200,6 +200,7 @@ type Client struct {
 	subscriptionIncarnation   uint64
 	subscriptionHorizonNanos  uint64
 	subscriptionDeadline      time.Time
+	subscriptionNow           func() time.Time
 	poisoned                  atomic.Bool
 	closed                    atomic.Bool
 	fatalMu                   sync.Mutex

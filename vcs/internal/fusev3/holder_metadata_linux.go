@@ -9,7 +9,6 @@ import (
 	"math"
 	"sort"
 	"syscall"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -95,7 +94,7 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 			key := nameKey{parent: parent.key.inode, name: name}
 			first = publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: r.cachedNameStable[key].name}
 			second, count = coordinate, 2
-			if r.cachedNames[key] != record || parent.stale.Load() || record.lookups == math.MaxUint64 || !r.cachedCoordinateAllowedLocked(first, r.cachedNameStamps[key], time.Now()) {
+			if r.cachedNames[key] != record || parent.stale.Load() || record.lookups == math.MaxUint64 || !r.cachedCoordinateAllowedLocked(first, r.cachedNameStamps[key]) {
 				r.mu.Unlock()
 				unlock()
 				return false, false, nil
@@ -140,6 +139,7 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 		}
 		r.pinMetadataLocked(p, s, record, first, second, count)
 		if fast && parent != nil {
+			p.cachedLookup = record
 			record.lookups++
 			r.identityIndexLocked(record)[record.key] = record
 		}

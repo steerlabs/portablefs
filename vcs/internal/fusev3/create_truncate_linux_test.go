@@ -268,7 +268,7 @@ func TestCloseAttemptsBarrierThroughHorizonAfterSessionEnd(t *testing.T) {
 	}
 	mount.subscription.mu.Lock()
 	mount.subscription.active = true
-	mount.subscription.horizon = time.Now().Add(80 * time.Millisecond)
+	mount.subscription.horizon = mount.subscription.config.clock.Now().Add(80 * time.Millisecond)
 	mount.subscription.mu.Unlock()
 	before := unreachable.barriers.Load()
 	start := time.Now()
@@ -324,7 +324,7 @@ func TestCloseFencesCapacityWaitBeforeBarrier(t *testing.T) {
 	waitFor(t, "shutdown capacity waiter", func() bool { return manager.buf.Stats().WaitingAdmissions == 1 })
 	mount := &Mount{delegations: manager, subscription: newSubscriptionRegistry(nil, nil, nil)}
 	mount.subscription.active = true
-	mount.subscription.horizon = time.Now().Add(80 * time.Millisecond)
+	mount.subscription.horizon = mount.subscription.config.clock.Now().Add(80 * time.Millisecond)
 	closed := make(chan error, 1)
 	go func() { closed <- mount.flushDelegationsBeforeClose() }()
 	select {

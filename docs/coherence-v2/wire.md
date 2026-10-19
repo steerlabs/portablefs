@@ -230,7 +230,7 @@ Symlink do.
 | Message; request/response oneof tag | Fields and meaning |
 |---|---|
 | `SubscribeRequest`; request 65 | `snapshot_id` (1): empty starts a cold subscription after the client has invalidated all state. Nonempty resumes pagination only. `after_identity` (2): empty on the initial request, otherwise exactly the preceding reply's `next_after_identity`. |
-| `SubscribeReply`; response 57 | `watermark` (1): atomic snapshot volume version. `delegated_identities` (2): sorted unique identities excluded by a reservation or live delegation at that snapshot, in bytewise order across pages. `incarnation` (3): new nonzero incarnation. `horizon_nanos` (4): conservative validity duration, at most 10,000,000,000 ns, anchored at the initial request's monotonic start. `snapshot_id` (5): token binding every page to this snapshot/session/incarnation. `next_after_identity` (6): final identity on a nonfinal page; empty marks completion. |
+| `SubscribeReply`; response 57 | `watermark` (1): atomic snapshot volume version. `delegated_identities` (2): sorted unique identities excluded by a reservation or live delegation at that snapshot, in bytewise order across pages. `incarnation` (3): new nonzero incarnation. `horizon_nanos` (4): conservative validity duration, at most 10,000,000,000 ns, anchored at the initial request's suspend-inclusive monotonic start. `snapshot_id` (5): token binding every page to this snapshot/session/incarnation. `next_after_identity` (6): final identity on a nonfinal page; empty marks completion. |
 | `RenewSubscriptionRequest`; request 66 | `incarnation` (1): exact current subscription. |
 | `RenewSubscriptionReply`; response 58 | `incarnation` (1): exact echo. `horizon_nanos` (2): conservative duration, at most 10 seconds, anchored at renewal request start. |
 | `NextControlEventRequest`; request 67 | `incarnation` (1): exact subscription. `after_sequence` (2): last received CONTROL event sequence, initially zero. `completed_event_through` (3): contiguous prefix whose ACK retries are surrendered. Long-polls for the delivered cursor's successor. |
@@ -248,6 +248,15 @@ incarnation, horizon duration, and snapshot token. It neither starts another
 subscription nor extends the horizon. Pages are sequential; repeating a page
 request returns the same page. A nonfinal page must contain at least one entry.
 Discard the partial snapshot on failure or expiry and subscribe cold again.
+
+Linux subscription request anchors, receipt/renewal validation, and every
+cache/delegation eligibility check use suspend-inclusive `CLOCK_BOOTTIME`.
+The original request anchor precedes queueing; pagination never moves it.
+Admission compares against the continuous horizon at the moment of use, even
+when CONTROL delivery and active-time timers have not run since resume. A late
+renewal cannot bridge an expired horizon; expiry requires cold withdrawal.
+Authority subscription/delegation deadlines and renewable session/lock leases
+use the same clock domain. No wall clock grants cache permission.
 Do not cache until the final page arrives; the first cacheable read must be at
 or after the watermark. The client may start polling/renewing after the first
 page so a large snapshot cannot prevent liveness, but must stage later changes

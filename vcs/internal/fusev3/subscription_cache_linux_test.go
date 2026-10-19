@@ -19,7 +19,7 @@ import (
 // A change entry withdraws exactly its own coordinate: a reply sampled before
 // it can no longer be cached, while a disjoint coordinate keeps its permission.
 func TestSubscriptionChangeClosesOnlyItsExactCoordinate(t *testing.T) {
-	registry, clock, _, _ := activeSubscriptionFixture(t, 11)
+	registry, _, _, _ := activeSubscriptionFixture(t, 11)
 	identityA, identityB := subscriptionIdentity(31), subscriptionIdentity(32)
 	coordinateA := publicationCoordinate{kind: publicationItemAttributes, item: identityA}
 	coordinateB := publicationCoordinate{kind: publicationItemAttributes, item: identityB}
@@ -28,10 +28,10 @@ func TestSubscriptionChangeClosesOnlyItsExactCoordinate(t *testing.T) {
 	if err := registry.registerChangeBatch(11, &authoritypb.ChangeBatch{Incarnation: 11, Entries: []*authoritypb.ChangeEntry{entry}}); err != nil {
 		t.Fatalf("register exact-coordinate change: %v", err)
 	}
-	if registry.remaining(coordinateA, stamp, 2, clock.Now()) != 0 {
+	if registry.remaining(coordinateA, stamp, 2) != 0 {
 		t.Fatal("changed coordinate accepted a pre-withdrawal reply")
 	}
-	if registry.remaining(coordinateB, stamp, 2, clock.Now()) <= 0 {
+	if registry.remaining(coordinateB, stamp, 2) <= 0 {
 		t.Fatal("disjoint coordinate was closed by an unrelated change")
 	}
 }
@@ -58,14 +58,14 @@ func TestSubscriptionRefusesNoncontiguousChangeBatchWithoutAdvancing(t *testing.
 // ordered change worker applies its release; receipt of the release alone
 // does not reopen caching.
 func TestSubscriptionDelegationExcludesCachingUntilReleaseApplies(t *testing.T) {
-	registry, clock, _, _ := activeSubscriptionFixture(t, 13)
+	registry, _, _, _ := activeSubscriptionFixture(t, 13)
 	identity := subscriptionIdentity(34)
 	data := publicationCoordinate{kind: publicationItemData, item: identity}
 	grant := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 2, Kind: authoritypb.ChangeKind_CHANGE_KIND_DELEGATION_GRANTED, Identity: identity[:]}
 	if err := registry.registerChangeBatch(13, &authoritypb.ChangeBatch{Incarnation: 13, Entries: []*authoritypb.ChangeEntry{grant}}); err != nil {
 		t.Fatal(err)
 	}
-	if registry.remaining(data, registry.stamp(), 2, clock.Now()) != 0 {
+	if registry.remaining(data, registry.stamp(), 2) != 0 {
 		t.Fatal("delegated identity remained cacheable")
 	}
 	if err := registry.applyChange(context.Background(), 13, grant); err != nil {
@@ -75,13 +75,13 @@ func TestSubscriptionDelegationExcludesCachingUntilReleaseApplies(t *testing.T) 
 	if err := registry.registerChangeBatch(13, &authoritypb.ChangeBatch{Incarnation: 13, Entries: []*authoritypb.ChangeEntry{release}}); err != nil {
 		t.Fatal(err)
 	}
-	if registry.remaining(data, registry.stamp(), 3, clock.Now()) != 0 {
+	if registry.remaining(data, registry.stamp(), 3) != 0 {
 		t.Fatal("receipt of release reopened caching before ordered application")
 	}
 	if err := registry.applyChange(context.Background(), 13, release); err != nil {
 		t.Fatal(err)
 	}
-	if registry.remaining(data, registry.stamp(), 3, clock.Now()) <= 0 {
+	if registry.remaining(data, registry.stamp(), 3) <= 0 {
 		t.Fatal("applied release did not permit a fresh cache fill")
 	}
 }
@@ -91,7 +91,7 @@ func TestSubscriptionHorizonIsNotKernelCacheLifetime(t *testing.T) {
 	coordinate := publicationCoordinate{kind: publicationItemData, item: subscriptionIdentity(35)}
 	stamp := registry.stamp()
 	clock.advance(time.Minute - time.Second)
-	if registry.remaining(coordinate, stamp, 1, clock.Now()) != 0 {
+	if registry.remaining(coordinate, stamp, 1) != 0 {
 		t.Fatal("cache permission survived the conservative subscription horizon")
 	}
 }
@@ -124,7 +124,7 @@ func TestSubscriptionHorizonWorkerWithdrawsEveryCacheAtExpiry(t *testing.T) {
 		rpc := &subscriptionTestRPC{horizon: now.Add(time.Minute)}
 		invalidator := &subscriptionTestInvalidator{}
 		registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
-			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: time.Millisecond,
+			clock: testActiveSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: time.Millisecond,
 			maxPages: 2, invalidator: invalidator,
 		})
 		registry.mu.Lock()
@@ -265,8 +265,8 @@ func TestExpiredEnumerationPageIsNotServedAfterResume(t *testing.T) {
 	frontend.mount.subscription.mu.Lock()
 	frontend.mount.subscription.incarnation++
 	frontend.mount.subscription.generation++
-	frontend.mount.subscription.cacheUntil = time.Now().Add(time.Minute)
-	frontend.mount.subscription.horizon = time.Now().Add(time.Minute + time.Second)
+	frontend.mount.subscription.cacheUntil = frontend.mount.subscription.config.clock.Now().Add(time.Minute)
+	frontend.mount.subscription.horizon = frontend.mount.subscription.config.clock.Now().Add(time.Minute + time.Second)
 	frontend.mount.subscription.active = true
 	frontend.mount.subscription.mu.Unlock()
 	if oldStamp.incarnation == frontend.mount.subscription.stamp().incarnation {
@@ -282,9 +282,9 @@ func TestExpiredEnumerationPageIsNotServedAfterResume(t *testing.T) {
 }
 
 func TestEnumerationPageWithoutGrantIsServedUncachedAndRetired(t *testing.T) {
-	registry, clock, _, _ := activeSubscriptionFixture(t, 17)
+	registry, _, _, _ := activeSubscriptionFixture(t, 17)
 	coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: subscriptionIdentity(36)}
-	if registry.remaining(coordinate, subscriptionStamp{}, 1, clock.Now()) != 0 {
+	if registry.remaining(coordinate, subscriptionStamp{}, 1) != 0 {
 		t.Fatal("unstamped enumeration was cacheable")
 	}
 }
@@ -318,8 +318,8 @@ func TestEnumerationPageForAnItemWithoutAStableIdentityFailsClosed(t *testing.T)
 }
 
 func TestSourceMutationReplyHasZeroCacheValidityWithoutSubscriptionStamp(t *testing.T) {
-	registry, clock, _, _ := activeSubscriptionFixture(t, 19)
-	if registry.remaining(publicationCoordinate{kind: publicationNamespaceName}, subscriptionStamp{}, 1, clock.Now()) != 0 {
+	registry, _, _, _ := activeSubscriptionFixture(t, 19)
+	if registry.remaining(publicationCoordinate{kind: publicationNamespaceName}, subscriptionStamp{}, 1) != 0 {
 		t.Fatal("reply without a subscription stamp had cache validity")
 	}
 }
@@ -427,8 +427,8 @@ func TestDaemonNamePayloadCannotBorrowReplacementGrant(t *testing.T) {
 	fixture.mount.subscription.mu.Lock()
 	fixture.mount.subscription.incarnation++
 	fixture.mount.subscription.generation++
-	fixture.mount.subscription.cacheUntil = time.Now().Add(time.Minute)
-	fixture.mount.subscription.horizon = time.Now().Add(time.Minute + time.Second)
+	fixture.mount.subscription.cacheUntil = fixture.mount.subscription.config.clock.Now().Add(time.Minute)
+	fixture.mount.subscription.horizon = fixture.mount.subscription.config.clock.Now().Add(time.Minute + time.Second)
 	fixture.mount.subscription.active = true
 	fixture.mount.subscription.mu.Unlock()
 
@@ -457,14 +457,14 @@ func TestRenewalPreservesDaemonPayloadForSameEpoch(t *testing.T) {
 	registry, clock, _, _ := activeSubscriptionFixture(t, 20)
 	coordinate := publicationCoordinate{kind: publicationItemData, item: subscriptionIdentity(41)}
 	stamp := registry.stamp().withVersion(1)
-	before := registry.remaining(coordinate, stamp, stamp.version, clock.Now())
+	before := registry.remaining(coordinate, stamp, stamp.version)
 	if before <= 0 {
 		t.Fatal("initial subscription did not admit payload")
 	}
-	if !registry.acceptRenewal(20, clock.Now().Add(2*time.Minute), clock.Now()) {
+	if !registry.acceptRenewal(20, clock.Now().Add(2*time.Minute)) {
 		t.Fatal("valid same-incarnation renewal was rejected")
 	}
-	after := registry.remaining(coordinate, stamp, stamp.version, clock.Now())
+	after := registry.remaining(coordinate, stamp, stamp.version)
 	if after <= before {
 		t.Fatalf("renewal failed to extend existing payload: before=%s after=%s", before, after)
 	}

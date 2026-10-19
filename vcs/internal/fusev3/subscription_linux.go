@@ -15,6 +15,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
@@ -81,12 +82,12 @@ type subscriptionClock interface {
 	NewTimer(time.Duration) subscriptionTimer
 }
 
-type wallSubscriptionClock struct{}
+type continuousSubscriptionClock struct{}
 
 type wallSubscriptionTimer struct{ timer *time.Timer }
 
-func (wallSubscriptionClock) Now() time.Time { return time.Now() }
-func (wallSubscriptionClock) NewTimer(d time.Duration) subscriptionTimer {
+func (continuousSubscriptionClock) Now() time.Time { return continuous.Time() }
+func (continuousSubscriptionClock) NewTimer(d time.Duration) subscriptionTimer {
 	return wallSubscriptionTimer{timer: time.NewTimer(d)}
 }
 func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
@@ -165,14 +166,14 @@ func newSubscriptionRegistry(mount *Mount, rpc subscriptionRPC, control subscrip
 		withdrawalLead = mount.withdrawalTimeout
 	}
 	return newSubscriptionRegistryWithConfig(mount, rpc, control, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: subscriptionRetryDelay, withdrawalLead: withdrawalLead,
+		clock: continuousSubscriptionClock{}, retryDelay: subscriptionRetryDelay, withdrawalLead: withdrawalLead,
 		maxPages: maxSubscriptionPages, invalidator: mountSubscriptionInvalidator{mount: mount},
 	})
 }
 
 func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, control subscriptionControlHandler, config subscriptionConfig) *subscriptionRegistry {
 	if config.clock == nil {
-		config.clock = wallSubscriptionClock{}
+		config.clock = continuousSubscriptionClock{}
 	}
 	if config.retryDelay <= 0 {
 		config.retryDelay = subscriptionRetryDelay
@@ -217,9 +218,9 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	if s == nil {
 		return subscriptionStamp{}
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if !s.active || !s.config.clock.Now().Before(s.cacheUntil) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.liveLocked() {
 		return subscriptionStamp{}
 	}
 	return subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
@@ -229,7 +230,7 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 // exact coordinates, so an unrelated event does not invalidate a reply already
 // in flight. The global generation remains in the stamp to distinguish a reply
 // admitted before a same-version withdrawal from one admitted after it.
-func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64, now time.Time) time.Duration {
+func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64) time.Duration {
 	if s == nil || stamp.incarnation == 0 {
 		return 0
 	}
@@ -239,22 +240,22 @@ func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp
 	if (coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData) && s.mount != nil && s.mount.delegations != nil && !s.mount.delegations.sharedCacheAllowed(coordinate.item[:]) {
 		return 0
 	}
-	return s.remainingAfterOwnershipCheck(coordinate, stamp, servedVersion, now)
+	return s.remainingAfterOwnershipCheck(coordinate, stamp, servedVersion)
 }
 
 // remainingAfterOwnershipCheck is used by a cached reply after checking local
 // delegation ownership outside raw.mu. Acquiring delegation locks under raw.mu
 // could deadlock with a queued epoch fence and a write's source gate.
-func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64, now time.Time) time.Duration {
+func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64) time.Duration {
 	if s == nil || stamp.incarnation == 0 {
 		return 0
 	}
 	if servedVersion == 0 {
 		servedVersion = stamp.version
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if !s.active || stamp.incarnation != s.incarnation || !now.Before(s.cacheUntil) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.liveLocked() || stamp.incarnation != s.incarnation {
 		return 0
 	}
 	if coordinate.kind == publicationNamespaceName {
@@ -276,7 +277,7 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 		servedVersion < s.watermark || servedVersion < s.versionFloor || servedVersion < state.minVersion {
 		return 0
 	}
-	return s.cacheUntil.Sub(now)
+	return max(time.Duration(0), s.cacheUntil.Sub(s.config.clock.Now()))
 }
 
 func (s *subscriptionRegistry) signalHorizonChangedLocked() {
@@ -509,9 +510,10 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 }
 
 func (s *subscriptionRegistry) currentIncarnation() (uint64, time.Time, <-chan struct{}, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.incarnation, s.cacheUntil, s.horizonChanged, s.active
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.liveLocked()
+	return s.incarnation, s.cacheUntil, s.horizonChanged, live
 }
 
 func (s *subscriptionRegistry) waitActive(ctx context.Context) error {
@@ -1007,7 +1009,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			continue
 		}
 		s.madeProgress()
-		if !s.acceptRenewal(incarnation, deadline, s.config.clock.Now()) {
+		if !s.acceptRenewal(incarnation, deadline) {
 			s.mu.RLock()
 			current := s.active && s.incarnation == incarnation
 			s.mu.RUnlock()
@@ -1019,13 +1021,14 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 	}
 }
 
-func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline, now time.Time) bool {
+func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.Time) bool {
 	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.active || s.paused || s.incarnation != incarnation {
+	if !s.liveLocked() || s.paused || s.incarnation != incarnation {
 		return false
 	}
+	now := s.config.clock.Now()
 	// A late renewal cannot revive permission after the prior conservative
 	// boundary. It is deliberately ignored rather than extending from receipt.
 	if !now.Before(s.cacheUntil) || !cacheUntil.After(now) {
@@ -1302,4 +1305,32 @@ func (r *rawFileSystem) markIdentityStale(identity publicationIdentity) {
 			record.node.stale.Store(true)
 		}
 	}
+}
+
+// liveLocked withdraws admission at the moment of use even when active-time
+// timers and CONTROL have not run since resume. Waking the horizon worker
+// preserves the ordinary cold-withdrawal path; no renewal may bridge this cut.
+func (s *subscriptionRegistry) liveLocked() bool {
+	if s.active && !s.config.clock.Now().Before(s.cacheUntil) {
+		s.active = false
+		s.generation++
+		s.signalHorizonChangedLocked()
+	}
+	return s.active
+}
+
+// Delegation reset owns its admission cut separately from cache withdrawal:
+// retained metadata callbacks may still drain between deactivate and
+// InterruptSubscription. That interval must nevertheless never cross expiry.
+func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if incarnation == 0 || incarnation != s.incarnation {
+		return false
+	}
+	if !s.config.clock.Now().Before(s.cacheUntil) {
+		s.liveLocked()
+		return false
+	}
+	return true
 }

@@ -154,9 +154,10 @@ type delegationFlushProgress struct {
 // Its methods return ordinary errors so the raw FUSE layer can make the errno
 // policy at the callback boundary.
 type delegationManager struct {
-	rpc      delegationRPC
-	timeout  time.Duration
-	maxWrite int
+	subscription *subscriptionRegistry
+	rpc          delegationRPC
+	timeout      time.Duration
+	maxWrite     int
 
 	epoch    sync.RWMutex
 	epochCtx context.Context
@@ -457,6 +458,9 @@ func (m *delegationManager) BaseAttr(identity []byte) (*authoritypb.Attr, bool) 
 }
 
 func (m *delegationManager) incarnation() uint64 {
+	if m != nil && m.subscription != nil && !m.subscription.delegationHorizonLive(m.inc.Load()) {
+		return 0
+	}
 	return m.inc.Load()
 }
 
