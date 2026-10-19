@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +15,8 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
 func validFuseMountState(t *testing.T, mountPath string) mountState {
@@ -100,6 +104,158 @@ func TestMountStateRoundtripAndListing(t *testing.T) {
 	}
 	if err := removeMountState(dir, "/tmp/work"); err != nil {
 		t.Fatalf("removing a missing state must be a no-op: %v", err)
+	}
+}
+
+func mountStateReaders() map[string]func(string, string) ([]mountState, error) {
+	return map[string]func(string, string) ([]mountState, error){
+		"lookup": func(dir, mountPath string) ([]mountState, error) {
+			st, err := readMountState(dir, mountPath)
+			if err != nil || st == nil {
+				return nil, err
+			}
+			return []mountState{*st}, nil
+		},
+		"inventory": func(dir, _ string) ([]mountState, error) { return listMountStates(dir) },
+	}
+}
+
+func TestMountStateReadersExcludeReplacementDuringRead(t *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		make func(*testing.T, string) mountState
+	}{
+		{"fuse", validFuseMountState},
+		{"fskit", validFSKitMountState},
+	} {
+		for name, read := range mountStateReaders() {
+			t.Run(fixture.name+"/"+name, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), "mounts")
+				st := fixture.make(t, "/tmp/replace-during-read")
+				if err := writeMountState(dir, st); err != nil {
+					t.Fatal(err)
+				}
+				next := st
+				next.Status = mountStatusCredentialExpired
+				next.StatusChangedAtMs = 123
+				originalRead := mountStateReadFile
+				t.Cleanup(func() { mountStateReadFile = originalRead })
+				writerBlocked := false
+				mountStateReadFile = func(path string) ([]byte, error) {
+					parent, err := privatepath.OpenExistingDir(dir)
+					if err != nil {
+						return nil, err
+					}
+					defer parent.Close()
+					fd, err := unix.Openat(int(parent.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+					if err != nil {
+						return nil, err
+					}
+					file := os.NewFile(uintptr(fd), path)
+					defer file.Close()
+					writer, err := privatepath.OpenLockFile(parent, dir, filepath.Base(path)+".lock")
+					if err != nil {
+						return nil, err
+					}
+					defer writer.Close()
+					// Other readers must remain admissible during this read.
+					if err := unix.Flock(int(writer.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
+						return nil, err
+					}
+					if err := unix.Flock(int(writer.Fd()), unix.LOCK_UN); err != nil {
+						return nil, err
+					}
+					// Force the writer's turn between open and validation. With
+					// the old unlocked reader it replaces this exact open inode,
+					// and ValidateOpenFile below deterministically sees nlink 0.
+					err = unix.Flock(int(writer.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+					switch {
+					case err == nil:
+						defer unix.Flock(int(writer.Fd()), unix.LOCK_UN)
+						if err := writeMountStateUnlocked(dir, next); err != nil {
+							return nil, err
+						}
+					case errors.Is(err, unix.EWOULDBLOCK), errors.Is(err, unix.EAGAIN):
+						writerBlocked = true
+					default:
+						return nil, err
+					}
+					if err := privatepath.ValidateOpenFile(parent, dir, filepath.Base(path), file); err != nil {
+						return nil, err
+					}
+					return io.ReadAll(file)
+				}
+				got, err := read(dir, st.MountPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !writerBlocked || len(got) != 1 || !reflect.DeepEqual(got[0], st) {
+					t.Fatalf("read = %+v, writer blocked = %v", got, writerBlocked)
+				}
+				mountStateReadFile = originalRead
+				// The read must release its lock, allowing the next version to
+				// publish and become visible without retries or sleeps.
+				if err := writeMountState(dir, next); err != nil {
+					t.Fatal(err)
+				}
+				got, err = read(dir, st.MountPath)
+				if err != nil || len(got) != 1 || !reflect.DeepEqual(got[0], next) {
+					t.Fatalf("read replacement = %+v, err %v", got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestMountStateReadersPreservePrivateFileChecks(t *testing.T) {
+	for name, read := range mountStateReaders() {
+		for _, target := range []string{"record", "lock"} {
+			for _, tamper := range []string{"hardlink", "symlink", "permissions"} {
+				t.Run(name+"/"+target+"/"+tamper, func(t *testing.T) {
+					dir := filepath.Join(t.TempDir(), "mounts")
+					st := validFuseMountState(t, "/tmp/private-record")
+					if err := writeMountState(dir, st); err != nil {
+						t.Fatal(err)
+					}
+					path := mountStatePath(dir, st.MountPath)
+					if target == "lock" {
+						path += ".lock"
+					}
+					var err error
+					switch tamper {
+					case "hardlink":
+						err = os.Link(path, path+".alias")
+					case "symlink":
+						if err = os.Rename(path, path+".target"); err == nil {
+							err = os.Symlink(path+".target", path)
+						}
+					case "permissions":
+						err = os.Chmod(path, 0o644)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := read(dir, st.MountPath); err == nil {
+						t.Fatal("unsafe private file accepted")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMountStateReadersDoNotCreateMissingDirectory(t *testing.T) {
+	for name, read := range mountStateReaders() {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "absent", "mounts")
+			got, err := read(dir, "/tmp/absent-record")
+			if err != nil || len(got) != 0 {
+				t.Fatalf("missing read = %+v, err %v", got, err)
+			}
+			if _, err := os.Lstat(filepath.Dir(dir)); !os.IsNotExist(err) {
+				t.Fatalf("read created missing directory: %v", err)
+			}
+		})
 	}
 }
 

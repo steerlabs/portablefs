@@ -304,7 +304,7 @@ func updateMountState(dir, mountPath string, update func(*mountState)) (bool, er
 	}
 	updated := false
 	err := withMountStateWriteLock(dir, mountPath, func() error {
-		st, err := readMountState(dir, mountPath)
+		st, err := readMountStateUnlocked(dir, mountPath)
 		if err != nil || st == nil {
 			return err
 		}
@@ -322,27 +322,31 @@ func updateMountState(dir, mountPath string, update func(*mountState)) (bool, er
 }
 
 func withMountStateWriteLock(dir, mountPath string, fn func() error) error {
-	parent, err := privatepath.OpenDir(dir)
+	return withMountStateLock(mountStatePath(dir, mountPath), unix.LOCK_EX, fn)
+}
+
+// The stable .json.lock inode protects each record's entire open/validate/read
+// against atomic replacement and removal. The .op.lock instead serializes
+// mount/unmount operations; status and renewal writers do not hold it.
+func withMountStateLock(recordPath string, operation int, fn func() error) error {
+	dir := filepath.Dir(recordPath)
+	openDir := privatepath.OpenExistingDir
+	if operation == unix.LOCK_EX {
+		openDir = privatepath.OpenDir
+	}
+	parent, err := openDir(dir)
 	if err != nil {
 		return fmt.Errorf("pin mount state directory: %w", err)
 	}
 	defer parent.Close()
-	path := mountStatePath(dir, mountPath) + ".lock"
+	path := recordPath + ".lock"
 	file, err := privatepath.OpenLockFile(parent, dir, filepath.Base(path))
 	if err != nil {
 		return fmt.Errorf("open mount state lock %s: %w", path, err)
 	}
 	defer file.Close()
 	fd := int(file.Fd())
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return fmt.Errorf("inspect mount state lock %s: %w", path, err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o777 != 0o600 ||
-		stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
-		return fmt.Errorf("mount state lock %s is not a private uid-owned 0600 regular file", path)
-	}
-	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
+	if err := unix.Flock(fd, operation); err != nil {
 		return fmt.Errorf("lock mount state %s: %w", path, err)
 	}
 	defer unix.Flock(fd, unix.LOCK_UN)
@@ -358,8 +362,26 @@ func readMountState(dir, mountPath string) (*mountState, error) {
 	if !validCanonicalMountPath(mountPath) {
 		return nil, fmt.Errorf("mount state lookup has non-canonical mount path %q", mountPath)
 	}
+	var st *mountState
+	err := withMountStateLock(mountStatePath(dir, mountPath), unix.LOCK_SH, func() error {
+		var err error
+		st, err = readMountStateUnlocked(dir, mountPath)
+		return err
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return st, err
+}
+
+// mountStateReadFile is the read seam for deterministic replacement tests.
+var mountStateReadFile = privatepath.ReadFile
+
+// readMountStateUnlocked requires the caller to hold the record lock. Updates
+// already own it exclusively and must not acquire another flock description.
+func readMountStateUnlocked(dir, mountPath string) (*mountState, error) {
 	path := mountStatePath(dir, mountPath)
-	data, err := privatepath.ReadFile(path)
+	data, err := mountStateReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -620,7 +642,17 @@ func listMountStates(dir string) ([]mountState, error) {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		data, err := privatepath.ReadFile(path)
+		var data []byte
+		err := withMountStateLock(path, unix.LOCK_SH, func() error {
+			var err error
+			data, err = mountStateReadFile(path)
+			return err
+		})
+		// Directory enumeration is not a snapshot: a writer may remove a
+		// record before we acquire its lock. Absence under the lock is final.
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("read mount state record %s: %w", path, err)
 		}
