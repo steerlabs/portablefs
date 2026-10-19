@@ -51,18 +51,13 @@ const (
 const (
 	macOSCLIName       = "portablefs"
 	fskitExtensionType = "com.apple.fskit.fsmodule"
-	// Compatibility aliases keep existing production-only internal tests
-	// explicit while the transaction itself carries its immutable layout.
-	macOSAppName             = "PortableFS.app"
-	macOSStagedAppName       = "PortableFS.next"
-	macOSAppExecutable       = "PortableFS"
-	macOSExtensionExecutable = "PortableFSExt"
 )
 
 type macOSInstallCodeIdentityPolicy uint8
 
 const (
 	macOSInstallDeveloperIDRelease macOSInstallCodeIdentityPolicy = iota + 1
+	macOSInstallDevelopmentHost
 )
 
 // macOSInstallLayout is a compile-time product identity, not input. Every
@@ -77,15 +72,6 @@ type macOSInstallLayout struct {
 	serviceMinimumOS    string
 	requiredAppID       string
 	codeIdentity        macOSInstallCodeIdentityPolicy
-}
-
-var productionMacOSInstallLayout = macOSInstallLayout{
-	appName:             macOSAppName,
-	stagedAppName:       macOSStagedAppName,
-	appExecutable:       macOSAppExecutable,
-	extensionExecutable: macOSExtensionExecutable,
-	serviceMinimumOS:    "26.0",
-	codeIdentity:        macOSInstallDeveloperIDRelease,
 }
 
 func (layout macOSInstallLayout) validate() error {
@@ -111,7 +97,7 @@ func (layout macOSInstallLayout) validate() error {
 			!strings.Contains(layout.requiredAppID, ".")) {
 		return fmt.Errorf("invalid compiled macOS install app identifier %q", layout.requiredAppID)
 	}
-	if layout.codeIdentity != macOSInstallDeveloperIDRelease {
+	if layout.codeIdentity != macOSInstallDeveloperIDRelease && layout.codeIdentity != macOSInstallDevelopmentHost {
 		return fmt.Errorf("invalid compiled macOS signing policy")
 	}
 	return nil
@@ -191,7 +177,7 @@ func runInstallMacOSApp(e *cmdEnv, sourceApp, requestedLinkDir string) (macOSIns
 		e,
 		sourceApp,
 		requestedLinkDir,
-		productionMacOSInstallLayout,
+		compiledMacOSInstallLayout,
 	)
 }
 
@@ -469,7 +455,7 @@ func runInstallMacOSAppWithLayout(
 }
 
 func validateMacOSInstallSource(sourceApp string) (string, error) {
-	return validateMacOSInstallSourceWithLayout(sourceApp, productionMacOSInstallLayout)
+	return validateMacOSInstallSourceWithLayout(sourceApp, compiledMacOSInstallLayout)
 }
 
 func validateMacOSInstallSourceWithLayout(
@@ -533,7 +519,7 @@ func validateMacOSInstallSourceWithLayout(
 }
 
 func sourceMacOSBundleIdentity(sourceApp string) (string, error) {
-	return sourceMacOSBundleIdentityWithLayout(sourceApp, productionMacOSInstallLayout)
+	return sourceMacOSBundleIdentityWithLayout(sourceApp, compiledMacOSInstallLayout)
 }
 
 func sourceMacOSBundleIdentityWithLayout(
@@ -696,7 +682,7 @@ func prepareMacOSInstall(sourceApp, destinationApp, cliLink string) (*preparedMa
 		sourceApp,
 		destinationApp,
 		cliLink,
-		productionMacOSInstallLayout,
+		compiledMacOSInstallLayout,
 	)
 }
 
@@ -821,7 +807,7 @@ func validateExistingManagedMacOSApp(path, expectedAppID string) error {
 	return validateExistingManagedMacOSAppWithLayout(
 		path,
 		expectedAppID,
-		productionMacOSInstallLayout,
+		compiledMacOSInstallLayout,
 	)
 }
 
@@ -3068,7 +3054,7 @@ func authenticateDaemonRelease(path, version string) (daemonRelease, error) {
 	if err != nil {
 		return daemonRelease{}, err
 	}
-	if err := validateInstalledMacOSBundleForPublicationWithLayout(app, version, appID, productionMacOSInstallLayout); err != nil {
+	if err := validateInstalledMacOSBundleForPublicationWithLayout(app, version, appID, compiledMacOSInstallLayout); err != nil {
 		return daemonRelease{}, err
 	}
 	identity, err := macOSServiceReleaseIdentity(app, version)
@@ -3315,7 +3301,7 @@ func requireRuntimePathAbsent(path, label string) error {
 }
 
 func rejectLiveMacOSRuntime(e *cmdEnv, stateDir string) error {
-	return rejectLiveMacOSRuntimeWithLayout(e, stateDir, productionMacOSInstallLayout)
+	return rejectLiveMacOSRuntimeWithLayout(e, stateDir, compiledMacOSInstallLayout)
 }
 
 func rejectLiveMacOSRuntimeWithLayout(
@@ -3442,7 +3428,7 @@ func validateStagedBundleForPublication(app, version, expectedAppID string) erro
 		app,
 		version,
 		expectedAppID,
-		productionMacOSInstallLayout,
+		compiledMacOSInstallLayout,
 	)
 }
 
@@ -3467,16 +3453,7 @@ func validateMacOSBundleForPublication(
 		app,
 		version,
 		expectedAppID,
-		productionMacOSInstallLayout,
-	)
-}
-
-func validateMacOSBundleForPublicationWithLayout(
-	app, version, expectedAppID string,
-	layout macOSInstallLayout,
-) error {
-	return validateMacOSBundleForPublicationWithPolicy(
-		app, version, expectedAppID, layout, layout.codeIdentity,
+		compiledMacOSInstallLayout,
 	)
 }
 
@@ -3484,13 +3461,12 @@ func validateInstalledMacOSBundleForPublicationWithLayout(
 	app, version, expectedAppID string,
 	layout macOSInstallLayout,
 ) error {
-	return validateMacOSBundleForPublicationWithPolicy(app, version, expectedAppID, layout, layout.codeIdentity)
+	return validateMacOSBundleForPublicationWithLayout(app, version, expectedAppID, layout)
 }
 
-func validateMacOSBundleForPublicationWithPolicy(
+func validateMacOSBundleForPublicationWithLayout(
 	app, version, expectedAppID string,
 	layout macOSInstallLayout,
-	codeIdentity macOSInstallCodeIdentityPolicy,
 ) error {
 	if err := layout.validate(); err != nil {
 		return err
@@ -3511,6 +3487,14 @@ func validateMacOSBundleForPublicationWithPolicy(
 	}
 	if symlink != "" {
 		return fmt.Errorf("staged app contains unexpected symlink %s", symlink)
+	}
+
+	appID, err := sourceMacOSBundleIdentityWithLayout(app, layout)
+	if err != nil {
+		return err
+	}
+	if appID != expectedAppID {
+		return fmt.Errorf("bundle identifier %q differs from expected %q", appID, expectedAppID)
 	}
 
 	appExecutable := filepath.Join(app, "Contents", "MacOS", layout.appExecutable)
@@ -3558,10 +3542,10 @@ func validateMacOSBundleForPublicationWithPolicy(
 		return fmt.Errorf("inspect staged daemon service profile: %w", err)
 	}
 
-	if out, err := exec.Command("/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", app).CombinedOutput(); err != nil {
+	if out, err := exec.Command("/usr/bin/codesign", "--verify", "--deep", "--strict", "--all-architectures", "--verbose=2", app).CombinedOutput(); err != nil {
 		return fmt.Errorf("verify staged app code hierarchy: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
-	if codeIdentity == macOSInstallDeveloperIDRelease {
+	if layout.codeIdentity == macOSInstallDeveloperIDRelease {
 		if out, err := exec.Command("/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=2", app).CombinedOutput(); err != nil {
 			return fmt.Errorf("Gatekeeper rejected staged app: %w (output: %s)", err, strings.TrimSpace(string(out)))
 		}
@@ -3720,7 +3704,6 @@ func validateMacOSBundleForPublicationWithPolicy(
 		daemon,
 		expectedAppID,
 		layout,
-		codeIdentity,
 	); err != nil {
 		return err
 	}
@@ -3754,88 +3737,113 @@ func validateMacOSBundleForPublicationWithPolicy(
 }
 
 func validateMacOSBundleCodeIdentity(
-	app string,
-	extension string,
-	serviceApp string,
-	cli string,
-	daemon string,
-	expectedAppID string,
+	app, extension, serviceApp, cli, daemon, expectedAppID string,
 	layout macOSInstallLayout,
-	codeIdentity macOSInstallCodeIdentityPolicy,
 ) error {
 	teamID, _, ok := strings.Cut(fskitidentity.AppGroup, ".")
 	if !ok || teamID == "" {
 		return fmt.Errorf("invalid linker-stamped app group %q", fskitidentity.AppGroup)
 	}
-	for _, code := range []string{app, extension, serviceApp, cli, daemon} {
-		out, err := exec.Command("/usr/bin/codesign", "-dv", "--verbose=4", code).CombinedOutput()
+	for _, code := range []struct {
+		name, path, executable, identifier string
+	}{
+		{"host", app, filepath.Join(app, "Contents", "MacOS", layout.appExecutable), expectedAppID},
+		{"extension", extension, filepath.Join(extension, "Contents", "MacOS", layout.extensionExecutable), expectedAppID + "." + layout.extensionExecutable},
+		{"daemon service", serviceApp, daemon, expectedAppID + ".PortableFSDService"},
+		{"CLI", cli, cli, ""},
+		{"daemon", daemon, daemon, expectedAppID + ".PortableFSDService"},
+	} {
+		out, err := exec.Command("/usr/bin/lipo", "-archs", code.executable).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("inspect staged code identity %s: %w", code, err)
+			return fmt.Errorf("inspect staged %s architectures: %w (output: %s)", code.name, err, strings.TrimSpace(string(out)))
 		}
-		identity := string(out)
-		for _, required := range []string{
-			"TeamIdentifier=" + teamID,
-			"flags=0x10000(runtime)",
-		} {
-			if !strings.Contains(identity, required) {
-				return fmt.Errorf("staged code %s is missing required identity marker %q", code, required)
+		architectures, err := macOSCodeArchitectures(string(out), layout.codeIdentity)
+		if err != nil {
+			return fmt.Errorf("staged %s: %w", code.name, err)
+		}
+		for _, architecture := range architectures {
+			out, err := exec.Command("/usr/bin/codesign", "-dv", "--verbose=4", "--arch", architecture, code.path).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("inspect staged %s %s code identity: %w", code.name, architecture, err)
+			}
+			if err := validateMacOSCodeSignature(string(out), layout.codeIdentity, code.name, teamID, code.identifier); err != nil {
+				return fmt.Errorf("staged %s %s: %w", code.name, architecture, err)
+			}
+			entitlements, err := exactCodeEntitlementsForArchitecture(code.path, filepath.Dir(app), architecture)
+			if err != nil {
+				return err
+			}
+			if err := validateMacOSComponentEntitlements(entitlements, code.name, fskitidentity.AppGroup); err != nil {
+				return fmt.Errorf("staged %s %s: %w", code.name, architecture, err)
 			}
 		}
 	}
-	if err := validateMacOSSigningAuthorities(
-		codeIdentity,
-		app,
-		extension,
-		serviceApp,
-		cli,
-		daemon,
-	); err != nil {
-		return err
-	}
-	for code, expectedIdentifier := range map[string]string{
-		app:        expectedAppID,
-		extension:  expectedAppID + "." + layout.extensionExecutable,
-		serviceApp: expectedAppID + ".PortableFSDService",
-	} {
-		out, err := exec.Command("/usr/bin/codesign", "-dv", "--verbose=4", code).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("inspect staged code identifier %s: %w", code, err)
-		}
-		if !strings.Contains(string(out), "\nIdentifier="+expectedIdentifier+"\n") &&
-			!strings.HasPrefix(string(out), "Identifier="+expectedIdentifier+"\n") {
-			return fmt.Errorf(
-				"staged code %s signature identifier does not match plist identifier %q",
-				code,
-				expectedIdentifier,
-			)
-		}
-	}
-
-	for name, code := range map[string]string{
-		"host":      app,
-		"extension": extension,
-		"daemon":    daemon,
-	} {
-		if err := validateExactMacOSAppGroupEntitlement(
-			code,
-			name,
-			fskitidentity.AppGroup,
-			filepath.Dir(app),
-		); err != nil {
-			return err
-		}
-	}
-	if err := validateAbsentMacOSAppGroupEntitlement(cli, "CLI", filepath.Dir(app)); err != nil {
-		return err
-	}
-
 	return nil
 }
 
+func macOSCodeArchitectures(output string, policy macOSInstallCodeIdentityPolicy) ([]string, error) {
+	architectures := strings.Fields(output)
+	seen := map[string]bool{}
+	for _, architecture := range architectures {
+		if (architecture != "arm64" && architecture != "x86_64") || seen[architecture] {
+			return nil, fmt.Errorf("invalid code architectures %q", output)
+		}
+		seen[architecture] = true
+	}
+	if len(architectures) == 0 {
+		return nil, fmt.Errorf("code has no architectures")
+	}
+	if policy == macOSInstallDeveloperIDRelease && (!seen["arm64"] || !seen["x86_64"]) {
+		return nil, fmt.Errorf("production code must include arm64 and x86_64")
+	}
+	return architectures, nil
+}
+
+func validateMacOSCodeSignature(output string, policy macOSInstallCodeIdentityPolicy, component, teamID, identifier string) error {
+	team, err := exactCodesignField(output, "TeamIdentifier")
+	if err != nil || team != teamID {
+		return fmt.Errorf("signature team does not equal %q: %v", teamID, err)
+	}
+	if !strings.Contains(output, "flags=0x10000(runtime)") {
+		return fmt.Errorf("signature is missing hardened runtime")
+	}
+	if err := validateMacOSSigningAuthorities(output, policy, component); err != nil {
+		return err
+	}
+	if identifier != "" {
+		signed, err := exactCodesignField(output, "Identifier")
+		if err != nil || signed != identifier {
+			return fmt.Errorf("signature identifier does not match plist identifier %q: %v", identifier, err)
+		}
+	}
+	return nil
+}
+
+func validateMacOSComponentEntitlements(entitlements map[string]any, component, group string) error {
+	if component == "CLI" {
+		return validateAbsentMacOSAppGroupEntitlementDictionary(entitlements, component)
+	}
+	// The app-like service and its executable carry the same restricted signature.
+	if component == "daemon service" {
+		component = "daemon"
+	}
+	if component == "daemon" && len(entitlements) != 1 {
+		return fmt.Errorf("signed daemon must carry only its app-group entitlement, got %v", entitlements)
+	}
+	return validateExactMacOSAppGroupEntitlementDictionary(entitlements, component, group)
+}
+
 func exactCodeEntitlements(code, tempRoot string) (map[string]any, error) {
-	entitlements, err := exec.Command(
-		"/usr/bin/codesign", "-d", "--entitlements", ":-", code,
-	).Output()
+	return exactCodeEntitlementsForArchitecture(code, tempRoot, "")
+}
+
+func exactCodeEntitlementsForArchitecture(code, tempRoot, architecture string) (map[string]any, error) {
+	args := []string{"-d", "--entitlements", ":-"}
+	if architecture != "" {
+		args = append(args, "--arch", architecture)
+	}
+	args = append(args, code)
+	entitlements, err := exec.Command("/usr/bin/codesign", args...).Output()
 	if err != nil {
 		return nil, fmt.Errorf("read exact staged entitlements %s: %w", code, err)
 	}
@@ -3876,63 +3884,31 @@ func requireJSONEOF(decoder *json.Decoder) error {
 	return fmt.Errorf("invalid trailing JSON: %w", err)
 }
 
-func validateMacOSSigningAuthorities(
-	policy macOSInstallCodeIdentityPolicy,
-	app, extension, serviceApp, cli, daemon string,
-) error {
-	type expectedAuthority struct {
-		name   string
-		path   string
-		prefix string
-	}
-	var expected []expectedAuthority
+func validateMacOSSigningAuthorities(output string, policy macOSInstallCodeIdentityPolicy, component string) error {
+	prefix := "Authority=Developer ID Application: "
 	switch policy {
 	case macOSInstallDeveloperIDRelease:
-		for name, path := range map[string]string{
-			"host": app, "extension": extension, "daemon service": serviceApp,
-			"CLI": cli, "daemon": daemon,
-		} {
-			expected = append(expected, expectedAuthority{
-				name: name, path: path, prefix: "Authority=Developer ID Application: ",
-			})
+	case macOSInstallDevelopmentHost:
+		switch component {
+		case "host", "extension", "CLI":
+			prefix = "Authority=Apple Development: "
+		case "daemon service", "daemon":
+		default:
+			return fmt.Errorf("unsupported development signing component %q", component)
 		}
 	default:
 		return fmt.Errorf("unsupported macOS code identity policy")
 	}
-	for _, identity := range expected {
-		out, err := exec.Command(
-			"/usr/bin/codesign", "-dv", "--verbose=4", identity.path,
-		).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("inspect staged %s signing authority: %w", identity.name, err)
+	matches := 0
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), prefix) {
+			matches++
 		}
-		lines := strings.Split(string(out), "\n")
-		matches := 0
-		for _, line := range lines {
-			if strings.HasPrefix(strings.TrimSpace(line), identity.prefix) {
-				matches++
-			}
-		}
-		if matches != 1 {
-			return fmt.Errorf(
-				"staged %s has %d exact %q signing authorities",
-				identity.name,
-				matches,
-				identity.prefix,
-			)
-		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("%s has %d exact %q signing authorities", component, matches, prefix)
 	}
 	return nil
-}
-
-func validateExactMacOSAppGroupEntitlement(
-	code, name, expected, tempRoot string,
-) error {
-	entitlements, err := exactCodeEntitlements(code, tempRoot)
-	if err != nil {
-		return fmt.Errorf("read staged %s entitlements: %w", name, err)
-	}
-	return validateExactMacOSAppGroupEntitlementDictionary(entitlements, name, expected)
 }
 
 func validateExactMacOSAppGroupEntitlementDictionary(
@@ -3949,14 +3925,6 @@ func validateExactMacOSAppGroupEntitlementDictionary(
 		)
 	}
 	return nil
-}
-
-func validateAbsentMacOSAppGroupEntitlement(code, name, tempRoot string) error {
-	entitlements, err := exactCodeEntitlements(code, tempRoot)
-	if err != nil {
-		return fmt.Errorf("read staged %s entitlements: %w", name, err)
-	}
-	return validateAbsentMacOSAppGroupEntitlementDictionary(entitlements, name)
 }
 
 func validateAbsentMacOSAppGroupEntitlementDictionary(
@@ -4112,16 +4080,18 @@ func validatePortableFSDServiceInfo(
 		return fmt.Errorf("daemon service property list %s has invalid CFBundleVersion", path)
 	}
 	return validateExactPlistObject(path, map[string]json.RawMessage{
-		"CFBundleDevelopmentRegion":     exactJSONString("en"),
-		"CFBundleExecutable":            exactJSONString("portablefsd"),
-		"CFBundleIdentifier":            exactJSONString(serviceID),
-		"CFBundleInfoDictionaryVersion": exactJSONString("6.0"),
-		"CFBundleName":                  exactJSONString("PortableFSDService"),
-		"CFBundlePackageType":           exactJSONString("APPL"),
-		"CFBundleShortVersionString":    exactJSONString(version),
-		"CFBundleVersion":               exactJSONString(buildString),
-		"LSBackgroundOnly":              json.RawMessage("true"),
-		"LSMinimumSystemVersion":        exactJSONString(minimumSystemVersion),
+		"CFBundleDevelopmentRegion":        exactJSONString("en"),
+		"CFBundleExecutable":               exactJSONString("portablefsd"),
+		"CFBundleIdentifier":               exactJSONString(serviceID),
+		"CFBundleInfoDictionaryVersion":    exactJSONString("6.0"),
+		"CFBundleName":                     exactJSONString("PortableFSDService"),
+		"CFBundlePackageType":              exactJSONString("APPL"),
+		"CFBundleShortVersionString":       exactJSONString(version),
+		"CFBundleVersion":                  exactJSONString(buildString),
+		"LSBackgroundOnly":                 json.RawMessage("true"),
+		"LSMinimumSystemVersion":           exactJSONString(minimumSystemVersion),
+		"NSLocalNetworkUsageDescription":   exactJSONString("PortableFS connects to filesystem authorities on your local network to mount and access your files."),
+		"NSNetworkVolumesUsageDescription": exactJSONString("PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority."),
 	})
 }
 

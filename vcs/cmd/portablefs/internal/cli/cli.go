@@ -35,6 +35,8 @@ type cmdEnv struct {
 	lifecycleStateDir string
 	// Test-only canonical operational state override.
 	stateDir string
+	// Test-only socket and helper paths; release authentication remains real.
+	fsKitConfigForTest *fskitConfig
 	// Test-only presentation seam. Production always performs the exact
 	// process + kernel mount identity checks in mountHealth.
 	mountHealthFn func(*mountState) string
@@ -232,7 +234,7 @@ func (e *cmdEnv) daemonLifecycleInventory(expected *daemonRelease) (int, error) 
 	if e.daemonLifecycleInventoryFn != nil {
 		return e.daemonLifecycleInventoryFn(expected)
 	}
-	cfg, err := fixedFSKitConfig()
+	cfg, err := e.fsKitConfig()
 	if err != nil {
 		return 0, err
 	}

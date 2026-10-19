@@ -252,13 +252,38 @@ extension, and nested `portablefsd` must each carry exactly one signed
 `com.apple.security.application-groups` value matching that metadata identity.
 The daemon service signature may carry no other entitlement, including
 `get-task-allow`.
-For signed development hosts, the outer host, extension, and unentitled CLI
-use the explicit Apple Development identity selected by Xcode, while the
-nested daemon service is independently signed with the configured
-`PORTABLEFS_SERVICE_SIGN_IDENTITY`. That setting must name the exact Developer
-ID Application identity; the embed phase never infers it from the keychain or
-reuses the host identity. Release export subsequently requires every nested
-component to prove the same Developer ID release authority.
+There are two macOS build artifacts. Each CLI binary contains one complete
+bundle and signing contract, selected at compilation. Ordinary Go builds and
+the `PortableFSApp` target select production: `PortableFS.app`, staging name
+`PortableFS.next`, host `PortableFS`, and `PortableFSExt.appex` with executable
+`PortableFSExt`. The production CLI preserves custom-fork app identifiers with
+the exact extension and service suffixes, and requires Developer ID Application
+signatures, universal arm64/x86_64 code, Gatekeeper assessment and a stapled
+notarization ticket.
+
+The `PortableFSKitDev` target builds only its CLI with Go tag
+`portablefs_devhost`, on every architecture and configuration. That CLI accepts
+exactly `PortableFSKitDev.app`, staging name `PortableFSKitDev.next`, host
+`PortableFSKitDev`, extension `PortableFSDev.appex` with executable
+`PortableFSDev`, and app identifier `dev.portablefs.oss.KitDev`. The extension
+identifier is `dev.portablefs.oss.KitDev.PortableFSDev`; the service and
+LaunchAgent use the same app identifier with `.PortableFSDService` and
+`.portablefsd` suffixes. Both artifacts use service minimum OS `26.0` and the
+same fixed CLI and nested daemon paths.
+
+The development policy requires Apple Development signatures on the host,
+extension and unentitled CLI. The nested service and daemon require the
+explicit Developer ID Application identity in
+`PORTABLEFS_SERVICE_SIGN_IDENTITY`; the embed phase never infers it from the
+keychain or reuses the host identity. Every included architecture must satisfy
+the selected policy, including strict sealed-code verification, team matching,
+hardened runtime, signature/plist identifier equality, exact app-group values,
+the daemon's restricted entitlement set and absent provisioning profile, and
+an empty CLI entitlement set. Development has no Gatekeeper or stapling
+requirement. Neither policy accepts unsigned or ad-hoc code as a live owner.
+There is no runtime layout table, discovery, flag or environment selector, and
+an authentication refusal never tries the other policy.
+
 The embedded `portablefs` CLI must carry no app-group entitlement: its shell
 process wakes the exact host and uses the external private control socket, and
 never enters the protected container. Packaging rejects either missing daemon
@@ -272,7 +297,27 @@ protocol manifest; the authenticated daemon reports its own live identity
 (identity schema 1, operational control, `pfslocal` major and minor). Static
 release authentication still covers signatures, hardened runtime,
 entitlements, sealed resources, the fixed layout, exact executable matching,
-universal slices, notarization, and attestation.
+all included code slices and the selected distribution policy. Shipping
+qualification additionally requires universal slices and notarization; Linux
+archives retain their separate attestation chain.
+
+The selected contract applies to source validation, ordinary connections,
+expected-owner inventory, installer publication, outgoing quiescence, rollback
+and terminal reconciliation. An incoming development helper can authenticate
+an intact older development bundle at another canonical path; it compares the
+complete expected path/version/SHA-256/CDHash tuple and does not require the
+outgoing embedded CLI to contain the new tag. The host uses its own incoming
+helper for that guard. Socket authentication still precedes every HTTP request.
+
+The artifacts share the canonical account state, app group and filesystem
+registration; distinct bundle identifiers do not permit simultaneous daemon
+owners. Development signing and lifecycle passes qualify only that artifact.
+They do not establish shipping installation, publication/rollback,
+notarization or native shipping acceptance. Run the production regressions
+separately. `scripts/test-macos-cli-layouts.sh`, the default local gate and
+native macOS CI build and test both compiled contracts; signed native and LAN
+qualification remain separate gates. Preserve historical failed artifacts and
+receipts when qualifying a corrected build under a new build number.
 
 **An authenticated daemon peer.** Before sending any request on a daemon
 socket, the CLI and the app authenticate the peer with the same rule, from that

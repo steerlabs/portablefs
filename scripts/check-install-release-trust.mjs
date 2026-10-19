@@ -59,6 +59,8 @@ const cliMacOSInstaller = await readFile(
   path.join(root, "vcs/cmd/portablefs/internal/cli/installmacos_darwin.go"),
   "utf8"
 );
+const cliProductionLayout = await readFile(path.join(root, "vcs/cmd/portablefs/internal/cli/installlayout_production_darwin.go"), "utf8");
+const cliDevelopmentLayout = await readFile(path.join(root, "vcs/cmd/portablefs/internal/cli/installlayout_devhost_darwin.go"), "utf8");
 const cliCommands = await readFile(
   path.join(root, "vcs/cmd/portablefs/internal/cli/cli.go"),
   "utf8"
@@ -384,11 +386,6 @@ for (const signedHelperContract of [
 for (const contract of [
   "type macOSInstallCodeIdentityPolicy uint8",
   "macOSInstallDeveloperIDRelease",
-  'appName:             macOSAppName',
-  'appExecutable:       macOSAppExecutable',
-  'extensionExecutable: macOSExtensionExecutable',
-  'serviceMinimumOS:    "26.0"',
-  'codeIdentity:        macOSInstallDeveloperIDRelease',
   "validateInstalledMacOSBundleForPublicationWithLayout(",
   "return runInstallMacOSAppWithLayout(",
   "validateMacOSInstallSourceWithLayout(sourceApp, layout)",
@@ -400,6 +397,52 @@ for (const contract of [
 ]) {
   requireText(cliMacOSInstaller, contract, `immutable macOS installer layout ${contract}`);
 }
+for (const contract of [
+  "//go:build darwin && !portablefs_devhost",
+  'macOSAppName             = "PortableFS.app"',
+  'macOSAppExecutable       = "PortableFS"',
+  'macOSExtensionExecutable = "PortableFSExt"',
+  'codeIdentity:        macOSInstallDeveloperIDRelease',
+]) {
+  requireText(cliProductionLayout, contract, `production CLI contract ${contract}`);
+}
+for (const contract of [
+  "//go:build darwin && portablefs_devhost",
+  'macOSAppName             = "PortableFSKitDev.app"',
+  'macOSStagedAppName       = "PortableFSKitDev.next"',
+  'macOSAppExecutable       = "PortableFSKitDev"',
+  'macOSExtensionExecutable = "PortableFSDev"',
+  'requiredAppID:       "dev.portablefs.oss.KitDev"',
+  'codeIdentity:        macOSInstallDevelopmentHost',
+]) {
+  requireText(cliDevelopmentLayout, contract, `development CLI contract ${contract}`);
+}
+for (const contract of [
+  'if layout.codeIdentity == macOSInstallDeveloperIDRelease {',
+  '"/usr/sbin/spctl", "--assess", "--type", "execute"',
+  '"/usr/bin/xcrun", "stapler", "validate", app',
+  '"--verify", "--deep", "--strict", "--all-architectures"',
+  'prefix := "Authority=Developer ID Application: "',
+  'prefix = "Authority=Apple Development: "',
+  'case "host", "extension", "CLI":',
+  'case "daemon service", "daemon":',
+  '"--arch", architecture, code.path',
+  'component == "daemon" && len(entitlements) != 1',
+]) {
+  requireText(cliMacOSInstaller, contract, `component signing policy ${contract}`);
+}
+for (const contract of [
+  'case "${TARGET_NAME:-}" in', 'PortableFSApp)', 'PortableFSKitDev)',
+  'cli_build_tags=portablefs_devhost', '[ "$tool" = portablefs ]',
+  'build_tags=$cli_build_tags', '-trimpath -tags "$build_tags"',
+  '[ "$PRODUCT_BUNDLE_IDENTIFIER" != dev.portablefs.oss.KitDev ]',
+  '[ "$FULL_PRODUCT_NAME" != PortableFSKitDev.app ]',
+  '[ "$EXECUTABLE_NAME" != PortableFSKitDev ]',
+  '[ "$MACOSX_DEPLOYMENT_TARGET" != 26.0 ]',
+]) {
+  requireText(helperEmbedder, contract, `embedded CLI build selection ${contract}`);
+}
+requireText(ciWorkflow, "run: bash scripts/test-macos-cli-layouts.sh", "CI gates both compiled CLI layouts");
 for (const forbidden of [
   'plistStringArray(entitlementPath, "com.apple.security.application-groups")',
   'Print :com.apple.security.application-groups',
@@ -413,7 +456,7 @@ for (const forbidden of [
   "PORTABLEFS_APP_NAME",
   "PORTABLEFS_EXTENSION_NAME",
 ]) {
-  if (cliMacOSInstaller.includes(forbidden)) {
+  if ([cliMacOSInstaller, cliProductionLayout, cliDevelopmentLayout, cliCommands].some((source) => source.includes(forbidden))) {
     failures.push(`macOS installer layout became runtime-configurable through ${forbidden}`);
   }
 }

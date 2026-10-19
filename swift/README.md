@@ -12,16 +12,19 @@ package and two Xcode projects.
   daemon used by the tests, and `PortableFSAppCore`, the service coordinator and
   support code for the menu-bar app.
 - **`PortableFSApp`** — the shipping product: `PortableFS.app` (a SwiftUI
-  `MenuBarExtra` agent app, `LSUIElement`) with the embedded CLI and daemon in
-  `Contents/Helpers` and `PortableFSExt.appex` in `Contents/Extensions`. The app
+  `MenuBarExtra` agent app, `LSUIElement`) with the embedded CLI in
+  `Contents/Helpers`, daemon in
+  `Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS`, and
+  `PortableFSExt.appex` in `Contents/Extensions`. The app
   is a presentation layer over the bundled CLI, which is the sole
   mount-lifecycle owner.
 - **`PortableFSKitDev`** — a minimal Xcode host app plus `PortableFSDev.appex`,
   used to register an FSKit extension manually for the package's
   test/verification loop. Its extension bundle id
   (`dev.portablefs.oss.KitDev.PortableFSDev`) is deliberately distinct from the
-  shipping app's, so a developer harness and a shipping install are never
-  confused for one another on the same machine.
+  shipping app's. Its embedded CLI compiles the exact development contract with
+  `portablefs_devhost`; the shipping target compiles production. They share
+  account state and the app group, so only one artifact may own the daemon.
 
 ## PortableFSKit package
 
@@ -144,7 +147,10 @@ form that qualifies it; the open native gates are listed in
 
 ```sh
 xcodebuild -project swift/PortableFSKitDev/PortableFSKitDev.xcodeproj \
-  -scheme PortableFSKitDev build CODE_SIGNING_ALLOWED=NO
+  -scheme PortableFSKitDev \
+  PORTABLEFS_APP_GROUP=B47U2LLKHW.pfsoss \
+  PORTABLEFS_GO="$(realpath "$(go -C vcs env GOROOT)/bin/go")" \
+  build CODE_SIGNING_ALLOWED=NO
 ```
 
 For signed local extension testing of the dev harness, set `DEVELOPMENT_TEAM` in
@@ -174,18 +180,23 @@ For signed local extension testing of the dev harness, set `DEVELOPMENT_TEAM` in
 
 ```sh
 xcodebuild -project swift/PortableFSApp/PortableFSApp.xcodeproj \
-  -scheme PortableFSApp build CODE_SIGNING_ALLOWED=NO
+  -scheme PortableFSApp \
+  PORTABLEFS_APP_GROUP=B47U2LLKHW.pfsoss \
+  PORTABLEFS_GO="$(realpath "$(go -C vcs env GOROOT)/bin/go")" \
+  build CODE_SIGNING_ALLOWED=NO
 ```
 
-For a runnable, signed local build set your team in
+For a signed shipping archive, set your team in
 `swift/PortableFSApp/Config/Development.xcconfig`:
 
 ```
-DEVELOPMENT_TEAM = <your Apple Development team id>
+DEVELOPMENT_TEAM = <your signing team id>
 ```
 
-then build without `CODE_SIGNING_ALLOWED=NO` (or run from Xcode). FSKit
-extensions must be signed to be registered by macOS; unsigned builds validate
+then build without `CODE_SIGNING_ALLOWED=NO`. The shipping CLI requires the
+notarized Developer ID distribution contract even when Xcode builds its host
+locally. Use `PortableFSKitDev` for Apple Development lifecycle qualification;
+development results do not qualify the shipping path. FSKit extensions must be signed to be registered by macOS; unsigned builds validate
 compilation and packaging but cannot exercise extension registration.
 
 The local packager embeds universal `portablefs` and `portablefsd` helpers,
@@ -277,11 +288,10 @@ exercise the behaviours the offline suite cannot reach.
    **File System Extensions** category (its ⓘ). Use the category view: on
    macOS 26 the per-app view's toggle can silently do nothing.
 3. Enable the "PortableFS OSS Dev" file system extension there.
-4. Start `portablefsd` with its pfslocal UDS inside the app-group container the
-   appex resolves via `PFSAppGroupIdentifier`:
-   `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock`.
-   The sandbox only allows the extension to connect to unix sockets inside that
-   container, so no other socket location can work.
+4. Let the signed host register its exact nested daemon through
+   ServiceManagement and wait for enabled state. Do not start a second daemon
+   from the shell. The daemon places pfslocal in the shared app-group container;
+   the CLI's private control socket remains outside that Data Vault.
 5. Mount:
 
 ```sh

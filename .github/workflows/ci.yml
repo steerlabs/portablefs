@@ -133,6 +133,8 @@ jobs:
           CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...
       - name: Test the Foundation-enabled Darwin data plane
         run: CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
+      - name: Build and race-test both compiled CLI layouts
+        run: bash scripts/test-macos-cli-layouts.sh
 
   # Packaging, not correctness: it proves the unsigned universal app and the
   # development host still assemble with the exact group and version identity.

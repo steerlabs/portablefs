@@ -9,6 +9,32 @@ if [ "${MARKETING_VERSION:-}" != "$version" ]; then
   echo "MARKETING_VERSION must match repository VERSION ($version)" >&2
   exit 1
 fi
+# Target identity selects the CLI contract at build time for every configuration
+# and slice. Signing identity and bundle contents never choose a layout.
+case "${TARGET_NAME:-}" in
+  PortableFSApp)
+    cli_build_tags=
+    if [ "$FULL_PRODUCT_NAME" != PortableFS.app ] ||
+       [ "$EXECUTABLE_NAME" != PortableFS ]; then
+      echo "PortableFSApp must build the production PortableFS.app identity" >&2
+      exit 1
+    fi
+    ;;
+  PortableFSKitDev)
+    cli_build_tags=portablefs_devhost
+    if [ "$PRODUCT_BUNDLE_IDENTIFIER" != dev.portablefs.oss.KitDev ] ||
+       [ "$FULL_PRODUCT_NAME" != PortableFSKitDev.app ] ||
+       [ "$EXECUTABLE_NAME" != PortableFSKitDev ] ||
+       [ "$MACOSX_DEPLOYMENT_TARGET" != 26.0 ]; then
+      echo "PortableFSKitDev build identity differs from its compiled CLI contract" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "unsupported PortableFS helper embedding target: ${TARGET_NAME:-<missing>}" >&2
+    exit 1
+    ;;
+esac
 contents_dir="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH"
 helper_dir="$contents_dir/Helpers"
 launch_agents_dir="$contents_dir/Library/LaunchAgents"
@@ -88,6 +114,10 @@ mkdir -p "$helper_dir" "$service_macos" "$work"
 build_universal() {
   tool=$1
   output=$2
+  build_tags=
+  if [ "$tool" = portablefs ]; then
+    build_tags=$cli_build_tags
+  fi
   set --
   for arch in ${ARCHS:-$(uname -m)}; do
     case "$arch" in
@@ -102,7 +132,7 @@ build_universal() {
       # uses Foundation's app-group resolver. Both shipped Darwin helpers
       # therefore require their real cgo platform boundary.
       GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" "$portablefs_go" build \
-        -trimpath \
+        -trimpath -tags "$build_tags" \
         -ldflags="-s -w -X main.version=$MARKETING_VERSION -X github.com/steerlabs/portablefs/vcs/internal/fskitidentity.AppGroup=$PORTABLEFS_APP_GROUP" \
         -o "$binary" \
         "./cmd/$tool"

@@ -93,6 +93,13 @@ type fskitConfig struct {
 	releaseForTest          func(string, string) (daemonRelease, error)
 }
 
+func (e *cmdEnv) fsKitConfig() (fskitConfig, error) {
+	if e.fsKitConfigForTest != nil {
+		return *e.fsKitConfigForTest, nil
+	}
+	return fixedFSKitConfig()
+}
+
 func fixedFSKitConfig() (fskitConfig, error) {
 	controlSocket, err := defaultFskitControlSocket()
 	if err != nil {

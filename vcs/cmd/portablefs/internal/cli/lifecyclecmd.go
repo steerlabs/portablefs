@@ -294,7 +294,7 @@ func (e *cmdEnv) strictAccountInventory(
 			len(intents), intent.MountPath, intent.Phase, intent.MountPath, action,
 		)
 	}
-	cfg, err := fixedFSKitConfig()
+	cfg, err := e.fsKitConfig()
 	if err != nil {
 		return inventory, err
 	}

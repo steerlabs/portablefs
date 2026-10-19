@@ -720,6 +720,42 @@ def check_control_lifecycle() -> None:
     finish(problems)
 
 
+@check("macos-cli-layouts", "each Darwin CLI selects one compiled product contract and both variants stay gated")
+def check_macos_cli_layouts() -> None:
+    problems: List[str] = []
+    prefix = "vcs/cmd/portablefs/internal/cli/"
+    records = {
+        "installlayout_production_darwin.go": (
+            "darwin && !portablefs_devhost", "PortableFS.app", "PortableFS.next", "PortableFS", "PortableFSExt", "", "macOSInstallDeveloperIDRelease",
+        ),
+        "installlayout_devhost_darwin.go": (
+            "darwin && portablefs_devhost", "PortableFSKitDev.app", "PortableFSKitDev.next", "PortableFSKitDev", "PortableFSDev", "dev.portablefs.oss.KitDev", "macOSInstallDevelopmentHost",
+        ),
+    }
+    definitions = set()
+    for name, source in production_go(prefix):
+        if re.search(r"var\s+compiledMacOSInstallLayout\s*=", source):
+            definitions.add(pathlib.Path(name).name)
+    require(problems, definitions == set(records), f"compiled CLI layout definitions differ: {definitions}")
+    for filename, (tag, app, staged, host, extension, app_id, policy) in records.items():
+        source = read(prefix + filename)
+        require(problems, source.startswith("//go:build " + tag + "\n"), f"{filename}: wrong build constraint")
+        for name, value in (("macOSAppName", app), ("macOSStagedAppName", staged), ("macOSAppExecutable", host), ("macOSExtensionExecutable", extension)):
+            require(problems, go_const(source, name) == value, f"{filename}: {name} differs from {value!r}")
+        for field, value in (("appName", "macOSAppName"), ("stagedAppName", "macOSStagedAppName"), ("appExecutable", "macOSAppExecutable"), ("extensionExecutable", "macOSExtensionExecutable"), ("serviceMinimumOS", '\"26.0\"'), ("requiredAppID", json.dumps(app_id)), ("codeIdentity", policy)):
+            require(problems, re.search(rf"\b{field}:\s*{re.escape(value)}\s*,", source) is not None, f"{filename}: compiled {field} differs")
+        require(problems, "os.Getenv" not in source and "os.LookupEnv" not in source, f"{filename}: layout has runtime input")
+    embed = read("swift/PortableFSApp/Scripts/embed-portablefs-tools.sh")
+    for contract in ('case "${TARGET_NAME:-}" in', "PortableFSApp)", "PortableFSKitDev)", "cli_build_tags=portablefs_devhost", '[ "$tool" = portablefs ]', 'build_tags=$cli_build_tags', '-trimpath -tags "$build_tags"', '[ "$PRODUCT_BUNDLE_IDENTIFIER" != dev.portablefs.oss.KitDev ]', '[ "$FULL_PRODUCT_NAME" != PortableFSKitDev.app ]', '[ "$EXECUTABLE_NAME" != PortableFSKitDev ]', '[ "$MACOSX_DEPLOYMENT_TARGET" != 26.0 ]'):
+        require(problems, contract in embed, f"embedding lacks {contract}")
+    gate = read("scripts/test-macos-cli-layouts.sh")
+    for contract in ("python3 scripts/test_embed_portablefs_tools.py", "for variant in production development", "tags=portablefs_devhost", 'build -tags "$tags"', 'vet -tags "$tags"', 'test -count=1 -tags "$tags"', 'test -race -count=1 -tags "$tags"'):
+        require(problems, contract in gate, f"CLI variant gate lacks {contract}")
+    for filename in ("scripts/verify-local.sh", ".github/workflows/ci.yml"):
+        require(problems, "bash scripts/test-macos-cli-layouts.sh" in read(filename), f"{filename}: compiled CLI variants are not gated")
+    finish(problems)
+
+
 # A readiness route segment appears either alone ("frontend-ready", as a daemon
 # dispatch case) or as a path suffix ("/frontend-ready", in a CLI request URL).
 READINESS_ROUTE = re.compile(r"\"/?([a-z-]*ready)\"")

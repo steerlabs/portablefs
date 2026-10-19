@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import unittest
+from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).with_name("check-current-architecture.py")
 SPEC = importlib.util.spec_from_file_location("check_current_architecture", SCRIPT)
@@ -87,6 +88,26 @@ class WireFixtures(unittest.TestCase):
     def test_truncated_varint(self) -> None:
         with self.assertRaises(ValueError):
             checker.protobuf_fields(bytes([0x08, 0x80]))
+
+
+class CompiledCLILayouts(unittest.TestCase):
+    def test_current_contract_and_gate_wiring(self) -> None:
+        checker.check_macos_cli_layouts()
+
+    def test_missing_tag_or_development_gate_is_rejected(self) -> None:
+        original = checker.read
+        for filename, old, new in (
+            ("vcs/cmd/portablefs/internal/cli/installlayout_devhost_darwin.go", "darwin && portablefs_devhost", "darwin"),
+            ("swift/PortableFSApp/Scripts/embed-portablefs-tools.sh", 'build_tags=$cli_build_tags', 'build_tags='),
+            ("scripts/verify-local.sh", "bash scripts/test-macos-cli-layouts.sh", "true"),
+        ):
+            with self.subTest(filename=filename):
+                def changed(name):
+                    text = original(name)
+                    return text.replace(old, new) if name == filename else text
+                with mock.patch.object(checker, "read", side_effect=changed):
+                    with self.assertRaises(checker.CheckFailure):
+                        checker.check_macos_cli_layouts()
 
 
 class GoConstants(unittest.TestCase):

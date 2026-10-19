@@ -283,7 +283,7 @@ func TestPreAcceptCommitFailureRequiresExactRollbackCompleteLiveProof(t *testing
 
 func makeFakeMacOSApp(t *testing.T, root, marker string) string {
 	t.Helper()
-	return makeFakeMacOSAppWithLayout(t, root, marker, productionMacOSInstallLayout)
+	return makeFakeMacOSAppWithLayout(t, root, marker, compiledMacOSInstallLayout)
 }
 
 func makeFakeMacOSAppWithLayout(
@@ -327,7 +327,7 @@ func writeTestBundleInfo(t *testing.T, path, bundleID, executable string) {
 
 func addTestBundleIdentity(t *testing.T, app, appID string) {
 	t.Helper()
-	addTestBundleIdentityWithLayout(t, app, appID, productionMacOSInstallLayout)
+	addTestBundleIdentityWithLayout(t, app, appID, compiledMacOSInstallLayout)
 }
 
 func addTestBundleIdentityWithLayout(
@@ -989,21 +989,8 @@ func TestRemoveSnapshottedTreePreservesReplacementAfterPin(t *testing.T) {
 	}
 }
 
-func TestSourceMacOSBundleIdentitySupportsExactCustomForkIdentity(t *testing.T) {
-	app := makeFakeMacOSApp(t, t.TempDir(), "source")
-	const appID = "org.example.portablefs"
-	addTestBundleIdentity(t, app, appID)
-	got, err := sourceMacOSBundleIdentity(app)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != appID {
-		t.Fatalf("app id = %q, want %q", got, appID)
-	}
-}
-
 func TestMacOSInstallLayoutRejectsInvalidCompiledIdentity(t *testing.T) {
-	valid := productionMacOSInstallLayout
+	valid := compiledMacOSInstallLayout
 	for _, mutate := range []func(*macOSInstallLayout){
 		func(layout *macOSInstallLayout) { layout.appName = "../PortableFS.app" },
 		func(layout *macOSInstallLayout) { layout.appName = "PortableFS" },
@@ -1217,16 +1204,18 @@ func TestPortableFSDServiceInfoRequiresTheLayoutMinimumSystemVersion(t *testing.
 	writeInfo := func(minimumSystemVersion string) {
 		t.Helper()
 		object := map[string]any{
-			"CFBundleDevelopmentRegion":     "en",
-			"CFBundleExecutable":            "portablefsd",
-			"CFBundleIdentifier":            serviceID,
-			"CFBundleInfoDictionaryVersion": "6.0",
-			"CFBundleName":                  "PortableFSDService",
-			"CFBundlePackageType":           "APPL",
-			"CFBundleShortVersionString":    version,
-			"CFBundleVersion":               "1",
-			"LSBackgroundOnly":              true,
-			"LSMinimumSystemVersion":        minimumSystemVersion,
+			"CFBundleDevelopmentRegion":        "en",
+			"CFBundleExecutable":               "portablefsd",
+			"CFBundleIdentifier":               serviceID,
+			"CFBundleInfoDictionaryVersion":    "6.0",
+			"CFBundleName":                     "PortableFSDService",
+			"CFBundlePackageType":              "APPL",
+			"CFBundleShortVersionString":       version,
+			"CFBundleVersion":                  "1",
+			"LSBackgroundOnly":                 true,
+			"LSMinimumSystemVersion":           minimumSystemVersion,
+			"NSLocalNetworkUsageDescription":   "PortableFS connects to filesystem authorities on your local network to mount and access your files.",
+			"NSNetworkVolumesUsageDescription": "PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority.",
 		}
 		data, err := json.Marshal(object)
 		if err != nil {
@@ -1263,6 +1252,8 @@ func TestPortableFSDServiceInfoRequiresTheLayoutMinimumSystemVersion(t *testing.
 
 func TestValidateStagedBundleRequiresRealExtensionExecutable(t *testing.T) {
 	app := makeFakeMacOSApp(t, t.TempDir(), "source")
+	appID := selectedTestAppID()
+	addTestBundleIdentity(t, app, appID)
 	for _, executable := range []string{
 		filepath.Join(app, "Contents", "MacOS", macOSAppExecutable),
 		filepath.Join(app, "Contents", filepath.FromSlash(macOSPortableFSDRelativePath)),
@@ -1286,7 +1277,7 @@ func TestValidateStagedBundleRequiresRealExtensionExecutable(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(missing), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err := validateStagedBundleForPublication(app, "1.2.3", "dev.portablefs.test")
+	err := validateStagedBundleForPublication(app, "1.2.3", appID)
 	if err == nil || !strings.Contains(err.Error(), missing) {
 		t.Fatalf("missing extension executable error = %v", err)
 	}

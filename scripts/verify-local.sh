@@ -107,6 +107,9 @@ go -C vcs test ./...
 step "go race suite (native)"
 go -C vcs test -race ./...
 
+step "compiled macOS CLI layouts (production and development)"
+bash scripts/test-macos-cli-layouts.sh
+
 # The maintained go-fuse fork is a nested module, so the suite above does not
 # enter it. ReplyWriteLifecycle tracks selected physical replies while
 # descriptor lifetime is shared with notifications. Normal unmount makes one
@@ -197,7 +200,8 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
 
   echo
   echo "verify-local: ok (full)"
-  echo "  ran: build/vet, govulncheck, native go suites, go-fuse reply/unmount seams,"
+  echo "  ran: build/vet, govulncheck, native go suites, both macOS CLI layouts,"
+  echo "       go-fuse reply/unmount seams,"
   echo "       Swift suite (macOS host only), workflow/release-trust policy,"
   echo "       current-architecture check, xfs-fuse-integration.sh,"
   echo "       coherence-matrix-linux.sh"
