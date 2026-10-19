@@ -33,7 +33,7 @@ PAGE_SIZE = mmap.PAGESIZE
 SIZE = max(4 * PAGE_SIZE, 2 * 1024 * 1024 + PAGE_SIZE)
 HOLD_CASES = ("before-apply", "after-durability-before-reply")
 FAULTS = ("ENOSPC", "EDQUOT", "EIO", "short-write", "transport-loss", "fencing")
-LIFECYCLE = ("pushInvalidate-proof-expiry", "ordinary-unmount", "writer-loss",
+LIFECYCLE = ("pushInvalidate-proof-expiry", "ordinary-unmount", "pushInvalidate-failure", "writer-loss",
              "authorization-loss", "daemon-death", "extension-stall", "sleep-wake")
 
 
@@ -55,6 +55,40 @@ def check_write(fd, data, offset):
         raise OSError(f"short application pwrite: {count}/{len(data)}")
 
 
+def recorded_call(emit, name, operation, **fields):
+    emit(name + "-started", **fields)
+    try:
+        value = operation()
+    except OSError as error:
+        emit(name + "-finished", success=False, errno=error.errno, error=str(error),
+             **fields, **({"access_refusal": True} if name == "reopen" else {}))
+        return False, None
+    emit(name + "-finished", success=True, **fields)
+    return True, value
+
+
+def reopen_fsync(fd, path, emit):
+    """A cleanup error must never replace the decisive barrier outcome."""
+    emit("reopen-fsync-started")
+    closed, _ = recorded_call(emit, "old-close", lambda: os.close(fd))
+    reached = False
+    if closed:
+        opened, reopened = recorded_call(emit, "reopen", lambda: os.open(path, os.O_RDWR))
+        if opened:
+            reached = True
+            recorded_call(emit, "reopened-fsync", lambda: os.fsync(reopened))
+            recorded_call(emit, "final-close", lambda: os.close(reopened))
+    emit("reopen-fsync-finished", fsync_reached=reached)
+
+
+def require_reopen_error(rows):
+    barriers = [row for row in rows if row["event"] == "reopened-fsync-finished"]
+    if any(row["success"] for row in barriers):
+        raise RuntimeError("close/reopen fsync certified an incomplete faulted cut; native proof FAILED")
+    if not barriers:
+        raise RuntimeError("reopened fsync not reached/completed; access refusal or close failure is not an error-retention proof; OPEN")
+
+
 def worker(path):
     """Independent input, write and barrier threads preserve blocked evidence."""
     fd = os.open(path, os.O_RDWR)
@@ -66,6 +100,9 @@ def worker(path):
             record(sys.stdout, event, **fields)
 
     def operation(command):
+        if command == "reopen-fsync":
+            reopen_fsync(fd, path, emit)
+            return
         emit(command + "-started")
         try:
             if command == "dirty":
@@ -75,15 +112,6 @@ def worker(path):
                 os.fsync(fd)
             elif command == "fullfsync":
                 fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-            elif command == "reopen-fsync":
-                # V3 final close has no error channel. Check retained error
-                # delivery after an application close and a fresh description.
-                os.close(fd)
-                reopened = os.open(path, os.O_RDWR)
-                try:
-                    os.fsync(reopened)
-                finally:
-                    os.close(reopened)
             else:
                 raise ValueError(command)
             emit(command + "-finished", success=True)
@@ -108,6 +136,47 @@ def checkpoint(output, text):
     record(output, "operator", checkpoint=text, evidence=answer)
     if not answer.strip():
         raise RuntimeError("required evidence missing; case remains OPEN")
+    return answer
+
+
+def proof_checkpoint(output, text, evidence_fields=(), **expected):
+    answer = checkpoint(output, text + "\nSupply a JSON object with nonempty evidence fields "
+                        f"{list(evidence_fields)} and exact values {json.dumps(expected)}.")
+    try:
+        proof = json.loads(answer)
+    except ValueError as error:
+        raise RuntimeError("structured proof missing; case remains OPEN") from error
+    if (not isinstance(proof, dict)
+            or any(not isinstance(proof.get(key), str) or not proof[key].strip() for key in evidence_fields)
+            or any(type(proof.get(key)) is not type(value) or proof[key] != value for key, value in expected.items())):
+        raise RuntimeError("required proof fields missing or inconsistent; case remains OPEN")
+    record(output, "proof", checkpoint=text, proof=proof)
+    return proof
+
+
+def prepare_mount(mount, output, phase, identities, adapter="V3"):
+    """Preparation is operator-owned; a writable bare mountpoint is never enough."""
+    fields = ["signed_app", "signed_extension", "signed_daemon", "signature_evidence",
+              "session_id", "epoch_id", "mount_evidence"]
+    expected = {"faults_restored": True, "adapter": adapter}
+    if adapter == "V3":
+        fields.append("grant_evidence")
+        expected.update(requested_mode="readWriteWithCache", granted_mode="writeBack")
+    else:
+        fields.append("adapter_evidence")
+    proof = proof_checkpoint(output, f"Prepare fresh healthy signed {adapter} mount for {phase}. Restore every fault; "
+                             "establish NEW session AND epoch identities. Record exact signed artifact hashes and signature "
+                             "verification, actual mounted filesystem identity and current grant/adapter traces before any "
+                             "fixture/directory operation. Never reuse the fenced session or silently recreate the mount.",
+                             evidence_fields=fields, **expected)
+    mounted = os.path.ismount(mount)
+    fresh = all(proof["session_id"] != old["session_id"] and proof["epoch_id"] != old["epoch_id"]
+                for old in identities)
+    record(output, "mount-preparation", phase=phase, mount=str(mount), actual_mount=mounted,
+           fresh_identities=fresh, proof=proof)
+    if not mounted or not fresh:
+        raise RuntimeError("actual fresh healthy mount/session/epoch not established; case remains OPEN")
+    identities.append(proof)
 
 
 def events(path):
@@ -122,6 +191,16 @@ def await_event(path, name, timeout=15):
             return found[-1]
         time.sleep(0.02)
     raise RuntimeError(f"{name} stalled; inspect {path}; result remains OPEN")
+
+
+def collect_reopen_error(artifact, output, label):
+    try:
+        await_event(artifact, "reopen-fsync-finished")
+    finally:
+        # Even a stalled final close cannot hide an observed fsync success.
+        reopened = events(artifact)
+        record(output, "reopen-error-delivery", label=label, results=reopened)
+        require_reopen_error(reopened)
 
 
 def command(process, name):
@@ -168,10 +247,7 @@ def hold_proof(directory, output_dir, output, hold, barrier, fault=None):
                 raise RuntimeError("healthy barrier failed; preserve failure")
             if fault:
                 command(process, "reopen-fsync")
-                reopened = await_event(artifact, "reopen-fsync-finished")
-                record(output, "reopen-error-delivery", label=label, result=reopened)
-                if reopened["success"]:
-                    raise RuntimeError("close/reopen fsync certified an incomplete faulted cut; native proof FAILED")
+                collect_reopen_error(artifact, output, label)
                 checkpoint(output, f"{label}: adjudicate error retention after close/reopen/fsync; no successful barrier may "
                            "certify an incomplete accepted cut. Record final-close timing (no FSKit error return), "
                            "ordinary unmount outcome and actual revoke/fence. Preserve all native errors.")
@@ -192,11 +268,18 @@ def hold_proof(directory, output_dir, output, hold, barrier, fault=None):
 
 def healthy_shapes(directory, output):
     path = directory / "shapes"
-    alias = directory / "alias"
+    other = directory / "other"
+    other.mkdir()
+    alias = other / "alias"
+    replacement = other / "replacement"
     with path.open("xb", buffering=0) as file:
         assert file.write(b"A" * SIZE) == SIZE
         os.fsync(file.fileno())
     os.link(path, alias)
+    with replacement.open("xb", buffering=0) as file:
+        assert file.write(b"T" * SIZE) == SIZE
+        os.fsync(file.fileno())
+    replaced_fd = os.open(replacement, os.O_RDWR)
     fd = os.open(path, os.O_RDWR)
     try:
         check_write(fd, b"B" * SIZE, 0)  # overwrite pages and callback chunks
@@ -210,21 +293,27 @@ def healthy_shapes(directory, output):
         # Each namespace operation has an earlier dirty cut with no explicit
         # application barrier between that write and the namespace syscall.
         check_write(fd, b"L" * PAGE_SIZE, 0)
-        os.link(path, directory / "dirty-link")
-        record(output, "dirty-link-returned", file=str(path))
+        os.link(path, other / "dirty-link")
+        record(output, "dirty-link-returned", file=str(path), alias=str(other / "dirty-link"))
         check_write(fd, b"R" * PAGE_SIZE, 0)
-        os.rename(alias, directory / "renamed")
-        record(output, "dirty-rename-returned", file=str(path))
+        os.rename(alias, directory / "renamed")  # cross-directory alias
+        record(output, "dirty-rename-returned", file=str(path), source=str(alias), target=str(directory / "renamed"))
+        check_write(fd, b"N" * PAGE_SIZE, 0)
+        check_write(replaced_fd, b"X" * PAGE_SIZE, 0)
+        os.rename(directory / "renamed", replacement)  # both items dirty
+        record(output, "dirty-replacement-returned", source=str(directory / "renamed"), target=str(replacement))
+        assert os.pread(replaced_fd, PAGE_SIZE, 0) == b"X" * PAGE_SIZE
         check_write(fd, b"U" * PAGE_SIZE, 0)
-        os.unlink(directory / "dirty-link")
+        os.unlink(other / "dirty-link")
         record(output, "dirty-unlink-returned", file=str(path))
         os.unlink(path)
-        os.unlink(directory / "renamed")
+        os.unlink(replacement)
         check_write(fd, b"D" * PAGE_SIZE, 0)
         os.fsync(fd)
         assert os.pread(fd, PAGE_SIZE, 0) == b"D" * PAGE_SIZE
     finally:
         os.close(fd)
+        os.close(replaced_fd)
     for name, flag in (("sync", getattr(os, "O_SYNC", None)), ("dsync", getattr(os, "O_DSYNC", None))):
         if flag is None:
             record(output, "unsupported", operation=name)
@@ -235,26 +324,93 @@ def healthy_shapes(directory, output):
             os.fsync(fd)
         finally:
             os.close(fd)
-    path = directory / "existing-0200"
-    path.write_bytes(b"A" * SIZE)
-    path.chmod(0o200)
+    permission_shapes(directory, output)
+    checkpoint(output, "Review shape traces: overwrite/extend/truncate-regrow, native pages/chunks, O_SYNC/O_DSYNC, aliases, "
+               "open-unlinked and read-only mappings. Correlate dirty-link/rename/unlink returns with their earlier WRITE "
+               "durability and push completion BEFORE namespace dispatch, including both dirty replacement identities "
+               "and cross-directory aliases/rename. "
+               "Record concurrent writes with a defined barrier cut, supported mappings and explicit unsupported mapping errors; "
+               "do not infer any of these guarantees from the healthy local checks alone.")
+
+
+def permission_shapes(directory, output):
+    # Keep CREATE's legitimate retained read/write rights as a distinct case.
+    path = directory / "create-retained-rights"
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     try:
-        for flags in (os.O_WRONLY, os.O_WRONLY | os.O_APPEND):
+        check_write(fd, b"C" * PAGE_SIZE, 0)
+        proof_checkpoint(output, f"{path}: CREATE with its legitimate read/write description still retained. "
+                         "Record the V3 request/grant and description rights; require writeBack eligibility.",
+                         evidence_fields=("grant_evidence", "description_evidence"),
+                         requested_mode="readWriteWithCache", granted_mode="writeBack", retained_read_description=True)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    for name, mode in (("existing-0200", 0o200), ("existing-readable", 0o600)):
+        path = directory / name
+        with path.open("xb", buffering=0) as file:
+            assert file.write(b"A" * SIZE) == SIZE
+            os.fsync(file.fileno())
+        path.chmod(mode)
+        for trial, flags in (("O_WRONLY", os.O_WRONLY), ("O_APPEND", os.O_WRONLY | os.O_APPEND)):
+            # Application close and chmod do not retire FSKit's retained CREATE
+            # rights. Require the actual native boundary before EACH reopen.
+            proof_checkpoint(output, f"{path} mode {mode:04o} {trial}: BEFORE reopening, record real FSKit final close "
+                             "and retirement of ALL prior descriptions for this fixture, including CREATE and the previous "
+                             "trial. Prove no retained read description. Application close alone is insufficient.",
+                             evidence_fields=("final_close_evidence", "retirement_evidence"),
+                             fixture=str(path), trial=trial, mode=f"{mode:04o}", no_retained_read_description=True)
+            record(output, "write-only-open-started", fixture=str(path), trial=trial, flags=flags, mode=f"{mode:04o}")
             fd = os.open(path, flags)
             try:
-                assert os.write(fd, b"W" * 100) == 100
+                if os.write(fd, b"W" * 100) != 100:
+                    raise OSError("short write-only application write")
                 os.fsync(fd)
             finally:
                 os.close(fd)
-    finally:
-        path.chmod(0o600)
-    checkpoint(output, "Review shape traces: overwrite/extend/truncate-regrow, native pages/chunks, O_SYNC/O_DSYNC, aliases, "
-               "open-unlinked and read-only mappings. Correlate dirty-link/rename/unlink returns with their earlier WRITE "
-               "durability and push completion BEFORE namespace dispatch, including replacement/aliases. "
-               "Existing O_WRONLY/O_APPEND and 0200 must receive noCache when only "
-               "write rights remain; verify no extra read OPEN. Repeat on an existing readable file. "
-               "Record concurrent writes with a defined barrier cut, supported mappings and explicit unsupported mapping errors; "
-               "do not infer any of these guarantees from the healthy local checks alone.")
+            proof_checkpoint(output, f"{path} {trial}: record actual requested/granted modes and bounded OPEN/ownership "
+                             "traces through this trial. Require noCache, no read OPEN and no retained read description. "
+                             "The O_WRONLY supplemental diagnostic likewise cannot prove writeBack/coalescing without "
+                             "independent legitimate retained read rights.",
+                             evidence_fields=("requested_mode", "grant_evidence", "open_trace", "description_evidence"),
+                             fixture=str(path), trial=trial, granted_mode="noCache",
+                             no_retained_read_description=True, read_open_observed=False)
+            record(output, "write-only-trial-recorded", fixture=str(path), trial=trial)
+
+
+def collect_proofs(mount, output_dir, output):
+    identities = []
+    for hold in HOLD_CASES:
+        for barrier in ("fsync", "fullfsync"):
+            for fault in (None, *FAULTS):
+                prepare_mount(mount, output, f"{hold}/{barrier}/{fault or 'success'}", identities)
+                directory = mount / f"writeback-{time.time_ns()}"
+                directory.mkdir()
+                hold_proof(directory, output_dir, output, hold, barrier, fault)
+    # The last case fences or unmounts. Do not touch shapes on its old session
+    # or on the now-writable local directory underneath the mountpoint.
+    prepare_mount(mount, output, "healthy shapes", identities)
+    directory = mount / f"writeback-shapes-{time.time_ns()}"
+    directory.mkdir()
+    healthy_shapes(directory, output)
+    for case in LIFECYCLE:
+        prepare_mount(mount, output, case, identities)
+        checkpoint(output, f"{case}: accept dirty kernel pages, record real writeBack grant; "
+                   "for healthy proof-only expiry/unmount require completed pushInvalidate, all reentrant durable WRITE replies, "
+                   "pinned descriptions and no deadlock under grant renewal/final-close/reclaim/namespace overlap. "
+                   "In the separate pushInvalidate-failure case inject a failed action: unchanged kernel state must "
+                   "fail/fence, never acknowledge withdrawal. End that case before preparing another fresh mount. "
+                   "For ownership/authorization loss require revoke without pushing into any new session/epoch; old dirty callbacks fail. "
+                   "Verify a previously successful barrier's data independently at authority and Linux old/new readers. "
+                   "Use test-macos27-kernel-cache.py's native-page observer for daemon death/stall/sleep, retain stale wake/stall "
+                   "windows honestly, prove exclusion expiry plus storage drain before Linux mutation; no automatic pass.")
+    prepare_mount(mount, output, "V2 comparison", identities, adapter="V2")
+    checkpoint(output, "Repeat relevant held barrier/error/error-retention cases on V2 using this separately reviewed deployed artifact. "
+               "Require the same fresh signed actual-mount/session/epoch preparation after each destructive case; "
+               "record V2 adapter evidence rather than claiming a V3 grant. "
+               "Preserve unchanged acceptance runs and their deadlines/failures; no qualification inherited from build 5008. "
+               "Review every callback cut, native error and independent hash. Any missing proof leaves writeBack unqualified.")
 
 
 def main():
@@ -279,29 +435,7 @@ def main():
         checkpoint(output, "Record exact signed app/extension/daemon hashes, version, OS build, authority/session/epoch, "
                    "path/load, trace setup and independent authority hash command. Keep fresh identities per failure. "
                    "Start bounded grant/callback size/count/durability/final-close tracing; retain raw logs outside the mount.")
-        for hold in HOLD_CASES:
-            for barrier in ("fsync", "fullfsync"):
-                for fault in (None, *FAULTS):
-                    checkpoint(output, f"Prepare fresh healthy mount/session for {hold}/{barrier}/{fault or 'success'}; "
-                               "record artifact identity again after any restart; restore faults before fixture persistence.")
-                    directory = args.mount / f"writeback-{time.time_ns()}"
-                    directory.mkdir()
-                    hold_proof(directory, args.output, output, hold, barrier, fault)
-        directory = args.mount / f"writeback-shapes-{time.time_ns()}"
-        directory.mkdir()
-        healthy_shapes(directory, output)
-        for case in LIFECYCLE:
-            checkpoint(output, f"{case}: fresh signed mount; accept dirty kernel pages, record real writeBack grant; "
-                       "for healthy proof-only expiry/unmount require completed pushInvalidate, all reentrant durable WRITE replies, "
-                       "pinned descriptions and no deadlock under grant renewal/final-close/reclaim/namespace overlap. "
-                       "Inject a failed pushInvalidate separately: unchanged kernel state must fail/fence, never acknowledge withdrawal. "
-                       "For ownership/authorization loss require revoke without pushing into any new session/epoch; old dirty callbacks fail. "
-                       "Verify a previously successful barrier's data independently at authority and Linux old/new readers. "
-                       "Use test-macos27-kernel-cache.py's native-page observer for daemon death/stall/sleep, retain stale wake/stall "
-                       "windows honestly, prove exclusion expiry plus storage drain before Linux mutation; no automatic pass.")
-        checkpoint(output, "Repeat relevant held barrier/error/error-retention cases on V2 using a separately reviewed deployed artifact. "
-                   "Preserve unchanged acceptance runs and their deadlines/failures; no qualification inherited from build 5008. "
-                   "Review every callback cut, native error and independent hash. Any missing proof leaves writeBack unqualified.")
+        collect_proofs(args.mount, args.output, output)
     print("Evidence collected. Native writeBack qualification requires review; no automatic pass claimed.")
 
 
