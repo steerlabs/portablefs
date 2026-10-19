@@ -405,16 +405,16 @@ type v3CachedReply struct {
 }
 
 // serveCachedAttr is the GetAttr half of hit admission for currentAttr.
-func (d *v3DataPlane) serveCachedAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, bool, int32) {
+func (d *v3DataPlane) serveCachedAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, bool, int32, v3CacheResult) {
 	var attr pfslocal.Attr
+	reason := v3CacheBypass
 	hit, errno := d.serveCached(ctx, operationID, 0, func(conflict v3CacheConflict, _ *v3ReplyResourceCollector) v3CacheResult {
-		var reason v3CacheResult
 		attr, reason = d.attrHitLocked(conflict, item, handle)
 		return reason
 	}, func() bool {
 		return d.itemsByID[item.item.ItemID] == item && (handle == nil || d.handles[handle.id] == handle)
 	})
-	return attr, hit, errno
+	return attr, hit, errno, reason
 }
 
 // serveCachedLookup is the Lookup half of hit admission.

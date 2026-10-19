@@ -610,33 +610,52 @@ func (d *v3DataPlane) lookup(ctx context.Context, operationID uint64, request *p
 }
 
 func (d *v3DataPlane) getattr(ctx context.Context, operationID uint64, request *pfslocal.GetAttrRequest) (any, int32) {
-	item, errno := d.item(request.Item)
-	if errno != 0 {
-		return nil, errno
-	}
-	var handle *v3HandleRecord
-	if request.Handle != 0 {
-		var release func()
-		handle, release, errno = d.acquireHandle(request.Handle, item)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, v3LocalErrno(err)
+		}
+		item, errno := d.item(request.Item)
 		if errno != 0 {
 			return nil, errno
 		}
-		defer release()
+		var handle *v3HandleRecord
+		release := func() {}
+		if request.Handle != 0 {
+			handle, release, errno = d.acquireHandle(request.Handle, item)
+			if errno != 0 {
+				return nil, errno
+			}
+		}
+		attr, hit, errno, reason := d.serveCachedAttr(ctx, operationID, item, handle)
+		if !hit && reason == v3CacheHeld {
+			release()
+			if err := d.bridge.sourcePublication.waitForCacheSettlement(ctx, v3AttributeCoordinate(item)); err != nil {
+				return nil, v3LocalErrno(err)
+			}
+			continue
+		}
+		if !hit {
+			attr, errno = d.fetchCurrentAttr(ctx, operationID, item, handle)
+		}
+		release()
+		if errno != 0 {
+			return nil, errno
+		}
+		return &pfslocal.GetAttrReply{Attr: attr}, 0
 	}
-	attr, errno := d.currentAttr(ctx, operationID, item, handle)
-	if errno != 0 {
-		return nil, errno
-	}
-	return &pfslocal.GetAttrReply{Attr: attr}, 0
 }
 
-// currentAttr is the one attribute retrieval path for GetAttr, a no-op
-// SetAttr, and a zero-length Write. A non-nil handle is held under its shared
-// lock by the caller, so no path here reacquires it behind a waiting Close.
+// currentAttr serves a no-op SetAttr or zero-length Write without waiting on
+// its own source lease. GETATTR alone settles held misses before retrying.
+// A non-nil handle is pinned by the caller and is never reacquired here.
 func (d *v3DataPlane) currentAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, int32) {
-	if attr, hit, errno := d.serveCachedAttr(ctx, operationID, item, handle); hit {
+	if attr, hit, errno, _ := d.serveCachedAttr(ctx, operationID, item, handle); hit {
 		return attr, errno
 	}
+	return d.fetchCurrentAttr(ctx, operationID, item, handle)
+}
+
+func (d *v3DataPlane) fetchCurrentAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, int32) {
 	query := &authoritypb.GetAttrRequest{Item: cloneBytesV3(item.token)}
 	if handle != nil {
 		query.Handle = cloneBytesV3(handle.token)

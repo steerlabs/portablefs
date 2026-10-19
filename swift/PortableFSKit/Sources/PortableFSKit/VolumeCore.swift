@@ -30,6 +30,16 @@ public struct PfsXattrSetRequest: Sendable, Equatable {
     }
 }
 
+/// Mirrors the authority's fixed ValidateXattr policy. Shared golden cases
+/// exercise this predicate and the Go validator; neither caches remote state.
+enum PfsXattrPolicy {
+    static func permits(_ name: String) -> Bool {
+        let bytes = name.utf8
+        return !bytes.isEmpty && bytes.count <= 255 && !bytes.contains(0)
+            && name.hasPrefix("user.") && !name.hasPrefix("user.portablefs.")
+    }
+}
+
 /// Stable item identity carried by pfslocal and surfaced to FSKit.
 public struct PfsItemIdentity: Hashable, Sendable {
     public var itemID: UInt64
@@ -937,6 +947,7 @@ public actor VolumeCore {
     }
 
     public func xattrGet(item: PortableFSItem, name: String) async throws -> Data {
+        try validateXattrAccess(item: item, name: name)
         let objectID = ObjectIdentifier(item)
         return try await withDescriptorGate(for: objectID) {
             try await xattrGetLocked(item: item, objectID: objectID, name: name)
@@ -957,6 +968,19 @@ public actor VolumeCore {
             throw PfsLocalClientError.unexpectedReply(String(describing: envelope.body))
         }
         return reply.value
+    }
+
+    /// Item ownership precedes GET/REMOVE grammar and policy, as at the daemon.
+    /// This preflight takes no descriptor/publication/window resources.
+    func validateXattrAccess(item: PortableFSItem, name: String) throws {
+        _ = try identity(for: item)
+        let bytes = name.utf8
+        guard !bytes.isEmpty, bytes.count <= 255, !bytes.contains(0) else {
+            throw PfsLocalClientError.daemon(errno: EINVAL, message: "invalid xattr name")
+        }
+        guard PfsXattrPolicy.permits(name) else {
+            throw PfsLocalClientError.daemon(errno: ENOTSUP, message: "unsupported xattr namespace")
+        }
     }
 
     /// The fixed refusal for setting a user xattr. PortableFS user xattrs are
@@ -1000,6 +1024,7 @@ public actor VolumeCore {
     }
 
     public func xattrRemove(item: PortableFSItem, name: String) async throws {
+        try validateXattrAccess(item: item, name: name)
         let objectID = ObjectIdentifier(item)
         try await withDescriptorGate(for: objectID) {
             try await xattrRemoveLocked(item: item, objectID: objectID, name: name)

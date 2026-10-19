@@ -516,32 +516,63 @@ type v3CacheConflict func(coordinates ...v3PublicationCoordinate) v3CacheResult
 func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	read(func(coordinates ...v3PublicationCoordinate) v3CacheResult {
+	read(c.cacheConflictLocked)
+}
+
+func (c *v3SourcePublicationCoordinator) cacheConflictLocked(coordinates ...v3PublicationCoordinate) v3CacheResult {
+	if c.terminal != nil {
+		return v3CacheTerminal
+	}
+	for _, coordinate := range coordinates {
+		for holder := range c.sourceHolds[coordinate] {
+			if holder.active != 0 {
+				return v3CacheHeld
+			}
+			if holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
+				return v3CacheHeld
+			}
+		}
+		switch coordinate.kind {
+		case v3PublicationItemAttributes:
+			if len(c.unresolvedAttributes) != 0 {
+				return v3CacheHeld
+			}
+		case v3PublicationItemData:
+			if len(c.unresolvedData) != 0 {
+				return v3CacheHeld
+			}
+		}
+	}
+	return v3CacheHit
+}
+
+// waitForCacheSettlement waits for handlers and unresolved bindings, never for
+// PublicationAck. The notification is sampled under the same mutex as conflict
+// detection; callers hold no data-plane or handle lock needed by a producer.
+func (c *v3SourcePublicationCoordinator) waitForCacheSettlement(ctx context.Context, coordinate v3PublicationCoordinate) error {
+	for {
+		c.mu.Lock()
 		if c.terminal != nil {
-			return v3CacheTerminal
+			err := c.terminal
+			c.mu.Unlock()
+			return err
 		}
-		for _, coordinate := range coordinates {
-			for holder := range c.sourceHolds[coordinate] {
-				if holder.active != 0 {
-					return v3CacheHeld
-				}
-				if holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
-					return v3CacheHeld
-				}
-			}
-			switch coordinate.kind {
-			case v3PublicationItemAttributes:
-				if len(c.unresolvedAttributes) != 0 {
-					return v3CacheHeld
-				}
-			case v3PublicationItemData:
-				if len(c.unresolvedData) != 0 {
-					return v3CacheHeld
-				}
-			}
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return err
 		}
-		return v3CacheHit
-	})
+		reason := c.cacheConflictLocked(coordinate)
+		changed := c.changed
+		c.mu.Unlock()
+		if reason != v3CacheHeld {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("portablefsd: cache source settlement: %w", ctx.Err())
+		}
+	}
 }
 
 // finishRequest runs exactly once at the whole handler's return, never at RPC

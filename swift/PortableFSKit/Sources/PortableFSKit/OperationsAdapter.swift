@@ -745,12 +745,15 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
     /// unpublished.
     func publishAfterReply<Value>(
         callbackKind: StaticString = #function,
+        traceFields: [PfsTraceRecord.Field] = [],
+        resultTraceFields: @escaping (Value) -> [PfsTraceRecord.Field] = { _ in [] },
         preflight: @escaping @Sendable () async throws -> Void = {},
         _ operation: @escaping () async throws -> Value,
         reply: @escaping (Result<Value, Error>) -> Void,
         settled: @escaping @Sendable () -> Void = {}
     ) {
-        publishAfterReply(callbackKind: callbackKind, preflight: preflight, operation,
+        publishAfterReply(callbackKind: callbackKind, traceFields: traceFields,
+                          resultTraceFields: resultTraceFields, preflight: preflight, operation,
                           finalize: { $0 }, reply: reply, settled: settled)
     }
 
@@ -758,6 +761,8 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
     /// the framework reply or the semantic publication verdict is selected.
     func publishAfterReply<Value, ReplyValue>(
         callbackKind: StaticString = #function,
+        traceFields: [PfsTraceRecord.Field] = [],
+        resultTraceFields: @escaping (Value) -> [PfsTraceRecord.Field] = { _ in [] },
         preflight: @escaping @Sendable () async throws -> Void = {},
         _ operation: @escaping () async throws -> Value,
         finalize: @escaping (Value) throws -> ReplyValue,
@@ -767,9 +772,11 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         let trace = PfsCallbackTrace(
             kind: callbackKind,
             connection: traceConnection,
-            trace: core.client.trace
+            trace: core.client.trace,
+            fields: traceFields
         )
         let operation = PfsUncheckedSendableBox(operation)
+        let resultTraceFields = PfsUncheckedSendableBox(resultTraceFields)
         let finalize = PfsUncheckedSendableBox(finalize)
         let reply = PfsUncheckedSendableBox(reply)
         Task(priority: .userInitiated) {
@@ -778,8 +785,9 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
             do {
                 try await preflight()
             } catch {
-                reply.value(.failure(PfsErrorMapper.fsKitError(for: error)))
-                trace.finish(outcome: "preflight-refused")
+                let failure = PfsErrorMapper.fsKitError(for: error)
+                reply.value(.failure(failure))
+                trace.finish(outcome: "preflight-refused", errno: (failure as NSError).code)
                 return
             }
 
@@ -821,9 +829,13 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
             trace.emit("FrameworkReplyReturned")
 
             await complete(published)
+            var fields: [PfsTraceRecord.Field] = []
+            if published, self.core.client.trace.isActive, case let .success(value) = result {
+                fields = resultTraceFields.value(value)
+            }
             trace.finish(outcome: self.window.publicationGate.terminalError != nil && !published
                 ? "revoked"
-                : (published ? "success" : "failure"))
+                : (published ? "success" : "failure"), resultFields: fields)
         }
     }
 
@@ -863,12 +875,27 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         }
     }
 
+    private func metadataTraceFields(
+        item: FSItem? = nil,
+        parent: FSItem? = nil,
+        name: FSFileName? = nil,
+        wanted: FSItem.Attribute? = nil
+    ) -> [PfsTraceRecord.Field] {
+        guard core.client.trace.isActive else { return [] }
+        var fields = [PfsTraceRecord.Field(key: "pid", value: "unavailable")]
+        if let item { fields += PfsMetadataTrace.identity(item as? PortableFSItem, role: "item") }
+        if let parent { fields += PfsMetadataTrace.identity(parent as? PortableFSItem, role: "parent") }
+        if let name { fields += PfsMetadataTrace.name(name.data) }
+        if let wanted { fields.append(.init(key: "wanted", value: String(wanted.rawValue))) }
+        return fields
+    }
+
     public func getAttributes(
         _ desiredAttributes: FSItem.GetAttributesRequest,
         of item: FSItem,
         replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void
     ) {
-        publishAfterReply({
+        publishAfterReply(traceFields: metadataTraceFields(item: item, wanted: desiredAttributes.wantedAttributes), {
             try await self.attributes(desiredAttributes, of: item)
         }, reply: { result in
             switch result {
@@ -923,7 +950,8 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         inDirectory directory: FSItem,
         replyHandler reply: @escaping (FSItem?, FSFileName?, Error?) -> Void
     ) {
-        publishAfterReply({
+        publishAfterReply(traceFields: metadataTraceFields(parent: directory, name: name),
+                          resultTraceFields: { PfsMetadataTrace.identity($0.0 as? PortableFSItem, role: "returned") }, {
             try await self.lookupItem(named: name, inDirectory: directory)
         }, reply: { result in
             switch result {
@@ -1512,9 +1540,24 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         })
     }
 
+    // Permitted names take ordinary descriptor/publication admission. Only
+    // a fixed refusal needs the earlier actor hop to check local ownership.
+    private func refuseXattrAccessIfNeeded(named name: FSFileName, of item: FSItem) async throws {
+        let target = try portableItem(item)
+        let decoded = try PfsFSKitMapping.xattrName(from: name)
+        if !PfsXattrPolicy.permits(decoded) {
+            try await core.validateXattrAccess(item: target, name: decoded)
+        }
+    }
+
     @nonobjc
     public func xattr(named name: FSFileName, of item: FSItem) async throws -> Data {
-        try await core.client.withPublicationBoundary {
+        do {
+            try await refuseXattrAccessIfNeeded(named: name, of: item)
+        } catch {
+            throw PfsErrorMapper.fsKitXattrError(for: error)
+        }
+        return try await core.client.withPublicationBoundary {
             do {
                 return try await core.xattrGet(item: try portableItem(item), name: try PfsFSKitMapping.xattrName(from: name))
             } catch {
@@ -1528,8 +1571,15 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         of item: FSItem,
         replyHandler reply: @escaping (Data?, Error?) -> Void
     ) {
-        publishAfterReply({
-            try await self.xattr(named: name, of: item)
+        let fields = metadataTraceFields(item: item, name: name)
+        let target = PfsUncheckedSendableBox(item)
+        let name = PfsUncheckedSendableBox(name)
+        publishAfterReply(traceFields: fields, preflight: {
+            do {
+                try await self.refuseXattrAccessIfNeeded(named: name.value, of: target.value)
+            } catch { throw PfsErrorMapper.fsKitXattrError(for: error) }
+        }, {
+            try await self.xattr(named: name.value, of: target.value)
         }, reply: { result in
             switch result {
             case let .success(value): reply(value, nil)
@@ -1566,7 +1616,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
     ) {
         let preflightName = PfsUncheckedSendableBox(name)
         let preflightItem = PfsUncheckedSendableBox(item)
-        publishAfterReply(preflight: {
+        publishAfterReply(traceFields: metadataTraceFields(item: item, name: name), preflight: {
             do {
                 _ = try await self.refuseXattrSetIfRequested(
                     named: preflightName.value,
@@ -1602,7 +1652,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         of item: FSItem,
         replyHandler reply: @escaping ([FSFileName]?, Error?) -> Void
     ) {
-        publishAfterReply({
+        publishAfterReply(traceFields: metadataTraceFields(item: item), {
             try await self.xattrs(of: item)
         }, reply: { result in
             switch result {
@@ -1626,6 +1676,9 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         let request: PfsXattrSetRequest
         switch policy {
         case .delete:
+            if !PfsXattrPolicy.permits(xattrName) {
+                try await core.validateXattrAccess(item: try portableItem(item), name: xattrName)
+            }
             return xattrName
         case .mustCreate:
             request = try PfsXattrSetRequest(name: xattrName, createOnly: true, replaceOnly: false)

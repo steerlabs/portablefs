@@ -37,7 +37,15 @@ final class PfsAsyncSocket: @unchecked Sendable {
     private let closeLock = NSLock()
     private var closed = false
 
-    private init(fd: Int32, maxFrameLength: Int) throws {
+    enum ReceiveEvent: Sendable, Equatable {
+        case readRequested(Int)
+        case resumed
+    }
+
+    private let receiveObserver: (@Sendable (ReceiveEvent) -> Void)?
+
+    init(fd: Int32, maxFrameLength: Int, receiveObserver: (@Sendable (ReceiveEvent) -> Void)? = nil) throws {
+        self.receiveObserver = receiveObserver
         self.maxFrameLength = maxFrameLength
         self.queue = DispatchQueue(label: "dev.portablefs.pfslocal.io.\(UUID().uuidString)", qos: .userInitiated)
         let ioFD = dup(fd)
@@ -68,35 +76,70 @@ final class PfsAsyncSocket: @unchecked Sendable {
     /// this one. At most one bounded frame crosses the actor hop; a stalled
     /// receiver leaves later bytes in the socket and backpressures the sender.
     func readFrame() async throws -> PfsEnvelope {
-        let header = try await readExactly(4, frameStart: true)
-        let length = header.enumerated().reduce(UInt32(0)) { $0 | (UInt32($1.element) << ($1.offset * 8)) }
-        guard length <= maxFrameLength else {
-            throw PfsLocalClientError.frameTooLarge(length: length, max: maxFrameLength)
-        }
-        let payload = try await readExactly(Int(length), frameStart: false)
-        let envelope = try PfsEnvelope(serializedBytes: payload)
-        try PfsUnknownFieldGuard.requireKnownFields(envelope)
-        return envelope
-    }
-
-    private func readExactly(_ count: Int, frameStart: Bool) async throws -> Data {
-        if count == 0 { return Data() }
-        return try await withCheckedThrowingContinuation { continuation in
-            let box = PfsContinuationBox<Data>(continuation)
-            queue.async { [io, queue] in
-                var bytes = Data()
-                io.read(offset: 0, length: count, queue: queue) { done, data, error in
-                    if error != 0 {
-                        box.resume(throwing: PfsLocalClientError.system(errno: error, operation: "read"))
-                        return
+        try await withCheckedThrowingContinuation { continuation in
+            let box = PfsContinuationBox<PfsEnvelope>(continuation)
+            queue.async { [self] in
+                readExactly(4, frameStart: true) { [self] headerResult in
+                    switch headerResult {
+                    case let .failure(error):
+                        receiveObserver?(.resumed)
+                        box.resume(throwing: error)
+                    case let .success(header):
+                        let length = header.enumerated().reduce(UInt32(0)) {
+                            $0 | (UInt32($1.element) << ($1.offset * 8))
+                        }
+                        guard length <= maxFrameLength else {
+                            receiveObserver?(.resumed)
+                            box.resume(throwing: PfsLocalClientError.frameTooLarge(length: length, max: maxFrameLength))
+                            return
+                        }
+                        readExactly(Int(length), frameStart: false) { [self] payloadResult in
+                            let result = payloadResult.flatMap { payload in
+                                Result {
+                                    let envelope = try PfsEnvelope(serializedBytes: payload)
+                                    try PfsUnknownFieldGuard.requireKnownFields(envelope)
+                                    return envelope
+                                }
+                            }
+                            receiveObserver?(.resumed)
+                            switch result {
+                            case let .success(envelope): box.resume(returning: envelope)
+                            case let .failure(error): box.resume(throwing: error)
+                            }
+                        }
                     }
-                    if let data { bytes.append(Data(data)) }
-                    guard done else { return }
-                    if bytes.count == count { box.resume(returning: bytes) }
-                    else if frameStart, bytes.isEmpty { box.resume(throwing: PfsLocalClientError.connectionClosed) }
-                    else { box.resume(throwing: PfsLocalClientError.invalidFrame("EOF before completing frame")) }
                 }
             }
+        }
+    }
+
+    // Header and payload collection stay on the I/O queue. No second frame is
+    // requested until the ordered receive owner has applied this frame.
+    private func readExactly(
+        _ count: Int,
+        frameStart: Bool,
+        completion: @escaping @Sendable (Result<Data, Error>) -> Void
+    ) {
+        receiveObserver?(.readRequested(count))
+        if count == 0 {
+            completion(.success(Data()))
+            return
+        }
+        var bytes = Data()
+        var completed = false
+        io.read(offset: 0, length: count, queue: queue) { done, data, error in
+            guard !completed else { return }
+            if error != 0 {
+                completed = true
+                completion(.failure(PfsLocalClientError.system(errno: error, operation: "read")))
+                return
+            }
+            if let data { bytes.append(Data(data)) }
+            guard done else { return }
+            completed = true
+            if bytes.count == count { completion(.success(bytes)) }
+            else if frameStart, bytes.isEmpty { completion(.failure(PfsLocalClientError.connectionClosed)) }
+            else { completion(.failure(PfsLocalClientError.invalidFrame("EOF before completing frame"))) }
         }
     }
 

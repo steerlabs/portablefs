@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"strings"
@@ -214,58 +215,179 @@ func TestV3CacheHitsStopAtImmediatePoisonAndTheAuthorizationDeadline(t *testing.
 	})
 }
 
-// A hit is atomic with source acquisition: a held coordinate or any
-// unresolved post-binding claim, including one owned by the same callback,
-// sends the read to the authority.
-func TestV3CacheHitsYieldToSourceHoldsAndUnresolvedClaims(t *testing.T) {
+// A held GETATTR waits for source work, including same-callback work and
+// unknown namespace bindings, then retries ordinary admission before any ack.
+func TestV3CacheGetattrSettlesAndRechecks(t *testing.T) {
+	for _, namespace := range []bool{false, true} {
+		for _, sameCallback := range []bool{false, true} {
+			t.Run(fmt.Sprintf("namespace=%t/same-callback=%t", namespace, sameCallback), func(t *testing.T) {
+				f := newCachedV3Fixture(t, v3FileObjects())
+				f.ns.bind(0x20, "file", 0x70)
+				file := f.lookup(f.root, "file")
+				c := f.d.bridge.sourcePublication
+				const op = uint64(9101)
+				c.reserve(testCallback(op))
+				gate, err := v3ItemSourceGate(file.Item, true)
+				if namespace {
+					gate, err = v3NamespaceSourceGate(f.root, []byte("other"), false)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				lease, err := c.acquireSource(context.Background(), testCallback(op), gate)
+				if err != nil {
+					t.Fatal(err)
+				}
+				operation := uint64(0)
+				if sameCallback {
+					operation = op
+				}
+				before := f.authorityCalls()
+				pending := startHeldGetattr(t, f, context.Background(), file.Item, 0, operation)
+				// A names-only lookup keeps its existing ordinary miss path.
+				if namespace {
+					f.requireAuthority("Lookup under an unresolved claim", func() { f.lookup(f.root, "file") })
+					before = f.authorityCalls()
+					lease.finishRequest()
+					select {
+					case errno := <-pending:
+						t.Fatalf("unresolved binding completed early: %d", errno)
+					default:
+					}
+					if err := lease.resolveNoBinding(gate, v3PublicationNamespace{parent: v3PublicationIdentity(f.root.StableIdentity), name: "other"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Settlement, rather than PublicationAck, is the wakeup.
+				if !namespace {
+					lease.finishRequest()
+				}
+				requireGetattrResult(t, pending, 0)
+				if got := f.authorityCalls() - before; got != 0 {
+					t.Fatalf("settled hit made %d authority calls", got)
+				}
+				c.mu.Lock()
+				acknowledged := c.operations[testCallback(op)].acknowledged
+				c.mu.Unlock()
+				if acknowledged {
+					t.Fatal("test accidentally acknowledged the producer")
+				}
+			})
+		}
+	}
+}
+
+func TestV3CacheGetattrSettlementRealMiss(t *testing.T) {
 	f := newCachedV3Fixture(t, v3FileObjects())
 	f.ns.bind(0x20, "file", 0x70)
-	f.getattr(f.root)
 	file := f.lookup(f.root, "file")
-	coordinator := f.d.bridge.sourcePublication
+	c := f.d.bridge.sourcePublication
+	c.reserve(testCallback(9102))
+	gate, _ := v3ItemSourceGate(file.Item, false)
+	lease, err := c.acquireSource(context.Background(), testCallback(9102), gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.authorityCalls()
+	pending := startHeldGetattr(t, f, context.Background(), file.Item, 0, 0)
+	f.d.mu.Lock()
+	f.d.itemsByID[file.Item.ItemID].valid = false
+	f.d.mu.Unlock()
+	lease.finishRequest()
+	requireGetattrResult(t, pending, 0)
+	if got := f.authorityCalls() - before; got != 1 {
+		t.Fatalf("real miss made %d authority calls, want 1", got)
+	}
+}
 
-	hold := func(operationID uint64, gate *v3SourceGate) func() {
-		coordinator.reserve(testCallback(operationID))
-		if _, err := coordinator.acquireSource(context.Background(), testCallback(operationID), gate); err != nil {
-			t.Fatal(err)
-		}
-		return func() {
-			if _, err := coordinator.acknowledge(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished); err != nil {
+func TestV3CacheGetattrSettlementInterruptions(t *testing.T) {
+	for _, interruption := range []string{"deadline", "cancel", "terminal"} {
+		t.Run(interruption, func(t *testing.T) {
+			f := newCachedV3Fixture(t, v3FileObjects())
+			f.ns.bind(0x20, "file", 0x70)
+			file := f.lookup(f.root, "file")
+			c := f.d.bridge.sourcePublication
+			c.reserve(testCallback(9103))
+			gate, _ := v3ItemSourceGate(file.Item, false)
+			lease, err := c.acquireSource(context.Background(), testCallback(9103), gate)
+			if err != nil {
 				t.Fatal(err)
 			}
-			coordinator.retire(testCallback(operationID))
+			defer lease.finishRequest()
+			ctx, cancel := context.WithCancel(context.Background())
+			if interruption == "deadline" {
+				ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+			}
+			defer cancel()
+			before := f.authorityCalls()
+			pending := startHeldGetattr(t, f, ctx, file.Item, 0, 0)
+			want := int32(darwinETIMEDOUT)
+			switch interruption {
+			case "cancel":
+				cancel()
+				want = darwinEINTR
+			case "terminal":
+				_ = f.d.fail(errors.New("test terminal while held"))
+				want = darwinEIO
+			}
+			requireGetattrResult(t, pending, want)
+			if got := f.authorityCalls() - before; got != 0 {
+				t.Fatalf("interrupted wait made %d authority calls", got)
+			}
+		})
+	}
+}
+
+func startHeldGetattr(t *testing.T, f *cachedV3Fixture, ctx context.Context, item pfslocal.Item, handle, operation uint64) <-chan int32 {
+	t.Helper()
+	f.d.mu.Lock()
+	before := f.d.cacheCounters.reads[0][v3CacheHeld]
+	f.d.mu.Unlock()
+	done := make(chan int32, 1)
+	go func() {
+		request := &pfslocal.GetAttrRequest{Item: item, Handle: handle}
+		var errno int32
+		if operation == 0 {
+			_, errno = dispatchV3Test(f.d, ctx, 0, request)
+		} else {
+			_, errno = dispatchV3Owned(f.d, ctx, operation, request)
+		}
+		done <- errno
+	}()
+	deadline := time.After(2 * time.Second)
+	for {
+		f.d.mu.Lock()
+		held := f.d.cacheCounters.reads[0][v3CacheHeld] > before
+		f.d.mu.Unlock()
+		if held {
+			break
+		}
+		select {
+		case errno := <-done:
+			t.Fatalf("getattr returned before source settlement: %d", errno)
+		case <-deadline:
+			t.Fatal("getattr did not reach held admission")
+		case <-time.After(time.Millisecond):
 		}
 	}
-	itemGate, err := v3ItemSourceGate(file.Item, true)
-	if err != nil {
-		t.Fatal(err)
+	select {
+	case errno := <-done:
+		t.Fatalf("held getattr completed early: %d", errno)
+	default:
 	}
-	release := hold(9101, itemGate)
-	f.requireAuthority("GetAttr under a write hold", func() { f.getattr(file.Item) })
-	release()
-	f.requireServedLocally("GetAttr after release", func() { f.getattr(file.Item) })
+	return done
+}
 
-	// An unrelated create's unresolved claim could bind any identity.
-	createGate, err := v3NamespaceSourceGate(f.root, []byte("other"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	release = hold(9102, createGate)
-	f.requireAuthority("GetAttr under an unresolved claim", func() { f.getattr(file.Item) })
-	f.requireAuthority("Lookup under an unresolved claim", func() { f.lookup(f.root, "file") })
-	release()
-	f.requireServedLocally("Lookup after release", func() { f.lookup(f.root, "file") })
-
-	// A claim owned by the very callback asking is still a conflict: its own
-	// in-flight request may already have committed.
-	const sameCallback = uint64(9103)
-	release = hold(sameCallback, itemGate)
-	f.requireAuthority("GetAttr under the same callback's hold", func() {
-		if _, errno := dispatchV3Owned(f.d, context.Background(), sameCallback, &pfslocal.GetAttrRequest{Item: file.Item}); errno != 0 {
-			t.Fatalf("getattr errno=%d", errno)
+func requireGetattrResult(t *testing.T, done <-chan int32, want int32) {
+	t.Helper()
+	select {
+	case errno := <-done:
+		if errno != want {
+			t.Fatalf("getattr errno=%d, want %d", errno, want)
 		}
-	})
-	release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("getattr did not wake")
+	}
 }
 
 // The r2 counterexample: a Lookup of an unheld X samples s=5; an unlink of X
@@ -1169,8 +1291,13 @@ func TestV3CacheSameCallbackWritesWithReversedReplies(t *testing.T) {
 	if _, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.WriteRequest{Handle: handle, Offset: 10, Data: []byte("fghij")}); errno != 0 {
 		t.Fatalf("second write errno=%d", errno)
 	}
-	f.requireAuthority("read with an overlapping source request still active", func() { f.getattr(file.Item) })
+	before := f.authorityCalls()
+	pending := startHeldGetattr(t, f, context.Background(), file.Item, handle, 0)
 	close(releaseFirst)
+	requireGetattrResult(t, pending, 0)
+	if got := f.authorityCalls() - before; got != 0 {
+		t.Fatalf("settled write made %d extra authority calls", got)
+	}
 	if errno := <-first; errno != 0 || f.d.terminalError() != nil {
 		t.Fatalf("older reply after newer = %d terminal=%v, want no fence", errno, f.d.terminalError())
 	}
@@ -1229,29 +1356,6 @@ func TestV3CacheSameCallbackSameNameNamespaceRequests(t *testing.T) {
 	f.requireAuthority("lookup of the dropped coordinate", func() {
 		if _, errno := f.dispatch(&pfslocal.LookupRequest{Dir: f.root, Name: []byte("n")}); errno != darwinENOENT {
 			t.Fatalf("lookup errno=%d", errno)
-		}
-	})
-}
-
-// An unresolved namespace claim owned by the very callback asking gates its
-// hits too: the identity it will bind is not known yet.
-func TestV3CacheSameCallbackUnresolvedNamespaceClaimGatesAHit(t *testing.T) {
-	f := newCachedV3Fixture(t, v3FileObjects())
-	f.ns.bind(0x20, "file", 0x70)
-	f.getattr(f.root)
-	file := f.lookup(f.root, "file")
-	const operationID = uint64(97301)
-	f.d.bridge.reserveFrontendPublication(testCallback(operationID))
-	gate, err := v3NamespaceSourceGate(f.root, []byte("other"), false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.d.bridge.sourcePublication.acquireSource(context.Background(), testCallback(operationID), gate); err != nil {
-		t.Fatal(err)
-	}
-	f.requireAuthority("GetAttr under the same callback's unresolved claim", func() {
-		if _, errno := dispatchV3Owned(f.d, context.Background(), operationID, &pfslocal.GetAttrRequest{Item: file.Item}); errno != 0 {
-			t.Fatalf("getattr errno=%d", errno)
 		}
 	})
 }
@@ -1527,8 +1631,9 @@ func TestV3CacheMetricsExposeBoundedMissReasonsAndLookupPolarity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.getattr(file.Item) // held
+	pending := startHeldGetattr(t, f, context.Background(), file.Item, 0, 0)
 	lease.finishRequest()
+	requireGetattrResult(t, pending, 0)
 	f.clock.advance(10 * time.Minute)
 	f.getattr(file.Item) // horizon
 	f.d.mu.Lock()
@@ -1566,7 +1671,7 @@ func TestV3CacheMetricsDistinguishTerminalCoordinatorFromSourceHolds(t *testing.
 	}
 	collector := &v3ReplyResourceCollector{d: f.d}
 	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
-	if _, hit, errno := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
+	if _, hit, errno, _ := f.d.serveCachedAttr(ctx, 0, record, nil); hit || errno != 0 {
 		t.Fatalf("withdrawn coordinator: hit=%t errno=%d", hit, errno)
 	}
 	metrics := f.d.cacheMetrics()
@@ -1663,4 +1768,42 @@ func TestV3AuthorityAndCachedReadsKeepTheSameOverlappingSnapshot(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Close and cleanup need the exclusive handle lock. GETATTR releases its read
+// pin before waiting so source producers cannot be blocked behind the waiter.
+func TestV3CacheGetattrSettlementDropsHandleLock(t *testing.T) {
+	f := newCachedV3Fixture(t, v3FileObjects())
+	f.ns.bind(0x20, "file", 0x70)
+	file := f.lookup(f.root, "file")
+	opened, errno := f.dispatch(&pfslocal.OpenRequest{Item: file.Item, Mode: pfslocal.OpenModeReadWrite})
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	handleID := opened.(*pfslocal.OpenReply).Handle
+	c := f.d.bridge.sourcePublication
+	c.reserve(testCallback(9104))
+	gate, _ := v3ItemSourceGate(file.Item, false)
+	lease, err := c.acquireSource(context.Background(), testCallback(9104), gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := startHeldGetattr(t, f, context.Background(), file.Item, handleID, 0)
+	handle, errno := f.d.handle(handleID, nil)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	producer := make(chan struct{})
+	go func() {
+		handle.mu.Lock()
+		lease.finishRequest()
+		handle.mu.Unlock()
+		close(producer)
+	}()
+	select {
+	case <-producer:
+	case <-time.After(2 * time.Second):
+		t.Fatal("getattr retained the producer-needed handle lock")
+	}
+	requireGetattrResult(t, pending, 0)
 }

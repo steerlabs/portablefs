@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import os
 import Synchronization
 
@@ -10,8 +11,10 @@ import Synchronization
 /// These records provide no complete callback inventory, loss accounting, or
 /// cross-process correlation guarantee.
 ///
-/// Records carry labels, IDs, request kinds, errnos and access modes only: no
-/// names, contents or credentials.
+/// Names use a process-keyed, bounded token: repeated names can be joined
+/// inside one capture without publishing names or permitting dictionary probes.
+/// Item IDs/file numbers/incarnations carry identity, never capabilities.
+/// FSKitContext exposes uid/gid only; caller PID is unavailable.
 struct PfsTraceRecord: Sendable, Equatable {
     enum Event: String, Sendable {
         case callbackBegan = "CallbackBegan"
@@ -134,7 +137,10 @@ struct PfsCallbackTrace: Sendable {
     private let trace: PfsTrace
     private let interval: (OSSignpostID, OSSignpostIntervalState)?
 
-    init(kind: StaticString, connection: String, trace: PfsTrace) {
+    private let fields: [PfsTraceRecord.Field]
+
+    init(kind: StaticString, connection: String, trace: PfsTrace, fields: [PfsTraceRecord.Field] = []) {
+        self.fields = fields
         let kind = String(describing: kind)
         let label = trace.allocateCallbackLabel()
         self.label = label
@@ -144,7 +150,7 @@ struct PfsCallbackTrace: Sendable {
         let began = PfsTraceRecord(
             .callbackBegan,
             connection: connection,
-            ["callback": label, "kind": kind]
+            ["callback": label, "kind": kind], context: fields
         )
         if PfsTrace.callbackSignposter.isEnabled {
             let id = PfsTrace.callbackSignposter.makeSignpostID()
@@ -169,11 +175,12 @@ struct PfsCallbackTrace: Sendable {
         )
     }
 
-    func finish(outcome: String) {
+    func finish(outcome: String, errno: Int? = nil, resultFields: [PfsTraceRecord.Field] = []) {
+        let errnoFields = errno.map { [PfsTraceRecord.Field(key: "errno", value: String($0))] } ?? []
         let finished = PfsTraceRecord(
             .callbackFinished,
             connection: connection,
-            ["callback": label, "outcome": outcome]
+            ["callback": label, "outcome": outcome], context: fields + errnoFields + resultFields
         )
         if let (_, state) = interval {
             PfsTrace.callbackSignposter.endInterval(
@@ -183,5 +190,27 @@ struct PfsCallbackTrace: Sendable {
             )
         }
         trace.emit { finished }
+    }
+}
+
+/// Fixed-size identity fields only, built when trace collection is active.
+enum PfsMetadataTrace {
+    private static let nameKey = SymmetricKey(size: .bits256)
+
+    static func identity(_ item: PortableFSItem?, role: String) -> [PfsTraceRecord.Field] {
+        guard let item else { return [.init(key: role, value: "unavailable")] }
+        return [
+            .init(key: "\(role)_local", value: String(item.identity.itemID)),
+            .init(key: "\(role)_generation", value: String(item.identity.generation)),
+            .init(key: "\(role)_file", value: String(item.fileID)),
+        ]
+    }
+
+    static func name(_ bytes: Data) -> [PfsTraceRecord.Field] {
+        let mac = HMAC<SHA256>.authenticationCode(for: bytes, using: nameKey)
+        return [
+            .init(key: "name_token", value: mac.prefix(16).map { String(format: "%02x", $0) }.joined()),
+            .init(key: "name_bytes", value: String(bytes.count)),
+        ]
     }
 }

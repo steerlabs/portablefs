@@ -530,3 +530,115 @@ private func checkDisjointCallbackTrips(adapter: PortableFSVolume.Type) async th
     await f.volume.shutdown()
 }
 }
+
+extension PfsLocalMockDaemonTests {
+@available(macOS 26.0, *)
+@Test func fixedXattrRefusalsHaveZeroCallbackTripsAndBoundedIdentityTrace() async throws {
+    try await checkFixedXattrRefusals(adapter: PortableFSVolumeV2.self)
+}
+
+@available(macOS 27.0, *)
+@Test func v3FixedXattrRefusalsHaveZeroCallbackTripsAndBoundedIdentityTrace() async throws {
+    try await checkFixedXattrRefusals(adapter: PortableFSVolumeV3.self)
+}
+
+@available(macOS 26.0, *)
+private func checkFixedXattrRefusals(adapter: PortableFSVolume.Type) async throws {
+    let f = try await CallbackTripFixture(adapter: adapter)
+    defer { f.daemon.stop() }
+    let item = try await f.create("private-diagnostic-file")
+    let portable = try #require(item as? PortableFSItem)
+    // Use the real native entry points, including delete's setXattr entry.
+    for name in ["com.apple.FinderInfo", "security.capability", "user.portablefs.secret"] {
+        for deleting in [false, true] {
+            let before = f.log.all().count
+            let reply = TraceReplyBox<Int>()
+            if deleting {
+                f.volume.setXattr(named: FSFileName(string: name), to: nil, on: item, policy: .delete) { error in
+                    reply.set((error as NSError?)?.code ?? 0)
+                }
+            } else {
+                f.volume.getXattr(named: FSFileName(string: name), of: item) { _, error in
+                    reply.set((error as NSError?)?.code ?? 0)
+                }
+            }
+            #expect(try await waitForReply(reply) == Int(EOPNOTSUPP))
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !f.log.all().dropFirst(before).contains(where: { $0.event == .callbackFinished }) {
+                try #require(ContinuousClock.now < deadline)
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            let records = Array(f.log.all().dropFirst(before))
+            #expect(records.filter { $0.event == .dispatched }.isEmpty)
+            #expect(records.filter { $0.event == .callbackOperation }.isEmpty)
+            let began = try #require(records.first { $0.event == .callbackBegan })
+            #expect(began.value("item_local") == String(portable.identity.itemID))
+            #expect(began.value("item_generation") == String(portable.identity.generation))
+            #expect(began.value("item_file") == String(portable.fileID))
+            #expect(began.value("pid") == "unavailable")
+            #expect(began.value("name_token")?.count == 32)
+            #expect(began.value("name_bytes") == String(name.utf8.count))
+            #expect(records.allSatisfy { !$0.message.contains(name) })
+            #expect(records.contains { $0.event == .callbackFinished && $0.value("outcome") == "preflight-refused" && $0.value("errno") == String(EOPNOTSUPP) })
+        }
+    }
+    for policy: FSVolume.SetXattrPolicy in [.mustCreate, .mustReplace, .alwaysSet] {
+        let before = f.log.all().count
+        let reply = TraceReplyBox<Int>()
+        f.volume.setXattr(named: FSFileName(string: "user.test"), to: Data([1]), on: item, policy: policy) { error in
+            reply.set((error as NSError?)?.code ?? 0)
+        }
+        #expect(try await waitForReply(reply) == Int(EOPNOTSUPP))
+        #expect(f.log.all().dropFirst(before).filter { $0.event == .dispatched }.isEmpty)
+    }
+    // Permitted names still use one local request for each native callback.
+    try await f.daemon.seedXattr(named: "user.test", value: Data([7]), on: portable.identity)
+    let value: Data = try await f.step(["xattr-get"]) { finish in
+        f.volume.getXattr(named: FSFileName(string: "user.test"), of: item) { value, error in
+            finish(error.map { .failure($0) } ?? .success(value ?? Data()))
+        }
+    }
+    #expect(value == Data([7]))
+    let _: [FSFileName] = try await f.step(["xattr-list"]) { finish in
+        f.volume.listXattrs(of: item) { names, error in
+            finish(error.map { .failure($0) } ?? .success(names ?? []))
+        }
+    }
+    try await f.step(["xattr-remove"]) { finish in
+        f.volume.setXattr(named: FSFileName(string: "user.test"), to: nil, on: item, policy: .delete) { error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    _ = try await f.lookup("private-diagnostic-file")
+    let before = f.log.all().count
+    let _: FSItem.Attributes = try await f.step(["getattr"]) { finish in
+        let request = FSItem.GetAttributesRequest()
+        request.wantedAttributes = [.fileID, .type]
+        f.volume.getAttributes(request, of: item) { attributes, error in
+            if let error { finish(.failure(error)) }
+            else if let attributes { finish(.success(attributes)) }
+        }
+    }
+    let getattr = try #require(f.log.all().dropFirst(before).first { $0.event == .callbackBegan })
+    #expect(getattr.value("item_file") == String(portable.fileID))
+    #expect(getattr.value("wanted") != nil)
+    let lookup = try #require(f.log.all().last { $0.event == .callbackBegan && $0.value("kind")?.hasPrefix("lookupItem") == true })
+    #expect(lookup.value("parent_file") == String((f.root as? PortableFSItem)?.fileID ?? 0))
+    #expect(lookup.value("name_token")?.count == 32)
+    #expect(lookup.value("pid") == "unavailable")
+    #expect(!lookup.message.contains("private-diagnostic-file"))
+    let lookupResult = try #require(f.log.all().last { $0.event == .callbackFinished && $0.value("callback") == lookup.value("callback") })
+    #expect(lookupResult.value("returned_local") == String(portable.identity.itemID))
+    #expect(lookupResult.value("returned_generation") == String(portable.identity.generation))
+    #expect(lookupResult.value("returned_file") == String(portable.fileID))
+    await f.volume.shutdown()
+}
+}
+
+@Test func metadataNameTokensAreBoundedAndStableWithinTheProcess() {
+    let a = PfsMetadataTrace.name(Data("a b\nprivate".utf8))
+    #expect(a == PfsMetadataTrace.name(Data("a b\nprivate".utf8)))
+    #expect(a != PfsMetadataTrace.name(Data("different".utf8)))
+    #expect(a.first?.value.count == 32)
+    #expect(PfsMetadataTrace.name(Data(repeating: 65, count: 100_000)).first?.value.count == 32)
+}

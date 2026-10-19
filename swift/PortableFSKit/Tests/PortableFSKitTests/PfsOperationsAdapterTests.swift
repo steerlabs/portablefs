@@ -1724,3 +1724,38 @@ private func waitForWindowFailure(_ volume: PortableFSVolume) async throws -> Bo
     }
 }
 }
+
+extension PfsLocalMockDaemonTests {
+@available(macOS 26.0, *)
+@Test func fixedXattrGetAndDeletePreserveItemAndGrammarPrecedence() async throws {
+    let harness = try await makeAdapterHarness()
+    defer { harness.daemon.stop() }
+    let item = try await createAdapterFile(volume: harness.volume, in: harness.root, name: "xattr-precedence")
+    let portable = try #require(item as? PortableFSItem)
+    let foreign = PortableFSItem(identity: .init(itemID: 999, generation: 1), fileID: 999, kind: .file)
+    for name in ["", String(repeating: "a", count: 256)] {
+        #expect(await adapterErrno("malformed live get") {
+            _ = try await harness.volume.xattr(named: FSFileName(string: name), of: item)
+        } == Int(EINVAL))
+        #expect(await adapterErrno("foreign identity before GET grammar") {
+            _ = try await harness.volume.xattr(named: FSFileName(string: name), of: foreign)
+        } == Int(ESTALE))
+    }
+    #expect(await clientErrno {
+        _ = try await harness.core.xattrGet(item: portable, name: "user.\u{0}nul")
+    } == EINVAL)
+    try await harness.core.reclaim(item: portable)
+    for name in ["", "com.apple.FinderInfo", "user.portablefs.secret", "user.test"] {
+        #expect(await adapterErrno("reclaimed identity before GET policy") {
+            _ = try await harness.volume.xattr(named: FSFileName(string: name), of: item)
+        } == Int(ESTALE))
+        #expect(await adapterErrno("reclaimed identity before delete policy") {
+            try await harness.volume.setXattr(named: FSFileName(string: name), to: nil, on: item, policy: .delete)
+        } == Int(ESTALE))
+    }
+    let stats = await harness.daemon.stats()
+    #expect(stats.xattrGetRequests == 0)
+    #expect(stats.xattrRemoveRequests == 0)
+    await harness.volume.shutdown()
+}
+}

@@ -1,0 +1,74 @@
+[
+  {
+    "name": "",
+    "allowed": false
+  },
+  {
+    "name": "user.",
+    "allowed": true
+  },
+  {
+    "name": "user.comment",
+    "allowed": true
+  },
+  {
+    "name": "user.com.apple.FinderInfo",
+    "allowed": true
+  },
+  {
+    "name": "com.apple.FinderInfo",
+    "allowed": false
+  },
+  {
+    "name": "security.capability",
+    "allowed": false
+  },
+  {
+    "name": "trusted.overlay.opaque",
+    "allowed": false
+  },
+  {
+    "name": "system.posix_acl_access",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs.secret",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs.",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs",
+    "allowed": true
+  },
+  {
+    "name": "User.test",
+    "allowed": false
+  },
+  {
+    "name": "user.a/b",
+    "allowed": true
+  },
+  {
+    "name": "user.\u0000x",
+    "allowed": false
+  },
+  {
+    "name": "user.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "allowed": true
+  },
+  {
+    "name": "user.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "allowed": false
+  },
+  {
+    "name": "user.ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "allowed": true
+  },
+  {
+    "name": "user.éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "allowed": false
+  }
+]
