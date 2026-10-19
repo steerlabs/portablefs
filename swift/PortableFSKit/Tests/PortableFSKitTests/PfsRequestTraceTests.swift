@@ -549,7 +549,12 @@ private func checkFixedXattrRefusals(adapter: PortableFSVolume.Type) async throw
     let item = try await f.create("private-diagnostic-file")
     let portable = try #require(item as? PortableFSItem)
     // Use the real native entry points, including delete's setXattr entry.
-    for name in ["com.apple.FinderInfo", "security.capability", "user.portablefs.secret"] {
+    for name in [
+        "com.apple.FinderInfo", "security.capability", "user.portablefs.secret",
+        "user.portablefs.\u{0301}x", "user.portablefs.\u{0301}\u{0327}x",
+        "user.portablefs.\u{FE0F}x", "user.portablefs.\u{200D}x",
+        "user\u{0301}.x", "user\u{FF0E}x"
+    ] {
         for deleting in [false, true] {
             let before = f.log.all().count
             let reply = TraceReplyBox<Int>()
@@ -582,6 +587,9 @@ private func checkFixedXattrRefusals(adapter: PortableFSVolume.Type) async throw
             #expect(records.contains { $0.event == .callbackFinished && $0.value("outcome") == "preflight-refused" && $0.value("errno") == String(EOPNOTSUPP) })
         }
     }
+    let refusedStats = await f.daemon.stats()
+    #expect(refusedStats.xattrGetRequests == 0)
+    #expect(refusedStats.xattrRemoveRequests == 0)
     for policy: FSVolume.SetXattrPolicy in [.mustCreate, .mustReplace, .alwaysSet] {
         let before = f.log.all().count
         let reply = TraceReplyBox<Int>()
@@ -592,21 +600,28 @@ private func checkFixedXattrRefusals(adapter: PortableFSVolume.Type) async throw
         #expect(f.log.all().dropFirst(before).filter { $0.event == .dispatched }.isEmpty)
     }
     // Permitted names still use one local request for each native callback.
-    try await f.daemon.seedXattr(named: "user.test", value: Data([7]), on: portable.identity)
-    let value: Data = try await f.step(["xattr-get"]) { finish in
-        f.volume.getXattr(named: FSFileName(string: "user.test"), of: item) { value, error in
-            finish(error.map { .failure($0) } ?? .success(value ?? Data()))
+    for name in [
+        "user.test", "user.\u{0301}x", "user.\u{0301}\u{0327}x",
+        "user.\u{FE0F}x", "user.\u{200D}x", "user.portablefs\u{0301}.x",
+        "user.portablefs\u{FF0E}x", "user.e\u{0301}", "user.é"
+    ] {
+        try await f.daemon.seedXattr(named: name, value: Data([7]), on: portable.identity)
+        let value: Data = try await f.step(["xattr-get"]) { finish in
+            f.volume.getXattr(named: FSFileName(string: name), of: item) { value, error in
+                finish(error.map { .failure($0) } ?? .success(value ?? Data()))
+            }
         }
-    }
-    #expect(value == Data([7]))
-    let _: [FSFileName] = try await f.step(["xattr-list"]) { finish in
-        f.volume.listXattrs(of: item) { names, error in
-            finish(error.map { .failure($0) } ?? .success(names ?? []))
+        #expect(value == Data([7]))
+        let listed: [FSFileName] = try await f.step(["xattr-list"]) { finish in
+            f.volume.listXattrs(of: item) { names, error in
+                finish(error.map { .failure($0) } ?? .success(names ?? []))
+            }
         }
-    }
-    try await f.step(["xattr-remove"]) { finish in
-        f.volume.setXattr(named: FSFileName(string: "user.test"), to: nil, on: item, policy: .delete) { error in
-            finish(error.map { .failure($0) } ?? .success(()))
+        #expect(try listed.map { Array(try PfsFSKitMapping.xattrName(from: $0).utf8) } == [Array(name.utf8)])
+        try await f.step(["xattr-remove"]) { finish in
+            f.volume.setXattr(named: FSFileName(string: name), to: nil, on: item, policy: .delete) { error in
+                finish(error.map { .failure($0) } ?? .success(()))
+            }
         }
     }
     _ = try await f.lookup("private-diagnostic-file")

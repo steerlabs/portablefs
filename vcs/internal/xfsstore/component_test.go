@@ -3,6 +3,7 @@ package xfsstore
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -65,9 +66,10 @@ func TestValidateXattrExtensionParity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range cases {
-		t.Run(tc.Name, func(t *testing.T) {
+		// Escaping keeps combining marks and joiners visible in failure names.
+		t.Run(strconv.QuoteToASCII(tc.Name), func(t *testing.T) {
 			if allowed := ValidateXattr(tc.Name) == nil; allowed != tc.Allowed {
-				t.Fatalf("ValidateXattr(%q) allowed=%v, want %v", tc.Name, allowed, tc.Allowed)
+				t.Fatalf("ValidateXattr(%+q) allowed=%v, want %v", tc.Name, allowed, tc.Allowed)
 			}
 		})
 	}

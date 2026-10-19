@@ -8,5 +8,8 @@ import Testing
     for _ in 0..<5 { root.deleteLastPathComponent() }
     let file = root.appendingPathComponent("vcs/internal/xfsstore/testdata/xattr-policy.json")
     let cases = try JSONDecoder().decode([Case].self, from: Data(contentsOf: file))
-    for test in cases { #expect(PfsXattrPolicy.permits(test.name) == test.allowed, "\(test.name)") }
+    for test in cases {
+        // Byte diagnostics distinguish invisible marks and canonically equal names.
+        #expect(PfsXattrPolicy.permits(test.name) == test.allowed, "UTF-8: \(Array(test.name.utf8))")
+    }
 }

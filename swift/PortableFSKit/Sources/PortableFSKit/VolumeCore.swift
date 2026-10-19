@@ -32,11 +32,12 @@ public struct PfsXattrSetRequest: Sendable, Equatable {
 
 /// Mirrors the authority's fixed ValidateXattr policy. Shared golden cases
 /// exercise this predicate and the Go validator; neither caches remote state.
+/// Prefixes match raw UTF-8 bytes, even when a suffix extends the final grapheme.
 enum PfsXattrPolicy {
     static func permits(_ name: String) -> Bool {
         let bytes = name.utf8
         return !bytes.isEmpty && bytes.count <= 255 && !bytes.contains(0)
-            && name.hasPrefix("user.") && !name.hasPrefix("user.portablefs.")
+            && bytes.starts(with: "user.".utf8) && !bytes.starts(with: "user.portablefs.".utf8)
     }
 }
 

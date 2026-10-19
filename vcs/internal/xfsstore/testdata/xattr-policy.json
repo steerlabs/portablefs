@@ -70,5 +70,69 @@
   {
     "name": "user.éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
     "allowed": false
+  },
+  {
+    "name": "user.\u0301x",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\u0301x",
+    "allowed": false
+  },
+  {
+    "name": "user.\u0301\u0327x",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\u0301\u0327x",
+    "allowed": false
+  },
+  {
+    "name": "user.\ufe0fx",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\ufe0fx",
+    "allowed": false
+  },
+  {
+    "name": "user.\u200dx",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\u200dx",
+    "allowed": false
+  },
+  {
+    "name": "user\u0301.x",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs\u0301.x",
+    "allowed": true
+  },
+  {
+    "name": "user\uff0ex",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs\uff0ex",
+    "allowed": true
+  },
+  {
+    "name": "user.e\u0301",
+    "allowed": true
+  },
+  {
+    "name": "user.\u00e9",
+    "allowed": true
+  },
+  {
+    "name": "user.e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301x",
+    "allowed": true
+  },
+  {
+    "name": "user.e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301xx",
+    "allowed": false
   }
 ]
