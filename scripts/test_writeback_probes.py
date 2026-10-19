@@ -37,15 +37,24 @@ def mount_proof(index, adapter="V3"):
 
 def permission_answers(directory):
     answers = [{"grant_evidence": "CREATE grant", "description_evidence": "live CREATE read/write rights",
-                "requested_mode": "readWriteWithCache", "granted_mode": "writeBack", "retained_read_description": True}]
-    for name, mode in (("existing-0200", "0200"), ("existing-readable", "0600")):
-        for trial in ("O_WRONLY", "O_APPEND"):
-            common = {"fixture": str(directory / name), "trial": trial, "no_retained_read_description": True}
-            answers.append({**common, "mode": mode, "final_close_evidence": "FSKit final close",
-                            "retirement_evidence": "all descriptions released"})
-            answers.append({**common, "requested_mode": "readWriteWithCache", "granted_mode": "noCache",
-                            "grant_evidence": "noCache grant", "open_trace": "only write OPEN",
-                            "description_evidence": "write-only ownership", "read_open_observed": False})
+                "requested_mode": "readWriteWithCache", "granted_mode": "writeBack", "retained_read_description": True}
+               for _ in range(4)]
+    for name, mode, denied in native.PERMISSION_FIXTURES:
+        for trial, _ in native.PERMISSION_TRIALS:
+            common = {"fixture": str(directory / name), "trial": trial}
+            answers.append({**common, "mode": f"{mode:04o}", "no_retained_read_description": True,
+                            "final_close_evidence": "FSKit final close", "retirement_evidence": "all descriptions released",
+                            "permission_evidence": "effective storage access check", "read_denied": denied,
+                            "write_allowed": True, "storage_acl": name == "existing-acl"})
+            proof = {**common, "requested_mode": "readWriteWithCache", "granted_mode": "noCache" if denied else "writeBack",
+                     "grant_evidence": "grant trace", "open_trace": "authority OPEN trace",
+                     "description_evidence": "authority access ownership", "canonical_item_evidence": "same capability",
+                     "successful_read_description": not denied, "application_read_errno": "EBADF", "no_destructive_repeat": True,
+                     "authority_opens": ([{"access": "readWrite", "result": "EACCES"}, {"access": "write", "result": "success"}]
+                                         if denied else [{"access": "readWrite", "result": "success"}])}
+            if denied:
+                proof["cache_fill_read_observed"] = False
+            answers.append(proof)
     return answers
 
 
@@ -252,7 +261,7 @@ class WriteBackProbeTests(unittest.TestCase):
                     self.assertEqual(proof["fixture"], str(path))
                     self.assertTrue(proof["no_retained_read_description"])
                     self.assertEqual(proof["retirement_evidence"], "all descriptions released")
-                    self.assertEqual(proof["trial"], "O_APPEND" if flags & native.os.O_APPEND else "O_WRONLY")
+                    self.assertEqual(proof["trial"], next(trial for trial, expected_flags in native.PERMISSION_TRIALS if flags == expected_flags))
                     self.assertEqual(flags & native.os.O_ACCMODE, native.os.O_WRONLY)
                     opened_trials.append((path.name, proof["trial"]))
                 return real_open(path, flags, *args)
@@ -260,31 +269,34 @@ class WriteBackProbeTests(unittest.TestCase):
             with patch("builtins.input", side_effect=[json.dumps(answer) for answer in answers]), \
                  patch.object(native.os, "open", side_effect=tracked_open):
                 native.permission_shapes(directory, output)
-            self.assertEqual(opened_trials, [(name, trial) for name in ("existing-0200", "existing-readable")
-                                            for trial in ("O_WRONLY", "O_APPEND")])
+            self.assertEqual(opened_trials, [(name, trial) for name, _, _ in native.PERMISSION_FIXTURES
+                                            for trial, _ in native.PERMISSION_TRIALS])
             proofs = [row["proof"] for row in rows(output) if row["event"] == "proof"]
             self.assertEqual(proofs, answers)
             self.assertEqual(proofs[0]["granted_mode"], "writeBack")
-            self.assertTrue(all(proofs[index]["granted_mode"] == "noCache" for index in (2, 4, 6, 8)))
+            self.assertTrue(all(proof["granted_mode"] == ("noCache" if "0200" in proof["fixture"] or "acl" in proof["fixture"] else "writeBack")
+                                for proof in proofs[5::2]))
 
     def test_missing_retirement_evidence_prevents_writeonly_open(self):
         for missing in ("final_close_evidence", "retirement_evidence", "no_retained_read_description"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
                 output = io.StringIO()
-                answers = permission_answers(Path(temporary))[:2]
-                del answers[1][missing]
+                answers = permission_answers(Path(temporary))[:5]
+                del answers[4][missing]
                 with patch("builtins.input", side_effect=[json.dumps(answer) for answer in answers]), \
                      patch.object(native.os, "open", wraps=native.os.open) as opened:
                     with self.assertRaisesRegex(RuntimeError, "OPEN"):
                         native.permission_shapes(Path(temporary), output)
-                self.assertEqual(opened.call_count, 1)  # CREATE only; never reopen the existing file
+                self.assertEqual(opened.call_count, 4)  # new CREATE cases only; never reopen the existing file
                 self.assertFalse(any(row["event"] == "write-only-open-started" for row in rows(output)))
 
     def test_writeonly_missing_or_unsafe_grant_evidence_stays_open(self):
-        for trial_index in (2, 4, 6, 8):
-            for field, value in (("requested_mode", ""), ("granted_mode", "writeBack"),
-                                 ("read_open_observed", True), ("no_retained_read_description", False),
-                                 ("open_trace", "")):
+        # First denied and first readable trials, including failed read OPENs
+        # which are allowed only without a successful read description/fill.
+        for trial_index in (5, 15):
+            for field, value in (("requested_mode", ""), ("granted_mode", "incorrect"),
+                                 ("successful_read_description", "incorrect"), ("authority_opens", []),
+                                 ("no_destructive_repeat", False), ("open_trace", "")):
                 with self.subTest(trial_index=trial_index, field=field), tempfile.TemporaryDirectory() as temporary:
                     output = io.StringIO()
                     answers = permission_answers(Path(temporary))[:trial_index + 1]
@@ -293,7 +305,13 @@ class WriteBackProbeTests(unittest.TestCase):
                         with self.assertRaisesRegex(RuntimeError, "OPEN"):
                             native.permission_shapes(Path(temporary), output)
                     completed = [row for row in rows(output) if row["event"] == "write-only-trial-recorded"]
-                    self.assertEqual(len(completed), trial_index // 2 - 1)
+                    self.assertEqual(len(completed), (trial_index - 5) // 2)
+        with tempfile.TemporaryDirectory() as temporary:
+            answers = permission_answers(Path(temporary))[:6]
+            answers[-1]["cache_fill_read_observed"] = True
+            with patch("builtins.input", side_effect=[json.dumps(answer) for answer in answers]):
+                with self.assertRaisesRegex(RuntimeError, "OPEN"):
+                    native.permission_shapes(Path(temporary), io.StringIO())
 
     def test_create_with_retained_rights_requires_writeback_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -318,7 +336,7 @@ class WriteBackProbeTests(unittest.TestCase):
                     replacements.append(str(target))
                 real_rename(source, target)
 
-            with patch.object(native, "permission_shapes"), patch.object(native, "checkpoint"), \
+            with patch.object(native, "permission_shapes"), patch.object(native, "buffered_writeonly_shapes"), patch.object(native, "checkpoint"), \
                  patch.object(native.os, "rename", side_effect=rename):
                 native.healthy_shapes(Path(temporary), output)
             self.assertEqual(len(replacements), 1)
@@ -336,6 +354,8 @@ class WriteBackProbeTests(unittest.TestCase):
                      patch.object(small.os, "close", side_effect=lambda fd: calls.append(("close", 0))), \
                      patch.object(small, "inspect_file", return_value=actual):
                     stat.return_value.st_size = 0
+                    stat.return_value.st_dev = 7
+                    stat.return_value.st_ino = 42
                     result = small.run_file(Path("fixture"), Path("independent"), name, count, size, flags, drain)
                 self.assertEqual(calls[:count], [("write", size)] * count)
                 self.assertEqual(calls[count:], [("fsync", 0), ("close", 0)] if drain == "fsync" else [("close", 0)])
@@ -344,6 +364,49 @@ class WriteBackProbeTests(unittest.TestCase):
                 self.assertFalse(result["verified"])  # no retry or invented authority match
                 self.assertEqual(result["authority"], actual)
                 self.assertGreaterEqual(result["write_and_drain_ns"], result["loop_ns"])
+
+    def test_buffered_writeonly_partial_pages_dirty_eof_truncate_and_multi_append(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = io.StringIO()
+            with patch.object(native, "checkpoint"), patch.object(native, "independent_shape_proof") as proof:
+                native.buffered_writeonly_shapes(Path(temporary), output)
+            self.assertEqual(proof.call_count, 3)
+            partial = (Path(temporary) / "partial-pages").read_bytes()
+            self.assertEqual(partial, b"D" * (native.PAGE_SIZE + 19) + b"\0" * (native.SIZE - native.PAGE_SIZE - 19))
+            self.assertEqual((Path(temporary) / "multi-append").stat().st_size, 4 + 2 * 128 * 100)
+            self.assertEqual([row["event"] for row in rows(output)], ["dirty-eof", "multi-append-loops-finished"])
+
+    def test_application_writeonly_read_and_pread_stay_ebadf(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "file"
+            fd = native.os.open(path, native.os.O_CREAT | native.os.O_WRONLY, 0o600)
+            try:
+                native.require_writeonly_reads_fail(fd)
+            finally:
+                native.os.close(fd)
+            fd = native.os.open(path, native.os.O_RDONLY)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "FAILED"):
+                    native.require_writeonly_reads_fail(fd)
+            finally:
+                native.os.close(fd)
+
+    def test_diagnostic_phase_timestamps_repetition_and_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "file"
+            for drain in ("fsync", "close"):
+                path.write_bytes(b"")
+                result = small.run_file(path, path, "append", 5, 100, small.os.O_APPEND, drain, repetition=3)
+                self.assertTrue(result["verified"])
+                self.assertEqual(result["repetition"], 3)
+                stat = path.stat()
+                self.assertEqual(result["file_identity"], {"device": stat.st_dev, "inode": stat.st_ino})
+                expected = ["write_loop", "fsync", "close", "verification"] if drain == "fsync" else ["write_loop", "close", "verification"]
+                self.assertEqual(list(result["phases"]), expected)
+                for clock in ("time_ns", "monotonic_ns"):
+                    values = [result["phases"][phase][edge][clock] for phase in expected for edge in ("start", "end")]
+                    self.assertTrue(all(isinstance(value, int) and value > 0 for value in values))
+                    self.assertEqual(values, sorted(values))
 
     def test_diagnostic_short_write_is_preserved(self):
         with patch.object(small.os, "open", return_value=10), patch.object(small.os, "fstat") as stat, \

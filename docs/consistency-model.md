@@ -119,10 +119,20 @@ On macOS 27, the extension controls retained kernel data through
 `FSVolume.DataCacheHandler`. A compatible readWriteWithCache request can
 receive writeBack with live writer/authorization proof and legitimately
 retained read/write rights; read requests/rights can receive readCache, while
-no-cache requests and only write rights receive noCache. Cache fills never
-acquire unauthorized read rights, including existing-file O_WRONLY/O_APPEND
-and mode 0200. Usable proof expiry completes pushInvalidate before downgrade;
-ordinary unmount drains before ownership release. Terminal ownership or
+no-cache requests receive noCache. An eligible V3 write-only application open
+may acquire separately authorized backing read access for cache fills. A fresh
+open requests read/write together; a retained writer requests only missing
+read. A definite nonterminal read-access denial preserves a valid write-only
+open, using at most one write-only retry after a denied combined OPEN, and
+receives noCache. Other failures propagate, including the write retry's error.
+Application read/pread through O_WRONLY remains EBADF. Backing OPENs use the
+same canonical capability and carry no create, exclusive, truncate or append
+effects. Cache upgrades can acquire read access for a retained writer but
+never invent write access. CREATE's legitimate read/write description remains
+sufficient for mode 0200. Permission/ACL changes affect each new authority
+acquisition; already granted rights survive until final retirement.
+
+Usable proof expiry completes pushInvalidate before downgrade; ordinary unmount drains before ownership release. Terminal ownership or
 authorization loss revokes and fails pending work without pushing old pages
 into another owner/session/epoch. Calls run without module locks or gates
 needed by reentrant writes, pin descriptions through completion and revalidate

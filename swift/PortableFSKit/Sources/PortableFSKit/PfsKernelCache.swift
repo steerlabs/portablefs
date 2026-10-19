@@ -109,8 +109,8 @@ final class PfsKernelCache: @unchecked Sendable {
     }
 
     /// Called inside the publication gate, at the actual framework reply.
-    /// Cache fills require legitimate retained read rights, including for an
-    /// O_WRONLY/O_APPEND open. Never acquire read access merely for caching.
+    /// Cache fills require an authority-granted retained read description,
+    /// including when the application descriptor itself is O_WRONLY.
     func grant(_ item: PortableFSItem, requested: Mode) throws -> Coherency {
         let now: UInt64
         do { now = try clock() } catch { throw AdmissionFailure.clock(error) }
@@ -126,6 +126,20 @@ final class PfsKernelCache: @unchecked Sendable {
             entries[ObjectIdentifier(item)]?.mode = requested
             entries[ObjectIdentifier(item)]?.coherency = coherency
             return coherency
+        }
+    }
+
+    /// Avoid acquiring optional rights when a writeBack grant is already
+    /// ineligible. This is only an acquisition check: grant rechecks everything
+    /// at publication after the authority await and any intervening withdrawal.
+    func canAcquireRead(_ item: PortableFSItem) throws -> Bool {
+        let now: UInt64
+        do { now = try clock() } catch { throw AdmissionFailure.clock(error) }
+        return try lock.withLock {
+            try checkAuthorization()
+            guard let entry = entries[ObjectIdentifier(item)] else { return false }
+            return item.kind == .file && !entry.retiring && !revoked && !unmounting
+                && withdrawing == 0 && horizon > now
         }
     }
 

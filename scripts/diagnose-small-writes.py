@@ -43,7 +43,11 @@ def inspect_file(path):
     return {"length": length, "sha256": sha.hexdigest()}
 
 
-def run_file(path, authority_path, name, count, size, flags, drain):
+def stamp():
+    return {"time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()}
+
+
+def run_file(path, authority_path, name, count, size, flags, drain, repetition=None):
     payload = bytes(range(100)) if name == "append" else bytes(range(256)) * 16
     assert len(payload) == size
     expected_hash = hashlib.sha256()
@@ -58,6 +62,7 @@ def run_file(path, authority_path, name, count, size, flags, drain):
     failure = None
     write_count = 0
     fsync_ns = None
+    phases = {"write_loop": {"start": stamp()}}
     start = time.perf_counter_ns()
     try:
         for _ in range(count):
@@ -70,27 +75,35 @@ def run_file(path, authority_path, name, count, size, flags, drain):
     except OSError as error:
         failure = {"phase": "write", "errno": error.errno, "error": str(error)}
     loop_end = time.perf_counter_ns()
+    phases["write_loop"]["end"] = stamp()
     if drain == "fsync":
+        phases["fsync"] = {"start": stamp()}
         began = time.perf_counter_ns()
         try:
             os.fsync(fd)
         except OSError as error:
             failure = failure or {"phase": "fsync", "errno": error.errno, "error": str(error)}
         fsync_ns = time.perf_counter_ns() - began
+        phases["fsync"]["end"] = stamp()
+    phases["close"] = {"start": stamp()}
     close_start = time.perf_counter_ns()
     try:
         os.close(fd)
     except OSError as error:
         failure = failure or {"phase": "close", "errno": error.errno, "error": str(error)}
     end = time.perf_counter_ns()
+    phases["close"]["end"] = stamp()
     expected = {"length": count * size, "sha256": expected_hash.hexdigest()}
     # One immediate independent observation. No retries, scraping or sleeps
     # can silently move the measured close-only completion boundary.
+    phases["verification"] = {"start": stamp()}
     try:
         actual = inspect_file(authority_path)
     except OSError as error:
         actual = {"errno": error.errno, "error": str(error)}
-    return {"workload": name, "file": str(path), "authority_file": str(authority_path),
+    phases["verification"]["end"] = stamp()
+    return {"repetition": repetition, "file_identity": {"device": metadata.st_dev, "inode": metadata.st_ino},
+            "phases": phases, "workload": name, "file": str(path), "authority_file": str(authority_path),
             "writes_required": count, "writes_completed": write_count, "write_size": size,
             "drain": drain, "loop_ns": loop_end - start, "write_ns": sum(latencies),
             "fsync_ns": fsync_ns, "close_ns": end - close_start, "write_and_drain_ns": end - start,
@@ -123,7 +136,7 @@ def main():
             for name, count, size, flags in WORKLOADS:
                 filename = f"{name}-{repetition}"
                 result = run_file(args.directory / filename, args.authority_directory / filename,
-                                  name, count, size, flags, args.drain)
+                                  name, count, size, flags, args.drain, repetition)
                 output.write(json.dumps({"repetition": repetition, **result}) + "\n")
                 output.flush()
                 failed |= not result["verified"]

@@ -1675,8 +1675,8 @@ final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @un
         }
     }
 
-    /// Upgrade changes cache permission, not descriptor access. New open modes
-    /// acquire missing rights through the same VolumeCore permission checks.
+    /// Upgrade may acquire authorized backing read access for an already held
+    /// writer. Only an application open can acquire missing write access.
     func cacheOpen(_ item: FSItem, modes: FSVolume.OpenModes?, cacheMode: FSVolume.DataCacheMode,
                    reply: @escaping (FSVolume.KernelCacheCoherencyType?, Error?) -> Void) {
         publishAfterReply({
@@ -1690,8 +1690,8 @@ final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @un
             guard let item = item as? PortableFSItem else { throw POSIXError(.EINVAL) }
             if let modes {
                 guard !modes.isEmpty, modes.subtracting([.read, .write]).isEmpty else { throw POSIXError(.EINVAL) }
-                try await self.core.open(item: item, mode: PfsFSKitMapping.openMode(from: modes))
             }
+            try await self.core.cacheOpen(item: item, mode: modes.map { PfsFSKitMapping.openMode(from: $0) }, requested: requested)
             return (item, requested)
         }, finalize: { value -> FSVolume.KernelCacheCoherencyType in
             let (item, requested) = value

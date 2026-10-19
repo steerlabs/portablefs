@@ -138,6 +138,9 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         /// reuses or upgrades a description is judged by exactly which
         /// descriptions it asked the authority for, not merely how many.
         public var openModes: [PfsOpenMode]
+        public var openItems: [PfsItem]
+        public var openAppendFlags: [Bool]
+        public var grantedOpenModes: [PfsOpenMode]
         public var closeRequests: Int
         public var reclaimRequests: Int
         public var activeHandles: Int
@@ -287,6 +290,15 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
     public func delayNextOpen(nanoseconds: UInt64) async {
         await fileSystem.delayNextOpen(nanoseconds: nanoseconds)
+    }
+
+    public func failNextOpen(errno: Int32) async {
+        await fileSystem.failNextOpen(errno: errno)
+    }
+
+    /// Models a storage ACL independently of the attributes visible to FSKit.
+    public func denyReadOpen(item: PfsItemIdentity, denied: Bool) async {
+        await fileSystem.denyReadOpen(item: item, denied: denied)
     }
 
     /// Corrupts the next successful CreateReply by omitting its mandatory
@@ -1029,6 +1041,11 @@ private actor MockFileSystem {
     private var helloRequests = 0
     private var openRequests = 0
     private var openModes: [PfsOpenMode] = []
+    private var openItems: [PfsItem] = []
+    private var openAppendFlags: [Bool] = []
+    private var grantedOpenModes: [PfsOpenMode] = []
+    private var pendingOpenErrnos: [Int32] = []
+    private var readDeniedItems: Set<UInt64> = []
     private var closeRequests = 0
     private var reclaimRequests = 0
     private var readRequests = 0
@@ -1110,6 +1127,9 @@ private actor MockFileSystem {
             helloRequests: helloRequests,
             openRequests: openRequests,
             openModes: openModes,
+            openItems: openItems,
+            openAppendFlags: openAppendFlags,
+            grantedOpenModes: grantedOpenModes,
             closeRequests: closeRequests,
             reclaimRequests: reclaimRequests,
             activeHandles: handles.count,
@@ -1161,6 +1181,9 @@ private actor MockFileSystem {
         helloRequests = 0
         openRequests = 0
         openModes.removeAll()
+        openItems.removeAll()
+        openAppendFlags.removeAll()
+        grantedOpenModes.removeAll()
         closeRequests = 0
         reclaimRequests = 0
         readRequests = 0
@@ -1203,6 +1226,13 @@ private actor MockFileSystem {
 
     func delayNextOpen(nanoseconds: UInt64) {
         pendingOpenDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func failNextOpen(errno: Int32) { pendingOpenErrnos.append(errno) }
+
+    func denyReadOpen(item: PfsItemIdentity, denied: Bool) {
+        if denied { readDeniedItems.insert(item.itemID) }
+        else { readDeniedItems.remove(item.itemID) }
     }
 
     func omitNextCreateHandle() {
@@ -1399,6 +1429,11 @@ private actor MockFileSystem {
                 let node = try namespaceNode(for: request.item)
                 openRequests += 1
                 openModes.append(request.mode)
+                openItems.append(request.item)
+                openAppendFlags.append(request.append)
+                if !pendingOpenErrnos.isEmpty {
+                    throw MockPOSIXError(errno: pendingOpenErrnos.removeFirst(), message: "injected open refusal")
+                }
                 let readable = request.mode == .read || request.mode == .readWrite
                 let writable = request.mode == .write || request.mode == .readWrite
                 guard readable || writable else {
@@ -1407,7 +1442,7 @@ private actor MockFileSystem {
                 // The authority opens under its own credentials, which own
                 // every object it stores, so the owner bits decide. This is
                 // what makes a mode-0200 file writable but unreadable.
-                guard !readable || node.mode & 0o400 != 0,
+                guard !readable || (node.mode & 0o400 != 0 && !readDeniedItems.contains(request.item.itemID)),
                       !writable || node.mode & 0o200 != 0 else {
                     throw MockPOSIXError(errno: EACCES, message: "open access denied by mode")
                 }
@@ -1432,6 +1467,7 @@ private actor MockFileSystem {
                 }
                 var response = PfsOpenReply()
                 response.handle = handle
+                if handle != 0 { grantedOpenModes.append(request.mode) }
                 reply.body = .openReply(response)
             case let .close(request):
                 closeRequests += 1

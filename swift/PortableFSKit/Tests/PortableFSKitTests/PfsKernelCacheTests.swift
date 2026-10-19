@@ -796,7 +796,7 @@ extension PfsLocalMockDaemonTests {
 }
 
 @available(macOS 27, *)
-@Test func v3WriteOnlyExistingAppendAnd0200NeverAcquireCacheFillRights() async throws {
+@Test func v3WriteOnlyExisting0200RefusesOptionalCacheRead() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -806,7 +806,7 @@ extension PfsLocalMockDaemonTests {
     let created = try await core.createFile(in: core.rootItem(), name: Data("write-only".utf8), mode: 0o200)
     // CREATE legitimately supplies a read/write creation description even for
     // 0200. Final close removes that grant; an existing-file O_WRONLY reopen
-    // has only write rights. APPEND is positioned by the kernel, not an OPEN
+    // retains only write rights after optional read denial. APPEND is positioned by the kernel, not an OPEN
     // read permission or an authority append flag.
     try await core.close(item: created.item)
     cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
@@ -817,9 +817,9 @@ extension PfsLocalMockDaemonTests {
     }
     try await cacheEventually { result.value != nil }
     #expect(result.value == .noCache)
-    #expect(await daemon.stats().openModes == [.write])
+    #expect(await daemon.stats().openModes == [.readWrite, .write])
     #expect(try await volume.write(contents: Data([65]), to: created.item, at: 0) == 1)
-    #expect(await daemon.stats().openModes == [.write])
+    #expect(await daemon.stats().openModes == [.readWrite, .write])
     await volume.shutdown()
 }
 }

@@ -271,7 +271,7 @@ extension PfsLocalMockDaemonTests {
     #expect(await core.testingDebugState().openHandleCount == 0)
 }
 
-/// O_WRONLY installs a write-only description, and a write needs nothing
+/// V2 and uncached O_WRONLY opens install a write-only description; a write needs nothing
 /// more. The first write must reuse it, not replace it with a read/write
 /// OPEN and close the original.
 @Test func writeOnlyOpenWritesThroughItsOwnDescription() async throws {

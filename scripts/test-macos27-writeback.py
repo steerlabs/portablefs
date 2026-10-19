@@ -16,6 +16,7 @@ stall and sleep/wake; it records native page geometry and per-page residuals.
 This collector does not claim device power-loss qualification.
 """
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -73,7 +74,7 @@ def reopen_fsync(fd, path, emit):
     closed, _ = recorded_call(emit, "old-close", lambda: os.close(fd))
     reached = False
     if closed:
-        opened, reopened = recorded_call(emit, "reopen", lambda: os.open(path, os.O_RDWR))
+        opened, reopened = recorded_call(emit, "reopen", lambda: os.open(path, os.O_WRONLY))
         if opened:
             reached = True
             recorded_call(emit, "reopened-fsync", lambda: os.fsync(reopened))
@@ -91,7 +92,7 @@ def require_reopen_error(rows):
 
 def worker(path):
     """Independent input, write and barrier threads preserve blocked evidence."""
-    fd = os.open(path, os.O_RDWR)
+    fd = os.open(path, os.O_WRONLY)
     output_lock = threading.Lock()
     threads = []
 
@@ -217,7 +218,8 @@ def hold_proof(directory, output_dir, output, hold, barrier, fault=None):
     record(output, "persisted-fixture", label=label, **digest(path))
     checkpoint(output, f"{label}: verify fixture independently at authority; arm targeted WRITE hold {hold}. "
                "Keep KeepAlive/authorization live. Trace every covered callback/chunk and its durable result. "
-               "Require requested readWriteWithCache and granted writeBack for this fixture on the exact signed artifact.")
+               "Prove all seed CREATE/read descriptions retired before the worker O_WRONLY reopen, and trace its combined "
+               "access-only OPEN. Require requested readWriteWithCache and granted writeBack on the exact signed artifact.")
     artifact = output_dir / (label + ".jsonl")
     with artifact.open("x") as stream, (output_dir / (label + ".stderr")).open("x") as errors:
         process = subprocess.Popen([sys.executable, __file__, "--worker", str(path)], stdin=subprocess.PIPE,
@@ -264,6 +266,92 @@ def hold_proof(directory, output_dir, output, hold, barrier, fault=None):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+
+def independent_shape_proof(output, path, expected):
+    proof_checkpoint(output, f"{path}: obtain final length/hash through an independent authority read path. "
+                     "Record read-path provenance and requested/granted modes/callback counts; mount reads alone are insufficient.",
+                     evidence_fields=("authority_path_evidence", "grant_evidence", "callback_evidence"),
+                     fixture=str(path), authority_length=len(expected), authority_sha256=hashlib.sha256(expected).hexdigest())
+
+
+def buffered_writeonly_shapes(directory, output):
+    path = directory / "partial-pages"
+    expected = bytearray(b"A" * SIZE)
+    with path.open("xb", buffering=0) as file:
+        assert file.write(expected) == len(expected)
+        os.fsync(file.fileno())
+    checkpoint(output, f"{path}: persist fixture and prove all CREATE/read descriptions retired before the O_WRONLY "
+               "reopen; trace a combined access-only OPEN and writeBack grant. Arm a delayed pre-write attribute reply "
+               "without blocking writes, then release it after the dirty extension and record its sequence.")
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        require_writeonly_reads_fail(fd)
+        for offset, payload in ((17, b"partial"), (PAGE_SIZE + 13, b"neighbours")):
+            check_write(fd, payload, offset)
+            expected[offset:offset + len(payload)] = payload
+        end = SIZE + PAGE_SIZE + 3
+        check_write(fd, b"EOF", end)
+        expected.extend(b"\0" * (end - len(expected)) + b"EOF")
+        observed = os.fstat(fd).st_size
+        record(output, "dirty-eof", fixture=str(path), expected=len(expected), observed=observed)
+        assert observed == len(expected)
+        checkpoint(output, "Release the delayed old attribute reply now. Record that it cannot regress dirty EOF. "
+                   "No application fsync has occurred; identify the delivered-only authority size separately.")
+        assert os.fstat(fd).st_size == len(expected)
+        os.fsync(fd)
+        assert path.read_bytes() == expected  # partial fills preserve every neighbour
+        independent_shape_proof(output, path, expected)
+        # Dirty pages exist before shrink/regrow, with no intervening barrier.
+        check_write(fd, b"D" * SIZE, 0)
+        os.ftruncate(fd, PAGE_SIZE + 19)
+        os.ftruncate(fd, SIZE)
+        expected = b"D" * (PAGE_SIZE + 19) + b"\0" * (SIZE - PAGE_SIZE - 19)
+        os.fsync(fd)
+        assert path.read_bytes() == expected
+        independent_shape_proof(output, path, expected)
+    finally:
+        os.close(fd)
+
+    path = directory / "multi-append"
+    with path.open("xb", buffering=0) as file:
+        assert file.write(b"seed") == 4
+        os.fsync(file.fileno())
+    checkpoint(output, f"{path}: persist and retire fixture descriptions, then trace two O_WRONLY|O_APPEND descriptors "
+               "with authorized backing reads/writeBack. No fsync or close may interleave with the append loops.")
+    descriptors = [os.open(path, os.O_WRONLY | os.O_APPEND) for _ in range(2)]
+    failures = []
+    start = threading.Barrier(2)
+
+    def append(index):
+        try:
+            start.wait(timeout=5)
+            for sequence in range(128):
+                payload = (f"{index}:{sequence:04d}:".encode() + b"A" * 93)
+                if os.write(descriptors[index], payload) != 100:
+                    raise OSError("short concurrent append")
+        except Exception as error:
+            failures.append(str(error))
+
+    threads = [threading.Thread(target=append, args=(index,)) for index in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        if failures or any(thread.is_alive() for thread in threads):
+            raise RuntimeError(f"append loops failed/stalled: {failures}; OPEN")
+        record(output, "multi-append-loops-finished", fixture=str(path), dirty_length=os.fstat(descriptors[0]).st_size)
+        for fd in descriptors:
+            os.fsync(fd)
+        actual = path.read_bytes()
+        records = [actual[offset:offset + 100] for offset in range(4, len(actual), 100)]
+        wanted = [(f"{index}:{sequence:04d}:".encode() + b"A" * 93) for index in range(2) for sequence in range(128)]
+        assert actual[:4] == b"seed" and sorted(records) == sorted(wanted)
+        independent_shape_proof(output, path, actual)
+    finally:
+        for fd in descriptors:
+            os.close(fd)
 
 
 def healthy_shapes(directory, output):
@@ -324,6 +412,7 @@ def healthy_shapes(directory, output):
             os.fsync(fd)
         finally:
             os.close(fd)
+    buffered_writeonly_shapes(directory, output)
     permission_shapes(directory, output)
     checkpoint(output, "Review shape traces: overwrite/extend/truncate-regrow, native pages/chunks, O_SYNC/O_DSYNC, aliases, "
                "open-unlinked and read-only mappings. Correlate dirty-link/rename/unlink returns with their earlier WRITE "
@@ -333,49 +422,82 @@ def healthy_shapes(directory, output):
                "do not infer any of these guarantees from the healthy local checks alone.")
 
 
-def permission_shapes(directory, output):
-    # Keep CREATE's legitimate retained read/write rights as a distinct case.
-    path = directory / "create-retained-rights"
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    try:
-        check_write(fd, b"C" * PAGE_SIZE, 0)
-        proof_checkpoint(output, f"{path}: CREATE with its legitimate read/write description still retained. "
-                         "Record the V3 request/grant and description rights; require writeBack eligibility.",
-                         evidence_fields=("grant_evidence", "description_evidence"),
-                         requested_mode="readWriteWithCache", granted_mode="writeBack", retained_read_description=True)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+PERMISSION_FIXTURES = (("existing-0200", 0o200, True), ("existing-0644", 0o644, False),
+                       ("existing-0600", 0o600, False), ("existing-acl", 0o600, True))
+PERMISSION_TRIALS = (("O_WRONLY", os.O_WRONLY), ("O_APPEND", os.O_WRONLY | os.O_APPEND),
+                     ("O_TRUNC", os.O_WRONLY | os.O_TRUNC), ("O_CREAT", os.O_WRONLY | os.O_CREAT),
+                     ("O_CREAT_TRUNC", os.O_WRONLY | os.O_CREAT | os.O_TRUNC))
 
-    for name, mode in (("existing-0200", 0o200), ("existing-readable", 0o600)):
+
+def require_writeonly_reads_fail(fd):
+    for operation in (lambda: os.read(fd, 1), lambda: os.pread(fd, 1, 0)):
+        try:
+            operation()
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                continue
+            raise
+        raise RuntimeError("application read through O_WRONLY succeeded; native proof FAILED")
+
+
+def permission_shapes(directory, output):
+    # CREATE grants read/write backing ownership even for a new 0200 file.
+    # Keep the application descriptor O_WRONLY in both creation trials.
+    for suffix, mode, effects in (("0600", 0o600, os.O_EXCL), ("0200", 0o200, os.O_EXCL),
+                                  ("trunc-0600", 0o600, os.O_TRUNC), ("trunc-0200", 0o200, os.O_TRUNC)):
+        path = directory / ("create-retained-rights-" + suffix)
+        fd = os.open(path, os.O_CREAT | effects | os.O_WRONLY, mode)
+        try:
+            check_write(fd, b"C" * PAGE_SIZE, 0)
+            require_writeonly_reads_fail(fd)
+            proof_checkpoint(output, f"{path}: new O_CREAT|O_WRONLY flags={os.O_CREAT | effects | os.O_WRONLY} with legitimate CREATE read/write backing "
+                             "description retained. Record application EBADF and V3 grant/ownership traces.",
+                             evidence_fields=("grant_evidence", "description_evidence"),
+                             requested_mode="readWriteWithCache", granted_mode="writeBack", retained_read_description=True)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    for name, mode, denied in PERMISSION_FIXTURES:
         path = directory / name
         with path.open("xb", buffering=0) as file:
             assert file.write(b"A" * SIZE) == SIZE
             os.fsync(file.fileno())
         path.chmod(mode)
-        for trial, flags in (("O_WRONLY", os.O_WRONLY), ("O_APPEND", os.O_WRONLY | os.O_APPEND)):
-            # Application close and chmod do not retire FSKit's retained CREATE
-            # rights. Require the actual native boundary before EACH reopen.
+        for trial, flags in PERMISSION_TRIALS:
+            # Application close and chmod do not retire CREATE rights. ACL
+            # fixtures require an actual storage ACL, not an inference from mode.
             proof_checkpoint(output, f"{path} mode {mode:04o} {trial}: BEFORE reopening, record real FSKit final close "
-                             "and retirement of ALL prior descriptions for this fixture, including CREATE and the previous "
-                             "trial. Prove no retained read description. Application close alone is insufficient.",
-                             evidence_fields=("final_close_evidence", "retirement_evidence"),
-                             fixture=str(path), trial=trial, mode=f"{mode:04o}", no_retained_read_description=True)
+                             "and retirement of ALL prior descriptions, including CREATE/previous trials. Prove no retained "
+                             "read description. For existing-acl install a same-principal storage ACL denying read but "
+                             "allowing write; record its effective access check. Preserve the original create/truncate intent.",
+                             evidence_fields=("final_close_evidence", "retirement_evidence", "permission_evidence"),
+                             fixture=str(path), trial=trial, mode=f"{mode:04o}", no_retained_read_description=True,
+                             read_denied=denied, write_allowed=True, storage_acl=name == "existing-acl")
             record(output, "write-only-open-started", fixture=str(path), trial=trial, flags=flags, mode=f"{mode:04o}")
-            fd = os.open(path, flags)
+            fd = os.open(path, flags, 0o600)
             try:
+                require_writeonly_reads_fail(fd)
                 if os.write(fd, b"W" * 100) != 100:
                     raise OSError("short write-only application write")
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            proof_checkpoint(output, f"{path} {trial}: record actual requested/granted modes and bounded OPEN/ownership "
-                             "traces through this trial. Require noCache, no read OPEN and no retained read description. "
-                             "The O_WRONLY supplemental diagnostic likewise cannot prove writeBack/coalescing without "
-                             "independent legitimate retained read rights.",
-                             evidence_fields=("requested_mode", "grant_evidence", "open_trace", "description_evidence"),
-                             fixture=str(path), trial=trial, granted_mode="noCache",
-                             no_retained_read_description=True, read_open_observed=False)
+            expected = dict(requested_mode="readWriteWithCache", granted_mode="noCache" if denied else "writeBack",
+                            successful_read_description=not denied,
+                            authority_opens=([{"access": "readWrite", "result": "EACCES"},
+                                              {"access": "write", "result": "success"}] if denied else
+                                             [{"access": "readWrite", "result": "success"}]),
+                            no_destructive_repeat=True, application_read_errno="EBADF")
+            if denied:
+                expected.update(cache_fill_read_observed=False)
+            proof_checkpoint(output, f"{path} {trial}: record exact authority OPEN access/results for the SAME canonical "
+                             "capability and requested/granted cache modes. A denied case may issue a FAILED read-capable "
+                             "OPEN, but must retain no successful read-capable description and issue no cache-fill READ. "
+                             "Readable cases require writeBack. Verify CREATE/TRUNC happened exactly once on their original "
+                             "paths, never in optional access acquisition or its retry.",
+                             evidence_fields=("grant_evidence", "open_trace", "description_evidence", "canonical_item_evidence"),
+                             fixture=str(path), trial=trial, **expected)
             record(output, "write-only-trial-recorded", fixture=str(path), trial=trial)
 
 

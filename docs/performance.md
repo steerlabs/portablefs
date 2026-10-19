@@ -14,12 +14,25 @@ undelivered dirty data, as on V2 and a local disk without fsync. Linux peers see
 delivered state only. Namespace publication pushes earlier dirty data, and
 ordinary unmount drains before ownership release.
 
+An eligible readable existing file opened O_WRONLY or O_APPEND can receive
+writeBack after one combined authority read/write OPEN. If read access is
+denied by mode or ACL, at most one extra write-only OPEN preserves write
+success with noCache; it retains the durable callback cost. A retained writer
+needs only one missing-read OPEN on cache upgrade and never loses its existing
+description on denial. CREATE can supply legitimate read/write backing rights
+even for mode 0200. These are authority access checks, not predictions from
+mode bits. Application descriptors remain O_WRONLY and cannot read. Record
+actual grants and callback counts when measuring; buffering does not establish
+a coalescing size or speedup.
+
 `scripts/diagnose-small-writes.py` is a supplemental diagnostic for separate
 review, leaving the fixed acceptance runner unchanged: exactly 10,000
 unbuffered 100-byte O_APPEND writes and 64 MiB in 4 KiB chunks on precreated
 files, no barrier/close inside either loop. It records loop/write latency,
-final fsync and close separately, complete write+drain time, and an immediate
-independent authority length/hash check. Run the close-only variant separately
+final fsync and close separately, absolute and monotonic start/end timestamps
+for each loop/fsync/close/verification phase with repetition and device/inode
+identity, complete write+drain time, and an immediate independent authority
+length/hash check. Run the close-only variant separately
 on fresh files. Compare V2/V3 on the same authorized 27 host/path before
 repeating on 26; bulk with 1 MiB application writes and SQLite's ordered flushes
 do not cover many tiny writes to one open file. Keep bounded mode, callback

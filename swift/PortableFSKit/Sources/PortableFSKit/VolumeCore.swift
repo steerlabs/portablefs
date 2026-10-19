@@ -213,7 +213,7 @@ public actor VolumeCore {
 
     /// The open file descriptions one object holds. Each keeps exactly the
     /// access it was opened with. A missing right is acquired as its own
-    /// description, never by reopening the union: a fresh OPEN re-checks
+    /// description when rights are already held: a fresh OPEN re-checks
     /// every right it names against the current mode, so reopening could
     /// lose a right an earlier open was granted. An object therefore holds at
     /// most one read-capable and one write-capable description, and they are
@@ -525,6 +525,37 @@ public actor VolumeCore {
         let objectID = ObjectIdentifier(item)
         try await withLifecycleGate(for: objectID) {
             try await openLocked(item: item, objectID: objectID, mode: mode)
+        }
+    }
+
+    /// The application's modes remain unchanged. A V3 write cache may acquire
+    /// its own authority-checked read right; a definite refusal of that optional
+    /// right preserves the original write open. OPEN here carries access only,
+    /// so the one denied-combined retry cannot repeat CREATE or truncation.
+    func cacheOpen(item: PortableFSItem, mode: PfsOpenMode?, requested: PfsKernelCache.Mode) async throws {
+        let objectID = ObjectIdentifier(item)
+        try await withLifecycleGate(for: objectID) {
+            let identity = try identity(for: item)
+            let held = openHandles[objectID]?.heldAccess ?? .unspecified
+            let optionalRead = mode == .write || (mode == nil && held.grantsWrite)
+            if requested == .readWriteWithCache, optionalRead, !held.grantsRead,
+               try kernelCache?.canAcquireRead(item) == true {
+                do {
+                    try await reconcileOpenHandleLocked(
+                        objectID: objectID, identity: identity, requestedMode: .readWrite,
+                        origin: "cache", fileID: item.fileID
+                    )
+                    return
+                } catch PfsLocalClientError.daemon(errno: EACCES, message: _) {
+                    // An ordinary same-principal access refusal is the only
+                    // recoverable outcome. Terminal loss must win even when
+                    // an access-denied reply raced its notification.
+                    try client.publicationGate.check()
+                }
+            }
+            if let mode {
+                try await openLocked(item: item, objectID: objectID, mode: mode)
+            }
         }
     }
 

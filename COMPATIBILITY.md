@@ -39,10 +39,25 @@ one device share device contention and media failure. See
 PortableFS adopts `FSVolume.DataCacheHandler`. A compatible
 `readWriteWithCache` request receives `writeBack` only with live exclusive-writer
 and authorization proof and legitimately retained read/write descriptions.
-Read-only requests/rights receive `readCache`; no-cache requests and write-only
-rights receive `noCache`. Existing-file `O_WRONLY`/`O_APPEND` and mode 0200 do
-not acquire unauthorized read rights to fill a cache. A legitimate read/write
-creation description can supply those rights until final close.
+Read-only requests/rights receive `readCache`; no-cache requests receive
+`noCache`. For an eligible regular-file V3 `readWriteWithCache` write open,
+the extension acquires missing backing read access through the normal
+same-principal authority OPEN. A fresh `O_WRONLY`/`O_APPEND` open requests read
+and write together; a retained writer acquires only the missing read right.
+A definite nonterminal read-access denial preserves write access: a denied
+combined OPEN retries the original write-only OPEN once; denied added read
+keeps the retained writer. Success without read rights receives `noCache`.
+Other errors keep their failure semantics, and terminal state wins publication.
+
+The application descriptor stays `O_WRONLY`; application read/pread fails
+`EBADF`. Backing OPENs carry access only on the same canonical capability,
+without create, exclusive, truncate or append effects. CREATE's legitimate
+read/write description suffices even for mode 0200. Later cache upgrades may
+acquire missing read access for a retained writer, but never acquire write
+access. Existing descriptions retain their granted rights across chmod/ACL
+changes until retirement; each new acquisition checks current storage access.
+No local mode-bit decision, privileged helper, permission TTL or per-write
+retry supplies cache-fill rights.
 
 macOS 27 buffers ordinary writes in the kernel like V2; every delivered FSKit
 mutation callback still waits for authority-storage durability. Native fsync

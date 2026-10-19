@@ -53,14 +53,33 @@ owner. A macOS 27 error never retries through the macOS 26 adapter.
 On macOS 27, `readWriteWithCache` receives `writeBack` only with live
 exclusive-writer/authorization proof and legitimately retained read/write
 rights. `readWithCache` and read-only rights can receive `readCache`; `none`
-and write-only rights receive `noCache`. Existing-file `O_WRONLY`/`O_APPEND`
-and mode 0200 never trigger a read OPEN merely to fill a cache. CREATE's
-legitimate read/write description remains reusable, including on a newly
-created 0200 inode. Upgrades change cache permission, not descriptor access.
-Terminal or authorization loss fails access. Descriptions retain their rights
-until V3's final item close, after kernel cache management; new opens acquire
-only missing access through authority checks. Final close cannot return an
-error, so cleanup failure ends serving.
+receives `noCache`. An eligible V3 `O_WRONLY`/`O_APPEND` write open requests
+missing backing read access through the normal same-principal authority OPEN,
+under the item's existing lifecycle ownership. With no held descriptions this
+is one combined read/write OPEN; with a retained writer it is a read-only OPEN.
+A definite nonterminal access denial retries a fresh combined request once as
+write-only, or keeps an already retained writer, yielding `noCache`. A refused
+write retry returns its own error. Transport, protocol, resource and terminal
+failures propagate; terminal state and live cache proof are rechecked at the
+framework reply. The authority checks current permissions and ACLs; the
+extension never decides access from cached mode bits.
+
+The application descriptor remains `O_WRONLY`; application read/pread still
+fails `EBADF`. Optional backing OPENs address the same canonical item and carry
+access only, so neither the attempt nor its retry repeats CREATE, EXCL, TRUNC or
+append effects. CREATE's legitimate read/write description remains reusable,
+including on a newly created 0200 inode. An upgrade to `readWriteWithCache`
+can acquire missing read access for a retained writer; it cannot invent write
+access. V2, `none`, read-only opens and ineligible items do not attempt optional
+cache reads. No per-write retry or permission TTL is used.
+
+Combined descriptions own both rights; separate descriptions keep their
+original access. chmod/ACL changes affect new acquisitions, while legitimately
+held rights survive until retirement. Descriptions remain owned through V3's
+final item close and every push pin, including unlink and replacement. Each
+owned description retires once. Terminal or authorization loss fails access.
+Final close cannot return an error, so cleanup failure ends serving.
+
 On 27, reclaim settles pending item publications and checks `FSItem.tryReclaim`
 under the shared publication gate; a retained kernel reference restores the
 canonical item without releasing authority ownership. Reentrant failure replies
