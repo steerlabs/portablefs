@@ -63,7 +63,7 @@ func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second p
 	r.cachedReplyFree = p.cachedNext
 	p.cachedNext = nil
 	p.owner, p.requestUnique, p.originalFinalized, p.cachedArena = r, unique, true, true
-	p.stamp = stamp
+	p.stamp, p.retainedAnswer = stamp, true
 	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
 	r.replyPublications[unique] = p
 	return true
@@ -131,7 +131,7 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 		return false
 	}
 	record.lookups++
-	r.replyPublications[unique].cachedLookup = record
+	r.replyPublications[unique].lookupReference = record
 	r.identityIndexLocked(record)[record.key] = record
 	*out = fuse.EntryOut{NodeId: record.id, Generation: 1, Attr: payload.fuseAttr}
 	return true

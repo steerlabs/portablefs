@@ -105,4 +105,6 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestEpochRecoveryStopsAtOper
 # Suspend-inclusive permission must be checked before CONTROL or timers run.
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRefusesFreshCachedLookupAndGetattr
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRejectsAlreadyAdmittedCachePublication
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendInterruptedCachedLookupSettlesReferenceOnce
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendPreservesAcceptedHolderMutation
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRejectsRenewalBeforeTimerRuns

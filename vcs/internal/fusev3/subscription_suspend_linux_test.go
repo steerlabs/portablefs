@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,48 +162,188 @@ func TestSubscriptionSuspendRefusesFreshCachedLookupAndGetattr(t *testing.T) {
 }
 
 func TestSubscriptionSuspendRejectsAlreadyAdmittedCachePublication(t *testing.T) {
-	for _, operation := range []string{"lookup", "positive-lookup", "getattr"} {
+	for _, operation := range []string{"lookup", "positive-lookup", "getattr", "holder-getattr", "slow-holder-getattr", "holder-lookup", "slow-holder-lookup", "holder-readdirplus"} {
 		t.Run(operation, func(t *testing.T) {
-			f := newStockFixture(t)
+			holder := strings.Contains(operation, "holder")
+			var f *stockFixture
+			var entry *fuse.EntryOut
+			name := "existing"
+			if holder {
+				f, entry = dirtyHolderMetadataFixture(t)
+				name = "cached"
+			} else {
+				f = newStockFixture(t)
+				item := testItem(95, authoritypb.Attr_REGULAR, 95)
+				f.rpc.byName = map[string]*authoritypb.Item{name: item}
+				entry = f.lookup(t, 1, name)
+				f.rpc.missingNames["missing"] = true
+				f.lookup(t, 1, "missing")
+			}
 			sub := f.mount.subscription
 			clock := &subscriptionTestClock{now: sub.config.clock.Now()}
 			sub.config.clock = clock
-			item := testItem(95, authoritypb.Attr_REGULAR, 95)
-			f.rpc.byName = map[string]*authoritypb.Item{"existing": item}
-			entry := f.lookup(t, 1, "existing")
-			f.rpc.missingNames["missing"] = true
-			f.lookup(t, 1, "missing")
+			if strings.HasPrefix(operation, "slow-") {
+				f.raw.cachedReplyFree = nil
+			}
 			record := f.raw.nodesByID[entry.NodeId]
-			priorLookups := record.lookups
+			priorLookups, calls := record.lookups, f.rpcCalls()
 			unique := f.unique.Add(2)
 			var status fuse.Status
 			var opcode uint32
-			if operation == "lookup" || operation == "positive-lookup" {
-				name := "missing"
-				if operation == "positive-lookup" {
-					name = "existing"
+			switch {
+			case operation == "holder-readdirplus":
+				dir, _ := testDirHandle(t, f.raw, metadataPage(f.rpc.item))
+				opcode = 44
+				status = f.raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: dir}, fuse.NewDirEntryList(make([]byte, 4096), 0))
+			case strings.Contains(operation, "lookup"):
+				if operation == "lookup" {
+					name = "missing"
 				}
 				opcode = 1
 				status = f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, name, &fuse.EntryOut{})
-			} else {
+			default:
 				opcode = 3
-				status = f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+				var out fuse.AttrOut
+				status = f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &out)
+				if holder && (out.Size != 4101 || f.rpcCalls() != calls) {
+					t.Fatalf("holder GETATTR missed retained overlay: size=%d RPCs=%d", out.Size, f.rpcCalls()-calls)
+				}
 			}
 			if status != fuse.OK {
 				t.Fatal(status)
+			}
+			p := f.raw.replyPublications[unique]
+			if p == nil {
+				t.Fatal("read omitted physical publication ownership")
+			}
+			pin := p.holderAdmission
+			if holder && (pin == nil || strings.HasPrefix(operation, "slow-") && p.cachedArena) {
+				t.Fatal("holder read omitted its pin or bypassed arena exhaustion")
 			}
 			clock.advance(11 * time.Second)
 			_, reply, prepare := f.raw.PrepareReplyPayload(unique, 0, opcode, nil, nil, 0)
 			f.raw.ReplyWritten(unique, fuse.OK) // the EIO callback reply reached the kernel
 			if reply != fuse.EIO || prepare != fuse.OK {
-				t.Fatalf("expired cached publication: reply=%v prepare=%v", reply, prepare)
+				t.Errorf("expired cached publication: reply=%v prepare=%v", reply, prepare)
 			}
 			if f.mount.isRevoked() {
-				t.Fatal("recoverable cache expiry revoked the mount")
+				t.Error("recoverable cache expiry revoked the mount")
 			}
 			if record.lookups != priorLookups {
-				t.Fatalf("refused cached reply leaked lookup references: %d -> %d", priorLookups, record.lookups)
+				t.Errorf("refused read changed lookup references: %d -> %d", priorLookups, record.lookups)
 			}
+			if pin != nil {
+				if !pin.admission.TryLock() {
+					t.Fatal("physically settled EIO retained the metadata pin")
+				}
+				pin.admission.Unlock()
+			}
+			if f.raw.ReplyWriteTracked(unique) {
+				t.Fatal("physically settled EIO retained publication ownership")
+			}
+		})
+	}
+}
+
+// The fixture runs callbacks synchronously with CONTROL and horizon workers
+// parked. The first clock sample after the cached LOOKUP acquires its reference
+// advances elapsed time, without depending on the number of admission checks.
+type lookupSuspendClock struct {
+	*subscriptionTestClock
+	record       *inodeRecord
+	priorLookups uint64
+	suspended    bool
+}
+
+func (c *lookupSuspendClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.suspended && c.record.lookups > c.priorLookups {
+		c.now = c.now.Add(11 * time.Second)
+		c.suspended = true
+	}
+	return c.now
+}
+
+func TestSubscriptionSuspendInterruptedCachedLookupSettlesReferenceOnce(t *testing.T) {
+	f := newStockFixture(t)
+	entry := f.lookup(t, 1, "cached")
+	record := f.raw.nodesByID[entry.NodeId]
+	priorLookups, calls := record.lookups, f.rpcCalls()
+	sub := f.mount.subscription
+	clock := &lookupSuspendClock{subscriptionTestClock: &subscriptionTestClock{now: sub.config.clock.Now()}, record: record, priorLookups: priorLookups}
+	sub.config.clock = clock
+	f.raw.cachedReplyFree = nil
+	unique := f.unique.Add(2)
+	status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{})
+	if status != fuse.EIO || !clock.suspended || f.rpcCalls() != calls {
+		t.Fatalf("slow cached LOOKUP missed interruption: status=%v suspended=%v RPCs=%d", status, clock.suspended, f.rpcCalls()-calls)
+	}
+	p := f.raw.replyPublications[unique]
+	if p == nil || p.cachedArena || p.lookupReference != record || p.holderAdmission != nil {
+		t.Fatal("interrupted cache hit lost its physical lookup ownership or published metadata")
+	}
+	_, reply, prepare := f.raw.PrepareReplyPayload(unique, 1, 1, nil, nil, 0)
+	f.raw.ReplyWritten(unique, fuse.OK)
+	if reply != fuse.EIO || prepare != fuse.OK {
+		t.Errorf("physical EIO lifecycle: reply=%v prepare=%v", reply, prepare)
+	}
+	if record.lookups != priorLookups {
+		t.Errorf("interrupted cached LOOKUP released a kernel reference: %d -> %d", priorLookups, record.lookups)
+	}
+	if f.mount.isRevoked() || f.raw.ReplyWriteTracked(unique) {
+		t.Fatal("interrupted cached LOOKUP left a revoked mount or unsettled reply")
+	}
+	// Exercise ordinary cold recovery and a new public callback on this mount.
+	sub.config.clock = clock.subscriptionTestClock
+	sub.rpc = suspendSubscriptionRPC{subscriptionRPC: f.rpc, clock: clock.subscriptionTestClock}
+	if err := sub.subscribe(t.Context()); err != nil {
+		t.Fatalf("cold resubscription after physical EIO: %v", err)
+	}
+	if next := f.lookup(t, 1, "cached"); next.NodeId != entry.NodeId || record.lookups != priorLookups+1 || f.mount.isRevoked() {
+		t.Fatalf("mount unusable after recovery: node=%d lookups=%d revoked=%v", next.NodeId, record.lookups, f.mount.isRevoked())
+	}
+}
+
+func TestSubscriptionSuspendPreservesAcceptedHolderMutation(t *testing.T) {
+	for _, delegated := range []bool{false, true} {
+		name := "authority"
+		if delegated {
+			name = "delegated"
+		}
+		t.Run(name, func(t *testing.T) {
+			var f *stockFixture
+			var entry *fuse.EntryOut
+			if delegated {
+				f, entry = dirtyHolderMetadataFixture(t)
+			} else {
+				f = newStockFixture(t)
+				entry = f.lookup(t, 1, "cached")
+			}
+			sub := f.mount.subscription
+			clock := &subscriptionTestClock{now: sub.config.clock.Now()}
+			sub.config.clock = clock
+			unique := f.unique.Add(2)
+			in := &fuse.SetAttrIn{}
+			in.Unique, in.NodeId, in.Valid, in.Mode = unique, entry.NodeId, fuse.FATTR_MODE, 0o640
+			if status := f.raw.SetAttr(nil, in, &fuse.AttrOut{}); status != fuse.OK {
+				t.Fatal(status)
+			}
+			p := f.raw.replyPublications[unique]
+			if p == nil || p.holderAdmission == nil || p.source == nil || (p.postState == nil) != delegated {
+				t.Fatal("mutation missed its metadata pin, source ownership or expected post-state")
+			}
+			pin := p.holderAdmission
+			clock.advance(11 * time.Second)
+			_, reply, prepare := f.raw.PrepareReplyPayload(unique, entry.NodeId, 4, nil, nil, 0)
+			f.raw.ReplyWritten(unique, fuse.OK)
+			if reply != fuse.OK || prepare != fuse.OK || f.mount.isRevoked() {
+				t.Fatalf("accepted mutation lost its result: reply=%v prepare=%v revoked=%v", reply, prepare, f.mount.isRevoked())
+			}
+			if !pin.admission.TryLock() {
+				t.Fatal("physically settled mutation retained the metadata pin")
+			}
+			pin.admission.Unlock()
 		})
 	}
 }

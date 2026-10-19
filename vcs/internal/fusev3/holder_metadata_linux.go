@@ -139,7 +139,7 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 		}
 		r.pinMetadataLocked(p, s, record, first, second, count)
 		if fast && parent != nil {
-			p.cachedLookup = record
+			p.lookupReference = record
 			record.lookups++
 			r.identityIndexLocked(record)[record.key] = record
 		}
@@ -184,6 +184,12 @@ func (r *rawFileSystem) renderMetadataLocked(s *delegationState, base *authority
 }
 
 func (r *rawFileSystem) pinMetadataLocked(p *replyPublication, s *delegationState, record *inodeRecord, first, second publicationCoordinate, count int) {
+	// A source mutation publishes its accepted outcome even after permission
+	// expires. Other holder metadata depends on retained permission, including
+	// directory rows and slow reads that could not allocate a cached reply.
+	if s.ref != nil && p.source == nil && p.postState == nil {
+		p.retainedAnswer = true
+	}
 	if p.holderAdmission == nil {
 		p.cachedCoordinates, p.cachedCount, p.holderAdmission = [2]publicationCoordinate{first, second}, count, s
 		return

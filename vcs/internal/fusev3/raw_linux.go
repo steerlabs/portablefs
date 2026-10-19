@@ -205,11 +205,12 @@ type replyDataPublication struct {
 type replyPublication struct {
 	cachedNext  *replyPublication
 	cachedArena bool
-	// A slow cache hit must stay tracked even without cache reservations.
-	cachedAnswer bool
+	// A read using retained cache or holder permission must stay tracked and
+	// revalidate that permission at physical publication, regardless of arena.
+	retainedAnswer bool
 	// Callback refusal still has a successful physical write lifecycle.
 	cacheRejected          bool
-	cachedLookup           *inodeRecord
+	lookupReference        *inodeRecord
 	holderAdmission        *delegationState
 	holderAdmissions       []*delegationState
 	metadataSample         uint64
@@ -266,7 +267,7 @@ type replyPublication struct {
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 && p.cachedCount == 0 && p.holderAdmission == nil &&
-		!p.cachedAnswer && p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
+		!p.retainedAnswer && p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
@@ -1688,15 +1689,17 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
-	if publication.cachedArena || publication.cachedAnswer {
+	if publication.retainedAnswer {
 		live := r.mount.subscription.stamp()
 		if live.incarnation == 0 || live.incarnation != publication.stamp.incarnation {
 			publication.cacheRejected = true
-			r.mu.Unlock()
-			// Permission loss refuses this answer; the lifecycle and mount remain
-			// usable so the ordinary cold-withdrawal path can complete.
-			return 0, fuse.EIO, fuse.OK
 		}
+	}
+	if publication.cacheRejected {
+		r.mu.Unlock()
+		// Permission loss refuses this answer; the lifecycle and mount remain
+		// usable so the ordinary cold-withdrawal path can complete.
+		return 0, fuse.EIO, fuse.OK
 	}
 	if publication.cachedArena {
 		r.mu.Unlock()
@@ -1905,8 +1908,8 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	responseConsumption := r.settleReplyPublicationLocked(publication, successful)
 	r.mu.Unlock()
 	r.finishDirPlusLookupCompletion(dirPlusCompletion)
-	if publication.cacheRejected && publication.cachedLookup != nil {
-		r.Forget(publication.cachedLookup.id, 1)
+	if publication.cacheRejected && publication.lookupReference != nil {
+		r.Forget(publication.lookupReference.id, 1)
 	}
 	if publication.source != nil {
 		if status.Ok() {
@@ -2369,7 +2372,7 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 		}
 		if negative {
 			p.servedVersion = stamp.version
-			p.cachedAnswer = true
+			p.retainedAnswer = true
 			r.mu.Unlock()
 			return nil, nil, true
 		}
@@ -2407,8 +2410,8 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 			r.identityIndexLocked(record)[record.key] = record
 			attr = proto.Clone(payload.attr).(*authoritypb.Attr)
 			p.servedVersion = min(stamp.version, payload.stamp.version)
-			p.cachedAnswer = true
-			p.cachedLookup = record
+			p.retainedAnswer = true
+			p.lookupReference = record
 			p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
 			return true
 		})
@@ -2537,7 +2540,7 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 			}
 			attr = proto.Clone(payload.attr).(*authoritypb.Attr)
 			p.servedVersion = payload.stamp.version
-			p.cachedAnswer = true
+			p.retainedAnswer = true
 			p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
 			return true
 		})
@@ -2566,48 +2569,47 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 		return lifecycle
 	}
 	defer finish()
-	if record, attr, negative := r.cachedLookup(ctx, parent, name); negative {
+	record, attr, negative := r.cachedLookup(ctx, parent, name)
+	if negative {
 		*out = fuse.EntryOut{}
 		out.SetEntryTimeout(0)
 		return fuse.OK
-	} else if record != nil {
-		r.bindPath(record, parent, name)
-		if err := r.publishEntry(ctx, out, parent, name, record, attr); err != nil {
-			if errors.Is(err, errMetadataInterrupted) {
-				r.Forget(record.id, 1)
-				return fuse.EIO
+	}
+	if record == nil {
+		item, errno := parent.node.Lookup(ctx, name)
+		if errno != 0 {
+			// A shared ENOENT states a namespace fact which the daemon may retain
+			// under its subscription stamp. Other errors describe no namespace
+			// fact and remain ordinary unmarked replies.
+			if errno == syscall.ENOENT {
+				status, err := r.publishNegativeEntry(ctx, out, parent, name)
+				if err != nil {
+					r.mount.revoke(err)
+					return fuse.Status(syscall.ENOTCONN)
+				}
+				return status
 			}
-			r.mount.revoke(err)
-			return fuse.Status(syscall.ENOTCONN)
+			out.SetEntryTimeout(0)
+			return fuse.Status(errno)
 		}
-		return fuse.OK
-	}
-	item, errno := parent.node.Lookup(ctx, name)
-	if errno != 0 {
-		// A shared ENOENT states a namespace fact which the daemon may retain
-		// under its subscription stamp. Other errors describe no namespace
-		// fact and remain ordinary unmarked replies.
-		if errno == syscall.ENOENT {
-			status, err := r.publishNegativeEntry(ctx, out, parent, name)
-			if err != nil {
-				r.mount.revoke(err)
-				return fuse.Status(syscall.ENOTCONN)
-			}
-			return status
+		record, errno = r.intern(ctx, item)
+		if errno != 0 {
+			return fuse.Status(errno)
 		}
-		out.SetEntryTimeout(0)
-		return fuse.Status(errno)
+		attr = item.GetAttr()
 	}
-	record, errno := r.intern(ctx, item)
-	if errno != 0 {
-		return fuse.Status(errno)
-	}
+	publication := replyPublicationFromContext(ctx)
+	// Both cached and authority lookups transfer their reference only with the
+	// physical reply. A holder overlay can lose permission after either sample.
+	publication.lookupReference = record
 	r.bindPath(record, parent, name)
-	if err := r.publishEntry(ctx, out, parent, name, record, item.GetAttr()); err != nil {
+	if err := r.publishEntry(ctx, out, parent, name, record, attr); err != nil {
 		if errors.Is(err, errMetadataInterrupted) {
-			// The failed LOOKUP transfers no kernel lookup reference. Its
-			// retained Authority response is still consumed by normal settlement.
-			r.Forget(record.id, 1)
+			// Physical settlement is the sole rollback owner, including when
+			// metadata admission refuses the callback before reply preparation.
+			r.mu.Lock()
+			publication.cacheRejected = true
+			r.mu.Unlock()
 			return fuse.EIO
 		}
 		r.mount.revoke(err)
