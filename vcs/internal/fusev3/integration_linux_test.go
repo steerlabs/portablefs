@@ -1268,11 +1268,6 @@ func TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach(t *testing.T)
 	retained := mustOpenFile(t, path, os.O_RDONLY, 0)
 	mount := f.mounts[0]
 
-	connectionDone := make(chan struct{})
-	go func() {
-		mount.Wait()
-		close(connectionDone)
-	}()
 	if output, err := exec.Command("fusermount3", "-u", "-z", f.mountPath(0)).CombinedOutput(); err != nil {
 		_ = retained.Close()
 		t.Fatalf("lazy unmount: %v (%s)", err, output)
@@ -1281,17 +1276,28 @@ func TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach(t *testing.T)
 		_ = retained.Close()
 		t.Fatal("lazy unmount left the mount in this namespace")
 	}
+	// FSYNC must complete through the retained connection after namespace
+	// detach; a cached read alone would not establish that it can still serve.
+	if err := retained.Sync(); err != nil {
+		_ = retained.Close()
+		t.Fatalf("fsync through the retained lazy mount: %v", err)
+	}
 	select {
-	case <-connectionDone:
+	case <-mount.kernelConnectionDone:
 		_ = retained.Close()
 		t.Fatal("FUSE serving connection ended while an open descriptor still retained the lazy mount")
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 	if count := f.membership.activeCount(); count != 1 {
 		_ = retained.Close()
 		t.Fatalf("durable membership during retained lazy mount = %d, want 1", count)
 	}
 
+	connectionDone := make(chan struct{})
+	go func() {
+		mount.Wait()
+		close(connectionDone)
+	}()
 	if err := retained.Close(); err != nil {
 		t.Logf("closing the retained descriptor after lazy unmount reported %v", err)
 	}
