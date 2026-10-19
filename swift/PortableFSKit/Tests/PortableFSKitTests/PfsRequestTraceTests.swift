@@ -256,3 +256,204 @@ extension PfsLocalMockDaemonTests {
     }
 }
 }
+
+// This boundary counts every pfslocal request emitted by a real callback.
+// v3trips_test.go reconciles lookup/getattr with the daemon's 0/1 authority
+// paths, and close/reclaim with held background authority releases. The mock
+// does not model authority caching: a local lookup/getattr is still one local
+// request. Keeping both boundaries explicit catches an extra Swift OPEN or
+// STATFS without inventing an authority simulator here.
+@available(macOS 26.0, *)
+private final class CallbackTripFixture {
+    let log: TraceLog
+    let daemon: PfsLocalMockDaemon
+    let volume: PortableFSVolume
+    let root: FSItem
+
+    init() async throws {
+        let log = TraceLog()
+        var configuration = PfsLocalClient.Configuration(clientName: "callback-trips")
+        configuration.traceObserver = { log.append($0) }
+        let daemon = try PfsLocalMockDaemon(configuration: .init(attachRef: "callback-trips"))
+        self.log = log
+        self.daemon = daemon
+        let core = try await VolumeCore.connect(
+            socketPath: daemon.socketPath, attachRef: "callback-trips", configuration: configuration
+        )
+        volume = try await PortableFSVolume.make(core: core, attachRef: "callback-trips")
+        root = try await core.rootItem()
+    }
+
+    // Associate the exact ordered request list with one callback label, including
+    // requests with operation 0. Filtering by operation alone would miss STATFS.
+    func step<Value>(
+        _ expected: [String],
+        invoke: (@escaping (Result<Value, Error>) -> Void) -> Void
+    ) async throws -> Value {
+        let before = log.all().count
+        let reply = TraceReplyBox<Result<Value, Error>>()
+        invoke { reply.set($0) }
+        let result = try await waitForReply(reply).get()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while ContinuousClock.now < deadline {
+            if log.all().dropFirst(before).contains(where: { $0.event == .callbackFinished }) { break }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        let records = Array(log.all().dropFirst(before))
+        let began = records.filter { $0.event == .callbackBegan }
+        #expect(began.count == 1)
+        let label = try #require(began.first?.value("callback"))
+        let requests = records.filter { $0.event == .dispatched }
+        #expect(requests.allSatisfy { $0.value("callback") == label })
+        #expect(requests.compactMap { $0.value("kind") } == expected)
+        #expect(records.contains { $0.event == .callbackFinished && $0.value("callback") == label && $0.value("outcome") == "success" })
+        return result
+    }
+
+    func create(_ name: String, type: FSItem.ItemType = .file) async throws -> FSItem {
+        try await step([type == .directory ? "mkdir" : "create"]) { finish in
+            volume.createItem(named: FSFileName(string: name), type: type, inDirectory: root,
+                              attributes: FSItem.SetAttributesRequest()) { item, _, error in
+                if let error { finish(.failure(error)) }
+                else if let item { finish(.success(item)) }
+                else { finish(.failure(PfsLocalClientError.unexpectedReply("create omitted item"))) }
+            }
+        }
+    }
+
+    func lookup(_ name: String) async throws -> FSItem {
+        try await step(["lookup"]) { finish in
+            volume.lookupItem(named: FSFileName(string: name), inDirectory: root) { item, _, error in
+                if let error { finish(.failure(error)) }
+                else if let item { finish(.success(item)) }
+                else { finish(.failure(PfsLocalClientError.unexpectedReply("lookup omitted item"))) }
+            }
+        }
+    }
+
+    func open(_ item: FSItem, expected: [String]) async throws {
+        try await step(expected) { finish in
+            volume.openItem(item, modes: [.read]) { error in
+                finish(error.map { .failure($0) } ?? .success(()))
+            }
+        }
+    }
+
+    func close(_ item: FSItem) async throws {
+        try await step(["close"]) { finish in
+            volume.closeItem(item, modes: []) { error in
+                finish(error.map { .failure($0) } ?? .success(()))
+            }
+        }
+    }
+}
+
+extension PfsLocalMockDaemonTests {
+@available(macOS 26.0, *)
+@Test func callbackTripCountsAndGitObjectChain() async throws {
+    let f = try await CallbackTripFixture()
+    defer { f.daemon.stop() }
+    let item = try await f.create("temporary")
+    // CREATE's description covers this open; no request of any kind is allowed.
+    try await f.open(item, expected: [])
+    let request = FSItem.GetAttributesRequest()
+    request.wantedAttributes = [.type, .fileID]
+    try await f.step(["getattr"]) { finish in
+        f.volume.getAttributes(request, of: item) { _, error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    let written: Int = try await f.step(["write"]) { finish in
+        f.volume.write(contents: Data("abc".utf8), to: item, at: 0) { count, error in
+            finish(error.map { .failure($0) } ?? .success(count))
+        }
+    }
+    #expect(written == 3)
+    // FSKit constructs FSMutableFileDataBuffer (its init is unavailable).
+    // Use the existing callback-window seam for the same core READ and socket
+    // dispatch, without fabricating a framework-owned buffer.
+    let read: Data = try await f.step(["read"]) { finish in
+        f.volume.testOnlyPublishAfterReply(operation: {
+            try await f.volume.core.read(item: try #require(item as? PortableFSItem), offset: 0, length: 3)
+        }, reply: finish)
+    }
+    #expect(read == Data("abc".utf8))
+    try await f.close(item)
+    try await f.step(["link"]) { finish in
+        f.volume.createLink(to: item, named: FSFileName(string: "object"), inDirectory: f.root) { _, error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    // Both local requests map to zero authority trips in TestV3GitObjectAuthorityChain.
+    let temporary = try await f.lookup("temporary")
+    let alias = try await f.lookup("object")
+    #expect(temporary === alias)
+    try await f.step(["remove"]) { finish in
+        f.volume.removeItem(item, named: FSFileName(string: "temporary"), fromDirectory: f.root) { error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    _ = try await f.lookup("object")
+    // No retained description after close: exactly one real OPEN is required.
+    try await f.open(alias, expected: ["open"])
+    try await f.close(alias)
+    try await f.step(["rename"]) { finish in
+        f.volume.renameItem(alias, inDirectory: f.root, named: FSFileName(string: "object"),
+                            to: FSFileName(string: "renamed"), inDirectory: f.root, overItem: nil) { _, error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    _ = try await f.create("directory", type: .directory)
+    try await f.step(["sync-volume", "statfs"]) { finish in
+        f.volume.synchronize(flags: .wait) { error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    try await f.step(["reclaim"]) { finish in
+        f.volume.reclaimItem(alias) { error in
+            finish(error.map { .failure($0) } ?? .success(()))
+        }
+    }
+    await f.volume.shutdown()
+}
+}
+
+extension PfsLocalMockDaemonTests {
+@available(macOS 26.0, *)
+@Test func disjointCallbackTripsReachDaemonBeforeEitherReply() async throws {
+    let f = try await CallbackTripFixture()
+    defer { f.daemon.stop() }
+    let a = try #require(try await f.create("a") as? PortableFSItem)
+    let b = try #require(try await f.create("b") as? PortableFSItem)
+    let before = f.log.all().count
+    let readsBefore = await f.daemon.stats().readRequests
+    await f.daemon.pauseReads()
+    let replies = [TraceReplyBox<Result<Data, Error>>(), TraceReplyBox<Result<Data, Error>>()]
+    for (item, reply) in zip([a, b], replies) {
+        f.volume.testOnlyPublishAfterReply(operation: {
+            try await f.volume.core.read(item: item, offset: 0, length: 3)
+        }, reply: { reply.set($0) })
+    }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    var arrived = 0
+    while ContinuousClock.now < deadline {
+        arrived = await f.daemon.stats().readRequests - readsBefore
+        if arrived == 2 { break }
+        try await Task.sleep(for: .milliseconds(2))
+    }
+    // The second request must reach real socket dispatch while the first is
+    // still waiting. Time is only a deadlock bound, never a latency assertion.
+    #expect(arrived == 2)
+    #expect(replies.allSatisfy { $0.get() == nil })
+    await f.daemon.resumeReads()
+    for reply in replies {
+        #expect(try await waitForReply(reply).get().isEmpty)
+    }
+    let records = Array(f.log.all().dropFirst(before))
+    let requests = records.filter { $0.event == .dispatched }
+    #expect(requests.compactMap { $0.value("kind") } == ["read", "read"])
+    #expect(Set(requests.compactMap { $0.value("callback") }).count == 2)
+    #expect(records.filter { $0.event == .callbackBegan }.count == 2)
+    await f.volume.shutdown()
+}
+}

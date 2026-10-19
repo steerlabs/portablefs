@@ -97,15 +97,15 @@ type v3ItemRecord struct {
 	// Metadata cache state (see v3cache.go). attr is the retained observation
 	// and valid says whether it may serve a hit; version is the last accepted
 	// object version, and snapshot is the observation's storage snapshot while
-	// valid or the minimum admissible snapshot while not. binding is the one
-	// name remembered for the record. A directory also caches remembered
+	// valid or the minimum admissible snapshot while not. bindings contains the
+	// observed names for the record. A directory also caches remembered
 	// children, authoritative absences, and its name watermark. Everything here
 	// lives exactly as long as the record and is protected by v3DataPlane.mu.
 	attr      *authoritypb.Attr
 	valid     bool
 	version   uint64
 	snapshot  uint64
-	binding   *v3Binding
+	bindings  map[v3Binding]struct{}
 	children  map[string]*v3ItemRecord
 	negatives map[string]struct{}
 	watermark uint64
@@ -126,8 +126,8 @@ type v3MkdirWitness struct {
 	searchPermitted bool
 }
 
-// v3Binding is a record's one remembered name. Retiring the parent record
-// clears it, so a rendered parent is always live.
+// v3Binding names one coordinate in an exact parent incarnation. Both the
+// parent's children and the child's bindings contain it, or neither does.
 type v3Binding struct {
 	parent *v3ItemRecord
 	name   string
@@ -231,7 +231,12 @@ type v3DataPlane struct {
 	// starting at the storage baseline 1. A newly interned record cannot adopt
 	// a sample older than it (see v3cache.go). Reclaim never lowers it.
 	coldFloor uint64
-	// negativeDirs indexes the directories holding cached absences, bounded in
+	// Positive bindings have an independent mount-wide count and byte bound;
+	// none owns an additional item capability.
+	bindingDirs  map[*v3ItemRecord]struct{}
+	bindingNames int
+	bindingBytes int
+	// negativeDirs indexes directories holding cached absences, bounded in
 	// total by negativeNames and negativeBytes.
 	negativeDirs    map[*v3ItemRecord]struct{}
 	negativeNames   int
@@ -344,7 +349,8 @@ func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane
 		client: cfg.Client, cfg: cfg, ctx: ctx, cancel: cancel, clock: clock,
 		ops: make(chan struct{}, limit), itemsByID: make(map[uint64]*v3ItemRecord),
 		itemsByIdentity: make(map[[16]byte]*v3ItemRecord), nextItemID: v3FirstItemID, coldFloor: 1,
-		negativeDirs: make(map[*v3ItemRecord]struct{}), handles: make(map[uint64]*v3HandleRecord), nextHandleID: 1,
+		bindingDirs: make(map[*v3ItemRecord]struct{}), negativeDirs: make(map[*v3ItemRecord]struct{}),
+		handles: make(map[uint64]*v3HandleRecord), nextHandleID: 1,
 		cookies: make(map[uint64]v3CookieRecord), cookieBatches: make(map[uint64]*v3CookieBatch),
 		nextCookieID: v3CookieFloor, nextCookieBatch: 1,
 		nameMax: 255, maxRead: maxRead, maxWrite: maxWrite,
@@ -1494,17 +1500,16 @@ func (d *v3DataPlane) reclaim(ctx context.Context, request *pfslocal.ReclaimRequ
 }
 
 // detachItemLocked retires a record from every local index before its
-// capability is reclaimed. Its remembered name goes with it, and a retired
+// capability is reclaimed. Every observed name goes with it, and a retired
 // directory takes every name, absence, and child parent reference beneath it,
 // so nothing can render or fill through the old local handle. d.mu must be
 // held.
 func (d *v3DataPlane) detachItemLocked(record *v3ItemRecord) {
 	delete(d.itemsByID, record.item.ItemID)
 	delete(d.itemsByIdentity, record.item.StableIdentity)
-	if binding := record.binding; binding != nil && binding.parent.children[binding.name] == record {
-		delete(binding.parent.children, binding.name)
+	for binding := range record.bindings {
+		d.dropBindingLocked(binding.parent, binding.name)
 	}
-	record.binding = nil
 	d.forgetNamesLocked(record)
 	d.dropCompletenessLocked(record)
 	for batchID, batch := range d.cookieBatches {
@@ -2171,8 +2176,8 @@ func (d *v3DataPlane) renderAttr(attr *authoritypb.Attr) (pfslocal.Attr, error) 
 	}, nil
 }
 
-// parentOf is the parent of the record's remembered binding, for operations
-// that name an item without a directory; nil when no live name is known.
+// parentOf selects a representative live parent for item-only attributes.
+// Namespace replies instead render the parent the caller actually named.
 func (d *v3DataPlane) parentOf(record *v3ItemRecord) *v3ParentBinding {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -2180,10 +2185,10 @@ func (d *v3DataPlane) parentOf(record *v3ItemRecord) *v3ParentBinding {
 }
 
 func (d *v3DataPlane) parentOfLocked(record *v3ItemRecord) *v3ParentBinding {
-	if record.binding == nil {
-		return nil
+	for binding := range record.bindings {
+		return v3ParentOf(binding.parent)
 	}
-	return v3ParentOf(record.binding.parent)
+	return nil
 }
 
 func (d *v3DataPlane) item(item pfslocal.Item) (*v3ItemRecord, int32) {

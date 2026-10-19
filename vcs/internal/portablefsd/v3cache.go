@@ -94,30 +94,55 @@ func (d *v3DataPlane) observeLocked(record *v3ItemRecord, attr *authoritypb.Attr
 	return nil
 }
 
-// bindNameLocked records child as the remembered binding at parent/name. A
-// record remembers one binding, so a hard-link alias replaces the previous
-// one. d.mu is held.
+// bindNameLocked retains an observed alias without adding ownership. Exhaustion
+// forgets all positive answers, just as negative-cache exhaustion does; it does
+// not remove items, prove absence, or discard directory completeness. d.mu is held.
 func (d *v3DataPlane) bindNameLocked(parent *v3ItemRecord, name string, child *v3ItemRecord) {
 	d.dropNameLocked(parent, name)
 	if child.root {
 		return
 	}
-	if previous := child.binding; previous != nil && previous.parent.children[previous.name] == child {
-		delete(previous.parent.children, previous.name)
+	if d.bindingNames+1 > v3MaxCompleteNames || d.bindingBytes+len(name) > v3MaxCompleteBytes {
+		for dir := range d.bindingDirs {
+			for name := range dir.children {
+				d.dropBindingLocked(dir, name)
+			}
+		}
 	}
 	if parent.children == nil {
 		parent.children = make(map[string]*v3ItemRecord)
+		d.bindingDirs[parent] = struct{}{}
+	}
+	if child.bindings == nil {
+		child.bindings = make(map[v3Binding]struct{})
 	}
 	parent.children[name] = child
-	child.binding = &v3Binding{parent: parent, name: name}
+	child.bindings[v3Binding{parent: parent, name: name}] = struct{}{}
+	d.bindingNames++
+	d.bindingBytes += len(name)
+}
+
+// dropBindingLocked removes both memberships of one positive answer. Neither
+// the shared inode nor its other names is retired by coordinate removal.
+func (d *v3DataPlane) dropBindingLocked(parent *v3ItemRecord, name string) {
+	if child := parent.children[name]; child != nil {
+		delete(child.bindings, v3Binding{parent: parent, name: name})
+		if len(child.bindings) == 0 {
+			child.bindings = nil
+		}
+		delete(parent.children, name)
+		d.bindingNames--
+		d.bindingBytes -= len(name)
+		if len(parent.children) == 0 {
+			parent.children = nil
+			delete(d.bindingDirs, parent)
+		}
+	}
 }
 
 // dropNameLocked forgets both cached answers at one coordinate. d.mu is held.
 func (d *v3DataPlane) dropNameLocked(parent *v3ItemRecord, name string) {
-	if child := parent.children[name]; child != nil {
-		child.binding = nil
-		delete(parent.children, name)
-	}
+	d.dropBindingLocked(parent, name)
 	if _, absent := parent.negatives[name]; absent {
 		delete(parent.negatives, name)
 		d.negativeNames--
@@ -152,10 +177,9 @@ func (d *v3DataPlane) recordAbsenceLocked(parent *v3ItemRecord, name string) {
 // directory, and the parent references of the children it named. d.mu is
 // held.
 func (d *v3DataPlane) forgetNamesLocked(dir *v3ItemRecord) {
-	for _, child := range dir.children {
-		child.binding = nil
+	for name := range dir.children {
+		d.dropBindingLocked(dir, name)
 	}
-	dir.children = nil
 	if dir.negatives != nil {
 		for name := range dir.negatives {
 			d.negativeNames--

@@ -31,6 +31,7 @@ type fakeV3DataClient struct {
 	mu             sync.Mutex
 	sequence       uint64
 	readCalls      int
+	operations     []string
 	keepErr        error
 	proof          time.Duration // KeepAlive proof; zero is a valid but unusable 1 ms proof
 	keepAlive      func(context.Context) (time.Duration, error)
@@ -46,6 +47,11 @@ type fakeV3DataClient struct {
 	reclaims       [][][]byte
 	closeBatches   [][][]byte
 	mutations      []*authoritypb.Request
+}
+
+func v3TestOperation(request *authoritypb.Request) string {
+	message := request.ProtoReflect()
+	return string(message.WhichOneof(message.Descriptor().Oneofs().ByName("body")).Name())
 }
 
 func newFakeV3DataClient() *fakeV3DataClient {
@@ -225,6 +231,7 @@ func (f *fakeV3DataClient) LocalAdmissionOpen() bool { return !f.poisoned.Load()
 func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.readCalls++
+	f.operations = append(f.operations, v3TestOperation(request))
 	hook := f.read
 	f.mu.Unlock()
 	if f.poisoned.Load() {
@@ -275,6 +282,7 @@ func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request
 	}
 	f.mu.Lock()
 	f.sequence++
+	f.operations = append(f.operations, v3TestOperation(request))
 	f.mutations = append(f.mutations, proto.Clone(request).(*authoritypb.Request))
 	identity := authorityrpc.MutationIdentity{Slot: 2, Sequence: f.sequence}
 	beforeAssigned := f.beforeAssigned

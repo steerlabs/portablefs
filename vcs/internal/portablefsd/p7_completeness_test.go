@@ -212,7 +212,15 @@ func TestP7MembershipSurvivesAliasesEvictionAndReclaim(t *testing.T) {
 		t.Fatal(errno)
 	}
 	p7Members(t, f.d, dir, "original", "alias")
-	f.requireAuthority("alias without remembered positive binding", func() { f.lookup(dir.item, "original") })
+	f.requireServedLocally("both aliases retain positive bindings", func() {
+		f.lookup(dir.item, "original")
+		f.lookup(dir.item, "alias")
+	})
+	f.d.mu.Lock()
+	f.d.dropBindingLocked(dir, "original")
+	f.d.mu.Unlock()
+	p7Members(t, f.d, dir, "original", "alias")
+	f.requireAuthority("evicted binding with names-only membership", func() { f.lookup(dir.item, "original") })
 	if _, errno := f.dispatch(&pfslocal.ReclaimRequest{Item: file.Item}); errno != 0 {
 		t.Fatal(errno)
 	}

@@ -439,9 +439,9 @@ func TestV3CacheRenameOverAndVictimSetattrInBothOrders(t *testing.T) {
 		}
 		f.d.mu.Lock()
 		mode, bound := victim.attr.GetMode(), root.children["y"]
-		victimBinding := victim.binding
+		victimBinding := victim.bindings
 		f.d.mu.Unlock()
-		if mode != 0o600 || bound == nil || bound.item.StableIdentity != [16]byte(testV3ID(0x70)) || victimBinding != nil {
+		if mode != 0o600 || bound == nil || bound.item.StableIdentity != [16]byte(testV3ID(0x70)) || len(victimBinding) != 0 {
 			t.Fatalf("renameFirst=%t: victim mode=%o y=%v victim binding=%v", renameFirst, mode, bound, victimBinding)
 		}
 	}
@@ -502,11 +502,11 @@ func TestV3CachePermissionChangeForgetsNamesAndRaisesTheWatermark(t *testing.T) 
 	f.d.mu.Lock()
 	err := f.d.observeLocked(dirRecord, locked, 20, 21) // discovered through a read
 	children, negatives, watermark := len(dirRecord.children), len(dirRecord.negatives), dirRecord.watermark
-	fileBinding := f.d.itemsByID[file.Item.ItemID].binding
+	fileBinding := f.d.itemsByID[file.Item.ItemID].bindings
 	f.d.fillLookupLocked(dirRecord, "file", f.d.itemsByID[file.Item.ItemID], 19)
 	refilled := dirRecord.children["file"] != nil
 	f.d.mu.Unlock()
-	if err != nil || children != 0 || negatives != 0 || watermark != 20 || fileBinding != nil || refilled {
+	if err != nil || children != 0 || negatives != 0 || watermark != 20 || len(fileBinding) != 0 || refilled {
 		t.Fatalf("permission change: err=%v children=%d negatives=%d W=%d binding=%v refilled=%t",
 			err, children, negatives, watermark, fileBinding, refilled)
 	}
@@ -525,9 +525,9 @@ func TestV3CacheDirectoryRetirementDropsNamesAndChildParents(t *testing.T) {
 		t.Fatalf("reclaim errno=%d", errno)
 	}
 	f.d.mu.Lock()
-	binding, negatives := f.d.itemsByID[file.Item.ItemID].binding, f.d.negativeNames
+	binding, negatives := f.d.itemsByID[file.Item.ItemID].bindings, f.d.negativeNames
 	f.d.mu.Unlock()
-	if binding != nil || negatives != 0 {
+	if len(binding) != 0 || negatives != 0 {
 		t.Fatalf("retired directory left binding=%v negatives=%d", binding, negatives)
 	}
 	if attr := f.getattr(file.Item); attr.Parent != nil || attr.ParentFileID != 0 {
@@ -570,8 +570,7 @@ func TestV3CacheNoOpRenameAndUnlinkedOpenInode(t *testing.T) {
 	})
 }
 
-// Hard-link aliases share one attr sample and one remembered binding; a new
-// LINK replaces the remembered alias and updates the shared nlink.
+// Hard-link aliases retain both names, one capability and one shared sample.
 func TestV3CacheHardLinkAliasesShareOneSample(t *testing.T) {
 	f := newCachedV3Fixture(t, v3FileObjects())
 	f.ns.bind(0x20, "dir", 0x50)
@@ -589,16 +588,17 @@ func TestV3CacheHardLinkAliasesShareOneSample(t *testing.T) {
 		if alias.Item != file.Item || alias.Nlink != 2 || alias.ParentFileID != dir.FileID {
 			t.Fatalf("alias = %+v", alias)
 		}
-		if attr := f.getattr(file.Item); attr.Nlink != 2 || attr.ParentFileID != dir.FileID {
+		if attr := f.getattr(file.Item); attr.Nlink != 2 || (attr.ParentFileID != dir.FileID && attr.ParentFileID != v3RootFileID) {
 			t.Fatalf("shared attr = %+v", attr)
 		}
 	})
+	f.requireServedLocally("original Lookup after LINK", func() { f.lookup(f.root, "file") })
 	root := f.record(f.root)
 	f.d.mu.Lock()
-	forgotten := root.children["file"] == nil
+	retained := root.children["file"] == f.d.itemsByID[file.Item.ItemID]
 	f.d.mu.Unlock()
-	if !forgotten {
-		t.Fatal("the record kept two remembered bindings")
+	if !retained {
+		t.Fatal("LINK forgot the original binding")
 	}
 }
 
@@ -1119,10 +1119,11 @@ func TestV3RenameDelayedPastAHeldSetattrOfTheMovedObjectIsLegal(t *testing.T) {
 	}
 	record := f.record(file.Item)
 	f.d.mu.Lock()
-	cachedSize, binding := record.attr.GetSize(), record.binding
+	cachedSize, bindings := record.attr.GetSize(), record.bindings
+	_, hasRenamed := bindings[v3Binding{parent: f.d.itemsByID[f.root.ItemID], name: "renamed"}]
 	f.d.mu.Unlock()
-	if cachedSize != 42 || binding == nil || binding.name != "renamed" {
-		t.Fatalf("after the overlap size=%d binding=%+v, want the setattr's size and the rename's name", cachedSize, binding)
+	if cachedSize != 42 || !hasRenamed {
+		t.Fatalf("after the overlap size=%d binding=%+v, want the setattr's size and the rename's name", cachedSize, bindings)
 	}
 	f.requireServedLocally("GetAttr after both handlers settle before either ack", func() { f.getattr(file.Item) })
 	for _, operationID := range []uint64{setattrOp, renameOp} {

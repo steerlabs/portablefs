@@ -603,6 +603,9 @@ func (ns *v3TestNamespace) issue(identity byte) *authoritypb.Item {
 func (ns *v3TestNamespace) read(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
+	if read := request.GetRead(); read != nil {
+		return &authoritypb.Response{Body: &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: []byte("abc")[:min(3, read.GetLength())]}}}, nil
+	}
 	if getattr := request.GetGetAttr(); getattr != nil {
 		identity := ns.tokens[[16]byte(getattr.GetItem())]
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
@@ -632,6 +635,8 @@ func (ns *v3TestNamespace) mutate(_ context.Context, identity authorityrpc.Mutat
 func (ns *v3TestNamespace) mutateLocked(identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 	response := exactTestMutationReply(identity)
 	switch body := request.GetBody().(type) {
+	case *authoritypb.Request_SyncFs:
+		response.Body = &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}
 	case *authoritypb.Request_Lookup:
 		target, ok := ns.names[ns.key(body.Lookup.GetParent(), body.Lookup.GetName())]
 		if !ok {
@@ -743,8 +748,8 @@ func (ns *v3TestNamespace) mutateLocked(identity authorityrpc.MutationIdentity, 
 		ns.objects[target].nlink++
 		ns.names[key] = target
 		ns.commit(parent, target)
-		item := ns.issue(target)
-		item.Token = body.Link.GetExistingItem()
+		item := &authoritypb.Item{Token: body.Link.GetExistingItem(), StableIdentity: testV3ID(target),
+			Attr: ns.attr(target), ObjectVersion: ns.objects[target].version, SnapshotSequence: ns.seq}
 		response.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: item}}
 		response.PostState = ns.state(ns.object(parent, v3PostStateRoleParent), ns.object(target, v3PostStateRoleTarget))
 	default:
@@ -846,11 +851,9 @@ func TestV3LastUnlinkOfAnOpenFileClearsItsParent(t *testing.T) {
 	}
 }
 
-// A record remembers one observed name. A namespace change at that name
-// disproves the binding, and the record then reports no parent (unavailable)
-// rather than a parent that no longer contains it, until a fresh lookup
-// observes a live name again.
-func TestV3ParentFollowsTheRememberedAliasOfAHardLink(t *testing.T) {
+// Removing or replacing an observed alias preserves a representative parent
+// from the surviving memberships, independently of lookup order.
+func TestV3ParentFollowsASurvivingAliasOfAHardLink(t *testing.T) {
 	// step is the namespace change: remove dir/b, rename root/x over dir/b,
 	// or (neither) remove an unrelated name.
 	type step struct {
@@ -860,19 +863,18 @@ func TestV3ParentFollowsTheRememberedAliasOfAHardLink(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		// lookups is the order of observations (true: dir/b, false: root/a);
-		// the last one is remembered.
+		// both observations remain cached.
 		lookups []bool
 		change  step
-		// parentIsDir/parentIsRoot is what getattr reports after the change;
-		// neither means unavailable.
+		// Either marked parent is a valid representative after the change.
 		parentIsDir, parentIsRoot bool
 		nlink                     uint32
 	}{
-		{name: "remembered-alias-removed", lookups: []bool{false, true}, change: step{removeDir: true}, nlink: 1},
+		{name: "remembered-alias-removed", lookups: []bool{false, true}, change: step{removeDir: true}, parentIsRoot: true, nlink: 1},
 		{name: "other-alias-removed", lookups: []bool{true, false}, change: step{removeDir: true}, parentIsRoot: true, nlink: 1},
-		{name: "remembered-alias-renamed-over", lookups: []bool{false, true}, change: step{renameOver: true}, nlink: 1},
+		{name: "remembered-alias-renamed-over", lookups: []bool{false, true}, change: step{renameOver: true}, parentIsRoot: true, nlink: 1},
 		{name: "other-alias-renamed-over", lookups: []bool{true, false}, change: step{renameOver: true}, parentIsRoot: true, nlink: 1},
-		{name: "unrelated-removal-keeps-binding", lookups: []bool{false, true}, change: step{}, parentIsDir: true, nlink: 2},
+		{name: "unrelated-removal-keeps-binding", lookups: []bool{false, true}, change: step{}, parentIsDir: true, parentIsRoot: true, nlink: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newFakeV3DataClient()
@@ -919,14 +921,12 @@ func TestV3ParentFollowsTheRememberedAliasOfAHardLink(t *testing.T) {
 			switch {
 			case attr.Nlink != test.nlink:
 				t.Fatalf("nlink=%d, want %d", attr.Nlink, test.nlink)
-			case test.parentIsDir && (attr.ParentFileID != dir.FileID || attr.Parent == nil || *attr.Parent != dir.Item),
-				test.parentIsRoot && (attr.ParentFileID != v3RootFileID || attr.Parent == nil || *attr.Parent != root),
-				!test.parentIsDir && !test.parentIsRoot && (attr.Parent != nil || attr.ParentFileID != 0):
+			case !(test.parentIsDir && attr.ParentFileID == dir.FileID && attr.Parent != nil && *attr.Parent == dir.Item ||
+				test.parentIsRoot && attr.ParentFileID == v3RootFileID && attr.Parent != nil && *attr.Parent == root):
 				t.Fatalf("parent after %s = %d (%+v)", test.name, attr.ParentFileID, attr.Parent)
 			}
-			// A fresh lookup of the surviving root alias observes a live name.
-			_ = lookupTestAttr(t, d, root, "a")
-			if attr := getattrTestAttr(t, d, file.Item, 0); attr.ParentFileID != v3RootFileID || attr.Parent == nil || *attr.Parent != root {
+			// Lookup renders its contextual parent regardless of the representative.
+			if attr := lookupTestAttr(t, d, root, "a"); attr.ParentFileID != v3RootFileID || attr.Parent == nil || *attr.Parent != root {
 				t.Fatalf("parent after relookup = %d (%+v), want the root", attr.ParentFileID, attr.Parent)
 			}
 		})
@@ -961,10 +961,10 @@ func TestV3LastLinkRemovalAndRenameMoveTheBindingIndex(t *testing.T) {
 	d.mu.Lock()
 	rootRecord, dirRecord := d.itemsByID[root.ItemID], d.itemsByID[dir.Item.ItemID]
 	onlyRecord, movedRecord := d.itemsByID[only.Item.ItemID], d.itemsByID[moved.Item.ItemID]
-	onlyBound := onlyRecord.binding != nil
+	onlyBound := len(onlyRecord.bindings) != 0
 	staleSource := rootRecord.children["moved"] != nil
-	indexed := dirRecord.children["moved"] == movedRecord && movedRecord.binding != nil &&
-		movedRecord.binding.parent == dirRecord && movedRecord.binding.name == "moved"
+	_, membership := movedRecord.bindings[v3Binding{parent: dirRecord, name: "moved"}]
+	indexed := dirRecord.children["moved"] == movedRecord && membership
 	d.mu.Unlock()
 	if onlyBound || staleSource || !indexed {
 		t.Fatalf("binding index after remove/rename: only bound=%t stale source=%t moved indexed=%t", onlyBound, staleSource, indexed)
