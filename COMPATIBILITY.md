@@ -577,9 +577,9 @@ has, this contract is a specification, and earlier protocol results are not
 evidence for it.
 
 - `bash scripts/verify-local.sh --full`: Darwin Foundation/cgo and static Linux
-  builds, native and race Go suites, the exact native Swift inventory,
-  release-trust and current-architecture checks, the privileged XFS/FUSE suite,
-  and the Linux coherence matrix.
+  builds, uncached `pfslocal` schema freshness, native and race Go suites, the
+  exact native Swift inventory, release-trust and current-architecture checks,
+  the privileged XFS/FUSE suite, and the Linux coherence matrix.
 - Native macOS 26 and 27 acceptance: first usable proof before readiness,
   terminal enforcement, the 128-callback window, no product-owned mount-root
   descriptor, one unforced unmount with real `EBUSY` under normal system

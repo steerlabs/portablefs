@@ -197,8 +197,9 @@ Windows has no production frontend and is refused by its primitive gate.
   mount processes through ordinary syscalls and runs falsifiability controls.
 - `scripts/run-powerloss.sh` distinguishes process death from device-level
   durability cuts, for both a Linux mount and the FSKit authority handler.
-- `scripts/verify-local.sh` runs portable compile, unit, race, workflow-policy,
-  and current-architecture checks; `--full` also runs the two suites above.
+- `scripts/verify-local.sh` runs portable compile, uncached `pfslocal` schema
+  freshness, unit, race, workflow-policy, and current-architecture checks;
+  `--full` also runs the two suites above.
 
 The exact subscription/delegation algorithm and remaining qualification are in
 [portable-coherence.md](./portable-coherence.md).

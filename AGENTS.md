@@ -11,6 +11,7 @@ There is no build system above the two languages and nothing to install:
 ```bash
 CGO_ENABLED=1 GOOS=darwin go -C vcs build ./... # on macOS; Foundation resolver
 CGO_ENABLED=0 GOOS=linux go -C vcs build ./...  # static Linux release
+go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
 go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
@@ -28,12 +29,13 @@ Testing suite; pure tests remain parallel.
 Run `bash scripts/verify-local.sh` and make it pass. On macOS it builds and vets
 the real Foundation/cgo Darwin boundary plus static Linux, while Linux compiles
 its native product plus Darwin's deliberate !cgo refusal stub. CI always
-supplies the required native macOS Foundation lane. The gate also runs the
-native Go and race suites, the Swift suite, the release-trust policy checks, and
-the current-architecture check (`scripts/check-current-architecture.py`), which
-asserts the exact protocol versions, profile set, schema shape, and production
-wiring positively rather than scanning for retired names. Do not report a change
-as complete with a failing `verify-local.sh`.
+supplies the required native macOS Foundation lane. The gate also runs uncached
+`pfslocal` schema freshness, the native Go and race suites, the Swift suite, the
+release-trust policy checks, and the current-architecture check
+(`scripts/check-current-architecture.py`), which asserts the exact protocol
+versions, profile set, schema shape, and production wiring positively rather
+than scanning for retired names. Do not report a change as complete with a
+failing `verify-local.sh`.
 
 That default mode runs no real mount. It closes by naming every gate it did not
 run, and it is not merge evidence for a change to the authority, a frontend, or

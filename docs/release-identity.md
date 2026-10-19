@@ -476,9 +476,10 @@ push would catch.
 - `release.yml` still declares `id-token: write` and `attestations: write`, still
   pins `actions/attest` by SHA, still names all four `subject-path` values and
   all four `.attestation.jsonl` asset names, still runs every validation gate
-  (cross-OS builds, vet, the Go suite, the Go race suite, `sh -n
-  scripts/install.sh`, both policy checkers, `govulncheck@v1.6.0`, `goreleaser
-  check`, `bash scripts/test-swift-xcode.sh`) with the three
+  (cross-OS builds, vet, uncached `pfslocal` schema freshness, the Go suite,
+  the Go race suite, `sh -n scripts/install.sh`, both policy checkers,
+  `govulncheck@v1.6.0`, `goreleaser check`, `bash scripts/test-swift-xcode.sh`)
+  with the three
   `needs:` edges intact, and never uses `--clobber`.
 
 It also **bans container images from the release path outright.** If

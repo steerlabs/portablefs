@@ -21,8 +21,9 @@ the two real-mount suites and names them as not run; `--full` appends them.
    Linux the native product plus Darwin's deliberate `!cgo` refusal stub;
 2. the pinned `govulncheck` reachable-call scan, which also enforces the exact
    Go security patch level required by `vcs/go.mod`;
-3. the native Go suite, then the native race suite — these tests exercise real
-   syscalls, sockets, and mounts, so they are only meaningful on the host;
+3. uncached `pfslocal` schema freshness, then the native Go and race suites —
+   the broad suites exercise real syscalls, sockets, and mounts, so they are
+   only meaningful on the host;
 4. `bash scripts/test-swift-xcode.sh` on macOS. The gate asks Xcode to
    enumerate the complete package inventory, executes that already-built
    inventory once through Xcode's native serial test runner, and rejects the
@@ -49,6 +50,7 @@ The raw commands, when you want one piece:
 CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...   # on macOS; Foundation resolver
 CGO_ENABLED=0 GOOS=linux  go -C vcs build ./...   # static Linux release
 go -C vcs vet ./...
+go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
 go -C vcs test ./...
 go -C vcs test -race ./...
 python3 scripts/check-current-architecture.py

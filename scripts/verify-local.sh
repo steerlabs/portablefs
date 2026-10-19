@@ -10,10 +10,10 @@
 # It has two modes, and the difference is not cosmetic.
 #
 #   default   Everything that runs without Docker and without a privileged
-#             container: cross-platform build and vet, govulncheck, the native
-#             Go suites, the go-fuse reply and unmount seams, the Swift suite on
-#             macOS, workflow/release-trust policy, and the current-architecture
-#             check.
+#             container: cross-platform build and vet, govulncheck, uncached
+#             pfslocal schema freshness, native Go suites, go-fuse reply and
+#             unmount seams, the Swift suite on macOS, workflow/release-trust
+#             policy, and the current-architecture check.
 #             It does NOT run either real-mount suite. The closing banner names
 #             what it skipped; this mode alone is not merge evidence for a
 #             change to the authority, a frontend, or the coherence protocol.
@@ -101,6 +101,10 @@ go -C vcs run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
 # 3. and 4. The Go suites run natively — the tests exercise real syscalls,
 # sockets and mounts, so they are only meaningful on the host platform.
+# Check the out-of-module schema without Go's test cache.
+step "pfslocal schema freshness (uncached)"
+go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
+
 step "go suite (native)"
 go -C vcs test ./...
 
