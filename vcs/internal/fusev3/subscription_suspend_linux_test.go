@@ -3,11 +3,13 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -240,6 +242,129 @@ func TestSubscriptionSuspendRejectsAlreadyAdmittedCachePublication(t *testing.T)
 			}
 			if f.raw.ReplyWriteTracked(unique) {
 				t.Fatal("physically settled EIO retained publication ownership")
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name     string
+		plus     bool
+		retained bool
+		eof      bool
+	}{
+		{name: "retained-readdirplus", plus: true, retained: true},
+		{name: "retained-readdir", retained: true},
+		{name: "retained-readdir-eof", retained: true, eof: true},
+		{name: "fresh-readdirplus", plus: true},
+		{name: "fresh-readdir"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStockFixture(t)
+			item := testItem(96, authoritypb.Attr_REGULAR, 96)
+			f.rpc.byName = map[string]*authoritypb.Item{"existing": item}
+			entry := f.lookup(t, 1, "existing")
+			record := f.raw.nodesByID[entry.NodeId]
+			sub := f.mount.subscription
+			clock := &subscriptionTestClock{now: sub.config.clock.Now()}
+			sub.config.clock = clock
+			dir, _ := testDirHandle(t, f.raw, metadataPage(item, item))
+			handle := f.raw.handles[dir].dir
+			// Each one-byte name takes a 32-byte dirent, plus EntryOut in
+			// PLUS. Force the authority page to span two kernel callbacks.
+			bufferSize, opcode := 32, uint32(28)
+			if tc.plus {
+				bufferSize += int(unsafe.Sizeof(fuse.EntryOut{}))
+				opcode = 44
+			}
+			if tc.eof {
+				bufferSize *= 2
+			}
+			read := func(unique, offset uint64) *fuse.DirEntryList {
+				out := fuse.NewDirEntryList(make([]byte, bufferSize), offset)
+				input := &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: dir, Offset: offset}
+				status := fuse.OK
+				if tc.plus {
+					status = f.raw.ReadDirPlus(nil, input, out)
+				} else {
+					status = f.raw.ReadDir(nil, input, out)
+				}
+				if status != fuse.OK {
+					t.Fatal(status)
+				}
+				return out
+			}
+			consumption := &recordingResponseConsumption{}
+			f.rpc.retainedConsumption = consumption
+			priorLookups := record.lookups
+			unique := f.unique.Add(2)
+			first := read(unique, 0)
+			wantOffset := uint64(1)
+			if tc.eof {
+				wantOffset = 2
+			}
+			if first.Offset != wantOffset || len(f.rpc.readdirs) != 1 {
+				t.Fatalf("first callback: offset=%d RPCs=%d", first.Offset, len(f.rpc.readdirs))
+			}
+			if tc.retained {
+				_, reply, prepare := f.raw.PrepareReplyPayload(unique, 0, opcode, nil, nil, 0)
+				f.raw.ReplyWritten(unique, fuse.OK)
+				if reply != fuse.OK || prepare != fuse.OK || consumption.calls.Load() != 1 {
+					t.Fatalf("first page settlement: reply=%v prepare=%v consumed=%d", reply, prepare, consumption.calls.Load())
+				}
+				f.rpc.retainedConsumption = nil
+				priorLookups = record.lookups
+				calls := f.rpcCalls()
+				unique = f.unique.Add(2)
+				second := read(unique, first.Offset)
+				if second.Offset != 2 || f.rpcCalls() != calls || len(f.rpc.readdirs) != 1 {
+					t.Fatalf("retained page missed reuse: offset=%d RPCs=%d", second.Offset, f.rpcCalls()-calls)
+				}
+			}
+			p := f.raw.replyPublications[unique]
+			if p == nil || f.mount.delegations.Owns(record.identity[:]) || p.holderAdmission != nil && p.holderAdmission.ref != nil {
+				t.Fatal("directory reply lost publication ownership or acquired a delegation")
+			}
+			if tc.plus && (record.lookups != priorLookups+1 || handle.plusReply == nil) {
+				t.Fatal("PLUS omitted its provisional lookup or cursor")
+			}
+			pin := p.holderAdmission
+			// CONTROL and renewal remain parked; only continuous time advances
+			// after the complete callback, before its physical reply edge.
+			clock.advance(11 * time.Second)
+			_, reply, prepare := f.raw.PrepareReplyPayload(unique, 0, opcode, nil, nil, 0)
+			f.raw.ReplyWritten(unique, fuse.OK) // the callback's reply reached the kernel
+			wantReply := fuse.OK
+			if tc.retained {
+				wantReply = fuse.EIO
+			}
+			if reply != wantReply || prepare != fuse.OK {
+				t.Errorf("directory publication after expiry: reply=%v prepare=%v, want %v/OK", reply, prepare, wantReply)
+			}
+			wantLookups := priorLookups
+			if tc.plus && !tc.retained {
+				wantLookups++
+			}
+			if record.lookups != wantLookups {
+				t.Errorf("directory settlement changed lookup references: %d -> %d, want %d", priorLookups, record.lookups, wantLookups)
+			}
+			if tc.plus && (handle.plusReply != nil || handle.next != first.Offset || !bytes.Equal(handle.cookie, encodeCookie(first.Offset))) {
+				t.Errorf("PLUS settlement lost cursor: next=%d cookie=%x pending=%v", handle.next, handle.cookie, handle.plusReply)
+			}
+			if f.mount.isRevoked() || f.raw.ReplyWriteTracked(unique) || consumption.calls.Load() != 1 {
+				t.Fatal("directory settlement revoked the mount or retained reply ownership")
+			}
+			if pin != nil {
+				if !pin.admission.TryLock() {
+					t.Fatal("directory settlement retained its metadata pin")
+				}
+				pin.admission.Unlock()
+			}
+			f.rpc.retainedConsumption = nil
+			sub.rpc = suspendSubscriptionRPC{subscriptionRPC: f.rpc, clock: clock}
+			if err := sub.subscribe(t.Context()); err != nil {
+				t.Fatalf("cold resubscription after directory reply: %v", err)
+			}
+			if next := f.lookup(t, 1, "existing"); next.NodeId != entry.NodeId || record.lookups != wantLookups+1 || f.mount.isRevoked() {
+				t.Fatalf("mount unusable after directory recovery: node=%d lookups=%d revoked=%v", next.NodeId, record.lookups, f.mount.isRevoked())
 			}
 		})
 	}

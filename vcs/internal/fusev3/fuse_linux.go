@@ -1351,6 +1351,9 @@ type dirHandle struct {
 	pageMetadataClock uint64
 	index             int
 	cursorGeneration  uint64
+	// pageRequest identifies the callback holding the fresh authority response.
+	// Later callbacks reuse entries or EOF under subscription permission.
+	pageRequest uint64
 	// withdrawals counts enumeration withdrawals (a peer change entry or this
 	// mount's own mutation of the directory). A page whose fetch one overtook
 	// is still the exact continuation from its cookie but predates the change:
@@ -1965,6 +1968,7 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPlusPageBoundary) (*fuse.DirEntry, *authoritypb.Dirent, syscall.Errno) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	publication := replyPublicationFromContext(ctx)
 	if h.stale.Load() {
 		return nil, nil, syscall.EIO
 	}
@@ -2001,11 +2005,18 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 		h.eof = false
 		h.cursorGeneration++
 	}
-	if h.pending != nil {
-		return h.pending, h.pendingDirent, 0
-	}
 	for {
-		for h.index >= len(h.page) {
+		if publication != nil && publication.requestUnique != h.pageRequest && h.pageStamp.incarnation != 0 &&
+			(h.pending != nil || h.index < len(h.page) || h.eof) {
+			// The fetching callback owns a fresh response through physical
+			// settlement. A later callback instead depends on retained page
+			// permission, including itemless rows and a retained EOF.
+			publication.stamp, publication.retainedAnswer = h.pageStamp, true
+		}
+		if h.pending != nil {
+			return h.pending, h.pendingDirent, 0
+		}
+		if h.index >= len(h.page) {
 			if len(boundary) != 0 && boundary[0].changedLocked(h) {
 				return nil, nil, 0
 			}
@@ -2082,6 +2093,10 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 				return nil, nil, syscall.ENOTCONN
 			}
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
+			h.pageRequest = 0
+			if publication != nil {
+				h.pageRequest = publication.requestUnique
+			}
 			// Each page owns its RPC admission stamp and served version.
 			// READDIRPLUS ends its reply at this page boundary or an overtaking
 			// withdrawal, so one reply never publishes two page samples.
@@ -2104,6 +2119,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			if len(h.page) == 0 && !h.eof {
 				return nil, nil, syscall.EIO
 			}
+			continue
 		}
 		entry := h.page[h.index]
 		attr := entry.GetAttr()
