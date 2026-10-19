@@ -211,6 +211,10 @@ and delegation eligibility checks use suspend-inclusive `CLOCK_BOOTTIME`,
 including checks before CONTROL or timers run after resume. The authority
 uses the same domain for subscription/delegation deadlines and session/lock
 leases. Expiry still requires cold withdrawal; timers only wake workers.
+Admission denial does not certify kernel withdrawal. Cold withdrawal retains
+its name and inode notification inventory until every notification succeeds;
+only then may a cold subscription restore permission. Expiry alone cannot
+replace reverse notification, including across suspend.
 Subscribe returns an atomic watermark and delegated-identity set.
 Acknowledging a change position certifies complete withdrawal through that
 position in the same incarnation. Grant activation and committed namespace

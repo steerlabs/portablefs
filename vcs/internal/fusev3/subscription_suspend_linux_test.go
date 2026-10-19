@@ -18,6 +18,24 @@ import (
 
 type suspendAuthorityClock struct{ *subscriptionTestClock }
 
+func assertMetadataPinReleased(t *testing.T, pin *delegationState) {
+	t.Helper()
+	if pin == nil {
+		return
+	}
+	// Settlement can make this state idle and wake its collector, which also
+	// takes admission. Exclude collection while testing for a leaked reader.
+	pin.manager.mu.Lock()
+	released := pin.admission.TryLock()
+	if released {
+		pin.admission.Unlock()
+	}
+	pin.manager.mu.Unlock()
+	if !released {
+		t.Fatal("settlement retained its metadata pin")
+	}
+}
+
 func (c suspendAuthorityClock) NewTimer(d time.Duration) volumeserver.CoherenceTimer {
 	return c.subscriptionTestClock.NewTimer(d)
 }
@@ -234,12 +252,7 @@ func TestSubscriptionSuspendRejectsAlreadyAdmittedCachePublication(t *testing.T)
 			if record.lookups != priorLookups {
 				t.Errorf("refused read changed lookup references: %d -> %d", priorLookups, record.lookups)
 			}
-			if pin != nil {
-				if !pin.admission.TryLock() {
-					t.Fatal("physically settled EIO retained the metadata pin")
-				}
-				pin.admission.Unlock()
-			}
+			assertMetadataPinReleased(t, pin)
 			if f.raw.ReplyWriteTracked(unique) {
 				t.Fatal("physically settled EIO retained publication ownership")
 			}
@@ -352,12 +365,7 @@ func TestSubscriptionSuspendRejectsAlreadyAdmittedCachePublication(t *testing.T)
 			if f.mount.isRevoked() || f.raw.ReplyWriteTracked(unique) || consumption.calls.Load() != 1 {
 				t.Fatal("directory settlement revoked the mount or retained reply ownership")
 			}
-			if pin != nil {
-				if !pin.admission.TryLock() {
-					t.Fatal("directory settlement retained its metadata pin")
-				}
-				pin.admission.Unlock()
-			}
+			assertMetadataPinReleased(t, pin)
 			f.rpc.retainedConsumption = nil
 			sub.rpc = suspendSubscriptionRPC{subscriptionRPC: f.rpc, clock: clock}
 			if err := sub.subscribe(t.Context()); err != nil {
@@ -465,10 +473,7 @@ func TestSubscriptionSuspendPreservesAcceptedHolderMutation(t *testing.T) {
 			if reply != fuse.OK || prepare != fuse.OK || f.mount.isRevoked() {
 				t.Fatalf("accepted mutation lost its result: reply=%v prepare=%v revoked=%v", reply, prepare, f.mount.isRevoked())
 			}
-			if !pin.admission.TryLock() {
-				t.Fatal("physically settled mutation retained the metadata pin")
-			}
-			pin.admission.Unlock()
+			assertMetadataPinReleased(t, pin)
 		})
 	}
 }

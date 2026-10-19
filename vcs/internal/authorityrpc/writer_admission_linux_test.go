@@ -207,7 +207,9 @@ func TestHandlerProofRetainsWriterExclusionThroughApplyDrainOnXFS(t *testing.T) 
 			var elapsed atomic.Int64
 			elapsed.Store(int64(time.Second))
 			continuous := func() (time.Duration, error) { return time.Duration(elapsed.Load()), nil }
-			runtime, err := volumeserver.New("writer-proof", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 16, ContinuousNow: continuous})
+			// The Linux peer must remain live while the Mac cache proof expires;
+			// otherwise session refusal hides the apply-drain exclusion under test.
+			runtime, err := volumeserver.New("writer-proof", volumeserver.Config{SessionLease: 2 * time.Minute, MaxReplaySlots: 16, MaxSessions: 4, MaxLockRecords: 16, ContinuousNow: continuous})
 			if err != nil {
 				t.Fatal(err)
 			}

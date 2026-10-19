@@ -149,6 +149,7 @@ func TestControlTransportLossWithdrawsEveryCacheAtHorizon(t *testing.T) {
 		t.Fatalf("insufficient cache coverage: names=%v inodes=%v", names, inodes)
 	}
 	incarnation := mount.subscription.stamp().incarnation
+	withdrawn := subscriptionWithdrawalDone(t, mount)
 	listener.partition(t, 1)
 	// This peer still has both transports. Its write must wait out the reader's
 	// permission while the reader process and its DATA socket remain alive.
@@ -157,6 +158,7 @@ func TestControlTransportLossWithdrawsEveryCacheAtHorizon(t *testing.T) {
 	waitUntil(t, 15*time.Second, "CONTROL-only horizon withdrawal", func() bool {
 		return mount.subscription.stamp() == (subscriptionStamp{}) && mount.delegations.incarnation() == 0
 	})
+	awaitSubscriptionWithdrawal(t, withdrawn)
 	notify.mu.Lock()
 	for key := range names {
 		if !notify.entries[key] {

@@ -1179,12 +1179,6 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	for identity := range r.completeDirectories {
 		r.dropCompleteDirectoryLocked(identity)
 	}
-	for key := range r.cachedNames {
-		r.dropCachedNameLocked(key)
-	}
-	for key := range r.cachedNegatives {
-		r.dropCachedNegativeLocked(key)
-	}
 	dataRecords := make(map[*inodeRecord]struct{}, len(r.cachedData))
 	for _, record := range r.cachedData {
 		if record != nil && !record.reclaimed {
@@ -1209,8 +1203,6 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 			}
 		}
 	}
-	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
-	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)
 	dirHandles := make([]*dirHandle, 0)
 	for _, handle := range r.handles {
 		if handle != nil && handle.dir != nil {
@@ -1261,6 +1253,17 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		}
 	}
 	r.mu.Lock()
+	// Admission is already closed. Keep its withdrawal inventory until every
+	// kernel notification succeeds: a failed attempt must not let a retry prove
+	// a cold boundary by finding only the daemon caches it previously emptied.
+	for key := range r.cachedNames {
+		r.dropCachedNameLocked(key)
+	}
+	for key := range r.cachedNegatives {
+		r.dropCachedNegativeLocked(key)
+	}
+	clear(r.cachedAttrs)
+	clear(r.cachedAttrPayloads)
 	for _, record := range r.nodesByID {
 		if record != nil {
 			// Epoch staleness belongs to the old server handle, not to the
@@ -1307,9 +1310,11 @@ func (r *rawFileSystem) markIdentityStale(identity publicationIdentity) {
 	}
 }
 
-// liveLocked withdraws admission at the moment of use even when active-time
+// liveLocked denies admission at the moment of use even when active-time
 // timers and CONTROL have not run since resume. Waking the horizon worker
 // preserves the ordinary cold-withdrawal path; no renewal may bridge this cut.
+// Denial is not withdrawal completion: serveDone joins the workers and their
+// subsequent kernel invalidation attempt.
 func (s *subscriptionRegistry) liveLocked() bool {
 	if s.active && !s.config.clock.Now().Before(s.cacheUntil) {
 		s.active = false

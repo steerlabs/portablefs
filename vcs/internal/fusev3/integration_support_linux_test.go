@@ -31,6 +31,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -361,8 +362,8 @@ type integrationFixture struct {
 	// non-mounting participant configured from a control-plane grant receives.
 	credentials integrationCredentials
 
-	// clockSkew drives the authority's clock. Advancing it ages session leases
-	// without making the test sleep for real.
+	// clockSkew advances both authority clock domains so injected lease expiry
+	// remains deterministic after leases move to suspend-inclusive time.
 	clockSkew atomic.Int64
 
 	store      *xfsstore.Volume
@@ -477,6 +478,11 @@ func (f *integrationFixture) now() time.Time {
 	return time.Now().Add(time.Duration(f.clockSkew.Load()))
 }
 
+func (f *integrationFixture) continuousNow() (time.Duration, error) {
+	now, err := continuous.Now()
+	return now + time.Duration(f.clockSkew.Load()), err
+}
+
 // advanceClock ages the authority's view of time. Session leases are evaluated
 // against it, so this expires leases deterministically instead of sleeping.
 func (f *integrationFixture) advanceClock(d time.Duration) { f.clockSkew.Add(int64(d)) }
@@ -506,7 +512,7 @@ func (f *integrationFixture) start() {
 	f.store = store
 	authority, err := volumeserver.New(integrationVolumeID, volumeserver.Config{
 		SessionLease: f.cfg.SessionLease, MaxReplaySlots: integrationMaxReplaySlots,
-		MaxSessions: 8, MaxLockRecords: 4096, Now: f.now,
+		MaxSessions: 8, MaxLockRecords: 4096, Now: f.now, ContinuousNow: f.continuousNow,
 	})
 	if err != nil {
 		t.Fatalf("create authority epoch: %v", err)
@@ -533,7 +539,7 @@ func (f *integrationFixture) start() {
 	// barrier a live operator's change would use.
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
-		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute, Now: f.now,
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute, Now: f.now, ContinuousNow: f.continuousNow,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)

@@ -1081,10 +1081,12 @@ func testAuthorityHorizonWithdrawalAndRecovery(t *testing.T, payload []byte) {
 	if got := readExactlyAt(t, retained, 0, len(payload), "prime retained pages"); !bytes.Equal(got, payload) {
 		t.Fatal("bad initial data")
 	}
+	withdrawn := subscriptionWithdrawalDone(t, f.mounts[1])
 	f.stopAuthority()
 	waitUntil(t, 20*time.Second, "subscription withdrawal", func() bool {
 		return f.mounts[1].subscription.stamp() == (subscriptionStamp{}) && f.mounts[1].delegations.incarnation() == 0
 	})
+	awaitSubscriptionWithdrawal(t, withdrawn)
 	outcome := make(chan error, 1)
 	buf := make([]byte, len(payload))
 	go func() { _, err := retained.ReadAt(buf, 0); outcome <- err }()
