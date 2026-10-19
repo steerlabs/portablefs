@@ -1200,10 +1200,12 @@ func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	rpc.block = make(chan struct{})
 	consumption := &recordingResponseConsumption{}
 	rpc.retainedConsumption = consumption
-	mount.start(time.Hour)
+	// Queue one complete batch before concurrent workers can split it across
+	// responses; this consumption belongs to exactly one cancelled response.
 	for id := uint64(1); id <= 8; id++ {
 		mount.deferReclaim(testToken(id))
 	}
+	mount.start(time.Hour)
 	waitFor(t, "a reclaim to be in flight", func() bool {
 		blocked := false
 		rpc.snapshot(func(f *fakeRPC) { blocked = f.calls > 0 })
