@@ -15,6 +15,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
 const mountIntentSchemaVersion = 3
@@ -141,13 +142,22 @@ func acquireMountOperation(stateDir, mountPath, volumeID, strategy string) (*mou
 	return op, nil
 }
 
+// .op.lock precedes .intent.json.lock; inventory takes only the latter.
+// No intent record critical section acquires .op.lock or calls another reader.
+var mountIntentReadFile = privatepath.ReadFileIfExists
+
 func readMountIntent(path, mountPath string) (*mountIntent, error) {
-	data, err := privatepath.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	var data []byte
+	err := privatepath.WithFileLock(path, unix.LOCK_SH, func() error {
+		var err error
+		data, err = mountIntentReadFile(path)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read mount operation intent %s: %w", path, err)
+	}
+	if data == nil {
+		return nil, nil
 	}
 	intent, err := decodeMountIntent(data)
 	if err != nil {
@@ -279,9 +289,17 @@ func listMountIntents(dir string) ([]mountIntent, error) {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		data, err := privatepath.ReadFile(path)
+		var data []byte
+		err := privatepath.WithFileLock(path, unix.LOCK_SH, func() error {
+			var err error
+			data, err = mountIntentReadFile(path)
+			return err
+		})
 		if err != nil {
 			return nil, fmt.Errorf("read mount operation intent %s: %w", path, err)
+		}
+		if data == nil {
+			continue
 		}
 		intent, err := decodeMountIntent(data)
 		if err != nil {
@@ -392,7 +410,9 @@ func writeMountIntentRecord(path string, intent *mountIntent) error {
 	if err != nil {
 		return err
 	}
-	if err := privatepath.WriteFileAtomic(path, append(data, '\n')); err != nil {
+	if err := privatepath.WithFileLock(path, unix.LOCK_EX, func() error {
+		return privatepath.WriteFileAtomic(path, append(data, '\n'))
+	}); err != nil {
 		return fmt.Errorf("publish mount intent: %w", err)
 	}
 	return nil
@@ -413,7 +433,9 @@ func (op *mountOperation) close(removeIntent bool) error {
 	}
 	var removeErr error
 	if removeIntent {
-		removeErr = privatepath.RemoveFileDurable(op.intentPath)
+		removeErr = privatepath.WithFileLock(op.intentPath, unix.LOCK_EX, func() error {
+			return privatepath.RemoveFileDurable(op.intentPath)
+		})
 	}
 	if op.file == nil {
 		if op.dir == nil {

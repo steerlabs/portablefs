@@ -325,36 +325,9 @@ func withMountStateWriteLock(dir, mountPath string, fn func() error) error {
 	return withMountStateLock(mountStatePath(dir, mountPath), unix.LOCK_EX, fn)
 }
 
-// The stable .json.lock inode protects each record's entire open/validate/read
-// against atomic replacement and removal. The .op.lock instead serializes
-// mount/unmount operations; status and renewal writers do not hold it.
-func withMountStateLock(recordPath string, operation int, fn func() error) error {
-	dir := filepath.Dir(recordPath)
-	openDir := privatepath.OpenExistingDir
-	if operation == unix.LOCK_EX {
-		openDir = privatepath.OpenDir
-	}
-	parent, err := openDir(dir)
-	if err != nil {
-		return fmt.Errorf("pin mount state directory: %w", err)
-	}
-	defer parent.Close()
-	path := recordPath + ".lock"
-	file, err := privatepath.OpenLockFile(parent, dir, filepath.Base(path))
-	if err != nil {
-		return fmt.Errorf("open mount state lock %s: %w", path, err)
-	}
-	defer file.Close()
-	fd := int(file.Fd())
-	if err := unix.Flock(fd, operation); err != nil {
-		return fmt.Errorf("lock mount state %s: %w", path, err)
-	}
-	defer unix.Flock(fd, unix.LOCK_UN)
-	if err := privatepath.ValidateOpenFile(parent, dir, filepath.Base(path), file); err != nil {
-		return err
-	}
-	return fn()
-}
+// Operation ownership (.op.lock) precedes a short record lock. Record critical
+// sections never acquire operation ownership, call RPC, or wait on serving.
+var withMountStateLock = privatepath.WithFileLock
 
 // readMountState loads the record for mountPath; a missing record returns
 // (nil, nil) so callers can degrade gracefully.
@@ -368,24 +341,18 @@ func readMountState(dir, mountPath string) (*mountState, error) {
 		st, err = readMountStateUnlocked(dir, mountPath)
 		return err
 	})
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
 	return st, err
 }
 
 // mountStateReadFile is the read seam for deterministic replacement tests.
-var mountStateReadFile = privatepath.ReadFile
+var mountStateReadFile = privatepath.ReadFileIfExists
 
 // readMountStateUnlocked requires the caller to hold the record lock. Updates
 // already own it exclusively and must not acquire another flock description.
 func readMountStateUnlocked(dir, mountPath string) (*mountState, error) {
 	path := mountStatePath(dir, mountPath)
 	data, err := mountStateReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
+	if err != nil || data == nil {
 		return nil, err
 	}
 	st, err := decodeMountState(data)
@@ -648,13 +615,12 @@ func listMountStates(dir string) ([]mountState, error) {
 			data, err = mountStateReadFile(path)
 			return err
 		})
-		// Directory enumeration is not a snapshot: a writer may remove a
-		// record before we acquire its lock. Absence under the lock is final.
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
 		if err != nil {
 			return nil, fmt.Errorf("read mount state record %s: %w", path, err)
+		}
+		// Enumeration is not a snapshot. Only record absence under SH is empty.
+		if data == nil {
+			continue
 		}
 		st, err := decodeMountState(data)
 		if err != nil {
@@ -711,18 +677,29 @@ type localRoutesRecord struct {
 // this machine can reach it.
 func readLocalRoutesRecord(mountsDir, volumeID string) (*localRoutesRecord, error) {
 	p := localRoutesRecordPath(mountsDir, volumeID)
-	data, err := privatepath.ReadFile(p)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	return readLocalRoutesRecordPath(p, volumeID)
+}
+
+var localRoutesReadFile = privatepath.ReadFileIfExists
+
+func readLocalRoutesRecordPath(p, volumeID string) (*localRoutesRecord, error) {
+	var data []byte
+	err := privatepath.WithFileLock(p, unix.LOCK_SH, func() error {
+		var err error
+		data, err = localRoutesReadFile(p)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read local-routes record %s: %w", p, err)
+	}
+	if data == nil {
+		return nil, nil
 	}
 	rec, err := decodeLocalRoutesRecord(data, p)
 	if err != nil {
 		return nil, err
 	}
-	if rec.VolumeID != volumeID {
+	if volumeID != "" && rec.VolumeID != volumeID {
 		return nil, fmt.Errorf("local-routes record %s names another volume", p)
 	}
 	return rec, nil
@@ -767,7 +744,9 @@ func writeLocalRoutesRecord(mountsDir, volumeID string, routes mountRoutes, nowM
 	if err != nil {
 		return err
 	}
-	if err := privatepath.WriteFileAtomic(p, append(data, '\n')); err != nil {
+	if err := privatepath.WithFileLock(p, unix.LOCK_EX, func() error {
+		return privatepath.WriteFileAtomic(p, append(data, '\n'))
+	}); err != nil {
 		return fmt.Errorf("write local-routes record %s: %w", p, err)
 	}
 	return nil

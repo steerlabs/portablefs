@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
 const attachRegistryVersion = 3
@@ -85,14 +85,21 @@ func loadPersistedAttaches(stateDir string) ([]persistedAttachEntry, error) {
 	return loaded.attaches, nil
 }
 
+var attachRegistryReadFile = privatepath.ReadFileIfExists
+
 func loadAttachRegistry(stateDir string) (loadedAttachRegistry, error) {
 	p := attachRegistryPath(stateDir)
-	data, err := privatepath.ReadFile(p)
+	var data []byte
+	err := privatepath.WithFileLock(p, unix.LOCK_SH, func() error {
+		var err error
+		data, err = attachRegistryReadFile(p)
+		return err
+	})
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return loadedAttachRegistry{}, nil
-		}
 		return loadedAttachRegistry{}, fmt.Errorf("read attach registry %s: %w", p, err)
+	}
+	if data == nil {
+		return loadedAttachRegistry{}, nil
 	}
 	if err := rejectDuplicateRegistryFields(data); err != nil {
 		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: %w", p, err)
@@ -269,6 +276,14 @@ func (r *registry) persistedEntries() []persistedAttachEntry {
 }
 
 func writePersistedAttaches(stateDir string, entries []persistedAttachEntry) error {
+	// persistMu orders snapshots. persistedEntries releases registry/attach mutexes
+	// before this filesystem lock: serving does not wait on a CLI's local read.
+	return privatepath.WithFileLock(attachRegistryPath(stateDir), unix.LOCK_EX, func() error {
+		return writePersistedAttachesUnlocked(stateDir, entries)
+	})
+}
+
+func writePersistedAttachesUnlocked(stateDir string, entries []persistedAttachEntry) error {
 	// File absence is the format-independent empty witness used during upgrade.
 	if len(entries) == 0 {
 		if err := privatepath.RemoveFileDurable(attachRegistryPath(stateDir)); err != nil {

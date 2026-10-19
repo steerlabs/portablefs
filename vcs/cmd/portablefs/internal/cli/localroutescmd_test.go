@@ -211,7 +211,10 @@ func TestStatusReportsLocalRoutes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(backing, "agent-app", "node_modules", "dep.js"), []byte("0123456789"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	row := e.localRoutesOf("vol_1")
+	row, err := e.localRoutesOf("vol_1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if row == nil || row.Revision != rules.RevisionHex() || strings.Join(row.Patterns, " ") != "**/node_modules/" {
 		t.Fatalf("status row = %+v", row)
 	}
@@ -222,7 +225,7 @@ func TestStatusReportsLocalRoutes(t *testing.T) {
 		t.Fatalf("status backing = %q", row.Roots[0].Backing)
 	}
 	// A volume with no routes reports nothing rather than an empty section.
-	if got := e.localRoutesOf("vol_2"); got != nil {
+	if got, err := e.localRoutesOf("vol_2"); err != nil || got != nil {
 		t.Fatalf("unrouted volume = %+v", got)
 	}
 }
@@ -247,7 +250,7 @@ func TestStatusEmptyFSKitDeclarationOutranksStaleFUSERouteRecord(t *testing.T) {
 	}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.localRoutesOf(st.VolumeID); got != nil {
+	if got, err := e.localRoutesOf(st.VolumeID); err != nil || got != nil {
 		t.Fatalf("empty live FSKit declaration inherited stale FUSE routing: %+v", got)
 	}
 }

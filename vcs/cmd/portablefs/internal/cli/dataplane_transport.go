@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -168,6 +169,9 @@ func (t dataPlaneTransport) tlsConfig() (*tls.Config, error) {
 	}
 }
 
+var publishPrivateCA = privatepath.WriteFileExclusive
+var privateCAReadFile = privatepath.ReadFile
+
 // materializePrivateCA publishes the manager-provided CA under its verified
 // digest so mount state can name immutable trust material without mutable
 // profile or environment indirection.
@@ -179,18 +183,17 @@ func (t dataPlaneTransport) materializePrivateCA(stateDir string) (path, digest 
 		return "", "", nil
 	}
 	path = filepath.Join(stateDir, "ca", t.CASHA256+".pem")
-	existing, readErr := privatepath.ReadFile(path)
-	switch {
-	case readErr == nil:
+	if writeErr := publishPrivateCA(path, []byte(t.CAPEM)); writeErr != nil {
+		if !errors.Is(writeErr, os.ErrExist) {
+			return "", "", fmt.Errorf("publish immutable lease-bound data-plane CA: %w", writeErr)
+		}
+		existing, readErr := privateCAReadFile(path)
+		if readErr != nil {
+			return "", "", fmt.Errorf("read immutable lease-bound data-plane CA: %w", readErr)
+		}
 		if !bytes.Equal(existing, []byte(t.CAPEM)) {
 			return "", "", fmt.Errorf("content-addressed data-plane CA %s does not match its SHA-256 name", path)
 		}
-	case os.IsNotExist(readErr):
-		if writeErr := privatepath.WriteFileAtomic(path, []byte(t.CAPEM)); writeErr != nil {
-			return "", "", fmt.Errorf("write immutable lease-bound data-plane CA: %w", writeErr)
-		}
-	default:
-		return "", "", fmt.Errorf("read immutable lease-bound data-plane CA: %w", readErr)
 	}
 	return path, t.CASHA256, nil
 }

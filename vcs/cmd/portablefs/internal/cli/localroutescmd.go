@@ -372,15 +372,8 @@ func collectPruneRows(mountsDir, onlyVolume string, remove bool) ([]pruneRow, er
 
 func readLocalRoutesRecordByStorage(mountsDir, storageID string) (*localRoutesRecord, error) {
 	p := filepath.Join(localBackingDir(mountsDir), storageID+".routes.json")
-	data, err := privatepath.ReadFile(p)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read local-routes record %s: %w", p, err)
-	}
-	rec, err := decodeLocalRoutesRecord(data, p)
-	if err != nil {
+	rec, err := readLocalRoutesRecordPath(p, "")
+	if err != nil || rec == nil {
 		return nil, err
 	}
 	if localdirs.StorageID(rec.VolumeID) != storageID {
@@ -410,75 +403,70 @@ type localRouteRoot struct {
 // localRoutesOf reports this machine's active routing for a volume: the
 // revision and patterns a live mount activated (or the recorded active set
 // when nothing is mounted), plus every route root that actually holds bytes.
-func (e *cmdEnv) localRoutesOf(volumeID string) *localRouteStatusRow {
+func (e *cmdEnv) localRoutesOf(volumeID string) (*localRouteStatusRow, error) {
 	dir, err := e.mountStateDir()
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	patterns, revision := []string(nil), ""
-	backing := ""
+	states, err := listMountStates(dir)
+	if err != nil {
+		return nil, err
+	}
+	var patterns []string
+	revision, backing := "", ""
 	mountAnswered := false
-	if states, err := listMountStates(dir); err == nil {
-		for i := range states {
-			st := &states[i]
-			if st.VolumeID != volumeID {
-				continue
-			}
-			if rules, err := mountRuleSet(st); err == nil {
-				mountAnswered = true
-				if rules.Empty() {
-					break
-				}
-				patterns, revision = rules.Patterns(), st.LocalRouteRevision
-				backing = mountBackingRoot(dir, st)
-
-				break
-			}
+	for i := range states {
+		st := &states[i]
+		if st.VolumeID != volumeID {
+			continue
 		}
+		rules, err := mountRuleSet(st)
+		if err != nil {
+			return nil, err
+		}
+		mountAnswered = true
+		patterns, revision = rules.Patterns(), st.LocalRouteRevision
+		backing = mountBackingRoot(dir, st)
+		break
 	}
-	if mountAnswered && len(patterns) == 0 {
-		// A current mount serving no routes outranks a stale
-		// last-activated FUSE sidecar for the same volume.
-		return nil
-	}
-	if len(patterns) == 0 {
+	if !mountAnswered {
 		rec, err := readLocalRoutesRecord(dir, volumeID)
 		if err != nil || rec == nil {
-			return nil
+			return nil, err
 		}
 		patterns, revision = rec.Patterns, rec.Revision
 		backing = localDirsBackingRoot(dir, volumeID)
 	}
 	if len(patterns) == 0 {
-		return nil
+		return nil, nil
 	}
 	rules, err := localroutes.Parse([]byte(strings.Join(patterns, "\n")))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	row := &localRouteStatusRow{Revision: revision, Patterns: rules.Patterns(), Backing: backing}
 	g, err := localdirs.New(localdirs.Config{BackingRoot: backing, Rules: rules})
-	if err != nil || g == nil {
-		return row
+	if err != nil {
+		return nil, err
+	}
+	if g == nil {
+		return row, nil
 	}
 	defer func() { _ = g.Close() }()
 	roots, eno := g.ActiveRootsUnder("")
 	if eno != 0 {
-		return row
+		return nil, fmt.Errorf("read active route roots: %w", eno)
 	}
 	for _, root := range roots {
 		bytes, files, err := localdirs.BackingUsage(backing, root)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		row.Roots = append(row.Roots, localRouteRoot{
-			Path:    root,
-			Backing: filepath.Join(backing, filepath.FromSlash(root)),
-			Bytes:   bytes,
-			Files:   files,
+			Path: root, Backing: filepath.Join(backing, filepath.FromSlash(root)), Bytes: bytes, Files: files,
 		})
 	}
-	return row
+	return row, nil
 }
 
 // printLocalRoutes renders the machine-local routing lines of
