@@ -18,13 +18,19 @@ not a script crash: mapped readers run in separate subprocesses.
 
 A proof-expiry-only case must keep the authority session authorized/usable while
 withholding renewal replies past the actual proof horizon. Verify an invalidate
-success and a noCache reopen, then let renewal recover. For writer/authorization
+success, a noCache reopen and actual post-expiry READ/miss evidence, then let
+renewal recover. For writer/authorization
 loss and daemon death require revoke results. Extension stall and sleep/wake
 explicitly examine residual races; record stale results without calling them a
 qualification pass. Per-item results do not prove negative-name/attribute or
 complete directory withdrawal. Do not infer withdrawal from callback-gate logs.
+The stall procedure mutates and samples before resuming the extension. Sleep
+observers write directly to files before sleep through withdrawal completion;
+first scheduled wake reads require no human checkpoint. Healthy probes include
+retained access across chmod and permission-checked reopen after final close.
 """
 import argparse
+import errno
 import json
 import mmap
 import os
@@ -41,23 +47,53 @@ CASES = ("proof-expiry", "writer-loss", "authorization-loss", "daemon-death",
 
 
 def emit(value):
-    print(json.dumps({"time_ns": time.time_ns(), **value}), flush=True)
+    print(json.dumps({"time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(), **value}), flush=True)
+
+
+def observe(fd, mapping, label, mode):
+    # Flush each completed read before touching another page or asking metadata.
+    # A later errno or mapped SIGBUS must never erase an earlier readable page.
+    for page, offset in enumerate((0, 4096), start=1):
+        record = {"sample": label, "mode": mode, "operation": "read", "page": page, "offset": offset}
+        try:
+            data = mapping[offset:offset + 1] if mapping is not None else os.pread(fd, 1, offset)
+            emit({**record, "bytes": list(data)})
+        except OSError as error:
+            emit({**record, "errno": error.errno, "error": str(error)})
+    try:
+        metadata = os.fstat(fd)
+        emit({"sample": label, "mode": mode, "operation": "fstat", "size": metadata.st_size, "inode": metadata.st_ino})
+    except OSError as error:
+        emit({"sample": label, "mode": mode, "operation": "fstat", "errno": error.errno, "error": str(error)})
+    emit({"sample": label, "mode": mode, "operation": "complete"})
 
 
 def reader(path, mode):
     fd = os.open(path, os.O_RDONLY)
     mapping = mmap.mmap(fd, 8192, access=mmap.ACCESS_READ) if mode == "mapped" else None
     emit({"ready": mode, "inode": os.fstat(fd).st_ino})
-    for line in sys.stdin:
-        if line.strip() == "stop":
-            break
-        try:
-            # Two different pages expose partial invalidation. The mapping is
-            # MAP_SHARED and read-only; no writable-mmap promise is implied.
-            data = bytes(mapping[:1] + mapping[4096:4097]) if mapping is not None else os.pread(fd, 1, 0) + os.pread(fd, 1, 4096)
-            emit({"sample": line.strip(), "mode": mode, "bytes": list(data), "size": os.fstat(fd).st_size})
-        except OSError as error:
-            emit({"sample": line.strip(), "mode": mode, "errno": error.errno, "error": str(error)})
+    observing = None
+    with selectors.DefaultSelector() as selector:
+        selector.register(sys.stdin, selectors.EVENT_READ)
+        while True:
+            if observing is not None and not selector.select(timeout=0.01):
+                # Output goes straight to the artifact, never a pipe that can
+                # fill while the operator sleeps. First scheduled wake reads
+                # need no human checkpoint; wall timestamps join kernel logs.
+                observe(fd, mapping, observing, mode)
+                continue
+            line = sys.stdin.readline()
+            if not line or line.strip() == "stop":
+                break
+            command = line.strip()
+            if command.startswith("arm:"):
+                observing = command.removeprefix("arm:")
+                emit({"sample": command, "mode": mode, "operation": "armed"})
+            elif command == "disarm":
+                observing = None
+                emit({"sample": command, "mode": mode, "operation": "disarmed"})
+            else:
+                observe(fd, mapping, command, mode)
     if mapping is not None:
         mapping.close()
     os.close(fd)
@@ -65,42 +101,148 @@ def reader(path, mode):
 
 def checkpoint(label, evidence):
     print(label, flush=True)
-    answer = input("Record action, authority exclusion evidence and observed errors; Enter to continue: ")
+    answer = input("Record actions, timestamps, commands/log paths and observed errors; Enter to continue: ")
     evidence.write(json.dumps({"time_ns": time.time_ns(), "checkpoint": label, "operator": answer}) + "\n")
     evidence.flush()
 
 
-def sample(processes, label, evidence, expected=None):
+def collect(processes, label, evidence, expected=None, completion="complete"):
     for mode, process, output in processes:
-        if process.poll() is not None:
-            evidence.write(json.dumps({"sample": label, "mode": mode, "exit": process.returncode}) + "\n")
-            if expected is not None:
-                raise RuntimeError(f"healthy {mode} reader exited")
-            continue
-        process.stdin.write(label + "\n")
-        process.stdin.flush()
         deadline = time.monotonic() + 10
+        pages = {}
         while True:
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ)
-                if not selector.select(timeout=max(0, deadline - time.monotonic())):
+            line = output.readline()
+            if not line:
+                if process.poll() is not None:
+                    result = {"sample": label, "mode": mode, "exit": process.returncode}
+                    evidence.write(json.dumps(result) + "\n")
+                    evidence.flush()
+                    if expected is not None:
+                        raise RuntimeError(f"healthy {mode} reader exited")
+                    break
+                if time.monotonic() >= deadline:
                     evidence.write(json.dumps({"sample": label, "mode": mode, "stalled": True}) + "\n")
+                    evidence.flush()
                     if expected is not None:
                         raise RuntimeError(f"healthy {mode} read stalled")
                     break
-            line = process.stdout.readline()
-            output.write(line)
-            output.flush()
-            result = json.loads(line) if line else {"exit": process.poll()}
-            evidence.write(json.dumps({"requested_sample": label, "mode": mode, "result": result}) + "\n")
-            # A previously stalled read may finish after a later checkpoint.
-            # Keep its original label rather than attributing it to a new read.
-            if line and result.get("sample") != label:
+                time.sleep(0.01)
                 continue
-            if expected is not None and result.get("bytes") != expected:
-                raise RuntimeError(f"{label}: {mode} observed {result}, expected {expected}")
-            break
-    evidence.flush()
+            result = json.loads(line)
+            evidence.write(json.dumps({"requested_sample": label, "mode": mode, "result": result}) + "\n")
+            evidence.flush()
+            # Keep original labels on reads that finish after a stalled sample.
+            if result.get("sample") != label:
+                continue
+            if result.get("operation") == "read":
+                pages[result["page"]] = result
+            if expected is not None and result.get("operation") == "fstat":
+                if result.get("size") != 8192:
+                    raise RuntimeError(f"{label}: {mode} metadata failed: {result}")
+            if result.get("operation") == completion:
+                if expected is not None:
+                    for page, byte in enumerate(expected, start=1):
+                        if pages.get(page, {}).get("bytes") != [byte]:
+                            raise RuntimeError(f"{label}: {mode} page {page}: {pages.get(page)}, expected {[byte]}")
+                break
+
+
+def command(processes, label):
+    for _, process, _ in processes:
+        if process.poll() is None:
+            process.stdin.write(label + "\n")
+            process.stdin.flush()
+
+
+def sample(processes, label, evidence, expected=None):
+    # Start both observers before waiting: a blocked fd must not postpone the
+    # mapped probe until the extension has resumed or withdrawn its pages.
+    command(processes, label)
+    collect(processes, label, evidence, expected)
+
+
+def loss_procedure(case, relative_path, processes, evidence):
+    mutation = (f"Through Linux overwrite {relative_path} IN PLACE with 8192 bytes of 76, "
+                "fsync and preserve its inode; retain command output and timestamps")
+    if case == "extension-stall":
+        checkpoint("STOP the extension (SIGSTOP); record PID/status, last proof and exclusion deadline. Keep it stopped through the Linux mutation and Mac samples", evidence)
+        checkpoint("While stopped and before exclusion ends, prove Linux write-intent OPEN is refused EBUSY; retain exact errno and authority timestamps. Then fence the Mac writer/stop its renewals at the authority, without resuming the extension; record the final promised exclusion", evidence)
+        checkpoint("WAIT for the recorded authority exclusion end AND admitted-storage drain; record actual end evidence. Extension must remain stopped", evidence)
+        checkpoint(mutation + " WHILE THE EXTENSION IS STILL STOPPED", evidence)
+        sample(processes, "stopped-after-linux-mutation", evidence)
+        checkpoint("Record stale byte 65 and partial successes as residuals. Now RESUME the extension; record resume timestamp and wait for actual revoke completion for this fixture, including errors", evidence)
+        sample(processes, "resumed-after-withdrawal", evidence)
+        return
+    if case == "sleep-wake":
+        checkpoint("Arrange a Linux operator/job to prove early EBUSY, wait for recorded exclusion end AND storage drain, then " + mutation + " DURING MAC SLEEP. Retain the sleep interval, exclusion end and mutation/fsync timestamps", evidence)
+        command(processes, "arm:sleep-wake-continuous")
+        collect(processes, "arm:sleep-wake-continuous", evidence, completion="armed")
+        checkpoint("Observers are ARMED. Sleep the Mac now, let Linux complete the ordered mutation during sleep, then wake. Observers record first scheduled reads on wake before this prompt returns; record exact sleep/wake times and Linux evidence", evidence)
+        checkpoint("Keep observers running until actual fixture revoke completion; record withdrawal timestamps/errors and any old byte 65 seen on wake as a residual", evidence)
+        command(processes, "disarm")
+        collect(processes, "disarm", evidence, completion="disarmed")
+        sample(processes, "wake-after-withdrawal", evidence)
+        return
+    checkpoint(f"Inject {case}; record actual proof horizon/authorization deadline and setCacheState outcomes", evidence)
+    if case == "proof-expiry":
+        checkpoint("Keep session authorized/usable while withholding renewal past the recorded horizon. Require successful invalidate and noCache grant; record fixture READ/miss counters BEFORE the following post-expiry samples", evidence)
+        sample(processes, "proof-expired", evidence)
+        checkpoint("Retain actual POST-EXPIRY fixture READ/miss trace and authority READ counter delta for both pages, with timestamps. Unchanged byte 65, noCache and setCacheState success alone do not prove invalidation", evidence)
+        checkpoint("Restore renewal and require readCache eligibility", evidence)
+        sample(processes, "proof-recovered", evidence)
+        checkpoint("Now end writer ownership, retaining its terminal revoke results", evidence)
+    checkpoint("Prove early Linux write-intent OPEN refused EBUSY; then wait for recorded authority exclusion end AND admitted-storage drain", evidence)
+    checkpoint(mutation, evidence)
+    sample(processes, "after-linux-mutation", evidence)
+    checkpoint("Require actual fixture revoke completion, including errors; a callback gate alone is insufficient", evidence)
+    sample(processes, "after-withdrawal", evidence)
+
+
+def retained_permissions(directory, evidence):
+    if os.geteuid() == 0:
+        raise RuntimeError("native permission qualification requires an unprivileged mount user")
+    path = directory / "retained-permissions"
+    created = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    retained = None
+    try:
+        assert os.pwrite(created, b"held", 0) == 4
+        os.fsync(created)
+        retained = os.open(path, os.O_RDONLY)
+        os.chmod(path, 0)
+        assert os.pread(retained, 4, 0) == b"held"
+        assert os.pwrite(created, b"live", 0) == 4
+        os.fsync(created)
+        assert os.pread(retained, 4, 0) == b"live"
+        evidence.write(json.dumps({"time_ns": time.time_ns(), "permission_probe": "chmod-000-retained-read-write-succeeded"}) + "\n")
+        evidence.flush()
+        os.close(retained)
+        retained = None
+        os.close(created)
+        created = None
+        try:
+            reopened = os.open(path, os.O_RDONLY)
+        except OSError as error:
+            evidence.write(json.dumps({"time_ns": time.time_ns(), "permission_probe": "close-reopen", "errno": error.errno}) + "\n")
+            evidence.flush()
+            if error.errno != errno.EACCES:
+                raise
+        else:
+            os.close(reopened)
+            raise RuntimeError("fresh read open after chmod 000 and final close unexpectedly succeeded")
+        os.chmod(path, 0o600)
+        reopened = os.open(path, os.O_RDONLY)
+        try:
+            assert os.pread(reopened, 4, 0) == b"live"
+        finally:
+            os.close(reopened)
+        evidence.write(json.dumps({"time_ns": time.time_ns(), "permission_probe": "chmod-600-reopen-succeeded"}) + "\n")
+        evidence.flush()
+    finally:
+        if retained is not None:
+            os.close(retained)
+        if created is not None:
+            os.close(created)
+        os.chmod(path, 0o600)
 
 
 def open_unlinked(directory):
@@ -153,23 +295,26 @@ def main():
                     os.fsync(file.fileno())
                 os.link(path, alias)
                 open_unlinked(directory)
+                retained_permissions(directory, evidence)
                 processes = []
                 outputs = []
                 try:
                     for mode in ("fd", "mapped"):
-                        output = (args.output / f"{case}-{mode}.jsonl").open("w")
-                        outputs.append(output)
-                        process = subprocess.Popen([sys.executable, __file__, "--reader", mode, "--path", str(alias)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=output, text=True)
-                        processes.append((mode, process, output))
-                        with selectors.DefaultSelector() as selector:
-                            selector.register(process.stdout, selectors.EVENT_READ)
-                            if not selector.select(timeout=10):
-                                process.kill()
-                                process.wait()
-                                raise RuntimeError(f"{mode} reader did not become ready")
-                        ready = process.stdout.readline()
-                        output.write(ready)
-                        output.flush()
+                        artifact = args.output / f"{case}-{mode}.jsonl"
+                        output = artifact.open("w")
+                        errors = (args.output / f"{case}-{mode}.stderr").open("w")
+                        outputs.extend((output, errors))
+                        process = subprocess.Popen([sys.executable, __file__, "--reader", mode, "--path", str(alias)], stdin=subprocess.PIPE, stdout=output, stderr=errors, text=True)
+                        observed = artifact.open("r")
+                        outputs.append(observed)
+                        processes.append((mode, process, observed))
+                        deadline = time.monotonic() + 10
+                        while not (ready := observed.readline()):
+                            if process.poll() is not None or time.monotonic() >= deadline:
+                                raise RuntimeError(f"{mode} reader did not become ready; inspect {artifact}")
+                            time.sleep(0.01)
+                        evidence.write(ready)
+                        evidence.flush()
                         if "ready" not in json.loads(ready):
                             raise RuntimeError(f"{mode} reader failed to initialize")
                     checkpoint("Require cache grant read_cache=true for the fixture and retain authority cold/warm READ counts; warm fd/mapped pages must actually use readCache", evidence)
@@ -187,18 +332,8 @@ def main():
                         file.write(b"A" * 8192)
                         os.fsync(file.fileno())
                     sample(processes, "rewarm-expect-65", evidence, [65, 65])
-                    checkpoint(f"Inject {case}. Record actual horizon/deadline and every setCacheState result/error from kernel-cache.jsonl", evidence)
-                    sample(processes, "fault", evidence)
-                    if case == "proof-expiry":
-                        checkpoint("Keep session usable: require successful invalidate/noCache, read via both aliases, then restore renewal and require readCache eligibility", evidence)
-                        sample(processes, "proof-recovered", evidence)
-                        checkpoint("Now end writer ownership so Linux can eventually mutate after exclusion drains", evidence)
-                    if case in ("extension-stall", "sleep-wake"):
-                        checkpoint("Observe retained reads while stopped or immediately on wake, then resume the extension; classify stale access as a residual", evidence)
-                        sample(processes, "residual-window", evidence)
-                    checkpoint(f"Prove early Linux write refused EBUSY, then authority exclusion ended. Through Linux overwrite {path.relative_to(args.mount)} in place with 8192 bytes of 76 and fsync; retain command output", evidence)
-                    sample(processes, "after-linux-mutation", evidence)
-                    checkpoint("Inspect fd/mapped artifacts and syscall errors or SIGBUS. Require actual invalidate/revoke completion; record stale old bytes and all withdrawal failures. A callback gate alone is insufficient", evidence)
+                    loss_procedure(case, path.relative_to(args.mount), processes, evidence)
+                    checkpoint("Inspect page-by-page fd/mapped artifacts, independent fstat outcomes, exits/SIGBUS and all withdrawal errors; record residual stale reads honestly", evidence)
                     checkpoint("Review healthy open-unlinked probe: require no revoke caused solely by unlink; compare its timestamps with cache actions", evidence)
                 finally:
                     for _, process, _ in processes:

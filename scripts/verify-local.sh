@@ -121,7 +121,11 @@ go -C vcs/third_party/go-fuse vet ./fuse
 go -C vcs/third_party/go-fuse test ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
 go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
 
-# 5. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
+# 5. The native observer's evidence rules need no mount or platform privilege.
+step "native cache observer evidence"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_macos27_kernel_cache_observer.py
+
+# The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
 # contain the same unique all-passing set. Other hosts skip this macOS-only
 # package loudly; the macOS CI job always runs it.

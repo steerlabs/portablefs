@@ -58,16 +58,54 @@ final class PfsSessionPublicationGate: @unchecked Sendable {
         return try operation()
     }
 
+    func whileLive(_ operation: () -> Void) {
+        synchronized { if terminal == nil { operation() } }
+    }
+
+    /// The condition and first-cause latch are one transition. Callers take
+    /// their state lock inside this gate, as grant and withdrawal admission do.
+    func revoke(if cause: () -> Error?) -> Error? {
+        synchronized {
+            guard terminal == nil, let error = cause() else { return nil }
+            terminal = error
+            return error
+        }
+    }
+
     func check() throws {
         if let error = terminalError { throw error }
     }
 
     @discardableResult
     func decide(_ reply: (Error?) -> Void) -> Bool {
+        decide({}, terminalCause: { _ in nil }) { outcome in
+            switch outcome {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        }
+    }
+
+    @discardableResult
+    func decide<Value>(
+        _ decision: () throws -> Value,
+        terminalCause: (Error) -> Error?,
+        reply: (Result<Value, Error>) -> Void
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        reply(terminal)
-        return terminal == nil
+        let outcome: Result<Value, Error>
+        if let terminal { outcome = .failure(terminal) }
+        else {
+            do { outcome = .success(try decision()) }
+            catch {
+                if let cause = terminalCause(error) { terminal = cause }
+                outcome = .failure(terminal ?? error)
+            }
+        }
+        reply(outcome)
+        if case .success = outcome { return true }
+        return false
     }
 }
 
@@ -128,15 +166,28 @@ public actor PfsCallbackWindow {
     }
 
     /// Replies under the session gate and releases this slot exactly once.
-    /// False means a duplicate settlement or a terminal verdict; either way
-    /// the caller must not publish its original successful result.
+    /// False means a duplicate settlement or an unsuccessful final decision.
     public func settle(
         _ ticket: PfsCallbackTicket,
         reply: @Sendable (_ terminal: Error?) -> Void
     ) async -> Bool {
+        await settle(ticket, decision: {}, terminalCause: { _ in nil }) { outcome in
+            switch outcome {
+            case .success: reply(nil)
+            case let .failure(error): reply(error)
+            }
+        }
+    }
+
+    func settle<Value>(
+        _ ticket: PfsCallbackTicket,
+        decision: @Sendable () throws -> Value,
+        terminalCause: @Sendable (Error) -> Error?,
+        reply: @Sendable (Result<Value, Error>) -> Void
+    ) async -> Bool {
         if let beforeSettlement { await beforeSettlement() }
         guard admitted.remove(ObjectIdentifier(ticket)) != nil else { return false }
-        let published = publicationGate.decide(reply)
+        let published = publicationGate.decide(decision, terminalCause: terminalCause, reply: reply)
         handOffFreedSlots()
         return published
     }

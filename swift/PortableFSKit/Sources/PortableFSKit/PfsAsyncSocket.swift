@@ -1,4 +1,5 @@
 import Foundation
+import SwiftProtobuf
 @preconcurrency import Dispatch
 @preconcurrency import Darwin
 
@@ -63,37 +64,37 @@ final class PfsAsyncSocket: @unchecked Sendable {
         }
     }
 
-    func startReading(
-        onFrame: @escaping @Sendable (PfsEnvelope) -> Void,
-        onClose: @escaping @Sendable (Error) -> Void
-    ) {
-        queue.async { [io, queue, maxFrameLength] in
-            var decoder = PfsFrameDecoder(maxFrameLength: maxFrameLength)
-            let closeOnce = PfsCloseCallback(onClose)
-            io.read(offset: 0, length: Int.max, queue: queue) { done, dispatchData, error in
-                if error != 0 {
-                    closeOnce.call(PfsLocalClientError.system(errno: error, operation: "read"))
-                    return
-                }
+    /// The single receive owner asks for another frame only after applying
+    /// this one. At most one bounded frame crosses the actor hop; a stalled
+    /// receiver leaves later bytes in the socket and backpressures the sender.
+    func readFrame() async throws -> PfsEnvelope {
+        let header = try await readExactly(4, frameStart: true)
+        let length = header.enumerated().reduce(UInt32(0)) { $0 | (UInt32($1.element) << ($1.offset * 8)) }
+        guard length <= maxFrameLength else {
+            throw PfsLocalClientError.frameTooLarge(length: length, max: maxFrameLength)
+        }
+        let payload = try await readExactly(Int(length), frameStart: false)
+        let envelope = try PfsEnvelope(serializedBytes: payload)
+        try PfsUnknownFieldGuard.requireKnownFields(envelope)
+        return envelope
+    }
 
-                if let dispatchData, dispatchData.count > 0 {
-                    do {
-                        let frames = try decoder.append(Data(dispatchData))
-                        for frame in frames {
-                            onFrame(frame)
-                        }
-                    } catch {
-                        closeOnce.call(error)
+    private func readExactly(_ count: Int, frameStart: Bool) async throws -> Data {
+        if count == 0 { return Data() }
+        return try await withCheckedThrowingContinuation { continuation in
+            let box = PfsContinuationBox<Data>(continuation)
+            queue.async { [io, queue] in
+                var bytes = Data()
+                io.read(offset: 0, length: count, queue: queue) { done, data, error in
+                    if error != 0 {
+                        box.resume(throwing: PfsLocalClientError.system(errno: error, operation: "read"))
                         return
                     }
-                }
-
-                if done {
-                    if decoder.bufferedByteCount == 0 {
-                        closeOnce.call(PfsLocalClientError.connectionClosed)
-                    } else {
-                        closeOnce.call(PfsLocalClientError.invalidFrame("EOF before completing frame"))
-                    }
+                    if let data { bytes.append(Data(data)) }
+                    guard done else { return }
+                    if bytes.count == count { box.resume(returning: bytes) }
+                    else if frameStart, bytes.isEmpty { box.resume(throwing: PfsLocalClientError.connectionClosed) }
+                    else { box.resume(throwing: PfsLocalClientError.invalidFrame("EOF before completing frame")) }
                 }
             }
         }
@@ -129,22 +130,5 @@ final class PfsAsyncSocket: @unchecked Sendable {
                 }
             }
         }
-    }
-}
-
-private final class PfsCloseCallback: @unchecked Sendable {
-    private let lock = NSLock()
-    private var callback: (@Sendable (Error) -> Void)?
-
-    init(_ callback: @escaping @Sendable (Error) -> Void) {
-        self.callback = callback
-    }
-
-    func call(_ error: Error) {
-        lock.lock()
-        let callback = callback
-        self.callback = nil
-        lock.unlock()
-        callback?(error)
     }
 }

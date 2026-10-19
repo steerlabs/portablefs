@@ -735,6 +735,7 @@ public actor PfsLocalClient {
     private var nextRequestID: UInt64 = 1
     private var isShutdown = false
     private var beforeNextResourceSettlement: (@Sendable () async -> Void)?
+    private var beforeReceive: (@Sendable (PfsEnvelope) async -> Void)?
 
     /// Only terminal session state permits frontend-only ownership retirement.
     var isDetachingOrStopped: Bool {
@@ -1089,18 +1090,12 @@ public actor PfsLocalClient {
 
     private func startReader(for connection: PfsConnection) {
         let connectionID = connection.id
-        // Socket callbacks arrive serially. One consumer preserves that order
-        // across the actor hop, including the final close. Independent tasks
-        // can otherwise install an older proof after a newer proof or terminal.
-        let (frames, continuation) = AsyncThrowingStream<PfsEnvelope, Error>.makeStream()
-        connection.socket.startReading { envelope in
-            continuation.yield(envelope)
-        } onClose: { error in
-            continuation.finish(throwing: error)
-        }
+        // One owner reads and applies each bounded frame before reading the
+        // next, including EOF. No task-per-frame scheduling or ingress buffer.
         Task(priority: .userInitiated) { [weak self] in
             do {
-                for try await envelope in frames {
+                while true {
+                    let envelope = try await connection.socket.readFrame()
                     await self?.receive(envelope, from: connectionID)
                 }
             } catch {
@@ -1109,7 +1104,13 @@ public actor PfsLocalClient {
         }
     }
 
-    private func receive(_ envelope: PfsEnvelope, from connectionID: UUID) {
+    func testingBeforeReceive(_ hook: @escaping @Sendable (PfsEnvelope) async -> Void) {
+        beforeReceive = hook
+    }
+
+    private func receive(_ envelope: PfsEnvelope, from connectionID: UUID) async {
+        guard connection?.id == connectionID else { return }
+        await beforeReceive?(envelope)
         guard let connection, connection.id == connectionID else {
             return
         }

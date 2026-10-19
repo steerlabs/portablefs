@@ -168,15 +168,16 @@ one positioned authority WRITE, without append, sync, delegation, flush
 sequence, or lock owner. There is no fragmented or staged write.
 
 On macOS 26, `write(2)` can return at kernel page-cache acceptance, as POSIX
-permits. macOS 27 grants no dirty-data cache mode: `readCache` writes bypass
-the kernel data cache. The
-kernel pushes those pages as write callbacks on fsync, close, unmount, or memory
-pressure. A native `fsync` or `F_FULLFSYNC` is durable only if macOS pushes the
-file's dirty pages as callbacks, waits for every reply, and reports their
-errors; ordinary unmount needs the same drain. That is host-kernel behavior and
-is not yet qualified on either release. Per-callback durability is necessary
-for the guarantee but does not prove it. A forced unmount can discard pages the
-kernel accepted but never delivered.
+permits. The kernel pushes those dirty pages as write callbacks on fsync,
+close, unmount, or memory pressure. A forced unmount can discard pages the
+kernel accepted but never delivered. macOS 27 grants no dirty-data cache mode:
+`readCache` writes bypass the kernel data cache.
+
+A native `fsync` or `F_FULLFSYNC` is durable only if macOS delivers all preceding
+writes as callbacks, waits for every reply, and reports their errors; ordinary
+unmount needs the same drain. That host-kernel behavior is not yet qualified on
+either release. Per-callback durability is necessary for the guarantee but does
+not prove it.
 
 ## CREATE and OPEN
 

@@ -415,6 +415,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
     private var shutdownTask: Task<Void, Never>?
     private var beforeShutdownCleanup: (@Sendable () async -> Void)?
     private var onShutdownWait: (@Sendable (Task<Void, Never>) async -> Void)?
+    private var beforePublicationFailureCleanup: (@Sendable () async -> Void)?
 
     /// Installs a volume around a resolved core. The connection's event
     /// binding is established before the volume can be returned to FSKit:
@@ -441,7 +442,8 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         attachRef: String,
         adapter: PortableFSVolume.Type,
         moduleIdentity: PortableFSModuleIdentity = PortableFSIdentity.moduleIdentity,
-        windowCapacity: Int = PfsCallbackWindow.defaultCapacity
+        windowCapacity: Int = PfsCallbackWindow.defaultCapacity,
+        cacheClock: @escaping @Sendable () throws -> UInt64 = PfsKernelCache.continuousNanos
     ) async throws -> PortableFSVolume {
         guard let resolved = await core.resolvedVolume else {
             await core.shutdown()
@@ -463,7 +465,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
             try client.publicationGate.check()
             let cache: PfsKernelCache?
             if #available(macOS 27, *), adapter == PortableFSVolumeV3.self {
-                cache = PfsKernelCache(gate: client.publicationGate) { error in
+                cache = PfsKernelCache(gate: client.publicationGate, clock: cacheClock) { error in
                     await client.close(error: error)
                 }
             } else {
@@ -726,12 +728,27 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         reply: @escaping (Result<Value, Error>) -> Void,
         settled: @escaping @Sendable () -> Void = {}
     ) {
+        publishAfterReply(callbackKind: callbackKind, preflight: preflight, operation,
+                          finalize: { $0 }, reply: reply, settled: settled)
+    }
+
+    /// Final cache admission is part of the gate's outcome, before either
+    /// the framework reply or the semantic publication verdict is selected.
+    func publishAfterReply<Value, ReplyValue>(
+        callbackKind: StaticString = #function,
+        preflight: @escaping @Sendable () async throws -> Void = {},
+        _ operation: @escaping () async throws -> Value,
+        finalize: @escaping (Value) throws -> ReplyValue,
+        reply: @escaping (Result<ReplyValue, Error>) -> Void,
+        settled: @escaping @Sendable () -> Void = {}
+    ) {
         let trace = PfsCallbackTrace(
             kind: callbackKind,
             connection: traceConnection,
             trace: core.client.trace
         )
         let operation = PfsUncheckedSendableBox(operation)
+        let finalize = PfsUncheckedSendableBox(finalize)
         let reply = PfsUncheckedSendableBox(reply)
         Task(priority: .userInitiated) {
             defer { settled() }
@@ -766,23 +783,30 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
                 )
             }
             let outcome = PfsUncheckedSendableBox(result)
-            let ownOutcomeReplied = await self.window.settle(ticket) { terminal in
-                if let terminal {
-                    reply.value(.failure(PfsErrorMapper.fsKitError(for: terminal)))
-                } else {
-                    reply.value(outcome.value.mapError {
-                        PfsErrorMapper.fsKitError(for: $0) as Error
-                    })
+            let published = await self.window.settle(ticket, decision: {
+                try finalize.value(outcome.value.get())
+            }, terminalCause: { error in
+                guard let cause = (error as? PfsKernelCache.AdmissionFailure)?.cause else { return nil }
+                Task {
+                    let hook = self.shutdownLock.withLock { self.beforePublicationFailureCleanup }
+                    await hook?()
+                    await self.core.client.close(error: cause)
                 }
-            }
+                return cause
+            }, reply: { result in
+                reply.value(result.mapError { PfsErrorMapper.fsKitError(for: $0) as Error })
+            })
             trace.emit("FrameworkReplyReturned")
 
-            let published = ownOutcomeReplied && result.pfsIsSuccess
             await complete(published)
-            trace.finish(outcome: !ownOutcomeReplied
+            trace.finish(outcome: self.window.publicationGate.terminalError != nil && !published
                 ? "revoked"
                 : (published ? "success" : "failure"))
         }
+    }
+
+    func testingBeforePublicationFailureCleanup(_ hook: @escaping @Sendable () async -> Void) {
+        shutdownLock.withLock { beforePublicationFailureCleanup = hook }
     }
 
     /// Deterministic seam for the window suite: the same callback path as
@@ -1619,19 +1643,16 @@ final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @un
                 try await self.core.open(item: item, mode: PfsFSKitMapping.openMode(from: modes))
             }
             return (item, try await self.core.ownsReadDescription(item), requested)
+        }, finalize: { value -> FSVolume.KernelCacheCoherencyType in
+            let (item, read, requested) = value
+            let grant = try self.kernelCache?.grant(item, requested: requested, ownsRead: read) ?? false
+            self.logger.debug("cache grant file=\(item.fileID) read_cache=\(grant)")
+            return grant ? .readCache : .noCache
         }, reply: { result in
-            do {
-                let (item, read, requested) = try result.get()
-                let grant = try self.kernelCache?.grant(item, requested: requested, ownsRead: read) ?? false
-                self.logger.debug("cache grant file=\(item.fileID) read_cache=\(grant)")
-                reply(grant ? .readCache : .noCache, nil)
-            } catch let failure as PfsKernelCache.AdmissionFailure {
-                let cause = failure.cause
-                // This reply already holds the publication lock. Close after
-                // replying; every cache admission independently checks expiry.
-                Task { await self.core.client.close(error: cause) }
-                reply(nil, PfsErrorMapper.fsKitError(for: cause))
-            } catch { reply(nil, PfsErrorMapper.fsKitError(for: error)) }
+            switch result {
+            case let .success(grant): reply(grant, nil)
+            case let .failure(error): reply(nil, error)
+            }
         })
     }
 
