@@ -119,6 +119,9 @@ func newFskitWriteHarnessWithAccess(t *testing.T, access volumeserver.Access) (*
 	if err := h.trackOpen(credential.ID, handle, false); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { h.closeSessionResources(credential.ID) })
+	t.Cleanup(func() {
+		runtime.FenceSession(credential.ID)
+		h.closeSessionResources(credential.ID)
+	})
 	return h, credential, store, terminal
 }

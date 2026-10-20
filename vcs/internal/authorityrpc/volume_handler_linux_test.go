@@ -2444,8 +2444,55 @@ func newAuthorityTestHandler(t *testing.T, membership volumeserver.DurableMountM
 	h := testVolumeHandler()
 	loadedCoordinationFor("", runtime, membership, 1024).Bind(h)
 	h.Store, h.Runtime, h.Authorizer = &resourceAdmissionFaultStore{}, runtime, authorizer
+	t.Cleanup(func() {
+		h.resourcesMu.Lock()
+		sessions := make([]volumeserver.SessionID, 0, len(h.resources))
+		for id := range h.resources {
+			sessions = append(sessions, id)
+		}
+		h.resourcesMu.Unlock()
+		// Fencing invokes resource cleanup, which takes resourcesMu itself.
+		for _, id := range sessions {
+			runtime.FenceSession(id)
+		}
+	})
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{0xA5})
 	return h, ctx, authorizer, h.Routes
+}
+
+func TestHandlerFixturesEndSessions(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T) <-chan struct{}
+	}{
+		{name: "direct FSKit", setup: func(t *testing.T) <-chan struct{} {
+			_, _, _, terminal := newFskitWriteHarness(t)
+			return terminal
+		}},
+		{name: "authority", setup: func(t *testing.T) <-chan struct{} {
+			h, ctx, _, _ := newAuthorityTestHandler(t, nil)
+			_, _, proof := attachAndActivateHandler(t, h, ctx, 1, fskitAttachRequest(1).GetAttach())
+			var id volumeserver.SessionID
+			copy(id[:], proof.GetId())
+			terminal, err := h.Runtime.SessionTerminal(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return terminal
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var terminal <-chan struct{}
+			if !t.Run("fixture", func(t *testing.T) { terminal = test.setup(t) }) {
+				return
+			}
+			select {
+			case <-terminal:
+			default:
+				t.Fatal("fixture cleanup left its session and writer watcher live")
+			}
+		})
+	}
 }
 
 func fskitAttachRequest(id uint64) *authoritypb.Request {

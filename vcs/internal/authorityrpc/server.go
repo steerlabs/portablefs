@@ -364,13 +364,18 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 	bootstrapData := entry.role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(s.IdleTimeout)); err != nil {
+			// Shutdown can land before the deadline is installed as well as
+			// during the read. net.Pipe reports either end closing as ErrClosedPipe.
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		request := new(authoritypb.Request)
 		allowBulk := entry.role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA && !bootstrapData
 		releaseFrame, payloadDigest, err := readRequestFrameRetained(ctx, conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request, allowBulk)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || ctx.Err() != nil {
 				return nil
 			}
 			return err

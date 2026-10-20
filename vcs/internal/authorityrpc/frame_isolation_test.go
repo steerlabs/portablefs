@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net"
 	"strconv"
 	"testing"
@@ -111,7 +110,7 @@ func TestDataBudgetSaturationPreservesControlAndBootstrap(t *testing.T) {
 			t.Fatalf("Resume=%v", &response)
 		}
 		_ = client.Close()
-		if err := <-done; err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
 	}
