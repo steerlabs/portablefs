@@ -3,11 +3,10 @@ import Foundation
 /// Presentation-safe row emitted by `portablefs mounts --json`.
 ///
 /// The CLI intentionally omits credentials and other daemon persistence
-/// details. `branch` is deliberately not read: a v3 volume is branchless, so
-/// the field the CLI still emits is always empty and naming it in the UI would
-/// promise a branch graph that does not exist. Additive fields decode with
-/// conservative defaults so an older CLI remains readable while cleanup
-/// intents are never mistaken for live mounts.
+/// details. The CLI ships in the same sealed bundle as this app. Its
+/// `cleanupRequired`, `operationPhase`, `attachState` and `attachError`
+/// members are omitted when empty, so their absence decodes to exactly that
+/// empty value; cleanup intents are never mistaken for live mounts.
 public struct PortableFSMountInventoryRow: Decodable, Sendable, Identifiable, Equatable {
     public let mountPath: String
     public let volumeId: String

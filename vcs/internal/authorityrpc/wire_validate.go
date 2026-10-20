@@ -2,6 +2,9 @@ package authorityrpc
 
 import (
 	"fmt"
+	"math"
+	"time"
+	"unicode/utf8"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -24,8 +27,6 @@ const (
 	maxWireFieldOccurrences = 262144
 	maxWireLogicalElements  = 262144
 	maxWireRepeatedElements = 4096
-	maxWireFeatureElements  = 64
-	maxWireSourceTargets    = 16
 )
 
 type wireValidationState struct {
@@ -54,11 +55,16 @@ func validateWireMessageDepth(raw []byte, descriptor protoreflect.MessageDescrip
 	}
 	var occurrences [maxWireDescriptorFields]uint32
 	var oneofs [maxWireDescriptorFields]bool
+	var previous protowire.Number
 	for len(raw) != 0 {
 		number, wireType, tagBytes := protowire.ConsumeTag(raw)
 		if tagBytes < 0 {
 			return protowire.ParseError(tagBytes)
 		}
+		if tagBytes != protowire.SizeTag(number) || number < previous {
+			return fmt.Errorf("noncanonical field tag or order")
+		}
+		previous = number
 		raw = raw[tagBytes:]
 		field := fields.ByNumber(number)
 		if field == nil {
@@ -98,13 +104,7 @@ func validateWireMessageDepth(raw []byte, descriptor protoreflect.MessageDescrip
 		state.logicalElements += logicalElements
 		if field.IsList() {
 			limit := uint32(maxWireRepeatedElements)
-			if field.Name() == "features" && (descriptor.FullName() == "portablefs.authority.v1.HelloRequest" ||
-				descriptor.FullName() == "portablefs.authority.v1.HelloReply" ||
-				descriptor.FullName() == "portablefs.authority.v1.AttachReply") {
-				limit = maxWireFeatureElements
-			} else if field.Name() == "targets" && descriptor.FullName() == "portablefs.authority.v1.SourcePublicationGate" {
-				limit = maxWireSourceTargets
-			} else if field.FullName() == "portablefs.authority.v1.CloseBatchRequest.closes" || field.FullName() == "portablefs.authority.v1.CloseBatchReply.results" {
+			if field.FullName() == "portablefs.authority.v1.CloseBatchRequest.closes" || field.FullName() == "portablefs.authority.v1.CloseBatchReply.results" {
 				limit = MaxCloseBatch
 			} else if field.FullName() == "portablefs.authority.v1.ReadDirRequest.held_identities" {
 				limit = MaxReadDirHeldIdentities
@@ -148,12 +148,47 @@ func consumeWireField(raw []byte, field protoreflect.FieldDescriptor, wireType p
 		if n < 0 {
 			return 0, 0, protowire.ParseError(n)
 		}
+		size, prefixBytes := protowire.ConsumeVarint(raw)
+		if prefixBytes < 0 || prefixBytes != protowire.SizeVarint(size) {
+			return 0, 0, fmt.Errorf("noncanonical length")
+		}
+		if field.Kind() == protoreflect.StringKind && !utf8.Valid(value) {
+			return 0, 0, fmt.Errorf("invalid UTF-8")
+		}
 		if field.Kind() == protoreflect.MessageKind {
 			if err := validateWireMessageDepth(value, field.Message(), depth+1, state); err != nil {
 				return 0, 0, err
 			}
 		}
 		return n, 1, nil
+	}
+	if wireType == protowire.VarintType {
+		value, n := protowire.ConsumeVarint(raw)
+		if n < 0 || n != protowire.SizeVarint(value) {
+			return 0, 0, fmt.Errorf("noncanonical scalar")
+		}
+		switch field.Kind() {
+		case protoreflect.BoolKind:
+			if value > 1 {
+				return 0, 0, fmt.Errorf("invalid bool")
+			}
+		case protoreflect.Uint32Kind:
+			if value > math.MaxUint32 {
+				return 0, 0, fmt.Errorf("uint32 overflow")
+			}
+		case protoreflect.Int32Kind:
+			if uint64(int64(int32(value))) != value {
+				return 0, 0, fmt.Errorf("int32 overflow")
+			}
+		case protoreflect.EnumKind:
+			if uint64(int64(int32(value))) != value || field.Enum().Values().ByNumber(protoreflect.EnumNumber(int32(value))) == nil {
+				return 0, 0, fmt.Errorf("unknown enum")
+			}
+		}
+		if field.FullName() == "portablefs.authority.v1.Response.session_valid_for_nanos" &&
+			(value == 0 || value > uint64(MaxCacheProof) || value%uint64(time.Millisecond) != 0) {
+			return 0, 0, fmt.Errorf("invalid KeepAlive validity proof")
+		}
 	}
 	n := protowire.ConsumeFieldValue(field.Number(), wireType, raw)
 	if n < 0 {

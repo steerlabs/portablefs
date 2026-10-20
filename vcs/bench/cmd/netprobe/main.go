@@ -6,9 +6,9 @@
 // what any PortableFS operation over the same path can cost, so a measured
 // op latency can be attributed to "the wire" vs "the protocol".
 //
-//	go run ./bench/cmd/netprobe -addr sakura.proxy.rlwy.net:45100 -n 30
-//	go run ./bench/cmd/netprobe -addr sakura.proxy.rlwy.net:45100 -tls -n 30
-//	go run ./bench/cmd/netprobe -addr sakura.proxy.rlwy.net:45100 -upload 32
+//	go run ./bench/cmd/netprobe -addr authority.example:443 -n 30
+//	go run ./bench/cmd/netprobe -addr authority.example:443 -tls -n 30
+//	go run ./bench/cmd/netprobe -addr authority.example:443 -upload 32
 //
 // Reproducible: no state, no writes, no mutation of any volume.
 package main
@@ -72,7 +72,7 @@ func main() {
 
 // uploadProbe measures how fast bytes can be pushed into the TCP path. Once
 // the receive window and socket buffers fill, the write rate equals the path's
-// achievable upload bandwidth — the ceiling any flusher can reach.
+// achievable upload bandwidth — the ceiling any bulk write path can reach.
 func uploadProbe(addr string, mb int, useTLS bool) {
 	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {

@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -46,7 +45,13 @@ func (s *Server) ServeFrontend(ctx context.Context) error {
 			_ = c.Close()
 			continue
 		}
-		fc := &frontendConn{srv: s, conn: c}
+		origin := allocateFrontendOrigin(&frontendOrigins)
+		if origin == 0 {
+			s.frontendConnections.Add(-1)
+			_ = c.Close()
+			continue
+		}
+		fc := &frontendConn{srv: s, conn: c, origin: origin}
 		go func() {
 			defer s.frontendConnections.Add(-1)
 			fc.serve(ctx)
@@ -71,34 +76,29 @@ type frontendConn struct {
 	attach   *attach
 
 	eventsMu sync.Mutex
-	events   *eventSubscriber
 	v3Events bool
 
 	publicationMu     sync.Mutex
 	operations        map[uint64]*frontendOperationEntry
 	lastOperationID   uint64
 	publicationClosed bool
+	connectionClosed  atomic.Bool
 	closeOnce         sync.Once
 	inFlight          atomic.Int32
-	visibilityAckBusy atomic.Bool
 	handlerWG         sync.WaitGroup
 
 	resourceMu     sync.Mutex
 	provisional    map[uint64]*v3ProvisionalResources
 	resourceClosed bool
 
-	// testAfterRetractionCapture fires between a reply's retraction-verdict
-	// capture and its frame write. It exists because that gap is not otherwise
-	// reachable from a test and it is exactly the gap a delegation handoff used
-	// to fit a crossing into: the verdict said "not retracted", the crossing
-	// happened, and the frame carrying the stale verdict went out afterwards.
-	// nil in production.
-	testAfterRetractionCapture func(operationID uint64)
+	// testBeforeReplyWrite pauses a candidate before its eligibility check.
+	// Nil in production.
+	testBeforeReplyWrite func(operationID uint64)
 }
 
 type frontendOperationEntry struct {
 	ready          chan struct{}
-	op             *frontendOperation
+	attach         *attach
 	err            error
 	activeRequests int
 	replyExposed   bool
@@ -109,65 +109,6 @@ var errFrontendPublicationUnprovable = errors.New(
 	"portablefsd: FSKit frontend publication is unprovable",
 )
 
-// frontendRequestDeadline is what the daemon TELLS a frontend to wait for one
-// reply, and it is derived from the daemon's own budgets rather than chosen.
-//
-// ── WHY THE FRONTEND MUST NOT PICK THIS NUMBER ──────────────────────────────
-//
-// It used to. The extension carried requestDeadlineNanoseconds = 60s; the
-// daemon gave one request an operationAdmissionBudget of 50s. Nothing related
-// the two, and 10s is not a margin: one request's ADMISSION may legitimately
-// consume most of its 50s, and admission is only part of a handler — the live
-// battery recorded a warm rmdir that took 80s and SUCCEEDED. So the frontend's
-// bound expired first on an operation the daemon was still going to answer
-// correctly, and a latency outlier was converted into a protocol event.
-//
-// ── WHY IT IS A MULTIPLE, NOT A SUM ─────────────────────────────────────────
-//
-// The daemon does not promise a total handler bound; it promises a definite
-// OUTCOME, and its internal budgets bound the waits it can be asked to make.
-// A frontend deadline exists only to notice a daemon that has stopped
-// answering at all, which is a different question from "is this slow". So the
-// number is deliberately far above anything a healthy handler can reach, and it
-// moves with operationAdmissionBudget so the two can never drift apart again.
-//
-// The remaining bound on a genuinely wedged request is the frontend's, and its
-// expiry is now REQUEST-LOCAL (see PfsLocalClient.timeoutRequest): it answers
-// that one request and leaves the connection — and therefore every other
-// operation's publication — alone.
-//
-// ── ROUND 17: WHY THIS NUMBER IS NOT A SAFETY MECHANISM, AND MUST NOT BE ────
-//
-// The obvious reading of "200s exceeds the ~60s FSKit reply envelope" is that
-// the multiplier is the defect and the advertised bound should be CLAMPED to
-// the kernel's own ceiling, so that an expiry would mean "the mutation did not
-// and will not commit". It cannot mean that, for two independent reasons, and
-// clamping would buy nothing while costing a certified property:
-//
-//  1. THE DAEMON PROMISES NO TOTAL HANDLER BOUND. operationAdmissionBudget is
-//     an absolute deadline on the WAITS a request may be asked to make, not on
-//     the request. A handler past every wait can still commit — the live
-//     battery's 80s warm rmdir SUCCEEDED against a 50s budget — so there is no
-//     instant T after which "has not committed" implies "will not commit".
-//     Advertising 60s instead of 200s changes when the extension gives up; it
-//     changes nothing about when the daemon can commit.
-//
-//  2. THE KERNEL'S CEILING IS EXTERNAL. Whatever this daemon advertises, FSKit
-//     abandons an upcall on its own schedule. A negotiated number can neither
-//     enlarge that ceiling nor make the extension's expiry coincide with it, so
-//     the extension's deadline can never be the mechanism that keeps the
-//     kernel's view correct.
-//
-// And clamping has a real cost: a 60s frontend bound against a 50s daemon
-// budget is exactly the pairing round 15 removed, on exactly the operation
-// (the 80s rmdir) that motivated removing it.
-//
-// So the deadline is demoted, deliberately, from a correctness mechanism to a
-// LIVENESS one — it exists to notice a daemon that has stopped answering. The
-// correctness boundary is the publication ledger itself: if a publishing reply
-// becomes ready after the callback has already acknowledged failure, or an
-// exposed reply loses its connection before acknowledgement, this incarnation
-// is fenced. There is no repair path that may guess what FSKit installed.
 func frontendRequestDeadline() time.Duration {
 	return frontendRequestDeadlineFactor * operationAdmissionBudgetValue()
 }
@@ -182,7 +123,6 @@ const frontendRequestDeadlineFactor = 4
 const maxFrontendOperationsPerConnection = 4096
 const maxFrontendRequestsInFlight = 1024
 const maxFrontendConnections = 256
-const maxProvisionalResourcesPerConnection = maxFrontendRequestsInFlight
 
 type frontendProtocolState uint8
 
@@ -194,22 +134,22 @@ const (
 
 func (c *frontendConn) serve(ctx context.Context) {
 	connCtx, cancel := context.WithCancel(ctx)
+	// Socket fixtures also enter here directly; production allocates at accept.
+	if c.origin == 0 {
+		c.origin = allocateFrontendOrigin(&frontendOrigins)
+		if c.origin == 0 {
+			cancel()
+			_ = c.conn.Close()
+			return
+		}
+	}
 	c.connCtx = connCtx
 	c.cancel = cancel
+	// close owns cancellation after withdrawing publication admission. Waking
+	// an unallocated waiter first could expose a publishing error to a dead
+	// socket and turn this connection's harmless loss into mount-wide failure.
 	defer c.close()
-	defer cancel()
-	// Two watermarks, one per ordering lane. Request IDs are allocated in one
-	// strictly increasing sequence, but the frontend writes on two lanes: the
-	// reserved control lane (visibility acknowledgements, liveness) is
-	// dequeued ahead of ordinary requests precisely so a barrier ack can
-	// never queue behind a request burst. The lanes therefore interleave on
-	// the wire, and a single global watermark misreads that interleaving as
-	// replay: under a mutation storm the first visibility ack that overtook a
-	// queued ordinary request killed the connection — and with it the mount.
-	// Each lane is FIFO and increasing within itself, which is exactly the
-	// replay protection the check exists for.
 	var lastRequestID uint64
-	var lastControlRequestID uint64
 	state := frontendAwaitingHello
 	for {
 		env, err := pfslocal.ReadFrame(c.conn)
@@ -247,48 +187,43 @@ func (c *frontendConn) serve(ctx context.Context) {
 				(req.SemanticCommit != pfslocal.PublicationSemanticCommitPublished &&
 					req.SemanticCommit != pfslocal.PublicationSemanticCommitNotPublished) {
 				log.Printf(
-					"portablefsd frontend: closing connection: malformed publication ack (operationID=%d semanticCommit=%d)",
-					req.OperationID, req.SemanticCommit,
+					"portablefsd frontend: closing connection: malformed publication ack (origin=%d operationID=%d semanticCommit=%d)",
+					c.origin, req.OperationID, req.SemanticCommit,
 				)
 				return
 			}
 			if a := c.currentAttach(); a != nil {
 				if bridge := a.v3CoherenceBridge(); bridge != nil {
-					known, err := bridge.acknowledgePublication(req.OperationID, req.SemanticCommit)
+					known, err := bridge.acknowledgePublication(c.callback(req.OperationID), req.SemanticCommit)
 					if err != nil {
 						// The source coordinator made the terminal decision while it
 						// still owned the exact lease. Fence the attach before any
 						// frontend publication bookkeeping can release a broader gate.
-						a.fenceV3(err)
-						log.Printf("portablefsd frontend: closing connection: publication semantic commit failed for operation %d: %v", req.OperationID, err)
+						a.stopV3Serving(err)
+						log.Printf("portablefsd frontend: closing connection: publication semantic commit failed for callback %d/%d: %v", c.origin, req.OperationID, err)
 						return
 					}
 					if !known {
-						log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+						log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged callback %d/%d", c.origin, req.OperationID)
 						return
 					}
 				}
 			}
 			if !c.acknowledgePublication(req.OperationID) {
-				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged operation %d", req.OperationID)
+				log.Printf("portablefsd frontend: closing connection: publication ack for unknown or already-acknowledged callback %d/%d", c.origin, req.OperationID)
 				return
 			}
 			continue
 		} else {
-			lane, ok := admitLaneRequestID(env.Body, env.RequestID, &lastRequestID, &lastControlRequestID)
+			ok := admitRequestID(env.RequestID, &lastRequestID)
 			if !ok {
-				log.Printf("portablefsd frontend: closing connection: %s-lane request id %d violated its lane's strictly-increasing order", lane, env.RequestID)
+				log.Printf("portablefsd frontend: closing connection: origin=%d request id %d violated strictly-increasing order", c.origin, env.RequestID)
 				return
 			}
 		}
 		switch req := env.Body.(type) {
 		case *pfslocal.Hello:
 			if state != frontendAwaitingHello {
-				return
-			}
-			if req.ProtocolMajor != pfslocal.ProtocolMajor ||
-				req.ProtocolMinor < pfslocal.ProtocolMinor {
-				c.errorReply(env.RequestID, darwinEINVAL, "unsupported protocol version")
 				return
 			}
 			c.helloClientName = req.ClientName
@@ -317,35 +252,14 @@ func (c *frontendConn) serve(ctx context.Context) {
 				return
 			}
 			state = frontendAttached
-			if c.reply(env.RequestID, &rep) &&
-				c.helloClientName == nativeFSKitFrontendClientName {
-				a.registerNativeFrontendWitness(c)
+			if c.reply(env.RequestID, &rep) {
+				if c.helloClientName == shippingFSKitFrontendClientName {
+					a.registerFrontendWitness(c)
+				}
 			}
 		default:
 			if state != frontendAttached {
 				return
-			}
-			// Visibility acknowledgement is the strict mount's reserved control
-			// lane. It bypasses ordinary admission and frontend namespace locks.
-			if ack, ok := req.(*pfslocal.VisibilityAckRequest); ok {
-				if env.OperationID != 0 {
-					return
-				}
-				// Exactly one visibility event can be outstanding, and a correct
-				// frontend waits for this request's reply before issuing another.
-				// Bound the reserved lane independently instead of permitting a
-				// local peer to create an unbounded set of goroutines parked on
-				// the source-publication barrier.
-				if !c.visibilityAckBusy.CompareAndSwap(false, true) {
-					return
-				}
-				c.handlerWG.Add(1)
-				go func(requestID uint64, request *pfslocal.VisibilityAckRequest) {
-					defer c.handlerWG.Done()
-					defer c.visibilityAckBusy.Store(false)
-					c.handleVisibilityAck(connCtx, requestID, request)
-				}(env.RequestID, ack)
-				continue
 			}
 			if c.inFlight.Add(1) > maxFrontendRequestsInFlight {
 				c.inFlight.Add(-1)
@@ -380,7 +294,7 @@ func (c *frontendConn) serve(ctx context.Context) {
 				// continuation without maintaining a second request classifier.
 				if a := c.currentAttach(); a != nil {
 					if bridge := a.v3CoherenceBridge(); bridge != nil {
-						bridge.reserveFrontendPublication(env.OperationID)
+						bridge.reserveFrontendPublication(c.callback(env.OperationID))
 					}
 				}
 			}
@@ -409,11 +323,12 @@ func (c *frontendConn) serve(ctx context.Context) {
 
 func (c *frontendConn) close() {
 	c.closeOnce.Do(func() {
+		c.connectionClosed.Store(true)
 		// A closing transport is not a live native FSKit witness. Retire the
 		// witness before any handler join or publication cleanup can block, so
 		// mount readiness never observes a connection whose teardown has begun.
 		if a := c.currentAttach(); a != nil {
-			a.removeNativeFrontendWitness(c)
+			a.removeFrontendWitness(c)
 		}
 		// A resource-bearing reply remains owned by this connection until the
 		// VolumeCore ownership disposition arrives. Once the connection is gone no
@@ -427,46 +342,26 @@ func (c *frontendConn) close() {
 		// cause and hide why this incarnation became unprovable.
 		c.resourceMu.Lock()
 		orphanedResources := c.closeProvisionalResourceTableLocked()
-		// Freeze publication bookkeeping before joining handlers. Once an
-		// exposed reply loses its connection without an acknowledgement, the
-		// kernel view is unprovable. Retire and wake the handoff gate before
-		// publishing the terminal session verdict: a handler can be waiting behind
-		// the very handoff that is waiting for this operation, so handlerWG cannot
-		// be joined safely until that cycle has been broken.
+		// An exposed reply without its ack leaves the kernel view unproven.
+		// Publish this exact cause before cancellation races other terminal paths.
 		c.publicationMu.Lock()
 		c.publicationClosed = true
-		orphaned := make([]*frontendOperation, 0, len(c.operations))
 		lostPublications := 0
 		for _, entry := range c.operations {
-			if entry.op == nil {
-				continue
-			}
-			if entry.replyExposed && !entry.ackPending {
+			if entry.attach != nil && entry.replyExposed && !entry.ackPending {
 				lostPublications++
 			}
-			orphaned = append(orphaned, entry.op)
 		}
 		c.publicationMu.Unlock()
-		// DEFINITIVE RESOLUTION OF EVERY OUTSTANDING PUBLICATION ACK.
-		//
-		// Retire every gate member before fencing or joining handlers. A handler
-		// may be waiting behind a handoff that is itself waiting for this exact
-		// publication; retiring first wakes that cycle. Retirement does not claim
-		// the kernel cache is sound. An exposed reply without its acknowledgement
-		// is terminal immediately below, because the mount outlives this socket and
-		// the daemon cannot prove whether FSKit installed or discarded the frame.
-		for _, op := range orphaned {
-			op.attach.finishFrontendOperation(op)
-		}
 		if lostPublications > 0 {
 			cause := fmt.Errorf(
 				"%w: frontend disconnected after exposing %d publishing reply(s) without PublicationAck",
 				errFrontendPublicationUnprovable, lostPublications,
 			)
+			log.Printf("portablefsd: attach %s stopped serving: %v", c.currentAttachRef(), cause)
 			if a := c.currentAttach(); a != nil {
-				a.fenceV3(cause)
+				a.stopV3Serving(cause)
 			}
-			log.Printf("portablefsd: attach %s fenced: %v", c.currentAttachRef(), cause)
 		}
 		// A handler that reached resource registration during the publication
 		// scan has been blocked on resourceMu. Release it only after the exact
@@ -475,11 +370,11 @@ func (c *frontendConn) close() {
 		c.resourceMu.Unlock()
 		if cleanups := abandonV3ProvisionalResources(orphanedResources); len(cleanups) != 0 {
 			go func() {
+				// Every orphaned cleanup finishes, even after one fails, so its
+				// pending reservation retires; a failure is terminal and
+				// the rest then send nothing.
 				for _, cleanup := range cleanups {
-					if err := cleanup.finish(); err != nil {
-						_ = cleanup.d.fail(err)
-						return
-					}
+					_ = cleanup.finish()
 				}
 			}()
 		}
@@ -490,6 +385,11 @@ func (c *frontendConn) close() {
 		// PublicationAck was recorded. Closing the transport now unblocks handlers
 		// writing replies; admission and release waits observe the canceled
 		// connection context.
+		if a := c.currentAttach(); a != nil {
+			if b := a.v3CoherenceBridge(); b != nil {
+				b.frontendClosing(c.origin)
+			}
+		}
 		if c.cancel != nil {
 			c.cancel()
 		}
@@ -499,7 +399,7 @@ func (c *frontendConn) close() {
 		}
 		// A handler may still be completing a local syscall or mutation after
 		// cancellation. Joining it here keeps connection teardown ordered
-		// behind its own handlers; it no longer gates any delegation handoff.
+		// behind its own handlers.
 		c.handlerWG.Wait()
 		c.publicationMu.Lock()
 		pending := c.operations
@@ -507,19 +407,19 @@ func (c *frontendConn) close() {
 		c.publicationMu.Unlock()
 		for operationID, entry := range pending {
 			<-entry.ready
-			c.releaseFrontendPublication(operationID)
+			// No byte of an unexposed callback reached FSKit. Retire its own
+			// nonpublication verdict; an applied mutation still terminals the mount.
+			if !entry.replyExposed && !entry.ackPending && entry.attach != nil {
+				if bridge := entry.attach.v3CoherenceBridge(); bridge != nil {
+					_, _ = bridge.acknowledgePublication(c.callback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
+				}
+			}
 			c.finishLogicalOperation(operationID, entry)
 		}
 		if a := c.currentAttach(); a != nil {
 			a.removeConn(c.conn)
 		}
 		c.eventsMu.Lock()
-		if c.events != nil {
-			if a := c.currentAttach(); a != nil {
-				a.unsubscribe(c.events)
-			}
-			c.events = nil
-		}
 		c.v3Events = false
 		c.eventsMu.Unlock()
 	})
@@ -546,10 +446,15 @@ func (c *frontendConn) setAttach(a *attach) bool {
 		c.attachMu.Unlock()
 		return false
 	}
-	c.attach = a
+
 	if c.origin == 0 {
 		c.origin = a.newOrigin()
+		if c.origin == 0 {
+			c.attachMu.Unlock()
+			return false
+		}
 	}
+	c.attach = a
 	c.attachMu.Unlock()
 	a.addConn(c.conn)
 	return true
@@ -559,6 +464,20 @@ func (c *frontendConn) write(env *pfslocal.Envelope) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return pfslocal.WriteFrame(c.conn, env)
+}
+
+// writeCommitted writes env unless commit, evaluated under the frame write
+// lock, refuses it. Every terminal revocation of this connection takes the
+// same lock, so a reply commit admits is either written before a revocation
+// or commit has already observed it. commit may take the source-publication
+// coordinator and d.mu (writeMu → coordinator → d.mu); it must not wait.
+func (c *frontendConn) writeCommitted(env *pfslocal.Envelope, commit func() bool) (bool, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if commit != nil && !commit() {
+		return false, nil
+	}
+	return true, pfslocal.WriteFrame(c.conn, env)
 }
 
 func (c *frontendConn) reply(req uint64, body any) bool {
@@ -593,10 +512,6 @@ func resourceBearingV3Reply(body any, collected *v3ReplyResourceCollector) (bool
 		if items != 1 || handles != 0 {
 			return true, fmt.Errorf("portablefsd: %T did not collect exactly one item", body)
 		}
-	case *pfslocal.EnumerateReply:
-		if handles != 0 {
-			return true, errors.New("portablefsd: EnumerateReply unexpectedly collected a handle")
-		}
 	default:
 		if items != 0 || handles != 0 {
 			return false, fmt.Errorf("portablefsd: %T collected resources but has no disposition contract", body)
@@ -607,12 +522,14 @@ func resourceBearingV3Reply(body any, collected *v3ReplyResourceCollector) (bool
 }
 
 func (c *frontendConn) registerProvisionalResource(requestID uint64, resources *v3ProvisionalResources) bool {
-	if requestID == 0 || resources == nil {
+	if requestID == 0 || resources == nil || resources.d == nil {
 		return false
 	}
 	c.resourceMu.Lock()
 	defer c.resourceMu.Unlock()
-	if c.resourceClosed || len(c.provisional) >= maxProvisionalResourcesPerConnection {
+	// Capacity was reserved before dispatch. Only connection loss or an
+	// invalid duplicate request can refuse an allocated reply here.
+	if c.resourceClosed {
 		return false
 	}
 	if c.provisional == nil {
@@ -718,9 +635,7 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 		consumeV3ProvisionalResponses(resources)
 		if abandonCleanup.required() {
 			go func() {
-				if finishErr := abandonCleanup.finish(); finishErr != nil {
-					_ = resources.d.fail(finishErr)
-				}
+				_ = abandonCleanup.finish()
 			}()
 		}
 		return false
@@ -728,16 +643,14 @@ func (c *frontendConn) settleProvisionalResource(disposition *pfslocal.ResourceR
 	consumeV3ProvisionalResponses(resources)
 	if cleanup.required() {
 		go func() {
-			if err := cleanup.finish(); err != nil {
-				_ = resources.d.fail(err)
-			}
+			_ = cleanup.finish()
 		}()
 	}
 	return true
 }
 
 // replyWithPublication writes one reply frame and reports whether that frame
-// was delivered without a retraction. A publishing frame is written only after
+// was delivered. A publishing frame is written only after
 // markPublicationReplyExposed has pinned its acknowledgement obligation; if
 // that callback already acknowledged, the attach is fenced and no frame is
 // written.
@@ -751,10 +664,6 @@ func (c *frontendConn) replyWithPublication(
 	return delivered
 }
 
-// replyWithPublicationWriteStatus additionally distinguishes a physically
-// written retraction from a frame that never reached the frontend. The former
-// is a valid terminal-response consumption boundary even though the callback
-// must not install the returned filesystem state.
 func (c *frontendConn) replyWithPublicationWriteStatus(
 	req uint64,
 	operationID uint64,
@@ -779,129 +688,47 @@ func (c *frontendConn) replyWithPublicationDisposition(
 	ackRequired bool,
 	lateDiscardable bool,
 ) (delivered bool, written bool, discarded bool) {
+	delivered, written, discarded, _ = c.replyWithPublicationCommit(req, operationID, body, ackRequired, lateDiscardable, nil)
+	return delivered, written, discarded
+}
+
+// replyWithPublicationCommit adds a fourth outcome for a reply computed from
+// the daemon cache: commit, run at the physical write boundary, may refuse
+// it. Nothing is written then, and the caller settles the unexposed candidate
+// and takes the coherent authority path inside the same operation.
+func (c *frontendConn) replyWithPublicationCommit(
+	req uint64,
+	operationID uint64,
+	body any,
+	ackRequired bool,
+	lateDiscardable bool,
+	commit func() bool,
+) (delivered bool, written bool, discarded bool, refused bool) {
 	if ackRequired {
 		exposed, lateDiscarded := c.markPublicationReplyExposedForV3(operationID, lateDiscardable)
 		if !exposed {
 			if !lateDiscarded {
 				_ = c.conn.Close()
 			}
-			return false, false, lateDiscarded
+			return false, false, lateDiscarded, false
 		}
 	}
-	// THE VERDICT AND THE FRAME ARE ONE GATE TRANSITION.
-	//
-	// The retraction is read under the same lock a crossing takes, and — when it
-	// answers "not retracted" — this frame is registered as a carrier the
-	// crossing must wait for until the bytes are out. Sampling the verdict and
-	// then writing left a gap a handoff fitted into exactly: the frame was built
-	// before the crossing and delivered after it, so the frontend installed a
-	// view the daemon had already decided to retract, with the only carrier the
-	// retraction had already spent. See attach.captureRetractionCarrier.
-	retracted, releaseCarrier := c.captureRetraction(operationID)
-	defer releaseCarrier()
-	if c.testAfterRetractionCapture != nil {
-		c.testAfterRetractionCapture(operationID)
+	if c.testBeforeReplyWrite != nil {
+		c.testBeforeReplyWrite(operationID)
 	}
-	if err := c.write(&pfslocal.Envelope{
-		RequestID:              req,
-		PublicationAckRequired: ackRequired,
-		OperationID:            operationID,
-		Body:                   body,
-		// THE RETRACTION RIDES THE REPLY, AND THAT IS THE WHOLE ORDERING.
-		//
-		// A handoff that crossed this operation needs the frontend to discard
-		// what the operation collected BEFORE the framework installs it, and
-		// the install happens the instant the callback returns. Stamping the
-		// verdict on the reply the callback is waiting for makes that ordering
-		// a property of the byte stream rather than of anything the two sides
-		// have to agree about: one frame, delivered once, and the callback
-		// cannot proceed past it.
-		//
-		// It is read on EVERY reply of the operation, not only publishing ones.
-		// The reply that unblocks the callback is the initiator's — the request
-		// parked inside the delegation release — and whether that request
-		// happens to publish is unrelated to whether it is the last one the
-		// callback is waiting for.
-		PublicationRetracted: retracted,
-	}); err != nil {
+	admitted, err := c.writeCommitted(&pfslocal.Envelope{
+		RequestID: req, PublicationAckRequired: ackRequired,
+		OperationID: operationID, Body: body,
+	}, commit)
+	if err != nil {
 		log.Printf("frontend write reply: %v", err)
 		_ = c.conn.Close()
-		return false, false, false
+		return false, false, false, false
 	}
-	return !retracted, true, false
-}
-
-// publicationRetracted answers whether a delegation handoff has crossed this
-// operation, so its reply must tell the frontend to install nothing.
-//
-// ── THE INVARIANT THE FRONTEND DEPENDS ON, CHECKED HERE ─────────────────────
-//
-// A retraction is only ever carried on an operation that has ALREADY written an
-// acknowledgement-required reply on this connection. The frontend relies on
-// that: it learns which connection owes the acknowledgement from the earlier
-// ack-required reply, so a retraction arriving as an operation's FIRST reply
-// would leave it holding no connection to acknowledge on, and the daemon would
-// wait out its settle window for an acknowledgement nobody could send.
-//
-// The invariant is structural — op.retracted is set only by a crossing, and
-// publicationBlockersLocked only ever nominates an operation with op.published
-// set, which notePublicationExposed sets from markPublicationReplyExposed, i.e.
-// from a written ack-required reply on this same connection. An operation never
-// spans connections either: it is created per connection and every operation is
-// retired when its connection closes.
-//
-// It is checked rather than assumed anyway, because the failure it prevents is
-// a silent hang rather than a wrong answer, and because "structural" is a claim
-// about code that has now been rearranged several times. A retraction that
-// somehow reached an unexposed operation is DROPPED and announced, which fails
-// towards the behaviour that existed before retractions did.
-func (c *frontendConn) publicationRetracted(operationID uint64) bool {
-	retracted, release := c.captureRetraction(operationID)
-	release()
-	return retracted
-}
-
-// captureRetraction is publicationRetracted for the reply that will CARRY the
-// verdict: it takes the gate transition rather than a sample, and the returned
-// release must run once the frame is on the wire. See
-// attach.captureRetractionCarrier.
-func (c *frontendConn) captureRetraction(operationID uint64) (bool, func()) {
-	noop := func() {}
-	if operationID == 0 {
-		return false, noop
+	if !admitted {
+		return false, false, false, true
 	}
-	c.publicationMu.Lock()
-	entry := c.operations[operationID]
-	var (
-		op      *frontendOperation
-		exposed bool
-	)
-	if entry != nil {
-		op, exposed = entry.op, entry.replyExposed
-	}
-	c.publicationMu.Unlock()
-	if op == nil {
-		return false, noop
-	}
-	// publicationMu is released first. The gate lock is taken from this
-	// connection's side in exactly one other place
-	// (markPublicationReplyExposed) and with the same discipline, so the two
-	// stay unordered rather than newly nested.
-	retracted, release := op.attach.captureRetractionCarrier(op)
-	if !retracted {
-		return false, release
-	}
-	release()
-	if !exposed {
-		log.Printf(
-			"portablefsd: attach %s retracted logical operation %d before it had "+
-				"exposed any reply; the retraction is dropped because the frontend "+
-				"would have no connection to acknowledge it on",
-			op.attach.ref, operationID,
-		)
-		return false, noop
-	}
-	return true, noop
+	return true, true, false, false
 }
 
 func (c *frontendConn) markPublicationReplyExposed(operationID uint64) bool {
@@ -917,7 +744,7 @@ func (c *frontendConn) markPublicationReplyExposedForV3(
 	entry := c.operations[operationID]
 	if c.publicationClosed ||
 		entry == nil ||
-		entry.op == nil {
+		entry.attach == nil {
 		c.publicationMu.Unlock()
 		return false, false
 	}
@@ -931,33 +758,16 @@ func (c *frontendConn) markPublicationReplyExposedForV3(
 		// its authority result may already be durable while the source kernel still
 		// holds its pre-mutation cache. Refuse to write the frame and fence before
 		// any caller can treat it as a successful publication.
-		op := entry.op
+		a := entry.attach
 		c.publicationMu.Unlock()
-		op.attach.finishFrontendOperation(op)
-		op.attach.fenceV3(fmt.Errorf(
-			"%w: logical operation %d produced a publishing reply after its callback acknowledged",
-			errFrontendPublicationUnprovable, operationID,
+		a.stopV3Serving(fmt.Errorf(
+			"%w: callback %d/%d produced a publishing reply after its callback acknowledged",
+			errFrontendPublicationUnprovable, c.origin, operationID,
 		))
 		return false, false
 	}
 	entry.replyExposed = true
-	op := entry.op
 	c.publicationMu.Unlock()
-	// PUBLISH THE OBLIGATION TO THE HANDOFF GATE BEFORE THE BYTES GO OUT.
-	//
-	// replyWithPublication calls this and only then writes the frame, so the
-	// gate learns that this logical operation owes an acknowledgement while the
-	// daemon can still decide what a delegation handoff is allowed to do about
-	// it. Recording it after the write would leave a window in which the reply
-	// is on the wire and the barrier does not know — which is precisely the
-	// state finding 5 describes, reached by a different route.
-	//
-	// The gate lock is taken with publicationMu RELEASED. That direction is the
-	// established one (beginLogicalOperation drops publicationMu before every
-	// reserve/activate call), and nothing under frontendGateMu ever reaches
-	// back into a connection's publication table, so the two locks stay
-	// unordered with respect to each other rather than newly nested.
-	op.attach.notePublicationExposed(op)
 	return true, false
 }
 
@@ -965,38 +775,11 @@ func (c *frontendConn) errorReply(req uint64, eno int32, msg string) {
 	c.reply(req, &pfslocal.ErrorReply{Errno: eno, Message: msg})
 }
 
-// errorReplyForOperation is errorReply for a request that belongs to a logical
-// operation but does not publish. It exists only so the reply can carry a
-// retraction: a non-publishing request is very often the LAST one a framework
-// callback is waiting for, and a retraction that misses that reply misses the
-// only carrier it had.
+// errorReplyForOperation preserves the callback identity on a nonpublishing error.
 func (c *frontendConn) errorReplyForOperation(req, operationID uint64, eno int32, msg string) {
 	_ = c.replyWithPublication(
 		req, operationID, &pfslocal.ErrorReply{Errno: eno, Message: msg}, false,
 	)
-}
-
-// admitLaneRequestID enforces per-lane replay protection. Request IDs are
-// allocated in one increasing sequence but written on two lanes, and the
-// control lane (visibility acknowledgments, liveness) deliberately overtakes
-// queued ordinary requests — so a control frame may legally arrive carrying a
-// lower ID than an ordinary frame already received. Each lane is FIFO with
-// increasing IDs within itself; that per-lane monotonicity is the replay
-// protection, and enforcing it globally once killed healthy mounts the
-// moment a barrier acknowledgment overtook a request burst.
-func admitLaneRequestID(body any, id uint64, lastRequest, lastControl *uint64) (lane string, ok bool) {
-	watermark := lastRequest
-	lane = "request"
-	switch body.(type) {
-	case *pfslocal.VisibilityAckRequest, *pfslocal.V3LivenessRequest:
-		watermark = lastControl
-		lane = "control"
-	}
-	if id == 0 || id <= *watermark {
-		return lane, false
-	}
-	*watermark = id
-	return lane, true
 }
 
 // acknowledgePublication retires the logical operation the frontend has
@@ -1057,31 +840,18 @@ func (c *frontendConn) finishLogicalRequest(operationID uint64) {
 		delete(c.operations, operationID)
 	}
 	c.publicationMu.Unlock()
-	if inactive {
-		c.releaseFrontendPublication(operationID)
-	}
 	if finish {
 		c.finishLogicalOperation(operationID, entry)
 	}
 }
 
 func (c *frontendConn) finishLogicalOperation(operationID uint64, entry *frontendOperationEntry) {
-	if entry != nil && entry.op != nil {
-		a := entry.op.attach
-		a.finishFrontendOperation(entry.op)
-		if bridge := a.v3CoherenceBridge(); bridge != nil {
-			_ = bridge.finishFrontendPublication(operationID)
-		}
-	}
-}
-
-// releaseFrontendPublication closes the authority bridge's serial-reader
-// reservation when activeRequests reaches zero. A source lease is released
-// only after both this retirement and the callback's PublicationAck.
-func (c *frontendConn) releaseFrontendPublication(operationID uint64) {
-	if a := c.currentAttach(); a != nil {
-		if bridge := a.v3CoherenceBridge(); bridge != nil {
-			bridge.releaseFrontendPublication(operationID)
+	if entry != nil && entry.attach != nil {
+		if bridge := entry.attach.v3CoherenceBridge(); bridge != nil {
+			// One reservation covers the entire callback, including gaps between
+			// requests; finalization waits for every handler and PublicationAck.
+			bridge.releaseFrontendPublication(c.callback(operationID))
+			_ = bridge.finishFrontendPublication(c.callback(operationID))
 		}
 	}
 }
@@ -1119,7 +889,10 @@ func (c *frontendConn) reserveLogicalOperation(
 		return false, false
 	}
 	c.operations[operationID] = &frontendOperationEntry{
-		ready:          make(chan struct{}),
+		ready: make(chan struct{}),
+		// Reservation precedes handler startup. Close must still own its
+		// coordinator record if the queued handler has not begun yet.
+		attach:         c.currentAttach(),
 		activeRequests: 1,
 	}
 	c.lastOperationID = operationID
@@ -1127,125 +900,45 @@ func (c *frontendConn) reserveLogicalOperation(
 }
 
 func (c *frontendConn) beginLogicalOperation(
-	ctx context.Context,
-	a *attach,
-	operationID uint64,
-	initialize bool,
-	body any,
-) (context.Context, *frontendOperationParticipant, bool, bool, error) {
-	paths, pathEpoch, publishes := a.frontendOperationPaths(body)
-
+	ctx context.Context, a *attach, operationID uint64, initialize bool, body any,
+) (bool, error) {
+	publishes := frontendRequestPublishes(body)
 	if operationID == 0 {
 		if publishes {
-			return ctx, nil, false, false, fmt.Errorf("invalid frontend operation id")
+			return false, fmt.Errorf("invalid frontend operation id")
 		}
-		return ctx, nil, false, false, nil
+		return false, nil
 	}
 	if initialize && !publishes {
-		return ctx, nil, false, false, fmt.Errorf(
-			"frontend operation id began with a nonpublishing request",
-		)
+		return false, fmt.Errorf("frontend operation id began with a nonpublishing request")
 	}
-
 	c.publicationMu.Lock()
+	entry := c.operations[operationID]
 	if c.publicationClosed {
-		// close() retains the operation table until every handler exits. The
-		// one initializing handler owns ready's completion even when
-		// disconnect wins before that handler begins; continuations and close
-		// can then join the same definite net.ErrClosed outcome.
-		if initialize {
-			if entry := c.operations[operationID]; entry != nil {
-				entry.err = net.ErrClosed
-				close(entry.ready)
-			}
+		if initialize && entry != nil {
+			entry.err = net.ErrClosed
+			close(entry.ready)
 		}
 		c.publicationMu.Unlock()
-		return ctx, nil, false, false, net.ErrClosed
+		return false, net.ErrClosed
 	}
-	entry := c.operations[operationID]
 	if entry == nil {
 		c.publicationMu.Unlock()
-		return ctx, nil, false, false, fmt.Errorf("frontend operation was not reserved")
+		return false, fmt.Errorf("frontend operation was not reserved")
 	}
-	if !initialize {
+	if initialize {
+		entry.attach = a
+		close(entry.ready)
 		c.publicationMu.Unlock()
-		select {
-		case <-entry.ready:
-		case <-ctx.Done():
-			return ctx, nil, false, false, ctx.Err()
-		}
-		if entry.err != nil {
-			return ctx, nil, false, false, entry.err
-		}
-		if !publishes {
-			// HANDLE CLOSE NEVER WAITS FOR A DELEGATION HANDOFF.
-			//
-			// The publication gate exists to hold a handoff until cacheable
-			// state a callback exposed has been acknowledged, and to keep a
-			// request's reply on the correct side of that handoff. A request
-			// that publishes nothing — close, fsync, statfs, reclaim,
-			// syncVolume — exposes no such state, so it has no side to be on.
-			// Admitting it as an ordinary participant made it WAIT twice for
-			// no coherence benefit: an extension collapses the
-			// logical operation to the mount-wide scope on any path-epoch
-			// change, and the resume half of suspendFrontendOperation blocks
-			// until every overlapping delegation handoff has ended — a window
-			// that spans the release's authority round trips and is unbounded
-			// when the uplink is slow or dead. A close(2) carrying an
-			// operation ID therefore queued on a scope release while the
-			// identical close carrying none returned instantly.
-			//
-			// Join PERMANENTLY SUSPENDED instead. The participant still
-			// exists, so the logical operation cannot be considered finished
-			// while this request runs (that is what keeps a recall holding a
-			// namespace mirror lock from deadlocking against the very
-			// operation it is waiting to publish), but it is never a member
-			// of the active publication set, so it neither blocks a handoff
-			// nor waits for one. close(2) is bounded local bookkeeping:
-			// admitted data belongs to the engine and drains in the
-			// background; fsync, synchronize, unmount and recall remain the
-			// only drain barriers.
-			participant, err := a.joinFrontendOperationSuspended(entry.op)
-			if err != nil {
-				return ctx, nil, false, false, err
-			}
-			return context.WithValue(ctx, frontendOperationContextKey{}, participant),
-				participant, true, false, nil
-		}
-		participant, err := a.reserveFrontendExtension(entry.op, paths, pathEpoch)
-		if err != nil {
-			return ctx, nil, false, false, err
-		}
-		return context.WithValue(ctx, frontendOperationContextKey{}, participant),
-			participant, true, publishes, nil
+		return publishes, nil
 	}
 	c.publicationMu.Unlock()
-
-	// RESERVE, never begin: the operation is created with its first
-	// participant suspended and waits for no handoff. Its continuations
-	// therefore observe entry.ready promptly, and the gate wait this call used
-	// to pay is deferred to activation, where it can be paid holding no
-	// frontend mirror (see the publication activation protocol in
-	// coherence_refresh.go).
-	op, participant := a.reserveFrontendOperation(paths, pathEpoch)
-	var err error
-	c.publicationMu.Lock()
-	if c.publicationClosed {
-		err = net.ErrClosed
+	select {
+	case <-entry.ready:
+		return publishes, entry.err
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
-	if err == nil {
-		entry.op = op
-	}
-	entry.err = err
-	close(entry.ready)
-	c.publicationMu.Unlock()
-	if err != nil {
-		a.finishFrontendParticipant(participant)
-		a.finishFrontendOperation(op)
-		return ctx, nil, false, false, err
-	}
-	return context.WithValue(ctx, frontendOperationContextKey{}, participant),
-		participant, true, true, nil
 }
 
 func (c *frontendConn) handleAttached(
@@ -1256,87 +949,10 @@ func (c *frontendConn) handleAttached(
 	initializeOperation bool,
 	body any,
 ) {
-	// ── THE DISPATCHER-ORDERING CONTRACT ────────────────────────────────────
-	//
-	// One request runs in four phases, and the order is the whole point:
-	//
-	//	0. DEADLINE     One absolute bound for the operation, installed before
-	//	   + RESERVE.   anything can wait; then this request joins its logical
-	//	                operation SUSPENDED, holding nothing and waiting for
-	//	                nothing.
-	//	1. ADMISSION.   Classification, delegation transition and metadata-lane
-	//	                pacing — every step that can BLOCK on the uplink — taken
-	//	                holding NOTHING, and carrying the reserved publication
-	//	                identity so a release's handoff recognises this
-	//	                request's own operation.
-	//	2. PUBLICATION  The frontend mirrors (serialization, name stripes,
-	//	   + MIRRORS.   per-handle gate), then a NONBLOCKING attempt to activate
-	//	                into the publication set. Nothing acquired here waits on
-	//	                the far end, and nothing here waits at all while a mirror
-	//	                is held.
-	//	3. MUTATE.      The handler: a nonblocking revalidate of what phase 1
-	//	                decided, then the mutation itself.
-	//
-	// RESERVE exists because a CONTINUATION used to run phase 1 before it
-	// joined its logical operation, so its admission context carried no
-	// publication identity. A delegation release taken during classification
-	// reached OnHandoffStart, which saw the continuation's OWN already-active
-	// operation as a foreign member of the publication set and waited for it —
-	// an operation that cannot finish, because this continuation is one of its
-	// in-flight requests. A bounded deadlock resolved only by the operation
-	// deadline, surfacing as an EINTR and a spurious drain error.
-	//
-	// Phase 1 used to sit INSIDE phase 2. lockFrontendRequest takes the frontend
-	// serialization lock, the name stripes and a per-handle frontend RLock; then
-	// mutation admission could park for a full metadata admission budget. A
-	// close(2) on the same descriptor needs that handle gate EXCLUSIVELY, so it
-	// queued behind a request that was waiting on the authority — close-behind-
-	// backlog, the exact shape the close-is-local-bookkeeping work removed by one
-	// route, reappearing by another. The fix is structural and lives here, once,
-	// rather than in each handler: no frontend lock is held while anything waits
-	// on the uplink, on any request, ever.
-	//
-	// The unwind obeys the same contract. A lane invalidated inside the locks
-	// unwinds by RELEASING the mirrors and taking this request out of the
-	// publication set before it re-admits, so the second pass's claim and release
-	// are also paid holding nothing.
-	//
-	// Within phase 2 there is now ONE order for every request, continuation or
-	// not: take the mirrors while suspended (blocking no handoff), then ATTEMPT
-	// activation. The two orders this replaced each waited under the mirrors —
-	// a new operation in the gate entry it took after them, a continuation in
-	// the resume half of its suspend/mirrors/resume sequence — and that wait
-	// spans a delegation release's authority round trips.
-	// An authority-v3 attach is served by the v3 data plane through its own
-	// handler: it keeps the logical-operation/PublicationAck ledger this
-	// connection owns but never enters the clientcore admission, mirror, or
-	// delegation machinery below (see v3attach.go).
 	c.handleV3Attached(
 		ctx, a, requestID, operationID,
 		initializeOperation, body,
 	)
-}
-
-func (c *frontendConn) handleVisibilityAck(ctx context.Context, requestID uint64, request *pfslocal.VisibilityAckRequest) {
-	a := c.currentAttach()
-	if a == nil {
-		c.errorReply(requestID, darwinENXIO, "v3 attach is unavailable")
-		return
-	}
-	bridge := a.v3CoherenceBridge()
-	if bridge == nil {
-		c.errorReply(requestID, darwinENOTSUP, "attach does not use v3 visibility")
-		return
-	}
-	if err := bridge.acknowledge(ctx, request); err != nil {
-		errno := darwinEIO
-		if errors.Is(err, syscall.EINVAL) {
-			errno = darwinEINVAL
-		}
-		c.errorReply(requestID, errno, err.Error())
-		return
-	}
-	c.reply(requestID, &pfslocal.VisibilityAckReply{})
 }
 
 func (c *frontendConn) subscribeEvents(a *attach) error {
@@ -1349,9 +965,17 @@ func (c *frontendConn) subscribeEvents(a *attach) error {
 	if bridge == nil {
 		return fmt.Errorf("attach has no visibility stream")
 	}
+	if err := bridge.bind(); err != nil {
+		return err
+	}
+	bridge.mu.Lock()
+	if c.helloClientName == shippingFSKitFrontendClientName {
+		bridge.frontendOrigin = c.origin
+	}
+	bridge.mu.Unlock()
 	c.v3Events = true
 	go func() {
-		err := bridge.run(c.connCtx, func(event *pfslocal.Event) error {
+		err := bridge.runBound(c.connCtx, func(event *pfslocal.Event) error {
 			return c.write(&pfslocal.Envelope{RequestID: 0, Body: event})
 		})
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
@@ -1478,4 +1102,17 @@ func (l *publishedUnixListener) Close() error {
 		l.err = errors.Join(closeErr, statErr)
 	})
 	return l.err
+}
+
+// All request/reply frames share one FIFO sequence. Only one-way publication
+// and resource dispositions bypass it with request ID zero.
+func admitRequestID(id uint64, last *uint64) bool {
+	if id == 0 || id <= *last {
+		return false
+	}
+	*last = id
+	return true
+}
+func (c *frontendConn) callback(operation uint64) v3CallbackID {
+	return v3CallbackID{origin: c.origin, operation: operation}
 }

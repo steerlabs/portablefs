@@ -5,23 +5,11 @@ package mountv3
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 )
-
-// Profile validates the retained CLI spelling for protocol 7's one exact
-// frontend cache contract. The profile is no longer negotiated on the wire.
-func Profile(name string) (fusev3.CoherenceProfile, error) {
-	switch name {
-	case "strict":
-		return fusev3.CoherenceStrict, nil
-	default:
-		return 0, fmt.Errorf("coherence must be strict, not %q", name)
-	}
-}
 
 // Transport joins the fusev3 mount frontend to the authority client. It
 // exists because the two are owned separately and their contracts are not

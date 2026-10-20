@@ -28,11 +28,11 @@ type Host struct{}
 
 func New(Config) (*Host, error) { return nil, errors.New("cellhost: supported only on Linux") }
 
-func (*Host) Apply(_ context.Context, _ cellplan.VolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (*Host) Apply(_ context.Context, _ cellplan.EffectiveVolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	return controlplane.VolumeObservation{Error: "cellhost: supported only on Linux"}, cellhelper.HostUpdate{}
 }
 
-func (*Host) Observe(_ context.Context, _ cellplan.VolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (*Host) Observe(_ context.Context, _ cellplan.EffectiveVolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	return controlplane.VolumeObservation{Error: "cellhost: supported only on Linux"}, cellhelper.HostUpdate{}
 }
 
@@ -61,20 +61,24 @@ func (*Host) ClearQuiesceRequest(string) error { return errNotLinux }
 
 func (*Host) ReadQuiesceProof(string) (QuiesceProof, error) { return QuiesceProof{}, errNotLinux }
 
-func (*Host) WriteArchiverConfig(cellplan.VolumePlan) error                { return errNotLinux }
-func (*Host) WriteHydratorConfig(cellplan.VolumePlan, HydratorMode) error  { return errNotLinux }
-func (*Host) WriteArchiverDropIns(cellplan.VolumePlan) error               { return errNotLinux }
-func (*Host) WriteHydratorDropIns(cellplan.VolumePlan, HydratorMode) error { return errNotLinux }
-func (*Host) StartArchiver(context.Context, string) error                  { return errNotLinux }
-func (*Host) StopArchiver(context.Context, string) error                   { return errNotLinux }
-func (*Host) ArchiverAbsent(context.Context, string) (bool, error)         { return false, errNotLinux }
-func (*Host) StartHydrator(context.Context, string, HydratorMode) error    { return errNotLinux }
-func (*Host) StopHydrator(context.Context, string) error                   { return errNotLinux }
-func (*Host) HydratorAbsent(context.Context, string) (bool, error)         { return false, errNotLinux }
-func (*Host) RemoveArchiverDropIns(context.Context, string) error          { return errNotLinux }
-func (*Host) RemoveHydratorDropIns(context.Context, string) error          { return errNotLinux }
-func (*Host) RemoveArchiverConfig(string) error                            { return errNotLinux }
-func (*Host) RemoveHydratorConfig(string) error                            { return errNotLinux }
+func (*Host) WriteArchiverConfig(cellplan.EffectiveVolumePlan) error { return errNotLinux }
+func (*Host) WriteHydratorConfig(cellplan.EffectiveVolumePlan, HydratorMode) error {
+	return errNotLinux
+}
+func (*Host) WriteArchiverDropIns(cellplan.EffectiveVolumePlan) error { return errNotLinux }
+func (*Host) WriteHydratorDropIns(cellplan.EffectiveVolumePlan, HydratorMode) error {
+	return errNotLinux
+}
+func (*Host) StartArchiver(context.Context, string) error               { return errNotLinux }
+func (*Host) StopArchiver(context.Context, string) error                { return errNotLinux }
+func (*Host) ArchiverAbsent(context.Context, string) (bool, error)      { return false, errNotLinux }
+func (*Host) StartHydrator(context.Context, string, HydratorMode) error { return errNotLinux }
+func (*Host) StopHydrator(context.Context, string) error                { return errNotLinux }
+func (*Host) HydratorAbsent(context.Context, string) (bool, error)      { return false, errNotLinux }
+func (*Host) RemoveArchiverDropIns(context.Context, string) error       { return errNotLinux }
+func (*Host) RemoveHydratorDropIns(context.Context, string) error       { return errNotLinux }
+func (*Host) RemoveArchiverConfig(string) error                         { return errNotLinux }
+func (*Host) RemoveHydratorConfig(string) error                         { return errNotLinux }
 func (*Host) ReadArchiveSealed(string) (ArchiveSealedRecord, error) {
 	return ArchiveSealedRecord{}, errNotLinux
 }

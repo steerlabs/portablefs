@@ -8,6 +8,14 @@ private func transportBytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+/// Re-decodes `envelope` with field 4 set: the deleted publication-retraction
+/// bit, which a pfslocal 2.0 decoder retains only as an unknown field.
+private func appendingUnknownEnvelopeField(_ envelope: PfsEnvelope) -> PfsEnvelope? {
+    guard var bytes = try? envelope.serializedData() else { return nil }
+    bytes.append(contentsOf: [0x20, 0x01])
+    return try? PfsEnvelope(serializedBytes: bytes)
+}
+
 private func writeRawTransportFrame(fd: Int32, envelope: PfsEnvelope) throws {
     let frame = try PfsFrameCodec().encode(envelope)
     try frame.withUnsafeBytes { rawBuffer in
@@ -55,6 +63,58 @@ private actor PfsTestAsyncGate {
             continuation.resume()
         }
     }
+}
+
+/// Each deadline stays suspended until the test expires that request ID.
+/// AsyncStream cancellation retires successful setup requests' waits, even
+/// when their detached timer tasks start after the reply has arrived.
+private actor PfsTestRequestDeadlines {
+    private struct Wait {
+        let nanoseconds: UInt64
+        let continuation: AsyncStream<Void>.Continuation
+    }
+    private var waits: [UInt64: Wait] = [:]
+    private var observers: [UInt64: CheckedContinuation<Void, Never>] = [:]
+
+    func sleep(requestID: UInt64, nanoseconds: UInt64) async throws {
+        try Task.checkCancellation()
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        waits[requestID] = Wait(nanoseconds: nanoseconds, continuation: continuation)
+        observers.removeValue(forKey: requestID)?.resume()
+        for await _ in stream { break }
+        waits.removeValue(forKey: requestID)
+        try Task.checkCancellation()
+    }
+
+    func expire(_ requestID: UInt64) async throws -> UInt64 {
+        if waits[requestID] == nil {
+            await withCheckedContinuation { observers[requestID] = $0 }
+        }
+        let wait = try #require(waits[requestID])
+        wait.continuation.yield(())
+        wait.continuation.finish()
+        return wait.nanoseconds
+    }
+}
+
+private actor PfsTestHeldReply {
+    private let releaseGate = PfsTestAsyncGate()
+    private var reply: PfsEnvelope?
+    private var observer: CheckedContinuation<PfsEnvelope, Never>?
+
+    func hold(_ reply: PfsEnvelope) async {
+        self.reply = reply
+        observer?.resume(returning: reply)
+        observer = nil
+        await releaseGate.wait()
+    }
+
+    func waitUntilHeld() async -> PfsEnvelope {
+        if let reply { return reply }
+        return await withCheckedContinuation { observer = $0 }
+    }
+
+    func release() async { await releaseGate.release() }
 }
 
 extension PfsLocalMockDaemonTests {
@@ -107,9 +167,10 @@ extension PfsLocalMockDaemonTests {
     defer { PfsUnixSocket.close(peerFD) }
 
     // A peer that deliberately does not read creates real socket backpressure.
-    // Repeated Hello frames are side-effect-free and each has a definite reply,
-    // so the pending-response observation below proves the writer is blocked
-    // without relying on a guessed Darwin buffer capacity.
+    // After the one Hello and Resolve, repeated Statfs frames are
+    // side-effect-free and each has a definite reply, so the pending-response
+    // observation below proves the writer is blocked without relying on a
+    // guessed Darwin buffer capacity.
     var receiveBufferBytes: Int32 = 1_024
     #expect(
         setsockopt(
@@ -121,14 +182,23 @@ extension PfsLocalMockDaemonTests {
         ) == 0
     )
     for requestID in 1...4_096 {
-        var hello = PfsHello()
-        hello.protocolMajor = 1
-        hello.protocolMinor = 12
-        hello.clientName = "backpressure-owner"
-        hello.clientVersion = "1"
         var envelope = PfsEnvelope()
         envelope.requestID = UInt64(requestID)
-        envelope.body = .hello(hello)
+        switch requestID {
+        case 1:
+            var hello = PfsHello()
+            hello.protocolMajor = PfsLocalClient.protocolMajor
+            hello.protocolMinor = PfsLocalClient.protocolMinor
+            hello.clientName = "backpressure-owner"
+            hello.clientVersion = "1"
+            envelope.body = .hello(hello)
+        case 2:
+            var resolve = PfsResolveRequest()
+            resolve.attachRef = "mock"
+            envelope.body = .resolve(resolve)
+        default:
+            envelope.body = .statfs(PfsStatfsRequest())
+        }
         try writeRawTransportFrame(fd: peerFD, envelope: envelope)
     }
 
@@ -452,13 +522,15 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
     defer { server.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: server.socketPath,
-        configuration: .init(maxReconnectAttempts: 1, requestDeadlineNanoseconds: 1_000_000_000)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration(
+        maxConnectAttempts: 1, handshakeDeadlineNanoseconds: 1_000_000_000
     )
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: server.socketPath, configuration: configuration)
 
     do {
-        _ = try await client.request(.statfs(PfsStatfsRequest()))
+        _ = try await client.resolve(attachRef: "mock")
         Issue.record("expected EOF-mid-frame to fail")
     } catch let error as PfsLocalClientError {
         #expect(error == .invalidFrame("EOF before completing frame"))
@@ -475,13 +547,15 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
     defer { server.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: server.socketPath,
-        configuration: .init(maxFrameLength: 4096, maxReconnectAttempts: 1, requestDeadlineNanoseconds: 1_000_000_000)
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration(
+        maxFrameLength: 4096, maxConnectAttempts: 1, handshakeDeadlineNanoseconds: 1_000_000_000
     )
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: server.socketPath, configuration: configuration)
 
     do {
-        _ = try await client.request(.statfs(PfsStatfsRequest()))
+        _ = try await client.resolve(attachRef: "mock")
         Issue.record("expected oversized frame to fail")
     } catch let error as PfsLocalClientError {
         #expect(error == .frameTooLarge(length: 4097, max: 4096))
@@ -489,39 +563,55 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 }
 
 @Test func requestTimesOutAndClearsPendingEntry() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(lookupNoReplyNames: ["hung"]))
+    let daemon = try PfsLocalMockDaemon(configuration: .init(
+        requestDeadlineMilliseconds: 50
+    ))
     defer { daemon.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(requestDeadlineNanoseconds: 50_000_000)
-    )
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: daemon.socketPath, configuration: configuration)
     let resolved = try await client.resolve(attachRef: "mock")
+
+    let heldReply = PfsTestHeldReply()
+    await daemon.holdNextReply { await heldReply.hold($0) }
 
     var request = PfsLookupRequest()
     request.dir = resolved.root
     request.name = transportBytes("hung")
 
+    let lookup = Task { try await client.request(.lookup(request)) }
+    let reply = await heldReply.waitUntilHeld()
+    #expect(await client.testingPendingRequestCount() == 1)
+    #expect(try await deadlines.expire(reply.requestID) == 50_000_000)
+    let outcome = await lookup.result
+    await heldReply.release()
+
     do {
-        _ = try await client.request(.lookup(request))
+        _ = try outcome.get()
         Issue.record("expected lookup timeout")
     } catch let error as PfsLocalClientError {
         #expect(error == .timeout)
     }
 
     #expect(await client.testingPendingRequestCount() == 0)
+    // The late reply and this per-request timeout leave the session usable.
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
 @Test func requestCancellationResumesPromptlyAndClearsPendingEntry() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(lookupNoReplyNames: ["hung"]))
+    let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(requestDeadlineNanoseconds: 5_000_000_000)
-    )
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: daemon.socketPath, configuration: configuration)
     let resolved = try await client.resolve(attachRef: "mock")
 
+    let heldReply = PfsTestHeldReply()
+    await daemon.holdNextReply { await heldReply.hold($0) }
     var request = PfsLookupRequest()
     request.dir = resolved.root
     request.name = transportBytes("hung")
@@ -529,44 +619,36 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     let lookup = Task {
         try await client.request(.lookup(request))
     }
-    try await Task.sleep(nanoseconds: 20_000_000)
-    let started = ContinuousClock.now
+    _ = await heldReply.waitUntilHeld()
+    #expect(await client.testingPendingRequestCount() == 1)
     lookup.cancel()
 
+    // Cancellation must complete while both the reply and deadline are held.
+    let outcome = await lookup.result
+    await heldReply.release()
+
     do {
-        _ = try await lookup.value
+        _ = try outcome.get()
         Issue.record("expected cancellation")
     } catch let error as PfsLocalClientError {
         #expect(error == .cancelled)
     }
 
-    #expect(started.duration(to: .now) < .milliseconds(250))
     #expect(await client.testingPendingRequestCount() == 0)
 }
 
 /// FSKit cancels one operation's task when its initiating process is
 /// interrupted or dies mid-syscall — a burst of short-lived processes (`git
 /// init` copying hook templates) produces this routinely. The cost must be
-/// exactly one operation. The old behavior closed the whole connection, which
-/// stranded every other in-flight operation's publication, made the daemon
-/// treat the disconnect as a kernel-coherence failure, and turned one
-/// interrupted process into a permanently fenced mount.
-@Test func requestCancellationLeavesTheStrictConnectionAndItsPublicationsIntact() async throws {
-    var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 7
-    contract.authorityEpoch = Data(repeating: 0xE1, count: 16)
-    contract.sessionID = Data(repeating: 0x51, count: 16)
-    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
-    contract.repairBudgetMillis = 2_500
+/// exactly one operation: closing the bound connection would strand every
+/// other in-flight operation's publication and end the whole session.
+@Test func requestCancellationLeavesTheBoundConnectionAndItsPublicationsIntact() async throws {
     let daemon = try PfsLocalMockDaemon(
-        configuration: .init(lookupNoReplyNames: ["hung"], v3Coherence: contract)
+        configuration: .init(lookupNoReplyNames: ["hung"])
     )
     defer { daemon.stop() }
 
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(requestDeadlineNanoseconds: 5_000_000_000)
-    )
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
     let resolved = try await client.resolve(attachRef: "mock")
 
     let hung = Task {
@@ -598,8 +680,8 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     }
     #expect(acks == 1)
 
-    // A strict-v3 client never transparently reconnects, so a follow-up
-    // request that reaches the daemon proves the exact connection survived.
+    // A bound client never reconnects, so a follow-up request that reaches
+    // the daemon proves the exact connection survived.
     var followUp = PfsLookupRequest()
     followUp.dir = resolved.root
     followUp.name = transportBytes("present-after-cancel")
@@ -607,7 +689,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
         _ = try await client.request(.lookup(followUp))
     } catch let error as PfsLocalClientError {
         guard case .daemon = error else {
-            Issue.record("the strict connection did not survive a single cancelled request: \(error)")
+            Issue.record("the bound connection did not survive a single cancelled request: \(error)")
             return
         }
     }
@@ -650,23 +732,17 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     #expect(await daemon.stats().writeRequests == 1)
 }
 
-/// A daemon-derived hard deadline is the point at which the exact mutation
-/// outcome is no longer recoverable. That is terminal for a strict mount: the
-/// client returns EIO and closes the participant instead of exposing a
-/// retryable timeout while the daemon may still apply the request.
-@Test func dispatchedMutationTimeoutTerminatesStrictMountAsUncertain() async throws {
-    var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 7
-    contract.authorityEpoch = Data(repeating: 0xE3, count: 16)
-    contract.sessionID = Data(repeating: 0x53, count: 16)
-    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
-    contract.repairBudgetMillis = 2_500
-    let daemon = try PfsLocalMockDaemon(configuration: .init(v3Coherence: contract))
+/// The daemon's request deadline is the point at which the exact mutation
+/// outcome is no longer recoverable. That ends the session: the client
+/// returns EIO and closes its connection instead of exposing a retryable
+/// timeout while the daemon may still apply the request.
+@Test func dispatchedMutationTimeoutEndsTheSessionAsUncertain() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(requestDeadlineMilliseconds: 20))
     defer { daemon.stop() }
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(requestDeadlineNanoseconds: 20_000_000)
-    )
+    let deadlines = PfsTestRequestDeadlines()
+    var configuration = PfsLocalClient.Configuration()
+    configuration.requestDeadlineSleep = { try await deadlines.sleep(requestID: $0, nanoseconds: $1) }
+    let client = PfsLocalClient(socketPath: daemon.socketPath, configuration: configuration)
     let resolved = try await client.resolve(attachRef: "mock")
 
     var create = PfsCreateRequest()
@@ -682,15 +758,29 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
         return
     }
 
-    await daemon.delayNextWrite(nanoseconds: 100_000_000)
+    let heldReply = PfsTestHeldReply()
+    await daemon.holdNextReply { await heldReply.hold($0) }
     var write = PfsWriteRequest()
     write.handle = createReply.handle
     write.data = Data("late".utf8)
-    do {
-        _ = try await client.withPublicationBoundary {
+    let mutation = Task {
+        try await client.withPublicationBoundary {
             try await client.request(.write(write))
         }
-        Issue.record("expected the strict mutation deadline to terminate the mount")
+    }
+    let reply = await heldReply.waitUntilHeld()
+    // The daemon has applied the mutation, but its exact outcome remains
+    // withheld. Expiry cannot race Resolve, CREATE, dispatch or reply delivery.
+    #expect(reply.publicationAckRequired)
+    #expect(reply.writeReply.written == 4)
+    #expect(await daemon.stats().writeRequests == 1)
+    #expect(await client.testingPendingRequestCount() == 1)
+    #expect(try await deadlines.expire(reply.requestID) == 20_000_000)
+    let outcome = await mutation.result
+    await heldReply.release()
+    do {
+        _ = try outcome.get()
+        Issue.record("expected the mutation deadline to end the session")
     } catch let error as PfsLocalClientError {
         #expect(error.posixErrno == EIO)
         guard case .system(errno: ETIMEDOUT, operation: "ordered mutation outcome deadline") = error else {
@@ -701,9 +791,9 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
     #expect(await client.testingPendingRequestCount() == 0)
     do {
         _ = try await client.request(.statfs(PfsStatfsRequest()))
-        Issue.record("strict client reconnected after an uncertain mutation")
+        Issue.record("client reconnected after an uncertain mutation")
     } catch let error as PfsLocalClientError {
-        #expect(error == .connectionClosed)
+        #expect(error == .system(errno: ETIMEDOUT, operation: "ordered mutation outcome deadline"))
     }
 }
 
@@ -711,24 +801,15 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// lane; its operation's acknowledgement travels the priority publication
 /// lane, which the writer dequeues first. An immediate cancellation once let
 /// the acknowledgement reach the daemon before the request that creates the
-/// operation, and the daemon rightly closed the whole strict connection. The
-/// mock daemon now keeps the real reader's obligation ledger, so any
-/// recurrence kills the connection and fails the follow-up below.
+/// operation, and the daemon rightly closed the whole connection. The mock
+/// daemon keeps the real reader's obligation ledger, so any recurrence kills
+/// the connection and fails the follow-up below.
 @Test func immediateCancellationNeverLetsTheAckOvertakeItsRequest() async throws {
-    var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 7
-    contract.authorityEpoch = Data(repeating: 0xE2, count: 16)
-    contract.sessionID = Data(repeating: 0x52, count: 16)
-    contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
-    contract.repairBudgetMillis = 2_500
     let daemon = try PfsLocalMockDaemon(
-        configuration: .init(lookupNoReplyNames: ["hung"], v3Coherence: contract)
+        configuration: .init(lookupNoReplyNames: ["hung"])
     )
     defer { daemon.stop() }
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(requestDeadlineNanoseconds: 5_000_000_000)
-    )
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
     let resolved = try await client.resolve(attachRef: "mock")
 
     for _ in 0..<25 {
@@ -744,7 +825,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
         _ = try? await hung.value
     }
     // Give the boundary acknowledgements time to drain through the daemon's
-    // ledger before the liveness probe.
+    // ledger before the follow-up probe.
     try await Task.sleep(nanoseconds: 100_000_000)
 
     var followUp = PfsLookupRequest()
@@ -754,143 +835,10 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
         _ = try await client.request(.lookup(followUp))
     } catch let error as PfsLocalClientError {
         guard case .daemon = error else {
-            Issue.record("an immediately-cancelled request cost the strict connection: \(error)")
+            Issue.record("an immediately-cancelled request cost the bound connection: \(error)")
             return
         }
     }
-}
-
-@Test func eventsAreResubscribedAfterReconnect() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let core = try await VolumeCore.connect(
-        socketPath: daemon.socketPath,
-        attachRef: "mock",
-        configuration: .init(maxReconnectAttempts: 10, reconnectBaseDelayNanoseconds: 5_000_000)
-    )
-    let root = try await core.rootItem()
-    _ = try await core.createFile(in: root, name: transportBytes("after"), mode: 0o644)
-    let stream = try await core.subscribeEvents()
-
-    daemon.dropConnections()
-    do {
-        _ = try await core.lookup(in: root, name: transportBytes("after"))
-    } catch {}
-    _ = try await core.lookup(in: root, name: transportBytes("after"))
-
-    let rootIdentity = await daemon.rootIdentity()
-    daemon.emitInvalidation(item: rootIdentity.proto, contentVersion: 9)
-
-    let event = try await nextEvent(from: stream)
-    guard case let .invalidation(invalidation)? = event.kind else {
-        Issue.record("expected invalidation event")
-        return
-    }
-    #expect(invalidation.contentVersion == 9)
-}
-
-@Test func deferredPublicationOperationCannotSpanReplacementConnections() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(
-            maxReconnectAttempts: 10,
-            reconnectBaseDelayNanoseconds: 5_000_000
-        )
-    )
-    let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-
-    let (result, complete) = await client.withDeferredPublication {
-        _ = try await client.request(.getAttr(getattr))
-        daemon.dropConnections()
-
-        // Let the reader retire connection A before issuing the second
-        // ack-producing request on connection B.
-        try await Task.sleep(nanoseconds: 20_000_000)
-        _ = try await client.request(.getAttr(getattr))
-    }
-    do {
-        try result.get()
-        Issue.record("expected a multi-request publication operation to fail across reconnect")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .connectionClosed)
-    }
-    await complete(false)
-
-    var stats = await daemon.stats()
-    #expect(stats.publicationAcks == 0)
-
-    // A fresh logical operation uses connection B normally. The stale ticket
-    // from A is never replayed onto it.
-    _ = try await client.request(.getAttr(getattr))
-    let deadline = ContinuousClock.now + .seconds(1)
-    while stats.publicationAcks < 1, ContinuousClock.now < deadline {
-        try await Task.sleep(for: .milliseconds(5))
-        stats = await daemon.stats()
-    }
-    #expect(stats.publicationAcks == 1)
-    _ = try await client.request(.statfs(PfsStatfsRequest()))
-}
-
-@Test func deferredPublicationNonpublishingContinuationCannotSpanReplacementConnections() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(
-            maxReconnectAttempts: 10,
-            reconnectBaseDelayNanoseconds: 5_000_000
-        )
-    )
-    let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-
-    let (result, complete) = await client.withDeferredPublication {
-        _ = try await client.request(.getAttr(getattr))
-        daemon.dropConnections()
-
-        // Establish replacement connection B from a detached task, which
-        // intentionally does not inherit this callback's task-local
-        // publication collector.
-        try await Task.detached {
-            var lastError: Error = PfsLocalClientError.connectionClosed
-            for _ in 0..<20 {
-                do {
-                    _ = try await client.request(.statfs(PfsStatfsRequest()))
-                    return
-                } catch {
-                    lastError = error
-                    try await Task.sleep(for: .milliseconds(5))
-                }
-            }
-            throw lastError
-        }.value
-
-        // A nonpublishing continuation still belongs to the publication
-        // operation bound to A and must not be issued with operation ID zero
-        // on B.
-        _ = try await client.request(.statfs(PfsStatfsRequest()))
-    }
-    do {
-        try result.get()
-        Issue.record("expected a nonpublishing continuation to fail across reconnect")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .connectionClosed)
-    }
-    await complete(false)
-
-    let stats = await daemon.stats()
-    #expect(stats.publicationAcks == 0)
-
-    // The replacement connection remains healthy for a new logical operation.
-    _ = try await client.request(.statfs(PfsStatfsRequest()))
 }
 
 private func waitForTransportPublicationAcks(
@@ -989,176 +937,292 @@ private func settledAckBaseline(
     #expect(stats.notPublishedPublicationAcks == 1)
 }
 
-/// A retraction is answered by REISSUING the operation, below userspace.
-///
-/// The retraction contract itself is unchanged — the crossed attempt's values
-/// are never handed back — but the frontend no longer surfaces that as EINTR
-/// and hope the kernel restarts the syscall. FSKit on macOS 26 does not restart
-/// rmdir(2), so the EINTR reached the application. The extension runs the
-/// operation again instead, and only the surviving attempt's values are
-/// returned.
-@Test func retractedDeferredPublicationIsReissuedAndBothAttemptsAcknowledged() async throws {
-    let daemon = try PfsLocalMockDaemon()
+/// pfslocal 2.0 is an exact grammar. A reply carrying a field this build does
+/// not know (here the deleted publication-retraction bit) is a frame defect:
+/// no value it carried reaches the caller, every other request in flight fails
+/// with the same defect, and the session ends without reconnecting.
+@Test func unknownEnvelopeFieldIsAFrameDefectThatEndsTheSession() async throws {
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(lookupNoReplyNames: ["parked"])
+    )
     defer { daemon.stop() }
 
     let client = PfsLocalClient(socketPath: daemon.socketPath)
     let resolved = try await client.resolve(attachRef: "mock")
+    let baseline = try await settledAckBaseline(daemon, owed: 0)
+    let baselineGetattrs = await daemon.stats().getAttrRequests
+
+    var parkedLookup = PfsLookupRequest()
+    parkedLookup.dir = resolved.root
+    parkedLookup.name = transportBytes("parked")
+    let parked = Task {
+        try await client.request(.lookup(parkedLookup))
+    }
+    for _ in 0..<1_000 {
+        if await daemon.stats().lookupRequests == 1 { break }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    #expect(await daemon.stats().lookupRequests == 1)
+
+    await daemon.transformNextReply { envelope in
+        guard case .getAttrReply? = envelope.body else { return nil }
+        return appendingUnknownEnvelopeField(envelope)
+    }
     var getattr = PfsGetAttrRequest()
     getattr.item = resolved.root
-
-    // Nothing before this point publishes, so no ack can be in flight — but
-    // say so exactly rather than assuming it.
-    let baseline = try await settledAckBaseline(daemon, owed: 0)
-    await daemon.retractNextPublications()
-
     let (result, complete) = await client.withDeferredPublication {
         try await client.request(.getAttr(getattr))
     }
-    // The reissue converged, so the caller gets a value rather than an errno.
-    _ = try result.get()
+    do {
+        _ = try result.get()
+        Issue.record("a reply with an unknown field delivered its values")
+    } catch let error as PfsLocalClientError {
+        guard case .invalidFrame = error else {
+            Issue.record("expected a frame defect, got \(error)")
+            return
+        }
+    }
+    await complete(false)
+    #expect(await daemon.stats().getAttrRequests == baselineGetattrs + 1)
 
-    // The daemon's handoff gate is released for EVERY attempt: retraction is
-    // about what the FRAMEWORK installs, not about the daemon's bookkeeping.
-    // The retracted attempt's ack was sent before the reissue began, so the
-    // reissue could not queue behind the handoff waiting for it.
-    await complete(true)
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
-    #expect(stats.publicationAcks == baseline + 2)
+    do {
+        _ = try await parked.value
+        Issue.record("a request on the retired connection completed")
+    } catch let error as PfsLocalClientError {
+        guard case .invalidFrame = error else {
+            Issue.record("expected the parked request to fail with the defect, got \(error)")
+            return
+        }
+    }
+    // The client is terminal: a later request reports the same defect
+    // without connecting again.
+    let hellosBeforeFollowUp = await daemon.stats().helloRequests
+    do {
+        _ = try await client.request(.statfs(PfsStatfsRequest()))
+        Issue.record("a terminal client sent another request")
+    } catch let error as PfsLocalClientError {
+        guard case .invalidFrame = error else {
+            Issue.record("expected the original defect after termination, got \(error)")
+            return
+        }
+    }
+    #expect(await daemon.stats().helloRequests == hellosBeforeFollowUp)
+    #expect(await daemon.stats().getAttrRequests == baselineGetattrs + 1)
+    #expect(await daemon.stats().publicationAcks == baseline)
+}
 
-    // The connection is unaffected — a retraction is the daemon speaking on a
-    // healthy connection, not a transport failure.
+/// Unknown fields are refused at every depth, not only on the envelope. A
+/// nested deleted field (the old Capabilities.symlinks boolean) inside an
+/// otherwise valid ResolveReply is as foreign as a top-level one.
+@Test func nestedUnknownFieldIsAFrameDefect() throws {
+    var capabilities = try PfsCapabilities(serializedBytes: Data([0x08, 0x01]))
+    capabilities.maxNameBytes = 255
+    var reply = PfsResolveReply()
+    reply.capabilities = capabilities
+    var envelope = PfsEnvelope()
+    envelope.requestID = 2
+    envelope.body = .resolveReply(reply)
+    let frame = try PfsFrameCodec().encode(envelope)
+
+    var decoder = PfsFrameDecoder()
+    #expect(throws: PfsLocalClientError.invalidFrame("envelope carries a field outside pfslocal 2.0")) {
+        _ = try decoder.append(frame)
+    }
+
+    var clean = envelope
+    clean.resolveReply.capabilities = {
+        var known = PfsCapabilities()
+        known.maxNameBytes = 255
+        return known
+    }()
+    var cleanDecoder = PfsFrameDecoder()
+    #expect(try cleanDecoder.append(try PfsFrameCodec().encode(clean)) == [clean])
+}
+
+/// Every client is pre-Resolve when it first connects, so a protocol defect
+/// during Hello must be terminal on its own terms. Connection backoff exists
+/// for failures to reach the daemon, not for a peer's malformed answer:
+/// retrying would consume the defect and hide it behind a later success.
+@Test func protocolDefectDuringHelloIsTerminalAndNeverRetried() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    await daemon.transformNextReply { envelope in
+        guard case .helloReply? = envelope.body else { return nil }
+        return appendingUnknownEnvelopeField(envelope)
+    }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxConnectAttempts: 5, connectRetryBaseDelayNanoseconds: 1_000_000)
+    )
+
+    for _ in 0..<2 {
+        do {
+            _ = try await client.resolve(attachRef: "mock")
+            Issue.record("a client resolved after a defective HelloReply")
+        } catch let error as PfsLocalClientError {
+            guard case .invalidFrame = error else {
+                Issue.record("expected the original frame defect, got \(error)")
+                return
+            }
+        }
+    }
+    #expect(await daemon.stats().helloRequests == 1)
+}
+
+/// pfslocal is paired by exact major and minor. Any other HelloReply version
+/// is the daemon's definite answer, not a connection failure, so it surfaces
+/// after exactly one handshake, in either number and in either direction.
+@Test func helloVersionMismatchIsNotRetried() async throws {
+    for (major, minor) in [(UInt32(2), UInt32(1)), (1, 0), (3, 0)] {
+        let daemon = try PfsLocalMockDaemon()
+        defer { daemon.stop() }
+        await daemon.transformNextReply { envelope in
+            guard case var .helloReply(reply)? = envelope.body else { return nil }
+            reply.protocolMajor = major
+            reply.protocolMinor = minor
+            var changed = envelope
+            changed.body = .helloReply(reply)
+            return changed
+        }
+        let client = PfsLocalClient(
+            socketPath: daemon.socketPath,
+            configuration: .init(maxConnectAttempts: 5, connectRetryBaseDelayNanoseconds: 1_000_000)
+        )
+        await #expect(throws: PfsLocalClientError.protocolMismatch(major: major, minor: minor)) {
+            _ = try await client.resolve(attachRef: "mock")
+        }
+        #expect(await daemon.stats().helloRequests == 1)
+    }
+}
+
+/// The request deadline is required and positive. A zero has no meaning and
+/// no local default replaces it: the handshake fails as a protocol defect.
+@Test func helloReplyWithoutItsDeadlineIsAProtocolDefect() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    await daemon.transformNextReply { envelope in
+        guard case var .helloReply(reply)? = envelope.body else { return nil }
+        reply.requestDeadlineMs = 0
+        var changed = envelope
+        changed.body = .helloReply(reply)
+        return changed
+    }
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxConnectAttempts: 5, connectRetryBaseDelayNanoseconds: 1_000_000)
+    )
+    await #expect(throws: PfsLocalClientError.invalidFrame("HelloReply omitted its required request deadline")) {
+        _ = try await client.resolve(attachRef: "mock")
+    }
+    #expect(await daemon.stats().helloRequests == 1)
+}
+
+/// Every filesystem request and the event binding follow the one Resolve.
+/// The client refuses them locally before sending anything, and a connection
+/// resolves exactly once.
+@Test func requestsBeforeResolveAndASecondResolveAreRefusedLocally() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+
+    await #expect(throws: PfsLocalClientError.unresolved) {
+        _ = try await client.request(.statfs(PfsStatfsRequest()))
+    }
+    await #expect(throws: PfsLocalClientError.unresolved) {
+        _ = try await client.subscribeEvents()
+    }
+    #expect(await daemon.stats().helloRequests == 1)
+
+    // A refused Resolve leaves the connection unbound and may be retried.
+    await #expect(throws: PfsLocalClientError.daemon(errno: ENOENT, message: "unknown attachRef")) {
+        _ = try await client.resolve(attachRef: "not-this-attach")
+    }
+    let resolved = try await client.resolve(attachRef: "mock")
+    #expect(resolved.root.itemID == 1)
+    do {
+        _ = try await client.resolve(attachRef: "mock")
+        Issue.record("a bound connection resolved a second time")
+    } catch let error as PfsLocalClientError {
+        guard case .unexpectedReply = error else {
+            Issue.record("unexpected second-resolve refusal: \(error)")
+            return
+        }
+    }
     _ = try await client.request(.statfs(PfsStatfsRequest()))
+    #expect(await daemon.stats().helloRequests == 1)
 }
 
-@Test func retractedPublicationBoundaryIsReissuedAndBothAttemptsAcknowledged() async throws {
-    let daemon = try PfsLocalMockDaemon()
+/// Resolve binds the connection to one attach incarnation. Losing it ends
+/// the session: in-flight requests fail, the event stream finishes, and no
+/// later request reconnects or re-resolves into a successor.
+@Test func boundSessionLossIsTerminalWithoutReconnect() async throws {
+    let daemon = try PfsLocalMockDaemon(configuration: .init(lookupNoReplyNames: ["parked"]))
     defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let client = PfsLocalClient(
+        socketPath: daemon.socketPath,
+        configuration: .init(maxConnectAttempts: 10, connectRetryBaseDelayNanoseconds: 1_000_000)
+    )
     let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-
-    // Nothing before this point publishes, so no ack can be in flight — but
-    // say so exactly rather than assuming it.
-    let baseline = try await settledAckBaseline(daemon, owed: 0)
-    await daemon.retractNextPublications()
-
-    _ = try await client.withPublicationBoundary {
-        try await client.request(.getAttr(getattr))
+    let events = try await client.subscribeEvents()
+    let streamEnded = Task {
+        for await _ in events {}
+        return true
     }
-
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
-    #expect(stats.publicationAcks == baseline + 2)
-}
-
-/// A retraction condemns the whole logical operation, not just the reply that
-/// carried the bit. The framework installs a callback's result as one unit, so
-/// an earlier reply that was individually fine cannot be published on its own.
-///
-/// Here EVERY attempt is retracted, which is what makes the two halves of the
-/// contract visible at once: the reissue is bounded, and a retraction that
-/// never stops still reaches the caller as one verdict for the operation rather
-/// than as an incidental per-request errno.
-@Test func retractionOnLaterReplyCondemnsTheWholeOperationAndReissueIsBounded() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-
-    // Nothing before this point publishes, so no ack can be in flight — but
-    // say so exactly rather than assuming it.
-    let baseline = try await settledAckBaseline(daemon, owed: 0)
-
-    let (result, complete) = await client.withDeferredPublication {
-        _ = try await client.request(.getAttr(getattr))
-        // The handoff crosses here: the first reply is already in hand and
-        // uncondemned, and only the parked continuation carries the verdict.
-        // Re-arming on every attempt models a mount that keeps crossing.
-        await daemon.retractNextPublications()
-        return try await client.request(.getAttr(getattr))
-    }
-    do {
-        _ = try result.get()
-        Issue.record("expected a late retraction to condemn the whole operation")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .publicationRetracted)
-    }
-
-    await complete(false)
-    // Both requests of an attempt share one operation ID, so each ATTEMPT owes
-    // exactly one acknowledgement — and every attempt made is acknowledged.
-    let attempts = PfsLocalClient.publicationRetractionReissueLimit
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + attempts)
-    #expect(stats.publicationAcks == baseline + attempts)
-}
-
-@Test func retractionCarriedOnRefusedRequestWithholdsValuesAndLeavesNoMutation() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-
-    var create = PfsCreateRequest()
-    create.dir = resolved.root
-    create.name = transportBytes("doomed")
-    create.mode = 0o644
-    _ = try await client.request(.create(create))
-
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-    var remove = PfsRemoveRequest()
-    remove.dir = resolved.root
-    remove.name = transportBytes("doomed")
-
-    // `create` is itself a publishing operation and owes an ack of its own,
-    // which may still be in flight at this point.
-    let baseline = try await settledAckBaseline(daemon, owed: 1)
-
-    let (result, complete) = await client.withDeferredPublication {
-        // A first reply binds the operation and arrives uncondemned.
-        _ = try await client.request(.getAttr(getattr))
-        // The handoff crosses. The unlink is the parked request, and the
-        // daemon answers it without executing it.
-        await daemon.refuseNextPublicationsAsRetracted()
-        return try await client.request(.remove(remove))
-    }
-    do {
-        _ = try result.get()
-        Issue.record("expected a refused-and-retracted operation to withhold its result")
-    } catch let error as PfsLocalClientError {
-        // The collector's verdict wins over the refusal's own errno, so the
-        // caller sees one retraction for the operation. Re-arming the refusal
-        // on every attempt means the reissue can never converge, so the bound
-        // is what ends it — and this is the ONLY way the caller sees a
-        // retraction at all now.
-        #expect(error == .publicationRetracted)
-        #expect(error.posixErrno == EINTR)
-    }
-    await complete(false)
-
-    // Every attempt is acknowledged; none of them mutated anything.
-    let attempts = PfsLocalClient.publicationRetractionReissueLimit
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + attempts)
-    #expect(stats.publicationAcks == baseline + attempts)
-
-    // The name is still there: the refusal executed no mutation, so the
-    // retried syscall will find exactly the state it started from.
     var lookup = PfsLookupRequest()
     lookup.dir = resolved.root
-    lookup.name = transportBytes("doomed")
-    let survivor = try await client.request(.lookup(lookup))
-    guard case .lookupReply? = survivor.body else {
-        Issue.record("expected the retracted unlink to have left its target in place")
-        return
+    lookup.name = transportBytes("parked")
+    let parked = Task { try await client.request(.lookup(lookup)) }
+    for _ in 0..<1_000 {
+        if await daemon.stats().lookupRequests == 1 { break }
+        try await Task.sleep(nanoseconds: 1_000_000)
     }
+
+    daemon.dropConnections()
+    await #expect(throws: PfsLocalClientError.self) { _ = try await parked.value }
+    #expect(await streamEnded.value)
+    for _ in 0..<3 {
+        await #expect(throws: PfsLocalClientError.connectionClosed) {
+            _ = try await client.request(.statfs(PfsStatfsRequest()))
+        }
+        await #expect(throws: PfsLocalClientError.connectionClosed) {
+            _ = try await client.resolve(attachRef: "mock")
+        }
+    }
+    #expect(await daemon.stats().helloRequests == 1)
+    #expect(await client.isDetachingOrStopped)
 }
 
-@Test func unretractedPublicationOperationDeliversValuesAndAcknowledges() async throws {
+/// The event binding is established once on the bound connection and its
+/// stream carries attach state in order.
+@Test func eventBindingIsSingleAndDeliversAttachStateInOrder() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    _ = try await client.resolve(attachRef: "mock")
+    let events = try await client.subscribeEvents()
+    do {
+        _ = try await client.subscribeEvents()
+        Issue.record("a connection accepted a second event binding")
+    } catch let error as PfsLocalClientError {
+        guard case .unexpectedReply = error else {
+            Issue.record("unexpected second-subscribe refusal: \(error)")
+            return
+        }
+    }
+    #expect(await daemon.stats().subscribeRequests == 1)
+
+    daemon.emitAttachState(.attached, detail: "first")
+    daemon.emitAttachState(.degraded, detail: "second")
+    var details: [String] = []
+    for await event in events {
+        guard case let .attachState(state)? = event.kind else { continue }
+        details.append(state.detail)
+        if details.count == 2 { break }
+    }
+    #expect(details == ["first", "second"])
+}
+
+@Test func publicationOperationDeliversValuesAndAcknowledgesOnce() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
 
@@ -1191,29 +1255,6 @@ private func settledAckBaseline(
     }
     let afterBoundary = try await waitForTransportPublicationAcks(daemon, atLeast: baseline + 2)
     #expect(afterBoundary.publicationAcks == baseline + 2)
-}
-
-private func nextEvent(from stream: AsyncStream<PfsEvent>) async throws -> PfsEvent {
-    try await withThrowingTaskGroup(of: PfsEvent?.self) { group in
-        group.addTask {
-            for await event in stream {
-                return event
-            }
-            return nil
-        }
-        group.addTask {
-            try await Task.sleep(nanoseconds: 1_000_000_000)
-            return nil
-        }
-        guard let result = try await group.next() else {
-            throw PfsLocalClientError.timeout
-        }
-        group.cancelAll()
-        guard let event = result else {
-            throw PfsLocalClientError.timeout
-        }
-        return event
-    }
 }
 
 private final class PfsRawServer: @unchecked Sendable {

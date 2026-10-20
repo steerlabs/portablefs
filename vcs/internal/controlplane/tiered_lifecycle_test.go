@@ -46,7 +46,7 @@ func TestArchiveReleaseAndCrossCellWakeLifecycle(t *testing.T) {
 		t.Fatalf("ArchiveVolume = %+v, %v", archiving, err)
 	}
 	plan := verifiedPlan(t, h.manager, first.ID, *h.now)
-	if plan.Version != 2 || plan.Volumes[0].Phase != cellplan.PhaseArchive || plan.Volumes[0].ArchiveTo == nil {
+	if plan.Version != cellplan.Version || plan.Volumes[0].Phase != cellplan.PhaseArchive || plan.Volumes[0].ArchiveTo == nil {
 		t.Fatalf("archive plan = %+v", plan)
 	}
 	observeTieredVolume(t, h, first.ID, "quiesced", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: archiving.AuthorityEpoch,

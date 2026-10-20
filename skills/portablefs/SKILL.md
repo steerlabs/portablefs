@@ -16,11 +16,17 @@ Everything you need is the `portablefs` CLI and this file. Every command accepts
 
 - **Volume.** One workspace. It is one XFS directory on one Linux host, served by
   one authority process. That directory is the truth.
-- **Authority.** The process that owns the volume. Every read and write goes
-  through it. It applies your bytes to the real filesystem before your `write(2)`
-  returns, so nothing you have written is stuck in a buffer somewhere.
-- **Mount.** One machine's live view of a volume. Several mounts can be live at
-  once, on different machines, and they see one filesystem.
+- **Authority.** The process that owns the volume. Every namespace change
+  (create, rename, unlink, mkdir) is applied there before it returns. File data
+  can be accepted earlier: on Linux an uncontended writer's bytes may wait in a
+  bounded daemon buffer until `fsync`, a peer read, or unmount flushes them, and
+  on macOS `write(2)` returns at kernel page-cache acceptance, as on a local
+  disk.
+- **Mount.** One machine's live view of a volume. Several Linux mounts can be
+  live at once, on different machines, and they see one filesystem. A macOS
+  mount is the volume's only writer while it is mounted: Linux mounts keep
+  reading, their writes fail with `EBUSY` until the Mac unmounts, and a second
+  Mac cannot mount the same volume.
 - **Machine-local routes.** Directories the volume declares as per-machine —
   typically `node_modules`, `.venv`, `target`. They are served from local disk and
   never travel. The declaration belongs to the volume, not to your machine.
@@ -51,9 +57,10 @@ key must be `chmod 600`.
 The command daemonizes and returns; the mount persists. `--foreground` keeps it
 attached and unmounts on interrupt.
 
-The capability is **single-use and never renewed**. When it ends, the mount ends.
-Mounting again with a fresh capability is what re-establishes it; there is
-nothing to refresh.
+The capability is **single-use**: it authorizes one attach. When the mount's
+authorization ends, the mount ends, and mounting again with a fresh capability
+re-establishes it. Hosted mounts can instead rotate a live mount's authorization
+in place with `portablefs reauthorize`.
 
 Then just use the directory. Read, write, create, rename, lock. It is a
 filesystem.
@@ -62,10 +69,12 @@ filesystem.
 portablefs umount ~/work --json
 ```
 
-A normal unmount runs the full drain barrier and fails, leaving the mount
-attached, if the drain cannot complete. `--force` skips the proof rather than
-abandoning data: a mount holds no local durability debt, because every
-acknowledged write is already applied at the authority. Use `--force` when the
+A normal unmount runs the full drain barrier and makes one ordinary unmount
+attempt. If the drain cannot complete, or something still holds the mount open
+(a shell's working directory, an open file, Finder or Spotlight on macOS), it
+fails with the real error, such as `EBUSY`, and leaves the mount attached.
+`--force` detaches without that drain, so writes still buffered in the local
+page cache or a delegated write buffer can be lost. Use `--force` only when the
 authority is unreachable and you need the mount gone now.
 
 ## The commands that exist
@@ -73,8 +82,10 @@ authority is unreachable and you need the mount gone now.
 | Command | Use it for |
 | --- | --- |
 | `portablefs mount <volumeId> <path>` | Attach a volume on this machine. |
-| `portablefs umount <path>` | Drain and detach. `--force` skips the drain proof. |
+| `portablefs reauthorize` | Rotate a hosted live mount's authorization in place. |
+| `portablefs umount <path>` | Drain and detach. `--force` skips the drain proof. `unmount` is an alias. |
 | `portablefs mounts` | This machine's mounts and their health: live, stale, or credential-expired. |
+| `portablefs mount-loss <path>` | Linux: read the exact writeback loss counter of a live mount. |
 | `portablefs route <path>` | Whether a path is machine-local or shared, and which rule decided. |
 | `portablefs prune-local` | Reclaim machine-local backing no route can reach. Dry-run by default; `--delete` to act. |
 | `portablefs mount-check` | Inspect this host's mount prerequisites. Contacts nothing, changes nothing. |
@@ -111,9 +122,8 @@ you can do to a workspace's speed.
 
 The volume declares which directories are machine-local in `.portablefs/local-dirs`.
 Your mount adopts that declaration when it attaches, and every machine routes
-identically. You cannot override it per machine: `--local-dir` is refused, because
-a per-machine route would hide from you a directory your peers still treat as
-shared.
+identically. There is no per-machine override, because a per-machine route
+would hide from you a directory your peers still treat as shared.
 
 ```bash
 portablefs route ~/work/agent-app/node_modules/react   # machine-local, and why
@@ -146,17 +156,23 @@ identity.
 | Symptom | What it means |
 | --- | --- |
 | `mount` fails naming the credential shape | A required flag is missing. All of `--addr`, `--mount-token`, `--data-plane-transport`, `--data-plane-server-name`, `--client-cert`, `--client-key` are needed. |
-| `mount` refuses `--branch` or `--local-dir` | Those are retired surfaces. A volume is branchless, and routes are declared volume-wide. |
 | `mounts` shows `credential-expired` | The single-use capability ended. Mount again with a fresh one. |
 | `mounts` shows `stale` | The daemon is gone. `portablefs umount <path>` cleans it up. |
 | On macOS, mount fails on the extension | `PortableFS.app` must be installed and its File System Extension enabled once under System Settings. `portablefs mount-check` reports the prerequisite; `portablefs doctor` reports the rest. |
 | Unmount refuses because an intent is stuck | `portablefs umount <path> --discard-record` removes bookkeeping only, and only after proving nothing is mounted and no owner survives. Never edit the mount state directory by hand. |
-| Everything on the mount returns `ENOTCONN` | The mount revoked itself after losing the authority for longer than its repair budget. Remount. |
+| Everything on the mount returns `ENOTCONN` | The mount revoked itself after losing its authority session. Remount. |
+| A write on Linux returns `EBUSY` | A Mac currently mounts the volume and is its only writer. Writes succeed again after the Mac unmounts. |
+| A Mac mount is refused while another Mac has the volume mounted | One Mac writer at a time. Unmount the other Mac first. |
+| `umount` returns `EBUSY` | Something holds the mount open. Close it (including a shell whose working directory is inside) and retry; reach for `--force` only if you accept losing undelivered writes. |
 
 ## Safety notes
 
-- **Acknowledged means applied.** A returned `write(2)` is in the volume. There
-  is no flush window to wait out and no local tail to lose.
+- **A returned `write(2)` is accepted, not yet durable.** It may still sit in
+  the macOS page cache or a Linux delegated write buffer, as on a local disk.
+  Every successful FSKit mutation reply certifies authority-storage durability.
+  Whether `fsync` forces delivery of every dirty page is not yet qualified.
+  [Teardown completion](../../docs/fskit-mount.md#callback-publication-and-local-teardown)
+  certifies only local cleanup.
 - **`close` is not `fsync`.** If you need durability across power loss, `fsync`
   the file and its parent directory, as you would locally.
 - **`syncfs(2)` does not reach the authority** on Linux FUSE. Use file and

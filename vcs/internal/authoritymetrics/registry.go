@@ -1,6 +1,6 @@
 // Package authoritymetrics provides the dependency-free telemetry surface for
 // one PortableFS authority worker. Metric handles are registered once during
-// startup and update atomically; rendering is the only path that walks the
+// startup and update concurrently; rendering is the only path that walks the
 // registry or formats labels.
 package authoritymetrics
 
@@ -140,20 +140,22 @@ func (g *Gauge) writeTo(w io.Writer, name string) error {
 }
 
 // Histogram uses fixed, noncumulative counters internally. Observe performs a
-// bounded linear bucket scan plus atomic updates; scrape-time rendering builds
-// the cumulative Prometheus buckets.
+// bounded linear bucket scan plus two updates under mu. Rendering copies one
+// consistent observation set before building the cumulative Prometheus buckets.
 type Histogram struct {
+	mu      sync.Mutex
 	labels  string
 	bounds  []float64
-	buckets []atomic.Uint64
-	count   atomic.Uint64
-	sum     atomic.Uint64
+	buckets []uint64
+	sum     float64
 }
 
 func (h *Histogram) Observe(value float64) {
 	if h == nil || math.IsNaN(value) {
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	bucket := len(h.bounds)
 	for index, bound := range h.bounds {
 		if value <= bound {
@@ -161,47 +163,31 @@ func (h *Histogram) Observe(value float64) {
 			break
 		}
 	}
-	h.buckets[bucket].Add(1)
-	h.count.Add(1)
-	for {
-		current := h.sum.Load()
-		next := math.Float64bits(math.Float64frombits(current) + value)
-		if h.sum.CompareAndSwap(current, next) {
-			return
-		}
-	}
-}
-
-func (h *Histogram) Count() uint64 {
-	if h == nil {
-		return 0
-	}
-	return h.count.Load()
-}
-
-func (h *Histogram) Sum() float64 {
-	if h == nil {
-		return 0
-	}
-	return math.Float64frombits(h.sum.Load())
+	h.buckets[bucket]++
+	h.sum += value
 }
 
 func (h *Histogram) writeTo(w io.Writer, name string) error {
+	h.mu.Lock()
+	buckets := append([]uint64(nil), h.buckets...)
+	sum := h.sum
+	h.mu.Unlock()
+
 	cumulative := uint64(0)
 	for index, bound := range h.bounds {
-		cumulative += h.buckets[index].Load()
+		cumulative += buckets[index]
 		if _, err := fmt.Fprintf(w, "%s_bucket%s %d\n", name, labelsWith(h.labels, "le", formatFloat(bound)), cumulative); err != nil {
 			return err
 		}
 	}
-	cumulative += h.buckets[len(h.bounds)].Load()
+	cumulative += buckets[len(h.bounds)]
 	if _, err := fmt.Fprintf(w, "%s_bucket%s %d\n", name, labelsWith(h.labels, "le", "+Inf"), cumulative); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w, "%s_sum%s %s\n", name, h.labels, formatFloat(h.Sum())); err != nil {
+	if _, err := fmt.Fprintf(w, "%s_sum%s %s\n", name, h.labels, formatFloat(sum)); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(w, "%s_count%s %d\n", name, h.labels, h.count.Load())
+	_, err := fmt.Fprintf(w, "%s_count%s %d\n", name, h.labels, cumulative)
 	return err
 }
 
@@ -211,7 +197,7 @@ func (r *Registry) RegisterCounter(name, help string, labels ...Label) (*Counter
 		return nil, err
 	}
 	series := &Counter{labels: formatted}
-	if err := r.register(name, help, counterType, nil, key, series); err != nil {
+	if err := r.register(name, help, counterType, nil, []string{key}, series); err != nil {
 		return nil, err
 	}
 	return series, nil
@@ -223,7 +209,7 @@ func (r *Registry) RegisterGauge(name, help string, labels ...Label) (*Gauge, er
 		return nil, err
 	}
 	series := &Gauge{labels: formatted}
-	if err := r.register(name, help, gaugeType, nil, key, series); err != nil {
+	if err := r.register(name, help, gaugeType, nil, []string{key}, series); err != nil {
 		return nil, err
 	}
 	return series, nil
@@ -243,14 +229,14 @@ func (r *Registry) RegisterHistogram(name, help string, bounds []float64, labels
 		return nil, err
 	}
 	ownedBounds := append([]float64(nil), bounds...)
-	series := &Histogram{labels: formatted, bounds: ownedBounds, buckets: make([]atomic.Uint64, len(ownedBounds)+1)}
-	if err := r.register(name, help, histogramType, ownedBounds, key, series); err != nil {
+	series := &Histogram{labels: formatted, bounds: ownedBounds, buckets: make([]uint64, len(ownedBounds)+1)}
+	if err := r.register(name, help, histogramType, ownedBounds, []string{key}, series); err != nil {
 		return nil, err
 	}
 	return series, nil
 }
 
-func (r *Registry) register(name, help string, kind metricType, bounds []float64, key string, series metricSeries) error {
+func (r *Registry) register(name, help string, kind metricType, bounds []float64, keys []string, series metricSeries) error {
 	if r == nil || !validMetricName(name) || help == "" || strings.ContainsAny(help, "\r") {
 		return errors.New("authoritymetrics: metric name and help are required and must be valid")
 	}
@@ -267,10 +253,14 @@ func (r *Registry) register(name, help string, kind metricType, bounds []float64
 	} else if family.help != help || family.typeName != kind || !sameBounds(family.bounds, bounds) {
 		return fmt.Errorf("authoritymetrics: inconsistent registration for %s", name)
 	}
-	if _, duplicate := family.seriesKeys[key]; duplicate {
-		return fmt.Errorf("authoritymetrics: duplicate label set for %s", name)
+	for _, key := range keys {
+		if _, duplicate := family.seriesKeys[key]; duplicate {
+			return fmt.Errorf("authoritymetrics: duplicate label set for %s", name)
+		}
 	}
-	family.seriesKeys[key] = struct{}{}
+	for _, key := range keys {
+		family.seriesKeys[key] = struct{}{}
+	}
 	family.series = append(family.series, series)
 	return nil
 }

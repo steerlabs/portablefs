@@ -4,6 +4,37 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
 vcs_root="$repo_root/vcs"
+version=$(/bin/cat "$repo_root/VERSION")
+if [ "${MARKETING_VERSION:-}" != "$version" ]; then
+  echo "MARKETING_VERSION must match repository VERSION ($version)" >&2
+  exit 1
+fi
+# Target identity selects the CLI contract at build time for every configuration
+# and slice. Signing identity and bundle contents never choose a layout.
+case "${TARGET_NAME:-}" in
+  PortableFSApp)
+    cli_build_tags=
+    if [ "$FULL_PRODUCT_NAME" != PortableFS.app ] ||
+       [ "$EXECUTABLE_NAME" != PortableFS ]; then
+      echo "PortableFSApp must build the production PortableFS.app identity" >&2
+      exit 1
+    fi
+    ;;
+  PortableFSKitDev)
+    cli_build_tags=portablefs_devhost
+    if [ "$PRODUCT_BUNDLE_IDENTIFIER" != dev.portablefs.oss.KitDev ] ||
+       [ "$FULL_PRODUCT_NAME" != PortableFSKitDev.app ] ||
+       [ "$EXECUTABLE_NAME" != PortableFSKitDev ] ||
+       [ "$MACOSX_DEPLOYMENT_TARGET" != 26.0 ]; then
+      echo "PortableFSKitDev build identity differs from its compiled CLI contract" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "unsupported PortableFS helper embedding target: ${TARGET_NAME:-<missing>}" >&2
+    exit 1
+    ;;
+esac
 contents_dir="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH"
 helper_dir="$contents_dir/Helpers"
 launch_agents_dir="$contents_dir/Library/LaunchAgents"
@@ -65,19 +96,6 @@ if [ "$actual_go_version" != "$required_go_version" ]; then
   exit 1
 fi
 
-native_qualification=${PORTABLEFS_NATIVE_QUALIFICATION:-}
-qualification_build_tags=
-case "$native_qualification" in
-  "") ;;
-  sdk27-live-qualification-only)
-    qualification_build_tags=portablefs_macos27_qualification
-    ;;
-  *)
-    echo "PORTABLEFS_NATIVE_QUALIFICATION has an unsupported value" >&2
-    exit 1
-    ;;
-esac
-
 : "${PORTABLEFS_APP_GROUP:?PORTABLEFS_APP_GROUP is required to build PortableFS helpers}"
 case "$PORTABLEFS_APP_GROUP" in
   *[!A-Za-z0-9.-]*)
@@ -96,6 +114,10 @@ mkdir -p "$helper_dir" "$service_macos" "$work"
 build_universal() {
   tool=$1
   output=$2
+  build_tags=
+  if [ "$tool" = portablefs ]; then
+    build_tags=$cli_build_tags
+  fi
   set --
   for arch in ${ARCHS:-$(uname -m)}; do
     case "$arch" in
@@ -104,23 +126,14 @@ build_universal() {
       *) echo "unsupported macOS architecture: $arch" >&2; exit 1 ;;
     esac
     binary="$work/$tool-$arch"
-    qualification_ldflag=
-    if [ "$tool" = portablefs ] && [ -n "$native_qualification" ]; then
-      qualification_ldflag=" -X github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli.nativeFSKitPolicyQualification=$native_qualification"
-    fi
     (
       cd "$vcs_root"
       # portablefs uses AppKit's exact-URL NSWorkspace launcher; portablefsd
       # uses Foundation's app-group resolver. Both shipped Darwin helpers
       # therefore require their real cgo platform boundary.
-      if [ -n "$qualification_build_tags" ]; then
-        set -- -tags "$qualification_build_tags"
-      else
-        set --
-      fi
-      GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" "$portablefs_go" build "$@" \
-        -trimpath \
-        -ldflags="-s -w -X main.version=$MARKETING_VERSION -X github.com/steerlabs/portablefs/vcs/internal/fskitidentity.AppGroup=$PORTABLEFS_APP_GROUP$qualification_ldflag" \
+      GOFLAGS= GOTOOLCHAIN=local CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" "$portablefs_go" build \
+        -trimpath -tags "$build_tags" \
+        -ldflags="-s -w -X main.version=$MARKETING_VERSION -X github.com/steerlabs/portablefs/vcs/internal/fskitidentity.AppGroup=$PORTABLEFS_APP_GROUP" \
         -o "$binary" \
         "./cmd/$tool"
     )
@@ -164,6 +177,8 @@ service_info="$service_contents/Info.plist"
 /usr/bin/plutil -insert CFBundleIdentifier -string "$service_bundle_identifier" "$service_info"
 /usr/bin/plutil -insert CFBundleInfoDictionaryVersion -string 6.0 "$service_info"
 /usr/bin/plutil -insert CFBundleName -string PortableFSDService "$service_info"
+/usr/bin/plutil -insert NSLocalNetworkUsageDescription -string "PortableFS connects to filesystem authorities on your local network to mount and access your files." "$service_info"
+/usr/bin/plutil -insert NSNetworkVolumesUsageDescription -string "PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority." "$service_info"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL "$service_info"
 /usr/bin/plutil -insert CFBundleShortVersionString -string "$MARKETING_VERSION" "$service_info"
 /usr/bin/plutil -insert CFBundleVersion -string "$CURRENT_PROJECT_VERSION" "$service_info"

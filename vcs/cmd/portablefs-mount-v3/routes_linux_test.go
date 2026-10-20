@@ -52,17 +52,16 @@ const (
 )
 
 type attachFixture struct {
-	t              *testing.T
-	address        string
-	clientTLS      *tls.Config
-	capability     []byte
-	routes         *authorityrpc.RoutesController
-	attaches       *attachCounter
-	stop           context.CancelFunc
-	served         chan error
-	listener       net.Listener
-	store          *xfsstore.Volume
-	writeAdmission *authorityrpc.WriteAdmission
+	t          *testing.T
+	address    string
+	clientTLS  *tls.Config
+	capability []byte
+	routes     *authorityrpc.RoutesController
+	attaches   *attachCounter
+	stop       context.CancelFunc
+	served     chan error
+	listener   net.Listener
+	store      *xfsstore.Volume
 }
 
 // attachCounter records every attach the authority was asked to perform and how
@@ -134,23 +133,6 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		t.Fatalf("open XFS volume: %v", err)
 	}
 	f.store = store
-	writeAdmissionRoot := volumeRoot + ".write-admission"
-	if err := os.Mkdir(writeAdmissionRoot, 0o700); err != nil {
-		t.Fatalf("create write admission root: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(writeAdmissionRoot) })
-	f.writeAdmission, err = authorityrpc.OpenWriteAdmission(writeAdmissionRoot)
-	if err != nil {
-		t.Fatalf("open write admission root: %v", err)
-	}
-	t.Cleanup(func() {
-		if f.writeAdmission != nil {
-			if err := f.writeAdmission.Close(); err != nil {
-				t.Errorf("close write admission: %v", err)
-			}
-			f.writeAdmission = nil
-		}
-	})
 
 	authority, err := volumeserver.New(attachVolumeID, volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 64, MaxSessions: 8, MaxLockRecords: 1024,
@@ -161,7 +143,6 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: noMembership{},
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
@@ -202,15 +183,8 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		},
 		MaxFrame: 4 << 20, MaxRead: 1 << 20, MaxWrite: 1 << 20, MaxInFlight: 64,
 		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 4096, MaxOpens: 4096,
-		MaxRetainedReplyBytes:         32 << 20,
-		WriteAdmission:                f.writeAdmission,
-		MaxWriteBytesPerSession:       16 << 30,
-		MaxWriteBytesInFlight:         64 << 30,
-		MaxWritesPerSession:           8,
-		MaxWrites:                     64,
-		WriteAdmissionProgressTimeout: 2 * time.Minute,
-		WriteAbsoluteTimeout:          30 * time.Minute,
-		TerminalDeliveryTimeout:       45 * time.Second,
+		MaxRetainedReplyBytes:   32 << 20,
+		TerminalDeliveryTimeout: 45 * time.Second,
 	}
 	coordination.Bind(handler)
 	f.attaches = &attachCounter{inner: handler}
@@ -245,12 +219,12 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	return f
 }
 
-// attachConfig is exactly what the mount binary builds for a default strict
+// attachConfig is exactly what the mount binary builds for a default Linux
 // mount: no flags, no environment, one capability.
 func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 	return authorityrpc.ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
 		AccessToken: f.capability, ReplaySlots: 64, MaxFrame: 4 << 20,
 		DialTimeout: 10 * time.Second, CancelDrainTimeout: 5 * time.Second, MaxInFlight: 64,
@@ -266,7 +240,13 @@ func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 
 type noMembership struct{}
 
-func (noMembership) Activate(volumeserver.SessionID) error   { return nil }
+func (noMembership) PriorCacheState() (volumeserver.PriorEpochDisposition, bool) {
+	return volumeserver.PriorEpochStrictMountsFenced, false
+}
+
+func (noMembership) ActivateProfile(volumeserver.SessionID, volumeserver.MountMembershipProfile) error {
+	return nil
+}
 func (noMembership) Deactivate(volumeserver.SessionID) error { return nil }
 
 func randomSuffix(t *testing.T) string {

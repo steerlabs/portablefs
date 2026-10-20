@@ -33,12 +33,12 @@ func activeSubscriptionFixture(t *testing.T, incarnation uint64) (*subscriptionR
 	return registry, clock, rpc, invalidator
 }
 
-// TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled now covers the
-// equivalent protocol-7 race: a reply admitted before a change delivery may
+// TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled covers the race
+// in which a reply admitted before a change delivery may
 // complete after that delivery, but its exact-coordinate generation cannot be
 // installed and delegation exclusion must take effect immediately.
 func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
-	registry, clock, _, _ := activeSubscriptionFixture(t, 1)
+	registry, _, _, _ := activeSubscriptionFixture(t, 1)
 	identity := subscriptionIdentity(21)
 	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
 	preWithdrawal := registry.stamp()
@@ -46,19 +46,19 @@ func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
 	if err := registry.registerChangeBatch(1, &authoritypb.ChangeBatch{Incarnation: 1, Entries: []*authoritypb.ChangeEntry{entry}}); err != nil {
 		t.Fatalf("register grant withdrawal: %v", err)
 	}
-	if got := registry.remaining(coordinate, preWithdrawal, 2, clock.Now()); got != 0 {
+	if got := registry.remaining(coordinate, preWithdrawal, 2); got != 0 {
 		t.Fatalf("reply admitted before delegation withdrawal survived for %s", got)
 	}
-	if got := registry.remaining(coordinate, registry.stamp(), 2, clock.Now()); got != 0 {
+	if got := registry.remaining(coordinate, registry.stamp(), 2); got != 0 {
 		t.Fatalf("delegated identity admitted data caching for %s", got)
 	}
 }
 
-// lease protocol's read admission exists for. A blocking read(2) has no
+// Blocking read admission must survive a peer's ordinary rewrites. A read(2) has no
 // retryable errno: EAGAIN reaches the caller verbatim, where a Go runtime
 // registers the descriptor with its poller and never wakes. Every coherence
 // state a peer's write puts this mount into -- the authority coordinate closed
-// from recall reservation to discharge, this mount repairing that coordinate,
+// from recall reservation to discharge, this mount withdrawing that coordinate,
 // and the recall catching a read already in flight -- used to refuse a read
 // with exactly that errno.
 //
@@ -83,6 +83,7 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 	var readFailure atomic.Pointer[error]
 	var reads atomic.Int64
 	stop := make(chan struct{})
+	progress := make(chan struct{}, 1)
 	var readers sync.WaitGroup
 	for range 6 {
 		readers.Add(1)
@@ -100,9 +101,17 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 				if _, err := syscall.Pread(int(reader.Fd()), buf, 0); err != nil {
 					failure := fmt.Errorf("blocking pread during a peer write: %w", err)
 					readFailure.CompareAndSwap(nil, &failure)
+					select {
+					case progress <- struct{}{}:
+					default:
+					}
 					return
 				}
 				reads.Add(1)
+				select {
+				case progress <- struct{}{}:
+				default:
+				}
 				// Paced, not saturating. What opens the window this test is
 				// about is a read landing inside a recall, not raw throughput.
 				time.Sleep(50 * time.Microsecond)
@@ -117,7 +126,7 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 			readers.Wait()
 		}
 	}
-	t.Cleanup(stopReaders)
+	defer stopReaders()
 
 	payloads := [2][]byte{after, before}
 	for round := range 64 {
@@ -132,16 +141,19 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 		// Buffered writes can finish faster than the paced readers get CPU.
 		// Keep every rewrite round live until readers make progress, retaining
 		// the original minimum sample instead of relying on v6 write latency.
-		deadline := time.Now().Add(2 * time.Second)
+		watchdog := time.NewTimer(2 * time.Second)
 		for reads.Load()-startedReads < 8 {
 			if failure := readFailure.Load(); failure != nil {
+				watchdog.Stop()
 				t.Fatal(*failure)
 			}
-			if time.Now().After(deadline) {
+			select {
+			case <-progress:
+			case <-watchdog.C:
 				t.Fatal("blocking readers stopped making progress")
 			}
-			time.Sleep(time.Millisecond)
 		}
+		watchdog.Stop()
 	}
 	stopReaders()
 	if failure := readFailure.Load(); failure != nil {
@@ -191,14 +203,14 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 // This is deliberately a transport-admission test, not a live-kernel load
 // test. Continuously reading the target through FUSE also continuously takes
 // its folio locks; stock invalidate_inode_pages2 can be starved by those locks,
-// which is the separate, explicitly unbounded residual in
-// docs/portable-coherence.md §7.3b. Driving that unrelated scheduler race made
+// which is a separate kernel-side residual no userspace bound can close.
+// Driving that unrelated scheduler race made
 // the former integration test take anywhere from 19 to 49 seconds and
 // occasionally revoke a correct mount at its authority horizon. Filling the
 // actual lane and observing the publication registry proves the intended
 // ordering directly and deterministically.
 func TestSaturatedBulkLaneDoesNotStallASourcePurge(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(91, authoritypb.Attr_REGULAR, 91)
 	fixture.rpc.item = item
 	fixture.rpc.byName = map[string]*authoritypb.Item{"saturated": item}
@@ -285,15 +297,15 @@ func summarize(data []byte) string {
 // for that publication's physical reply, so an open admitted on the metadata
 // lane -- which parks for the entire barrier -- would be a reply the purge waits
 // on that is itself waiting on the purge's own transaction. That cycle is broken
-// only by the repair budget, which revokes the peer mount.
+// only by the withdrawal timeout, which revokes the peer mount.
 //
 // Unlike the other race tests here, every reader opens the file inside the write
 // loop rather than holding a descriptor across it. The openers are bounded per
 // round and joined before the next one: what has to land inside a recall is an
 // open, not a sustained read stream. A sustained stream on one inode measures
 // something else entirely -- how long stock's whole-file invalidation can be
-// starved of the folio locks it needs, which docs/portable-coherence.md §7.3b
-// records as an unbounded kernel-side residual.
+// starved of the folio locks it needs, which is an unbounded kernel-side
+// residual.
 func TestRepeatedOpenForReadRacingAPeerWriteKeepsBothMountsServing(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	const size = 96 * 1024
@@ -319,8 +331,8 @@ func TestRepeatedOpenForReadRacingAPeerWriteKeepsBothMountsServing(t *testing.T)
 			return
 		}
 		// Content is deliberately not asserted here. A read concurrent with a
-		// multi-chunk rewrite may legitimately observe an intermediate size, and
-		// §3.3's disclosed mixed-state residual covers the rest. What this test
+		// multi-chunk rewrite may legitimately observe an intermediate size; a
+		// reader is not promised a whole-rewrite snapshot. What this test
 		// is about is that the open and the read complete at all, and that
 		// neither mount is torn down by the barrier they raced.
 		opens.Add(1)

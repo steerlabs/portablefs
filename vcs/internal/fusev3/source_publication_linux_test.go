@@ -21,7 +21,7 @@ type gateMutationResult struct {
 // startGateMutation exercises the same source-publication acquisition and
 // physical-reply release edges as a raw callback, while leaving operation-
 // specific response validation out of scheduling tests.
-func startGateMutation(t *testing.T, fixture *strictFixture, request *authoritypb.Request, gate *sourcePublicationGate) <-chan gateMutationResult {
+func startGateMutation(t *testing.T, fixture *stockFixture, request *authoritypb.Request, gate *sourcePublicationGate) <-chan gateMutationResult {
 	t.Helper()
 	unique := fixture.unique.Add(2)
 	ctx, finish, status := fixture.raw.mutationContext(unique)
@@ -80,7 +80,7 @@ func writeGateRequest(item *authoritypb.Item, marker byte) (*authoritypb.Request
 	}}}, gate, nil
 }
 
-func installAuthorityHook(fixture *strictFixture, hook func(*authoritypb.Request)) {
+func installAuthorityHook(fixture *stockFixture, hook func(*authoritypb.Request)) {
 	fixture.rpc.mu.Lock()
 	fixture.rpc.hook = hook
 	fixture.rpc.mu.Unlock()
@@ -101,7 +101,7 @@ func finishDirectSourceLease(t *testing.T, lease *sourcePublicationLease, resolv
 }
 
 func TestDistinctDirectoryCreatesReachAuthorityConcurrently(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	firstParent := testItem(101, authoritypb.Attr_DIRECTORY, 101)
 	secondParent := testItem(102, authoritypb.Attr_DIRECTORY, 102)
 	firstRequest, firstGate, err := createGateRequest(firstParent, "first")
@@ -150,7 +150,7 @@ func TestDistinctDirectoryCreatesReachAuthorityConcurrently(t *testing.T) {
 }
 
 func TestUnrelatedWriteReachesAuthorityWhileCreatePending(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	parent := testItem(103, authoritypb.Attr_DIRECTORY, 103)
 	unrelated := testItem(104, authoritypb.Attr_REGULAR, 104)
 	createRequest, createGate, err := createGateRequest(parent, "created")
@@ -195,7 +195,7 @@ func TestUnrelatedWriteReachesAuthorityWhileCreatePending(t *testing.T) {
 }
 
 func TestSameIdentityWritesSerializeAtSourcePublicationGate(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	item := testItem(105, authoritypb.Attr_REGULAR, 105)
 	firstRequest, firstGate, err := writeGateRequest(item, 1)
 	if err != nil {
@@ -247,7 +247,7 @@ func TestSameIdentityWritesSerializeAtSourcePublicationGate(t *testing.T) {
 }
 
 func TestCreateAndWriteOnKnownIdentitySerialize(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	parent := testItem(106, authoritypb.Attr_DIRECTORY, 106)
 	child := testItem(107, authoritypb.Attr_REGULAR, 107)
 	record, errno := fixture.raw.intern(context.Background(), child)
@@ -316,7 +316,7 @@ func TestCreateReplyBindingDrainsOnlyExactIdentityPublications(t *testing.T) {
 		{name: "unrelated child", publishing: publicationIdentity(testIdentity(110)), blocks: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newStrictFixture(t)
+			fixture := newStockFixture(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			parent := testItem(108, authoritypb.Attr_DIRECTORY, 108)
@@ -399,18 +399,18 @@ func TestCreateReplyBindingDrainsOnlyExactIdentityPublications(t *testing.T) {
 }
 
 func TestUnresolvedCreateIgnoresUnrelatedRecallAndAllowsUnrelatedPublication(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	parent := testItem(111, authoritypb.Attr_DIRECTORY, 111)
 	gate, err := namespaceSourceGate(parent, "created", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	unrelated := publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(112))}
-	repairLease, err := fixture.raw.closeCacheCoordinate(context.Background(), unrelated)
+	withdrawalLease, err := fixture.raw.closeCacheCoordinate(context.Background(), unrelated)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer repairLease.Open()
+	defer withdrawalLease.Open()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -437,7 +437,7 @@ func TestUnresolvedCreateIgnoresUnrelatedRecallAndAllowsUnrelatedPublication(t *
 func TestReplyDiscoveredCoordinateCoOwnershipSurvivesEitherReleaseOrder(t *testing.T) {
 	for _, releaseReplyFirst := range []bool{false, true} {
 		t.Run(fmt.Sprintf("release_reply_first=%t", releaseReplyFirst), func(t *testing.T) {
-			fixture := newStrictFixture(t)
+			fixture := newStockFixture(t)
 			parent := testItem(113, authoritypb.Attr_DIRECTORY, 113)
 			child := testItem(114, authoritypb.Attr_REGULAR, 114)
 			childIdentity, _ := publicationIdentityFromItem(child)
@@ -516,7 +516,7 @@ func TestReplyDiscoveredCoordinateCoOwnershipSurvivesEitherReleaseOrder(t *testi
 }
 
 func TestSourceDischargeBindsUnknownChildBeforePurging(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	parent := testItem(115, authoritypb.Attr_DIRECTORY, 115)
 	child := testItem(116, authoritypb.Attr_REGULAR, 116)
 	childIdentity, _ := publicationIdentityFromItem(child)
@@ -566,7 +566,7 @@ func TestSourceDischargeBindsUnknownChildBeforePurging(t *testing.T) {
 }
 
 func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
-	fixture := newStrictFixture(t)
+	fixture := newStockFixture(t)
 	child := testItem(118, authoritypb.Attr_REGULAR, 118)
 	childIdentity, _ := publicationIdentityFromItem(child)
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
@@ -583,11 +583,11 @@ func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	repairLease, err := fixture.raw.closeCacheCoordinate(ctx, coordinate)
+	withdrawalLease, err := fixture.raw.closeCacheCoordinate(ctx, coordinate)
 	if err != nil {
 		t.Fatalf("subscription withdrawal waited for an existing source gate: %v", err)
 	}
-	repairLease.Open()
+	withdrawalLease.Open()
 	fixture.raw.mu.Lock()
 	openedEarly := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
 	fixture.raw.mu.Unlock()
@@ -650,7 +650,7 @@ func BenchmarkSourcePublicationAdmissionWithUnrelatedCoordinates(b *testing.B) {
 func TestSourceCompletionWithdrawsSettledAttributesAndKeepsDataObligation(t *testing.T) {
 	for _, kind := range []publicationCoordinateKind{publicationItemAttributes, publicationItemData} {
 		t.Run(fmt.Sprint(kind), func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			entry := f.lookup(t, 1, "file")
 			record := f.raw.acquire(entry.NodeId)
 			defer f.raw.release(record)
@@ -677,7 +677,7 @@ func TestSourceCompletionWithdrawsSettledAttributesAndKeepsDataObligation(t *tes
 }
 
 func TestSourceChangedChannelIsDemandAllocated(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	r := f.raw
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -712,7 +712,7 @@ func TestNamespaceSourceGateCoversEveryEmittedChangeKind(t *testing.T) {
 	seen := make(map[volumeserver.ChangeKind]bool)
 	for _, truncate := range []bool{false, true} {
 		t.Run(fmt.Sprintf("truncate=%t", truncate), func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			entry := f.lookup(t, 1, "file")
 			child := f.raw.acquire(entry.NodeId)
 			parent := f.raw.acquire(1)
@@ -766,8 +766,8 @@ func TestNamespaceSourceGateCoversEveryEmittedChangeKind(t *testing.T) {
 				t.Fatal(err)
 			}
 			dir.mu.Lock()
-			if len(dir.page) != 0 || dir.eof || dir.cursorGeneration != 1 {
-				t.Errorf("source enumeration retained page/EOF: page=%v eof=%v generation=%d", dir.page, dir.eof, dir.cursorGeneration)
+			if len(dir.page) != 0 || dir.eof || dir.withdrawals != 1 {
+				t.Errorf("source enumeration retained page/EOF: page=%v eof=%v withdrawals=%d", dir.page, dir.eof, dir.withdrawals)
 			}
 			dir.mu.Unlock()
 			f.raw.mu.Lock()

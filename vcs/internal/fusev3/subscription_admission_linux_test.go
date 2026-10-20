@@ -17,10 +17,11 @@ import (
 // A full buffer must fail the parked admission before subscribe waits on that
 // reader; waiting for the request deadline changes the promised EIO to timeout.
 func TestColdSubscriptionInterruptsCapacityBeforeCallbackDrain(t *testing.T) {
-	m, err := newDelegationManager(&delegationFakeRPC{block: make(chan struct{})}, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	m, err := newDelegationManager(&delegationFakeRPC{block: make(chan struct{})}, time.Second, 7, writeback.Options{MaxEntries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.StartWriteback()
 	t.Cleanup(m.Stop)
 	identity := installDelegationForTest(t, m, 34, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	if _, err := m.Write(t.Context(), identity, 0, []byte("accepted"), false); err != nil {
@@ -72,10 +73,11 @@ func TestColdSubscriptionInterruptsCapacityBeforeCallbackDrain(t *testing.T) {
 }
 
 func TestEpochRecoveryInterruptsCapacityBeforeCallbackDrain(t *testing.T) {
-	m, err := newDelegationManager(&delegationFakeRPC{block: make(chan struct{})}, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	m, err := newDelegationManager(&delegationFakeRPC{block: make(chan struct{})}, time.Second, 7, writeback.Options{MaxEntries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.StartWriteback()
 	provider := &recoveringFrontendTestRPC{fakeRPC: newFakeRPC(), next: newFakeRPC()}
 	mount := newMount(context.Background(), provider, testConfig(32))
 	mount.delegations.Stop()

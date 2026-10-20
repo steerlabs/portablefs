@@ -3,7 +3,21 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
+
+func TestShippedDefaultFrameCapacity(t *testing.T) {
+	// These are the constants used by main_linux.go's flag registrations, not
+	// a reduced connection-count fixture that could hide a default startup refusal.
+	if err := validateConnectionCapacity(defaultMaxSessions, defaultMaxConnections); err != nil {
+		t.Fatal(err)
+	}
+	minimum := authorityrpc.MinimumFrameBytesInFlight(defaultMaxWriteBytes + authorityrpc.FramePayloadReserve)
+	if defaultMaxFrameBytesInFlight < minimum {
+		t.Fatalf("shipped frame budget %d < startup floor %d (connections %d)", defaultMaxFrameBytesInFlight, minimum, defaultMaxConnections)
+	}
+}
 
 func TestValidateConnectionCapacity(t *testing.T) {
 	tests := []struct {
@@ -37,27 +51,19 @@ func TestValidateConnectionCapacity(t *testing.T) {
 	}
 }
 
-func TestDefaultWriteTransactionsPerSession(t *testing.T) {
-	tests := []struct {
-		name                 string
-		maxInFlight          int
-		maxWriteTransactions uint
-		want                 uint
+func TestLinuxExecutionCapacityIncludesOrderedReplay(t *testing.T) {
+	const frame = 1 << 20
+	minimum := uint64(frame) + 4*uint64(authorityrpc.MinimumFrameBytes)
+	for _, test := range []struct {
+		flight int
+		slots  uint
+		bytes  uint64
+		ok     bool
 	}{
-		{name: "stock authority", maxInFlight: defaultMaxInFlight, maxWriteTransactions: defaultMaxWriteTransactions, want: defaultMaxInFlight},
-		{name: "worker bound is smaller", maxInFlight: 512, maxWriteTransactions: 64, want: 64},
-		{name: "connection bound is smaller", maxInFlight: 32, maxWriteTransactions: 4096, want: 32},
-		{name: "invalid connection bound", maxInFlight: 0, maxWriteTransactions: 4096, want: 0},
-		{name: "invalid worker bound", maxInFlight: 32, maxWriteTransactions: 0, want: 0},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := defaultWriteTransactionsPerSession(test.maxInFlight, test.maxWriteTransactions); got != test.want {
-				t.Fatalf("defaultWriteTransactionsPerSession(%d, %d) = %d, want %d", test.maxInFlight, test.maxWriteTransactions, got, test.want)
-			}
-		})
-	}
-	if defaultMaxItemsPerSession < 1<<16 {
-		t.Fatalf("default max items per session = %d, below mount cached-name capacity %d", defaultMaxItemsPerSession, 1<<16)
+		{9, 9, minimum, true}, {8, 9, minimum, false}, {9, 8, minimum, false}, {9, 9, minimum - 1, false},
+	} {
+		if err := validateExecutionCapacity(test.flight, test.slots, frame, test.bytes); (err == nil) != test.ok {
+			t.Fatalf("%+v: %v", test, err)
+		}
 	}
 }

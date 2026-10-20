@@ -4,7 +4,7 @@
 //
 // It is a separate binary from the matrix driver on purpose. The driver must
 // build and run with nothing but the standard library so it can be dropped on
-// any machine (including a second Mac) that has no PortableFS source tree, and
+// any machine (including a Linux peer) that has no PortableFS source tree, and
 // so a compile error anywhere in the engine cannot stop the matrix from
 // reporting. Only this tool links the production capability signer.
 package main

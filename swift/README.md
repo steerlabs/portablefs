@@ -3,25 +3,32 @@
 This directory contains the macOS FSKit frontend for PortableFS: one Swift
 package and two Xcode projects.
 
+Build with Xcode 27.1 (build 27A9275) and the macOS 27 SDK (27.0); see
+[Local Development](../docs/local-dev.md) for toolchain selection. The deployment
+target remains macOS 26, using V2 there and V3 on macOS 27.
+
 ## Layout
 
 - **`PortableFSKit`** — the SwiftPM package (`swift-tools-version: 6.2`,
   `.macOS(.v26)`). It holds everything that is not an app: the pfslocal client
-  and its transport, `VolumeCore`, the FSKit Operations adapter, the macOS 26
-  best-effort coherence composition, the generated protobuf bindings, a mock daemon
-  used by the tests, and `PortableFSAppCore`, a small support target for the
-  menu-bar app.
+  and its transport, `VolumeCore`, the FSKit Operations adapter, the
+  exclusive-writer frontend composition, the generated protobuf bindings, a mock
+  daemon used by the tests, and `PortableFSAppCore`, the service coordinator and
+  support code for the menu-bar app.
 - **`PortableFSApp`** — the shipping product: `PortableFS.app` (a SwiftUI
-  `MenuBarExtra` agent app, `LSUIElement`) with the embedded CLI and daemon in
-  `Contents/Helpers` and `PortableFSExt.appex` in `Contents/Extensions`. The app
+  `MenuBarExtra` agent app, `LSUIElement`) with the embedded CLI in
+  `Contents/Helpers`, daemon in
+  `Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS`, and
+  `PortableFSExt.appex` in `Contents/Extensions`. The app
   is a presentation layer over the bundled CLI, which is the sole
   mount-lifecycle owner.
 - **`PortableFSKitDev`** — a minimal Xcode host app plus `PortableFSDev.appex`,
   used to register an FSKit extension manually for the package's
   test/verification loop. Its extension bundle id
   (`dev.portablefs.oss.KitDev.PortableFSDev`) is deliberately distinct from the
-  shipping app's, so a developer harness and a shipping install are never
-  confused for one another on the same machine.
+  shipping app's. Its embedded CLI compiles the exact development contract with
+  `portablefs_devhost`; the shipping target compiles production. They share
+  account state and the app group, so only one artifact may own the daemon.
 
 ## PortableFSKit package
 
@@ -36,35 +43,49 @@ It speaks to `portablefsd` over a unix socket. It never sees authority TLS
 credentials.
 
 **`VolumeCore`** is the volume-level state the adapter operates on: item
-identity, resolution, lookup/create/enumerate results, attribute shapes. It also
-holds the v3 gate — when a resolve reply declares a v3 coherence contract,
-`VolumeCore` parses it and admits only the declared macOS 26 policy;
-`fskit-native-revocation-v1` is refused with `ENOTSUP` rather than silently
-downgraded.
+identity and interning, resolution, lookup/create/enumerate results, attribute
+shapes, and open state. One item can hold distinct read and write descriptions;
+an open acquires only missing access, and a write needs only write access.
+CREATE installs the real create-time description. The connection is bound to
+one attach by Resolve; losing that binding is terminal.
 
 **The FSKit Operations adapter** is `OperationsAdapter.swift`
 (`PortableFSFileSystem`, `PortableFSVolume`) plus `FSKitMapping.swift` and
 `PortableFSIdentity.swift`. These, with `VolumeCore`, are the only files that
-import FSKit.
+import FSKit. The mapping translates file IDs as pfslocal file ID plus one (root
+2), maps the fixed symlink, hard-link, and case-sensitivity semantics, and
+returns Darwin `EOPNOTSUPP` for extended-attribute set after validating the
+request and the live item.
 
-**The macOS 26 best-effort coherence composition** now lives in this target
-alongside the above, in five files:
+**The frontend composition** admits at most 128 concurrent callbacks, carries
+each callback's operation ID and PublicationAck verdict, sends one
+ResourceReplyDisposition per resource-bearing reply, and owns the single
+terminal path: socket or event-binding loss, or a degraded or detaching attach
+state, fails the serving callback window, wakes every waiter, revokes
+outstanding tickets, and stops successful serving publication. Completed
+deactivation and resource unloading acknowledge local cleanup only, including
+after terminal failure; unmount has an errorless completion at the same cleanup
+boundary. These acknowledgements preserve the first terminal cause and prove
+neither durability, kernel absence, nor daemon/CLI reconciliation. Loading,
+activation, mounting, and synchronize remain gated; close, reclaim, release,
+and other cleanup activity retain their publication and resource-settlement
+rules. The extension keeps no metadata cache and sends no heartbeat; the daemon
+owns the cache and the authority renewal.
 
-| File | Role |
-| --- | --- |
-| `MacOSV3Namespace.swift` | `PfsMacOSNamespaceIndex` (name coordinates, with a reverse index so every hard-link alias survives independently) and `PfsMacOSLiveObjectIndex` (live objects, which unlink must not retire), plus `PfsMacOSRepairPlanner` |
-| `MacOSV3Coherence.swift` | the coherence runner, backends, transport protocol, `PfsMacOS26RepairAuthenticator`, and the `PfsMacOS26POSIXActuator` |
-| `MacOSV3RepairGate.swift` | `PfsMacOS26RepairArmRegistry`, the repair arm/gate |
-| `MacOSV3FSKitComposition.swift` | `PfsMacOSFSKitPublicationBarrier`, the deferred mount actuator, mount-root location, and `PfsMacOSV3VolumeCoherence` — the composition root the adapter installs |
-| `MacOSV3PfsLocalTransport.swift` | `PfsLocalMacOSV3CoherenceTransport`, which carries the contract and visibility events over pfslocal |
+The contract these implement, and what is not yet qualified, is
+[../docs/fskit-mount.md](../docs/fskit-mount.md).
 
-The contract these implement, and what is still ungated, is
-[../docs/macos-26-coherence-contract.md](../docs/macos-26-coherence-contract.md).
-
-`PortableFSAppCore` is a small target holding only what the menu-bar app needs
-that is worth testing on its own: account-home resolution, mount-inventory row
-decoding, and kernel mount-table parsing. It owns no daemon, mount, lease, or
-recovery behavior; all of that belongs to the CLI.
+`PortableFSAppCore` holds what the menu-bar app needs that is worth testing on
+its own: account-home resolution, mount-inventory row decoding, kernel
+mount-table parsing, and the service coordinator. The coordinator
+authenticates a daemon peer from its socket's kernel audit token (exact
+canonical daemon path, kernel CodeDirectory hash equal to the release's,
+`CS_VALID` and `CS_RUNTIME`), the same rule the CLI applies. For an outgoing
+release it then accepts that release's own reported protocol numbers and uses
+lifecycle v1 to read its inventory and stop it only if idle; with no outgoing
+daemon running, it proceeds only if `attaches.json` is absent while it holds
+the canonical state-singleton flock, which it keeps across unregistration. It
+owns no mount or recovery behavior; that belongs to the CLI.
 
 ### Regenerating pfslocal Swift bindings
 
@@ -97,12 +118,12 @@ concurrent, but consumes one-way ownership dispositions and publication
 acknowledgements on its serial socket reader before admitting the next frame,
 matching the production daemon's wire-order boundary.
 
-The suite is swift-testing, not XCTest. It currently reports **344 tests**,
-covering the pfslocal transport and wire goldens, the Operations
-adapter and its open-handle lifecycle, attribute and error mapping, enumeration
-paging, write acknowledgement, and the macOS 26 coherence stack (namespace and
-live-object indexes, the publication barrier, the repair gate and authenticator,
-enforcement, and production wiring).
+The suite is swift-testing, not XCTest. The gate enumerates its exact inventory
+on every run rather than trusting a recorded count. It covers the pfslocal
+transport and the shared wire goldens, the Operations adapter and its
+open-handle lifecycle, attribute and error mapping, enumeration paging, write
+acknowledgement, the callback window and terminal path, resource dispositions,
+and the service coordinator's lifecycle decisions.
 
 ### Nothing in the suite mounts a real FSKit volume
 
@@ -121,15 +142,19 @@ death, forced unmount, and held-descriptor revocation. The final full matrix
 still exercises negative/positive lookup, attributes, data/EOF, concurrent
 mutators, direct source removal, hard links, rename-over-open descriptors,
 authority restart, hostile exact-callback races, and bounded metadata-storm
-latency. The current evidence and remaining matrix are in
-[../docs/macos-26-coherence-contract.md](../docs/macos-26-coherence-contract.md);
-see [Manual FSKit verification](#manual-fskit-verification) below for the loop.
+latency. None of that installed-extension evidence predates protocol 8 in a
+form that qualifies it; the open native gates are listed in
+[../docs/fskit-mount.md](../docs/fskit-mount.md#verification). See
+[Manual FSKit verification](#manual-fskit-verification) below for the loop.
 
 ### Building the dev harness
 
 ```sh
 xcodebuild -project swift/PortableFSKitDev/PortableFSKitDev.xcodeproj \
-  -scheme PortableFSKitDev build CODE_SIGNING_ALLOWED=NO
+  -scheme PortableFSKitDev \
+  PORTABLEFS_APP_GROUP=B47U2LLKHW.pfsoss \
+  PORTABLEFS_GO="$(realpath "$(go -C vcs env GOROOT)/bin/go")" \
+  build CODE_SIGNING_ALLOWED=NO
 ```
 
 For signed local extension testing of the dev harness, set `DEVELOPMENT_TEAM` in
@@ -159,18 +184,23 @@ For signed local extension testing of the dev harness, set `DEVELOPMENT_TEAM` in
 
 ```sh
 xcodebuild -project swift/PortableFSApp/PortableFSApp.xcodeproj \
-  -scheme PortableFSApp build CODE_SIGNING_ALLOWED=NO
+  -scheme PortableFSApp \
+  PORTABLEFS_APP_GROUP=B47U2LLKHW.pfsoss \
+  PORTABLEFS_GO="$(realpath "$(go -C vcs env GOROOT)/bin/go")" \
+  build CODE_SIGNING_ALLOWED=NO
 ```
 
-For a runnable, signed local build set your team in
+For a signed shipping archive, set your team in
 `swift/PortableFSApp/Config/Development.xcconfig`:
 
 ```
-DEVELOPMENT_TEAM = <your Apple Development team id>
+DEVELOPMENT_TEAM = <your signing team id>
 ```
 
-then build without `CODE_SIGNING_ALLOWED=NO` (or run from Xcode). FSKit
-extensions must be signed to be registered by macOS; unsigned builds validate
+then build without `CODE_SIGNING_ALLOWED=NO`. The shipping CLI requires the
+notarized Developer ID distribution contract even when Xcode builds its host
+locally. Use `PortableFSKitDev` for Apple Development lifecycle qualification;
+development results do not qualify the shipping path. FSKit extensions must be signed to be registered by macOS; unsigned builds validate
 compilation and packaging but cannot exercise extension registration.
 
 The local packager embeds universal `portablefs` and `portablefsd` helpers,
@@ -235,8 +265,8 @@ user-controlled macOS setting.
 
 ### Known limitations
 
-- macOS 26 only (the FSKit Operations adapter targets the macOS 26 API surface,
-  and the package declares `.macOS(.v26)`).
+- macOS 26 and 27, one product and one profile (the FSKit Operations adapter
+  targets the macOS 26 API surface, and the package declares `.macOS(.v26)`).
 - Developer ID export/notarization requires the corresponding Apple signing
   profiles and a local `notarytool` credential; the packager fails visibly if
   either is unavailable.
@@ -245,12 +275,10 @@ user-controlled macOS setting.
   into the extension, CLI, and daemon at build time. This is a sandbox
   requirement, not a preference: a sandboxed FSKit extension may only
   `connect(2)` to unix sockets on app-group paths.
-- The macOS coherence policy that ships is an explicitly declared compatibility
-  policy with open live-kernel gates. Do not treat a macOS mount as equivalent to
-  a Linux one without reading
-  [../docs/macos-26-coherence-contract.md](../docs/macos-26-coherence-contract.md)
-  and the macOS platform gaps in
-  [../docs/liveness-followups.md](../docs/liveness-followups.md).
+- A macOS mount is the volume's exclusive writer, with open native gates. Do
+  not treat it as equivalent to a Linux mount without reading
+  [../docs/fskit-mount.md](../docs/fskit-mount.md), in particular that ending a
+  Mac session does not withdraw state its kernel already holds.
 
 ## Manual FSKit verification
 
@@ -264,11 +292,10 @@ exercise the behaviours the offline suite cannot reach.
    **File System Extensions** category (its ⓘ). Use the category view: on
    macOS 26 the per-app view's toggle can silently do nothing.
 3. Enable the "PortableFS OSS Dev" file system extension there.
-4. Start `portablefsd` with its pfslocal UDS inside the app-group container the
-   appex resolves via `PFSAppGroupIdentifier`:
-   `~/Library/Group Containers/B47U2LLKHW.pfsoss/portablefsd/pfs.sock`.
-   The sandbox only allows the extension to connect to unix sockets inside that
-   container, so no other socket location can work.
+4. Let the signed host register its exact nested daemon through
+   ServiceManagement and wait for enabled state. Do not start a second daemon
+   from the shell. The daemon places pfslocal in the shared app-group container;
+   the CLI's private control socket remains outside that Data Vault.
 5. Mount:
 
 ```sh
@@ -278,10 +305,10 @@ mkdir -p /tmp/pfs
 
 6. Smoke-test the mounted tree with normal filesystem tools (`ls`, `stat`,
    `cat`, create/write/rename/remove files). Xattrs are intentionally partial:
-   pre-existing portable attributes can be read/listed/removed. Production
-   resolve declares set unsupported, so FSKit validates and refuses it locally
-   with Darwin `EOPNOTSUPP` (102), emits no daemon mutation, and never permits
-   an AppleDouble `._*` file to appear.
+   pre-existing portable attributes can be read/listed/removed. Set is fixed
+   unsupported, so FSKit validates and refuses it locally with Darwin
+   `EOPNOTSUPP` (102), emits no daemon mutation, and never permits an
+   AppleDouble `._*` file to appear.
 7. Unmount:
 
 ```sh
@@ -291,7 +318,7 @@ umount /tmp/pfs
 Do not automate the System Settings approval step; it is a one-time
 user-controlled macOS toggle.
 
-The heavier live harnesses live in `scripts/`: `fskit-solo-battery.sh`,
-`live-mount-battery.sh`, `coherence-matrix-macos.sh`, and `two-mac-stress.sh`.
-They run against already-mounted paths and are the only things in this
-repository that observe real kernel behaviour on macOS.
+The heavier live harnesses live in `scripts/`: `live-mount-battery.sh` (one
+mounted path) and `coherence-matrix-macos.sh` (a Mac mount and a Linux peer's
+mount of the same volume). They run against already-mounted paths and are the
+only things in this repository that observe real kernel behaviour on macOS.

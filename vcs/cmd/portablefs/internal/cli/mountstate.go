@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -11,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -27,36 +25,31 @@ import (
 
 // mountState is one active mount's record under
 // ~/.local/state/portablefs/mounts/<hash>.json; umount and mounts read it.
+const mountStateSchemaVersion = 1
+
 type mountState struct {
-	MountPath string `json:"mountPath"`
-	VolumeID  string `json:"volumeId"`
-	Branch    string `json:"branch"`
-	PID       int    `json:"pid"`
+	SchemaVersion int    `json:"schemaVersion"`
+	MountPath     string `json:"mountPath"`
+	VolumeID      string `json:"volumeId"`
+	PID           int    `json:"pid"`
 	// ProcessStartIdentity binds PID to one kernel process incarnation. PID
 	// alone is never sufficient authority to signal a process because it may
 	// have been recycled.
 	ProcessStartIdentity string `json:"processStartIdentity,omitempty"`
 	Strategy             string `json:"strategy"`
-	// Engine names the data plane behind the strategy's platform transport:
-	// mountEngineFuseV3 (the Linux fusev3 stack) or mountEngineDaemonV3 (the
-	// portablefsd-owned macOS v3 attach). Empty marks a record written by the
-	// retired clientcore engine. Unmount picks its teardown from the
-	// (strategy, engine) pair — a v3 FUSE mount has no write-back tail to
-	// drain or park, and a v3 FSKit mount's evidence-bearing detach is owned
-	// entirely by the daemon.
-	Engine              string `json:"engine,omitempty"`
-	FSType              string `json:"fsType,omitempty"`
-	MountInstanceID     string `json:"mountInstanceId,omitempty"`
-	KernelMountID       string `json:"kernelMountId,omitempty"`
-	MountTargetDevice   uint64 `json:"mountTargetDevice,omitempty"`
-	MountTargetInode    uint64 `json:"mountTargetInode,omitempty"`
-	MountMechanism      string `json:"mountMechanism,omitempty"`
-	FUSEHelperPath      string `json:"fuseHelperPath,omitempty"`
-	DataPlaneCAPath     string `json:"dataPlaneCaPath,omitempty"`
-	DataPlaneCASHA256   string `json:"dataPlaneCaSha256,omitempty"`
-	DataPlaneTransport  string `json:"dataPlaneTransport,omitempty"`
-	DataPlaneServerName string `json:"dataPlaneServerName,omitempty"`
-	AuthorityURL        string `json:"authorityUrl,omitempty"`
+	Engine               string `json:"engine,omitempty"`
+	FSType               string `json:"fsType,omitempty"`
+	MountInstanceID      string `json:"mountInstanceId,omitempty"`
+	KernelMountID        string `json:"kernelMountId,omitempty"`
+	MountTargetDevice    uint64 `json:"mountTargetDevice,omitempty"`
+	MountTargetInode     uint64 `json:"mountTargetInode,omitempty"`
+	MountMechanism       string `json:"mountMechanism,omitempty"`
+	FUSEHelperPath       string `json:"fuseHelperPath,omitempty"`
+	DataPlaneCAPath      string `json:"dataPlaneCaPath,omitempty"`
+	DataPlaneCASHA256    string `json:"dataPlaneCaSha256,omitempty"`
+	DataPlaneTransport   string `json:"dataPlaneTransport,omitempty"`
+	DataPlaneServerName  string `json:"dataPlaneServerName,omitempty"`
+	AuthorityURL         string `json:"authorityUrl,omitempty"`
 	// AttachRef is the portablefsd attach this fskit mount serves (the
 	// release-scoped generic URL resource the kernel holds); umount
 	// diagnostics correlate on it.
@@ -66,52 +59,19 @@ type mountState struct {
 	// supervisor publishes a same-user local control socket for live loss
 	// snapshots and, without automatic enrollment, reauthorization; macOS
 	// routes the same operation through portablefsd's existing control socket.
-	AuthorizationSessionID       string `json:"authorizationSessionId,omitempty"`
-	ReauthorizationControlSocket string `json:"reauthorizationControlSocket,omitempty"`
-	MountEnrollmentID            string `json:"mountEnrollmentId,omitempty"`
-	AuthorizationDeadlineAtMs    int64  `json:"authorizationDeadlineAtMs,omitempty"`
-	LastReauthorizationAtMs      int64  `json:"lastReauthorizationAtMs,omitempty"`
-	NextReauthorizationAtMs      int64  `json:"nextReauthorizationAtMs,omitempty"`
-	ReauthorizationFailures      uint64 `json:"reauthorizationFailures,omitempty"`
-	ReauthorizationError         string `json:"reauthorizationError,omitempty"`
-	StartedAtMs                  int64  `json:"startedAtMs"`
-	// LocalDirs are the machine-local graft roots an FSKit mount serves, as
-	// literal paths (the macOS daemon's shape).
-	LocalDirs         []string `json:"localDirs,omitempty"`
-	LocalDirsDeclared bool     `json:"localDirsDeclared,omitempty"`
-	// LocalRoutes is the canonical rule set a FUSE mount serves and
-	// LocalBackingRoot the volume's machine-local backing tree.
-	//
-	// LocalRouteRevision is the VOLUME DECLARATION's revision — the SHA-256 of
-	// the canonical form of .portablefs/local-dirs and of nothing else. It is
-	// the value the authority pins the attach to, so it describes what the
-	// volume declares, identically on every machine. It is deliberately NOT a
-	// hash of LocalRoutes: on the legacy --local-dir path (allowed only when
-	// the volume publishes no declaration) the two differ, and
-	// LocalRoutesPerMachine records exactly that case.
-	//
-	// Together they let `portablefs route`, `portablefs mounts` and
-	// `portablefs prune-local` answer without re-reading the volume.
-	LocalRoutes           []string `json:"localRoutes,omitempty"`
-	LocalRouteRevision    string   `json:"localRouteRevision,omitempty"`
-	LocalRoutesPerMachine bool     `json:"localRoutesPerMachine,omitempty"`
-	LocalBackingRoot      string   `json:"localBackingRoot,omitempty"`
-	// AccessLease is the manager access lease backing this mount's data-plane
-	// credential (nil only when --addr was used). Persisted so the daemon can
-	// renew/release it and an operator can correlate a mount with its lease.
-	AccessLease *leaseState `json:"accessLease,omitempty"`
-	// ManagerURL and AccessLeaseReleaseOperationID make lease teardown an
-	// exact retryable operation. They are published before mount readiness
-	// and retained until the manager confirms a terminal release.
-	ManagerURL                    string `json:"managerUrl,omitempty"`
-	AccessLeaseReleaseOperationID string `json:"accessLeaseReleaseOperationId,omitempty"`
-	// Status is the mount's health beyond pid-liveness. Empty means healthy
-	// ("live"); mountStatusCredentialExpired means the daemon is running but
-	// this mount's credential ended, so filesystem access is degraded until
-	// the mount is made again with a fresh volume mount capability;
-	// mountStatusRevoked means the mount self-revoked and refuses to serve.
-	// Additive: older records have no field.
-	Status string `json:"status,omitempty"`
+	AuthorizationSessionID       string   `json:"authorizationSessionId,omitempty"`
+	ReauthorizationControlSocket string   `json:"reauthorizationControlSocket,omitempty"`
+	MountEnrollmentID            string   `json:"mountEnrollmentId,omitempty"`
+	AuthorizationDeadlineAtMs    int64    `json:"authorizationDeadlineAtMs,omitempty"`
+	LastReauthorizationAtMs      int64    `json:"lastReauthorizationAtMs,omitempty"`
+	NextReauthorizationAtMs      int64    `json:"nextReauthorizationAtMs,omitempty"`
+	ReauthorizationFailures      uint64   `json:"reauthorizationFailures,omitempty"`
+	ReauthorizationError         string   `json:"reauthorizationError,omitempty"`
+	StartedAtMs                  int64    `json:"startedAtMs"`
+	LocalRoutes                  []string `json:"localRoutes,omitempty"`
+	LocalRouteRevision           string   `json:"localRouteRevision,omitempty"`
+	LocalBackingRoot             string   `json:"localBackingRoot,omitempty"`
+	Status                       string   `json:"status,omitempty"`
 	// StatusChangedAtMs is when Status last transitioned (unix ms).
 	StatusChangedAtMs int64 `json:"statusChangedAtMs,omitempty"`
 	// StatusReason is the machine-readable class behind a revoked status: one
@@ -122,17 +82,9 @@ type mountState struct {
 	// two different verdicts wearing one file.
 	StatusReason string `json:"statusReason,omitempty"`
 	StatusDetail string `json:"statusDetail,omitempty"`
-	// ForceParkAcknowledged is the durable response frame for the exact
-	// identity-bound SIGUSR1 force protocol used by Linux FUSE. The owner
-	// publishes it only after CloseJournalDurable has fsynced the recovery
-	// job, and before it detaches the kernel mount.
-	ForceParkAcknowledged bool   `json:"forceParkAcknowledged,omitempty"`
-	ForceRecoveryJobID    string `json:"forceRecoveryJobId,omitempty"`
 }
 
-// The recorded mount engines. Empty is deliberately NOT a constant: it is the
-// absence of a claim, the shape every record written by the retired
-// clientcore engine has.
+// Exact data-plane identities for the two supported mount strategies.
 const (
 	mountEngineFuseV3   = "fusev3"
 	mountEngineDaemonV3 = "daemon-v3"
@@ -151,18 +103,13 @@ const mountStatusCredentialExpired = "credential-expired"
 // and still answers nothing.
 const mountStatusRevoked = "revoked"
 
-// The shared revocation vocabulary. These are the exact tokens both engines
-// produce — the Linux fusev3 frontend classifies its own fatal cause into the
-// first four (see fusev3's RevocationSessionTerminal and friends), the macOS
-// supervisor's watchdog produces the last three — so `portablefs mounts --json`
-// answers with one vocabulary regardless of which platform recorded it.
+// Linux records terminal frontend verdicts; unavailable FSKit control never
+// produces a permanent revocation record.
 const (
 	mountRevokedSessionTerminal      = "session-terminal"
 	mountRevokedRepairBudgetExceeded = "repair-budget-exceeded"
 	mountRevokedRoutesChanged        = "routes-changed"
 	mountRevokedCoherenceViolation   = "coherence-violation"
-	mountRevokedDaemonUnreachable    = "daemon-unreachable"
-	mountRevokedAttachNotOwned       = "attach-not-owned"
 	// mountRevokedUnclassified is what an unrecognized token becomes. An
 	// engine that grows a new reason must not be able to make a revocation
 	// unrecordable, and mislabelling it as one of the known classes would be
@@ -170,11 +117,8 @@ const (
 	mountRevokedUnclassified = "unclassified"
 )
 
-// mountRevocation is one platform's revocation verdict in the shape the
-// supervisor persists. It is deliberately platform-neutral: the Linux engine
-// reports a fusev3.RevocationReport and the macOS watchdog reports its own
-// probe decision, but both reduce to the same three facts, and `portablefs
-// mounts` must not have to know which one produced a row.
+// mountRevocation carries the Linux engine's fusev3.RevocationReport in the
+// shape the supervisor persists and `portablefs mounts` reports.
 type mountRevocation struct {
 	reason string
 	detail string
@@ -188,7 +132,6 @@ func validMountRevocationReason(reason string) bool {
 	switch reason {
 	case mountRevokedSessionTerminal, mountRevokedRepairBudgetExceeded,
 		mountRevokedRoutesChanged, mountRevokedCoherenceViolation,
-		mountRevokedDaemonUnreachable, mountRevokedAttachNotOwned,
 		mountRevokedUnclassified:
 		return true
 	}
@@ -287,15 +230,8 @@ func setMountStatus(dir, mountPath, status string, atMs int64) bool {
 	return err == nil && updated
 }
 
-// setMountRevoked records the terminal self-revocation verdict: the status, the
-// machine-readable class, the engine's own sentence, and when it happened. It
-// is called by the mount supervisor on both platforms — the Linux one from the
-// fusev3 revocation observer, the macOS one from the FSKit revocation watchdog
-// — which is what makes `revoked` a first-class recorded status rather than a
-// message that only ever reached a log.
-//
-// The first revocation wins: escalation can observe the same terminal condition
-// more than once, and the earliest timestamp is the honest one.
+// setMountRevoked persists the Linux frontend's terminal revocation verdict.
+// The first verdict wins so repeated observations retain the original cause.
 func setMountRevoked(dir, mountPath, reason, detail string, atMs int64) bool {
 	updated, err := updateMountState(dir, mountPath, func(st *mountState) {
 		if st.Status == mountStatusRevoked {
@@ -307,15 +243,6 @@ func setMountRevoked(dir, mountPath, reason, detail string, atMs int64) bool {
 		st.StatusChangedAtMs = atMs
 	})
 	return err == nil && updated
-}
-
-// leaseState is the persisted slice of an access lease: enough to renew
-// (controlSeq is the CAS precondition) and to release on unmount.
-type leaseState struct {
-	AccessLeaseID string `json:"accessLeaseId"`
-	AccessToken   string `json:"accessToken"`
-	ExpiresAtMs   int64  `json:"expiresAt"`
-	ControlSeq    string `json:"controlSeq,omitempty"`
 }
 
 func (e *cmdEnv) mountStateDir() (string, error) {
@@ -377,7 +304,7 @@ func updateMountState(dir, mountPath string, update func(*mountState)) (bool, er
 	}
 	updated := false
 	err := withMountStateWriteLock(dir, mountPath, func() error {
-		st, err := readMountState(dir, mountPath)
+		st, err := readMountStateUnlocked(dir, mountPath)
 		if err != nil || st == nil {
 			return err
 		}
@@ -395,35 +322,12 @@ func updateMountState(dir, mountPath string, update func(*mountState)) (bool, er
 }
 
 func withMountStateWriteLock(dir, mountPath string, fn func() error) error {
-	parent, err := privatepath.OpenDir(dir)
-	if err != nil {
-		return fmt.Errorf("pin mount state directory: %w", err)
-	}
-	defer parent.Close()
-	path := mountStatePath(dir, mountPath) + ".lock"
-	file, err := privatepath.OpenLockFile(parent, dir, filepath.Base(path))
-	if err != nil {
-		return fmt.Errorf("open mount state lock %s: %w", path, err)
-	}
-	defer file.Close()
-	fd := int(file.Fd())
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return fmt.Errorf("inspect mount state lock %s: %w", path, err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o777 != 0o600 ||
-		stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
-		return fmt.Errorf("mount state lock %s is not a private uid-owned 0600 regular file", path)
-	}
-	if err := unix.Flock(fd, unix.LOCK_EX); err != nil {
-		return fmt.Errorf("lock mount state %s: %w", path, err)
-	}
-	defer unix.Flock(fd, unix.LOCK_UN)
-	if err := privatepath.ValidateOpenFile(parent, dir, filepath.Base(path), file); err != nil {
-		return err
-	}
-	return fn()
+	return withMountStateLock(mountStatePath(dir, mountPath), unix.LOCK_EX, fn)
 }
+
+// Operation ownership (.op.lock) precedes a short record lock. Record critical
+// sections never acquire operation ownership, call RPC, or wait on serving.
+var withMountStateLock = privatepath.WithFileLock
 
 // readMountState loads the record for mountPath; a missing record returns
 // (nil, nil) so callers can degrade gracefully.
@@ -431,12 +335,24 @@ func readMountState(dir, mountPath string) (*mountState, error) {
 	if !validCanonicalMountPath(mountPath) {
 		return nil, fmt.Errorf("mount state lookup has non-canonical mount path %q", mountPath)
 	}
+	var st *mountState
+	err := withMountStateLock(mountStatePath(dir, mountPath), unix.LOCK_SH, func() error {
+		var err error
+		st, err = readMountStateUnlocked(dir, mountPath)
+		return err
+	})
+	return st, err
+}
+
+// mountStateReadFile is the read seam for deterministic replacement tests.
+var mountStateReadFile = privatepath.ReadFileIfExists
+
+// readMountStateUnlocked requires the caller to hold the record lock. Updates
+// already own it exclusively and must not acquire another flock description.
+func readMountStateUnlocked(dir, mountPath string) (*mountState, error) {
 	path := mountStatePath(dir, mountPath)
-	data, err := privatepath.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
+	data, err := mountStateReadFile(path)
+	if err != nil || data == nil {
 		return nil, err
 	}
 	st, err := decodeMountState(data)
@@ -472,26 +388,16 @@ func validateMountStateRecord(path string, st *mountState) error {
 	if st == nil {
 		return fmt.Errorf("mount state %s is empty", path)
 	}
+	if st.SchemaVersion != mountStateSchemaVersion {
+		return fmt.Errorf("mount state %s has unequal format", path)
+	}
 	if !validCanonicalMountPath(st.MountPath) {
 		return fmt.Errorf("mount state %s has non-canonical mount path %q", path, st.MountPath)
 	}
 	if !validVolumeName(st.VolumeID) {
 		return fmt.Errorf("mount state %s has invalid volume identity", path)
 	}
-	// A v3 engine is branchless and a legacy clientcore record is
-	// branch-bound. Both claims are checked rather than defaulted: a
-	// branchless record carrying a branch (or the reverse) is two different
-	// mounts wearing one file.
-	switch st.Engine {
-	case "":
-		if !validStateString(st.Branch, 1024) {
-			return fmt.Errorf("mount state %s has invalid branch identity", path)
-		}
-	case mountEngineFuseV3, mountEngineDaemonV3:
-		if st.Branch != "" {
-			return fmt.Errorf("mount state %s carries a branch on a branchless v3 engine record", path)
-		}
-	default:
+	if st.Engine != mountEngineFuseV3 && st.Engine != mountEngineDaemonV3 {
 		return fmt.Errorf("mount state %s has invalid engine %q", path, st.Engine)
 	}
 	if st.PID <= 0 || !validStateString(st.ProcessStartIdentity, 128) {
@@ -509,7 +415,7 @@ func validateMountStateRecord(path string, st *mountState) error {
 
 	switch st.Strategy {
 	case "fuse":
-		if st.Engine != "" && st.Engine != mountEngineFuseV3 {
+		if st.Engine != mountEngineFuseV3 {
 			return fmt.Errorf("mount state %s has engine %q for a FUSE mount", path, st.Engine)
 		}
 		if st.FSType != "" || st.AttachRef != "" || !validKernelMountID(st.KernelMountID) {
@@ -531,7 +437,7 @@ func validateMountStateRecord(path string, st *mountState) error {
 			return fmt.Errorf("mount state %s has invalid reauthorization control socket", path)
 		}
 	case "fskit":
-		if st.Engine != "" && st.Engine != mountEngineDaemonV3 {
+		if st.Engine != mountEngineDaemonV3 {
 			return fmt.Errorf("mount state %s has engine %q for an FSKit mount", path, st.Engine)
 		}
 		if !validFSKitType(st.FSType) || !mountid.ValidAttachRef(st.AttachRef) || st.KernelMountID != "" {
@@ -570,22 +476,8 @@ func validateMountStateRecord(path string, st *mountState) error {
 	if err := validatePersistedDataPlaneTransport(st); err != nil {
 		return fmt.Errorf("mount state %s has invalid data-plane transport: %w", path, err)
 	}
-	if err := validatePersistedLocalDirs(st.LocalDirs); err != nil {
-		return fmt.Errorf("mount state %s has invalid local dirs: %w", path, err)
-	}
 	if err := validatePersistedLocalRoutes(st); err != nil {
 		return fmt.Errorf("mount state %s has invalid machine-local routes: %w", path, err)
-	}
-
-	leaseTransaction := st.ManagerURL != "" || st.AccessLeaseReleaseOperationID != "" || st.AccessLease != nil
-	if leaseTransaction {
-		if !validStateString(st.ManagerURL, 2048) || !validStateString(st.AccessLeaseReleaseOperationID, 256) ||
-			st.AccessLease == nil || !validLeaseState(st.AccessLease) {
-			return fmt.Errorf("mount state %s has incomplete access-lease transaction identity", path)
-		}
-		if _, err := canonicalOrigin(st.ManagerURL); err != nil {
-			return fmt.Errorf("mount state %s has invalid access-lease manager URL: %w", path, err)
-		}
 	}
 
 	switch st.Status {
@@ -615,15 +507,6 @@ func validateMountStateRecord(path string, st *mountState) error {
 	// record.
 	if st.Status != mountStatusRevoked && (st.StatusReason != "" || st.StatusDetail != "") {
 		return fmt.Errorf("mount state %s carries a revocation classification under status %q", path, st.Status)
-	}
-	if st.ForceRecoveryJobID != "" && !st.ForceParkAcknowledged {
-		return fmt.Errorf("mount state %s has a force-recovery job without a force-park acknowledgement", path)
-	}
-	if (st.ForceParkAcknowledged || st.ForceRecoveryJobID != "") && st.Strategy != "fuse" {
-		return fmt.Errorf("mount state %s has FUSE force state for strategy %q", path, st.Strategy)
-	}
-	if st.ForceRecoveryJobID != "" && !validRecoveryJobID(st.ForceRecoveryJobID) {
-		return fmt.Errorf("mount state %s has invalid force-recovery job identity", path)
 	}
 	return nil
 }
@@ -680,20 +563,12 @@ func validatePersistedDataPlaneTransport(st *mountState) error {
 	return nil
 }
 
-// emptyRoutesRevision is the revision of a volume that declares nothing —
-// the hash of the empty canonical rule set. A mount serving per-machine
-// --local-dir routes reports exactly this, because such routes are allowed
-// only when the volume publishes no declaration.
+// emptyRoutesRevision is the revision of a volume with no local routes.
 func emptyRoutesRevision() string { return localroutes.RuleSet{}.RevisionHex() }
 
-// validatePersistedLocalRoutes proves a record's routing and the revision it
-// answers for are each exactly what they claim. Declared routing must be the
-// canonical form of its revision; per-machine routing must answer for the
-// empty-declaration revision, since that is the only case it is permitted in.
-// A record that failed either check would let `portablefs route` answer for
-// one rule set while the authority pinned the attach to another.
+// The recorded canonical rules must hash to the exact authority-pinned revision.
 func validatePersistedLocalRoutes(st *mountState) error {
-	if len(st.LocalRoutes) == 0 && st.LocalRouteRevision == "" && st.LocalBackingRoot == "" && !st.LocalRoutesPerMachine {
+	if len(st.LocalRoutes) == 0 && st.LocalRouteRevision == "" && st.LocalBackingRoot == "" {
 		return nil
 	}
 	if st.LocalBackingRoot != "" && !validAbsoluteCleanPath(st.LocalBackingRoot) {
@@ -706,53 +581,10 @@ func validatePersistedLocalRoutes(st *mountState) error {
 	if strings.Join(rules.Patterns(), "\n") != strings.Join(st.LocalRoutes, "\n") {
 		return fmt.Errorf("route patterns are not canonical")
 	}
-	if st.LocalRoutesPerMachine {
-		if st.LocalRouteRevision != emptyRoutesRevision() {
-			return fmt.Errorf("per-machine routes must answer for the empty-declaration revision, not %q", st.LocalRouteRevision)
-		}
-		return nil
-	}
 	if rules.RevisionHex() != st.LocalRouteRevision {
 		return fmt.Errorf("route revision %q does not match the recorded patterns", st.LocalRouteRevision)
 	}
 	return nil
-}
-
-func validatePersistedLocalDirs(dirs []string) error {
-	if err := localdirs.ValidateStrict(dirs); err != nil {
-		return err
-	}
-	normalized, err := localdirs.Normalize(dirs)
-	if err != nil {
-		return err
-	}
-	if len(normalized) != len(dirs) {
-		return fmt.Errorf("local dirs are not canonical")
-	}
-	for i := range dirs {
-		if normalized[i] != dirs[i] {
-			return fmt.Errorf("local dirs are not canonically ordered")
-		}
-	}
-	return nil
-}
-
-func validLeaseState(lease *leaseState) bool {
-	if lease == nil || !validStateString(lease.AccessLeaseID, 256) ||
-		lease.AccessToken == "" || len(lease.AccessToken) > 4096 ||
-		lease.ExpiresAtMs <= 0 || !validStateString(lease.ControlSeq, 20) {
-		return false
-	}
-	controlSeq, err := strconv.ParseUint(lease.ControlSeq, 10, 64)
-	return err == nil && controlSeq > 0 && strconv.FormatUint(controlSeq, 10) == lease.ControlSeq
-}
-
-func validRecoveryJobID(value string) bool {
-	if len(value) != 35 || !strings.HasPrefix(value, "job") {
-		return false
-	}
-	_, err := hex.DecodeString(value[3:])
-	return err == nil && value == strings.ToLower(value)
 }
 
 func removeMountState(dir, mountPath string) error {
@@ -777,9 +609,18 @@ func listMountStates(dir string) ([]mountState, error) {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		data, err := privatepath.ReadFile(path)
+		var data []byte
+		err := withMountStateLock(path, unix.LOCK_SH, func() error {
+			var err error
+			data, err = mountStateReadFile(path)
+			return err
+		})
 		if err != nil {
 			return nil, fmt.Errorf("read mount state record %s: %w", path, err)
+		}
+		// Enumeration is not a snapshot. Only record absence under SH is empty.
+		if data == nil {
+			continue
 		}
 		st, err := decodeMountState(data)
 		if err != nil {
@@ -804,58 +645,30 @@ func listMountStates(dir string) ([]mountState, error) {
 	return out, nil
 }
 
-// ---- machine-local dirs (grafts) persistence ----
-//
-// FUSE-grafted content lives under <stateBase>/local/<volume storage id>/
-// (stateBase is the parent of the mounts dir), with each route root at its own
-// volume-relative path inside that tree. portablefsd deliberately has a
-// separate <stateBase>/portablefsd/local/<volume+branch storage id>/ tree;
-// operator tooling derives that path through portablefsd.LocalBackingRoot.
-// The FUSE identity is (volume, route root) and nothing else, so
-// a dependency tree survives unmount, remount, and remount at a different
-// path, while a different volume at the same mountpoint can never inherit it.
-//
-// Two sidecars sit BESIDE the tree (never inside it, where a name could
-// collide with a route root): the per-mount --local-dir record, which
-// preserves the flag precedence across remounts, and the per-volume active
-// route record, which tells `portablefs prune-local` what is still routed
-// when no mount of the volume is running. Both must survive a clean unmount —
-// persistent local dependency trees are the whole point.
-
-// localDirsBackingRoot is the machine-local backing tree for one volume.
+// The backing tree belongs to a volume, independent of its mount path. The
+// adjacent active-route record keeps prune decisions tied to the declaration
+// most recently activated by this machine.
 func localDirsBackingRoot(mountsDir, volumeID string) string {
 	return localdirs.BackingRoot(filepath.Dir(mountsDir), volumeID)
 }
 
-// localMountRecordKey distinguishes the per-mount sidecars of one volume.
-func localMountRecordKey(branch, mountPath string) string {
-	sum := sha256.Sum256([]byte(branch + "\x00" + mountPath))
-	return hex.EncodeToString(sum[:8])
-}
-
-func localDirsRecordPath(mountsDir, volumeID, branch, mountPath string) string {
-	return localDirsBackingRoot(mountsDir, volumeID) + ".dirs-" + localMountRecordKey(branch, mountPath) + ".json"
-}
-
-// localRoutesRecordPath names the volume's active route record.
+// Active-route state sits beside the backing tree, outside routed names.
 func localRoutesRecordPath(mountsDir, volumeID string) string {
 	return localDirsBackingRoot(mountsDir, volumeID) + ".routes.json"
-}
-
-type localDirsRecord struct {
-	LocalDirs []string `json:"localDirs"`
 }
 
 // localRoutesRecord is the volume's last activated routing on this machine.
 // prune-local reads it to decide which backing subtrees are still reachable
 // when nothing is mounted; it is written on every successful activation.
 // Revision is the volume declaration's, exactly as in mountState.
+const localRoutesSchemaVersion = 1
+
 type localRoutesRecord struct {
-	VolumeID    string   `json:"volumeId"`
-	Patterns    []string `json:"patterns"`
-	Revision    string   `json:"revision"`
-	PerMachine  bool     `json:"perMachine,omitempty"`
-	UpdatedAtMs int64    `json:"updatedAtMs"`
+	SchemaVersion int      `json:"schemaVersion"`
+	VolumeID      string   `json:"volumeId"`
+	Patterns      []string `json:"patterns"`
+	Revision      string   `json:"revision"`
+	UpdatedAtMs   int64    `json:"updatedAtMs"`
 }
 
 // readLocalRoutesRecord loads a volume's active route set. A missing record
@@ -864,14 +677,32 @@ type localRoutesRecord struct {
 // this machine can reach it.
 func readLocalRoutesRecord(mountsDir, volumeID string) (*localRoutesRecord, error) {
 	p := localRoutesRecordPath(mountsDir, volumeID)
-	data, err := privatepath.ReadFile(p)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	return readLocalRoutesRecordPath(p, volumeID)
+}
+
+var localRoutesReadFile = privatepath.ReadFileIfExists
+
+func readLocalRoutesRecordPath(p, volumeID string) (*localRoutesRecord, error) {
+	var data []byte
+	err := privatepath.WithFileLock(p, unix.LOCK_SH, func() error {
+		var err error
+		data, err = localRoutesReadFile(p)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read local-routes record %s: %w", p, err)
 	}
-	return decodeLocalRoutesRecord(data, p)
+	if data == nil {
+		return nil, nil
+	}
+	rec, err := decodeLocalRoutesRecord(data, p)
+	if err != nil {
+		return nil, err
+	}
+	if volumeID != "" && rec.VolumeID != volumeID {
+		return nil, fmt.Errorf("local-routes record %s names another volume", p)
+	}
+	return rec, nil
 }
 
 // decodeLocalRoutesRecord parses and self-checks one record: the patterns
@@ -879,17 +710,22 @@ func readLocalRoutesRecord(mountsDir, volumeID string) (*localRoutesRecord, erro
 // beside them, so nothing downstream can act on a half-written file.
 func decodeLocalRoutesRecord(data []byte, p string) (*localRoutesRecord, error) {
 	var rec localRoutesRecord
-	if err := json.Unmarshal(data, &rec); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&rec); err != nil {
 		return nil, fmt.Errorf("parse local-routes record %s: %w", p, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("local-routes record %s has trailing data", p)
 	}
 	rules, err := localroutes.Parse([]byte(strings.Join(rec.Patterns, "\n")))
 	if err != nil {
 		return nil, fmt.Errorf("validate local-routes record %s: %w", p, err)
 	}
-	want := rules.RevisionHex()
-	if rec.PerMachine {
-		want = emptyRoutesRevision()
+	if rec.SchemaVersion != localRoutesSchemaVersion || !validVolumeName(rec.VolumeID) || rec.UpdatedAtMs <= 0 || strings.Join(rec.Patterns, "\n") != strings.Join(rules.Patterns(), "\n") {
+		return nil, fmt.Errorf("local-routes record has unequal format")
 	}
+	want := rules.RevisionHex()
 	if want != rec.Revision {
 		return nil, fmt.Errorf("local-routes record %s does not match its revision", p)
 	}
@@ -899,63 +735,23 @@ func decodeLocalRoutesRecord(data []byte, p string) (*localRoutesRecord, error) 
 func writeLocalRoutesRecord(mountsDir, volumeID string, routes mountRoutes, nowMs int64) error {
 	p := localRoutesRecordPath(mountsDir, volumeID)
 	data, err := json.MarshalIndent(localRoutesRecord{
-		VolumeID:    volumeID,
-		Patterns:    routes.rules.Patterns(),
-		Revision:    routes.revision,
-		PerMachine:  routes.perMachine,
-		UpdatedAtMs: nowMs,
+		SchemaVersion: localRoutesSchemaVersion,
+		VolumeID:      volumeID,
+		Patterns:      routes.rules.Patterns(),
+		Revision:      routes.revision,
+		UpdatedAtMs:   nowMs,
 	}, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := privatepath.WriteFileAtomic(p, append(data, '\n')); err != nil {
+	if err := privatepath.WithFileLock(p, unix.LOCK_EX, func() error {
+		return privatepath.WriteFileAtomic(p, append(data, '\n'))
+	}); err != nil {
 		return fmt.Errorf("write local-routes record %s: %w", p, err)
 	}
 	return nil
 }
 
-// readPersistedLocalDirs loads the graft roots remembered for a mount key;
-// missing or unreadable records mean "none" (the record is a convenience, not
-// a source of truth the mount should fail on).
-func readPersistedLocalDirs(mountsDir, volumeID, branch, mountPath string) ([]string, error) {
-	path := localDirsRecordPath(mountsDir, volumeID, branch, mountPath)
-	data, err := privatepath.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read persisted local-dirs record %s: %w", path, err)
-	}
-	var rec localDirsRecord
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return nil, fmt.Errorf("parse persisted local-dirs record %s: %w", path, err)
-	}
-	if err := localdirs.ValidateStrict(rec.LocalDirs); err != nil {
-		return nil, fmt.Errorf("validate persisted local-dirs record %s: %w", path, err)
-	}
-	return rec.LocalDirs, nil
-}
-
-// writePersistedLocalDirs remembers the EXPLICITLY configured graft roots
-// (flag-level config; the volume's declaration is re-read on every mount and
-// is deliberately not baked in). An empty list removes the record: explicit
-// flags win and update state.
-func writePersistedLocalDirs(mountsDir, volumeID, branch, mountPath string, dirs []string) error {
-	p := localDirsRecordPath(mountsDir, volumeID, branch, mountPath)
-	if len(dirs) == 0 {
-		return privatepath.RemoveFileDurable(p)
-	}
-	data, err := json.MarshalIndent(localDirsRecord{LocalDirs: dirs}, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := privatepath.WriteFileAtomic(p, append(data, '\n')); err != nil {
-		return fmt.Errorf("write local-dirs state %s: %w", p, err)
-	}
-	return nil
-}
-
-// pidAlive reports whether pid exists (signal 0 probe).
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false

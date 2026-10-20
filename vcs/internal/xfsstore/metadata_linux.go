@@ -189,6 +189,37 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 	} else {
 		metadataFD, metadataKind = obj.fd(), obj.kind
 	}
+	// A compound request must be rejected before any effect when its constraints
+	// are deterministic. Later syscall failures carry possible application.
+	if spec.Size != nil {
+		if metadataKind == KindDirectory {
+			return Attr{}, syscall.EISDIR
+		}
+		if metadataKind != KindRegular {
+			return Attr{}, syscall.EINVAL
+		}
+	}
+	var unixMode uint32
+	if spec.Mode != nil {
+		unixMode, err = modeToUnix(*spec.Mode)
+		if err != nil {
+			return Attr{}, err
+		}
+		if metadataKind == KindSymlink {
+			return Attr{}, syscall.EOPNOTSUPP
+		}
+	}
+	if spec.UID != nil && *spec.UID != v.ownerUID || spec.GID != nil && *spec.GID != v.ownerGID {
+		return Attr{}, syscall.EPERM
+	}
+	if spec.Size != nil {
+		if *spec.Size < 0 || opened != nil && !opened.write {
+			return Attr{}, fs.ErrInvalid
+		}
+	}
+	if spec.ATimeNS != nil && spec.ATimeNow || spec.MTimeNS != nil && spec.MTimeNow {
+		return Attr{}, fs.ErrInvalid
+	}
 	changed := false
 	apply := func(operation func() error) error {
 		if err := operation(); err != nil {
@@ -200,14 +231,22 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 		changed = true
 		return nil
 	}
+	// Linux checks truncate access against the old mode. Finish this step
+	// before chmod/chown so a refused reopen cannot leave metadata changed.
+	if spec.Size != nil {
+		fd := metadataFD
+		if opened == nil {
+			fd, err = v.reopen(obj.fd(), unix.O_RDWR, obj.kind)
+			if err != nil {
+				return Attr{}, err
+			}
+			defer unix.Close(fd)
+		}
+		if err := apply(func() error { return unix.Ftruncate(fd, *spec.Size) }); err != nil {
+			return v.setAttrPost(obj, opened, itemID, err)
+		}
+	}
 	if spec.Mode != nil {
-		unixMode, modeErr := modeToUnix(*spec.Mode)
-		if modeErr != nil {
-			return Attr{}, modeErr
-		}
-		if metadataKind == KindSymlink {
-			return Attr{}, syscall.EOPNOTSUPP
-		}
 		if err := apply(func() error { return v.chmodCapability(metadataFD, metadataKind, unixMode) }); err != nil {
 			return v.setAttrPost(obj, opened, itemID, err)
 		}
@@ -215,15 +254,9 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 	if spec.UID != nil || spec.GID != nil {
 		uid, gid := -1, -1
 		if spec.UID != nil {
-			if *spec.UID != v.ownerUID {
-				return Attr{}, syscall.EPERM
-			}
 			uid = int(*spec.UID)
 		}
 		if spec.GID != nil {
-			if *spec.GID != v.ownerGID {
-				return Attr{}, syscall.EPERM
-			}
 			gid = int(*spec.GID)
 		}
 		if err := apply(func() error {
@@ -232,43 +265,7 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 			return v.setAttrPost(obj, opened, itemID, err)
 		}
 	}
-	if spec.Size != nil {
-		if *spec.Size < 0 {
-			return Attr{}, fs.ErrInvalid
-		}
-		if handleID != (Capability{}) {
-			if !opened.write {
-				return Attr{}, fs.ErrInvalid
-			}
-			if err := apply(func() error { return unix.Ftruncate(opened.fd(), *spec.Size) }); err != nil {
-				return v.setAttrPost(obj, opened, itemID, err)
-			}
-		} else {
-			if obj.kind == KindSymlink {
-				return Attr{}, syscall.EOPNOTSUPP
-			}
-			flags := unix.O_RDONLY
-			if obj.kind == KindRegular {
-				flags = unix.O_RDWR
-			}
-			if obj.kind == KindDirectory {
-				flags |= unix.O_DIRECTORY
-			}
-			fd, reopenErr := v.reopen(obj.fd(), flags, obj.kind)
-			if reopenErr != nil {
-				return v.setAttrPost(obj, opened, itemID, firstError(reopenErr, syscall.EIO))
-			}
-			truncateErr := unix.Ftruncate(fd, *spec.Size)
-			closeErr := unix.Close(fd)
-			if err := apply(func() error { return errors.Join(truncateErr, closeErr) }); err != nil {
-				return v.setAttrPost(obj, opened, itemID, err)
-			}
-		}
-	}
 	if spec.ATimeNS != nil || spec.MTimeNS != nil || spec.ATimeNow || spec.MTimeNow {
-		if spec.ATimeNS != nil && spec.ATimeNow || spec.MTimeNS != nil && spec.MTimeNow {
-			return Attr{}, fs.ErrInvalid
-		}
 		times := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, {Nsec: unix.UTIME_OMIT}}
 		if spec.ATimeNow {
 			times[0].Nsec = unix.UTIME_NOW
@@ -298,7 +295,7 @@ func (v *Volume) setAttrPost(obj object, opened *openFile, hasItem Capability, a
 	} else {
 		return Attr{}, fs.ErrInvalid
 	}
-	post, statErr := statFD(fd)
+	post, statErr := v.postStat(fd)
 	if statErr != nil {
 		return Attr{}, outcomeUncertain(errors.Join(applyErr, statErr))
 	}

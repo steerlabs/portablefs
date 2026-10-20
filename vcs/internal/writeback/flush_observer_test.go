@@ -18,11 +18,11 @@ func (f *observedFlusher) FlushCycleCompleted(_ context.Context, _ Identity) {
 }
 func TestBackgroundFlushObserverRunsAfterAppliedCutWithoutBufferLock(t *testing.T) {
 	f := &observedFlusher{observed: make(chan Stats, 1)}
-	b := newTestBuffer(t, f, Options{MaxBytes: 1024, MaxEntries: 16, FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{MaxBytes: 1024, MaxEntries: 16})
 	f.buffer = b
 	mustWrite(t, b, testIdentity(1), 0, "one")
 	mustWrite(t, b, testIdentity(1), 3, "two")
-	b.trigger()
+	b.Start()
 	stats := await(t, f.observed, "flush observer")
 	if stats.Accepted != 0 || stats.Applied != 2 {
 		t.Fatalf("observer before application: %+v", stats)
@@ -50,11 +50,11 @@ func (f *idleObservedFlusher) BufferIdle(id Identity) {
 
 func TestIdleObserverCanForgetAfterFinalBackgroundReference(t *testing.T) {
 	f := &idleObservedFlusher{idle: make(chan bool, 2)}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	f.buffer = b
 	id := testIdentity(1)
 	mustWrite(t, b, id, 0, "retained")
-	b.trigger()
+	b.Start()
 	if await(t, f.idle, "flush reference") {
 		t.Fatal("forgot identity while background job still retained it")
 	}

@@ -9,9 +9,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"slices"
@@ -29,7 +31,7 @@ import (
 
 const (
 	testMaxFrame    uint32 = 4 << 20
-	testMaxInFlight int    = 8
+	testMaxInFlight int    = 9
 )
 
 func testAuthorityRoot() *authoritypb.Item {
@@ -48,12 +50,12 @@ func testPreKernelMountAbsence(context.Context) (*authoritypb.MountAbsenceProof,
 }
 
 // coherentTestClientConfig keeps ordinary transport tests on the exact Linux
-// protocol-7 mount contract.
+// protocol-8 mount contract.
 func coherentTestClientConfig(address string, clientTLS *tls.Config, volumeID string, replaySlots uint32, maxInFlight int) ClientConfig {
 	return ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: volumeID, AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		ReplaySlots:     replaySlots, MaxFrame: testMaxFrame, DialTimeout: time.Second,
 		CancelDrainTimeout: time.Second, MaxInFlight: maxInFlight,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
@@ -86,17 +88,17 @@ func (h *mutationAssignmentHandler) Handle(ctx context.Context, req *authoritypb
 func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 	assignedOnWire := make(chan struct{})
 	handler := &mutationAssignmentHandler{
-		clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 3},
+		clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9},
 		assigned:          assignedOnWire,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 3, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     3, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 3,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		ReplaySlots:     9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -151,18 +153,15 @@ func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 }
 
 type clientTestHandler struct {
-	epoch             []byte
-	started           chan struct{}
-	once              *sync.Once
-	omitHelloFeature  bool
-	legacyHello       bool
-	omitAttachFeature bool
-	omitExactRepair   bool
-	attachCount       *atomic.Int32
-	readBound         *uint32
-	keepAliveErrno    int32
-	maxInFlight       int
-	mountEnrollment   bool
+	epoch           []byte
+	started         chan struct{}
+	once            *sync.Once
+	attachCount     *atomic.Int32
+	readBound       *uint32
+	keepAliveErrno  int32
+	maxInFlight     int
+	refuseHello     bool
+	mountEnrollment bool
 }
 
 var clientTestNeverTerminal = make(chan struct{})
@@ -190,9 +189,6 @@ func (h *pooledReadClientHandler) Handle(ctx context.Context, request *authority
 
 func (h *clientReauthorizationHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	response := h.clientTestHandler.Handle(ctx, request)
-	if hello := response.GetHello(); hello != nil {
-		hello.Features = append(hello.Features, sessionReauthorizationFeature)
-	}
 	if reauthorization := request.GetReauthorize(); reauthorization != nil {
 		h.requests.Add(1)
 		response.Errno = 0
@@ -205,15 +201,15 @@ func (h *clientReauthorizationHandler) Handle(ctx context.Context, request *auth
 }
 
 func TestClientReauthorizationInstallsOnlyAValidatedReplacementCertificate(t *testing.T) {
-	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 4}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}}
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     4, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 4,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		ReplaySlots:     9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -282,19 +278,13 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	switch req.GetBody().(type) {
 	case *authoritypb.Request_Hello:
 		helloRequest := req.GetHello()
-		features, ok := helloFeatures(helloRequest.GetFrontendProfile())
-		if !ok {
+		if !validFrontendProfile(helloRequest.GetFrontendProfile()) {
 			response.Errno = int32(syscall.EINVAL)
 			break
 		}
-		if h.mountEnrollment {
-			features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
-		}
-		if h.omitHelloFeature {
-			features = features[1:]
-		}
-		if h.legacyHello {
-			features = []string{"xfs-current-state", "session-exact-epoch", "direct-write"}
+		if h.refuseHello {
+			response.Errno = int32(syscall.EPROTO)
+			break
 		}
 		bounds := h.Bounds()
 		readBound := uint32(1 << 20)
@@ -302,7 +292,7 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 			readBound = *h.readBound
 		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: ProtocolMajor, Features: features,
+			ProtocolMajor: ProtocolMajor,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: readBound, MaxWriteBytes: 1 << 20,
 			MaxInFlight: uint32(bounds.MaxInFlight), Role: helloRequest.GetRole(),
 			ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
@@ -317,27 +307,16 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 			ProvisionalDeadlineUnixNanos: time.Now().Add(time.Minute).UnixNano(),
 		}}
 	case *authoritypb.Request_Activate:
-		features := append([]string(nil), requiredAttachFeatures...)
-		if h.mountEnrollment {
-			features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
-		}
-		if h.omitAttachFeature {
-			features = features[1:]
-		}
-		features = append(features, requiredStrictAttachFeatures...)
-		if h.omitExactRepair {
-			features = features[:len(features)-1]
-		}
 		deadline := int64(0)
 		if h.mountEnrollment {
 			deadline = time.Now().Add(time.Minute).UnixNano()
 		}
 		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
-			Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000,
+			Root: testAuthorityRoot(), SessionLeaseMilliseconds: 30_000,
 			AuthorizationDeadlineUnixNanos: deadline, RoutesRevision: append([]byte(nil), req.GetSession().GetId()...),
 			State:           authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		}}
 		// Routes are an attach property. The common test configuration uses the
 		// all-zero 32-byte revision, which remains an explicit declaration.
@@ -349,6 +328,12 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	case *authoritypb.Request_KeepAlive:
 		response.Errno = h.keepAliveErrno
 	case *authoritypb.Request_Cancel:
+	case *authoritypb.Request_Mkdir:
+		result := mkdirTestReply(false)
+		response.Body, response.PostState = result.Body, result.PostState
+		if mutation := req.GetMutation(); mutation != nil {
+			response.Mutation = &authoritypb.MutationState{Slot: mutation.GetSlot(), AcceptedSequence: mutation.GetSequence()}
+		}
 	case *authoritypb.Request_Write:
 		response.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(len(req.GetWrite().GetData()))}}
 	case *authoritypb.Request_StatFs:
@@ -369,24 +354,24 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	return response
 }
 
-func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, 5, time.Minute)
+func TestClientReservesIndependentProtocol8ControlLanes(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		ReplaySlots:     9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if cap(client.ordinary.permits) != 2 || cap(client.flush.permits) != 1 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 2 {
-		t.Fatalf("strict lanes ordinary/poll/ack/liveness/blocking = %d/%d/%d/%d/%d, want 2/1/1/1/2",
-			cap(client.ordinary.permits), cap(client.controlPoll.permits), cap(client.controlAck.permits), cap(client.liveness.permits), cap(client.blocking.permits))
+	if cap(client.ordinary.permits) != 1 || cap(client.flush.permits) != 4 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.changeAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 4 {
+		t.Fatalf("lanes ordinary/flush/poll/delegation-ack/change-ack/liveness/blocking = %d/%d/%d/%d/%d/%d/%d, want 1/4/1/1/1/1/4",
+			cap(client.ordinary.permits), cap(client.flush.permits), cap(client.controlPoll.permits), cap(client.controlAck.permits), cap(client.changeAck.permits), cap(client.liveness.permits), cap(client.blocking.permits))
 	}
 	next := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
 	ack := &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}
@@ -401,20 +386,7 @@ func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
 
 func TestFrontendProfileControlMethodsCannotCrossProfiles(t *testing.T) {
 	ctx := context.Background()
-	linux := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES}}
-	if _, err := linux.NextVisibility(ctx, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("Linux NextVisibility error = %v, want EOPNOTSUPP", err)
-	}
-	if err := linux.AckVisibility(ctx, &authoritypb.VisibilityCursor{}); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("Linux AckVisibility error = %v, want EOPNOTSUPP", err)
-	}
-	if _, err := linux.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{
-		NextLeaseEvent: &authoritypb.NextLeaseEventRequest{},
-	}}); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("Linux legacy lease request error = %v, want EOPNOTSUPP", err)
-	}
-
-	fskit := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR}}
+	fskit := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE}}
 	if _, _, err := fskit.Subscribe(ctx, nil, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("FSKit Subscribe error = %v, want EOPNOTSUPP", err)
 	}
@@ -426,48 +398,6 @@ func TestFrontendProfileControlMethodsCannotCrossProfiles(t *testing.T) {
 	}
 	if err := fskit.AcknowledgeChanges(ctx, 1, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("FSKit AcknowledgeChanges error = %v, want EOPNOTSUPP", err)
-	}
-}
-
-func TestStrictClientRequiresExactParentRepairSemantics(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{
-		epoch: make([]byte, 16), maxInFlight: 5, omitExactRepair: true,
-	}, 5, time.Minute)
-	defer stop()
-	client, err := DialClient(context.Background(), ClientConfig{
-		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
-		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
-		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
-	})
-	if err == nil {
-		_ = client.Close()
-		t.Fatal("strict client attached to an authority with the old terminal blocked-report semantics")
-	}
-}
-
-func TestClientRefusesLegacyHelloBeforeAttachSideEffects(t *testing.T) {
-	var attaches atomic.Int32
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{
-		epoch: make([]byte, 16), maxInFlight: 5, legacyHello: true, attachCount: &attaches,
-	}, 5, time.Minute)
-	defer stop()
-	client, err := DialClient(context.Background(), ClientConfig{
-		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("single-use-capability"),
-		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
-		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
-	})
-	if err == nil {
-		_ = client.Close()
-		t.Fatal("new client accepted an authority whose Hello predates exact repair semantics")
-	}
-	if got := attaches.Load(); got != 0 {
-		t.Fatalf("legacy Hello refusal reached Attach %d times and could spend its capability", got)
 	}
 }
 
@@ -492,11 +422,11 @@ func TestClientRefusesAReadBoundBelowTheWriteBound(t *testing.T) {
 			var attaches atomic.Int32
 			bound := tc.bound
 			address, clientTLS, stop := startTestServer(t, clientTestHandler{
-				epoch: bytes.Repeat([]byte{0x2c}, 16), maxInFlight: 4,
+				epoch: bytes.Repeat([]byte{0x2c}, 16), maxInFlight: 9,
 				readBound: &bound, attachCount: &attaches,
-			}, 4, time.Minute)
+			}, 9, time.Minute)
 			defer stop()
-			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 			if !tc.refused {
 				if err != nil {
 					t.Fatal(err)
@@ -528,10 +458,10 @@ func TestClientRefusesAReadBoundBelowTheWriteBound(t *testing.T) {
 // survive the per-dial Clone or it resumes nothing.
 func TestClientResumesItsTLSSessionAcrossTransportReconnects(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{
-		epoch: bytes.Repeat([]byte{0x2d}, 16), maxInFlight: 5,
-	}, 5, time.Minute)
+		epoch: bytes.Repeat([]byte{0x2d}, 16), maxInFlight: 9,
+	}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 5, 5))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,11 +498,11 @@ func TestClientResumesItsTLSSessionAcrossTransportReconnects(t *testing.T) {
 
 func TestReauthorizedCertificateDropsResumableTLSSessions(t *testing.T) {
 	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{
-		epoch: bytes.Repeat([]byte{0x2e}, 16), maxInFlight: 4,
+		epoch: bytes.Repeat([]byte{0x2e}, 16), maxInFlight: 9,
 	}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -617,13 +547,12 @@ func (h *strictContractHandler) Handle(_ context.Context, req *authoritypb.Reque
 	case req.GetHello() != nil:
 		bounds := h.Bounds()
 		helloRequest := req.GetHello()
-		features, ok := helloFeatures(helloRequest.GetFrontendProfile())
-		if !ok {
+		if !validFrontendProfile(helloRequest.GetFrontendProfile()) {
 			response.Errno = int32(syscall.EINVAL)
 			break
 		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: ProtocolMajor, Features: features,
+			ProtocolMajor: ProtocolMajor,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: uint32(bounds.MaxInFlight),
 			Role: helloRequest.GetRole(), ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
 			FrontendProfile: helloRequest.GetFrontendProfile(),
@@ -637,13 +566,11 @@ func (h *strictContractHandler) Handle(_ context.Context, req *authoritypb.Reque
 			ProvisionalDeadlineUnixNanos: time.Now().Add(time.Minute).UnixNano(),
 		}}
 	case req.GetActivate() != nil:
-		features := append([]string(nil), requiredAttachFeatures...)
-		features = append(features, requiredStrictAttachFeatures...)
 		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
-			Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000,
+			Root: testAuthorityRoot(), SessionLeaseMilliseconds: 30_000,
 			RoutesRevision: make([]byte, 32), State: authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		}}
 	case req.GetResume() != nil:
 		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
@@ -668,7 +595,7 @@ func (h *strictContractHandler) recordedDetach() *authoritypb.DetachRequest {
 // committedCleanupHandler models only the ownership boundary under test: an
 // ACTIVE response means the strict membership is durable, and only a
 // successful authenticated Detach removes it. Transport state transitions are
-// still exercised by the real protocol-7 Server around this handler.
+// still exercised by the real protocol-8 Server around this handler.
 type committedCleanupHandler struct {
 	clientTestHandler
 	mutateActive    func(*authoritypb.ActivateReply)
@@ -729,9 +656,9 @@ func strictCleanupClientConfig(address string, clientTLS *tls.Config, observer f
 	return ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("single-use-cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		ReplaySlots:     9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: observer,
 	}
 }
@@ -741,21 +668,17 @@ func TestCommittedActiveLocalValidationFailureDetachesWithExactPreKernelEvidence
 		name   string
 		mutate func(*authoritypb.ActivateReply)
 	}{
-		{name: "features", mutate: func(reply *authoritypb.ActivateReply) { reply.Features = nil }},
 		{name: "root", mutate: func(reply *authoritypb.ActivateReply) { reply.Root = nil }},
 		{name: "lease", mutate: func(reply *authoritypb.ActivateReply) { reply.SessionLeaseMilliseconds = 0 }},
 		{name: "routes", mutate: func(reply *authoritypb.ActivateReply) { reply.RoutesRevision[0] = 1 }},
-		{name: "cursor", mutate: func(reply *authoritypb.ActivateReply) {
-			reply.LeaseCursor = &authoritypb.LeaseEventCursor{Sequence: 1, Phase: authoritypb.LeaseEventPhase_LEASE_EVENT_PHASE_REVOKE}
-		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler := &committedCleanupHandler{
-				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x71}, 16), maxInFlight: 5},
+				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x71}, 16), maxInFlight: 9},
 				mutateActive:      test.mutate,
 			}
-			address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+			address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 			defer stop()
 			var observations atomic.Int32
 			proof := &authoritypb.MountAbsenceProof{
@@ -878,11 +801,11 @@ func TestCommittedActiveCleanupFailureNeverInventsFallback(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler := &committedCleanupHandler{
-				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x72}, 16), maxInFlight: 5},
+				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x72}, 16), maxInFlight: 9},
 				mutateActive:      func(reply *authoritypb.ActivateReply) { reply.Root = nil },
 				detachErrno:       test.detachErrno, loseDetachReply: test.loseReply,
 			}
-			address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+			address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 			defer stop()
 			client, err := DialClient(context.Background(), strictCleanupClientConfig(address, clientTLS, test.observer))
 			if err == nil {
@@ -916,19 +839,19 @@ func TestPreActivationFailuresNeverObservePreKernelAbsence(t *testing.T) {
 		{
 			name: "Hello refusal",
 			handler: &committedCleanupHandler{clientTestHandler: clientTestHandler{
-				epoch: bytes.Repeat([]byte{0x73}, 16), maxInFlight: 5, omitHelloFeature: true,
+				epoch: bytes.Repeat([]byte{0x73}, 16), maxInFlight: 9, refuseHello: true,
 			}},
 		},
 		{
 			name: "Activate refusal",
 			handler: &committedCleanupHandler{
-				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x74}, 16), maxInFlight: 5},
+				clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x74}, 16), maxInFlight: 9},
 				refuseActivate:    true,
 			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			address, clientTLS, stop := startTestServer(t, test.handler, 5, time.Minute)
+			address, clientTLS, stop := startTestServer(t, test.handler, 9, time.Minute)
 			defer stop()
 			var observations atomic.Int32
 			observer := func(ctx context.Context) (*authoritypb.MountAbsenceProof, error) {
@@ -956,9 +879,9 @@ func TestPreActivationFailuresNeverObservePreKernelAbsence(t *testing.T) {
 
 func TestReleaseBeforeMountIsOneAuthenticatedIdempotentTransition(t *testing.T) {
 	handler := &committedCleanupHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x75}, 16), maxInFlight: 5},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x75}, 16), maxInFlight: 9},
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	var observations atomic.Int32
 	observer := func(ctx context.Context) (*authoritypb.MountAbsenceProof, error) {
@@ -988,15 +911,15 @@ func TestReleaseBeforeMountIsOneAuthenticatedIdempotentTransition(t *testing.T) 
 // set an unconditional boolean, which meant a mount that could not repair its
 // cache could still leave the barrier just by asking.
 func TestStrictDetachRequiresSuppliedEvidence(t *testing.T) {
-	handler := &strictContractHandler{epoch: make([]byte, 16), maxInFlight: 5}
-	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+	handler := &strictContractHandler{epoch: make([]byte, 16), maxInFlight: 9}
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		ReplaySlots:     9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -1046,7 +969,7 @@ func startTestServer(t *testing.T, handler Handler, maxInFlight int, idle time.D
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
 		Handler: handler, MaxFrame: testMaxFrame, MaxInFlight: maxInFlight, MaxConnections: 8,
-		MaxFrameBytesInFlight: 8 << 20, HandshakeTimeout: time.Second, IdleTimeout: idle, WriteTimeout: time.Second,
+		MaxFrameBytesInFlight: controlFrameReserve() + 8<<20, HandshakeTimeout: time.Second, IdleTimeout: idle, WriteTimeout: time.Second,
 	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(ctx, listener, serverTLS) }()
@@ -1060,7 +983,7 @@ func startTestServer(t *testing.T, handler Handler, maxInFlight int, idle time.D
 
 func TestClientSignalsTerminalSessionOnExpiredKeepAlive(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), keepAliveErrno: int32(syscall.ESTALE), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1083,7 +1006,7 @@ func TestClientSignalsTerminalSessionOnExpiredKeepAlive(t *testing.T) {
 func TestIdleLinuxControlLossResumesWithoutEndingSession(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1123,32 +1046,13 @@ func TestIdleLinuxControlLossResumesWithoutEndingSession(t *testing.T) {
 	}
 }
 
-func TestClientRequiresArchitectureFeatures(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		handler clientTestHandler
-	}{
-		{name: "hello", handler: clientTestHandler{epoch: make([]byte, 16), omitHelloFeature: true, maxInFlight: testMaxInFlight}},
-		{name: "attach", handler: clientTestHandler{epoch: make([]byte, 16), omitAttachFeature: true, maxInFlight: testMaxInFlight}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			address, clientTLS, stop := startTestServer(t, tc.handler, testMaxInFlight, time.Minute)
-			_, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
-			if err == nil {
-				t.Fatal("DialClient accepted an authority missing a required feature")
-			}
-			stop()
-		})
-	}
-}
-
-func TestClientConfiguredForMountEnrollmentRefusesAnOlderV3Authority(t *testing.T) {
+func TestClientConfiguredForMountEnrollmentRequiresSignedDeadline(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.RequireMountEnrollmentReauthorization = true
 	_, err := DialClient(context.Background(), cfg)
-	if err == nil || !strings.Contains(err.Error(), "Manager-enrolled") {
+	if err == nil || !strings.Contains(err.Error(), "signed authorization deadline") {
 		t.Fatalf("automatic mount against older v3 authority = %v", err)
 	}
 }
@@ -1156,7 +1060,7 @@ func TestClientConfiguredForMountEnrollmentRefusesAnOlderV3Authority(t *testing.
 func TestClientConfiguredForMountEnrollmentPinsAuthorityDeadline(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight, mountEnrollment: true}, testMaxInFlight, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.RequireMountEnrollmentReauthorization = true
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -1171,8 +1075,8 @@ func TestClientConfiguredForMountEnrollmentPinsAuthorityDeadline(t *testing.T) {
 
 func TestClientCancellationDrainsAuthorityOutcome(t *testing.T) {
 	started := make(chan struct{})
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), started: started, once: new(sync.Once), maxInFlight: 3}, 3, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 3, 3))
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), started: started, once: new(sync.Once), maxInFlight: 9}, 9, time.Minute)
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1198,7 +1102,7 @@ func TestClientCancellationDrainsAuthorityOutcome(t *testing.T) {
 
 func TestTLSClientAttachAndMultiplexedCall(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1213,9 +1117,9 @@ func TestTLSClientAttachAndMultiplexedCall(t *testing.T) {
 }
 
 func TestMutationAPIRefusesControlTraffic(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x09}, 16), maxInFlight: 4}, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x09}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1254,10 +1158,10 @@ func (h *splitNegotiationHandler) Handle(ctx context.Context, request *authority
 }
 
 func TestClientRefusesSplitRoleNegotiationBeforeAttach(t *testing.T) {
-	handler := &splitNegotiationHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x10}, 16), maxInFlight: 4}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	handler := &splitNegotiationHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x10}, 16), maxInFlight: 9}}
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.AccessToken = []byte("single-use-cap")
 	client, err := DialClient(context.Background(), cfg)
 	if err == nil {
@@ -1290,10 +1194,10 @@ func (h *transportTraceHandler) Handle(ctx context.Context, request *authoritypb
 }
 
 func TestClientCompletesBothHellosBeforeDataAttachAndControlActivate(t *testing.T) {
-	handler := &transportTraceHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 4}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	handler := &transportTraceHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 9}}
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1360,12 +1264,12 @@ func (h *attachActivationRecoveryHandler) Handle(ctx context.Context, request *a
 
 func TestLostProvisionalAttachReplyReplaysTheExactAttempt(t *testing.T) {
 	handler := &attachActivationRecoveryHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x21}, 16), maxInFlight: 4},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x21}, 16), maxInFlight: 9},
 		closeFirstAttach:  true,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.AccessToken = []byte("single-use-cap")
 	cfg.DialTimeout = 2 * time.Second
 	client, err := DialClient(context.Background(), cfg)
@@ -1387,12 +1291,12 @@ func TestLostProvisionalAttachReplyReplaysTheExactAttempt(t *testing.T) {
 
 func TestLostActivateReplyResumesBothRolesAndNeverAborts(t *testing.T) {
 	handler := &attachActivationRecoveryHandler{
-		clientTestHandler:  clientTestHandler{epoch: bytes.Repeat([]byte{0x22}, 16), maxInFlight: 4},
+		clientTestHandler:  clientTestHandler{epoch: bytes.Repeat([]byte{0x22}, 16), maxInFlight: 9},
 		closeFirstActivate: true,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.DialTimeout = 2 * time.Second
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -1412,12 +1316,12 @@ func TestLostActivateReplyResumesBothRolesAndNeverAborts(t *testing.T) {
 
 func TestDefiniteActivationRefusalAbortsTheProvisionalAttempt(t *testing.T) {
 	handler := &attachActivationRecoveryHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x23}, 16), maxInFlight: 4},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x23}, 16), maxInFlight: 9},
 		refuseActivate:    true,
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err == nil {
 		_ = client.Close()
 		t.Fatal("client published after a definite activation refusal")
@@ -1431,6 +1335,13 @@ func TestDefiniteActivationRefusalAbortsTheProvisionalAttempt(t *testing.T) {
 }
 
 func startWrongHelloEchoServer(t *testing.T, mutate func(*authoritypb.HelloReply)) (string, *tls.Config, func()) {
+	t.Helper()
+	return startHelloResponseServer(t, func(response *authoritypb.Response) { mutate(response.GetHello()) })
+}
+
+// startHelloResponseServer answers one Hello with a reply the test may make
+// defective; the frame is written without the writer's grammar checks.
+func startHelloResponseServer(t *testing.T, mutate func(*authoritypb.Response)) (string, *tls.Config, func()) {
 	t.Helper()
 	serverTLS, clientTLS := testTLSConfigs(t)
 	serverTLS = serverTLS.Clone()
@@ -1463,17 +1374,23 @@ func startWrongHelloEchoServer(t *testing.T, mutate func(*authoritypb.HelloReply
 			return
 		}
 		hello := &authoritypb.HelloReply{
-			ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+			ProtocolMajor: ProtocolMajor,
 			MaxFrameBytes: testMaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
-			MaxInFlight: 4, Role: helloRequest.GetRole(),
+			MaxInFlight: 9, Role: helloRequest.GetRole(),
 			ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
 			FrontendProfile: helloRequest.GetFrontendProfile(),
 		}
-		mutate(hello)
-		done <- writeFrame(conn, testMaxFrame, &authoritypb.Response{
+		response := &authoritypb.Response{
 			RequestId: request.GetRequestId(), Epoch: bytes.Repeat([]byte{0x31}, 16),
 			Body: &authoritypb.Response_Hello{Hello: hello},
-		})
+		}
+		mutate(response)
+		frame, err := rawResponseFrame(response, nil)
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- writeAll(conn, frame)
 	}()
 	return listener.Addr().String(), clientTLS, func() {
 		_ = listener.Close()
@@ -1495,13 +1412,13 @@ func TestClientRefusesWrongHelloTransportEcho(t *testing.T) {
 			reply.ConnectionSetId[0] ^= 0xFF
 		}},
 		{name: "frontend profile", mutate: func(reply *authoritypb.HelloReply) {
-			reply.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+			reply.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			address, clientTLS, stop := startWrongHelloEchoServer(t, tc.mutate)
 			defer stop()
-			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 			if err == nil {
 				_ = client.Close()
 				t.Fatal("client accepted a Hello that changed its physical transport identity")
@@ -1513,26 +1430,45 @@ func TestClientRefusesWrongHelloTransportEcho(t *testing.T) {
 	}
 }
 
-func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
-	address, clientTLS, stop := startWrongHelloEchoServer(t, func(reply *authoritypb.HelloReply) {
-		reply.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
-	})
-	defer stop()
+// rawResponseFrame encodes a response exactly as writeFrame does, but without
+// the writer's grammar checks, so a test authority can send a defective frame.
+func rawResponseFrame(response *authoritypb.Response, bulk []byte) ([]byte, error) {
+	metadata, err := proto.MarshalOptions{Deterministic: true}.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	frame := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata)+len(bulk))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(metadata)))
+	binary.BigEndian.PutUint32(frame[4:], uint32(len(bulk)))
+	return append(append(frame, metadata...), bulk...), nil
+}
+
+// newReconnectTestClient is a Linux mount client with no live transport, for
+// driving one reconnect handshake against a test authority.
+func newReconnectTestClient(address string, clientTLS *tls.Config) *Client {
 	tlsConfig := clientTLS.Clone()
 	tlsConfig.MinVersion = tls.VersionTLS13
 	tlsConfig.NextProtos = []string{protocolALPN}
-	client := &Client{
+	return &Client{
 		cfg: ClientConfig{
 			Address: address, TLS: tlsConfig, MaxFrame: testMaxFrame,
 			DialTimeout: time.Second, CancelDrainTimeout: time.Second,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		},
 		data:             newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
 		fatalDone:        make(chan struct{}),
 		fatalPendingDone: make(chan struct{}),
 	}
+}
+
+func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
+	address, clientTLS, stop := startWrongHelloEchoServer(t, func(reply *authoritypb.HelloReply) {
+		reply.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
+	})
+	defer stop()
+	client := newReconnectTestClient(address, clientTLS)
 	if err := client.reconnectTransport(context.Background(), authoritypb.TransportRole_TRANSPORT_ROLE_DATA); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("reconnect profile mismatch = %v, want ErrTransportBinding", err)
 	}
@@ -1543,41 +1479,159 @@ func TestReconnectProfileMismatchEndsTheSession(t *testing.T) {
 	}
 }
 
+// A Hello reply outside the wire grammar during recovery is a proven
+// authority defect, not transport loss: the session ends instead of retrying
+// the handshake.
+func TestReconnectMalformedHelloFrameEndsTheSession(t *testing.T) {
+	address, clientTLS, stop := startHelloResponseServer(t, func(response *authoritypb.Response) {
+		response.SessionValidForNanos = uint64(time.Second) // a proof is never legal beside a body
+	})
+	defer stop()
+	client := newReconnectTestClient(address, clientTLS)
+	err := client.reconnectTransport(context.Background(), authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
+	if !errors.Is(err, ErrTransportBinding) || !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("reconnect with a malformed Hello frame = %v, want a transport binding defect", err)
+	}
+	select {
+	case <-client.SessionDone():
+	case <-time.After(time.Second):
+		t.Fatal("a malformed Hello frame during recovery did not end the session")
+	}
+}
+
+// startRecoveryScriptServer is a raw authority for pre-publication recovery
+// handshakes. Each connection answers its Hello and then, if asked, one
+// Resume; defect picks the single reply, by role and step, sent outside the
+// wire grammar. Every other reply is healthy, so a client that retried past
+// the defect would succeed. It reports the connections accepted.
+func startRecoveryScriptServer(t *testing.T, epoch []byte, defect func(role authoritypb.TransportRole, resume bool) bool) (string, *tls.Config, func() int32) {
+	t.Helper()
+	serverTLS, clientTLS := testTLSConfigs(t)
+	serverTLS = serverTLS.Clone()
+	serverTLS.NextProtos = []string{protocolALPN}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var connections atomic.Int32
+	var defectSent atomic.Bool
+	reply := func(conn net.Conn, response *authoritypb.Response, role authoritypb.TransportRole, resume bool) bool {
+		malformed := defect(role, resume) && defectSent.CompareAndSwap(false, true)
+		if malformed {
+			response.SessionValidForNanos = uint64(time.Second) // a proof is never legal beside a body
+		}
+		frame, err := rawResponseFrame(response, nil)
+		return err == nil && writeAll(conn, frame) == nil && !malformed
+	}
+	// Connections are served concurrently: the client holds one role's
+	// connection open while it opens the other.
+	var served sync.WaitGroup
+	served.Add(1)
+	go func() {
+		defer served.Done()
+		for {
+			raw, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			served.Add(1)
+			go func() {
+				defer served.Done()
+				defer raw.Close()
+				_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+				conn := tls.Server(raw, serverTLS)
+				request := new(authoritypb.Request)
+				if conn.Handshake() != nil || readFrame(conn, testMaxFrame, nil, 0, request) != nil || request.GetHello() == nil {
+					return
+				}
+				hello := request.GetHello()
+				if !reply(conn, &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
+					ProtocolMajor: ProtocolMajor,
+					MaxFrameBytes: testMaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: 9,
+					Role: hello.GetRole(), ConnectionSetId: hello.GetConnectionSetId(), FrontendProfile: hello.GetFrontendProfile(),
+				}}}, hello.GetRole(), false) {
+					return
+				}
+				request = new(authoritypb.Request)
+				if readFrame(conn, testMaxFrame, nil, 0, request) != nil || request.GetResume() == nil {
+					return
+				}
+				reply(conn, &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{
+					Role: hello.GetRole(), BindingGeneration: 1, State: authoritypb.SessionState_SESSION_STATE_PROVISIONAL,
+				}}}, hello.GetRole(), true)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		served.Wait()
+	})
+	return listener.Addr().String(), clientTLS, connections.Load
+}
+
+// A malformed reply during Attach or Activate recovery is a proven authority
+// defect: each recovery helper returns it at once instead of retrying into the
+// healthy replies that follow, and the recovery wrapper keeps its class.
+func TestRecoveryNeverRetriesPastAFrameDefect(t *testing.T) {
+	data, control := authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL
+	for _, test := range []struct {
+		name        string
+		defect      func(role authoritypb.TransportRole, resume bool) bool
+		recover     func(context.Context, *Client) error
+		connections int32
+	}{
+		{name: "lost-attach-hello", defect: func(authoritypb.TransportRole, bool) bool { return true }, recover: func(ctx context.Context, c *Client) error {
+			data, control, err := c.reopenInitialPair(ctx)
+			closeNegotiations(data, control)
+			return err
+		}, connections: 1},
+		{name: "lost-activate-hello", defect: func(_ authoritypb.TransportRole, resume bool) bool { return !resume }, recover: func(ctx context.Context, c *Client) error {
+			opened, err := c.resumeRawForActivation(ctx, data)
+			closeNegotiations(opened)
+			return err
+		}, connections: 1},
+		{name: "lost-activate-control-resume", defect: func(role authoritypb.TransportRole, resume bool) bool { return role == control && resume }, recover: func(ctx context.Context, c *Client) error {
+			data, control, err := c.resumeRawPairForActivation(ctx)
+			closeNegotiations(data, control)
+			return err
+		}, connections: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			epoch := bytes.Repeat([]byte{0x31}, 16)
+			address, clientTLS, connections := startRecoveryScriptServer(t, epoch, test.defect)
+			client := newReconnectTestClient(address, clientTLS)
+			client.epoch = epoch
+			client.negotiatedFrame, client.negotiatedInFlight = testMaxFrame, 9
+			client.maxRead, client.maxWrite = 1<<20, 1<<20
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err := test.recover(ctx, client)
+			if !errors.Is(err, ErrTransportBinding) || !errors.Is(err, ErrFrameEncoding) || ctx.Err() != nil {
+				t.Fatalf("recovery past a malformed reply = %v (deadline %v), want the transport binding defect", err, ctx.Err())
+			}
+			if got := connections(); got != test.connections {
+				t.Fatalf("recovery opened %d connection(s), want %d and no retry past the defect", got, test.connections)
+			}
+			wrapped := recoveryFailure("activation", err)
+			if !errors.Is(wrapped, ErrTransportBinding) || !errors.Is(wrapped, ErrFrameEncoding) || errors.Is(wrapped, ErrTransportUncertain) {
+				t.Fatalf("recovery wrapper = %v, want the defect's own class", wrapped)
+			}
+		})
+	}
+	// Ordinary loss keeps its unknown-outcome class.
+	if lost := recoveryFailure("activation", io.ErrUnexpectedEOF); !errors.Is(lost, ErrTransportUncertain) || errors.Is(lost, ErrTransportBinding) {
+		t.Fatalf("recovery wrapper for transport loss = %v, want ErrTransportUncertain", lost)
+	}
+}
+
 func TestResponseStateCannotCrossFrontendProfiles(t *testing.T) {
-	linux := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES}}
-	if err := linux.validateResponseFrontendProfile(&authoritypb.Response{
-		Body: &authoritypb.Response_FskitRepair{FskitRepair: &authoritypb.VisibilityEvent{}},
-	}); !errors.Is(err, ErrTransportBinding) {
-		t.Fatalf("Linux FSKit response validation = %v, want ErrTransportBinding", err)
-	}
-	fskit := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR}}
-	if err := fskit.validateResponseFrontendProfile(&authoritypb.Response{
-		LeaseGrants: []*authoritypb.LeaseGrant{{}},
-	}); !errors.Is(err, ErrTransportBinding) {
-		t.Fatalf("FSKit lease grant validation = %v, want ErrTransportBinding", err)
-	}
+	fskit := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE}}
 	if err := fskit.validateResponseFrontendProfile(&authoritypb.Response{
 		VisibleSequence: 1,
 		Body:            &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{}},
 	}); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("FSKit visibility response validation = %v, want ErrTransportBinding", err)
-	}
-}
-
-func TestLinuxProfileRejectsRetiredLeaseResponseState(t *testing.T) {
-	client := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES}}
-	for _, test := range []struct {
-		name     string
-		response *authoritypb.Response
-	}{
-		{"lease grants", &authoritypb.Response{LeaseGrants: []*authoritypb.LeaseGrant{{}}}},
-		{"source lease discharge", &authoritypb.Response{SourceLeaseDischarge: &authoritypb.SourceLeaseDischarge{}}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := client.validateResponseFrontendProfile(test.response); !errors.Is(err, ErrTransportBinding) {
-				t.Fatalf("retired Linux response state validation = %v, want ErrTransportBinding", err)
-			}
-		})
 	}
 }
 
@@ -1605,12 +1659,12 @@ func (h *dualPendingHandler) Handle(ctx context.Context, request *authoritypb.Re
 
 func TestDataAndControlOwnIndependentPendingNamespaces(t *testing.T) {
 	handler := &dualPendingHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 4},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 9},
 		reached:           make(chan authoritypb.TransportRole, 2), release: make(chan struct{}),
 	}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1655,9 +1709,9 @@ func TestDataAndControlOwnIndependentPendingNamespaces(t *testing.T) {
 }
 
 func TestBlockedMaximumDataFrameCannotBlockControlProgress(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x13}, 16), maxInFlight: 4}, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x13}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1706,10 +1760,10 @@ func TestBlockedMaximumDataFrameCannotBlockControlProgress(t *testing.T) {
 
 func TestIdempotentWriteSkipsDefensiveRequestClone(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{
-		epoch: bytes.Repeat([]byte{0x7d}, 16), maxInFlight: 4,
-	}, 4, time.Minute)
+		epoch: bytes.Repeat([]byte{0x7d}, 16), maxInFlight: 9,
+	}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1753,11 +1807,11 @@ func TestIdempotentWriteSkipsDefensiveRequestClone(t *testing.T) {
 
 func TestClientRetainsPooledReadPayloadUntilConsumption(t *testing.T) {
 	handler := &pooledReadClientHandler{clientTestHandler: clientTestHandler{
-		epoch: bytes.Repeat([]byte{0x4A}, 16), maxInFlight: 4,
+		epoch: bytes.Repeat([]byte{0x4A}, 16), maxInFlight: 9,
 	}}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1793,14 +1847,14 @@ func TestClientRetainsPooledReadPayloadUntilConsumption(t *testing.T) {
 }
 
 func TestIdleDataLossReconnectsOnlyDataRole(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x14}, 16), maxInFlight: 5}, 5, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x14}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		ReplaySlots:     5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		ReplaySlots:     9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
@@ -1841,9 +1895,9 @@ func TestIdleDataLossReconnectsOnlyDataRole(t *testing.T) {
 }
 
 func TestInFlightControlLossReconnectsOnlyControlRole(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x15}, 16), maxInFlight: 4}, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: bytes.Repeat([]byte{0x15}, 16), maxInFlight: 9}, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2103,7 +2157,7 @@ func TestTerminalSessionEndCannotOvertakeBufferedDataResponse(t *testing.T) {
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	// An authenticated session verdict, not a socket EOF, is terminal.
 	client.signalSessionEnd(ErrSessionEnded)
 	waitForClientTerminalCause(t, client)
 	select {
@@ -2173,7 +2227,7 @@ func TestTerminalSessionEndCannotOvertakeDeliveredResponseCallback(t *testing.T)
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	// An authenticated session verdict, not a socket EOF, is terminal.
 	client.signalSessionEnd(ErrSessionEnded)
 	waitForClientTerminalCause(t, client)
 	select {
@@ -2232,7 +2286,7 @@ func TestTerminalDrainRevokesBeforeForcedSessionDone(t *testing.T) {
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	// An authenticated session verdict, not a socket EOF, is terminal.
 	client.signalSessionEnd(ErrSessionEnded)
 	select {
 	case <-forced:
@@ -2342,7 +2396,12 @@ func TestTerminalDeliveryReceiptFailureRevokesBeforeSessionDone(t *testing.T) {
 	go func() {
 		_, consumption, _ := client.CallMutationWithIdentityRetained(
 			context.Background(), terminalAppliedMutationRequest(), nil,
-			func(error) { revoked.Store(true) },
+			func(cause error) {
+				if cause != client.SessionEndCause() {
+					t.Errorf("receipt revocation = %v, recorded cause = %v", cause, client.SessionEndCause())
+				}
+				revoked.Store(true)
+			},
 		)
 		result <- consumption
 	}()
@@ -2405,7 +2464,12 @@ func TestMalformedTerminalDeliveryTokenRevokesBeforeLocalDrain(t *testing.T) {
 	go func() {
 		_, consumption, err := client.CallMutationWithIdentityRetained(
 			context.Background(), terminalAppliedMutationRequest(), nil,
-			func(error) { revoked.Store(true) },
+			func(cause error) {
+				if cause != client.SessionEndCause() {
+					t.Errorf("token revocation = %v, recorded cause = %v", cause, client.SessionEndCause())
+				}
+				revoked.Store(true)
+			},
 		)
 		result <- retainedResult{consumption: consumption, err: err}
 	}()
@@ -2417,7 +2481,7 @@ func TestMalformedTerminalDeliveryTokenRevokesBeforeLocalDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	completed := <-result
-	if completed.err == nil || completed.consumption == nil || !revoked.Load() {
+	if completed.err == nil || completed.err != client.SessionEndCause() || completed.consumption == nil || !revoked.Load() {
 		t.Fatalf("malformed terminal token = (receipt %T, err %v, revoked %t)", completed.consumption, completed.err, revoked.Load())
 	}
 	select {
@@ -2435,7 +2499,7 @@ func TestMalformedTerminalDeliveryTokenRevokesBeforeLocalDrain(t *testing.T) {
 
 func TestConcurrentCallsReconnectWhenConnectionIsTransientlyMissing(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2501,6 +2565,10 @@ type replayHandler struct {
 	releaseFirst   chan struct{}
 	mutationCalls  atomic.Int32
 	applyCalls     atomic.Int32
+	// mutationResult supplies a complete retained reply for result/replay tests.
+	mutationResult func() *authoritypb.Response
+	// fskit serves the FSKit profile, including batched close.
+	fskit bool
 }
 
 func (h *replayHandler) Epoch() []byte {
@@ -2607,16 +2675,17 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	case *authoritypb.Request_Hello:
 		bounds := h.Bounds()
 		helloRequest := req.GetHello()
-		features, ok := helloFeatures(helloRequest.GetFrontendProfile())
-		if !ok {
+		if !validFrontendProfile(helloRequest.GetFrontendProfile()) {
 			return fail(int32(syscall.EINVAL))
 		}
-		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: ProtocolMajor, Features: features,
+		reply := &authoritypb.HelloReply{
+			ProtocolMajor: ProtocolMajor,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20, MaxInFlight: uint32(bounds.MaxInFlight),
 			Role: helloRequest.GetRole(), ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
 			FrontendProfile: helloRequest.GetFrontendProfile(),
-		}}}
+		}
+
+		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Hello{Hello: reply}}
 	case *authoritypb.Request_Attach:
 		cred, attempt, deadline, err := prepareFixtureAttach(ctx, h.runtime, req, h.access)
 		if err != nil {
@@ -2648,13 +2717,17 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if !token.Replay() {
 			h.runtime.CommitActivation(token)
 		}
-		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
-			Root: testAuthorityRoot(), Features: append(append([]string(nil), requiredAttachFeatures...), requiredStrictAttachFeatures...),
+		active := &authoritypb.ActivateReply{
+			Root:                     testAuthorityRoot(),
 			SessionLeaseMilliseconds: uint64(h.runtime.SessionLease() / time.Millisecond),
 			RoutesRevision:           make([]byte, 32), State: authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		}}}
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+		}
+		if h.fskit {
+			active.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
+		}
+		return &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Body: &authoritypb.Response_Activate{Activate: active}}
 	case *authoritypb.Request_Resume:
 		var cred volumeserver.SessionCredential
 		if len(req.GetEpoch()) != len(cred.Epoch) || req.GetSession() == nil {
@@ -2729,9 +2802,29 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	}
 	id := volumeserver.MutationID{Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Fingerprint: fingerprint}
 	mutationCall := h.mutationCalls.Add(1)
-	_, err = h.runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
+	outcome, err := h.runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
 		h.applyCalls.Add(1)
-		return volumeserver.Outcome{}
+		if h.mutationResult != nil {
+			reply, err := proto.MarshalOptions{Deterministic: true}.Marshal(h.mutationResult())
+			if err != nil {
+				return volumeserver.Outcome{Errno: int32(syscall.EIO)}
+			}
+			return volumeserver.Outcome{Reply: reply}
+		}
+		closes := req.GetCloseBatch().GetCloses()
+		if len(closes) == 0 {
+			return volumeserver.Outcome{}
+		}
+		// Each first-time close retires; the retained outcome is what replays.
+		results := make([]*authoritypb.CloseBatchResult, len(closes))
+		for index := range closes {
+			results[index] = &authoritypb.CloseBatchResult{Retired: true}
+		}
+		reply, err := proto.Marshal(&authoritypb.CloseBatchReply{Results: results})
+		if err != nil {
+			return volumeserver.Outcome{Errno: int32(syscall.EIO)}
+		}
+		return volumeserver.Outcome{Reply: reply}
 	})
 	if err != nil {
 		switch {
@@ -2745,7 +2838,19 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		close(h.afterExecution)
 		<-h.releaseFirst
 	}
-	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch}
+	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: epoch, Errno: outcome.Errno}
+	if req.GetMkdir() != nil && len(outcome.Reply) != 0 {
+		if err := proto.Unmarshal(outcome.Reply, response); err != nil {
+			return fail(int32(syscall.EIO))
+		}
+		response.RequestId, response.Epoch = req.GetRequestId(), epoch
+	} else if len(outcome.Reply) != 0 {
+		var retained authoritypb.CloseBatchReply
+		if err := proto.Unmarshal(outcome.Reply, &retained); err != nil {
+			return fail(int32(syscall.EIO))
+		}
+		response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &retained}
+	}
 	if !h.suppressState {
 		response.Mutation = &authoritypb.MutationState{Slot: id.Slot, AcceptedSequence: id.Sequence}
 	}
@@ -2753,7 +2858,7 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 }
 
 func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
-	runtime, err := volumeserver.New("reclaim-replay-volume", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("reclaim-replay-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 9, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2763,7 +2868,7 @@ func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
 	}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "reclaim-replay-volume", 4, 4))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "reclaim-replay-volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2776,7 +2881,7 @@ func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
 	completed := make(chan result, 1)
 	go func() {
 		response, err := client.CallMutation(context.Background(), &authoritypb.Request{
-			Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: bytes.Repeat([]byte{0x91}, 16)}},
+			Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{bytes.Repeat([]byte{0x91}, 16)}}},
 		})
 		completed <- result{response: response, err: err}
 	}()
@@ -2804,13 +2909,78 @@ func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
 	}
 }
 
+// FSKit releases descriptors only through CloseBatch, so a lost CloseBatch
+// reply must replay its exact retained per-handle outcome after same-session
+// recovery, with each close applied once and never retried item by item.
+func TestFskitCloseBatchLostReplyReplaysExactOutcome(t *testing.T) {
+	runtime, err := volumeserver.New("closebatch-replay-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 9, MaxSessions: 4, MaxLockRecords: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &replayHandler{
+		runtime: runtime, access: volumeserver.AccessRead | volumeserver.AccessWrite, fskit: true,
+		afterExecution: make(chan struct{}), releaseFirst: make(chan struct{}),
+	}
+	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
+	defer stop()
+	cfg := coherentTestClientConfig(address, clientTLS, "closebatch-replay-volume", 9, 9)
+	cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE
+	client, err := DialClient(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	type result struct {
+		response *authoritypb.Response
+		err      error
+	}
+	completed := make(chan result, 1)
+	go func() {
+		batch := &authoritypb.CloseBatchRequest{}
+		for index := byte(1); index <= 3; index++ {
+			batch.Closes = append(batch.Closes, &authoritypb.CloseRequest{Handle: bytes.Repeat([]byte{0xa0 + index}, 16)})
+		}
+		response, err := client.CallMutation(context.Background(), &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}})
+		completed <- result{response: response, err: err}
+	}()
+	select {
+	case <-handler.afterExecution:
+	case <-time.After(time.Second):
+		t.Fatal("CloseBatch did not reach its recorded-outcome boundary")
+	}
+	client.data.pendingMu.Lock()
+	oldConn := client.data.conn
+	client.data.pendingMu.Unlock()
+	client.failConnection(client.data, oldConn, ErrTransportUncertain)
+	close(handler.releaseFirst)
+
+	select {
+	case got := <-completed:
+		results := got.response.GetCloseBatch().GetResults()
+		if got.err != nil || got.response.GetErrno() != 0 || got.response.GetMutation() == nil || len(results) != 3 {
+			t.Fatalf("replayed CloseBatch=(%v,%v)", got.response, got.err)
+		}
+		for index, entry := range results {
+			if !entry.GetRetired() || entry.GetErrno() != 0 {
+				t.Fatalf("replayed CloseBatch entry %d = %v, want the retained retirement", index, entry)
+			}
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseBatch did not reconnect and replay after its lost reply")
+	}
+	if calls, applies := handler.mutationCalls.Load(), handler.applyCalls.Load(); calls != 2 || applies != 1 {
+		t.Fatalf("CloseBatch wire calls=%d apply calls=%d, want 2 and 1", calls, applies)
+	}
+}
+
 // Defect 1: a read-only mount refuses a write before the authority records
 // anything, but the client used to advance its slot on any exact reply. The
 // next mutation that landed on the same slot then arrived one sequence ahead,
 // the authority raised a sequence gap, fenced the session, and every later
 // request returned ESTALE until the mount was torn down.
 func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
-	runtime, err := volumeserver.New("read-only-volume", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("read-only-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 9, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2820,7 +2990,7 @@ func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
 	// Three slots reserve independent flush and blocking lanes, putting every ordinary mutation on
 	// the same slot, which is what makes the desynchronization observable
 	// immediately instead of after a full slot cycle.
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "read-only-volume", 3, 3))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "read-only-volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2858,14 +3028,14 @@ func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
 // original failure, which is what makes the fix load-bearing rather than
 // incidental: without the reported state the client has to guess.
 func TestSuppressedSlotStateStillCannotDesynchronize(t *testing.T) {
-	runtime, err := volumeserver.New("suppressed-volume", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("suppressed-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 9, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
 	handler := &replayHandler{runtime: runtime, access: volumeserver.AccessRead | volumeserver.AccessWrite, suppressState: true}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "suppressed-volume", 3, 3))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "suppressed-volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2905,7 +3075,7 @@ type blockingLockHandler struct {
 }
 
 func (h *blockingLockHandler) Epoch() []byte           { return append([]byte(nil), h.epoch...) }
-func (h *blockingLockHandler) Bounds() TransportBounds { return testBounds(4) }
+func (h *blockingLockHandler) Bounds() TransportBounds { return testBounds(9) }
 func (h *blockingLockHandler) RegisterSessionEndHook(func(volumeserver.SessionID)) {
 }
 func (h *blockingLockHandler) SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool) {
@@ -2920,13 +3090,12 @@ func (h *blockingLockHandler) Handle(ctx context.Context, req *authoritypb.Reque
 	case *authoritypb.Request_Hello:
 		bounds := h.Bounds()
 		helloRequest := req.GetHello()
-		features, ok := helloFeatures(helloRequest.GetFrontendProfile())
-		if !ok {
+		if !validFrontendProfile(helloRequest.GetFrontendProfile()) {
 			response.Errno = int32(syscall.EINVAL)
 			break
 		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: ProtocolMajor, Features: features,
+			ProtocolMajor: ProtocolMajor,
 			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
 			MaxInFlight: uint32(bounds.MaxInFlight), Role: helloRequest.GetRole(),
 			ConnectionSetId: append([]byte(nil), helloRequest.GetConnectionSetId()...),
@@ -2939,11 +3108,11 @@ func (h *blockingLockHandler) Handle(ctx context.Context, req *authoritypb.Reque
 		}}
 	case *authoritypb.Request_Activate:
 		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
-			Root: testAuthorityRoot(), Features: append(append([]string(nil), requiredAttachFeatures...), requiredStrictAttachFeatures...),
+			Root:                     testAuthorityRoot(),
 			SessionLeaseMilliseconds: 30_000, RoutesRevision: make([]byte, 32),
 			State:           authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		}}
 	case *authoritypb.Request_Resume:
 		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
@@ -2968,9 +3137,9 @@ func (h *blockingLockHandler) Handle(ctx context.Context, req *authoritypb.Reque
 // torn down while the authority was healthy.
 func TestBlockingLockWaitsCannotStarveTheOrdinaryLane(t *testing.T) {
 	handler := &blockingLockHandler{epoch: make([]byte, 16), release: make(chan struct{}), parked: make(chan struct{}, 8)}
-	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	cfg := coherentTestClientConfig(address, clientTLS, "volume", 4, 4)
+	cfg := coherentTestClientConfig(address, clientTLS, "volume", 9, 9)
 	cfg.CancelDrainTimeout = 2 * time.Second
 	client, err := DialClient(context.Background(), cfg)
 	if err != nil {
@@ -3018,7 +3187,7 @@ func TestDialClientRefusesLanelessAdmission(t *testing.T) {
 }
 
 func TestCanonicalFingerprintIsIndependentOfTheEnvelope(t *testing.T) {
-	runtime, err := volumeserver.New("fingerprint", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
+	runtime, err := volumeserver.New("fingerprint", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3054,33 +3223,33 @@ func TestCanonicalFingerprintIsIndependentOfTheEnvelope(t *testing.T) {
 // which is documented as unstable across library versions. The encoding is now
 // this package's own, so it can be pinned by value.
 func TestCanonicalFormIsPinnedByValue(t *testing.T) {
-	runtime, err := volumeserver.New("canonical-form", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
+	runtime, err := volumeserver.New("canonical-form", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: []byte{1, 2, 3}}}}
+	request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{{1, 2, 3}}}}}
 	encoded, err := canonicalBytes(request.ProtoReflect())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// field 36 (reclaim), length 5; nested field 1 (item), length 3.
-	want := []byte{0xA2, 0x02, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03}
+	// field 36 (reclaim), length 5; nested field 2 (items), length 3.
+	want := []byte{0xA2, 0x02, 0x05, 0x12, 0x03, 0x01, 0x02, 0x03}
 	if fmt.Sprintf("%x", encoded) != fmt.Sprintf("%x", want) {
 		t.Fatalf("canonical encoding = %x, want %x", encoded, want)
 	}
-	unknown := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: []byte{1}}}}
+	unknown := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{{1}}}}}
 	unknown.ProtoReflect().SetUnknown([]byte{0xF8, 0x3F, 0x01})
 	if _, err := canonicalFingerprint(runtime, unknown); !errors.Is(err, errNonCanonical) {
 		t.Fatalf("top-level unknown fields = %v, want a refusal", err)
 	}
-	nestedBody := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: []byte{1}}}}
+	nestedBody := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{{1}}}}}
 	nestedBody.GetReclaim().ProtoReflect().SetUnknown([]byte{0xF8, 0x3F, 0x01})
 	if _, err := canonicalFingerprint(runtime, nestedBody); !errors.Is(err, errNonCanonical) {
 		t.Fatalf("nested body unknown fields = %v, want a refusal", err)
 	}
 	nestedSession := &authoritypb.Request{
 		Session: &authoritypb.SessionProof{Id: make([]byte, 16), Generation: 1, ResumeSecret: make([]byte, 32)},
-		Body:    &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: []byte{1}}},
+		Body:    &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{{1}}}},
 	}
 	nestedSession.GetSession().ProtoReflect().SetUnknown([]byte{0xF8, 0x3F, 0x01})
 	if _, err := canonicalFingerprint(runtime, nestedSession); !errors.Is(err, errNonCanonical) {
@@ -3153,13 +3322,13 @@ func TestInvalidDelegationReleaseDoesNotConsumeSequence(t *testing.T) {
 	for _, field := range []string{"sequence", "completion", "shape"} {
 		t.Run(field, func(t *testing.T) {
 			seen := make(chan *authoritypb.DelegationReleaseRequest, 3)
-			handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(_ context.Context, r *authoritypb.Request) *authoritypb.Response {
+			handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, release: func(_ context.Context, r *authoritypb.Request) *authoritypb.Response {
 				seen <- proto.Clone(r.GetDelegationRelease()).(*authoritypb.DelegationReleaseRequest)
 				return releaseReceiptResponse(r)
 			}}
-			address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+			address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 			defer stop()
-			client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+			client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 9, 9))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3197,25 +3366,26 @@ func TestInvalidDelegationReleaseDoesNotConsumeSequence(t *testing.T) {
 
 func TestMalformedDelegationReleaseReplyEndsSession(t *testing.T) {
 	var calls atomic.Int32
-	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(_ context.Context, r *authoritypb.Request) *authoritypb.Response {
+	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, release: func(_ context.Context, r *authoritypb.Request) *authoritypb.Response {
 		calls.Add(1)
 		return &authoritypb.Response{RequestId: r.RequestId, Epoch: make([]byte, 16), Body: &authoritypb.Response_ChangeAck{ChangeAck: &authoritypb.ChangeAckReply{}}}
 	}}
-	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 1)); err == nil {
+	_, cause := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 1))
+	if cause == nil {
 		t.Fatal("malformed release succeeded")
 	}
 	if client.releaseCompleted != 0 || !client.poisoned.Load() || client.SessionError() == nil {
 		t.Fatal("uncertain result was receipted or session survived")
 	}
-	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 2)); !errors.Is(err, ErrTransportUncertain) {
-		t.Fatal(err)
+	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 2)); err != cause {
+		t.Fatalf("later release = %v, want recorded cause %v", err, cause)
 	}
 	if calls.Load() != 1 {
 		t.Fatal("later release reached wire")
@@ -3226,7 +3396,7 @@ func TestDelegationReleaseSequenceSurvivesControlReconnectAndHoldsLane(t *testin
 	seen := make(chan *authoritypb.DelegationReleaseRequest, 3)
 	dropFirst, allowReplay := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int32
-	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, release: func(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
 		call := calls.Add(1)
 		seen <- proto.Clone(r.GetDelegationRelease()).(*authoritypb.DelegationReleaseRequest)
 		switch call {
@@ -3246,9 +3416,9 @@ func TestDelegationReleaseSequenceSurvivesControlReconnectAndHoldsLane(t *testin
 		}
 		return releaseReceiptResponse(r)
 	}}
-	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3296,7 +3466,7 @@ func TestDelegationReleaseSequenceSurvivesControlReconnectAndHoldsLane(t *testin
 
 func TestUncertainDelegationReleaseRequiresColdSubscriptionWithoutEndingSession(t *testing.T) {
 	seen := make(chan *authoritypb.DelegationReleaseRequest, 1)
-	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, release: func(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
 		if r.GetDelegationRelease().GetIncarnation() == 1 {
 			if transport, ok := transportConnectionFromContext(ctx); ok {
 				transport.close()
@@ -3306,9 +3476,9 @@ func TestUncertainDelegationReleaseRequiresColdSubscriptionWithoutEndingSession(
 		}
 		return releaseReceiptResponse(r)
 	}}
-	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	address, tlsConfig, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
-	config := coherentTestClientConfig(address, tlsConfig, "volume", 5, 5)
+	config := coherentTestClientConfig(address, tlsConfig, "volume", 9, 9)
 	config.CancelDrainTimeout = 10 * time.Millisecond
 	client, err := DialClient(t.Context(), config)
 	if err != nil {

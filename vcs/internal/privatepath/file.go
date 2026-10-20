@@ -26,6 +26,16 @@ func privateFileParts(path string) (string, string, error) {
 // WriteFileAtomic replaces one private 0600 regular file relative to a pinned
 // 0700 parent descriptor and fsyncs both the file and parent publication.
 func WriteFileAtomic(path string, data []byte) error {
+	return writeFileAtomic(path, data, false)
+}
+
+// WriteFileExclusive publishes a complete durable private file only if its
+// name is absent. An existing inode is never replaced; EEXIST is returned.
+func WriteFileExclusive(path string, data []byte) error {
+	return writeFileAtomic(path, data, true)
+}
+
+func writeFileAtomic(path string, data []byte, exclusive bool) error {
 	dirPath, name, err := privateFileParts(path)
 	if err != nil {
 		return err
@@ -64,8 +74,19 @@ func WriteFileAtomic(path string, data []byte) error {
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close private temporary file: %w", err)
 	}
-	if err := unix.Renameat(int(parent.Fd()), tmpName, int(parent.Fd()), name); err != nil {
-		return fmt.Errorf("replace private file %s: %w", path, err)
+	rename := unix.Renameat
+	if exclusive {
+		rename = renameNoReplace
+	}
+	if err := rename(int(parent.Fd()), tmpName, int(parent.Fd()), name); err != nil {
+		// A concurrent winner may not have synced its publication yet. An
+		// EEXIST observer must establish that durability before succeeding.
+		if exclusive && errors.Is(err, unix.EEXIST) {
+			if syncErr := parent.Sync(); syncErr != nil {
+				return fmt.Errorf("sync existing private publication %s: %w", path, syncErr)
+			}
+		}
+		return fmt.Errorf("publish private file %s: %w", path, err)
 	}
 	keep = true
 	if err := parent.Sync(); err != nil {
@@ -77,16 +98,33 @@ func WriteFileAtomic(path string, data []byte) error {
 // ReadFile opens a private file relative to a pinned no-symlink parent and
 // validates the named inode before reading.
 func ReadFile(path string) ([]byte, error) {
+	return readFile(path, false)
+}
+
+// ReadFileIfExists returns nil bytes only when the directory/file lookup is
+// absent. Validation failures (including ENOENT after open) remain errors.
+// Mutable records require a companion SH/EX lock across this entire call.
+func ReadFileIfExists(path string) ([]byte, error) {
+	return readFile(path, true)
+}
+
+func readFile(path string, missingOK bool) ([]byte, error) {
 	dirPath, name, err := privateFileParts(path)
 	if err != nil {
 		return nil, err
 	}
 	parent, err := OpenExistingDir(dirPath)
+	if missingOK && errors.Is(err, unix.ENOENT) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer parent.Close()
 	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if missingOK && errors.Is(err, unix.ENOENT) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +148,10 @@ func OpenFileAppend(path string) (*os.File, error) {
 }
 
 func RemoveFileDurable(path string) error {
+	return removeFileDurable(path, (*os.File).Sync)
+}
+
+func removeFileDurable(path string, syncParent func(*os.File) error) error {
 	dirPath, name, err := privateFileParts(path)
 	if err != nil {
 		return err
@@ -123,6 +165,11 @@ func RemoveFileDurable(path string) error {
 	}
 	defer parent.Close()
 	if err := validateExistingPrivateFileAt(parent, name, path); errors.Is(err, unix.ENOENT) {
+		// A previous unlink may have succeeded before its directory sync
+		// failed. Absence alone cannot finish that durability obligation.
+		if err := syncParent(parent); err != nil {
+			return fmt.Errorf("sync private directory after removing %s: %w", path, err)
+		}
 		return nil
 	} else if err != nil {
 		return err
@@ -141,7 +188,7 @@ func RemoveFileDurable(path string) error {
 		return fmt.Errorf("remove private file %s: %w", path, err)
 	}
 	_ = file.Close()
-	if err := parent.Sync(); err != nil {
+	if err := syncParent(parent); err != nil {
 		return fmt.Errorf("sync private directory after removing %s: %w", path, err)
 	}
 	return nil

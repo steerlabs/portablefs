@@ -44,26 +44,26 @@ func run() error {
 		serverName         = flag.String("tls-server-name", "", "authority certificate DNS name")
 		maxFrame           = flag.Uint("max-frame-bytes", uint(mountv3.MaxFrame), "hard protobuf frame bound")
 		replaySlots        = flag.Uint("replay-slots", uint(mountv3.ReplaySlots), "same-epoch in-flight mutation replay slots")
-		maxInFlight        = flag.Int("max-in-flight", mountv3.MaxInFlight, "maximum concurrent authority calls")
+		maxInFlight        = flag.Int("max-in-flight", mountv3.MaxInFlight, fmt.Sprintf("maximum concurrent authority calls (at least %d: ordinary and blocking work plus the ordered-flush lane)", authorityrpc.MinimumLinuxInFlight))
 		maxBackground      = flag.Int("max-background", 128, "maximum FUSE background requests")
 		reclaimQueue       = flag.Int("reclaim-queue", mountv3.ReclaimQueue, "bounded forgotten-object cleanup queue")
 		dialTimeout        = flag.Duration("dial-timeout", mountv3.DialTimeout, "authority dial and TLS timeout")
 		cancelDrainTimeout = flag.Duration("cancel-drain-timeout", mountv3.CancelDrainTimeout, "time to obtain an exact result after interrupting an in-flight request")
 		requestTimeout     = flag.Duration("request-timeout", mountv3.RequestTimeout, "non-blocking filesystem operation timeout")
-		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
-		cachedNames        = flag.Int("cached-name-capacity", mountv3.CachedNameCapacity, "local daemon name-lease cache bound")
-		repairBudget       = flag.Duration("repair-budget", mountv3.RepairBudget, "local lease-recall and withdrawal deadline")
+		nameCacheCapacity  = flag.Int("name-cache-capacity", mountv3.NameCacheCapacity, "local bound on cached names, absences and attributes")
+		withdrawalTimeout  = flag.Duration("withdrawal-timeout", mountv3.WithdrawalTimeout, "local deadline for withdrawing kernel cache state before the mount revokes itself")
 		localBacking       = flag.String("local-backing", "", "per-machine directory holding the volume's machine-local route subtrees")
 		noLocalDirs        = flag.Bool("no-local-dirs", false, "refuse to mount a volume that declares machine-local routes in "+fusev3.LocalDirsPath)
 	)
-	var localDirs stringList
-	flag.Var(&localDirs, "local-dir", "refused: machine-local routes are declared volume-wide in "+fusev3.LocalDirsPath)
 	flag.Parse()
 	if flag.NArg() != 0 || *authority == "" || *volumeID == "" || *mountpoint == "" || *accessTokenFile == "" || *clientCert == "" || *clientKey == "" || *serverCA == "" || *serverName == "" {
 		return errors.New("authority, volume-id, mountpoint, access-token-file, tls-cert, tls-key, tls-server-ca, and tls-server-name are required")
 	}
-	if *maxFrame == 0 || *maxFrame > uint(^uint32(0)) || *replaySlots == 0 || *replaySlots > uint(^uint32(0)) || *maxInFlight <= 0 || *maxBackground <= 0 || *reclaimQueue <= 0 || *dialTimeout <= 0 || *cancelDrainTimeout <= 0 || *requestTimeout <= 0 {
-		return errors.New("protocol, concurrency, queue, and timeout bounds must be positive and representable")
+	if *maxFrame == 0 || *maxFrame > uint(^uint32(0)) || *replaySlots == 0 || *replaySlots > uint(^uint32(0)) || *maxInFlight <= 0 || *maxBackground <= 0 || *reclaimQueue <= 0 || *dialTimeout <= 0 || *cancelDrainTimeout <= 0 || *requestTimeout <= 0 || *nameCacheCapacity <= 0 || *withdrawalTimeout <= 0 {
+		return errors.New("protocol, concurrency, queue, cache, and timeout bounds must be positive and representable")
+	}
+	if *maxInFlight < authorityrpc.MinimumLinuxInFlight {
+		return fmt.Errorf("max-in-flight must be at least %d to carry the ordered-flush lane beside ordinary and blocking work", authorityrpc.MinimumLinuxInFlight)
 	}
 	if uint64(*replaySlots) < uint64(*maxInFlight) {
 		return errors.New("replay-slots must be at least max-in-flight")
@@ -106,13 +106,6 @@ func run() error {
 	if len(token) == 0 {
 		return errors.New("access token file is empty")
 	}
-	profile, err := mountv3.Profile(*coherence)
-	if err != nil {
-		return err
-	}
-	if *cachedNames <= 0 || *repairBudget <= 0 {
-		return errors.New("strict coherence requires a positive local cached-name capacity and repair budget")
-	}
 	mountInstanceID, err := mountid.NewMountInstance()
 	if err != nil {
 		return fmt.Errorf("create unique mount identity: %w", err)
@@ -121,18 +114,17 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	requests := make(chan os.Signal, 1)
+	signal.Notify(requests, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(requests)
+	ctx := context.Background()
 	attach := authorityrpc.ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         *authority, TLS: tlsConfig, VolumeID: *volumeID,
 		AccessToken: token, ReplaySlots: uint32(*replaySlots),
 		MaxFrame: uint32(*maxFrame), DialTimeout: *dialTimeout, CancelDrainTimeout: *cancelDrainTimeout, MaxInFlight: *maxInFlight,
 		ObservePreKernelMountAbsence: preKernelAbsence,
-	}
-	if len(localDirs) != 0 {
-		return fmt.Errorf("machine-local routes are declared volume-wide in %s; -local-dir would add a route only this machine knows about, which desynchronizes the routing topology the authority pins every mount to", fusev3.LocalDirsPath)
 	}
 	// One attach, and at most one more if this mount had never seen the volume's
 	// routing. The refusal that teaches it carries the declaration and does not
@@ -156,13 +148,13 @@ func run() error {
 		MountInstanceID: mountInstanceID, RequestTimeout: *requestTimeout,
 		MaxBackground: *maxBackground, MaxInFlight: *maxInFlight, ReclaimQueue: *reclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-		Coherence: profile, CachedNameCapacity: *cachedNames, RepairBudget: *repairBudget,
+		NameCacheCapacity: *nameCacheCapacity, WithdrawalTimeout: *withdrawalTimeout,
 		Routes: routes, LocalBacking: *localBacking,
 	})
 	if err != nil {
 		return err
 	}
-	log.Printf("PortableFS v3 volume %s mounted at %s (%s coherence)", *volumeID, absoluteMount, profile)
+	log.Printf("PortableFS v3 volume %s mounted at %s", *volumeID, absoluteMount)
 	// The capability this mount attached with is short lived, and ordinary lease
 	// renewal never extends a signed authorization deadline. Renewal re-reads the
 	// same file, so a credential manager that rotates it in place keeps the mount
@@ -170,22 +162,18 @@ func run() error {
 	done := make(chan struct{})
 	go func() { mount.Wait(); close(done) }()
 	renewal, err := startCredentialRenewal(mount, *accessTokenFile, token)
+	var renewalFailed <-chan error
 	if err != nil {
-		return errors.Join(err, shutdown(mount, done, absoluteMount))
+		failed := make(chan error, 1)
+		failed <- err
+		renewalFailed = failed
+	} else {
+		defer renewal.Close()
+		renewalFailed = renewal.failed
 	}
-	defer renewal.Close()
-	select {
-	case <-done:
-		return mount.Close()
-	case err := <-renewal.failed:
-		// The mount still holds a valid authorization for the safety margin the
-		// renewer reserved. Withdrawing it now is the difference between an
-		// orderly unmount and every open file failing when the deadline passes.
-		log.Printf("automatic reauthorization failed closed: %v; unmounting %s", err, absoluteMount)
-		return errors.Join(err, shutdown(mount, done, absoluteMount))
-	case <-ctx.Done():
-		return shutdown(mount, done, absoluteMount)
-	}
+	return superviseMount(mount, done, requests, renewalFailed, func(err error) {
+		log.Printf("mount %s: %v", absoluteMount, err)
+	})
 }
 
 func releaseClientBeforeKernelMount(client *authorityrpc.Client, timeout time.Duration, cause error) error {
@@ -194,37 +182,34 @@ func releaseClientBeforeKernelMount(client *authorityrpc.Client, timeout time.Du
 	return errors.Join(cause, client.ReleaseBeforeMount(ctx))
 }
 
-// shutdown removes the kernel mount before this process exits.
-//
-// Exiting while the mount is still installed is strictly worse than waiting:
-// /dev/fuse would close, every process under the mountpoint would see ENOTCONN
-// with no way to recover, the stale mount would still be listed, and the
-// authority session would be dropped without a Detach. EBUSY simply means some
-// process still holds a file under the mountpoint, so the only correct answer
-// is to keep serving and try again.
-func shutdown(mount *fusev3.Mount, done <-chan struct{}, mountpoint string) error {
-	const (
-		firstRetry = 250 * time.Millisecond
-		maxRetry   = 30 * time.Second
-	)
-	for delay := firstRetry; ; delay = min(2*delay, maxRetry) {
-		err := mount.Unmount()
-		if err == nil {
-			<-done
-			return nil
-		}
+// The supervisor owns serving until the exact connection is terminal. Only an
+// explicit signal requests a normal unmount; a refusal leaves every serving
+// and enforcement owner alive. Renewal failure is diagnostic here: the mount's
+// authorization/session enforcement owner still withdraws expired authority.
+func superviseMount(mount interface {
+	UnmountKernel() error
+	Close() error
+}, done <-chan struct{}, requests <-chan os.Signal, renewalFailed <-chan error, report func(error)) error {
+	var renewalErr error
+	for {
+		// Prefer a terminal connection over another queued request. Close owns
+		// the identity/absence proof and must report its own cleanup result.
 		select {
 		case <-done:
-			// The kernel mount disappeared underneath us (an external
-			// fusermount -u, for example). Release the authority session.
-			return mount.Close()
+			return errors.Join(renewalErr, mount.Close())
 		default:
 		}
-		log.Printf("unmount %s: %v; the mount is still in use and remains served, retrying in %s", mountpoint, err, delay)
 		select {
 		case <-done:
-			return mount.Close()
-		case <-time.After(delay):
+			return errors.Join(renewalErr, mount.Close())
+		case <-requests:
+			if err := mount.UnmountKernel(); err != nil {
+				report(fmt.Errorf("normal unmount refused; mount remains supervised: %w", err))
+			}
+		case err := <-renewalFailed:
+			renewalFailed = nil
+			renewalErr = err
+			report(fmt.Errorf("automatic reauthorization failed; authorization enforcement remains active: %w", err))
 		}
 	}
 }

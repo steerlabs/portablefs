@@ -20,14 +20,11 @@ import (
 // has installed a successor on the same identity.
 type staleFlushRPC struct {
 	delegationFakeRPC
-	ordered bool
 	outcome string
 	entered chan struct{}
 	resume  chan struct{}
 	once    sync.Once
 }
-
-func (f *staleFlushRPC) SupportsOrderedFlush() bool { return f.ordered }
 
 func (f *staleFlushRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, pieces [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
 	if err := assigned(authorityrpc.MutationIdentity{Sequence: request.GetWrite().GetFlushSequence()}); err != nil {
@@ -77,10 +74,10 @@ func (f *staleFlushRPC) CallMutation(ctx context.Context, request *authoritypb.R
 }
 
 func TestDelegationDelayedFlushCannotMutateSuccessor(t *testing.T) {
-	for _, path := range []string{"write", "metadata", "ordered"} {
+	for _, path := range []string{"ordered write", "metadata"} {
 		for _, outcome := range []string{"coherence", "capacity", "uncertain", "success"} {
 			t.Run(path+"/"+outcome, func(t *testing.T) {
-				fake := &staleFlushRPC{ordered: path == "ordered", outcome: outcome, entered: make(chan struct{}), resume: make(chan struct{})}
+				fake := &staleFlushRPC{outcome: outcome, entered: make(chan struct{}), resume: make(chan struct{})}
 				manager := newDelegationTestManager(t, fake)
 				id := installDelegationForTest(t, manager, 49, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 				parsed, _ := delegationIdentity(id)
@@ -137,10 +134,11 @@ func TestDelegationCapacityWaiterCannotBlockLoss(t *testing.T) {
 	for _, kind := range []string{"write", "metadata"} {
 		t.Run(kind, func(t *testing.T) {
 			fake := &staleFlushRPC{outcome: "capacity", entered: make(chan struct{}), resume: make(chan struct{})}
-			manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+			manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
+			manager.StartWriteback()
 			t.Cleanup(manager.Stop)
 			id := installDelegationForTest(t, manager, 50, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 			if _, err := manager.Write(t.Context(), id, 0, []byte("old"), false); err != nil {
@@ -213,6 +211,10 @@ func TestDelegationDelayedInvalidationCannotDropSuccessor(t *testing.T) {
 }
 
 type staleCloseRPC struct{ delegationFakeRPC }
+
+func (f *staleCloseRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
 
 func (f *staleCloseRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if request.GetBarrier() != nil {

@@ -56,15 +56,18 @@ func (h *VolumeHandler) coherenceCloseAccounting(id volumeserver.SessionID, hand
 }
 
 func (h *VolumeHandler) coherenceCreateCapacity(id volumeserver.SessionID, request *authoritypb.CreateRequest, existed bool) (*volumeserver.DelegationCapacity, error) {
-	if existed || !request.GetWriteIntent() {
+	if !request.GetWriteIntent() {
 		return nil, nil
 	}
 	profile, err := h.sessionFrontendProfile(id)
 	if err != nil {
 		return nil, err
 	}
-	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || !request.GetFlags().GetWrite() {
+	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX || !request.GetFlags().GetWrite() {
 		return nil, syscall.EINVAL
+	}
+	if existed {
+		return nil, nil
 	}
 	token, err := h.coherenceToken(id)
 	if err != nil {
@@ -76,13 +79,6 @@ func (h *VolumeHandler) coherenceCreateCapacity(id volumeserver.SessionID, reque
 func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability, request *authoritypb.CreateRequest, existed bool, capacity *volumeserver.DelegationCapacity) error {
 	if !request.GetWriteIntent() {
 		return nil
-	}
-	profile, _ := h.sessionFrontendProfile(id)
-	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return syscall.EINVAL
-	}
-	if !request.GetFlags().GetWrite() {
-		return syscall.EINVAL
 	}
 	if existed {
 		return nil
@@ -107,14 +103,12 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 	if cacheless && (requestRequiresWrite(req) || req.GetOpen().GetWriteIntent() || req.GetOpen().GetCacheCapable()) {
 		return h.coherenceError(req.GetRequestId(), syscall.EPERM)
 	}
-	if req.GetOpen().GetWriteIntent() || req.GetOpen().GetFlags().GetWrite() {
+	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE && (req.GetOpen().GetWriteIntent() || req.GetOpen().GetFlags().GetWrite()) {
 		if err := h.coherenceProfileAdmission.RLockContext(ctx); err != nil {
 			return h.coherenceError(req.GetRequestId(), err)
 		}
 		defer h.coherenceProfileAdmission.RUnlock()
-		if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
-			return h.coherenceError(req.GetRequestId(), err)
-		}
+
 	}
 	return h.mutate(ctx, req, cred, func() *authoritypb.Response {
 		body := req.GetOpen()
@@ -130,14 +124,14 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 			return h.coherenceError(0, err)
 		}
 		var token volumeserver.SubscriptionToken
-		if !cacheless {
+		if !cacheless && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			token, err = h.coherenceToken(cred.ID)
 			if err != nil {
 				return h.coherenceError(0, err)
 			}
 		}
 		var delegationReservation *volumeserver.DelegationReservation
-		if body.GetWriteIntent() {
+		if body.GetWriteIntent() && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
 			reservation, e := h.Coherence.Reserve(ctx, token, identity)
 			if e != nil {
 				return h.coherenceError(0, e)
@@ -155,7 +149,7 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 				guard.Release()
 			}
 		}()
-		release, err := h.coherenceStorage.Acquire(ctx, volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityAttributes, Identity: identity}}))
+		release, err := h.coherenceStorage.Acquire(ctx, volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{{Scope: volumeserver.MutationAttributes, Identity: identity}}))
 		if err != nil {
 			return h.coherenceError(0, err)
 		}
@@ -170,6 +164,11 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 			return h.coherenceError(0, err)
 		}
 		defer reservation.release()
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE && (body.GetFlags().GetWrite() || body.GetWriteIntent()) {
+			if err := h.Writers.CheckOwner(cred.ID); err != nil {
+				return h.coherenceError(0, err)
+			}
+		}
 		handle, err := h.Store.OpenFile(item, openFlags(body.GetFlags()))
 		if err != nil {
 			return h.coherenceError(0, err)

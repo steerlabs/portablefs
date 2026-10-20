@@ -136,10 +136,12 @@ func summarizeEnumeration(entries []os.DirEntry) string {
 // A reply whose enumeration grant the frontend cannot install -- because a
 // newer recall already raised the grant floor, because that coordinate's recall
 // has begun and not finished, or because the family is at its cache budget --
-// is not an authority protocol violation. The authority is explicitly permitted
-// to answer a read without cache authority (docs/portable-coherence.md §2.2:
-// grants MAY be attached, and a coordinate under recall "serves its bytes and
-// mints nothing"), and §5.4 says an enumeration without E-R simply refetches.
+// is not an authority protocol violation. A reply carries no cache permission
+// of its own: the subscription stamp decides whether it may be cached, a
+// coordinate being withdrawn still serves its bytes uncached, and an uncovered
+// enumeration simply refetches from its continuation cookie
+// (docs/portable-coherence.md, "Visibility and cache permission" and
+// "Namespace, enumeration, and locks").
 // Treating the ungranted reply as a violation revoked the mount instead, and
 // every descriptor on it then returned ENOTCONN -- which is exactly what live
 // staging qualification hit, in seconds, three runs out of three.

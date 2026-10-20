@@ -189,6 +189,10 @@ func (m *delegationManager) reapStateLocked(s *delegationState, oldestRequest ui
 		return
 	}
 	s.collected = true
+	// Authority generations are volume-global. The grant-request cut above
+	// proved that no unreported older generation can still arrive, so one
+	// scalar preserves stale-CONTROL rejection after this identity is erased.
+	m.retiredGrantFloor = max(m.retiredGrantFloor, s.retiredGeneration)
 	delete(m.identityLoss, s.identity)
 	delete(m.byID, s.identity)
 	delete(m.retainedStates, s)

@@ -12,10 +12,6 @@ func testReleaseIdentity(hexDigit, version string) ReleaseIdentity {
 		CodeDirectoryHash: strings.Repeat(hexDigit, 40),
 		ExecutableSHA256:  strings.Repeat(hexDigit, 64),
 		DaemonVersion:     version,
-		IdentitySchema:    1,
-		ControlProtocol:   1,
-		PFSLocalMajor:     1,
-		PFSLocalMinor:     15,
 	}
 }
 
@@ -203,12 +199,22 @@ func TestDecodeExactRejectsDuplicateAndEscapedEquivalentKeysAtEveryDepth(t *test
 	}
 }
 
-func TestReleaseIdentityAllowsProtocolMinorZero(t *testing.T) {
-	identity := testReleaseIdentity("a", "2.0.0")
-	identity.PFSLocalMajor = 2
-	identity.PFSLocalMinor = 0
-	if err := ValidateReleaseIdentity(identity); err != nil {
-		t.Fatalf("valid 2.0 protocol identity rejected: %v", err)
+func TestReleaseIdentityRejectsRemovedProtocolFields(t *testing.T) {
+	release := testReleaseIdentity("a", "2.0.0")
+	data, err := json.Marshal(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeExact[ReleaseIdentity](data); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"} {
+		for _, value := range []string{"0", "null"} {
+			extra := strings.TrimSuffix(string(data), "}") + ",\"" + name + "\":" + value + "}"
+			if _, err := DecodeExact[ReleaseIdentity]([]byte(extra)); err == nil {
+				t.Fatalf("removed member %s accepted", extra)
+			}
+		}
 	}
 }
 
@@ -221,5 +227,30 @@ func TestSocketPathIsOutsideDaemonAndAppGroupRoots(t *testing.T) {
 	lease := LeasePath("/Users/example")
 	if lease != "/Users/example/.local/state/portablefs/host/activation.json" {
 		t.Fatalf("lease path = %q", lease)
+	}
+}
+
+func TestRemovedReleaseMembersAreRejectedInsideHandoffsAndLeases(t *testing.T) {
+	old, target := testReleaseIdentity("a", "1.0.0"), testReleaseIdentity("b", "2.0.0")
+	lease := ActivationLease{SchemaVersion: SchemaVersion, Phase: PhaseOldAbsent, OldRelease: old, TargetRelease: target}
+	reply := PreparedReply{SchemaVersion: SchemaVersion, State: "prepared", OldRelease: old, TargetRelease: target}
+	leaseData, err := json.Marshal(lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyData, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor"} {
+		inject := func(data []byte) []byte {
+			return []byte(strings.Replace(string(data), `"oldRelease":{`, `"oldRelease":{"`+key+`":0,`, 1))
+		}
+		if _, err := DecodeExact[ActivationLease](inject(leaseData)); err == nil {
+			t.Fatalf("lease accepted removed %s", key)
+		}
+		if _, err := DecodeExact[PreparedReply](inject(replyData)); err == nil {
+			t.Fatalf("host update accepted removed %s", key)
+		}
 	}
 }

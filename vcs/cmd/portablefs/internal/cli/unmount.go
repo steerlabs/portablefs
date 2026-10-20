@@ -40,11 +40,7 @@ var platformUnmountBudget = 30 * time.Second
 // kernel mount table (which always answers) to decide.
 var errPlatformUnmountAbandoned = errors.New("platform unmount helper did not return within its budget")
 
-// hostUnmountOps takes its helper budget explicitly because different callers
-// answer to different clocks: an operator-driven `portablefs umount` may wait
-// the full platform budget, but the revocation watchdog acts inside the
-// authority's fencing grace and a 30-second helper wait would blow straight
-// through a 15-second budget it exists to honor.
+// hostUnmountOps bounds one explicit platform unmount helper invocation.
 func hostUnmountOps(budget time.Duration) unmountOps {
 	return unmountOps{
 		goos:           runtime.GOOS,
@@ -154,4 +150,28 @@ func commandUnmountError(argv []string, output []byte, err error) error {
 		return fmt.Errorf("%s: %w", strings.Join(argv, " "), err)
 	}
 	return fmt.Errorf("%s: %w (output: %s)", strings.Join(argv, " "), err, text)
+}
+
+// This force path is reachable only from an explicit user force request.
+func forceFSKitKernelMount(st *mountState) error {
+	present, err := recordedKernelMountPresent(st)
+	if err != nil {
+		return fmt.Errorf("refuse explicit force because kernel identity is unverified: %w", err)
+	}
+	if !present {
+		return nil
+	}
+	if st.Strategy != "fskit" {
+		return fmt.Errorf("explicit FSKit force requires an FSKit record")
+	}
+	ops := platformUnmountOpsSource(platformUnmountBudget)
+	if ops.goos != "darwin" {
+		return fmt.Errorf("FSKit force requires macOS")
+	}
+	argv := []string{"/sbin/umount", "-f", st.MountPath}
+	out, err := ops.combinedOut(argv[0], argv[1:]...)
+	if err != nil {
+		return commandUnmountError(argv, out, err)
+	}
+	return nil
 }

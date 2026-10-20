@@ -13,6 +13,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 var (
@@ -24,6 +25,24 @@ var (
 
 const frameHeaderBytes = 8
 
+// The largest supported CONTROL body is DelegationRelease: the wire grammar
+// admits 4096 entries, each at most 44 canonical bytes (16-byte ID, uint64
+// generation and applied sequence, including nested tags/lengths). 16 KiB of
+// headroom covers the request/session envelope, and also exceeds the 8192-byte
+// access-token bound used by Attach/Reauthorize. No bulk body is legal in
+// CONTROL or bootstrap frames.
+const maxControlFrameBytes uint32 = maxWireRepeatedElements*44 + 16<<10
+
+// A burst of 64 maximal CONTROL/bootstrap frames leaves room for concurrent
+// keepalives, acknowledgments and pair recovery under DATA saturation without
+// charging every accepted connection a permanent quota. This is bounded burst
+// headroom (12 MiB), not a guarantee against saturation by CONTROL itself.
+const reservedControlFrames = 64
+
+func controlFrameReserve() uint64 {
+	return reservedControlFrames * uint64(frameAllocationBytes(maxControlFrameBytes))
+}
+
 // frameBudget bounds the bytes concurrently allocated for inbound frame
 // payloads across every connection a worker accepts. Without it the only bound
 // on attacker-paced transient allocation is MaxConnections multiplied by the
@@ -31,23 +50,28 @@ const frameHeaderBytes = 8
 type frameBudget struct {
 	mu        sync.Mutex
 	available uint64
+	reserve   uint64
 	// changed is closed and replaced on every release so that every waiter,
 	// not just one, re-evaluates its own reservation size.
 	changed chan struct{}
 }
 
-func newFrameBudget(limit uint64) *frameBudget {
-	return &frameBudget{available: limit, changed: make(chan struct{})}
+func newFrameBudget(limit, reserve uint64) *frameBudget {
+	return &frameBudget{available: limit, reserve: reserve, changed: make(chan struct{})}
 }
 
 // acquire reserves n bytes, waiting at most until ctx is done or wait elapses.
+// DATA leaves the fixed CONTROL/bootstrap reserve; CONTROL can use any bytes.
 // It never partially reserves.
-func (b *frameBudget) acquire(ctx context.Context, n uint32, wait time.Duration) error {
+func (b *frameBudget) acquire(ctx context.Context, n uint32, wait time.Duration, data bool) error {
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		b.mu.Lock()
-		if b.available >= uint64(n) {
+		if b.available >= uint64(n) && (!data || b.available-uint64(n) >= b.reserve) {
 			b.available -= uint64(n)
 			b.mu.Unlock()
 			return nil
@@ -104,6 +128,13 @@ func framePoolClass(size int) int {
 }
 
 func framePoolBytes(class int) int { return (class + 1) * framePoolGranularity }
+
+func frameAllocationBytes(size uint32) uint32 {
+	if class := framePoolClass(int(size)); class >= 0 {
+		return uint32(framePoolBytes(class))
+	}
+	return size
+}
 
 // acquireFramePayload returns a size-length buffer whose every byte the caller
 // immediately overwrites with the frame it is reading. A pooled buffer is
@@ -165,23 +196,39 @@ func readFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.D
 // replay payload digest into the socket-to-frame copy so handler execution can
 // authenticate the exact same bytes without traversing the completed payload
 // again.
-func readRequestFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message *authoritypb.Request) (func(), *[sha256.Size]byte, error) {
-	return readFrameInto(r, max, budget, wait, message, true, true)
+func readRequestFrameRetained(ctx context.Context, r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message *authoritypb.Request, allowBulk bool) (func(), *[sha256.Size]byte, error) {
+	return readFrameWithContext(ctx, r, max, budget, wait, message, true, true, allowBulk)
 }
 
 func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message, recycle, digestBulk bool) (func(), *[sha256.Size]byte, error) {
+	return readFrameWithContext(context.Background(), r, max, budget, wait, message, recycle, digestBulk, true)
+}
+
+// Authenticated CONTROL and bootstrap readers disallow bulk from the header,
+// before either a reservation or allocation can be influenced by that body.
+func readFrameWithContext(ctx context.Context, r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message, recycle, digestBulk, allowBulk bool) (func(), *[sha256.Size]byte, error) {
 	var header [frameHeaderBytes]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, nil, err
 	}
 	metadataSize := binary.BigEndian.Uint32(header[:4])
 	bulkSize := binary.BigEndian.Uint32(header[4:])
+	if !allowBulk && bulkSize != 0 {
+		return nil, nil, fmt.Errorf("%w: bulk on CONTROL/bootstrap", ErrFramePayload)
+	}
+	if !allowBulk && metadataSize > maxControlFrameBytes {
+		return nil, nil, fmt.Errorf("%w: CONTROL/bootstrap metadata %d (max %d)", ErrFrameBounds, metadataSize, maxControlFrameBytes)
+	}
 	total := uint64(metadataSize) + uint64(bulkSize)
 	if metadataSize == 0 || total > uint64(max) {
 		return nil, nil, fmt.Errorf("%w: metadata %d + bulk %d (max %d)", ErrFrameBounds, metadataSize, bulkSize, max)
 	}
+	allocated := uint32(total)
+	if recycle {
+		allocated = frameAllocationBytes(allocated)
+	}
 	if budget != nil {
-		if err := budget.acquire(context.Background(), uint32(total), wait); err != nil {
+		if err := budget.acquire(ctx, allocated, wait, allowBulk); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -209,7 +256,7 @@ func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Durat
 			releaseFramePayload(payload, class)
 		}
 		if budget != nil {
-			budget.release(uint32(total))
+			budget.release(allocated)
 		}
 	}
 	fail := func(err error) (func(), *[sha256.Size]byte, error) {
@@ -225,7 +272,7 @@ func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Durat
 		return fail(err)
 	}
 	if err := (proto.UnmarshalOptions{DiscardUnknown: false}).Unmarshal(metadata, message); err != nil {
-		return fail(fmt.Errorf("decode protobuf frame: %w", err))
+		return fail(fmt.Errorf("%w: decode protobuf frame: %v", ErrFrameEncoding, err))
 	}
 	carrier, err := frameBulkCarrier(message)
 	if err != nil {
@@ -304,17 +351,18 @@ func writeFrameBulk(w io.Writer, max uint32, message proto.Message, segments [][
 	// Keep the fixed header and small protobuf metadata in one TLS write. The
 	// bulk body remains a second write so it is never copied into a staging
 	// buffer merely to recover writev-like shape above TLS.
-	prefix := make([]byte, frameHeaderBytes, frameHeaderBytes+proto.Size(message))
-	prefix, err = proto.MarshalOptions{Deterministic: true}.MarshalAppend(prefix, message)
+	metadata, err := canonicalBytes(message.ProtoReflect())
 	if carrier != nil {
 		*carrier = bulk
 	}
 	if err != nil {
-		return fmt.Errorf("encode protobuf frame: %w", err)
+		return fmt.Errorf("%w: %v", ErrFrameEncoding, err)
 	}
-	metadata := prefix[frameHeaderBytes:]
-	// Canonical encoding is produced by the typed deterministic marshaler.
-	// Reflective grammar and allocation bounds are checked once, on ingress.
+	if err := validateWireMessage(metadata, message.ProtoReflect().Descriptor()); err != nil {
+		return err
+	}
+	prefix := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata))
+	prefix = append(prefix, metadata...)
 	bulkBytes := uint64(len(bulk))
 	if segments != nil {
 		bulkBytes = segmentedBytes
@@ -358,11 +406,14 @@ func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 		if write := typed.GetWrite(); write != nil {
 			return &write.Data, nil
 		}
-		if write := typed.GetFskitWrite(); write != nil &&
-			write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA {
-			return &write.Data, nil
-		}
 	case *authoritypb.Response:
+		if proof := typed.GetSessionValidForNanos(); proof != 0 &&
+			(proof > uint64(MaxCacheProof) || proof%uint64(time.Millisecond) != 0 || !keepAliveSucceeded(typed)) {
+			return nil, fmt.Errorf("%w: invalid KeepAlive validity proof", ErrFrameEncoding)
+		}
+		if _, mkdir := typed.GetBody().(*authoritypb.Response_Mkdir); mkdir && typed.GetErrno() == 0 && !typed.GetUncertain() && !validMkdirReply(typed) {
+			return nil, fmt.Errorf("%w: malformed mkdir result", ErrFrameEncoding)
+		}
 		if read := typed.GetRead(); read != nil {
 			return &read.Data, nil
 		}
@@ -387,4 +438,29 @@ func writeAll(w io.Writer, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// keepAliveSucceeded is the one definition of a successful KeepAlive reply,
+// used for both proof placement and consumption. The success envelope is
+// exactly the request ID, the epoch, and (for FSKit) the proof; any other
+// populated field marks a different outcome: an errno, uncertainty, failure
+// class, route record, replay state, post-state, terminal-delivery token,
+// restore detail, application or visibility sequence, terminal flag, a body,
+// or an unknown field. Checking populated
+// fields rather than a list of known markers keeps a future non-success field
+// from passing.
+func keepAliveSucceeded(response *authoritypb.Response) bool {
+	if response == nil || len(response.ProtoReflect().GetUnknown()) != 0 {
+		return false
+	}
+	succeeded := true
+	response.ProtoReflect().Range(func(field protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		switch field.Name() {
+		case "request_id", "epoch", "session_valid_for_nanos":
+			return true
+		}
+		succeeded = false
+		return false
+	})
+	return succeeded
 }

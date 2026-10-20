@@ -44,7 +44,8 @@ type Store interface {
 	LogicalSize(entry uint32) (int64, error)
 	PWrite(entry uint32, off int64, data []byte) error
 	Fdatasync(entry uint32) error
-	RestoreMtime(entry uint32) error
+	Mtime(entry uint32) (int64, error)
+	RestoreMtime(entry uint32, nanos int64) error
 	Linked(entry uint32) (bool, error)
 	// DiscardUnlinked drops an entry only after no authority item or open
 	// capability can make its unlinked inode reachable again.
@@ -69,6 +70,9 @@ type Config struct {
 	MaxFrameBytes    uint32
 	Now              func() time.Time
 
+	// OnStorageFailure terminates the epoch after hydration persistence or
+	// timestamp restoration fails. It must not wait for restore workers to stop.
+	OnStorageFailure func(error)
 	// OnDurableMark is a test/diagnostic hook invoked after the map fsync. It
 	// never participates in correctness and production leaves it nil.
 	OnDurableMark func(entry, chunk uint32, userModified bool)

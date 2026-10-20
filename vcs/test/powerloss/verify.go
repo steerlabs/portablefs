@@ -15,16 +15,16 @@ type Requirement string
 
 const (
 	// RequirePresent: an fsync through the mount returned success before the
-	// cut, so unix.Fdatasync had returned on the target descriptor in the
-	// authority. The file must exist after recovery with exactly the bytes the
+	// cut, so the authority's fdatasync or fsync had returned on the target
+	// descriptor. The file must exist after recovery with exactly the bytes the
 	// workload wrote. A missing or different file here is a durability defect.
 	RequirePresent Requirement = "present"
-	// RequirePermitted: the write was acknowledged but never fsynced, or it
-	// was fsynced only after this cut. The authority acknowledges a write
-	// transaction once sendfile has applied the staged bytes to the XFS inode,
-	// which puts them in the page cache and nowhere else, so a power cut may
-	// legitimately discard them. Absent, empty, partial and complete are all
-	// conforming outcomes.
+	// RequirePermitted: write(2) returned but nothing was fsynced, or the
+	// fsync came only after this cut. Until that fsync the bytes may live in
+	// the kernel page cache, the mount's delegated write buffer or the
+	// authority's XFS page cache, all of which a power cut may legitimately
+	// discard. Absent, empty, partial and complete are all conforming
+	// outcomes.
 	//
 	// One thing is still asserted: whatever bytes ARE there must be bytes this
 	// workload wrote, or zeros. Checkpoint files are write-once, so any other
@@ -86,7 +86,7 @@ func Expectations(log *Log, ledger *Ledger, endEntry int) ([]Expectation, error)
 			expectations = append(expectations, Expectation{
 				Checkpoint:  checkpoint,
 				Requirement: RequirePermitted,
-				Why:         "the write was acknowledged but never fsynced, so it lived only in the page cache a power cut discards",
+				Why:         "write(2) returned but nothing was fsynced, so the bytes lived only in caches a power cut discards",
 			})
 		}
 	}

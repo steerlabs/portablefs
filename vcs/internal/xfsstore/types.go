@@ -7,9 +7,9 @@ package xfsstore
 import (
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"syscall"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 )
@@ -77,9 +77,19 @@ func outcomeUncertain(cause error) error {
 	return fmt.Errorf("%w: %w", ErrOutcomeUncertain, cause)
 }
 
-// Config contains provisioned identity, not tuning knobs. Project zero is
-// never a production volume because XFS does not enforce project-zero limits.
+// StorageSync reports one actual persistence syscall, after any failure has
+// fenced the volume. The observer must be nonblocking and safe concurrently.
+type StorageSync struct {
+	Kind    string
+	Elapsed time.Duration
+	Waiters int
+}
+
+// Config contains provisioned identity and an optional observation sink. Project
+// zero is never a production volume because XFS does not enforce its limits.
 type Config struct {
+	OnStorageSync func(StorageSync)
+
 	ExpectedProjectID uint32
 	// PortableFS v3 volumes are single-principal workspaces. Every inode is
 	// owned by the unprivileged authority service identity; mount frontends
@@ -230,15 +240,12 @@ func (e *WriteLimitError) Error() string {
 
 func (*WriteLimitError) Unwrap() error { return syscall.EFBIG }
 
-// WriteTarget is one pinned writable open description and its immutable XFS
-// identity. Pinning separates handle-table lifetime from one staged write:
-// CLOSE may retire the client handle while a previously accepted transaction
-// still owns the descriptor. CommitWrite applies a staged multi-fragment
-// syscall; CommitWriteData applies a complete retained-frame payload directly.
-// Exactly one primitive is selected by the negotiated max_write boundary.
+// WriteTarget pins one writable description and immutable identity through a
+// direct retained-frame write and its persistence obligation. CLOSE can retire
+// the capability without invalidating an already admitted target.
 type WriteTarget interface {
+	Sync() error
 	Coordinate() ObjectCoordinate
-	CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (committedSize, assignedOffset uint64, post Attr, err error)
 	CommitWriteData(data []byte, spec WriteCommit) (committedSize, assignedOffset uint64, post Attr, err error)
 	Close() error
 }
@@ -271,8 +278,8 @@ const (
 // OpenFlags is the intentionally small set of file-open behavior exposed on
 // the remote protocol. Arbitrary Linux flags are never accepted from a peer.
 // Sync and DataSync are immutable logical handle state: the authority keeps
-// its data fd non-sticky so a fragmented transaction does not flush once per
-// fragment, then performs the one operation-level sync Linux requires.
+// its data fd non-sticky and performs the one operation-level sync Linux
+// requires after the complete direct write.
 type OpenFlags struct {
 	Read     bool
 	Write    bool
@@ -280,6 +287,14 @@ type OpenFlags struct {
 	Truncate bool
 	Sync     bool
 	DataSync bool
+}
+
+// Validate runs before any CREATE side effect as well as before OPEN.
+func (f OpenFlags) Validate() error {
+	if !f.Read && !f.Write || (f.Append || f.Truncate) && !f.Write {
+		return fs.ErrInvalid
+	}
+	return nil
 }
 
 // RenameFlags map to renameat2's atomic behaviors.

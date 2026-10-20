@@ -29,6 +29,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
+	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/mountrecord"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -148,16 +149,28 @@ func (pki v3TestPKI) enrollmentCertificateForClientKey(t *testing.T, enrollmentI
 // authorityrpc server transport: mutual TLS, the full Hello/Attach handshake,
 // and enough of the operation surface for the daemon's v3 data plane.
 type v3TestAuthority struct {
-	epoch                        []byte
-	session                      []byte
-	leaseMillis                  uint64
-	maxFskitWrite                uint64
-	mountEnrollment              bool
+	epoch           []byte
+	session         []byte
+	leaseMillis     uint64
+	maxFskitWrite   uint64
+	mountEnrollment bool
+	// omitDirectWrite/omitDurableMutations/omitBatchedClose model an
+	// authority that predates the FSKit direct-write, durable-mutation, and
+	// FSKit CloseBatch contracts.
+	omitDirectWrite              bool
+	omitDurableMutations         bool
+	omitBatchedClose             bool
+	omitVersionedMetadata        bool
 	initialAuthorizationDeadline int64
 	renewedAuthorizationDeadline int64
+	releaseStarted               chan struct{}
+	releaseFinish                chan struct{}
+	releaseErrno                 int32
+	detachErrno                  int32
 
 	mu               sync.Mutex
 	keepAliveErrno   int32
+	keepAliveHook    func(context.Context, *authoritypb.Request)
 	statfsNameMax    uint32
 	attach           *authoritypb.AttachRequest
 	detach           *authoritypb.DetachRequest
@@ -170,10 +183,10 @@ var v3TestNeverTerminal = make(chan struct{})
 
 func newV3TestAuthority() *v3TestAuthority {
 	return &v3TestAuthority{
-		epoch:         bytes.Repeat([]byte{0x5a}, 16),
-		session:       bytes.Repeat([]byte{0x6b}, 16),
-		leaseMillis:   30_000,
-		maxFskitWrite: authorityrpc.RequiredFskitWriteBytes,
+		epoch:       bytes.Repeat([]byte{0x5a}, 16),
+		session:     bytes.Repeat([]byte{0x6b}, 16),
+		leaseMillis: 30_000,
+
 		statfsNameMax: 255,
 	}
 }
@@ -237,20 +250,12 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	switch req.GetBody().(type) {
 	case *authoritypb.Request_Hello:
 		bounds := h.Bounds()
-		features := []string{
-			"xfs-current-state", "session-exact-epoch", "framed-bulk-data-v1",
-			"authority-keyed-replay-fingerprint-v1", "mandatory-dual-transport-v1", "exact-resource-acquisition",
-			"fskit-sync-repair-v1", "fskit-source-publication-v1", "fskit-fragmented-write-v1",
-		}
-		if h.mountEnrollment {
-			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
-		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: authorityrpc.ProtocolMajor, Features: features,
-			Role: req.GetHello().GetRole(), ConnectionSetId: append([]byte(nil), req.GetHello().GetConnectionSetId()...),
+			ProtocolMajor: authorityrpc.ProtocolMajor,
+			Role:          req.GetHello().GetRole(), ConnectionSetId: append([]byte(nil), req.GetHello().GetConnectionSetId()...),
 			FrontendProfile: req.GetHello().GetFrontendProfile(),
 			MaxFrameBytes:   bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
-			MaxInFlight: uint32(bounds.MaxInFlight), MaxFskitWriteBytes: h.maxFskitWrite,
+			MaxInFlight: uint32(bounds.MaxInFlight),
 		}}
 	case *authoritypb.Request_Attach:
 		h.mu.Lock()
@@ -261,29 +266,15 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			ResumeSecret: make([]byte, 32), ProvisionalDeadlineUnixNanos: time.Now().Add(time.Minute).UnixNano(),
 		}}
 	case *authoritypb.Request_Activate:
-		features := []string{
-			"write-through", "no-history", "no-branches",
-			"user-xattr-readonly", "single-principal", "distributed-posix-locks",
-			"stable-item-identity", "volume-syncfs-barrier", "exact-resource-acquisition",
-			"fskit-sync-repair-v1", "fskit-source-publication-v1", "fskit-fragmented-write-v1",
-			"peer-complete-fifo-feedback",
-		}
-		if h.mountEnrollment {
-			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
-		}
 		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
-			Root:                     h.rootItem(),
-			Features:                 features,
-			SessionLeaseMilliseconds: h.leaseMillis,
-			FskitRepairCursor: &authoritypb.VisibilityCursor{
-				Sequence: 1,
-				Phase:    authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE,
-			},
+			Root: h.rootItem(),
+
+			SessionLeaseMilliseconds:       h.leaseMillis,
 			AuthorizationDeadlineUnixNanos: h.initialAuthorizationDeadline,
 			RoutesRevision:                 bytes.Repeat([]byte{0xab}, 32),
 			State:                          authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:                        authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile:                authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+			FrontendProfile:                authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
 		}}
 	case *authoritypb.Request_Resume:
 		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
@@ -299,7 +290,14 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	case *authoritypb.Request_KeepAlive:
 		h.mu.Lock()
 		response.Errno = h.keepAliveErrno
+		hook := h.keepAliveHook
 		h.mu.Unlock()
+		if hook != nil {
+			hook(ctx, req)
+		}
+		if response.Errno == 0 {
+			response.SessionValidForNanos = uint64(min(time.Duration(h.leaseMillis)*time.Millisecond, authorityrpc.MaxCacheProof))
+		}
 	case *authoritypb.Request_StatFs:
 		h.mu.Lock()
 		h.statfsCalls++
@@ -320,15 +318,31 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
 			Item: &authoritypb.Item{
 				Token: bytes.Repeat([]byte{0x33}, 16), StableIdentity: bytes.Repeat([]byte{0x44}, 16),
-				Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+				Attr:          &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+				ObjectVersion: 1, SnapshotSequence: 1,
 			},
 		}}
-	case *authoritypb.Request_NextFskitRepair:
-		// The strict long-poll: nothing becomes visible in these tests, so the
-		// poll parks until the session ends.
-		<-ctx.Done()
-		response.Errno = 4
+	case *authoritypb.Request_CloseBatch:
+		if h.releaseStarted != nil {
+			close(h.releaseStarted)
+		}
+		if h.releaseFinish != nil {
+			select {
+			case <-h.releaseFinish:
+			case <-ctx.Done():
+			}
+		}
+		response.Mutation = &authoritypb.MutationState{Slot: req.GetMutation().GetSlot(), AcceptedSequence: req.GetMutation().GetSequence()}
+		response.Errno = h.releaseErrno
+		if response.Errno == 0 {
+			results := make([]*authoritypb.CloseBatchResult, len(req.GetCloseBatch().GetCloses()))
+			for i := range results {
+				results[i] = &authoritypb.CloseBatchResult{Retired: true}
+			}
+			response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}
+		}
 	case *authoritypb.Request_Detach:
+		response.Errno = h.detachErrno
 		h.mu.Lock()
 		h.detach = req.GetDetach()
 		h.mu.Unlock()
@@ -379,12 +393,10 @@ func v3TestEnsureRequest(address string, pki v3TestPKI, mountPath string) ensure
 		TLSCASHA256:         pki.caSHA256,
 		MountPath:           mountPath,
 		V3: &v3AttachRequest{
-			ClientCertPEM:      pki.clientCertPEM,
-			ClientKeyPEM:       pki.clientKeyPEM,
-			CachedNameCapacity: 1024,
-			RepairBudgetMillis: 60_000,
-			CachePolicy:        v3CachePolicyMacOS26,
-			RoutesRevision:     strings.Repeat("ab", 32),
+			ClientCertPEM: pki.clientCertPEM,
+			ClientKeyPEM:  pki.clientKeyPEM,
+
+			RoutesRevision: strings.Repeat("ab", 32),
 		},
 	}
 	req.observePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
@@ -475,7 +487,6 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 	// and registry path as an ordinary direct attach.
 	stateDir := privateTestDir(t)
 	r := newRegistry(stateDir)
-	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, req)
 	t.Cleanup(a.lifeCancel)
 
@@ -519,7 +530,9 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 	if _, handled, err := a.rotateLiveCredential(context.Background(), "manual", renewedDeadline.UnixMilli(), 2, pki.clientCertPEM, false); !handled || err == nil || !strings.Contains(err.Error(), "automatic reauthorization owner") {
 		t.Fatalf("manual fallback against automatic owner: handled=%t err=%v", handled, err)
 	}
-	if found, _, err := r.delete(context.Background(), a.ref, true); err != nil || !found {
+	if found, err := r.unmountFSKitWith(a.ref, true, fskitKernelOps{
+		present: func(string, string) (bool, error) { return false, nil },
+	}); err != nil || !found {
 		t.Fatalf("detach automatic renewal owner: found=%t err=%v", found, err)
 	}
 	select {
@@ -548,7 +561,6 @@ func TestV3ManualReauthorizationUsesAuthorityDeadline(t *testing.T) {
 	handler.renewedAuthorizationDeadline = authorityDeadline.UnixNano()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3ManualReauthorization")
 	req.AuthTokenExpiresAtMs = initialDeadline.UnixMilli()
 	a := ensureV3TestAttach(t, r, req)
@@ -580,16 +592,12 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3"))
 
 	// The daemon — not the frontend — declared the strict barrier contract.
 	admitted := handler.recordedAttach()
 	if admitted == nil ||
-		admitted.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR ||
-		admitted.GetFskitCachedNameCapacity() != 1024 ||
-		admitted.GetFskitRepairBudgetMillis() != 60_000 ||
-		admitted.GetFskitNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED ||
+		admitted.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE ||
 		hex.EncodeToString(admitted.GetRoutesRevision()) != strings.Repeat("ab", 32) ||
 		string(admitted.GetAccessToken()) != "capability" {
 		t.Fatalf("authority admitted contract %+v", admitted)
@@ -618,37 +626,15 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	if !ok {
 		t.Fatalf("resolve reply = %T", resolvedAny)
 	}
-	if resolved.Branch != "" || resolved.Root.ItemID != v3RootItemID ||
+	if resolved.Root.ItemID != v3RootItemID ||
 		resolved.Root.StableIdentity != ([16]byte{0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42}) {
 		t.Fatalf("v3 resolve root = %+v", resolved)
 	}
-	contract := resolved.V3Coherence
-	if contract == nil ||
-		!bytes.Equal(contract.AuthorityEpoch, handler.epoch) ||
-		!bytes.Equal(contract.SessionID, handler.session) ||
-		contract.AuthorityProtocolMajor != authorityrpc.ProtocolMajor ||
-		contract.CachePolicy != v3CachePolicyMacOS26 ||
-		contract.RepairBudgetMillis != 60_000 {
-		t.Fatalf("v3 resolve contract = %+v", contract)
-	}
-
 	// Binding the visibility subscriber is what admits strict operations.
 	client.call(&pfslocal.SubscribeEventsRequest{})
 	d := a.v3Backend()
 	if d == nil {
 		t.Fatal("no v3 data plane installed")
-	}
-	authorityClient, ok := d.client.(*authorityrpc.Client)
-	if !ok {
-		t.Fatalf("v3 data-plane client = %T, want authorityrpc.Client", d.client)
-	}
-	if cursor := authorityClient.InitialLeaseCursor(); cursor != nil {
-		t.Fatalf("FSKit activation installed Linux lease cursor %+v", cursor)
-	}
-	cursor := authorityClient.InitialVisibilityCursor()
-	if cursor == nil || cursor.GetSequence() != 1 ||
-		cursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
-		t.Fatalf("FSKit activation repair cursor = %+v, want exact COMPLETE sequence 1", cursor)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for d.bridge.readyForOperations() != nil {
@@ -680,45 +666,20 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	}
 }
 
-func TestV3NamespaceRepairMatchesCacheExecutionModel(t *testing.T) {
-	tests := []struct {
-		policy string
-		want   authoritypb.NamespaceRepair
-	}{
-		{v3CachePolicyMacOS26V1, authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED},
-		{v3CachePolicyMacOS26, authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED},
-		{v3CachePolicyFSKit, authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT},
-		{"unknown", authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED},
-	}
-	for _, test := range tests {
-		if got := v3NamespaceRepair(test.policy); got != test.want {
-			t.Fatalf("v3NamespaceRepair(%q) = %v, want %v", test.policy, got, test.want)
-		}
-	}
-}
-
 func TestV3AttachEnsureRefusesUnsupportedShapes(t *testing.T) {
 	pki := newV3TestPKI(t)
 	base := v3TestEnsureRequest("127.0.0.1:1", pki, "/Volumes/PortableFSV3Refuse")
 	for name, mutate := range map[string]func(*ensureAttachRequest){
-		"branch": func(req *ensureAttachRequest) { req.Branch = "main" },
 		"plaintext": func(req *ensureAttachRequest) {
 			req.DataPlaneTransport = "plaintext"
 			req.DataPlaneServerName, req.TLSCAPEM, req.TLSCASHA256 = "", "", ""
 		},
 		"missing capability": func(req *ensureAttachRequest) { req.AuthToken = "" },
-		"local dirs":         func(req *ensureAttachRequest) { req.Options.LocalDirs = []string{"cache"} },
-		"prefetch":           func(req *ensureAttachRequest) { req.Options.Prefetch = true },
-		"disk cache":         func(req *ensureAttachRequest) { req.Options.DiskCacheMB = 1 },
-		"cache policy":       func(req *ensureAttachRequest) { req.V3.CachePolicy = "automatic" },
 		"routes revision":    func(req *ensureAttachRequest) { req.V3.RoutesRevision = "AB" },
-		"repair budget":      func(req *ensureAttachRequest) { req.V3.RepairBudgetMillis = 0 },
-		"name capacity":      func(req *ensureAttachRequest) { req.V3.CachedNameCapacity = 0 },
 		"identity":           func(req *ensureAttachRequest) { req.V3.ClientKeyPEM = "not a key" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newRegistry(privateTestDir(t))
-			t.Cleanup(r.stopPersister)
 			req := base
 			v3 := *base.V3
 			req.V3 = &v3
@@ -740,7 +701,6 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 
 	t.Run("foreign CA refused", func(t *testing.T) {
 		r := newRegistry(privateTestDir(t))
-		t.Cleanup(r.stopPersister)
 		foreign := newV3TestPKI(t)
 		req := v3TestEnsureRequest(address, foreign, "/Volumes/PortableFSV3WrongCA")
 		if _, _, err := r.ensure(context.Background(), req); err == nil {
@@ -752,7 +712,6 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 	})
 	t.Run("wrong exact server name refused", func(t *testing.T) {
 		r := newRegistry(privateTestDir(t))
-		t.Cleanup(r.stopPersister)
 		req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3WrongName")
 		req.DataPlaneServerName = "other.example"
 		if _, _, err := r.ensure(context.Background(), req); err == nil {
@@ -767,22 +726,9 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 	}
 }
 
-func TestV3AttachRequiresFullFSKitWriteCapacityBeforeAttach(t *testing.T) {
-	pki := newV3TestPKI(t)
-	handler := newV3TestAuthority()
-	handler.maxFskitWrite = authorityrpc.RequiredFskitWriteBytes - 1
-	address := startV3TestAuthority(t, handler, pki.serverTLS)
-	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
-	if _, _, err := r.ensure(context.Background(), v3TestEnsureRequest(
-		address, pki, "/Volumes/PortableFSV3ShortWriteCapacity",
-	)); err == nil || !strings.Contains(err.Error(), "fragmented-write capacity") {
-		t.Fatalf("short FSKit write capacity = %v, want pre-Attach refusal", err)
-	}
-	if handler.recordedAttach() != nil || len(r.list()) != 0 {
-		t.Fatal("short FSKit write capacity left authority or daemon attach state")
-	}
-}
+// The daemon sends one ordinary WRITE per chunk and acknowledges FSKit
+// mutations as durable, so an authority that lacks either contract must be
+// refused before a mount exists, never served with weaker semantics.
 
 func TestV3DataPlanePreflightFailureReleasesActiveSessionBeforeFSKitMount(t *testing.T) {
 	pki := newV3TestPKI(t)
@@ -792,7 +738,6 @@ func TestV3DataPlanePreflightFailureReleasesActiveSessionBeforeFSKitMount(t *tes
 	handler.statfsNameMax = 0
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3PreflightFailure")
 	if _, _, err := r.ensure(context.Background(), req); err == nil || !strings.Contains(err.Error(), "NAME_MAX") {
 		t.Fatalf("v3 preflight failure = %v, want NAME_MAX refusal", err)
@@ -814,7 +759,6 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Detach"))
 
 	var mu sync.Mutex
@@ -834,9 +778,6 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			kernelDetachModes = append(kernelDetachModes, force)
-			if !force {
-				return syscall.EBUSY
-			}
 			unmounted = true
 			if handler.recordedDetach() != nil {
 				detachesBeforeUnmount++
@@ -844,15 +785,15 @@ func TestV3DetachDeliversMountAbsenceProofBeforeRelease(t *testing.T) {
 			return nil
 		},
 	}
-	found, jobID, err := r.unmountFSKitWith(a.ref, false, ops)
-	if err != nil || !found || jobID != "" {
-		t.Fatalf("v3 unmount=(%v,%q,%v)", found, jobID, err)
+	found, err := r.unmountFSKitWith(a.ref, false, ops)
+	if err != nil || !found {
+		t.Fatalf("v3 unmount=(%v,%v)", found, err)
 	}
 	if detachesBeforeUnmount != 0 {
 		t.Fatal("mount-absence proof reached the authority before the kernel detach")
 	}
-	if len(kernelDetachModes) != 2 || kernelDetachModes[0] || !kernelDetachModes[1] {
-		t.Fatalf("kernel detach modes=%v, want synchronized then forced", kernelDetachModes)
+	if len(kernelDetachModes) != 1 || kernelDetachModes[0] {
+		t.Fatalf("kernel detach modes=%v, want one unforced attempt", kernelDetachModes)
 	}
 	sent := handler.recordedDetach()
 	proof := sent.GetMountAbsence()
@@ -878,7 +819,6 @@ func TestV3NormalDetachNeverForcesPastASynchronizeFailure(t *testing.T) {
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(
 		address,
 		pki,
@@ -886,7 +826,7 @@ func TestV3NormalDetachNeverForcesPastASynchronizeFailure(t *testing.T) {
 	))
 
 	var kernelDetachModes []bool
-	found, _, err := r.unmountFSKitWith(a.ref, false, fskitKernelOps{
+	found, err := r.unmountFSKitWith(a.ref, false, fskitKernelOps{
 		present: func(_, _ string) (bool, error) { return true, nil },
 		unmountExact: func(_, _ string, force bool) error {
 			kernelDetachModes = append(kernelDetachModes, force)
@@ -912,7 +852,6 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Fence"))
 
 	var mu sync.Mutex
@@ -933,7 +872,7 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 			return nil
 		},
 	}
-	found, _, err := r.unmountFSKitWith(a.ref, false, ops)
+	found, err := r.unmountFSKitWith(a.ref, false, ops)
 	if !found || err == nil {
 		t.Fatalf("unprovable v3 detach = (%v, %v), want a definite refusal", found, err)
 	}
@@ -958,14 +897,82 @@ func TestV3DetachWithoutAbsenceProofEndsFenced(t *testing.T) {
 		present:      func(_, _ string) (bool, error) { return false, nil },
 		unmountExact: func(_, _ string, _ bool) error { return errors.New("nothing to detach") },
 	}
-	if found, _, err := r.unmountFSKitWith(a.ref, false, absent); err != nil || !found {
+	if found, err := r.unmountFSKitWith(a.ref, false, absent); err == nil || !found {
 		t.Fatalf("fenced v3 detach retry = (%v, %v)", found, err)
 	}
-	if r.get(a.ref) != nil {
-		t.Fatal("fenced v3 attach was not released after the exact absence observation")
+	if r.get(a.ref) != nil || !a.isDetached() {
+		t.Fatal("completed fenced teardown remained registered")
 	}
 	if handler.recordedDetach() != nil {
 		t.Fatal("a fenced session delivered detach evidence")
+	}
+}
+
+func TestV3FrontendLossDeliversAbsenceProofBeforeClosingAuthority(t *testing.T) {
+	for name, initiallyPresent := range map[string]bool{"already-absent": false, "mounted": true} {
+		t.Run(name, func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSFrontendLoss"))
+			d := a.v3Backend()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			done := make(chan error, 1)
+			go func() { done <- d.bridge.run(ctx, func(*pfslocal.Event) error { return nil }) }()
+			deadline := time.Now().Add(time.Second)
+			for {
+				d.bridge.mu.Lock()
+				subscribed := d.bridge.subscribed
+				d.bridge.mu.Unlock()
+				if subscribed {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("frontend did not subscribe")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatalf("frontend loss = %v", err)
+			}
+			if d.terminalError() == nil {
+				t.Fatal("frontend loss did not stop local serving")
+			}
+			select {
+			case <-d.client.SessionDone():
+				t.Fatal("frontend loss closed the authority before the supervisor observed unmount")
+			default:
+			}
+			mounted := initiallyPresent
+			ops := fskitKernelOps{
+				present: func(_, _ string) (bool, error) { return mounted, nil },
+				unmountExact: func(_, _ string, force bool) error {
+					if !mounted || !force {
+						return errors.New("terminal teardown must force only the existing mount")
+					}
+					mounted = false
+					return nil
+				},
+			}
+			if found, err := r.unmountFSKitWith(a.ref, true, ops); !found || err != nil {
+				t.Fatalf("retire frontend loss = (%v, %v)", found, err)
+			}
+			if detach := handler.recordedDetach(); detach == nil || detach.GetMountAbsence() == nil {
+				t.Fatal("authority did not receive the exact session's mount-absence proof")
+			}
+			if r.get(a.ref) != nil {
+				t.Fatal("proved retirement left the attach registered")
+			}
+			select {
+			case <-d.client.SessionDone():
+			default:
+				t.Fatal("proved retirement did not close its authority transport")
+			}
+
+		})
 	}
 }
 
@@ -974,11 +981,7 @@ func TestV3TerminalSessionMarksAttachTerminal(t *testing.T) {
 	handler := newV3TestAuthority()
 	address := startV3TestAuthority(t, handler, pki.serverTLS)
 	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
 	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Terminal")
-	// A short repair budget makes the liveness pulse fast (min(lease,budget)/3)
-	// without touching any production constant.
-	req.V3.RepairBudgetMillis = 300
 	a := ensureV3TestAttach(t, r, req)
 	d := a.v3Backend()
 	if d == nil {
@@ -1019,17 +1022,15 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 	first := newRegistry(stateDir)
 	a := ensureV3TestAttach(t, first, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3Revive"))
 	ref := a.ref
-	first.stopPersister()
 	// The previous daemon process is gone; its strict session dies with it.
 	a.fenceV3(errors.New("previous daemon process exited"))
 
 	revived := newRegistry(stateDir)
-	t.Cleanup(revived.stopPersister)
 	if revived.loadErr != nil {
 		t.Fatal(revived.loadErr)
 	}
 	b := revived.get(ref)
-	if b == nil || !b.isV3() || b.v3Config == nil || !b.v3Config.revived {
+	if b == nil || b.v3Config == nil || !b.v3Config.revived {
 		t.Fatalf("revived v3 attach = %+v", b)
 	}
 	if err := b.activate(context.Background(), "capability", 0, 1, ""); err == nil ||
@@ -1039,14 +1040,141 @@ func TestV3AttachRevivesForExactUnmountOnly(t *testing.T) {
 	if _, eno := b.v3RootReply(); eno != darwinEIO {
 		t.Fatalf("revived v3 resolve errno=%d, want %d", eno, darwinEIO)
 	}
-	found, jobID, err := revived.unmountFSKitWith(ref, false, fskitKernelOps{
+	found, err := revived.unmountFSKitWith(ref, false, fskitKernelOps{
 		present:      func(_, _ string) (bool, error) { return false, nil },
 		unmountExact: func(_, _ string, _ bool) error { return errors.New("nothing to detach") },
 	})
-	if err != nil || !found || jobID != "" {
-		t.Fatalf("revived v3 unmount=(%v,%q,%v)", found, jobID, err)
+	if err != nil || !found {
+		t.Fatalf("revived v3 unmount=(%v,%v)", found, err)
 	}
 	if revived.get(ref) != nil {
 		t.Fatal("revived v3 attach was not released by the exact unmount")
+	}
+}
+
+// Only a release failure recorded before transfer is a separate diagnostic.
+// Accepted exact absence also retires forming and in-flight release obligations.
+func TestV3DetachSeparatesReleaseDiagnosticsFromAcceptedAbsence(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		wantErr bool
+		inject  func(*v3ReleaseOwner)
+	}{
+		{name: "sticky-release-failure", wantErr: true, inject: func(r *v3ReleaseOwner) {
+			r.failure = errors.New("injected release failure")
+		}},
+		{name: "in-flight", inject: func(r *v3ReleaseOwner) {
+			// DATA ownership does not delay or fail exact absence.
+			r.running = true
+		}},
+		{name: "forming", inject: func(r *v3ReleaseOwner) {
+			r.forming = &v3ReleaseBatch{reclaims: v3ReleaseTokens("item")}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3DrainFailure"))
+			d := a.v3Backend()
+			d.releases.mu.Lock()
+			test.inject(d.releases)
+			d.releases.mu.Unlock()
+			var mu sync.Mutex
+			unmounted := false
+			ops := fskitKernelOps{
+				present: func(string, string) (bool, error) {
+					mu.Lock()
+					defer mu.Unlock()
+					return !unmounted, nil
+				},
+				unmountExact: func(string, string, bool) error {
+					mu.Lock()
+					defer mu.Unlock()
+					unmounted = true
+					return nil
+				},
+			}
+			found, err := r.unmountFSKitWith(a.ref, false, ops)
+			if !found || (err != nil) != test.wantErr || err != nil && !strings.Contains(err.Error(), "authority release cleanup") {
+				t.Fatalf("unmount = (%v,%v), want release diagnostic=%t", found, err, test.wantErr)
+			}
+			if handler.recordedDetach().GetMountAbsence() == nil {
+				t.Fatal("release cleanup withheld the exact absence proof")
+			}
+			if !a.isDetached() || d.terminalError() == nil {
+				t.Fatal("local teardown did not complete")
+			}
+			if r.get(a.ref) != nil {
+				t.Fatal("completed teardown remained registered")
+			}
+			reloaded := newRegistry(r.stateDir)
+			if reloaded.loadErr != nil || reloaded.get(a.ref) != nil {
+				t.Fatalf("registry removal was not durable: load=%v attach=%v", reloaded.loadErr, reloaded.get(a.ref))
+			}
+		})
+	}
+}
+
+func TestV3ExactAbsenceUsesControlDespiteReleaseFailure(t *testing.T) {
+	for _, name := range []string{"definite-refusal", "stalled-data", "proof-refused"} {
+		t.Run(name, func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			handler.releaseStarted = make(chan struct{})
+			if name == "definite-refusal" {
+				handler.releaseErrno = errnos.EINVAL
+			} else {
+				handler.releaseFinish = make(chan struct{})
+			}
+			if name == "proof-refused" {
+				handler.detachErrno = errnos.EPERM
+			}
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSReleaseControl"))
+			d := a.v3Backend()
+			if err := d.releases.submit(v3ReleaseTokens("h"), nil); err != nil {
+				t.Fatal(err)
+			}
+			<-handler.releaseStarted
+			if name == "definite-refusal" {
+				waitV3ReleasesIdle(t, d)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := r.unmountFSKitWith(a.ref, true, fskitKernelOps{present: func(string, string) (bool, error) { return false, nil }})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if name == "stalled-data" {
+					if err != nil {
+						t.Fatalf("accepted absence with transferred DATA release: %v", err)
+					}
+				} else {
+					want := "authority release cleanup"
+					if name == "proof-refused" {
+						want = "deliver v3 mount-absence proof"
+					}
+					if err == nil || !strings.Contains(err.Error(), want) {
+						t.Fatalf("detach result = %v, want %q", err, want)
+					}
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("CONTROL absence proof waited for stalled DATA release")
+			}
+			if handler.recordedDetach().GetMountAbsence() == nil {
+				t.Fatal("exact absence withheld")
+			}
+			if handler.releaseFinish != nil {
+				close(handler.releaseFinish)
+			}
+			waitV3ReleasesIdle(t, d)
+			if r.get(a.ref) != nil || !a.isDetached() {
+				t.Fatal("completed detach remained registered")
+			}
+		})
 	}
 }

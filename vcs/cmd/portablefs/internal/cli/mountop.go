@@ -15,41 +15,37 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
+const mountIntentSchemaVersion = 3
+
 type mountIntent struct {
-	SchemaVersion               int         `json:"schemaVersion"`
-	Phase                       string      `json:"phase"`
-	MountPath                   string      `json:"mountPath"`
-	VolumeID                    string      `json:"volumeId,omitempty"`
-	Branch                      string      `json:"branch,omitempty"`
-	Strategy                    string      `json:"strategy,omitempty"`
-	Engine                      string      `json:"engine,omitempty"`
-	AttachRef                   string      `json:"attachRef,omitempty"`
-	FSType                      string      `json:"fsType,omitempty"`
-	MountInstanceID             string      `json:"mountInstanceId"`
-	KernelMountID               string      `json:"kernelMountId,omitempty"`
-	MountTargetDevice           uint64      `json:"mountTargetDevice,omitempty"`
-	MountTargetInode            uint64      `json:"mountTargetInode,omitempty"`
-	ManagerURL                  string      `json:"managerUrl,omitempty"`
-	LeaseCreateOperationID      string      `json:"leaseCreateOperationId,omitempty"`
-	LeaseReleaseOperationID     string      `json:"leaseReleaseOperationId,omitempty"`
-	LeaseConsumerID             string      `json:"leaseConsumerId,omitempty"`
-	LeaseTeamID                 string      `json:"leaseTeamId,omitempty"`
-	AccessLease                 *leaseState `json:"accessLease,omitempty"`
-	MountMechanism              string      `json:"mountMechanism,omitempty"`
-	FUSEHelperPath              string      `json:"fuseHelperPath,omitempty"`
-	StartedAtMs                 int64       `json:"startedAtMs,omitempty"`
-	AuthorityURL                string      `json:"authorityUrl,omitempty"`
-	DataPlaneTransport          string      `json:"dataPlaneTransport,omitempty"`
-	DataPlaneServerName         string      `json:"dataPlaneServerName,omitempty"`
-	DataPlaneCAPath             string      `json:"dataPlaneCaPath,omitempty"`
-	DataPlaneCASHA256           string      `json:"dataPlaneCaSha256,omitempty"`
-	MountOwnerPID               int         `json:"mountOwnerPid,omitempty"`
-	MountOwnerStartIdentity     string      `json:"mountOwnerStartIdentity,omitempty"`
-	OperationOwnerPID           int         `json:"operationOwnerPid"`
-	OperationOwnerStartIdentity string      `json:"operationOwnerStartIdentity"`
-	UpdatedAtMs                 int64       `json:"updatedAtMs"`
+	SchemaVersion               int    `json:"schemaVersion"`
+	Phase                       string `json:"phase"`
+	MountPath                   string `json:"mountPath"`
+	VolumeID                    string `json:"volumeId,omitempty"`
+	Strategy                    string `json:"strategy,omitempty"`
+	Engine                      string `json:"engine,omitempty"`
+	AttachRef                   string `json:"attachRef,omitempty"`
+	FSType                      string `json:"fsType,omitempty"`
+	MountInstanceID             string `json:"mountInstanceId"`
+	KernelMountID               string `json:"kernelMountId,omitempty"`
+	MountTargetDevice           uint64 `json:"mountTargetDevice,omitempty"`
+	MountTargetInode            uint64 `json:"mountTargetInode,omitempty"`
+	MountMechanism              string `json:"mountMechanism,omitempty"`
+	FUSEHelperPath              string `json:"fuseHelperPath,omitempty"`
+	StartedAtMs                 int64  `json:"startedAtMs,omitempty"`
+	AuthorityURL                string `json:"authorityUrl,omitempty"`
+	DataPlaneTransport          string `json:"dataPlaneTransport,omitempty"`
+	DataPlaneServerName         string `json:"dataPlaneServerName,omitempty"`
+	DataPlaneCAPath             string `json:"dataPlaneCaPath,omitempty"`
+	DataPlaneCASHA256           string `json:"dataPlaneCaSha256,omitempty"`
+	MountOwnerPID               int    `json:"mountOwnerPid,omitempty"`
+	MountOwnerStartIdentity     string `json:"mountOwnerStartIdentity,omitempty"`
+	OperationOwnerPID           int    `json:"operationOwnerPid"`
+	OperationOwnerStartIdentity string `json:"operationOwnerStartIdentity"`
+	UpdatedAtMs                 int64  `json:"updatedAtMs"`
 }
 
 type mountOperation struct {
@@ -59,19 +55,12 @@ type mountOperation struct {
 	intentPath      string
 	mountPath       string
 	volumeID        string
-	branch          string
 	strategy        string
 	engine          string
 	attachRef       string
 	mountInstanceID string
 	kernelMountID   string
 	mountTarget     mountTargetIdentity
-	managerURL      string
-	leaseCreateOp   string
-	leaseReleaseOp  string
-	leaseConsumerID string
-	leaseTeamID     string
-	accessLease     *leaseState
 	mountMechanism  string
 	fuseHelperPath  string
 	fsType          string
@@ -89,7 +78,7 @@ func mountOperationPaths(stateDir, mountPath string) (string, string) {
 	return base + ".op.lock", base + ".intent.json"
 }
 
-func acquireMountOperation(stateDir, mountPath, volumeID, branch, strategy string) (*mountOperation, error) {
+func acquireMountOperation(stateDir, mountPath, volumeID, strategy string) (*mountOperation, error) {
 	lockPath, intentPath := mountOperationPaths(stateDir, mountPath)
 	dir, err := privatepath.OpenDir(stateDir)
 	if err != nil {
@@ -117,7 +106,7 @@ func acquireMountOperation(stateDir, mountPath, volumeID, branch, strategy strin
 		_ = file.Close()
 		_ = dir.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, fmt.Errorf("another mount or unmount operation already owns %s", mountPath)
+			return nil, fmt.Errorf("another mount or unmount operation already owns %s: %w", mountPath, err)
 		}
 		return nil, fmt.Errorf("lock mount operation for %s: %w", mountPath, err)
 	}
@@ -129,7 +118,7 @@ func acquireMountOperation(stateDir, mountPath, volumeID, branch, strategy strin
 	}
 	op := &mountOperation{
 		file: file, dir: dir, lockPath: lockPath, intentPath: intentPath, mountPath: mountPath,
-		volumeID: volumeID, branch: branch, strategy: strategy,
+		volumeID: volumeID, strategy: strategy,
 	}
 	prior, err := readMountIntent(intentPath, mountPath)
 	if err != nil {
@@ -153,19 +142,28 @@ func acquireMountOperation(stateDir, mountPath, volumeID, branch, strategy strin
 	return op, nil
 }
 
+// .op.lock precedes .intent.json.lock; inventory takes only the latter.
+// No intent record critical section acquires .op.lock or calls another reader.
+var mountIntentReadFile = privatepath.ReadFileIfExists
+
 func readMountIntent(path, mountPath string) (*mountIntent, error) {
-	data, err := privatepath.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	var data []byte
+	err := privatepath.WithFileLock(path, unix.LOCK_SH, func() error {
+		var err error
+		data, err = mountIntentReadFile(path)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read mount operation intent %s: %w", path, err)
+	}
+	if data == nil {
+		return nil, nil
 	}
 	intent, err := decodeMountIntent(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse mount operation intent %s: %w", path, err)
 	}
-	if intent.SchemaVersion != 2 || intent.MountPath != mountPath {
+	if intent.SchemaVersion != mountIntentSchemaVersion || intent.MountPath != mountPath {
 		return nil, fmt.Errorf("mount operation intent %s has incompatible identity", path)
 	}
 	if err := validateMountIntent(path, &intent); err != nil {
@@ -191,8 +189,11 @@ func decodeMountIntent(data []byte) (mountIntent, error) {
 }
 
 func validateMountIntent(path string, intent *mountIntent) error {
+	if intent == nil || intent.SchemaVersion != mountIntentSchemaVersion {
+		return fmt.Errorf("mount operation intent %s has unequal format", path)
+	}
 	switch intent.Phase {
-	case "starting", "mounting", "attaching", "attached", "kernel-mounted", "live", "unmounting", "drain-prepared", "force-requested", "force-prepared", "resources-cleaned", "lease-released", "cleanup-unverified":
+	case "starting", "mounting", "attaching", "attached", "kernel-mounted", "live", "unmounting", "resources-cleaned", "cleanup-unverified":
 	default:
 		return fmt.Errorf("mount operation intent %s has unknown phase %q", path, intent.Phase)
 	}
@@ -202,6 +203,9 @@ func validateMountIntent(path string, intent *mountIntent) error {
 	}
 	switch intent.Engine {
 	case "":
+		if intent.Phase != "starting" && intent.Phase != "cleanup-unverified" {
+			return fmt.Errorf("mount intent has no engine")
+		}
 	case mountEngineFuseV3:
 		if intent.Strategy != "" && intent.Strategy != "fuse" {
 			return fmt.Errorf("mount operation intent %s has engine %q for strategy %q", path, intent.Engine, intent.Strategy)
@@ -218,12 +222,12 @@ func validateMountIntent(path string, intent *mountIntent) error {
 		return fmt.Errorf("mount operation intent %s has incomplete mount instance identity", path)
 	}
 	if intent.Strategy == "fskit" &&
-		(intent.Phase == "attaching" || intent.Phase == "attached" || intent.Phase == "kernel-mounted" || intent.Phase == "live" || intent.Phase == "unmounting" || intent.Phase == "force-requested" || intent.Phase == "force-prepared") &&
+		(intent.Phase == "attaching" || intent.Phase == "attached" || intent.Phase == "kernel-mounted" || intent.Phase == "live" || intent.Phase == "unmounting") &&
 		!mountid.ValidAttachRef(intent.AttachRef) {
 		return fmt.Errorf("mount operation intent %s has incomplete FSKit attach identity", path)
 	}
 	if intent.Strategy == "fuse" &&
-		(intent.Phase == "kernel-mounted" || intent.Phase == "live" || intent.Phase == "unmounting" || intent.Phase == "drain-prepared" || intent.Phase == "force-requested" || intent.Phase == "force-prepared") &&
+		(intent.Phase == "kernel-mounted" || intent.Phase == "live" || intent.Phase == "unmounting") &&
 		!validKernelMountID(intent.KernelMountID) {
 		return fmt.Errorf("mount operation intent %s has incomplete kernel mount identity", path)
 	}
@@ -232,20 +236,6 @@ func validateMountIntent(path string, intent *mountIntent) error {
 	}
 	if (intent.MountTargetDevice == 0) != (intent.MountTargetInode == 0) {
 		return fmt.Errorf("mount operation intent %s has incomplete mount target identity", path)
-	}
-	leaseTransaction := intent.ManagerURL != "" || intent.LeaseCreateOperationID != "" ||
-		intent.LeaseReleaseOperationID != "" || intent.LeaseConsumerID != "" ||
-		intent.LeaseTeamID != "" || intent.AccessLease != nil
-	if leaseTransaction && (intent.ManagerURL == "" || intent.LeaseReleaseOperationID == "" ||
-		intent.VolumeID == "" || intent.Branch == "") {
-		return fmt.Errorf("mount operation intent %s has incomplete access-lease transaction identity", path)
-	}
-	if intent.AccessLease != nil && (intent.AccessLease.AccessLeaseID == "" || intent.AccessLease.AccessToken == "") {
-		return fmt.Errorf("mount operation intent %s has incomplete access lease", path)
-	}
-	if intent.AccessLease == nil && leaseTransaction &&
-		(intent.LeaseCreateOperationID == "" || intent.LeaseConsumerID == "") {
-		return fmt.Errorf("mount operation intent %s cannot recover a create response", path)
 	}
 	if intent.Strategy == "fuse" && intent.Phase != "starting" &&
 		intent.MountMechanism != "direct" && intent.MountMechanism != "helper" {
@@ -299,15 +289,23 @@ func listMountIntents(dir string) ([]mountIntent, error) {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		data, err := privatepath.ReadFile(path)
+		var data []byte
+		err := privatepath.WithFileLock(path, unix.LOCK_SH, func() error {
+			var err error
+			data, err = mountIntentReadFile(path)
+			return err
+		})
 		if err != nil {
 			return nil, fmt.Errorf("read mount operation intent %s: %w", path, err)
+		}
+		if data == nil {
+			continue
 		}
 		intent, err := decodeMountIntent(data)
 		if err != nil {
 			return nil, fmt.Errorf("parse mount operation intent %s: %w", path, err)
 		}
-		if intent.SchemaVersion != 2 || intent.MountPath == "" ||
+		if intent.SchemaVersion != mountIntentSchemaVersion || intent.MountPath == "" ||
 			!filepath.IsAbs(intent.MountPath) || filepath.Clean(intent.MountPath) != intent.MountPath {
 			return nil, fmt.Errorf("mount operation intent %s has incompatible identity", path)
 		}
@@ -372,11 +370,10 @@ func (op *mountOperation) writeIntent(phase string, pid int, identity string) er
 		return fmt.Errorf("record mount operation process identity: %w", err)
 	}
 	intent := mountIntent{
-		SchemaVersion:               2,
+		SchemaVersion:               mountIntentSchemaVersion,
 		Phase:                       phase,
 		MountPath:                   op.mountPath,
 		VolumeID:                    op.volumeID,
-		Branch:                      op.branch,
 		Strategy:                    op.strategy,
 		Engine:                      op.engine,
 		AttachRef:                   op.attachRef,
@@ -385,12 +382,6 @@ func (op *mountOperation) writeIntent(phase string, pid int, identity string) er
 		KernelMountID:               op.kernelMountID,
 		MountTargetDevice:           op.mountTarget.device,
 		MountTargetInode:            op.mountTarget.inode,
-		ManagerURL:                  op.managerURL,
-		LeaseCreateOperationID:      op.leaseCreateOp,
-		LeaseReleaseOperationID:     op.leaseReleaseOp,
-		LeaseConsumerID:             op.leaseConsumerID,
-		LeaseTeamID:                 op.leaseTeamID,
-		AccessLease:                 op.accessLease,
 		MountMechanism:              op.mountMechanism,
 		FUSEHelperPath:              op.fuseHelperPath,
 		StartedAtMs:                 op.startedAtMs,
@@ -419,7 +410,9 @@ func writeMountIntentRecord(path string, intent *mountIntent) error {
 	if err != nil {
 		return err
 	}
-	if err := privatepath.WriteFileAtomic(path, append(data, '\n')); err != nil {
+	if err := privatepath.WithFileLock(path, unix.LOCK_EX, func() error {
+		return privatepath.WriteFileAtomic(path, append(data, '\n'))
+	}); err != nil {
 		return fmt.Errorf("publish mount intent: %w", err)
 	}
 	return nil
@@ -440,7 +433,9 @@ func (op *mountOperation) close(removeIntent bool) error {
 	}
 	var removeErr error
 	if removeIntent {
-		removeErr = privatepath.RemoveFileDurable(op.intentPath)
+		removeErr = privatepath.WithFileLock(op.intentPath, unix.LOCK_EX, func() error {
+			return privatepath.RemoveFileDurable(op.intentPath)
+		})
 	}
 	if op.file == nil {
 		if op.dir == nil {

@@ -131,6 +131,16 @@ func writeObservedResponse(conn net.Conn, maxFrame uint32, timeout time.Duration
 	}
 	err = writeFrame(conn, maxFrame, response)
 	observedErr = err
+	if errors.Is(err, ErrFrameEncoding) || errors.Is(err, ErrFramePayload) {
+		// Validation writes no bytes. Report a terminal internal defect using a
+		// fresh envelope: none of the invalid proof, body or replay state may be
+		// reused. Uncertainty ends client admission without claiming that the
+		// runtime has fenced. The observer retires the original as undelivered.
+		return writeFrame(conn, maxFrame, &authoritypb.Response{
+			RequestId: requestID, Epoch: handler.Epoch(), Errno: int32(syscall.EIO),
+			Failure: authoritypb.FailureClass_FAILURE_CLASS_INTERNAL, Uncertain: true,
+		})
+	}
 	if errors.Is(err, ErrFrameBounds) {
 		// The replacement must carry the same epoch and the same recorded
 		// replay-slot state as the reply it stands in for. Dropping either would
@@ -160,7 +170,8 @@ type Server struct {
 	// used by readiness only and must be nonblocking.
 	OnServing func(bool)
 
-	budget *frameBudget
+	budget          *frameBudget
+	frameBudgetOnce sync.Once
 
 	registryMu sync.Mutex
 	registry   *transportRegistry
@@ -175,7 +186,7 @@ func (s *Server) validate() (TransportBounds, error) {
 		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must independently admit ordinary work and a blocking wait")
 	}
 	if s.MaxConnections < 2 {
-		return TransportBounds{}, errors.New("authorityrpc: protocol 7 requires capacity for one DATA/CONTROL connection pair")
+		return TransportBounds{}, errors.New("authorityrpc: protocol 8 requires capacity for one DATA/CONTROL connection pair")
 	}
 	bounds := s.Handler.Bounds()
 	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {
@@ -185,10 +196,22 @@ func (s *Server) validate() (TransportBounds, error) {
 	if bounds.MaxRequestFrame == 0 || bounds.MaxRequestFrame > s.MaxFrame {
 		return TransportBounds{}, errors.New("authorityrpc: advertised request-frame bound must be positive and within the transport frame")
 	}
-	if s.MaxFrameBytesInFlight < uint64(bounds.MaxRequestFrame) {
-		return TransportBounds{}, errors.New("authorityrpc: frame allocation budget cannot admit one maximal request")
+	if s.MaxFrameBytesInFlight < MinimumFrameBytesInFlight(bounds.MaxRequestFrame) {
+		return TransportBounds{}, errors.New("authorityrpc: frame allocation budget must admit one maximal DATA allocation plus the CONTROL/bootstrap reserve")
 	}
 	return bounds, nil
+}
+
+// MinimumFrameBytesInFlight admits one maximal DATA allocation while leaving
+// the fixed CONTROL/bootstrap reserve available across all connections.
+func MinimumFrameBytesInFlight(maxRequestFrame uint32) uint64 {
+	return uint64(frameAllocationBytes(maxRequestFrame)) + controlFrameReserve()
+}
+
+func (s *Server) initializeFrameBudget() {
+	s.frameBudgetOnce.Do(func() {
+		s.budget = newFrameBudget(s.MaxFrameBytesInFlight, controlFrameReserve())
+	})
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tls.Config) error {
@@ -199,7 +222,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	if tlsConfig == nil || tlsConfig.MinVersion < tls.VersionTLS13 || tlsConfig.ClientAuth != tls.RequireAndVerifyClientCert || tlsConfig.ClientCAs == nil {
 		return errors.New("authorityrpc: TLS 1.3 and CA-verified client certificates are required")
 	}
-	s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
+	s.initializeFrameBudget()
 	if err := s.initializeTransportRegistry(); err != nil {
 		return err
 	}
@@ -284,6 +307,7 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds Transpo
 // serveConn so the transport can be exercised without standing up TLS, while
 // the exported path stays fail-closed.
 func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, conn net.Conn, bounds TransportBounds, identity volumeserver.PeerIdentity) error {
+	s.initializeFrameBudget()
 	if err := s.initializeTransportRegistry(); err != nil {
 		return err
 	}
@@ -303,10 +327,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 	if err != nil {
 		return err
 	}
-	if entry.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && s.MaxInFlight < 3 {
-		return errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
-	}
-	ordinaryLimit, blockingLimit, flushLimit := serverExecutionLanes(s.MaxInFlight, entry.profile, entry.orderedFlush)
+	ordinaryLimit, blockingLimit, flushLimit := executionLanes(s.MaxInFlight, entry.profile, entry.role)
 	ordinary := make(chan struct{}, ordinaryLimit)
 	blocking := make(chan struct{}, blockingLimit)
 	flushes := make(chan struct{}, flushLimit)
@@ -338,14 +359,23 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			inflightMu.Unlock()
 		}()
 	}
+	// The first DATA request binds/resumes the session. It uses bootstrap
+	// capacity; execution stays in a cancellable worker so EOF cancels waits.
+	bootstrapData := entry.role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(s.IdleTimeout)); err != nil {
+			// Shutdown can land before the deadline is installed as well as
+			// during the read. net.Pipe reports either end closing as ErrClosedPipe.
+			if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		request := new(authoritypb.Request)
-		releaseFrame, payloadDigest, err := readRequestFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
+		allowBulk := entry.role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA && !bootstrapData
+		releaseFrame, payloadDigest, err := readRequestFrameRetained(ctx, conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request, allowBulk)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || ctx.Err() != nil {
 				return nil
 			}
 			return err
@@ -358,6 +388,13 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 		if err := requestAllowedOnRole(request, entry.role); err != nil {
 			releaseFrame()
 			return err
+		}
+		if bootstrapData {
+			if request.GetAttach() == nil && request.GetResume() == nil {
+				releaseFrame()
+				return fmt.Errorf("%w: DATA must first Attach or Resume", ErrTransportBinding)
+			}
+			bootstrapData = false
 		}
 		if cancelRequest := request.GetCancel(); cancelRequest != nil {
 			session, sessionErr := sessionIDFromRequest(request)
@@ -473,20 +510,4 @@ func delegatedFlushRequest(request *authoritypb.Request) bool {
 		return fallocate.GetDelegation() != nil
 	}
 	return false
-}
-
-func serverExecutionLanes(maxInFlight int, profile authoritypb.FrontendProfile, orderedMode ...bool) (ordinary, blocking, flush int) {
-	ordinary, blocking = blockingWaitLane(maxInFlight)
-	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return ordinary, blocking, 0
-	}
-	// Preserve the protocol's half-capacity blocking-lock lane. One slot from
-	// the ordinary half is enough to break a cross-recall dependency while the
-	// remaining ordinary requests wait for holder acknowledgments.
-	flush = 1
-	if len(orderedMode) == 1 && orderedMode[0] && ordinary >= volumeserver.OrderedFlushWindow+1 {
-		flush = volumeserver.OrderedFlushWindow
-	}
-	ordinary -= flush
-	return ordinary, blocking, flush
 }

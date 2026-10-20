@@ -40,29 +40,19 @@ public enum PfsErrorMapper {
 
 public enum PfsFSKitMapping {
     /// FSKit reserves identifiers 0, 1, and 2 for invalid, parent-of-root,
-    /// and root respectively. PortableFS uses authority inode 1 for its root,
-    /// so expose the complete pfslocal identity space through one checked
-    /// offset at the platform boundary. VolumeCore and portablefsd continue
-    /// to use the unmodified durable identity.
-    ///
-    /// The high half of the identifier space is minted locally for macOS 26
-    /// repair scratch items, which the daemon must never know about. This is a
-    /// real namespace partition, not a small rollover window: one synthetic
-    /// vnode consumes one identifier for the process lifetime because FSKit
-    /// may retain that vnode after unlink until a later reclaim callback. The
-    /// former 4,096-ID band exhausted under an ordinary peer-create soak and
-    /// terminally broke coherence even though XFS had ample space.
-    ///
-    /// Refusing an authority item with the high bit set keeps the two spaces
-    /// provably disjoint while leaving 2^63-1 durable item identifiers.
-    public static let localRepairIdentifierFloor: UInt64 = 1 << 63
-
-    public static func itemIdentifier(from itemID: UInt64) throws -> FSItem.Identifier {
-        guard itemID > 0, itemID < localRepairIdentifierFloor,
-              let identifier = FSItem.Identifier(rawValue: itemID + 1) else {
+    /// and root respectively. pfslocal assigns file ID 1 to the volume root
+    /// and an XFS inode number in [2, UInt64.max) to every other object, so
+    /// the checked successor `fileID + 1` maps the root to FSKit's root and
+    /// every ordinary object above the reserved values. Zero and UInt64.max
+    /// have no FSKit identifier and are refused rather than wrapped. File IDs
+    /// are independent of ownership handles: the whole UInt64 range below the
+    /// overflow belongs to daemon objects, with no frontend-minted partition.
+    public static func itemIdentifier(from fileID: UInt64) throws -> FSItem.Identifier {
+        guard fileID > 0, fileID < UInt64.max,
+              let identifier = FSItem.Identifier(rawValue: fileID + 1) else {
             throw PfsLocalClientError.daemon(
                 errno: EOVERFLOW,
-                message: "pfslocal item identifier cannot be represented by FSKit"
+                message: "pfslocal file ID cannot be represented by FSKit"
             )
         }
         return identifier
@@ -118,13 +108,13 @@ public enum PfsFSKitMapping {
     }
 
     private static func parentIdentifier(from attr: PfsAttr) throws -> FSItem.Identifier {
-        if attr.item.itemID == 1 {
+        if attr.fileID == 1 {
             return .parentOfRoot
         }
-        guard attr.hasParent else {
+        guard attr.parentFileID != 0 else {
             return .invalid
         }
-        return try itemIdentifier(from: attr.parent.itemID)
+        return try itemIdentifier(from: attr.parentFileID)
     }
 
     /// The identifier the synthetic `".."` entry carries during enumeration.
@@ -133,10 +123,10 @@ public enum PfsFSKitMapping {
     /// whose last name is gone has no live parent to name, so both resolve to
     /// the enumerated directory itself.
     public static func parentDirectoryIdentifier(from attr: PfsAttr) throws -> FSItem.Identifier {
-        guard attr.item.itemID != 1, attr.hasParent else {
-            return try itemIdentifier(from: attr.item.itemID)
+        guard attr.fileID != 1, attr.parentFileID != 0 else {
+            return try itemIdentifier(from: attr.fileID)
         }
-        return try itemIdentifier(from: attr.parent.itemID)
+        return try itemIdentifier(from: attr.parentFileID)
     }
 
     /// Builds one atomic FSKit snapshot. Get-attribute and readdir-plus callers
@@ -153,41 +143,7 @@ public enum PfsFSKitMapping {
         from attr: PfsAttr,
         requested: FSItem.Attribute? = nil
     ) throws -> FSItem.Attributes {
-        try attributes(
-            from: attr,
-            requested: requested,
-            fileIdentifier: itemIdentifier(from: attr.item.itemID)
-        )
-    }
-
-    /// Builds the same complete attribute snapshot for the process-local item
-    /// returned by an authenticated macOS 26 repair create. Its identifier is
-    /// deliberately inside the range ordinary daemon items may never occupy,
-    /// so only this explicit entry point may project it into FSKit.
-    public static func localRepairAttributes(
-        from attr: PfsAttr,
-        requested: FSItem.Attribute? = nil
-    ) throws -> FSItem.Attributes {
-        guard attr.item.itemID >= localRepairIdentifierFloor,
-              attr.item.itemID < UInt64.max,
-              let identifier = FSItem.Identifier(rawValue: attr.item.itemID + 1) else {
-            throw PfsLocalClientError.daemon(
-                errno: EOVERFLOW,
-                message: "local repair identifier cannot be represented by FSKit"
-            )
-        }
-        return try attributes(
-            from: attr,
-            requested: requested,
-            fileIdentifier: identifier
-        )
-    }
-
-    private static func attributes(
-        from attr: PfsAttr,
-        requested: FSItem.Attribute?,
-        fileIdentifier: FSItem.Identifier
-    ) throws -> FSItem.Attributes {
+        let fileIdentifier = try itemIdentifier(from: attr.fileID)
         let attributes = FSItem.Attributes()
         if includes(.uid, in: requested) {
             attributes.uid = attr.uid
@@ -242,38 +198,15 @@ public enum PfsFSKitMapping {
 
     /// Translates a kernel SETATTR into the pfslocal request.
     ///
-    /// A BSD flags change is forwarded exactly when the daemon on this
-    /// connection COMPREHENDS the request — `flagsUnderstood` from the resolve
-    /// reply — and not otherwise. That is the only question this layer is
-    /// positioned to answer.
-    ///
-    /// The refusal cannot be delegated to the daemon. `set_flags`/`flags` are
-    /// APPENDED pfslocal fields at the same protocol minor, so a daemon built
-    /// before them proto3-discards both and applies the rest of the setattr
-    /// perfectly — a refusal it never had the chance to make, and a chflags(2)
-    /// that returns success while nothing changed. Such a daemon also predates
-    /// `flagsUnderstood`, so it decodes false and this gate closes on its own.
-    ///
-    /// What this gate must NOT be is `flagsSupported`. That field describes
-    /// the attached AUTHORITY's durable flag storage, and an attach's
-    /// namespace is not all authority: a machine-local graft is backed by a
-    /// real host inode, so chflags(2) on it persists with no authority feature
-    /// involved. Refusing volume-wide on `flagsSupported` breaks graft chflags
-    /// on every attach whose authority lacks FeatureFlagPersistence. The
-    /// per-target decision is the daemon's, and it comes back as an errno on
-    /// the request that asked for it.
+    /// A BSD flags change is always forwarded with `set_flags`. Whether an
+    /// object can take a flag word is the daemon's per-request decision, and
+    /// it refuses the entire compound SetAttr before applying any of it, so
+    /// an unsupported flags change can never become a partial success here.
     public static func setAttributes(
-        from request: FSItem.SetAttributesRequest,
-        flagsUnderstood: Bool
-    ) throws -> PfsSetAttributes {
+        from request: FSItem.SetAttributesRequest
+    ) -> PfsSetAttributes {
         var attributes = PfsSetAttributes()
         if request.isValid(.flags) {
-            guard flagsUnderstood else {
-                throw PfsLocalClientError.daemon(
-                    errno: ENOTSUP,
-                    message: "this PortableFS daemon does not understand BSD file flags"
-                )
-            }
             attributes.flags = request.flags
             request.consumedAttributes.insert(.flags)
         }
@@ -348,32 +281,23 @@ public enum PfsFSKitMapping {
         return result
     }
 
-    public static func supportedCapabilities(from capabilities: PfsCapabilities) -> FSVolume.SupportedCapabilities {
+    /// The volume's static FSKit capabilities. Symlinks, hard links and
+    /// case-sensitive names are baseline pfslocal semantics, not negotiated
+    /// options. Immutable-file support stays declared because a flag change
+    /// must reach the daemon, whose explicit atomic refusal is the actual
+    /// per-object answer; a static volume refusal would replace it with a
+    /// kernel-side outcome this frontend does not own.
+    public static func supportedCapabilities() -> FSVolume.SupportedCapabilities {
         let supported = FSVolume.SupportedCapabilities()
-        supported.supportsPersistentObjectIDs = true
-        supported.supportsSymbolicLinks = capabilities.symlinks
-        supported.supportsHardLinks = capabilities.hardLinks
+        supported.supportsPersistentObjectIDs = false
+        supported.supportsSymbolicLinks = true
+        supported.supportsHardLinks = true
         supported.supports64BitObjectIDs = true
         supported.supports2TBFiles = true
         supported.supportsFastStatFS = true
         supported.supportsSparseFiles = true
-        // A MOUNT-TIME static capability, and therefore a statement about the
-        // WHOLE volume — which is why it follows `flagsUnderstood` and not
-        // `flagsSupported`. Flag support on this volume is per-object: a
-        // machine-local graft persists chflags(2) on its host inode while an
-        // authority without FeatureFlagPersistence cannot, and both live in
-        // one namespace. A volume that supports flags on SOME objects must not
-        // declare blanket non-support, because the kernel would then refuse
-        // changes that would have succeeded and never let the extension speak.
-        // Objects that genuinely cannot take a flag word refuse per request,
-        // as an errno.
-        //
-        // Declaring support against a daemon that does not even parse
-        // `set_flags` would be the opposite lie — a chflags(2) reported
-        // successful while nothing changed — so the capability is not
-        // hardcoded either.
-        supported.doesNotSupportImmutableFiles = !capabilities.flagsUnderstood
-        supported.caseFormat = capabilities.caseSensitive ? .sensitive : .insensitiveCasePreserving
+        supported.doesNotSupportImmutableFiles = false
+        supported.caseFormat = .sensitive
         return supported
     }
 

@@ -48,7 +48,6 @@ type RestoreFiles struct {
 type restoreFile struct {
 	res      *resource
 	identity [16]byte
-	mtimeNS  int64
 }
 
 // ResolveRestoreFiles walks at most maxVisited namespace entries. identities
@@ -133,7 +132,7 @@ func (v *Volume) visitRestoreEntry(pathFD int, identities map[[16]byte]uint32, m
 	if err != nil {
 		return err
 	}
-	result.files[entry] = restoreFile{res: newResource(writeFD), identity: identity, mtimeNS: attr.MTimeNS}
+	result.files[entry] = restoreFile{res: newResource(writeFD), identity: identity}
 	return nil
 }
 
@@ -239,6 +238,9 @@ func (v *Volume) openRestoreFile(pathFD int) (int, error) {
 }
 
 func (r *RestoreFiles) hold(entry uint32) (restoreFile, error) {
+	if err := r.volume.Health(); err != nil {
+		return restoreFile{}, err
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if r.closed {
@@ -282,7 +284,7 @@ func permissionBitsFD(fd int) (uint32, error) {
 //
 // The caller holds the restore mode's per-entry lock (restoremode.Mode installs
 // a fetched chunk under it), which is what keeps the mtime this write moves
-// from being observed before RestoreMtime puts the archived one back.
+// from being observed before RestoreMtime puts the sampled value back.
 func (r *RestoreFiles) PWrite(entry uint32, off int64, data []byte) error {
 	file, err := r.hold(entry)
 	if err != nil {
@@ -308,22 +310,35 @@ func (r *RestoreFiles) Fdatasync(entry uint32) error {
 		return err
 	}
 	defer file.res.release()
-	return unix.Fdatasync(file.res.fd)
+	state := r.volume.fsyncState(file.identity)
+	defer r.volume.releaseFsyncState(state)
+	_, err = r.volume.syncInode(state, file.res.fd, true)
+	return err
 }
 
-// RestoreMtime puts the archived mtime back after a hydration write moved it.
+func (r *RestoreFiles) Mtime(entry uint32) (int64, error) {
+	file, err := r.hold(entry)
+	if err != nil {
+		return 0, err
+	}
+	defer file.res.release()
+	attr, err := statFD(file.res.fd)
+	return attr.MTimeNS, err
+}
+
+// RestoreMtime puts the pre-hydration mtime back after a hydration write.
 // utimensat with explicit timestamps is permitted to the inode's owner
 // regardless of its mode - the kernel requires write permission only for the
 // UTIME_NOW form - and this call addresses the retained descriptor with
 // AT_EMPTY_PATH, so it resolves no path component and cannot be refused by an
 // unsearchable directory either.
-func (r *RestoreFiles) RestoreMtime(entry uint32) error {
+func (r *RestoreFiles) RestoreMtime(entry uint32, nanos int64) error {
 	file, err := r.hold(entry)
 	if err != nil {
 		return err
 	}
 	defer file.res.release()
-	times := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(file.mtimeNS)}
+	times := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(nanos)}
 	return unix.UtimesNanoAt(file.res.fd, "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 

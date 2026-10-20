@@ -49,6 +49,7 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=0 GOOS=linux go -C vcs build ./...
           go -C vcs vet ./...
+          go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
           go -C vcs test ./...
           go -C vcs test -race ./...
       - name: Release trust policy
@@ -209,7 +210,7 @@ jobs:
 
   macos-app:
     needs: [validate, goreleaser]
-    runs-on: macos-26
+    runs-on: xcode-27
     # Must exceed the 2h `notarytool --wait --timeout 2h` in
     # scripts/package-macos-app.sh so the notary wait reports its own timeout
     # instead of the job being hard-killed mid-submission.
@@ -217,11 +218,19 @@ jobs:
     environment: release
     permissions:
       contents: write # upload the notarized app to the draft release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Verify pinned Xcode and macOS SDK
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
+          test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: vcs/go.mod
@@ -242,6 +251,7 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...
           CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...
+          CGO_ENABLED=1 GOOS=darwin go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
           CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
 
       - name: Test the Swift app and installer core

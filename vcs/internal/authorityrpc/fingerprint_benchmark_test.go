@@ -25,7 +25,7 @@ func BenchmarkReadRequestRetainedBulkFrame1MiB(b *testing.B) {
 	b.SetBytes(1 << 20)
 	for b.Loop() {
 		var got authoritypb.Request
-		release, digest, err := readRequestFrameRetained(bytes.NewReader(wire), 2<<20, nil, 0, &got)
+		release, digest, err := readRequestFrameRetained(b.Context(), bytes.NewReader(wire), 2<<20, nil, 0, &got, true)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -42,7 +42,8 @@ func BenchmarkFrameReplayFingerprint1MiB(b *testing.B) {
 		Handle: bytes.Repeat([]byte{1}, 16), Position: 4096, Size: 1 << 20, Data: make([]byte, 1<<20),
 	}}}
 	runtime, err := volumeserver.New("fingerprint-benchmark", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
 	})
 	if err != nil {
 		b.Fatal(err)

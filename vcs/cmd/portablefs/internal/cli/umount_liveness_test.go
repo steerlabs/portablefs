@@ -147,7 +147,7 @@ func TestDiscardRecordClearsALatchedUnmountingIntent(t *testing.T) {
 		t.Fatalf("the latched intent must be gone, %s survived (%v)", intentPath, err)
 	}
 	// And a mount at that path is no longer blocked by the incomplete operation.
-	op, err := acquireMountOperation(mountStateDir, mountPath, "vol_1", "main", "fskit")
+	op, err := acquireMountOperation(mountStateDir, mountPath, "vol_1", "fskit")
 	if err != nil {
 		t.Fatalf("mounting must be possible again after the record is discarded: %v", err)
 	}
@@ -195,12 +195,12 @@ func writeLatchedUnmountingIntent(t *testing.T, mountStateDir, mountPath string)
 	t.Helper()
 	_, intentPath := mountOperationPaths(mountStateDir, mountPath)
 	intent := mountIntent{
-		SchemaVersion:               2,
+		SchemaVersion:               mountIntentSchemaVersion,
 		Phase:                       "unmounting",
 		MountPath:                   mountPath,
 		VolumeID:                    "vol_1",
-		Branch:                      "main",
 		Strategy:                    "fskit",
+		Engine:                      mountEngineDaemonV3,
 		AttachRef:                   "att_AAAAAAAAAAAAAAAAAAAAAA",
 		FSType:                      defaultFskitType,
 		MountInstanceID:             "mnt_AAAAAAAAAAAAAAAAAAAAAA",

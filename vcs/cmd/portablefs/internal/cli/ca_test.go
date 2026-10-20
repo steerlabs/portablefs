@@ -8,12 +8,16 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
 func testCertificatePEM(t *testing.T, serial int64) string {
@@ -93,5 +97,62 @@ func TestLeaseCAsAreImmutableAndContentAddressed(t *testing.T) {
 	}
 	if _, _, err := firstTransport.materializePrivateCA(stateDir); err == nil {
 		t.Fatal("tampered immutable CA was overwritten or accepted")
+	}
+}
+
+func TestPrivateCAConcurrentCreatorsPreservePublishedInode(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "mounts")
+	ca := testCertificatePEM(t, 3)
+	sum := sha256.Sum256([]byte(ca))
+	transport := dataPlaneTransport{Mode: dataPlaneTransportTLSPrivateCA, ServerName: "router.example", CAPEM: ca, CASHA256: hex.EncodeToString(sum[:])}
+	// Both creators reach publication before either can publish.
+	originalPublish := publishPrivateCA
+	reached, release := make(chan struct{}, 2), make(chan struct{})
+	publishPrivateCA = func(path string, data []byte) error {
+		reached <- struct{}{}
+		<-release
+		return originalPublish(path, data)
+	}
+	t.Cleanup(func() { publishPrivateCA = originalPublish })
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { _, _, err := transport.materializePrivateCA(stateDir); done <- err }()
+	}
+	<-reached
+	<-reached
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	publishPrivateCA = originalPublish
+	// A delayed creator reaches publication after another reader has opened
+	// the winning inode, exactly the original replace-after-miss schedule.
+	originalRead := privateCAReadFile
+	t.Cleanup(func() { privateCAReadFile = originalRead })
+	privateCAReadFile = func(path string) ([]byte, error) {
+		parent, err := privatepath.OpenExistingDir(filepath.Dir(path))
+		if err != nil {
+			return nil, err
+		}
+		defer parent.Close()
+		fd, err := unix.Openat(int(parent.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return nil, err
+		}
+		file := os.NewFile(uintptr(fd), path)
+		defer file.Close()
+		err = publishPrivateCA(path, []byte(ca))
+		if err != nil && !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if err := privatepath.ValidateOpenFile(parent, filepath.Dir(path), filepath.Base(path), file); err != nil {
+			return nil, err
+		}
+		return io.ReadAll(file)
+	}
+	if _, _, err := transport.materializePrivateCA(stateDir); err != nil {
+		t.Fatal(err)
 	}
 }

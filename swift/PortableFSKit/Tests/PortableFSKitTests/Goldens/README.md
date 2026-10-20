@@ -1,12 +1,14 @@
-These `.hex` fixtures are copied from the Go daemon tree at the repository
-root:
+These current pfslocal 2.0 fixtures are shared with `pfslocal/testdata`.
+Regenerate both copies from the Go codec together:
 
-`pfslocal/testdata/*.hex`
+```
+UPDATE_GOLDENS=1 go -C vcs test ./internal/pfslocal
+```
 
-Keep the `.hex` files byte-identical to the Go fixtures. The Swift tests decode
-them with SwiftProtobuf and re-encode the same logical envelopes to catch
-cross-language pfslocal wire drift.
+`hello_request.hex` and `hello_reply.hex` carry a live 2.0 pairing and a positive
+request deadline. `resolve_contract.hex` carries the root, root attributes, volume identity/name
+and numeric limits. Resolve binds the connection to one exact attach incarnation. Owning Items
+carry nonzero stable identities; enumeration snapshots transfer no ownership.
 
-`v7_resolve_contract.hex` is also compared against the real Go coherence
-bridge's emitted Resolve contract. Swift decodes it and runs the shipping
-contract parser, so independent fixtures cannot hide a nested-major mismatch.
+`cache_proof.hex` carries the shared continuous-clock horizon and installed
+authorization deadline in a request-ID-zero CacheProof event.

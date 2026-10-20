@@ -4,6 +4,7 @@ package fusev3
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"sync/atomic"
@@ -100,6 +101,26 @@ func TestReopenNotificationFailureIsInodeLocal(t *testing.T) {
 			if err := reader.Close(); err != nil {
 				t.Fatal(err)
 			}
+			mount := f.mounts[0]
+			mount.delegations.hookMu.RLock()
+			flushInvalidator := mount.delegations.flushCycleInvalidator
+			mount.delegations.hookMu.RUnlock()
+			resumeFlush := make(chan struct{})
+			mount.delegations.SetFlushCycleInvalidator(func(ctx context.Context, identity []byte) error {
+				select {
+				case <-resumeFlush:
+					return flushInvalidator(ctx, identity)
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+			defer func() {
+				mount.delegations.SetFlushCycleInvalidator(flushInvalidator)
+				close(resumeFlush)
+			}()
+			// Hold the application owner's purge so OPEN owns the pending
+			// invalidation. Natural background progress can otherwise finish it
+			// before the fault injector is installed.
 			writer := mustOpenFile(t, path, os.O_WRONLY, 0)
 			if _, err := writer.WriteAt(next, 0); err != nil {
 				t.Fatal(err)
@@ -109,9 +130,8 @@ func TestReopenNotificationFailureIsInodeLocal(t *testing.T) {
 			}
 			f.waitForDelegationReleases(t)
 
-			mount := f.mounts[0]
 			loss := mount.delegations.LossSequence()
-			mount.subscription.config.repairLead = 100 * time.Millisecond
+			mount.subscription.config.withdrawalLead = 100 * time.Millisecond
 			mount.subscription.config.retryDelay = 5 * time.Millisecond
 			original := mount.notifier()
 			failing := &failingOwnCacheNotifier{kernelNotifier: original, persistent: persistent}
@@ -119,6 +139,9 @@ func TestReopenNotificationFailureIsInodeLocal(t *testing.T) {
 			defer mount.setNotifier(original)
 
 			reopened, openErr := os.Open(path)
+			if reopened != nil {
+				defer reopened.Close()
+			}
 			if persistent {
 				if !errors.Is(openErr, syscall.EIO) || reopened != nil || failing.attempts.Load() < 2 {
 					t.Fatalf("persistent reopen = file %v err %v attempts %d", reopened, openErr, failing.attempts.Load())
@@ -127,7 +150,6 @@ func TestReopenNotificationFailureIsInodeLocal(t *testing.T) {
 				if openErr != nil || reopened == nil || failing.attempts.Load() != 2 {
 					t.Fatalf("transient reopen = file %v err %v attempts %d", reopened, openErr, failing.attempts.Load())
 				}
-				defer reopened.Close()
 				if got := readExactlyAt(t, reopened, 0, len(next), "reopen after retry"); !bytes.Equal(got, next) {
 					t.Fatal("retry left stale cached data")
 				}

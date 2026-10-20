@@ -16,6 +16,10 @@ func processStartIdentity(pid int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	const szomb = 5 // SZOMB in <sys/proc.h>: awaiting collection by the parent.
+	if info.Proc.P_stat == szomb {
+		return "", unix.ESRCH
+	}
 	start := info.Proc.P_starttime
 	return fmt.Sprintf("%d:%d", start.Sec, start.Usec), nil
 }

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/benchmark"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"golang.org/x/sys/unix"
 )
 
@@ -61,25 +62,25 @@ type performanceRun struct {
 	results map[string]performanceSample
 }
 
-// TestStrictPerformanceAgainstDirectXFS is a measurement harness, not a timing
+// TestPerformanceAgainstDirectXFS is a measurement harness, not a timing
 // gate. It runs one byte-identical workload against the authority's direct XFS
-// ceiling, one strict mount, and two strict mounts where the second mount has
+// ceiling, one mount, and two mounts where the second mount has
 // deliberately acquired the exact negative-name/data grants affected by every
 // mutation. The last case therefore measures the guarantee PortableFS actually
-// sells: the mutating syscall does not return until the peer has repaired the
+// sells: the mutating syscall does not return until the peer has withdrawn the
 // overlapping state.
 //
 // Enable it explicitly so shared CI load never turns latency noise into a
 // correctness failure:
 //
-//	PORTABLEFS_PERFORMANCE_TEST=1 go test -run TestStrictPerformanceAgainstDirectXFS
+//	PORTABLEFS_PERFORMANCE_TEST=1 go test -run TestPerformanceAgainstDirectXFS
 //
 // Every result is one stable JSON object prefixed with PORTABLEFS_PERF. The
 // payload and the peer's final bytes are hashed, so a fast but incorrect run is
 // a test failure rather than a performance result.
-func TestStrictPerformanceAgainstDirectXFS(t *testing.T) {
+func TestPerformanceAgainstDirectXFS(t *testing.T) {
 	if os.Getenv(envPerformance) != "1" {
-		t.Skipf("set %s=1 to run the live direct-XFS/strict-mount performance matrix", envPerformance)
+		t.Skipf("set %s=1 to run the live direct-XFS/mount performance matrix", envPerformance)
 	}
 	env := requireIntegrationEnvironment(t)
 
@@ -670,7 +671,7 @@ func TestCreateUsesSubscribedNegativeWithoutLookupRPC(t *testing.T) {
 	}
 }
 
-func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
+func TestThousandFileInstallCoalescesDurabilityWhileOwnerIsBusy(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	barrier := mustOpenFile(t, f.mountPath(0), os.O_RDONLY, 0)
 	defer barrier.Close()
@@ -678,17 +679,59 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 	flushBefore := f.counter.count("flush")
 	closeBefore, batchBefore := f.counter.count("close"), f.counter.count("close_batch")
 	ackBefore, pollBefore := f.counter.count("change-ack"), f.counter.count("next-control-event")
+	// Coalescing follows arrivals during an in-flight barrier, without a
+	// collection timer. Establish that overlap explicitly rather than assume
+	// how many serial syscalls fit inside a storage/transport latency window.
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var enterOnce, resumeOnce sync.Once
+	release := func() { resumeOnce.Do(func() { close(resume) }) }
+	defer release()
+	cuts := make(chan uint64, 4)
+	f.counter.setBeforeHandle(func(request *authoritypb.Request) {
+		if barrier := request.GetBarrier(); barrier != nil {
+			cuts <- barrier.GetCutSequence()
+		}
+		if request.GetWaitVisibility() != nil {
+			// This request follows the first durable receipt. Blocking before the
+			// first Barrier instead would let that sync cover all later writes.
+			enterOnce.Do(func() { close(entered); <-resume })
+		}
+	})
+	defer f.counter.setBeforeHandle(nil)
+
 	for i := 0; i < 1000; i++ {
 		if err := os.WriteFile(f.join(0, fmt.Sprintf("install-%04d", i)), []byte("payload"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		if i == 0 {
+			awaitAllocatingControl(t, entered, "first install durability owner")
+		}
+
 	}
+	f.waitForDelegationReleases(t)
+	manager := f.mounts[0].delegations
+	manager.durabilityMu.Lock()
+	finalCut := manager.appliedHigh
+	manager.durabilityMu.Unlock()
+	release()
+	var observed [2]uint64
+	for i := range observed {
+		select {
+		case observed[i] = <-cuts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("install did not complete first and coalesced durability cuts")
+		}
+	}
+	if observed[0] == 0 || observed[0] >= finalCut || observed[1] != finalCut {
+		t.Fatalf("install durability cuts=%v, want initial application then final %d", observed, finalCut)
+	}
+
 	if err := barrier.Sync(); err != nil {
 		t.Fatal(err)
 	}
 	count := f.counter.count("barrier") - before
-	if count < 1 || count > 8 {
-		t.Fatalf("1000-file install issued %d Barriers, want 1 through 8 including explicit completion", count)
+	if count != 3 {
+		t.Fatalf("1000-file install issued %d Barriers, want first, coalesced final and explicit completion", count)
 	}
 	flushes := f.counter.count("flush") - flushBefore
 	if flushes != 0 {
@@ -713,7 +756,9 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	closes, batches := f.counter.count("close")-closeBefore, f.counter.count("close_batch")-batchBefore
-	if closes != 0 || batches < 8 || batches > 64 {
+	// Cleanup drains available work without waiting to fill a batch. Its RPC
+	// count depends on arrivals during each in-flight batch, not a time window.
+	if closes != 0 || batches == 0 {
 		t.Fatalf("install cleanup: serial=%d batches=%d", closes, batches)
 	}
 	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d flush=%d change_ack=%d next_control_event=%d close=%d close_batch=%d", count, flushes, acks, polls, closes, batches)

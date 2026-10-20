@@ -16,10 +16,37 @@ enum PortableFSDStrictJSON {
         try scanner.parseDocument()
     }
 
+    /// One member value of a flat object as it is spelled on the wire.
+    /// Numbers keep their token text: Foundation normalizes `-0` to an
+    /// integer zero, erasing exactly the spelling Go's unsigned decoding
+    /// refuses, so numeric grammar must be judged on the token itself.
+    enum Scalar: Equatable {
+        case string(String)
+        case number(String)
+        case bool(Bool)
+        case null
+    }
+
+    /// Parses one complete JSON object whose members are all scalars, with
+    /// the same grammar, duplicate-key and trailing-data rules as `validate`.
+    static func flatObject(_ data: Data) throws -> [String: Scalar] {
+        var scanner = Scanner(bytes: Array(data), maximumDepth: 1)
+        scanner.members = [:]
+        try scanner.parseDocument()
+        guard let members = scanner.members, data.first(where: {
+            !($0 == 0x20 || $0 == 0x09 || $0 == 0x0a || $0 == 0x0d)
+        }) == 0x7b else {
+            throw PortableFSDStrictJSONError.invalid
+        }
+        return members
+    }
+
     private struct Scanner {
         let bytes: [UInt8]
         let maximumDepth: Int
         var index = 0
+        /// Non-nil only for `flatObject`, which records the top-level members.
+        var members: [String: Scalar]?
 
         mutating func parseDocument() throws {
             skipWhitespace()
@@ -65,11 +92,34 @@ enum PortableFSDStrictJSON {
                 skipWhitespace()
                 guard consume(0x3a) else { throw PortableFSDStrictJSONError.invalid }
                 skipWhitespace()
+                let valueStart = index
                 try parseValue(depth: depth)
+                if depth == 1, members != nil {
+                    let value = try scalar(bytes[valueStart..<index])
+                    members?[key] = value
+                }
                 skipWhitespace()
                 if consume(0x7d) { return }
                 guard consume(0x2c) else { throw PortableFSDStrictJSONError.invalid }
                 skipWhitespace()
+            }
+        }
+
+        /// Classifies one already validated scalar token.
+        private func scalar(_ token: ArraySlice<UInt8>) throws -> Scalar {
+            guard let first = token.first else { throw PortableFSDStrictJSONError.invalid }
+            switch first {
+            case 0x22:
+                do {
+                    return .string(try JSONDecoder().decode(String.self, from: Data(token)))
+                } catch {
+                    throw PortableFSDStrictJSONError.invalid
+                }
+            case 0x74: return .bool(true)
+            case 0x66: return .bool(false)
+            case 0x6e: return .null
+            case 0x2d, 0x30...0x39: return .number(String(decoding: token, as: UTF8.self))
+            default: throw PortableFSDStrictJSONError.invalid
             }
         }
 

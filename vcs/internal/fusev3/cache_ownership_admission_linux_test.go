@@ -56,7 +56,7 @@ func TestCacheAdmissionDoesNotWaitForDelegationOwnership(t *testing.T) {
 			done := make(chan time.Duration, 1)
 			go func() {
 				f.raw.mu.Lock()
-				remaining := f.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now())
+				remaining := f.mount.subscription.remaining(coordinate, stamp, stamp.version)
 				f.raw.mu.Unlock()
 				done <- remaining
 			}()

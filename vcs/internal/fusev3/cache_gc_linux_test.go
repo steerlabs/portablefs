@@ -19,7 +19,7 @@ func TestSlowMetadataCacheWaitsForCollectionAndRechecksOwnership(t *testing.T) {
 				name = operation + "/new-grant"
 			}
 			t.Run(name, func(t *testing.T) {
-				f := newStrictFixture(t)
+				f := newStockFixture(t)
 				entry := f.lookup(t, 1, "file")
 				parent, record := f.raw.acquire(1), f.raw.acquire(entry.NodeId)
 				defer f.raw.release(parent)
@@ -77,7 +77,7 @@ func TestSlowMetadataCacheWaitsForCollectionAndRechecksOwnership(t *testing.T) {
 func TestColdSubscriptionInterruptsWaitingMetadataCacheReader(t *testing.T) {
 	for _, operation := range []string{"lookup", "getattr"} {
 		t.Run(operation, func(t *testing.T) {
-			f := newStrictFixture(t)
+			f := newStockFixture(t)
 			entry := f.lookup(t, 1, "file")
 			parent, record := f.raw.acquire(1), f.raw.acquire(entry.NodeId)
 			defer f.raw.release(parent)

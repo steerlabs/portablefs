@@ -1,29 +1,31 @@
 # Tiered storage: restore mode, archiver, and hydrator
 
-Status: **Phase 0 contract, revision 3 — incorporates both adversarial
-reviews; frozen before implementation**
+Status: **implemented contract for the archive tier (revision 3); the reference
+implementation is `vcs/internal/restoremode`, `vcs/internal/archiver`, and
+`vcs/internal/hydrator`**
 
 Restore mode is the serving state between wake and convergence: the volume's
 namespace is fully materialized in XFS, content drains in from the sealed
 archive, and reads of not-yet-hydrated chunks recall on demand. It is bounded
 by four hard constraints of the current implementation:
 
-1. The authority cannot reach the network: `PrivateNetwork=yes` +
-   `RestrictAddressFamilies=AF_UNIX`
-   (`deploy/systemd/portablefs-authority@.service:14,29`). All archive-store
-   I/O lives in sibling per-volume processes; the authority speaks to its
+1. The authority cannot reach the network: `PrivateNetwork=yes` in
+   `deploy/systemd/portablefs-authority@.service`; its public listener is
+   socket-activated and its admin listener binds inside that private
+   namespace. All archive-store I/O lives in sibling per-volume processes; the authority speaks to its
    hydrator over one AF_UNIX socket in its bind-mounted namespace.
-2. The server RPC path has two lanes and a connection-level guillotine: a
-   request that waits longer than `WriteTimeout` (default 30 s) for a lane
-   permit tears down the whole TLS connection
-   (`authorityrpc/server.go:250-267`). Recall must never park a connection.
+2. The server RPC path has bounded per-connection execution lanes (ordinary,
+   blocking, and on Linux DATA the delegated-flush lane) and a
+   connection-level guillotine: a request that waits longer than
+   `WriteTimeout` (default 30 s) for a lane permit tears down the whole TLS
+   connection (`authorityrpc/server.go`). Recall must never park a connection.
 3. `EIO`/`EUCLEAN`/`ESHUTDOWN`/`ENOTRECOVERABLE` fence the store and end the
-   epoch (`volume_handler_linux.go:2145`). A hydration failure must never
-   surface as one of them.
+   epoch (`authorityrpc/volume_handler_linux.go`). A hydration failure must
+   never surface as one of them.
 4. The authority is the only writer to the volume tree
-   (`xfs-authority-architecture.md:135-137`). Hydrated bytes are therefore
-   written by the authority itself; the hydrator fetches, verifies, and
-   decompresses, but never touches XFS.
+   ([xfs-authority-architecture.md](../xfs-authority-architecture.md#tiered-canonical-representation)).
+   Hydrated bytes are therefore written by the authority itself; the hydrator
+   fetches, verifies, and decompresses, but never touches XFS.
 
 ## Components
 
@@ -33,8 +35,8 @@ same service UID as the authority, network access (its own unit does NOT set
 cell configuration, no listener. Runs only while the volume is quiesced
 (authority absent). Reads the volume tree read-only, builds pack + manifest
 (pack-format.md), uploads, verifies every digest by read-back, reports the
-seal through the helper observation. It is the "future backup controller
-with its own narrow identity" that `hosted-control-plane.md:342-346`
+seal through the helper observation. It is the narrow-identity controller
+that [hosted-control-plane.md](../hosted-control-plane.md#current-limits)
 reserves; it adds no file-copy semantics to the authority.
 
 **Restorer / hydrator** (`portablefs-hydrator`): per-volume process, same
@@ -216,8 +218,8 @@ surfaced volume-wide.
 ## Hydration map
 
 - Lives in the per-volume StateRoot (outside the user tree and the project
-  quota; StateRoot capacity is added to cell sizing), beside the strict
-  membership file, owned and written only by the authority.
+  quota; StateRoot capacity is added to cell sizing), beside the
+  `mount.membership` file, owned and written only by the authority.
 - Keyed by **restored-inode identity** (the XFS export handle used for
   `StableIdentity`), not path — renames don't move chunk state, and
   hardlink aliases share one inode and therefore exactly one map entry by
@@ -270,16 +272,18 @@ surfaced volume-wide.
 - **mtime preservation across hydration.** The restorer materializes every
   inode with its manifest ns-mtime. A hydration write (recall or drain) is
   invisible base-bytes movement, not a user mutation, so it must not
-  change the observed mtime: on an inode the user has not yet mutated, the
-  authority performs `pwrite` + `utimensat`(manifest mtime) as one
-  sequence under the inode's hydration lock, and attribute reads of
-  RESTORING inodes take that lock, so no reader observes the transient
-  bump. The first user mutation of an inode sets a per-inode
-  user-modified bit in the hydration map; from then on mtime behaves
-  ordinarily and hydration writes stop restoring it (the user's own mtime
-  is newer and must win). This is what keeps `make` from rebuilding and
-  `git status` clean across a wake. ctime is explicitly outside the
-  contract (pack-format.md).
+  change the observed mtime. Every hydration install captures the inode's
+  current mtime under its exclusive entry lock and restores that exact
+  value before unlocking, including after a partial-write error and
+  regardless of whether the user has modified the inode: before any user
+  change that value is the manifest mtime, afterwards it is the user's.
+  Every published attribute sample of a RESTORING inode (GetAttr, Lookup,
+  enumeration, and mutation post-state) honours that lock, so no reader
+  observes the transient bump. A failed restoration is a storage failure
+  that fences the epoch, never a silently changed mtime. This is what keeps
+  `make` from rebuilding and `git status` clean across a wake, and what
+  lets a Mac's metadata cache treat mtime as exact. ctime is explicitly
+  outside the contract (pack-format.md).
 - Extending truncate marks the new tail hydrated (zeros are canonical);
   shortening truncate recalls the new-boundary chunk first (rule 2), then
   truncates and marks all beyond-EOF chunks hydrated. Unlink of a cold
@@ -289,19 +293,17 @@ surfaced volume-wide.
 
 ## Recall semantics
 
-- The gate inserts exactly where the `stabilize*` visibility gates already
-  sit — between capability resolution and the XFS syscall:
-  `stabilizeItem`/`stabilizeOpen`/`lookupForSession`/`stabilizeDirectoryPage`
-  (`authorityrpc/visibility_linux.go:56,69,116,155`) and their call sites
-  (Read `:977`, GetAttr `:1958/:1967`, Readlink `:868`, Lookup `:411`,
-  Write prepare, SetAttr{size}). Namespace and attribute operations never
-  recall — the namespace is fully materialized; only content does.
+- The gate sits between capability resolution and the XFS syscall on every
+  content path: READ, WRITE (which also carries Linux delegated flushes),
+  copy-range source and destination, range mutations, SetAttr{size}, and
+  truncating CREATE/OPEN. Namespace and attribute operations never recall —
+  the namespace is fully materialized; only content does.
 - Single-flight per chunk. `O_TRUNC` to zero skips the fetch and marks the
   chunk range hydrated; unlink of a fully-cold file fetches nothing; every
   user write and shortening truncate recalls its overlapping cold chunks
   first — there is no fetch-free overwrite path (ordering contract,
   rule 2).
-- Protocol-6 range mutations use the same rule. Hole-punch and zero-range
+- Range mutations use the same rule. Hole-punch and zero-range
   hydrate and durably mark every overlapping stored chunk before XFS apply;
   collapse and insert do so from the mutation offset through the old EOF.
   `copy_file_range` hydrates its source range for reading and durably hydrates
@@ -319,10 +321,10 @@ surfaced volume-wide.
   so a wake burst past the cap queues (bounded by each caller's recall
   deadline) instead of surfacing errors to applications, and no
   lock-ordering cycle through the cap can exist. CI proves the session
-  lease and keepalive survive recall saturation. This keeps the v3 wire
-  protocol unchanged — no new lanes, no frozen-surface touch.
-- Hydration failures map to a new additive failure class
-  (`FAILURE_CLASS_RESTORE`) carrying errno `EIO`, never fatal-storage.
+  lease and keepalive survive recall saturation. Recall adds no lane to the
+  authority wire.
+- Hydration failures map to the failure class `FAILURE_CLASS_RESTORE`
+  carrying errno `EIO`, never fatal-storage.
   `EAGAIN` is specifically forbidden here: FUSE files are pollable, so
   `EAGAIN` on a blocking regular-file read parks poll-driven runtimes
   (Go's netpoller) on a readiness event that never fires — a hang, not an
@@ -432,25 +434,3 @@ opaque kinds are listed but not opened, as in live mode.
 - Metrics: `mount_to_last_on_demand_fetch`, recalled-vs-drained byte ratio
   (SLO: drain must win), p95/p99 first-use latency (cold-file open→data) by
   workload class, drain throughput, recall depth, RESTORE_BLOCKED seconds.
-
-## Doc amendments this contract requires
-
-- `docs/architecture.md` invariant 3 and "What not to build": the sealed
-  archive of an ARCHIVED/RESTORING volume becomes the second named durable
-  exception, stated per-state (the canonical-representation table in
-  identity-lifecycle-and-capacity.md §2).
-- `docs/xfs-authority-architecture.md:93-96, 135-137, 519-526` and the
-  proof ledger (new Open items for archive round-trip, recall saturation,
-  convergence identity).
-- `docs/failure-modes.md`: new failure scope `restore` with
-  `FAILURE_CLASS_RESTORE`; RESTORE_BLOCKED/RESTORE_CORRUPT rows.
-- `docs/consistency-model.md:74-81`: a not-yet-hydrated read blocks until
-  hydrated or fails with the named restore error; it never returns stale or
-  partial data.
-- `docs/hosted-control-plane.md:342-346`: the archiver/hydrator are the
-  narrow-identity controllers this paragraph reserved; the helper still
-  accepts no remote snapshot command — archive phases are typed plan
-  phases, and credentials are root-provisioned cell configuration.
-- `docs/hosted-cell-deployment.md`: unit inventory gains the archiver and
-  hydrator templates; the authority keeps exactly its three bind mounts
-  plus the hydrator socket directory.

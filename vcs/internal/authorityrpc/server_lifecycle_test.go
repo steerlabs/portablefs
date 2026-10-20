@@ -119,7 +119,7 @@ func (h *lifecycleTestHandler) Handle(ctx context.Context, request *authoritypb.
 }
 
 func lifecyclePair(t *testing.T, registry *transportRegistry, session volumeserver.SessionID) (*transportConnection, *atomic.Int32, *transportConnection, *atomic.Int32, transportPairSnapshot) {
-	return lifecyclePairForProfile(t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES)
+	return lifecyclePairForProfile(t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX)
 }
 
 func lifecyclePairForProfile(
@@ -181,7 +181,7 @@ func TestTransportAttachReplayAndActivateSerializeExactBoundary(t *testing.T) {
 	}
 	server := &Server{Handler: handler, registry: registry}
 	attachRequest := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 	}}}
 	activateRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
 		DataBindingGeneration: snapshot.dataGeneration, ControlBindingGeneration: snapshot.controlGeneration,
@@ -453,11 +453,11 @@ func TestTransportPlannedTerminalReplyAttemptsWriteBeforeResponderClose(t *testi
 	}
 }
 
-func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
+func TestTransportKeepAliveReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x44}
 	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
-		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
 	)
 	if err := registry.markActive(control, session); err != nil {
 		t.Fatal(err)
@@ -470,7 +470,7 @@ func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 		waitForLifecycleCondition(t, func() bool {
 			pairs, sessions := lifecycleRegistryCounts(registry)
 			return pairs == 0 && sessions == 0
-		}, "repair-acknowledgment terminal transition")
+		}, "KeepAlive terminal transition")
 		return &authoritypb.Response{
 			RequestId: request.GetRequestId(), Errno: 116,
 			Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
@@ -484,7 +484,7 @@ func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 	err := server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 		RequestId: 7,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-		Body:      &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
+		Body:      &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
 	}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
 		pairs, sessions := lifecycleRegistryCounts(registry)
 		if pairs != 0 || sessions != 0 {
@@ -500,29 +500,32 @@ func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if wrote == nil || wrote.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || wrote.GetErrno() != 116 {
-		t.Fatalf("repair acknowledgment response = %+v", wrote)
+		t.Fatalf("KeepAlive response = %+v", wrote)
 	}
 	if controlClosed.Load() != 1 {
 		t.Fatalf("CONTROL close count after reply = %d, want 1", controlClosed.Load())
 	}
 }
 
-func TestTransportFskitAckSuccessKeepsActivePairServing(t *testing.T) {
+func TestTransportKeepAliveSuccessKeepsActivePairServing(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x45}
 	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
-		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
 	)
 	if err := registry.markActive(control, session); err != nil {
 		t.Fatal(err)
 	}
 	handler := newLifecycleTestHandler(volumeserver.SessionStateActive)
+	handler.handle = func(_ context.Context, request *authoritypb.Request) *authoritypb.Response {
+		return &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: handler.Epoch(), SessionValidForNanos: uint64(time.Second)}
+	}
 	server := &Server{Handler: handler, registry: registry}
 	var wrote *authoritypb.Response
 	err := server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 		RequestId: 8,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-		Body:      &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
+		Body:      &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
 	}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
 		wrote = response
 		if _, err := registry.activeWitness(control, session); err != nil {
@@ -537,13 +540,13 @@ func TestTransportFskitAckSuccessKeepsActivePairServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if wrote == nil || wrote.GetErrno() != 0 {
-		t.Fatalf("nonterminal repair acknowledgment response = %+v", wrote)
+		t.Fatalf("nonterminal KeepAlive response = %+v", wrote)
 	}
 	if dataClosed.Load() != 0 || controlClosed.Load() != 0 {
-		t.Fatalf("nonterminal repair acknowledgment closed DATA/CONTROL = %d/%d", dataClosed.Load(), controlClosed.Load())
+		t.Fatalf("nonterminal KeepAlive closed DATA/CONTROL = %d/%d", dataClosed.Load(), controlClosed.Load())
 	}
 	if _, pin, err := registry.pinActive(data, session); err != nil {
-		t.Fatalf("DATA was not executable after a nonterminal repair acknowledgment: %v", err)
+		t.Fatalf("DATA was not executable after a nonterminal KeepAlive: %v", err)
 	} else {
 		pin.Release()
 	}
@@ -556,18 +559,18 @@ func TestTransportFskitAckSuccessKeepsActivePairServing(t *testing.T) {
 	}
 }
 
-func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testing.T) {
+func TestTransportExecutionPinDelaysControlExposureUntilKeepAliveReply(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x46}
 	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
-		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
 	)
 	if err := registry.markActive(control, session); err != nil {
 		t.Fatal(err)
 	}
 	candidate, candidateClosed := testTransportRegistrationForProfile(
 		t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL,
-		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE,
 	)
 
 	ackEntered := make(chan struct{})
@@ -579,10 +582,10 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 	handler := newLifecycleTestHandler(volumeserver.SessionStateActive)
 	handler.handle = func(_ context.Context, request *authoritypb.Request) *authoritypb.Response {
 		switch {
-		case request.GetAckFskitRepair() != nil:
+		case request.GetKeepAlive() != nil:
 			close(ackEntered)
 			<-releaseAck
-			return &authoritypb.Response{RequestId: request.GetRequestId()}
+			return &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: handler.Epoch(), SessionValidForNanos: uint64(time.Second)}
 		case request.GetResume() != nil:
 			select {
 			case <-ackWrote:
@@ -603,11 +606,11 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 		ackDone <- server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 			RequestId: 9,
 			Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-			Body:      &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
+			Body:      &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
 		}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
 			close(ackWrote)
 			if response == nil || response.GetErrno() != 0 {
-				return errors.New("repair acknowledgment returned a failure response")
+				return errors.New("KeepAlive returned a failure response")
 			}
 			registry.mu.Lock()
 			current := data.pair.control.current
@@ -622,7 +625,7 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 	select {
 	case <-ackEntered:
 	case <-time.After(time.Second):
-		t.Fatal("repair acknowledgment did not enter handler")
+		t.Fatal("KeepAlive did not enter handler")
 	}
 
 	resumeDone := make(chan error, 1)
@@ -669,7 +672,7 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 		t.Fatal(err)
 	}
 	if !resumeCrossedResponse.Load() {
-		t.Fatal("CONTROL Resume handler did not overlap the pinned FSKit Ack as expected")
+		t.Fatal("CONTROL Resume handler did not overlap the pinned KeepAlive as expected")
 	}
 	if controlClosed.Load() != 1 || candidateClosed.Load() != 0 || dataClosed.Load() != 0 {
 		t.Fatalf("post-Resume close counts DATA/current CONTROL/candidate CONTROL = %d/%d/%d", dataClosed.Load(), controlClosed.Load(), candidateClosed.Load())
@@ -693,5 +696,34 @@ func waitForLifecycleCondition(t *testing.T, condition func() bool, description 
 			t.Fatalf("timed out waiting for %s", description)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestEncodingDefectRetiresOriginalResponseAsUndelivered(t *testing.T) {
+	base := newLifecycleTestHandler(volumeserver.SessionStateActive)
+	handler := &responseObserverTestHandler{lifecycleTestHandler: base, written: make(chan observedResponseWrite, 1)}
+	invalid := &authoritypb.Response{RequestId: 7, Epoch: base.Epoch(), SessionValidForNanos: 1}
+	writer, reader := net.Pipe()
+	defer writer.Close()
+	defer reader.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- writeObservedResponse(writer, 4096, time.Second, handler, &authoritypb.Request{RequestId: 7}, invalid)
+	}()
+	var decoded authoritypb.Response
+	if err := readFrame(reader, 4096, nil, 0, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if decoded.GetRequestId() != 7 || !decoded.GetUncertain() || decoded.GetErrno() == 0 ||
+		decoded.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || decoded.GetSessionValidForNanos() != 0 ||
+		decoded.GetSessionTerminal() {
+		t.Fatalf("invalid result was not replaced by an internal refusal: %v", &decoded)
+	}
+	observed := <-handler.written
+	if observed.response != invalid || !errors.Is(observed.err, ErrFrameEncoding) {
+		t.Fatalf("original response was reported as delivered: %+v", observed)
 	}
 }

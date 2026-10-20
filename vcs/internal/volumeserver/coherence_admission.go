@@ -1,22 +1,11 @@
 package volumeserver
 
-// CheckCompatibilityWriter refuses a writer while another FSKit mount owns
-// the compatibility exclusion. The handler holds its activation admission
-// guard across this check and the operation which can establish write intent.
-func (c *VisibilityCoordinator) CheckCompatibilityWriter(source SessionID) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, p := range c.participants {
-		if id != source && p.compatibilityWriter {
-			return ErrCompatibilityWriterLease
-		}
-	}
-	return nil
-}
+import (
+	"fmt"
+	"math"
+	"time"
+)
 
-// DelegatedIdentities is a point snapshot used when a Mac compatibility mount
-// takes exclusive writer admission. It includes reservations: those must also
-// retire before an unrevocable Mac cache can become active.
 func (c *CoherenceCoordinator) DelegatedIdentities() [][16]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -25,4 +14,46 @@ func (c *CoherenceCoordinator) DelegatedIdentities() [][16]byte {
 		result = append(result, identity)
 	}
 	return result
+}
+
+// WriterRestartGrace is frozen alongside MaxCacheProof. The extra
+// second and 1,000 ppm term cover the supported cross-host clock assumptions.
+const WriterRestartGrace = MaxCacheProof + time.Second + (MaxCacheProof+999)/1000
+
+// StartWriterGrace must be called only after safe takeover: root
+// and membership ownership are exclusive, predecessor renewal is irrevocably
+// closed, and predecessor storage work has drained. Shipping shutdown joins
+// transport workers and restore background work before releasing those locks.
+// A root lock alone is not proof of an arbitrary embedding's quiescence.
+func (c *WriterRegistry) StartWriterGrace() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writerRestartStarted {
+		return fmt.Errorf("volumeserver: writer takeover already sampled")
+	}
+	c.writerRestartStarted = true
+	now, err := c.now()
+	if err != nil || now < 0 || now > time.Duration(math.MaxInt64)-WriterRestartGrace {
+		c.writerRestartFailed = true
+		return fmt.Errorf("volumeserver: unusable continuous takeover clock (sample %v): %v", now, err)
+	}
+	c.writerRestartLast = now
+	c.writerRestartDeadline = now + WriterRestartGrace
+	return nil
+}
+
+func (c *WriterRegistry) priorWriterBlockedLocked() bool {
+	if c.startupReady {
+		return false
+	}
+	if !c.writerRestartStarted || c.writerRestartFailed {
+		return true
+	}
+	now, err := c.now()
+	if err != nil || now < c.writerRestartLast {
+		c.writerRestartFailed = true
+		return true
+	}
+	c.writerRestartLast = now
+	return now < c.writerRestartDeadline
 }

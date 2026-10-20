@@ -1,14 +1,17 @@
 # Hosted control plane
 
-Status: **implemented; single-manager and single-AZ by design**
+Status: **implemented for authority protocol 8; single-manager and single-AZ by
+design; fresh protocol-8 cell provisioning is not yet qualified** (see
+[COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status))
 
 PortableFS can still be self-hosted with credentials minted out of band. The
 hosted stack adds a product-neutral manager and a narrow storage-cell control
 loop around the same authority data plane. It does not put the manager in the
 filesystem I/O path and it does not create a second writable filesystem truth.
 
-The exact mount transport is Linux FUSE. Shipping macOS 26 uses the named
-best-effort FSKit data plane against the same hosted authority.
+Linux mounts use stock kernel FUSE under `FRONTEND_PROFILE_LINUX`. macOS 26 and
+27 mount the same hosted authority under `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`,
+as the volume's only writer while mounted ([fskit-mount.md](./fskit-mount.md)).
 
 ```text
 product backend                    Linux mount
@@ -36,9 +39,9 @@ parallel with mounts. The product backend remains the user-authorization
 boundary and signs a token bound to the exact read request. It issues a
 standalone `access: ["read"]`, `automatic_reauthorization: false` Manager grant
 for the gateway CSR; no mount enrollment is created. For a live volume the
-gateway opens an uncached authority session and performs only object-relative
-lookup, directory read, and file read operations. For an ARCHIVED volume it
-serves the same bounded operations directly from the sealed manifest and pack
+gateway opens a `FRONTEND_PROFILE_CACHELESS_READER` authority session and
+performs only object-relative lookup, directory read, and file read operations.
+For an ARCHIVED volume it serves the same bounded operations directly from the sealed manifest and pack
 objects without an authority session or wake. Directory pages, preview bytes,
 session count, cursor count, and lifetimes are bounded. The Manager remains
 outside the file data path. A scaled deployment consistently routes a volume ID
@@ -94,21 +97,22 @@ before a local process-absence proof.
 one strict root-owned config, constructs a fixed authority argument shape, and
 execs a root-owned authority binary. The authority itself runs under a unique
 service UID, receives its listener from systemd, sees only one bind-mounted
-volume/config/state/staging set, has no network namespace of its own, and
-refuses root. Staging is outside the served namespace but inherits the exact
-volume XFS project and hard quota; its bind source cannot be replaced by the
-authority UID.
+volume, read-only configuration, and runtime state set, has no network namespace
+of its own, and refuses root. Its durable mount membership file is
+`mount.membership` in the runtime state directory, passed as
+`-mount-membership-file`; no other private directory is bound.
 
 `portablefs-files` is the optional read-only product adapter. It accepts only
 short-lived, body-bound requests signed by its colocated product backend, then
 uses a read-only capability and its own proof-of-possession identity to speak
 directly to the volume authority. It has bounded sessions, cursors, operations,
 downloads, request bodies, previews, and directory pages. It never mounts a
-volume and keeps no namespace or content cache. Protocol 5 has one strict
-session model, so the adapter still joins the visibility barrier with an exact
-no-kernel-mount observation and acknowledges each visibility phase immediately
-after observing it. It never adds a second filesystem truth or a weaker
-coherence profile.
+volume and keeps no namespace or content cache. Its session uses the cacheless
+reader profile: read access only, no cache permission, no subscription, and no
+writer exclusion. Each data-consuming read first breaks a Linux writer's
+delegation for read, so it observes flushed bytes without excluding that
+writer, and its transport loss leaves no withdrawal duty. It never adds a second
+filesystem truth.
 
 The intended deployment is one adapter beside one product backend in a shared
 pod network namespace, listening only on loopback. The product backend's exact
@@ -188,7 +192,7 @@ Linux FUSE supervisor is the one renewal owner. There is no global mount daemon
 and no second sequencer, and an automatic mount exposes no manual rotation
 socket.
 
-The macOS data plane has an equivalent single renewer inside its portablefsd
+The macOS data plane has an equivalent single renewer inside its `portablefsd`
 attach and refuses manual rotation.
 
 The owner immediately asks
@@ -212,15 +216,14 @@ latest non-derivable response is stored once per enrollment, while Manager-wide
 CA and release material is content-addressed and shared rather than copied into
 every enrollment. The
 authority pins the enrollment as the session's sole reauthorization issuer at
-initial attach and handles `Reauthorize` on its reserved
-liveness lane and:
+initial attach. Its `Reauthorize` handling:
 
 - accepts only the exact next sequence;
 - makes a byte-identical retry of that sequence harmless;
 - fences a changed replay or a sequence gap;
 - permits access to stay the same or narrow, never broaden;
 - extends the signed authorization deadline without replacing the filesystem
-  session, locks, handles, or strict-cache membership.
+  session, locks, handles, or durable mount membership.
 
 Activate returns the exact authority-verified initial deadline. The owner checks
 it against the Manager response and schedules only from the authority value, so
@@ -238,11 +241,16 @@ Changing the key is a new mTLS principal and requires a new mount/session.
 Temporary Manager failures retry the same sequence with bounded exponential
 backoff. A definitive denial fails closed immediately. If renewal cannot finish
 before the safety margin, Linux unmounts while the last grant is still valid.
-Clean detach closes the enrollment; the product may revoke it earlier.
-Revocation cannot erase an installed grant, so its remaining exposure is
-bounded by the short grant lifetime. The qualification macOS implementation
-instead terminalizes its data plane and exercises its FSKit-detach watchdog;
-that historical path does not broaden production platform support.
+The macOS daemon instead terminalizes the attach's data plane: serving
+operations fail closed until exact unmount and reconciliation. Completed
+deactivation and resource unloading still acknowledge local cleanup only;
+unmount's errorless completion proves neither durability nor kernel absence
+([FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown)).
+PortableFS does not remove the Mac's kernel mount automatically, and terminal
+enforcement does not withdraw kernel cache state the Mac already holds. Clean
+detach closes the enrollment; the product may revoke it earlier. Revocation cannot erase an
+installed grant, so its remaining exposure is bounded by the short grant
+lifetime.
 
 A live enrollment lease may renew short data grants without an absolute
 session-age limit. Explicit revocation, renewal fencing, authority replacement,
@@ -263,18 +271,17 @@ Standalone mounts omit all enrollment flags and retain the explicit
 `portablefs reauthorize` path. The mode is fixed at mount creation. An
 incomplete automatic configuration is refused and never falls back.
 
-Automatic authorization does not weaken strict-session continuity rules. If a
-qualification Mac sleeps past the installed grant, `portablefsd` restarts, the
-Linux mount owner exits, or the authority changes epoch/generation, that exact
-session cannot safely be reconstructed from kernel caches. It fails closed and
-requires the existing exact unmount/remount flow. A normal sleep or network
-interruption shorter than the installed window simply resumes the same renewal
-loop.
+Automatic authorization does not weaken session continuity rules. If a Mac
+sleeps past the installed grant, `portablefsd` restarts, the Linux mount owner
+exits, or the authority changes epoch/generation, that exact session cannot
+safely be reconstructed from kernel caches. It fails closed and requires the
+existing exact unmount/remount flow. A normal sleep or network interruption
+shorter than the installed window simply resumes the same renewal loop.
 
 The product writes the returned certificates and CA bundle to protected local
-files and invokes this production Linux command shape (timestamps are Unix
-milliseconds). A qualification Mac can exercise the same credential syntax,
-but that does not bypass its pre-Attach platform gate:
+files and invokes this command shape (timestamps are Unix milliseconds). The
+same credential syntax mounts on macOS, where the platform-support check still
+runs before Attach:
 
 ```text
 PORTABLEFS_MOUNT_TOKEN="$CAPABILITY" portablefs mount "$VOLUME" "$PATH" \
@@ -297,7 +304,7 @@ no second writer or unsafe epoch restart is introduced.
 
 ## Volume lifecycle and fencing
 
-Manager state schema v2 has one volume lifecycle:
+Manager state has one volume lifecycle:
 
 ```text
 PROVISIONING -> READY <-> FENCING
@@ -306,7 +313,7 @@ READY | ARCHIVED -> DESTROYING -> DESTROYED            (terminal, durable record
 QUARANTINED
 ```
 
-Archive first closes strict-attach admission and proves membership empty, then
+Archive first closes attach admission and proves mount membership empty, then
 stops the authority, exports to attempt-addressed immutable objects, and commits
 ARCHIVED only after the Manager verifies the manifest and object inventory.
 `DESTROY` and `RELEASE` remove the old placement with an exact helper-recorded
@@ -331,14 +338,16 @@ from XFS before it reports provisioning success.
 
 Planned restart uses the authority-owned quiesce handshake before stopping the
 complete service cgroup. The authority closes attach admission and proves its
-strict membership empty; the helper then stops both service and listener,
-verifies the cgroup empty, and rechecks the proof. The manager allocates the
-next authority generation only after `AuthorityAbsent && QuiesceProven`. A live
+mount membership empty; the helper then stops both service and listener,
+verifies the cgroup empty, rereads `mount.membership` through the same codec the
+authority writes, and rechecks the proof. The manager allocates the next
+authority generation only after `AuthorityAbsent && QuiesceProven`. A live
 client that has not detached therefore leaves the restart waiting rather than
 being forced off. An authority failure still enters fail-closed fencing and
-requires placement-bound operator evidence that every prior strict mount is
-absent or fenced. The same explicit evidence is the crash-recovery exception
-for a planned restart whose authority cannot finish quiescing. Operator volume
+requires placement-bound operator evidence that every prior mount is absent or
+fenced; the next generation then starts with `-prior-strict-mounts-fenced`.
+The same explicit evidence is the crash-recovery exception for a planned
+restart whose authority cannot finish quiescing. Operator volume
 views expose the durable `restart_requested` cursor so a release retry can keep
 waiting on that planned transaction while refusing an unplanned `FENCING`
 volume; product views omit the cursor.
@@ -369,10 +378,10 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | operator | `POST /v1/cells` | register cell capacity and allocator ranges |
 | operator | `PUT /v1/cells/{id}` | converge an exactly named cell registration without overwriting live state |
 | operator | `GET /v1/cells` | list the complete cell inventory in cell-ID order |
-| operator | `PATCH /v1/cells/{id}/capacity` | raise registered cell capacity monotonically (v2) |
-| operator | `POST /v1/cells/{id}/decommission` | stop admission and drain the cell through archive (v2) |
-| operator | `POST /v1/cells/{id}/abandon` | record a permanently lost cell and release only Manager-verified archived placements (v2) |
-| operator | `GET /v1/capacity` | inspect per-pool measured use, pending charges, counts, and admission verdicts (v2) |
+| operator | `PATCH /v1/cells/{id}/capacity` | raise registered cell capacity monotonically |
+| operator | `POST /v1/cells/{id}/decommission` | stop admission and drain the cell through archive |
+| operator | `POST /v1/cells/{id}/abandon` | record a permanently lost cell and release only Manager-verified archived placements |
+| operator | `GET /v1/capacity` | inspect per-pool measured use, pending charges, counts, and admission verdicts |
 | cell | `GET /v1/cells/{id}/plan` | fetch complete signed desired state |
 | cell | `POST /v1/cells/{id}/observations` | reconcile changed observed state |
 | cell | `POST /v1/cells/{id}/heartbeat` | refresh live health without a durable log write |
@@ -381,9 +390,9 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product/operator | `GET /v1/volumes/{id}` | inspect an authorized volume |
 | product | `POST /v1/volumes/{id}/restart` | enter the fencing state |
 | operator | `POST /v1/volumes/{id}/strict-fence` | record purpose-specific, placement-bound external strict-mount fence evidence for restart or terminal deletion recovery |
-| product | `POST /v1/volumes/{id}/archive` | enter the typed archive cycle (v2 surface) |
-| product | `POST /v1/volumes/{id}/wake` | place and restore an ARCHIVED volume (v2 surface) |
-| product | `DELETE /v1/volumes/{id}` | destroy the volume and retain the terminal audit record (v2) |
+| product | `POST /v1/volumes/{id}/archive` | enter the typed archive cycle |
+| product | `POST /v1/volumes/{id}/wake` | place and restore an ARCHIVED volume |
+| product | `DELETE /v1/volumes/{id}` | destroy the volume and retain the terminal audit record |
 | product | `POST /v1/mount-authorizations` | issue client cert plus initial grant and, when explicitly requested, an automatic enrollment |
 | product | `POST /v1/mount-reauthorizations` | renew cert plus exact session grant |
 | enrolled mount | `POST /v1/mount-enrollments/{id}/reauthorizations` | obtain the exact next live-session grant |
@@ -400,18 +409,10 @@ terminal deletion never moves an allocator backward. The first PUT
 creates the cell; an exact normalized replay returns the live current cell as a
 no-op. It never resets a monotonic capacity raise, allocator progress, health,
 or desired-plan state. Any changed registration declaration returns `409` and
-leaves state untouched. A schema-v2 cell written before allocator bounds
-existed accepts one compatible declaration, whether or not it already carries
-the earlier pre-bound declaration digest (same identities and pool, with
-capacity and allocator starts no greater than their monotonic live values). Its
-current next project ID, UID, and port must each be no greater than the
-declared last value plus the single exhausted sentinel. Thus a legacy cell that
-already consumed the final declared identity can be pinned truthfully as
-exhausted without inventing a larger range. That one transaction installs only
-the three bounds and the exact declaration digest; it does not otherwise
-rewrite live state. Later replays use the exact rule. There is no implicit or
-unbounded allocator range. The two operator inventory GETs always return
-arrays, including when empty, with entries sorted by stable ID.
+leaves state untouched. Every stored cell carries its allocator bounds and
+declaration digest; there is no implicit or unbounded allocator range. The two
+operator inventory GETs always return arrays, including when empty, with
+entries sorted by stable ID.
 
 Refusal classes on create, archive, wake, and delete routes are kept
 distinct because each demands a different client response:
@@ -475,16 +476,22 @@ window; observations are state-based and reapplying them is safe.
 - The manager currently loads CA and Ed25519 signing keys from private local
   files. Production key custody can replace those signers with KMS/HSM-backed
   implementations without changing the cell or mount contracts.
-- The hosted API and manager state schema are new internal surfaces, not part of
-  the frozen v3 authority protocol. The authority `Reauthorize` RPC is additive
-  and advertised as `session-reauthorization-v1`. Automatic mounts additionally
-  require `mount-enrollment-reauthorization-v1` and refuse an older authority
-  rather than changing renewal modes. A client that supports the sliding lease
+- The Manager HTTP API and its JSON outputs (including `CreateAdmissible` and
+  `RestoreAdmissible`), the enrollment and reauthorization schemas, and the
+  three CLI capability strings are external contracts and are preserved
+  ([COMPATIBILITY.md](../COMPATIBILITY.md#external-hosted-contracts)). The
+  `v1` in the API prefix and the product-authorization format is not the
+  authority protocol major. Session reauthorization and enrollment-bound
+  reauthorization are mandatory authority behavior; there is no authority
+  feature string to negotiate. A client that supports the sliding lease
   contract advertises `hosted-automatic-mount-reauthorization-v2`.
-- Tiered storage uses Manager state schema v2 and signed cell-plan v2. Rollout is
-  gated helper, then agent, then Manager using explicit advertised plan and
-  helper-state versions; the Manager does not sign v2 or admit archive/restore
-  on a cell until both host components report v2 capability.
+- Private hosted state has exact format markers: Manager snapshot schema 3,
+  signed cell plan version 3 (token prefix `v3.` and its own signing domain),
+  and cell helper state version 2. The signed plan carries the authority CA,
+  client CA, and capability public key once at plan level; a per-volume
+  override is not part of the signed shape and strict decoding rejects one. No
+  earlier format is decoded or migrated: protocol-8 Manager state and cells are
+  provisioned fresh.
 
 These are explicit scope boundaries, not silent availability claims. The data
 plane remains usable in standalone mode without the hosted components.

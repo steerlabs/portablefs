@@ -17,6 +17,7 @@ import (
 type coherenceOperationKey struct{}
 type coherenceOperation struct {
 	beforeAdmission func() error
+	measurement     *MutationObservation
 
 	reservation *volumeserver.DelegationReservation
 	delegation  volumeserver.Delegation
@@ -29,6 +30,7 @@ func (h *VolumeHandler) initCoherence() {
 		}
 		h.coherenceStorage = volumeserver.NewStorageSequencer()
 		h.coherenceVersion = 1
+		h.objectVersionFloor = 1
 		h.Metrics.BindCoherence(h.Coherence.Stats)
 
 	})
@@ -40,6 +42,9 @@ func (h *VolumeHandler) coherenceVersionNow() uint64 {
 	return h.coherenceVersion
 }
 func (h *VolumeHandler) SweepCoherence() {
+	if h.Writers != nil {
+		h.Writers.SweepExclusions()
+	}
 	if h.Coherence == nil {
 		return
 	}
@@ -53,22 +58,10 @@ func (h *VolumeHandler) SweepCoherence() {
 	}
 }
 
-func coherenceGateTargets(gate volumeserver.SourcePublicationGate) []volumeserver.VisibilityTarget {
-	targets := make([]volumeserver.VisibilityTarget, 0, len(gate.Targets))
-	for _, t := range gate.Targets {
-		if len(t.Name) != 0 {
-			targets = append(targets, volumeserver.VisibilityTarget{Scope: volumeserver.VisibilityNamespace, ParentIdentity: t.ParentIdentity, Name: t.Name, RelatedIdentities: t.BoundIdentities})
-		} else {
-			targets = append(targets, volumeserver.VisibilityTarget{Scope: volumeserver.VisibilityAttributes, Identity: t.Identity})
-		}
-	}
-	return targets
-}
-
 // Resolve without retaining a storage stripe. Delegation cuts may cause the
 // holder to flush through exactly those stripes and must run before acquiring
 // the complete storage dependency footprint.
-func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb.Request, id volumeserver.SessionID, gate volumeserver.SourcePublicationGate) (*volumeserver.DelegationFlush, [16]byte, error) {
+func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb.Request, id volumeserver.SessionID, gate volumeserver.MutationFootprint) (*volumeserver.DelegationFlush, [16]byte, error) {
 	token, err := h.coherenceToken(id)
 	if err != nil {
 		return nil, [16]byte{}, err
@@ -163,7 +156,7 @@ func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb
 	return pin, identity, err
 }
 
-func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error), apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget), releases ...*func()) *authoritypb.Response {
+func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, prepare func(*operationResolutionContext) ([]volumeserver.MutationTarget, error), apply func(uint64, *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget), syncMutation func() error, releases ...*func()) *authoritypb.Response {
 	h.initCoherence()
 	if err := h.Coherence.WaitPriorCacheHorizon(ctx); err != nil {
 		for _, release := range releases {
@@ -175,17 +168,15 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 		return h.coherenceError(req.GetRequestId(), err)
 	}
 	profile, _ := h.sessionFrontendProfile(cred.ID)
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return h.mutateFskitCoherence(ctx, req, cred, prepare, apply, releases...)
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
+		return h.mutateFskitCoherence(ctx, req, cred, prepare, apply, syncMutation, releases...)
 	}
 	if coherenceFlushReference(req) == nil {
 		if err := h.coherenceProfileAdmission.RLockContext(ctx); err != nil {
 			return h.coherenceError(req.GetRequestId(), err)
 		}
 		defer h.coherenceProfileAdmission.RUnlock()
-		if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
-			return h.coherenceError(req.GetRequestId(), err)
-		}
+
 	}
 	// Mac activation holds exclusive profile admission while recalling old
 	// delegations. Their exact-generation flushes must still pass so recall can
@@ -211,7 +202,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				return h.coherenceError(0, err)
 			}
 		}
-		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
+		for attempt := 0; attempt < maxResolutionAttempts; attempt++ {
 			resolver := newOperationResolutionContext(h, cred.ID)
 			gate, err := resolver.deriveCoherenceGate(req)
 			if err != nil {
@@ -227,15 +218,17 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 					pin = nil
 				}
 			}
-			dependencies := volumeserver.MutationDependenciesForTargets(coherenceGateTargets(gate))
+			dependencies := volumeserver.MutationDependenciesForFootprint(gate)
+			finishPhase := beginMutationPhase(ctx, phaseStorageWait)
 			releaseTurn, err := h.coherenceStorage.Acquire(ctx, dependencies)
+			finishPhase()
 			if err != nil {
 				finishPin(0)
 				return h.coherenceError(0, err)
 			}
 			current := newOperationResolutionContext(h, cred.ID)
 			checked, err := current.deriveCoherenceGate(req)
-			if err != nil || !sourcePublicationGatesEqual(&gate, &checked) {
+			if err != nil || !mutationFootprintsEqual(&gate, &checked) {
 				releaseTurn()
 				finishPin(0)
 				if err != nil {
@@ -257,7 +250,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				releaseStorage()
 				releaseTurn()
 				finishPin(0)
-				if errors.Is(err, volumeserver.ErrVisibilityDependencyRefresh) {
+				if errors.Is(err, volumeserver.ErrMutationDependencyRefresh) {
 					continue
 				}
 				return h.coherenceError(0, err)
@@ -275,8 +268,16 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				finishPin(0)
 				return h.coherenceError(0, err)
 			}
+			releaseCommit, err := h.reserveCoherenceCommit()
+			if err != nil {
+				releaseStorage()
+				releaseTurn()
+				finishPin(0)
+				return h.coherenceError(0, err)
+			}
 			applyUse, err := h.Runtime.Begin(cred)
 			if err != nil {
+				releaseCommit()
 				releaseStorage()
 				releaseTurn()
 				finishPin(0)
@@ -286,21 +287,24 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			// mutations. Recall flushes have an exact generation pin instead.
 			// The fresh runtime pin is the atomic source-liveness cut: a fence
 			// either wins before it or follows an operation already admitted to
-			// apply. The v7 storage turn remains the sole mutation scheduler.
-			provisional := h.coherenceOperationSequence.Add(1) | uint64(1)<<63
+			// apply. The shared storage turn remains the sole mutation scheduler.
+			changed := new(mutationChanges)
 			var response *authoritypb.Response
-			var changes []volumeserver.VisibilityTarget
+			var changes []volumeserver.MutationTarget
+			finishPhase = beginMutationPhase(ctx, phaseApply)
 			func() {
 				defer applyUse.End()
-				response, changes = apply(provisional)
+				response, changes = apply(1, changed)
 			}()
+			finishPhase()
 			if response == nil {
 				response = h.errorResponse(0, errInternal, true)
 			}
 			var retainedGrantErr error
 
-			withdrawal := h.publishCoherenceCommitAdmitted(req, cred.ID, identity, provisional, response, changes, &token, sourceCacheAdmission(gate, response))
-			stampVisibilityTargets(changes, response.GetPostState())
+			withdrawal := h.publishCoherenceCommitAdmitted(req, cred.ID, identity, response, changes, changed, &token, sourceCacheAdmission(gate, response))
+			releaseCommit()
+			stampMutationTargets(changes, response.GetPostState())
 			if changes != nil {
 				err = volumeserver.ValidateMutationCompletion(changes, prepared)
 			}
@@ -318,7 +322,9 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			releaseTurn()
 			finishPin(response.GetAppliedSequence())
 			if err != nil {
-				return h.errorResponse(0, fmt.Errorf("%w: %w", volumeserver.ErrVisibilityPoisoned, err), true)
+				failure := h.errorResponse(0, fmt.Errorf("%w: %w", volumeserver.ErrMutationPoisoned, err), true)
+				failure.PostState, failure.VolumeVersion = response.GetPostState(), response.GetVolumeVersion()
+				return failure
 			}
 			if retainedGrantErr != nil {
 				h.discardCoherenceOpenReply(cred.ID, response)
@@ -340,9 +346,14 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				if response.GetAppliedSequence() != 0 && (coherenceFlushReference(req) != nil || op != nil && op.delegation.ID != 0) {
 					// The response is an application receipt. Holder cut acknowledgments must
 					// be able to pass a withdrawal of the holder's pending read publication.
+					if op != nil && op.measurement != nil {
+						op.measurement.DetachedWithdrawal = true
+					}
 					go wait()
 				} else {
+					finishPhase = beginMutationPhase(ctx, phaseWithdrawal)
 					wait()
+					finishPhase()
 				}
 			} else {
 				h.coherenceDurability.markVisible(cred.ID, applied)
@@ -383,15 +394,15 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 	}, nil)
 }
 
-func (r *operationResolutionContext) deriveCoherenceGate(req *authoritypb.Request) (volumeserver.SourcePublicationGate, error) {
+func (r *operationResolutionContext) deriveCoherenceGate(req *authoritypb.Request) (volumeserver.MutationFootprint, error) {
 	if w := req.GetWrite(); w != nil {
 		resolved, err := r.open(w.GetHandle())
 		if err != nil {
-			return volumeserver.SourcePublicationGate{}, err
+			return volumeserver.MutationFootprint{}, err
 		}
-		return volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{{Identity: resolved.identity, Attributes: true, Data: true}}}, nil
+		return volumeserver.MutationFootprint{Targets: []volumeserver.FootprintTarget{{Identity: resolved.identity, Attributes: true, Data: true}}}, nil
 	}
-	return r.deriveSourcePublicationGate(req, true)
+	return r.deriveMutationFootprint(req)
 }
 func coherenceFlushReference(req *authoritypb.Request) *authoritypb.DelegationRef {
 	if w := req.GetWrite(); w != nil {
@@ -412,11 +423,11 @@ func coherenceDelegationProto(d volumeserver.Delegation) *authoritypb.Delegation
 	return &authoritypb.Delegation{Id: coherenceDelegationID(d.ID), Generation: d.Generation, Mode: authoritypb.DelegationMode(d.Mode)}
 }
 
-func (h *VolumeHandler) publishCoherenceCommit(req *authoritypb.Request, id volumeserver.SessionID, identity [16]byte, provisional uint64, resp *authoritypb.Response, targets []volumeserver.VisibilityTarget) uint64 {
-	return h.publishCoherenceCommitAdmitted(req, id, identity, provisional, resp, targets, nil, volumeserver.CacheAdmission{}).Position
+func (h *VolumeHandler) publishCoherenceCommit(req *authoritypb.Request, id volumeserver.SessionID, identity [16]byte, resp *authoritypb.Response, targets []volumeserver.MutationTarget, changedIdentities *mutationChanges) uint64 {
+	return h.publishCoherenceCommitAdmitted(req, id, identity, resp, targets, changedIdentities, nil, volumeserver.CacheAdmission{}).Position
 }
 
-func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request, id volumeserver.SessionID, identity [16]byte, provisional uint64, resp *authoritypb.Response, targets []volumeserver.VisibilityTarget, source *volumeserver.SubscriptionToken, admission volumeserver.CacheAdmission) volumeserver.Withdrawal {
+func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request, id volumeserver.SessionID, identity [16]byte, resp *authoritypb.Response, targets []volumeserver.MutationTarget, changedIdentities *mutationChanges, source *volumeserver.SubscriptionToken, admission volumeserver.CacheAdmission) volumeserver.Withdrawal {
 	h.coherenceCommitMu.Lock()
 	defer h.coherenceCommitMu.Unlock()
 	changed := targets != nil
@@ -427,7 +438,17 @@ func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request,
 		h.coherenceVersion++
 	}
 	seq := h.coherenceVersion
-	versions := h.finalizeMutationPostState(provisional, seq, resp.GetPostState())
+	if changed && resp.GetPostState() == nil {
+		// A failed post-apply observation may leave no exact attributes. Keep
+		// every explicitly declared possible inode effect in the change stream
+		// and version map; absence of a PostState is not evidence of no change.
+		for _, target := range targets {
+			if target.Scope != volumeserver.MutationNamespace {
+				changedIdentities.add(target.Identity)
+			}
+		}
+	}
+	versions := h.finalizeMutationPostState(seq, resp.GetPostState(), changedIdentities)
 	rewriteMutationReplyMetadata(resp.ProtoReflect(), seq, versions)
 	resp.VolumeVersion = seq
 	if w := resp.GetWrite(); w != nil {
@@ -435,7 +456,7 @@ func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request,
 	}
 	var entries []volumeserver.ChangeEntry
 	if changed {
-		entries = coherenceChanges(req, resp, targets, seq)
+		entries = coherenceChanges(req, resp, targets, seq, changedIdentities)
 	}
 	var withdrawal volumeserver.Withdrawal
 	if source != nil {
@@ -446,12 +467,12 @@ func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request,
 	if !changed {
 		return withdrawal
 	}
-	if identity != ([16]byte{}) && (req.GetWrite() != nil || req.GetSetAttr() != nil || req.GetFallocate() != nil) {
+	if identity != ([16]byte{}) && (req.GetWrite() != nil || req.GetSetAttr() != nil || req.GetFallocate() != nil || req.GetOpen().GetWriteIntent() || req.GetCreate().GetWriteIntent()) {
 		resp.AppliedSequence = h.coherenceDurability.recordApplied(id, identity, seq)
 	}
 	return withdrawal
 }
-func coherenceChanges(req *authoritypb.Request, resp *authoritypb.Response, targets []volumeserver.VisibilityTarget, version uint64) []volumeserver.ChangeEntry {
+func coherenceChanges(req *authoritypb.Request, resp *authoritypb.Response, targets []volumeserver.MutationTarget, version uint64, changed *mutationChanges) []volumeserver.ChangeEntry {
 	entries := make([]volumeserver.ChangeEntry, 0, len(targets)*2+len(resp.GetPostState().GetObjects()))
 	type coordinate struct {
 		kind             volumeserver.ChangeKind
@@ -469,12 +490,18 @@ func coherenceChanges(req *authoritypb.Request, resp *authoritypb.Response, targ
 	}
 	for _, t := range targets {
 		switch t.Scope {
-		case volumeserver.VisibilityNamespace:
+		case volumeserver.MutationNamespace:
 			add(volumeserver.ChangeEntry{Kind: volumeserver.NamespaceChanged, ParentIdentity: t.ParentIdentity, Name: string(t.Name)})
 			add(volumeserver.ChangeEntry{Kind: volumeserver.DirectoryChanged, Identity: t.ParentIdentity})
-		case volumeserver.VisibilityAttributes:
+		case volumeserver.MutationAttributes:
+			if !changed.contains(t.Identity) {
+				continue
+			}
 			add(volumeserver.ChangeEntry{Kind: volumeserver.AttributesChanged, Identity: t.Identity})
-		case volumeserver.VisibilityData:
+		case volumeserver.MutationData:
+			if !changed.contains(t.Identity) {
+				continue
+			}
 			e := volumeserver.ChangeEntry{Kind: volumeserver.DataChanged, Identity: t.Identity}
 			if w := resp.GetWrite(); w != nil && w.GetCommittedSize() != 0 {
 				e.HasRange = true
@@ -495,10 +522,12 @@ func coherenceChanges(req *authoritypb.Request, resp *authoritypb.Response, targ
 		}
 	}
 	for _, o := range resp.GetPostState().GetObjects() {
-		if o.GetObjectVersion() == version && len(o.GetStableIdentity()) == 16 {
+		if len(o.GetStableIdentity()) == 16 {
 			var i [16]byte
 			copy(i[:], o.GetStableIdentity())
-			add(volumeserver.ChangeEntry{Kind: volumeserver.AttributesChanged, Identity: i})
+			if changed.contains(i) {
+				add(volumeserver.ChangeEntry{Kind: volumeserver.AttributesChanged, Identity: i})
+			}
 		}
 	}
 	return entries

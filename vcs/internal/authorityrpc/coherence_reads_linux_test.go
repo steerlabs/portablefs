@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"sync/atomic"
@@ -19,11 +20,13 @@ import (
 
 type coherenceReadPathStore struct {
 	resourceAdmissionFaultStore
-	handle xfsstore.Capability
-	data   []byte
-	read   atomic.Uint32
-	attr   atomic.Uint32
-	fsync  atomic.Uint32
+	handle  xfsstore.Capability
+	data    []byte
+	read    atomic.Uint32
+	attr    atomic.Uint32
+	fsync   atomic.Uint32
+	syncErr error
+	fences  atomic.Uint32
 }
 
 func (s *coherenceReadPathStore) IdentityOpen(handle xfsstore.Capability) ([16]byte, error) {
@@ -56,13 +59,15 @@ func (s *coherenceReadPathStore) GetattrOpen(handle xfsstore.Capability) (xfssto
 	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: int64(len(s.data)), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
 }
 
-func (s *coherenceReadPathStore) Fsync(handle xfsstore.Capability, _ bool) error {
+func (s *coherenceReadPathStore) FsyncCoalesced(handle xfsstore.Capability, _ bool) (int, error) {
 	if handle != s.handle {
-		return syscall.EBADF
+		return 0, syscall.EBADF
 	}
 	s.fsync.Add(1)
-	return nil
+	return 1, s.syncErr
 }
+
+func (s *coherenceReadPathStore) Fence(error) { s.fences.Add(1) }
 
 func (*coherenceReadPathStore) CloseOpen(xfsstore.Capability) error { return nil }
 
@@ -578,7 +583,7 @@ func TestCoherenceReadDirPublishesRevalidatedPageStamp(t *testing.T) {
 }
 
 type coherenceChurningDirectoryStore struct {
-	readdirPostStabilizationChangeStore
+	readdirPageChangeStore
 	lookupCalls atomic.Uint32
 	unstableFor uint32
 	eagainFor   uint32
@@ -607,12 +612,12 @@ func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T
 		unstable uint32
 		eagain   uint32
 	}{
-		{name: "revalidation changes", unstable: 2 * maxStabilizeAttempts},
-		{name: "openat2 retry", eagain: maxStabilizeAttempts + 3},
+		{name: "revalidation changes", unstable: 2 * maxResolutionAttempts},
+		{name: "openat2 retry", eagain: maxResolutionAttempts + 3},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := &coherenceChurningDirectoryStore{
-				readdirPostStabilizationChangeStore: readdirPostStabilizationChangeStore{
+				readdirPageChangeStore: readdirPageChangeStore{
 					root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 				},
 				unstableFor: test.unstable, eagainFor: test.eagain,
@@ -630,7 +635,7 @@ func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T
 			if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 || response.GetReadDir().GetEntries()[0].GetAttr().GetMode() != 0o640 {
 				t.Fatalf("READDIR under churn = %+v", response)
 			}
-			if calls := store.lookupCalls.Load(); calls <= maxStabilizeAttempts {
+			if calls := store.lookupCalls.Load(); calls <= maxResolutionAttempts {
 				t.Fatalf("lookup calls=%d, regression did not cross the former retry bound", calls)
 			}
 			if got := len(h.resources[credential.ID].items); got != 1 {
@@ -692,9 +697,9 @@ func TestCoherenceReadDependenciesCoverBindingsAndObjects(t *testing.T) {
 	parent := [16]byte{0x11}
 	child := [16]byte{0x22}
 	got := coherenceBindingDependencies(parent, []byte("child"), child)
-	want := volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{
+	want := volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{
 		{
-			Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: []byte("child"),
+			Scope: volumeserver.MutationNamespace, ParentIdentity: parent, Name: []byte("child"),
 			RelatedIdentities: [][16]byte{child},
 		},
 	})
@@ -709,13 +714,13 @@ func TestCoherenceReadDependenciesCoverBindingsAndObjects(t *testing.T) {
 		dirent:   &authoritypb.Dirent{Name: []byte("child")},
 	}}
 	got = h.coherenceDirectoryDependencies(directory, candidates)
-	want = volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{
-		{Scope: volumeserver.VisibilityAttributes, Identity: directory},
+	want = volumeserver.MutationDependenciesForTargets([]volumeserver.MutationTarget{
+		{Scope: volumeserver.MutationAttributes, Identity: directory},
 		{
-			Scope: volumeserver.VisibilityNamespace, ParentIdentity: directory, Name: []byte("child"),
+			Scope: volumeserver.MutationNamespace, ParentIdentity: directory, Name: []byte("child"),
 			RelatedIdentities: [][16]byte{child},
 		},
-		{Scope: volumeserver.VisibilityAttributes, Identity: child},
+		{Scope: volumeserver.MutationAttributes, Identity: child},
 	})
 	if !got.Equal(want) {
 		t.Fatal("readdir did not acquire the complete directory/name/child footprint")
@@ -864,5 +869,48 @@ func TestCoherenceLookupRebindDuringBreakDiscardsRetainedProbe(t *testing.T) {
 	}
 	if store.lookup.Load() != 2 || store.attr.Load() != 1 || store.forget.Load() != 1 {
 		t.Fatalf("probe/accounting: lookups=%d attrs=%d forgotten=%d", store.lookup.Load(), store.attr.Load(), store.forget.Load())
+	}
+}
+
+func TestCoherenceFsyncPersistenceFailureTerminatesWithoutDurableCut(t *testing.T) {
+	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+		for _, dataOnly := range []bool{false, true} {
+			t.Run(cause.Error()+map[bool]string{false: "/fsync", true: "/fdatasync"}[dataOnly], func(t *testing.T) {
+				failure := &xfsstore.DurabilityError{Cause: cause}
+				store := &coherenceReadPathStore{handle: xfsstore.Capability{0x44}, syncErr: failure}
+				h, ctx, cred, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+				if err := h.trackOpen(cred.ID, store.handle, false); err != nil {
+					t.Fatal(err)
+				}
+				called := make(chan error, 1)
+				h.OnStorageFailure = func(err error) { called <- err }
+				req := coherenceReadRequest(cred)
+				req.Body = &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: store.handle[:], DataOnly: dataOnly}}
+				resp := h.Handle(ctx, req)
+				if resp.GetErrno() != int32(syscall.EIO) || !resp.GetUncertain() || resp.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE || resp.GetFsync() != nil || store.fsync.Load() != 1 || store.fences.Load() == 0 {
+					t.Fatalf("FSYNC=%v calls=%d fences=%d", resp, store.fsync.Load(), store.fences.Load())
+				}
+				select {
+				case err := <-called:
+					var got *xfsstore.DurabilityError
+					if !errors.As(err, &got) || got != failure {
+						t.Fatalf("terminal cause=%v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("FSYNC did not terminate storage")
+				}
+				if h.Coherence.LatestDurable() != 0 {
+					t.Fatal("FSYNC published a durable cut")
+				}
+				if _, durable := h.latestCoherenceDurability(cred.ID); durable != 0 {
+					t.Fatalf("durable prefix=%d", durable)
+				}
+				req.RequestId++
+				_ = h.Handle(ctx, req)
+				if store.fsync.Load() != 1 {
+					t.Fatal("terminal request retried persistence")
+				}
+			})
+		}
 	}
 }

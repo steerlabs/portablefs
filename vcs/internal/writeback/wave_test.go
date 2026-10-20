@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 )
 
@@ -13,9 +14,6 @@ type waveTestFlusher struct {
 	call           func([]Entry) ([]uint64, error)
 }
 
-func (*waveTestFlusher) Flush(context.Context, Identity, Entry) (uint64, error) {
-	panic("batch flusher reached serial path")
-}
 func (f *waveTestFlusher) FlushBatchSize() (int, int) { return f.width, f.payload }
 func (f *waveTestFlusher) FlushBatch(_ context.Context, _ Identity, entries []Entry) ([]uint64, error) {
 	return f.call(entries)
@@ -29,7 +27,7 @@ func entryPieces(e Entry) [][]byte {
 
 func TestFlushWaveBorrowsRecordsAndPreservesOverlapAndCut(t *testing.T) {
 	f := &waveTestFlusher{width: 4, payload: 8}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(1)
 	mustWrite(t, b, id, 0, "abcdefghijklmnopq")
 	mustWrite(t, b, id, 17, "rstuv")
@@ -107,7 +105,7 @@ func TestFlushWaveBorrowsRecordsAndPreservesOverlapAndCut(t *testing.T) {
 
 func TestFlushWaveRetryKeepsTokensAndPartiallyConsumedRecord(t *testing.T) {
 	f := &waveTestFlusher{width: 4, payload: 8}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(2)
 	cut := mustWrite(t, b, id, 0, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 	failure := errors.New("retryable wave refusal")
@@ -165,7 +163,7 @@ func TestFlushWaveRetryKeepsTokensAndPartiallyConsumedRecord(t *testing.T) {
 func TestFlushWaveDropDoesNotMutateBorrowedEntries(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	f := &waveTestFlusher{width: 4, payload: 4}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(3)
 	cut := mustWrite(t, b, id, 0, "abcdefghijklmnop")
 	f.call = func(entries []Entry) ([]uint64, error) {
@@ -191,7 +189,7 @@ func TestFlushWaveDropDoesNotMutateBorrowedEntries(t *testing.T) {
 
 func TestFlushWaveRejectsSequenceBelowPriorWave(t *testing.T) {
 	f := &waveTestFlusher{width: 2, payload: 4}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(4)
 	cut := mustWrite(t, b, id, 0, "abcd")
 	f.call = func([]Entry) ([]uint64, error) { return []uint64{10}, nil }
@@ -210,7 +208,7 @@ func TestFlushWaveRejectsSequenceBelowPriorWave(t *testing.T) {
 
 func TestFlushWaveCompletesPrefixBeforePartialRecord(t *testing.T) {
 	f := &waveTestFlusher{width: 1, payload: 4}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	id := testIdentity(5)
 	small := mustWrite(t, b, id, 0, "ab")
 	cut := mustWrite(t, b, id, 2, "cdefgh")
@@ -248,7 +246,7 @@ func TestFlushWaveAdmissionOrderModel(t *testing.T) {
 	rng := rand.New(rand.NewSource(192))
 	for trial := 0; trial < 100; trial++ {
 		f := &waveTestFlusher{width: 1 + rng.Intn(4), payload: 1 + rng.Intn(16)}
-		b := newTestBuffer(t, f, Options{FlushInterval: -1})
+		b := newTestBuffer(t, f, Options{})
 		id := testIdentity(6)
 		want, got := make([]byte, 256), make([]byte, 256)
 		for n := 0; n < 40; n++ {
@@ -283,16 +281,15 @@ func TestFlushWaveAdmissionOrderModel(t *testing.T) {
 
 func TestFileDurabilityCannotRetireAnotherIdentityOrLaterCut(t *testing.T) {
 	f := &waveTestFlusher{width: 4, payload: 8}
-	var seq uint64
+	var seq atomic.Uint64
 	f.call = func(e []Entry) ([]uint64, error) {
 		r := make([]uint64, len(e))
 		for i := range r {
-			seq++
-			r[i] = seq
+			r[i] = seq.Add(1)
 		}
 		return r, nil
 	}
-	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	b := newTestBuffer(t, f, Options{})
 	one, two := testIdentity(7), testIdentity(8)
 	mustWrite(t, b, two, 0, "earlier")
 	cut := mustWrite(t, b, one, 0, "first")
@@ -317,5 +314,64 @@ func TestFileDurabilityCannotRetireAnotherIdentityOrLaterCut(t *testing.T) {
 	b.Drop(one, "fence")
 	if err := b.DurableIdentity(one, cut); !errors.Is(err, ErrLost) {
 		t.Fatalf("file sync erased intervening loss: %v", err)
+	}
+}
+
+// The wave shape is the only flush contract: a flusher that cannot carry at
+// least one operation, or would exceed the retained wave storage or the
+// payload bound, is refused at construction rather than served by another mode.
+func TestNewRefusesAnUnusableWaveShape(t *testing.T) {
+	for _, shape := range []struct{ width, payload int }{
+		{0, MaxPayload}, {-1, MaxPayload}, {MaxWaveWidth + 1, MaxPayload},
+		{1, 0}, {1, -1}, {1, MaxPayload + 1},
+	} {
+		if _, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("New(width %d, payload %d) error = %v, want ErrInvalid", shape.width, shape.payload, err)
+		}
+	}
+	for _, shape := range []struct{ width, payload int }{{1, 1}, {MaxWaveWidth, MaxPayload}} {
+		b, err := New(&waveTestFlusher{width: shape.width, payload: shape.payload}, Options{})
+		if err != nil {
+			t.Fatalf("New(width %d, payload %d): %v", shape.width, shape.payload, err)
+		}
+		b.Stop()
+	}
+}
+
+// The receipt rule flushers rely on: a failed wave is offered again with the
+// same tokens while later admissions wait behind it, and the identity's next
+// wave carries only strictly greater tokens.
+func TestRetainedWaveRecursUntilAppliedAndNextWaveHasGreaterTokens(t *testing.T) {
+	var calls [][]uint64
+	fail := true
+	f := &waveTestFlusher{width: 1, payload: 4}
+	f.call = func(entries []Entry) ([]uint64, error) {
+		tokens := make([]uint64, len(entries))
+		for i, entry := range entries {
+			tokens[i] = entry.Token
+		}
+		calls = append(calls, tokens)
+		if fail {
+			fail = false
+			return nil, errors.New("interrupted")
+		}
+		sequences := make([]uint64, len(entries))
+		for i := range sequences {
+			sequences[i] = uint64(len(calls)*10 + i)
+		}
+		return sequences, nil
+	}
+	b := newTestBuffer(t, f, Options{})
+	id := testIdentity(9)
+	cut := mustWrite(t, b, id, 0, "abcd")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err == nil {
+		t.Fatal("interrupted wave reported success")
+	}
+	cut = mustWrite(t, b, id, 4, "efgh")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || len(calls[0]) != 1 || calls[1][0] != calls[0][0] || calls[2][0] <= calls[1][0] {
+		t.Fatalf("wave tokens by call = %v, want the retained wave again, then a greater token", calls)
 	}
 }

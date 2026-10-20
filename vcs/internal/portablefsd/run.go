@@ -37,10 +37,6 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer releaseSingleton(frontendSingleton)
 
-	// Registry construction is intentionally behind every singleton lock.
-	// It opens local backing roots, replays the binding journal, stamps legacy
-	// WAL identity, sweeps WAL state, and starts a persister. A daemon that
-	// loses either lock must perform none of those operations.
 	if err := stateSingleton.validate(); err != nil {
 		return fmt.Errorf("revalidate portablefsd state singleton: %w", err)
 	}
@@ -51,7 +47,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("revalidate portablefsd frontend singleton: %w", err)
 	}
 	// A Unix socket pathname survives an unclean process exit and a machine
-	// reboot even though no listener survives with it. Reclaim only the three
+	// reboot even though no listener survives with it. Reclaim only the two
 	// canonical sockets after this process owns every singleton lock. A live
 	// PortableFS daemon cannot reach this point concurrently, and the pinned
 	// directory/inode checks below refuse every non-socket or replaced entry.
@@ -64,10 +60,8 @@ func (s *Server) Run(ctx context.Context) error {
 	if err := reclaimStaleUnixSocket(socketSingleton, s.cfg.ControlSocket); err != nil {
 		return err
 	}
-	for _, socketPath := range []string{s.cfg.FrontendSocket, s.mountRootSocketPath()} {
-		if err := reclaimStaleUnixSocket(frontendSingleton, socketPath); err != nil {
-			return err
-		}
+	if err := reclaimStaleUnixSocket(frontendSingleton, s.cfg.FrontendSocket); err != nil {
+		return err
 	}
 	if err := privatepath.EnsureDir(s.cfg.MountLogDir); err != nil {
 		return fmt.Errorf("validate per-mount log directory: %w", err)
@@ -80,8 +74,8 @@ func (s *Server) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errs := make(chan error, 3)
-	wg.Add(3)
+	errs := make(chan error, 2)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		if err := s.ServeFrontend(ctx); err != nil && ctx.Err() == nil {
@@ -94,12 +88,6 @@ func (s *Server) Run(ctx context.Context) error {
 			errs <- err
 		}
 	}()
-	go func() {
-		defer wg.Done()
-		if err := s.ServeMountRootHandoff(ctx); err != nil && ctx.Err() == nil {
-			errs <- err
-		}
-	}()
 	var serveErr error
 	select {
 	case <-ctx.Done():
@@ -109,19 +97,6 @@ func (s *Server) Run(ctx context.Context) error {
 		cancel()
 		serveErr = err
 	}
-	// TERMINATION IS NOT ALLOWED TO DEPEND ON COOPERATION.
-	//
-	// closeAll runs every attach's authority drain barrier, and an attach whose
-	// authority has stopped answering can hold that barrier open indefinitely
-	// (registry.detach does not honour the shutdown context). Waiting on it
-	// turned SIGTERM into "portablefsd never exits", which is the observable
-	// front half of the unkillable-daemon incident.
-	//
-	// The shutdown transaction still runs to completion on its own goroutine —
-	// nothing durable is abandoned — but this function stops waiting at the
-	// budget and returns a definite verdict, so the process exits and its
-	// singleton lock is released. Everything the barrier had not shipped is
-	// already durable in the write-back WAL and replays on the next attach.
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), daemonShutdownBudget)
 	defer shutCancel()
 	shutDone := make(chan error, 1)
@@ -136,8 +111,7 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-shutCtx.Done():
 		shutErr = fmt.Errorf(
 			"cooperative shutdown did not complete within %s; portablefsd is exiting anyway "+
-				"so its singleton lock is released — every unshipped write-back record stays "+
-				"durable locally and replays on the next attach",
+				"so its singleton lock is released; registered mounts require exact unmount",
 			daemonShutdownBudget,
 		)
 	}
@@ -366,36 +340,11 @@ func acquireFrontendSingleton(frontendSocket string) (*singletonLock, error) {
 }
 
 func acquireLock(dirPath, name, owner string) (*singletonLock, error) {
-	guard, err := tryAcquireLock(dirPath, name, owner)
-	if err == nil {
-		return guard, nil
-	}
-	if !errors.Is(err, errSingletonHeld) {
-		return nil, err
-	}
-	// The lock is held. It is held either by a daemon that is alive — in which
-	// case this one must not start — or by a process the kernel has already
-	// finished with, whose descriptors will never be closed. Only the second
-	// case is recoverable, and only with proof.
-	//
-	// THE PROOF COMES BEFORE ANY WRITE. A daemon that loses the singleton race
-	// must leave the shared state directory byte-for-byte untouched, so the
-	// classification reads the existing lock file and creates nothing.
-	if !singletonHolderIsProvablyGone(dirPath, name) {
-		return nil, err
-	}
-	taken, takeoverErr := takeOverDeadSingleton(dirPath, name, owner)
-	if takeoverErr != nil {
-		return nil, errors.Join(err, takeoverErr)
-	}
-	if taken == nil {
-		return nil, err
-	}
-	return taken, nil
+	return tryAcquireLock(dirPath, name, owner)
 }
 
 // errSingletonHeld distinguishes "another process holds this lock" from every
-// other acquisition failure, so only that case reaches the takeover policy.
+// other acquisition failure without interpreting bytes in the lock inode.
 var errSingletonHeld = errors.New("portablefsd singleton is held")
 
 func tryAcquireLock(dirPath, name, owner string) (*singletonLock, error) {
@@ -410,10 +359,9 @@ func tryAcquireLock(dirPath, name, owner string) (*singletonLock, error) {
 	}
 	if flockErr := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); flockErr != nil {
 		held := errors.Is(flockErr, syscall.EWOULDBLOCK) || errors.Is(flockErr, syscall.EAGAIN)
-		detail := describeSingletonHolder(lock)
 		_ = lock.Close()
 		_ = dir.Close()
-		wrapped := fmt.Errorf("another portablefsd owns %s: %w%s", owner, flockErr, detail)
+		wrapped := fmt.Errorf("portablefsd singleton for %s is held: %w", owner, flockErr)
 		if held {
 			return nil, errors.Join(wrapped, errSingletonHeld)
 		}
@@ -424,157 +372,6 @@ func tryAcquireLock(dirPath, name, owner string) (*singletonLock, error) {
 		releaseSingleton(guard)
 		return nil, fmt.Errorf("validate portablefsd singleton lock: %w", err)
 	}
-	if err := publishSingletonOwner(guard, "", owner); err != nil {
-		releaseSingleton(guard)
-		return nil, err
-	}
-	return guard, nil
-}
-
-// describeSingletonHolder names WHO holds a refused lock. An operator reading
-// "resource temporarily unavailable" has nothing to act on; an operator reading
-// the holder's pid and state does.
-func describeSingletonHolder(lock *os.File) string {
-	record, err := readSingletonOwner(lock)
-	if err != nil || record == nil {
-		// A lock written by a build that predates owner records. There is no
-		// way to prove its holder departed, so takeover is refused — but the
-		// operator must still be told how to find and end it, because "resource
-		// temporarily unavailable" on its own is what made the live incident
-		// look like it required a reboot.
-		return fmt.Sprintf(
-			" (the lock carries no owner record, so its holder cannot be proven departed;"+
-				" find it with `lsof %s` and terminate it)",
-			lock.Name(),
-		)
-	}
-	verdict, why := classifySingletonHolder(record)
-	suffix := ""
-	if verdict == holderLive {
-		suffix = fmt.Sprintf("; stop it with `kill %d` if it is not serving a mount", record.PID)
-	}
-	return fmt.Sprintf(" (held by pid %d, %s: %s%s)", record.PID, verdict, why, suffix)
-}
-
-// singletonHolderIsProvablyGone classifies the holder of an existing lock file
-// WITHOUT creating, renaming or writing anything. It answers false for every
-// ambiguity: a missing lock, an unreadable one, no owner record, an unprovable
-// platform, or a live holder.
-func singletonHolderIsProvablyGone(dirPath, name string) bool {
-	dir, err := privatepath.OpenDir(dirPath)
-	if err != nil {
-		return false
-	}
-	defer dir.Close()
-	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return false
-	}
-	file := os.NewFile(uintptr(fd), filepath.Join(dirPath, name))
-	if file == nil {
-		_ = unix.Close(fd)
-		return false
-	}
-	defer file.Close()
-	record, err := readSingletonOwner(file)
-	if err != nil || record == nil {
-		return false
-	}
-	verdict, _ := classifySingletonHolder(record)
-	return verdict == holderGone
-}
-
-// takeOverDeadSingleton replaces a lock inode whose recorded owner is PROVEN
-// unable to act again. It returns (nil, nil) when the holder is live or cannot
-// be proven dead — the only safe default, and the one that keeps a merely slow
-// daemon from being displaced.
-func takeOverDeadSingleton(dirPath, name, owner string) (*singletonLock, error) {
-	dir, err := privatepath.OpenDir(dirPath)
-	if err != nil {
-		return nil, fmt.Errorf("open portablefsd singleton directory for takeover: %w", err)
-	}
-	defer dir.Close()
-
-	// Serialize takeovers through a lock the stuck holder has never opened.
-	// Without it two contenders could each install a fresh inode and both
-	// believe they are the singleton.
-	takeoverLock, err := privatepath.OpenLockFile(dir, dirPath, name+".takeover")
-	if err != nil {
-		return nil, fmt.Errorf("open portablefsd singleton takeover lock: %w", err)
-	}
-	defer takeoverLock.Close()
-	if err := syscall.Flock(int(takeoverLock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		// Another contender is performing the takeover right now. Not an error:
-		// this daemon simply loses the race and reports the held lock.
-		return nil, nil
-	}
-	defer syscall.Flock(int(takeoverLock.Fd()), syscall.LOCK_UN)
-
-	current, err := privatepath.OpenLockFile(dir, dirPath, name)
-	if err != nil {
-		return nil, fmt.Errorf("reopen portablefsd singleton lock for takeover: %w", err)
-	}
-	// Re-prove the lock is still held under the takeover lock: the holder may
-	// have exited between the refusal and here, in which case the plain path
-	// must be used and no inode replaced.
-	if flockErr := syscall.Flock(int(current.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); flockErr == nil {
-		_ = syscall.Flock(int(current.Fd()), syscall.LOCK_UN)
-		_ = current.Close()
-		return tryAcquireLock(dirPath, name, owner)
-	}
-	record, readErr := readSingletonOwner(current)
-	_ = current.Close()
-	if readErr != nil {
-		return nil, fmt.Errorf("read portablefsd singleton owner record: %w", readErr)
-	}
-	verdict, why := classifySingletonHolder(record)
-	if verdict != holderGone {
-		return nil, nil
-	}
-
-	// Install a fresh lock inode. The stuck holder keeps its exclusive lock on
-	// the now-unlinked old inode, which nothing will open again.
-	replacement := name + ".replacement"
-	_ = unix.Unlinkat(int(dir.Fd()), replacement, 0)
-	fresh, err := privatepath.OpenLockFile(dir, dirPath, replacement)
-	if err != nil {
-		return nil, fmt.Errorf("create replacement portablefsd singleton lock: %w", err)
-	}
-	if err := syscall.Flock(int(fresh.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = fresh.Close()
-		return nil, fmt.Errorf("lock replacement portablefsd singleton lock: %w", err)
-	}
-	if err := unix.Renameat(int(dir.Fd()), replacement, int(dir.Fd()), name); err != nil {
-		_ = syscall.Flock(int(fresh.Fd()), syscall.LOCK_UN)
-		_ = fresh.Close()
-		return nil, fmt.Errorf("install replacement portablefsd singleton lock: %w", err)
-	}
-	if err := dir.Sync(); err != nil {
-		_ = syscall.Flock(int(fresh.Fd()), syscall.LOCK_UN)
-		_ = fresh.Close()
-		return nil, fmt.Errorf("sync replaced portablefsd singleton lock directory %s: %w", dirPath, err)
-	}
-	guard := &singletonLock{dirPath: dirPath, name: name, dir: nil, file: fresh}
-	// Re-pin the directory through the canonical traversal so validate() holds
-	// the same invariants as a normal acquisition.
-	pinned, err := privatepath.OpenDir(dirPath)
-	if err != nil {
-		releaseSingleton(guard)
-		return nil, fmt.Errorf("re-pin portablefsd singleton directory after takeover: %w", err)
-	}
-	guard.dir = pinned
-	if err := guard.validate(); err != nil {
-		releaseSingleton(guard)
-		return nil, fmt.Errorf("validate portablefsd singleton lock after takeover: %w", err)
-	}
-	if err := publishSingletonOwner(guard, "", owner); err != nil {
-		releaseSingleton(guard)
-		return nil, err
-	}
-	log.Printf(
-		"portablefsd: took over the %s singleton lock from a provably departed holder (%s)",
-		owner, why,
-	)
 	return guard, nil
 }
 

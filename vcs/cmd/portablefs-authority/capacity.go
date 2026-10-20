@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
 const (
@@ -10,24 +12,15 @@ const (
 	transportConnectionsPerLiveSession = 4
 	defaultMaxConnections              = defaultMaxSessions * transportConnectionsPerLiveSession
 	defaultMaxInFlight                 = 256
-	defaultMaxWriteTransactions        = 4096
+	defaultMaxWriteBytes               = 1 << 20
+	defaultMaxFrameBytesInFlight       = 512 << 20
 	// The authority has no item-capacity negotiation. This must remain at least
-	// mountv3.CachedNameCapacity so a stock mount can retain its declared cache.
+	// mountv3.NameCacheCapacity so a stock mount can retain its declared cache.
 	defaultMaxItemsPerSession = 1 << 16
 )
 
-func defaultWriteTransactionsPerSession(maxInFlight int, maxWriteTransactions uint) uint {
-	if maxInFlight <= 0 || maxWriteTransactions == 0 {
-		return 0
-	}
-	if uint64(maxInFlight) < uint64(maxWriteTransactions) {
-		return uint(maxInFlight)
-	}
-	return maxWriteTransactions
-}
-
 // validateConnectionCapacity keeps physical transport admission ahead of the
-// logical session limit. Protocol 5 holds one DATA and one CONTROL connection
+// logical session limit. Protocol 8 holds one DATA and one CONTROL connection
 // for every live mount. Exact pair recovery must authenticate both replacement
 // roles before either old generation can be retired, so it can transiently hold
 // old and candidate DATA/CONTROL pairs at the same time. Four is therefore the
@@ -42,6 +35,19 @@ func validateConnectionCapacity(maxSessions uint, maxConnections int) error {
 	minimum := uint64(maxSessions) * transportConnectionsPerLiveSession
 	if uint64(maxConnections) < minimum {
 		return fmt.Errorf("max-connections must be at least %d (4 per max-session: current and recovering DATA/CONTROL pairs)", minimum)
+	}
+	return nil
+}
+
+func validateExecutionCapacity(maxInFlight int, replaySlots uint, maxFrame uint, retained uint64) error {
+	if maxInFlight < authorityrpc.MinimumLinuxInFlight || replaySlots < authorityrpc.MinimumLinuxInFlight {
+		return errors.New("Linux authority needs at least nine execution lanes and replay slots")
+	}
+	// One maximal outcome plus the fixed replies for every ordered flush must
+	// fit together. These are retained bytes, independent of inbound frame memory.
+	minimum := uint64(maxFrame) + 4*uint64(authorityrpc.MinimumFrameBytes)
+	if minimum < uint64(maxFrame) || retained < minimum {
+		return fmt.Errorf("max-retained-reply-bytes must be at least %d for a maximal reply and four ordered flushes", minimum)
 	}
 	return nil
 }

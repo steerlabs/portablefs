@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
@@ -27,6 +28,10 @@ func (f *soakEndedEpochRPC) CallIdempotent(ctx context.Context, request *authori
 		return nil, ctx.Err()
 	}
 	return f.delegationFakeRPC.CallIdempotent(ctx, request)
+}
+
+func (f *soakEndedEpochRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
 }
 
 func (f *soakEndedEpochRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {

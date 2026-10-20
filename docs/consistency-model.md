@@ -1,10 +1,10 @@
 # Consistency model
 
-PortableFS v3 uses authority protocol 7 on stock Linux FUSE 7.31 or newer.
-A volume subscription controls caching and identity-scoped file delegations
-permit daemon write-back. There is no mixed-major execution or downgrade.
-The normative algorithm and accepted residuals are in
-[portable-coherence.md](./portable-coherence.md).
+PortableFS v3 uses authority protocol 8. On stock Linux FUSE 7.31 or newer a
+volume subscription controls caching and identity-scoped file delegations
+permit daemon write-back; the normative algorithm and accepted residuals are in
+[portable-coherence.md](./portable-coherence.md). macOS mounts as the volume's
+exclusive writer ([fskit-mount.md](./fskit-mount.md)). There is no downgrade.
 
 ## Truth and operation ordering
 
@@ -41,6 +41,23 @@ Visibility does not imply power-loss durability.
 - Rename, link, and unlink flush every named dirty identity before dispatch.
   Namespace atomicity comes from XFS. Durable application protocols retain
   their ordinary file-and-directory fsync discipline.
+- FSKit has no fsync callback. Each successful FSKit mutation reply waits for
+  its storage effect to be durable, covering data, attributes, and namespace
+  changes. macOS 27 writeBack buffers ordinary writes in the kernel like V2;
+  `write(2)` may return before delivery. Native fsync must cover buffered data,
+  await every covered durable callback and report errors, pending native proof.
+  writeBack is not qualified until those proofs pass. Writer loss may lose
+  undelivered dirty data, as on V2 and a local disk without fsync; an
+  unacknowledged in-flight write may already have applied. Linux peers see
+  delivered state only, not newer bytes held solely in Mac pages. Mac link,
+  rename and unlink push the earlier dirty cut before namespace dispatch;
+  usable proof expiry and ordinary unmount drain before releasing cache/owner
+  rights. Terminal loss revokes without pushing into another owner/session/epoch.
+- Filesystem-wide barriers (FSKit handleless mutations, the Linux root barrier,
+  SYNCFS) use syncfs on the cell filesystem. On a shared multi-project cell an
+  unrelated project's writeback failure can fail and fence them, and unrelated
+  dirty data lengthens them; see
+  [COMPATIBILITY.md](../COMPATIBILITY.md#two-limits-that-apply-to-every-deployment).
 - A run opens a directory handle on the mount root before its first operation
   and fsyncs that handle at completion. FSYNCDIR takes a mount-wide accepted
   cut and checks loss since OPENDIR. Failure fails the run. Ordinary stock-FUSE
@@ -62,10 +79,15 @@ withdrawn. A grant activates only after peer acknowledgment or horizon expiry.
 
 Shared kernel name validity stays zero. Positive and negative bindings,
 attributes, and directory pages are cached by the daemon under the subscription.
-Plain READDIR uses XFS continuation cookies. Concurrent mutation invalidates
+Directory reads use XFS continuation cookies. Concurrent mutation invalidates
 cached pages without abandoning the cursor: unchanged entries appear exactly
 once, changed entries may or may not appear, and the walk never returns ESTALE.
-READDIRPLUS and kernel directory caching are not used.
+A mount of a volume without machine-local routes serves READDIRPLUS: each
+Authority page carries entry attributes and capabilities (omitting ones the
+session already holds), and the daemon publishes those entries through the same
+exact physical-reply transaction as every other cache-installing reply. A mount
+of a volume that declares machine-local routes serves plain READDIR only.
+Kernel directory-page caching is not used.
 
 Forward pathname resolution and enumeration are covered. Reverse rendering of
 retained dentries (`getcwd`, `/proc/*/fd`, and `d_path`) is outside the contract.
@@ -88,10 +110,42 @@ until the daemon resumes and invalidates. This is the accepted residual, not a
 claim that a userspace timeout can erase kernel pages. Failed withdrawal stales
 the affected inode and does not earn an acknowledgment.
 
-Every attached Mac mount retains compatibility-writer exclusion, including a
-read-only Mac mount. Linux mutations are refused EBUSY while that membership
-is live; a second Mac attach is refused. The cacheless files gateway holds no
-such membership and its reads break for read without blocking Linux writers.
+An attached Mac mount holds writer exclusion, including a Mac mount whose
+access is read-only. Linux mutations are refused EBUSY while that exclusion is
+live; a second Mac attach is refused. The cacheless files gateway holds no
+exclusion and its reads break for read without blocking Linux writers.
+
+On macOS 27, the extension controls retained kernel data through
+`FSVolume.DataCacheHandler`. A compatible readWriteWithCache request can
+receive writeBack with live writer/authorization proof and legitimately
+retained read/write rights; read requests/rights can receive readCache, while
+no-cache requests receive noCache. An eligible V3 write-only application open
+may acquire separately authorized backing read access for cache fills. A fresh
+open requests read/write together; a retained writer requests only missing
+read. A definite nonterminal read-access denial preserves a valid write-only
+open, using at most one write-only retry after a denied combined OPEN, and
+receives noCache. Other failures propagate, including the write retry's error.
+Application read/pread through O_WRONLY remains EBADF. Backing OPENs use the
+same canonical capability and carry no create, exclusive, truncate or append
+effects. Cache upgrades can acquire read access for a retained writer but
+never invent write access. CREATE's legitimate read/write description remains
+sufficient for mode 0200. Permission/ACL changes affect each new authority
+acquisition; already granted rights survive until final retirement.
+
+Usable proof expiry completes pushInvalidate before downgrade; ordinary unmount drains before ownership release. Terminal ownership or
+authorization loss revokes and fails pending work without pushing old pages
+into another owner/session/epoch. Calls run without module locks or gates
+needed by reentrant writes, pin descriptions through completion and revalidate
+ownership. Failed actions leave kernel state unchanged and fail/fence.
+Ordinary open-unlinked files remain accessible. Every delivered successful
+mutation callback remains authority-durable; native writeBack is unqualified.
+
+A stopped extension cannot revoke, and cached reads can race wake before the
+extension executes. Per-item control does not prove exact negative-name,
+inode-attribute or directory-enumeration invalidation. macOS 26 retains the
+existing residual: after terminal publication stops new serving, retained
+kernel names, attributes and pages can remain observable until unmount. Neither
+OS has a qualified guarantee of zero stale access after failover.
 
 ## Append
 
@@ -113,8 +167,8 @@ what would misplace the ordinary sequential writes that carry the same offset.
 
 ## Replay and uncertain outcomes
 
-Protocol 7 is session-exact within one authority epoch. Each mutation carries a
-daemon-owned operation identity; exact replay returns the retained outcome and
+Replay is session-exact within one authority epoch. Each mutation carries a
+client-owned replay slot and sequence; exact replay returns the retained outcome and
 does not re-execute. Identity reuse with a different canonical request or a
 sequence gap fences the session.
 
@@ -152,15 +206,18 @@ to another principal fails rather than creating a host-ID mapping by accident.
 
 ## Platform boundary
 
-Current FSKit cannot prove subscription withdrawal for names and attributes,
-control per-reply metadata installation, or expose exact append intent or distributed
-lock callbacks. macOS therefore uses the explicit `FSKIT_SYNC_REPAIR` profile:
-mutations retain ordered PREPARE/COMPLETE repair, while those host-cache,
-append, and lock edges remain best-effort rather than Linux-equivalent. The
-compatibility writer lease is what makes that honest — a mounted Mac writes and
-everyone else reads, so the missing FSKit invalidation primitive is never asked
-to serve a concurrent remote mutation. Cross-machine `fcntl`/`flock` exclusion
-and cross-client atomic append need Linux mounts with no Mac writer attached.
+Current FSKit cannot invalidate names, attributes, or enumerations, control
+per-reply metadata installation, or expose exact append intent or advisory-lock
+callbacks. macOS therefore mounts through `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`: a
+mounted Mac writes and every other client reads, so the missing invalidation is
+never asked to serve a concurrent remote mutation. A second Mac is refused at
+activation. Delivered Mac mutations publish ordered changes and wait for Linux
+reader withdrawal, so Linux readers observe delivered state coherently; newer
+bytes may remain solely in Mac kernel pages. Ending or fencing a Mac
+session stops PortableFS from serving that Mac. macOS 27 also withdraws retained
+item caches within the limits stated above; macOS 26 may continue exposing
+retained kernel names, attributes and pages until unmount. Cross-machine `fcntl`/`flock` exclusion and cross-client atomic
+append need Linux mounts with no Mac writer attached.
 
 Windows has no admitted transport. A future frontend must prove exact cache
 withdrawal, lock forwarding, and cache behavior before it can participate.
@@ -171,8 +228,11 @@ withdrawal, lock forwarding, and cache behavior before it can participate.
 - Shared writable file-backed `mmap`.
 - Ordinary stock-FUSE `syncfs(2)` as the run-completion barrier.
 - Symmetric multi-writer coherence with a macOS mount attached: while a Mac
-  holds the compatibility writer lease, another Mac and every Linux peer are
-  readers and their visible mutations are refused `EBUSY`.
+  is the writer, every Linux peer is a reader whose visible mutations are
+  refused `EBUSY`, and a second Mac cannot mount.
+- Complete synchronous withdrawal of macOS kernel state on fence or loss,
+  including a stopped extension, sleep/wake races and exact namespace state.
+- Durability-error or latency isolation between volumes in one XFS cell.
 - Multiple POSIX principals inside one volume.
 - Writable extended attributes.
 - Local-XFS read latency during RESTORING. A cold content read may pay one

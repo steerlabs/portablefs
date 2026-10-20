@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -115,82 +114,6 @@ func TestAllocatorLifetimeExhaustionSurvivesVolumeDeletionAndIsCapacity(t *testi
 	if report.Pools[0].CreateAdmissible || report.Pools[0].CreateStatus != AdmissionCapacity {
 		t.Fatalf("exhausted allocator capacity report = %+v", report.Pools[0])
 	}
-}
-
-func TestPreBoundAdoptionPreservesExhaustedCursorAndReportsCapacity(t *testing.T) {
-	h := newManagerHarness(t)
-	declaration := RegisterCellRequest{
-		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
-		FirstProjectID: 12_000, FirstServiceUID: 212_000, FirstPort: 32_000,
-		LastProjectID: 12_000, LastServiceUID: 212_000, LastPort: 32_000,
-	}
-	cell, err := h.manager.RegisterCell("exhausted-pre-bound-cell", declaration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prepareCellForAdmission(t, h, cell)
-	if _, err := h.manager.CreateVolume("exhausted-pre-bound-first", CreateVolumeRequest{
-		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
-		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.store.TransactNatural("test-exhausted-pre-bound-registration", h.now.Unix(), func(state *State) (any, bool, error) {
-		current := state.Cells[cell.ID]
-		current.RegistrationSHA256 = strings.Repeat("b", 64)
-		current.LastProjectID = 0
-		current.LastServiceUID = 0
-		current.LastPort = 0
-		state.Cells[cell.ID] = current
-		return current, true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	before := currentState(t, h).Cells[cell.ID]
-	if before.NextProjectID != declaration.LastProjectID+1 ||
-		before.NextServiceUID != declaration.LastServiceUID+1 ||
-		before.NextPort != declaration.LastPort+1 {
-		t.Fatalf("fixture allocator cursors are not exhausted: %+v", before)
-	}
-	sequence := h.store.sequence
-	pinned, err := h.manager.ConvergeCell(cell.ID, declaration)
-	if err != nil {
-		t.Fatalf("fully exhausted pre-bound adoption = %v", err)
-	}
-	want := before
-	want.LastProjectID = declaration.LastProjectID
-	want.LastServiceUID = declaration.LastServiceUID
-	want.LastPort = declaration.LastPort
-	want.RegistrationSHA256 = pinned.RegistrationSHA256
-	if !reflect.DeepEqual(pinned, want) || h.store.sequence != sequence+1 {
-		t.Fatalf("exhausted adoption changed live state or append count: got=%+v want=%+v sequence=%d->%d", pinned, want, sequence, h.store.sequence)
-	}
-	if _, err := h.manager.CreateVolume("exhausted-pre-bound-second", CreateVolumeRequest{
-		AuthorizationDomain: "org", Owner: "other", ProductIssuer: "opensteer",
-		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
-	}); !errors.Is(err, ErrCapacity) {
-		t.Fatalf("allocation after exhausted pre-bound adoption = %v", err)
-	}
-
-	response := serveControlRequest(t, testHTTPHandler(h.manager), "GET", "/v1/capacity", nil, RoleProduct, "opensteer", "")
-	if response.Code != 200 {
-		t.Fatalf("capacity HTTP status=%d body=%s", response.Code, response.Body.String())
-	}
-	var report CapacityReport
-	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil {
-		t.Fatal(err)
-	}
-	for _, pool := range report.Pools {
-		if pool.Pool == PoolProduct {
-			if pool.CreateAdmissible || pool.CreateStatus != AdmissionCapacity {
-				t.Fatalf("exhausted adopted allocator capacity report = %+v", pool)
-			}
-			return
-		}
-	}
-	t.Fatalf("product pool missing from capacity report: %+v", report)
 }
 
 func TestPlacementAdmissionUsesPendingChargesAndStaleUsageFailsClosed(t *testing.T) {

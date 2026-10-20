@@ -1,79 +1,101 @@
-# Authority protocol 7 wire contract
+# Authority wire contract
 
-Workstream A defines the encoding and handshake for the coherence v2 design in
-[design.md](design.md). This is an integration contract for streams C and F;
-adding these messages does not implement subscription or delegation execution.
+This is the normative encoding and handshake of authority protocol 8. The
+schema source is `proto/authority/v1/authority.proto`, generated into the Go
+package `authoritypb`; the descriptor manifest
+`vcs/internal/authoritypb/testdata/protocol8-schema.json` pins the exact current
+grammar and the Go suite checks the generated code against it. Compatibility
+rules are in [COMPATIBILITY.md](../../COMPATIBILITY.md); the Linux coherence
+algorithm is in [portable-coherence.md](../portable-coherence.md).
 
-Protocol major is exactly `7`; the only TLS ALPN is
-`portablefs-authority-v7`. Both peers use mutually authenticated TLS 1.3 and
-refuse protocol 6, including a peer that offers only `portablefs-authority-v6`.
-A peer that reaches Hello must still name major 7. There is no downgrade.
-The protobuf package `portablefs.authority.v1` and Go package `authoritypb`
-keep their existing names; neither names the negotiated protocol major.
+Protocol major is exactly `8`; the only TLS ALPN is `portablefs-authority-v8`.
+Both peers use mutually authenticated TLS 1.3. The server rejects an unequal
+major at transport ingress, before handler dispatch, and the client rejects an
+unequal HelloReply. There is no downgrade and no plaintext mode. The protobuf
+package `portablefs.authority.v1` and Go package `authoritypb` keep their names;
+neither names the protocol major.
 
-## Required features
+There are no feature strings. The major and the frontend profile fix the
+grammar and semantics. Unknown fields, unknown bodies, unknown enum values,
+duplicate singular fields, and multiple oneof members are invalid, so any
+grammar or semantic change is a new exact major and ALPN.
 
-Feature names are exact, case-sensitive strings. Extra advertisements do not
-relax a requirement. The following table is the complete required set, grouped
-by the common requirements and the additions for each frontend. Activation
-requirements travel in `ActivateReply.features`, despite the historical Go
-identifier `requiredAttachFeatures`.
+## Handshake and sessions
 
-| Boundary and audience | Required strings |
+A session owns exactly one DATA and one CONTROL TLS connection, joined by a
+32-byte random `connection_set_id`. Each connection sends Hello with
+`protocol_major`, its `role`, the set identity, and the session's
+`frontend_profile`; HelloReply echoes role, set, and profile and states
+`max_frame_bytes`, `max_read_bytes`, `max_write_bytes`, and `max_in_flight` for
+that connection.
+
+Execution capacity is partitioned by role and profile. For the Linux profile
+both roles must advertise `max_in_flight >= 9`: DATA reserves
+`blocking = max / 2` and a dedicated ordered-flush lane of 4, leaving
+`ordinary = max - blocking - 4`; CONTROL keeps `ordinary = max - max / 2` and
+`blocking = max / 2` with no flush lane, so at 9 it retains five ordinary slots
+for delegation acknowledgments, change acknowledgments, and liveness. FSKit and
+cacheless sessions split ordinary and blocking halves with no flush lane and
+need at least 2. A smaller advertisement is refused at Hello, before the
+connection can register. Replay slots and retained-byte budgets must cover the
+same partition.
+
+`AttachRequest` names the volume, the signed access token, the replay slot
+count, the 32-byte `routes_revision`, a 32-byte random `attach_attempt_id`, the
+`purpose`, and the profile. Attach is provisional: `AttachReply` carries the
+session identity, generation, resume secret, a provisional deadline, and the two
+binding generations. A provisional credential cannot execute filesystem
+operations. `ActivateRequest` names the attempt and both binding generations;
+activation succeeds only after both role bindings are proven and returns the
+opaque root Item, the session lease in milliseconds, the admitted routes
+revision, the installed authorization deadline, the session state, purpose, and
+profile. `AbortAttach` releases one exact provisional attempt and is invalid
+after activation. `Resume` rebinds a role connection to an existing session.
+
+`SESSION_PURPOSE_MOUNT` sessions enter durable mount membership.
+`SESSION_PURPOSE_ROUTE_ADMIN` sessions are capability-authenticated control
+sessions for `ApplyRoutes`; they receive no root capability, subscription, or
+membership, and only they may use `FRONTEND_PROFILE_UNSPECIFIED`.
+
+`Reauthorize` replaces the signed access decision of the exact live session; it
+is bound to the session ID, the TLS peer SPKI, and a monotonic sequence. An
+identical retry is idempotent; a gap, changed token, or broader access fences
+the session. `KeepAlive` renews the session lease. `Detach` carries a
+`MountAbsenceProof`: the authenticated supervisor's description of its own
+observation that its exact kernel mount is gone. The authority checks that the
+observation belongs to this mount and postdates any obligation it discharges;
+it cannot re-derive a remote kernel's mount table. A frontend that cannot
+establish absence sends nothing and lets its session die fenced.
+
+## Frontend profiles
+
+| Profile | Admitted operations and obligations |
 |---|---|
-| Hello, every profile | `xfs-current-state`, `session-exact-epoch`, `framed-bulk-data-v1`, `authority-keyed-replay-fingerprint-v1`, `mandatory-dual-transport-v1`, `exact-resource-acquisition` |
-| Hello, Linux additions | `direct-write`, `volume-subscription-v1`, `ordered-change-stream-v1`, `file-write-delegation-v1` |
-| Hello, cacheless reader additions | `cacheless-peer-reader-v1` |
-| Hello, FSKit additions | `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1` |
-| Activate, every profile | `no-history`, `no-branches`, `user-xattr-readonly`, `single-principal`, `stable-item-identity`, `volume-syncfs-barrier`, `exact-resource-acquisition` |
-| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1` |
-| Activate, cacheless reader additions | `cacheless-peer-reader-v1` |
-| Activate, FSKit additions | `write-through`, `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1`, `peer-complete-fifo-feedback` |
+| `FRONTEND_PROFILE_LINUX` (1) | All filesystem operations, both CLOSE and CLOSE_BATCH, file locks, FSYNC/FLUSH/SYNCFS, Barrier and WaitVisibility on DATA; Subscribe, RenewSubscription, NextControlEvent, ChangeAck, delegation acknowledgments, DelegationRelease on CONTROL. |
+| `FRONTEND_PROFILE_FSKIT_EXCLUSIVE` (2) | Lookup, GetAttr, ReadDir, Open, Read, positioned direct Write, Create, Mkdir, Symlink, Readlink, Link, Unlink, Rename, SetAttr, xattr get/list/remove, StatFS, CLOSE_BATCH, Reclaim, KeepAlive with a cache proof. No individual CLOSE, subscription, delegation, or lock operation. Holds writer exclusion. |
+| `FRONTEND_PROFILE_CACHELESS_READER` (3) | Lifecycle operations, Lookup, GetAttr, read-only Open, individual CLOSE, Read, ReadDir, Reclaim. Exactly read access; no mutation, cache-capable handle, subscription, delegation, or CLOSE_BATCH. |
 
-`volume-subscription-v1` includes cold subscription, pagination, renewal,
-incarnation fencing, and the 10-second horizon. `ordered-change-stream-v1`
-includes the CONTROL delivery cursor, bounded batches, and cumulative proven
-withdrawal acks. `file-write-delegation-v1` includes CREATE/OPEN piggyback,
-cache-capable handle accounting, full and writethrough modes, and generation
-checks on every delegated flush. `delegation-control-v1` requires recall,
-break, mode changes, their acks, and batch release. `session-durable-sequence-v1` and `root-directory-barrier-v1` require session
-application/durability tickets and the root FSYNCDIR barrier. Optional
-`batched-close-v1` advertises the bounded DATA close operation below.
-
-Linux no longer requires or advertises `lease-coherence-v1`,
-`directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`,
-`open-by-identity-v1`, or `write-through`. `volume-syncfs-barrier` continues to
-name the existing authority RPC; it does not assert that Linux delivers
-FUSE_SYNCFS. `direct-io-no-file-mmap` keeps its existing scope: direct-IO
-handles do not promise mmap; cacheable read handles retain private/read-only
-mapping support. No shared writable mapping is admitted.
-
-The frozen enum spelling `FRONTEND_PROFILE_LINUX_LEASES = 1` remains the Linux
-frontend identifier. Major 7 determines its subscription/delegation contract;
-it is not a switch to a v6 execution path. FSKit retains its explicit repair
-profile and the design's compatibility writer exclusion for every Mac mount.
-`FRONTEND_PROFILE_CACHELESS_READER = 3` is an authenticated peer reader. Attach
-requires exactly read access. The profile admits lifecycle operations, LOOKUP,
-GETATTR, read-only OPEN/CLOSE, READ, READDIR and RECLAIM. It admits no mutation,
-cache-capable handle, subscription, delegation or FSKit repair operation. Each
-data-consuming operation uses BreakForRead before storage admission and binding
-revalidation. It neither recalls the Linux writer nor joins the Mac writer
-exclusion; no writer waits for a cacheless reader's acknowledgment. The files
-gateway uses this profile. Its transport loss leaves no cache withdrawal duty.
-
-Optional session and enrollment reauthorization feature names are unchanged.
+The profile is pinned into the canonical session fingerprint and cannot change
+on replay or resume. A Linux session cannot invoke FSKit-only behavior and an
+FSKit session cannot invoke subscription or delegation control. Each
+data-consuming cacheless operation breaks delegated data for read before
+storage admission and binding revalidation. A cacheless reader neither recalls
+the Linux writer nor joins Mac writer exclusion, no writer waits for its
+acknowledgment, and its transport loss leaves no withdrawal duty. The files
+gateway uses it.
 
 ## Framing, envelopes, and counter domains
 
-The existing frame header carries big-endian 32-bit metadata and bulk lengths.
-Only the existing READ/WRITE/FSKit carriers use out-of-line bulk; none of the
-new control messages does. Unknown fields, duplicate singular fields, multiple
-oneof alternatives, incorrect wire types, and allocation amplification remain
-invalid. The canonical replay representation emits fields by ascending tag,
-repeated values in their declared order, and explicit optional/message presence.
-It rejects unknown fields, maps, and fixed-width fields. No new message uses a
-map or fixed-width field. The write-data digest substitution is unchanged.
-Changing delegation id or generation changes a mutation's replay fingerprint.
+The frame header carries big-endian 32-bit metadata and bulk lengths. Only READ
+and WRITE use out-of-line bulk; no control message does. Unknown fields,
+duplicate singular fields, multiple oneof alternatives, incorrect wire types,
+and allocation amplification are invalid. The canonical replay representation
+emits fields by ascending tag with minimal varints, repeated values in their
+declared order, and explicit optional/message presence. It rejects unknown
+fields, maps, and fixed-width fields; no message uses either. The keyed replay
+fingerprint substitutes a digest for WRITE payload bytes. Changing delegation
+id or generation changes a mutation's replay fingerprint. Outgoing frames are
+validated against this grammar before any byte is written.
 
 Repeated collections have at most 4,096 elements, except `CloseBatchRequest`
 and replies, whose limit is 128. Every collection must also fit the
@@ -84,16 +106,18 @@ slash, and cannot be `.` or `..`. Unspecified enum values are invalid in live
 operations. These semantic checks belong to the coordinator/handler; the
 frame decoder enforces the structural protobuf grammar.
 
-The ordinary `Request` envelope retains `request_id`, `epoch`, `session`, and
+The `Request` envelope carries `request_id`, `epoch`, `session`, and
 `mutation`. CONTROL requests below require the active session proof and epoch,
-but no mutation replay slot. DATA mutations and Barrier use the existing
-session-exact mutation replay header. A response echoes the request id and
-epoch; nonzero `errno` means the operation did not provide the successful
-contract below. Existing uncertainty and failure classification still apply.
+but no mutation replay slot. DATA mutations and Barrier use the session-exact
+mutation replay header: a client-owned slot and sequence. A response echoes the
+request id and epoch; nonzero `errno` means the operation did not provide the
+successful contract. `uncertain` means the operation may have reached XFS and is
+never retried automatically; `failure` separates STORAGE, INTERNAL, COHERENCE,
+ROUTES, and RESTORE where one errno has two meanings.
 
 ### Directory-page capability reuse and reclaim
 
-`ReadDirRequest.want_items` remains tag 5. The additive
+`ReadDirRequest.want_items` is tag 5. The
 `held_identities` field (tag 6) is a sorted, unique list of nonzero 16-byte
 stable identities that the session already retains for the page beginning at
 the request cookie. It is a page-local optimization hint, never authority.
@@ -110,9 +134,8 @@ if that binding is absent or mismatched. The Authority still resolves and
 revalidates every entry under the page's storage cut and never turns the hint
 into access authority.
 
-`ReclaimRequest.item` remains the legacy singular tag 1. The additive `items`
-field at tag 2 carries 1–4,096 distinct item capabilities. Exactly one form is
-nonempty. The complete shape and every session capability are validated before
+`ReclaimRequest.items` (tag 2) carries 1–4,096 distinct item capabilities;
+there is no singular form. The complete shape and every session capability are validated before
 retirement begins, and one mutation replay slot owns the whole ordered batch.
 The client batches lazily at its cleanup watermark or timer and never combines
 tokens from different Authority epochs. A negotiated frame bound may require a
@@ -132,10 +155,24 @@ Counters must not wrap or reuse values within their scope; retire that scope
 before exhaustion.
 
 `Response.applied_sequence` (tag 56) carries the ticket for successful changed
-WRITE, SETATTR, and FALLOCATE results. Other operations leave it zero. The
-handler retains this ticket with the replay outcome. A rejected flush gets no
-ticket; a partially applied result must describe its actual applied effects
-and cannot retire a rejected suffix as durable.
+WRITE, SETATTR, and FALLOCATE results, and for successful truncating write-intent
+OPEN and truncating write-intent existing-name CREATE under the exact
+identity-bound delegation pin. Truncating an already empty existing file still carries its
+ticket. Nontruncating OPEN and unchanged existing-name CREATE need no new
+ticket. A new empty-file CREATE with no preflight file pin may leave it zero;
+its namespace result waits synchronously for withdrawal. The handler retains
+the original ticket with the exact replay outcome, never allocating another
+on replay. A rejected flush gets no ticket; a partially applied result must
+describe its actual applied effects and cannot retire a rejected suffix as
+durable.
+
+The authority records `AppliedSequence` on the pinned delegation through
+`DelegationFlush.End(ticket)`. A delegation cut accepts its event floor or a
+ticket issued under that exact generation while the cut was pending, never
+another inode's session-wide high-water mark. The application ledger maps
+tickets to volume versions; the delegation record validates the generation's
+cut. Application, remote visibility, and durability prove different facts;
+none substitutes for another.
 
 `Response.volume_version` (67) names the version at which any cache-installing
 reply was served, including a negative LOOKUP and empty READDIR. The new
@@ -145,12 +182,55 @@ in-flight cache-installing replies before acknowledging a withdrawal and
 tracks the local publication generation: a version comparison alone cannot
 reject an equal-version reply that predates delegation withdrawal.
 
+### READ and READLINK results
+
+`ReadReply` contains data (tag 1) and `volume_version` (tag 2).
+`ReadlinkReply` contains only target bytes (tag 1). Neither body carries an
+attribute sample or promises same-sample read attributes. Existing read
+chunking remains in place; a separate GETATTR is a separate observation.
+
+Authority mutation `PostState` supplies the daemon's metadata cache. The
+paired `pfslocal` grammar retains its operation-specific attributes and
+identities rather than forwarding a full mutation-operand result set for
+native `FSVolume.Handler` publication. Its READ and READLINK replies contain
+only data and target bytes, respectively.
+
+## Object versions, post-state, and MKDIR
+
+Every Item, GetAttr reply, Dirent, and mutation post-state object carries an
+object version `v` sampled at a committed storage sequence `s`, with
+`0 < v <= s`; a negative Lookup carries `negative_snapshot_sequence > 0`. Both
+are in the authority's committed storage-sequence domain, scoped to one epoch
+and stable identity. Samples in increasing snapshot order have nondecreasing
+versions; every logical change gets a newer commit sequence and a version
+strictly greater than earlier samples of that identity; equal versions of one
+identity agree on logical attributes. Versions may advance without a logical
+change: the authority keeps a bounded version map and raises a floor when it
+fills, so unchanged identities can report a higher version. Neither side infers
+a changed identity, namespace effect, permission change, or durable outcome
+from numerical equality with the snapshot. `Attr.blocks` and restore-mode ctime
+remain observational; restore hydration preserves logical mtime. Exact replay
+returns the original stamps.
+
+A successful mutation carries `Response.post_state`: the complete versioned
+attributes of every affected object with its roles, the snapshot sequence, and
+the visibility sequence. Clients apply it instead of issuing follow-up reads.
+
+A successful MKDIR returns `Response.mkdir` (tag 73), a `MkdirReply` with the
+owning `item` and `child_search_permitted`. The bit is the kernel's
+effective-credential search check on the new directory's identity, evaluated
+at the same committed cut as the Item and post-state, while the new directory
+is still unexposed. `false` is an evaluated denial and canonical omission, not
+an absent observation; the mkdir itself succeeded. Replay returns the original
+bit without resampling. A successful MKDIR never uses `LookupReply`; Lookup and
+Symlink do.
+
 ## Subscription and delivery messages
 
 | Message; request/response oneof tag | Fields and meaning |
 |---|---|
 | `SubscribeRequest`; request 65 | `snapshot_id` (1): empty starts a cold subscription after the client has invalidated all state. Nonempty resumes pagination only. `after_identity` (2): empty on the initial request, otherwise exactly the preceding reply's `next_after_identity`. |
-| `SubscribeReply`; response 57 | `watermark` (1): atomic snapshot volume version. `delegated_identities` (2): sorted unique identities excluded by a reservation or live delegation at that snapshot, in bytewise order across pages. `incarnation` (3): new nonzero incarnation. `horizon_nanos` (4): conservative validity duration, at most 10,000,000,000 ns, anchored at the initial request's monotonic start. `snapshot_id` (5): token binding every page to this snapshot/session/incarnation. `next_after_identity` (6): final identity on a nonfinal page; empty marks completion. |
+| `SubscribeReply`; response 57 | `watermark` (1): atomic snapshot volume version. `delegated_identities` (2): sorted unique identities excluded by a reservation or live delegation at that snapshot, in bytewise order across pages. `incarnation` (3): new nonzero incarnation. `horizon_nanos` (4): conservative validity duration, at most 10,000,000,000 ns, anchored at the initial request's suspend-inclusive monotonic start. `snapshot_id` (5): token binding every page to this snapshot/session/incarnation. `next_after_identity` (6): final identity on a nonfinal page; empty marks completion. |
 | `RenewSubscriptionRequest`; request 66 | `incarnation` (1): exact current subscription. |
 | `RenewSubscriptionReply`; response 58 | `incarnation` (1): exact echo. `horizon_nanos` (2): conservative duration, at most 10 seconds, anchored at renewal request start. |
 | `NextControlEventRequest`; request 67 | `incarnation` (1): exact subscription. `after_sequence` (2): last received CONTROL event sequence, initially zero. `completed_event_through` (3): contiguous prefix whose ACK retries are surrendered. Long-polls for the delivered cursor's successor. |
@@ -168,6 +248,15 @@ incarnation, horizon duration, and snapshot token. It neither starts another
 subscription nor extends the horizon. Pages are sequential; repeating a page
 request returns the same page. A nonfinal page must contain at least one entry.
 Discard the partial snapshot on failure or expiry and subscribe cold again.
+
+Linux subscription request anchors, receipt/renewal validation, and every
+cache/delegation eligibility check use suspend-inclusive `CLOCK_BOOTTIME`.
+The original request anchor precedes queueing; pagination never moves it.
+Admission compares against the continuous horizon at the moment of use, even
+when CONTROL delivery and active-time timers have not run since resume. A late
+renewal cannot bridge an expired horizon; expiry requires cold withdrawal.
+Authority subscription/delegation deadlines and renewable session/lock leases
+use the same clock domain. No wall clock grants cache permission.
 Do not cache until the final page arrives; the first cacheable read must be at
 or after the watermark. The client may start polling/renewing after the first
 page so a large snapshot cannot prevent liveness, but must stage later changes
@@ -198,7 +287,7 @@ receipt only across a contiguous prefix of finished handlers. Completed records 
 below the receipt are deleted; current grant tracking is deleted at recall or release. A
 poll can deliver a recall while an earlier ChangeBatch is still being withdrawn; this
 separation prevents an ack/flush dependency from stopping delivery of the event that can
-resolve it. C and F must reserve independent CONTROL execution capacity for renewal and
+resolve it. Both ends reserve independent CONTROL execution capacity for renewal and
 acknowledgments while the poll is parked.
 
 Release operations share one serialized acknowledgment lane, held across reconnect and
@@ -207,8 +296,8 @@ accepted sequence. The Authority retains only the latest exact request fingerpri
 result, including definite errors. An exact retry repeats both coordinates. A malformed final response ends the client session. An uncertain final response fences
 the subscription incarnation: no further release, renewal, or poll may use that incarnation.
 The client withdraws its caches before a cold subscription creates a new release replay
-domain; it cannot acknowledge or surrender the uncertain result in the old domain. Invalid local request shapes consume no sequence. Linux attach requires
-`bounded-control-replay-v1` so clients cannot silently omit these coordinates.
+domain; it cannot acknowledge or surrender the uncertain result in the old domain. Invalid local request shapes consume no sequence. The Linux profile requires
+these coordinates; omitting them is invalid.
 
 Application tickets retain monotonic applied/durable counters and only the
 volume-version suffix above the session's durable prefix. Volume sync retires covered
@@ -254,7 +343,7 @@ to a current cursor. Transient notify failure gets a bounded retry, not a premat
 
 An operation/grant awaiting withdrawal from a subscriber waits for that
 subscriber's ack through the relevant position or its horizon. Change entries
-have no PREPARE/COMPLETE handshake. A committed namespace operation completes
+have no separate completion handshake. A committed namespace operation completes
 externally after its required deliveries/withdrawals. A delegation reservation
 becomes a grant only after peers' DELEGATION_GRANTED withdrawals finish. The
 initiating session handles its own publication boundary locally. Its source
@@ -268,6 +357,15 @@ notification can otherwise wait on the initiating syscall's VFS locks and
 block acknowledgments needed by a concurrent peer mutation. Skipped internal
 positions do not create holes in the session's wire change positions.
 
+`WaitTargeted` captures the affected peer subscription incarnations at commit
+and waits for actual withdrawal: cumulative ChangeAck after cache-installing
+reply drain and kernel invalidation, or the existing cold-reset/horizon proof.
+DATA reply delivery, delegation acknowledgment, and mere session fencing do
+not prove withdrawal. The handler marks the application visible only after
+this wait succeeds; `VisibleSequence` remains a contiguous session prefix.
+Durability has its separate storage barrier and prefix, and neither visibility
+nor durability implies the other.
+
 ## Delegations and flushes
 
 `Delegation` contains opaque `id` (1), nonzero `generation` (2), and `mode` (3).
@@ -279,7 +377,7 @@ Subscription expiry retires its delegations as well as cache permission; a cold
 resubscription never revives an old reference. A mode transition preserves generation; retiring/reassigning ownership must
 invalidate the old reference even if the same session later reacquires it.
 
-| Existing message | Additions and semantics |
+| Message | Coherence fields and semantics |
 |---|---|
 | `CreateRequest` | `write_intent` (6) requests a delegation; it requires `flags.write`. `cache_capable` (7) requests kernel caching for the returned handle. |
 | `CreateReply` | `delegation` (3), absent if no grant; `cache_capable` (4) is the admitted capability for this handle. `item` and `handle` retain tags 1 and 2. |
@@ -287,15 +385,45 @@ invalidate the old reference even if the same session later reacquires it.
 | `OpenReply` | `delegation` (2), `cache_capable` (3); `handle` remains 1. Identity comes from the opened item. |
 | `WriteRequest` | `delegation` (13), a DelegationRef required on each buffered flush. Optional `flush_sequence` (14) orders pipelined chunks as specified below. Payload stays out of line. |
 | `SetAttrRequest` | `delegation` (11), required when flushing buffered attributes or truncate. Optional size/mode/time presence remains unchanged. |
-| `FallocateRequest` | `delegation` (8), required when operating under a delegation. Reserved tags stay reserved. |
+| `FallocateRequest` | `delegation` (8), required when operating under a delegation. |
 | `WriteReply` | `durable_sequence` (8), the session's contiguous durable application prefix. The common response carries this operation's applied ticket. |
-| `FsyncReply`; response 66 | New body with `durable_sequence` (1). Success still promises durability of the requested file's flushed cut. |
-| `SyncFSReply`; response 35 | `durable_sequence` (1), after the existing volume durability operation. It does not stand in for the root FSYNCDIR barrier. |
+| `FsyncReply`; response 66 | `durable_sequence` (1). Success promises durability of the requested file's flushed cut. |
+| `SyncFSReply`; response 35 | `durable_sequence` (1), after the volume durability operation. It does not stand in for the root FSYNCDIR barrier. |
 
-CREATE reserves ownership before publishing the new binding; CREATE/OPEN return
-a grant only after withdrawal. FULL permits daemon buffering. WRITETHROUGH
-requires immediate authority application and peer invalidation for each write
-while another session retains a pre-existing cache-capable handle. A peer that
+CREATE reserves ownership before publishing the new binding. CREATE/OPEN have
+two grant paths:
+
+- **Existing public generation.** A synchronous mutation pins the exact
+  generation already eligible for a DATA reply. After apply, commit publication,
+  release of storage locks, and `End(ticket)`, the authority returns the
+  application receipt before targeted withdrawal. OPEN/CREATE return the real
+  allocated handle, retained exact grant, and operation ticket. The detached
+  authority wait retains the visibility obligation. Public does not mean DATA
+  has already reached the client.
+- **New private generation.** The client has never been offered this generation.
+  `RetainDelegation` returns it to `DelegationReserved`, opens reserved-reader
+  admission, and clears `ephemeral`. The handler releases the storage turn and
+  ends its apply pin, waits for mutation withdrawal while the grant stays
+  reserved, then calls `Grant`. Reserved peer reads may sample storage under a
+  reader pin; activation closes that admission and joins existing pins before
+  activating and returning the grant. No holder CONTROL may issue while the
+  generation is Reserved. This path also preserves reservation withdrawal and
+  reader drain for newly reserved nontruncating OPEN and new-name CREATE where
+  applicable. After activation CONTROL may overtake DATA.
+
+The client installs a returned grant, exact identity/ref, handle, and application
+ticket atomically before CONTROL can inspect that generation. It records a
+synchronous operation's actual application ticket before releasing its operation
+lock to CONTROL. A CONTROL handler that overtook DATA waits without holding
+locks needed by installation; grant registration wakes it. The client releases
+locks needed by CONTROL before waiting for visibility and must continue
+servicing CONTROL during that wait.
+The FUSE OPEN/CREATE success still waits for visibility, including source
+publication; an early authority application receipt is not filesystem success.
+
+FULL permits daemon buffering. WRITETHROUGH requires immediate authority
+application and peer invalidation for each write while another session retains
+a pre-existing cache-capable handle. A peer that
 opens an already delegated identity gets `cache_capable = false`. Requests
 express a preference; only the reply authorizes kernel caching. A write-intent
 handle is direct-IO. A separate holder read handle can be cache-capable if the
@@ -310,15 +438,15 @@ these capabilities. Omitting both returns EINVAL before storage application.
 An absent DelegationRef is an ordinary synchronous operation, including a
 first write that needs authority ownership arbitration. It never authorizes
 local buffering. Reacquisition through OPEN with write_intent supplies the new
-Delegation to an existing writer; F may close that auxiliary server handle
+Delegation to an existing writer; the client may close that auxiliary server handle
 once it has a grant usable with its original valid handle. The schema does not
 pretend an ordinary WriteReply grants a delegation. Reject an invalid or stale
 reference before applying any part of its flush. The sender advances its loss
 sequence if already accepted data cannot be applied.
 
-Flush requests on disjoint files can pipeline freely within the existing
+Flush requests on disjoint files can pipeline freely within the
 transport bounds. Requests for one file preserve accepted program order;
-independent replay slots do not provide ordering. F must wait for a preceding
+independent replay slots do not provide ordering. The client must wait for a preceding
 same-file request's application acknowledgment before dispatching the next,
 unless its dispatcher supplies an equivalent proven ordering. Each flush may
 coalesce several accepted entries; all share its resulting application ticket.
@@ -331,6 +459,33 @@ unrelated file. The buffer can mark those exact entries durable from that
 operation-specific proof; it can retire arbitrary entries only through the
 reported contiguous prefix. A failed operation makes no new durability claim.
 Never advance the prefix merely to the maximum completed fsync ticket.
+
+## Ordered delegated flush
+
+Ordered flush is part of the Linux profile, not an option. All delegated WRITE,
+SETATTR, and FALLOCATE requests share four dedicated flush permits on both
+endpoints. Each delegated WRITE carries a nonzero `flush_sequence`, a dense
+ordinal starting at one for the exact delegation ID and generation; at most four
+successors may be registered. The replay runtime resolves duplicates before
+registering an ordinal. A successor waits before acquiring storage or mutation
+dependencies, and its predecessor releases it only after recording its exact
+replay outcome. Definite recorded errors consume their ordinal. An unrecorded
+refusal retires the authenticated owner's exact grant and wakes successors; it
+cannot leave an unfillable gap. Subscription loss, recall expiry, and transport
+cancellation also terminate waiting ordinals. Metadata flushes separate WRITE
+waves.
+
+The client admits each predecessor to its transport lane before launching the
+next chunk and joins the wave before changing local ownership. Transport
+retries keep the same mutation identity, ordinal, and immutable scatter spans;
+an unprovable wave result loses the delegation, while definite capacity errors
+keep the grant and report the errno. A partial acceptance record stays retained
+and outside the applied acceptance cut until its final chunk succeeds. Scatter
+spans use the single bulk carrier and canonical frame bytes.
+
+While a Mac activation holds exclusive profile admission, exact-generation
+recall flushes still drain, so activation cannot deadlock behind the recall it
+issued.
 
 ## Delegation control and release
 
@@ -362,7 +517,7 @@ and cache-installing replies, flushes the identity cut, then acknowledges with
 the greatest application ticket covering that cut (zero if it never changed).
 The ack does not assert durability. Arriving writes wait for a new grant;
 they cannot enter the retiring generation. A missed deadline drops ownership
-and advances the affected holder's loss sequence. There is no second COMPLETE
+and advances the affected holder's loss sequence. There is no second completion
 event for the retired grant.
 
 Break is a flush request/ack exchange without ownership withdrawal. Capture
@@ -375,16 +530,21 @@ For a downgrade to WRITETHROUGH, stop buffered admission, drain and flush the
 old mode's cut, install the target mode, then ack. Subsequent writes execute
 synchronously. For an upgrade to FULL, install the new mode and ack the latest
 applied identity cut. The authority cannot depend on a mode transition before
-its ack. Neither mode exchange retires ownership or needs a COMPLETE phase.
+its ack. Neither mode exchange retires ownership or needs a completion phase.
 Serialize control transitions per identity so recall, break, and mode change
 cannot contradict one another. Disjoint identities can progress concurrently.
 
 An ack must match incarnation, event sequence, event type, and grant reference.
 It certifies all accepted entries in the event's identity cut were applied;
-a ticket from some unrelated mutation is not a substitute. An exact repeated
-ack is idempotent; a conflicting ack for an already completed event is invalid.
-These acks do not acknowledge ChangeBatch positions. Conversely, ChangeAck
-does not discharge a recall, break, or mode change.
+a ticket from some unrelated mutation is not a substitute. A delegation
+acknowledgment proves application and the required local drain, not completion
+of a preceding ChangeAck or remote visibility. Peer withdrawal may depend on an
+in-flight READ that itself needs the holder's applied cut, so delivery,
+delegation acknowledgments, and cumulative withdrawal acknowledgments retain
+independent progress paths. An exact repeated ack is idempotent; a conflicting
+ack for an already completed event is invalid. These acks do not acknowledge
+ChangeBatch positions. Conversely, ChangeAck does not discharge a recall,
+break, or mode change.
 
 Release follows last-handle close and a completed flush of that identity. It
 stops admission under every listed reference, but does not discard applied
@@ -416,8 +576,9 @@ authority makes the ticket prefix durable; it must reject a cut greater than
 its applied prefix rather than park waiting for unsent client data. A reply
 may cover later work, but need not wait for entries accepted after the client
 cut. The durability operation also covers namespace mutations acknowledged before
-this barrier, including when the data cut is zero; implementations can retain
-the existing ordered volume syncfs operation for this. A replay returns the
+this barrier, including when the data cut is zero; the authority uses its
+ordered volume syncfs operation, with the shared-cell error and latency scope
+stated in COMPATIBILITY.md. A replay returns the
 same or an already sufficient retained result.
 
 The client reports EIO if loss advanced since the root handle opened, even if
@@ -427,191 +588,174 @@ become permanently stale at epoch change. Neither a new subscription nor a
 new epoch silently retires non-durable entries. FUSE_SYNCFS is never the
 completion trigger; successful syncfs(2) on stock FUSE proves no daemon barrier.
 
+## Batched descriptor close
+
+`Request.close_batch` (tag 74) and `Response.close_batch` (tag 68) travel on
+DATA for Linux and FSKit sessions; Linux may also use individual CLOSE, and
+FSKit uses only the batch. Cacheless readers use individual CLOSE only. A
+request contains 1–128 distinct 16-byte handle capabilities, each with its lock
+owner and flock-unlock flag. The whole shape is validated before any close, and
+the frame grammar bounds both lists to 128 before allocation.
+
+One mutation replay slot owns the complete ordered request and ordered results.
+Top-level success carries one result per input, including individual failures;
+every entry is attempted. Exact replay returns those outcomes without closing
+again; a changed order or handle is a replay mismatch.
+
+A result carries errno, failure class, and `retired`. Once a session capability
+is validated, descriptor close is attempted even if explicit flock cleanup
+fails. The store consumes its capability before reporting a final close error;
+the authority removes session accounting and sets `retired` even then. An
+already-stale session handle is also retired. Other pre-close refusal does not
+claim retirement. Clients remove retired handles while preserving the error for
+diagnostics. Unknown transport outcomes or malformed replies revoke the mounted
+session; terminal session cleanup owns its remaining descriptors.
+
+Linux final-handle cleanup first applies each buffered cut and releases the
+grants in one CONTROL batch; it does not wait for durability. Applied records
+leave the read overlay after release, but their bytes and loss obligations stay
+retained until a durable prefix or fencing loss. No per-file lock spans the
+release or close RPC.
+
+## FSKit exclusive-writer profile
+
+**Writes.** FSKit sessions use the ordinary `Request.write` body (tag 55) for
+one positioned write of an out-of-line payload no larger than the negotiated
+maximum, with the ordinary replay fingerprint, short-write, and post-apply
+carriers. `append`, `sync`, `data_sync`, `delegation`, `flush_sequence`,
+`lock_owner`, and the lock-owner write flag must be unset; the authority
+refuses them with EINVAL before admission. FSKit sessions receive no
+application ticket or durable sequence.
+
+**Durability.** Every successful FSKit mutation reply certifies authority-storage
+durability before the reply is sent or retained for replay. Every mutation that
+applied or may have applied waits for its selected storage barrier, even if its
+eventual reply fails. A mutation with a retained syncable description (WRITE,
+CREATE, truncating OPEN, handle-backed SETATTR) full-fsyncs that description.
+A handleless mutation (namespace operations, item-backed metadata) uses syncfs
+on the volume's retained root description. The barrier is chosen from the
+operation; there is no post-apply reopen and no alternate barrier after an
+acquisition failure, and failure to retain a required handle after apply is
+terminal. Any persistence syscall failure is an uncertain EIO with
+`FAILURE_CLASS_STORAGE` and fences the epoch before waiters are released; the
+first failure survives an apparently successful later syscall. Linux withdrawal
+may precede durability; a successful reply may not. Cancellation after apply
+does not abandon the barrier.
+
+**Frontend publication and teardown.** No FSKit callback publishing data,
+metadata, namespace, or durability reports success after the session is
+terminal. Resource loading, volume activation, mounting, and synchronize remain
+serving callbacks. Their final synchronous reply and session termination share
+one publication gate: a reply that wins precedes termination; termination that
+wins rejects publication with the first terminal cause. Earlier definite
+request refusals remain failures.
+
+Volume deactivation and resource unloading acknowledge completed local cleanup
+only, even after terminal failure. Genuine request or local cleanup errors
+remain errors; repeated completed teardown is idempotent, and overlapping
+callers wait for the cleanup they acknowledge. Unmount's void completion has
+no error or errno and acknowledges the same local boundary. None certifies
+durability, replaces the first terminal cause, revives the session, proves
+kernel absence or authority acceptance of absence, or certifies daemon/CLI
+reconciliation. This exception does not change close, reclaim, release,
+cancellation, or other publication and resource-settlement rules.
+
+Mutation durability above is unchanged. Synchronize waits for the authority
+barrier over its captured applied cut and then Statfs, propagates their errors,
+and still passes the final serving gate. It cannot cover undelivered kernel
+pages or mutations outside the cut; native fsync/F_FULLFSYNC waiting, dirty-page
+drain, and error propagation remain qualification boundaries. Closing a session
+cannot retract kernel cache already published. Local teardown success neither
+authorizes a daemon control 204 nor removes a durable registry record: the CLI
+independently checks exact kernel absence and daemon completion under
+[the detach reporting contract](../fskit-mount.md#unmount-and-detach). No new
+wire outcome or typed teardown receipt follows from these local callbacks.
+
+**Stamps.** FSKit Lookup, GetAttr, directory entries and mutation post-state
+carry the conservative versions above. The authority samples existence,
+attributes, `v`, and `s` under one storage read dependency set; every attribute
+sample honours the hydration lock. READ and READLINK retain the result bodies
+specified above and carry no same-sample attributes.
+
+**Cache proof.** A successful KeepAlive reply carries
+`Response.session_valid_for_nanos` (tag 72): the remaining duration, sampled
+after renewal under the session lock, of `min(lease remaining, authorization
+remaining, advertised lease, MaxCacheProof)`, rounded down to a whole
+millisecond and encoded in nanoseconds, with `MaxCacheProof` =
+60,000,000,000 ns. A terminal session receives no positive value, and no other
+reply or profile carries the field. Both peers refuse a zero,
+fractional-millisecond, or over-cap value and the field beside an errno,
+failure class, body, uncertain outcome, or terminal flag; the client also
+requires the exact request ID and epoch and a proof no larger than the
+advertised lease. Any such reply is a protocol defect that ends the session.
+
+With `R` in nanoseconds, `epsilon(R) = 1,000,000,000 + ceil(R / 1000)`. The
+client anchors `R` at `t0`, taken before the KeepAlive is queued on a clock that
+advances across sleep, requires `R > epsilon(R)`, and serves cached metadata
+only before `t0 + R - epsilon(R)`. The margin assumes at most 1,000 ppm
+aggregate relative clock-rate error and one second of measurement uncertainty;
+it assumes no clock-offset agreement.
+
+**Exclusion.** The authority registers each proof before its reply can escape
+and keeps the session's writer exclusion until the latest granted proof has
+expired, even if the session is fenced earlier. An ordinary request that renews
+a longer session lease grants no cache permission. Exclusion ends after both
+the retained deadline and the drain of every admitted storage application of
+the old session; an accepted absence proof removes only the deadline. Activation
+refuses an occupied Mac writer before waiting for exclusive profile admission
+and rechecks under it before publishing; an ordinary FSKit mutation is admitted
+only while the writer registry names its session as the current unfenced
+writer.
+
+## Ordering across the profiles
+
+A new private OPEN/CREATE generation stays reserved until the operation's
+synchronous withdrawal completes. Pending peer reads may sample storage under a
+reservation; grant activation drains those samples before the DATA reply.
+CONTROL may then overtake DATA, so the client handles that ordering. A
+synchronous mutation under an existing public generation returns its
+application receipt before its visibility wait, so the holder can acknowledge
+a peer cut independently. Private synchronous generations exclude their source from
+grant/release reverse notifications; its exact publication gate and post-state
+cover those coordinates. Client-visible grants remain broadcast to purge the
+holder's earlier cached pages.
+
+`Response.visible_sequence` (70) is the largest contiguous session application
+prefix whose peer withdrawals have completed; `WaitVisibility` (request 75,
+response 71) waits for withdrawal through one already-issued ticket without a
+storage or durability operation. `Response.session_terminal` (69) is true only
+with envelope ESTALE when this exact session expired or was fenced; the client
+starts local session enforcement before delivering that response. Ordinary
+stale item/handle ESTALE omits it. A volume-terminal exact outcome carries
+`terminal_delivery_token` (9); the frontend returns it in
+`TerminalDeliveryReceipt` on CONTROL after its kernel publication boundary, and
+the authority keeps the fenced epoch's transports alive until then.
+
+## Restart fencing
+
+A new authority process accounts for the preceding epoch's cache horizons from
+durable membership (`mount.membership`, profiles `linux`, `fskit-exclusive`,
+`cacheless`). If any prior Linux mount is recorded, the replacement waits a full
+subscription horizon from coordinator creation before granting a writer
+delegation or applying a mutation; cold Subscribe, ordinary reads, and barriers
+remain available, and a canceled wait takes no storage or identity turn. If
+prior FSKit membership is recorded, foreign visible mutations and write-intent
+opens are refused for `MaxCacheProof + epsilon(MaxCacheProof)` (61.06 s),
+measured on a clock that includes suspend, from safe takeover: exclusive root
+and membership ownership, irreversibly closed predecessor renewal, and no
+predecessor storage apply still able to run. Mac activation against that
+membership requires operator reconciliation. Neither bound establishes kernel
+mount absence: old durable records still block topology changes and archive
+proof until exact absence or operator reconciliation.
+
 ## Refusals
 
-Use the existing response `errno` and `failure` envelope. Malformed coordinates,
+Refusals use the response `errno` and `failure` envelope. Malformed coordinates,
 unknown enum values, inconsistent flags, an undelivered ack position, an
 unissued application ticket, or a conflicting retry receive EINVAL with no
 state change. Wrong/expired incarnations and stale delegation references
 receive EIO with `FAILURE_CLASS_COHERENCE`; the client invalidates or reports
 loss for the affected state, without interpreting it as storage death. A
 stale-generation flush fails whole before apply. Ordinary storage errors keep
-their existing errno and partial-application reporting. Handler enforcement of
-these semantic refusals belongs to C/F; structural frame refusals already
-occur before dispatch.
-
-## Integration boundaries and decisions
-
-C owns subscription snapshots, horizons, event retention, withdrawal waits,
-delegation arbitration, and exact idempotency validation. F maps those objects
-to these generated messages, implements polls and independent ack/renew lanes,
-maintains accepted-to-application-ticket accounting, retains replay tickets,
-and supplies the served volume versions. Generation checks must precede any
-storage mutation. No commit lock may span an ack, recall, horizon, or durability
-wait. The authority's existing mutation sequencer orders conflicting work.
-
-The historical v6 lease schema stays for inspection of stored wire history.
-`Lease*`, `NextLeaseEventRequest`, `AcknowledgeLeaseEventRequest`, `RenewLeasesRequest`,
-SourceLeaseDischarge, AcknowledgeSourceLeaseDischarge, `lease_grants`,
-`source_lease_discharge`, and Activate's `lease_cursor` are not sent or honoured
-by the completed v7 implementation. F owns deletion of their executable
-handler/client paths. Workstream A does not certify those paths as converted.
-
-Decisions made here: paginated atomic subscribe snapshots avoid exceeding the
-existing allocation bounds; one response per CONTROL long-poll preserves the
-transport's request-id model; separate delivery and withdrawal cursors prevent
-head-of-line blocking; authority application tickets avoid assuming that local
-accepted sequences or replay-slot sequences are global storage order. The
-additional transport-role allowlist entries and their exhaustive tests are
-necessary wire plumbing outside PLAN's enumerated A files; no filesystem
-handler or client state machine changes accompany them.
-
-## Workstream A verification receipt (2026-09-16)
-
-The following commands passed on this macOS arm64 worktree:
-
-```sh
-bash scripts/generate-authority-proto.sh
-CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...
-CGO_ENABLED=0 GOOS=linux go -C vcs build ./...
-go -C vcs vet ./...
-go -C vcs test ./internal/authorityrpc/...
-go -C vcs test -race ./internal/authorityrpc/...
-bash scripts/verify-local.sh
-go -C vcs test ./internal/authorityrpc -run '^$' -bench '^BenchmarkChangeBatchEncoding$' -benchtime=100ms -benchmem
-```
-
-Generation used protoc 35.1 and protoc-gen-go 1.36.11; repeating generation
-produced identical Go bytes. A descriptor comparison with base commit
-`3fdc83866cdec3742818295d946d1af945ec90a8` preserved all 445 existing field
-definitions, message reservations, and existing top-level enum values.
-The default gate passed both builds/vets, vulnerability checking, native Go
-and race suites, the go-fuse seam, all 344 enumerated Swift tests, release
-policy checks, and architecture scans. Encoding tests cover every new body,
-nested fields, frozen tags, unknown/duplicate rejection, collection bounds,
-optional range presence, and delegation replay fingerprints. TLS and Hello
-tests refuse literal protocol 6; feature tests assert exact sets.
-
-The 256-entry benchmark measured CONTROL frame encoding at 117,926 ns/op,
-9,476 B/op, and 1 allocation/op; canonical encoding measured 357,163 ns/op,
-163,920 B/op, and 3,340 allocations/op. These are short local observations
-on an Apple M5 Max while other verification ran, not a filesystem throughput
-claim. CONTROL uses the frame path; canonical response encoding is a separate
-measurement of the existing canonical writer.
-
-`bash scripts/verify-local.sh --full` failed in the privileged XFS/FUSE suite:
-`TestMutationPostStateEliminatesFollowupMetadataRPCs` observed three GETATTR
-RPCs after mknod where its assertion expected zero. An untouched detached
-worktree at the base commit above also failed this same test when run with:
-
-```sh
-PORTABLEFS_GO_TEST_FLAGS='-run ^TestMutationPostStateEliminatesFollowupMetadataRPCs$' bash scripts/xfs-fuse-integration.sh
-```
-
-That baseline run failed earlier at fallocate (one unexpected GETATTR), with
-an additional unmount-cleanup failure. This establishes a failing baseline,
-not proof that every full-suite failure is unrelated to the wire change.
-No frontend behavior or test expectation was altered to obtain a pass.
-The full gate remains unpassed and cannot serve as merge evidence.
-
-The separately invoked `bash scripts/coherence-matrix-linux.sh` passed with
-22 live cases passing, zero failures, and the declared
-`remote_chown_visible` skip (23 total, zero unexpected results). Both
-falsifiability controls reached their declared expectations. This exercises
-the current frontend paths; it does not prove the new C/F state machines.
-
-## Integration ordering clarifications
-
-A new OPEN/CREATE grant remains reserved until the operation's synchronous
-withdrawal completes. Pending peer reads may sample storage under a reservation;
-grant activation drains those samples before the DATA reply. CONTROL may then
-overtake DATA, so the client still handles that ordering. A synchronous mutation
-under an already installed grant returns its application receipt before its
-visibility wait, allowing the holder to acknowledge a peer cut independently.
-
-Private synchronous generations exclude their source from grant/release reverse
-notifications; its exact publication gate and post-state repair those coordinates.
-Promotion to a visible grant restores the ordinary release notification. Normal
-client-visible grants remain broadcast to purge the holder's earlier cached pages.
-
-A new Authority process must also account for the preceding epoch's cache
-horizon. Durable membership distinguishes Linux v7, cacheless readers, and
-compatibility mounts. If any prior Linux v7 mount is recorded, the replacement
-waits a full SubscriptionTTL from coordinator creation before granting a writer
-delegation or applying a mutation. Cold Subscribe, ordinary reads, and barriers
-remain available during that interval. A canceled wait takes no storage or
-identity turn. This bound does not establish kernel mount absence: old durable
-records still block topology changes and archive proof. Prior compatibility or
-untyped legacy membership continues to require explicit fencing evidence.
-
-
-## Batched descriptor close
-
-Linux Activate optionally advertises `batched-close-v1`; absent advertisement
-selects individual CLOSE requests. The required feature set is unchanged. DATA carries
-`Request.close_batch` (tag 74) and `Response.close_batch` (tag 68); FSKit and
-CACHELESS_READER retain ordinary CLOSE. A request contains 1–128 distinct
-16-byte handle capabilities with each handle's lock owner and flock-unlock
-flag. The entire shape is validated before any close. The frame grammar bounds
-both request and reply lists to 128 before protobuf allocation.
-
-One mutation replay slot owns the complete ordered request and ordered results.
-Top-level success carries one result per input, including individual failures;
-all entries are attempted. Exact replay returns those outcomes without closing
-again. A changed order or handle is a replay mismatch. Callers retry only the
-identical whole request in its existing replay domain.
-
-A result carries errno, failure class, and `retired`. Once a session capability
-is validated, descriptor close is attempted even if explicit flock cleanup
-fails. The store consumes its capability before reporting a final close error;
-the Authority removes session accounting and sets `retired` even on that error.
-An already-stale session handle is also retired. Other pre-close refusal does
-not claim retirement. Clients remove retired handles while preserving the error
-for diagnostics. Unknown transport outcomes or malformed replies revoke the mounted session;
-terminal session cleanup owns its remaining descriptors. Malformed result count, errno, or failure classification is refused.
-
-Final-handle cleanup first applies each buffered cut and releases the grants in
-one CONTROL batch. It does not wait for durability. Applied records cease to
-participate in the read overlay after release, but their bytes and loss
-obligations remain retained until a durable prefix or fencing loss. No per-file
-acquire, transition, or operation lock spans the release or close RPC; a local
-release flight orders same-identity admissions through completion.
-
-
-## Optional ordered delegated flush
-
-Linux peers may negotiate `ordered-delegated-flush-v1`. It is an optional Hello
-feature: the client offers it only with four dedicated flush permits and replay
-slots plus at least one ordinary slot; the Authority echoes it only when its
-ordinary half can reserve those same five slots. DATA and CONTROL must agree,
-including replacement transports. Activate must also advertise it. The frozen
-required feature sets and protocol major are unchanged. Without negotiation,
-clients use the existing serial delegated flush.
-
-With negotiation, all delegated WRITE, SETATTR and FALLOCATE requests share the
-four flush permits on both endpoints. Each nonzero WRITE `flush_sequence` is a
-dense ordinal starting at one for the exact delegation ID and generation. At
-most four successors may be registered. The replay runtime resolves duplicates
-before registering an ordinal. A successor waits before acquiring storage or
-mutation dependencies; its predecessor releases it only after recording its
-exact replay outcome. Definite recorded errors consume their ordinal. An
-unrecorded refusal retires the authenticated owner's exact grant and wakes
-successors; it cannot leave an unfillable gap. Subscription loss, recall expiry,
-and runtime transport cancellation also terminate waiting ordinals. Ordinal zero
-retains the existing serial behavior; metadata flushes separate WRITE waves.
-
-The daemon admits each predecessor to its transport lane before launching the
-next chunk. It joins the wave before changing local ownership. Transport retries
-retain the same mutation identity, ordinal and immutable scatter spans; an
-unprovable wave result loses the delegation, while definite capacity errors keep
-the grant and report the errno. A partial acceptance record remains retained and
-is excluded from the applied acceptance cut until its final chunk succeeds.
-Scatter spans use the existing single bulk carrier and canonical frame bytes;
-there is no new bulk encoding or payload-copy requirement.
-
-`Response.session_terminal` (69) is an additive terminal-session witness. It is
-true only with envelope ESTALE when this exact Authority session expired or was
-fenced. The client starts local session enforcement before delivering that
-response, even if the transport remains connected. Ordinary stale item/handle
-ESTALE omits the field and remains nonterminal. Epoch mismatch retains the
-existing exact-epoch comparison; this field does not change its recovery path.
+their errno and partial-application reporting. The handler enforces
+these semantic refusals; structural frame refusals occur before dispatch.

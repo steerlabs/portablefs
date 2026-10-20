@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -14,11 +15,12 @@ import (
 
 type coherenceV2ClientHandler struct {
 	clientTestHandler
-	pollStarted chan struct{}
-	pollRelease chan struct{}
-	pollOnce    sync.Once
-	paginate    bool
-	pageDelay   time.Duration
+	pollStarted             chan struct{}
+	pollRelease             chan struct{}
+	pollOnce                sync.Once
+	paginate                bool
+	pageDelay               time.Duration
+	beforeSubscriptionReply atomic.Pointer[func()]
 }
 
 func (h *coherenceV2ClientHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
@@ -42,8 +44,14 @@ func (h *coherenceV2ClientHandler) Handle(ctx context.Context, request *authorit
 		if h.paginate && len(body.Subscribe.GetSnapshotId()) == 0 {
 			reply.NextAfterIdentity = bytes.Clone(identity)
 		}
+		if hook := h.beforeSubscriptionReply.Load(); hook != nil {
+			(*hook)()
+		}
 		response.Body = &authoritypb.Response_Subscribe{Subscribe: reply}
 	case *authoritypb.Request_RenewSubscription:
+		if hook := h.beforeSubscriptionReply.Load(); hook != nil {
+			(*hook)()
+		}
 		response.Body = &authoritypb.Response_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionReply{
 			Incarnation: body.RenewSubscription.GetIncarnation(), HorizonNanos: uint64(10 * time.Second),
 		}}
@@ -98,7 +106,7 @@ func (h *coherenceV2ClientHandler) Handle(ctx context.Context, request *authorit
 
 func TestSubscribePaginationKeepsInitialHorizonAnchor(t *testing.T) {
 	handler := &coherenceV2ClientHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x19}, 16), maxInFlight: 6},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x19}, 16), maxInFlight: 9},
 		pollStarted:       make(chan struct{}),
 		pollRelease:       make(chan struct{}),
 		paginate:          true,
@@ -123,9 +131,9 @@ func TestSubscribePaginationKeepsInitialHorizonAnchor(t *testing.T) {
 
 func dialCoherenceV2TestClient(t *testing.T, handler *coherenceV2ClientHandler) *Client {
 	t.Helper()
-	address, clientTLS, stop := startTestServer(t, handler, 6, time.Minute)
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	t.Cleanup(stop)
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 6, 6))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 9, 9))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +143,7 @@ func dialCoherenceV2TestClient(t *testing.T, handler *coherenceV2ClientHandler) 
 
 func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T) {
 	handler := &coherenceV2ClientHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 6},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x11}, 16), maxInFlight: 9},
 		pollStarted:       make(chan struct{}),
 		pollRelease:       make(chan struct{}),
 	}
@@ -144,7 +152,7 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 	if client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}) != &client.controlPoll ||
 		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}) != &client.changeAck ||
 		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}}) != &client.liveness {
-		t.Fatal("protocol-7 poll, acknowledgment, and renewal did not receive independent admission lanes")
+		t.Fatal("protocol-8 poll, acknowledgment, and renewal did not receive independent admission lanes")
 	}
 
 	pollResult := make(chan error, 1)
@@ -161,12 +169,12 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 		t.Fatal("control poll did not park at the authority")
 	}
 
-	renewStarted := time.Now()
+	renewStarted := client.subscriptionTime()
 	horizon, err := client.RenewSubscription(context.Background(), 7)
 	if err != nil {
 		t.Fatalf("RenewSubscription while poll parked: %v", err)
 	}
-	if horizon.Before(renewStarted.Add(9*time.Second)) || horizon.After(time.Now().Add(11*time.Second)) {
+	if horizon.Before(renewStarted.Add(9*time.Second)) || horizon.After(client.subscriptionTime().Add(11*time.Second)) {
 		t.Fatalf("renewed conservative horizon = %v", horizon)
 	}
 	if err := client.AcknowledgeChanges(context.Background(), 7, 1); err != nil {
@@ -181,19 +189,19 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 
 func TestCoherenceV2ClientMethodsValidateAndCloneWireResults(t *testing.T) {
 	handler := &coherenceV2ClientHandler{
-		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 6},
+		clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x12}, 16), maxInFlight: 9},
 		pollStarted:       make(chan struct{}),
 		pollRelease:       make(chan struct{}),
 	}
 	client := dialCoherenceV2TestClient(t, handler)
 
-	started := time.Now()
+	started := client.subscriptionTime()
 	reply, horizon, err := client.Subscribe(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reply.GetIncarnation() != 7 || reply.GetWatermark() != 41 ||
-		horizon.Before(started.Add(9*time.Second)) || horizon.After(time.Now().Add(11*time.Second)) {
+		horizon.Before(started.Add(9*time.Second)) || horizon.After(client.subscriptionTime().Add(11*time.Second)) {
 		t.Fatalf("Subscribe reply=%+v horizon=%v", reply, horizon)
 	}
 
@@ -240,7 +248,7 @@ func TestCoherenceV2ClientMethodsValidateAndCloneWireResults(t *testing.T) {
 	}
 }
 
-func TestValidateControlEventRejectsMalformedProtocol7Bodies(t *testing.T) {
+func TestValidateControlEventRejectsMalformedControlBodies(t *testing.T) {
 	identity := bytes.Repeat([]byte{0x61}, 16)
 	ref := &authoritypb.DelegationRef{Id: bytes.Repeat([]byte{0x62}, 16), Generation: 1}
 	tests := []struct {
@@ -306,5 +314,58 @@ func TestAuthorityEpochChangeWaitsForResponseConsumptionWithoutForcedRevocation(
 	case <-client.SessionEndPending():
 	case <-time.After(time.Second):
 		t.Fatal("epoch terminal edge did not publish after response consumption")
+	}
+}
+
+func TestSubscriptionReplyAfterSuspendIsRejected(t *testing.T) {
+	for _, operation := range []string{"subscribe", "renew", "pagination"} {
+		t.Run(operation, func(t *testing.T) {
+			handler := &coherenceV2ClientHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x51}, 16), maxInFlight: 9}, paginate: operation == "pagination"}
+			client := dialCoherenceV2TestClient(t, handler)
+			start := time.Unix(123, 0)
+			var elapsed atomic.Int64
+			client.subscriptionNow = func() time.Time { return start.Add(time.Duration(elapsed.Load())) }
+			var first *authoritypb.SubscribeReply
+			if operation != "subscribe" {
+				var err error
+				first, _, err = client.Subscribe(t.Context(), nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			hook := func() { elapsed.Store(int64(11 * time.Second)) }
+			handler.beforeSubscriptionReply.Store(&hook)
+			var err error
+			switch operation {
+			case "subscribe":
+				_, _, err = client.Subscribe(t.Context(), nil, nil)
+			case "renew":
+				_, err = client.RenewSubscription(t.Context(), 7)
+			case "pagination":
+				_, _, err = client.Subscribe(t.Context(), first.GetSnapshotId(), first.GetNextAfterIdentity())
+			}
+			if !errors.Is(err, ErrSubscriptionReset) {
+				t.Fatalf("%s reply delivered after suspend: %v, want cold reset", operation, err)
+			}
+		})
+	}
+}
+
+func TestSubscriptionProofUsesContinuousRequestAnchor(t *testing.T) {
+	handler := &coherenceV2ClientHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x52}, 16), maxInFlight: 9}}
+	client := dialCoherenceV2TestClient(t, handler)
+	start := time.Unix(123, 0)
+	var elapsed atomic.Int64
+	client.subscriptionNow = func() time.Time { return start.Add(time.Duration(elapsed.Load())) }
+	hook := func() { elapsed.Add(int64(time.Second)) }
+	handler.beforeSubscriptionReply.Store(&hook)
+	_, deadline, err := client.Subscribe(t.Context(), nil, nil)
+	if err != nil || !deadline.Equal(start.Add(10*time.Second)) {
+		t.Fatalf("subscribe deadline=%v err=%v", deadline, err)
+	}
+	anchor := client.subscriptionTime()
+	deadline, err = client.RenewSubscription(t.Context(), 7)
+	if err != nil || !deadline.Equal(anchor.Add(10*time.Second)) {
+		t.Fatalf("renewal deadline=%v err=%v", deadline, err)
 	}
 }

@@ -14,7 +14,7 @@ import (
 // applyQuiesceFence performs the authority-owned empty-membership handshake
 // before using the ordinary process fence. Archive and destructive quiesce use
 // this one implementation; restart fencing deliberately does not.
-func (host *Host) applyQuiesceFence(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *Host) applyQuiesceFence(ctx context.Context, plan cellplan.EffectiveVolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	if plan.PriorStrictFenced {
 		return host.applyExternallyFencedQuiesce(ctx, plan), cellhelper.HostUpdate{}
 	}
@@ -87,7 +87,7 @@ func (host *Host) applyQuiesceFence(ctx context.Context, plan cellplan.VolumePla
 // binds that attestation to this placement. The helper still establishes local
 // authority absence, but it does not claim that the authority completed its
 // ordinary empty-membership handshake.
-func (host *Host) applyExternallyFencedQuiesce(ctx context.Context, plan cellplan.VolumePlan) controlplane.VolumeObservation {
+func (host *Host) applyExternallyFencedQuiesce(ctx context.Context, plan cellplan.EffectiveVolumePlan) controlplane.VolumeObservation {
 	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID)}
 	absent, err := host.fence(ctx, plan.VolumeID)
 	if err != nil || !absent {
@@ -101,7 +101,7 @@ func (host *Host) applyExternallyFencedQuiesce(ctx context.Context, plan cellpla
 	return observed
 }
 
-func (host *Host) observeQuiesceFence(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) controlplane.VolumeObservation {
+func (host *Host) observeQuiesceFence(ctx context.Context, plan cellplan.EffectiveVolumePlan, previous cellhelper.Assignment) controlplane.VolumeObservation {
 	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID)}
 	absent, err := host.authorityAbsent(ctx, plan.VolumeID)
 	if err != nil || !absent {

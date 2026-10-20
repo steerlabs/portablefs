@@ -79,10 +79,10 @@ func (p *GatewayPeerFixture) Join(i int, elements ...string) string {
 	return p.f.join(i, elements...)
 }
 
-// RepairBudget is the per-phase budget every mount in this fixture declared. A
-// frontend that does not discharge inside it is fenced, so it is the scale a
-// claim about obstruction has to be measured against.
-func (p *GatewayPeerFixture) RepairBudget() time.Duration { return integrationRepairBudget }
+// WithdrawalTimeout is the kernel-withdrawal bound every mount in this fixture
+// runs with. A mount that cannot withdraw inside it revokes itself, so it is
+// the scale a claim about obstruction has to be measured against.
+func (p *GatewayPeerFixture) WithdrawalTimeout() time.Duration { return integrationWithdrawalTimeout }
 
 // LastAttachProfile is the frontend profile of the most recent attach the
 // authority handled.

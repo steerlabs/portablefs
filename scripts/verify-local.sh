@@ -10,9 +10,10 @@
 # It has two modes, and the difference is not cosmetic.
 #
 #   default   Everything that runs without Docker and without a privileged
-#             container: cross-platform build and vet, govulncheck, the native
-#             Go suites, the go-fuse physical-reply seam, the Swift suite on
-#             macOS, workflow/release-trust policy, and the architecture scans.
+#             container: cross-platform build and vet, govulncheck, uncached
+#             pfslocal schema freshness, native Go suites, go-fuse reply and
+#             unmount seams, the Swift suite on macOS, workflow/release-trust
+#             policy, and the current-architecture check.
 #             It does NOT run either real-mount suite. The closing banner names
 #             what it skipped; this mode alone is not merge evidence for a
 #             change to the authority, a frontend, or the coherence protocol.
@@ -38,7 +39,7 @@ for arg in "$@"; do
   case "$arg" in
     --full) VERIFY_LOCAL_FULL=1 ;;
     --help|-h)
-      sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -100,23 +101,36 @@ go -C vcs run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
 # 3. and 4. The Go suites run natively — the tests exercise real syscalls,
 # sockets and mounts, so they are only meaningful on the host platform.
+# Check the out-of-module schema without Go's test cache.
+step "pfslocal schema freshness (uncached)"
+go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
+
 step "go suite (native)"
 go -C vcs test ./...
 
 step "go race suite (native)"
 go -C vcs test -race ./...
 
+step "compiled macOS CLI layouts (production and development)"
+bash scripts/test-macos-cli-layouts.sh
+
 # The maintained go-fuse fork is a nested module, so the suite above does not
-# enter it. Protocol 7 retains one stock-FUSE-neutral seam: ReplyWriteLifecycle
-# tracks selected physical replies while descriptor lifetime is shared with
-# notifications. Gate that lifecycle without running the retired private-ABI tests.
-step "maintained go-fuse physical reply seam"
+# enter it. ReplyWriteLifecycle tracks selected physical replies while
+# descriptor lifetime is shared with notifications. Normal unmount makes one
+# helper attempt and joins workers only after success. Gate both maintained
+# seams; the fork's other tests are not part of this product's contract.
+step "maintained go-fuse reply and unmount seams"
 go -C vcs/third_party/go-fuse build ./fuse
 go -C vcs/third_party/go-fuse vet ./fuse
-go -C vcs/third_party/go-fuse test ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites)$'
-go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites)$'
+go -C vcs/third_party/go-fuse test ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
+go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
 
-# 5. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
+# 5. The native observer's evidence rules need no mount or platform privilege.
+step "native cache observer evidence"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_macos27_kernel_cache_observer.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_writeback_probes.py
+
+# The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
 # contain the same unique all-passing set. Other hosts skip this macOS-only
 # package loudly; the macOS CI job always runs it.
@@ -128,8 +142,8 @@ else
 fi
 
 # 6. Workflow semantics and release-trust policy. actionlint is version-pinned
-# exactly like CI and reads .github/actionlint.yaml for the one approved custom
-# runner label. The two project checkers are dependency-free single-file node
+# exactly like CI and reads .github/actionlint.yaml for approved runner labels.
+# The two project checkers are dependency-free single-file node
 # programs (the repository carries no JavaScript packages); they read the
 # installer, the workflows and .goreleaser.yaml as text.
 step "release trust policy"
@@ -153,100 +167,21 @@ if [ -f deploy/files/test_release_registry.py ]; then
   python3 deploy/files/test_release_registry.py
 fi
 
-# 7. Stale-architecture scan. v3 is the direct-store system: a Go data plane
-# addressing an XFS-backed authority, with the FSKit frontend on top. The
-# journal-era v2 architecture (a remote append-only journal, a TypeScript
-# control plane, and the clientcore/history stack layered on them) was
-# deleted wholesale. These identifiers are that architecture's actual API and
-# package surface, so a match means it is growing back rather than that a
-# comment mentions history.
-#
-# The package identifiers are matched as import paths (internal/<pkg>), not as
-# bare words. Protocol 7 deliberately has an internal/writeback client buffer;
-# that package is unrelated to the removed journal client and is covered by its
-# own tests. fsproto remains retired, while pfslocal.proto's prose may still
-# refer to that retired wire.
-#
-# Excluded: docs/ and CHANGELOG.md (history is supposed to name the thing it
-# replaced), this script, and the two harnesses that really do drive pnpm as
-# one of the package managers under test -- scripts/package-manager-matrix.sh
-# locally and deploy/opensteer/staging-qualification.sh against live staging.
-step "stale architecture scan"
-if rg --hidden -n \
-  -e 'JournalRecord\b' \
-  -e '\bremotejournal\b' \
-  -e 'internal/clientcore\b' \
-  -e 'internal/fsproto\b' \
-  -e '\bhistworker\b' \
-  -e '\bpfj3\b' \
-  -e 'volume-api' \
-  -e 'authority-manager' \
-  -e '\bpnpm\b' \
-  . \
-  -g '!.git' \
-  -g '!docs' \
-  -g '!CHANGELOG.md' \
-  -g '!scripts/verify-local.sh' \
-  -g '!scripts/package-manager-matrix.sh' \
-  -g '!deploy/opensteer/staging-qualification.sh'
-then
-  echo "stale v2 (journal-era) references found" >&2
-  exit 1
-fi
-
-# Protocol 7 uses explicit frontend profiles, subscriptions and file delegations.
-# Broad cross-frontend profile predicates, the old non-participant profile and both
-# retired namespace-repair models keep their names reserved in the
-# source schema (and therefore in generated descriptor bytes), while docs and
-# the changelog may describe their retirement. None may re-enter executable
-# code, tests, scripts, or configuration.
-if rg --hidden -n \
-	-e '\bstrictSession\b' \
-  -e 'CoherenceUncached' \
-  -e 'COHERENCE_PROFILE_UNCACHED' \
-  -e 'PORTABLEFS_COHERENCE' \
-  -e '--coherence uncached' \
-  -e 'LOCKLESS_EXPIRATION' \
-  -e 'NamespaceRepairLocklessExpiration' \
-  -e 'PARENT_EXCLUSIVE' \
-  -e 'NamespaceRepairParentExclusive' \
-  -e 'blocked_parent_kernel_inos' \
-  -e 'BlockedParentKernelInos' \
-  . \
-  -g '!.git' \
-  -g '!docs' \
-  -g '!CHANGELOG.md' \
-  -g '!proto/authority/v1/authority.proto' \
-  -g '!vcs/internal/authoritypb/authority.pb.go' \
-  -g '!scripts/verify-local.sh'
-then
-  echo "retired non-participant coherence profile references found" >&2
-  exit 1
-fi
-
-# Active product material must describe the protocol-7 stock-FUSE architecture.
-# Historical qualification receipts are intentionally outside this list: they
-# remain evidence, not a build or runtime dependency. The patch series for the
-# retired private ABI is no longer in the tree at all; git history holds it.
-# Keeping the input list explicit makes a newly active contract an
-# intentional review event rather than silently granting all docs authority.
-step "active stock-FUSE contract scan"
-if rg -n \
-  -e 'portablefs-authority-v5' \
-  -e 'authority protocol major `5`' \
-  -e '\bCAP_PFS_' \
-  -e '\bFUSE_PFS_' \
-  -e 'exact patched kernel' \
-  -e 'pinned Linux 6\.12\.100' \
-  README.md COMPATIBILITY.md \
-  docs/architecture.md docs/consistency-model.md docs/failure-modes.md \
-  docs/local-dev.md docs/xfs-authority-deployment.md \
-  .github/workflows scripts/coherence-matrix-linux.sh \
-  scripts/xfs-fuse-integration.sh
-then
-  echo "retired private-kernel contract found in active product material" >&2
-  exit 1
-fi
+# 7. Current-architecture check. These are positive structural assertions,
+# not a blacklist of retired names: the exact authority major and ALPN, the
+# four frontend profiles, the handshake and private-frontend grammar, the
+# shared golden frames, exact pfslocal/control/lifecycle pairing on both sides
+# of each boundary, the single mount-membership codec, which production
+# frontend selects which profile, the exact product executables and language
+# roots, every launcher/script/doc command line against the executable's real
+# flags, the privileged required-test inventories, COMPATIBILITY.md agreeing
+# with the code, and every relative documentation link. The expected values
+# live in the checker's manifest; changing one is a deliberate contract change.
+# Its parsers have their own unit tests, run first so a checker defect cannot
+# masquerade as a tree defect.
+step "current architecture check"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_current_architecture.py
+python3 scripts/check-current-architecture.py
 
 # 8. The two privileged real-mount suites. These are the only gates in this
 # repository that observe a real kernel FUSE mount against real XFS, so no
@@ -274,14 +209,20 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
 
   echo
   echo "verify-local: ok (full)"
-  echo "  ran: build/vet, govulncheck, native go suites, go-fuse physical-reply seam,"
+  echo "  ran: build/vet, govulncheck, native go suites, both macOS CLI layouts,"
+  echo "       go-fuse reply/unmount seams,"
   echo "       Swift suite (macOS host only), workflow/release-trust policy,"
-  echo "       architecture scans, xfs-fuse-integration.sh, coherence-matrix-linux.sh"
+  echo "       current-architecture check, xfs-fuse-integration.sh,"
+  echo "       coherence-matrix-linux.sh"
   echo "  still NOT run by --full:"
   echo "    - scripts/package-manager-matrix.sh   third Docker suite; a workload"
   echo "                                         soak, run on demand, not in CI"
   echo "    - scripts/coherence-matrix-macos.sh   live macOS FSKit mount matrix;"
   echo "                                         needs a user-enabled extension"
+  echo "    - scripts/run-powerloss.sh            dm-log-writes power-cut harness"
+  echo "                                         (Linux and FSKit-handler cuts);"
+  echo "                                         privileged runner, weekly in CI"
+  echo "    - native macOS 26/27 acceptance and the LAN workload"
   echo "    - deploy/opensteer/staging-qualification.sh against a live cell"
   exit 0
 fi
@@ -298,6 +239,8 @@ if [[ "$(uname -s)" != Darwin ]]; then
   echo "  - scripts/test-swift-xcode.sh      Xcode-native Swift suite (macOS only)"
 fi
 echo "  - scripts/coherence-matrix-macos.sh live macOS FSKit mount matrix"
+echo "  - scripts/run-powerloss.sh          dm-log-writes power-cut harness"
+echo "  - native macOS 26/27 acceptance and the LAN workload"
 echo "  - deploy/opensteer/staging-qualification.sh real-workload staging corpus"
 echo
 echo "CI runs both privileged Linux suites on its ubuntu-24.04 lanes"

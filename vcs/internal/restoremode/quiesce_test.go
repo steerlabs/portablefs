@@ -20,13 +20,13 @@ func TestQuiesceProofIsWrittenOnlyUnderEmptyMembershipLock(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	membership, _, err := volumeserver.OpenFileVisibilityMembership(filepath.Join(stateRoot, "visibility.membership"), "volume-a", false)
+	membership, _, err := volumeserver.OpenFileMountMembership(filepath.Join(stateRoot, "mount.membership"), "volume-a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer membership.Close()
 	id := volumeserver.SessionID{1}
-	if err := membership.Activate(id); err != nil {
+	if err := membership.ActivateProfile(id, volumeserver.MembershipFSKitExclusive); err != nil {
 		t.Fatal(err)
 	}
 	nonce := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -44,7 +44,7 @@ func TestQuiesceProofIsWrittenOnlyUnderEmptyMembershipLock(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(stateRoot, QuiesceProof)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("proof while membership active: %v", err)
 	}
-	if err := membership.Activate(volumeserver.SessionID{2}); !errors.Is(err, volumeserver.ErrQuiescing) {
+	if err := membership.ActivateProfile(volumeserver.SessionID{2}, volumeserver.MembershipFSKitExclusive); !errors.Is(err, volumeserver.ErrQuiescing) {
 		t.Fatalf("strict attach during quiesce = %v", err)
 	}
 	if err := membership.Deactivate(id); err != nil {
@@ -63,7 +63,7 @@ func TestQuiesceProofIsWrittenOnlyUnderEmptyMembershipLock(t *testing.T) {
 	if err := watcher.Check(); err != nil {
 		t.Fatal(err)
 	}
-	if err := membership.Activate(volumeserver.SessionID{3}); err != nil {
+	if err := membership.ActivateProfile(volumeserver.SessionID{3}, volumeserver.MembershipFSKitExclusive); err != nil {
 		t.Fatalf("strict attach after cancellation = %v", err)
 	}
 }

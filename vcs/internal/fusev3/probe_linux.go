@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -35,26 +36,51 @@ type KernelProbe struct {
 // pass on a kernel that cannot carry the request size a real mount negotiates.
 const probeMaxIO = 1 << 20
 
+// probeMaxBackground is the probe's FUSE background bound. The probe serves no
+// requests, so any small positive bound negotiates the same INIT.
+const probeMaxBackground = 8
+
 // ProbeKernelFUSE installs one real FUSE mount on a private, empty temporary
 // directory, completes the kernel INIT handshake against this binary's own
-// mount options, verifies the same kernel guarantees a live mount requires,
-// and unmounts.
+// mount options, captures the mount identity and retains its verified writable
+// fusectl abort descriptor through the same startup path as a live mount,
+// verifies the kernel guarantees, and unmounts.
 //
 // It exists because every cheaper check — the /dev/fuse node existing, the
 // device opening, CAP_SYS_ADMIN being held, a helper being installed — is
-// satisfied by a client that can never complete FUSE INIT. That is exactly the
-// failure that reaches production silently: the mount command starts, attaches
-// to an authority, installs a kernel mount, and only then discovers that the
-// interface it asked for is not one this kernel will speak.
+// satisfied by a client that can never complete FUSE INIT or retain its abort
+// descriptor. These startup failures must reach the probe before a tenant's
+// first mount.
 //
 // It proves nothing about the authority, the wire protocol, or coherence. No
 // authority is contacted and no file is served; the mounted filesystem answers
-// nothing. Only INIT, the negotiated capability set, and the mount/unmount
-// lifecycle are exercised.
+// nothing. Only INIT, the negotiated capability set, the fusectl control
+// prerequisite, and the mount/unmount lifecycle are exercised.
 func ProbeKernelFUSE() (KernelProbe, error) {
+	return probeKernelFUSE(fuse.NewServer)
+}
+
+func probeKernelFUSE(newServer func(fuse.RawFileSystem, string, *fuse.MountOptions) (*fuse.Server, error)) (KernelProbe, error) {
+	mountpoint, err := os.MkdirTemp("", "portablefs-fuse-probe-")
+	if err != nil {
+		return KernelProbe{}, fmt.Errorf("fusev3: create FUSE probe mountpoint: %w", err)
+	}
+	defer os.Remove(mountpoint)
+	// Mountinfo names the kernel-resolved absolute path, even when TMPDIR is
+	// relative or contains a symlink.
+	mountpoint, err = filepath.Abs(mountpoint)
+	if err != nil {
+		return KernelProbe{}, fmt.Errorf("fusev3: resolve FUSE probe mountpoint: %w", err)
+	}
+	mountpoint, err = filepath.EvalSymlinks(mountpoint)
+	if err != nil {
+		return KernelProbe{}, fmt.Errorf("fusev3: resolve FUSE probe mountpoint: %w", err)
+	}
+
 	options := mountOptions(Config{
-		MountInstanceID: "fuse-probe",
-		MaxBackground:   minMaxInFlight,
+		// Identity capture must distinguish concurrent probe mounts.
+		MountInstanceID: filepath.Base(mountpoint),
+		MaxBackground:   probeMaxBackground,
 	}, probeMaxIO, probeMaxIO)
 	// The probe must not be able to pass by asking for a weaker interface than
 	// a live mount asks for.
@@ -62,30 +88,51 @@ func ProbeKernelFUSE() (KernelProbe, error) {
 		return KernelProbe{}, err
 	}
 
-	mountpoint, err := os.MkdirTemp("", "portablefs-fuse-probe-")
+	server, err := newServer(probeFileSystem{fuse.NewDefaultRawFileSystem()}, mountpoint, options)
 	if err != nil {
-		return KernelProbe{}, fmt.Errorf("fusev3: create FUSE probe mountpoint: %w", err)
+		return KernelProbe{}, errors.Join(fmt.Errorf("fusev3: install FUSE probe mount: %w", err), removeMountInstalledByFailedHelper(options.FsName, mountpoint))
 	}
-	defer os.Remove(mountpoint)
-
-	server, err := fuse.NewServer(probeFileSystem{fuse.NewDefaultRawFileSystem()}, mountpoint, options)
-	if err != nil {
-		return KernelProbe{}, fmt.Errorf("fusev3: install FUSE probe mount: %w", err)
-	}
+	installed, probeErr := captureKernelMount(options.FsName, mountpoint)
+	// NewServer prepares a request-loop reference; even failed startup must
+	// run Serve once before normal Unmount can finish.
 	served := make(chan struct{})
 	go func() {
 		server.Serve()
 		close(served)
 	}()
 
-	probe, probeErr := completeProbeInit(server)
-	unmountErr := server.Unmount()
-	<-served
-	if probeErr != nil {
-		return KernelProbe{}, probeErr
+	var probe KernelProbe
+	if probeErr == nil {
+		probe, probeErr = completeProbeInit(server)
 	}
+	unmountErr := server.Unmount()
+	joinServe := unmountErr == nil
 	if unmountErr != nil {
-		return KernelProbe{}, fmt.Errorf("fusev3: remove FUSE probe mount: %w", unmountErr)
+		unmountErr = fmt.Errorf("fusev3: remove FUSE probe mount: %w", unmountErr)
+		// A refused normal unmount leaves Serve running. As in live terminal
+		// withdrawal, abort the retained connection before an identity-checked
+		// lazy detach. The refusal remains a failed probe even after cleanup.
+		abortErr := installed.abortKernelConnection()
+		joinServe = abortErr == nil
+		if abortErr != nil {
+			abortErr = fmt.Errorf("fusev3: abort FUSE probe connection: %w", abortErr)
+		}
+		present, detachErr := installed.detachTargetInstalled()
+		if detachErr == nil && present {
+			detachErr = server.UnmountLazy()
+		}
+		_, absenceErr := installed.absent()
+		unmountErr = errors.Join(unmountErr, abortErr, detachErr, absenceErr)
+	}
+	// Only successful unmount or abort establishes connection termination.
+	// If neither succeeded, report cleanup failure and release the descriptor
+	// without waiting on a connection that may still be serving.
+	if joinServe {
+		<-served
+	}
+	closeErr := installed.abortFile.close()
+	if err := errors.Join(probeErr, unmountErr, closeErr); err != nil {
+		return KernelProbe{}, err
 	}
 	return probe, nil
 }

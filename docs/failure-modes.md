@@ -1,6 +1,6 @@
 # Failure modes
 
-Protocol 7 scopes coherence failures to permissions, identities, or handles.
+Coherence failures are scoped to permissions, identities, or handles.
 The mount survives subscription recovery and recall budget loss. Shipping
 mounts withdraw on Authority epoch replacement and require fresh authorization.
 Authentication, exact replay, and storage invariants still
@@ -18,6 +18,7 @@ fail closed. The full contract and accepted residuals are in
 | Volume epoch | Authority death, fatal XFS I/O or topology error | old capabilities, locks, and handles die; new handles require cold reattachment |
 | Restore | archive-store outage, absent hydrator, digest failure | content reads fail with FAILURE_CLASS_RESTORE; epoch and sessions remain alive |
 | Frontend | unsupported FUSE level or operation outside profile | refuse explicitly; no silent downgrade |
+| Storage cell | writeback or log failure on a shared XFS cell, possibly from another project | the next syncfs barrier on any volume in the cell fails and fences that store; no filtering or cursor reset |
 
 Failure never converts an already-applied mutation into a new retry. Responses
 retain the STORAGE, COHERENCE, ROUTES, RESTORE, and INTERNAL failure classes;
@@ -46,7 +47,15 @@ every old handle and restarting renewal for the new session. That path requires
 a still-valid configured attach grant; it does not acquire fresh Host authority.
 Old Linux membership is fenced through its subscription horizon. Unproven
 membership still blocks route/archive transitions until absence is established;
-old Mac membership requires its compatibility-cache fence.
+old FSKit membership requires its writer fence: foreign writers wait 61.06
+seconds after safe takeover and Mac activation requires operator
+reconciliation.
+
+A syncfs barrier reports the cell filesystem's superblock-wide writeback error
+sequence. On a shared multi-project cell, an error caused by another project's
+inode fences this store at its next barrier; the authority treats it as storage
+failure and never relabels it, retries to clear it, or rotates the root
+description. Separate filesystems are separate error domains.
 
 Same-epoch exact replay returns the retained result without re-execution.
 Reusing an operation identity with a different canonical body or skipping its
@@ -84,6 +93,8 @@ and invalidates. Stock FUSE offers no userspace mechanism to fence those reads.
 Reverse d_path/getcwd rendering of retained dentries is outside the contract.
 
 ## Process failure and completion
+
+An exited, unreaped mount supervisor counts as stopped.
 
 A dead mount daemon loses its volatile accepted tail and the kernel eventually
 aborts its FUSE connection. A missed delegation budget can lose data that was
@@ -164,11 +175,19 @@ O_APPEND placement is Authority-resolved at true EOF. Stock FUSE does not
 forward per-call RWF_APPEND/RWF_NOAPPEND; their disclosed deviations are in the
 consistency model, not silently inferred from an offset.
 
-macOS 26 and 27 mount through the explicit `FSKIT_SYNC_REPAIR` profile. Current
-FSKit cannot prove name/attribute cache withdrawal, per-reply metadata installation
-control, exact append intent, or distributed locks, so those edges are declared
-best-effort. The authority still orders its PREPARE/COMPLETE repair around the
-same XFS mutation and fences a session that misses that repair deadline.
+macOS 26 and 27 mount through `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`. Current FSKit
+cannot withdraw name or attribute caches, control per-reply metadata
+installation, or expose append intent or distributed locks, so a Mac mount is
+the volume's exclusive writer and a second Mac is refused. On Mac session loss,
+fence, or daemon failure, the daemon stops serving and the extension rejects
+successful serving publication, but names, attributes, and pages already in
+the macOS kernel remain observable on that Mac until unmount; PortableFS does
+not force an unmount. A normal unmount makes one unforced attempt and reports a
+real `EBUSY`. Completed deactivation, resource unloading, and errorless unmount
+completion acknowledge local cleanup only, preserving the first terminal cause
+and every mutation/synchronize error. They prove neither durability nor kernel absence
+or daemon reconciliation. See
+[the FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown).
 
 Windows has no production frontend and is refused by its primitive gate.
 
@@ -179,9 +198,10 @@ Windows has no production frontend and is refused by its primitive gate.
 - `scripts/coherence-matrix-linux.sh` drives two independent stock-kernel
   mount processes through ordinary syscalls and runs falsifiability controls.
 - `scripts/run-powerloss.sh` distinguishes process death from device-level
-  durability cuts.
-- `scripts/verify-local.sh` runs portable compile, unit, race, workflow-policy,
-  and active-contract scans; `--full` also runs the two suites above.
+  durability cuts, for both a Linux mount and the FSKit authority handler.
+- `scripts/verify-local.sh` runs portable compile, uncached `pfslocal` schema
+  freshness, unit, race, workflow-policy, and current-architecture checks;
+  `--full` also runs the two suites above.
 
 The exact subscription/delegation algorithm and remaining qualification are in
 [portable-coherence.md](./portable-coherence.md).

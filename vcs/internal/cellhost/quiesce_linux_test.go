@@ -234,7 +234,7 @@ func TestApplyQuiesceFenceAcceptsMatchingProofAndFencesAuthority(t *testing.T) {
 	nonce := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	writeProof(t, fixture, answeredProof(nonce), 0o600)
 	writeMembership(t, fixture, membershipDocument(testVolumeID), 0o600)
-	plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+	plan := cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}}
 	previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: nonce}
 
 	observed, update := fixture.host.Apply(context.Background(), plan, previous)
@@ -256,8 +256,8 @@ func TestApplyQuiesceFenceUsesExternalFenceWithoutClaimingQuiesceProof(t *testin
 	var staleSession [16]byte
 	staleSession[0] = 1
 	writeMembership(t, fixture, membershipDocument(testVolumeID, staleSession), 0o600)
-	plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7,
-		ServiceGID: 210000, PriorStrictFenced: true}
+	plan := cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7,
+		ServiceGID: 210000, PriorStrictFenced: true}}
 
 	observed, update := fixture.host.Apply(context.Background(), plan, cellhelper.Assignment{})
 	if observed.Error != "" || !observed.AuthorityAbsent || observed.QuiesceProven || update.LastQuiesceNonce != "" {
@@ -279,7 +279,7 @@ func TestApplyQuiesceFenceRefusesStaleProof(t *testing.T) {
 	requested := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	stale := hex.EncodeToString([]byte("abcdef0123456789abcdef0123456789"))
 	writeProof(t, fixture, answeredProof(stale), 0o600)
-	plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+	plan := cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}}
 	previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: requested}
 
 	observed, _ := fixture.host.Apply(context.Background(), plan, previous)
@@ -298,7 +298,7 @@ func TestApplyQuiesceFenceHandlesAuthorityAlreadyAbsent(t *testing.T) {
 		nonce := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 		writeProof(t, fixture, answeredProof(nonce), 0o600)
 		writeMembership(t, fixture, membershipDocument(testVolumeID), 0o600)
-		plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+		plan := cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}}
 		previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: nonce}
 
 		observed, _ := fixture.host.Apply(context.Background(), plan, previous)
@@ -312,7 +312,7 @@ func TestApplyQuiesceFenceHandlesAuthorityAlreadyAbsent(t *testing.T) {
 		runner := &quiesceFenceRunner{}
 		fixture.host.cfg.Runner = runner
 		nonce := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
-		plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+		plan := cellplan.EffectiveVolumePlan{VolumePlan: cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}}
 		previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: nonce}
 
 		observed, _ := fixture.host.Apply(context.Background(), plan, previous)

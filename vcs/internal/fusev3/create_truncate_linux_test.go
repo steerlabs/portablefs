@@ -15,12 +15,26 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"google.golang.org/protobuf/proto"
 )
 
+type heldBackgroundDurabilityRPC struct{ delegationRPC }
+
+func (r heldBackgroundDurabilityRPC) CallMutation(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
+	if req.GetBarrier() != nil {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.delegationRPC.CallMutation(ctx, req)
+}
+
 func TestCreateTruncateRetiresExistingDelegatedOverlayBeforeDispatch(t *testing.T) {
 	mount, rpc := testMount(t, 32)
+	// Retention is this test's subject. Hold background completion outside the
+	// fake transport's dispatch lock so CREATE and its source reply can run.
+	mount.delegations.rpc = heldBackgroundDurabilityRPC{mount.delegations.rpc}
 	raw := mount.raw
 	root := raw.nodesByID[1].node
 	existing := cloneItem(rpc.item)
@@ -254,7 +268,7 @@ func TestCloseAttemptsBarrierThroughHorizonAfterSessionEnd(t *testing.T) {
 	}
 	mount.subscription.mu.Lock()
 	mount.subscription.active = true
-	mount.subscription.horizon = time.Now().Add(80 * time.Millisecond)
+	mount.subscription.horizon = mount.subscription.config.clock.Now().Add(80 * time.Millisecond)
 	mount.subscription.mu.Unlock()
 	before := unreachable.barriers.Load()
 	start := time.Now()
@@ -282,12 +296,22 @@ func TestCloseAttemptsBarrierThroughHorizonAfterSessionEnd(t *testing.T) {
 	}
 }
 
+// Shutdown's admission test holds the flush before replay assignment. An
+// assigned request with no outcome has the distinct retained-data-loss contract.
+type unsentShutdownFlushRPC struct{ delegationFakeRPC }
+
+func (*unsentShutdownFlushRPC) CallMutationSegments(ctx context.Context, _ *authoritypb.Request, _ [][]byte, _ authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func TestCloseFencesCapacityWaitBeforeBarrier(t *testing.T) {
-	fake := &delegationFakeRPC{block: make(chan struct{})}
-	manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	fake := &unsentShutdownFlushRPC{}
+	manager, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	manager.StartWriteback()
 	t.Cleanup(manager.Stop)
 	id := installDelegationForTest(t, manager, 93, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	if _, err := manager.Write(t.Context(), id, 0, []byte("dirty"), false); err != nil {
@@ -300,7 +324,7 @@ func TestCloseFencesCapacityWaitBeforeBarrier(t *testing.T) {
 	waitFor(t, "shutdown capacity waiter", func() bool { return manager.buf.Stats().WaitingAdmissions == 1 })
 	mount := &Mount{delegations: manager, subscription: newSubscriptionRegistry(nil, nil, nil)}
 	mount.subscription.active = true
-	mount.subscription.horizon = time.Now().Add(80 * time.Millisecond)
+	mount.subscription.horizon = mount.subscription.config.clock.Now().Add(80 * time.Millisecond)
 	closed := make(chan error, 1)
 	go func() { closed <- mount.flushDelegationsBeforeClose() }()
 	select {

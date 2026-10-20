@@ -3,6 +3,7 @@ package portablefsd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -15,79 +16,24 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
-// The live failure this pins: the frontend's control lane (visibility
-// acknowledgments, liveness) deliberately overtakes queued ordinary requests,
-// so under a mutation storm a barrier acknowledgment legally arrives with a
-// LOWER request id than an ordinary frame already received. A single global
-// watermark read that as replay and closed the connection — killing the mount
-// the moment it was busy enough for the ack to overtake anything.
-func TestControlLaneMayOvertakeOrdinaryRequests(t *testing.T) {
-	var lastRequest, lastControl uint64
-	admit := func(body any, id uint64) bool {
-		_, ok := admitLaneRequestID(body, id, &lastRequest, &lastControl)
-		return ok
-	}
-	lookup := &pfslocal.LookupRequest{}
-	ack := &pfslocal.VisibilityAckRequest{}
-	liveness := &pfslocal.V3LivenessRequest{}
-
-	if !admit(lookup, 5) {
-		t.Fatal("ordinary request 5 refused")
-	}
-	// The storm shape: the ack was allocated id 3 before the burst but its
-	// lane delivered it after ordinary id 5.
-	if !admit(ack, 3) {
-		t.Fatal("a control frame with a lower id than the ordinary watermark was refused; the priority lane's whole point is overtaking the request burst")
-	}
-	if !admit(lookup, 6) {
-		t.Fatal("ordinary request 6 refused after a control frame")
-	}
-	if !admit(liveness, 4) {
-		t.Fatal("liveness with a lower id than the ordinary watermark was refused")
-	}
-
-	// Replay protection survives per lane.
-	if admit(lookup, 6) {
-		t.Fatal("a replayed ordinary id was admitted")
-	}
-	if admit(ack, 4) {
-		t.Fatal("a replayed control id was admitted")
-	}
-	if admit(lookup, 0) {
-		t.Fatal("request id zero was admitted")
-	}
-}
-
 func publicationTestOperation(
 	t *testing.T,
 	c *frontendConn,
 	a *attach,
 	operationID uint64,
-) (*frontendOperation, *frontendOperationParticipant) {
+) {
 	t.Helper()
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
 		t.Fatal("publishing operation was not reserved")
 	}
 	if bridge := a.v3CoherenceBridge(); bridge != nil {
-		bridge.reserveFrontendPublication(operationID)
+		bridge.reserveFrontendPublication(testCallback(operationID))
 	}
-	_, participant, participates, publishes, err := c.beginLogicalOperation(
-		context.Background(), a, operationID, true, &pfslocal.GetAttrRequest{},
-	)
-	if err != nil || !participates || !publishes || participant == nil {
-		t.Fatalf(
-			"begin publishing operation = participant=%v participates=%v publishes=%v error=%v",
-			participant, participates, publishes, err,
-		)
+	publishes, err := c.beginLogicalOperation(context.Background(), a, operationID, true, &pfslocal.GetAttrRequest{})
+	if err != nil || !publishes {
+		t.Fatalf("begin publishing operation: %t, %v", publishes, err)
 	}
-	c.publicationMu.Lock()
-	op := c.operations[operationID].op
-	c.publicationMu.Unlock()
-	if op == nil {
-		t.Fatal("publishing operation has no gate record")
-	}
-	return op, participant
 }
 
 func publicationTestAttach(t *testing.T) (*attach, *v3DataPlane) {
@@ -109,6 +55,179 @@ func (c *countingV3ResponseConsumption) Consume() {
 	}
 }
 
+func TestPublicationAckRacingLastHandlerRetiresBothLedgersBeforeConsumption(t *testing.T) {
+	const operationID = uint64(307)
+	a, d := publicationTestAttach(t)
+	c := &frontendConn{origin: 1, attach: a}
+	publicationTestOperation(t, c, a, operationID)
+	var consumed atomic.Int32
+	if err := d.bridge.sourcePublication.retainFrontendResponseConsumption(testCallback(operationID), &countingV3ResponseConsumption{count: &consumed}); err != nil {
+		t.Fatal(err)
+	}
+	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
+		t.Fatal("semantic publication acknowledgement was refused")
+	}
+
+	// Pause the last handler at the actual live failure: its connection count
+	// is zero, while its out-of-lock bridge retirement has not run. The serial
+	// ack reader now owns logical completion and must close both ledgers.
+	c.publicationMu.Lock()
+	c.operations[operationID].activeRequests = 0
+	c.publicationMu.Unlock()
+	if !c.acknowledgePublication(operationID) {
+		t.Fatal("callback acknowledgement was refused")
+	}
+	if err := d.terminalError(); err != nil {
+		t.Fatalf("a healthy publication race terminalized the mount: %v", err)
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("completed publication consumed %d receipts, want 1", got)
+	}
+	// The delayed handler may finish after the ack reader; its retirement is
+	// idempotent and must neither recreate the operation nor consume twice.
+	d.bridge.releaseFrontendPublication(testCallback(operationID))
+	if err := d.bridge.finishFrontendPublication(testCallback(operationID)); err != nil {
+		t.Fatal(err)
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("late handler consumed the receipt again: %d", got)
+	}
+}
+
+func TestPublicationReservationCoversEveryRequestUntilCallbackCompletion(t *testing.T) {
+	for _, requests := range []int{1, 3} {
+		t.Run(fmt.Sprintf("requests-%d", requests), func(t *testing.T) {
+			const operationID = uint64(308)
+			a, d := publicationTestAttach(t)
+			c := &frontendConn{origin: 1, attach: a}
+			publicationTestOperation(t, c, a, operationID)
+			for request := 0; request < requests; request++ {
+
+				c.finishLogicalRequest(operationID)
+				d.bridge.sourcePublication.mu.Lock()
+				op := d.bridge.sourcePublication.operations[testCallback(operationID)]
+				reserved := op != nil && op.reserved
+				d.bridge.sourcePublication.mu.Unlock()
+				if !reserved {
+					t.Fatal("a handler withdrew the still-live callback's reservation")
+				}
+				if request+1 < requests {
+					initialize, ok := c.reserveLogicalOperation(operationID, false)
+					if initialize || !ok {
+						t.Fatal("continuation could not join its live callback")
+					}
+					d.bridge.reserveFrontendPublication(testCallback(operationID))
+					_, err := c.beginLogicalOperation(
+						context.Background(), a, operationID, false, &pfslocal.GetAttrRequest{},
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if !acknowledgeBridgePublished(t, d.bridge, operationID) ||
+				!c.acknowledgePublication(operationID) {
+				t.Fatal("completed callback acknowledgement was refused")
+			}
+			d.bridge.sourcePublication.mu.Lock()
+			_, retained := d.bridge.sourcePublication.operations[testCallback(operationID)]
+			d.bridge.sourcePublication.mu.Unlock()
+			if retained || d.terminalError() != nil {
+				t.Fatal("completed callback retained its reservation or terminalized the mount")
+			}
+		})
+	}
+}
+
+func TestFrontendLossDrainsAssignedMutationWithoutDiscardingAuthority(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	a := &attach{ref: "assigned-loss", v3Data: d, v3Coherence: d.bridge}
+	server, peer := net.Pipe()
+	defer peer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := &frontendConn{origin: 1, conn: server, attach: a, cancel: cancel}
+	const exposedID, assignedID = uint64(8001), uint64(8002)
+	publicationTestOperation(t, c, a, exposedID)
+	if !c.markPublicationReplyExposed(exposedID) {
+		t.Fatal("prior callback did not expose its reply")
+	}
+
+	c.finishLogicalRequest(exposedID)
+	initialize, ok := c.reserveLogicalOperation(assignedID, true)
+	if !ok || !initialize {
+		t.Fatal("mutation callback was not reserved")
+	}
+	d.bridge.reserveFrontendPublication(testCallback(assignedID))
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var consumed atomic.Int32
+	client.mu.Lock()
+	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
+		return &countingV3ResponseConsumption{count: &consumed}
+	}
+	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetMkdir() == nil {
+			return nil, errors.New("unexpected compensation during terminal retirement")
+		}
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+		}
+		response := exactTestMutationReply(identity)
+		item := authorityTestItem(2, authoritypb.Attr_DIRECTORY, 0x71, 0x72)
+		response.PostState = testV3RootBinding(item, v3PostStateRoleCreated)
+		response.Body = &authoritypb.Response_Mkdir{Mkdir: &authoritypb.MkdirReply{Item: item}}
+		return response, nil
+	}
+	client.mu.Unlock()
+	c.handlerWG.Add(1)
+	go func() {
+		defer c.handlerWG.Done()
+		c.handleV3Attached(ctx, a, 1, assignedID, true, &pfslocal.MkdirRequest{
+			Dir: d.resolveReply().Root, Name: []byte("during-crash"), Mode: 0o755,
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("mutation never reached its assigned authority call")
+	}
+	closed := make(chan struct{})
+	go func() { c.close(); close(closed) }()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("frontend cancellation did not run")
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("assigned mutation did not settle during frontend retirement")
+	}
+	if !errors.Is(d.terminalError(), errFrontendPublicationUnprovable) {
+		t.Fatalf("local terminal cause = %v", d.terminalError())
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("frontend loss discarded the original authority before mount-absence proof")
+	default:
+	}
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("assigned response consumed %d times, want once after revocation", got)
+	}
+}
+
 // A request-local frontend timeout can acknowledge the callback while its
 // daemon handler is still running. If that handler later produces a publishing
 // reply, no callback remains to install it and no second PublicationAck can
@@ -117,8 +236,8 @@ func (c *countingV3ResponseConsumption) Consume() {
 func TestPublishingReplyAfterCallbackAcknowledgementFencesBeforeExposure(t *testing.T) {
 	const operationID = uint64(301)
 	a, d := publicationTestAttach(t)
-	c := &frontendConn{attach: a}
-	op, participant := publicationTestOperation(t, c, a, operationID)
+	c := &frontendConn{origin: 1, attach: a}
+	publicationTestOperation(t, c, a, operationID)
 
 	if !c.acknowledgePublication(operationID) {
 		t.Fatal("early callback acknowledgement was refused")
@@ -141,34 +260,25 @@ func TestPublishingReplyAfterCallbackAcknowledgementFencesBeforeExposure(t *test
 	if exposed {
 		t.Fatal("late reply was recorded as an exposed publication")
 	}
-	a.frontendGateMu.Lock()
-	completed := op.completed
-	_, active := a.frontendActive[op]
-	a.frontendGateMu.Unlock()
-	if !completed || active {
-		t.Fatalf("gate retired before fence = completed=%v active=%v", completed, active)
-	}
 
-	a.finishFrontendParticipant(participant)
 	c.finishLogicalRequest(operationID)
 }
 
 // The socket can disappear after the daemon pinned a publishing reply but
 // before FSKit's PublicationAck. Teardown must first retire the publication
-// gate (waking any handoff cycle), then synchronously fence the v3 session; it
-// must not park forever waiting for handlers or invent a later repair.
+// gate, then synchronously fence the v3 session without waiting for handlers.
 func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T) {
 	const operationID = uint64(302)
 	a, d := publicationTestAttach(t)
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
-	op, participant := publicationTestOperation(t, c, a, operationID)
+	c := &frontendConn{origin: 1, conn: server, attach: a}
+	publicationTestOperation(t, c, a, operationID)
 	gate, err := v3ItemSourceGate(testV3PublicationItem(1, 0x5a), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := d.bridge.sourcePublication.acquireSource(context.Background(), operationID, gate)
+	lease, err := d.bridge.sourcePublication.acquireSource(context.Background(), testCallback(operationID), gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,23 +312,16 @@ func TestFrontendDisconnectWithExposedPublicationRetiresThenFences(t *testing.T)
 		!strings.Contains(terminal.Error(), "without PublicationAck") {
 		t.Fatalf("terminal cause = %v", terminal)
 	}
-	a.frontendGateMu.Lock()
-	completed := op.completed
-	_, active := a.frontendActive[op]
-	a.frontendGateMu.Unlock()
-	if !completed || active {
-		t.Fatalf("disconnect gate retirement = completed=%v active=%v", completed, active)
-	}
 	d.bridge.sourcePublication.mu.Lock()
 	released, sourceTerminal := lease.released, d.bridge.sourcePublication.terminal
 	d.bridge.sourcePublication.mu.Unlock()
 	if released || sourceTerminal == nil {
 		t.Fatalf("disconnect reopened source lease: released=%t terminal=%v", released, sourceTerminal)
 	}
-	a.finishFrontendParticipant(participant)
+
 }
 
-// A successful authority COMMIT is not consumed at the Go return boundary.
+// A successful authority WRITE is not consumed at the Go return boundary.
 // The receipt remains owned by the exact logical operation while its pfslocal
 // frame is written and while the callback owes PublicationAck. Only the joint
 // Ack + handler-retirement boundary may send the terminal delivery receipt.
@@ -236,10 +339,10 @@ func TestV3RetainedMutationReceiptWaitsForPhysicalReplyAndPublicationAck(t *test
 	server, peer := net.Pipe()
 	defer server.Close()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	c := &frontendConn{origin: 1, conn: server, attach: a}
+	publicationTestOperation(t, c, a, operationID)
 
-	reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+	reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 		Handle: handle, Data: []byte("receipt"),
 	})
 	if errno != 0 || reply == nil {
@@ -274,16 +377,16 @@ func TestV3RetainedMutationReceiptWaitsForPhysicalReplyAndPublicationAck(t *test
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("PublicationAck consumed receipt %d time(s) before handler retirement", got)
 	}
-	a.finishFrontendParticipant(participant)
+
 	c.finishLogicalRequest(operationID)
-	if got := consumed.Load(); got != 3 {
-		t.Fatalf("completed logical publication consumed receipt %d time(s), want BEGIN+DATA+COMMIT=3", got)
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("completed logical publication consumed receipt %d time(s), want the one WRITE", got)
 	}
-	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
+	if err := d.bridge.finishFrontendPublication(testCallback(operationID)); err != nil {
 		t.Fatal(err)
 	}
-	if got := consumed.Load(); got != 3 {
-		t.Fatalf("duplicate finish consumed receipt %d time(s), want exactly 3", got)
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("duplicate finish consumed receipt %d time(s), want exactly 1", got)
 	}
 }
 
@@ -306,12 +409,12 @@ func TestV3RetainedMutationReceiptTimeoutRevokesBeforeConsumption(t *testing.T) 
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	c := &frontendConn{origin: 1, conn: server, attach: a}
+	publicationTestOperation(t, c, a, operationID)
 	var revoked atomic.Bool
 	revokeStarted := make(chan struct{})
 	dispatchCtx := context.WithValue(
-		context.Background(),
+		context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)),
 		v3ResponseConsumptionRevokerContextKey{},
 		v3ResponseConsumptionRevoker(func(cause error) {
 			close(revokeStarted)
@@ -357,10 +460,9 @@ func TestV3RetainedMutationReceiptTimeoutRevokesBeforeConsumption(t *testing.T) 
 		t.Fatalf("forced revocation consumed receipt %d time(s) before local teardown", got)
 	}
 
-	a.finishFrontendParticipant(participant)
 	c.close()
-	if got := consumed.Load(); got != 3 {
-		t.Fatalf("revoked logical publication consumed receipt %d time(s), want BEGIN+DATA+COMMIT=3", got)
+	if got := consumed.Load(); got != 1 {
+		t.Fatalf("revoked logical publication consumed receipt %d time(s), want the one WRITE", got)
 	}
 }
 
@@ -376,7 +478,7 @@ func TestV3PlainResponseReceiptWaitsForPhysicalFrontendFrame(t *testing.T) {
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 401, 0, false, &pfslocal.StatfsRequest{})
@@ -417,12 +519,12 @@ func TestV3PublishingReadReceiptWaitsForFrameAckAndHandlerRetirement(t *testing.
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
 		t.Fatal("publishing read operation was not reserved")
 	}
-	d.bridge.reserveFrontendPublication(operationID)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 404, operationID, initialize, &pfslocal.GetAttrRequest{Item: file})
@@ -477,7 +579,7 @@ func TestV3LateHealthyReadAfterNotPublishedAckIsDiscarded(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
-			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
+			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o755, Nlink: 1}, ObjectVersion: 1, SnapshotSequence: 1,
 		}}}, nil
 	}
 	var consumed atomic.Int32
@@ -487,12 +589,12 @@ func TestV3LateHealthyReadAfterNotPublishedAckIsDiscarded(t *testing.T) {
 	server, peer := net.Pipe()
 	defer server.Close()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
 		t.Fatal("late read operation was not reserved")
 	}
-	d.bridge.reserveFrontendPublication(operationID)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 406, operationID, initialize, &pfslocal.GetAttrRequest{Item: file})
@@ -503,9 +605,7 @@ func TestV3LateHealthyReadAfterNotPublishedAckIsDiscarded(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("authority read was not dispatched")
 	}
-	known, err := d.bridge.acknowledgePublication(
-		operationID, pfslocal.PublicationSemanticCommitNotPublished,
-	)
+	known, err := d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
 	if err != nil || !known {
 		t.Fatalf("early NOT_PUBLISHED bridge ack = (%t,%v)", known, err)
 	}
@@ -570,12 +670,12 @@ func TestV3LateLookupAfterNotPublishedAckWithdrawsProvisionalItem(t *testing.T) 
 	server, peer := net.Pipe()
 	defer server.Close()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	initialize, ok := c.reserveLogicalOperation(operationID, true)
 	if !ok || !initialize {
 		t.Fatal("late lookup operation was not reserved")
 	}
-	d.bridge.reserveFrontendPublication(operationID)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 407, operationID, initialize, &pfslocal.LookupRequest{
@@ -588,9 +688,7 @@ func TestV3LateLookupAfterNotPublishedAckWithdrawsProvisionalItem(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("authority lookup was not dispatched")
 	}
-	known, err := d.bridge.acknowledgePublication(
-		operationID, pfslocal.PublicationSemanticCommitNotPublished,
-	)
+	known, err := d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
 	if err != nil || !known {
 		t.Fatalf("early NOT_PUBLISHED bridge ack = (%t,%v)", known, err)
 	}
@@ -655,7 +753,7 @@ func TestV3TerminalPlainResponsesRevokeBeforeConsumptionAndWriteNoFrame(t *testi
 			}
 			server, peer := net.Pipe()
 			defer peer.Close()
-			c := &frontendConn{conn: server, attach: a}
+			c := &frontendConn{origin: 1, conn: server, attach: a}
 			done := make(chan struct{})
 			go func() {
 				c.handleV3Attached(context.Background(), a, 405, 0, false, test.body)
@@ -697,7 +795,7 @@ func TestV3OpenReceiptWaitsForResourceDisposition(t *testing.T) {
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 402, 0, false, &pfslocal.OpenRequest{
@@ -748,7 +846,7 @@ func TestV3InvalidResourceDispositionRevokesBeforeReceiptConsumption(t *testing.
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
+	c := &frontendConn{origin: 1, conn: server, attach: a}
 	done := make(chan struct{})
 	go func() {
 		c.handleV3Attached(context.Background(), a, 403, 0, false, &pfslocal.OpenRequest{
@@ -792,7 +890,7 @@ func TestV3InvalidResourceDispositionRevokesBeforeReceiptConsumption(t *testing.
 	}
 }
 
-// A malformed parsed COMMIT can itself carry the terminal delivery token. It
+// A malformed parsed WRITE can itself carry the terminal delivery token. It
 // must take the same synchronized local-revocation path as the bounded force
 // callback before the callMutation defer consumes (and therefore receipts)
 // that response.
@@ -809,16 +907,16 @@ func TestV3MalformedRetainedMutationRevokesBeforeReceiptConsumption(t *testing.T
 		return &countingV3ResponseConsumption{count: &consumed}
 	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		response := exactTestWriteCommit(identity, request)
+		response := exactTestWriteReply(identity, request)
 		response.Uncertain = true
 		return response, nil
 	}
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	c := &frontendConn{origin: 1, conn: server, attach: a}
+	publicationTestOperation(t, c, a, operationID)
 	dispatchCtx := context.WithValue(
-		context.Background(),
+		context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)),
 		v3ResponseConsumptionRevokerContextKey{},
 		v3ResponseConsumptionRevoker(func(cause error) {
 			if got := consumed.Load(); got != 0 {
@@ -839,7 +937,7 @@ func TestV3MalformedRetainedMutationRevokesBeforeReceiptConsumption(t *testing.T
 	if got := consumed.Load(); got != 1 {
 		t.Fatalf("malformed retained result consumed receipt %d time(s), want 1 after revocation", got)
 	}
-	a.finishFrontendParticipant(participant)
+
 	c.close()
 }
 
@@ -854,8 +952,8 @@ func TestLostPublicationCauseWinsVisibleProvisionalAbandonment(t *testing.T) {
 	a, d := publicationTestAttach(t)
 	server, peer := net.Pipe()
 	defer peer.Close()
-	c := &frontendConn{conn: server, attach: a}
-	_, participant := publicationTestOperation(t, c, a, operationID)
+	c := &frontendConn{origin: 1, conn: server, attach: a}
+	publicationTestOperation(t, c, a, operationID)
 	if !c.markPublicationReplyExposed(operationID) {
 		t.Fatal("visible mutation reply was not exposed")
 	}
@@ -899,7 +997,7 @@ func TestLostPublicationCauseWinsVisibleProvisionalAbandonment(t *testing.T) {
 			resourceClosed, provisionalReplies, itemReachable, identityReachable, provisionalClaims,
 		)
 	}
-	a.finishFrontendParticipant(participant)
+
 }
 
 // Closing a connection does not itself turn an unexposed request, or a reply
@@ -920,8 +1018,8 @@ func TestFrontendDisconnectDoesNotFenceHarmlessPublicationStates(t *testing.T) {
 			a, d := publicationTestAttach(t)
 			server, peer := net.Pipe()
 			defer peer.Close()
-			c := &frontendConn{conn: server, attach: a}
-			_, participant := publicationTestOperation(t, c, a, operationID)
+			c := &frontendConn{origin: 1, conn: server, attach: a}
+			publicationTestOperation(t, c, a, operationID)
 			if test.expose && !c.markPublicationReplyExposed(operationID) {
 				t.Fatal("publishing reply was not exposed")
 			}
@@ -936,7 +1034,7 @@ func TestFrontendDisconnectDoesNotFenceHarmlessPublicationStates(t *testing.T) {
 			if terminal := d.terminalError(); terminal != nil {
 				t.Fatalf("harmless teardown fenced v3 session: %v", terminal)
 			}
-			a.finishFrontendParticipant(participant)
+
 		})
 	}
 }
@@ -963,7 +1061,7 @@ func TestPublicationAckBetweenReservationAndBeginKeepsReservedHandlers(t *testin
 
 	c.publicationMu.Lock()
 	entry := c.operations[operationID]
-	if entry == nil || entry.op != nil || entry.activeRequests != 2 {
+	if entry == nil || entry.attach != nil || entry.activeRequests != 2 {
 		c.publicationMu.Unlock()
 		t.Fatalf("pre-handler reservation = %+v, want op=nil activeRequests=2", entry)
 	}
@@ -979,22 +1077,21 @@ func TestPublicationAckBetweenReservationAndBeginKeepsReservedHandlers(t *testin
 		t.Fatal("a frame arriving after acknowledgement joined the spent operation")
 	}
 
-	_, first, participates, publishes, err := c.beginLogicalOperation(
+	publishes, err := c.beginLogicalOperation(
 		context.Background(), a, operationID, true, &pfslocal.GetAttrRequest{},
 	)
-	if err != nil || !participates || !publishes || first == nil {
-		t.Fatalf("reserved initializer after ack = participant=%v participates=%v publishes=%v error=%v", first, participates, publishes, err)
+	if err != nil || !publishes {
+		t.Fatalf("reserved initializer after ack = publishes=%v error=%v", publishes, err)
 	}
-	_, second, participates, publishes, err := c.beginLogicalOperation(
-		context.Background(), a, operationID, false, &pfslocal.FsyncRequest{},
+	publishes, err = c.beginLogicalOperation(
+		context.Background(), a, operationID, false, &pfslocal.StatfsRequest{},
 	)
-	if err != nil || !participates || publishes || second == nil {
-		t.Fatalf("reserved continuation after ack = participant=%v participates=%v publishes=%v error=%v", second, participates, publishes, err)
+	if err != nil || publishes {
+		t.Fatalf("reserved continuation after ack = publishes=%v error=%v", publishes, err)
 	}
 
-	a.finishFrontendParticipant(second)
 	c.finishLogicalRequest(operationID)
-	a.finishFrontendParticipant(first)
+
 	c.finishLogicalRequest(operationID)
 	c.publicationMu.Lock()
 	_, retained := c.operations[operationID]

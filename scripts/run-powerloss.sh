@@ -1,18 +1,25 @@
 #!/usr/bin/env bash
 # Power-loss and crash-consistency harness for the PortableFS v3 authority.
 #
-# This is the automated evidence for one sentence in
-# docs/direct-store-consensus-evaluation.md: "Successful fsync and directory
-# fsync are assumptions until power-cut testing confirms them."
+# It stacks dm-log-writes under the XFS a real portablefs-authority serves and
+# records two workloads against it, each with a log mark after every
+# durability claim:
 #
-# It stacks dm-log-writes under the XFS a real portablefs-authority serves,
-# drives a real kernel FUSE mount through a workload with known fsync points,
-# kills the authority and the mount outright, and then replays the recorded
-# write log to each of those points. Replaying to entry N reconstructs the
-# platter state a power cut after the Nth bio would have left - dirty page
-# cache is NOT replayed, because a power cut does not write it back. Every
-# reconstructed device is mounted (which runs XFS log recovery), checked
-# against the durability contract, and then checked with xfs_repair -n.
+#   - a real Linux kernel FUSE mount writing files and fsyncing them. A write
+#     is promised durable only once its fsync returned.
+#   - pfs-powerloss-fskit-driver attaching an FSKit-exclusive session directly,
+#     as portablefsd does, and issuing CREATE, WRITE, MKDIR, LINK, SYMLINK,
+#     RENAME, UNLINK, truncate, chmod and timestamp mutations. FSKit has no
+#     fsync, so every acknowledged mutation is promised durable.
+#
+# It then kills the data plane outright and replays the write log to each mark
+# and to a sweep of the filesystem's own barriers. Replaying to entry N
+# reconstructs the platter state a power cut after the Nth bio would have
+# left - dirty page cache is NOT replayed, because a power cut does not write
+# it back. Every reconstructed device is mounted (which runs XFS log
+# recovery), checked against that workload's contract, and then checked with
+# xfs_repair -n. docs/power-loss-testing.md states both contracts and what the
+# harness does not claim.
 #
 #   scripts/run-powerloss.sh                 # host side (needs docker)
 #   scripts/run-powerloss.sh --in-container  # container side (root)
@@ -26,7 +33,7 @@ set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository, and the
 # same image the privileged XFS/FUSE and coherence jobs use.
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c}"
 # The device the authority serves, and the log device that records every write
 # to it. The log must be larger than the target: it holds a copy of every
 # written block plus one metadata block each, and dm-log-writes stops recording
@@ -37,9 +44,10 @@ set -euo pipefail
 : "${PORTABLEFS_POWERLOSS_VOLUME:=powerloss-volume}"
 : "${PORTABLEFS_POWERLOSS_PROJECT_ID:=42101}"
 : "${PORTABLEFS_POWERLOSS_AUTHORITY_PORT:=17643}"
-# Fsynced checkpoints the power-cut workload writes. Every one of them becomes
-# a replay point, and each replay point costs one full device replay, one mount
-# and one xfs_repair pass.
+# Fsynced checkpoints the Linux power-cut workload writes. Every one of them
+# becomes a replay point, and each replay point costs one full device replay,
+# one mount and one xfs_repair pass. The FSKit workload's acknowledged steps
+# are fixed by its driver and are replay points the same way.
 : "${PORTABLEFS_POWERLOSS_CHECKPOINTS:=12}"
 # Additional cuts taken at flush/FUA barriers the filesystem issued on its own,
 # spread across the whole log. These are the ones that look for a cut position
@@ -67,6 +75,7 @@ REQUIRED_TESTS=(
   TestReplayReproducesTheDeviceTheKernelWrote
   TestXFSHonoursFsyncAtEveryCut
   TestFsyncedWritesSurvivePowerLoss
+  TestFSKitAcknowledgedMutationsSurvivePowerLoss
   TestAuthorityKillDuringWritesKeepsFsyncedData
 )
 
@@ -122,6 +131,13 @@ install_container_dependencies() {
   # losetup, blockdev, findmnt.
   apt-get install -y -qq --no-install-recommends \
     xfsprogs dmsetup kmod fuse3 util-linux procps >/dev/null
+  # The mount pins its exact kernel abort descriptor before serving. Device
+  # access alone cannot prove that boundary; mount the control filesystem in
+  # this container just as the other privileged qualification lanes do.
+  [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
+  mountpoint -q /sys/fs/fuse/connections ||
+    mount -t fusectl none /sys/fs/fuse/connections ||
+    fail "cannot mount FUSE control filesystem" 69
 }
 
 # ensure_loop_nodes pre-creates the loop device nodes.
@@ -188,7 +204,8 @@ build_binaries() {
   as_service go -C /work/vcs build -o /var/tmp/powerloss-bin/ \
     ./cmd/portablefs-authority ./cmd/portablefs-mount-v3 \
     ./test/coherence/cmd/pfs-coherence-credentials \
-    ./test/powerloss/cmd/pfs-powerloss-driver ||
+    ./test/powerloss/cmd/pfs-powerloss-driver \
+    ./test/powerloss/cmd/pfs-powerloss-fskit-driver ||
     fail "building the harness binaries failed" 70
 }
 
@@ -197,11 +214,12 @@ build_binaries() {
 # production signer (volumecap.Sign), so a run cannot pass against a credential
 # production would refuse.
 #
-# Tokens are single use. The power-cut instrument takes one, and each
-# process-kill round takes two: one for the mount it kills and one for the
-# mount it attaches after the restart.
+# Tokens are single use, and the Go suite assigns each attach a fixed index
+# (fixture_linux_test.go): the Linux power cut takes access-0, the FSKit power
+# cut access-1, and each process-kill round two more - one for the mount it
+# kills and one for the mount it attaches after the restart.
 mint_credentials() {
-  local tokens=$((1 + 2 * PORTABLEFS_POWERLOSS_KILL_ROUNDS + 2))
+  local tokens=$((2 + 2 * PORTABLEFS_POWERLOSS_KILL_ROUNDS))
   as_service /var/tmp/powerloss-bin/pfs-coherence-credentials \
     --dir /var/tmp/powerloss-creds \
     --volume-id "$PORTABLEFS_POWERLOSS_VOLUME" \
@@ -255,7 +273,7 @@ run_container() {
 
   # The Go suite owns every device, process and assertion from here. It runs as
   # root because it creates the device-mapper stack and the mounts; it spawns
-  # the authority, the mount and the workload driver as the unprivileged
+  # the authority, the mount and both workload drivers as the unprivileged
   # identity, exactly as a deployment runs them.
   export PORTABLEFS_POWERLOSS_TEST=1
   export PORTABLEFS_POWERLOSS_REQUIRED=1
@@ -281,6 +299,8 @@ run_container() {
   echo "======================================================================"
   echo "power-loss harness: kernel $(uname -r), $(go version)"
   echo "  device instrument : dm-log-writes under the XFS the authority serves"
+  echo "    Linux workload  : durable once fsync through the mount returned"
+  echo "    FSKit workload  : durable once the FSKit authority handler acknowledged"
   echo "  process instrument: SIGKILL of the authority, ${PORTABLEFS_POWERLOSS_KILL_ROUNDS} rounds"
   echo "======================================================================"
   local log=/var/tmp/powerloss-suite.log

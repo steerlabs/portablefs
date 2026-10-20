@@ -12,37 +12,31 @@ import (
 )
 
 // CoordinationConfig is the complete construction input for one volume's
-// protocol-7 coordination. Every field is a safety property of the deployment,
+// protocol-8 coordination. Every field is a safety property of the deployment,
 // so none of them has a default a caller may inherit silently.
 type CoordinationConfig struct {
 	Store  *xfsstore.Volume
 	Fencer volumeserver.SessionFencer
 	Locks  *volumeserver.LockTable
 	// Membership is the durable mount record. MountLifecycle is its only owner;
-	// the visibility coordinator composes on top of it rather than writing it a
-	// second time.
-	Membership volumeserver.DurableVisibilityMembership
+	// the writer registry never writes a second membership record.
+	Membership volumeserver.DurableMountMembership
 	Prior      volumeserver.PriorEpochDisposition
 	ClockSkew  time.Duration
 
-	MaxCachedNameCapacity uint64
-	MaxRepairBudget       time.Duration
-
-	Now       func() time.Time
-	OnBarrier func(time.Duration, int)
+	ContinuousNow func() (time.Duration, error)
+	Now           func() time.Time
 }
 
-// Coordination is a volume's complete protocol-7 coordination assembly.
+// Coordination is a volume's complete protocol-8 coordination assembly.
 //
-// Linux subscription state is epoch-local. FSKit repair and durable mount
-// membership retain their existing coordinators. Linux uses only the v7
-// subscription and delegation coordinator.
+// Linux caching, exclusive Mac writing and durable topology have separate owners.
 type Coordination struct {
-	Store      *xfsstore.Volume
-	Lifecycle  *volumeserver.MountLifecycle
-	Visibility *volumeserver.VisibilityCoordinator
-	Coherence  *volumeserver.CoherenceCoordinator
-	Routes     *RoutesController
+	Store     *xfsstore.Volume
+	Lifecycle *volumeserver.MountLifecycle
+	Writers   *volumeserver.WriterRegistry
+	Coherence *volumeserver.CoherenceCoordinator
+	Routes    *RoutesController
 }
 
 // NewCoordination assembles the volume's coordination and activates the routing
@@ -60,16 +54,9 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 	if err != nil {
 		return nil, err
 	}
-	compatibilityPrior, priorLinux := cfg.Prior, false
-	if typed, ok := cfg.Membership.(interface {
-		PriorCacheState() (volumeserver.PriorEpochDisposition, bool)
-	}); ok {
-		compatibilityPrior, priorLinux = typed.PriorCacheState()
-	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: compatibilityPrior, ExternalMembership: true, Fencer: cfg.Fencer,
-		MaxCachedNameCapacity: cfg.MaxCachedNameCapacity, MaxRepairBudget: cfg.MaxRepairBudget,
-		MaxClockSkew: cfg.ClockSkew, Now: cfg.Now, OnBarrier: cfg.OnBarrier,
+	writerPrior, priorLinux := cfg.Membership.PriorCacheState()
+	writers, err := volumeserver.NewWriterRegistry(volumeserver.WriterRegistryConfig{
+		Fencer: cfg.Fencer, Prior: writerPrior, ContinuousNow: cfg.ContinuousNow,
 	})
 	if err != nil {
 		return nil, err
@@ -82,13 +69,13 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 		return nil, fmt.Errorf("load machine-local routing declaration: %w", err)
 	}
 	return &Coordination{
-		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{PriorLinuxCaches: priorLinux}), Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Routes: routes,
+		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{PriorLinuxCaches: priorLinux}), Store: cfg.Store, Lifecycle: lifecycle, Writers: writers, Routes: routes,
 	}, nil
 }
 
 // Bind installs the volume assembly on its handler.
 func (c *Coordination) Bind(h *VolumeHandler) {
-	h.Lifecycle, h.Visibility, h.Routes = c.Lifecycle, c.Visibility, c.Routes
+	h.Lifecycle, h.Writers, h.Routes = c.Lifecycle, c.Writers, c.Routes
 	h.Coherence = c.Coherence
 	h.initCoherence()
 }

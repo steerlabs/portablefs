@@ -3,7 +3,6 @@ package cli
 import (
 	"flag"
 	"io"
-	"strings"
 )
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -30,15 +29,4 @@ func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 		rest = fs.Args()
 	}
 	return positionals, nil
-}
-
-// stringListFlag is a repeatable string flag (flag.Var), e.g. --local-dir a
-// --local-dir b.
-type stringListFlag []string
-
-func (f *stringListFlag) String() string { return strings.Join(*f, ",") }
-
-func (f *stringListFlag) Set(v string) error {
-	*f = append(*f, v)
-	return nil
 }

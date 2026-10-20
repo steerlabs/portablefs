@@ -5,28 +5,29 @@ several machines at once. Every mount reads and writes the same current
 filesystem. There are no commits, no branches, and no user-visible history: the
 mounted tree is the product.
 
-Protocol 7 integrates volume subscriptions, delegated daemon write-back, and a
-root-directory completion barrier on stock Linux FUSE. The local real-mount
-results and remaining production gates are in
-[the integration record](./docs/coherence-v2/integration.md). Exact O_APPEND
-placement remains Authority-resolved; per-call RWF_APPEND/RWF_NOAPPEND remain
-disclosed stock-FUSE deviations. macOS 26/27 uses the separate FSKit synchronous
-repair profile with compatibility-writer exclusion.
+Authority protocol 8 combines volume subscriptions, delegated daemon
+write-back, and a root-directory completion barrier on stock Linux FUSE with a
+single exclusive macOS writer on FSKit. It is specified and not yet qualified;
+the open gates are listed in [COMPATIBILITY.md](./COMPATIBILITY.md). Exact
+O_APPEND placement is Authority-resolved; per-call RWF_APPEND/RWF_NOAPPEND
+remain disclosed stock-FUSE deviations.
 
 One volume is one XFS project directory on one Linux host, served by one
 `portablefs-authority` process. XFS is the only durable filesystem truth.
 PortableFS adds authentication, object capabilities, session-exact replay, an
 authority implementation of distributed POSIX locks, and authority-issued
-subscriptions and file delegations. Linux uses stock FUSE protocol 7.31 or newer and forwards those
-locks. macOS uses a separate, explicitly declared protocol-7
-`FSKIT_SYNC_REPAIR` profile: the authority orders its existing PREPARE/COMPLETE
-repair around the same XFS mutation, while the daemon drives the best cache
-repair the host API exposes. PortableFS adds no second inode tree, mutation
-log, checkpoint format, or offline reconciliation. Linux may buffer delegated
-file data in memory; fsync and the run barrier establish durability.
+subscriptions and file delegations. Linux uses stock FUSE protocol 7.31 or
+newer and forwards those locks. macOS uses the explicit
+`FRONTEND_PROFILE_FSKIT_EXCLUSIVE` profile: while a Mac is mounted it is the
+volume's only writer, Linux mounts read its changes, and a second Mac is
+refused, because FSKit cannot invalidate another writer's names and attributes.
+PortableFS adds no second inode tree, mutation log, checkpoint format, or
+offline reconciliation. Linux may buffer delegated file data in memory; fsync
+and the run barrier establish durability. Every successful macOS mutation reply
+is already durable.
 
 ```text
-stock Linux FUSE 7.31+ mounts     macOS 26/27 FSKit mounts
+stock Linux FUSE 7.31+ mounts   one macOS 26/27 FSKit writer   files gateway
                  |
         mutually authenticated TLS 1.3
                      |
@@ -66,7 +67,7 @@ A file created on A is visible on B. An uncontended delegated `write(2)` can
 return after bounded daemon acceptance. A peer read breaks the delegation and
 flushes that accepted cut before returning data. File fsync or the root-handle
 completion barrier establishes durability. `portablefs umount <path>` drains
-and detaches.
+and detaches with one unforced unmount attempt; a held mount reports `EBUSY`.
 
 ## Install
 
@@ -119,8 +120,7 @@ portablefs-authority \
   -tls-cert server.pem -tls-key server.key \
   -client-ca clients-ca.pem \
   -capability-public-key capability.pub.pem \
-  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership \
-  -write-staging-dir /srv/portablefs/.portablefs-control/my-workspace/write-staging
+  -mount-membership-file /srv/portablefs/.portablefs-control/my-workspace/mount.membership
 ```
 
 Then mount it, as above. Clean unmount drains accepted writes, completes the
@@ -128,7 +128,9 @@ durability barrier, releases delegations, and sends a session-authenticated
 detach after the FUSE connection closes. A crashed daemon can lose non-durable
 buffered writes. The authority waits out an old subscription horizon before
 admitting conflicting work. An authority epoch change stales old handles;
-fresh opens work after the mount reattaches cold.
+fresh opens work after the mount reattaches cold. Volumes that share one XFS
+cell share its durability-error and latency domain; see
+[COMPATIBILITY.md](./COMPATIBILITY.md#two-limits-that-apply-to-every-deployment).
 
 Full operator guidance — provisioning, credentials, bounds, restart, and backups
 — is in [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md).
@@ -190,8 +192,9 @@ unprivileged reference image.
 - **The platform contract stays explicit.** Atomic rename decides whole-file
   replacement, and open descriptors keep working after unlink until final
   close. Linux POSIX record locks and BSD `flock` are distributed and
-  independent. macOS declares the separate FSKit synchronous-repair profile and
-  its weaker cache, append, and lock edges rather than claiming Linux semantics.
+  independent. macOS declares its exclusive-writer profile and its weaker
+  cache, append, and lock edges rather than claiming Linux semantics; ending a
+  Mac session does not withdraw state its kernel already holds.
 
 ## What PortableFS is not
 
@@ -216,13 +219,10 @@ unprivileged reference image.
 
 | Platform | Transport | Status |
 | --- | --- | --- |
-| Linux | stock kernel FUSE protocol 7.31+ (`vcs/internal/fusev3`) | The protocol-7 Linux frontend. Writable `O_APPEND` is supported and exact: the authority places every append at the true EOF under its per-inode writer stripe. Stock FUSE does not forward the per-call `RWF_APPEND`/`RWF_NOAPPEND` flags, and those two cases are disclosed deviations rather than guesses made from a cached offset. No private kernel capability or opcode is accepted. CI currently exercises one hosted Ubuntu stock kernel; the broader LTS matrix remains an open qualification gate. |
-| macOS 26 | FSKit synchronous VFS repair | Uses the explicit protocol-7 FSKit profile with Mac writer exclusion. Mutations are ordered through PREPARE/COMPLETE, but host cache repair remains best-effort and append/lock/cache edges are not claimed equivalent to Linux. |
-| macOS 27 | FSKit synchronous VFS repair; separately signed native `DataCacheHandler` build | The ordinary app uses the same admitted v2 repair contract as macOS 26. A build-stamped native artifact strengthens retained-data revocation. Neither claims exact namespace/attribute withdrawal, append intent, or distributed locks. |
+| Linux | stock kernel FUSE protocol 7.31+ (`vcs/internal/fusev3`) | `FRONTEND_PROFILE_LINUX`. Writable `O_APPEND` is exact: the authority places every append at the true EOF under its per-inode writer stripe. Stock FUSE does not forward the per-call `RWF_APPEND`/`RWF_NOAPPEND` flags; those two cases are disclosed deviations rather than guesses made from a cached offset. No private kernel capability or opcode is accepted. CI exercises one hosted Ubuntu stock kernel; the broader LTS matrix remains an open qualification gate. |
+| macOS 26 and 27 | FSKit (`swift/PortableFSKit`) | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`, the same product and profile on both releases. The Mac is the volume's only writer while mounted; successful mutation replies are durable on authority storage; no exact namespace/attribute withdrawal, append intent, or distributed locks. Native qualification is pending. |
 
-The macOS 26 policy and its historical measurements remain evidence for that
-weaker profile. The remaining platform gaps are in
-[docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
+The macOS contract and its open gates are in [docs/fskit-mount.md](./docs/fskit-mount.md).
 
 ## Development and verification
 
@@ -239,7 +239,7 @@ need Docker and free loop devices.
 `verify-local.sh` runs cross-OS Go builds and vet, the pinned reachable-call
 vulnerability scan, the Go suite, the Go race suite, the native Xcode Swift
 gate on macOS, pinned workflow semantic validation, the release-trust policy
-checkers, and a stale-architecture scan. The Xcode gate separately enumerates
+checkers, and the current-architecture check. The Xcode gate separately enumerates
 the test inventory, executes one test process, and requires the xcresult to
 contain the same unique all-passing set. Socket-backed integration tests
 declare their process-wide resource constraint through a serialized Swift
@@ -253,28 +253,34 @@ bash scripts/coherence-matrix-linux.sh  # stock kernel, two-mount black-box matr
 bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume; on demand, not a CI lane
 ```
 
-The macOS matrix runs against two already-mounted paths, optionally with a
-remote peer:
+The macOS matrix runs against an already-mounted Mac path and a Linux peer's
+mount of the same volume:
 
 ```bash
-scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-mount /path/b
+scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@linux-host --remote-mount /path/b
 ```
+
+The power-loss harness (`scripts/run-powerloss.sh`) replays recorded block
+writes to each cut for a Linux mount workload and for the FSKit authority
+handler; see [docs/power-loss-testing.md](./docs/power-loss-testing.md).
 
 ## Documentation
 
+- [COMPATIBILITY.md](./COMPATIBILITY.md) — the protocol-8 launch contract, its
+  two deployment-wide limits, and its qualification status.
 - [docs/architecture.md](./docs/architecture.md) — the product contract, in brief.
 - [docs/xfs-authority-architecture.md](./docs/xfs-authority-architecture.md) — the
   XFS authority, confinement, and storage foundation.
-- [docs/portable-coherence.md](./docs/portable-coherence.md) — the protocol-7
+- [docs/coherence-v2/wire.md](./docs/coherence-v2/wire.md) — the authority wire
+  encoding and handshake.
+- [docs/portable-coherence.md](./docs/portable-coherence.md) — the Linux
   subscription/delegation contract, kernel proofs, and accepted residuals.
-- [docs/coherence-v2/integration.md](./docs/coherence-v2/integration.md) — the
-  integration decisions, replacement-test map, deletion record, and gate results.
-- [docs/coherence-v2/rollout.md](./docs/coherence-v2/rollout.md) — the protocol-7
-  maintenance window, ordered fleet cutover, verification, and abort criteria.
-- [docs/coherence-v2/opensteer-pins.md](./docs/coherence-v2/opensteer-pins.md) —
-  exact OpenSteer artifact-pin edits and publication dependencies.
-- [docs/coherence-v2/results.md](./docs/coherence-v2/results.md) — v6/v7
-  measurements, requests per operation, and profile-driven changes.
+- [docs/fskit-mount.md](./docs/fskit-mount.md) — the macOS exclusive-writer
+  mount and its platform limits.
+- [docs/consistency-model.md](./docs/consistency-model.md) — the exact
+  visibility, durability, and retry rules.
+- [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a
+  process observes when it does.
 - [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md) — running
   a volume yourself.
 - [docs/hosted-control-plane.md](./docs/hosted-control-plane.md) — the hosted
@@ -283,27 +289,18 @@ scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-
   the outbound agent, root helper, and systemd authority units on a cell.
 - [docs/opensteer-production-deployment.md](./docs/opensteer-production-deployment.md) —
   the single matched server/client promotion path used by OpenSteer.
-- [docs/consistency-model.md](./docs/consistency-model.md) — the exact
-  visibility, durability, and retry rules.
-- [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a
-  process observes when it does.
-- [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md) —
-  the declared macOS 26 cache policy and its open gates.
-- [docs/fskit-mount.md](./docs/fskit-mount.md) — how a macOS mount happens.
 - [docs/cross-mount-coherence-matrix.md](./docs/cross-mount-coherence-matrix.md) —
   the black-box behaviour matrix and its falsifiability controls.
+- [docs/power-loss-testing.md](./docs/power-loss-testing.md) — device-level
+  power-cut evidence and what it does not claim.
+- [docs/performance.md](./docs/performance.md) — snapshot measurement method and the
+  LAN workload target.
 - [docs/agents.md](./docs/agents.md) — using a workspace from an agent.
 - [docs/open-after-unlink.md](./docs/open-after-unlink.md) and
   [docs/graft-security.md](./docs/graft-security.md) — two specific contracts
   worth reading before relying on them.
-- [docs/performance.md](./docs/performance.md) — current v7 measurements,
-  remaining costs, tools, and explicitly historical protocol-4/5 results.
-- [docs/local-dev.md](./docs/local-dev.md),
-  [docs/release-identity.md](./docs/release-identity.md),
-  [docs/liveness-followups.md](./docs/liveness-followups.md) — working on it.
-- [docs/direct-store-exploration.md](./docs/direct-store-exploration.md) and
-  [docs/direct-store-consensus-evaluation.md](./docs/direct-store-consensus-evaluation.md)
-  — concluded exploration records, kept for their reasoning.
+- [docs/local-dev.md](./docs/local-dev.md) and
+  [docs/release-identity.md](./docs/release-identity.md) — working on it.
 
 Agents changing this repository should read [AGENTS.md](./AGENTS.md); agents
 using a workspace should read [skills/portablefs/SKILL.md](./skills/portablefs/SKILL.md).

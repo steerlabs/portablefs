@@ -3,11 +3,13 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -185,24 +187,22 @@ func TestLifecycleHoldInstallExclusiveRejectsLiveDaemonAttach(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(controlSocket) })
 	expectedSHA256 := strings.Repeat("a", 64)
-	e.daemonAttachStatusesFn = func(expected *daemonctl.Identity) (map[string]cliAttachStatus, error) {
+	e.daemonLifecycleInventoryFn = func(expected *daemonRelease) (int, error) {
 		if expected == nil ||
-			expected.DaemonVersion != "0.2.2" ||
-			expected.ExecutableSHA256 != expectedSHA256 ||
-			expected.PFSLocalMajor != 1 ||
-			expected.PFSLocalMinor != 13 {
+			expected.identity.DaemonVersion != "0.2.2" ||
+			expected.identity.ExecutableSHA256 != expectedSHA256 ||
+			expected.path != "/authenticated/portablefsd" ||
+			expected.identity.CodeDirectoryHash != strings.Repeat("b", 40) {
 			t.Fatalf("expected old daemon identity = %+v", expected)
 		}
-		return map[string]cliAttachStatus{
-			"att_live": {AttachRef: "att_live"},
-		}, nil
+		return 1, nil
 	}
 	if rc := e.run([]string{
 		"lifecycle", "hold-install-exclusive", "--json",
 		"--expected-daemon-version", "0.2.2",
 		"--expected-daemon-sha256", expectedSHA256,
-		"--expected-pfslocal-major", "1",
-		"--expected-pfslocal-minor", "13",
+		"--expected-daemon-path", "/authenticated/portablefsd",
+		"--expected-daemon-cdhash", strings.Repeat("b", 40),
 	}); rc != 1 {
 		t.Fatalf("rc = %d, want 1", rc)
 	}
@@ -221,39 +221,27 @@ func TestLifecycleHoldInstallExclusiveExpectedDaemonIdentityIsAllOrNone(t *testi
 	}); rc != 2 {
 		t.Fatalf("rc = %d, want usage refusal", rc)
 	}
-	if got := stderr.String(); !strings.Contains(got, "requires version, SHA-256, pfslocal major, and pfslocal minor together") {
+	if got := stderr.String(); !strings.Contains(got, "requires version, SHA-256, path, and CDHash together") {
 		t.Fatalf("stderr = %q", got)
 	}
 }
 
-func TestExpectedDaemonIdentityAllowsExplicitMinorZero(t *testing.T) {
-	identity, err := parseExpectedDaemonIdentity(
-		"2.0.0",
-		strings.Repeat("a", 64),
-		2,
-		0,
-		true,
-		true,
-		true,
-		true,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if identity == nil || identity.PFSLocalMajor != 2 || identity.PFSLocalMinor != 0 {
-		t.Fatalf("parsed identity = %+v", identity)
-	}
-	if _, err := parseExpectedDaemonIdentity(
-		"2.0.0",
-		strings.Repeat("a", 64),
-		2,
-		0,
-		true,
-		true,
-		true,
-		false,
-	); err == nil {
-		t.Fatal("omitted minor flag was accepted as explicit minor zero")
+func TestExpectedDaemonIdentityIsExactReleaseAndPath(t *testing.T) {
+	for _, test := range []struct {
+		path, cdhash       string
+		lastPresent, valid bool
+	}{
+		{"/authenticated/portablefsd", strings.Repeat("b", 40), true, true},
+		{"relative", strings.Repeat("b", 40), true, false},
+		{"/a/../portablefsd", strings.Repeat("b", 40), true, false},
+		{"/authenticated/portablefsd", strings.Repeat("B", 40), true, false},
+		{"/authenticated/portablefsd", "", true, false},
+		{"/authenticated/portablefsd", strings.Repeat("b", 40), false, false},
+	} {
+		release, err := parseExpectedDaemonIdentity("2.0.0", strings.Repeat("a", 64), test.path, test.cdhash, true, true, true, test.lastPresent)
+		if (err == nil) != test.valid {
+			t.Fatalf("%+v: release=%+v error=%v", test, release, err)
+		}
 	}
 }
 
@@ -274,18 +262,17 @@ func TestLifecycleHoldInstallExclusiveRejectsDurableDaemonAttach(t *testing.T) {
 	}
 	mountPath := filepath.Join(t.TempDir(), "mounted")
 	registry := fmt.Sprintf(
-		"{\"version\":2,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"branch\":\"main\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"options\":{},\"identityEpoch\":1}]}\n",
+		"{\"version\":3,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"identityEpoch\":1}]}\n",
 		attachRef,
 		mountPath,
 	)
-	if err := privatepath.WriteFileAtomic(filepath.Join(daemonStateDir, "attaches.json"), []byte(registry)); err != nil {
+	if err := privatepath.WriteFileAtomic(filepath.Join(daemonStateDir, daemonctl.PersistedAttachesFilename), []byte(registry)); err != nil {
 		t.Fatal(err)
 	}
 	if rc := e.run([]string{"lifecycle", "hold-install-exclusive", "--json"}); rc != 1 {
 		t.Fatalf("rc = %d, want 1", rc)
 	}
-	if got := stderr.String(); !strings.Contains(got, "1 durable daemon attach(es) remain") ||
-		!strings.Contains(got, attachRef) ||
+	if got := stderr.String(); !strings.Contains(got, "registry entry attaches.json exists") ||
 		!strings.Contains(got, "before updating the PortableFS service") {
 		t.Fatalf("stderr = %q", got)
 	}
@@ -308,7 +295,7 @@ func TestInstallerGateRejectsStartingIntent(t *testing.T) {
 	stateDir := t.TempDir()
 	mountDir := filepath.Join(stateDir, "mounts")
 	mountPath := filepath.Join(t.TempDir(), "mount")
-	operation, err := acquireMountOperation(mountDir, mountPath, "volume", "main", "fuse")
+	operation, err := acquireMountOperation(mountDir, mountPath, "volume", "fuse")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,18 +319,99 @@ func TestInstallerGateRejectsPersistedAttachWithoutDaemon(t *testing.T) {
 	}
 	mountPath := filepath.Join(t.TempDir(), "mount")
 	registry := fmt.Sprintf(
-		"{\"version\":2,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"branch\":\"main\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"options\":{},\"identityEpoch\":1}]}\n",
+		"{\"version\":3,\"attaches\":[{\"ref\":%q,\"volumeId\":\"volume\",\"mountPath\":%q,\"authorityUrl\":\"127.0.0.1:1\",\"dataPlaneTransport\":\"plaintext\",\"identityEpoch\":1}]}\n",
 		attachRef, mountPath,
 	)
-	if err := privatepath.WriteFileAtomic(filepath.Join(daemonStateDir, "attaches.json"), []byte(registry)); err != nil {
+	if err := privatepath.WriteFileAtomic(filepath.Join(daemonStateDir, daemonctl.PersistedAttachesFilename), []byte(registry)); err != nil {
 		t.Fatal(err)
 	}
 	err = rejectDurableMountAnchors(stateDir)
-	if err == nil || !strings.Contains(err.Error(), attachRef) ||
+	if err == nil || !strings.Contains(err.Error(), "registry entry attaches.json exists") ||
 		!strings.Contains(err.Error(), "portablefs umount") {
 		t.Fatalf("installer gate error = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(daemonStateDir, "attaches.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(daemonStateDir, daemonctl.PersistedAttachesFilename)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunningOutgoingInventoryNeverDecodesPrivateRegistry(t *testing.T) {
+	for _, grammar := range []string{`{"outgoing_format":900,"different_records":[]}`, `{"version":3,"attaches":[]}`, "not-json"} {
+		for _, count := range []int{0, 1} {
+			e, _, _ := testEnv(t)
+			mountDir, err := e.mountStateDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			daemonDir := filepath.Join(filepath.Dir(mountDir), "portablefsd")
+			if err := privatepath.WriteFileAtomic(filepath.Join(daemonDir, daemonctl.PersistedAttachesFilename), []byte(grammar)); err != nil {
+				t.Fatal(err)
+			}
+			expected := testDaemonRelease("/authenticated/portablefsd", "outgoing", strings.Repeat("a", 64))
+			calls := 0
+			e.daemonLifecycleInventoryFn = func(got *daemonRelease) (int, error) {
+				calls++
+				if got == nil || *got != expected {
+					t.Error("outgoing tuple changed")
+				}
+				return count, nil
+			}
+			inventory, err := e.strictAccountInventory("replacement", &expected)
+			if (err == nil) != (count == 0) || calls != 1 || inventory.LiveAttaches != count || inventory.attachCount() != count {
+				t.Fatalf("grammar=%q count=%d inventory=%+v calls=%d error=%v", grammar, count, inventory, calls, err)
+			}
+		}
+	}
+}
+
+func TestOutgoingLifecycleFailureCannotSelectAbsentRegistryShortcut(t *testing.T) {
+	e, _, _ := testEnv(t)
+	expected := testDaemonRelease("/authenticated/portablefsd", "outgoing", strings.Repeat("a", 64))
+	sentinel := fmt.Errorf("outgoing authentication or inventory unavailable")
+	e.daemonLifecycleInventoryFn = func(*daemonRelease) (int, error) { return 0, sentinel }
+	if _, err := e.strictAccountInventory("replacement", &expected); !errors.Is(err, sentinel) {
+		t.Fatal(err)
+	}
+}
+
+func TestInstallerRegistryPreflightRefusesUnsafeParentsAndExistingKinds(t *testing.T) {
+	for _, kind := range []string{"empty", "unknown", "malformed", "symlink", "directory", "fifo", "inaccessible parent", "symlink parent"} {
+		t.Run(kind, func(t *testing.T) {
+			stateDir := t.TempDir()
+			daemonDir := filepath.Join(stateDir, "portablefsd")
+			if err := privatepath.EnsureDir(daemonDir); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(daemonDir, daemonctl.PersistedAttachesFilename)
+			var err error
+			switch kind {
+			case "empty":
+				err = os.WriteFile(path, nil, 0600)
+			case "unknown":
+				err = os.WriteFile(path, []byte(`{"version":99,"entries":[]}`), 0600)
+			case "malformed":
+				err = os.WriteFile(path, []byte("bad"), 0600)
+			case "symlink":
+				err = os.Symlink(filepath.Join(daemonDir, "absent"), path)
+			case "directory":
+				err = os.Mkdir(path, 0700)
+			case "fifo":
+				err = syscall.Mkfifo(path, 0600)
+			case "inaccessible parent":
+				err = os.Chmod(daemonDir, 0)
+				t.Cleanup(func() { _ = os.Chmod(daemonDir, 0700) })
+			case "symlink parent":
+				err = os.Rename(daemonDir, daemonDir+"-real")
+				if err == nil {
+					err = os.Symlink(daemonDir+"-real", daemonDir)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rejectDurableMountAnchors(stateDir); err == nil {
+				t.Fatal("existing or unsafe registry boundary admitted")
+			}
+		})
 	}
 }

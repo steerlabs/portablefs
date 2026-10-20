@@ -1,0 +1,296 @@
+package volumeserver
+
+import (
+	"bytes"
+	"encoding/hex"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountmembership"
+)
+
+func TestFileMountMembershipRequiresCurrentFilename(t *testing.T) {
+	for _, name := range []string{"visibility.membership", "membership", "mount.membership.old"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			if m, _, err := OpenFileMountMembership(path, "volume-a", false); err == nil {
+				m.Close()
+				t.Fatal("accepted a non-current membership filename")
+			}
+			if _, err := os.Stat(path + ".lock"); !os.IsNotExist(err) {
+				t.Fatalf("refused filename created a lock: %v", err)
+			}
+		})
+	}
+}
+
+func TestFileMountMembershipWritesSharedCodecBytesAndRollsBackDeactivate(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, mountmembership.Filename)
+	m, _, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	records := []mountmembership.Record{
+		{SessionID: [16]byte{3}, Profile: MembershipCacheless},
+		{SessionID: [16]byte{1}, Profile: MembershipFSKitExclusive},
+		{SessionID: [16]byte{2}, Profile: MembershipLinux},
+	}
+	assertDisk := func(records []mountmembership.Record) {
+		t.Helper()
+		want, err := mountmembership.Encode("volume-a", records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("disk membership=%q (%v), want shared codec %q", got, err, want)
+		}
+	}
+	assertDisk(nil)
+	for _, record := range records {
+		if err := m.ActivateProfile(SessionID(record.SessionID), record.Profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertDisk(records)
+	m.path = filepath.Join(dir, "missing", mountmembership.Filename)
+	id := SessionID(records[1].SessionID)
+	if err := m.Deactivate(id); err == nil {
+		t.Fatal("deactivate succeeded without persistence")
+	}
+	m.path = path
+	if _, ok := m.active[id]; !ok || m.profiles[id] != MembershipFSKitExclusive {
+		t.Fatal("failed deactivate lost its active profile")
+	}
+	assertDisk(records)
+	if err := m.Deactivate(id); err != nil {
+		t.Fatal(err)
+	}
+	assertDisk([]mountmembership.Record{records[0], records[2]})
+}
+
+func TestFileMountMembershipActivateRollsBackAfterPersistFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mount.membership")
+	registry, _, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := SessionID{1}
+	registry.path = filepath.Join(dir, "missing", "mount.membership")
+	if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err == nil {
+		t.Fatal("activate succeeded without a durable membership path")
+	}
+	registry.path = path
+	if _, active := registry.active[id]; active {
+		t.Fatal("failed activation remained live in memory")
+	}
+	if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err != nil {
+		t.Fatalf("retry activation after restoring persistence: %v", err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, disposition, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	if disposition != PriorEpochUnproven {
+		t.Fatalf("restart disposition = %v, want unproven", disposition)
+	}
+	if _, active := restarted.active[id]; !active {
+		t.Fatal("successful retry was not durable")
+	}
+}
+
+func TestFileMountMembershipSurvivesRestartUntilFencingProof(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mount.membership")
+	registry, disposition, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil || disposition != PriorEpochStrictMountsFenced {
+		t.Fatalf("open fresh membership = %v, %v", disposition, err)
+	}
+	id := SessionID{1}
+	if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, disposition, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disposition != PriorEpochUnproven {
+		t.Fatalf("restart disposition = %v, want unproven", disposition)
+	}
+	if _, _, err := OpenFileMountMembership(path, "volume-a", false); err == nil {
+		t.Fatal("second authority acquired the same membership lock")
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fenced, disposition, err := OpenFileMountMembership(path, "volume-a", true)
+	if err != nil || disposition != PriorEpochStrictMountsFenced {
+		t.Fatalf("open after fencing proof = %v, %v", disposition, err)
+	}
+	if len(fenced.active) != 0 {
+		t.Fatal("fencing proof did not clear prior membership")
+	}
+	if err := fenced.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// -prior-strict-mounts-fenced stays an explicit human assertion, but it stops
+// being an invisible one: the exact mounts it erased are durably recorded and
+// reported before the record it erases is rewritten.
+func TestFileMountMembershipAuditsOperatorAssertedFencing(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mount.membership")
+	registry, _, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := SessionID{1}, SessionID{2}
+	for _, id := range []SessionID{first, second} {
+		if err := registry.ActivateProfile(id, MembershipFSKitExclusive); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fenced, disposition, err := OpenFileMountMembership(path, "volume-a", true)
+	if err != nil || disposition != PriorEpochStrictMountsFenced {
+		t.Fatalf("open after fencing proof = %v, %v", disposition, err)
+	}
+	defer fenced.Close()
+	cleared := fenced.ClearedByOperatorAssertion()
+	if len(cleared) != 2 || cleared[0] != first || cleared[1] != second {
+		t.Fatalf("cleared set = %x, want both prior mounts", cleared)
+	}
+	audit, err := os.ReadFile(path + membershipAuditSuffix)
+	if err != nil {
+		t.Fatalf("read durable audit: %v", err)
+	}
+	for _, id := range cleared {
+		if !strings.Contains(string(audit), hex.EncodeToString(id[:])) {
+			t.Fatalf("audit does not name cleared mount %x:\n%s", id, audit)
+		}
+	}
+	if strings.Count(string(audit), "prior-strict-mounts-fenced") != 2 {
+		t.Fatalf("audit did not record one assertion per cleared mount:\n%s", audit)
+	}
+
+	// A run that clears nothing asserts nothing.
+	if err := fenced.Close(); err != nil {
+		t.Fatal(err)
+	}
+	again, _, err := OpenFileMountMembership(path, "volume-a", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if len(again.ClearedByOperatorAssertion()) != 0 {
+		t.Fatal("an empty record reported an operator assertion")
+	}
+}
+
+func TestFileMountMembershipIsBoundToOneVolume(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mount.membership")
+	registry, _, err := OpenFileMountMembership(path, "volume-a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := OpenFileMountMembership(path, "volume-b", false); err == nil {
+		t.Fatal("membership file was accepted for a different volume")
+	}
+}
+
+func TestProfiledMembershipPreservesMacExclusionAcrossRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		profiles      []MountMembershipProfile
+		compatibility PriorEpochDisposition
+		linux         bool
+	}{
+		{"linux", []MountMembershipProfile{MembershipLinux}, PriorEpochStrictMountsFenced, true},
+		{"mac", []MountMembershipProfile{MembershipFSKitExclusive}, PriorEpochUnproven, false},
+		{"gateway", []MountMembershipProfile{MembershipCacheless}, PriorEpochStrictMountsFenced, false},
+		{"mixed", []MountMembershipProfile{MembershipLinux, MembershipFSKitExclusive, MembershipCacheless}, PriorEpochUnproven, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "mount.membership")
+			m, _, err := OpenFileMountMembership(path, "vol", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, p := range tc.profiles {
+				if err := m.ActivateProfile(SessionID{byte(i + 1)}, p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, prior, err := OpenFileMountMembership(path, "vol", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			compatibility, linux := m.PriorCacheState()
+			if prior != PriorEpochUnproven || compatibility != tc.compatibility || linux != tc.linux {
+				t.Fatalf("prior=%v compatibility=%v linux=%v", prior, compatibility, linux)
+			}
+			for i, p := range tc.profiles {
+				if m.profiles[SessionID{byte(i + 1)}] != p {
+					t.Fatal("profile lost on reload")
+				}
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, prior, err = OpenFileMountMembership(path, "vol", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			compatibility, linux = m.PriorCacheState()
+			if prior != PriorEpochStrictMountsFenced || compatibility != PriorEpochStrictMountsFenced || linux || len(m.ClearedByOperatorAssertion()) != len(tc.profiles) {
+				t.Fatal("operator clear did not audit and clear every profile")
+			}
+		})
+	}
+}

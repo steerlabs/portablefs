@@ -25,7 +25,7 @@ set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository, and the
 # same image the privileged XFS/FUSE integration job uses.
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c}"
 : "${PORTABLEFS_XFS_IMAGE_SIZE:=1G}"
 : "${PORTABLEFS_SERVICE_UID:=200001}"
 : "${PORTABLEFS_SERVICE_GID:=200001}"
@@ -37,10 +37,11 @@ set -euo pipefail
 : "${PORTABLEFS_VOLUME_NAME:=coherence-volume}"
 : "${PORTABLEFS_AUTHORITY_PORT:=17443}"
 : "${PORTABLEFS_ATOMIC_REPLACE_ROUNDS:=20}"
-# The cases assert protocol-7 subscription/delegation behavior through syscalls.
-# Cache bounds remain explicit so Attach refuses incompatible admission limits.
-: "${PORTABLEFS_CACHED_NAME_CAPACITY:=65536}"
-: "${PORTABLEFS_REPAIR_BUDGET:=15s}"
+# The cases assert subscription/delegation behavior through syscalls. The
+# mounts' local name-cache and withdrawal bounds stay explicit so a run states
+# exactly the bounds it measured.
+: "${PORTABLEFS_NAME_CACHE_CAPACITY:=65536}"
+: "${PORTABLEFS_WITHDRAWAL_TIMEOUT:=15s}"
 # The driver's per-case wall bound. It is deliberately larger than
 # same_dir_concurrent_mutations' own storm bound (3m, stated in cases.go) so that
 # a deadlocked storm is reported by the case - which names what hung and still
@@ -131,8 +132,8 @@ run_host() {
     -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
     -e "PORTABLEFS_AUTHORITY_PORT=${PORTABLEFS_AUTHORITY_PORT}" \
     -e "PORTABLEFS_ATOMIC_REPLACE_ROUNDS=${PORTABLEFS_ATOMIC_REPLACE_ROUNDS}" \
-    -e "PORTABLEFS_CACHED_NAME_CAPACITY=${PORTABLEFS_CACHED_NAME_CAPACITY}" \
-    -e "PORTABLEFS_REPAIR_BUDGET=${PORTABLEFS_REPAIR_BUDGET}" \
+    -e "PORTABLEFS_NAME_CACHE_CAPACITY=${PORTABLEFS_NAME_CACHE_CAPACITY}" \
+    -e "PORTABLEFS_WITHDRAWAL_TIMEOUT=${PORTABLEFS_WITHDRAWAL_TIMEOUT}" \
     -e "PORTABLEFS_CASE_TIMEOUT=${PORTABLEFS_CASE_TIMEOUT}" \
     -e "PORTABLEFS_ROUTE_RULES=${PORTABLEFS_ROUTE_RULES}" \
     -e "PORTABLEFS_LOCAL_ROUTE=${PORTABLEFS_LOCAL_ROUTE}" \
@@ -150,10 +151,10 @@ install_container_dependencies() {
   apt-get install -y -qq --no-install-recommends xfsprogs fuse3 util-linux procps >/dev/null
 }
 
-# The FUSE control filesystem is the kernel interface a strict mount's
-# revocation ladder uses to abort its own serving connection. A production host
-# has it mounted; a container does not inherit it, and a mount that cannot abort
-# cannot release the requests parked in its kernel.
+# The FUSE control filesystem is the kernel interface a mount's revocation
+# ladder uses to abort its own serving connection. A production host has it
+# mounted; a container does not inherit it, and a mount that cannot abort cannot
+# release the requests parked in its kernel.
 provision_fuse_control() {
   [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
   mountpoint -q /sys/fs/fuse/connections ||
@@ -184,8 +185,7 @@ create_service_identity() {
   install -d -m 0700 -o "$PORTABLEFS_SERVICE_UID" -g "$PORTABLEFS_SERVICE_GID" \
     /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache \
     /home/portablefs/tmp /home/portablefs/bin /home/portablefs/creds \
-    /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs \
-    /home/portablefs/write-staging
+    /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs
 }
 
 # as_service runs a command as the unprivileged volume identity with a clean
@@ -215,23 +215,7 @@ build_binaries() {
 start_authority() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
   local control=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME
-  local membership=$control/strict-membership
-  local write_staging_source=$control/write-staging
-  local write_staging=/home/portablefs/write-staging
-  # Production gives the authority a private staging root through systemd's
-  # BindPaths boundary.  Do the same here: the cell's root-owned 0711 control
-  # directory is deliberately traversable-but-not-readable by the volume uid,
-  # while privatepath.OpenExistingDir deliberately opens every component and
-  # therefore must see only the service-owned 0700 presentation.  Both names
-  # resolve to the same project-inheriting XFS inode, so quota accounting cannot
-  # diverge from the visible volume.
-  mount --bind "$write_staging_source" "$write_staging"
-  WRITE_STAGING_BIND=$write_staging
-  [[ $(stat -c '%u:%g:%a' -- "$write_staging") == \
-      "$PORTABLEFS_SERVICE_UID:$PORTABLEFS_SERVICE_GID:700" ]] ||
-    fail "bound write staging is not the exact service-owned 0700 directory" 70
-  [[ $(findmnt -n -r -o TARGET --target "$write_staging") == "$write_staging" ]] ||
-    fail "write staging bind mount is not installed at $write_staging" 70
+  local membership=$control/mount.membership
   as_service /home/portablefs/bin/pfs-coherence-credentials \
     --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 --lifetime 1h ||
     fail "minting the credential set failed" 70
@@ -248,10 +232,7 @@ exec /home/portablefs/bin/portablefs-authority \
     --tls-key /home/portablefs/creds/server.key \
     --client-ca /home/portablefs/creds/ca.pem \
     --capability-public-key /home/portablefs/creds/capability-public.pem \
-    --visibility-membership-file "$membership" \
-    --write-staging-dir "$write_staging" \
-    --max-cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
-    --max-repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
+    --mount-membership-file "$membership" \
     --capability-max-lifetime 1h
 LAUNCH
   chmod 0700 /home/portablefs/launch-authority.sh
@@ -349,9 +330,8 @@ start_mount() {
     --tls-server-ca /home/portablefs/creds/ca.pem \
     --tls-server-name authority.portablefs.test \
     --max-frame-bytes 16777216 \
-    --coherence strict \
-    --cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
-    --repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
+    --name-cache-capacity "$PORTABLEFS_NAME_CACHE_CAPACITY" \
+    --withdrawal-timeout "$PORTABLEFS_WITHDRAWAL_TIMEOUT" \
     --local-backing "$backing" \
     >"/home/portablefs/logs/mount-${index}.log" 2>&1 &
   local pid=$!
@@ -385,9 +365,6 @@ teardown() {
   [[ -f /home/portablefs/authority.pid ]] && kill "$(cat /home/portablefs/authority.pid)" 2>/dev/null
   [[ -n ${AUTHORITY_PID:-} ]] && kill "$AUTHORITY_PID" 2>/dev/null
   wait 2>/dev/null
-  if [[ -n ${WRITE_STAGING_BIND:-} ]]; then
-    umount "$WRITE_STAGING_BIND" 2>/dev/null || true
-  fi
   echo "==== route declaration apply log ===="
   cat /home/portablefs/logs/apply-routes.log 2>/dev/null
   echo "==== authority log ===="
@@ -404,8 +381,8 @@ teardown() {
 # The disjoint-namespace phase declares that EVERY case must fail, and a mount
 # that has revoked itself fails every case too - so a fenced mount satisfies that
 # phase for entirely the wrong reason and the phase reports green. This run found
-# exactly that: a strict mount-A revoked itself one second after mounting, and
-# phase 1 still passed.
+# exactly that: mount-A revoked itself one second after mounting, and phase 1
+# still passed.
 #
 # So each phase is bracketed by a real create/read/unlink on both mountpoints. A
 # mount that cannot complete one is named, and the job fails, instead of the run
@@ -438,7 +415,7 @@ assert_mounts_serving() {
 # two roots sharing one filesystem is not measuring cross-mount coherence and
 # would be reporting green for free. Together with the stale-view control below,
 # this is what makes the real matrix's green result mean something.
-# Both pathname controls exclude these protocol-7 process experiments:
+# Both pathname controls exclude these process experiments:
 # - gateway_reads_delegated_data_without_obstructing_writer launches an external
 #   authenticated probe against the real mount-a and Authority. Replacing root B
 #   or replaying the actor's pathname answers does not intercept that subprocess;
@@ -462,8 +439,8 @@ run_disjoint_control() {
       # routes_revision_mismatch asserts an attach-time authority contract
       # through a client that touches no mountpoint, so pointing the second root
       # at an unrelated directory cannot turn it red. It is expected to PASS
-      # here, which is why it is simply not declared. The three protocol-7
-      # exclusions have separate process/handle rationales above.
+      # here, which is why it is simply not declared. The three process
+      # experiments have separate process/handle rationales above.
       routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes) continue ;;
     esac
     arguments+=(--expect "${entry}=FAIL:a mount that shares no namespace with the other must fail this case")

@@ -8,15 +8,30 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/pathcomponent"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
-	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
 )
 
 const maxV3SourcePublicationTargets = 16
 
-var errV3SourcePublicationInterrupted = errors.New("portablefsd: source publication interrupted by an already-owned peer repair cut")
+// v3CallbackID is mount-shared identity. Wire counters alone name no callback.
+type v3CallbackID struct{ origin, operation uint64 }
+
+func (id v3CallbackID) valid() bool { return id.origin != 0 && id.operation != 0 }
+
+type v3CallbackContextKey struct{}
+
+func v3Callback(ctx context.Context, operation uint64) v3CallbackID {
+	origin, _ := ctx.Value(v3CallbackContextKey{}).(uint64)
+	return v3CallbackID{origin: origin, operation: operation}
+}
+
+type v3SourceGate struct {
+	items []v3SourceItemSpec
+	names []v3SourceNamespaceSpec
+}
+
 var errV3SourcePublicationNotPublished = errors.New("portablefsd: authority-committed visible mutation did not cross the FSKit publication boundary")
 
 type v3PublicationIdentity [16]byte
@@ -85,7 +100,7 @@ func v3SourceItem(item pfslocal.Item, data bool) (v3SourceItemSpec, error) {
 
 func v3SourceNamespace(parent pfslocal.Item, name []byte, boundData bool) (v3SourceNamespaceSpec, error) {
 	identity, err := v3PublicationIdentityFromItem(parent)
-	if err != nil || !visibilitywire.ValidName(name) {
+	if err != nil || !pathcomponent.ValidName(name) {
 		return v3SourceNamespaceSpec{}, errors.New("portablefsd: namespace omitted its stable publication coordinate")
 	}
 	return v3SourceNamespaceSpec{
@@ -93,7 +108,7 @@ func v3SourceNamespace(parent pfslocal.Item, name []byte, boundData bool) (v3Sou
 	}, nil
 }
 
-func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSpec) (*authoritypb.FskitSourcePublication, error) {
+func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSpec) (*v3SourceGate, error) {
 	itemSet := make(map[v3PublicationIdentity]v3SourceItemSpec, len(items))
 	for _, item := range items {
 		if item.identity == (v3PublicationIdentity{}) || !item.attributes || item.data && !item.attributes {
@@ -107,7 +122,7 @@ func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSp
 	}
 	nameSet := make(map[v3PublicationNamespace]v3SourceNamespaceSpec, len(names))
 	for _, name := range names {
-		if name.parent == (v3PublicationIdentity{}) || !visibilitywire.ValidName([]byte(name.name)) || name.data && !name.attributes {
+		if name.parent == (v3PublicationIdentity{}) || !pathcomponent.ValidName([]byte(name.name)) || name.data && !name.attributes {
 			return nil, errors.New("portablefsd: malformed namespace source-publication target")
 		}
 		key := v3PublicationNamespace{parent: name.parent, name: name.name}
@@ -137,28 +152,11 @@ func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSp
 		}
 		return bytes.Compare([]byte(orderedNames[i].name), []byte(orderedNames[j].name)) < 0
 	})
-	gate := &authoritypb.FskitSourcePublication{
-		Targets: make([]*authoritypb.FskitSourcePublicationTarget, 0, len(orderedItems)+len(orderedNames)),
-	}
-	for _, item := range orderedItems {
-		gate.Targets = append(gate.Targets, &authoritypb.FskitSourcePublicationTarget{
-			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
-				Identity: append([]byte(nil), item.identity[:]...), Attributes: item.attributes, Data: item.data,
-			}},
-		})
-	}
-	for _, name := range orderedNames {
-		gate.Targets = append(gate.Targets, &authoritypb.FskitSourcePublicationTarget{
-			Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
-				ParentIdentity: append([]byte(nil), name.parent[:]...), Name: []byte(name.name),
-				BoundAttributes: name.attributes, BoundData: name.data,
-			}},
-		})
-	}
+	gate := &v3SourceGate{items: orderedItems, names: orderedNames}
 	return gate, nil
 }
 
-func v3ItemSourceGate(item pfslocal.Item, data bool) (*authoritypb.FskitSourcePublication, error) {
+func v3ItemSourceGate(item pfslocal.Item, data bool) (*v3SourceGate, error) {
 	target, err := v3SourceItem(item, data)
 	if err != nil {
 		return nil, err
@@ -166,7 +164,7 @@ func v3ItemSourceGate(item pfslocal.Item, data bool) (*authoritypb.FskitSourcePu
 	return v3CanonicalSourceGate([]v3SourceItemSpec{target}, nil)
 }
 
-func v3NamespaceSourceGate(parent pfslocal.Item, name []byte, boundData bool, additional ...pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+func v3NamespaceSourceGate(parent pfslocal.Item, name []byte, boundData bool, additional ...pfslocal.Item) (*v3SourceGate, error) {
 	namespace, err := v3SourceNamespace(parent, name, boundData)
 	if err != nil {
 		return nil, err
@@ -186,7 +184,7 @@ func v3NamespaceSourceGate(parent pfslocal.Item, name []byte, boundData bool, ad
 	return v3CanonicalSourceGate(items, []v3SourceNamespaceSpec{namespace})
 }
 
-func v3RenameSourceGate(oldParent pfslocal.Item, oldName []byte, newParent pfslocal.Item, newName []byte) (*authoritypb.FskitSourcePublication, error) {
+func v3RenameSourceGate(oldParent pfslocal.Item, oldName []byte, newParent pfslocal.Item, newName []byte) (*v3SourceGate, error) {
 	oldNamespace, err := v3SourceNamespace(oldParent, oldName, false)
 	if err != nil {
 		return nil, err
@@ -219,45 +217,35 @@ type v3SourcePublicationOperation struct {
 
 type v3SourcePublicationLease struct {
 	gate                 *v3SourcePublicationCoordinator
-	operationID          uint64
+	operationID          v3CallbackID
 	coordinates          map[v3PublicationCoordinate]struct{}
 	names                map[v3PublicationNamespace]v3PublicationClaims
 	unresolvedAttributes int
 	unresolvedData       int
 	assigned             uint32
-	released             bool
+	// active counts whole source handlers, through validated cache application
+	// and claim settlement. PublicationAck retains ordering holds independently.
+	active   uint32
+	released bool
 }
 
-// v3SourcePublicationCoordinator is the one local ordering point between
-// callback-owned source publication and authority-owned peer repair. It uses
-// stable identities only. The older mount-wide path handoff gate remains a
-// separate delegation mechanism and is never consulted for this correctness
-// cut.
 type v3SourcePublicationCoordinator struct {
 	mu                   sync.Mutex
 	changed              chan struct{}
 	terminal             error
-	operations           map[uint64]*v3SourcePublicationOperation
-	sourceHolds          map[v3PublicationCoordinate]*v3SourcePublicationLease
+	operations           map[v3CallbackID]*v3SourcePublicationOperation
+	sourceHolds          map[v3PublicationCoordinate]map[*v3SourcePublicationLease]struct{} // every holder; see holdLocked
 	unresolvedAttributes map[*v3SourcePublicationLease]int
 	unresolvedData       map[*v3SourcePublicationLease]int
-	peerSequence         uint64
-	peerHolds            map[v3PublicationCoordinate]struct{}
-	// peerContended records an ordered request definitely refused behind this
-	// exact peer cut before Swift could observe PREPARE. COMPLETE consumes it
-	// into the existing Ack contention bit, preserving dormant FIFO credit
-	// without another wire field.
-	peerContended bool
 }
 
 func newV3SourcePublicationCoordinator() *v3SourcePublicationCoordinator {
 	return &v3SourcePublicationCoordinator{
 		changed:              make(chan struct{}),
-		operations:           make(map[uint64]*v3SourcePublicationOperation),
-		sourceHolds:          make(map[v3PublicationCoordinate]*v3SourcePublicationLease),
+		operations:           make(map[v3CallbackID]*v3SourcePublicationOperation),
+		sourceHolds:          make(map[v3PublicationCoordinate]map[*v3SourcePublicationLease]struct{}),
 		unresolvedAttributes: make(map[*v3SourcePublicationLease]int),
 		unresolvedData:       make(map[*v3SourcePublicationLease]int),
-		peerHolds:            make(map[v3PublicationCoordinate]struct{}),
 	}
 }
 
@@ -266,12 +254,8 @@ func (c *v3SourcePublicationCoordinator) signalLocked() {
 	c.changed = make(chan struct{})
 }
 
-func v3PublicationCoordinatesOverlap(left, right v3PublicationCoordinate) bool {
-	return left == right
-}
-
-func (c *v3SourcePublicationCoordinator) reserve(operationID uint64) {
-	if operationID == 0 {
+func (c *v3SourcePublicationCoordinator) reserve(operationID v3CallbackID) {
+	if !operationID.valid() {
 		return
 	}
 	c.mu.Lock()
@@ -287,8 +271,8 @@ func (c *v3SourcePublicationCoordinator) reserve(operationID uint64) {
 	op.reserved = true
 }
 
-func (c *v3SourcePublicationCoordinator) retire(operationID uint64) {
-	if operationID == 0 {
+func (c *v3SourcePublicationCoordinator) retire(operationID v3CallbackID) {
+	if !operationID.valid() {
 		return
 	}
 	c.mu.Lock()
@@ -307,7 +291,7 @@ func (c *v3SourcePublicationCoordinator) retire(operationID uint64) {
 }
 
 func (c *v3SourcePublicationCoordinator) acknowledge(
-	operationID uint64,
+	operationID v3CallbackID,
 	semanticCommit pfslocal.PublicationSemanticCommit,
 ) (bool, error) {
 	c.mu.Lock()
@@ -337,143 +321,74 @@ func (c *v3SourcePublicationCoordinator) acknowledge(
 	return true, nil
 }
 
-func (c *v3SourcePublicationCoordinator) operationLease(operationID uint64) *v3SourcePublicationLease {
+func (c *v3SourcePublicationCoordinator) operationLease(operationID v3CallbackID) *v3SourcePublicationLease {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.operationLeaseLocked(operationID)
 }
 
-func (c *v3SourcePublicationCoordinator) operationLeaseLocked(operationID uint64) *v3SourcePublicationLease {
+func (c *v3SourcePublicationCoordinator) operationLeaseLocked(operationID v3CallbackID) *v3SourcePublicationLease {
 	if op := c.operations[operationID]; op != nil {
 		return op.lease
 	}
 	return nil
 }
 
-func coordinatesForV3SourceGate(gate *authoritypb.FskitSourcePublication) (map[v3PublicationCoordinate]struct{}, map[v3PublicationNamespace]v3PublicationBounds, error) {
-	if gate == nil || len(gate.GetTargets()) == 0 || len(gate.GetTargets()) > maxV3SourcePublicationTargets {
-		return nil, nil, errors.New("portablefsd: source publication gate is missing or oversized")
+func coordinatesForV3SourceGate(gate *v3SourceGate) (map[v3PublicationCoordinate]struct{}, map[v3PublicationNamespace]v3PublicationBounds, error) {
+	if gate == nil || len(gate.items)+len(gate.names) == 0 || len(gate.items)+len(gate.names) > maxV3SourcePublicationTargets {
+		return nil, nil, errors.New("portablefsd: invalid source publication gate")
 	}
-	coordinates := make(map[v3PublicationCoordinate]struct{}, len(gate.GetTargets())*2)
+	coordinates := make(map[v3PublicationCoordinate]struct{})
 	names := make(map[v3PublicationNamespace]v3PublicationBounds)
-	var previous []byte
-	for _, target := range gate.GetTargets() {
-		var canonical []byte
-		switch {
-		case target.GetItem() != nil:
-			item := target.GetItem()
-			var identity v3PublicationIdentity
-			if len(item.GetIdentity()) != len(identity) || !item.GetAttributes() || item.GetData() && !item.GetAttributes() {
-				return nil, nil, errors.New("portablefsd: malformed item source publication target")
-			}
-			copy(identity[:], item.GetIdentity())
-			if identity == (v3PublicationIdentity{}) {
-				return nil, nil, errors.New("portablefsd: zero item source publication identity")
-			}
-			canonical = append([]byte{0}, identity[:]...)
-			coordinates[v3PublicationCoordinate{kind: v3PublicationItemAttributes, item: identity}] = struct{}{}
-			if item.GetData() {
-				coordinates[v3PublicationCoordinate{kind: v3PublicationItemData, item: identity}] = struct{}{}
-			}
-		case target.GetNamespace() != nil:
-			namespace := target.GetNamespace()
-			var parent v3PublicationIdentity
-			if len(namespace.GetParentIdentity()) != len(parent) || !visibilitywire.ValidName(namespace.GetName()) ||
-				namespace.GetBoundData() && !namespace.GetBoundAttributes() {
-				return nil, nil, errors.New("portablefsd: malformed namespace source publication target")
-			}
-			copy(parent[:], namespace.GetParentIdentity())
-			if parent == (v3PublicationIdentity{}) {
-				return nil, nil, errors.New("portablefsd: zero parent source publication identity")
-			}
-			canonical = append([]byte{1}, parent[:]...)
-			canonical = append(canonical, namespace.GetName()...)
-			name := v3PublicationNamespace{parent: parent, name: string(namespace.GetName())}
-			coordinates[v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: parent, name: name.name}] = struct{}{}
-			names[name] = v3PublicationBounds{
-				attributes: namespace.GetBoundAttributes(), data: namespace.GetBoundData(),
-			}
-		default:
-			return nil, nil, errors.New("portablefsd: source publication target omitted its coordinate")
+	for _, item := range gate.items {
+		if item.identity == (v3PublicationIdentity{}) || !item.attributes {
+			return nil, nil, errors.New("invalid source item")
 		}
-		if previous != nil && bytes.Compare(previous, canonical) >= 0 {
-			return nil, nil, errors.New("portablefsd: source publication targets are not canonical and unique")
+		addV3BoundCoordinates(coordinates, item.identity, v3PublicationBounds{attributes: item.attributes, data: item.data})
+	}
+	for _, name := range gate.names {
+		if name.parent == (v3PublicationIdentity{}) || !pathcomponent.ValidName([]byte(name.name)) || name.data && !name.attributes {
+			return nil, nil, errors.New("invalid source namespace")
 		}
-		previous = canonical
+		key := v3PublicationNamespace{parent: name.parent, name: name.name}
+		coordinates[v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: name.parent, name: name.name}] = struct{}{}
+		names[key] = v3PublicationBounds{attributes: name.attributes, data: name.data}
 	}
 	return coordinates, names, nil
 }
 
-func coordinatesForV3PeerTargets(targets []*authoritypb.VisibilityTarget) (map[v3PublicationCoordinate]struct{}, error) {
-	coordinates := make(map[v3PublicationCoordinate]struct{}, len(targets)*2)
-	for _, target := range targets {
-		if err := visibilitywire.ValidateTarget(target); err != nil {
-			return nil, err
-		}
-		switch target.GetScope() {
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
-			var parent v3PublicationIdentity
-			copy(parent[:], target.GetParentIdentity())
-			coordinates[v3PublicationCoordinate{kind: v3PublicationNamespaceName, parent: parent, name: string(target.GetName())}] = struct{}{}
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES:
-			var identity v3PublicationIdentity
-			copy(identity[:], target.GetIdentity())
-			coordinates[v3PublicationCoordinate{kind: v3PublicationItemAttributes, item: identity}] = struct{}{}
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA:
-			var identity v3PublicationIdentity
-			copy(identity[:], target.GetIdentity())
-			coordinates[v3PublicationCoordinate{kind: v3PublicationItemAttributes, item: identity}] = struct{}{}
-			coordinates[v3PublicationCoordinate{kind: v3PublicationItemData, item: identity}] = struct{}{}
-		default:
-			return nil, errors.New("portablefsd: peer target has no publication scope")
+// heldByOtherLocked reports whether any lease other than owner holds the
+// exact coordinate (coordinates overlap only when equal).
+func (c *v3SourcePublicationCoordinator) heldByOtherLocked(coordinate v3PublicationCoordinate, owner *v3SourcePublicationLease) bool {
+	for holder := range c.sourceHolds[coordinate] {
+		if holder != owner {
+			return true
 		}
 	}
-	return coordinates, nil
+	return false
+}
+
+// holdLocked records lease as a holder of coordinate. Acquisition admits one
+// holder per coordinate, but a namespace lease's unresolved claim can resolve
+// onto an identity an item-only lease already holds (the legal overlap of a
+// rename with a setattr of the renamed object); both then hold it until each
+// publishes.
+func (c *v3SourcePublicationCoordinator) holdLocked(coordinate v3PublicationCoordinate, lease *v3SourcePublicationLease) {
+	if _, exists := lease.coordinates[coordinate]; exists {
+		return
+	}
+	lease.coordinates[coordinate] = struct{}{}
+	holders := c.sourceHolds[coordinate]
+	if holders == nil {
+		holders = make(map[*v3SourcePublicationLease]struct{}, 1)
+		c.sourceHolds[coordinate] = holders
+	}
+	holders[lease] = struct{}{}
 }
 
 func (c *v3SourcePublicationCoordinator) sourceConflictLocked(coordinates map[v3PublicationCoordinate]struct{}, owner *v3SourcePublicationLease) bool {
 	for coordinate := range coordinates {
-		for heldCoordinate, held := range c.sourceHolds {
-			if held != owner && v3PublicationCoordinatesOverlap(coordinate, heldCoordinate) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (c *v3SourcePublicationCoordinator) peerConflictLocked(coordinates map[v3PublicationCoordinate]struct{}) bool {
-	if c.sourceConflictLocked(coordinates, nil) {
-		return true
-	}
-	for coordinate := range coordinates {
-		switch coordinate.kind {
-		case v3PublicationItemAttributes:
-			if len(c.unresolvedAttributes) != 0 {
-				return true
-			}
-		case v3PublicationItemData:
-			if len(c.unresolvedData) != 0 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (c *v3SourcePublicationCoordinator) peerConflictsSourceLocked(coordinates map[v3PublicationCoordinate]struct{}, names map[v3PublicationNamespace]v3PublicationBounds) bool {
-	for coordinate := range coordinates {
-		if _, held := c.peerHolds[coordinate]; held {
-			return true
-		}
-	}
-	attributes, data := false, false
-	for _, bounds := range names {
-		attributes = attributes || bounds.attributes
-		data = data || bounds.data
-	}
-	for coordinate := range c.peerHolds {
-		if attributes && coordinate.kind == v3PublicationItemAttributes || data && coordinate.kind == v3PublicationItemData {
+		if c.heldByOtherLocked(coordinate, owner) {
 			return true
 		}
 	}
@@ -489,11 +404,9 @@ func (c *v3SourcePublicationCoordinator) unresolvedConflictsExistingLocked(names
 	if !attributes && !data {
 		return false
 	}
-	for coordinate, lease := range c.sourceHolds {
-		if lease == owner {
-			continue
-		}
-		if attributes && coordinate.kind == v3PublicationItemAttributes || data && coordinate.kind == v3PublicationItemData {
+	for coordinate := range c.sourceHolds {
+		if (attributes && coordinate.kind == v3PublicationItemAttributes || data && coordinate.kind == v3PublicationItemData) &&
+			c.heldByOtherLocked(coordinate, owner) {
 			return true
 		}
 	}
@@ -514,8 +427,8 @@ func (c *v3SourcePublicationCoordinator) unresolvedConflictsExistingLocked(names
 	return false
 }
 
-func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, operationID uint64, gate *authoritypb.FskitSourcePublication) (*v3SourcePublicationLease, error) {
-	if ctx == nil || operationID == 0 {
+func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, operationID v3CallbackID, gate *v3SourceGate) (*v3SourcePublicationLease, error) {
+	if ctx == nil || !operationID.valid() {
 		return nil, errors.New("portablefsd: source publication needs a live callback identity")
 	}
 	coordinates, names, err := coordinatesForV3SourceGate(gate)
@@ -538,15 +451,6 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 			c.mu.Unlock()
 			return nil, errors.New("portablefsd: source callback already crossed PublicationAck")
 		}
-		// Peer-first is a definite local refusal, never a wait. The framework
-		// callback may be the only actuator lane that can complete that peer
-		// repair; parking it behind the cut would close the cycle. No replay
-		// identity has been assigned and no DATA bytes have been sent here.
-		if c.peerConflictsSourceLocked(coordinates, names) {
-			c.peerContended = true
-			c.mu.Unlock()
-			return nil, errV3SourcePublicationInterrupted
-		}
 		lease := op.lease
 		if lease == nil {
 			lease = &v3SourcePublicationLease{
@@ -568,11 +472,9 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 		if op.lease == nil {
 			op.lease = lease
 		}
+		lease.active++
 		for coordinate := range coordinates {
-			if _, exists := lease.coordinates[coordinate]; !exists {
-				lease.coordinates[coordinate] = struct{}{}
-				c.sourceHolds[coordinate] = lease
-			}
+			c.holdLocked(coordinate, lease)
 		}
 		for namespace, bounds := range names {
 			claims := lease.names[namespace]
@@ -600,6 +502,92 @@ func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, oper
 	}
 }
 
+// v3CacheConflict distinguishes live source holds from terminal admission or a
+// peer cut, which withdraws this session's cache service entirely.
+type v3CacheConflict func(coordinates ...v3PublicationCoordinate) v3CacheResult
+
+// cacheRead runs read under the coordinator mutex, the first lock of the short
+// coordinator → d.mu snapshot order used by cache hits. read may take d.mu and
+// must neither wait nor take any other lock. A hit admitted under it is atomic
+// with every source acquisition: a mutation either holds or claims a
+// coordinate the hit checks, or acquires only after the hit's snapshot.
+// Unresolved post-binding claims conflict with every attribute or data read,
+// because the identity they will bind is not known yet.
+func (c *v3SourcePublicationCoordinator) cacheRead(read func(v3CacheConflict)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	read(c.cacheConflictLocked)
+}
+
+func (c *v3SourcePublicationCoordinator) cacheConflictLocked(coordinates ...v3PublicationCoordinate) v3CacheResult {
+	if c.terminal != nil {
+		return v3CacheTerminal
+	}
+	for _, coordinate := range coordinates {
+		for holder := range c.sourceHolds[coordinate] {
+			if holder.active != 0 {
+				return v3CacheHeld
+			}
+			if holder.unresolvedAttributes != 0 || holder.unresolvedData != 0 {
+				return v3CacheHeld
+			}
+		}
+		switch coordinate.kind {
+		case v3PublicationItemAttributes:
+			if len(c.unresolvedAttributes) != 0 {
+				return v3CacheHeld
+			}
+		case v3PublicationItemData:
+			if len(c.unresolvedData) != 0 {
+				return v3CacheHeld
+			}
+		}
+	}
+	return v3CacheHit
+}
+
+// waitForCacheSettlement waits for handlers and unresolved bindings, never for
+// PublicationAck. The notification is sampled under the same mutex as conflict
+// detection; callers hold no data-plane or handle lock needed by a producer.
+func (c *v3SourcePublicationCoordinator) waitForCacheSettlement(ctx context.Context, coordinate v3PublicationCoordinate) error {
+	for {
+		c.mu.Lock()
+		if c.terminal != nil {
+			err := c.terminal
+			c.mu.Unlock()
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return err
+		}
+		reason := c.cacheConflictLocked(coordinate)
+		changed := c.changed
+		c.mu.Unlock()
+		if reason != v3CacheHeld {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return fmt.Errorf("portablefsd: cache source settlement: %w", ctx.Err())
+		}
+	}
+}
+
+// finishRequest runs exactly once at the whole handler's return, never at RPC
+// return. A terminal outcome has already closed admission before this decrement.
+func (l *v3SourcePublicationLease) finishRequest() {
+	c := l.gate
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if l.active == 0 {
+		panic("portablefsd: source request settled twice")
+	}
+	l.active--
+	c.signalLocked()
+}
+
 func (l *v3SourcePublicationLease) markAssigned() error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: source publication assignment has no lease")
@@ -619,6 +607,8 @@ func (l *v3SourcePublicationLease) markAssigned() error {
 // before reply construction or socket exposure can fail. A callback-level
 // NOT_PUBLISHED verdict is terminal whenever this bit is set, including when a
 // later request in the same logical operation is the one that fails.
+// Terminal withdrawal forbids new leases and assignments; already assigned
+// replies still settle their exact bindings and receipts before teardown.
 func (l *v3SourcePublicationLease) markCommitted() error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: committed source mutation has no publication lease")
@@ -626,8 +616,8 @@ func (l *v3SourcePublicationLease) markCommitted() error {
 	l.gate.mu.Lock()
 	defer l.gate.mu.Unlock()
 	op := l.gate.operations[l.operationID]
-	if l.gate.terminal != nil || l.released || op == nil || op.lease != l ||
-		op.acknowledged || l.assigned == 0 {
+	if l.released || op == nil || op.lease != l ||
+		(op.acknowledged && l.gate.terminal == nil) || l.assigned == 0 {
 		return errors.New("portablefsd: committed source mutation crossed an inactive publication lease")
 	}
 	op.committed = true
@@ -649,7 +639,7 @@ func (l *v3SourcePublicationLease) retainResponseConsumption(consumption authori
 	l.gate.mu.Lock()
 	defer l.gate.mu.Unlock()
 	op := l.gate.operations[l.operationID]
-	if l.gate.terminal != nil || l.released || op == nil || op.lease != l ||
+	if l.released || op == nil || op.lease != l ||
 		!op.committed || l.assigned == 0 {
 		return errors.New("portablefsd: retained authority response crossed an inactive publication lease")
 	}
@@ -664,16 +654,16 @@ func (l *v3SourcePublicationLease) retainResponseConsumption(consumption authori
 // it begins before authority dispatch and ends only after the physical
 // pfslocal reply, PublicationAck, and every handler retirement.
 func (c *v3SourcePublicationCoordinator) retainFrontendResponseConsumption(
-	operationID uint64,
+	operationID v3CallbackID,
 	consumption authorityrpc.ResponseConsumption,
 ) error {
-	if operationID == 0 || consumption == nil {
+	if !operationID.valid() || consumption == nil {
 		return errors.New("portablefsd: retained frontend response omitted its publication identity")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	op := c.operations[operationID]
-	if c.terminal != nil || op == nil || !op.reserved {
+	if op == nil || !op.reserved {
 		return errors.New("portablefsd: retained frontend response crossed an inactive publication operation")
 	}
 	op.responseConsumptions = append(op.responseConsumptions, consumption)
@@ -687,8 +677,8 @@ func (c *v3SourcePublicationCoordinator) retainFrontendResponseConsumption(
 // other boundary ResponseConsumption permits. Receipts are returned rather
 // than consumed under mu because terminal receipts perform a CONTROL round
 // trip and must never hold the source ordering lock while doing so.
-func (c *v3SourcePublicationCoordinator) finishFrontendPublication(operationID uint64) ([]authorityrpc.ResponseConsumption, error) {
-	if operationID == 0 {
+func (c *v3SourcePublicationCoordinator) finishFrontendPublication(operationID v3CallbackID) ([]authorityrpc.ResponseConsumption, error) {
+	if !operationID.valid() {
 		return nil, errors.New("portablefsd: frontend publication finish omitted its operation identity")
 	}
 	c.mu.Lock()
@@ -724,7 +714,7 @@ func addV3BoundCoordinates(coordinates map[v3PublicationCoordinate]struct{}, ide
 	}
 }
 
-func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePublication, namespace v3PublicationNamespace, identity v3PublicationIdentity) error {
+func (l *v3SourcePublicationLease) attachBinding(gate *v3SourceGate, namespace v3PublicationNamespace, identity v3PublicationIdentity) error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: definitive source binding has no publication lease")
 	}
@@ -742,7 +732,7 @@ func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePu
 	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.terminal != nil || l.released {
+	if l.released {
 		return errors.New("portablefsd: definitive source binding reached an inactive publication lease")
 	}
 	if !l.hasNamespaceClaimLocked(namespace, bounds) {
@@ -750,12 +740,8 @@ func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePu
 	}
 	additional := make(map[v3PublicationCoordinate]struct{}, 2)
 	addV3BoundCoordinates(additional, identity, bounds)
-	if c.sourceConflictLocked(additional, l) {
-		return errors.New("portablefsd: source publication crossed an unresolved source binding")
-	}
 	for coordinate := range additional {
-		l.coordinates[coordinate] = struct{}{}
-		c.sourceHolds[coordinate] = l
+		c.holdLocked(coordinate, l)
 	}
 	l.consumeNamespaceClaimLocked(namespace, bounds)
 	l.updateUnresolvedIndexesLocked()
@@ -763,7 +749,7 @@ func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePu
 	return nil
 }
 
-func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.FskitSourcePublication, namespace v3PublicationNamespace) error {
+func (l *v3SourcePublicationLease) resolveNoBinding(gate *v3SourceGate, namespace v3PublicationNamespace) error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: source namespace resolution has no lease")
 	}
@@ -778,7 +764,7 @@ func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.FskitSourc
 	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.terminal != nil || l.released {
+	if l.released {
 		return errors.New("portablefsd: source namespace resolved after its publication lease ended")
 	}
 	if !l.hasNamespaceClaimLocked(namespace, bounds) {
@@ -790,7 +776,7 @@ func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.FskitSourc
 	return nil
 }
 
-func (l *v3SourcePublicationLease) resolveNoBindings(gate *authoritypb.FskitSourcePublication) error {
+func (l *v3SourcePublicationLease) resolveNoBindings(gate *v3SourceGate) error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: source namespace resolution has no lease")
 	}
@@ -801,7 +787,7 @@ func (l *v3SourcePublicationLease) resolveNoBindings(gate *authoritypb.FskitSour
 	c := l.gate
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.terminal != nil || l.released {
+	if l.released {
 		return errors.New("portablefsd: source namespaces resolved after their publication lease ended")
 	}
 	for namespace, bounds := range names {
@@ -864,99 +850,13 @@ func (c *v3SourcePublicationCoordinator) releaseSourceLocked(lease *v3SourcePubl
 	delete(c.unresolvedAttributes, lease)
 	delete(c.unresolvedData, lease)
 	for coordinate := range lease.coordinates {
-		if c.sourceHolds[coordinate] == lease {
+		holders := c.sourceHolds[coordinate]
+		delete(holders, lease)
+		if len(holders) == 0 {
 			delete(c.sourceHolds, coordinate)
 		}
 	}
 	c.signalLocked()
-}
-
-func (c *v3SourcePublicationCoordinator) acquirePeer(ctx context.Context, sequence uint64, targets []*authoritypb.VisibilityTarget) error {
-	if ctx == nil || sequence == 0 {
-		return errors.New("portablefsd: peer PREPARE omitted its sequence")
-	}
-	coordinates, err := coordinatesForV3PeerTargets(targets)
-	if err != nil || len(coordinates) == 0 {
-		return errors.Join(errors.New("portablefsd: peer PREPARE omitted its exact publication footprint"), err)
-	}
-	// Close peer admission first, atomically. Existing source leases remain
-	// owners and are drained below; every later overlapping source acquisition
-	// sees peerHolds and is definitely refused before replay assignment. A
-	// check-then-install loop would let a source continuously slip through the
-	// drain window and would not define a publication cut at all.
-	c.mu.Lock()
-	if c.terminal != nil {
-		err := c.terminal
-		c.mu.Unlock()
-		return err
-	}
-	if c.peerSequence != 0 {
-		c.mu.Unlock()
-		return errors.New("portablefsd: peer PREPARE overlapped an unreleased phase")
-	}
-	c.peerSequence = sequence
-	c.peerHolds = coordinates
-	c.peerContended = false
-	c.signalLocked()
-	c.mu.Unlock()
-
-	for {
-		c.mu.Lock()
-		if c.terminal != nil {
-			err := c.terminal
-			c.mu.Unlock()
-			return err
-		}
-		if c.peerSequence != sequence {
-			c.mu.Unlock()
-			return errors.New("portablefsd: peer PREPARE lost its publication cut while draining")
-		}
-		if !c.peerConflictLocked(coordinates) {
-			c.mu.Unlock()
-			return nil
-		}
-		changed := c.changed
-		c.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return fmt.Errorf("portablefsd: peer PREPARE waited for callback publication: %w", ctx.Err())
-		}
-	}
-}
-
-func (c *v3SourcePublicationCoordinator) validateComplete(sequence uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.terminal != nil {
-		return c.terminal
-	}
-	if sequence == 0 || c.peerSequence != sequence || len(c.peerHolds) == 0 {
-		return errors.New("portablefsd: peer COMPLETE has no matching held PREPARE cut")
-	}
-	return nil
-}
-
-func (c *v3SourcePublicationCoordinator) peerContention(sequence uint64) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return sequence != 0 && c.peerSequence == sequence && c.peerContended
-}
-
-func (c *v3SourcePublicationCoordinator) releasePeer(sequence uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.terminal != nil {
-		return c.terminal
-	}
-	if sequence == 0 || c.peerSequence != sequence {
-		return errors.New("portablefsd: peer COMPLETE released a different publication cut")
-	}
-	c.peerSequence = 0
-	c.peerHolds = make(map[v3PublicationCoordinate]struct{})
-	c.peerContended = false
-	c.signalLocked()
-	return nil
 }
 
 func (c *v3SourcePublicationCoordinator) fail(cause error) {

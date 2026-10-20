@@ -1,4 +1,5 @@
 import Foundation
+import SwiftProtobuf
 @preconcurrency import Dispatch
 @preconcurrency import Darwin
 
@@ -36,7 +37,15 @@ final class PfsAsyncSocket: @unchecked Sendable {
     private let closeLock = NSLock()
     private var closed = false
 
-    private init(fd: Int32, maxFrameLength: Int) throws {
+    enum ReceiveEvent: Sendable, Equatable {
+        case readRequested(Int)
+        case resumed
+    }
+
+    private let receiveObserver: (@Sendable (ReceiveEvent) -> Void)?
+
+    init(fd: Int32, maxFrameLength: Int, receiveObserver: (@Sendable (ReceiveEvent) -> Void)? = nil) throws {
+        self.receiveObserver = receiveObserver
         self.maxFrameLength = maxFrameLength
         self.queue = DispatchQueue(label: "dev.portablefs.pfslocal.io.\(UUID().uuidString)", qos: .userInitiated)
         let ioFD = dup(fd)
@@ -63,39 +72,74 @@ final class PfsAsyncSocket: @unchecked Sendable {
         }
     }
 
-    func startReading(
-        onFrame: @escaping @Sendable (PfsEnvelope) -> Void,
-        onClose: @escaping @Sendable (Error) -> Void
-    ) {
-        queue.async { [io, queue, maxFrameLength] in
-            var decoder = PfsFrameDecoder(maxFrameLength: maxFrameLength)
-            let closeOnce = PfsCloseCallback(onClose)
-            io.read(offset: 0, length: Int.max, queue: queue) { done, dispatchData, error in
-                if error != 0 {
-                    closeOnce.call(PfsLocalClientError.system(errno: error, operation: "read"))
-                    return
-                }
-
-                if let dispatchData, dispatchData.count > 0 {
-                    do {
-                        let frames = try decoder.append(Data(dispatchData))
-                        for frame in frames {
-                            onFrame(frame)
+    /// The single receive owner asks for another frame only after applying
+    /// this one. At most one bounded frame crosses the actor hop; a stalled
+    /// receiver leaves later bytes in the socket and backpressures the sender.
+    func readFrame() async throws -> PfsEnvelope {
+        try await withCheckedThrowingContinuation { continuation in
+            let box = PfsContinuationBox<PfsEnvelope>(continuation)
+            queue.async { [self] in
+                readExactly(4, frameStart: true) { [self] headerResult in
+                    switch headerResult {
+                    case let .failure(error):
+                        receiveObserver?(.resumed)
+                        box.resume(throwing: error)
+                    case let .success(header):
+                        let length = header.enumerated().reduce(UInt32(0)) {
+                            $0 | (UInt32($1.element) << ($1.offset * 8))
                         }
-                    } catch {
-                        closeOnce.call(error)
-                        return
-                    }
-                }
-
-                if done {
-                    if decoder.bufferedByteCount == 0 {
-                        closeOnce.call(PfsLocalClientError.connectionClosed)
-                    } else {
-                        closeOnce.call(PfsLocalClientError.invalidFrame("EOF before completing frame"))
+                        guard length <= maxFrameLength else {
+                            receiveObserver?(.resumed)
+                            box.resume(throwing: PfsLocalClientError.frameTooLarge(length: length, max: maxFrameLength))
+                            return
+                        }
+                        readExactly(Int(length), frameStart: false) { [self] payloadResult in
+                            let result = payloadResult.flatMap { payload in
+                                Result {
+                                    let envelope = try PfsEnvelope(serializedBytes: payload)
+                                    try PfsUnknownFieldGuard.requireKnownFields(envelope)
+                                    return envelope
+                                }
+                            }
+                            receiveObserver?(.resumed)
+                            switch result {
+                            case let .success(envelope): box.resume(returning: envelope)
+                            case let .failure(error): box.resume(throwing: error)
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+
+    // Header and payload collection stay on the I/O queue. No second frame is
+    // requested until the ordered receive owner has applied this frame.
+    private func readExactly(
+        _ count: Int,
+        frameStart: Bool,
+        completion: @escaping @Sendable (Result<Data, Error>) -> Void
+    ) {
+        receiveObserver?(.readRequested(count))
+        if count == 0 {
+            completion(.success(Data()))
+            return
+        }
+        var bytes = Data()
+        var completed = false
+        io.read(offset: 0, length: count, queue: queue) { done, data, error in
+            guard !completed else { return }
+            if error != 0 {
+                completed = true
+                completion(.failure(PfsLocalClientError.system(errno: error, operation: "read")))
+                return
+            }
+            if let data { bytes.append(Data(data)) }
+            guard done else { return }
+            completed = true
+            if bytes.count == count { completion(.success(bytes)) }
+            else if frameStart, bytes.isEmpty { completion(.failure(PfsLocalClientError.connectionClosed)) }
+            else { completion(.failure(PfsLocalClientError.invalidFrame("EOF before completing frame"))) }
         }
     }
 
@@ -129,22 +173,5 @@ final class PfsAsyncSocket: @unchecked Sendable {
                 }
             }
         }
-    }
-}
-
-private final class PfsCloseCallback: @unchecked Sendable {
-    private let lock = NSLock()
-    private var callback: (@Sendable (Error) -> Void)?
-
-    init(_ callback: @escaping @Sendable (Error) -> Void) {
-        self.callback = callback
-    }
-
-    func call(_ error: Error) {
-        lock.lock()
-        let callback = callback
-        self.callback = nil
-        lock.unlock()
-        callback?(error)
     }
 }

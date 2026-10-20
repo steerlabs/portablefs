@@ -51,6 +51,9 @@ let package = Package(
             name: "PortableFSAppCoreTests",
             dependencies: [
                 "PortableFSAppCore"
+            ],
+            resources: [
+                .copy("Fixtures")
             ]
         )
     ]

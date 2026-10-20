@@ -26,7 +26,8 @@ const (
 )
 
 // validPostStateShape validates invariants that do not depend on the operation
-// that produced the envelope. Operation-specific role and identity validation
+// that produced the envelope. Versions are conservative: equality with the
+// snapshot does not identify changed objects. Operation-specific role and identity validation
 // is intentionally performed at the consumer boundary before cache admission.
 func validPostStateShape(state *authoritypb.PostState, mutation bool) bool {
 	if state == nil || state.GetSnapshotSequence() == 0 || len(state.GetObjects()) < 1 || len(state.GetObjects()) > 4 {
@@ -42,6 +43,7 @@ func validPostStateShape(state *authoritypb.PostState, mutation bool) bool {
 	var previous []byte
 	for _, object := range state.GetObjects() {
 		if object == nil || len(object.GetStableIdentity()) != 16 || object.GetObjectVersion() == 0 ||
+			bytes.Equal(object.GetStableIdentity(), make([]byte, 16)) ||
 			object.GetObjectVersion() > state.GetSnapshotSequence() || object.GetAttr() == nil ||
 			object.GetRoles() == 0 || object.GetRoles()&^postStateKnownRoles != 0 {
 			return false
@@ -85,7 +87,7 @@ func validMutationPostStateRoles(request *authoritypb.Request, state *authorityp
 	}
 	got := postStateRoleMultiset(state)
 	switch body := request.GetBody().(type) {
-	case *authoritypb.Request_Write, *authoritypb.Request_FskitWrite,
+	case *authoritypb.Request_Write,
 		*authoritypb.Request_SetAttr, *authoritypb.Request_Fallocate,
 		*authoritypb.Request_Open, *authoritypb.Request_SetXattr,
 		*authoritypb.Request_RemoveXattr:

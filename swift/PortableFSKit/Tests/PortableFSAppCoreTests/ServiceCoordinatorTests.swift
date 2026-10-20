@@ -49,11 +49,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     let identity = PortableFSDReleaseIdentity(
         codeDirectoryHash: String(repeating: "a", count: 40),
         executableSHA256: String(repeating: "b", count: 64),
-        daemonVersion: "0.2.3",
-        identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 15
+        daemonVersion: "0.2.3"
     )
     try identity.validate()
     let object = try #require(
@@ -62,29 +58,21 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     )
     #expect(Set(object.keys) == [
         "codeDirectoryHash", "executableSHA256", "daemonVersion",
-        "identitySchema", "controlProtocol", "pfslocalMajor", "pfslocalMinor",
     ])
+    #expect(Set(object.keys) == PortableFSDReleaseIdentity.jsonKeys)
 
     #expect(throws: (any Error).self) {
         try PortableFSDReleaseIdentity(
             codeDirectoryHash: String(repeating: "A", count: 40),
             executableSHA256: String(repeating: "b", count: 64),
-            daemonVersion: "0.2.3",
-            identitySchema: 1,
-            controlProtocol: 1,
-            pfslocalMajor: 1,
-            pfslocalMinor: 15
+            daemonVersion: "0.2.3"
         ).validate()
     }
 
     try PortableFSDReleaseIdentity(
         codeDirectoryHash: String(repeating: "a", count: 40),
         executableSHA256: String(repeating: "b", count: 64),
-        daemonVersion: "0.2.3",
-        identitySchema: 1,
-        controlProtocol: 1,
-        pfslocalMajor: 1,
-        pfslocalMinor: 0
+        daemonVersion: "0.2.3"
     ).validate()
 }
 
@@ -132,67 +120,349 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     }
 }
 
-@Test func anUnreachableDaemonProvesAbsenceInsteadOfWedgingAnEnabledService() throws {
-    // The wedge this covers: BTM reports the agent enabled, but no daemon was
-    // ever bootstrapped into launchd (or the running one no longer matches the
-    // persisted identity). Probing it raises a transport error. If that error
-    // escaped, the enabled service could only ever be repaired by register(),
-    // which reregister is the sole caller of — a deadlock with no user exit.
-    let probed = PortableFSDServiceCoordinator.daemonDepartureProof {
-        throw PfsLocalClientError.system(errno: ENOENT, operation: "connect")
+@Test func daemonOwnershipRequiresTheCanonicalNestedServicePath() throws {
+    let suffix = "/Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd"
+    for app in ["/Applications/PortableFS.app", "/tmp/build/PortableFSKitDev.app"] {
+        #expect(try PortableFSDServiceCoordinator.daemonOwningBundle(
+            executableURL: URL(fileURLWithPath: app + suffix)
+        ).path == app)
     }
-    guard case .unpublished = probed else {
-        Issue.record("an unreachable daemon must fall back to proof of absence")
-        return
+    for path in [
+        "/tmp/portablefsd",
+        "/Applications/PortableFS.app/Contents/MacOS/portablefsd",
+        "/Applications/PortableFS.app/Contents/Library/LaunchAgents/Other.app/Contents/MacOS/portablefsd",
+        "/Applications/PortableFS.app" + suffix + ".other",
+        "/tmp/not-an-app" + suffix,
+    ] {
+        #expect(throws: (any Error).self) {
+            try PortableFSDServiceCoordinator.daemonOwningBundle(
+                executableURL: URL(fileURLWithPath: path)
+            )
+        }
     }
-
-    // Falling back is not the same as assuming absence. `.unpublished` resolves
-    // through the state singleton, so a daemon that is alive but unreachable
-    // still refuses the update.
-    let fileManager = FileManager.default
-    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-        .appendingPathComponent("pfs-absent-probe-\(UUID().uuidString)", isDirectory: true)
-    try fileManager.createDirectory(
-        at: root,
-        withIntermediateDirectories: false,
-        attributes: [.posixPermissions: 0o700]
-    )
-    defer { try? fileManager.removeItem(at: root) }
-    #expect(try PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
-
-    let lock = root.appendingPathComponent(".portablefsd-state.lock")
-    #expect(fileManager.createFile(
-        atPath: lock.path,
-        contents: Data("owner\n".utf8),
-        attributes: [.posixPermissions: 0o600]
-    ))
-    let descriptor = Darwin.open(lock.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-    #expect(descriptor >= 0)
-    guard descriptor >= 0 else { return }
-    defer { Darwin.close(descriptor) }
-    #expect(serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0)
-    defer { _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN) }
-    #expect(try !PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
+    let networkURL = try #require(URL(string: "https://example.com/PortableFS.app" + suffix))
+    #expect(throws: (any Error).self) {
+        try PortableFSDServiceCoordinator.daemonOwningBundle(executableURL: networkURL)
+    }
 }
 
-@Test func anAuthenticatedPeerStillYieldsTheStrongerProcessProof() throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-    process.arguments = ["30"]
-    try process.run()
-    defer {
-        if process.isRunning { process.terminate() }
-        process.waitUntilExit()
+@Test func serviceOwnershipAdmitsAReleaseUpdateWithinTheSameSignedProduct() throws {
+    let incoming = try PortableFSDServiceCoordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.4.1",
+        buildVersion: "42"
+    )
+    let running = try PortableFSDServiceCoordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.3.0",
+        buildVersion: "1"
+    )
+    try PortableFSDServiceCoordinator.validateServiceOwner(running, expected: incoming)
+}
+
+@Test func serviceOwnershipRejectsOtherProductsTeamsAndAppGroups() throws {
+    let expected = try PortableFSDServiceCoordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.4.1",
+        buildVersion: "42"
+    )
+    for (product, team, group) in [
+        ("dev.portablefs.Other", "B47U2LLKHW", "B47U2LLKHW.pfsoss"),
+        ("dev.portablefs.oss.KitDev", "OTHERTEAM", "OTHERTEAM.pfsoss"),
+        ("dev.portablefs.oss.KitDev", "B47U2LLKHW", "B47U2LLKHW.other"),
+    ] {
+        let owner = try PortableFSDServiceCoordinator.deriveConfiguration(
+            bundleIdentifier: product,
+            teamIdentifier: team,
+            appGroupIdentifier: group,
+            shortVersion: "0.3.0",
+            buildVersion: "1"
+        )
+        #expect(throws: (any Error).self) {
+            try PortableFSDServiceCoordinator.validateServiceOwner(owner, expected: expected)
+        }
+    }
+}
+
+private func liveIdentity(
+    version: String = "0.3.0",
+    sha256: String = String(repeating: "b", count: 64),
+    schema: Int = 1,
+    control: Int,
+    major: UInt32,
+    minor: UInt32
+) -> PortableFSDLiveIdentity {
+    PortableFSDLiveIdentity(
+        schemaVersion: schema, controlProtocol: control, daemonVersion: version,
+        executableSha256: sha256, pfslocalMajor: major, pfslocalMinor: minor
+    )
+}
+
+/// A release is its authenticated CodeDirectory hash, executable hash and
+/// version. The live identity of an authenticated execution matches it by
+/// version and hash, whatever valid control and pfslocal numbers that
+/// release reports: a trusted outgoing release's own numbers are not
+/// spoofing. A changed version or hash is refused.
+@Test func liveIdentityMatchesTheAuthenticatedReleaseVersionAndHash() {
+    let release = PortableFSDReleaseIdentity(
+        codeDirectoryHash: String(repeating: "a", count: 40),
+        executableSHA256: String(repeating: "b", count: 64),
+        daemonVersion: "0.3.0"
+    )
+    for (control, major, minor) in [(77, UInt32(91), UInt32(18)), (2, 2, 0), (1, UInt32.max, UInt32.max)] {
+        #expect(liveIdentity(control: control, major: major, minor: minor).matches(release))
+        #expect(!liveIdentity(version: "0.4.1", control: control, major: major, minor: minor).matches(release))
+        #expect(!liveIdentity(
+            sha256: String(repeating: "c", count: 64),
+            control: control, major: major, minor: minor
+        ).matches(release))
+    }
+}
+
+/// Two authenticated releases with different operational and pfslocal
+/// numbers: the outgoing one is quiesced through its own numbers, while
+/// this app's own daemon is activated and used only when its live numbers
+/// equal this build's exact pairing, schema 1, control 2 and pfslocal 2.0.
+@Test func incomingLiveIdentityRequiresExactPairing() throws {
+    #expect(PortableFSDServiceCoordinator.pairedIdentitySchema == 1)
+    #expect(PortableFSDServiceCoordinator.pairedControlProtocol == 2)
+    #expect(PortableFSDServiceCoordinator.pairedPFSLocalMajor == 2)
+    #expect(PortableFSDServiceCoordinator.pairedPFSLocalMinor == 0)
+    let paired = liveIdentity(control: 2, major: 2, minor: 0)
+    #expect(PortableFSDServiceCoordinator.isPaired(paired))
+    try PortableFSDServiceCoordinator.requirePaired(paired)
+
+    let outgoing = liveIdentity(version: "0.2.9", control: 1, major: 1, minor: 16)
+    let outgoingRelease = PortableFSDReleaseIdentity(
+        codeDirectoryHash: String(repeating: "e", count: 40),
+        executableSHA256: String(repeating: "b", count: 64),
+        daemonVersion: "0.2.9"
+    )
+    #expect(outgoing.matches(outgoingRelease))
+    for unpaired in [
+        outgoing,
+        liveIdentity(schema: 2, control: 2, major: 2, minor: 0),
+        liveIdentity(control: 1, major: 2, minor: 0),
+        liveIdentity(control: 3, major: 2, minor: 0),
+        liveIdentity(control: 2, major: 1, minor: 16),
+        liveIdentity(control: 2, major: 2, minor: 1),
+        liveIdentity(control: 2, major: 3, minor: 0),
+    ] {
+        #expect(!PortableFSDServiceCoordinator.isPaired(unpaired))
+        #expect(throws: (any Error).self) { try PortableFSDServiceCoordinator.requirePaired(unpaired) }
+    }
+}
+
+/// Lifecycle identity is schema 1 with exactly six members and bounded
+/// scalar shapes, decoded without any expectation of this build's numbers.
+@Test func lifecycleIdentityDecodesStrictly() throws {
+    let digest = String(repeating: "d", count: 64)
+    let valid = #"{"schemaVersion":1,"controlProtocol":77,"daemonVersion":"0.9.1","executableSha256":"\#(digest)","pfslocalMajor":91,"pfslocalMinor":0}"#
+    let decoded = try PortableFSDLiveIdentity.decode(Data(valid.utf8))
+    #expect(decoded == PortableFSDLiveIdentity(
+        schemaVersion: 1, controlProtocol: 77, daemonVersion: "0.9.1",
+        executableSha256: digest, pfslocalMajor: 91, pfslocalMinor: 0
+    ))
+    // Trailing JSON whitespace is not trailing data.
+    #expect(try PortableFSDLiveIdentity.decode(Data((valid + "\n").utf8)) == decoded)
+
+    var invalid = [
+        valid.replacingOccurrences(of: #""schemaVersion":1"#, with: #""schemaVersion":2"#),
+        valid.replacingOccurrences(of: #""controlProtocol":77"#, with: #""controlProtocol":0"#),
+        valid.replacingOccurrences(of: #""controlProtocol":77"#, with: #""controlProtocol":7.5"#),
+        valid.replacingOccurrences(of: #""pfslocalMajor":91"#, with: #""pfslocalMajor":0"#),
+        valid.replacingOccurrences(of: #""pfslocalMinor":0"#, with: #""pfslocalMinor":4294967296"#),
+        valid.replacingOccurrences(of: #""0.9.1""#, with: #""""#),
+        valid.replacingOccurrences(of: #""0.9.1""#, with: #""0.9 1""#),
+        valid.replacingOccurrences(of: #""0.9.1""#, with: #"""# + String(repeating: "v", count: 129) + #"""#),
+        valid.replacingOccurrences(of: digest, with: String(repeating: "D", count: 64)),
+        valid.replacingOccurrences(of: digest, with: String(repeating: "d", count: 63)),
+        valid.replacingOccurrences(of: #""pfslocalMinor":0"#, with: #""pfslocalMinor":0,"pid":1"#),
+        valid + "{}",
+        "[" + valid + "]",
+    ]
+    for key in ["schemaVersion", "controlProtocol", "daemonVersion", "executableSha256", "pfslocalMajor", "pfslocalMinor"] {
+        let member = #"""# + key + #"":"#
+        invalid.append(valid.replacingOccurrences(of: member, with: #""Unknown":"#))
+        invalid.append(valid.replacingOccurrences(of: member, with: member + "null," + member))
+        invalid.append(valid.replacingOccurrences(of: member, with: #""A":0,"# + member))
+    }
+    for data in invalid {
+        #expect(throws: (any Error).self, "accepted \(data)") {
+            _ = try PortableFSDLiveIdentity.decode(Data(data.utf8))
+        }
+    }
+}
+
+/// Live-identity parity vectors with Go's `daemonctl.DecodeIdentity`, which
+/// decodes through encoding/json into `int` and `uint32` fields. Each body is
+/// a whole lifecycle identity and the verdict is Go's: an unsigned field
+/// takes digits only (Go refuses `-0` for uint32), a signed field takes an
+/// optional minus sign and must then be positive, neither takes a fraction,
+/// an exponent or an out-of-range value, and duplicate, null, unknown or
+/// trailing input is refused. The same table was run against the Go decoder.
+private let liveIdentityParityVectors: [(body: String, accepted: Bool)] = {
+    let digest = String(repeating: "d", count: 64)
+    let defaults: [(String, String)] = [
+        ("schemaVersion", "1"), ("controlProtocol", "2"), ("daemonVersion", #""0.9.1""#),
+        ("executableSha256", #"""# + digest + #"""#), ("pfslocalMajor", "2"), ("pfslocalMinor", "0"),
+    ]
+    func body(_ key: String? = nil, _ value: String = "") -> String {
+        "{" + defaults.map { member in
+            #"""# + member.0 + #"":"# + (member.0 == key ? value : member.1)
+        }.joined(separator: ",") + "}"
+    }
+    let valid = body()
+    var vectors: [(String, Bool)] = [
+        (valid, true),
+        (body("pfslocalMinor", "4294967295"), true),
+        (body("pfslocalMajor", "4294967295"), true),
+        (body("controlProtocol", "9223372036854775807"), true),
+        (valid.replacingOccurrences(of: #""pfslocalMinor""#, with: #""pfslocal\u004dinor""#), true),
+        (" " + valid + "\n", true),
+    ]
+    for (key, value) in [
+        ("pfslocalMinor", "-0"), ("pfslocalMinor", "-1"), ("pfslocalMinor", "0.0"),
+        ("pfslocalMinor", "0e0"), ("pfslocalMinor", "0E+0"), ("pfslocalMinor", "4294967296"),
+        ("pfslocalMinor", "00"), ("pfslocalMinor", "+0"), ("pfslocalMinor", "-"),
+        ("pfslocalMinor", #""0""#), ("pfslocalMinor", "null"), ("pfslocalMinor", "true"),
+        ("pfslocalMajor", "0"), ("pfslocalMajor", "-0"), ("pfslocalMajor", "-2"),
+        ("pfslocalMajor", "2.0"), ("pfslocalMajor", "4294967296"),
+        ("controlProtocol", "0"), ("controlProtocol", "-0"), ("controlProtocol", "-2"),
+        ("controlProtocol", "9223372036854775808"), ("controlProtocol", "2.5"),
+        ("schemaVersion", "2"), ("schemaVersion", "-1"), ("schemaVersion", "1.0"),
+    ] {
+        vectors.append((body(key, value), false))
+    }
+    vectors += [
+        (valid.replacingOccurrences(of: #""pfslocalMinor":0"#, with: #""pfslocalMinor":0,"pfslocalMinor":0"#), false),
+        (valid.replacingOccurrences(of: #""pfslocalMinor":0"#, with: #""pfslocalMinor":0,"pid":1"#), false),
+        (valid.replacingOccurrences(of: #","pfslocalMinor":0"#, with: ""), false),
+        (valid + "{}", false),
+        (valid + " x", false),
+        ("[" + valid + "]", false),
+        ("", false),
+        ("null", false),
+    ]
+    return vectors
+}()
+
+@Test func liveIdentityNumbersFollowGoFieldGrammar() throws {
+    for vector in liveIdentityParityVectors {
+        let decoded = try? PortableFSDLiveIdentity.decode(Data(vector.body.utf8))
+        #expect((decoded != nil) == vector.accepted, "live \(vector.body)")
+    }
+    // A zero minor and both uint32 limits decode to exactly their values.
+    let maximum = try PortableFSDLiveIdentity.decode(Data(
+        liveIdentityParityVectors[1].body.utf8
+    ))
+    #expect(maximum.pfslocalMinor == UInt32.max)
+    #expect(try PortableFSDLiveIdentity.decode(Data(liveIdentityParityVectors[0].body.utf8)).pfslocalMinor == 0)
+}
+
+private func lifecycleResponse(_ status: String, headers: [String] = [], body: String = "") -> Data {
+    var text = "HTTP/1.1 \(status)\r\n"
+    for header in headers { text += header + "\r\n" }
+    text += "\r\n" + body
+    return Data(text.utf8)
+}
+
+/// Identity is exactly HTTP 200 with its strict body; stop-if-idle is exactly
+/// HTTP 204 with no body, 409 is the definite busy refusal, and every other
+/// status, a missing endpoint included, proves nothing. Chunked transfer,
+/// oversized bodies and a mismatched Content-Length are refused.
+@Test func lifecycleResponsesAreClassifiedExactly() throws {
+    let digest = String(repeating: "e", count: 64)
+    let body = #"{"schemaVersion":1,"controlProtocol":2,"daemonVersion":"0.5.0","executableSha256":"\#(digest)","pfslocalMajor":2,"pfslocalMinor":0}"#
+    let identity = try PortableFSDLifecycle.identity(from: PortableFSDLifecycle.parseResponse(
+        lifecycleResponse("200 OK", headers: ["Content-Type: application/json", "Content-Length: \(body.utf8.count)"], body: body)
+    ))
+    #expect(identity.executableSha256 == digest)
+    for status in ["404 Not Found", "426 Upgrade Required", "500 Internal Server Error", "301 Moved Permanently", "204 No Content"] {
+        #expect(throws: PortableFSDLifecycleError.self) {
+            _ = try PortableFSDLifecycle.identity(from: PortableFSDLifecycle.parseResponse(
+                lifecycleResponse(status, body: status.hasPrefix("204") ? "" : body)
+            ))
+        }
     }
 
-    let witness = try PortableFSDServiceCoordinator.DaemonProcessWitness(
-        pid: process.processIdentifier,
-        pidVersion: 1
-    )
-    let probed = PortableFSDServiceCoordinator.daemonDepartureProof { witness }
-    guard case .process = probed else {
-        Issue.record("a live authenticated peer must yield a process witness")
-        return
+    try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(lifecycleResponse("204 No Content")))
+    #expect(throws: PortableFSDLifecycleError.busy) {
+        try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(
+            lifecycleResponse("409 Conflict", headers: ["Content-Length: 11"], body: "busy detail")
+        ))
+    }
+    for (status, responseBody) in [("204 No Content", "{}"), ("200 OK", ""), ("202 Accepted", ""),
+                                   ("404 Not Found", ""), ("307 Temporary Redirect", ""), ("500 Internal Server Error", "")] {
+        #expect(throws: PortableFSDLifecycleError.self) {
+            try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(
+                lifecycleResponse(status, body: responseBody)
+            ))
+        }
+    }
+    do {
+        try PortableFSDLifecycle.stopIfIdleOutcome(PortableFSDLifecycle.parseResponse(lifecycleResponse("404 Not Found")))
+    } catch let error as PortableFSDLifecycleError {
+        #expect(error == .refused(status: 404))
+    }
+
+    for malformed in [
+        lifecycleResponse("200 OK", headers: ["Transfer-Encoding: chunked"], body: "5\r\nhello\r\n0\r\n\r\n"),
+        lifecycleResponse("200 OK", headers: ["Content-Length: 3"], body: body),
+        lifecycleResponse("200 OK", headers: ["Content-Length: 1", "Content-Length: 1"], body: "x"),
+        lifecycleResponse("200 OK", body: String(repeating: " ", count: 4_097)),
+        lifecycleResponse("2000 OK"),
+        Data("HTTP/1.0 200 OK\r\n\r\n".utf8),
+        Data("HTTP/1.1 200 OK\r\nno-colon-header\r\n\r\n".utf8),
+        Data("HTTP/1.1 200 OK\r\n".utf8),
+    ] {
+        #expect(throws: PortableFSDLifecycleError.malformedResponse) {
+            _ = try PortableFSDLifecycle.parseResponse(malformed)
+        }
+    }
+}
+
+/// The exchange speaks the fixed lifecycle request grammar: exact method and
+/// path, no operational control-protocol header, an empty POST body.
+@Test func lifecycleExchangeSpeaksTheFixedRequestGrammar() throws {
+    for (method, path, response) in [
+        ("GET", PortableFSDLifecycle.identityPath, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+        ("POST", PortableFSDLifecycle.stopIfIdlePath, "HTTP/1.1 204 No Content\r\n\r\n"),
+    ] {
+        var pair: [Int32] = [-1, -1]
+        try #require(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0)
+        let server = pair[1]
+        let received = DispatchSemaphore(value: 0)
+        final class Captured: @unchecked Sendable { var request = Data() }
+        let captured = Captured()
+        let thread = Thread {
+            var buffer = [UInt8](repeating: 0, count: 1_024)
+            while captured.request.range(of: Data("\r\n\r\n".utf8)) == nil {
+                let count = Darwin.read(server, &buffer, buffer.count)
+                if count <= 0 { break }
+                captured.request.append(buffer, count: count)
+            }
+            _ = response.withCString { Darwin.write(server, $0, strlen($0)) }
+            Darwin.close(server)
+            received.signal()
+        }
+        thread.start()
+        let reply = try PortableFSDLifecycle.exchange(pair[0], method: method, path: path)
+        Darwin.close(pair[0])
+        received.wait()
+        let request = String(decoding: captured.request, as: UTF8.self)
+        var expected = "\(method) \(path) HTTP/1.1\r\nHost: portablefsd\r\nConnection: close\r\n"
+        if method == "POST" { expected += "Content-Length: 0\r\n" }
+        expected += "\r\n"
+        #expect(request == expected)
+        #expect(!request.contains("X-PortableFS-Control-Protocol"))
+        #expect(reply.status == (method == "GET" ? 200 : 204))
     }
 }
 
@@ -235,9 +505,17 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     #expect(try witness.hasExited())
 }
 
+private func canonicalTemporaryDirectory() throws -> URL {
+    guard let path = Darwin.realpath(NSTemporaryDirectory(), nil) else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    defer { free(path) }
+    return URL(fileURLWithPath: String(cString: path), isDirectory: true)
+}
+
 @Test func unpublishedDaemonFenceProvesThePinnedStateSingleton() throws {
     let fileManager = FileManager.default
-    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    let root = (try canonicalTemporaryDirectory())
         .appendingPathComponent("pfs-state-fence-\(UUID().uuidString)", isDirectory: true)
     #expect(try PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
 
@@ -271,7 +549,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
     let fileManager = FileManager.default
 
     func withRoot(_ body: (URL) throws -> Void) throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let root = (try canonicalTemporaryDirectory())
             .appendingPathComponent("pfs-state-fence-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(
             at: root,
@@ -354,7 +632,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
 @Test func unpublishedDaemonFenceRejectsLockAndDirectoryReplacementRaces() throws {
     let fileManager = FileManager.default
 
-    let lockRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    let lockRoot = (try canonicalTemporaryDirectory())
         .appendingPathComponent("pfs-lock-race-\(UUID().uuidString)", isDirectory: true)
     try fileManager.createDirectory(
         at: lockRoot,
@@ -384,7 +662,7 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
         )
     }
 
-    let directoryRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    let directoryRoot = (try canonicalTemporaryDirectory())
         .appendingPathComponent("pfs-dir-race-\(UUID().uuidString)", isDirectory: true)
     let displaced = directoryRoot.appendingPathExtension("old")
     try fileManager.createDirectory(
@@ -408,5 +686,801 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
                 )
             }
         )
+    }
+}
+
+// MARK: - Live service owner decision flow
+
+private typealias Coordinator = PortableFSDServiceCoordinator
+
+private func ownerTestConfiguration() throws -> Coordinator.Configuration {
+    try Coordinator.deriveConfiguration(
+        bundleIdentifier: "dev.portablefs.oss.KitDev",
+        teamIdentifier: "B47U2LLKHW",
+        appGroupIdentifier: "B47U2LLKHW.pfsoss",
+        shortVersion: "0.4.2",
+        buildVersion: "42"
+    )
+}
+
+private func ownerTestRelease(
+    version: String,
+    digit: Character
+) -> PortableFSDReleaseIdentity {
+    PortableFSDReleaseIdentity(
+        codeDirectoryHash: String(repeating: digit, count: 40),
+        executableSHA256: String(repeating: digit, count: 64),
+        daemonVersion: version
+    )
+}
+
+/// What the authenticated execution of `release` reports on lifecycle v1.
+private func ownerTestLive(
+    _ release: PortableFSDReleaseIdentity,
+    controlProtocol: Int = 2,
+    pfslocalMajor: UInt32 = 2,
+    pfslocalMinor: UInt32 = 0
+) -> PortableFSDLiveIdentity {
+    PortableFSDLiveIdentity(
+        schemaVersion: 1,
+        controlProtocol: controlProtocol,
+        daemonVersion: release.daemonVersion,
+        executableSha256: release.executableSHA256,
+        pfslocalMajor: pfslocalMajor,
+        pfslocalMinor: pfslocalMinor
+    )
+}
+
+/// Unix socket paths must fit sockaddr_un, so fixtures live under /tmp rather
+/// than the much longer per-user temporary directory.
+private func withOwnerFixtureDirectory(_ body: (URL) throws -> Void) throws {
+    var template = Array("/tmp/pfs-owner.XXXXXX".utf8CString)
+    guard let created = Darwin.mkdtemp(&template) else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    guard let canonical = Darwin.realpath(created, nil) else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let root = URL(fileURLWithPath: String(cString: canonical), isDirectory: true)
+    free(canonical)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try body(root)
+}
+
+private func makeOwnerBundle(at url: URL, identifier: String) throws -> Bundle {
+    let contents = url.appendingPathComponent("Contents", isDirectory: true)
+    try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+    let plist: [String: Any] = [
+        "CFBundleIdentifier": identifier,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": "0.4.1",
+        "CFBundleVersion": "41",
+        "PFSAppGroupIdentifier": "B47U2LLKHW.pfsoss",
+    ]
+    let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    try data.write(to: contents.appendingPathComponent("Info.plist"))
+    return try #require(Bundle(url: url))
+}
+
+private func ownerRefusal(
+    _ operation: () throws -> Void
+) -> Coordinator.UnauthenticatedServiceOwner? {
+    do {
+        try operation()
+    } catch Coordinator.RegistrationError.unauthenticatedServiceOwner(let owner) {
+        return owner
+    } catch {
+        Issue.record("expected an unauthenticated-owner refusal, got \(error.localizedDescription)")
+        return nil
+    }
+    Issue.record("expected an unauthenticated-owner refusal")
+    return nil
+}
+
+private func ownProcessExecutablePath() throws -> String {
+    var buffer = [CChar](repeating: 0, count: 4 * 1_024)
+    let length = proc_pidpath(getpid(), &buffer, UInt32(buffer.count))
+    guard length > 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+    return URL(fileURLWithPath: String(decoding: bytes, as: UTF8.self)).standardizedFileURL.path
+}
+
+/// A valid older release, or this release from another copy of the app, is
+/// replaced, and every later step binds to its authenticated identity: the
+/// empty-inventory guard reads that exact daemon's attaches and the fence
+/// waits for that exact execution before the final singleton exclusion.
+@Test func liveOwnerDecisionReplacesAValidOlderReleaseThroughItsOwnIdentity() throws {
+    try withOwnerFixtureDirectory { root in
+        let incoming = ownerTestRelease(version: "0.4.2", digit: "b")
+        // An arbitrary distinct release whose authenticated execution reports
+        // its own operational and pfslocal numbers; they are never checked
+        // against this build's pairing.
+        let older = ownerTestRelease(version: "0.4.1", digit: "c")
+        let olderLive = ownerTestLive(older, controlProtocol: 7, pfslocalMajor: 3, pfslocalMinor: 15)
+        #expect(olderLive.matches(older))
+        let incomingURL = root.appendingPathComponent("New.app", isDirectory: true)
+        let oldBundle = try makeOwnerBundle(
+            at: root.appendingPathComponent("Old.app", isDirectory: true),
+            identifier: "dev.portablefs.oss.KitDev"
+        )
+        let running = Coordinator.RunningDaemon(
+            bundle: oldBundle,
+            releaseIdentity: older,
+            liveIdentity: olderLive
+        )
+
+        guard case .replace(let outgoing?) = Coordinator.registrationStep(
+            for: .authenticated(running),
+            incoming: incoming,
+            bundleURL: incomingURL
+        ) else {
+            Issue.record("a valid older release must be replaced through its identity")
+            return
+        }
+        #expect(outgoing.releaseIdentity == older)
+        // The helper adopts exactly the authenticated outgoing daemon: its
+        // release tuple and the canonical executable in its owning bundle.
+        // The kernel reports real paths: /tmp fixtures live under /private.
+        let daemonPath = "/private" + oldBundle.bundleURL.path
+            + "/Contents/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd"
+        #expect(try outgoing.expected().executablePath == daemonPath)
+        #expect(Coordinator.inventoryGuardArguments(outgoing: try outgoing.expected()) == [
+            "lifecycle", "hold-install-exclusive", "--json",
+            "--expected-daemon-version", "0.4.1",
+            "--expected-daemon-sha256", String(repeating: "c", count: 64),
+            "--expected-daemon-path", daemonPath,
+            "--expected-daemon-cdhash", String(repeating: "c", count: 40),
+        ])
+        #expect(Coordinator.inventoryGuardArguments(outgoing: nil) == [
+            "lifecycle", "hold-install-exclusive", "--json",
+        ])
+
+        var probed: [PortableFSDReleaseIdentity] = []
+        var singletonConsulted = false
+        let witness = try Coordinator.replacementWitness(
+            outgoing: outgoing,
+            probe: { daemon in
+                probed.append(daemon.releaseIdentity)
+                return try Coordinator.DaemonProcessWitness(pid: getpid(), pidVersion: 1)
+            },
+            excludeDaemons: {
+                singletonConsulted = true
+                return nil
+            }
+        )
+        guard case .process = witness else {
+            Issue.record("an authenticated outgoing daemon must be fenced by its execution")
+            return
+        }
+        #expect(probed == [older])
+        #expect(!singletonConsulted)
+
+        let sameReleaseElsewhere = Coordinator.RunningDaemon(
+            bundle: oldBundle,
+            releaseIdentity: incoming,
+            liveIdentity: ownerTestLive(incoming)
+        )
+        guard case .replace(_?) = Coordinator.registrationStep(
+            for: .authenticated(sameReleaseElsewhere),
+            incoming: incoming,
+            bundleURL: incomingURL
+        ) else {
+            Issue.record("this release running from another app copy must be replaced")
+            return
+        }
+        guard case .keep = Coordinator.registrationStep(
+            for: .authenticated(sameReleaseElsewhere),
+            incoming: incoming,
+            bundleURL: oldBundle.bundleURL
+        ) else {
+            Issue.record("the exact release from this bundle must be kept")
+            return
+        }
+    }
+}
+
+/// A missing endpoint is replaced only while this app holds the state
+/// singleton, so no daemon can run; the guard then adopts no daemon identity.
+@Test func liveOwnerDecisionReplacesAMissingEndpointOnlyWhileHoldingTheSingleton() throws {
+    try withOwnerFixtureDirectory { root in
+        let owner = try Coordinator.inspectLiveServiceOwner(
+            controlSocket: root.appendingPathComponent("control.sock"),
+            configuration: try ownerTestConfiguration()
+        )
+        guard case .unpublished = owner else {
+            Issue.record("a missing endpoint must classify as unpublished")
+            return
+        }
+        guard case .replace(nil) = Coordinator.registrationStep(
+            for: owner,
+            incoming: ownerTestRelease(version: "0.4.2", digit: "b"),
+            bundleURL: root.appendingPathComponent("New.app", isDirectory: true)
+        ) else {
+            Issue.record("an unpublished owner must be replaced without an outgoing identity")
+            return
+        }
+        #expect(Coordinator.inventoryGuardArguments(outgoing: nil) == [
+            "lifecycle", "hold-install-exclusive", "--json",
+        ])
+
+        let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: stateDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let witness = try Coordinator.replacementWitness(
+            outgoing: nil,
+            probe: { _ in
+                Issue.record("an unpublished owner has no execution to probe")
+                throw POSIXError(.EINVAL)
+            },
+            excludeDaemons: {
+                try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+            }
+        )
+        guard case .excluded = witness else {
+            Issue.record("a free singleton must be held across unregistration")
+            return
+        }
+        #expect(try witness.hasDeparted())
+        #expect(try !Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+        witness.releaseExclusion()
+        #expect(try Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+    }
+}
+
+/// No endpoint, but a held state singleton: a daemon is starting or stopping
+/// and nothing can authenticate it, so replacement is refused.
+@Test func liveOwnerDecisionRefusesAnOccupiedStateSingleton() throws {
+    try withOwnerFixtureDirectory { root in
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+        let lock = root.appendingPathComponent(".portablefsd-state.lock")
+        #expect(FileManager.default.createFile(
+            atPath: lock.path,
+            contents: Data(),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        let descriptor = Darwin.open(lock.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        try #require(descriptor >= 0)
+        defer { Darwin.close(descriptor) }
+        try #require(serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0)
+        defer { _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN) }
+
+        let refusal = ownerRefusal {
+            _ = try Coordinator.replacementWitness(
+                outgoing: nil,
+                probe: { _ in
+                    Issue.record("an unpublished owner has no execution to probe")
+                    throw POSIXError(.EINVAL)
+                },
+                excludeDaemons: {
+                    try Coordinator.acquireStateSingletonExclusion(at: root)
+                }
+            )
+        }
+        #expect(refusal == .occupiedStateSingleton)
+    }
+}
+
+private func ownerMessage(_ owner: Coordinator.UnauthenticatedServiceOwner?) -> String {
+    guard let owner else { return "" }
+    return Coordinator.RegistrationError.unauthenticatedServiceOwner(owner).localizedDescription
+}
+
+/// Only an observed absence is reported as a missing owner app. A bundle
+/// that exists but does not authenticate is reported as exactly that
+/// failure, with the underlying error, not as a guessed replacement.
+@Test func liveOwnerDecisionRefusesAMissingOrUnauthenticatableOwnerApp() throws {
+    try withOwnerFixtureDirectory { root in
+        let configuration = try ownerTestConfiguration()
+        let socket = root.appendingPathComponent("control.sock").path
+
+        let deleted = root.appendingPathComponent("Deleted.app", isDirectory: true)
+        let missing = ownerRefusal {
+            _ = try Coordinator.ownerApp(at: deleted, expected: configuration, controlSocket: socket)
+        }
+        #expect(missing == .ownerAppMissing(app: deleted.path))
+        #expect(ownerMessage(missing).contains("no longer exists at that path"))
+        #expect(ownerMessage(missing).contains("log out"))
+
+        // Present, plausible, but unsigned: the signature check's own error
+        // is the reported failure.
+        let unsigned = root.appendingPathComponent("Unsigned.app", isDirectory: true)
+        _ = try makeOwnerBundle(at: unsigned, identifier: "dev.portablefs.oss.KitDev")
+        let unauthenticated = ownerRefusal {
+            _ = try Coordinator.ownerApp(at: unsigned, expected: configuration, controlSocket: socket)
+        }
+        guard case let .unauthenticated(reportedSocket, step, failure)? = unauthenticated else {
+            Issue.record("an unsigned owner app must be reported as a failed authentication")
+            return
+        }
+        #expect(reportedSocket == socket)
+        #expect(step == .ownerAppSignature(app: unsigned.path))
+        #expect(failure.contains("signature"))
+        #expect(!ownerMessage(unauthenticated).contains("was replaced while"))
+
+        let file = root.appendingPathComponent("File.app", isDirectory: false)
+        #expect(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)))
+        #expect(ownerRefusal {
+            _ = try Coordinator.ownerApp(at: file, expected: configuration, controlSocket: socket)
+        } == .unauthenticated(
+            socket: socket,
+            step: .ownerAppSignature(app: file.path),
+            failure: "the path is not an app bundle"
+        ))
+    }
+}
+
+/// "Replaced" is reserved for an established identity mismatch: the daemon
+/// reports a different release or executable than the signed app at its
+/// path. Any other identity mismatch is only a failed proof.
+@Test func ownerReplacementRequiresAnEstablishedIdentityMismatch() {
+    let installed = ownerTestRelease(version: "0.4.2", digit: "b")
+    let app = "/Applications/PortableFS.app"
+    let socket = "/tmp/control.sock"
+    let olderDaemon = PortableFSDLiveIdentity(
+        schemaVersion: 1, controlProtocol: 2, daemonVersion: "0.4.1",
+        executableSha256: String(repeating: "c", count: 64), pfslocalMajor: 2, pfslocalMinor: 0
+    )
+    let replaced = Coordinator.identityRefusal(
+        reported: olderDaemon, sealed: installed, app: app, socket: socket
+    )
+    #expect(replaced == .ownerAppReplaced(
+        app: app,
+        running: "0.4.1 (executable cccccccccccc)",
+        installed: "0.4.2 (executable bbbbbbbbbbbb)"
+    ))
+    #expect(ownerMessage(replaced).contains("was replaced while its daemon ran"))
+
+    // Same release and executable reporting other valid protocol numbers:
+    // the authenticated executable's own report, not a spoof, so it is no
+    // identity mismatch and no replacement evidence.
+    let ownNumbers = PortableFSDLiveIdentity(
+        schemaVersion: 1, controlProtocol: 3, daemonVersion: installed.daemonVersion,
+        executableSha256: installed.executableSHA256, pfslocalMajor: 4, pfslocalMinor: 9
+    )
+    #expect(ownNumbers.matches(installed))
+}
+
+/// Whatever serves the endpoint without being the daemon nested in a
+/// PortableFS app is a foreign owner. Here the test process itself listens
+/// on the endpoint, so its real kernel-reported executable is classified.
+@Test func liveOwnerDecisionRefusesAForeignSocketOwner() throws {
+    try withOwnerFixtureDirectory { root in
+        let configuration = try ownerTestConfiguration()
+        let socket = root.appendingPathComponent("control.sock")
+        let listener = try PfsUnixSocket.bindAndListen(path: socket.path)
+        defer { PfsUnixSocket.close(listener) }
+
+        let refusal = ownerRefusal {
+            _ = try Coordinator.inspectLiveServiceOwner(
+                controlSocket: socket,
+                configuration: configuration
+            )
+        }
+        let executable = try ownProcessExecutablePath()
+        #expect(refusal == .foreignProcess(socket: socket.path, executable: executable))
+        #expect(ownerMessage(refusal).contains(executable))
+        #expect(ownerMessage(refusal).contains("Quit that program"))
+    }
+}
+
+/// connect(2) failures are classified by their real errno. Only
+/// ECONNREFUSED, a socket with no accepting daemon, gets the no-listener
+/// explanation. A file that is not a socket, or a path through a file,
+/// reports the OS error and invents no owner history or recovery.
+@Test func liveOwnerDecisionClassifiesConnectFailuresByTheirErrno() throws {
+    try withOwnerFixtureDirectory { root in
+        let configuration = try ownerTestConfiguration()
+        func classify(_ socket: URL) -> Coordinator.UnauthenticatedServiceOwner? {
+            ownerRefusal {
+                _ = try Coordinator.inspectLiveServiceOwner(
+                    controlSocket: socket,
+                    configuration: configuration
+                )
+            }
+        }
+
+        let stale = root.appendingPathComponent("stale.sock")
+        PfsUnixSocket.close(try PfsUnixSocket.bindAndListen(path: stale.path))
+        let refused = classify(stale)
+        #expect(refused == .unreachableEndpoint(socket: stale.path, errno: ECONNREFUSED))
+        #expect(ownerMessage(refused).contains("no daemon accepted a connection"))
+
+        let regular = root.appendingPathComponent("regular.sock")
+        #expect(FileManager.default.createFile(atPath: regular.path, contents: Data()))
+        let notSocket = classify(regular)
+        #expect(notSocket == .unreachableEndpoint(socket: regular.path, errno: ENOTSOCK))
+        #expect(ownerMessage(notSocket).contains("could not connect"))
+        #expect(ownerMessage(notSocket).contains(String(cString: strerror(ENOTSOCK))))
+        #expect(!ownerMessage(notSocket).contains("restarting"))
+        #expect(!ownerMessage(notSocket).contains("log out"))
+
+        let throughFile = regular.appendingPathComponent("control.sock")
+        let notDirectory = classify(throughFile)
+        #expect(notDirectory == .unreachableEndpoint(socket: throughFile.path, errno: ENOTDIR))
+        #expect(ownerMessage(notDirectory).contains(String(cString: strerror(ENOTDIR))))
+    }
+}
+
+/// Every refusal says that authentication identifies whose inventory may be
+/// trusted, and none of them asks the app to stop the owner it could not
+/// authenticate. Recovery is prescribed only where the cause is observed.
+@Test func unauthenticatedOwnerDiagnosesNameOnlyWhatWasObserved() {
+    let socket = "/Users/example/.local/state/portablefs/portablefsd/control.sock"
+    let app = "/Applications/PortableFS.app"
+    let cases: [(Coordinator.UnauthenticatedServiceOwner, [String])] = [
+        (.occupiedStateSingleton,
+         ["state lock", "starting or stopping", "another copy of PortableFS", "log out"]),
+        (.foreignService(app: "/Applications/PortableFSKitDev.app"),
+         ["/Applications/PortableFSKitDev.app", "different signed PortableFS product", "Quit that app", "Login Items"]),
+        (.ownerAppMissing(app: app),
+         [app, "no longer exists", "Unmount", "log out", "installer", "quiesces"]),
+        (.ownerAppReplaced(app: app, running: "0.4.1 (executable c)", installed: "0.4.2 (executable b)"),
+         [app, "0.4.1 (executable c)", "0.4.2 (executable b)", "Unmount", "log out", "installer"]),
+        (.unauthenticated(socket: socket, step: .peerBinding, failure: "Operation not permitted"),
+         [socket, "could not bind the process serving it", "Operation not permitted.", "Quit any other copy", "installer"]),
+        (.unauthenticated(socket: socket, step: .executableResolution, failure: "No such file or directory"),
+         ["could not resolve the executable", "No such file or directory."]),
+        (.unauthenticated(socket: socket, step: .daemonIdentity, failure: "invalid control reply"),
+         ["could not read its running daemon's release identity", "invalid control reply."]),
+        (.exitedDuringProof,
+         ["exited", "Reopen PortableFS"]),
+    ]
+    for (owner, facts) in cases {
+        let message = ownerMessage(owner)
+        for fact in facts {
+            #expect(message.contains(fact), "\(owner) diagnosis omits \"\(fact)\": \(message)")
+        }
+        if owner != .exitedDuringProof {
+            #expect(message.contains("authentication identifies the daemon whose mount inventory"))
+        }
+    }
+}
+
+// MARK: - State singleton exclusion
+
+/// What a starting portablefsd does first: open the canonical lock and try a
+/// nonblocking exclusive flock (`vcs/internal/portablefsd/run.go`
+/// tryAcquireLock). Returns whether this simulated daemon got the lock.
+private func simulatedDaemonAcquiresStateSingleton(in directory: URL) throws -> Bool {
+    let descriptor = Darwin.open(
+        directory.appendingPathComponent(".portablefsd-state.lock").path,
+        O_RDWR | O_NOFOLLOW | O_CLOEXEC
+    )
+    try #require(descriptor >= 0)
+    defer { Darwin.close(descriptor) }
+    if serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+        _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN)
+        return true
+    }
+    #expect(errno == EWOULDBLOCK)
+    return false
+}
+
+/// The exclusion is the flock on the one canonical inode. It never writes,
+/// truncates, renames or replaces the lock, so whatever bytes a previous
+/// process left there stay exactly as they were.
+private func expectLockUntouched(in directory: URL, bytes: Data, inode: ino_t) throws {
+    let lock = directory.appendingPathComponent(".portablefsd-state.lock")
+    #expect(try Data(contentsOf: lock) == bytes)
+    var status = stat()
+    #expect(Darwin.lstat(lock.path, &status) == 0)
+    #expect(status.st_ino == inode)
+    #expect(status.st_nlink == 1)
+}
+
+private func lockInode(in directory: URL) -> ino_t {
+    var status = stat()
+    _ = Darwin.lstat(directory.appendingPathComponent(".portablefsd-state.lock").path, &status)
+    return status.st_ino
+}
+
+/// The absence proof is held, not sampled. Between classification and the
+/// unregistration it authorizes, a daemon that KeepAlive starts cannot take
+/// the state singleton, so it cannot become an unauthenticated owner that the
+/// replacement then stops. Releasing the exclusion lets the incoming daemon
+/// start.
+@Test func stateSingletonExclusionBlocksADaemonStartUntilReleased() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: stateDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        // Bytes a previous process left behind, including an old-format
+        // record naming a long-gone pid, are irrelevant: only the flock on
+        // this inode excludes, and no content can grant a takeover.
+        let lock = stateDirectory.appendingPathComponent(".portablefsd-state.lock")
+        for stale in [
+            Data(#"{"schemaVersion":1,"pid":2147483646,"startIdentity":"1:1","version":"","owner":"old"}"#.utf8),
+            Data(),
+            Data([0xff, 0x00, 0x0a]),
+        ] {
+            try? FileManager.default.removeItem(at: lock)
+            #expect(FileManager.default.createFile(
+                atPath: lock.path,
+                contents: stale,
+                attributes: [.posixPermissions: 0o600]
+            ))
+            let inode = lockInode(in: stateDirectory)
+
+            let exclusion = try #require(
+                try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+            )
+            #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+            #expect(try !Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+            // A second replacement cannot take it either.
+            #expect(try Coordinator.acquireStateSingletonExclusion(at: stateDirectory) == nil)
+            try expectLockUntouched(in: stateDirectory, bytes: stale, inode: inode)
+
+            exclusion.release()
+            #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+            try expectLockUntouched(in: stateDirectory, bytes: stale, inode: inode)
+        }
+    }
+}
+
+/// A missing directory or lock goes through the same boundary: the
+/// exclusion creates them exactly as portablefsd would (0700 directory,
+/// single-link 0600 lock) and holds the lock, so a daemon starting later
+/// contends on it instead of creating its own.
+@Test func stateSingletonExclusionCreatesAMissingDirectoryAndLock() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = root
+            .appendingPathComponent("state", isDirectory: true)
+            .appendingPathComponent("portablefsd", isDirectory: true)
+        #expect(try Coordinator.stateSingletonIsUnlocked(at: stateDirectory))
+        #expect(!FileManager.default.fileExists(atPath: stateDirectory.path))
+
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        var directory = stat()
+        #expect(Darwin.lstat(stateDirectory.path, &directory) == 0)
+        #expect(directory.st_mode & 0o777 == 0o700)
+        var lock = stat()
+        #expect(Darwin.lstat(
+            stateDirectory.appendingPathComponent(".portablefsd-state.lock").path,
+            &lock
+        ) == 0)
+        #expect(lock.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG))
+        #expect(lock.st_mode & 0o777 == 0o600)
+        #expect(lock.st_nlink == 1)
+        #expect(try !simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+        try expectLockUntouched(in: stateDirectory, bytes: Data(), inode: lock.st_ino)
+
+        exclusion.release()
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+    }
+}
+
+/// A held exclusion stops proving absence if its lock is replaced by name.
+@Test func stateSingletonExclusionDetectsAReplacedLock() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        defer { exclusion.release() }
+        try exclusion.confirmHeld()
+        let lock = stateDirectory.appendingPathComponent(".portablefsd-state.lock")
+        try FileManager.default.removeItem(at: lock)
+        #expect(FileManager.default.createFile(
+            atPath: lock.path,
+            contents: Data(),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        #expect(throws: (any Error).self) {
+            try exclusion.confirmHeld()
+        }
+        #expect(throws: (any Error).self) {
+            _ = try Coordinator.DaemonFenceWitness.excluded(exclusion).hasDeparted()
+        }
+    }
+}
+
+// MARK: - Registry absence under the state singleton
+
+private func entryStatus(_ url: URL) -> stat? {
+    var status = stat()
+    return Darwin.lstat(url.path, &status) == 0 ? status : nil
+}
+
+private func makeStateDirectory(in root: URL) throws -> URL {
+    let stateDirectory = root.appendingPathComponent("state", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: stateDirectory,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+    return stateDirectory
+}
+
+/// When no outgoing daemon can run, only ENOENT for the registry name in the
+/// pinned state directory, decided while this app holds the state
+/// singleton, proves the departed release left no persisted attachment. Any
+/// entry at that name refuses: unknown, malformed, current-empty or
+/// zero-byte JSON, a dangling or live symlink, a directory or a FIFO. Nothing
+/// is opened, parsed or changed, so the FIFO cannot block the check.
+@Test func daemonRegistryAbsenceIsProvedOnlyByENOENTUnderTheExclusion() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = try makeStateDirectory(in: root)
+        let registry = stateDirectory.appendingPathComponent("attaches.json")
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        defer { exclusion.release() }
+        try exclusion.requireDaemonRegistryAbsent()
+
+        func expectRefusedUntouched(_ label: String) {
+            let before = entryStatus(registry)
+            // Never open non-regular entries: opening a FIFO here would
+            // block the proof that production only inspects its name.
+            let bytes = before.map { $0.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) } == true
+                ? try? Data(contentsOf: registry) : nil
+            #expect(throws: (any Error).self, "\(label) proved absence") {
+                try exclusion.requireDaemonRegistryAbsent()
+            }
+            let after = entryStatus(registry)
+            #expect(before?.st_ino == after?.st_ino && before?.st_mode == after?.st_mode, "\(label) changed")
+            if let bytes { #expect((try? Data(contentsOf: registry)) == bytes, "\(label) rewritten") }
+        }
+        for contents in [
+            #"{"version":3,"attaches":[]}"#, #"{"version":99,"records":[{"ref":"x"}]}"#,
+            "[]", "not json", "",
+        ] {
+            #expect(FileManager.default.createFile(
+                atPath: registry.path,
+                contents: Data(contents.utf8),
+                attributes: [.posixPermissions: 0o600]
+            ))
+            expectRefusedUntouched("file \(contents.debugDescription)")
+            try FileManager.default.removeItem(at: registry)
+        }
+        try FileManager.default.createSymbolicLink(atPath: registry.path, withDestinationPath: "missing-target")
+        expectRefusedUntouched("dangling symlink")
+        try FileManager.default.removeItem(at: registry)
+        try FileManager.default.createSymbolicLink(atPath: registry.path, withDestinationPath: "/dev/null")
+        expectRefusedUntouched("symlink")
+        try FileManager.default.removeItem(at: registry)
+        try FileManager.default.createDirectory(at: registry, withIntermediateDirectories: false)
+        expectRefusedUntouched("directory")
+        try FileManager.default.removeItem(at: registry)
+        #expect(Darwin.mkfifo(registry.path, 0o600) == 0)
+        expectRefusedUntouched("fifo")
+        try FileManager.default.removeItem(at: registry)
+        try exclusion.requireDaemonRegistryAbsent()
+
+        // An inaccessible pinned directory cannot prove anything.
+        #expect(Darwin.chmod(stateDirectory.path, 0o000) == 0)
+        #expect(throws: (any Error).self) { try exclusion.requireDaemonRegistryAbsent() }
+        #expect(Darwin.chmod(stateDirectory.path, 0o700) == 0)
+        try exclusion.requireDaemonRegistryAbsent()
+    }
+}
+
+/// The check inspects the directory the exclusion pinned, and only while the
+/// canonical path still names it: a substituted empty directory proves
+/// nothing about the daemon's real state.
+@Test func daemonRegistryAbsenceRefusesASubstitutedStateDirectory() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = try makeStateDirectory(in: root)
+        let exclusion = try #require(
+            try Coordinator.acquireStateSingletonExclusion(at: stateDirectory)
+        )
+        defer { exclusion.release() }
+        try FileManager.default.moveItem(
+            at: stateDirectory,
+            to: root.appendingPathComponent("moved", isDirectory: true)
+        )
+        try FileManager.default.createDirectory(
+            at: stateDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        #expect(throws: (any Error).self) { try exclusion.requireDaemonRegistryAbsent() }
+    }
+}
+
+/// The final boundary before the incoming daemon starts. A stopped running
+/// owner's departure is followed by taking the singleton, which a daemon
+/// restarted in the meantime refuses; an absent owner's exclusion, held
+/// since before unregistration, is used as it is. A registry entry that
+/// appeared after the helper's early preflight refuses. The exclusion is
+/// released afterwards in every case, so the incoming daemon can start.
+@Test func finalRegistryBoundaryHoldsTheSingletonForTheDecisiveCheck() throws {
+    try withOwnerFixtureDirectory { root in
+        let stateDirectory = try makeStateDirectory(in: root)
+        let registry = stateDirectory.appendingPathComponent("attaches.json")
+        let stopped = Coordinator.DaemonFenceWitness.process(
+            try Coordinator.DaemonProcessWitness(pid: getpid(), pidVersion: 1)
+        )
+
+        // A daemon holds the singleton: nothing is decided.
+        #expect(throws: (any Error).self) {
+            try Coordinator.requireDaemonRegistryAbsentAtFinalBoundary(
+                stopped,
+                excludeDaemons: { nil }
+            )
+        }
+
+        try Coordinator.requireDaemonRegistryAbsentAtFinalBoundary(
+            stopped,
+            excludeDaemons: { try Coordinator.acquireStateSingletonExclusion(at: stateDirectory) }
+        )
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+
+        // Created between the helper's preflight and this app's exclusion.
+        #expect(FileManager.default.createFile(
+            atPath: registry.path,
+            contents: Data(#"{"version":3,"attaches":[{"ref":"a"}]}"#.utf8),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        let inode = entryStatus(registry)?.st_ino
+        #expect(throws: (any Error).self) {
+            try Coordinator.requireDaemonRegistryAbsentAtFinalBoundary(
+                stopped,
+                excludeDaemons: { try Coordinator.acquireStateSingletonExclusion(at: stateDirectory) }
+            )
+        }
+        #expect(entryStatus(registry)?.st_ino == inode)
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+
+        // An absent owner's retained exclusion is the one that decides.
+        let held = try #require(try Coordinator.acquireStateSingletonExclusion(at: stateDirectory))
+        var consulted = false
+        #expect(throws: (any Error).self) {
+            try Coordinator.requireDaemonRegistryAbsentAtFinalBoundary(
+                .excluded(held),
+                excludeDaemons: { consulted = true; return nil }
+            )
+        }
+        #expect(!consulted)
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+        try FileManager.default.removeItem(at: registry)
+        let retained = try #require(try Coordinator.acquireStateSingletonExclusion(at: stateDirectory))
+        try Coordinator.requireDaemonRegistryAbsentAtFinalBoundary(
+            .excluded(retained),
+            excludeDaemons: { consulted = true; return nil }
+        )
+        #expect(!consulted)
+        #expect(try simulatedDaemonAcquiresStateSingleton(in: stateDirectory))
+    }
+}
+
+/// A no-follow final entry check is meaningful only in the canonical state
+/// directory. Neither an ancestor symlink nor a writable ancestor may select
+/// a substitute lock/empty registry, at acquisition or at the final check.
+@Test func daemonRegistryExclusionRejectsUnsafeAncestors() throws {
+    try withOwnerFixtureDirectory { root in
+        let parent = root.appendingPathComponent("parent", isDirectory: true)
+        let state = parent.appendingPathComponent("state", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: state, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
+        )
+        let link = root.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: parent.path)
+        #expect(throws: (any Error).self) {
+            _ = try Coordinator.acquireStateSingletonExclusion(at: link.appendingPathComponent("state"))
+        }
+        #expect(Darwin.chmod(parent.path, 0o777) == 0)
+        #expect(throws: (any Error).self) {
+            _ = try Coordinator.acquireStateSingletonExclusion(at: state)
+        }
+        #expect(Darwin.chmod(parent.path, 0o700) == 0)
+        let exclusion = try #require(try Coordinator.acquireStateSingletonExclusion(at: state))
+        defer { exclusion.release() }
+        try exclusion.requireDaemonRegistryAbsent()
+        // Even a symlink to the same inode cannot authorize the canonical
+        // path after the exclusion was taken.
+        let moved = root.appendingPathComponent("moved", isDirectory: true)
+        try FileManager.default.moveItem(at: parent, to: moved)
+        try FileManager.default.createSymbolicLink(atPath: parent.path, withDestinationPath: moved.path)
+        #expect(throws: (any Error).self) { try exclusion.requireDaemonRegistryAbsent() }
     }
 }

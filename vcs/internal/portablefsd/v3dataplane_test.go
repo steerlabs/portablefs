@@ -3,9 +3,9 @@ package portablefsd
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"math"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,71 +18,243 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// fakeV3DataClient models the authority closely enough to expose ownership
+// defects: every Lookup mints a fresh capability, the fake remembers which
+// item capabilities are live, and Reclaim enforces the authority's whole-batch
+// rule (one unknown or repeated token rejects the batch before any retires).
 type fakeV3DataClient struct {
-	*fakeV3VisibilityClient
-	root            *authoritypb.Item
-	lease           time.Duration
-	limit           int
-	mu              sync.Mutex
-	sequence        uint64
-	readCalls       int
-	idempotentCalls []*authoritypb.Request
-	keepErr         error
-	read            func(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
-	beforeAssigned  func(*authoritypb.Request) error
-	idempotent      func(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
-	mutation        func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error)
-	newConsumption  func(func(error)) authorityrpc.ResponseConsumption
+	*fakeV3SessionClient
+	root           *authoritypb.Item
+	lease          time.Duration
+	limit          int
+	maxWrite       uint32
+	mu             sync.Mutex
+	sequence       uint64
+	readCalls      int
+	operations     []string
+	keepErr        error
+	proof          time.Duration // KeepAlive proof; zero is a valid but unusable 1 ms proof
+	keepAlive      func(context.Context) (time.Duration, error)
+	keepAlives     int
+	authorization  time.Time
+	poisoned       atomic.Bool
+	read           func(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+	beforeAssigned func(*authoritypb.Request) error
+	mutation       func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error)
+	newConsumption func(func(error)) authorityrpc.ResponseConsumption
+	nextToken      uint64
+	live           map[[16]byte]bool
+	reclaims       [][][]byte
+	closeBatches   [][][]byte
+	mutations      []*authoritypb.Request
+}
+
+func v3TestOperation(request *authoritypb.Request) string {
+	message := request.ProtoReflect()
+	return string(message.WhichOneof(message.Descriptor().Oneofs().ByName("body")).Name())
 }
 
 func newFakeV3DataClient() *fakeV3DataClient {
-	visibility := newFakeV3VisibilityClient()
-	visibility.initial = nil
-	return &fakeV3DataClient{
-		fakeV3VisibilityClient: visibility,
-		root:                   authorityTestItem(1, authoritypb.Attr_DIRECTORY, 0x10, 0x20),
-		lease:                  time.Minute, limit: 2,
+	visibility := newFakeV3SessionClient()
+
+	client := &fakeV3DataClient{
+		fakeV3SessionClient: visibility,
+		root:                authorityTestItem(1, authoritypb.Attr_DIRECTORY, 0x10, 0x20),
+		lease:               time.Minute, limit: 2, maxWrite: 4096,
+		live: make(map[[16]byte]bool),
 	}
+	client.live[[16]byte(client.root.GetToken())] = true
+	return client
 }
 
+// authorityTestItem is a coherent read sample at the storage baseline:
+// object version 1 in snapshot 1.
 func authorityTestItem(inode uint64, kind authoritypb.Attr_Kind, tokenByte, identityByte byte) *authoritypb.Item {
 	return &authoritypb.Item{
 		Token: bytes.Repeat([]byte{tokenByte}, 16), StableIdentity: bytes.Repeat([]byte{identityByte}, 16),
-		Attr: &authoritypb.Attr{Kind: kind, Inode: inode, Mode: 0o755, Nlink: 1},
+		Attr:          &authoritypb.Attr{Kind: kind, Inode: inode, Mode: 0o755, Nlink: 1},
+		ObjectVersion: 1, SnapshotSequence: 1,
 	}
 }
 
-func (f *fakeV3DataClient) Root() *authoritypb.Item    { return f.root }
-func (f *fakeV3DataClient) IOLimits() (uint32, uint32) { return 4096, 4096 }
-func (f *fakeV3DataClient) MaxWriteTransactionBytes() uint64 {
-	return authorityrpc.RequiredFskitWriteBytes
+// issueItem mints a capability the fake authority will accept exactly once in
+// a Reclaim, the way a real Lookup issues a fresh token for every reply.
+func (f *fakeV3DataClient) issueItem(inode uint64, kind authoritypb.Attr_Kind, identityByte byte) *authoritypb.Item {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextToken++
+	var token [16]byte
+	token[0] = 0xc0
+	binary.BigEndian.PutUint64(token[8:], f.nextToken)
+	f.live[token] = true
+	item := authorityTestItem(inode, kind, 0, identityByte)
+	item.Token = token[:]
+	return item
 }
+
+// liveTokens is the number of item capabilities the fake authority still
+// holds for the session, including the root.
+func (f *fakeV3DataClient) liveTokens() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.live)
+}
+
+func (f *fakeV3DataClient) reclaimBatches() [][][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][][]byte(nil), f.reclaims...)
+}
+
+func (f *fakeV3DataClient) closedBatches() [][][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][][]byte(nil), f.closeBatches...)
+}
+
+// issueHandle mints an authority open handle that the fake's CloseBatch
+// accepts exactly once.
+func (f *fakeV3DataClient) issueHandle() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextToken++
+	var token [16]byte
+	token[0] = 0xd0
+	binary.BigEndian.PutUint64(token[8:], f.nextToken)
+	f.live[token] = true
+	return token[:]
+}
+
+// closeBatch applies the authority's per-entry CloseBatch outcomes: a live
+// handle retires cleanly, anything else reports ESTALE without retirement.
+func (f *fakeV3DataClient) closeBatch(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
+	response := exactTestMutationReply(identity)
+	closes := request.GetCloseBatch().GetCloses()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	handles := make([][]byte, len(closes))
+	results := make([]*authoritypb.CloseBatchResult, len(closes))
+	for index, close := range closes {
+		handles[index] = cloneBytesV3(close.GetHandle())
+		results[index] = &authoritypb.CloseBatchResult{Retired: true}
+		if len(close.GetHandle()) != 16 || !f.live[[16]byte(close.GetHandle())] {
+			results[index] = &authoritypb.CloseBatchResult{Errno: errnos.ESTALE}
+			continue
+		}
+		delete(f.live, [16]byte(close.GetHandle()))
+	}
+	f.closeBatches = append(f.closeBatches, handles)
+	if len(closes) == 0 || len(closes) > authorityrpc.MaxCloseBatch {
+		response.Errno = errnos.EINVAL
+		return response
+	}
+	response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}
+	return response
+}
+
+func (f *fakeV3DataClient) mutationRequests() []*authoritypb.Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*authoritypb.Request(nil), f.mutations...)
+}
+
+// reclaim applies the authority's batch rule to the fake's live set.
+func (f *fakeV3DataClient) reclaim(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
+	response := exactTestMutationReply(identity)
+	tokens := request.GetReclaim().GetItems()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reclaims = append(f.reclaims, tokens)
+	if len(tokens) == 0 || len(tokens) > authorityrpc.MaxReclaimBatch {
+		response.Errno = errnos.EINVAL
+		return response
+	}
+	seen := make(map[[16]byte]bool, len(tokens))
+	for _, raw := range tokens {
+		if len(raw) != 16 || seen[[16]byte(raw)] {
+			response.Errno = errnos.EINVAL
+			return response
+		}
+		if !f.live[[16]byte(raw)] {
+			response.Errno = errnos.ESTALE
+			return response
+		}
+		seen[[16]byte(raw)] = true
+	}
+	for token := range seen {
+		delete(f.live, token)
+	}
+	return response
+}
+
+func (f *fakeV3DataClient) Root() *authoritypb.Item      { return f.root }
+func (f *fakeV3DataClient) IOLimits() (uint32, uint32)   { return 4096, f.maxWrite }
 func (f *fakeV3DataClient) SessionLease() time.Duration  { return f.lease }
 func (f *fakeV3DataClient) DataPlaneOperationLimit() int { return f.limit }
+func (f *fakeV3DataClient) SupportsBatchedClose() bool   { return true }
+func (f *fakeV3DataClient) KeepAlive(ctx context.Context) (time.Duration, error) {
+	f.mu.Lock()
+	f.keepAlives++
+	keepErr, proof, hook := f.keepErr, f.proof, f.keepAlive
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(ctx)
+	}
+	if keepErr != nil {
+		return 0, keepErr
+	}
+	if proof == 0 {
+		// A valid proof too short to anchor any horizon: tests about the
+		// authority path stay on it unless they opt into cache hits.
+		proof = min(f.lease, authorityrpc.MaxCacheProof)
+	}
+	return proof, nil
+}
+func (f *fakeV3DataClient) AuthorizationDeadline() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authorization
+}
+func (f *fakeV3DataClient) BeginLocalPublication(force func(error)) (authorityrpc.ResponseConsumption, error) {
+	if f.poisoned.Load() {
+		return nil, authorityrpc.ErrSessionEnded
+	}
+	f.mu.Lock()
+	newConsumption := f.newConsumption
+	f.mu.Unlock()
+	if newConsumption != nil {
+		return newConsumption(force), nil
+	}
+	return &fakeV3ResponseConsumption{consume: func() {}}, nil
+}
+func (f *fakeV3DataClient) LocalAdmissionOpen() bool { return !f.poisoned.Load() }
 func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.readCalls++
+	f.operations = append(f.operations, v3TestOperation(request))
 	hook := f.read
 	f.mu.Unlock()
+	if f.poisoned.Load() {
+		// Like the real client, a poisoned session admits no new request.
+		return nil, authorityrpc.ErrTransportUncertain
+	}
 	if hook != nil {
 		return hook(ctx, request)
 	}
 	switch request.GetBody().(type) {
 	case *authoritypb.Request_StatFs:
 		return &authoritypb.Response{Body: &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{BlockSize: 4096, NameMax: 255}}}, nil
-	case *authoritypb.Request_KeepAlive:
-		if f.keepErr != nil {
-			return nil, f.keepErr
-		}
-		return &authoritypb.Response{}, nil
-	case *authoritypb.Request_Lookup:
-		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(2, authoritypb.Attr_REGULAR, 0x30, 0x40)}}}, nil
 	case *authoritypb.Request_GetAttr:
+		if bytes.Equal(request.GetGetAttr().GetItem(), f.root.GetToken()) {
+			return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+				Attr: proto.Clone(f.root.GetAttr()).(*authoritypb.Attr), ObjectVersion: 1, SnapshotSequence: 1,
+			}}}, nil
+		}
+		// The default file's attributes at the baseline, identical to the Item
+		// its default lookup returns.
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: &authoritypb.Attr{
-			Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1,
-		}}}}, nil
-	case *authoritypb.Request_Reclaim:
-		return &authoritypb.Response{}, nil
+			Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o755, Nlink: 1,
+		}, ObjectVersion: 1, SnapshotSequence: 1}}}, nil
 	default:
 		return &authoritypb.Response{}, nil
 	}
@@ -104,51 +276,14 @@ func (f *fakeV3DataClient) CallReadRetained(
 	}
 	return response, &fakeV3ResponseConsumption{consume: func() {}}, nil
 }
-func (f *fakeV3DataClient) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	f.mu.Lock()
-	f.idempotentCalls = append(f.idempotentCalls, proto.Clone(request).(*authoritypb.Request))
-	hook := f.idempotent
-	f.mu.Unlock()
-	if hook != nil {
-		return hook(ctx, request)
-	}
-	write := request.GetFskitWrite()
-	if write == nil {
-		return f.CallRead(ctx, request)
-	}
-	flags := uint32(0)
-	switch write.GetPhase() {
-	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
-		flags = v3WriteReplyBegun
-	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
-		flags = v3WriteReplyStaged
-	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
-		flags = v3WriteReplyAborted
-	}
-	return &authoritypb.Response{Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
-		TransactionId: write.GetTransactionId(), Flags: flags,
-	}}}, nil
-}
-func (f *fakeV3DataClient) CallIdempotentRetained(
-	ctx context.Context,
-	request *authoritypb.Request,
-	force func(error),
-) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
-	response, err := f.CallIdempotent(ctx, request)
-	if err != nil || response == nil {
-		return response, nil, err
-	}
-	f.mu.Lock()
-	newConsumption := f.newConsumption
-	f.mu.Unlock()
-	if newConsumption != nil {
-		return response, newConsumption(force), nil
-	}
-	return response, &fakeV3ResponseConsumption{consume: func() {}}, nil
-}
 func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	if f.poisoned.Load() {
+		return nil, authorityrpc.ErrTransportUncertain
+	}
 	f.mu.Lock()
 	f.sequence++
+	f.operations = append(f.operations, v3TestOperation(request))
+	f.mutations = append(f.mutations, proto.Clone(request).(*authoritypb.Request))
 	identity := authorityrpc.MutationIdentity{Slot: 2, Sequence: f.sequence}
 	beforeAssigned := f.beforeAssigned
 	hook := f.mutation
@@ -166,21 +301,18 @@ func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request
 	if hook != nil {
 		return hook(ctx, identity, request)
 	}
-	response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
+	response := exactTestMutationReply(identity)
 	switch request.GetBody().(type) {
 	case *authoritypb.Request_Lookup:
-		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(2, authoritypb.Attr_REGULAR, 0x30, 0x40)}}
+		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.issueItem(2, authoritypb.Attr_REGULAR, 0x40)}}
+	case *authoritypb.Request_Reclaim:
+		return f.reclaim(identity, request), nil
+	case *authoritypb.Request_CloseBatch:
+		return f.closeBatch(identity, request), nil
 	case *authoritypb.Request_Open:
-		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: bytes.Repeat([]byte{0x51}, 16)}}
-	case *authoritypb.Request_FskitWrite:
-		write := request.GetFskitWrite()
-		postSize := write.GetPosition() + write.GetFragmentOffset()
-		response.Body = &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
-			TransactionId: write.GetTransactionId(), CommittedSize: write.GetFragmentOffset(),
-			AssignedOffset: write.GetPosition(), PostSize: postSize, VisibilitySequence: identity.Sequence,
-			Flags: v3WriteReplyCommitted,
-		}}
-		response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1})
+		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: f.issueHandle()}}
+	case *authoritypb.Request_Write:
+		return exactTestWriteReply(identity, request), nil
 	case *authoritypb.Request_SyncFs:
 		response.Body = &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}
 	}
@@ -223,7 +355,7 @@ func (f *fakeV3DataClient) CallMutationWithIdentityRetained(
 
 func testV3DataPlane(t *testing.T, client *fakeV3DataClient) *v3DataPlane {
 	t.Helper()
-	d, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{Client: client, VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9, PrincipalUID: 501, PrincipalGID: 20, CachePolicy: v3CachePolicyFSKit})
+	d, err := newV3DataPlane(context.Background(), v3DataPlaneConfig{Client: client, VolumeID: "volume", VolumeName: "Volume", ItemGeneration: 9, PrincipalUID: 501, PrincipalGID: 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,26 +363,66 @@ func testV3DataPlane(t *testing.T, client *fakeV3DataClient) *v3DataPlane {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.fail(errors.New("test cleanup")) })
+	d.mu.Lock()
+	d.horizon = 0
+	d.mu.Unlock()
 	return d
 }
 
 var testV3OperationID atomic.Uint64
 
+// dispatchV3Test runs one request as a frontend that installs everything it
+// receives: publishing requests carry a logical operation that is published,
+// and every resource-bearing reply is accepted in full.
 func dispatchV3Test(d *v3DataPlane, ctx context.Context, operationID uint64, body any) (any, int32) {
+	ctx = context.WithValue(ctx, v3CallbackContextKey{}, uint64(1))
 	if frontendRequestPublishes(body) {
 		if operationID == 0 {
 			operationID = 10_000 + testV3OperationID.Add(1)
 		}
-		d.bridge.reserveFrontendPublication(operationID)
-		defer func() { _ = d.bridge.finishFrontendPublication(operationID) }()
-		defer d.bridge.releaseFrontendPublication(operationID)
+		d.bridge.reserveFrontendPublication(testCallback(operationID))
+		defer func() { _ = d.bridge.finishFrontendPublication(testCallback(operationID)) }()
+		defer d.bridge.releaseFrontendPublication(testCallback(operationID))
 		defer func() {
-			_, _ = d.bridge.acknowledgePublication(
-				operationID, pfslocal.PublicationSemanticCommitPublished,
-			)
+			_, _ = d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished)
 		}()
 	}
-	return d.dispatchFrontend(ctx, operationID, body)
+	return dispatchV3Owned(d, ctx, operationID, body)
+}
+
+// dispatchV3Owned is the resource half of handleV3Attached: the reply's
+// collector owns whatever the request interned, and the frontend's verdict is
+// to accept a successful reply's resources and abandon a failed one's.
+func dispatchV3Owned(d *v3DataPlane, ctx context.Context, operationID uint64, body any) (reply any, errno int32) {
+	ctx = context.WithValue(ctx, v3CallbackContextKey{}, uint64(1))
+	defer func() { d.recordLookupPolarity(body, errno) }()
+	collector := &v3ReplyResourceCollector{d: d}
+	reply, errno = d.dispatchFrontend(context.WithValue(ctx, v3ReplyResourceContextKey{}, collector), operationID, body)
+	resources, err := d.prepareReplyResources(collector)
+	if err != nil {
+		_ = d.fail(err)
+		return nil, darwinEIO
+	}
+	itemCount := uint32(0)
+	if errno == 0 {
+		itemCount = uint32(len(resources.items))
+	}
+	cleanup, err := d.applyReplyResourceDisposition(resources, errno == 0 && len(resources.handles) != 0, itemCount)
+	consumeV3ProvisionalResponses(resources)
+	if err != nil {
+		_ = d.fail(err)
+		return nil, darwinEIO
+	}
+	if cleanup.required() {
+		if err := cleanup.finish(); err != nil {
+			_ = d.fail(err)
+		}
+	}
+	if collector.cached != nil {
+		// This fake frontend installs its sampled reply immediately.
+		d.recordCacheResult(collector.cached.metric, v3CacheHit)
+	}
+	return reply, errno
 }
 
 func TestV3PublishingReadResponsesRemainRetainedThroughFrontendPublication(t *testing.T) {
@@ -261,30 +433,30 @@ func TestV3PublishingReadResponsesRemainRetainedThroughFrontendPublication(t *te
 		return &countingV3ResponseConsumption{count: &consumed}
 	}
 	const operationID = uint64(7601)
-	d.bridge.reserveFrontendPublication(operationID)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	request := &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{
 		Item: bytes.Repeat([]byte{0x30}, 16),
 	}}}
 	for index := 0; index < 2; index++ {
-		if response, errno := d.callRead(context.Background(), operationID, request); errno != 0 || response.GetGetAttr() == nil {
+		if response, errno := d.callRead(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, request); errno != 0 || response.GetGetAttr() == nil {
 			t.Fatalf("publishing read %d = (%#v,%d)", index, response, errno)
 		}
 	}
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("publishing reads consumed at authority return: %d", got)
 	}
-	known, err := d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished)
+	known, err := d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished)
 	if !known || err != nil {
 		t.Fatalf("PublicationAck = (%t,%v)", known, err)
 	}
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("publishing reads consumed before handler retirement: %d", got)
 	}
-	d.bridge.releaseFrontendPublication(operationID)
+	d.bridge.releaseFrontendPublication(testCallback(operationID))
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("publishing reads consumed before logical finish: %d", got)
 	}
-	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
+	if err := d.bridge.finishFrontendPublication(testCallback(operationID)); err != nil {
 		t.Fatal(err)
 	}
 	if got := consumed.Load(); got != 2 {
@@ -300,25 +472,25 @@ func TestV3PublishingReplayResponseRemainsRetainedThroughFrontendPublication(t *
 		return &countingV3ResponseConsumption{count: &consumed}
 	}
 	const operationID = uint64(7602)
-	d.bridge.reserveFrontendPublication(operationID)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	request := &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{
 		Parent: bytes.Repeat([]byte{0x10}, 16), Name: []byte("entry"),
 	}}}
-	if response, errno := d.callNonVisibleMutation(context.Background(), operationID, request); errno != 0 || response.GetLookup() == nil {
+	if response, errno := d.callNonVisibleMutation(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, request); errno != 0 || response.GetLookup() == nil {
 		t.Fatalf("publishing replay = (%#v,%d)", response, errno)
 	}
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("publishing replay consumed at authority return: %d", got)
 	}
-	known, err := d.bridge.acknowledgePublication(operationID, pfslocal.PublicationSemanticCommitPublished)
+	known, err := d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitPublished)
 	if !known || err != nil {
 		t.Fatalf("PublicationAck = (%t,%v)", known, err)
 	}
-	d.bridge.releaseFrontendPublication(operationID)
+	d.bridge.releaseFrontendPublication(testCallback(operationID))
 	if got := consumed.Load(); got != 0 {
 		t.Fatalf("publishing replay consumed before logical finish: %d", got)
 	}
-	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
+	if err := d.bridge.finishFrontendPublication(testCallback(operationID)); err != nil {
 		t.Fatal(err)
 	}
 	if got := consumed.Load(); got != 1 {
@@ -351,15 +523,30 @@ func collectTestItem(
 	candidate *authoritypb.Item,
 ) *v3ItemRecord {
 	t.Helper()
-	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
-	root := d.resolveReply().Root
-	record, errno := d.intern(ctx, candidate, &root)
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
+	record, errno := d.intern(ctx, candidate)
 	if errno != 0 {
 		t.Fatalf("intern errno=%d", errno)
 	}
-	collectV3ReplyItem(ctx, record)
 	if collector.err != nil {
 		t.Fatal(collector.err)
+	}
+	return record
+}
+
+// acceptedTestItem interns candidate under the root as an item a completed
+// frontend callback owns.
+func acceptedTestItem(t *testing.T, d *v3DataPlane, candidate *authoritypb.Item) *v3ItemRecord {
+	t.Helper()
+	collector := &v3ReplyResourceCollector{d: d}
+	record := collectTestItem(t, d, collector, candidate)
+	resources, err := d.prepareReplyResources(collector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := d.applyReplyResourceDisposition(resources, false, 1)
+	if err != nil || cleanup.required() {
+		t.Fatalf("accept test item cleanup=%+v err=%v", cleanup, err)
 	}
 	return record
 }
@@ -370,23 +557,26 @@ func exactTestMutationReply(identity authorityrpc.MutationIdentity) *authoritypb
 	}}
 }
 
-func exactTestWritePhaseReply(request *authoritypb.Request, flags uint32) *authoritypb.Response {
-	write := request.GetFskitWrite()
-	return &authoritypb.Response{Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
-		TransactionId: write.GetTransactionId(), Flags: flags,
-	}}}
+// exactTestWriteReply is the authority's complete success for one WRITE to
+// the fake's default file (identity 0x40, inode 2).
+func exactTestWriteReply(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
+	return exactTestWriteReplyFor(identity, request, 0x40, 2)
 }
 
-func exactTestWriteCommit(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
-	write := request.GetFskitWrite()
-	postSize := write.GetPosition() + write.GetFragmentOffset()
+// exactTestWriteReplyFor is the complete success for a WRITE to the item with
+// the given identity byte and inode: the post-state target names that exact
+// identity and carries the same attr as the reply.
+func exactTestWriteReplyFor(identity authorityrpc.MutationIdentity, request *authoritypb.Request, identityByte byte, inode uint64) *authoritypb.Response {
+	write := request.GetWrite()
+	post := &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: inode, Size: int64(write.GetPosition() + uint64(write.GetSize())), Nlink: 1}
 	response := exactTestMutationReply(identity)
-	response.Body = &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
-		TransactionId: write.GetTransactionId(), CommittedSize: write.GetFragmentOffset(),
-		AssignedOffset: write.GetPosition(), PostSize: postSize, VisibilitySequence: identity.Sequence,
-		Flags: v3WriteReplyCommitted,
+	response.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
+		CommittedSize: uint64(write.GetSize()), AssignedOffset: write.GetPosition(), PostAttr: post,
 	}}
-	response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1})
+	response.PostState = &authoritypb.PostState{VisibilitySequence: 2, SnapshotSequence: 2, Objects: []*authoritypb.ObjectPostState{{
+		StableIdentity: bytes.Repeat([]byte{identityByte}, 16), ObjectVersion: 2,
+		Attr: proto.Clone(post).(*authoritypb.Attr), Roles: v3PostStateRoleTarget,
+	}}}
 	return response
 }
 
@@ -395,11 +585,11 @@ func TestV3VisibleCreateReplyRejectedHandleIsTerminal(t *testing.T) {
 	d := testV3DataPlane(t, client)
 	collector := &v3ReplyResourceCollector{d: d, visible: true}
 	record := collectTestItem(t, d, collector, authorityTestItem(2, authoritypb.Attr_REGULAR, 0x31, 0x41))
-	handle, err := d.installHandle(bytes.Repeat([]byte{0x51}, 16), record.item.ItemID, false)
+	handle, err := d.installHandle(bytes.Repeat([]byte{0x51}, 16), record.item, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
 	collectV3ReplyHandle(ctx, handle)
 	resources, err := d.prepareReplyResources(collector)
 	if err != nil {
@@ -450,6 +640,56 @@ func TestV3VisibleReplyMissingPublishedItemIsTerminal(t *testing.T) {
 	}
 }
 
+func TestV3AssignedResourceCleanupSurvivesFrontendWithdrawal(t *testing.T) {
+	client := newFakeV3DataClient()
+	d := testV3DataPlane(t, client)
+	entered, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	client.mu.Lock()
+	client.mutation = func(ctx context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetCloseBatch() == nil {
+			return nil, errors.New("unexpected cleanup request")
+		}
+		close(entered)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-release:
+			return client.closeBatch(identity, request), nil
+		}
+	}
+	client.mu.Unlock()
+	cleanup := &v3ResourceCleanup{d: d, handles: []*v3HandleRecord{{
+		id: 42, token: client.issueHandle(),
+	}}}
+	if err := cleanup.finish(); err != nil {
+		t.Fatalf("cleanup transfer = %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not reach its assigned authority request")
+	}
+	_ = d.stopServing(errors.New("frontend disconnected during cleanup"))
+	close(release)
+	// The batch already in flight settles on the original session even though
+	// local serving was withdrawn underneath it.
+	if err := waitV3ReleaseOwner(context.Background(), d.releases); err != nil {
+		t.Fatalf("assigned cleanup was canceled by local withdrawal: %v", err)
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("assigned cleanup discarded the authority before mount-absence proof")
+	default:
+	}
+}
+
 func TestV3OverlappingItemRepliesCannotReclaimEachOther(t *testing.T) {
 	d := testV3DataPlane(t, newFakeV3DataClient())
 	candidate := authorityTestItem(2, authoritypb.Attr_REGULAR, 0x33, 0x43)
@@ -489,56 +729,6 @@ func TestV3OverlappingItemRepliesCannotReclaimEachOther(t *testing.T) {
 	}
 }
 
-func TestV3ItemPrefixCountsDuplicateHardLinkOccurrences(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	var reclaims int
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetReclaim() != nil {
-			reclaims++
-		}
-		return exactTestMutationReply(identity), nil
-	}
-
-	acceptedCollector := &v3ReplyResourceCollector{d: d}
-	record := collectTestItem(t, d, acceptedCollector, authorityTestItem(2, authoritypb.Attr_REGULAR, 0x34, 0x44))
-	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, acceptedCollector)
-	collectV3ReplyItem(ctx, record)
-	acceptedResources, err := d.prepareReplyResources(acceptedCollector)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cleanup, err := d.applyReplyResourceDisposition(acceptedResources, false, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cleanup.required() || !record.accepted || record.provisional != 0 {
-		t.Fatalf("accepted duplicate prefix cleanup=%+v record=%+v", cleanup, record)
-	}
-
-	abandonedCollector := &v3ReplyResourceCollector{d: d}
-	abandoned := collectTestItem(t, d, abandonedCollector, authorityTestItem(3, authoritypb.Attr_REGULAR, 0x35, 0x45))
-	ctx = context.WithValue(context.Background(), v3ReplyResourceContextKey{}, abandonedCollector)
-	collectV3ReplyItem(ctx, abandoned)
-	abandonedResources, err := d.prepareReplyResources(abandonedCollector)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cleanup, err = d.applyReplyResourceDisposition(abandonedResources, false, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cleanup.items) != 1 {
-		t.Fatalf("duplicate abandon queued %d reclaims, want one", len(cleanup.items))
-	}
-	if err := cleanup.finish(); err != nil {
-		t.Fatal(err)
-	}
-	if reclaims != 1 {
-		t.Fatalf("authority reclaims=%d, want one", reclaims)
-	}
-}
-
 func TestV3ReclaimWaitsForOverlappingItemDisposition(t *testing.T) {
 	d := testV3DataPlane(t, newFakeV3DataClient())
 	collector := &v3ReplyResourceCollector{d: d}
@@ -571,24 +761,13 @@ func TestV3ReclaimWaitsForOverlappingItemDisposition(t *testing.T) {
 func TestV3FrontendDisconnectAbandonsProvisionalOpen(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
-	var closes int
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetClose() != nil {
-			closes++
-		}
-		return exactTestMutationReply(identity), nil
-	}
-	root := d.resolveReply().Root
-	record, errno := d.intern(context.Background(), authorityTestItem(2, authoritypb.Attr_REGULAR, 0x37, 0x47), &root)
-	if errno != 0 {
-		t.Fatalf("intern errno=%d", errno)
-	}
-	handle, err := d.installHandle(bytes.Repeat([]byte{0x57}, 16), record.item.ItemID, false)
+	record := acceptedTestItem(t, d, authorityTestItem(2, authoritypb.Attr_REGULAR, 0x37, 0x47))
+	handle, err := d.installHandle(client.issueHandle(), record.item, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	collector := &v3ReplyResourceCollector{d: d}
-	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
 	collectV3ReplyHandle(ctx, handle)
 	resources, err := d.prepareReplyResources(collector)
 	if err != nil {
@@ -611,28 +790,40 @@ func TestV3FrontendDisconnectAbandonsProvisionalOpen(t *testing.T) {
 	if err := cleanups[0].finish(); err != nil {
 		t.Fatal(err)
 	}
-	if closes != 1 {
-		t.Fatalf("authority closes=%d, want one", closes)
+	waitV3ReleasesIdle(t, d)
+	if batches := client.closedBatches(); len(batches) != 1 || len(batches[0]) != 1 {
+		t.Fatalf("authority closes=%x, want one", batches)
 	}
 }
 
 func TestV3PostInternReplyBuildFailureRollsBackCollectedItem(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
+	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.GetAttrRequest{Item: d.resolveReply().Root}); errno != 0 {
+		t.Fatalf("root getattr errno=%d", errno)
+	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetLookup() == nil {
-			return nil, errors.New("expected lookup")
+		if request.GetMkdir() == nil {
+			return nil, errors.New("expected mkdir")
 		}
-		item := authorityTestItem(2, authoritypb.Attr_REGULAR, 0x38, 0x48)
-		item.Attr.Blocks = math.MaxUint64/512 + 1 // accepted by intern, rejected by localAttr
+		// The new directory is adopted first; the reply then contradicts the
+		// root's cached version 1, which is only discovered while applying.
+		item := authorityTestItem(2, authoritypb.Attr_DIRECTORY, 0x38, 0x48)
+		item.ObjectVersion, item.SnapshotSequence = 2, 2
 		response := exactTestMutationReply(identity)
-		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}
+		response.PostState = testV3MutationState(2,
+			testV3PostObject{identity: 0x20, attr: testV3DirAttr(1, 3), version: 1, roles: v3PostStateRoleParent},
+			testV3PostObject{identity: 0x48, attr: item.GetAttr(), version: 2, roles: v3PostStateRoleCreated},
+		)
+		response.Body = &authoritypb.Response_Mkdir{Mkdir: &authoritypb.MkdirReply{Item: item}}
 		return response, nil
 	}
+	const operationID = uint64(7701)
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
 	collector := &v3ReplyResourceCollector{d: d}
-	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
-	if _, errno := d.lookup(ctx, 0, &pfslocal.LookupRequest{Dir: d.resolveReply().Root, Name: []byte("bad-attr")}); errno != darwinEIO {
-		t.Fatalf("lookup errno=%d, want %d", errno, darwinEIO)
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
+	if _, errno := d.dispatchFrontend(ctx, operationID, &pfslocal.MkdirRequest{Dir: d.resolveReply().Root, Name: []byte("bad-reply"), Mode: 0o755}); errno != darwinEIO {
+		t.Fatalf("mkdir errno=%d, want %d", errno, darwinEIO)
 	}
 	if len(collector.items) != 1 || collector.items[0].provisional != 1 {
 		t.Fatalf("collector did not retain post-intern item: %+v", collector)
@@ -656,24 +847,13 @@ func TestV3PostInternReplyBuildFailureRollsBackCollectedItem(t *testing.T) {
 func TestV3RegistrationRaceSynchronouslyAbandonsOpen(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
-	var closes int
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetClose() != nil {
-			closes++
-		}
-		return exactTestMutationReply(identity), nil
-	}
-	root := d.resolveReply().Root
-	record, errno := d.intern(context.Background(), authorityTestItem(2, authoritypb.Attr_REGULAR, 0x39, 0x49), &root)
-	if errno != 0 {
-		t.Fatalf("intern errno=%d", errno)
-	}
-	handle, err := d.installHandle(bytes.Repeat([]byte{0x59}, 16), record.item.ItemID, false)
+	record := acceptedTestItem(t, d, authorityTestItem(2, authoritypb.Attr_REGULAR, 0x39, 0x49))
+	handle, err := d.installHandle(client.issueHandle(), record.item, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	collector := &v3ReplyResourceCollector{d: d}
-	ctx := context.WithValue(context.Background(), v3ReplyResourceContextKey{}, collector)
+	ctx := context.WithValue(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), v3ReplyResourceContextKey{}, collector)
 	collectV3ReplyHandle(ctx, handle)
 	resources, err := d.prepareReplyResources(collector)
 	if err != nil {
@@ -696,8 +876,9 @@ func TestV3RegistrationRaceSynchronouslyAbandonsOpen(t *testing.T) {
 	if err := cleanup.finish(); err != nil {
 		t.Fatal(err)
 	}
-	if closes != 1 {
-		t.Fatalf("authority closes=%d, want one", closes)
+	waitV3ReleasesIdle(t, d)
+	if batches := client.closedBatches(); len(batches) != 1 || len(batches[0]) != 1 {
+		t.Fatalf("authority closes=%x, want one", batches)
 	}
 }
 
@@ -708,41 +889,7 @@ func TestV3DataPlaneRootIdentityAndGenesisContract(t *testing.T) {
 	if resolved == nil || resolved.Root.ItemID != 1 || resolved.Root.ItemGeneration != 9 || resolved.Root.StableIdentity != ([16]byte{0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20}) {
 		t.Fatalf("unexpected v3 root: %#v", resolved)
 	}
-	if resolved.V3Coherence == nil || resolved.V3Coherence.InitialCursor != nil {
-		t.Fatalf("genesis contract serialized an invalid cursor: %#v", resolved.V3Coherence)
-	}
-	// Xattrs advertises the operation family; XattrSetSupported separately
-	// prevents the macOS frontend from entering ordered mutation machinery for
-	// the production authority's deliberately unsupported write surface.
-	if !resolved.Capabilities.Xattrs || resolved.Capabilities.XattrSetSupported {
-		t.Fatalf("v3 resolve xattr capabilities = %+v", resolved.Capabilities)
-	}
-}
 
-func TestV3DataPlaneItemIdentifiersStopAtTheRepairPartition(t *testing.T) {
-	if v3RepairItemFloor != uint64(1)<<63 {
-		t.Fatalf("repair item floor=%#x, want the high-half boundary", v3RepairItemFloor)
-	}
-	d := testV3DataPlane(t, newFakeV3DataClient())
-	d.mu.Lock()
-	d.nextItemID = v3RepairItemFloor - 1
-	d.mu.Unlock()
-
-	last, errno := d.intern(
-		context.Background(),
-		authorityTestItem(2, authoritypb.Attr_REGULAR, 0x31, 0x41),
-		&d.resolveReply().Root,
-	)
-	if errno != 0 || last.item.ItemID != v3RepairItemFloor-1 {
-		t.Fatalf("last daemon item=(%#v,%d)", last, errno)
-	}
-	if _, errno := d.intern(
-		context.Background(),
-		authorityTestItem(3, authoritypb.Attr_REGULAR, 0x32, 0x42),
-		&d.resolveReply().Root,
-	); errno != darwinEIO {
-		t.Fatalf("first repair-partition item errno=%d, want %d", errno, darwinEIO)
-	}
 }
 
 func TestV3DataPlaneOpenCloseOperationZeroKeepsReplayButNoPublicationTicket(t *testing.T) {
@@ -770,344 +917,19 @@ func TestV3DataPlaneOpenCloseOperationZeroKeepsReplayButNoPublicationTicket(t *t
 	}
 }
 
-func TestV3DataPlaneWriteInstallsExactSourceGateBeforeAssignment(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	lookupAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.LookupRequest{Dir: d.resolveReply().Root, Name: []byte("file")})
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	file := lookupAny.(*pfslocal.LookupReply).Attr.Item
-	openedAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.OpenRequest{Item: file, Mode: pfslocal.OpenModeReadWrite})
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	handle := openedAny.(*pfslocal.OpenReply).Handle
-	d.bridge.reserveFrontendPublication(77)
-	client.beforeAssigned = func(request *authoritypb.Request) error {
-		if request.GetFskitSourcePublication() == nil {
-			return errors.New("source gate was not carried into replay assignment")
-		}
-		d.bridge.sourcePublication.mu.Lock()
-		lease := d.bridge.sourcePublication.operationLeaseLocked(77)
-		installed := lease != nil && lease.assigned == 0
-		d.bridge.sourcePublication.mu.Unlock()
-		if !installed {
-			return errors.New("source gate was not installed before replay assignment")
-		}
-		return nil
-	}
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetFskitWrite()
-		if write == nil || write.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT ||
-			write.GetTransactionId() != 1 || write.GetRequestedSize() != 3 || write.GetFragmentOffset() != 3 ||
-			write.GetPosition() != 0 || write.GetRlimitFsize() != math.MaxUint64 || write.GetFileMaxSize() != math.MaxInt64 {
-			return nil, errors.New("expected exact write transaction COMMIT")
-		}
-		if request.GetFskitFrontendOperationId() != 77 {
-			return nil, errors.New("write lost its pfslocal frontend operation identity")
-		}
-		gate := request.GetFskitSourcePublication()
-		if gate == nil || len(gate.GetTargets()) != 1 || gate.GetTargets()[0].GetItem() == nil ||
-			!bytes.Equal(gate.GetTargets()[0].GetItem().GetIdentity(), bytes.Repeat([]byte{0x40}, 16)) ||
-			!gate.GetTargets()[0].GetItem().GetAttributes() || !gate.GetTargets()[0].GetItem().GetData() {
-			return nil, errors.New("write lost its exact item ATTR+DATA source gate")
-		}
-		return exactTestWriteCommit(identity, request), nil
-	}
-	replyAny, errno := d.dispatchFrontend(
-		context.Background(), 77,
-		&pfslocal.WriteRequest{Handle: handle, Data: []byte("abc")},
-	)
-	if errno != 0 || replyAny.(*pfslocal.WriteReply).Written != 3 {
-		t.Fatalf("write=(%#v,%d)", replyAny, errno)
-	}
-	if !acknowledgeBridgePublished(t, d.bridge, 77) {
-		t.Fatal("PublicationAck did not release the write source gate")
-	}
-	d.bridge.releaseFrontendPublication(77)
-
-	client.mu.Lock()
-	inert := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	if len(inert) != 2 {
-		t.Fatalf("write inert phase count=%d, want BEGIN+DATA", len(inert))
-	}
-	for index, exact := range []struct {
-		phase          authoritypb.FskitWritePhase
-		fragmentOffset uint64
-		size           uint32
-		data           []byte
-	}{
-		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN},
-		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, size: 3, data: []byte("abc")},
-	} {
-		request := inert[index]
-		write := request.GetFskitWrite()
-		if request.GetMutation() != nil || request.GetFskitSourcePublication() != nil || request.GetFskitFrontendOperationId() != 0 ||
-			write == nil || write.GetPhase() != exact.phase || write.GetTransactionId() != 1 ||
-			!bytes.Equal(write.GetHandle(), bytes.Repeat([]byte{0x51}, 16)) || write.GetRequestedSize() != 3 ||
-			write.GetFragmentOffset() != exact.fragmentOffset || write.GetPosition() != 0 ||
-			write.GetRlimitFsize() != math.MaxUint64 || write.GetFileMaxSize() != math.MaxInt64 ||
-			write.GetLockOwner() != 0 || write.GetWriteFlags() != v3WriteFlagKillSUIDGID || write.GetFlags() != 0 ||
-			write.GetSize() != exact.size || !bytes.Equal(write.GetData(), exact.data) {
-			t.Fatalf("inert phase[%d] = %#v, want exact immutable transaction metadata", index, request)
-		}
-	}
-}
-
-func TestV3DataPlaneWriteFragmentsOneTransactionAndCommitsOnce(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	_, handle := openTestV3File(t, d, false)
-	d.maxWrite = 2
-	var consumed atomic.Int32
-	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
-		return &countingV3ResponseConsumption{count: &consumed}
-	}
-
-	commits := 0
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		commits++
-		write := request.GetFskitWrite()
-		if write == nil || write.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT ||
-			write.GetTransactionId() != 1 || write.GetFragmentOffset() != 5 {
-			return nil, errors.New("expected one exact five-byte COMMIT")
-		}
-		return exactTestWriteCommit(identity, request), nil
-	}
-	const operationID = uint64(780)
-	d.bridge.reserveFrontendPublication(operationID)
-	if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
-		Handle: handle, Offset: 7, Data: []byte("abcde"),
-	}); errno != 0 || reply.(*pfslocal.WriteReply).Written != 5 {
-		t.Fatalf("fragmented write=(%#v,%d)", reply, errno)
-	}
-	if got := consumed.Load(); got != 0 {
-		t.Fatalf("fragmented write consumed %d phase receipts before frontend publication", got)
-	}
-	client.mu.Lock()
-	inert := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	if commits != 1 || len(inert) != 4 {
-		t.Fatalf("fragmented phases: inert=%d commits=%d, want BEGIN+3 DATA+COMMIT", len(inert), commits)
-	}
-	for index, exact := range []struct {
-		phase  authoritypb.FskitWritePhase
-		offset uint64
-		data   string
-	}{
-		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN},
-		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, data: "ab"},
-		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, offset: 2, data: "cd"},
-		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, offset: 4, data: "e"},
-	} {
-		write := inert[index].GetFskitWrite()
-		if write == nil || write.GetPhase() != exact.phase || write.GetTransactionId() != 1 ||
-			write.GetFragmentOffset() != exact.offset || string(write.GetData()) != exact.data ||
-			write.GetSize() != uint32(len(exact.data)) {
-			t.Fatalf("fragment[%d]=%#v", index, inert[index])
-		}
-	}
-	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
-		t.Fatal("fragmented write PublicationAck was refused")
-	}
-	d.bridge.releaseFrontendPublication(operationID)
-	if got := consumed.Load(); got != 0 {
-		t.Fatalf("fragmented write consumed %d receipts before logical retirement", got)
-	}
-	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
-		t.Fatal(err)
-	}
-	if got := consumed.Load(); got != 5 {
-		t.Fatalf("fragmented write consumed %d receipts, want BEGIN+3 DATA+COMMIT=5", got)
-	}
-}
-
-func TestV3DataPlaneWriteDATAFailureUsesExactAbortAndNoCommit(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	_, handle := openTestV3File(t, d, false)
-	dataCalls := 0
-	client.idempotent = func(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetFskitWrite()
-		switch write.GetPhase() {
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
-			return exactTestWritePhaseReply(request, v3WriteReplyBegun), nil
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
-			dataCalls++
-			return &authoritypb.Response{Errno: errnos.ENOSPC}, nil
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
-			return exactTestWritePhaseReply(request, v3WriteReplyAborted), nil
-		default:
-			return nil, errors.New("unexpected idempotent phase")
-		}
-	}
-	commits := 0
-	client.mutation = func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error) {
-		commits++
-		return nil, errors.New("COMMIT must not follow failed DATA")
-	}
-	if reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{
-		Handle: handle, Data: []byte("abc"),
-	}); errno != darwinENOSPC || reply != nil {
-		t.Fatalf("DATA refusal=(%#v,%d), want ENOSPC", reply, errno)
-	}
-	client.mu.Lock()
-	inert := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	if dataCalls != 1 || commits != 0 || len(inert) != 3 {
-		t.Fatalf("DATA failure phases: data=%d commits=%d inert=%d", dataCalls, commits, len(inert))
-	}
-	abort := inert[2].GetFskitWrite()
-	if abort == nil || abort.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT ||
-		abort.GetTransactionId() != 1 || abort.GetFragmentOffset() != 0 || abort.GetSize() != 0 || len(abort.GetData()) != 0 {
-		t.Fatalf("ABORT=%#v, want exact metadata with zero offset/payload", inert[2])
-	}
-}
-
-func TestV3DataPlaneWriteStructuredRejectionAbortsWithoutPublicationCommit(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	_, handle := openTestV3File(t, d, false)
-	var consumed atomic.Int32
-	client.newConsumption = func(func(error)) authorityrpc.ResponseConsumption {
-		return &countingV3ResponseConsumption{count: &consumed}
-	}
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetFskitWrite()
-		return &authoritypb.Response{
-			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-			Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
-				TransactionId: write.GetTransactionId(), Flags: v3WriteReplyRejected, Error: -int32(errnos.ENOSPC),
-			}},
-		}, nil
-	}
-	const operationID = uint64(779)
-	d.bridge.reserveFrontendPublication(operationID)
-	if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
-		Handle: handle, Data: []byte("abc"),
-	}); errno != darwinENOSPC || reply != nil {
-		t.Fatalf("structured rejection=(%#v,%d), want ENOSPC", reply, errno)
-	}
-	if got := consumed.Load(); got != 0 {
-		t.Fatalf("definite no-publication rejection consumed receipt at authority return: %d", got)
-	}
-	client.mu.Lock()
-	inert := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	if len(inert) != 3 || inert[2].GetFskitWrite().GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT {
-		t.Fatalf("structured rejection phases=%#v, want BEGIN+DATA+ABORT", inert)
-	}
-	lease := d.bridge.sourcePublication.operationLease(operationID)
-	d.bridge.sourcePublication.mu.Lock()
-	op := d.bridge.sourcePublication.operations[operationID]
-	committed, released := op != nil && op.committed, lease != nil && lease.released
-	d.bridge.sourcePublication.mu.Unlock()
-	if lease == nil || committed || released || d.terminalError() != nil {
-		t.Fatalf("rejected lease=%#v committed=%t released=%t terminal=%v", lease, committed, released, d.terminalError())
-	}
-	if !acknowledgeBridgePublished(t, d.bridge, operationID) {
-		t.Fatal("rejected callback PublicationAck was not accepted")
-	}
-	d.bridge.releaseFrontendPublication(operationID)
-	if err := d.bridge.finishFrontendPublication(operationID); err != nil {
-		t.Fatal(err)
-	}
-	if got := consumed.Load(); got != 4 {
-		t.Fatalf("definite rejection consumed %d receipts, want BEGIN+DATA+COMMIT+ABORT=4", got)
-	}
-	d.bridge.sourcePublication.mu.Lock()
-	released = lease.released
-	d.bridge.sourcePublication.mu.Unlock()
-	if !released {
-		t.Fatal("definite rejection did not release its noncommitted source lease")
-	}
-}
-
-func TestV3DataPlaneWriteBeginDispatchOrderIsMonotonic(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	_, handle := openTestV3File(t, d, false)
-	firstEntered := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	var once sync.Once
-	client.idempotent = func(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetFskitWrite()
-		if write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN && write.GetTransactionId() == 1 {
-			once.Do(func() { close(firstEntered) })
-			select {
-			case <-releaseFirst:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		var flags uint32
-		switch write.GetPhase() {
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
-			flags = v3WriteReplyBegun
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
-			flags = v3WriteReplyStaged
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
-			flags = v3WriteReplyAborted
-		}
-		return exactTestWritePhaseReply(request, flags), nil
-	}
-
-	type result struct{ errno int32 }
-	results := make(chan result, 2)
-	go func() {
-		_, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{Handle: handle, Data: []byte("a")})
-		results <- result{errno: errno}
-	}()
-	<-firstEntered
-	go func() {
-		_, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{Handle: handle, Offset: 1, Data: []byte("b")})
-		results <- result{errno: errno}
-	}()
-	time.Sleep(20 * time.Millisecond)
-	client.mu.Lock()
-	beforeRelease := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	if len(beforeRelease) != 1 || beforeRelease[0].GetFskitWrite().GetTransactionId() != 1 {
-		t.Fatalf("BEGIN mutex allowed later dispatch before transaction 1 reply: %#v", beforeRelease)
-	}
-	close(releaseFirst)
-	for range 2 {
-		if result := <-results; result.errno != 0 {
-			t.Fatalf("concurrent write errno=%d", result.errno)
-		}
-	}
-	client.mu.Lock()
-	all := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	beginIDs := make([]uint64, 0, 2)
-	for _, request := range all {
-		if write := request.GetFskitWrite(); write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN {
-			beginIDs = append(beginIDs, write.GetTransactionId())
-		}
-	}
-	if !slices.Equal(beginIDs, []uint64{1, 2}) {
-		t.Fatalf("BEGIN dispatch IDs=%v, want [1 2]", beginIDs)
-	}
-}
-
-func TestV3DataPlaneZeroWritePublishesCurrentAttrWithoutTransaction(t *testing.T) {
+func TestV3DataPlaneZeroWritePublishesCurrentAttrWithoutMutation(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	_, handle := openTestV3File(t, d, true)
-	mutationsBefore := client.sequence
-	if reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{
+	mutationsBefore := len(client.mutationRequests())
+	reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{
 		Handle: handle, Offset: math.MaxInt64 - 1, Append: true,
-	}); errno != 0 || reply.(*pfslocal.WriteReply).Written != 0 {
+	})
+	if errno != 0 || reply.(*pfslocal.WriteReply).Written != 0 || reply.(*pfslocal.WriteReply).Attr.FileID != 2 {
 		t.Fatalf("zero write=(%#v,%d)", reply, errno)
 	}
-	client.mu.Lock()
-	inert := len(client.idempotentCalls)
-	mutationsAfter := client.sequence
-	client.mu.Unlock()
-	if inert != 0 || mutationsAfter != mutationsBefore || d.nextWriteTransaction != 1 {
-		t.Fatalf("zero write allocated work: inert=%d mutation=%d->%d nextTx=%d", inert, mutationsBefore, mutationsAfter, d.nextWriteTransaction)
+	if mutationsAfter := len(client.mutationRequests()); mutationsAfter != mutationsBefore {
+		t.Fatalf("zero write sent %d authority mutations", mutationsAfter-mutationsBefore)
 	}
 }
 
@@ -1142,7 +964,7 @@ func TestV3DataPlaneAppendHasNoPositionalFallback(t *testing.T) {
 			called := false
 			client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 				called = true
-				return exactTestWriteCommit(identity, request), nil
+				return exactTestWriteReply(identity, request), nil
 			}
 
 			replyAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.WriteRequest{
@@ -1175,21 +997,21 @@ func TestV3DataPlaneMixedOperationLocalFailureAfterCommittedWriteFailsClosed(t *
 
 	calls := 0
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetFskitWrite() == nil {
-			return nil, errors.New("expected write transaction")
+		if request.GetWrite() == nil {
+			return nil, errors.New("expected write")
 		}
 		calls++
-		return exactTestWriteCommit(identity, request), nil
+		return exactTestWriteReply(identity, request), nil
 	}
 
 	const operationID = 771
-	d.bridge.reserveFrontendPublication(operationID)
-	if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+	d.bridge.reserveFrontendPublication(testCallback(operationID))
+	if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 		Handle: handle, Data: []byte("a"),
 	}); errno != 0 || reply.(*pfslocal.WriteReply).Written != 1 {
 		t.Fatalf("committed write = (%#v, %d)", reply, errno)
 	}
-	if reply, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.WriteRequest{
+	if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.WriteRequest{
 		Handle: handle + 10_000, Offset: 1, Data: []byte("b"),
 	}); errno != darwinEBADF || reply != nil {
 		t.Fatalf("locally failing continuation = (%#v, %d), want EBADF", reply, errno)
@@ -1197,100 +1019,24 @@ func TestV3DataPlaneMixedOperationLocalFailureAfterCommittedWriteFailsClosed(t *
 	if calls != 1 {
 		t.Fatalf("local continuation failure reached authority: calls=%d", calls)
 	}
-	lease := d.bridge.sourcePublication.operationLease(operationID)
+	lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 	d.bridge.sourcePublication.mu.Lock()
-	op := d.bridge.sourcePublication.operations[operationID]
+	op := d.bridge.sourcePublication.operations[testCallback(operationID)]
 	committed := op != nil && op.committed
 	d.bridge.sourcePublication.mu.Unlock()
 	if lease == nil || !committed {
 		t.Fatalf("mixed operation lost committed source fact: lease=%#v committed=%t", lease, committed)
 	}
-	known, ackErr := d.bridge.acknowledgePublication(
-		operationID, pfslocal.PublicationSemanticCommitNotPublished,
-	)
+	known, ackErr := d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
 	if !known || !errors.Is(ackErr, errV3SourcePublicationNotPublished) {
 		t.Fatalf("mixed operation ack = (%t, %v)", known, ackErr)
 	}
-	d.bridge.releaseFrontendPublication(operationID)
+	d.bridge.releaseFrontendPublication(testCallback(operationID))
 	d.bridge.sourcePublication.mu.Lock()
 	released, terminal := lease.released, d.bridge.sourcePublication.terminal
 	d.bridge.sourcePublication.mu.Unlock()
 	if released || !errors.Is(terminal, errV3SourcePublicationNotPublished) || d.terminalError() == nil {
 		t.Fatalf("mixed operation reopened: released=%t terminal=%v dataTerminal=%v", released, terminal, d.terminalError())
-	}
-}
-
-func TestV3DataPlanePeerFirstRefusalAbortsStagingBeforeReplayAssignment(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	d.cfg.CachePolicy = v3CachePolicyMacOS26
-	lookupAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.LookupRequest{
-		Dir: d.resolveReply().Root, Name: []byte("file"),
-	})
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	file := lookupAny.(*pfslocal.LookupReply).Attr.Item
-	openedAny, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.OpenRequest{
-		Item: file, Mode: pfslocal.OpenModeReadWrite,
-	})
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	handle := openedAny.(*pfslocal.OpenReply).Handle
-	if err := d.bridge.sourcePublication.acquirePeer(
-		context.Background(), 17, []*authoritypb.VisibilityTarget{testV3AttributeTarget(0x40)},
-	); err != nil {
-		t.Fatal(err)
-	}
-	client.mu.Lock()
-	beforeSequence := client.sequence
-	client.mu.Unlock()
-	assigned := false
-	client.beforeAssigned = func(*authoritypb.Request) error {
-		assigned = true
-		return nil
-	}
-	d.bridge.reserveFrontendPublication(78)
-	reply, errno := d.dispatchFrontend(context.Background(), 78, &pfslocal.WriteRequest{
-		Handle: handle, Offset: 0, Data: []byte("x"),
-	})
-	if errno != darwinECANCELED || reply != nil {
-		t.Fatalf("peer-first write = (%#v, %d), want (nil, ECANCELED)", reply, errno)
-	}
-	client.mu.Lock()
-	afterSequence := client.sequence
-	client.mu.Unlock()
-	if assigned || afterSequence != beforeSequence {
-		t.Fatalf("peer-first refusal reached replay assignment/send: assigned=%t sequence=%d->%d", assigned, beforeSequence, afterSequence)
-	}
-	client.mu.Lock()
-	inert := append([]*authoritypb.Request(nil), client.idempotentCalls...)
-	client.mu.Unlock()
-	if len(inert) != 3 {
-		t.Fatalf("peer-first inert phase count=%d, want BEGIN+DATA+ABORT", len(inert))
-	}
-	for index, phase := range []authoritypb.FskitWritePhase{
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT,
-	} {
-		write := inert[index].GetFskitWrite()
-		if write == nil || write.GetTransactionId() != 1 || write.GetPhase() != phase ||
-			phase == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT &&
-				(write.GetFragmentOffset() != 0 || write.GetSize() != 0 || len(write.GetData()) != 0) {
-			t.Fatalf("peer-first inert phase[%d] = %#v", index, inert[index])
-		}
-	}
-	if lease := d.bridge.sourcePublication.operationLease(78); lease != nil {
-		t.Fatal("peer-first refusal retained a source lease")
-	}
-	if !acknowledgeBridgePublished(t, d.bridge, 78) {
-		t.Fatal("refused callback PublicationAck was not accepted")
-	}
-	d.bridge.releaseFrontendPublication(78)
-	if err := d.bridge.sourcePublication.releasePeer(17); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -1302,25 +1048,22 @@ func TestV3DataPlaneCreateDeclaresAndResolvesItsExactSourceGate(t *testing.T) {
 		if create == nil || !bytes.Equal(create.GetName(), []byte("new")) {
 			return nil, errors.New("expected create")
 		}
-		gate := request.GetFskitSourcePublication()
-		if gate == nil || len(gate.GetTargets()) != 2 || gate.GetTargets()[0].GetItem() == nil ||
-			!bytes.Equal(gate.GetTargets()[0].GetItem().GetIdentity(), bytes.Repeat([]byte{0x20}, 16)) ||
-			gate.GetTargets()[1].GetNamespace() == nil ||
-			!bytes.Equal(gate.GetTargets()[1].GetNamespace().GetParentIdentity(), bytes.Repeat([]byte{0x20}, 16)) ||
-			!bytes.Equal(gate.GetTargets()[1].GetNamespace().GetName(), []byte("new")) ||
-			!gate.GetTargets()[1].GetNamespace().GetBoundAttributes() || gate.GetTargets()[1].GetNamespace().GetBoundData() {
-			return nil, errors.New("create lost its canonical parent+namespace source gate")
+		lease := d.bridge.sourcePublication.operationLease(testCallback(88))
+		if lease == nil || len(lease.names) != 1 {
+			return nil, errors.New("create lost its namespace claim")
 		}
+		item := authorityTestItem(3, authoritypb.Attr_REGULAR, 0x61, 0x62)
 		return &authoritypb.Response{
-			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			Mutation:  &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			PostState: testV3RootBinding(item, v3PostStateRoleCreated),
 			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
-				Item:   authorityTestItem(3, authoritypb.Attr_REGULAR, 0x61, 0x62),
+				Item:   item,
 				Handle: bytes.Repeat([]byte{0x63}, 16),
 			}},
 		}, nil
 	}
-	d.bridge.reserveFrontendPublication(88)
-	replyAny, errno := d.dispatchFrontend(context.Background(), 88, &pfslocal.CreateRequest{
+	d.bridge.reserveFrontendPublication(testCallback(88))
+	replyAny, errno := dispatchV3Owned(d, context.Background(), 88, &pfslocal.CreateRequest{
 		Dir: d.resolveReply().Root, Name: []byte("new"), Mode: 0o644, Exclusive: true,
 	})
 	if errno != 0 {
@@ -1330,14 +1073,14 @@ func TestV3DataPlaneCreateDeclaresAndResolvesItsExactSourceGate(t *testing.T) {
 	if reply.Handle == 0 || reply.Attr.Item.StableIdentity != ([16]byte{0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62, 0x62}) {
 		t.Fatalf("unexpected create reply: %#v", reply)
 	}
-	lease := d.bridge.sourcePublication.operationLease(88)
+	lease := d.bridge.sourcePublication.operationLease(testCallback(88))
 	if lease == nil || lease.unresolvedAttributes != 0 {
 		t.Fatal("create reply did not resolve the namespace wildcard to its returned identity")
 	}
 	if !acknowledgeBridgePublished(t, d.bridge, 88) {
 		t.Fatal("PublicationAck did not release the create source gate")
 	}
-	d.bridge.releaseFrontendPublication(88)
+	d.bridge.releaseFrontendPublication(testCallback(88))
 }
 
 func TestV3DataPlaneRenameConsumesExactAuthoritativePostBindings(t *testing.T) {
@@ -1370,12 +1113,16 @@ func TestV3DataPlaneRenameConsumesExactAuthoritativePostBindings(t *testing.T) {
 				}
 				response := exactTestMutationReply(identity)
 				response.Body = &authoritypb.Response_Rename{Rename: reply}
+				response.PostState = testV3MutationState(2,
+					testV3PostObject{identity: 0x20, attr: testV3DirAttr(1, 2), version: 2, roles: v3PostStateRoleOldParent | v3PostStateRoleNewParent},
+					testV3PostObject{identity: test.newIdentity, attr: testV3FileAttr(9, 0, 1), version: 2, roles: v3PostStateRoleMoved},
+				)
 				return response, nil
 			}
 			operationID := uint64(890 + index)
-			d.bridge.reserveFrontendPublication(operationID)
+			d.bridge.reserveFrontendPublication(testCallback(operationID))
 			root := d.resolveReply().Root
-			replyAny, errno := d.dispatchFrontend(context.Background(), operationID, &pfslocal.RenameRequest{
+			replyAny, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, &pfslocal.RenameRequest{
 				FromDir: root, FromName: []byte(test.fromName),
 				ToDir: root, ToName: []byte(test.toName),
 			})
@@ -1388,9 +1135,9 @@ func TestV3DataPlaneRenameConsumesExactAuthoritativePostBindings(t *testing.T) {
 				(test.oldBound && !bytes.Equal(reply.OldPostIdentity, bytes.Repeat([]byte{test.oldIdentity}, 16))) {
 				t.Fatalf("rename post bindings = %#v", reply)
 			}
-			lease := d.bridge.sourcePublication.operationLease(operationID)
+			lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 			d.bridge.sourcePublication.mu.Lock()
-			op := d.bridge.sourcePublication.operations[operationID]
+			op := d.bridge.sourcePublication.operations[testCallback(operationID)]
 			committed := op != nil && op.committed
 			unresolvedAttributes := lease.unresolvedAttributes
 			unresolvedData := lease.unresolvedData
@@ -1409,7 +1156,7 @@ func TestV3DataPlaneRenameConsumesExactAuthoritativePostBindings(t *testing.T) {
 			if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 				t.Fatal("rename PublicationAck was not accepted")
 			}
-			d.bridge.releaseFrontendPublication(operationID)
+			d.bridge.releaseFrontendPublication(testCallback(operationID))
 		})
 	}
 }
@@ -1418,7 +1165,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 	type mutationCase struct {
 		name     string
 		request  func(root, file pfslocal.Item, handle uint64) any
-		expected func(root, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error)
+		expected func(root, file pfslocal.Item) (*v3SourceGate, error)
 	}
 	mode := uint32(0o600)
 	size := uint64(7)
@@ -1428,7 +1175,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.SetAttrRequest{Item: file, Handle: handle, Mode: &mode}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*v3SourceGate, error) {
 				return v3ItemSourceGate(file, false)
 			},
 		},
@@ -1437,7 +1184,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.SetAttrRequest{Item: file, Handle: handle, Size: &size}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*v3SourceGate, error) {
 				return v3ItemSourceGate(file, true)
 			},
 		},
@@ -1446,7 +1193,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, _ pfslocal.Item, handle uint64) any {
 				return &pfslocal.WriteRequest{Handle: handle, Data: []byte("payload")}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*v3SourceGate, error) {
 				return v3ItemSourceGate(file, true)
 			},
 		},
@@ -1455,7 +1202,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.CreateRequest{Dir: root, Name: []byte("created"), Mode: 0o644, Exclusive: true}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*v3SourceGate, error) {
 				return v3NamespaceSourceGate(root, []byte("created"), false)
 			},
 		},
@@ -1464,7 +1211,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.MkdirRequest{Dir: root, Name: []byte("directory"), Mode: 0o755}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*v3SourceGate, error) {
 				return v3NamespaceSourceGate(root, []byte("directory"), false)
 			},
 		},
@@ -1473,7 +1220,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.RemoveRequest{Dir: root, Name: []byte("gone")}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*v3SourceGate, error) {
 				return v3NamespaceSourceGate(root, []byte("gone"), false)
 			},
 		},
@@ -1482,7 +1229,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.RenameRequest{FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new")}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*v3SourceGate, error) {
 				return v3RenameSourceGate(root, []byte("old"), root, []byte("new"))
 			},
 		},
@@ -1491,7 +1238,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.SymlinkRequest{Dir: root, Name: []byte("symbol"), Target: []byte("target")}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*v3SourceGate, error) {
 				return v3NamespaceSourceGate(root, []byte("symbol"), false)
 			},
 		},
@@ -1500,17 +1247,8 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, file pfslocal.Item, _ uint64) any {
 				return &pfslocal.HardLinkRequest{Item: file, Dir: root, Name: []byte("alias")}
 			},
-			expected: func(root pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(root pfslocal.Item, file pfslocal.Item) (*v3SourceGate, error) {
 				return v3NamespaceSourceGate(root, []byte("alias"), false, file)
-			},
-		},
-		{
-			name: "set-xattr-with-corroborating-handle",
-			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
-				return &pfslocal.XattrSetRequest{Item: file, Handle: handle, Name: "user.key", Value: []byte("value")}
-			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
-				return v3ItemSourceGate(file, false)
 			},
 		},
 		{
@@ -1518,7 +1256,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.XattrRemoveRequest{Item: file, Handle: handle, Name: "user.key"}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*v3SourceGate, error) {
 				return v3ItemSourceGate(file, false)
 			},
 		},
@@ -1544,51 +1282,77 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			}
 			operationID := uint64(500 + index)
 			client.beforeAssigned = func(request *authoritypb.Request) error {
-				if request.GetFskitFrontendOperationId() != operationID {
-					return errors.New("visible mutation lost its exact callback identity")
+				lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
+				if lease == nil {
+					return errors.New("missing local source lease")
 				}
-				if !proto.Equal(request.GetFskitSourcePublication(), expected) {
-					return errors.New("visible mutation carried a different source publication footprint")
+				coordinates, _, err := coordinatesForV3SourceGate(expected)
+				if err != nil {
+					return err
+				}
+				d.bridge.sourcePublication.mu.Lock()
+				defer d.bridge.sourcePublication.mu.Unlock()
+				for coordinate := range coordinates {
+					if _, ok := lease.coordinates[coordinate]; !ok {
+						return errors.New("missing local source coordinate")
+					}
 				}
 				return nil
 			}
+			rootAttr := testV3DirAttr(1, 3)
+			parent := testV3PostObject{identity: 0x20, attr: rootAttr, version: 2, roles: v3PostStateRoleParent}
 			client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 				response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
+				created := func(identity byte, attr *authoritypb.Attr) *authoritypb.Item {
+					response.PostState = testV3MutationState(2, parent, testV3PostObject{identity: identity, attr: attr, version: 2, roles: v3PostStateRoleCreated})
+					return testV3StampedItem(bytes.Repeat([]byte{identity - 1}, 16), identity, attr, 2, 2)
+				}
 				switch request.GetBody().(type) {
 				case *authoritypb.Request_SetAttr:
-					response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7})
-				case *authoritypb.Request_FskitWrite:
-					response = exactTestWriteCommit(identity, request)
-					v3PostAttr(response).Mode = 0o600
+					response.PostState = testV3TargetState(0x40, &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7}, 2)
+				case *authoritypb.Request_RemoveXattr:
+					response.PostState = testV3TargetState(0x40, testV3FileAttr(2, 0, 1), 2)
+				case *authoritypb.Request_Write:
+					response = exactTestWriteReply(identity, request)
+					response.GetWrite().GetPostAttr().Mode = 0o600
+					response.GetPostState().GetObjects()[0].GetAttr().Mode = 0o600
+				case *authoritypb.Request_Unlink:
+					response.PostState = testV3MutationState(2, parent, testV3PostObject{identity: 0xa7, attr: testV3FileAttr(13, 0, 0), version: 2, roles: v3PostStateRoleRemoved})
 				case *authoritypb.Request_Rename:
 					response.Body = &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
 						NewPostIdentity: bytes.Repeat([]byte{0xaf}, 16),
 					}}
+					response.PostState = testV3MutationState(2,
+						testV3PostObject{identity: 0x20, attr: rootAttr, version: 2, roles: v3PostStateRoleOldParent | v3PostStateRoleNewParent},
+						testV3PostObject{identity: 0xaf, attr: testV3FileAttr(14, 0, 1), version: 2, roles: v3PostStateRoleMoved},
+					)
 				case *authoritypb.Request_Create:
-					response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: authorityTestItem(10, authoritypb.Attr_REGULAR, 0xa0, 0xa1), Handle: bytes.Repeat([]byte{0xa2}, 16)}}
+					response.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: created(0xa1, testV3FileAttr(10, 0, 1)), Handle: bytes.Repeat([]byte{0xa2}, 16)}}
 				case *authoritypb.Request_Mkdir:
-					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(11, authoritypb.Attr_DIRECTORY, 0xa3, 0xa4)}}
+					response.Body = &authoritypb.Response_Mkdir{Mkdir: &authoritypb.MkdirReply{Item: created(0xa4, testV3DirAttr(11, 2))}}
 				case *authoritypb.Request_Symlink:
-					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(12, authoritypb.Attr_SYMLINK, 0xa5, 0xa6)}}
+					response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: created(0xa6, &authoritypb.Attr{Kind: authoritypb.Attr_SYMLINK, Inode: 12, Mode: 0o777, Nlink: 1})}}
 				case *authoritypb.Request_Link:
-					linked := authorityTestItem(2, authoritypb.Attr_REGULAR, 0x30, 0x40)
-					linked.Attr.Nlink = 2
+					// LINK returns the source's own capability.
+					attr := testV3FileAttr(2, 0, 2)
+					linked := testV3StampedItem(request.GetLink().GetExistingItem(), 0x40, attr, 2, 2)
 					response.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: linked}}
+					response.PostState = testV3MutationState(2, parent, testV3PostObject{identity: 0x40, attr: attr, version: 2, roles: v3PostStateRoleTarget})
 				}
 				return response, nil
 			}
-			d.bridge.reserveFrontendPublication(operationID)
-			if reply, errno := d.dispatchFrontend(context.Background(), operationID, test.request(root, file, handle)); errno != 0 || reply == nil {
+			d.bridge.reserveFrontendPublication(testCallback(operationID))
+			if reply, errno := dispatchV3Owned(d, context.Background(), operationID, test.request(root, file, handle)); errno != 0 || reply == nil {
 				t.Fatalf("visible mutation reply = (%#v, %d)", reply, errno)
 			}
-			lease := d.bridge.sourcePublication.operationLease(operationID)
+			lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 			if lease == nil {
 				t.Fatal("visible mutation returned without a source lease")
 			}
 			if !acknowledgeBridgePublished(t, d.bridge, operationID) {
 				t.Fatal("visible mutation PublicationAck was not accepted")
 			}
-			d.bridge.releaseFrontendPublication(operationID)
+			d.bridge.releaseFrontendPublication(testCallback(operationID))
 		})
 	}
 }
@@ -1607,16 +1371,13 @@ func TestV3DataPlaneRejectsItemHandleIdentityMismatchBeforeSourceAssignment(t *t
 		t.Fatal(errno)
 	}
 	handle := openedAny.(*pfslocal.OpenReply).Handle
-	other, errno := d.intern(context.Background(), authorityTestItem(3, authoritypb.Attr_REGULAR, 0x31, 0x41), &root)
-	if errno != 0 {
-		t.Fatal(errno)
-	}
+	other := acceptedTestItem(t, d, authorityTestItem(3, authoritypb.Attr_REGULAR, 0x31, 0x41))
 	client.mu.Lock()
 	before := client.sequence
 	client.mu.Unlock()
 	mode := uint32(0o600)
-	d.bridge.reserveFrontendPublication(520)
-	if reply, errno := d.dispatchFrontend(context.Background(), 520, &pfslocal.SetAttrRequest{
+	d.bridge.reserveFrontendPublication(testCallback(520))
+	if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), 520, &pfslocal.SetAttrRequest{
 		Item: other.item, Handle: handle, Mode: &mode,
 	}); errno != darwinEBADF || reply != nil {
 		t.Fatalf("mismatched item+handle setattr = (%#v, %d), want EBADF", reply, errno)
@@ -1624,13 +1385,13 @@ func TestV3DataPlaneRejectsItemHandleIdentityMismatchBeforeSourceAssignment(t *t
 	client.mu.Lock()
 	after := client.sequence
 	client.mu.Unlock()
-	if after != before || d.bridge.sourcePublication.operationLease(520) != nil {
+	if after != before || d.bridge.sourcePublication.operationLease(testCallback(520)) != nil {
 		t.Fatalf("identity mismatch reached source assignment: sequence=%d->%d", before, after)
 	}
 	if !acknowledgeBridgePublished(t, d.bridge, 520) {
 		t.Fatal("refused mismatch PublicationAck was not accepted")
 	}
-	d.bridge.releaseFrontendPublication(520)
+	d.bridge.releaseFrontendPublication(testCallback(520))
 }
 
 func TestV3DataPlaneSyncVolumeUsesExactAuthorityBarrier(t *testing.T) {
@@ -1642,7 +1403,7 @@ func TestV3DataPlaneSyncVolumeUsesExactAuthorityBarrier(t *testing.T) {
 		return &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}, Body: &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}}, nil
 	}
 	reply, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.SyncVolumeRequest{})
-	if errno != 0 || !sawSync || reply.(*pfslocal.SyncVolumeReply).Degraded {
+	if errno != 0 || !sawSync || reply == nil {
 		t.Fatalf("sync=(%#v,%d) saw=%v", reply, errno, sawSync)
 	}
 }
@@ -1743,10 +1504,22 @@ func TestV3CookieTableKeepsResumptionReusableAndBoundsStaleSeeks(t *testing.T) {
 	}
 }
 
+// testV3Dirent is a resolvable want_items=false entry: attributes and stable
+// identity, no capability.
+func testV3Dirent(name string, inode uint64, kind authoritypb.Attr_Kind, identityByte byte, cookie byte) *authoritypb.Dirent {
+	return &authoritypb.Dirent{
+		Name: []byte(name), NextCookie: []byte{cookie},
+		Attr:           &authoritypb.Attr{Kind: kind, Inode: inode, Mode: 0o644, Nlink: 1, Size: 3},
+		StableIdentity: bytes.Repeat([]byte{identityByte}, 16),
+		ObjectVersion:  1, SnapshotSequence: 1,
+	}
+}
+
 func TestV3EnumerateAssignsIndependentBatchesToConcurrentWalks(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
-	retained, err := d.installHandle(bytes.Repeat([]byte{0x76}, 16), v3RootItemID, false)
+	root := d.resolveReply().Root
+	retained, err := d.installHandle(bytes.Repeat([]byte{0x76}, 16), root, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1754,52 +1527,38 @@ func TestV3EnumerateAssignsIndependentBatchesToConcurrentWalks(t *testing.T) {
 	var authorityCookies [][]byte
 	entries := make([]*authoritypb.Dirent, 3)
 	for index := range entries {
-		item := authorityTestItem(
-			uint64(index+10),
-			authoritypb.Attr_REGULAR,
-			byte(0x80+index),
-			byte(0x90+index),
-		)
-		entries[index] = &authoritypb.Dirent{
-			Name: []byte{byte('a' + index)}, Attr: item.Attr, Item: item,
-			NextCookie: []byte{byte(index + 1)},
-		}
+		entries[index] = testV3Dirent(string(rune('a'+index)), uint64(index+10), authoritypb.Attr_REGULAR, byte(0x90+index), byte(index+1))
 	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		response := &authoritypb.Response{Mutation: &authoritypb.MutationState{
-			Slot: identity.Slot, AcceptedSequence: identity.Sequence,
-		}}
+		response := exactTestMutationReply(identity)
 		switch request.GetBody().(type) {
-		case *authoritypb.Request_Open:
-			response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{
-				Handle: bytes.Repeat([]byte{0x76}, 16),
-			}}
 		case *authoritypb.Request_ReadDir:
 			authorityCookies = append(authorityCookies, cloneBytesV3(request.GetReadDir().GetCookie()))
 			response.Body = &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{
 				Entries: entries, Verifier: verifier, Eof: true,
 			}}
-		case *authoritypb.Request_Close:
+		case *authoritypb.Request_CloseBatch:
+			return client.closeBatch(identity, request), nil
 		default:
 			return nil, errors.New("unexpected enumeration mutation")
 		}
 		return response, nil
 	}
 
-	firstAny, errno := d.enumerate(context.Background(), 0, &pfslocal.EnumerateRequest{
-		Dir: d.resolveReply().Root, Handle: retained.id, MaxEntries: 3,
+	firstAny, errno := d.enumerateEntries(context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
+		Dir: root, Handle: retained.id, MaxEntries: 3,
 	})
 	if errno != 0 {
 		t.Fatalf("first enumerate errno=%d", errno)
 	}
-	secondAny, errno := d.enumerate(context.Background(), 0, &pfslocal.EnumerateRequest{
-		Dir: d.resolveReply().Root, Handle: retained.id, MaxEntries: 3,
+	secondAny, errno := d.enumerateEntries(context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
+		Dir: root, Handle: retained.id, MaxEntries: 3,
 	})
 	if errno != 0 {
 		t.Fatalf("second enumerate errno=%d", errno)
 	}
-	first := firstAny.(*pfslocal.EnumerateReply)
-	second := secondAny.(*pfslocal.EnumerateReply)
+	first := firstAny.(*pfslocal.EnumerateEntriesReply)
+	second := secondAny.(*pfslocal.EnumerateEntriesReply)
 	if len(first.Entries) != 3 || len(second.Entries) != 3 {
 		t.Fatalf("enumerate entry counts=(%d,%d)", len(first.Entries), len(second.Entries))
 	}
@@ -1811,9 +1570,8 @@ func TestV3EnumerateAssignsIndependentBatchesToConcurrentWalks(t *testing.T) {
 		t.Fatal("first walk continuation was not resolvable")
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		if _, errno := d.enumerate(context.Background(), 0, &pfslocal.EnumerateRequest{
-			Dir: d.resolveReply().Root, Handle: retained.id,
-			Cookie: first.Entries[1].Cookie, MaxEntries: 3,
+		if _, errno := d.enumerateEntries(context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
+			Dir: root, Handle: retained.id, Cookie: first.Entries[1].Cookie, MaxEntries: 3,
 		}); errno != 0 {
 			t.Fatalf("repeat page-boundary continuation %d errno=%d", attempt+1, errno)
 		}
@@ -1825,7 +1583,7 @@ func TestV3EnumerateAssignsIndependentBatchesToConcurrentWalks(t *testing.T) {
 	if _, ok := d.resolveCookie(v3RootItemID, retained.id, second.Entries[1].Cookie); !ok {
 		t.Fatal("first walk invalidated the concurrent walk's page")
 	}
-	otherHandle, err := d.installHandle(bytes.Repeat([]byte{0x79}, 16), v3RootItemID, false)
+	otherHandle, err := d.installHandle(bytes.Repeat([]byte{0x79}, 16), root, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1850,43 +1608,34 @@ func TestV3EnumerateAssignsIndependentBatchesToConcurrentWalks(t *testing.T) {
 func TestV3EnumerateMarksLastEmittedEntryTerminalPastOpaqueEOFTail(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
-	retained, err := d.installHandle(bytes.Repeat([]byte{0x78}, 16), v3RootItemID, false)
+	root := d.resolveReply().Root
+	retained, err := d.installHandle(bytes.Repeat([]byte{0x78}, 16), root, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	verifier := bytes.Repeat([]byte{0x77}, 16)
-	visible := authorityTestItem(10, authoritypb.Attr_REGULAR, 0x91, 0xa1)
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		response := &authoritypb.Response{Mutation: &authoritypb.MutationState{
-			Slot: identity.Slot, AcceptedSequence: identity.Sequence,
-		}}
-		switch request.GetBody().(type) {
-		case *authoritypb.Request_Open:
-			response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{
-				Handle: bytes.Repeat([]byte{0x78}, 16),
-			}}
-		case *authoritypb.Request_ReadDir:
-			response.Body = &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{
-				Entries: []*authoritypb.Dirent{
-					{Name: []byte("visible"), Attr: visible.Attr, Item: visible, NextCookie: []byte{1}},
-					{Name: []byte("opaque"), Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR}, NextCookie: []byte{2}},
-				},
-				Verifier: verifier, Eof: true,
-			}}
-		case *authoritypb.Request_Close:
-		default:
+		if request.GetReadDir() == nil {
 			return nil, errors.New("unexpected enumeration mutation")
 		}
+		response := exactTestMutationReply(identity)
+		response.Body = &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{
+			Entries: []*authoritypb.Dirent{
+				testV3Dirent("visible", 10, authoritypb.Attr_REGULAR, 0xa1, 1),
+				{Name: []byte("opaque"), Attr: &authoritypb.Attr{Inode: 11}, NextCookie: []byte{2}},
+			},
+			Verifier: verifier, Eof: true,
+		}}
 		return response, nil
 	}
 
-	replyAny, errno := d.enumerate(context.Background(), 0, &pfslocal.EnumerateRequest{
-		Dir: d.resolveReply().Root, Handle: retained.id, MaxEntries: 2,
+	replyAny, errno := d.enumerateEntries(context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
+		Dir: root, Handle: retained.id, MaxEntries: 2,
 	})
 	if errno != 0 {
 		t.Fatalf("enumerate errno=%d", errno)
 	}
-	reply := replyAny.(*pfslocal.EnumerateReply)
+	reply := replyAny.(*pfslocal.EnumerateEntriesReply)
 	if len(reply.Entries) != 1 || reply.Entries[0].Cookie != 0 || reply.NextCookie != 0 {
 		t.Fatalf("opaque EOF tail reply=%#v", reply)
 	}
@@ -1927,14 +1676,15 @@ func TestV3CookieIdentifiersNeverIssueTheSwiftTerminalMarkerOrWrap(t *testing.T)
 func TestV3EnumerateUsesTheRetainedDirectoryHandleWithoutHiddenOpenOrClose(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
+	root := d.resolveReply().Root
 	retainedToken := bytes.Repeat([]byte{0x73}, 16)
-	retained, err := d.installHandle(retainedToken, v3RootItemID, false)
+	retained, err := d.installHandle(retainedToken, root, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	readCalled := false
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
+		response := exactTestMutationReply(identity)
 		switch request.GetBody().(type) {
 		case *authoritypb.Request_ReadDir:
 			readCalled = true
@@ -1947,14 +1697,14 @@ func TestV3EnumerateUsesTheRetainedDirectoryHandleWithoutHiddenOpenOrClose(t *te
 		}
 		return response, nil
 	}
-	reply, errno := d.enumerate(context.Background(), 0, &pfslocal.EnumerateRequest{
-		Dir: d.resolveReply().Root, Handle: retained.id, MaxEntries: 1,
+	reply, errno := d.enumerateEntries(context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
+		Dir: root, Handle: retained.id, MaxEntries: 1,
 	})
 	if errno != 0 || reply == nil || !readCalled {
 		t.Fatalf("enumerate=(%#v,%d) read=%v", reply, errno, readCalled)
 	}
-	if _, errno := d.enumerate(context.Background(), 0, &pfslocal.EnumerateRequest{
-		Dir: d.resolveReply().Root, MaxEntries: 1,
+	if _, errno := d.enumerateEntries(context.Background(), 0, &pfslocal.EnumerateEntriesRequest{
+		Dir: root, MaxEntries: 1,
 	}); errno != darwinEBADF {
 		t.Fatalf("handle-free enumerate errno=%d, want %d", errno, darwinEBADF)
 	}
@@ -1969,164 +1719,11 @@ func TestV3DataPlaneReadRejectsUnframeableAllocation(t *testing.T) {
 	}
 }
 
-func TestV3LivenessBypassesSaturatedOperationsAndProvesExactSession(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	for range cap(d.ops) {
-		d.ops <- struct{}{}
-	}
-	defer func() {
-		for range cap(d.ops) {
-			<-d.ops
-		}
-	}()
-
-	request := &pfslocal.V3LivenessRequest{
-		AuthorityEpoch: client.Epoch(),
-		SessionID:      client.SessionID(),
-	}
-	replyAny, errno := dispatchV3Test(d, context.Background(), 0, request)
-	if errno != 0 {
-		t.Fatalf("liveness errno=%d", errno)
-	}
-	reply := replyAny.(*pfslocal.V3LivenessReply)
-	if !bytes.Equal(reply.AuthorityEpoch, request.AuthorityEpoch) || !bytes.Equal(reply.SessionID, request.SessionID) {
-		t.Fatalf("liveness reply=%#v, want exact authority identity", reply)
-	}
-
-	bad := *request
-	bad.SessionID = bytes.Repeat([]byte{0xff}, 16)
-	if _, errno := dispatchV3Test(d, context.Background(), 0, &bad); errno != darwinEINVAL {
-		t.Fatalf("mismatched session errno=%d, want %d", errno, darwinEINVAL)
-	}
-}
-
-func TestV3LivenessAuthorityFailureIsTerminal(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	client.keepErr = errors.New("authority unreachable")
-	_, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.V3LivenessRequest{
-		AuthorityEpoch: client.Epoch(), SessionID: client.SessionID(),
-	})
-	if errno != darwinEIO {
-		t.Fatalf("failed liveness errno=%d, want %d", errno, darwinEIO)
-	}
-	select {
-	case <-d.ctx.Done():
-	default:
-		t.Fatal("failed on-demand liveness did not terminate data plane")
-	}
-}
-
-func TestV3KeepAliveIntervalAndFailureAreTerminal(t *testing.T) {
-	if got := v3KeepAliveInterval(9*time.Second, time.Minute); got != 3*time.Second {
-		t.Fatalf("lease interval=%s", got)
-	}
-	if got := v3KeepAliveInterval(time.Minute, 12*time.Second); got != 4*time.Second {
-		t.Fatalf("repair interval=%s", got)
-	}
-	client := newFakeV3DataClient()
-	client.lease = 6 * time.Millisecond
-	client.budget = 6 * time.Millisecond
-	client.keepErr = errors.New("fenced")
-	d := testV3DataPlane(t, client)
-	select {
-	case <-d.ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("keepalive failure did not terminate v3 data plane")
-	}
-}
-
 func TestLinuxToDarwinErrnoTranslation(t *testing.T) {
 	for linux, darwin := range map[int32]int32{errnos.EAGAIN: darwinEAGAIN, errnos.ENAMETOOLONG: darwinENAMETOOLONG, errnos.ENOTEMPTY: darwinENOTEMPTY, errnos.ELOOP: darwinELOOP, errnos.ENODATA: darwinENOATTR, errnos.EOVERFLOW: darwinEOVERFLOW, errnos.EOPNOTSUPP: darwinENOTSUP, errnos.ETIMEDOUT: darwinETIMEDOUT, errnos.ESTALE: darwinESTALE, errnos.EDQUOT: darwinEDQUOT} {
 		if got := linuxToDarwin(linux); got != darwin {
 			t.Fatalf("linux errno %d -> %d, want %d", linux, got, darwin)
 		}
-	}
-}
-
-func TestV3DataPlaneMapsClassifiedPreApplyInterruptionToECANCELEDWithoutFencing(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	d.cfg.CachePolicy = v3CachePolicyMacOS26
-	root := d.resolveReply().Root
-
-	var calls, applies int
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		calls++
-		rename := request.GetRename()
-		if rename == nil || !bytes.Equal(rename.GetOldName(), []byte("old")) || !bytes.Equal(rename.GetNewName(), []byte("new")) {
-			return nil, errors.New("unexpected rename request")
-		}
-		response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
-		response.Errno = errnos.EINTR
-		response.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED
-		return response, nil
-	}
-
-	d.bridge.reserveFrontendPublication(71)
-	if reply, errno := d.dispatchFrontend(context.Background(), 71, &pfslocal.RenameRequest{
-		FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new"),
-	}); errno != darwinECANCELED {
-		t.Fatalf("classified rename=(%#v,%d), want ECANCELED", reply, errno)
-	}
-	if calls != 1 || applies != 0 {
-		t.Fatalf("classified rename calls=%d applies=%d, want one call and no apply", calls, applies)
-	}
-	if d.terminalError() != nil {
-		t.Fatalf("definite-preapply refusal fenced the mount: %v", d.terminalError())
-	}
-	lease := d.bridge.sourcePublication.operationLease(71)
-	d.bridge.sourcePublication.mu.Lock()
-	released := lease != nil && lease.released
-	unresolvedAttributes, unresolvedData, unresolvedNames := 0, 0, 0
-	if lease != nil {
-		unresolvedAttributes, unresolvedData = lease.unresolvedAttributes, lease.unresolvedData
-		unresolvedNames = len(lease.names)
-	}
-	d.bridge.sourcePublication.mu.Unlock()
-	if lease == nil || released {
-		t.Fatal("definite visibility interruption released its source gate before PublicationAck")
-	}
-	if unresolvedAttributes != 0 || unresolvedData != 0 {
-		t.Fatalf("definite visibility interruption did not resolve its impossible returned bindings: attrs=%d data=%d names=%d", unresolvedAttributes, unresolvedData, unresolvedNames)
-	}
-	if !acknowledgeBridgePublished(t, d.bridge, 71) {
-		t.Fatal("exact PublicationAck was not accepted")
-	}
-	d.bridge.sourcePublication.mu.Lock()
-	released = lease.released
-	d.bridge.sourcePublication.mu.Unlock()
-	if released {
-		t.Fatal("PublicationAck released the source gate before its handler reservation retired")
-	}
-	d.bridge.releaseFrontendPublication(71)
-	d.bridge.sourcePublication.mu.Lock()
-	released = lease.released
-	d.bridge.sourcePublication.mu.Unlock()
-	if !released {
-		t.Fatal("PublicationAck plus handler retirement did not release the definite-interruption source gate")
-	}
-}
-
-func TestV3DataPlaneRejectsLinuxOnlyItemVisibilityRetry(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
-		return &authoritypb.Response{
-			Errno: errnos.EINTR, Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-			FskitRepairRetrySequence: 1,
-			Mutation:                 &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-		}, nil
-	}
-	root := d.resolveReply().Root
-	if _, errno := dispatchV3Test(d, context.Background(), 74, &pfslocal.RenameRequest{
-		FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new"),
-	}); errno != darwinEIO {
-		t.Fatalf("Linux-only item retry on FSKit = %d, want fail-closed EIO", errno)
-	}
-	if d.terminalError() == nil {
-		t.Fatal("Linux-only item retry did not terminalize callback-serialized frontend")
 	}
 }
 
@@ -2150,13 +1747,13 @@ func TestV3DataPlaneAssignedUncertaintyFailsClosedAcrossPublicationAck(t *testin
 	client.mutation = func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error) {
 		return nil, authorityrpc.ErrTransportUncertain
 	}
-	d.bridge.reserveFrontendPublication(79)
-	if reply, errno := d.dispatchFrontend(context.Background(), 79, &pfslocal.WriteRequest{
+	d.bridge.reserveFrontendPublication(testCallback(79))
+	if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), 79, &pfslocal.WriteRequest{
 		Handle: handle, Offset: 0, Data: []byte("uncertain"),
 	}); errno != darwinEIO || reply != nil {
 		t.Fatalf("uncertain write = (%#v, %d), want terminal EIO", reply, errno)
 	}
-	lease := d.bridge.sourcePublication.operationLease(79)
+	lease := d.bridge.sourcePublication.operationLease(testCallback(79))
 	d.bridge.sourcePublication.mu.Lock()
 	assigned, released, terminal := uint32(0), false, d.bridge.sourcePublication.terminal
 	if lease != nil {
@@ -2172,7 +1769,7 @@ func TestV3DataPlaneAssignedUncertaintyFailsClosedAcrossPublicationAck(t *testin
 	if !acknowledgeBridgePublished(t, d.bridge, 79) {
 		t.Fatal("terminal callback PublicationAck was not recorded")
 	}
-	d.bridge.releaseFrontendPublication(79)
+	d.bridge.releaseFrontendPublication(testCallback(79))
 	d.bridge.sourcePublication.mu.Lock()
 	released = lease.released
 	d.bridge.sourcePublication.mu.Unlock()
@@ -2205,15 +1802,9 @@ func TestV3DataPlaneAuthoritySuccessWithUnpublishableItemResultIsTerminal(t *tes
 				return &pfslocal.WriteRequest{Handle: handle, Data: []byte("committed")}
 			},
 			result: func(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
-				write := request.GetFskitWrite()
-				return &authoritypb.Response{
-					Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-					Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
-						TransactionId: write.GetTransactionId(), CommittedSize: write.GetFragmentOffset(),
-						AssignedOffset: write.GetPosition(), PostSize: write.GetPosition() + write.GetFragmentOffset(),
-						VisibilitySequence: identity.Sequence, Flags: v3WriteReplyCommitted,
-					}},
-				}
+				response := exactTestWriteReply(identity, request)
+				response.GetWrite().PostAttr = nil
+				return response
 			},
 		},
 	}
@@ -2239,31 +1830,29 @@ func TestV3DataPlaneAuthoritySuccessWithUnpublishableItemResultIsTerminal(t *tes
 				return test.result(identity, request), nil
 			}
 			operationID := uint64(180 + index)
-			d.bridge.reserveFrontendPublication(operationID)
-			if reply, errno := d.dispatchFrontend(context.Background(), operationID, test.request(file, handle)); errno != darwinEIO || reply != nil {
+			d.bridge.reserveFrontendPublication(testCallback(operationID))
+			if reply, errno := d.dispatchFrontend(context.WithValue(context.Background(), v3CallbackContextKey{}, uint64(1)), operationID, test.request(file, handle)); errno != darwinEIO || reply != nil {
 				t.Fatalf("unpublishable committed result = (%#v, %d), want terminal EIO", reply, errno)
 			}
-			lease := d.bridge.sourcePublication.operationLease(operationID)
+			lease := d.bridge.sourcePublication.operationLease(testCallback(operationID))
 			d.bridge.sourcePublication.mu.Lock()
 			assigned, released, terminal := uint32(0), false, d.bridge.sourcePublication.terminal
 			committed := false
 			if lease != nil {
 				assigned, released = lease.assigned, lease.released
 			}
-			if op := d.bridge.sourcePublication.operations[operationID]; op != nil {
+			if op := d.bridge.sourcePublication.operations[testCallback(operationID)]; op != nil {
 				committed = op.committed
 			}
 			d.bridge.sourcePublication.mu.Unlock()
 			if lease == nil || assigned == 0 || !committed || released || terminal == nil || d.terminalError() == nil {
 				t.Fatalf("committed malformed result did not freeze publication: lease=%#v assigned=%d committed=%t released=%t terminal=%v", lease, assigned, committed, released, terminal)
 			}
-			known, ackErr := d.bridge.acknowledgePublication(
-				operationID, pfslocal.PublicationSemanticCommitNotPublished,
-			)
+			known, ackErr := d.bridge.acknowledgePublication(testCallback(operationID), pfslocal.PublicationSemanticCommitNotPublished)
 			if !known || !errors.Is(ackErr, errV3SourcePublicationNotPublished) {
 				t.Fatalf("terminal callback PublicationAck = (%t, %v)", known, ackErr)
 			}
-			d.bridge.releaseFrontendPublication(operationID)
+			d.bridge.releaseFrontendPublication(testCallback(operationID))
 			d.bridge.sourcePublication.mu.Lock()
 			released = lease.released
 			d.bridge.sourcePublication.mu.Unlock()
@@ -2271,49 +1860,6 @@ func TestV3DataPlaneAuthoritySuccessWithUnpublishableItemResultIsTerminal(t *tes
 				t.Fatal("PublicationAck and retirement reopened an unpublishable committed result")
 			}
 		})
-	}
-}
-
-func TestV3DataPlaneClassifiedInterruptionRemainsPreApplyWhenCallbackCancels(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	d.cfg.CachePolicy = v3CachePolicyMacOS26
-	ctx, cancel := context.WithCancel(context.Background())
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
-		cancel()
-		return &authoritypb.Response{
-			Errno:    errnos.EINTR,
-			Failure:  authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED,
-			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-		}, nil
-	}
-	root := d.resolveReply().Root
-	if _, errno := dispatchV3Test(d, ctx, 72, &pfslocal.RenameRequest{
-		FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new"),
-	}); errno != darwinECANCELED {
-		t.Fatalf("cancelled classified mutation errno=%d, want ECANCELED", errno)
-	}
-	if d.terminalError() != nil {
-		t.Fatalf("definite-preapply cancelled result fenced the mount: %v", d.terminalError())
-	}
-}
-
-func TestV3DataPlanePreservesV1VisibilityInterruptionBoundary(t *testing.T) {
-	client := newFakeV3DataClient()
-	d := testV3DataPlane(t, client)
-	d.cfg.CachePolicy = v3CachePolicyMacOS26V1
-	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
-		return &authoritypb.Response{
-			Errno:    errnos.EINTR,
-			Failure:  authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED,
-			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-		}, nil
-	}
-	root := d.resolveReply().Root
-	if _, errno := dispatchV3Test(d, context.Background(), 73, &pfslocal.RenameRequest{
-		FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new"),
-	}); errno != darwinEINTR {
-		t.Fatalf("v1 visibility interruption errno=%d, want frozen EINTR", errno)
 	}
 }
 
@@ -2371,11 +1917,7 @@ func TestAuthorityIdentityNamesTheExactMalformedField(t *testing.T) {
 	}
 }
 
-// A negative lookup is a successful answer carrying no item. The authority
-// reports an absent name that way under FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
-// and this frontend used to intern the missing item as malformed, which turned
-// every absent name into EIO and killed the coherence stream with it. On an
-// empty volume that made mount-root attestation fail outright.
+// A negative lookup is a successful authority answer carrying no item.
 func TestV3LookupTranslatesTheNegativeAnswerToENOENT(t *testing.T) {
 	client := newFakeV3DataClient()
 	client.mutation = func(

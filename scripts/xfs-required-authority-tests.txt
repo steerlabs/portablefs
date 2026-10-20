@@ -1,0 +1,48 @@
+# Required privileged tests in authorityrpc, xfsstore, archiver, hydrator and
+# restoremode. scripts/xfs-fuse-integration.sh requires every entry of this
+# list, xfs-required-fuse-tests.txt and xfs-required-tiered-tests.txt to run to
+# a PASS; load_required_tests there defines the line format and validation.
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestWriterPriorMembershipMappingOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestWriterSafeTakeoverWaitsForPendingApplyOnXFS
+github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestHydrationPreservesCurrentMtimeOnXFS
+github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSProjectGate
+github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSGateRefusesAForeignProjectID
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFSFskitDurability
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestBlockedLockWaitDoesNotHoldTheTopologyGuard
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestRoutesControllerRefusesGitTrackedContentOnXFS
+# The archiver, hydrator and restore-mode stages of the tiered-storage
+# lifecycle; xfs-required-tiered-tests.txt explains why each stage is named.
+# Every test that materializes a restore namespace needs real XFS export
+# handles (restorefixture.Root), so the everywhere `go` lane skips them on its
+# ext4 runner; this suite is where they must actually run, on the provisioned
+# volume, and never skip.
+github.com/steerlabs/portablefs/vcs/internal/archiver:TestArchiveRestoreServeRoundTrip
+github.com/steerlabs/portablefs/vcs/internal/hydrator:TestMaterializeRestoresRestrictiveModes
+github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode
+github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator
+github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirSearchWitnessOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessProtectsNewChildThroughCommitOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessReplayAndNewChildOrderingOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMkdirWitnessUnexpectedFailureIsAppliedAndSyncedOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestHandlerProofRetainsWriterExclusionThroughApplyDrainOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestLinuxReplaySyncAndLocksSurviveMacWriterExclusionOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyActivationRecallAndPendingRoutesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyCachelessBreakAndPendingRoutesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyActivationAndRoutePublicationOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyApplyCancellationLeavesLocksAndRoutesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyRouteValidationAndNoOpPrecedenceOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyRouteCancellationAfterPublicationSettlesOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestTopologyActivationDeferredFenceUsesProductionCleanupOnXFS
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCoherencePublicOpenCreateApplicationPrecedesWithdrawal
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCoherencePrivateOpenCreateJoinsReadWithdrawal
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCoherenceOpenCreateApplicationBoundaries
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCoherenceTruncatingOpenCreateApplicationOnXFS
+# Required only when PORTABLEFS_PERFORMANCE_TEST=1: the busy-neighbor barrier
+# measurement against the second provisioned project on the same XFS cell.
+# It is a measurement, not an acceptance threshold.
+performance github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSharedXFSBarrierLatency
+# Subscription receipt checks retain the original continuous request anchor.
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSubscriptionReplyAfterSuspendIsRejected
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSubscriptionProofUsesContinuousRequestAnchor

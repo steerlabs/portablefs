@@ -12,6 +12,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -159,25 +160,31 @@ func TestCoherenceSyncPublishesOnlyCapturedVolumeCut(t *testing.T) {
 }
 
 func TestCoherenceSyncFailureMakesNoDurabilityClaim(t *testing.T) {
-	syncErr := errors.New("injected syncfs failure")
-	store := &coherenceSyncTestStore{err: syncErr}
-	h := &VolumeHandler{Store: store, Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{})}
-	h.initCoherence()
-	session := volumeserver.SessionID{1}
-
-	h.coherenceCommitMu.Lock()
-	h.coherenceVersion = 1
-	h.coherenceDurability.recordApplied(session, [16]byte{1}, 1)
-	h.coherenceCommitMu.Unlock()
-
-	if _, _, err := h.coherenceSyncVolume(session); !errors.Is(err, syncErr) {
-		t.Fatalf("coherenceSyncVolume error = %v, want %v", err, syncErr)
-	}
-	if durableCut := h.Coherence.LatestDurable(); durableCut != 0 {
-		t.Fatalf("published volume cut after failure = %d, want 0", durableCut)
-	}
-	if store.calls.Load() != 1 {
-		t.Fatalf("syncfs calls = %d, want 1", store.calls.Load())
+	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			// The actual syscall fault/retry matrix lives in xfsstore. Here verify
+			// that the handler never publishes a cut or a session prefix after that
+			// store-terminal result, including repeated barriers in this epoch.
+			syncErr := &xfsstore.DurabilityError{Cause: cause}
+			store := &coherenceSyncTestStore{err: syncErr}
+			h := &VolumeHandler{Store: store, Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{})}
+			h.initCoherence()
+			session := volumeserver.SessionID{1}
+			h.coherenceVersion = 1
+			h.coherenceDurability.recordApplied(session, [16]byte{1}, 1)
+			for range 2 {
+				applied, durable, err := h.coherenceSyncVolume(session)
+				if err != syncErr || applied != 0 || durable != 0 {
+					t.Fatalf("failed barrier=%d/%d %v", applied, durable, err)
+				}
+				if cut := h.Coherence.LatestDurable(); cut != 0 {
+					t.Fatalf("published failed cut=%d", cut)
+				}
+				if _, durable := h.latestCoherenceDurability(session); durable != 0 {
+					t.Fatalf("published session durable prefix=%d", durable)
+				}
+			}
+		})
 	}
 }
 

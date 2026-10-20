@@ -1,7 +1,6 @@
 # Tiered storage: pack + manifest format
 
-Status: **Phase 0 contract, revision 3 — incorporates both adversarial
-reviews; versioned shared format, frozen before implementation.** The
+Status: **versioned shared format, revision 3; implemented.** The
 reference implementation in `vcs/archive` and its golden manifest files are
 the normative byte-level layout; this document freezes the semantic
 content, the bounds, and every invariant a second implementation must

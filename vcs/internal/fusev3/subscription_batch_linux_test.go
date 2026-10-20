@@ -12,7 +12,7 @@ import (
 )
 
 func TestBatchWithdrawalClosesEveryCoordinateBeforeReplyDrain(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	unique := f.unique.Add(2)
 	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
@@ -25,13 +25,13 @@ func TestBatchWithdrawalClosesEveryCoordinateBeforeReplyDrain(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	done := make(chan error, 1)
-	var lease *cacheRepairLease
+	var lease *cacheWithdrawalLease
 	go func() { var err error; lease, err = f.raw.closeCacheCoordinates(ctx, coordinates); done <- err }()
 	for {
 		f.raw.mu.Lock()
 		p := f.raw.replyPublications[unique]
 		waiting := p != nil && p.originalDone != nil
-		all := f.raw.repairingCoordinates[coordinates[0]] && f.raw.repairingCoordinates[coordinates[1]]
+		all := f.raw.withdrawingCoordinates[coordinates[0]] && f.raw.withdrawingCoordinates[coordinates[1]]
 		f.raw.mu.Unlock()
 		if waiting {
 			if !all {
@@ -56,7 +56,7 @@ func TestBatchWithdrawalClosesEveryCoordinateBeforeReplyDrain(t *testing.T) {
 }
 
 func TestBatchWithdrawalDropsEveryPayloadBeforeCoalescedNotification(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	f.lookup(t, 1, "alias")
 	identity := f.raw.nodesByID[entry.NodeId].identity
@@ -109,7 +109,7 @@ func TestRegisteredGrantCannotBeClearedByEarlierRelease(t *testing.T) {
 				name += "/release-last"
 			}
 			t.Run(name, func(t *testing.T) {
-				f := newStrictFixture(t)
+				f := newStockFixture(t)
 				identity := f.raw.nodesByID[1].identity
 				s := f.mount.subscription
 				incarnation := s.stamp().incarnation
@@ -163,8 +163,8 @@ func TestRegisteredGrantCannotBeClearedByEarlierRelease(t *testing.T) {
 	}
 }
 
-func TestCacheRepairOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
-	f := newStrictFixture(t)
+func TestCacheWithdrawalOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
 	first, err := f.raw.closeCacheCoordinate(t.Context(), coordinate)
@@ -178,8 +178,8 @@ func TestCacheRepairOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
 	first.Open()
 	first.Open()
 	f.raw.mu.Lock()
-	closed := f.raw.repairingCoordinates[coordinate]
-	owners := len(f.raw.repairOwners[coordinate])
+	closed := f.raw.withdrawingCoordinates[coordinate]
+	owners := len(f.raw.withdrawalOwners[coordinate])
 	f.raw.mu.Unlock()
 	if !closed || owners != 1 {
 		t.Fatalf("overlap lost ownership: closed=%v owners=%d", closed, owners)
@@ -194,8 +194,8 @@ func TestCacheRepairOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
 	}
 	second.Open()
 	f.raw.mu.Lock()
-	closed = f.raw.repairingCoordinates[coordinate]
-	owners = len(f.raw.repairOwners[coordinate])
+	closed = f.raw.withdrawingCoordinates[coordinate]
+	owners = len(f.raw.withdrawalOwners[coordinate])
 	f.raw.mu.Unlock()
 	if !closed || owners != 1 {
 		t.Fatalf("pre-cold release opened successor: closed=%v owners=%d", closed, owners)
@@ -203,13 +203,13 @@ func TestCacheRepairOwnersSurviveOverlapAndColdRetirement(t *testing.T) {
 	successor.Open()
 	f.raw.mu.Lock()
 	defer f.raw.mu.Unlock()
-	if f.raw.repairingCoordinates[coordinate] || len(f.raw.repairOwners) != 0 {
-		t.Fatal("settled repair owners leaked")
+	if f.raw.withdrawingCoordinates[coordinate] || len(f.raw.withdrawalOwners) != 0 {
+		t.Fatal("settled withdrawal owners leaked")
 	}
 }
 
-func TestFailedColdProofRetiresOnlyItsOwnRepairOwner(t *testing.T) {
-	f := newStrictFixture(t)
+func TestFailedColdProofRetiresOnlyItsOwnWithdrawalOwner(t *testing.T) {
+	f := newStockFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
 	local, err := f.raw.closeCacheCoordinate(t.Context(), coordinate)
@@ -222,9 +222,9 @@ func TestFailedColdProofRetiresOnlyItsOwnRepairOwner(t *testing.T) {
 		t.Fatal("cold proof accepted failed notification")
 	}
 	f.raw.mu.Lock()
-	_, retained := f.raw.repairOwners[coordinate][local]
-	owners := len(f.raw.repairOwners[coordinate])
-	closed := f.raw.repairingCoordinates[coordinate]
+	_, retained := f.raw.withdrawalOwners[coordinate][local]
+	owners := len(f.raw.withdrawalOwners[coordinate])
+	closed := f.raw.withdrawingCoordinates[coordinate]
 	f.raw.mu.Unlock()
 	if !retained || owners != 1 || !closed {
 		t.Fatalf("failed cold cleanup affected local cut: retained=%v owners=%d closed=%v", retained, owners, closed)
@@ -277,7 +277,7 @@ func TestSubscriptionBatchAcknowledgesOnlyAfterAllWithdrawals(t *testing.T) {
 func TestSubscriptionBatchFailureLeavesEveryCoordinateClosedAndUnacknowledged(t *testing.T) {
 	rpc := &subscriptionTestRPC{horizon: time.Now().Add(time.Second)}
 	invalidator := &subscriptionTestInvalidator{fail: context.DeadlineExceeded}
-	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: 5 * time.Millisecond, maxPages: 2, invalidator: invalidator})
+	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{clock: testActiveSubscriptionClock{}, retryDelay: time.Millisecond, withdrawalLead: 5 * time.Millisecond, maxPages: 2, invalidator: invalidator})
 	registry.active, registry.incarnation = true, 9
 	registry.horizon, registry.cacheUntil = rpc.horizon, rpc.horizon
 	batch := &authoritypb.ChangeBatch{Incarnation: 9}

@@ -1,16 +1,13 @@
-// Command zratio measures how compressible a real agent workload is, at the
-// granularity the write-back flusher would actually compress at.
-//
-// This matters because the flusher ships batches of WAL records
-// (writeback/flush.go: flushMaxRecords=128, flushMaxBytes=8MiB). Compressing
-// each record on its own gives a much worse ratio than compressing the whole
-// batch as one stream, because a 4 KiB record has almost no window to work
-// with. Both numbers are reported so the roadmap can price the two designs.
+// Command zratio measures how compressible a real agent corpus is when it is
+// compressed in independent windows of each requested size and as one stream.
+// Small windows give a much worse ratio than large ones because each window
+// starts with an empty dictionary. It is a corpus measurement, not a statement
+// about any PortableFS code path.
 //
 // It also reports content-defined chunk dedup potential over the same corpus,
 // so compression and dedup can be ranked against each other on one input.
 //
-//	go run ./bench/cmd/zratio -root /path/to/repo -levels 1,3,9
+//	go run ./bench/cmd/zratio -root /path/to/repo -levels 1,3,9 -windows 4096,8388608
 //
 // Read-only: it never writes to -root.
 package main
@@ -35,11 +32,20 @@ const maxCorpusBytes = 64 << 20
 func main() {
 	root := flag.String("root", ".", "directory to sample as the workload corpus")
 	levels := flag.String("levels", "1,3,9", "zstd levels to try")
-	recordSize := flag.Int("record", 4096, "per-record compression granularity in bytes")
-	batchSize := flag.Int("batch", 8<<20, "per-batch compression granularity in bytes")
+	windowList := flag.String("windows", "4096,8388608", "comma-separated independent compression window sizes in bytes")
 	chunkAvg := flag.Int("chunk", 8192, "average content-defined chunk size for the dedup estimate")
 	skip := flag.String("skip", "node_modules,.git,vendor,dist,build,target,.next", "comma-separated dir names to skip")
 	flag.Parse()
+
+	var windows []int
+	for _, w := range strings.Split(*windowList, ",") {
+		size, err := strconv.Atoi(strings.TrimSpace(w))
+		if err != nil || size <= 0 {
+			fmt.Fprintf(os.Stderr, "zratio: invalid -windows entry %q\n", w)
+			os.Exit(2)
+		}
+		windows = append(windows, size)
+	}
 
 	skips := map[string]bool{}
 	for _, s := range strings.Split(*skip, ",") {
@@ -62,23 +68,19 @@ func main() {
 		if err != nil {
 			continue
 		}
-		for _, g := range []struct {
-			name string
-			size int
-		}{
-			{"per-record", *recordSize},
-			{"per-batch", *batchSize},
-			{"whole-corpus", len(corpus)},
-		} {
-			out, err := compressChunked(corpus, g.size, lvl)
+		for _, size := range append(append([]int(nil), windows...), len(corpus)) {
+			out, err := compressChunked(corpus, size, lvl)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "zstd -%d: %v\n", lvl, err)
 				continue
 			}
+			name := "window(" + human(size) + ")"
+			if size == len(corpus) {
+				name = "whole-corpus"
+			}
 			ratio := float64(len(corpus)) / float64(out)
 			fmt.Printf("zstd-%-3d %-14s %12d %12d %7.2fx %9.1f%%\n",
-				lvl, fmt.Sprintf("%s(%s)", g.name, human(g.size)), len(corpus), out,
-				ratio, 100*(1-float64(out)/float64(len(corpus))))
+				lvl, name, len(corpus), out, ratio, 100*(1-float64(out)/float64(len(corpus))))
 		}
 	}
 
@@ -97,8 +99,7 @@ func human(n int) string {
 	}
 }
 
-// collect reads a deterministic (sorted) slice of the tree as one byte stream,
-// which is what the flusher would see as a stream of write payloads.
+// collect reads a deterministic (sorted) slice of the tree as one byte stream.
 func collect(root string, skips map[string]bool) ([]byte, int, error) {
 	var paths []string
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -138,8 +139,7 @@ func collect(root string, skips map[string]bool) ([]byte, int, error) {
 }
 
 // compressChunked compresses the corpus in independent windows of the given
-// size and sums the outputs — exactly what a per-record or per-batch
-// compression design would produce on the wire.
+// size and sums the outputs.
 func compressChunked(data []byte, window, level int) (int, error) {
 	if window <= 0 || window > len(data) {
 		window = len(data)

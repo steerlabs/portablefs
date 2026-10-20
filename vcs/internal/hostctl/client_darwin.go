@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"net"
 	"os"
@@ -14,8 +15,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 type Session struct {
@@ -657,4 +656,18 @@ func applyDeadline(ctx context.Context, conn *net.UnixConn) error {
 		deadline = time.Now().Add(20 * time.Second)
 	}
 	return conn.SetDeadline(deadline)
+}
+
+// AuthenticateSocketPeer binds a connected owner-private socket to one live
+// executable from an already authenticated sealed release. Claimed JSON
+// identity fields cannot substitute for the kernel audit-token witness.
+func AuthenticateSocketPeer(conn *net.UnixConn, expectedPath, expectedCDHash string) error {
+	if !filepath.IsAbs(expectedPath) || filepath.Clean(expectedPath) != expectedPath || !validLowerHex(expectedCDHash, 40) {
+		return fmt.Errorf("invalid expected socket peer path or code directory hash")
+	}
+	witness, err := exactPeer(conn)
+	if err != nil {
+		return err
+	}
+	return witness.requireRunningImage(expectedPath, expectedCDHash)
 }

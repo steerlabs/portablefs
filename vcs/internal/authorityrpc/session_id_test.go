@@ -9,18 +9,17 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-// A strict frontend cannot recognise its own mutations in a visibility event
-// without this, so it must refuse to run strict at all.
+// The session identity lets consumers recognize their own authority changes.
 func TestClientExposesItsSessionID(t *testing.T) {
-	handler := &strictContractHandler{epoch: make([]byte, 16), maxInFlight: 5}
-	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
+	handler := &strictContractHandler{epoch: make([]byte, 16), maxInFlight: 9}
+	address, clientTLS, stop := startTestServer(t, handler, 9, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
-		ReplaySlots: 5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
-		CancelDrainTimeout: time.Second, MaxInFlight: 5,
+		ReplaySlots: 9, MaxFrame: testMaxFrame, DialTimeout: time.Second,
+		CancelDrainTimeout: time.Second, MaxInFlight: 9,
 		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {

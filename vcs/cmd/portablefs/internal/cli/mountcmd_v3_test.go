@@ -14,8 +14,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
 )
 
 // testClientIdentityFiles writes one self-signed mutual-TLS client identity
@@ -66,7 +64,6 @@ func v3MountOpts(t *testing.T) *mountOpts {
 		dataPlaneServerName: "authority.example",
 		clientCertPath:      certPath,
 		clientKeyPath:       keyPath,
-		coherence:           "strict",
 	}
 }
 
@@ -157,16 +154,13 @@ func TestValidateDirectV3MountOptsNamesEveryMissingPiece(t *testing.T) {
 		change func(*mountOpts)
 		want   string
 	}{
-		"no addr":          {func(o *mountOpts) { o.addr = "" }, "--addr"},
-		"no transport":     {func(o *mountOpts) { o.dataPlaneTransport = "" }, "--data-plane-transport"},
-		"plaintext":        {func(o *mountOpts) { o.dataPlaneTransport = dataPlaneTransportPlaintext }, "mutually authenticated TLS"},
-		"no token":         {func(o *mountOpts) { o.mountToken = "" }, "--mount-token"},
-		"no client cert":   {func(o *mountOpts) { o.clientCertPath = "" }, "--client-cert"},
-		"no client key":    {func(o *mountOpts) { o.clientKeyPath = "" }, "--client-key"},
-		"bad coherence":    {func(o *mountOpts) { o.coherence = "eventual" }, "--coherence"},
-		"retired uncached": {func(o *mountOpts) { o.coherence = "uncached" }, "--coherence must be strict"},
-		"local-dir":        {func(o *mountOpts) { o.localDirs = stringListFlag{"node_modules"} }, "declared volume-wide"},
-		"lease-only shape": {func(o *mountOpts) { o.addr = ""; o.dataPlaneTransport = ""; o.mountToken = "" }, "cannot mint v3 credentials"},
+		"no addr":                    {func(o *mountOpts) { o.addr = "" }, "--addr"},
+		"no transport":               {func(o *mountOpts) { o.dataPlaneTransport = "" }, "--data-plane-transport"},
+		"plaintext":                  {func(o *mountOpts) { o.dataPlaneTransport = dataPlaneTransportPlaintext }, "mutually authenticated TLS"},
+		"no token":                   {func(o *mountOpts) { o.mountToken = "" }, "--mount-token"},
+		"no client cert":             {func(o *mountOpts) { o.clientCertPath = "" }, "--client-cert"},
+		"no client key":              {func(o *mountOpts) { o.clientKeyPath = "" }, "--client-key"},
+		"missing direct credentials": {func(o *mountOpts) { o.addr = ""; o.dataPlaneTransport = ""; o.mountToken = "" }, "initial attach requires a volume mount capability"},
 	}
 	for name, tc := range mutate {
 		o := v3MountOpts(t)
@@ -181,29 +175,18 @@ func TestValidateDirectV3MountOptsNamesEveryMissingPiece(t *testing.T) {
 	}
 }
 
-// TestMountCommandRefusesLegacyManagerLeaseInvocation pins the CLI edge: the
-// plain v2-era invocation fails with the direct-credential guidance and never
-// falls back to the clientcore engine.
-func TestMountCommandRefusesLegacyManagerLeaseInvocation(t *testing.T) {
+// TestMountCommandRequiresDirectCredentials pins the CLI edge: the
+// invocation without credentials fails before starting a mount.
+func TestMountCommandRequiresDirectCredentials(t *testing.T) {
 	e, _, stderr := testEnv(t)
 	if rc := e.run([]string{"mount", "vol_1", filepath.Join(t.TempDir(), "m")}); rc == 0 {
-		t.Fatal("manager/lease-only mount invocation succeeded")
+		t.Fatal("mount without direct credentials succeeded")
 	}
 	out := stderr.String()
-	for _, want := range []string{"--addr", "--mount-token", "--client-cert", "cannot mint v3 credentials"} {
+	for _, want := range []string{"--addr", "--mount-token", "--client-cert", "initial attach requires a volume mount capability"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("refusal %q does not name %q", out, want)
 		}
-	}
-}
-
-func TestMountCommandRefusesRetiredBranchFlag(t *testing.T) {
-	e, _, stderr := testEnv(t)
-	if rc := e.run([]string{"mount", "vol_1", filepath.Join(t.TempDir(), "m"), "--branch=dev"}); rc == 0 {
-		t.Fatal("retired --branch flag accepted")
-	}
-	if !strings.Contains(stderr.String(), "branchless") {
-		t.Fatalf("refusal %q does not explain that v3 volumes are branchless", stderr.String())
 	}
 }
 
@@ -251,7 +234,6 @@ func TestMountStateEngineValidation(t *testing.T) {
 	valid := func() mountState {
 		st := validFuseMountState(t, "/tmp/v3")
 		st.Engine = mountEngineFuseV3
-		st.Branch = ""
 		st.DataPlaneTransport = dataPlaneTransportTLSSystemPKI
 		st.DataPlaneServerName = "authority.example"
 		return st
@@ -264,9 +246,9 @@ func TestMountStateEngineValidation(t *testing.T) {
 		t.Fatalf("valid v3 FUSE record refused: %v", err)
 	}
 	st = valid()
-	st.Branch = "main"
+	st.Engine = ""
 	if err := validateMountStateRecord("test", &st); err == nil {
-		t.Fatal("branch on a branchless v3 record accepted")
+		t.Fatal("missing engine accepted")
 	}
 	st = valid()
 	st.Engine = mountEngineDaemonV3
@@ -280,7 +262,6 @@ func TestMountStateEngineValidation(t *testing.T) {
 	}
 	fskit := validFSKitMountState(t, "/tmp/v3-fskit")
 	fskit.Engine = mountEngineDaemonV3
-	fskit.Branch = ""
 	if err := validateMountStateRecord("test", &fskit); err != nil {
 		t.Fatalf("valid daemon-v3 FSKit record refused: %v", err)
 	}
@@ -295,7 +276,7 @@ func TestMountStateEngineValidation(t *testing.T) {
 func TestMountIntentEngineValidation(t *testing.T) {
 	base := func() mountIntent {
 		return mountIntent{
-			SchemaVersion: 2, Phase: "starting", MountPath: "/tmp/v3",
+			SchemaVersion: mountIntentSchemaVersion, Phase: "starting", MountPath: "/tmp/v3",
 			OperationOwnerPID: os.Getpid(), OperationOwnerStartIdentity: "id",
 			UpdatedAtMs: 1,
 		}
@@ -319,27 +300,21 @@ func TestMountIntentEngineValidation(t *testing.T) {
 }
 
 // TestFskitEnsureRequestCarriesTheDaemonV3Contract pins the exact wire shape
-// portablefsd's v3AttachRequest decodes: the mutual-TLS identity, the two
-// barrier numbers, the declared macOS 26 cache policy, an empty branch, and
-// a well-formed 64-hex routes revision.
+// portablefsd decodes: an explicit initial authorization deadline and a
+// required v3 block with mutual-TLS identity and the canonical routes revision.
 func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 	req := fskitEnsureAttachRequest{
 		AttachRef:           "att_AAAAAAAAAAAAAAAAAAAAAA",
 		VolumeID:            "vol_1",
-		Branch:              "",
 		AuthorityURL:        "127.0.0.1:2050",
 		AuthToken:           "capability",
 		DataPlaneTransport:  dataPlaneTransportTLSSystemPKI,
 		DataPlaneServerName: "authority.example",
 		MountPath:           "/tmp/v3",
-		Options:             fskitAttachOptions{},
-		V3: &fskitV3AttachRequest{
-			ClientCertPEM:      "CERT",
-			ClientKeyPEM:       "KEY",
-			CachedNameCapacity: 1 << 16,
-			RepairBudgetMillis: 15_000,
-			CachePolicy:        portablefsd.V3CachePolicyMacOS26,
-			RoutesRevision:     emptyRoutesRevision(),
+		V3: fskitV3AttachRequest{
+			ClientCertPEM:  "CERT",
+			ClientKeyPEM:   "KEY",
+			RoutesRevision: emptyRoutesRevision(),
 		},
 	}
 	data, err := json.Marshal(req)
@@ -350,19 +325,28 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["branch"] != "" {
-		t.Fatalf("a v3 ensure request must be branchless, got branch %v", decoded["branch"])
+	wantKeys := []string{"attachRef", "volumeId", "authorityUrl", "authToken", "authTokenExpiresAtMs", "dataPlaneTransport", "dataPlaneServerName", "mountPath", "v3"}
+	if len(decoded) != len(wantKeys) {
+		t.Fatalf("unexpected attach fields: %s", data)
+	}
+	for _, key := range wantKeys {
+		if _, ok := decoded[key]; !ok {
+			t.Fatalf("missing attach field %s: %s", key, data)
+		}
+	}
+	if deadline, present := decoded["authTokenExpiresAtMs"]; !present || deadline != float64(0) {
+		t.Fatalf("standalone deadline must be explicit zero: %s", data)
 	}
 	v3, ok := decoded["v3"].(map[string]any)
 	if !ok {
 		t.Fatalf("ensure request carries no v3 block: %s", data)
 	}
+	if len(v3) != 3 {
+		t.Fatalf("unexpected current attach fields: %s", data)
+	}
 	for key, want := range map[string]any{
-		"clientCertPem":      "CERT",
-		"clientKeyPem":       "KEY",
-		"cachedNameCapacity": float64(1 << 16),
-		"repairBudgetMillis": float64(15_000),
-		"cachePolicy":        "macos26-synchronous-vfs-repair-v2",
+		"clientCertPem": "CERT",
+		"clientKeyPem":  "KEY",
 	} {
 		if v3[key] != want {
 			t.Fatalf("v3 block key %q = %v, want %v", key, v3[key], want)
@@ -376,8 +360,7 @@ func TestFskitEnsureRequestCarriesTheDaemonV3Contract(t *testing.T) {
 
 // TestUmountReconcilesStaleV3FuseRecordWithoutForce pins the engine-aware
 // teardown: a v3 FUSE mount holds no write-back tail, so a record whose
-// kernel mount and owner are both gone reconciles on a plain umount — the v2
-// path demanded --force here to park a journal that v3 does not have.
+// kernel mount and owner are both gone reconciles on a plain umount.
 func TestUmountReconcilesStaleV3FuseRecordWithoutForce(t *testing.T) {
 	e, stdout, stderr, stateDir := umountTestEnv(t)
 	mountPath, err := canonicalMountPath(t.TempDir())
@@ -386,7 +369,6 @@ func TestUmountReconcilesStaleV3FuseRecordWithoutForce(t *testing.T) {
 	}
 	st := validFuseMountState(t, mountPath)
 	st.Engine = mountEngineFuseV3
-	st.Branch = ""
 	st.DataPlaneTransport = dataPlaneTransportTLSSystemPKI
 	st.DataPlaneServerName = "authority.example"
 	st.PID = 4194000
@@ -403,28 +385,5 @@ func TestUmountReconcilesStaleV3FuseRecordWithoutForce(t *testing.T) {
 	remaining, err := readMountState(stateDir, mountPath)
 	if err != nil || remaining != nil {
 		t.Fatalf("stale v3 record was not removed: %+v %v", remaining, err)
-	}
-}
-
-// TestUmountStaleV2FuseRecordStillFailsClosed pins that the engine gate did
-// not weaken the legacy contract: a clientcore record with a possible
-// write-back tail still refuses the same plain unmount.
-func TestUmountStaleV2FuseRecordStillFailsClosed(t *testing.T) {
-	e, _, stderr, stateDir := umountTestEnv(t)
-	mountPath, err := canonicalMountPath(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := validFuseMountState(t, mountPath)
-	st.PID = 4194000
-	st.ProcessStartIdentity = "dead-process"
-	if err := writeMountState(stateDir, st); err != nil {
-		t.Fatal(err)
-	}
-	if rc := e.run([]string{"umount", mountPath}); rc == 0 {
-		t.Fatal("plain umount of a stale v2 record succeeded")
-	}
-	if !strings.Contains(stderr.String(), "cannot prove a clean drain") {
-		t.Fatalf("v2 fail-closed detail missing: %q", stderr.String())
 	}
 }

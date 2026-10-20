@@ -4,6 +4,20 @@ This is a two-language tree — the Go data plane under `vcs/` and the Swift
 FSKit/app package under `swift/PortableFSKit` — with no build system above them
 and no package manager to install.
 
+macOS builds require Xcode 27.1 (build 27A9275) and the macOS 27 SDK (27.0) for
+FSKit V3 APIs. Select that installation before running the gate:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer
+xcodebuild -version # Xcode 27.1, Build version 27A9275
+xcrun --sdk macosx --show-sdk-version # 27.0
+```
+
+Use the path to your Xcode 27.1 installation if it differs. CI and release use
+the `xcode-27` image and assert the exact build and SDK version. The app,
+extension, and Swift package still deploy to macOS 26, using V2 there and V3 on
+macOS 27.
+
 ## The merge gate
 
 ```bash
@@ -15,13 +29,15 @@ That script is the local gate, and it is plain bash so a developer Mac and a
 Linux CI runner execute the same steps. The default mode below stops short of
 the two real-mount suites and names them as not run; `--full` appends them.
 
-1. cross-platform compile and vet: `GOOS=darwin` and `GOOS=linux`, both built
-   before anything runs, because the daemon, mount clients, and frontend
-   adapters all carry per-GOOS files;
+1. cross-platform compile and vet, both built before anything runs, because
+   the daemon, mount clients, and frontend adapters all carry per-GOOS files:
+   on macOS the real Foundation/cgo Darwin boundary plus static Linux, and on
+   Linux the native product plus Darwin's deliberate `!cgo` refusal stub;
 2. the pinned `govulncheck` reachable-call scan, which also enforces the exact
    Go security patch level required by `vcs/go.mod`;
-3. the native Go suite, then the native race suite — these tests exercise real
-   syscalls, sockets, and mounts, so they are only meaningful on the host;
+3. uncached `pfslocal` schema freshness, then the native Go and race suites —
+   the broad suites exercise real syscalls, sockets, and mounts, so they are
+   only meaningful on the host;
 4. `bash scripts/test-swift-xcode.sh` on macOS. The gate asks Xcode to
    enumerate the complete package inventory, executes that already-built
    inventory once through Xcode's native serial test runner, and rejects the
@@ -34,17 +50,24 @@ the two real-mount suites and names them as not run; `--full` appends them.
    `scripts/check-install-release-trust.mjs` (the project checkers are
    dependency-free single-file node programs that read the installer, the
    workflows, and `.goreleaser.yaml` as text);
-6. stale-architecture and active-contract scans, which fail if the deleted
-   journal-era packages reappear or active docs/CI regain a private-kernel
-   dependency.
+6. the current-architecture check, `scripts/check-current-architecture.py`,
+   which asserts the current state positively rather than scanning for retired
+   names: the exact authority major and ALPN, the frontend profile set, the
+   authority and `pfslocal` schema shape and pairing, the daemon control and
+   lifecycle versions, production readiness and flag wiring, the required-test
+   inventories, version statements in maintained text, and documentation
+   links. `--only <check>` runs one check; `--list` names them.
 
 The raw commands, when you want one piece:
 
 ```bash
-GOOS=darwin go -C vcs build ./...
-GOOS=linux  go -C vcs vet ./...
+CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...   # on macOS; Foundation resolver
+CGO_ENABLED=0 GOOS=linux  go -C vcs build ./...   # static Linux release
+go -C vcs vet ./...
+go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
 go -C vcs test ./...
 go -C vcs test -race ./...
+python3 scripts/check-current-architecture.py
 bash scripts/test-swift-xcode.sh
 ```
 
@@ -59,9 +82,15 @@ bash scripts/xfs-fuse-integration.sh --in-container   # container side; needs ro
 Runs a throwaway privileged container against a real XFS loopback filesystem
 with project quotas and real kernel FUSE mounts. Its host or VM must expose
 `/dev/fuse`, loop devices, and stock FUSE protocol 7.31 or newer. The same script
-is the CI entry point and local reproduction. It enumerates required tests by
-name: a test that is renamed, deleted, or skipped fails the job rather than
-quietly shrinking privileged coverage.
+is the CI entry point and local reproduction. It enforces exact required-test
+inventories, one per owning package: `scripts/xfs-required-authority-tests.txt`,
+`scripts/xfs-required-fuse-tests.txt`, and `scripts/xfs-required-tiered-tests.txt`.
+A separate root invocation runs the cell helper's root-only boundary tests
+against its own exact list in the script. A test that is renamed, deleted, or
+skipped fails the job (exit 70) rather than quietly shrinking privileged
+coverage, and a focused `PORTABLEFS_GO_TEST_FLAGS='-run ...'` selection is
+reported as missing tests, never as a full pass. Rename or delete a required
+test and its list entry in the same change.
 
 ## The cross-mount coherence matrix
 
@@ -69,20 +98,22 @@ quietly shrinking privileged coverage.
 bash scripts/coherence-matrix-linux.sh        # host side; needs docker
 ```
 
-On a stock Linux host or VM, this provisions a real XFS cell, starts a real authority and two real mount
-processes, then drives both mountpoints with ordinary syscalls from a separate
-black-box program — 23 named cases, nothing in-process and nothing faked. The
-matrix proves only observed syscall behavior; dedicated protocol tests must
-prove grant, recall, and discharge. The harness has no weaker profile selector.
+On a stock Linux host or VM, this provisions a real XFS cell, starts a real
+authority and two real mount processes, then drives both mountpoints with
+ordinary syscalls from a separate black-box program: 29 named cases, nothing
+in-process and nothing faked. The matrix proves only observed syscall behavior;
+dedicated protocol tests must prove subscription withdrawal, delegation grant,
+recall, and break. The harness has no profile selector.
 
-On macOS the same cases can run against paths mounted by a qualification build;
-the script never mounts, unmounts, or drives `portablefsd`, and a pass does not
-promote FSKit to product support:
+On macOS the shared cases run between one FSKit mount on the Mac and one Linux
+kernel-FUSE mount on a remote peer. There is no Mac-to-Mac form, because writer
+exclusion refuses a second Mac mount of a volume. The script never mounts,
+unmounts, or drives `portablefsd`, and a run is not native FSKit qualification:
 
 ```bash
-scripts/coherence-matrix-macos.sh --mount-a /path/a --mount-b /path/b
-scripts/coherence-matrix-macos.sh --mount-a /path/a \
-  --remote user@host --remote-mount /path/b
+scripts/coherence-matrix-macos.sh --mount-a /path/on/mac \
+  --remote user@linux-host --remote-mount /path/on/linux \
+  [--remote-binary /path/to/linux/pfs-coherence-matrix]
 ```
 
 Both scripts fail closed. A case that cannot be honestly asserted skips loudly
@@ -98,5 +129,5 @@ isolated volume worker, credentials, and connecting a Linux mount — is
 Production mounts pass `--mount-token` and an explicit transport: `tls-system-pki`
 plus `--data-plane-server-name`, or `tls-private-ca` plus that exact server name
 and `--data-plane-ca <ca.pem>`. There is no TLS environment fallback, an empty CA
-never selects plaintext, and plaintext is refused outright — a v3 authority
+never selects plaintext, and plaintext is refused outright: an authority
 session is mutually authenticated TLS 1.3.

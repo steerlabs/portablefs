@@ -9,7 +9,6 @@ import (
 	"math"
 	"sort"
 	"syscall"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -89,13 +88,13 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 			unlock()
 			return false, false, syscall.EIO
 		}
-		blocked := len(r.cacheReservations[coordinate]) != 0 || r.repairingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, source)
+		blocked := len(r.cacheReservations[coordinate]) != 0 || r.withdrawingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, source)
 		first, second, count := coordinate, publicationCoordinate{}, 1
 		if parent != nil {
 			key := nameKey{parent: parent.key.inode, name: name}
 			first = publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: r.cachedNameStable[key].name}
 			second, count = coordinate, 2
-			if r.cachedNames[key] != record || parent.stale.Load() || record.lookups == math.MaxUint64 || !r.cachedCoordinateAllowedLocked(first, r.cachedNameStamps[key], time.Now()) {
+			if r.cachedNames[key] != record || parent.stale.Load() || record.lookups == math.MaxUint64 || !r.cachedCoordinateAllowedLocked(first, r.cachedNameStamps[key]) {
 				r.mu.Unlock()
 				unlock()
 				return false, false, nil
@@ -140,6 +139,7 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 		}
 		r.pinMetadataLocked(p, s, record, first, second, count)
 		if fast && parent != nil {
+			p.lookupReference = record
 			record.lookups++
 			r.identityIndexLocked(record)[record.key] = record
 		}
@@ -184,6 +184,12 @@ func (r *rawFileSystem) renderMetadataLocked(s *delegationState, base *authority
 }
 
 func (r *rawFileSystem) pinMetadataLocked(p *replyPublication, s *delegationState, record *inodeRecord, first, second publicationCoordinate, count int) {
+	// A source mutation publishes its accepted outcome even after permission
+	// expires. Other holder metadata depends on retained permission, including
+	// directory rows and slow reads that could not allocate a cached reply.
+	if s.ref != nil && p.source == nil && p.postState == nil {
+		p.retainedAnswer = true
+	}
 	if p.holderAdmission == nil {
 		p.cachedCoordinates, p.cachedCount, p.holderAdmission = [2]publicationCoordinate{first, second}, count, s
 		return
@@ -297,7 +303,7 @@ func (r *rawFileSystem) publishDirectoryMetadata(ctx context.Context, candidates
 		for _, row := range rows {
 			coordinate := publicationCoordinate{kind: publicationItemAttributes, item: row.record.identity}
 			invalid = invalid || row.record.stale.Load() || row.record.reclaimed
-			blocked = blocked || len(r.cacheReservations[coordinate]) != 0 || r.repairingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, p.source)
+			blocked = blocked || len(r.cacheReservations[coordinate]) != 0 || r.withdrawingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, p.source)
 		}
 		if invalid {
 			r.mu.Unlock()

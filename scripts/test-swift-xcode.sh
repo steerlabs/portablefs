@@ -49,6 +49,9 @@ cleanup() {
     rm -rf -- "$work_root"
   else
     echo "test-swift-xcode: retained failure evidence at $work_root" >&2
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+      printf 'failure-evidence=%s\n' "$work_root" >>"$GITHUB_OUTPUT"
+    fi
   fi
   exit "$status"
 }
@@ -150,6 +153,8 @@ evidence_status=$?
 set -e
 if ((xcode_status != 0 || evidence_status != 0)); then
   echo "test-swift-xcode: rejected Xcode execution (xcode=$xcode_status evidence=$evidence_status)" >&2
+  run_bounded 60 "failure diagnostics" python3 "$repo_root/scripts/print_xcode_failures.py" \
+    --results "$result_json" --result-bundle "$result_bundle" || true
   exit 1
 fi
 

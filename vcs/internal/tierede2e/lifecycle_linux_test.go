@@ -130,8 +130,8 @@ func TestTieredVolumeLifecycleOnXFS(t *testing.T) {
 		return wiring
 	})
 	// The restore failure stage starts only after the preceding run's accepted
-	// writes are durable. Protocol 7 makes that boundary an explicit root-handle
-	// barrier; close alone can leave a delegated flush outstanding.
+	// writes are durable. Close alone can leave a delegated flush outstanding,
+	// so that boundary is an explicit fsync of the mount root.
 	barrier, err := os.Open(live.mountPath)
 	if err != nil {
 		t.Fatalf("open lifecycle barrier: %v", err)

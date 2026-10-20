@@ -14,9 +14,4 @@ type mountRoutes struct {
 	revision string
 	// declared reports that the volume publishes a declaration at all.
 	declared bool
-	// perMachine reports that rules came from this machine's own routing
-	// rather than from the volume. A v3 mount never sets it: --local-dir is
-	// refused unconditionally, so every route this mount serves is the
-	// volume's.
-	perMachine bool
 }

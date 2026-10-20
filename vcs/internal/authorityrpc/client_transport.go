@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-// clientTransport is one physical protocol-7 lane. Everything whose identity
+// clientTransport is one physical protocol-8 lane. Everything whose identity
 // is scoped to a TCP/TLS connection lives here: publication, serialization,
 // request IDs, waiters, reconnect exclusion, and negotiated frame accounting.
 // Session identity is deliberately not duplicated here; both transports prove
@@ -37,15 +36,13 @@ type clientTransport struct {
 }
 
 type transportNegotiation struct {
-	conn          net.Conn
-	epoch         []byte
-	features      []string
-	maxFrame      uint32
-	maxRead       uint32
-	maxWrite      uint32
-	maxFskitWrite uint64
-	maxInFlight   uint32
-	role          authoritypb.TransportRole
+	conn        net.Conn
+	epoch       []byte
+	maxFrame    uint32
+	maxRead     uint32
+	maxWrite    uint32
+	maxInFlight uint32
+	role        authoritypb.TransportRole
 	// Set only by proof-bearing Resume during pre-publication activation
 	// recovery. Hello itself never conveys a binding generation.
 	resumedBindingGeneration uint64
@@ -84,15 +81,42 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 				}
 			}
 			closeNegotiations(opened)
-			if errors.Is(err, ErrAuthorityChanged) {
-				return nil, err
-			}
+		}
+		if recoveryTerminal(err) {
+			return nil, err
 		}
 		last = err
 		if err := waitTransportRetry(ctx); err != nil {
 			return nil, fmt.Errorf("%v: %w", last, err)
 		}
 	}
+}
+
+// recoveryTerminal reports an error that no retry of a recovery handshake may
+// pass: a changed authority, or a proven frame defect from any read of the
+// attempt (Hello or Resume). Everything else is transport loss, retried.
+func recoveryTerminal(err error) bool {
+	return errors.Is(err, ErrAuthorityChanged) || frameDefect(err)
+}
+
+// frameDefect reports a received frame that is a proven protocol defect:
+// complete bytes outside the negotiated bounds, the exact wire grammar, or
+// the bulk carrier rules. Loss of the bytes themselves (EOF, truncation,
+// reset, timeout) is not a defect; TLS rules out corruption in transit, so no
+// defect is ever recovered by reconnecting and replaying.
+func frameDefect(err error) bool {
+	return errors.Is(err, ErrFrameEncoding) || errors.Is(err, ErrFramePayload) || errors.Is(err, ErrFrameBounds)
+}
+
+// receivedFrameError classifies a read error: a frame defect becomes a
+// transport-binding (protocol) failure, which every caller treats as
+// terminal; anything else is returned unchanged for the existing transport
+// recovery.
+func receivedFrameError(err error) error {
+	if frameDefect(err) {
+		return fmt.Errorf("%w: authority sent a malformed frame: %w", ErrTransportBinding, err)
+	}
+	return err
 }
 
 func waitTransportRetry(ctx context.Context) error {
@@ -117,6 +141,9 @@ func (c *Client) resumeRawPairForActivation(ctx context.Context) (*transportNego
 			return data, control, nil
 		}
 		closeNegotiations(data)
+		if recoveryTerminal(err) {
+			return nil, nil, err
+		}
 		if waitErr := waitTransportRetry(ctx); waitErr != nil {
 			return nil, nil, fmt.Errorf("%v: %w", err, waitErr)
 		}
@@ -185,45 +212,31 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if err := conn.SetDeadline(deadline); err != nil {
 		return fail(err)
 	}
-	requiredFeatures, ok := helloFeatures(c.cfg.FrontendProfile)
-	if !ok {
-		return fail(errors.New("authorityrpc: unsupported frontend profile"))
-	}
 	request := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
 		ProtocolMajor:   ProtocolMajor,
-		Features:        append([]string(nil), requiredFeatures...),
 		Role:            role,
 		ConnectionSetId: append([]byte(nil), c.connectionSetID[:]...),
 		FrontendProfile: c.cfg.FrontendProfile,
 	}}}
-	if c.canPipelineFlushes() {
-		request.GetHello().Features = append(request.GetHello().Features, orderedDelegatedFlushFeature)
-	}
 	if err := writeFrame(conn, c.cfg.MaxFrame, request); err != nil {
 		return fail(err)
 	}
 	var response authoritypb.Response
 	releaseFrame, err := readFrameRetained(conn, c.cfg.MaxFrame, nil, 0, &response)
 	if err != nil {
-		return fail(err)
+		return fail(receivedFrameError(err))
 	}
 	defer releaseFrame()
 	hello := response.GetHello()
-	if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || hello == nil ||
-		hello.GetProtocolMajor() != ProtocolMajor {
-		return fail(fmt.Errorf("authorityrpc: %s protocol handshake refused with errno %d", role, response.GetErrno()))
+	if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || hello == nil {
+		return fail(fmt.Errorf("%w: %s protocol handshake refused with errno %d", ErrTransportBinding, role, response.GetErrno()))
+	}
+	if err := validateProtocolMajor(hello.GetProtocolMajor()); err != nil {
+		return fail(err)
 	}
 	if hello.GetRole() != role || !equalBytes(hello.GetConnectionSetId(), c.connectionSetID[:]) ||
 		hello.GetFrontendProfile() != c.cfg.FrontendProfile {
 		return fail(fmt.Errorf("%w: %s Hello did not echo its exact transport binding", ErrTransportBinding, role))
-	}
-	if !hasFeatures(hello.GetFeatures(), requiredFeatures) {
-		return fail(errors.New("authorityrpc: authority omitted required current-state features"))
-	}
-	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
-		hello.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
-	) {
-		return fail(errors.New("authorityrpc: authority does not support Manager-enrolled mount reauthorization"))
 	}
 	if len(response.GetEpoch()) != len(volumeserver.Epoch{}) {
 		return fail(errors.New("authorityrpc: protocol handshake omitted a valid authority epoch"))
@@ -256,17 +269,10 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 			hello.GetMaxReadBytes(), hello.GetMaxWriteBytes(),
 		))
 	}
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR && hello.GetMaxFskitWriteBytes() != 0 {
-		return fail(errors.New("authorityrpc: Linux profile received FSKit write capacity"))
-	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
-		hello.GetMaxFskitWriteBytes() < RequiredFskitWriteBytes {
-		return fail(errors.New("authorityrpc: FSKit profile omitted fragmented-write capacity"))
-	}
 	return &transportNegotiation{
 		conn: conn, epoch: append([]byte(nil), response.GetEpoch()...),
-		features: append([]string(nil), hello.GetFeatures()...), maxFrame: negotiatedFrame,
-		maxRead: hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(), maxFskitWrite: hello.GetMaxFskitWriteBytes(),
+		maxFrame: negotiatedFrame,
+		maxRead:  hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(),
 		maxInFlight: hello.GetMaxInFlight(), role: role,
 	}, nil
 }
@@ -276,9 +282,9 @@ func validateNegotiationPair(data, control *transportNegotiation) error {
 		control.role != authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
 		return errors.New("authorityrpc: incomplete transport pair")
 	}
-	if !equalBytes(data.epoch, control.epoch) || !slices.Equal(data.features, control.features) ||
+	if !equalBytes(data.epoch, control.epoch) ||
 		data.maxFrame != control.maxFrame || data.maxRead != control.maxRead ||
-		data.maxWrite != control.maxWrite || data.maxFskitWrite != control.maxFskitWrite || data.maxInFlight != control.maxInFlight {
+		data.maxWrite != control.maxWrite || data.maxInFlight != control.maxInFlight {
 		return errors.New("authorityrpc: DATA and CONTROL negotiated different authority state")
 	}
 	return nil
@@ -321,9 +327,9 @@ func (c *Client) reopenInitialPair(ctx context.Context) (*transportNegotiation, 
 				}
 			}
 			closeNegotiations(data, control)
-			if errors.Is(err, ErrAuthorityChanged) {
-				return nil, nil, err
-			}
+		}
+		if recoveryTerminal(err) {
+			return nil, nil, err
 		}
 		last = err
 		if err := waitTransportRetry(ctx); err != nil {
@@ -338,8 +344,8 @@ func (c *Client) validateReconnectNegotiation(opened *transportNegotiation) erro
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	if !slices.Equal(opened.features, c.helloFeatures) || opened.maxFrame != c.negotiatedFrame ||
-		opened.maxRead != c.maxRead || opened.maxWrite != c.maxWrite || opened.maxFskitWrite != c.maxFskitWrite ||
+	if opened.maxFrame != c.negotiatedFrame ||
+		opened.maxRead != c.maxRead || opened.maxWrite != c.maxWrite ||
 		opened.maxInFlight != c.negotiatedInFlight {
 		return errors.New("authorityrpc: resumed transport negotiated different authority state")
 	}
@@ -365,7 +371,7 @@ func rawRoundTrip(conn net.Conn, frameMax uint32, request *authoritypb.Request) 
 	response := new(authoritypb.Response)
 	releaseFrame, err := readFrameRetained(conn, frameMax, nil, 0, response)
 	if err != nil {
-		return nil, err
+		return nil, receivedFrameError(err)
 	}
 	defer releaseFrame()
 	if response.GetRequestId() != request.GetRequestId() {
@@ -417,6 +423,11 @@ func (c *Client) publishTransport(transport *clientTransport, opened *transportN
 		return err
 	}
 	transport.pendingMu.Lock()
+	if err := c.checkCallEntry(); err != nil {
+		transport.pendingMu.Unlock()
+		_ = opened.conn.Close()
+		return err
+	}
 	if c.closed.Load() || transport.conn != nil {
 		transport.pendingMu.Unlock()
 		_ = opened.conn.Close()
@@ -479,7 +490,8 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 // caller's replay identity and retry transport establishment until its deadline
 // or an authenticated Hello/Resume establishes the epoch and session verdict.
 // Even a caller without a deadline cannot retry beyond one subscription TTL.
-func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) error {
+func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, volumeserver.SubscriptionTTL)
 	defer cancel()
@@ -491,11 +503,16 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 	}
 	for {
 		err := c.reconnectTransportOnce(ctx, role)
+		// A session's terminal verdict applies to every admitted caller, even
+		// one whose context expired while its transport outcome was unsettled.
+		if terminalErr := c.checkCallEntry(); terminalErr != nil {
+			return terminalErr
+		}
 		if ctx.Err() != nil {
 			return boundedError()
 		}
-		if err == nil || c.closed.Load() || c.poisoned.Load() {
-			return err
+		if err == nil {
+			return nil
 		}
 		var networkError *net.OpError
 		if !errors.As(err, &networkError) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, context.DeadlineExceeded) {
@@ -507,21 +524,19 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 	}
 }
 
-func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) error {
+func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	transport := c.transportForRole(role)
 	if transport == nil {
 		return ErrTransportBinding
 	}
-	if c.poisoned.Load() {
-		if err := c.SessionEndCause(); err != nil {
-			return err
-		}
-		return ErrSessionEnded
-	}
 	transport.lifecycle.Lock()
 	defer transport.lifecycle.Unlock()
-	if c.closed.Load() {
-		return net.ErrClosed
+	if err := c.checkCallEntry(); err != nil {
+		return err
 	}
 	transport.pendingMu.Lock()
 	live := transport.conn != nil

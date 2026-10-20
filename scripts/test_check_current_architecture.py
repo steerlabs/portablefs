@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Unit tests for the parsers inside check-current-architecture.py.
+
+The checker's assertions are only as strong as its parsing. These tests pin
+the parsing on small fixtures so that a parser defect fails here rather than
+silently weakening an architecture assertion over the real tree.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+import unittest
+from unittest import mock
+
+SCRIPT = pathlib.Path(__file__).with_name("check-current-architecture.py")
+SPEC = importlib.util.spec_from_file_location("check_current_architecture", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+checker = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(checker)
+
+
+PROTO = """
+syntax = "proto3";
+package demo.v1;
+// reserved in a comment is not a declaration
+message Outer {
+  uint64 id = 1; // trailing comment = 9;
+  message Inner { uint32 hidden = 7; }
+  enum Kind { KIND_UNSPECIFIED = 0; KIND_A = 1; }
+  repeated Inner inner = 2;
+  oneof body {
+    Inner first = 10;
+    Inner second = 11;
+  }
+}
+enum Profile {
+  PROFILE_UNSPECIFIED = 0;
+  PROFILE_LINUX = 1;
+}
+"""
+
+
+class ProtoParsing(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source = checker.strip_proto_comments(PROTO)
+
+    def test_comments_are_not_declarations(self) -> None:
+        self.assertNotIn("reserved", self.source)
+        self.assertNotIn("= 9", self.source)
+
+    def test_message_fields_skip_nested_declarations(self) -> None:
+        fields = checker.proto_fields(checker.proto_block(self.source, "message", "Outer"))
+        self.assertEqual(fields, {"id": 1, "inner": 2, "first": 10, "second": 11})
+
+    def test_oneof_arms(self) -> None:
+        outer = checker.proto_block(self.source, "message", "Outer")
+        self.assertEqual(checker.proto_oneof(outer, "body"), {"first": 10, "second": 11})
+
+    def test_enum_values_in_order(self) -> None:
+        values = checker.proto_enum(checker.proto_block(self.source, "enum", "Profile"))
+        self.assertEqual(values, [("PROFILE_UNSPECIFIED", 0), ("PROFILE_LINUX", 1)])
+
+    def test_missing_declaration_fails(self) -> None:
+        with self.assertRaises(checker.CheckFailure):
+            checker.proto_block(self.source, "message", "Absent")
+
+
+class WireFixtures(unittest.TestCase):
+    # The current shared Hello fixtures: length prefix, request_id 1, then the
+    # Hello (field 10) or HelloReply (field 60) body.
+    HELLO_REQUEST = "120000000801520e08021a0573776966742203312e30"
+    HELLO_REPLY = "1d0000000801e2031808021a10706f727461626c656673642d7465737420e0d403"
+
+    def test_hello_versions(self) -> None:
+        self.assertEqual(checker.hello_version(checker.pfslocal_frame(self.HELLO_REQUEST), 10), (2, 0))
+        self.assertEqual(checker.hello_version(checker.pfslocal_frame(self.HELLO_REPLY), 60), (2, 0))
+
+    def test_explicit_minor(self) -> None:
+        # Hello{major 1, minor 16} under field 10.
+        envelope = bytes([0x52, 0x04, 0x08, 0x01, 0x10, 0x10])
+        self.assertEqual(checker.hello_version(envelope, 10), (1, 16))
+
+    def test_length_prefix_must_match(self) -> None:
+        with self.assertRaises(ValueError):
+            checker.pfslocal_frame("05000000" + "0801")
+
+    def test_truncated_varint(self) -> None:
+        with self.assertRaises(ValueError):
+            checker.protobuf_fields(bytes([0x08, 0x80]))
+
+
+class CompiledCLILayouts(unittest.TestCase):
+    def test_current_contract_and_gate_wiring(self) -> None:
+        checker.check_macos_cli_layouts()
+
+    def test_missing_tag_or_development_gate_is_rejected(self) -> None:
+        original = checker.read
+        for filename, old, new in (
+            ("vcs/cmd/portablefs/internal/cli/installlayout_devhost_darwin.go", "darwin && portablefs_devhost", "darwin"),
+            ("swift/PortableFSApp/Scripts/embed-portablefs-tools.sh", 'build_tags=$cli_build_tags', 'build_tags='),
+            ("scripts/verify-local.sh", "bash scripts/test-macos-cli-layouts.sh", "true"),
+        ):
+            with self.subTest(filename=filename):
+                def changed(name):
+                    text = original(name)
+                    return text.replace(old, new) if name == filename else text
+                with mock.patch.object(checker, "read", side_effect=changed):
+                    with self.assertRaises(checker.CheckFailure):
+                        checker.check_macos_cli_layouts()
+
+
+class GoConstants(unittest.TestCase):
+    def test_forms(self) -> None:
+        text = """
+const ProtocolMajor uint32 = 8
+const (
+	ControlProtocolVersion = 2
+	ControlPathPrefix      = "/v2/" // operational routes
+)
+"""
+        self.assertEqual(checker.go_const(text, "ProtocolMajor"), "8")
+        self.assertEqual(checker.go_const(text, "ControlProtocolVersion"), "2")
+        self.assertEqual(checker.go_const(text, "ControlPathPrefix"), "/v2/")
+        self.assertIsNone(checker.go_const(text, "Absent"))
+
+    def test_flag_definitions(self) -> None:
+        text = """
+	flag.StringVar(&o.root, "root", "", "root")
+	quiet := flag.Bool("quiet", false, "quiet")
+	flag.Var(&rules, "local-dir", "refused")
+	fs.DurationVar(&d, "withdrawal-timeout", time.Second, "bound")
+"""
+        names = set(checker.GO_FLAG.findall(text)) | set(checker.GO_FLAG_VAR.findall(text))
+        self.assertEqual(names, {"root", "quiet", "local-dir", "withdrawal-timeout"})
+
+
+class CommandLines(unittest.TestCase):
+    def test_continuations_and_build_paths(self) -> None:
+        text = "\n".join([
+            "go build -o out ./cmd/portablefs-authority",
+            "exec /home/portablefs/bin/portablefs-authority \\",
+            "  --root /srv \\",
+            "  -volume-id v",
+            "systemctl start portablefs-authority@vol.service",
+            "portablefs-authority --listen=:7443",
+        ])
+        commands = list(checker.command_lines(text, "portablefs-authority"))
+        self.assertEqual([line for line, _ in commands], [2, 6])
+        flags = [checker.SHELL_FLAG.findall(command) for _, command in commands]
+        self.assertEqual(flags, [["root", "volume-id"], ["listen"]])
+
+    def test_values_are_not_flags(self) -> None:
+        self.assertEqual(checker.SHELL_FLAG.findall(' --offset -1 --name "a-b" x--y'), ["offset", "name"])
+
+
+class Markdown(unittest.TestCase):
+    def test_anchors(self) -> None:
+        text = "# Title\n## Two limits that apply to every deployment\n## Repeat\n## Repeat\n```\n# not a heading\n```\n## `code` and [link](x.md)\n"
+        self.assertEqual(
+            checker.heading_anchors(text),
+            {"title", "two-limits-that-apply-to-every-deployment", "repeat", "repeat-1", "code-and-link"},
+        )
+
+    def test_code_is_not_scanned_for_links(self) -> None:
+        text = "see [a](a.md)\n```\n[b](b.md)\n```\n`[c](c.md)` and [d](d.md#x)\n"
+        links = checker.LINK.findall(checker.markdown_without_code(text))
+        self.assertEqual(links, ["a.md", "d.md#x"])
+
+    def test_images_are_not_links(self) -> None:
+        self.assertEqual(checker.LINK.findall("![alt](pic.png) [t](doc.md)"), ["doc.md"])
+
+
+class SwiftVersionLiterals(unittest.TestCase):
+    def test_declaration_assignment_and_comparison(self) -> None:
+        text = "\n".join([
+            "public static let protocolMajor: UInt32 = 2",
+            "hello.protocolMajor = Self.protocolMajor",
+            "hello.protocolMajor = 2",
+            "guard reply.protocolMajor == 2 else {",
+            "let protocolMajorText = \"x\"",
+        ])
+        self.assertEqual(checker.swift_version_literals(text, "protocolMajor"), [2, 2, 2])
+
+    def test_stale_literal_is_reported(self) -> None:
+        self.assertEqual(checker.swift_version_literals("hello.protocolMinor = 16", "protocolMinor"), [16])
+
+
+class RequiredInventories(unittest.TestCase):
+    def test_shell_array(self) -> None:
+        text = 'X=1\nREQUIRED_TESTS=(\n  TestA\n  "pkg:TestB" # why\n\n)\nREQUIRED_TESTS_OTHER=(\n  TestC\n)\n'
+        self.assertEqual(checker.shell_array(text, "REQUIRED_TESTS"), ["TestA", "pkg:TestB"])
+        self.assertEqual(checker.shell_array(text, "ABSENT"), [])
+
+    def test_list_entries_drop_qualifiers_and_comments(self) -> None:
+        text = "# comment\npkg:TestA\nperformance pkg:TestB\npkg:TestC/Sub\n"
+        self.assertEqual(checker.required_list_entries(text), ["pkg:TestA", "pkg:TestB", "pkg:TestC/Sub"])
+
+
+class RootInventory(unittest.TestCase):
+    def suite(self, entries: list) -> str:
+        body = "".join(f'  "{entry}"\n' for entry in entries)
+        return (
+            "REQUIRED_TESTS=()\n"
+            f"REQUIRED_ROOT_TESTS=(\n{body})\n"
+            "run_root_boundary_suite() {\n  validate_root_tests\n}\n"
+            "validate_root_tests() {\n  :\n}\n"
+        )
+
+    def test_current_obligation_passes(self) -> None:
+        self.assertEqual(checker.root_inventory_problems(self.suite(sorted(checker.ROOT_REQUIRED))), [])
+
+    def test_empty_inventory_fails(self) -> None:
+        problems = checker.root_inventory_problems(self.suite([]))
+        self.assertTrue(any("is empty" in p for p in problems), problems)
+        self.assertTrue(any("does not require root obligations" in p for p in problems), problems)
+
+    def test_missing_inventory_fails(self) -> None:
+        problems = checker.root_inventory_problems("REQUIRED_TESTS=()\n")
+        self.assertEqual(problems, ["scripts/xfs-fuse-integration.sh declares no REQUIRED_ROOT_TESTS"])
+
+    def test_foreign_package_duplicate_and_missing_validation_fail(self) -> None:
+        current = sorted(checker.ROOT_REQUIRED)
+        foreign = self.suite(current + ["github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestA"])
+        self.assertTrue(any("is not a top-level test" in p for p in checker.root_inventory_problems(foreign)))
+        duplicate = self.suite(current + current)
+        self.assertTrue(any("repeats an entry" in p for p in checker.root_inventory_problems(duplicate)))
+        unvalidated = self.suite(current).replace("  validate_root_tests\n", "")
+        self.assertTrue(any("does not validate" in p for p in checker.root_inventory_problems(unvalidated)))
+
+    def test_checks_read_the_suite_from_the_tree(self) -> None:
+        # The two inventory checks must fail when the real suite's root list
+        # is emptied, not only when the helper is called directly.
+        original = checker.read
+        empty = self.suite([])
+
+        def patched(relative: str) -> str:
+            if relative == "scripts/xfs-fuse-integration.sh":
+                return empty + "".join(f"# {name}\n" for name in ("xfs-required-authority-tests.txt", "xfs-required-fuse-tests.txt", "xfs-required-tiered-tests.txt"))
+            return original(relative)
+
+        checker.read = patched
+        try:
+            with self.assertRaises(checker.CheckFailure):
+                checker.check_required_inventories()
+        finally:
+            checker.read = original
+
+
+class ReadinessRoutes(unittest.TestCase):
+    def test_dispatch_case_and_request_suffix(self) -> None:
+        text = 'case "frontend-ready":\n url := "/v2/attaches/" + ref + "/frontend-ready"\n s := "ready"'
+        self.assertEqual(checker.READINESS_ROUTE.findall(text), ["frontend-ready", "frontend-ready", "ready"])
+
+    def test_other_prefixes_are_reported(self) -> None:
+        self.assertEqual(checker.READINESS_ROUTE.findall('"/native-frontend-ready"'), ["native-frontend-ready"])
+
+
+class ContractAgreement(unittest.TestCase):
+    def test_changed_kernel_floor_fails(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+        for before, after in (
+            ("minor > 17", "minor > 18"),
+            ('!strings.Contains(parts[2], "-rc")', "true"),
+        ):
+            with self.subTest(after=after):
+                def read(relative: str) -> str:
+                    text = original(relative)
+                    if relative == "vcs/internal/xfsstore/kernel_linux.go":
+                        self.assertIn(before, text)
+                        text = text.replace(before, after)
+                    return text
+
+                with patch.object(checker, "read", side_effect=read):
+                    with self.assertRaises(checker.CheckFailure):
+                        checker.check_contract_agreement()
+
+    def test_independent_protocol_wording_is_valid(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+
+        def read(relative: str) -> str:
+            text = original(relative)
+            if relative == "COMPATIBILITY.md":
+                text += "\nDaemon operational protocol 2 is paired with pfslocal 2.0.\n"
+            return text
+
+        with patch.object(checker, "read", side_effect=read):
+            checker.check_contract_agreement()
+
+    def test_missing_surface_contract_fails(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+
+        def read(relative: str) -> str:
+            text = original(relative)
+            if relative == "COMPATIBILITY.md":
+                text = text.replace("`portablefs-authority-v8`", "absent")
+            return text
+
+        with patch.object(checker, "read", side_effect=read):
+            with self.assertRaises(checker.CheckFailure):
+                checker.check_contract_agreement()
+
+
+class LifecycleWiring(unittest.TestCase):
+    def test_inventory_uses_the_paired_cli_guard(self) -> None:
+        checker.check_control_lifecycle()
+
+    def test_missing_inventory_handoff_fails(self) -> None:
+        from unittest.mock import patch
+        original = checker.read
+        for path, before, after in (
+            ("swift/PortableFSKit/Sources/PortableFSAppCore/ServiceCoordinator.swift",
+             '["lifecycle", "hold-install-exclusive", "--json"]', '["lifecycle", "identity"]'),
+            ("vcs/cmd/portablefs/internal/cli/lifecyclecmd.go",
+             "e.daemonLifecycleInventory(expectedIdentity)", "0, errorUnavailable"),
+            ("vcs/cmd/portablefs/internal/cli/fskitmount.go",
+             "daemonctl.LifecycleInventoryPath", '"/wrong/inventory"'),
+        ):
+            with self.subTest(path=path):
+                def read(relative: str) -> str:
+                    text = original(relative)
+                    if relative == path:
+                        self.assertIn(before, text)
+                        text = text.replace(before, after)
+                    return text
+
+                with patch.object(checker, "read", side_effect=read):
+                    with self.assertRaises(checker.CheckFailure):
+                        checker.check_control_lifecycle()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

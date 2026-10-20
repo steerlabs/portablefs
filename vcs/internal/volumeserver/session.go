@@ -71,7 +71,7 @@ const (
 	// hide a directory tree from every other machine. Mount mutations under
 	// .portablefs/ are refused outright for the same reason: the file is
 	// reachable only through ApplyRoutes, which runs the change through the
-	// visibility barrier instead of skewing one machine's topology silently.
+	// topology exclusion instead of skewing one machine's topology silently.
 	AccessAdmin
 )
 
@@ -98,7 +98,10 @@ type Config struct {
 	// was admitted on. Raising it above the equal share deliberately
 	// over-commits the table and gives up that guarantee.
 	MaxLockRecordsPerSession uint32
-	Now                      func() time.Time
+	// Now checks absolute signed authorization and lifecycle timestamps.
+	Now func() time.Time
+	// ContinuousNow governs renewable leases and retained proof horizons.
+	ContinuousNow func() (time.Duration, error)
 	// Lifecycle observers run under the authority/session locks at the exact
 	// state transition. They must be nonblocking and must not call back into the
 	// Authority; production uses atomic gauges only.
@@ -158,6 +161,7 @@ type session struct {
 	access                Access
 	state                 SessionState
 	provisionalDeadline   time.Time
+	provisionalExpires    time.Time
 	leaseExpires          time.Time
 	authorizationDeadline time.Time
 	authorizationSequence uint64
@@ -171,6 +175,7 @@ type session struct {
 	ending         bool
 	active         uint64
 	cleanupStarted bool
+	exclusion      *WriterExclusion
 	terminal       chan struct{}
 	slots          []replaySlot
 	activation     *ActivationToken
@@ -196,7 +201,7 @@ type attachAttempt struct {
 
 // ActivationToken is an opaque, single transition reservation returned by
 // PrepareActivation. While it is live, AbortProvisional and Sweep cannot race
-// between durable visibility registration and the runtime commit. The caller
+// between durable mount registration and the runtime commit. The caller
 // must either CommitActivation or CancelActivation on every path.
 type ActivationToken struct {
 	authority *Authority
@@ -316,6 +321,7 @@ func (u *SessionUse) End() {
 		cleanup := s.ending && s.active == 0 && !s.cleanupStarted
 		if cleanup {
 			s.cleanupStarted = true
+			s.exclusion.drain()
 		}
 		s.mu.Unlock()
 		if cleanup {
@@ -350,6 +356,14 @@ func New(volumeID string, cfg Config) (*Authority, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.ContinuousNow == nil {
+		cfg.ContinuousNow = continuousNow
+	}
+	// Require the qualified clock even with fenced prior membership: this
+	// epoch may later grant a proof whose retention depends on that clock.
+	if _, err := cfg.ContinuousNow(); err != nil {
+		return nil, fmt.Errorf("initialize continuous authority clock: %w", err)
+	}
 	perSession := cfg.MaxLockRecordsPerSession
 	if perSession == 0 {
 		if perSession = cfg.MaxLockRecords / cfg.MaxSessions; perSession == 0 {
@@ -363,7 +377,7 @@ func New(volumeID string, cfg Config) (*Authority, error) {
 	a := &Authority{
 		volumeID: volumeID, cfg: cfg,
 		sessions: make(map[SessionID]*session), attempts: make(map[AttachAttemptID]*attachAttempt),
-		locks: NewLockTable(cfg.MaxLockRecords, perSession, cfg.Now),
+		locks: NewLockTable(cfg.MaxLockRecords, perSession, func() time.Time { return continuousLeaseTime(cfg.ContinuousNow) }),
 	}
 	if _, err := rand.Read(a.epoch[:]); err != nil {
 		return nil, fmt.Errorf("generate authority epoch: %w", err)
@@ -440,7 +454,7 @@ func (a *Authority) purgeAttachAttemptsLocked(now time.Time) {
 	}
 }
 
-// PrepareAttach creates one non-executable session for an exact protocol-7
+// PrepareAttach creates one non-executable session for an exact protocol-8
 // attach attempt. Admission is reserved before authorize is called, so a full
 // authority neither spends a single-use capability nor starts unbounded work.
 // The attempt record is installed before the call and retained through its
@@ -486,6 +500,7 @@ func (a *Authority) PrepareAttach(
 		return SessionCredential{}, ErrAdmission
 	}
 	admissionDeadline := now.Add(a.cfg.SessionLease)
+	admissionExpires := a.leaseNow().Add(a.cfg.SessionLease)
 	attempt := &attachAttempt{
 		fingerprint: fingerprint, peer: peer, slots: slots,
 		deadline: admissionDeadline, ready: make(chan struct{}),
@@ -503,7 +518,7 @@ func (a *Authority) PrepareAttach(
 		return SessionCredential{}, err
 	}
 	provisionalDeadline := minTime(admissionDeadline, authorization.Deadline)
-	if !a.cfg.Now().Before(provisionalDeadline) {
+	if !a.cfg.Now().Before(provisionalDeadline) || !a.leaseNow().Before(admissionExpires) {
 		err = ErrSessionExpired
 		a.finishPreparedAttach(attemptID, attempt, provisionalDeadline, SessionCredential{}, nil, err)
 		return SessionCredential{}, err
@@ -520,8 +535,8 @@ func (a *Authority) PrepareAttach(
 	}
 	s := &session{
 		id: id, attempt: attemptID, secret: secret, peer: peer, access: authorization.Access,
-		state: SessionStateProvisional, provisionalDeadline: provisionalDeadline,
-		leaseExpires: provisionalDeadline, authorizationDeadline: authorization.Deadline,
+		state: SessionStateProvisional, provisionalDeadline: provisionalDeadline, provisionalExpires: admissionExpires,
+		leaseExpires: admissionExpires, authorizationDeadline: authorization.Deadline,
 		slots: make([]replaySlot, slots), terminal: make(chan struct{}),
 		mountEnrollmentID: authorization.MountEnrollmentID,
 	}
@@ -573,7 +588,7 @@ func (a *Authority) preparedAttachResult(attemptID AttachAttemptID) (SessionCred
 	s := attempt.session
 	s.mu.Lock()
 	cleanup := false
-	if s.state == SessionStateProvisional && s.activation == nil && !now.Before(s.provisionalDeadline) {
+	if s.state == SessionStateProvisional && s.activation == nil && (!now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires)) {
 		s.state = SessionStateAborted
 		cleanup = a.endSessionLocked(s.id, s)
 	}
@@ -602,7 +617,7 @@ func credentialMatchesSession(s *session, cred SessionCredential) bool {
 
 // PrepareActivation authenticates proof that the peer received the provisional
 // AttachReply and reserves the only PROVISIONAL -> ACTIVE transition. The
-// reservation closes the abort/sweep race while durable visibility membership
+// reservation closes the abort/sweep race while durable mount membership
 // is written. An exact replay after commit succeeds with a no-op token.
 func (a *Authority) PrepareActivation(ctx context.Context, cred SessionCredential, attemptID AttachAttemptID) (*ActivationToken, error) {
 	if ctx == nil || cred.Epoch != a.epoch || attemptID == (AttachAttemptID{}) {
@@ -630,7 +645,7 @@ func (a *Authority) PrepareActivation(ctx context.Context, cred SessionCredentia
 		switch s.state {
 		case SessionStateActive:
 			now := a.cfg.Now()
-			if !now.Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
+			if !a.leaseNow().Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
 				cleanup := a.endSessionLocked(s.id, s)
 				s.mu.Unlock()
 				a.mu.Unlock()
@@ -673,7 +688,7 @@ func (a *Authority) PrepareActivation(ctx context.Context, cred SessionCredentia
 			}
 		}
 		now := a.cfg.Now()
-		if !now.Before(s.provisionalDeadline) || !now.Before(s.authorizationDeadline) {
+		if !now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires) || !now.Before(s.authorizationDeadline) {
 			s.state = SessionStateAborted
 			cleanup := a.endSessionLocked(s.id, s)
 			s.mu.Unlock()
@@ -712,7 +727,7 @@ func (a *Authority) CommitActivation(token *ActivationToken) {
 	}
 	now := a.cfg.Now()
 	s.state = SessionStateActive
-	s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), s.authorizationDeadline)
+	s.leaseExpires = a.leaseNow().Add(min(a.cfg.SessionLease, s.authorizationDeadline.Sub(now)))
 	s.lockLease = a.locks.RegisterSession(s.id, s.leaseExpires)
 	if a.cfg.OnSessionActive != nil {
 		a.cfg.OnSessionActive(s.id)
@@ -917,7 +932,7 @@ func (a *Authority) notifySessionEnd(id SessionID) {
 
 // AttachActiveForTest creates an immediately active session solely for direct
 // tests of post-activation runtime behavior. Its explicit name prevents a
-// production handler from accidentally bypassing protocol 7's provisional
+// production handler from accidentally bypassing protocol 8's provisional
 // receipt proof and lifecycle-transactional activation boundary.
 func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authorization Authorization) (SessionCredential, error) {
 	if err := a.ValidateAttachSlots(slots); err != nil {
@@ -937,7 +952,7 @@ func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authori
 	}
 	s := &session{
 		id: id, secret: secret, peer: peer, access: authorization.Access, state: SessionStateActive,
-		leaseExpires:          minTime(now.Add(a.cfg.SessionLease), authorization.Deadline),
+		leaseExpires:          a.leaseNow().Add(min(a.cfg.SessionLease, authorization.Deadline.Sub(now))),
 		authorizationDeadline: authorization.Deadline,
 		slots:                 make([]replaySlot, slots),
 		terminal:              make(chan struct{}),
@@ -978,8 +993,9 @@ func (a *Authority) SessionTerminal(id SessionID) (<-chan struct{}, error) {
 
 // FenceSession ends one session immediately and permanently. It is the action
 // behind participant-scoped cache fencing: the authority stops recognising this
-// mount, and the mount learns it has been fenced from its own session dying,
-// which is what obliges it to revoke its kernel mount locally. It is idempotent,
+// mount. The frontend stops publication when it observes terminal session
+// state; this does not synchronously withdraw retained FSKit kernel caches.
+// It is idempotent,
 // so the path that fences a session and the terminal-channel watcher that
 // observes the result can both call it.
 func (a *Authority) FenceSession(id SessionID) {
@@ -1028,7 +1044,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		return nil, ErrSessionExpired
 	}
 	s.mu.Lock()
-	if s.fenced || s.ending {
+	if s.fenced || s.ending || renew && s.exclusion.closed() {
 		cleanup := a.endSessionLocked(cred.ID, s)
 		s.mu.Unlock()
 		a.mu.Unlock()
@@ -1059,7 +1075,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 	}
 	now := a.cfg.Now()
 	if s.state == SessionStateProvisional {
-		if s.activation == nil && (!now.Before(s.provisionalDeadline) || !now.Before(s.authorizationDeadline)) {
+		if s.activation == nil && (!now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires) || !now.Before(s.authorizationDeadline)) {
 			s.state = SessionStateAborted
 			cleanup := a.endSessionLocked(cred.ID, s)
 			s.mu.Unlock()
@@ -1082,7 +1098,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		}
 		return nil, ErrSessionFenced
 	}
-	if !now.Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
+	if !a.leaseNow().Before(s.leaseExpires) || !now.Before(s.authorizationDeadline) {
 		s.fenced = true
 		cleanup := a.endSessionLocked(cred.ID, s)
 		s.mu.Unlock()
@@ -1093,7 +1109,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		return nil, ErrSessionExpired
 	}
 	if renew {
-		s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), s.authorizationDeadline)
+		s.leaseExpires = a.leaseNow().Add(min(a.cfg.SessionLease, s.authorizationDeadline.Sub(now)))
 		if s.lockLease == nil {
 			s.mu.Unlock()
 			a.mu.Unlock()
@@ -1140,6 +1156,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 	}
 	if !s.ending {
 		wasActive := s.state == SessionStateActive
+		s.exclusion.stop(false)
 		s.ending = true
 		s.fenced = true
 		if s.state != SessionStateAborted {
@@ -1155,6 +1172,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 		}
 	}
 	if s.active == 0 && !s.cleanupStarted {
+		s.exclusion.drain()
 		s.cleanupStarted = true
 		return true
 	}
@@ -1222,7 +1240,7 @@ func (a *Authority) Reauthorize(cred SessionCredential, authorization Authorizat
 		}
 		return err
 	}
-	if s.fenced || s.ending {
+	if s.fenced || s.ending || s.exclusion.closed() {
 		return fail(ErrSessionFenced, true)
 	}
 	if cred.Generation != sessionCredentialGeneration || subtle.ConstantTimeCompare(s.secret[:], cred.Secret[:]) != 1 {
@@ -1268,7 +1286,7 @@ func (a *Authority) Reauthorize(cred SessionCredential, authorization Authorizat
 	s.authorizationDeadline = authorization.Deadline
 	s.authorizationSequence = sequence
 	s.authorizationProof = proof
-	s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), authorization.Deadline)
+	s.leaseExpires = a.leaseNow().Add(min(a.cfg.SessionLease, authorization.Deadline.Sub(now)))
 	s.lockLease.Renew(s.leaseExpires)
 	s.mu.Unlock()
 	a.mu.Unlock()
@@ -1412,13 +1430,13 @@ func (a *Authority) Sweep() int {
 			// A concurrent fence is remembered by endSessionLocked and applied by
 			// whichever resolution owns the token.
 			expired := s.activation == nil &&
-				(!now.Before(s.provisionalDeadline) || !now.Before(s.authorizationDeadline))
+				(!now.Before(s.provisionalDeadline) || !a.leaseNow().Before(s.provisionalExpires) || !now.Before(s.authorizationDeadline))
 			dead = dead || expired
 			if expired && !s.fenced && !s.ending {
 				s.state = SessionStateAborted
 			}
 		} else if s.state == SessionStateActive {
-			dead = dead || !now.Before(s.leaseExpires) || !now.Before(s.authorizationDeadline)
+			dead = dead || !a.leaseNow().Before(s.leaseExpires) || !now.Before(s.authorizationDeadline)
 		} else {
 			dead = true
 		}
@@ -1443,4 +1461,16 @@ func (a *Authority) Sweep() int {
 		hook()
 	}
 	return removed
+}
+
+// Signed authorization is checked against wall time separately. A renewable
+// session and its lock rights expire in the same continuous domain as coherence.
+func (a *Authority) leaseNow() time.Time { return continuousLeaseTime(a.cfg.ContinuousNow) }
+
+func continuousLeaseTime(read func() (time.Duration, error)) time.Time {
+	now, err := read()
+	if err != nil {
+		panic(err)
+	}
+	return time.Unix(0, int64(now))
 }

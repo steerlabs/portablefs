@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 func processStartIdentity(pid int) (string, error) {
@@ -27,6 +28,10 @@ func processStartIdentity(pid int) (string, error) {
 	fields := strings.Fields(string(data[close+1:]))
 	if len(fields) <= 19 {
 		return "", fmt.Errorf("malformed /proc/%d/stat: only %d trailing fields", pid, len(fields))
+	}
+	// Exited processes retain their starttime until reaped, but cannot serve.
+	if fields[0] == "Z" || fields[0] == "X" {
+		return "", &os.PathError{Op: "open", Path: fmt.Sprintf("/proc/%d/stat", pid), Err: syscall.ENOENT}
 	}
 	start, err := strconv.ParseUint(fields[19], 10, 64)
 	if err != nil {

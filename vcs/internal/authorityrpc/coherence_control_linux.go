@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -95,7 +96,7 @@ type coherenceControlState struct {
 func (h *VolumeHandler) initCoherenceControlState() *coherenceControlState {
 	h.coherenceControlOnce.Do(func() {
 		h.coherenceControl = &coherenceControlState{
-			now: time.Now, random: rand.Reader,
+			now: continuous.Time, random: rand.Reader,
 			sessions: make(map[volumeserver.SessionID]*coherenceControlSession),
 		}
 	})

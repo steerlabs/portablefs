@@ -1,8 +1,10 @@
 package cellplan
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -66,7 +68,7 @@ func TestSignedPlanBindsCellAndExactPayload(t *testing.T) {
 	}
 }
 
-func TestPlanAcceptsOnlyV2EnvelopeAndPayload(t *testing.T) {
+func TestPlanAcceptsOnlyCurrentEnvelopeAndPayload(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_700_000_000, 0)
 	plan := validPlan(now)
@@ -154,5 +156,51 @@ func TestSignRejectsPlanBeyondTransportBound(t *testing.T) {
 	plan.Volumes[0].ProductPublicKeyPEM = strings.Repeat("x", MaxPayloadBytes)
 	if _, err := Sign(privateKey, plan); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("oversized plan = %v, want ErrInvalid", err)
+	}
+}
+
+func TestSignedPlanGrammarRejectsVolumeTrustOverrides(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_700_000_000, 0)
+	plan := validPlan(now)
+	payload, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"authority_ca_pem", "client_ca_pem", "capability_public_key_pem"} {
+		for _, value := range []string{`"override"`, `""`, `null`} {
+			t.Run(key+value, func(t *testing.T) {
+				injected := bytes.Replace(payload, []byte(`"volumes":[{`), []byte(`"volumes":[{"`+key+`":`+value+`,`), 1)
+				envelope := signPayload(privateKey, "v3", domainV3, injected)
+				if got, digest, err := Verify(publicKey, envelope, plan.CellID, now, time.Second, 5*time.Minute); !errors.Is(err, ErrInvalid) || got.Version != 0 || digest != ([32]byte{}) {
+					t.Fatalf("override decode = version %d digest %x error %v", got.Version, digest, err)
+				}
+			})
+		}
+	}
+}
+
+func signPayload(key ed25519.PrivateKey, prefix, domain string, payload []byte) Envelope {
+	signature := ed25519.Sign(key, append([]byte(domain), payload...))
+	return Envelope{Token: prefix + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature)}
+}
+
+func TestSignedPlanRequiresExactVersionPrefixAndDomain(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_700_000_000, 0)
+	plan := validPlan(now)
+	for _, version := range []uint32{0, Version - 1, Version + 1, ^uint32(0)} {
+		plan.Version = version
+		payload, _ := json.Marshal(plan)
+		if _, _, err := Verify(publicKey, signPayload(privateKey, "v3", domainV3, payload), plan.CellID, now, time.Second, 5*time.Minute); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("version %d accepted: %v", version, err)
+		}
+	}
+	plan.Version = Version
+	payload, _ := json.Marshal(plan)
+	for _, test := range []struct{ prefix, domain string }{{"v2", domainV3}, {"v4", domainV3}, {"v3", "portablefs-cell-plan-v2\x00"}, {"v3", "portablefs-cell-plan-v4\x00"}} {
+		if _, _, err := Verify(publicKey, signPayload(privateKey, test.prefix, test.domain, payload), plan.CellID, now, time.Second, 5*time.Minute); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("prefix/domain accepted: %v", err)
+		}
 	}
 }

@@ -55,8 +55,8 @@ func validCopyFileRangeRequest(body *authoritypb.CopyFileRangeRequest) bool {
 		body.GetFlags() == 0
 }
 
-func rangeCoordinate(coordinate xfsstore.ObjectCoordinate) visibilityCoordinate {
-	return visibilityCoordinate{
+func rangeCoordinate(coordinate xfsstore.ObjectCoordinate) mutationCoordinate {
+	return mutationCoordinate{
 		identity: coordinate.Stable,
 		ino:      coordinate.Ino,
 		device:   uint64(coordinate.DeviceMajor)<<32 | uint64(coordinate.DeviceMinor),
@@ -105,10 +105,10 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 		return h.errorResponse(req.GetRequestId(), errInternal, false)
 	}
 	var handle xfsstore.Capability
-	var coordinate visibilityCoordinate
+	var coordinate mutationCoordinate
 	var before xfsstore.Attr
 	var releaseMutation func()
-	prepare := func() ([]volumeserver.VisibilityTarget, error) {
+	prepare := func() ([]volumeserver.MutationTarget, error) {
 		if !validFallocateRequest(body) {
 			return nil, syscall.EINVAL
 		}
@@ -122,7 +122,7 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			return nil, err
 		}
 		coordinate = rangeCoordinate(resolved)
-		before, err = h.Store.GetattrOpen(handle)
+		before, err = h.getattrOpen(handle)
 		if err != nil {
 			return nil, err
 		}
@@ -130,12 +130,12 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 		if err != nil {
 			return nil, err
 		}
-		return []volumeserver.VisibilityTarget{
-			inodeTarget(volumeserver.VisibilityData, coordinate, 0),
-			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
+		return []volumeserver.MutationTarget{
+			inodeTarget(volumeserver.MutationData, coordinate, 0),
+			inodeTarget(volumeserver.MutationAttributes, coordinate, 0),
 		}, nil
 	}
-	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64, changed *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
 		var post xfsstore.Attr
 		var applyErr error
 		dispatched := false
@@ -160,26 +160,31 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			}
 			_, _, applyErr = h.Restore.Write(ctx, coordinate.identity, body.GetOffset(), length, apply)
 		} else {
-			_, _, applyErr = apply()
+			// Allocation-only modes still update and sample inode metadata.
+			// Keep both inside the hydration lock without recalling file data.
+			applyErr = h.Restore.WithAttrLock(coordinate.identity, func() error {
+				_, _, err := apply()
+				return err
+			})
 		}
 		if applyErr != nil && !dispatched {
 			return h.errorResponse(0, applyErr, false), nil
 		}
 		if applyErr != nil && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
-				return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
+				return h.errorResponse(0, applyErr, true), []volumeserver.MutationTarget{}
 			}
 			var limit *xfsstore.WriteLimitError
 			if errors.As(applyErr, &limit) && limit.RLimit &&
 				(post.Kind != xfsstore.KindRegular || post.Size < 0) {
-				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+				return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 			}
 			response := fallocateRejected(h, post, applyErr)
 			h.deferStorageFailure(nil, applyErr)
 			return response, nil
 		}
 		if post.Kind != xfsstore.KindRegular || post.Size < 0 || sequence == 0 {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 		}
 		flags, resultErr := rangeReplyApplied, int32(0)
 		if applyErr != nil {
@@ -187,18 +192,18 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			resultErr = rangeResultError(applyErr)
 		}
 		resp := h.success(0)
-		resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
+		resp.PostState = h.mutationPostState(changed, sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		resp.Body = &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 			PostSize: uint64(post.Size), VisibilitySequence: sequence, Flags: flags, Error: resultErr,
 		}}
 		if applyErr != nil {
 			h.deferStorageFailure(resp, applyErr)
 		}
-		return resp, []volumeserver.VisibilityTarget{
-			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
-			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
+		return resp, []volumeserver.MutationTarget{
+			inodeTarget(volumeserver.MutationData, coordinate, post.Size),
+			inodeTarget(volumeserver.MutationAttributes, coordinate, 0),
 		}
-	}, &releaseMutation)
+	}, nil, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()
 	}
@@ -211,10 +216,10 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		return h.errorResponse(req.GetRequestId(), errInternal, false)
 	}
 	var input, output xfsstore.Capability
-	var sourceCoordinate, destinationCoordinate visibilityCoordinate
+	var sourceCoordinate, destinationCoordinate mutationCoordinate
 	var sourceBefore xfsstore.Attr
 	var releaseMutation func()
-	prepare := func() ([]volumeserver.VisibilityTarget, error) {
+	prepare := func() ([]volumeserver.MutationTarget, error) {
 		if !validCopyFileRangeRequest(body) {
 			return nil, syscall.EINVAL
 		}
@@ -226,7 +231,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if err != nil {
 			return nil, err
 		}
-		sourceBefore, err = h.Store.GetattrOpen(input)
+		sourceBefore, err = h.getattrOpen(input)
 		if err != nil {
 			return nil, err
 		}
@@ -246,14 +251,22 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if err != nil {
 			return nil, err
 		}
-		return []volumeserver.VisibilityTarget{
-			inodeTarget(volumeserver.VisibilityData, sourceCoordinate, 0),
-			inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0),
-			inodeTarget(volumeserver.VisibilityData, destinationCoordinate, 0),
-			inodeTarget(volumeserver.VisibilityAttributes, destinationCoordinate, 0),
+		return []volumeserver.MutationTarget{
+			inodeTarget(volumeserver.MutationData, sourceCoordinate, 0),
+			inodeTarget(volumeserver.MutationAttributes, sourceCoordinate, 0),
+			inodeTarget(volumeserver.MutationData, destinationCoordinate, 0),
+			inodeTarget(volumeserver.MutationAttributes, destinationCoordinate, 0),
 		}, nil
 	}
-	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64, changed *mutationChanges) (*authoritypb.Response, []volumeserver.MutationTarget) {
+		// On the required noatime mount, CFR leaves a distinct source inode
+		// unchanged. Sample it under the complete storage turn before apply so
+		// a destination sync failure cannot fence away that exact observation.
+		var sourceErr error
+		sourceBefore, sourceErr = h.getattrOpen(input)
+		if sourceErr != nil {
+			return h.errorResponse(0, sourceErr, false), nil
+		}
 		copyLength := uint64(0)
 		if sourceBefore.Size > 0 && body.GetInputOffset() < uint64(sourceBefore.Size) {
 			copyLength = min(body.GetLength(), uint64(sourceBefore.Size)-body.GetInputOffset())
@@ -275,7 +288,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			})
 			return int(copied), -1, applyErr
 		}
-		if h.Restore != nil && h.Restore.Active() && copyLength != 0 {
+		if h.Restore != nil && h.Restore.Active() {
 			var n int
 			n, _, applyErr = h.Restore.Write(ctx, destinationCoordinate.identity, body.GetOutputOffset(), copyLength, apply)
 			copied = uint64(n)
@@ -285,8 +298,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if applyErr != nil && !dispatched {
 			return h.errorResponse(0, applyErr, false), nil
 		}
-		zeroPostApply := copied == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
-			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
+		zeroPostApply := copied == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply)
 		if copied == 0 && !zeroPostApply {
 			if applyErr == nil {
 				resp := h.success(0)
@@ -294,30 +306,30 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 				return resp, nil
 			}
 			if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) || errors.Is(applyErr, xfsstore.ErrWritePostApply) {
-				return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
+				return h.errorResponse(0, applyErr, true), []volumeserver.MutationTarget{}
 			}
 			response := copyFileRangeRejected(h, applyErr)
 			h.deferStorageFailure(nil, applyErr)
 			return response, nil
 		}
 		if copied > body.GetLength() || post.Kind != xfsstore.KindRegular || post.Size < 0 || sequence == 0 ||
-			errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			(errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) && !errors.Is(applyErr, xfsstore.ErrWritePostApply)) {
+			return h.errorResponse(0, errors.Join(syscall.EIO, applyErr), true), []volumeserver.MutationTarget{}
 		}
 		if copied != 0 && (body.GetOutputOffset() > math.MaxInt64-copied || uint64(post.Size) < body.GetOutputOffset()+copied) {
-			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.MutationTarget{}
 		}
 		flags, resultErr := rangeReplyApplied, int32(0)
 		if errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			flags |= rangeReplyPostApply
 			resultErr = rangeResultError(applyErr)
 		}
-		sourcePost, sourceErr := h.Store.GetattrOpen(input)
-		if sourceErr != nil {
-			return h.errorResponse(0, sourceErr, true), []volumeserver.VisibilityTarget{}
+		sourcePost := sourceBefore
+		if sourceCoordinate.identity == destinationCoordinate.identity {
+			sourcePost = post
 		}
 		resp := h.success(0)
-		resp.PostState = h.mutationPostState(sequence,
+		resp.PostState = h.mutationPostState(changed, sequence,
 			postStateSnapshot{identity: sourceCoordinate.identity, attr: sourcePost, roles: postStateRoleSource, changed: false},
 			postStateSnapshot{identity: destinationCoordinate.identity, attr: post, roles: postStateRoleDestination, changed: true},
 		)
@@ -327,12 +339,12 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if applyErr != nil {
 			h.deferStorageFailure(resp, applyErr)
 		}
-		return resp, []volumeserver.VisibilityTarget{
-			inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0),
-			inodeTarget(volumeserver.VisibilityData, destinationCoordinate, post.Size),
-			inodeTarget(volumeserver.VisibilityAttributes, destinationCoordinate, 0),
+		return resp, []volumeserver.MutationTarget{
+			inodeTarget(volumeserver.MutationAttributes, sourceCoordinate, 0),
+			inodeTarget(volumeserver.MutationData, destinationCoordinate, post.Size),
+			inodeTarget(volumeserver.MutationAttributes, destinationCoordinate, 0),
 		}
-	}, &releaseMutation)
+	}, nil, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()
 	}

@@ -4,8 +4,10 @@ package fusev3
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -140,4 +142,40 @@ func TestEpochRecoveryStalesOldHandlesAndAdmitsNewOpens(t *testing.T) {
 	if errno != 0 || newHandle == nil || newHandle.stale.Load() || newRecord.node.epochStale.Load() {
 		t.Fatalf("new-epoch Open = (%p, %v), stale node/handle", newHandle, errno)
 	}
+}
+
+type unavailableEpochRPC struct {
+	*fakeRPC
+	attempts int
+}
+
+func (r *unavailableEpochRPC) RecoverEpoch(context.Context) (RPC, error) {
+	r.attempts++
+	return nil, syscall.ECONNREFUSED
+}
+
+func TestEpochRecoveryStopsAtOperationDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		provider := &unavailableEpochRPC{fakeRPC: newFakeRPC()}
+		cfg := testConfig(8)
+		cfg.RequestTimeout = 250 * time.Millisecond
+		mount := newMount(t.Context(), provider, cfg)
+		newRawFileSystem(mount, &node{mount: mount, item: provider.Root()})
+		mount.setNotifier(&fakeNotifier{})
+		t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
+		start := time.Now()
+		if err := mount.recoverEpoch(t.Context()); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("recovery = %v, want its operation deadline", err)
+		}
+		if elapsed := time.Since(start); elapsed != cfg.RequestTimeout {
+			t.Fatalf("recovery elapsed %s, budget %s", elapsed, cfg.RequestTimeout)
+		}
+		if provider.attempts != 3 {
+			t.Fatalf("recovery attempts = %d, want three bounded connection attempts", provider.attempts)
+		}
+		_, _, _, active := mount.subscription.currentIncarnation()
+		if active || !mount.raw.nodesByID[1].node.epochStale.Load() {
+			t.Fatal("failed recovery revived old cache admission")
+		}
+	})
 }

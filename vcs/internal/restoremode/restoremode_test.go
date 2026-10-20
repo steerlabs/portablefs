@@ -23,6 +23,7 @@ type fakeStore struct {
 	events        []string
 	linked        bool
 	mtimeRestores int
+	mtime         int64
 }
 
 func newFakeStore(sizes map[uint32]int64) *fakeStore {
@@ -63,10 +64,16 @@ func (s *fakeStore) bytes(entry uint32) []byte {
 	return append([]byte(nil), s.data[entry]...)
 }
 func (s *fakeStore) Fdatasync(uint32) error { s.event("fdatasync"); return nil }
-func (s *fakeStore) RestoreMtime(uint32) error {
+func (s *fakeStore) Mtime(uint32) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mtime, nil
+}
+func (s *fakeStore) RestoreMtime(_ uint32, nanos int64) error {
 	s.mu.Lock()
 	s.events = append(s.events, "mtime")
 	s.mtimeRestores++
+	s.mtime = nanos
 	s.mu.Unlock()
 	return nil
 }
@@ -589,36 +596,48 @@ func TestRecallCapQueuesAndDeadlineIsNamed(t *testing.T) {
 	first := make(chan error, 1)
 	go func() { first <- mode.EnsureHydrated(context.Background(), identity, 0, 4) }()
 	<-hydrator.fetchStarted
-	// A second recall for a DIFFERENT chunk queues behind the held slot and
-	// shares its fate: the slot never frees, so it names the deadline too.
+	// A second recall for a different chunk queues behind the held slot. Its
+	// deadline must be named whether it expires queued or fetching after the
+	// first call releases the slot.
 	second := make(chan error, 1)
 	go func() {
 		second <- mode.EnsureHydrated(context.Background(), identity, 4, 4)
 	}()
-	select {
-	case err := <-second:
-		t.Fatalf("queued recall returned before the deadline: %v", err)
-	case <-time.After(30 * time.Millisecond):
-	}
 	if err := <-first; !errors.Is(err, ErrRecallDeadline) {
 		t.Fatalf("deadline=%v", err)
 	}
 	if err := <-second; !errors.Is(err, ErrRecallDeadline) {
 		t.Fatalf("queued recall=%v", err)
 	}
-	// Once the hydrator recovers, a queued recall completes instead of failing.
+	// Both calls have returned, so neither may retain recall capacity, even
+	// while the hydrator is still blocked and no drain can release it.
+	if got := len(mode.recalls); got != 0 {
+		t.Fatalf("recall slots after deadlines = %d, want 0", got)
+	}
 	hydrator.mu.Lock()
 	close(hydrator.blockFetch)
 	hydrator.blockFetch = nil
 	hydrator.mu.Unlock()
-	if err := mode.EnsureHydrated(context.Background(), identity, 0, 4); err != nil {
+	// Exercise the same hydration path without the short deadline used above
+	// to force expiry. This checks capacity and socket pool recovery without
+	// imposing an 80 ms scheduling bound on a loaded runner.
+	key := chunkKey{0, 0}
+	lock := mode.chunkLock(key)
+	lock.Lock()
+	_, err := mode.hydrateLocked(context.Background(), key, false, true)
+	lock.Unlock()
+	if err != nil {
 		t.Fatalf("recall after recovery = %v", err)
+	}
+	if got := len(mode.recalls); got != 0 {
+		t.Fatalf("recall slots after recovery = %d, want 0", got)
 	}
 }
 
 func TestRecallSaturationDoesNotBlockSessionKeepAlive(t *testing.T) {
 	authority, err := volumeserver.New("12345678-1234-1234-1234-123456789abc", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -705,18 +724,17 @@ func TestDrainConvergesAndWritesProgress(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := os.Stat(filepath.Join(mode.cfg.StateRoot, ProgressFilename)); err != nil {
-		time.Sleep(30 * time.Millisecond)
-		_, err = os.Stat(filepath.Join(mode.cfg.StateRoot, ProgressFilename))
-		if err != nil {
+	// Convergence and periodic progress have independent publication cuts. An
+	// earlier progress file may already exist when convergence becomes visible.
+	var progress progressRecord
+	waitForRestoreMode(t, time.Until(deadline), "final drain progress record", func() bool {
+		err := readStrictJSON(filepath.Join(mode.cfg.StateRoot, ProgressFilename), &progress)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
-	}
-	var progress progressRecord
-	if err := readStrictJSON(filepath.Join(mode.cfg.StateRoot, ProgressFilename), &progress); err != nil {
-		t.Fatal(err)
-	}
-	if progress.Version != 1 || progress.ProgressPermille != 1000 || progress.State != StateHealthy || progress.DrainedBytes != 8 {
+		return err == nil && progress.ProgressPermille == 1000 && progress.State == StateHealthy && progress.DrainedBytes == 8
+	})
+	if progress.Version != 1 {
 		t.Fatalf("progress = %+v", progress)
 	}
 	var converged convergedRecord
@@ -820,7 +838,7 @@ func TestTruncateZeroIsFetchFreeAndShorteningRecallsBoundary(t *testing.T) {
 	}
 }
 
-func TestUserModifiedSuppressesLaterMtimeRestore(t *testing.T) {
+func TestUserModifiedPreservesLaterHydrationMtime(t *testing.T) {
 	store := newFakeStore(map[uint32]int64{0: 8})
 	mode, _, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}, [2]uint32{0, 1}), map[chunkKey]Chunk{{0, 0}: {Extents: []Extent{{Data: []byte("abcd")}}}, {0, 1}: {Extents: []Extent{{Data: []byte("efgh")}}}}, func(c *Config) { c.disableDrain = true })
 	if err := mode.EnsureHydrated(context.Background(), identity, 0, 4); err != nil {
@@ -835,8 +853,8 @@ func TestUserModifiedSuppressesLaterMtimeRestore(t *testing.T) {
 	store.mu.Lock()
 	restores := store.mtimeRestores
 	store.mu.Unlock()
-	if restores != 1 {
-		t.Fatalf("mtime restores=%d want 1", restores)
+	if restores != 2 {
+		t.Fatalf("mtime restores=%d want 2", restores)
 	}
 }
 

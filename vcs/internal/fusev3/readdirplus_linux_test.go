@@ -326,7 +326,7 @@ func TestReadDirPlusWithdrawalStopsTheCurrentReplyPage(t *testing.T) {
 			subscription.mu.Lock()
 			cacheUntil := subscription.cacheUntil
 			if expiry {
-				subscription.cacheUntil = time.Now().Add(-time.Second)
+				subscription.cacheUntil = subscription.config.clock.Now().Add(-time.Second)
 			}
 			subscription.mu.Unlock()
 			if !expiry {
@@ -399,4 +399,67 @@ func TestReadDirPlusReclaimsDiscardedPageBeforeFetchingAgain(t *testing.T) {
 	if len(rpc.readdirs) != 2 {
 		t.Fatal("cleanup did not reopen page admission")
 	}
+}
+
+// One READDIRPLUS reply carries one page's snapshot. When this mount's own
+// mutations overtake every fetch, each page is served without a stamp, so two
+// such pages look alike; a withdrawal between two entries of a reply must
+// still end the reply instead of letting it continue into the next page.
+func TestReadDirPlusReplyNeverSpansTwoOvertakenPages(t *testing.T) {
+	raw, mount, rpc := testRawFileSystem(t, 16)
+	pages := plusTestPages(4)
+	first := &authoritypb.ReadDirReply{Verifier: testToken(5), Entries: pages[0].Entries[:2]}
+	second := &authoritypb.ReadDirReply{Verifier: testToken(5), Entries: pages[0].Entries[2:], Eof: true}
+	for _, entry := range second.Entries {
+		entry.SnapshotSequence, entry.Item.SnapshotSequence = 7, 7
+	}
+	id, _ := testDirHandle(t, raw, first, second)
+	held, handle := raw.acquireDirHandle(id)
+	rpc.hook = func(request *authoritypb.Request) {
+		if request.GetReadDir() != nil {
+			handle.invalidateEnumeration()
+		}
+	}
+	unique := nextTestRequestUnique()
+	ctx, finish, status := raw.mutationContext(unique)
+	if status != fuse.OK {
+		t.Fatal(status)
+	}
+	defer finish()
+	cursor, errno := handle.beginDirPlus(ctx, 0)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	if err := raw.attachDirPlusLookupTransaction(ctx, cursor, held); err != nil {
+		t.Fatal(err)
+	}
+	out := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	var page dirPlusPageBoundary
+	entry, _, item, _, stamp, errno := handle.takePlus(ctx, out, &page)
+	if errno != 0 || entry == nil || item == nil || stamp != (subscriptionStamp{}) {
+		t.Fatalf("overtaken first page entry = %v item=%v stamp=%+v errno=%v, want an entry with no stamp", entry, item, stamp, errno)
+	}
+	record, errno := raw.intern(ctx, item)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	if err := raw.stageDirPlusLookup(ctx, record, held.inode, entry.Name); err != nil {
+		t.Fatal(err)
+	}
+	handle.invalidateEnumeration()
+	if entry, _, item, _, _, errno := handle.takePlus(ctx, out, &page); errno != 0 || entry != nil || item != nil {
+		t.Fatalf("reply continued across a withdrawal: entry=%v item=%v errno=%v", entry, item, errno)
+	}
+	if len(rpc.readdirs) != 1 {
+		t.Fatalf("the ended reply fetched %d pages, want 1", len(rpc.readdirs))
+	}
+	if err := raw.commitDirPlusLookupTransaction(ctx); err != nil {
+		t.Fatal(err)
+	}
+	raw.PrepareReplyPayload(unique, 42, 44, nil, nil, 0)
+	completeTestReply(t, raw, unique, fuse.OK)
+	if handle.next != 1 || record.lookups != 1 {
+		t.Fatalf("accepted one-entry reply lost its cursor or lookup: next=%d lookups=%d", handle.next, record.lookups)
+	}
+	_ = mount
 }

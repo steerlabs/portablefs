@@ -24,7 +24,7 @@ import Testing
 
     if #available(macOS 26.0, *) {
         let expectedRootIdentifier = try PfsFSKitMapping.itemIdentifier(
-            from: root.identity.itemID
+            from: root.fileID
         )
         #expect(expectedRootIdentifier == .rootDirectory)
 

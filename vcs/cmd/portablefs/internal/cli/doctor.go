@@ -78,7 +78,7 @@ func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
 		hostCheck:     mounthost.Check,
 		verifiedMount: e.verifiedMount,
 		daemonHealthy: func(controlSock string) bool {
-			cfg, err := fskitConfigFromEnv(e.getenv)
+			cfg, err := fixedFSKitConfig()
 			if err != nil {
 				return false
 			}
@@ -87,7 +87,7 @@ func newDoctorRun(e *cmdEnv, opts commonOpts) *doctorRun {
 			return err == nil
 		},
 		daemonAttaches: func(controlSock string) ([]cliAttachStatus, error) {
-			cfg, err := fskitConfigFromEnv(e.getenv)
+			cfg, err := fixedFSKitConfig()
 			if err != nil {
 				return nil, err
 			}
@@ -262,7 +262,7 @@ func (r *doctorRun) checkDaemon() doctorResult {
 	if r.goos != "darwin" {
 		return doctorSkip("portablefsd serves FSKit mounts (macOS-only)")
 	}
-	cfg, err := fskitConfigFromEnv(r.e.getenv)
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return doctorFail(err.Error(), "repair canonical account home resolution before using FSKit")
 	}
@@ -288,7 +288,7 @@ func (r *doctorRun) checkAttaches() doctorResult {
 	if r.goos != "darwin" {
 		return r.checkFUSESessions()
 	}
-	cfg, err := fskitConfigFromEnv(r.e.getenv)
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return doctorFail(err.Error(), "repair canonical account home resolution before using FSKit")
 	}
@@ -305,7 +305,7 @@ func (r *doctorRun) checkAttaches() doctorResult {
 	var lines []string
 	problems := 0
 	for _, a := range attaches {
-		line := fmt.Sprintf("%s  %s@%s  %s", a.MountPath, a.VolumeID, a.Branch, a.State)
+		line := fmt.Sprintf("%s  %s  %s", a.MountPath, a.VolumeID, a.State)
 		if a.State == "degraded" && a.LastError != "" {
 			line += "  (" + a.LastError + ")"
 		}
@@ -401,7 +401,7 @@ func (r *doctorRun) checkMounts() doctorResult {
 	var stale, expired, revoked []string
 	for _, st := range states {
 		health := r.e.classifyMount(&st)
-		line := fmt.Sprintf("%s  %s@%s  %s  %s", st.MountPath, st.VolumeID, st.Branch, st.Strategy, health)
+		line := fmt.Sprintf("%s  %s  %s  %s", st.MountPath, st.VolumeID, st.Strategy, health)
 		if health == mountStatusRevoked && st.StatusReason != "" {
 			line += "  (" + st.StatusReason + ")"
 		}

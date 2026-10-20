@@ -27,7 +27,7 @@ type record struct {
 }
 type file struct {
 	batchStorage    batch
-	entryStorage    [4]Entry
+	entryStorage    [MaxWaveWidth]Entry
 	flushOffset     int
 	id              Identity
 	generation      uint64
@@ -56,7 +56,6 @@ type barrierState struct {
 	errno   syscall.Errno
 }
 type Buffer struct {
-	batcher                                 BatchFlusher
 	batchWidth, batchPayload                int
 	maxFlushIdentities                      int
 	waitingAdmissions                       int
@@ -82,9 +81,11 @@ type Buffer struct {
 	ctx                                     context.Context
 	cancel                                  context.CancelFunc
 	done                                    chan struct{}
-	interval                                time.Duration
+	start                                   sync.Once
 }
 
+// New allocates the buffer. The owner calls Start after installing its flush
+// callbacks; admissions made before Start retain their wakeup.
 func New(flusher Flusher, opts Options) (*Buffer, error) {
 	if flusher == nil || opts.MaxBytes < 0 || opts.MaxEntries < 0 || opts.MaxFlushIdentities < 0 {
 		return nil, ErrInvalid
@@ -94,9 +95,6 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 	}
 	if opts.MaxEntries == 0 {
 		opts.MaxEntries = DefaultMaxEntries
-	}
-	if opts.FlushInterval == 0 {
-		opts.FlushInterval = time.Second
 	}
 	if opts.MaxFlushIdentities == 0 {
 		opts.MaxFlushIdentities = 16
@@ -109,26 +107,22 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 		records:     make([]record, opts.MaxEntries),
 		pool:        newExtentPool(2*opts.MaxEntries + 2),
 		maxBytes:    opts.MaxBytes, maxEntries: opts.MaxEntries,
-		flusher: flusher, interval: opts.FlushInterval,
-		kick: make(chan struct{}, 1), done: make(chan struct{}),
+		flusher: flusher,
+		kick:    make(chan struct{}, 1), done: make(chan struct{}),
 	}
-	if batcher, ok := flusher.(BatchFlusher); ok {
-		width, payload := batcher.FlushBatchSize()
-		if width < 0 || width > 4 || width > 0 && (payload <= 0 || payload > MaxPayload) {
-			return nil, ErrInvalid
-		}
-		if width > 0 {
-			b.batcher, b.batchWidth, b.batchPayload = batcher, width, payload
-		}
+	b.batchWidth, b.batchPayload = flusher.FlushBatchSize()
+	if b.batchWidth <= 0 || b.batchWidth > MaxWaveWidth || b.batchPayload <= 0 || b.batchPayload > MaxPayload {
+		return nil, ErrInvalid
 	}
 	for i := range b.records {
 		b.records[i].next = b.free
 		b.free = &b.records[i]
 	}
 	b.ctx, b.cancel = context.WithCancel(context.Background())
-	go b.schedule()
 	return b, nil
 }
+
+func (b *Buffer) Start() { b.start.Do(func() { go b.schedule() }) }
 func (b *Buffer) file(id Identity) *file {
 	f := b.files[id]
 	if f == nil {
@@ -265,9 +259,10 @@ func (b *Buffer) admit(ctx context.Context, id Identity, generation uint64, kind
 			b.count++
 			b.bytes += int64(len(data))
 			b.overlay(f, r)
-			if b.count == b.maxEntries || b.bytes == b.maxBytes {
-				b.trigger()
+			if f.scheduled || f.flushing {
+				f.reschedule = true
 			}
+			b.trigger()
 			return Cut{b.sequence, b.loss}, nil
 		}
 		if b.count == b.maxEntries || b.bytes == b.maxBytes || int64(len(data)) > b.maxBytes-b.bytes {
@@ -577,6 +572,7 @@ func (b *Buffer) FenceAdmissions() {
 func (b *Buffer) Stop() {
 	b.FenceAdmissions()
 	b.cancel()
+	b.Start()
 	<-b.done
 }
 
@@ -604,7 +600,7 @@ func (b *Buffer) schedule() {
 				}
 				b.mu.Lock()
 				job.file.scheduled = false
-				if err == nil && job.file.reschedule && job.file.accepted != nil {
+				if job.file.reschedule && job.file.accepted != nil {
 					job.file.reschedule = false
 					b.trigger()
 				}
@@ -618,25 +614,27 @@ func (b *Buffer) schedule() {
 		workers.Wait()
 		close(b.done)
 	}()
-	var tick <-chan time.Time
-	if b.interval > 0 {
-		timer := time.NewTicker(b.interval)
-		tick = timer.C
-		defer timer.Stop()
-	}
 	for {
 		select {
 		case <-b.ctx.Done():
 			return
-		case <-tick:
 		case <-b.kick:
 		}
 		b.mu.Lock()
 		cut := Cut{b.sequence, b.loss}
 		var pending []backgroundFlush
 		for _, f := range b.active {
-			if f.scheduled || f.flushing {
-				f.reschedule = true
+			if f.scheduled {
+				continue
+			}
+			if f.flushing {
+				// An explicit owner can consume only an earlier cut or return
+				// without application. Hand this scan's work to its completion;
+				// a scheduled background owner already owns its wakeup and must
+				// not turn an ordinary failure into an endless retry loop.
+				if f.accepted != nil {
+					f.reschedule = true
+				}
 				continue
 			}
 			f.reschedule = false

@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -201,5 +202,35 @@ func TestStoreCompactionAndReloadPreserveRenewalFenceHighWater(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerSnapshotUsesExactCurrentCellGrammar(t *testing.T) {
+	if StateSchemaVersion != 3 {
+		t.Fatalf("snapshot schema = %d", StateSchemaVersion)
+	}
+	h := newManagerHarness(t)
+	cell, err := h.manager.RegisterCell("cell-grammar", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100000, Pool: PoolProduct, LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(cell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"plan_versions", "helper_plan_versions", "helper_state_versions"} {
+		for _, value := range []string{"null", "[]"} {
+			injected := append([]byte(`{"`+key+`":`+value+`,`), data[1:]...)
+			if _, err := decodeStrict[Cell](injected); err == nil {
+				t.Fatalf("removed cell member %s=%s accepted", key, value)
+			}
+		}
+	}
+	state := currentState(t, h)
+	for _, version := range []uint32{0, StateSchemaVersion - 1, StateSchemaVersion + 1} {
+		state.SchemaVersion = version
+		if err := state.Validate(); err == nil {
+			t.Fatalf("state version %d accepted", version)
+		}
 	}
 }

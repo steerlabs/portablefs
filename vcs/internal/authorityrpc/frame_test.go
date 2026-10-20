@@ -299,7 +299,7 @@ func TestStreamedFrameDigestMatchesOneShotReplayFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	decoded := new(authoritypb.Request)
-	release, streamed, err := readRequestFrameRetained(bytes.NewReader(encoded.Bytes()), 2<<20, nil, 0, decoded)
+	release, streamed, err := readRequestFrameRetained(t.Context(), bytes.NewReader(encoded.Bytes()), 2<<20, nil, 0, decoded, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,8 @@ func TestStreamedFrameDigestMatchesOneShotReplayFingerprint(t *testing.T) {
 		t.Fatalf("streamed payload digest = %x, want %x", streamed, wantDigest)
 	}
 	runtime, err := volumeserver.New("streamed-frame-digest", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -430,14 +431,6 @@ func TestFrameRejectsInlineBulkCopy(t *testing.T) {
 	}
 }
 
-func encodedRawFrame(metadata, bulk []byte) []byte {
-	frame := make([]byte, frameHeaderBytes, frameHeaderBytes+len(metadata)+len(bulk))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(metadata)))
-	binary.BigEndian.PutUint32(frame[4:8], uint32(len(bulk)))
-	frame = append(frame, metadata...)
-	return append(frame, bulk...)
-}
-
 func TestFrameRejectsNonCanonicalMetadataBeforeDecode(t *testing.T) {
 	valid, err := proto.Marshal(&authoritypb.Request{
 		RequestId: 17,
@@ -484,32 +477,21 @@ func TestFrameRejectsNonCanonicalMetadataBeforeDecode(t *testing.T) {
 }
 
 func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
-	features := make([]string, maxWireFeatureElements+1)
-	request := &authoritypb.Request{
-		RequestId: 19,
-		Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
-			ProtocolMajor: ProtocolMajor,
-			Features:      features,
-		}},
-	}
+	request := &authoritypb.Request{RequestId: 19, Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: make([][]byte, maxWireRepeatedElements+1)}}}
 	metadata, err := proto.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var decoded authoritypb.Request
-	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
 		t.Fatalf("oversized repeated field = %v, want ErrFrameEncoding", err)
 	}
-	if decoded.GetHello() != nil {
+	if decoded.GetRequestId() != 0 || decoded.GetBody() != nil {
 		t.Fatal("repeated-field amplification reached protobuf decode")
 	}
-	// The typed outbound encoder does not repeat untrusted ingress validation.
 	var outbound bytes.Buffer
-	if err := writeFrame(&outbound, 4096, request); err != nil {
-		t.Fatal(err)
-	}
-	if err := readFrame(&outbound, 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("encoded oversized repetition escaped ingress: %v", err)
+	if err := writeFrame(&outbound, 1<<20, request); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("outbound repeated bound: %v", err)
 	}
 
 }
@@ -532,12 +514,10 @@ func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
 		t.Fatal("nested allocation amplification reached protobuf decode")
 	}
 	var outbound bytes.Buffer
-	if err := writeFrame(&outbound, 1<<20, response); err != nil {
-		t.Fatal(err)
+	if err := writeFrame(&outbound, 1<<20, response); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("outbound tree bound: %v", err)
 	}
-	if err := readFrame(&outbound, 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("encoded nested amplification escaped ingress: %v", err)
-	}
+
 }
 
 func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
@@ -552,17 +532,17 @@ func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	total := binary.BigEndian.Uint32(frame.Bytes()[:4]) + binary.BigEndian.Uint32(frame.Bytes()[4:8])
-	budget := newFrameBudget(uint64(total))
+	budget := newFrameBudget(uint64(total), 0)
 	var got authoritypb.Request
 	release, err := readFrameRetained(bytes.NewReader(frame.Bytes()), 8192, budget, time.Second, &got)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := budget.acquire(context.Background(), 1, 20*time.Millisecond); !errors.Is(err, ErrFrameBudget) {
+	if err := budget.acquire(context.Background(), 1, 20*time.Millisecond, true); !errors.Is(err, ErrFrameBudget) {
 		t.Fatalf("budget while handler owns bulk = %v, want ErrFrameBudget", err)
 	}
 	release()
-	if err := budget.acquire(context.Background(), total, time.Second); err != nil {
+	if err := budget.acquire(context.Background(), total, time.Second, true); err != nil {
 		t.Fatalf("budget after handler release = %v", err)
 	}
 	budget.release(total)
@@ -698,7 +678,7 @@ func TestConcurrentRetainedFramesNeverShareAPayload(t *testing.T) {
 		}
 		frames[reader] = frame.Bytes()
 	}
-	budget := newFrameBudget(uint64(readers) * (128 << 10))
+	budget := newFrameBudget(uint64(readers)*(128<<10), 0)
 	var failures sync.WaitGroup
 	errs := make(chan error, readers*rounds)
 	for reader := range readers {
@@ -881,8 +861,8 @@ func TestFrameBudgetBoundsConcurrentAllocation(t *testing.T) {
 	}
 	size := binary.BigEndian.Uint32(frame.Bytes()[:4]) + binary.BigEndian.Uint32(frame.Bytes()[4:8])
 
-	budget := newFrameBudget(uint64(size))
-	if err := budget.acquire(context.Background(), size, time.Second); err != nil {
+	budget := newFrameBudget(uint64(size), 0)
+	if err := budget.acquire(context.Background(), size, time.Second, true); err != nil {
 		t.Fatal(err)
 	}
 	var decoded authoritypb.Request
@@ -911,7 +891,7 @@ func (echoHandler) SessionTerminalForTransport(volumeserver.SessionID) (<-chan s
 	return frameTestNeverTerminal, true
 }
 func (h echoHandler) Bounds() TransportBounds {
-	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 4}
+	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 9}
 }
 func (h echoHandler) Handle(_ context.Context, req *authoritypb.Request) *authoritypb.Response {
 	response := &authoritypb.Response{RequestId: req.GetRequestId(), Epoch: h.Epoch()}
@@ -937,9 +917,7 @@ func testServeSession(t *testing.T, s *Server, conn net.Conn) chan error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.budget == nil {
-		s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
-	}
+	s.initializeFrameBudget()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -1035,8 +1013,8 @@ func (p activeTestPair) close(t *testing.T) {
 
 func TestServerMultiplexesRequestIDs(t *testing.T) {
 	s := &Server{
-		Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		Handler: echoHandler{epoch: []byte("epoch")}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	pair := startActiveTestPair(t, s)
 	defer pair.close(t)
@@ -1072,7 +1050,7 @@ func (nilResponseHandler) SessionTerminalForTransport(volumeserver.SessionID) (<
 	return frameTestNeverTerminal, true
 }
 func (h nilResponseHandler) Bounds() TransportBounds {
-	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 4}
+	return TransportBounds{MaxFrame: 4096, MaxRequestFrame: 4096, MaxInFlight: 9}
 }
 func (h nilResponseHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	if request.GetHello() != nil || request.GetAttach() != nil || request.GetActivate() != nil {
@@ -1087,8 +1065,8 @@ func (h nilResponseHandler) Handle(ctx context.Context, request *authoritypb.Req
 func TestNilHandlerResponseKeepsTheAuthorityEpoch(t *testing.T) {
 	epoch := bytes.Repeat([]byte{0xA5}, 16)
 	s := &Server{
-		Handler: nilResponseHandler{epoch: epoch}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		Handler: nilResponseHandler{epoch: epoch}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	pair := startActiveTestPair(t, s)
 	defer pair.close(t)
@@ -1121,15 +1099,15 @@ func (disagreeingHandler) Bounds() TransportBounds {
 // clients were independent values with nothing forcing agreement.
 func TestServerRefusesToRunWithBoundsItDoesNotEnforce(t *testing.T) {
 	s := &Server{
-		Handler: disagreeingHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		Handler: disagreeingHandler{}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	if _, err := s.validate(); err == nil {
 		t.Fatal("server accepted a handler advertising bounds it does not enforce")
 	}
 	agreeing := &Server{
-		Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 4, MaxConnections: 4,
-		MaxFrameBytesInFlight: 1 << 20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
+		Handler: echoHandler{}, MaxFrame: 4096, MaxInFlight: 9, MaxConnections: 4,
+		MaxFrameBytesInFlight: controlFrameReserve() + 1<<20, HandshakeTimeout: time.Second, IdleTimeout: time.Minute, WriteTimeout: time.Second,
 	}
 	if _, err := agreeing.validate(); err != nil {
 		t.Fatalf("agreeing bounds refused: %v", err)
@@ -1275,14 +1253,5 @@ func TestServerDelegatedFlushUsesIndependentDataLane(t *testing.T) {
 	if delegatedFlushRequest(&authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}) {
 		t.Fatal("ordinary write used flush lane")
 	}
-	for _, limit := range []int{3, 8, 127} {
-		ordinary, blocking, flush := serverExecutionLanes(limit, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES)
-		if ordinary < 1 || blocking < 1 || flush < 1 || ordinary+blocking+flush != limit || blocking != limit/2 {
-			t.Fatalf("serverExecutionLanes(%d) = %d,%d,%d", limit, ordinary, blocking, flush)
-		}
-	}
-	ordinary, blocking, flush := serverExecutionLanes(2, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
-	if ordinary != 1 || blocking != 1 || flush != 0 {
-		t.Fatalf("FSKit serverExecutionLanes(2) = %d,%d,%d", ordinary, blocking, flush)
-	}
+
 }

@@ -1,8 +1,10 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,27 +60,60 @@ func BenchmarkDispatchInstrumentation(b *testing.B) {
 	}
 }
 
+type countingDispatchHandler struct {
+	benchmarkDispatchHandler
+	calls int
+}
+
+func (h *countingDispatchHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	h.calls++
+	return h.benchmarkDispatchHandler.Handle(ctx, request)
+}
+
+func TestDispatchRecordsCompletedHandlerOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response *authoritypb.Response
+		outcome  string
+	}{
+		{"positive", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: &authoritypb.Item{}}}}, "success"},
+		{"stamped-negative", &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: 7}}}, "success"},
+		{"permission", &authoritypb.Response{Errno: 13}, "permission"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, err := authoritymetrics.New("dispatch-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := &countingDispatchHandler{benchmarkDispatchHandler: benchmarkDispatchHandler{response: tc.response}}
+			server := &Server{Handler: handler, Metrics: metrics}
+			request := &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}
+			if response := server.dispatchRequest(t.Context(), request); response != handler.response {
+				t.Fatal("dispatch replaced the handler reply")
+			}
+			if handler.calls != 1 {
+				t.Fatalf("handler invocations=%d, want 1", handler.calls)
+			}
+			var rendered bytes.Buffer
+			if err := metrics.Registry().WritePrometheus(&rendered); err != nil {
+				t.Fatal(err)
+			}
+			for _, sample := range []string{
+				`portablefs_authority_rpc_requests_total{volume="dispatch-test",opcode="lookup",outcome="` + tc.outcome + `"} 1`,
+				`portablefs_authority_rpc_duration_seconds_count{volume="dispatch-test",opcode="lookup"} 1`,
+			} {
+				if !strings.Contains(rendered.String(), sample+"\n") {
+					t.Errorf("missing completed invocation: %s", sample)
+				}
+			}
+		})
+	}
+}
+
 func TestRequestOperationAndResponseOutcome(t *testing.T) {
 	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}
 	if got := requestOperation(request); got != authoritymetrics.OperationWrite {
 		t.Fatalf("operation = %s, want positioned_write", got)
-	}
-	for phase, want := range map[authoritypb.FskitWritePhase]authoritymetrics.Operation{
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:  authoritymetrics.OperationFskitWriteBegin,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:   authoritymetrics.OperationFskitWriteData,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT: authoritymetrics.OperationFskitWriteCommit,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:  authoritymetrics.OperationFskitWriteAbort,
-	} {
-		request = &authoritypb.Request{Body: &authoritypb.Request_FskitWrite{FskitWrite: &authoritypb.FskitWriteRequest{Phase: phase}}}
-		if got := requestOperation(request); got != want {
-			t.Fatalf("FSKit write %s operation = %s, want %s", phase, got, want)
-		}
-	}
-	if got := requestOperation(&authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}); got != authoritymetrics.OperationNextFskitRepair {
-		t.Fatalf("next FSKit repair operation = %s", got)
-	}
-	if got := requestOperation(&authoritypb.Request{Body: &authoritypb.Request_AckFskitRepair{}}); got != authoritymetrics.OperationAckFskitRepair {
-		t.Fatalf("ack FSKit repair operation = %s", got)
 	}
 	response := &authoritypb.Response{Errno: 5, Failure: authoritypb.FailureClass_FAILURE_CLASS_STORAGE}
 	if got := responseOutcome(response); got != authoritymetrics.OutcomeStorage {
@@ -101,7 +136,7 @@ func TestServerServingObserverTracksTLSAcceptLoop(t *testing.T) {
 	states := make(chan bool, 2)
 	server := &Server{
 		Handler:  &benchmarkDispatchHandler{response: &authoritypb.Response{}},
-		MaxFrame: 1, MaxInFlight: 2, MaxConnections: 2, MaxFrameBytesInFlight: 1,
+		MaxFrame: 1, MaxInFlight: 2, MaxConnections: 2, MaxFrameBytesInFlight: MinimumFrameBytesInFlight(1),
 		HandshakeTimeout: time.Second, IdleTimeout: time.Second, WriteTimeout: time.Second,
 		OnServing: func(up bool) { states <- up },
 	}
@@ -134,7 +169,7 @@ func TestServerServingObserverTracksTLSAcceptLoop(t *testing.T) {
 	}
 }
 
-func TestProtocolSevenOperationMetrics(t *testing.T) {
+func TestLinuxCoherenceOperationMetrics(t *testing.T) {
 	for _, tc := range []struct {
 		request *authoritypb.Request
 		want    authoritymetrics.Operation

@@ -18,8 +18,8 @@
 // therefore never removes a directory it did not create, so pointing -dir at a
 // workspace that already holds data is safe.
 //
-// Every phase is independent and reported separately; -json emits machine
-// readable records for the roadmap tables. The -bulk phase additionally emits
+// Every phase is independent and reported separately; -json emits
+// machine-readable records. The -bulk phase additionally emits
 // one stable `fsops-bulk key=value ...` line that separates the write(2)
 // acknowledgement rate from the fsync barrier that follows it.
 package main
@@ -194,8 +194,8 @@ func run() error {
 }
 
 // runOps walks the primitive VFS operations one at a time. Each phase runs to
-// completion before the next starts, so a phase's distribution is not polluted
-// by another phase's background flush traffic.
+// completion before the next starts, so a phase's distribution is less
+// polluted by another phase's background descriptor-release traffic.
 func runOps(rec *recorder, dir string, n, size int, doFsync bool) error {
 	payload := make([]byte, size)
 	for i := range payload {
@@ -239,7 +239,7 @@ func runOps(rec *recorder, dir string, n, size int, doFsync bool) error {
 		}
 	}
 
-	// close(2) — reported independently even though PortableFS writes through.
+	// close(2), timed separately from the write(2) phase above.
 	for i := 0; i < n; i++ {
 		t0 := time.Now()
 		err := handles[i].Close()
@@ -531,9 +531,9 @@ func runEnum(rec *recorder, dir, spec string) error {
 // runBulk measures sustained synchronous write-ack throughput followed by the
 // separate XFS durability barrier.
 //
-// The payload is re-randomized for every chunk. A repeated buffer would be
-// trivially deduplicated or compressed somewhere in the stack and the measured
-// rate would describe the dedup table, not the upload path.
+// The payload is re-randomized for every chunk. A repeated buffer could be
+// compressed by a lower layer, and the measured rate would then describe that
+// layer rather than the write path.
 func runBulk(dir string, mb, chunk int) error {
 	p := filepath.Join(dir, "bulk.bin")
 	buf := make([]byte, chunk)

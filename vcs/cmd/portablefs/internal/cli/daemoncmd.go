@@ -19,7 +19,7 @@ func cmdDaemon(e *cmdEnv, args []string) int {
 	if err := daemonStopPolicy(); err != nil {
 		return e.fail("daemon stop", err)
 	}
-	cfg, err := fskitConfigFromEnv(e.getenv)
+	cfg, err := fixedFSKitConfig()
 	if err != nil {
 		return e.fail("daemon stop", err)
 	}

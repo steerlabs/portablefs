@@ -18,19 +18,6 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
-// The Linux mount engine: one strict fusev3 session against the
-// v3 XFS authority. This replaces the legacy clientcore FUSE engine for
-// `portablefs mount`; the lifecycle contract around it — canonical state
-// root, mount records, locks, exact unmount — is unchanged and lives in
-// runMountForeground.
-//
-// One honest asymmetry with the legacy engine: fusev3 owns its kernel-mount
-// edge (go-fuse resolves the fusermount helper itself), so the host-facts
-// mechanism the record carries governs the exact UNMOUNT — direct umount(2)
-// or the validated root-managed helper — rather than selecting how the mount
-// syscall is issued. The recorded kernel identity checks are unchanged, so
-// unmount still refuses anything but the exact recorded mount.
-
 // fuseV3Config is everything the v3 engine needs to attach and mount. The
 // caller owns mountpoint validation, lifecycle records, and teardown.
 type fuseV3Config struct {
@@ -38,16 +25,12 @@ type fuseV3Config struct {
 	token           string
 	transport       dataPlaneTransport
 	identity        *clientTLSIdentity
-	coherence       string
 	volumeID        string
 	mountPath       string
 	mountInstanceID string
 	// backingRoot is the per-machine tree that serves the volume's declared
 	// machine-local routes; used only when the adopted rule set is non-empty.
-	backingRoot string
-	// noLocalDirs refuses a volume that declares machine-local routes instead
-	// of serving them (adopt=false in the attach protocol).
-	noLocalDirs            bool
+	backingRoot            string
 	requireMountEnrollment bool
 	// onRevoked observes this mount's self-revocation. It is handed to the
 	// engine at construction because a strict mount can revoke before
@@ -130,10 +113,6 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 // keeps a Manager enrollment alive when cleanup is ambiguous, while a failure
 // before attach can close an enrollment that was never handed to a session.
 func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ error) {
-	profile, err := mountv3.Profile(cfg.coherence)
-	if err != nil {
-		return nil, false, err
-	}
 	tlsCfg, err := cfg.transport.tlsConfig()
 	if err != nil {
 		return nil, false, fmt.Errorf("data-plane transport: %w", err)
@@ -150,7 +129,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 	}
 	attach := authorityrpc.ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         cfg.addr, TLS: tlsCfg, VolumeID: cfg.volumeID,
 		AccessToken: []byte(cfg.token), ReplaySlots: mountv3.ReplaySlots,
 		MaxFrame: mountv3.MaxFrame, DialTimeout: mountv3.DialTimeout,
@@ -158,7 +137,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		RequireMountEnrollmentReauthorization: cfg.requireMountEnrollment,
 		ObservePreKernelMountAbsence:          preKernelAbsence,
 	}
-	client, rules, err := mountv3.AttachWithRoutes(context.Background(), attach, !cfg.noLocalDirs)
+	client, rules, err := mountv3.AttachWithRoutes(context.Background(), attach, true)
 	if err != nil {
 		// A routing refusal names both revisions and the volume's declaration.
 		// It is surfaced exactly as it arrived: the operator is told what the
@@ -181,7 +160,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		RequireRemountOnEpochChange: true,
 		MaxBackground:               mountv3.MaxInFlight, MaxInFlight: mountv3.MaxInFlight, ReclaimQueue: mountv3.ReclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-		Coherence: profile, CachedNameCapacity: mountv3.CachedNameCapacity, RepairBudget: mountv3.RepairBudget,
+		NameCacheCapacity: mountv3.NameCacheCapacity, WithdrawalTimeout: mountv3.WithdrawalTimeout,
 		Routes: rules, LocalBacking: backing,
 		OnRevoked: func(report fusev3.RevocationReport) {
 			if cfg.onRevoked != nil {

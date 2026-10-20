@@ -6,10 +6,51 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestMountWaitBlocksUntilItsExactConnectionTerminates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mount := &Mount{kernelConnectionDone: make(chan struct{})}
+		other := &Mount{kernelConnectionDone: make(chan struct{})}
+		returned := make(chan struct{})
+		go func() {
+			mount.Wait()
+			close(returned)
+		}()
+
+		// Quiescence proves the waiter has run and durably blocked; no elapsed
+		// interval or goroutine-start signal can establish that state.
+		synctest.Wait()
+		select {
+		case <-returned:
+			t.Fatal("Wait returned before its connection terminated")
+		default:
+		}
+
+		close(other.kernelConnectionDone)
+		other.Wait()
+		synctest.Wait()
+		select {
+		case <-returned:
+			t.Fatal("Wait returned when a different connection terminated")
+		default:
+		}
+
+		close(mount.kernelConnectionDone)
+		synctest.Wait()
+		select {
+		case <-returned:
+		default:
+			t.Fatal("Wait did not return after its exact connection terminated")
+		}
+		mount.Wait()
+	})
+}
 
 func fakeAbortFile(t *testing.T) *kernelAbortFile {
 	t.Helper()
@@ -171,13 +212,13 @@ func TestKernelMountRetainedAbortDistinguishesIdenticalReusedRecord(t *testing.T
 	if err := m.productionKernelWithdrawal().detach(k.point); err != nil {
 		t.Fatalf("successor passed to detach: %v", err)
 	}
-	if err := m.unmountOwnedKernelMount(); err != nil {
-		t.Fatalf("successor passed to ordinary unmount: %v", err)
+	if err := m.unmountOwnedKernelMount(); err == nil {
+		t.Fatal("ordinary unmount accepted a reused mountpoint")
 	}
 }
 
 func TestMountCloseJoinsWithdrawalBeforeClosingAbortDescriptor(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	a := fakeAbortFile(t)
 	f.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent", filesystem: "fuse.portablefs", source: "portablefs:unit-close", abortFile: a}
 	close(f.mount.kernelConnectionDone)
@@ -229,7 +270,7 @@ func TestKernelMountMissingControlPathCannotProveMatchingMountAbsent(t *testing.
 }
 
 func TestMountCloseReleasesAbortDescriptorOnDetachFailure(t *testing.T) {
-	f := newStrictFixture(t)
+	f := newStockFixture(t)
 	a := fakeAbortFile(t)
 	f.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent", filesystem: "fuse.portablefs", source: "portablefs:unit-close", abortFile: a}
 	close(f.mount.kernelConnectionDone)
@@ -239,5 +280,32 @@ func TestMountCloseReleasesAbortDescriptorOnDetachFailure(t *testing.T) {
 	}
 	if _, err := a.file.Stat(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("failed close leaked abort descriptor: %v", err)
+	}
+}
+
+func TestTerminalConnectionCannotCleanDetachAReusedMountpoint(t *testing.T) {
+	f := newStockFixture(t)
+	f.mount.kernelMount = kernelMount{id: "42", device: "0:99", point: "/owned", filesystem: "fuse.portablefs", source: "portablefs:original"}
+	close(f.mount.kernelConnectionDone)
+	prior := readMountInfo
+	readMountInfo = func() ([]byte, error) {
+		return []byte("42 1 0:99 / /owned rw - fuse.portablefs portablefs:replacement rw\n"), nil
+	}
+	defer func() { readMountInfo = prior }()
+	// There is no server in this fixture: touching the successor would panic.
+	if err := f.mount.UnmountKernel(); err == nil {
+		t.Fatal("normal attempt accepted the replacement")
+	}
+	first := f.mount.Close()
+	if first == nil || !strings.Contains(first.Error(), "different kernel mount identity") {
+		t.Fatalf("terminal connection certified cleanup: %v", first)
+	}
+	if second := f.mount.Close(); second != first {
+		t.Fatalf("finalization result changed: %v; first %v", second, first)
+	}
+	f.rpc.mu.Lock()
+	defer f.rpc.mu.Unlock()
+	if len(f.rpc.detachProofs) != 0 || f.rpc.closes != 1 {
+		t.Fatalf("detach proofs = %d, closes = %d", len(f.rpc.detachProofs), f.rpc.closes)
 	}
 }

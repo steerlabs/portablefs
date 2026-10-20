@@ -60,21 +60,15 @@ type ClientConfig struct {
 	Purpose authoritypb.SessionPurpose
 	// FrontendProfile selects one immutable cache-coherence contract for the
 	// complete session. Linux mounts use volume subscriptions and file write
-	// delegations; FSKit mounts use the platform synchronous-repair stream.
+	// delegations; FSKit mounts use the exclusive-writer contract.
 	FrontendProfile authoritypb.FrontendProfile
-	// The FSKit repair declaration is mandatory only for FSKIT_SYNC_REPAIR and
-	// forbidden for every other profile.
-	FskitCachedNameCapacity uint64
-	FskitRepairBudget       time.Duration
-	FskitNamespaceRepair    authoritypb.NamespaceRepair
 	// RoutesRevision is the 32-byte digest of the canonical machine-local
 	// routing rules this mount will run. Required for every profile: a mount
 	// that routes a subtree to local disk hides it from every peer, so the
 	// authority refuses any mount whose topology is not the volume's active one.
 	RoutesRevision [32]byte
-	// RequireMountEnrollmentReauthorization makes automatic hosted renewal an
-	// attach-time contract. A mount configured with a Manager enrollment never
-	// starts against an authority that cannot verify enrollment-backed grants.
+	// RequireMountEnrollmentReauthorization requires an installed signed
+	// authorization deadline before an automatically renewed mount can start.
 	RequireMountEnrollmentReauthorization bool
 	// ObservePreKernelMountAbsence is the strict mount supervisor's exact local
 	// observation that this mount attempt has not installed its kernel source.
@@ -144,6 +138,7 @@ func (r *responseConsumption) revoke(cause error) {
 	if r == nil || r.force == nil {
 		return
 	}
+	r.client.reportSessionError(&cause)
 	r.forceOnce.Do(func() { r.force(cause) })
 }
 
@@ -167,10 +162,8 @@ type lane struct {
 }
 
 type Client struct {
-	batchedClose          atomic.Bool
-	orderedDelegatedFlush atomic.Bool
-	flush                 lane
-	cfg                   ClientConfig
+	flush lane
+	cfg   ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
@@ -182,22 +175,20 @@ type Client struct {
 	attachAttemptID           [32]byte
 	ordinary                  lane
 	blocking                  lane
-	repairControl             lane
 	controlPoll               lane
 	controlAck                lane
 	changeAck                 lane
 	liveness                  lane
 	epoch                     []byte
-	helloFeatures             []string
 	negotiatedFrame           uint32
 	negotiatedInFlight        uint32
 	proof                     *authoritypb.SessionProof
 	root                      *authoritypb.Item
 	routesRevision            [32]byte
 	authorizationDeadline     time.Time
+	currentAuthorization      time.Time // installed now; Reauthorize replaces the activation deadline
 	maxRead                   uint32
 	maxWrite                  uint32
-	maxFskitWrite             uint64
 	lease                     time.Duration
 	releaseInvalidIncarnation atomic.Uint64
 	releaseIncarnation        uint64 // protected by the single controlAck permit
@@ -209,8 +200,7 @@ type Client struct {
 	subscriptionIncarnation   uint64
 	subscriptionHorizonNanos  uint64
 	subscriptionDeadline      time.Time
-	fskitRepairCursor         *authoritypb.VisibilityCursor
-	sessionReauthorization    atomic.Bool
+	subscriptionNow           func() time.Time
 	poisoned                  atomic.Bool
 	closed                    atomic.Bool
 	fatalMu                   sync.Mutex
@@ -270,8 +260,8 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if cfg.MaxInFlight < 2 {
 		return nil, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
 	}
-	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && cfg.MaxInFlight < 3 {
-		return nil, errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
+	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && cfg.MaxInFlight < MinimumLinuxInFlight {
+		return nil, errors.New("authorityrpc: Linux max-in-flight must be at least 9 for ordinary work, four ordered flushes, and blocking waits")
 	}
 	if uint64(cfg.ReplaySlots) < uint64(cfg.MaxInFlight) {
 		return nil, errors.New("authorityrpc: replay slots must cover every possible in-flight mutation")
@@ -287,31 +277,15 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 			return nil, errors.New("authorityrpc: strict coherence requires an exact pre-kernel mount-absence observer")
 		}
 		switch cfg.FrontendProfile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-			if cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
-				cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
-				return nil, errors.New("authorityrpc: Linux subscription profile cannot declare FSKit repair state")
-			}
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-			if cfg.FskitCachedNameCapacity == 0 || cfg.FskitCachedNameCapacity > math.MaxUint32 ||
-				cfg.FskitRepairBudget < time.Millisecond || cfg.FskitRepairBudget%time.Millisecond != 0 {
-				return nil, errors.New("authorityrpc: FSKit repair profile requires representable cache capacity and repair budget")
-			}
-			switch cfg.FskitNamespaceRepair {
-			case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
-				authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED,
-				authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED:
-			default:
-				return nil, errors.New("authorityrpc: FSKit repair profile requires an FSKit namespace repair primitive")
-			}
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
+			authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER,
+			authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE:
 		default:
 			return nil, errors.New("authorityrpc: mount client requires an explicit frontend profile")
 		}
 	} else if cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
 		if cfg.RoutesRevision != ([32]byte{}) || cfg.ObservePreKernelMountAbsence != nil ||
-			cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED ||
-			cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
-			cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
+			cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED {
 			return nil, errors.New("authorityrpc: route-admin client cannot declare mount cache or route state")
 		}
 	} else {
@@ -324,13 +298,12 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
 	c := &Client{
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
-		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
-		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
-		repairControl: lane{permits: make(chan struct{}, 1)},
-		controlPoll:   lane{permits: make(chan struct{}, 1)},
-		controlAck:    lane{permits: make(chan struct{}, 1)},
-		changeAck:     lane{permits: make(chan struct{}, 1)},
-		liveness:      lane{permits: make(chan struct{}, 1)},
+		data:        newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
+		control:     newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
+		controlPoll: lane{permits: make(chan struct{}, 1)},
+		controlAck:  lane{permits: make(chan struct{}, 1)},
+		changeAck:   lane{permits: make(chan struct{}, 1)},
+		liveness:    lane{permits: make(chan struct{}, 1)},
 	}
 	connectionSetID, err := randomProtocolIdentity()
 	if err != nil {
@@ -353,7 +326,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 // is published. Both peers use the same partition: a flush must never wait for
 // ordinary work whose completion depends on that flush.
 func (c *Client) initializeExecutionLanes() {
-	ordinary, blocking, flush := serverExecutionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, c.SupportsOrderedFlush())
+	ordinary, blocking, flush := executionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
 	slots := make([]clientSlot, c.cfg.ReplaySlots)
 	blockingBase := len(slots) - blocking
 	flushBase := blockingBase - flush
@@ -362,11 +335,6 @@ func (c *Client) initializeExecutionLanes() {
 	if flush != 0 {
 		c.flush = lane{permits: make(chan struct{}, flush), slots: slots[flushBase:blockingBase], base: uint32(flushBase)}
 	}
-}
-
-func (c *Client) canPipelineFlushes() bool {
-	_, _, flush := serverExecutionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, true)
-	return flush == volumeserver.OrderedFlushWindow
 }
 
 // attachBody builds the attach request for exactly one session purpose. The
@@ -388,12 +356,17 @@ func (c *Client) attachBody() *authoritypb.AttachRequest {
 	}
 	attach.RoutesRevision = append([]byte(nil), c.cfg.RoutesRevision[:]...)
 	attach.FrontendProfile = c.cfg.FrontendProfile
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		attach.FskitCachedNameCapacity = uint32(c.cfg.FskitCachedNameCapacity)
-		attach.FskitRepairBudgetMillis = uint64(c.cfg.FskitRepairBudget / time.Millisecond)
-		attach.FskitNamespaceRepair = c.cfg.FskitNamespaceRepair
-	}
 	return attach
+}
+
+// recoveryFailure reports a failed Attach or Activate recovery. A proven frame
+// defect keeps its own transport-binding classification; any other failure
+// leaves the attempt's outcome unknown.
+func recoveryFailure(phase string, err error) error {
+	if frameDefect(err) {
+		return fmt.Errorf("authorityrpc: %s recovery failed: %w", phase, err)
+	}
+	return fmt.Errorf("%w: %s recovery failed: %v", ErrTransportUncertain, phase, err)
 }
 
 func (c *Client) attachAndActivate(ctx context.Context) error {
@@ -409,18 +382,15 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	}
 	c.lifecycle.Lock()
 	c.epoch = append([]byte(nil), data.epoch...)
-	c.helloFeatures = append([]string(nil), data.features...)
 	c.negotiatedFrame = data.maxFrame
 	c.negotiatedInFlight = data.maxInFlight
 	c.maxRead = data.maxRead
 	c.maxWrite = data.maxWrite
-	c.maxFskitWrite = data.maxFskitWrite
 	c.lifecycle.Unlock()
-	c.sessionReauthorization.Store(hasFeatures(data.features, []string{sessionReauthorizationFeature}))
 
 	attachRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Attach{Attach: c.attachBody()}}
 	response, err := rawRoundTrip(data.conn, data.maxFrame, attachRequest)
-	for err != nil {
+	for err != nil && !frameDefect(err) {
 		// The provisional result is keyed by attach_attempt_id. Reconnect both
 		// roles with the same set and replay that exact Attach; this learns the
 		// credential instead of leaking it until its deadline or inventing a
@@ -428,9 +398,13 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 		closeNegotiations(data, control)
 		data, control, err = c.reopenInitialPair(handshakeCtx)
 		if err != nil {
-			return fail(fmt.Errorf("%w: provisional Attach recovery failed: %v", ErrTransportUncertain, err))
+			return fail(recoveryFailure("provisional Attach", err))
 		}
 		response, err = rawRoundTrip(data.conn, data.maxFrame, attachRequest)
+	}
+	if err != nil {
+		// A malformed reply is a protocol defect, never a lost one to replay.
+		return fail(err)
 	}
 	if !equalBytes(response.GetEpoch(), data.epoch) {
 		return fail(ErrAuthorityChanged)
@@ -469,7 +443,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	controlGeneration := provisional.GetControlBindingGeneration()
 	requestID := uint64(2)
 	activateResponse, err := rawRoundTrip(control.conn, control.maxFrame, activateRequest(requestID, dataGeneration, controlGeneration))
-	for err != nil {
+	for err != nil && !frameDefect(err) {
 		// Once any Activate frame may have reached the authority, Abort is
 		// forbidden. Rebind both roles with proof, because loss of DATA can be
 		// the reason CONTROL's activation response disappeared, then replay the
@@ -477,12 +451,18 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 		closeNegotiations(data, control)
 		data, control, err = c.resumeRawPairForActivation(handshakeCtx)
 		if err != nil {
-			return fail(fmt.Errorf("%w: activation recovery failed: %v", ErrTransportUncertain, err))
+			return fail(recoveryFailure("activation", err))
 		}
 		dataGeneration = data.bindingGeneration()
 		controlGeneration = control.bindingGeneration()
 		requestID = 3
 		activateResponse, err = rawRoundTrip(control.conn, control.maxFrame, activateRequest(requestID, dataGeneration, controlGeneration))
+	}
+	if err != nil {
+		// A malformed Activate reply proves a defect, not a lost outcome. Abort
+		// is still forbidden; the provisional or ACTIVE session is left to the
+		// authority's own expiry.
+		return fail(err)
 	}
 	if !equalBytes(activateResponse.GetEpoch(), data.epoch) {
 		return fail(ErrAuthorityChanged)
@@ -625,14 +605,14 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	if active.GetFrontendProfile() != c.cfg.FrontendProfile {
 		return errors.New("authorityrpc: activation returned the wrong frontend profile")
 	}
-	lease := time.Duration(active.GetSessionLeaseMilliseconds()) * time.Millisecond
-	if lease <= 0 {
-		return errors.New("authorityrpc: authority omitted session lease")
+	leaseMillis := active.GetSessionLeaseMilliseconds()
+	if leaseMillis == 0 || leaseMillis > uint64(math.MaxInt64/int64(time.Millisecond)) {
+		return errors.New("authorityrpc: authority omitted a representable positive session lease")
 	}
+	lease := time.Duration(leaseMillis) * time.Millisecond
 	authorizationDeadline := time.Unix(0, active.GetAuthorizationDeadlineUnixNanos())
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
-		if active.GetRoot() != nil || len(active.GetRoutesRevision()) != len(c.routesRevision) ||
-			active.GetLeaseCursor() != nil || active.GetFskitRepairCursor() != nil {
+		if active.GetRoot() != nil || len(active.GetRoutesRevision()) != len(c.routesRevision) {
 			return errors.New("authorityrpc: route-admin activation exposed mount state")
 		}
 		c.lifecycle.Lock()
@@ -643,15 +623,6 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 		}
 		copy(c.routesRevision[:], active.GetRoutesRevision())
 		return nil
-	}
-	required, ok := activateFeatures(c.cfg.FrontendProfile)
-	if !ok || !hasFeatures(active.GetFeatures(), required) {
-		return errors.New("authorityrpc: authority omitted required frontend-profile features")
-	}
-	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
-		active.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
-	) {
-		return errors.New("authorityrpc: activation omitted Manager-enrolled mount reauthorization")
 	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !authorizationDeadline.After(time.Now()) {
 		return errors.New("authorityrpc: automatic mount activation omitted its signed authorization deadline")
@@ -665,37 +636,17 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 		!equalBytes(active.GetRoutesRevision(), c.cfg.RoutesRevision[:]) {
 		return errors.New("authorityrpc: activation did not confirm the exact routing revision")
 	}
-	fskitCursor := active.GetFskitRepairCursor()
-	switch c.cfg.FrontendProfile {
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-		if active.GetLeaseCursor() != nil || fskitCursor != nil {
-			return errors.New("authorityrpc: authority returned obsolete Linux lease activation state")
-		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-		if active.GetLeaseCursor() != nil || fskitCursor == nil || fskitCursor.GetSequence() == 0 ||
-			fskitCursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE ||
-			c.maxFskitWrite < RequiredFskitWriteBytes {
-			return errors.New("authorityrpc: authority returned invalid FSKit repair activation state")
-		}
-	default:
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED || !validFrontendProfile(c.cfg.FrontendProfile) {
 		return errors.New("authorityrpc: activation has no mount frontend profile")
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
-	ordered := c.canPipelineFlushes() && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature})
-	if ordered && !hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}) {
-		return errors.New("authorityrpc: activation changed the negotiated flush admission mode")
-	}
-	c.orderedDelegatedFlush.Store(ordered)
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
 	if active.GetAuthorizationDeadlineUnixNanos() != 0 {
 		c.authorizationDeadline = authorizationDeadline
-	}
-	if fskitCursor != nil {
-		c.fskitRepairCursor = proto.Clone(fskitCursor).(*authoritypb.VisibilityCursor)
+		c.currentAuthorization = authorizationDeadline
 	}
 	return nil
 }
@@ -719,7 +670,11 @@ func (opened *transportNegotiation) bindingGeneration() uint64 {
 // Reconnect restores whichever exact physical role is missing. A healthy role
 // is never churned as collateral damage, and a changed epoch remains a hard
 // mount boundary on either lane.
-func (c *Client) Reconnect(ctx context.Context) error {
+func (c *Client) Reconnect(ctx context.Context) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return err
+	}
 	if !c.transportIsLive(c.data) {
 		if err := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); err != nil {
 			return err
@@ -738,11 +693,16 @@ func (c *Client) Reconnect(ctx context.Context) error {
 // returned client, subscribes cold, and closes the old client. Reusing the old
 // Client in place would let an operation admitted under an old handle race onto
 // the new session, where capabilities and replay slots have unrelated meaning.
-func (c *Client) RecoverEpoch(ctx context.Context) (*Client, error) {
+// A failed replacement still reports the old client's recorded terminal cause.
+func (c *Client) RecoverEpoch(ctx context.Context) (result *Client, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if c == nil || ctx == nil {
 		return nil, syscall.EINVAL
 	}
 	if !errors.Is(c.SessionEndCause(), ErrAuthorityChanged) {
+		if err := c.checkCallEntry(); err != nil {
+			return nil, err
+		}
 		return nil, errors.New("authorityrpc: epoch reattach requested without an observed epoch change")
 	}
 	c.lifecycle.Lock()
@@ -771,10 +731,7 @@ func (c *Client) Root() *authoritypb.Item {
 	return proto.Clone(c.root).(*authoritypb.Item)
 }
 
-// Epoch is the authority incarnation this client attached to. A strict
-// frontend carries it across its local cache-coherence boundary and echoes it
-// on every visibility acknowledgement; an acknowledgement for any other epoch
-// is stale by definition and must never reach the authority.
+// Epoch is the authority incarnation binding this mount and its local proofs.
 func (c *Client) Epoch() []byte {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
@@ -790,31 +747,15 @@ func (c *Client) IOLimits() (maxRead, maxWrite uint32) {
 	return c.maxRead, c.maxWrite
 }
 
-// MaxWriteTransactionBytes is the FSKit profile's negotiated bound for one
-// framework write callback. DATA frames remain bounded by IOLimits; the
-// authority applies the logical write only at the final COMMIT.
-func (c *Client) MaxWriteTransactionBytes() uint64 {
-	c.lifecycle.Lock()
-	defer c.lifecycle.Unlock()
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return 0
-	}
-	return c.maxFskitWrite
-}
-
 // DataPlaneOperationLimit is the number of ordinary filesystem calls a mount
-// may issue concurrently on DATA. Protocol 6 gives lease/repair control and
+// may issue concurrently on DATA. Linux coherence control and
 // liveness a separate physical CONTROL transport, so those operations consume
 // neither a DATA socket permit nor a DATA replay slot.
 func (c *Client) DataPlaneOperationLimit() int {
 	return cap(c.ordinary.permits)
 }
 
-// SessionID is the authority-assigned session ID from the attach reply. A
-// strict frontend needs it to recognise its own mutations in a visibility
-// event's initiator field: that comparison is what exempts the frontend's own
-// in-flight callback from its own PREPARE drain, so without it a strict mount
-// would deadlock against itself and must refuse to run.
+// SessionID binds local operations and liveness to this mount incarnation.
 func (c *Client) SessionID() []byte {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
@@ -833,12 +774,13 @@ func (c *Client) SessionLease() time.Duration {
 // Reauthorize rotates the signed decision underneath an existing mount. The
 // manager assigns sequence and returns the same token for an idempotency key;
 // the authority accepts an exact retry and refuses gaps or broadened access.
-func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64) (time.Time, error) {
+func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64) (result time.Time, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return time.Time{}, err
+	}
 	if len(token) == 0 || sequence == 0 {
 		return time.Time{}, syscall.EINVAL
-	}
-	if !c.sessionReauthorization.Load() {
-		return time.Time{}, syscall.EOPNOTSUPP
 	}
 	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{
 		AccessToken: append([]byte(nil), token...), Sequence: sequence,
@@ -861,6 +803,9 @@ func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64)
 		c.signalSessionEnd(ErrSessionEnded)
 		return time.Time{}, ErrSessionEnded
 	}
+	c.lifecycle.Lock()
+	c.currentAuthorization = deadline
+	c.lifecycle.Unlock()
 	return deadline, nil
 }
 
@@ -869,7 +814,11 @@ func (c *Client) Reauthorize(ctx context.Context, token []byte, sequence uint64)
 // the certificate visible to a future transport resume. The exact current
 // connection performs Reauthorize under its still-valid identity; a failed
 // authority decision never changes the reconnect identity.
-func (c *Client) ReauthorizeWithCertificate(ctx context.Context, token []byte, sequence uint64, certificatePEM []byte, now time.Time) (time.Time, error) {
+func (c *Client) ReauthorizeWithCertificate(ctx context.Context, token []byte, sequence uint64, certificatePEM []byte, now time.Time) (result time.Time, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return time.Time{}, err
+	}
 	replacement, err := c.replacementClientCertificate(certificatePEM, now)
 	if err != nil {
 		return time.Time{}, err
@@ -959,83 +908,72 @@ func (c *Client) InitialAuthorizationDeadline() time.Time {
 	return c.authorizationDeadline
 }
 
-// InitialLeaseCursor remains as a nil-valued ABI accessor for the shared
-// portablefsd attachment checks. Protocol 7 activation rejects a non-nil lease
-// cursor and the Linux client has no executable lease-event path.
-func (c *Client) InitialLeaseCursor() *authoritypb.LeaseEventCursor { return nil }
-
-func (c *Client) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
+// AuthorizationDeadline is the signed deadline of the authorization installed
+// now, including any replacement accepted by Reauthorize; zero means the
+// session carries none. It is a local denial bound, never a cross-machine
+// freshness proof.
+func (c *Client) AuthorizationDeadline() time.Time {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	if c.fskitRepairCursor == nil {
-		return nil
-	}
-	return proto.Clone(c.fskitRepairCursor).(*authoritypb.VisibilityCursor)
+	return c.currentAuthorization
 }
 
-// VisibilityRepairBudget is the exact per-phase deadline declared by this
-// FSKit mount at Attach. Linux subscription mounts have no platform repair
-// budget because their horizon and invalidation budget are wire-defined.
-func (c *Client) VisibilityRepairBudget() time.Duration {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return 0
+// KeepAlive renews this exact session. For an FSKit-exclusive session it
+// returns the authority's relative cache proof
+// R; every other session returns zero. Only a reply of the complete success
+// shape renews: anything else ends the session and never yields a proof. The
+// frame layer owns the proof's own grammar (nonzero, whole milliseconds, at
+// most MaxCacheProof, only on a plain success envelope); this method owns what
+// depends on the session: the proof is present on every successful FSKit
+// renewal and never exceeds the advertised lease. An overgrant is never
+// clamped. R is relative to the authority; the caller anchors it at its own
+// request start.
+func (c *Client) KeepAlive(ctx context.Context) (result time.Duration, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+	if err != nil {
+		return 0, err
 	}
-	return c.cfg.FskitRepairBudget
+	if !keepAliveSucceeded(response) {
+		err := fmt.Errorf("authorityrpc: keepalive did not renew the session: errno=%d failure=%d uncertain=%t",
+			response.GetErrno(), response.GetFailure(), response.GetUncertain())
+		c.signalSessionEnd(err)
+		return 0, err
+	}
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
+		// validateSessionProofPlacement already refused a proof here.
+		return 0, nil
+	}
+	proof, lease := response.GetSessionValidForNanos(), c.SessionLease()
+	if proof == 0 || lease <= 0 || proof > uint64(lease) {
+		err := fmt.Errorf("%w: FSKit keepalive proof %dns is missing or exceeds the advertised lease %s",
+			ErrTransportBinding, proof, lease)
+		c.signalSessionEnd(err)
+		return 0, err
+	}
+	return time.Duration(proof), nil
 }
 
-// NextVisibility long-polls the FSKit synchronous-repair stream. The method
-// name is retained at the daemon boundary; the wire body is explicitly
-// profile-scoped and cannot be sent by a Linux subscription mount.
-func (c *Client) NextVisibility(ctx context.Context, after *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error) {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return nil, syscall.EOPNOTSUPP
-	}
-	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{
-		NextFskitRepair: &authoritypb.NextVisibilityRequest{After: after},
-	}})
+// BeginLocalPublication admits one frontend reply served from daemon state as
+// if it were an authority response: it is refused once the session is
+// poisoned, and until Consume it holds back SessionEndPending/SessionDone
+// exactly like a retained authority reply, with force revoking the frontend
+// serving boundary when the terminal drain bound expires. It carries no
+// terminal-delivery token, because no authority response exists to receipt.
+func (c *Client) BeginLocalPublication(force func(error)) (result ResponseConsumption, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	receipt, err := c.beginResponseConsumption(force)
 	if err != nil {
 		return nil, err
 	}
-	if response.GetErrno() != 0 {
-		return nil, c.endFSKitMount(syscall.Errno(response.GetErrno()))
-	}
-	if response.GetFskitRepair() == nil {
-		return nil, c.endFSKitMount(errors.New("authorityrpc: FSKit repair poll returned no event"))
-	}
-	return proto.Clone(response.GetFskitRepair()).(*authoritypb.VisibilityEvent), nil
+	return receipt, nil
 }
 
-func (c *Client) AckVisibility(ctx context.Context, cursor *authoritypb.VisibilityCursor) error {
-	return c.AckVisibilityWithContention(ctx, cursor, false)
-}
-
-func (c *Client) AckVisibilityWithContention(ctx context.Context, cursor *authoritypb.VisibilityCursor, orderedAdmissionContended bool) error {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return syscall.EOPNOTSUPP
-	}
-	if cursor == nil {
-		return syscall.EINVAL
-	}
-	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_AckFskitRepair{
-		AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Cursor: cursor, OrderedAdmissionContended: orderedAdmissionContended,
-		},
-	}})
-	if err != nil {
-		return err
-	}
-	if response.GetErrno() != 0 {
-		return c.endFSKitMount(syscall.Errno(response.GetErrno()))
-	}
-	return nil
-}
-
-// endFSKitMount makes a synchronous-repair protocol failure terminal. The
-// Linux subscription profile handles coherence refusal by horizon expiry and
-// cold resubscription instead of ending the mount.
-func (c *Client) endFSKitMount(cause error) error {
-	c.signalSessionEnd(ErrSessionEnded)
-	return cause
+// LocalAdmissionOpen reports, without registering anything, whether the
+// session could admit a new request right now. It turns false at the first
+// terminal edge, before any public terminal signal.
+func (c *Client) LocalAdmissionOpen() bool {
+	return !c.poisoned.Load() && !c.closed.Load()
 }
 
 // ApplyRoutes installs a new machine-local routing declaration for the whole
@@ -1043,7 +981,8 @@ func (c *Client) endFSKitMount(cause error) error {
 // replay slot because its identity is the compare-and-swap on expected, which
 // is a better answer to a retry than a retained reply - a caller that resubmits
 // an applied change is told which revision is active now.
-func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byte) (*authoritypb.ApplyRoutesReply, error) {
+func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byte) (result *authoritypb.ApplyRoutesReply, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	request := &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{ApplyRoutes: &authoritypb.ApplyRoutesRequest{
 		Rules:            append([]byte(nil), rules...),
 		ExpectedRevision: append([]byte(nil), expected[:]...),
@@ -1070,16 +1009,17 @@ func (c *Client) ApplyRoutes(ctx context.Context, rules []byte, expected [32]byt
 
 // DetachAfterUnmount leaves the barrier with the official supervisor's local
 // observation that this mount is terminal. The request is authenticated as this
-// exact session by Call; there is no session selector in DetachRequest. This
+// exact session envelope; there is no session selector in DetachRequest. This
 // client deliberately cannot synthesize an observation. A strict caller that
 // cannot establish its platform's terminal conditions closes instead and lets
 // its session die fenced.
-func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.MountAbsenceProof) error {
+func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.MountAbsenceProof) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if !completeMountAbsenceProof(proof) {
 		return syscall.EPERM
 	}
 	request := &authoritypb.DetachRequest{MountAbsence: proto.Clone(proof).(*authoritypb.MountAbsenceProof)}
-	response, err := c.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: request}})
+	response, err := c.dispatchCleanup(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: request}})
 	if err != nil {
 		return err
 	}
@@ -1092,11 +1032,12 @@ func (c *Client) DetachAfterUnmount(ctx context.Context, proof *authoritypb.Moun
 // DetachRouteAdmin ends a restricted route-control session. It carries no
 // mount-absence proof because this purpose never joined durable mount or lease
 // membership and never received a filesystem root.
-func (c *Client) DetachRouteAdmin(ctx context.Context) error {
+func (c *Client) DetachRouteAdmin(ctx context.Context) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if c == nil || c.cfg.Purpose != authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
 		return syscall.EPERM
 	}
-	response, err := c.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
+	response, err := c.dispatchCleanup(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
 	if err != nil {
 		return err
 	}
@@ -1120,7 +1061,8 @@ func completeMountAbsenceProof(proof *authoritypb.MountAbsenceProof) bool {
 // is idempotent: one caller owns the observation and wire transition; concurrent
 // or later callers observe that same result. It never substitutes AbortAttach
 // after ACTIVE and never manufactures evidence when observation fails.
-func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
+func (c *Client) ReleaseBeforeMount(ctx context.Context) (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if ctx == nil {
 		return syscall.EINVAL
 	}
@@ -1165,12 +1107,11 @@ func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
 }
 
 // SessionDone closes when this client can no longer safely continue the mount:
-// an idle connection died without an in-flight call to drive same-epoch
-// recovery, the authority epoch changed, an exact outcome became uncertain, or
-// the client was closed. A terminal edge poisons new admission immediately,
-// but its public signal waits for every already-parsed retained response to
-// cross the frontend's physical publication boundary. When the frontend opted
-// into local enforcement, the public signal also waits for its bounded kernel
+// the FSKit CONTROL transport was lost, the authority epoch changed, an exact
+// outcome became uncertain, or the client was closed. A terminal edge poisons
+// new admission immediately, but its public signal waits for already-parsed
+// retained responses to cross the frontend's physical publication boundary.
+// When the frontend opted into local enforcement, it also waits for bounded kernel
 // withdrawal to finish. SessionError becomes observable at the same boundary.
 func (c *Client) SessionDone() <-chan struct{} { return c.fatalDone }
 
@@ -1215,11 +1156,11 @@ func (c *Client) signalSessionEnd(err error) {
 	if err == nil {
 		err = ErrTransportUncertain
 	}
-	c.poisoned.Store(true)
 	c.fatalMu.Lock()
 	if c.fatalErr == nil {
 		c.fatalErr = err
 	}
+	c.poisoned.Store(true)
 	if c.fatalPublished {
 		c.fatalMu.Unlock()
 		return
@@ -1247,20 +1188,49 @@ func (c *Client) signalSessionEnd(err error) {
 	c.fatalMu.Unlock()
 }
 
-func (c *Client) beginResponseConsumption(force func(error)) (*responseConsumption, error) {
-	if force == nil {
-		return nil, syscall.EINVAL
-	}
+// checkCallEntry gives every ordinary entry the same terminal verdict before
+// caller cancellation or request assignment. Cleanup has separate, narrow
+// dispatch paths so exact absence and terminal receipts can still be delivered.
+func (c *Client) checkCallEntry() error {
 	c.fatalMu.Lock()
 	defer c.fatalMu.Unlock()
-	if c.poisoned.Load() || c.fatalPending || c.fatalPublished || c.closed.Load() {
+	return c.sessionErrorLocked(nil)
+}
+
+// reportSessionError is the return boundary for session operations. Exact
+// responses and successful cleanup retain their result; every error, including
+// one produced after admission or by cleanup, uses the first session verdict.
+// Defer it before resource cleanup so a terminal edge during drain also wins.
+func (c *Client) reportSessionError(err *error) {
+	if c == nil || *err == nil {
+		return
+	}
+	c.fatalMu.Lock()
+	*err = c.sessionErrorLocked(*err)
+	c.fatalMu.Unlock()
+}
+
+func (c *Client) sessionErrorLocked(fallback error) error {
+	if c.poisoned.Load() || c.fatalPending || c.fatalPublished {
 		if c.fatalErr != nil {
-			return nil, c.fatalErr
+			return c.fatalErr
 		}
-		if c.closed.Load() {
-			return nil, net.ErrClosed
-		}
-		return nil, ErrSessionEnded
+		return ErrTransportUncertain
+	}
+	if c.closed.Load() {
+		return net.ErrClosed
+	}
+	return fallback
+}
+
+func (c *Client) beginResponseConsumption(force func(error)) (*responseConsumption, error) {
+	c.fatalMu.Lock()
+	defer c.fatalMu.Unlock()
+	if err := c.sessionErrorLocked(nil); err != nil {
+		return nil, err
+	}
+	if force == nil {
+		return nil, syscall.EINVAL
 	}
 	receipt := &responseConsumption{client: c, force: force}
 	if c.responseConsumptions == nil {
@@ -1341,26 +1311,22 @@ func (c *Client) consumeResponse(receipt *responseConsumption) {
 	c.signalSessionEnd(err)
 }
 
-// dispatchTerminalDeliveryReceipt is the sole post-poison request path. It
-// uses only the already-bound CONTROL generation and current session envelope:
+// dispatchTerminalDeliveryReceipt is one of two post-poison cleanup paths,
+// alongside exact Detach. It uses only the already-bound CONTROL generation
+// and current session envelope:
 // reconnecting after the authority declared a terminal drain could bind a
 // different process edge and falsely acknowledge delivery to the wrong owner.
 // Keeping this separate from Call also prevents terminal mode from becoming a
 // general exception to new-operation admission.
-func (c *Client) dispatchTerminalDeliveryReceipt(ctx context.Context, token []byte) (*authoritypb.Response, error) {
+func (c *Client) dispatchTerminalDeliveryReceipt(ctx context.Context, token []byte) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if !validTerminalDeliveryToken(token) || !c.poisoned.Load() {
 		return nil, syscall.EINVAL
 	}
-	select {
-	case c.liveness.permits <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	defer func() { <-c.liveness.permits }()
 	request := &authoritypb.Request{Body: &authoritypb.Request_TerminalDeliveryReceipt{
 		TerminalDeliveryReceipt: &authoritypb.TerminalDeliveryReceipt{Token: append([]byte(nil), token...)},
 	}}
-	return c.dispatchOwned(ctx, request)
+	return c.dispatchCleanup(ctx, request)
 }
 
 func validTerminalDeliveryReceiptResponse(response *authoritypb.Response) bool {
@@ -1431,7 +1397,7 @@ func (c *Client) forceResponseConsumptionDrain() {
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
 	if c.flush.permits != nil && delegatedFlushRequest(request) {
 		// Flush progress is independent of ordinary calls waiting on recall,
-		// even without ordered pipelining. Metadata shares the server's flush
+		// with four ordered writes. Metadata shares the server's flush
 		// bound so it cannot strand an ordered predecessor behind successors.
 		return &c.flush
 	}
@@ -1445,9 +1411,6 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 		request.GetDelegationRecallAck() != nil || request.GetDelegationBreakAck() != nil ||
 		request.GetDelegationModeChangeAck() != nil || request.GetDelegationRelease() != nil {
 		return &c.controlAck
-	}
-	if request.GetNextFskitRepair() != nil || request.GetAckFskitRepair() != nil {
-		return &c.repairControl
 	}
 	if request.GetReauthorize() != nil || request.GetKeepAlive() != nil || request.GetDetach() != nil ||
 		request.GetTerminalDeliveryReceipt() != nil || request.GetRenewSubscription() != nil {
@@ -1466,12 +1429,16 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 // or mutate request concurrently, and must not reuse the value afterwards
 // except by handing it back to another call. Mutations must go through
 // CallMutation, which owns the replay identity.
+// A terminal session refuses even an already-canceled caller with its recorded
+// cause. Only the explicit Detach and terminal-receipt cleanup paths bypass
+// ordinary admission; raw Call cannot reopen it.
 //
 // Ownership is the contract on every path here because it is the one every
 // caller already satisfies: each constructs a request for one synchronous call
 // and drops it. Copying that request first isolated nothing and made a maximal
 // write pay for a second megabyte.
-func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, releaseFrame, err := c.callFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
 }
@@ -1482,15 +1449,18 @@ func (c *Client) callFrame(ctx context.Context, request *authoritypb.Request) (*
 		return nil, nil, err
 	}
 	defer func() { <-admitted.permits }()
-	return c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err := c.dispatchOwnedFrame(ctx, request)
+	return response, releaseFrame, err
 }
 
 // admitCall is the single shape and concurrency boundary for non-mutation
-// requests. Keeping it ahead of dispatch means a canceled caller never stamps or
-// serializes a request it did not submit. Mutation calls have their own
-// replay-slot admission because the permit and slot lifetime are intentionally
-// coupled.
+// requests. Dispatch rechecks cancellation after acquiring the permit, before
+// stamping or serializing the request. Mutation calls have their own replay-slot
+// admission because the permit and slot lifetime are intentionally coupled.
 func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*lane, error) {
+	if err := c.checkCallEntry(); err != nil {
+		return nil, err
+	}
 	if request == nil || request.GetHello() != nil || request.GetAttach() != nil || request.GetResume() != nil ||
 		request.GetActivate() != nil || request.GetAbortAttach() != nil || request.GetCancel() != nil {
 		return nil, syscall.EINVAL
@@ -1511,29 +1481,56 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 	return admitted, nil
 }
 
-// dispatchOwned performs one round trip, stamping and sending a request the
-// client owns. Admission is the caller's responsibility so that a replay slot is
-// never taken before the permit that bounds it. Mutation dispatch assigns its
-// replay identity once and may need to resend those exact bytes after a
-// same-epoch reconnect; copying for each attempt only duplicated large write
-// payloads without adding isolation.
-func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	response, releaseFrame, err := c.dispatchOwnedFrame(ctx, request)
+// dispatchCleanup preserves exact absence and delivery acknowledgments on an
+// already-bound CONTROL transport after ordinary admission has ended. It never
+// reconnects or accepts filesystem work.
+func (c *Client) dispatchCleanup(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetDetach() == nil && request.GetTerminalDeliveryReceipt() == nil {
+		return nil, syscall.EINVAL
+	}
+	select {
+	case c.liveness.permits <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-c.liveness.permits }()
+	response, releaseFrame, _, err := c.dispatchFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
 }
 
-func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
+// dispatchOwnedFrame rechecks ordinary admission after permit/slot acquisition
+// and assignment, then validates the finalized request before any socket write.
+func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), bool, error) {
+	if err := c.checkCallEntry(); err != nil {
+		return nil, nil, false, err
+	}
+	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
+		return nil, nil, false, syscall.EOPNOTSUPP
+	}
+	return c.dispatchFrame(ctx, request)
+}
+
+// submitted is true once a socket write is attempted: a failed write may have
+// delivered bytes. False settles only this attempt, never an earlier send of the
+// same replay identity. Request IDs alone do not establish submission.
+func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), submitted bool, err error) {
+	defer c.reportSessionError(&err)
+	// Refuse an already-canceled attempt before stamping or touching a transport:
+	// an expired write deadline must not break a usable connection.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, false, err
+	}
 	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
 		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
-		return nil, nil, syscall.EOPNOTSUPP
+		return nil, nil, false, syscall.EOPNOTSUPP
 	}
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT &&
 		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
-		return nil, nil, syscall.EOPNOTSUPP
+		return nil, nil, false, syscall.EOPNOTSUPP
 	}
 	role, err := roleForRequest(request)
 	if err != nil {
-		return nil, nil, syscall.EINVAL
+		return nil, nil, false, syscall.EINVAL
 	}
 	transport := c.transportForRole(role)
 	// An idle DATA failure has no coherence meaning. Rebind it lazily before a
@@ -1541,7 +1538,7 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 	// replay, because no bytes for this request have been assigned or sent yet.
 	if role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA && !c.transportIsLive(transport) && !c.poisoned.Load() {
 		if err := c.reconnectTransport(ctx, role); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 	// Request IDs are physical-connection envelopes, not replay identities. A
@@ -1554,26 +1551,20 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 	transport.pendingMu.Lock()
 	if c.closed.Load() {
 		transport.pendingMu.Unlock()
-		return nil, nil, net.ErrClosed
+		return nil, nil, false, net.ErrClosed
 	}
 	if transport.conn == nil {
-		terminal := c.poisoned.Load()
 		transport.pendingMu.Unlock()
-		if terminal {
-			if err := c.SessionEndCause(); err != nil {
-				return nil, nil, err
-			}
-			return nil, nil, ErrSessionEnded
-		}
 		// Nothing was written. Classifying this as a transport break lets the
 		// read and mutation wrappers safely establish the same epoch and submit
 		// the operation once, while their replay identity remains unchanged.
-		return nil, nil, ErrTransportUncertain
+		return nil, nil, false, ErrTransportUncertain
 	}
 	transport.pending[request.RequestId] = result
 	conn := transport.conn
 	transport.pendingMu.Unlock()
 
+	submitted = true
 	err = c.writeRequest(ctx, transport, conn, request)
 	if err != nil {
 		c.failConnection(transport, conn, ErrTransportUncertain)
@@ -1585,19 +1576,28 @@ func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Re
 		defer timer.Stop()
 		select {
 		case completed := <-result:
-			return c.completeCall(request, completed)
+			response, releaseFrame, err = c.completeCall(request, completed)
+			return
 		case <-timer.C:
 			c.failConnection(transport, conn, ErrTransportUncertain)
-			return nil, nil, ctx.Err()
+			return nil, nil, submitted, ctx.Err()
 		}
 	case completed := <-result:
-		return c.completeCall(request, completed)
+		response, releaseFrame, err = c.completeCall(request, completed)
+		return
 	}
 }
 
 func (c *Client) completeCall(request *authoritypb.Request, completed callResult) (*authoritypb.Response, func(), error) {
 	if completed.err == nil && completed.response != nil {
-		if err := c.validateResponseFrontendProfile(completed.response); err != nil {
+		err := c.validateResponseFrontendProfile(completed.response)
+		if err == nil {
+			err = c.validateSessionProofPlacement(request, completed.response)
+		}
+		if err == nil {
+			err = validateMkdirResult(request, completed.response)
+		}
+		if err != nil {
 			if completed.releaseFrame != nil {
 				completed.releaseFrame()
 			}
@@ -1611,26 +1611,29 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 	return completed.response, completed.releaseFrame, completed.err
 }
 
+// validateSessionProofPlacement admits session_valid_for_nanos only on a
+// successful KeepAlive to an FSKit-exclusive session. The frame layer cannot
+// see the request or the profile; anywhere else the proof is an
+// unrequested promise the client must refuse rather than ignore.
+func (c *Client) validateSessionProofPlacement(request *authoritypb.Request, response *authoritypb.Response) error {
+	if response.GetSessionValidForNanos() != 0 &&
+		(c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE || request.GetKeepAlive() == nil || !keepAliveSucceeded(response)) {
+		return fmt.Errorf("%w: session_valid_for_nanos outside a successful FSKit keepalive", ErrTransportBinding)
+	}
+	return nil
+}
+
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
 	if response.GetSessionTerminal() && response.GetErrno() != int32(syscall.ESTALE) {
 		return fmt.Errorf("%w: terminal session response omitted ESTALE", ErrTransportBinding)
 	}
 
-	// The schema keeps historical tags to prevent accidental reuse. This is a
-	// rejection guard shared by every profile, not an executable v6 client.
-	if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil {
-		return fmt.Errorf("%w: peer sent retired protocol state", ErrTransportBinding)
-	}
 	switch c.cfg.FrontendProfile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
+		if response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
 			return fmt.Errorf("%w: cacheless reader received cache participation state", ErrTransportBinding)
 		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
-		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
-			return fmt.Errorf("%w: Linux subscription session received FSKit response state", ErrTransportBinding)
-		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE:
 		if response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 {
 			return fmt.Errorf("%w: FSKit session received Linux subscription state", ErrTransportBinding)
 		}
@@ -1707,19 +1710,16 @@ func (c *Client) CallReadRetained(
 }
 
 // CallIdempotent retries one same-epoch operation whose protocol definition
-// makes duplicate delivery harmless. In addition to reads, PortableFS write
-// BEGIN, DATA, and ABORT use this path: they mutate only bounded session-owned
-// staging and are idempotent by transaction identity. COMMIT must never use it;
-// COMMIT is replay-retained through CallMutationWithIdentity.
-func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+// makes duplicate delivery harmless. Mutations that apply filesystem state use
+// CallMutationWithIdentity and retain their exact replay result instead.
+func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Request) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, releaseFrame, err := c.callIdempotentFrame(ctx, request)
 	return detachResponseFrame(response, releaseFrame), err
 }
 
 func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), err error) {
-	if c.poisoned.Load() {
-		return nil, nil, ErrTransportUncertain
-	}
+	defer c.reportSessionError(&err)
 	admitted, err := c.admitCall(ctx, request)
 	if err != nil {
 		return nil, nil, err
@@ -1769,7 +1769,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 			c.releaseInvalidIncarnation.Store(body.GetIncarnation())
 		}()
 	}
-	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
 	if !errors.Is(err, ErrTransportUncertain) {
 		return response, releaseFrame, err
 	}
@@ -1782,20 +1782,15 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		return nil, nil, syscall.EINVAL
 	}
 	if err := c.reconnectTransport(ctx, role); err != nil {
-		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-			c.signalSessionEnd(err)
-		}
 		return nil, nil, err
 	}
-	return c.dispatchOwnedFrame(ctx, request)
+	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
+	return response, releaseFrame, err
 }
 
-// CallIdempotentRetained is the staged-write counterpart to
-// CallReadRetained. BEGIN/DATA/ABORT are transport-idempotent but their kernel
-// callback still owns any terminal response until its physical reply write.
-// A parsed response remains retained until the frontend physically exposes the
-// corresponding ordinary reply (or revokes that serving boundary). COMMIT
-// still uses the replay-slot mutation API.
+// CallIdempotentRetained retains the response until the frontend physically
+// exposes its reply or revokes that serving boundary. Applied filesystem
+// mutations use the replay-slot mutation API.
 func (c *Client) CallIdempotentRetained(
 	ctx context.Context,
 	request *authoritypb.Request,
@@ -1809,7 +1804,8 @@ func (c *Client) CallIdempotentRetained(
 func (c *Client) callRetained(
 	force func(error),
 	call func() (*authoritypb.Response, func(), error),
-) (*authoritypb.Response, ResponseConsumption, error) {
+) (result *authoritypb.Response, receipt ResponseConsumption, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	consumption, err := c.beginResponseConsumption(force)
 	if err != nil {
 		return nil, nil, err
@@ -1844,16 +1840,11 @@ func (c *Client) callRetained(
 //
 // The client never infers that the authority advanced a slot: every rejection
 // the authority makes before recording an outcome leaves both counters equal.
-// Cancellation after send poisons the client because the outcome is genuinely
-// uncertain to the caller.
+// Cancellation after send without an exact outcome poisons the client because
+// the outcome is genuinely uncertain to the caller.
 func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
-
-const orderedDelegatedFlushFeature = "ordered-delegated-flush-v1"
-
-// SupportsOrderedFlush is negotiated at activation for this exact session.
-func (c *Client) SupportsOrderedFlush() bool { return c.orderedDelegatedFlush.Load() }
 
 type segmentedWriteKey struct{}
 type segmentedWrite struct {
@@ -1864,7 +1855,11 @@ type segmentedWrite struct {
 // CallMutationSegments sends retained WRITE spans without merging their bytes.
 // The caller owns the request and keeps every span immutable until return,
 // including reconnect/replay. Assignment observes the selected lane admission.
-func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned MutationAssigned) (*authoritypb.Response, error) {
+func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned MutationAssigned) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return nil, err
+	}
 	if request == nil || request.GetWrite() == nil || len(request.GetWrite().GetData()) != 0 || segments == nil {
 		return nil, syscall.EINVAL
 	}
@@ -1886,7 +1881,8 @@ func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.
 // publication point. The callback is invoked exactly once, before the first
 // dispatch, and is not repeated if the same request is replayed after a
 // same-epoch reconnect.
-func (c *Client) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned MutationAssigned) (*authoritypb.Response, error) {
+func (c *Client) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned MutationAssigned) (result *authoritypb.Response, resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	response, consumption, err := c.CallMutationWithIdentityRetained(ctx, request, assigned, func(error) {})
 	if consumption != nil {
 		consumption.Consume()
@@ -1905,12 +1901,10 @@ func (c *Client) CallMutationWithIdentityRetained(
 	request *authoritypb.Request,
 	assigned MutationAssigned,
 	force func(error),
-) (*authoritypb.Response, ResponseConsumption, error) {
-	if c.poisoned.Load() {
-		return nil, nil, ErrTransportUncertain
-	}
-	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && !c.SupportsOrderedFlush() {
-		return nil, nil, syscall.EOPNOTSUPP
+) (result *authoritypb.Response, receipt ResponseConsumption, resultErr error) {
+	defer c.reportSessionError(&resultErr)
+	if err := c.checkCallEntry(); err != nil {
+		return nil, nil, err
 	}
 	role, err := roleForRequest(request)
 	if err != nil || role != authoritypb.TransportRole_TRANSPORT_ROLE_DATA {
@@ -1950,26 +1944,38 @@ func (c *Client) CallMutationWithIdentityRetained(
 			return nil, nil, err
 		}
 	}
-	response, releaseFrame, err := c.dispatchOwnedFrame(ctx, request)
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		consumption.releaseFrame = releaseFrame
-		c.signalSessionEnd(ErrTransportUncertain)
-		return nil, nil, ErrTransportUncertain
-	}
+	response, releaseFrame, submitted, err := c.dispatchOwnedFrame(ctx, request)
 	if errors.Is(err, ErrTransportUncertain) {
 		if releaseFrame != nil {
 			releaseFrame()
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
+			// Recovery may have returned the already-recorded verdict. Only a
+			// live session's establishment failure can become uncertainty.
+			if terminalErr := c.checkCallEntry(); terminalErr != nil {
+				return nil, nil, terminalErr
+			}
+			if !submitted && (errors.Is(reconnectErr, context.Canceled) || errors.Is(reconnectErr, context.DeadlineExceeded)) {
+				return nil, nil, reconnectErr
+			}
 			if !errors.Is(reconnectErr, ErrAuthorityChanged) && !errors.Is(reconnectErr, ErrSessionEnded) && !errors.Is(reconnectErr, ErrTransportBinding) {
 				reconnectErr = ErrTransportUncertain
 			}
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
-		response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
+		var replaySubmitted bool
+		response, releaseFrame, replaySubmitted, err = c.dispatchOwnedFrame(ctx, request)
+		submitted = submitted || replaySubmitted
 	}
 	consumption.releaseFrame = releaseFrame
+	// Refusing an unsent attempt leaves its slot unchanged. Once any attempt
+	// may have reached the authority, cancellation cannot settle that identity,
+	// even when the exact replay was refused before its own socket write.
+	if submitted && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		c.signalSessionEnd(ErrTransportUncertain)
+		return nil, nil, ErrTransportUncertain
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2013,6 +2019,14 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 		response := new(authoritypb.Response)
 		releaseFrame, err := readFrameRetained(conn, transport.frameMax.Load(), nil, 0, response)
 		if err != nil {
+			if frameDefect(err) {
+				// A proven protocol defect poisons the session before any
+				// pending caller can reconnect and replay past it.
+				defect := receivedFrameError(err)
+				c.signalSessionEnd(defect)
+				c.failConnection(transport, conn, defect)
+				return
+			}
 			c.failConnection(transport, conn, ErrTransportUncertain)
 			return
 		}
@@ -2050,7 +2064,7 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 			}
 		}
 		if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE &&
-			c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 			c.signalSessionEnd(ErrSessionEnded)
 		}
 		// The volume's routing topology moved under this mount. Continuing would
@@ -2089,13 +2103,13 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	transport.conn = nil
 	pending := transport.pending
 	transport.pending = make(map[uint64]chan callResult)
-	idle := len(pending) == 0 && !c.closed.Load()
-	// Losing an idle DATA socket is only a transport event: the next safe read
-	// or exact mutation replay lazily resumes that one role. CONTROL owns the
-	// v7 subscription horizon, which independently withdraws stale caches. An
-	// idle socket loss cannot prove an epoch or session outcome. Other profiles
-	// retain their existing terminal CONTROL contract.
-	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+	// Losing a DATA socket is only a transport event: the next safe read
+	// or exact mutation replay lazily resumes that one role. FSKit CONTROL loss
+	// is terminal even with pending requests: poison admission before notifying
+	// their waiters, while retained replies and local enforcement keep their
+	// existing ownership of the terminal drain. Other profiles retain their
+	// transport recovery policy.
+	if !c.closed.Load() && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE {
 		c.signalSessionEnd(err)
 	}
 	transport.pendingMu.Unlock()
@@ -2105,13 +2119,13 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	}
 }
 
-func (c *Client) Close() error {
+func (c *Client) Close() (resultErr error) {
+	defer c.reportSessionError(&resultErr)
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	err := c.closeTransports()
 	c.signalSessionEnd(net.ErrClosed)
-	return err
+	return c.closeTransports()
 }
 
 func (c *Client) closeTransports() error {
@@ -2154,6 +2168,3 @@ func equalBytes(a, b []byte) bool {
 	}
 	return different == 0
 }
-
-// SupportsBatchedClose reports the optional capability of this active epoch.
-func (c *Client) SupportsBatchedClose() bool { return c.batchedClose.Load() }

@@ -37,8 +37,8 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_Symlink{}, true, true, false},
 		{&authoritypb.Request_Readlink{}, true, true, false},
 		{&authoritypb.Request_Open{}, true, true, true},
-		{&authoritypb.Request_Close{}, true, true, true},
-		{&authoritypb.Request_CloseBatch{}, true, false, false},
+		{&authoritypb.Request_Close{}, true, false, true},
+		{&authoritypb.Request_CloseBatch{}, true, true, false},
 		{&authoritypb.Request_Read{}, true, true, true},
 		{&authoritypb.Request_Fsync{}, true, true, false},
 		{&authoritypb.Request_ReadDir{}, true, true, true},
@@ -59,14 +59,7 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_Tmpfile{}, true, false, false},
 		{&authoritypb.Request_GetLock{}, true, false, false},
 		{&authoritypb.Request_SetLock{}, true, false, false},
-		{&authoritypb.Request_Write{}, true, false, false},
-		{&authoritypb.Request_NextLeaseEvent{}, false, false, false},
-		{&authoritypb.Request_AcknowledgeLeaseEvent{}, false, false, false},
-		{&authoritypb.Request_RenewLeases{}, false, false, false},
-		{&authoritypb.Request_AcknowledgeSourceLeaseDischarge{}, false, false, false},
-		{&authoritypb.Request_NextFskitRepair{}, false, true, false},
-		{&authoritypb.Request_AckFskitRepair{}, false, true, false},
-		{&authoritypb.Request_FskitWrite{}, false, true, false},
+		{&authoritypb.Request_Write{}, true, true, false},
 		{&authoritypb.Request_Subscribe{}, true, false, false},
 		{&authoritypb.Request_RenewSubscription{}, true, false, false},
 		{&authoritypb.Request_NextControlEvent{}, true, false, false},
@@ -91,34 +84,15 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		seen[bodyType] = struct{}{}
 		request := &authoritypb.Request{}
 		reflect.ValueOf(request).Elem().FieldByName("Body").Set(reflect.ValueOf(test.body))
-		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES); got != test.linux {
+		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX); got != test.linux {
 			t.Fatalf("%T Linux allowed=%t, want %t", test.body, got, test.linux)
 		}
-		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); got != test.fskit {
+		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE); got != test.fskit {
 			t.Fatalf("%T FSKit allowed=%t, want %t", test.body, got, test.fskit)
 		}
 		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER); got != test.cacheless {
 			t.Fatalf("%T cacheless allowed=%t, want %t", test.body, got, test.cacheless)
 		}
-	}
-}
-
-func TestFskitWriteAccessClassificationProtectsStagingAndAllowsAbort(t *testing.T) {
-	for _, phase := range []authoritypb.FskitWritePhase{
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA,
-		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT,
-	} {
-		request := &authoritypb.Request{Body: &authoritypb.Request_FskitWrite{FskitWrite: &authoritypb.FskitWriteRequest{Phase: phase}}}
-		if !requestRequiresWrite(request) {
-			t.Fatalf("FSKit phase %s can touch staging without write access", phase)
-		}
-	}
-	abort := &authoritypb.Request{Body: &authoritypb.Request_FskitWrite{FskitWrite: &authoritypb.FskitWriteRequest{
-		Phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT,
-	}}}
-	if requestRequiresWrite(abort) {
-		t.Fatal("FSKit ABORT must remain available after an access downgrade")
 	}
 }
 
@@ -136,7 +110,8 @@ func BenchmarkWriteMutationEncoding(b *testing.B) {
 		Handle: bytes.Repeat([]byte{1}, 16), Position: 4096, Size: 1 << 20, Data: make([]byte, 1<<20),
 	}}}
 	runtime, err := volumeserver.New("benchmark", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -178,8 +153,8 @@ func TestCanonicalStreamMatchesFrozenEncoding(t *testing.T) {
 		},
 		{
 			name:    "reclaim",
-			request: &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: []byte{1, 2, 3}}}},
-			want:    []byte{0xA2, 0x02, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03},
+			request: &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{{1, 2, 3}}}}},
+			want:    []byte{0xA2, 0x02, 0x05, 0x12, 0x03, 0x01, 0x02, 0x03},
 		},
 	}
 	for _, test := range tests {
@@ -192,25 +167,6 @@ func TestCanonicalStreamMatchesFrozenEncoding(t *testing.T) {
 				t.Fatalf("canonical encoding differs\n got %x\nwant %x", got.Bytes(), test.want)
 			}
 		})
-	}
-}
-
-func TestAuthorityProtocolV7RequiresSubscriptionAndDelegation(t *testing.T) {
-	if ProtocolMajor != 7 || ProtocolALPN != "portablefs-authority-v7" {
-		t.Fatalf("protocol=(%d, %q), want (7, portablefs-authority-v7)", ProtocolMajor, ProtocolALPN)
-	}
-	if !hasFeatures(requiredHelloFeatures, []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", subscriptionFeature, changeStreamFeature, delegationFeature}) {
-		t.Fatalf("incomplete v7 Hello: %v", requiredHelloFeatures)
-	}
-	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, visibilityCompletionFeature}) {
-		t.Fatalf("incomplete v7 Activate: %v", requiredStrictAttachFeatures)
-	}
-	for _, retired := range []string{"lease-coherence-v1", "directory-enumeration-lease-v1", "lease-recall-v1", "lease-renewal-v1", "open-by-identity-v1", "write-through"} {
-		for _, features := range [][]string{requiredHelloFeatures, requiredAttachFeatures, requiredStrictAttachFeatures} {
-			if hasFeatures(features, []string{retired}) {
-				t.Fatalf("Linux v7 advertises retired feature %q", retired)
-			}
-		}
 	}
 }
 
@@ -250,7 +206,7 @@ func TestRequestUsesTopologyReleasesBlockingLockWaits(t *testing.T) {
 	}
 }
 
-func TestV7ControlRequestsDoNotHoldTopologyDuringPeerWaits(t *testing.T) {
+func TestProtocol8ControlRequestsDoNotHoldTopologyDuringPeerWaits(t *testing.T) {
 	for _, request := range []*authoritypb.Request{
 		{Body: &authoritypb.Request_Subscribe{Subscribe: &authoritypb.SubscribeRequest{}}},
 		{Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}},
@@ -279,7 +235,7 @@ func TestV7ControlRequestsDoNotHoldTopologyDuringPeerWaits(t *testing.T) {
 	}
 }
 
-func TestV7OpenWriteIntentRequiresWriteAccess(t *testing.T) {
+func TestProtocol8OpenWriteIntentRequiresWriteAccess(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		open  *authoritypb.OpenRequest

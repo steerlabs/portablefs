@@ -15,12 +15,12 @@ import (
 )
 
 type readdirGuardStore struct {
-	readdirPostStabilizationChangeStore
+	readdirPageChangeStore
 	sampling, proceed chan struct{}
 }
 
 func (s *readdirGuardStore) ReadDirOpen(handle xfsstore.Capability, cookie uint64, maxEntries int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
-	entries, next, verifier, eof, directory, err := s.readdirPostStabilizationChangeStore.ReadDirOpen(handle, cookie, maxEntries)
+	entries, next, verifier, eof, directory, err := s.readdirPageChangeStore.ReadDirOpen(handle, cookie, maxEntries)
 	if s.readDirCalls.Load() == 2 {
 		close(s.sampling)
 		<-s.proceed
@@ -32,7 +32,7 @@ func (s *readdirGuardStore) LookupOpen(xfsstore.Capability, string) (xfsstore.Ca
 }
 
 func TestCoherenceReadDirRetainsEveryReadGuardThroughStorageRevalidation(t *testing.T) {
-	store := &readdirGuardStore{readdirPostStabilizationChangeStore: readdirPostStabilizationChangeStore{
+	store := &readdirGuardStore{readdirPageChangeStore: readdirPageChangeStore{
 		root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 	}, sampling: make(chan struct{}), proceed: make(chan struct{})}
 	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)

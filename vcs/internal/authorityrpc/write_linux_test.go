@@ -4,7 +4,7 @@ package authorityrpc
 
 import (
 	"bytes"
-	"io"
+	"errors"
 	"sync"
 	"syscall"
 	"testing"
@@ -39,6 +39,9 @@ func (s *writeTestStore) PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarg
 		return nil, syscall.ESTALE
 	}
 	target := s.targets[0]
+	if target.sync == nil {
+		target.sync = func() error { s.durableHandles.Add(1); return nil }
+	}
 	s.targets = s.targets[1:]
 	return target, nil
 }
@@ -46,23 +49,25 @@ func (s *writeTestStore) PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarg
 func (*writeTestStore) CloseOpen(xfsstore.Capability) error { return nil }
 
 type writeTestTarget struct {
-	mu        sync.Mutex
-	committed uint64
-	assigned  uint64
-	post      xfsstore.Attr
-	err       error
-	payloads  [][]byte
-	specs     []xfsstore.WriteCommit
-	started   chan struct{}
-	release   chan struct{}
-	once      sync.Once
+	sync       func() error
+	mu         sync.Mutex
+	coordinate xfsstore.ObjectCoordinate
+	committed  uint64
+	assigned   uint64
+	post       xfsstore.Attr
+	err        error
+	payloads   [][]byte
+	specs      []xfsstore.WriteCommit
+	started    chan struct{}
+	release    chan struct{}
+	once       sync.Once
 }
 
 func (t *writeTestTarget) Coordinate() xfsstore.ObjectCoordinate {
+	if t.coordinate.Stable != ([16]byte{}) {
+		return t.coordinate
+	}
 	return xfsstore.ObjectCoordinate{Stable: [16]byte{0x41}, Ino: 7, DeviceMinor: 1}
-}
-func (t *writeTestTarget) CommitWrite(io.ReaderAt, xfsstore.WriteCommit, []byte) (uint64, uint64, xfsstore.Attr, error) {
-	return 0, 0, xfsstore.Attr{}, syscall.EOPNOTSUPP
 }
 func (t *writeTestTarget) CommitWriteData(data []byte, spec xfsstore.WriteCommit) (uint64, uint64, xfsstore.Attr, error) {
 	if t.started != nil {
@@ -76,6 +81,12 @@ func (t *writeTestTarget) CommitWriteData(data []byte, spec xfsstore.WriteCommit
 	t.payloads = append(t.payloads, bytes.Clone(data))
 	t.specs = append(t.specs, spec)
 	return t.committed, t.assigned, t.post, t.err
+}
+func (t *writeTestTarget) Sync() error {
+	if t.sync != nil {
+		return t.sync()
+	}
+	return nil
 }
 func (t *writeTestTarget) Close() error { return nil }
 func (t *writeTestTarget) setCommitResult(committed, assigned uint64, post xfsstore.Attr, err error) {
@@ -105,7 +116,7 @@ func newWriteHarness(t *testing.T) (*VolumeHandler, volumeserver.SessionCredenti
 	store := &writeTestStore{}
 	h := testVolumeHandler()
 	h.Store, h.Runtime = store, runtime
-	if err := h.startSessionResources(credential.ID, xfsstore.Capability{1}, 4, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+	if err := h.startSessionResources(credential.ID, xfsstore.Capability{1}, 4, [32]byte{}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { h.closeSessionResources(credential.ID) })
@@ -131,24 +142,6 @@ func waitWriteTestSignal(t *testing.T, signal <-chan struct{}, description strin
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for %s", description)
 	}
-}
-
-func waitWriteAdmissionQueue(t *testing.T, h *VolumeHandler, count int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		h.writeAdmissionMu.Lock()
-		seen := 0
-		for waiter := h.writeAdmissionHead; waiter != nil; waiter = waiter.next {
-			seen++
-		}
-		h.writeAdmissionMu.Unlock()
-		if seen == count {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d queued writes", count)
 }
 
 func TestWriteAppliesRetainedPayloadDirectlyAndReplaysOnce(t *testing.T) {
@@ -183,14 +176,11 @@ func TestWriteAppliesRetainedPayloadDirectlyAndReplaysOnce(t *testing.T) {
 	if direct, _ := target.directSnapshot(); direct != 1 {
 		t.Fatalf("write replay applied storage %d times, want 1", direct)
 	}
-	resources, err := h.sessionResources(credential.ID)
+	_, err := h.sessionResources(credential.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resources.writeReservedBytes != 0 || resources.writeCount != 0 || h.totalWriteBytes != 0 || h.totalWrites != 0 {
-		t.Fatalf("write retained accounting accounting: session bytes %d/count %d, global bytes %d/count %d",
-			resources.writeReservedBytes, resources.writeCount, h.totalWriteBytes, h.totalWrites)
-	}
+
 }
 
 func TestWriteUsesStockPositionAndStructuredError(t *testing.T) {
@@ -221,49 +211,6 @@ func TestWriteUsesStockPositionAndStructuredError(t *testing.T) {
 			t.Fatalf("write structured rejection = %+v", response)
 		}
 	})
-}
-
-func TestWriteUsesTransactionFIFOAdmissionWithoutStaging(t *testing.T) {
-	h, credential, store := newWriteHarness(t)
-	h.MaxWritesPerSession = 2
-	h.MaxWriteBytesPerSession = 1
-	started := make(chan struct{})
-	release := make(chan struct{})
-	firstTarget := &writeTestTarget{started: started, release: release}
-	firstTarget.setCommitResult(1, 0, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 1, Mode: 0o600, Nlink: 1}, nil)
-	secondTarget := &writeTestTarget{}
-	secondTarget.setCommitResult(1, 1, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 2, Mode: 0o600, Nlink: 1}, nil)
-	handle := prepareOneShotTarget(t, h, credential, store, firstTarget)
-	store.mu.Lock()
-	store.targets = append(store.targets, secondTarget)
-	store.mu.Unlock()
-
-	first := stockWriteTestRequest(1, 0, 1, handle, []byte("a"), 0, 0)
-	firstResult := make(chan *authoritypb.Response, 1)
-	go func() { firstResult <- h.handleWrite(t.Context(), first, credential, first.GetWrite()) }()
-	waitWriteTestSignal(t, started, "first write direct apply")
-	second := stockWriteTestRequest(2, 1, 1, handle, []byte("b"), 1, 0)
-	secondResult := make(chan *authoritypb.Response, 1)
-	go func() {
-		secondResult <- h.handleWrite(t.Context(), second, credential, second.GetWrite())
-	}()
-	waitWriteAdmissionQueue(t, h, 1)
-	select {
-	case response := <-secondResult:
-		t.Fatalf("second one-shot bypassed FIFO capacity: %+v", response)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	for name, result := range map[string]<-chan *authoritypb.Response{"first": firstResult, "second": secondResult} {
-		select {
-		case response := <-result:
-			if response.GetErrno() != 0 || response.GetWrite().GetPostAttr() == nil {
-				t.Fatalf("%s one-shot = %+v", name, response)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for %s one-shot", name)
-		}
-	}
 }
 
 func TestWriteFingerprintHashesPayloadAndMetadata(t *testing.T) {
@@ -377,4 +324,43 @@ func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestWriteLogicalSyncFailureRetainsExactAppliedReply(t *testing.T) {
+	for _, cause := range []error{syscall.ENOSPC, syscall.EDQUOT, syscall.EIO} {
+		for _, dataOnly := range []bool{false, true} {
+			t.Run(cause.Error()+map[bool]string{false: "/sync", true: "/datasync"}[dataOnly], func(t *testing.T) {
+				h, cred, store := newWriteHarness(t)
+				h.OnStorageFailure = func(error) {}
+				post := xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 7, Mode: 0600, Nlink: 1}
+				target := &writeTestTarget{committed: 4, assigned: 3, post: post, err: errors.Join(xfsstore.ErrWritePostApply, &xfsstore.DurabilityError{Cause: cause})}
+				handle := prepareOneShotTarget(t, h, cred, store, target)
+				req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 3, 0)
+				req.GetWrite().Sync = !dataOnly
+				req.GetWrite().DataSync = dataOnly
+				reply := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+				if reply.GetErrno() != 0 || reply.GetUncertain() || reply.GetWrite().GetCommittedSize() != 4 || reply.GetWrite().GetAssignedOffset() != 3 || reply.GetWrite().GetPostAttr().GetSize() != 7 || reply.GetWrite().GetError() != -int32(syscall.EIO) || reply.GetPostState() == nil || !terminalReceiptCarriesExactAppliedState(reply) {
+					t.Fatalf("logical sync WRITE=%v", reply)
+				}
+				h.terminalFailureMu.Lock()
+				draining, receipts := h.terminalDraining, len(h.terminalReceiptFrames)
+				h.terminalFailureMu.Unlock()
+				if !draining || receipts == 0 {
+					t.Fatalf("no terminal delivery drain: draining=%v receipts=%d", draining, receipts)
+				}
+				if _, specs := target.directSnapshot(); len(specs) != 1 || specs[0].Sync != !dataOnly || specs[0].DataSync != dataOnly {
+					t.Fatalf("sync intent=%+v", specs)
+				}
+				req.RequestId++
+				replay := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+				reply.RequestId = replay.RequestId
+				if !proto.Equal(reply, replay) {
+					t.Fatalf("exact replay=%v", replay)
+				}
+				if calls, _ := target.directSnapshot(); calls != 1 {
+					t.Fatalf("reapplied WRITE: %d", calls)
+				}
+			})
+		}
+	}
 }

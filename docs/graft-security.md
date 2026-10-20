@@ -7,7 +7,7 @@ operation. The routing language, the topology rules, and the errno contract are
 described in
 [xfs-authority-architecture.md](./xfs-authority-architecture.md#machine-local-routing).
 
-## What the boundary is in v3
+## What the boundary is
 
 - Routes are declared volume-wide in `.portablefs/local-dirs` and replaced only
   through the authority's admin `ApplyRoutes` call, which canonicalizes the
@@ -15,15 +15,12 @@ described in
   session carrying a different revision fails closed
   (`vcs/internal/authorityrpc/routes_linux.go`,
   `vcs/internal/localroutes`).
-- `--local-dir` is refused unconditionally on every platform. The refusal lives
-  in the one gate every mount invocation passes
-  (`validateDirectV3MountOpts`, `vcs/cmd/portablefs/internal/cli/mountcmd.go`)
-  and is not conditioned on whether the volume publishes a declaration.
-  `--no-local-dirs` refuses a declaring volume rather than ignoring its
-  topology.
-- macOS v3 refuses local-dir and graft options outright
-  (`vcs/internal/portablefsd/v3attach.go`), so a volume that declares routes
-  mounts from Linux. Grafts are Linux-only:
+- There is no per-mount route option. `portablefs mount` on Linux adopts the
+  volume's declaration through the attach refusal and presents its revision;
+  nothing on one machine can add a route its peers do not see.
+- macOS serves no graft. The Mac attach always presents the empty rule set's
+  revision, so the authority refuses it on a volume that declares routes, and
+  such a volume mounts from Linux. Grafts are Linux-only:
   `vcs/internal/fusev3/graft_linux.go`, `vcs/internal/localdirs`,
   `vcs/internal/localroutes`.
 - Confinement is `vcs/internal/confinedfs`. Linux requires `openat2(2)` with
@@ -42,33 +39,19 @@ race detector:
 ```bash
 cd vcs
 go test -race ./internal/confinedfs ./internal/localdirs ./internal/localroutes -count=1
-go test ./internal/portablefsd -count=1
 go test ./cmd/portablefs/internal/cli -count=1
 ```
 
-The `portablefsd` suite carries the case-safety probe and the v3 attach
-refusal; the `cli` suite carries the unconditional `--local-dir` gate and the
-`--no-local-dirs` semantics.
+The `cli` suite carries route adoption, active-route state, `portablefs route`,
+and `prune-local`.
 
-### Case-exact backing, and what the probe does not cover
+### Case-exact backing is not probed
 
-Graft activation probes the machine-local backing filesystem and refuses when
-it folds names the shared namespace keeps distinct: `ErrBackingCaseUnsafe`, or
-`ErrBackingProbeIncomplete` when the probe could not reach a verdict at all
-(`vcs/internal/portablefsd/localcasesafety.go`). `TestBackingCaseProbe*` and
-`TestOpenLocalBackingRefusesAFoldingBacking` run and assert on every host: they
-compare the probe's verdict against ground truth measured independently with
-plain `os` calls, so the same test proves the refusal on a case-insensitive
-host and the acceptance on a case-sensitive one.
-
-Two honest limits apply to that probe today:
-
-- It sits on the retained daemon-side backing path. Because production macOS
-  never reaches Attach and the qualification attach refuses grafts before any
-  backing is opened, no macOS FSKit path reaches it.
-- The Linux FUSE frontend has no equivalent probe. A graft backed by a
-  case-insensitive filesystem mounted on Linux is still unguarded. That is an
-  open gap, not a covered case.
+The Linux graft path does not probe its machine-local backing filesystem for
+case folding. A graft backed by a case-insensitive filesystem mounted on Linux
+can fold names the shared namespace keeps distinct, and nothing refuses it.
+That is an open gap, not a covered case. The daemon-side probe that guarded the
+retired macOS backing path was removed with that path; macOS serves no graft.
 
 ## Real kernel confinement
 
@@ -80,7 +63,8 @@ stock kernel interface at FUSE protocol 7.31 or newer:
 bash scripts/xfs-fuse-integration.sh
 ```
 
-Its `REQUIRED_TESTS` list names the graft tests explicitly, including
+Its required fusev3 inventory, `scripts/xfs-required-fuse-tests.txt`, names the
+graft tests explicitly, including
 `TestGraftedSubtreeReachesTheAuthorityZeroTimes`,
 `TestRenamingAnAncestorOfAnActiveGraftIsEBUSY`,
 `TestTheGraftBoundaryIsEXDEV` and
@@ -102,9 +86,9 @@ bash scripts/test-swift-xcode.sh
 The shared gate disables Xcode parallel testing because several tests share
 process resources or exercise hard protocol deadlines. It separately
 enumerates and then proves the exact executed test set from the native
-`.xcresult`. This suite covers the qualification FSKit frontend, not graft
-confinement — the macOS graft refusal is a Go-side property and is covered by
-the `portablefsd` suite above.
+`.xcresult`. This suite covers the FSKit frontend, not graft confinement:
+macOS serves no graft, and its empty route revision is a property of the Go
+CLI attach.
 
 `bash scripts/verify-local.sh` is the repository's local gate and runs the Go
 and Swift suites together; `--full` also runs the two privileged real-mount
@@ -141,12 +125,9 @@ replace these release-environment checks:
 - A Linux host with `/dev/fuse` and `fusermount3` must run the real kernel-mount
   integration suite. Docker Desktop does not expose `/dev/fuse` to its Linux VM
   by default, so it cannot certify this gate.
-- A separately signed qualification PortableFS FSKit extension runs the live
-  macOS kernel-mount matrix when exercising that lane. The Swift mock/adapter
-  suite cannot certify extension activation, entitlements, signing, or kernel
-  handoff, and neither result admits a production macOS mount while the required
-  cache primitives are absent.
+- A signed PortableFS app on macOS 26 and 27 must run the native FSKit
+  acceptance listed in [COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status).
+  The Swift mock/adapter suite cannot certify extension activation,
+  entitlements, signing, or kernel handoff.
 
-The Linux gate is a production release blocker. The signed macOS run is a gate
-for the qualification artifact only; it is neither a production release blocker
-nor a fallback, and passing it cannot admit current FSKit.
+Both are release blockers for their platform. Neither has passed on protocol 8.

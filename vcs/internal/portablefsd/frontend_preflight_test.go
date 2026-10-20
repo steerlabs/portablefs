@@ -16,6 +16,7 @@ func servePreflightFrontend(
 	resolveError *pfslocal.ErrorReply,
 ) string {
 	t.Helper()
+	resolved := testV3DataPlane(t, newFakeV3DataClient()).resolveReply()
 	dir, err := os.MkdirTemp("", "pfsp-")
 	if err != nil {
 		t.Fatal(err)
@@ -44,13 +45,13 @@ func servePreflightFrontend(
 				reply = &pfslocal.HelloReply{
 					ProtocolMajor: pfslocal.ProtocolMajor,
 					ProtocolMinor: pfslocal.ProtocolMinor,
-					DaemonVersion: version,
+					DaemonVersion: version, RequestDeadlineMs: 60000,
 				}
 			case *pfslocal.ResolveRequest:
 				if resolveError != nil {
 					reply = resolveError
 				} else {
-					reply = &pfslocal.ResolveReply{}
+					reply = resolved
 				}
 			default:
 				return

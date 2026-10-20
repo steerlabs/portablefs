@@ -55,7 +55,7 @@ func TestRetireTransportConnectionsDoesNotExposeSuccessorBeforeExecutionDrain(t 
 
 func testTransportRegistration(t *testing.T, registry *transportRegistry, peer byte, set byte, role authoritypb.TransportRole) (*transportConnection, *atomic.Int32) {
 	return testTransportRegistrationForProfile(
-		t, registry, peer, set, role, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		t, registry, peer, set, role, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 	)
 }
 
@@ -93,7 +93,7 @@ func TestTransportRegistryRequiresExactPairAndRefusesUnprovedDuplicateRole(t *te
 	}
 	var set connectionSetID
 	set[0] = 2
-	if _, err := registry.register(volumeserver.PeerIdentity{1}, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, func() {}, func() error { return nil }); !errors.Is(err, ErrTransportBinding) {
+	if _, err := registry.register(volumeserver.PeerIdentity{1}, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX, func() {}, func() error { return nil }); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("duplicate DATA = %v, want ErrTransportBinding", err)
 	}
 	control, _ := testTransportRegistration(t, registry, 1, 2, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)
@@ -316,7 +316,7 @@ func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *test
 	var dataClosed atomic.Int32
 	data, err := registry.register(
 		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA,
-		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		func() {}, func() error {
 			dataClosed.Add(1)
 			close(dataCloseEntered)
@@ -330,7 +330,7 @@ func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *test
 	var controlClosed atomic.Int32
 	_, err = registry.register(
 		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL,
-		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		func() {}, func() error { controlClosed.Add(1); return nil },
 	)
 	if err != nil {
@@ -372,7 +372,7 @@ func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *test
 	}
 	if _, err := registry.register(
 		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA,
-		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		func() {}, func() error { return nil },
 	); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("terminating connection set admitted a replacement: %v", err)

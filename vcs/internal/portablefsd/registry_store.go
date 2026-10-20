@@ -2,25 +2,25 @@ package portablefsd
 
 import (
 	"bytes"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
+	"golang.org/x/sys/unix"
 )
 
-const attachRegistryVersion = 2
+const attachRegistryVersion = 3
 
 func attachRegistryPath(stateDir string) string {
-	return filepath.Join(stateDir, "attaches.json")
+	return filepath.Join(stateDir, daemonctl.PersistedAttachesFilename)
 }
 
 type persistedAttachRegistry struct {
@@ -29,29 +29,22 @@ type persistedAttachRegistry struct {
 }
 
 type loadedAttachRegistry struct {
-	attaches            []persistedAttachEntry
-	preserveLegacyEmpty bool
+	attaches []persistedAttachEntry
 }
 
 type persistedAttachEntry struct {
-	Ref                 string        `json:"ref"`
-	VolumeID            string        `json:"volumeId"`
-	Branch              string        `json:"branch"`
-	MountPath           string        `json:"mountPath"`
-	AuthorityURL        string        `json:"authorityUrl"`
-	DataPlaneTransport  string        `json:"dataPlaneTransport"`
-	DataPlaneServerName string        `json:"dataPlaneServerName,omitempty"`
-	TLSCAPEM            string        `json:"tlsCaPem,omitempty"`
-	TLSCASHA256         string        `json:"tlsCaSha256,omitempty"`
-	Options             AttachOptions `json:"options"`
-	IdentityEpoch       uint64        `json:"identityEpoch,omitempty"`
-	DetachPrepared      bool          `json:"detachPrepared,omitempty"`
-	DetachForce         bool          `json:"detachForce,omitempty"`
-	DetachJobID         string        `json:"detachJobId,omitempty"`
-	// Items is the retired client-journal architecture's FSKit item table. It
-	// is decoded so a legacy record still round-trips through revival (where
-	// it is refused with the unmount-and-remount remedy) and is never read.
-	Items []persistedItemRecord `json:"items,omitempty"`
+	Ref      string `json:"ref"`
+	VolumeID string `json:"volumeId"`
+
+	MountPath           string `json:"mountPath"`
+	AuthorityURL        string `json:"authorityUrl"`
+	DataPlaneTransport  string `json:"dataPlaneTransport"`
+	DataPlaneServerName string `json:"dataPlaneServerName,omitempty"`
+	TLSCAPEM            string `json:"tlsCaPem,omitempty"`
+	TLSCASHA256         string `json:"tlsCaSha256,omitempty"`
+
+	IdentityEpoch uint64 `json:"identityEpoch,omitempty"`
+
 	// V3 marks an authority-v3 attach. It carries only the credential-free
 	// declared contract (see v3attach.go): the strict session dies with the
 	// daemon process, so a revived v3 entry supports exactly one operation —
@@ -59,29 +52,15 @@ type persistedAttachEntry struct {
 	V3 *persistedV3Attach `json:"v3,omitempty"`
 }
 
-type persistedItemRecord struct {
-	Path            string `json:"path"`
-	ItemID          uint64 `json:"itemId"`
-	ItemGeneration  uint64 `json:"itemGeneration"`
-	AuthorityIno    bool   `json:"authorityIno,omitempty"`
-	AuthorityItemID uint64 `json:"authorityItemId,omitempty"`
-	Kind            string `json:"kind,omitempty"`
-	Graft           bool   `json:"graft,omitempty"`
-	// Detached records preserve an FSKit Item↔authority identity after its
-	// last locally known name is removed. FSKit stays mounted across a daemon
-	// restart, so only explicit Reclaim—not process lifetime—retires it.
-	Detached bool `json:"detached,omitempty"`
-}
-
 type PersistedAttachIdentity struct {
 	AttachRef string
 	VolumeID  string
-	Branch    string
+
 	MountPath string
 }
 
-// ReadPersistedAttachInventory is the strict read-only inventory boundary
-// used by installers and account mutation even when no daemon/socket exists.
+// ReadPersistedAttachInventory reads the exact private format for same-release
+// reconciliation. Cross-release lifecycle exclusion relies on file absence.
 func ReadPersistedAttachInventory(stateDir string) ([]PersistedAttachIdentity, error) {
 	entries, err := loadPersistedAttaches(stateDir)
 	if err != nil {
@@ -92,21 +71,10 @@ func ReadPersistedAttachInventory(stateDir string) ([]PersistedAttachIdentity, e
 		out = append(out, PersistedAttachIdentity{
 			AttachRef: entry.Ref,
 			VolumeID:  entry.VolumeID,
-			Branch:    entry.Branch,
 			MountPath: entry.MountPath,
 		})
 	}
 	return out, nil
-}
-
-func (i persistedItemRecord) authorityItemID() uint64 {
-	if i.AuthorityItemID != 0 {
-		return i.AuthorityItemID
-	}
-	if i.AuthorityIno {
-		return i.ItemID
-	}
-	return 0
 }
 
 func loadPersistedAttaches(stateDir string) ([]persistedAttachEntry, error) {
@@ -117,14 +85,21 @@ func loadPersistedAttaches(stateDir string) ([]persistedAttachEntry, error) {
 	return loaded.attaches, nil
 }
 
+var attachRegistryReadFile = privatepath.ReadFileIfExists
+
 func loadAttachRegistry(stateDir string) (loadedAttachRegistry, error) {
 	p := attachRegistryPath(stateDir)
-	data, err := privatepath.ReadFile(p)
+	var data []byte
+	err := privatepath.WithFileLock(p, unix.LOCK_SH, func() error {
+		var err error
+		data, err = attachRegistryReadFile(p)
+		return err
+	})
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return loadedAttachRegistry{}, nil
-		}
 		return loadedAttachRegistry{}, fmt.Errorf("read attach registry %s: %w", p, err)
+	}
+	if data == nil {
+		return loadedAttachRegistry{}, nil
 	}
 	if err := rejectDuplicateRegistryFields(data); err != nil {
 		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: %w", p, err)
@@ -139,24 +114,8 @@ func loadAttachRegistry(stateDir string) (loadedAttachRegistry, error) {
 	if err := decoder.Decode(&trailing); err == nil || err != io.EOF {
 		return loadedAttachRegistry{}, fmt.Errorf("parse attach registry %s: trailing JSON", p)
 	}
-	switch raw.Version {
-	case 1:
-		if raw.Attaches == nil || len(raw.Attaches) != 0 {
-			return loadedAttachRegistry{}, fmt.Errorf(
-				"attach registry %s has unsupported nonempty legacy version 1 inventory",
-				p,
-			)
-		}
-		// An explicitly empty v1 inventory carries no attach state requiring
-		// migration. Accept it read-only: this is compatibility, not recovery
-		// or self-healing, and must not rewrite the file behind the caller.
-		return loadedAttachRegistry{
-			attaches:            raw.Attaches,
-			preserveLegacyEmpty: true,
-		}, nil
-	case attachRegistryVersion:
-	default:
-		return loadedAttachRegistry{}, fmt.Errorf("attach registry %s has unsupported version %d", p, raw.Version)
+	if raw.Version != attachRegistryVersion || len(raw.Attaches) == 0 {
+		return loadedAttachRegistry{}, fmt.Errorf("attach registry %s has invalid version or inventory", p)
 	}
 	seenRef := map[string]struct{}{}
 	seenKey := map[string]struct{}{}
@@ -169,27 +128,23 @@ func loadAttachRegistry(stateDir string) (loadedAttachRegistry, error) {
 		if _, duplicate := seenRef[e.Ref]; duplicate {
 			return loadedAttachRegistry{}, fmt.Errorf("duplicate attach ref %s in %s", e.Ref, p)
 		}
-		key := attachKey(e.VolumeID, e.Branch, e.MountPath)
+		key := attachKey(e.VolumeID, e.MountPath)
 		if _, duplicate := seenKey[key]; duplicate {
 			return loadedAttachRegistry{}, fmt.Errorf("duplicate attach key for %s in %s", e.MountPath, p)
 		}
-		storage := storageKey(e.VolumeID, e.Branch)
+		storage := e.VolumeID
 		if _, duplicate := seenStorage[storage]; duplicate {
-			return loadedAttachRegistry{}, fmt.Errorf("multiple persisted attaches own %s@%s in %s", e.VolumeID, e.Branch, p)
-		}
-		if err := validatePersistedItems(*e); err != nil {
-			return loadedAttachRegistry{}, fmt.Errorf("attach registry entry %d in %s: %w", i, p, err)
+			return loadedAttachRegistry{}, fmt.Errorf("multiple persisted attaches own %s@%s in %s", e.VolumeID, "", p)
 		}
 		seenRef[e.Ref], seenKey[key], seenStorage[storage] = struct{}{}, struct{}{}, struct{}{}
 	}
 	return loadedAttachRegistry{attaches: raw.Attaches}, nil
 }
 
-// rejectDuplicateRegistryFields makes every durable field unambiguous before
-// the typed strict decode. In particular, a document cannot hide a nonempty
-// legacy inventory behind a later empty one or use last-value-wins semantics
-// inside an attach, its options, or its item table.
 func rejectDuplicateRegistryFields(data []byte) error {
+	if !utf8.Valid(data) {
+		return errors.New("registry is not UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	token, err := decoder.Token()
 	if err != nil {
@@ -212,6 +167,9 @@ func rejectDuplicateObjectFields(decoder *json.Decoder, objectPath string) error
 		if !ok {
 			return fmt.Errorf("object member name is not a string")
 		}
+		if !registryFieldAllowed(objectPath, name) {
+			return fmt.Errorf("unknown registry field %q in %s", name, objectPath)
+		}
 		if _, duplicate := seen[name]; duplicate {
 			return fmt.Errorf("duplicate field %q in %s", name, objectPath)
 		}
@@ -231,6 +189,9 @@ func rejectDuplicateValueFields(decoder *json.Decoder, valuePath string) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
+	}
+	if token == nil {
+		return fmt.Errorf("null registry field at %s", valuePath)
 	}
 	delim, isContainer := token.(json.Delim)
 	if !isContainer {
@@ -264,36 +225,20 @@ func validatePersistedAttach(e *persistedAttachEntry) error {
 	if strings.TrimSpace(e.VolumeID) == "" || strings.TrimSpace(e.VolumeID) != e.VolumeID {
 		return fmt.Errorf("volumeId is empty or has surrounding whitespace")
 	}
-	if strings.TrimSpace(e.Branch) != e.Branch {
-		return fmt.Errorf("branch has surrounding whitespace")
+	if e.V3 == nil {
+		return errors.New("missing v3 attach contract")
 	}
-	// A v3 attach is exactly the branchless case; every other attach still
-	// requires a branch, so the two modes cannot be confused in the inventory.
-	if e.Branch == "" && e.V3 == nil {
-		return fmt.Errorf("branch is empty")
+	if err := validPersistedV3Attach(e.V3); err != nil {
+		return err
 	}
-	if e.Branch != "" && e.V3 != nil {
-		return fmt.Errorf("a v3 attach must be branchless")
-	}
-	if e.V3 != nil {
-		if err := validPersistedV3Attach(e.V3); err != nil {
-			return fmt.Errorf("invalid v3 attach contract: %w", err)
-		}
-		if e.DataPlaneTransport != "tls-private-ca" && e.DataPlaneTransport != "tls-system-pki" {
-			return fmt.Errorf("v3 attach requires mutually authenticated TLS; transport %q is invalid", e.DataPlaneTransport)
-		}
+	if e.DataPlaneTransport != "tls-private-ca" && e.DataPlaneTransport != "tls-system-pki" {
+		return errors.New("attach requires mutually authenticated TLS")
 	}
 	if !filepath.IsAbs(e.MountPath) || filepath.Clean(e.MountPath) != e.MountPath {
 		return fmt.Errorf("mountPath %q is not canonical and absolute", e.MountPath)
 	}
 	if strings.TrimSpace(e.AuthorityURL) == "" || strings.TrimSpace(e.AuthorityURL) != e.AuthorityURL {
 		return fmt.Errorf("authorityUrl is empty or has surrounding whitespace")
-	}
-	if e.Options.DiskCacheMB < 0 {
-		return fmt.Errorf("negative diskCacheMb")
-	}
-	if e.V3 != nil && (len(e.Options.LocalDirs) != 0 || e.Options.VolumeLocalDirs) {
-		return fmt.Errorf("a v3 attach carries no machine-local graft routing")
 	}
 	if err := (dataPlaneTransport{
 		mode:       e.DataPlaneTransport,
@@ -306,80 +251,6 @@ func validatePersistedAttach(e *persistedAttachEntry) error {
 	if e.IdentityEpoch == 0 {
 		return fmt.Errorf("missing identityEpoch")
 	}
-	if e.DetachJobID != "" && !e.DetachForce {
-		return fmt.Errorf("detachJobId requires durable force authorization")
-	}
-	if e.DetachJobID != "" {
-		if len(e.DetachJobID) != 35 || !strings.HasPrefix(e.DetachJobID, "job") ||
-			e.DetachJobID != strings.ToLower(e.DetachJobID) {
-			return fmt.Errorf("detachJobId has invalid recovery-job identity")
-		}
-		if _, err := hex.DecodeString(e.DetachJobID[3:]); err != nil {
-			return fmt.Errorf("detachJobId has invalid recovery-job identity")
-		}
-	}
-	return nil
-}
-
-func validatePersistedItems(e persistedAttachEntry) error {
-	seenIDAuth := map[uint64]uint64{}
-	seenPath := map[string]struct{}{}
-	seenDetachedID := map[uint64]struct{}{}
-	for i, item := range e.Items {
-		if _, ok := fskitItemID(item.ItemID); !ok {
-			return fmt.Errorf("item %d has unrepresentable itemId %d", i, item.ItemID)
-		}
-		if item.ItemGeneration == 0 {
-			return fmt.Errorf("item %d has no itemGeneration", i)
-		}
-		if item.ItemGeneration != e.IdentityEpoch {
-			return fmt.Errorf("item %d generation %d does not equal identityEpoch %d", i, item.ItemGeneration, e.IdentityEpoch)
-		}
-		cleanPath := strings.Trim(path.Clean("/"+item.Path), "/")
-		if cleanPath == "." {
-			cleanPath = ""
-		}
-		if cleanPath != item.Path {
-			return fmt.Errorf("item %d path %q is not canonical", i, item.Path)
-		}
-		if item.Detached {
-			if item.Path == "" {
-				return fmt.Errorf("item %d detaches the root item", i)
-			}
-			if _, dup := seenDetachedID[item.ItemID]; dup {
-				return fmt.Errorf("item %d duplicates detached item id %d", i, item.ItemID)
-			}
-			seenDetachedID[item.ItemID] = struct{}{}
-		} else {
-			if _, dup := seenPath[cleanPath]; dup {
-				return fmt.Errorf("item %d duplicates path %q", i, cleanPath)
-			}
-			seenPath[cleanPath] = struct{}{}
-		}
-		switch item.Kind {
-		case "", "file", "directory", "symlink":
-		default:
-			return fmt.Errorf("item %d has invalid kind %q", i, item.Kind)
-		}
-		authorityItemID := item.authorityItemID()
-		if authorityItemID != 0 {
-			if _, ok := fskitItemID(authorityItemID); !ok {
-				return fmt.Errorf("item %d has unrepresentable authority item id %d", i, authorityItemID)
-			}
-		}
-		if auth, dup := seenIDAuth[item.ItemID]; dup && auth != authorityItemID {
-			return fmt.Errorf("item %d id %d conflicts with authority identity", i, item.ItemID)
-		}
-		expectedAuthorityIno := authorityItemID != 0
-		expectedAuthorityItemID := authorityItemID
-		if authorityItemID == item.ItemID {
-			expectedAuthorityItemID = 0
-		}
-		if item.AuthorityIno != expectedAuthorityIno || item.AuthorityItemID != expectedAuthorityItemID {
-			return fmt.Errorf("item %d authority identity fields are not canonical", i)
-		}
-		seenIDAuth[item.ItemID] = authorityItemID
-	}
 	return nil
 }
 
@@ -387,13 +258,9 @@ func (r *registry) persist() error {
 	r.persistMu.Lock()
 	defer r.persistMu.Unlock()
 	entries := r.persistedEntries()
-	if r.preserveLegacyEmpty && len(entries) == 0 {
-		return nil
-	}
-	if err := writePersistedAttaches(r.stateDir, entries); err != nil {
+	if err := r.writeAttaches(r.stateDir, entries); err != nil {
 		return err
 	}
-	r.preserveLegacyEmpty = false
 	return nil
 }
 
@@ -409,15 +276,27 @@ func (r *registry) persistedEntries() []persistedAttachEntry {
 }
 
 func writePersistedAttaches(stateDir string, entries []persistedAttachEntry) error {
+	// persistMu orders snapshots. persistedEntries releases registry/attach mutexes
+	// before this filesystem lock: serving does not wait on a CLI's local read.
+	return privatepath.WithFileLock(attachRegistryPath(stateDir), unix.LOCK_EX, func() error {
+		return writePersistedAttachesUnlocked(stateDir, entries)
+	})
+}
+
+func writePersistedAttachesUnlocked(stateDir string, entries []persistedAttachEntry) error {
+	// File absence is the format-independent empty witness used during upgrade.
+	if len(entries) == 0 {
+		if err := privatepath.RemoveFileDurable(attachRegistryPath(stateDir)); err != nil {
+			return fmt.Errorf("remove empty attach registry: %w", err)
+		}
+		return nil
+	}
 	seenRef, seenKey, seenStorage := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for i := range entries {
 		if err := validatePersistedAttach(&entries[i]); err != nil {
 			return fmt.Errorf("refuse invalid persisted attach %d: %w", i, err)
 		}
-		if err := validatePersistedItems(entries[i]); err != nil {
-			return fmt.Errorf("refuse invalid persisted attach items %d: %w", i, err)
-		}
-		key, storage := attachKey(entries[i].VolumeID, entries[i].Branch, entries[i].MountPath), storageKey(entries[i].VolumeID, entries[i].Branch)
+		key, storage := attachKey(entries[i].VolumeID, entries[i].MountPath), entries[i].VolumeID
 		if seenRef[entries[i].Ref] || seenKey[key] || seenStorage[storage] {
 			return fmt.Errorf("refuse duplicate persisted attach identity at entry %d", i)
 		}
@@ -430,4 +309,18 @@ func writePersistedAttaches(stateDir string, entries []persistedAttachEntry) err
 	}
 	data = append(data, '\n')
 	return privatepath.WriteFileAtomic(attachRegistryPath(stateDir), data)
+}
+
+func registryFieldAllowed(path, name string) bool {
+	if path == "$" {
+		return name == "version" || name == "attaches"
+	}
+	if strings.HasSuffix(path, ".v3") {
+		return name == "routesRevision"
+	}
+	switch name {
+	case "ref", "volumeId", "mountPath", "authorityUrl", "dataPlaneTransport", "dataPlaneServerName", "tlsCaPem", "tlsCaSha256", "identityEpoch", "v3":
+		return true
+	}
+	return false
 }

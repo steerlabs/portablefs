@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -130,94 +129,6 @@ func TestConvergentCellRegistrationNeverOverwritesLiveState(t *testing.T) {
 	mismatch.ID = "22222222-2222-4222-8222-222222222222"
 	if _, err := h.manager.ConvergeCell(cellID, mismatch); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("path/body identity mismatch = %v", err)
-	}
-}
-
-func TestConvergentCellRegistrationPinsCompatiblePreBoundStateOnce(t *testing.T) {
-	h := newManagerHarness(t)
-	cellID := "11111111-1111-4111-8111-111111111111"
-	declaration := RegisterCellRequest{
-		ID: cellID, AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 8 << 30, CapacityInodes: 800_000, Pool: PoolProduct,
-		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
-	}
-	cell, err := h.manager.RegisterCell("pre-bound-cell", declaration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	prepareCellForAdmission(t, h, cell)
-	if _, err := h.manager.CreateVolume("pre-bound-volume", CreateVolumeRequest{
-		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
-		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.manager.CreateVolume("pre-bound-volume-2", CreateVolumeRequest{
-		AuthorizationDomain: "org", Owner: "owner-2", ProductIssuer: "opensteer",
-		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.manager.UpdateCellCapacity("pre-bound-raise", cellID, UpdateCellCapacityRequest{
-		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.store.TransactNatural("test-pre-bound-registration", h.now.Unix(), func(state *State) (any, bool, error) {
-		current := state.Cells[cellID]
-		current.RegistrationSHA256 = strings.Repeat("b", 64)
-		current.LastProjectID = 0
-		current.LastServiceUID = 0
-		current.LastPort = 0
-		state.Cells[cellID] = current
-		return current, true, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	before := currentState(t, h).Cells[cellID]
-	oldFingerprint := before.RegistrationSHA256
-	if oldFingerprint == "" {
-		t.Fatal("fixture must exercise adoption from the earlier declaration digest")
-	}
-	sequence := h.store.sequence
-	tooSmallCases := []struct {
-		name   string
-		mutate func(*RegisterCellRequest)
-	}{
-		{"project ID", func(request *RegisterCellRequest) { request.LastProjectID = before.NextProjectID - 2 }},
-		{"service UID", func(request *RegisterCellRequest) { request.LastServiceUID = before.NextServiceUID - 2 }},
-		{"port", func(request *RegisterCellRequest) { request.LastPort = before.NextPort - 2 }},
-	}
-	for _, test := range tooSmallCases {
-		t.Run(test.name, func(t *testing.T) {
-			tooSmall := declaration
-			test.mutate(&tooSmall)
-			if _, err := h.manager.ConvergeCell(cellID, tooSmall); !errors.Is(err, ErrConflict) {
-				t.Fatalf("pre-bound adoption around an advanced allocator = %v", err)
-			}
-			if h.store.sequence != sequence || !reflect.DeepEqual(currentState(t, h).Cells[cellID], before) {
-				t.Fatal("failed allocator-bound adoption changed durable state")
-			}
-		})
-	}
-	pinned, err := h.manager.ConvergeCell(cellID, declaration)
-	if err != nil || pinned.RegistrationSHA256 == "" {
-		t.Fatalf("compatible pre-bound registration = %+v, %v", pinned, err)
-	}
-	want := before
-	want.LastProjectID = declaration.LastProjectID
-	want.LastServiceUID = declaration.LastServiceUID
-	want.LastPort = declaration.LastPort
-	want.RegistrationSHA256 = pinned.RegistrationSHA256
-	if !reflect.DeepEqual(pinned, want) || h.store.sequence != sequence+1 {
-		t.Fatalf("digest adoption changed live state or append count: got=%+v want=%+v sequence=%d->%d", pinned, want, sequence, h.store.sequence)
-	}
-	if pinned.RegistrationSHA256 == oldFingerprint {
-		t.Fatal("bounded declaration did not supersede the pre-bound fingerprint")
-	}
-	sequence = h.store.sequence
-	if replay, err := h.manager.ConvergeCell(cellID, declaration); err != nil || !reflect.DeepEqual(replay, pinned) || h.store.sequence != sequence {
-		t.Fatalf("post-adoption exact replay = %+v, %v sequence=%d->%d", replay, err, sequence, h.store.sequence)
 	}
 }
 
@@ -459,7 +370,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		t.Fatalf("hosted authority refused manager grant: %v", err)
 	}
 	runtimeAuthority, err := volumeserver.New(volume.ID, volumeserver.Config{
-		SessionLease: 10 * time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 16,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  10 * time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 16,
 		Now: func() time.Time { return *h.now },
 	})
 	if err != nil {
@@ -1750,9 +1662,9 @@ func TestManagerReleaseUpgradeAdvancesTheSignedPlanGeneration(t *testing.T) {
 	}
 }
 
-func TestCellPlanIsV2WithDestroyPhaseAndNoRecordedCapabilities(t *testing.T) {
+func TestCellPlanIsV3WithDestroyPhase(t *testing.T) {
 	h := newManagerHarness(t)
-	cell, err := h.manager.RegisterCell("v2-plan", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+	cell, err := h.manager.RegisterCell("v3-plan", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct,
 		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
@@ -1778,17 +1690,9 @@ func TestCellPlanIsV2WithDestroyPhaseAndNoRecordedCapabilities(t *testing.T) {
 	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
 	if plan.Version != cellplan.Version || plan.UsageRefreshSeconds != uint64(h.manager.cfg.UsageStaleAfter/time.Second) ||
 		len(plan.Volumes) != 1 || plan.Volumes[0].Phase != cellplan.PhaseDestroy {
-		t.Fatalf("v2 destroy plan = %+v", plan)
+		t.Fatalf("v3 destroy plan = %+v", plan)
 	}
-	if err := h.store.View(func(state State) error {
-		stored := state.Cells[cell.ID]
-		if len(stored.PlanVersions) != 0 || len(stored.HelperPlanVersions) != 0 || len(stored.HelperStateVersions) != 0 {
-			t.Fatalf("durable capabilities unexpectedly recorded: %+v", stored)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+
 }
 
 func TestObservationCannotSwapIsolationIdentity(t *testing.T) {

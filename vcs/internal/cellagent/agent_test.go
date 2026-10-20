@@ -113,14 +113,14 @@ type convergenceHost struct {
 	observed []string
 }
 
-func (host *convergenceHost) Apply(_ context.Context, plan cellplan.VolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *convergenceHost) Apply(_ context.Context, plan cellplan.EffectiveVolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	host.mu.Lock()
 	defer host.mu.Unlock()
 	host.applied = append(host.applied, plan.VolumeID)
 	return controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true}, cellhelper.HostUpdate{}
 }
 
-func (host *convergenceHost) Observe(_ context.Context, plan cellplan.VolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+func (host *convergenceHost) Observe(_ context.Context, plan cellplan.EffectiveVolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	host.mu.Lock()
 	defer host.mu.Unlock()
 	host.observed = append(host.observed, plan.VolumeID)

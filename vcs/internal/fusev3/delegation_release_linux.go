@@ -21,7 +21,7 @@ const (
 	delegationOperation
 )
 
-type delegationReleaseFlight struct{ done chan struct{} }
+type delegationFlight struct{ done chan struct{} }
 
 // A release owns a logical transition while its RPC runs, but holds none of
 // the state's physical locks. Joining it must release every requested lock:
@@ -100,7 +100,7 @@ type delegationReleaseBatch struct {
 	epochSerial uint64
 	incarnation uint64
 	groups      []*delegationReleaseGroup
-	flight      *delegationReleaseFlight
+	flight      *delegationFlight
 }
 
 // The batch is pinned to one captured epoch and buffer. Close cleanup does not
@@ -154,7 +154,7 @@ func (m *delegationManager) prepareReleaseBatch(ctx context.Context, buf *writeb
 				groups[i].state.acquire.Unlock()
 			}
 		}
-		var previous *delegationReleaseFlight
+		var previous *delegationFlight
 		for _, g := range groups {
 			if g.state.releaseFlight != nil {
 				previous = g.state.releaseFlight
@@ -170,19 +170,26 @@ func (m *delegationManager) prepareReleaseBatch(ctx context.Context, buf *writeb
 				return nil, ctx.Err()
 			}
 		}
-		batch := &delegationReleaseBatch{manager: m, buffer: buf, epochSerial: epochSerial, incarnation: incarnation, groups: groups, flight: &delegationReleaseFlight{done: make(chan struct{})}}
+		batch := &delegationReleaseBatch{manager: m, buffer: buf, epochSerial: epochSerial, incarnation: incarnation, groups: groups, flight: &delegationFlight{done: make(chan struct{})}}
 		var prepareErr error
 		for _, g := range groups {
 			s := g.state
 			s.admission.RLock()
 			g.ref = cloneDelegationRef(s.ref)
 			if g.closing != nil {
+				owned := false
 				g.release = len(s.handles) > 0
 				for handle := range s.handles {
-					if _, closing := g.closing[handle]; !closing {
+					if _, closing := g.closing[handle]; closing {
+						owned = true
+					} else {
 						g.release = false
-						break
 					}
+				}
+				// Stable identity only locates state. A descriptor absent from
+				// this grant cannot retire or acquire its failure scope.
+				if !owned {
+					g.ref = nil
 				}
 			}
 			s.admission.RUnlock()
@@ -364,42 +371,13 @@ func (m *delegationManager) SetCleanupRetryWaiter(wait func(context.Context) err
 	m.hookMu.Unlock()
 }
 
-// Peers without the optional capability retain the original CLOSE wire. The
-// release flight owns local transition state, without holding physical locks.
-func (m *delegationManager) closeSerial(ctx context.Context, epochSerial uint64, buf *writeback.Buffer, current []delegationClose, requests []*authoritypb.CloseRequest, groups map[writeback.Identity]*delegationReleaseGroup) error {
-	var first error
-	for i, request := range requests {
-		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: request}})
-		if !m.epochCurrent(epochSerial, buf) {
-			return writeback.ErrLost
-		}
-		if err != nil || response == nil || response.GetUncertain() {
-			if err == nil {
-				err = errors.New("fusev3: CLOSE has no definite outcome")
-			}
-			return m.unknownCloseOutcome(err)
-		}
-		if err := successfulDelegationResponse(response); err != nil {
-			if first == nil {
-				first = delegationCleanupError{cause: err, failure: response.GetFailure()}
-			}
-			continue
-		}
-		id, _ := delegationIdentity(current[i].identity)
-		s := groups[id].state
-		s.admission.Lock()
-		delete(s.handles, string(current[i].handle))
-		delete(s.writers, string(current[i].handle))
-		s.admission.Unlock()
+func (m *delegationManager) closeResetOutcome(session uint64) error {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	if session != m.sessionSerial {
+		return writeback.ErrLost
 	}
-	if first != nil {
-		var cleanup delegationCleanupError
-		if errors.As(first, &cleanup) {
-			return cleanup
-		}
-		return delegationCleanupError{cause: first}
-	}
-	return nil
+	return delegationCleanupError{cause: authorityrpc.ErrSubscriptionReset, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
 }
 
 // A failed deferred close is consumed after its transition flight has ended.

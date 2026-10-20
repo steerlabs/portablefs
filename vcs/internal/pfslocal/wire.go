@@ -15,26 +15,28 @@ const (
 var ErrMalformed = errors.New("pfslocal: malformed protobuf")
 
 func MarshalEnvelope(e *Envelope) ([]byte, error) {
-	if e == nil {
-		return nil, fmt.Errorf("pfslocal: nil envelope")
+	if err := validateLocalEnvelope(e); err != nil {
+		return nil, err
 	}
 	var b []byte
 	b = appendU64(b, 1, e.RequestID)
 	b = appendBool(b, 2, e.PublicationAckRequired)
 	b = appendU64(b, 3, e.OperationID)
-	b = appendBool(b, 4, e.PublicationRetracted)
-	if e.Body == nil {
-		return b, nil
-	}
 	num, payload, err := marshalBody(e.Body)
 	if err != nil {
 		return nil, err
 	}
 	b = appendMsg(b, num, payload)
+	if err := validateLocalWire(b); err != nil {
+		return nil, err
+	}
 	return b, nil
 }
 
 func UnmarshalEnvelope(b []byte) (*Envelope, error) {
+	if err := validateLocalWire(b); err != nil {
+		return nil, err
+	}
 	e := &Envelope{}
 	for len(b) > 0 {
 		num, wt, rest, err := consumeTag(b)
@@ -63,16 +65,6 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.PublicationAckRequired = v != 0
-		case 4:
-			if wt != wireVarint {
-				return nil, ErrMalformed
-			}
-			var v uint64
-			v, b, err = consumeVarint(b)
-			if err != nil {
-				return nil, err
-			}
-			e.PublicationRetracted = v != 0
 		case 3:
 			if wt != wireVarint {
 				return nil, ErrMalformed
@@ -83,8 +75,7 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.OperationID = v
-		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 90, 91:
+		case 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 29, 30, 32, 33, 34, 35, 36, 39, 40, 60, 61, 62, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 78, 79, 80, 82, 83, 84, 85, 88, 90, 91:
 			if wt != wireBytes {
 				return nil, ErrMalformed
 			}
@@ -116,8 +107,6 @@ func marshalBody(v any) (int, []byte, error) {
 		return 11, marshalResolveRequest(m), nil
 	case *LookupRequest:
 		return 12, marshalLookupRequest(m), nil
-	case *EnumerateRequest:
-		return 13, marshalEnumerateRequest(m), nil
 	case *GetAttrRequest:
 		return 14, marshalGetAttrRequest(m), nil
 	case *SetAttrRequest:
@@ -144,16 +133,12 @@ func marshalBody(v any) (int, []byte, error) {
 		return 25, marshalReadlinkRequest(m), nil
 	case *XattrGetRequest:
 		return 26, marshalXattrGetRequest(m), nil
-	case *XattrSetRequest:
-		return 27, marshalXattrSetRequest(m), nil
 	case *XattrListRequest:
 		return 28, marshalXattrListRequest(m), nil
 	case *XattrRemoveRequest:
 		return 29, marshalXattrRemoveRequest(m), nil
 	case *StatfsRequest:
 		return 30, nil, nil
-	case *FsyncRequest:
-		return 31, marshalFsyncRequest(m), nil
 	case *ReclaimRequest:
 		return 32, marshalReclaimRequest(m), nil
 	case *SubscribeEventsRequest:
@@ -164,20 +149,16 @@ func marshalBody(v any) (int, []byte, error) {
 		return 35, nil, nil
 	case *PublicationAck:
 		return 36, marshalPublicationAck(m), nil
-	case *VisibilityAckRequest:
-		return 37, marshalVisibilityAckRequest(m), nil
-	case *V3LivenessRequest:
-		return 38, marshalV3LivenessRequest(m), nil
 	case *ResourceReplyDisposition:
 		return 39, marshalResourceReplyDisposition(m), nil
+	case *EnumerateEntriesRequest:
+		return 40, marshalEnumerateEntriesRequest(m), nil
 	case *HelloReply:
 		return 60, marshalHelloReply(m), nil
 	case *ResolveReply:
 		return 61, marshalResolveReply(m), nil
 	case *LookupReply:
 		return 62, marshalLookupReply(m), nil
-	case *EnumerateReply:
-		return 63, marshalEnumerateReply(m), nil
 	case *GetAttrReply:
 		return 64, marshalGetAttrReply(m), nil
 	case *SetAttrReply:
@@ -204,16 +185,12 @@ func marshalBody(v any) (int, []byte, error) {
 		return 75, marshalReadlinkReply(m), nil
 	case *XattrGetReply:
 		return 76, marshalXattrGetReply(m), nil
-	case *XattrSetReply:
-		return 77, nil, nil
 	case *XattrListReply:
 		return 78, marshalXattrListReply(m), nil
 	case *XattrRemoveReply:
 		return 79, nil, nil
 	case *StatfsReply:
 		return 80, marshalStatfsReply(m), nil
-	case *FsyncReply:
-		return 81, nil, nil
 	case *ReclaimReply:
 		return 82, nil, nil
 	case *SubscribeEventsReply:
@@ -222,10 +199,8 @@ func marshalBody(v any) (int, []byte, error) {
 		return 84, marshalHardLinkReply(m), nil
 	case *SyncVolumeReply:
 		return 85, marshalSyncVolumeReply(m), nil
-	case *VisibilityAckReply:
-		return 86, nil, nil
-	case *V3LivenessReply:
-		return 87, marshalV3LivenessReply(m), nil
+	case *EnumerateEntriesReply:
+		return 88, marshalEnumerateEntriesReply(m), nil
 	case *ErrorReply:
 		return 90, marshalErrorReply(m), nil
 	case *Event:
@@ -243,8 +218,6 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalResolveRequest(b)
 	case 12:
 		return unmarshalLookupRequest(b)
-	case 13:
-		return unmarshalEnumerateRequest(b)
 	case 14:
 		return unmarshalGetAttrRequest(b)
 	case 15:
@@ -271,16 +244,12 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalReadlinkRequest(b)
 	case 26:
 		return unmarshalXattrGetRequest(b)
-	case 27:
-		return unmarshalXattrSetRequest(b)
 	case 28:
 		return unmarshalXattrListRequest(b)
 	case 29:
 		return unmarshalXattrRemoveRequest(b)
 	case 30:
 		return &StatfsRequest{}, nil
-	case 31:
-		return unmarshalFsyncRequest(b)
 	case 32:
 		return unmarshalReclaimRequest(b)
 	case 33:
@@ -291,20 +260,16 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return &SyncVolumeRequest{}, nil
 	case 36:
 		return unmarshalPublicationAck(b)
-	case 37:
-		return unmarshalVisibilityAckRequest(b)
-	case 38:
-		return unmarshalV3LivenessRequest(b)
 	case 39:
 		return unmarshalResourceReplyDisposition(b)
+	case 40:
+		return unmarshalEnumerateEntriesRequest(b)
 	case 60:
 		return unmarshalHelloReply(b)
 	case 61:
 		return unmarshalResolveReply(b)
 	case 62:
 		return unmarshalLookupReply(b)
-	case 63:
-		return unmarshalEnumerateReply(b)
 	case 64:
 		return unmarshalGetAttrReply(b)
 	case 65:
@@ -331,16 +296,12 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalReadlinkReply(b)
 	case 76:
 		return unmarshalXattrGetReply(b)
-	case 77:
-		return &XattrSetReply{}, nil
 	case 78:
 		return unmarshalXattrListReply(b)
 	case 79:
 		return &XattrRemoveReply{}, nil
 	case 80:
 		return unmarshalStatfsReply(b)
-	case 81:
-		return &FsyncReply{}, nil
 	case 82:
 		return &ReclaimReply{}, nil
 	case 83:
@@ -349,10 +310,8 @@ func unmarshalBody(num int, b []byte) (any, error) {
 		return unmarshalHardLinkReply(b)
 	case 85:
 		return unmarshalSyncVolumeReply(b)
-	case 86:
-		return &VisibilityAckReply{}, nil
-	case 87:
-		return unmarshalV3LivenessReply(b)
+	case 88:
+		return unmarshalEnumerateEntriesReply(b)
 	case 90:
 		return unmarshalErrorReply(b)
 	case 91:
@@ -489,72 +448,6 @@ func unmarshalResourceReplyDisposition(b []byte) (*ResourceReplyDisposition, err
 	})
 }
 
-func marshalVisibilityAckRequest(m *VisibilityAckRequest) []byte {
-	var b []byte
-	b = appendBytesField(b, 1, m.AuthorityEpoch)
-	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
-	b = appendBool(b, 5, m.OrderedAdmissionContended)
-	return b
-}
-
-func unmarshalVisibilityAckRequest(b []byte) (*VisibilityAckRequest, error) {
-	m := &VisibilityAckRequest{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.AuthorityEpoch, err = scalarBytes(wt, raw)
-		case 2:
-			m.Cursor, err = parseVisibilityCursorField(wt, raw)
-		case 5:
-			m.OrderedAdmissionContended, err = scalarBool(wt, raw)
-		}
-		return err
-	})
-}
-
-func marshalV3LivenessRequest(m *V3LivenessRequest) []byte {
-	var b []byte
-	b = appendBytesField(b, 1, m.AuthorityEpoch)
-	b = appendBytesField(b, 2, m.SessionID)
-	return b
-}
-
-func unmarshalV3LivenessRequest(b []byte) (*V3LivenessRequest, error) {
-	m := &V3LivenessRequest{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.AuthorityEpoch, err = scalarBytes(wt, raw)
-		case 2:
-			m.SessionID, err = scalarBytes(wt, raw)
-		}
-		return err
-	})
-}
-
-func marshalV3LivenessReply(m *V3LivenessReply) []byte {
-	var b []byte
-	b = appendBytesField(b, 1, m.AuthorityEpoch)
-	b = appendBytesField(b, 2, m.SessionID)
-	return b
-}
-
-func unmarshalV3LivenessReply(b []byte) (*V3LivenessReply, error) {
-	m := &V3LivenessReply{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.AuthorityEpoch, err = scalarBytes(wt, raw)
-		case 2:
-			m.SessionID, err = scalarBytes(wt, raw)
-		}
-		return err
-	})
-}
-
 func marshalResolveRequest(m *ResolveRequest) []byte {
 	var b []byte
 	return appendString(b, 1, m.AttachRef)
@@ -577,12 +470,8 @@ func marshalResolveReply(m *ResolveReply) []byte {
 	b = appendMsg(b, 1, marshalItem(&m.Root))
 	b = appendMsg(b, 2, marshalAttr(&m.RootAttr))
 	b = appendString(b, 3, m.VolumeID)
-	b = appendString(b, 4, m.Branch)
 	b = appendString(b, 5, m.VolumeName)
 	b = appendMsg(b, 6, marshalCapabilities(&m.Capabilities))
-	if m.V3Coherence != nil {
-		b = appendMsg(b, 7, marshalV3CoherenceContract(m.V3Coherence))
-	}
 	return b
 }
 
@@ -599,62 +488,12 @@ func unmarshalResolveReply(b []byte) (*ResolveReply, error) {
 			var v []byte
 			v, err = scalarBytes(wt, raw)
 			m.VolumeID = string(v)
-		case 4:
-			var v []byte
-			v, err = scalarBytes(wt, raw)
-			m.Branch = string(v)
 		case 5:
 			var v []byte
 			v, err = scalarBytes(wt, raw)
 			m.VolumeName = string(v)
 		case 6:
 			m.Capabilities, err = parseCapabilitiesField(wt, raw)
-		case 7:
-			m.V3Coherence, err = parseV3CoherenceContractField(wt, raw)
-		}
-		return err
-	})
-}
-
-func marshalV3CoherenceContract(m *V3CoherenceContract) []byte {
-	var b []byte
-	b = appendU32(b, 1, m.AuthorityProtocolMajor)
-	b = appendBytesField(b, 2, m.AuthorityEpoch)
-	b = appendBytesField(b, 3, m.SessionID)
-	b = appendString(b, 4, m.CachePolicy)
-	b = appendU64(b, 5, m.RepairBudgetMillis)
-	if m.InitialCursor != nil {
-		b = appendMsg(b, 6, marshalVisibilityCursor(m.InitialCursor))
-	}
-	return b
-}
-
-func parseV3CoherenceContractField(wt int, raw []byte) (*V3CoherenceContract, error) {
-	if wt != wireBytes {
-		return nil, ErrMalformed
-	}
-	m := &V3CoherenceContract{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			var v uint64
-			v, err = scalarU64(wt, raw)
-			m.AuthorityProtocolMajor = uint32(v)
-		case 2:
-			m.AuthorityEpoch, err = scalarBytes(wt, raw)
-		case 3:
-			m.SessionID, err = scalarBytes(wt, raw)
-		case 4:
-			var v []byte
-			v, err = scalarBytes(wt, raw)
-			m.CachePolicy = string(v)
-		case 5:
-			m.RepairBudgetMillis, err = scalarU64(wt, raw)
-		case 6:
-			var cursor VisibilityCursor
-			cursor, err = parseVisibilityCursorField(wt, raw)
-			m.InitialCursor = &cursor
 		}
 		return err
 	})
@@ -662,16 +501,9 @@ func parseV3CoherenceContractField(wt int, raw []byte) (*V3CoherenceContract, er
 
 func marshalCapabilities(m *Capabilities) []byte {
 	var b []byte
-	b = appendBool(b, 1, m.Symlinks)
-	b = appendBool(b, 2, m.HardLinks)
-	b = appendBool(b, 3, m.Xattrs)
-	b = appendBool(b, 4, m.CaseSensitive)
 	b = appendU32(b, 5, m.MaxNameBytes)
 	b = appendU64(b, 6, m.MaxFileSize)
 	b = appendU32(b, 7, m.PreferredIOSize)
-	b = appendBool(b, 8, m.FlagsSupported)
-	b = appendBool(b, 9, m.FlagsUnderstood)
-	b = appendBool(b, 10, m.XattrSetSupported)
 	return b
 }
 
@@ -682,22 +514,6 @@ func parseCapabilitiesField(wt int, raw []byte) (Capabilities, error) {
 	m := Capabilities{}
 	return m, scan(raw, func(num int, wt int, raw []byte) error {
 		switch num {
-		case 1:
-			v, err := scalarBool(wt, raw)
-			m.Symlinks = v
-			return err
-		case 2:
-			v, err := scalarBool(wt, raw)
-			m.HardLinks = v
-			return err
-		case 3:
-			v, err := scalarBool(wt, raw)
-			m.Xattrs = v
-			return err
-		case 4:
-			v, err := scalarBool(wt, raw)
-			m.CaseSensitive = v
-			return err
 		case 5:
 			v, err := scalarU64(wt, raw)
 			m.MaxNameBytes = uint32(v)
@@ -709,18 +525,6 @@ func parseCapabilitiesField(wt int, raw []byte) (Capabilities, error) {
 		case 7:
 			v, err := scalarU64(wt, raw)
 			m.PreferredIOSize = uint32(v)
-			return err
-		case 8:
-			v, err := scalarBool(wt, raw)
-			m.FlagsSupported = v
-			return err
-		case 9:
-			v, err := scalarBool(wt, raw)
-			m.FlagsUnderstood = v
-			return err
-		case 10:
-			v, err := scalarBool(wt, raw)
-			m.XattrSetSupported = v
 			return err
 		}
 		return nil
@@ -786,6 +590,8 @@ func marshalAttr(m *Attr) []byte {
 	}
 	b = appendU32(b, 14, m.Flags)
 	b = appendU64(b, 15, m.AllocSize)
+	b = appendU64(b, 16, m.FileID)
+	b = appendU64(b, 17, m.ParentFileID)
 	return b
 }
 
@@ -851,6 +657,10 @@ func parseAttrField(wt int, raw []byte) (Attr, error) {
 			m.Flags = uint32(v)
 		case 15:
 			m.AllocSize, err = scalarU64(wt, raw)
+		case 16:
+			m.FileID, err = scalarU64(wt, raw)
+		case 17:
+			m.ParentFileID, err = scalarU64(wt, raw)
 		}
 		return err
 	})
@@ -918,7 +728,7 @@ func unmarshalLookupReply(b []byte) (*LookupReply, error) {
 	})
 }
 
-func marshalEnumerateRequest(m *EnumerateRequest) []byte {
+func marshalEnumerateEntriesRequest(m *EnumerateEntriesRequest) []byte {
 	var b []byte
 	b = appendMsg(b, 1, marshalItem(&m.Dir))
 	b = appendU64(b, 2, m.Cookie)
@@ -928,8 +738,8 @@ func marshalEnumerateRequest(m *EnumerateRequest) []byte {
 	return b
 }
 
-func unmarshalEnumerateRequest(b []byte) (*EnumerateRequest, error) {
-	m := &EnumerateRequest{}
+func unmarshalEnumerateEntriesRequest(b []byte) (*EnumerateEntriesRequest, error) {
+	m := &EnumerateEntriesRequest{}
 	return m, scan(b, func(num int, wt int, raw []byte) error {
 		var err error
 		switch num {
@@ -977,7 +787,7 @@ func parseDirEntryField(wt int, raw []byte) (DirEntry, error) {
 	})
 }
 
-func marshalEnumerateReply(m *EnumerateReply) []byte {
+func marshalEnumerateEntriesReply(m *EnumerateEntriesReply) []byte {
 	var b []byte
 	for i := range m.Entries {
 		b = appendMsg(b, 1, marshalDirEntry(&m.Entries[i]))
@@ -987,8 +797,8 @@ func marshalEnumerateReply(m *EnumerateReply) []byte {
 	return b
 }
 
-func unmarshalEnumerateReply(b []byte) (*EnumerateReply, error) {
-	m := &EnumerateReply{}
+func unmarshalEnumerateEntriesReply(b []byte) (*EnumerateEntriesReply, error) {
+	m := &EnumerateEntriesReply{}
 	return m, scan(b, func(num int, wt int, raw []byte) error {
 		var err error
 		switch num {
@@ -1320,23 +1130,6 @@ func unmarshalWriteReply(b []byte) (*WriteReply, error) {
 			m.Attr, err = parseAttrField(wt, raw)
 		}
 		return err
-	})
-}
-
-func marshalFsyncRequest(m *FsyncRequest) []byte {
-	var b []byte
-	return appendU64(b, 1, m.Handle)
-}
-
-func unmarshalFsyncRequest(b []byte) (*FsyncRequest, error) {
-	m := &FsyncRequest{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
-		if num == 1 {
-			v, err := scalarU64(wt, raw)
-			m.Handle = v
-			return err
-		}
-		return nil
 	})
 }
 
@@ -1674,41 +1467,6 @@ func unmarshalXattrGetReply(b []byte) (*XattrGetReply, error) {
 	})
 }
 
-func marshalXattrSetRequest(m *XattrSetRequest) []byte {
-	var b []byte
-	b = appendMsg(b, 1, marshalItem(&m.Item))
-	b = appendString(b, 2, m.Name)
-	b = appendBytesField(b, 3, m.Value)
-	b = appendBool(b, 4, m.CreateOnly)
-	b = appendBool(b, 5, m.ReplaceOnly)
-	b = appendU64(b, 6, m.Handle)
-	return b
-}
-
-func unmarshalXattrSetRequest(b []byte) (*XattrSetRequest, error) {
-	m := &XattrSetRequest{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.Item, err = parseItemField(wt, raw)
-		case 2:
-			var v []byte
-			v, err = scalarBytes(wt, raw)
-			m.Name = string(v)
-		case 3:
-			m.Value, err = scalarBytes(wt, raw)
-		case 4:
-			m.CreateOnly, err = scalarBool(wt, raw)
-		case 5:
-			m.ReplaceOnly, err = scalarBool(wt, raw)
-		case 6:
-			m.Handle, err = scalarU64(wt, raw)
-		}
-		return err
-	})
-}
-
 func marshalXattrListRequest(m *XattrListRequest) []byte {
 	var b []byte
 	b = appendMsg(b, 1, marshalItem(&m.Item))
@@ -1781,19 +1539,14 @@ func unmarshalXattrRemoveRequest(b []byte) (*XattrRemoveRequest, error) {
 
 func marshalSyncVolumeReply(m *SyncVolumeReply) []byte {
 	var b []byte
-	b = appendBool(b, 1, m.Degraded)
 	return b
 }
 
 func unmarshalSyncVolumeReply(b []byte) (*SyncVolumeReply, error) {
-	m := &SyncVolumeReply{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
-		var err error
-		if num == 1 {
-			m.Degraded, err = scalarBool(wt, raw)
-		}
-		return err
-	})
+	if len(b) != 0 {
+		return nil, ErrMalformed
+	}
+	return &SyncVolumeReply{}, nil
 }
 
 func marshalStatfsReply(m *StatfsReply) []byte {
@@ -1846,12 +1599,10 @@ func unmarshalReclaimRequest(b []byte) (*ReclaimRequest, error) {
 func marshalEvent(m *Event) []byte {
 	var b []byte
 	switch k := m.Kind.(type) {
-	case *Invalidation:
-		b = appendMsg(b, 1, marshalInvalidation(k))
 	case *AttachState:
 		b = appendMsg(b, 2, marshalAttachState(k))
-	case *V3VisibilityEvent:
-		b = appendMsg(b, 3, marshalV3VisibilityEvent(k))
+	case *CacheProof:
+		b = appendMsg(b, 3, appendU64(appendU64(nil, 1, k.HorizonNanos), 2, k.AuthorizationDeadlineUnixNanos))
 	}
 	return b
 }
@@ -1861,162 +1612,27 @@ func unmarshalEvent(b []byte) (*Event, error) {
 	return m, scan(b, func(num int, wt int, raw []byte) error {
 		var err error
 		switch num {
-		case 1:
-			var inv Invalidation
-			inv, err = parseInvalidationField(wt, raw)
-			m.Kind = &inv
 		case 2:
 			var st AttachState
 			st, err = parseAttachStateField(wt, raw)
 			m.Kind = &st
 		case 3:
-			var visibility V3VisibilityEvent
-			visibility, err = parseV3VisibilityEventField(wt, raw)
-			m.Kind = &visibility
-		}
-		return err
-	})
-}
-
-func marshalVisibilityCursor(m *VisibilityCursor) []byte {
-	var b []byte
-	b = appendU64(b, 1, m.Sequence)
-	b = appendI32(b, 2, int32(m.Phase))
-	return b
-}
-
-func parseVisibilityCursorField(wt int, raw []byte) (VisibilityCursor, error) {
-	if wt != wireBytes {
-		return VisibilityCursor{}, ErrMalformed
-	}
-	m := VisibilityCursor{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		switch num {
-		case 1:
-			v, err := scalarU64(wt, raw)
-			m.Sequence = v
-			return err
-		case 2:
-			v, err := scalarU64(wt, raw)
-			m.Phase = VisibilityPhase(v)
-			return err
-		}
-		return nil
-	})
-}
-
-func marshalVisibilityTarget(m *VisibilityTarget) []byte {
-	var b []byte
-	b = appendI32(b, 1, int32(m.Scope))
-	b = appendBytesField(b, 2, m.Identity)
-	b = appendBytesField(b, 3, m.ParentIdentity)
-	b = appendBytesField(b, 4, m.Name)
-	b = appendI64(b, 5, m.Size)
-	b = appendBytesField(b, 6, m.PostIdentity)
-	return b
-}
-
-func parseVisibilityTargetField(wt int, raw []byte) (VisibilityTarget, error) {
-	if wt != wireBytes {
-		return VisibilityTarget{}, ErrMalformed
-	}
-	m := VisibilityTarget{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			var v uint64
-			v, err = scalarU64(wt, raw)
-			m.Scope = VisibilityScope(v)
-		case 2:
-			m.Identity, err = scalarBytes(wt, raw)
-		case 3:
-			m.ParentIdentity, err = scalarBytes(wt, raw)
-		case 4:
-			m.Name, err = scalarBytes(wt, raw)
-		case 5:
-			var v uint64
-			v, err = scalarU64(wt, raw)
-			m.Size = int64(v)
-		case 6:
-			m.PostIdentity, err = scalarBytes(wt, raw)
-		}
-		return err
-	})
-}
-
-func marshalV3VisibilityEvent(m *V3VisibilityEvent) []byte {
-	var b []byte
-	b = appendBytesField(b, 1, m.AuthorityEpoch)
-	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
-	b = appendBytesField(b, 3, m.InitiatorSessionID)
-	b = appendU32(b, 4, m.MutationSlot)
-	for i := range m.Targets {
-		b = appendMsg(b, 5, marshalVisibilityTarget(&m.Targets[i]))
-	}
-	b = appendU64(b, 6, m.MutationSequence)
-	return b
-}
-
-func parseV3VisibilityEventField(wt int, raw []byte) (V3VisibilityEvent, error) {
-	if wt != wireBytes {
-		return V3VisibilityEvent{}, ErrMalformed
-	}
-	m := V3VisibilityEvent{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.AuthorityEpoch, err = scalarBytes(wt, raw)
-		case 2:
-			m.Cursor, err = parseVisibilityCursorField(wt, raw)
-		case 3:
-			m.InitiatorSessionID, err = scalarBytes(wt, raw)
-		case 4:
-			var v uint64
-			v, err = scalarU64(wt, raw)
-			m.MutationSlot = uint32(v)
-		case 5:
-			var target VisibilityTarget
-			target, err = parseVisibilityTargetField(wt, raw)
-			if err == nil {
-				m.Targets = append(m.Targets, target)
+			if wt != wireBytes {
+				return ErrMalformed
 			}
-		case 6:
-			m.MutationSequence, err = scalarU64(wt, raw)
-		}
-		return err
-	})
-}
-
-func marshalInvalidation(m *Invalidation) []byte {
-	var b []byte
-	b = appendMsg(b, 1, marshalItem(&m.Item))
-	b = appendBool(b, 2, m.ContentChanged)
-	b = appendBool(b, 3, m.AttrsChanged)
-	b = appendBool(b, 4, m.NamespaceChanged)
-	b = appendU64(b, 5, m.ContentVersion)
-	return b
-}
-
-func parseInvalidationField(wt int, raw []byte) (Invalidation, error) {
-	if wt != wireBytes {
-		return Invalidation{}, ErrMalformed
-	}
-	m := Invalidation{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.Item, err = parseItemField(wt, raw)
-		case 2:
-			m.ContentChanged, err = scalarBool(wt, raw)
-		case 3:
-			m.AttrsChanged, err = scalarBool(wt, raw)
-		case 4:
-			m.NamespaceChanged, err = scalarBool(wt, raw)
-		case 5:
-			m.ContentVersion, err = scalarU64(wt, raw)
+			proof := &CacheProof{}
+			err = scan(raw, func(n int, w int, value []byte) error {
+				var e error
+				v, err := scalarU64(w, value)
+				if n == 1 {
+					proof.HorizonNanos = v
+				} else {
+					proof.AuthorizationDeadlineUnixNanos = v
+				}
+				e = err
+				return e
+			})
+			m.Kind = proof
 		}
 		return err
 	})
@@ -2141,7 +1757,7 @@ func consumeTag(b []byte) (int, int, []byte, error) {
 		return 0, 0, nil, err
 	}
 	num, wt := int(v>>3), int(v&7)
-	if num <= 0 {
+	if num <= 0 || v>>3 > (1<<29)-1 {
 		return 0, 0, nil, ErrMalformed
 	}
 	return num, wt, rest, nil
@@ -2160,6 +1776,9 @@ func consumeVarint(b []byte) (uint64, []byte, error) {
 		}
 		v |= uint64(c&0x7f) << (uint(i) * 7)
 		if c < 0x80 {
+			if i > 0 && c == 0 {
+				return 0, nil, ErrMalformed
+			}
 			return v, b, nil
 		}
 	}

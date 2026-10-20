@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 )
 
 const (
@@ -21,7 +23,7 @@ var (
 	ErrCoherenceIdentity    = errors.New("volumeserver: invalid coherence identity")
 )
 
-// CoherenceClock must use one monotonic time domain. NewTimer must accept zero
+// CoherenceClock must use one suspend-inclusive monotonic time domain. NewTimer must accept zero
 // durations. Implementations must not call the coordinator from these methods.
 type CoherenceClock interface {
 	Now() time.Time
@@ -31,16 +33,16 @@ type CoherenceTimer interface {
 	C() <-chan time.Time
 	Stop() bool
 }
-type coherenceWallClock struct{}
+type coherenceContinuousClock struct{}
 type coherenceWallTimer struct{ *time.Timer }
 
-func (coherenceWallClock) Now() time.Time { return time.Now() }
-func (coherenceWallClock) NewTimer(d time.Duration) CoherenceTimer {
+func (coherenceContinuousClock) Now() time.Time { return continuous.Time() }
+func (coherenceContinuousClock) NewTimer(d time.Duration) CoherenceTimer {
 	return coherenceWallTimer{time.NewTimer(d)}
 }
 func (t coherenceWallTimer) C() <-chan time.Time { return t.Timer.C }
 
-// ChangeKind is the v7 vocabulary, independent of the historical lease families.
+// ChangeKind is the Linux change-stream vocabulary.
 type ChangeKind uint8
 
 const (
@@ -212,7 +214,7 @@ type CoherenceCoordinator struct {
 
 func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.Clock == nil {
-		cfg.Clock = coherenceWallClock{}
+		cfg.Clock = coherenceContinuousClock{}
 	}
 	if cfg.MaxCacheFootprint <= 0 {
 		cfg.MaxCacheFootprint = 65536
@@ -239,22 +241,23 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 
 // WaitPriorCacheHorizon fences only prior Linux cache authority. Durable mount
 // records remain intact for topology/archive proof; unknown or Mac records are
-// separately subject to the compatibility coordinator's unbounded exclusion.
+// separately subject to retained writer proof and drain exclusion.
 func (c *CoherenceCoordinator) WaitPriorCacheHorizon(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("volumeserver: prior-cache wait needs a context")
 	}
-	remaining := c.priorCacheUntil.Sub(c.clock.Now())
-	if remaining <= 0 {
-		return ctx.Err()
-	}
-	timer := c.clock.NewTimer(remaining)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C():
-		return ctx.Err()
+	for {
+		remaining := c.priorCacheUntil.Sub(c.clock.Now())
+		if remaining <= 0 {
+			return ctx.Err()
+		}
+		timer := c.clock.NewTimer(remaining)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C():
+		}
 	}
 }
 
@@ -338,7 +341,7 @@ func (c *CoherenceCoordinator) subscriberLocked(token SubscriptionToken) (*chang
 	return s, nil
 }
 
-// CheckSession is mandatory at admission of every v7 request except Subscribe.
+// CheckSession is mandatory at admission of every Linux coherence request except Subscribe.
 // It supplements runtime authentication; subscription expiry must NOT call the
 // historical Authority.FenceSession, which permanently destroys the session.
 func (c *CoherenceCoordinator) CheckSession(token SubscriptionToken) error {
@@ -385,7 +388,7 @@ func (c *CoherenceCoordinator) OnCommit(entries []ChangeEntry) uint64 {
 }
 
 // OnCommitFrom excludes the initiating frontend from reverse notifications.
-// Its exact source publication gate repairs its local caches before replying;
+// The source frontend settles its local effects before publishing completion;
 // notifying it while the syscall holds VFS locks can deadlock cumulative peer
 // acknowledgments against concurrent commits on another mount.
 func (c *CoherenceCoordinator) OnCommitFrom(entries []ChangeEntry, source SessionID) uint64 {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
@@ -191,6 +192,10 @@ type lifetimeBlockedWriteRPC struct {
 	once    sync.Once
 }
 
+func (f *lifetimeBlockedWriteRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
+
 func (f *lifetimeBlockedWriteRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if request.GetWrite() != nil {
 		f.once.Do(func() { close(f.started) })
@@ -259,7 +264,7 @@ func TestDelegationLifetimeStaleCloseReleasesLossObserver(t *testing.T) {
 	id := installDelegationForTest(t, m, 44, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: id, Token: id}}
 	handle := &fileHandle{node: n, token: delegationTestToken(44, 2)}
-	if err := n.registerDelegatedHandle(handle, nil); err != nil {
+	if err := n.registerDelegatedHandle(handle, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Write(t.Context(), id, 0, []byte("lost"), false); err != nil {
@@ -280,6 +285,10 @@ func TestDelegationLifetimeStaleCloseReleasesLossObserver(t *testing.T) {
 }
 
 type lifetimeFileDurabilityRPC struct{ delegationFakeRPC }
+
+func (f *lifetimeFileDurabilityRPC) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	return waveWrite(ctx, &f.waveOrder, f.CallMutation, request, segments, assigned)
+}
 
 func (f *lifetimeFileDurabilityRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if request.GetBarrier() != nil {

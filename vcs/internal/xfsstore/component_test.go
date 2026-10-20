@@ -1,6 +1,9 @@
 package xfsstore
 
 import (
+	"encoding/json"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,5 +49,28 @@ func TestValidateXattr(t *testing.T) {
 		if err := ValidateXattr(name); err == nil {
 			t.Errorf("ValidateXattr(%q) succeeded", name)
 		}
+	}
+}
+
+// The extension and authority must refuse exactly the same fixed namespaces.
+func TestValidateXattrExtensionParity(t *testing.T) {
+	data, err := os.ReadFile("testdata/xattr-policy.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name    string
+		Allowed bool
+	}
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		// Escaping keeps combining marks and joiners visible in failure names.
+		t.Run(strconv.QuoteToASCII(tc.Name), func(t *testing.T) {
+			if allowed := ValidateXattr(tc.Name) == nil; allowed != tc.Allowed {
+				t.Fatalf("ValidateXattr(%+q) allowed=%v, want %v", tc.Name, allowed, tc.Allowed)
+			}
+		})
 	}
 }

@@ -24,10 +24,8 @@ const (
 	linuxENOTRECOVERABLE int32 = 131
 )
 
-// dispatchRequest is the one handler invocation point for accepted transport
-// requests. A nil Metrics keeps tests and embedders at the old direct-call
-// cost; production receives precomputed atomic handles and a monotonic latency
-// sample without building labels or consulting a map.
+// dispatchRequest instruments the single handler invocation for each accepted
+// request. With no metrics it retains the direct-call cost.
 func (s *Server) dispatchRequest(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	if s.Metrics == nil {
 		return handleTransportRequest(s.Handler, ctx, request)
@@ -87,10 +85,6 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationCancel
 	case *authoritypb.Request_TerminalDeliveryReceipt:
 		return authoritymetrics.OperationTerminalDeliveryReceipt
-	case *authoritypb.Request_NextFskitRepair:
-		return authoritymetrics.OperationNextFskitRepair
-	case *authoritypb.Request_AckFskitRepair:
-		return authoritymetrics.OperationAckFskitRepair
 	case *authoritypb.Request_ApplyRoutes:
 		return authoritymetrics.OperationApplyRoutes
 	case *authoritypb.Request_Lookup:
@@ -121,19 +115,6 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationRead
 	case *authoritypb.Request_Write:
 		return authoritymetrics.OperationWrite
-	case *authoritypb.Request_FskitWrite:
-		switch request.GetFskitWrite().GetPhase() {
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
-			return authoritymetrics.OperationFskitWriteBegin
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
-			return authoritymetrics.OperationFskitWriteData
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT:
-			return authoritymetrics.OperationFskitWriteCommit
-		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
-			return authoritymetrics.OperationFskitWriteAbort
-		default:
-			return authoritymetrics.OperationUnknown
-		}
 	case *authoritypb.Request_Fallocate:
 		return authoritymetrics.OperationFallocate
 	case *authoritypb.Request_CopyFileRange:
@@ -185,10 +166,6 @@ func responseOutcome(response *authoritypb.Response) authoritymetrics.Outcome {
 		return authoritymetrics.OutcomeCoherence
 	case authoritypb.FailureClass_FAILURE_CLASS_ROUTES:
 		return authoritymetrics.OutcomeRoutes
-	case authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED:
-		return authoritymetrics.OutcomeFskitRepairInterrupted
-	case authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY:
-		return authoritymetrics.OutcomeFskitRepairRetry
 	}
 	errno := response.GetErrno()
 	switch {

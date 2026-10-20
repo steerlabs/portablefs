@@ -55,7 +55,7 @@ func preflightFrontendAt(frontendSocket, attachRef, expectedVersion string) erro
 		return fmt.Errorf("frontend handshake: %w", err)
 	}
 	hello, ok := helloBody.(*pfslocal.HelloReply)
-	if !ok || hello.ProtocolMajor != pfslocal.ProtocolMajor || hello.DaemonVersion != expectedVersion {
+	if !ok || hello.DaemonVersion != expectedVersion {
 		gotMajor := uint32(0)
 		gotVersion := ""
 		if ok {

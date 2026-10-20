@@ -15,6 +15,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
@@ -81,23 +82,23 @@ type subscriptionClock interface {
 	NewTimer(time.Duration) subscriptionTimer
 }
 
-type wallSubscriptionClock struct{}
+type continuousSubscriptionClock struct{}
 
 type wallSubscriptionTimer struct{ timer *time.Timer }
 
-func (wallSubscriptionClock) Now() time.Time { return time.Now() }
-func (wallSubscriptionClock) NewTimer(d time.Duration) subscriptionTimer {
+func (continuousSubscriptionClock) Now() time.Time { return continuous.Time() }
+func (continuousSubscriptionClock) NewTimer(d time.Duration) subscriptionTimer {
 	return wallSubscriptionTimer{timer: time.NewTimer(d)}
 }
 func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
 func (t wallSubscriptionTimer) Stop() bool          { return t.timer.Stop() }
 
 type subscriptionConfig struct {
-	clock       subscriptionClock
-	retryDelay  time.Duration
-	repairLead  time.Duration
-	maxPages    int
-	invalidator subscriptionInvalidator
+	clock          subscriptionClock
+	retryDelay     time.Duration
+	withdrawalLead time.Duration
+	maxPages       int
+	invalidator    subscriptionInvalidator
 }
 
 type subscriptionCoordinateState struct {
@@ -105,7 +106,7 @@ type subscriptionCoordinateState struct {
 	minVersion uint64
 }
 
-// subscriptionRegistry owns one volume-wide protocol-7 subscription. Its mutex
+// subscriptionRegistry owns the mount's one volume-wide subscription. Its mutex
 // covers cache admission state only and is never held across transport calls,
 // reverse notifications, or publication drains.
 type subscriptionRegistry struct {
@@ -130,9 +131,10 @@ type subscriptionRegistry struct {
 	lastChangeSeen  uint64
 	lastChangeAck   uint64
 
-	horizonChanged chan struct{}
-	pauseChanged   chan struct{}
-	serveDone      chan struct{}
+	progressChanged chan struct{}
+	horizonChanged  chan struct{}
+	pauseChanged    chan struct{}
+	serveDone       chan struct{}
 }
 
 type mountSubscriptionInvalidator struct{ mount *Mount }
@@ -159,25 +161,25 @@ func (i mountSubscriptionInvalidator) MarkIdentityStale(identity publicationIden
 }
 
 func newSubscriptionRegistry(mount *Mount, rpc subscriptionRPC, control subscriptionControlHandler) *subscriptionRegistry {
-	repairLead := time.Second
-	if mount != nil && mount.repairBudget > 0 && mount.repairBudget < repairLead {
-		repairLead = mount.repairBudget
+	withdrawalLead := time.Second
+	if mount != nil && mount.withdrawalTimeout > 0 && mount.withdrawalTimeout < withdrawalLead {
+		withdrawalLead = mount.withdrawalTimeout
 	}
 	return newSubscriptionRegistryWithConfig(mount, rpc, control, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: subscriptionRetryDelay, repairLead: repairLead,
+		clock: continuousSubscriptionClock{}, retryDelay: subscriptionRetryDelay, withdrawalLead: withdrawalLead,
 		maxPages: maxSubscriptionPages, invalidator: mountSubscriptionInvalidator{mount: mount},
 	})
 }
 
 func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, control subscriptionControlHandler, config subscriptionConfig) *subscriptionRegistry {
 	if config.clock == nil {
-		config.clock = wallSubscriptionClock{}
+		config.clock = continuousSubscriptionClock{}
 	}
 	if config.retryDelay <= 0 {
 		config.retryDelay = subscriptionRetryDelay
 	}
-	if config.repairLead <= 0 {
-		config.repairLead = time.Second
+	if config.withdrawalLead <= 0 {
+		config.withdrawalLead = time.Second
 	}
 	if config.maxPages <= 0 {
 		config.maxPages = maxSubscriptionPages
@@ -190,10 +192,11 @@ func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, contro
 	return &subscriptionRegistry{
 		mount: mount, rpc: rpc, control: control, config: config,
 		delegated: make(map[publicationIdentity]uint64), stale: make(map[publicationIdentity]struct{}),
-		coordinates:    make(map[publicationCoordinate]subscriptionCoordinateState),
-		horizonChanged: make(chan struct{}),
-		pauseChanged:   make(chan struct{}),
-		serveDone:      serveDone,
+		coordinates:     make(map[publicationCoordinate]subscriptionCoordinateState),
+		progressChanged: make(chan struct{}),
+		horizonChanged:  make(chan struct{}),
+		pauseChanged:    make(chan struct{}),
+		serveDone:       serveDone,
 	}
 }
 
@@ -215,9 +218,9 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	if s == nil {
 		return subscriptionStamp{}
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if !s.active || !s.config.clock.Now().Before(s.cacheUntil) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.liveLocked() {
 		return subscriptionStamp{}
 	}
 	return subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
@@ -227,7 +230,7 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 // exact coordinates, so an unrelated event does not invalidate a reply already
 // in flight. The global generation remains in the stamp to distinguish a reply
 // admitted before a same-version withdrawal from one admitted after it.
-func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64, now time.Time) time.Duration {
+func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64) time.Duration {
 	if s == nil || stamp.incarnation == 0 {
 		return 0
 	}
@@ -237,22 +240,22 @@ func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp
 	if (coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData) && s.mount != nil && s.mount.delegations != nil && !s.mount.delegations.sharedCacheAllowed(coordinate.item[:]) {
 		return 0
 	}
-	return s.remainingAfterOwnershipCheck(coordinate, stamp, servedVersion, now)
+	return s.remainingAfterOwnershipCheck(coordinate, stamp, servedVersion)
 }
 
 // remainingAfterOwnershipCheck is used by a cached reply after checking local
 // delegation ownership outside raw.mu. Acquiring delegation locks under raw.mu
 // could deadlock with a queued epoch fence and a write's source gate.
-func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64, now time.Time) time.Duration {
+func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64) time.Duration {
 	if s == nil || stamp.incarnation == 0 {
 		return 0
 	}
 	if servedVersion == 0 {
 		servedVersion = stamp.version
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if !s.active || stamp.incarnation != s.incarnation || !now.Before(s.cacheUntil) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.liveLocked() || stamp.incarnation != s.incarnation {
 		return 0
 	}
 	if coordinate.kind == publicationNamespaceName {
@@ -274,7 +277,7 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 		servedVersion < s.watermark || servedVersion < s.versionFloor || servedVersion < state.minVersion {
 		return 0
 	}
-	return s.cacheUntil.Sub(now)
+	return max(time.Duration(0), s.cacheUntil.Sub(s.config.clock.Now()))
 }
 
 func (s *subscriptionRegistry) signalHorizonChangedLocked() {
@@ -353,6 +356,9 @@ func (s *subscriptionRegistry) resume() {
 func (s *subscriptionRegistry) retry(ctx context.Context, deadline time.Time, operation func() error) error {
 	var last error
 	for s.config.clock.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := operation(); err == nil {
 			return nil
 		} else {
@@ -382,10 +388,10 @@ func (s *subscriptionRegistry) retry(ctx context.Context, deadline time.Time, op
 
 func (s *subscriptionRegistry) invalidateAll(ctx context.Context) error {
 	s.deactivate()
-	deadline := s.config.clock.Now().Add(s.config.repairLead)
-	repairCtx, cancel := context.WithTimeout(ctx, s.config.repairLead)
+	deadline := s.config.clock.Now().Add(s.config.withdrawalLead)
+	withdrawalCtx, cancel := context.WithTimeout(ctx, s.config.withdrawalLead)
 	defer cancel()
-	return s.retry(repairCtx, deadline, func() error { return s.config.invalidator.InvalidateAllCaches(repairCtx) })
+	return s.retry(withdrawalCtx, deadline, func() error { return s.config.invalidator.InvalidateAllCaches(withdrawalCtx) })
 }
 
 func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
@@ -461,7 +467,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 		}
 		next := reply.GetNextAfterIdentity()
 		if len(next) == 0 {
-			cacheUntil := horizon.Add(-s.config.repairLead)
+			cacheUntil := horizon.Add(-s.config.withdrawalLead)
 			if !cacheUntil.After(s.config.clock.Now()) {
 				return fmt.Errorf("%w: snapshot completed too near its horizon", errSubscriptionExpired)
 			}
@@ -504,9 +510,10 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 }
 
 func (s *subscriptionRegistry) currentIncarnation() (uint64, time.Time, <-chan struct{}, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.incarnation, s.cacheUntil, s.horizonChanged, s.active
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.liveLocked()
+	return s.incarnation, s.cacheUntil, s.horizonChanged, live
 }
 
 func (s *subscriptionRegistry) waitActive(ctx context.Context) error {
@@ -550,6 +557,7 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 		}
 		_, _, _, active := s.currentIncarnation()
 		if !active {
+			progress := s.progress()
 			if err := s.subscribe(ctx); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
@@ -557,7 +565,7 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 				if errors.Is(err, errSubscriptionPaused) {
 					continue
 				}
-				if err := s.waitRetry(ctx); err != nil {
+				if err := s.waitProgress(ctx, progress); err != nil {
 					return err
 				}
 				continue
@@ -728,6 +736,7 @@ func (q *subscriptionChangeQueue) close() {
 func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64, changes *subscriptionChangeQueue) error {
 	var after uint64
 	for {
+		progress := s.progress()
 		event, err := s.rpc.NextControlEvent(ctx, incarnation, after, changes.completedThrough())
 		if err != nil {
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
@@ -736,7 +745,7 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err := s.waitRetry(ctx); err != nil {
+			if err := s.waitProgress(ctx, progress); err != nil {
 				return err
 			}
 			continue
@@ -766,17 +775,37 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 				}
 			}(event.GetSequence())
 		}
+		s.madeProgress()
 		after = event.GetSequence()
 	}
 }
 
-func (s *subscriptionRegistry) waitRetry(ctx context.Context) error {
-	timer := s.config.clock.NewTimer(s.config.retryDelay)
+// A retry waits for actual CONTROL contact or an epoch pause/resume edge.
+// Snapshot before the failed operation so concurrent progress cannot be lost.
+type subscriptionProgress struct {
+	contact, pause <-chan struct{}
+}
+
+func (s *subscriptionRegistry) progress() subscriptionProgress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return subscriptionProgress{s.progressChanged, s.pauseChanged}
+}
+
+func (s *subscriptionRegistry) madeProgress() {
+	s.mu.Lock()
+	close(s.progressChanged)
+	s.progressChanged = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *subscriptionRegistry) waitProgress(ctx context.Context, progress subscriptionProgress) error {
 	select {
-	case <-timer.C():
+	case <-progress.contact:
+		return nil
+	case <-progress.pause:
 		return nil
 	case <-ctx.Done():
-		timer.Stop()
 		return ctx.Err()
 	}
 }
@@ -938,13 +967,29 @@ func (s *subscriptionRegistry) ackChanges(ctx context.Context, incarnation, posi
 	s.mu.RLock()
 	deadline := s.cacheUntil
 	s.mu.RUnlock()
-	err := s.retry(ctx, deadline, func() error {
-		return s.rpc.AcknowledgeChanges(ctx, incarnation, position)
-	})
-	if err != nil {
-		return fmt.Errorf("fusev3: acknowledge changes through %d: %w", position, err)
+	// The horizon is the real bound. Renewal, polling and KeepAlive supply
+	// readiness after a failed CONTROL call; a 10 ms timer supplies none.
+	remaining := deadline.Sub(s.config.clock.Now())
+	if remaining <= 0 {
+		return errSubscriptionExpired
 	}
-	return nil
+	ackCtx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	for {
+		if err := ackCtx.Err(); err != nil {
+			return err
+		}
+		progress := s.progress()
+		if err := s.rpc.AcknowledgeChanges(ackCtx, incarnation, position); err == nil {
+			s.madeProgress()
+			return nil
+		} else if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+			return err
+		}
+		if err := s.waitProgress(ackCtx, progress); err != nil {
+			return fmt.Errorf("fusev3: acknowledge changes through %d: %w", position, err)
+		}
+	}
 }
 
 func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64) error {
@@ -963,7 +1008,8 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			}
 			continue
 		}
-		if !s.acceptRenewal(incarnation, deadline, s.config.clock.Now()) {
+		s.madeProgress()
+		if !s.acceptRenewal(incarnation, deadline) {
 			s.mu.RLock()
 			current := s.active && s.incarnation == incarnation
 			s.mu.RUnlock()
@@ -975,13 +1021,14 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 	}
 }
 
-func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline, now time.Time) bool {
-	cacheUntil := deadline.Add(-s.config.repairLead)
+func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.Time) bool {
+	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.active || s.paused || s.incarnation != incarnation {
+	if !s.liveLocked() || s.paused || s.incarnation != incarnation {
 		return false
 	}
+	now := s.config.clock.Now()
 	// A late renewal cannot revive permission after the prior conservative
 	// boundary. It is deliberately ignored rather than extending from receipt.
 	if !now.Before(s.cacheUntil) || !cacheUntil.After(now) {
@@ -1132,12 +1179,6 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	for identity := range r.completeDirectories {
 		r.dropCompleteDirectoryLocked(identity)
 	}
-	for key := range r.cachedNames {
-		r.dropCachedNameLocked(key)
-	}
-	for key := range r.cachedNegatives {
-		r.dropCachedNegativeLocked(key)
-	}
 	dataRecords := make(map[*inodeRecord]struct{}, len(r.cachedData))
 	for _, record := range r.cachedData {
 		if record != nil && !record.reclaimed {
@@ -1162,8 +1203,6 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 			}
 		}
 	}
-	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
-	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)
 	dirHandles := make([]*dirHandle, 0)
 	for _, handle := range r.handles {
 		if handle != nil && handle.dir != nil {
@@ -1214,10 +1253,21 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		}
 	}
 	r.mu.Lock()
+	// Admission is already closed. Keep its withdrawal inventory until every
+	// kernel notification succeeds: a failed attempt must not let a retry prove
+	// a cold boundary by finding only the daemon caches it previously emptied.
+	for key := range r.cachedNames {
+		r.dropCachedNameLocked(key)
+	}
+	for key := range r.cachedNegatives {
+		r.dropCachedNegativeLocked(key)
+	}
+	clear(r.cachedAttrs)
+	clear(r.cachedAttrPayloads)
 	for _, record := range r.nodesByID {
 		if record != nil {
 			// Epoch staleness belongs to the old server handle, not to the
-			// subscription incarnation. A cold cache proof can repair an inode
+			// subscription incarnation. A cold cache proof can clear an inode
 			// invalidation failure, but it must never resurrect an old-epoch node.
 			if record.node == nil || !record.node.epochStale.Load() {
 				record.stale.Store(false)
@@ -1227,9 +1277,9 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 			}
 		}
 	}
-	for coordinate := range r.repairingCoordinates {
-		delete(r.repairingCoordinates, coordinate)
-		delete(r.repairOwners, coordinate)
+	for coordinate := range r.withdrawingCoordinates {
+		delete(r.withdrawingCoordinates, coordinate)
+		delete(r.withdrawalOwners, coordinate)
 	}
 	reclaims := make([][]byte, 0)
 	for _, record := range r.nodesByID {
@@ -1258,4 +1308,34 @@ func (r *rawFileSystem) markIdentityStale(identity publicationIdentity) {
 			record.node.stale.Store(true)
 		}
 	}
+}
+
+// liveLocked denies admission at the moment of use even when active-time
+// timers and CONTROL have not run since resume. Waking the horizon worker
+// preserves the ordinary cold-withdrawal path; no renewal may bridge this cut.
+// Denial is not withdrawal completion: serveDone joins the workers and their
+// subsequent kernel invalidation attempt.
+func (s *subscriptionRegistry) liveLocked() bool {
+	if s.active && !s.config.clock.Now().Before(s.cacheUntil) {
+		s.active = false
+		s.generation++
+		s.signalHorizonChangedLocked()
+	}
+	return s.active
+}
+
+// Delegation reset owns its admission cut separately from cache withdrawal:
+// retained metadata callbacks may still drain between deactivate and
+// InterruptSubscription. That interval must nevertheless never cross expiry.
+func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if incarnation == 0 || incarnation != s.incarnation {
+		return false
+	}
+	if !s.config.clock.Now().Before(s.cacheUntil) {
+		s.liveLocked()
+		return false
+	}
+	return true
 }

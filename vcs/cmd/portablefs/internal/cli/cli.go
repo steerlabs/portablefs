@@ -14,8 +14,6 @@ import (
 	"os"
 	"runtime"
 	"time"
-
-	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 )
 
 const hostedMountReauthorizationFeature = "hosted-mount-reauthorization-v1"
@@ -37,12 +35,14 @@ type cmdEnv struct {
 	lifecycleStateDir string
 	// Test-only canonical operational state override.
 	stateDir string
+	// Test-only socket and helper paths; release authentication remains real.
+	fsKitConfigForTest *fskitConfig
 	// Test-only presentation seam. Production always performs the exact
 	// process + kernel mount identity checks in mountHealth.
 	mountHealthFn func(*mountState) string
 	// Test-only daemon inventory seam. Production proves the exact installed
 	// daemon identity before reading its live attaches.
-	daemonAttachStatusesFn func(*daemonctl.Identity) (map[string]cliAttachStatus, error)
+	daemonLifecycleInventoryFn func(*daemonRelease) (int, error)
 	// Test-only daemon lifecycle seam. Production adopts the exact launchd
 	// agent or wakes the exact containing host through ensurePortablefsd.
 	ensurePortablefsdFn func(fskitConfig, string, string) (*fsdControl, error)
@@ -70,15 +70,6 @@ func (e *cmdEnv) ensureFskitDaemon(cfg fskitConfig, stateRoot string) (*fsdContr
 		return e.ensurePortablefsdFn(cfg, stateRoot, e.version)
 	}
 	return ensurePortablefsd(cfg, stateRoot, e.version)
-}
-
-func (e *cmdEnv) daemonAttachStatuses(
-	expected *daemonctl.Identity,
-) (map[string]cliAttachStatus, error) {
-	if e.daemonAttachStatusesFn != nil {
-		return e.daemonAttachStatusesFn(expected)
-	}
-	return fskitAttachStatusesForIdentity(e.getenv, e.version, expected)
 }
 
 func (e *cmdEnv) stdinReader() io.Reader {
@@ -151,7 +142,7 @@ func commands() []command {
 		{"install-linux-release", "atomically activate a verified Linux release", cmdInstallLinuxRelease},
 		{"version", "print the CLI version", cmdVersion},
 	}
-	return append(commands, qualificationCommands()...)
+	return commands
 }
 
 func findCommand(name string) (command, bool) {
@@ -235,4 +226,41 @@ func cmdVersion(e *cmdEnv, args []string) int {
 	}
 	fmt.Fprintf(e.stdout, "portablefs %s\n", e.version)
 	return 0
+}
+
+// Lifecycle inventory accepts arbitrary authenticated outgoing versions. Ordinary
+// attach inventory still requires this CLI's exact paired release.
+func (e *cmdEnv) daemonLifecycleInventory(expected *daemonRelease) (int, error) {
+	if e.daemonLifecycleInventoryFn != nil {
+		return e.daemonLifecycleInventoryFn(expected)
+	}
+	cfg, err := e.fsKitConfig()
+	if err != nil {
+		return 0, err
+	}
+	var ctl *fsdControl
+	if expected == nil {
+		ctl, err = connectCompatiblePortablefsd(cfg, e.version)
+	} else {
+		var authenticated daemonRelease
+		authenticated, err = authenticateDaemonRelease(expected.path, expected.identity.DaemonVersion)
+		if err == nil && authenticated != *expected {
+			err = fmt.Errorf("supplied outgoing daemon tuple differs from its authenticated bundle")
+		}
+		if err == nil {
+			ctl, err = newFsdControl(cfg.controlSock, authenticated)
+		}
+		if ctl != nil {
+			defer ctl.close()
+		}
+		if err == nil {
+			err = ctl.requireOutgoingIdentityWithin(expected.identity, 3*time.Second)
+		}
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer ctl.close()
+	inventory, err := ctl.lifecycleInventory()
+	return inventory.AttachmentCount, err
 }

@@ -25,7 +25,7 @@ type operationResolutionContext struct {
 type sourceResolvedIdentity struct {
 	cap        xfsstore.Capability
 	identity   [16]byte
-	coordinate visibilityCoordinate
+	coordinate mutationCoordinate
 }
 
 type namespaceResolutionKey struct {
@@ -34,7 +34,7 @@ type namespaceResolutionKey struct {
 }
 
 type namespaceResolution struct {
-	coordinate visibilityCoordinate
+	coordinate mutationCoordinate
 	size       int64
 	found      bool
 }
@@ -100,7 +100,7 @@ func (r *operationResolutionContext) namespace(parent xfsstore.Capability, name 
 	if resolved, ok := r.namespaces[key]; ok {
 		return resolved, nil
 	}
-	item, attr, err := r.h.Store.Lookup(parent, string(name))
+	item, attr, err := r.h.lookupRestored(parent, string(name))
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
 		resolved := namespaceResolution{}
 		r.namespaces[key] = resolved

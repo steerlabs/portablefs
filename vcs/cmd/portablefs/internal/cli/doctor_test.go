@@ -255,8 +255,8 @@ func TestDoctorMountHealthFailures(t *testing.T) {
 	}
 	requireContains(t, stdout.String(),
 		"FAIL  mounts: 2 mount(s): 1 stale, 1 credential-expired",
-		"/tmp/stale  vol1@main  fuse  stale",
-		"/tmp/expired  vol2@main  fuse  credential-expired",
+		"/tmp/stale  vol1  fuse  stale",
+		"/tmp/expired  vol2  fuse  credential-expired",
 		// Once the strict session's credential ended, neither automatic nor
 		// manual renewal can reconstruct its kernel-cache continuity.
 		"fix: clean up stale mounts with `portablefs umount /tmp/stale`; mount credential-expired paths again with a fresh volume mount capability; an expired or denied enrollment cannot reconstruct the old strict session",

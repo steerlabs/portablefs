@@ -203,37 +203,10 @@ func (manager *Manager) ConvergeCell(cellID string, request RegisterCellRequest)
 			return nil, false, ErrQuarantined
 		}
 		fingerprint := registerCellFingerprint(request)
-		if cellAllocatorBounded(current) {
-			if current.RegistrationSHA256 != fingerprint {
-				return nil, false, ErrConflict
-			}
-			return current, false, nil
-		}
-		// Schema-v2 cells written before allocator bounds may already have the
-		// earlier declaration digest or may predate convergent registration
-		// entirely. The first compatible bounded declaration supersedes that
-		// pre-bound digest exactly once. It pins the ends and the complete new
-		// declaration without changing any pre-existing live field. Capacity and
-		// allocator starts may only describe floors the current cell has already
-		// advanced beyond.
-		if current.ID != request.ID || current.AvailabilityZone != request.AvailabilityZone ||
-			current.AuthorityHost != request.AuthorityHost || current.AuthorityDNSZone != request.AuthorityDNSZone || current.Pool != request.Pool ||
-			request.CapacityBytes > current.CapacityBytes || request.CapacityInodes > current.CapacityInodes ||
-			request.FirstProjectID > current.NextProjectID || request.FirstServiceUID > current.NextServiceUID || request.FirstPort > current.NextPort ||
-			uint64(current.NextProjectID) > uint64(request.LastProjectID)+1 ||
-			uint64(current.NextServiceUID) > uint64(request.LastServiceUID)+1 ||
-			uint64(current.NextPort) > uint64(request.LastPort)+1 {
+		if current.RegistrationSHA256 != fingerprint {
 			return nil, false, ErrConflict
 		}
-		// A schema-v2 cell that predates allocator bounds is admitted exactly
-		// once. The declaration may only put immutable ends around allocator
-		// cursors that already exist; it never rewinds or advances live state.
-		current.LastProjectID = request.LastProjectID
-		current.LastServiceUID = request.LastServiceUID
-		current.LastPort = request.LastPort
-		current.RegistrationSHA256 = fingerprint
-		state.Cells[cellID] = current
-		return current, true, nil
+		return current, false, nil
 	})
 	if err != nil {
 		return Cell{}, err

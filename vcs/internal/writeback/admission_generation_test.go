@@ -12,7 +12,7 @@ func TestGenerationBoundAdmissionCannotCrossDrop(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			b := newTestBuffer(t, flusherFunc(func(context.Context, Identity, Entry) (uint64, error) {
 				return 0, errors.New("hold capacity")
-			}), Options{MaxEntries: 1, FlushInterval: -1})
+			}), Options{MaxEntries: 1})
 			id := testIdentity(1)
 			generation := b.Generation(id)
 			admit := func() (Cut, error) {

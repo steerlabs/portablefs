@@ -1,0 +1,138 @@
+[
+  {
+    "name": "",
+    "allowed": false
+  },
+  {
+    "name": "user.",
+    "allowed": true
+  },
+  {
+    "name": "user.comment",
+    "allowed": true
+  },
+  {
+    "name": "user.com.apple.FinderInfo",
+    "allowed": true
+  },
+  {
+    "name": "com.apple.FinderInfo",
+    "allowed": false
+  },
+  {
+    "name": "security.capability",
+    "allowed": false
+  },
+  {
+    "name": "trusted.overlay.opaque",
+    "allowed": false
+  },
+  {
+    "name": "system.posix_acl_access",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs.secret",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs.",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs",
+    "allowed": true
+  },
+  {
+    "name": "User.test",
+    "allowed": false
+  },
+  {
+    "name": "user.a/b",
+    "allowed": true
+  },
+  {
+    "name": "user.\u0000x",
+    "allowed": false
+  },
+  {
+    "name": "user.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "allowed": true
+  },
+  {
+    "name": "user.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "allowed": false
+  },
+  {
+    "name": "user.ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "allowed": true
+  },
+  {
+    "name": "user.éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+    "allowed": false
+  },
+  {
+    "name": "user.\u0301x",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\u0301x",
+    "allowed": false
+  },
+  {
+    "name": "user.\u0301\u0327x",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\u0301\u0327x",
+    "allowed": false
+  },
+  {
+    "name": "user.\ufe0fx",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\ufe0fx",
+    "allowed": false
+  },
+  {
+    "name": "user.\u200dx",
+    "allowed": true
+  },
+  {
+    "name": "user.portablefs.\u200dx",
+    "allowed": false
+  },
+  {
+    "name": "user\u0301.x",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs\u0301.x",
+    "allowed": true
+  },
+  {
+    "name": "user\uff0ex",
+    "allowed": false
+  },
+  {
+    "name": "user.portablefs\uff0ex",
+    "allowed": true
+  },
+  {
+    "name": "user.e\u0301",
+    "allowed": true
+  },
+  {
+    "name": "user.\u00e9",
+    "allowed": true
+  },
+  {
+    "name": "user.e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301x",
+    "allowed": true
+  },
+  {
+    "name": "user.e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301xx",
+    "allowed": false
+  }
+]

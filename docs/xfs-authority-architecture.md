@@ -1,7 +1,7 @@
 # PortableFS authoritative-XFS architecture
 
-Status: **protocol-7 verification candidate; local qualification and remaining
-production gates are recorded in [coherence-v2/integration.md](./coherence-v2/integration.md).**
+Status: **protocol 8, specified and not yet qualified; the open gates are in
+[COMPATIBILITY.md](../COMPATIBILITY.md#qualification-status).**
 
 PortableFS is a remote gateway to one ordinary XFS project directory while a
 volume is serving. READY uses that XFS instance; ARCHIVED uses one sealed
@@ -10,7 +10,8 @@ and XFS. The authority adds
 confinement, authentication, replay, distributed locks, subscription/delegation coherence, and
 bounded resource admission. It does not add an inode database, content index,
 live mutation history, or branch graph. Linux delegated writes may remain in a
-volatile daemon buffer until the run/file durability barrier.
+volatile daemon buffer until the run/file durability barrier; every successful
+FSKit mutation reply is already durable.
 
 The subscription/delegation algorithm and stock-FUSE mapping are normative in
 [portable-coherence.md](./portable-coherence.md). This document defines the
@@ -19,9 +20,9 @@ authority and storage beneath it.
 ## Root design
 
 ```text
-stock Linux FUSE mounts
+stock Linux FUSE mounts | one FSKit writer | cacheless gateway
           |
- authenticated protocol-7 DATA + CONTROL pair
+ authenticated protocol-8 DATA + CONTROL pair
           |
  one active authority epoch for one volume
           |
@@ -38,10 +39,26 @@ one capability, and one authority epoch. Clients never attach the block device.
 The optional manager controls placement and credentials but is not on the
 filesystem request path.
 
-Linux uses stock FUSE. FSKit uses the separate synchronous-repair profile and
-retains compatibility-writer exclusion for every attached Mac mount. The files
-gateway is an authenticated cacheless reader and never excludes Linux writers.
-Neither profile is silently promoted to Linux cache-withdrawal semantics.
+Linux uses stock FUSE under `FRONTEND_PROFILE_LINUX`. macOS uses
+`FRONTEND_PROFILE_FSKIT_EXCLUSIVE`: an attached Mac is the volume's only writer,
+so FSKit's missing cache invalidation is never asked to serve a concurrent
+remote mutation. The files gateway is an authenticated cacheless reader and
+never excludes writers. No profile is silently promoted to another's
+semantics.
+
+The native Mac operation boundary remains `FSVolume.Operations` and
+`FSVolume.ReadWriteOperations` on macOS 26 and 27. macOS 27 separately retains
+package B/C's `FSVolume.DataCacheHandler` cache lifecycle and writeBack work,
+with the limits in [fskit-mount.md](./fskit-mount.md). Neither
+`FSVolume.Handler` nor `FSVolume.ReadWriteHandler` is adopted. Package D part 1
+is selected; part 2 is cancelled for protocol 8.
+
+Authority READ carries data and `volume_version`; READLINK carries target
+bytes. Their local replies contain only data or target bytes, with existing
+chunking and no same-sample attribute promise. Authority mutation `PostState`
+remains owned by the daemon's metadata cache. The local grammar retains its
+operation-specific attributes and identities, without a full native
+mutation-operand result set.
 
 ## Source of truth and durability
 
@@ -53,11 +70,77 @@ prefix. A run opens the mount root before work and fsyncs that same directory
 handle at completion; loss since open fails the barrier. Stock-FUSE syncfs is
 not this completion surface.
 
+FSKit exposes no fsync callback, so a successful FSKit mutation reply is itself
+the durability point. Before an applied FSKit mutation's reply is sent or
+retained for replay, a handle-backed mutation retains its authoritative input
+or output file description and performs full fsync on it. This covers WRITE, CREATE,
+truncating OPEN, and handle-backed SETATTR. A mutation without such a
+description uses syncfs on the volume root directly, including namespace
+changes and item-backed metadata. The authority requires Linux 5.17 or newer
+and refuses older kernels and 5.17 release candidates at storage startup: both
+XFS log-force and VFS sync_fs failures must reach syncfs. Durability never
+reopens an object or changes strategy after a descriptor acquisition failure.
+The sync runs after storage locks are released and after required Linux
+withdrawal; exact replay repeats neither apply nor sync.
+
+Every failed fsync, fdatasync, or syncfs fences the store before releasing its
+waiters. The first failure is retained, including ENOSPC and EDQUOT writeback
+errors; later barriers cannot certify durability or advance a durable cut.
+Inode barriers preserve full-fsync versus data-only coverage. The volume has
+one retained syncfs description and one serialized error cursor. Concurrent
+arrivals during a syscall share the next batch, without a timer or delay.
+
+That description reports the cell filesystem's superblock-wide writeback error
+sequence, and `sync_filesystem` waits for every dirty inode on it. A shared
+multi-project cell is therefore one durability-error and latency domain: a
+failure caused by another project's inode fences this store at its next
+syncfs, and other projects' dirty data lengthens its barriers. The authority
+does not filter, relabel, or reset such an error and does not rotate the
+description to clear the cursor. Isolation requires a separate filesystem per
+volume.
+
+The FSKit frontend gates successful serving replies against session
+termination: no callback publishing data, metadata, namespace, or durability
+reports success after the session is terminal. Resource loading, activation,
+mounting, and synchronize obey that gate. Synchronize waits for the authority
+barrier over its captured applied cut, then Statfs, propagates their errors,
+and can still fail at final publication if termination wins. It cannot cover
+undelivered kernel pages; native fsync/F_FULLFSYNC waiting, dirty-page drain,
+and error propagation remain unqualified.
+
+Completed volume deactivation and resource unloading acknowledge local cleanup
+only, including after terminal failure; genuine request or cleanup errors
+remain errors, and repeated completed teardown is idempotent. Unmount's void
+completion has no errno and acknowledges the same cleanup boundary. These
+acknowledgements never certify durability, clear the first terminal cause,
+revive serving, prove kernel absence or authority acceptance of absence, or
+certify daemon/CLI reconciliation. Every successful mutation reply still
+requires authority-storage durability. Close, reclaim, release, and other
+cleanup activity retain their existing publication and settlement rules. The
+CLI independently reports exact kernel absence and daemon completion; a Swift
+teardown acknowledgement authorizes neither a daemon 204 nor registry removal.
+Closing a terminal session cannot retract already-published kernel cache, and
+a real sync failure or busy reference may still block normal unmount. See
+[the FSKit lifecycle contract](./fskit-mount.md#callback-publication-and-local-teardown)
+and [detach reporting](./fskit-mount.md#unmount-and-detach).
+
 Runtime subscriptions, delegations, connections, locks, handles, and replay
 outcomes are epoch-local. Restart permanently stales old handles; cold
 reattachment permits new opens. The Authority fences prior Linux membership
-through the subscription horizon before conflicting writes. Prior Mac or
-unproven membership retains its separate compatibility/lifecycle fence.
+through the subscription horizon before conflicting writes. Prior FSKit
+membership retains its writer fence: it refuses Mac activation until operator
+reconciliation, and refuses foreign writers for 61.06 seconds (the 60-second
+cache-proof bound plus its margin) after safe takeover.
+
+Three owners keep the Mac writer exclusion distinct. An active FSKit
+participant excludes other writers while it serves. After it is fenced, an
+epoch-local obligation excludes writers and another Mac until every KeepAlive
+cache proof granted to that session has expired and its admitted storage
+applications have drained. An accepted clean absence proof discharges the time
+obligation, not the drain obligation. Durable mount
+membership records topology and survives restart until exact absence or
+operator reconciliation. Out-of-band edits to the backing XFS tree on the
+authority host are unsupported; they would bypass all three.
 No client checkpoint or journal reconstructs XFS.
 
 ### Tiered canonical representation
@@ -98,17 +181,18 @@ open-after-unlink semantics.
 
 ## Protocol and replay
 
-Authority protocol 7 uses ALPN `portablefs-authority-v7` and exactly one DATA
+Authority protocol 8 uses ALPN `portablefs-authority-v8` and exactly one DATA
 and one CONTROL connection in a random authenticated connection set. Attach is
 provisional; Activate makes it usable only after both transport bindings and
-their generations are proven. There is no single-transport or protocol-6 path.
+their generations are proven. There is no single-transport path.
 
-Hello/Activate require all exact features for the selected profile listed in
-[wire.md](./coherence-v2/wire.md#required-features). Missing features refuse the
-session; they do not select an older engine. Frozen old message numbers remain
-in the schema, but executable Linux lease handlers and clients are deleted.
+There is no feature negotiation. The exact major and the immutable frontend
+profile fix the grammar and semantics; the schema holds only current
+declarations, and an unknown field or body is a malformed frame. The handshake
+and per-profile admission are specified in [wire.md](./coherence-v2/wire.md).
 
-Mutation operation identities are daemon-owned. Within one epoch, exact replay
+Mutation operation identities are client-owned replay slots and sequences.
+Within one epoch, exact replay
 returns the retained outcome without re-execution. Reusing an identity for a
 different canonical body or violating its sequence fences the session. Replay
 state dies with the epoch; a reply lost across authority death is uncertain and
@@ -122,7 +206,16 @@ handler releases the body.
 ## Subscription and delegation coherence
 
 A volume subscription has a ten-second Authority horizon, renewed every three
-seconds. Subscribe returns an atomic watermark and delegated-identity set.
+seconds. Subscription anchors, receipt/renewal validation, and all Linux cache
+and delegation eligibility checks use suspend-inclusive `CLOCK_BOOTTIME`,
+including checks before CONTROL or timers run after resume. The authority
+uses the same domain for subscription/delegation deadlines and session/lock
+leases. Expiry still requires cold withdrawal; timers only wake workers.
+Admission denial does not certify kernel withdrawal. Cold withdrawal retains
+its name and inode notification inventory until every notification succeeds;
+only then may a cold subscription restore permission. Expiry alone cannot
+replace reverse notification, including across suspend.
+Subscribe returns an atomic watermark and delegated-identity set.
 Acknowledging a change position certifies complete withdrawal through that
 position in the same incarnation. Grant activation and committed namespace
 responses wait for acknowledgments or the old horizon, without holding a
@@ -147,6 +240,20 @@ advances loss on the affected handles; it does not abort the mount.
 
 ## Operation semantics
 
+Every read and mutation reply carries conservative object versions in the
+committed storage-sequence domain: `0 < v <= s`, nondecreasing in snapshot
+order, strictly increasing on each logical change, and equal only for equal
+logical attributes. The commit mutex owns the sequence, a floor, and a bounded
+map of at most 65,536 recent changed identities; when a mutation's changed set
+would overflow the map, the floor rises to the current sequence and the map
+clears. Unchanged identities report `max(floor, entry)`, so versions can advance
+without a change, and nobody infers change from numerical equality. Reads
+capture `(s, floor, entries)` atomically under commit ordering. Each mutation
+carries its explicit changed set (at most four objects) in its post-state;
+there is no per-inode history. A successful MKDIR also returns a kernel
+effective-credential search check on the new directory, taken at the same
+committed cut while the directory is still unexposed.
+
 XFS supplies each syscall's locking and atomicity. Dependency coordinates
 serialize conflicting mutations while disjoint operations run concurrently.
 Rename acquires both parent/name coordinates and relevant object coordinates as
@@ -167,7 +274,7 @@ User xattr writes are refused because XFS attribute-fork blocks are not charged
 to project quota. Read, list, and remove are limited to portable `user.*` names;
 the reserved internal prefix and privileged namespaces never cross the wire.
 
-## Routing
+## Machine-local routing
 
 `.portablefs/local-dirs` declares names served from per-machine Linux storage.
 The authority owns the canonical declaration and its revision. Admin
@@ -186,9 +293,8 @@ UID/GID. The project directory and descendants retain PROJINHERIT. Block and
 inode hard limits are installed and verified before authority startup.
 
 The authority refuses root execution. The cell root remains root-owned and not
-writable by volume identities. Write staging is a service-owned project-
-inheriting directory on the same XFS filesystem, so staged bytes cannot escape
-the volume quota.
+writable by volume identities. Write payloads stay in bounded frame memory;
+there is no staging file on any filesystem.
 
 With project block and inode hard limits installed, XFS `statfs` on the volume
 root reports the project's limits and remaining usage. That projection is
@@ -196,9 +302,11 @@ load-bearing for `df` and tiered capacity accounting. A project without hard
 limits reports cell-wide XFS capacity; neither case requires granting the
 authority quota-administration capability.
 
-In-memory budgets cover sessions, handles, subscriptions, delegations, replay outcomes, frame bytes,
-locks, and queued work. Exhaustion rejects new work before unbounded allocation.
-It never spills authoritative data onto another filesystem.
+In-memory budgets cover sessions, connections, items, handles, subscriptions,
+delegations, replay slots and retained outcome bytes, frame bytes, execution
+lanes, locks, and queued work. Exhaustion rejects new work before unbounded
+allocation; an applied mutation keeps its resources through durability and
+replay settlement. Nothing spills authoritative data onto another filesystem.
 
 The current volume is single-principal. Mounts project the service identity to
 their local user; host numeric IDs are not treated as portable identities.
@@ -235,12 +343,21 @@ lifecycle, capacity, and restore ordering in
 ## Production proof gates
 
 - stock Linux FUSE 7.31+ INIT and real-VFS integration on supported LTS kernels;
-- two independent mounts passing the black-box coherence matrix and its red
-  controls;
-- subscription/delegation grant, break, recall and renewal, stale-generation
-  rejection, exact publication, stable-cookie enumeration, append placement,
-  root-directory barrier delivery, and epoch/loss fault tests;
+- two independent Linux mounts passing the black-box coherence matrix and its
+  red controls;
+- subscription/delegation grant, break, recall and renewal, ordered flush,
+  stale-generation rejection, exact publication, stable-cookie enumeration,
+  append placement, root-directory barrier delivery, and epoch/loss fault tests;
+- conservative version bounds under churn beyond a deliberately tiny map,
+  including replay across compaction and no false Linux invalidation;
+- Mac writer exclusion: proof, fence, retained deadline, apply drain,
+  readmission, second-Mac refusal, and restart from durable membership;
 - XFS project/quota, confinement, storage-failure, and open-after-unlink tests;
+- FSKit durability at every fsync/fdatasync/syncfs boundary with injected EIO,
+  ENOSPC, and EDQUOT, and real power-cut recovery around acknowledged FSKit
+  mutations;
+- a real two-project writeback fault and dirty-neighbor barrier latency on a
+  shared cell, with a separate-filesystem control;
 - Go race, native Swift qualification/refusal, release-identity, and workflow
   policy gates;
 - power-loss and authority-restart drills;
@@ -249,10 +366,8 @@ lifecycle, capacity, and restore ordering in
   and hard links;
 - recall saturation, restore-blocked recovery, post-convergence equivalence,
   quiesce admission closure, and project-`statfs` capacity tests; and
-- protocol-7 measurements with workload/VM caveats, and production measurement
-  before any SLO claim.
+- production measurement, with workload and VM caveats, before any SLO claim.
 
-The protocol-5 qualification receipt and the private vNext design remain in-tree
-as historical evidence. The Linux 6.12.100 private patch series is no longer
-checked in; it lives only in git history. None of the three is a build, test,
-deployment, or runtime dependency of this architecture.
+None of these has passed on the integrated protocol-8 tree yet. Restore
+hydration's mtime restoration is not crash-atomic and is a separately stated
+qualification boundary.
