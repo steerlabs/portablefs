@@ -307,6 +307,13 @@ func TestFallocateCarriesExactDelegationReference(t *testing.T) {
 				roles uint32
 			}{item, postStateRoleTarget}), Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{Flags: rangeResultApplied, PostSize: 4096, VisibilitySequence: 2}}}, nil
 		}
+		// The applied FALLOCATE wakes the background durability owner, whose
+		// BARRIER can arrive before this override is removed. A transport error
+		// there is an unknown durability outcome that revokes the mount, so
+		// answer it as the authority would.
+		if request.GetBarrier() != nil {
+			return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: f.rpc.applied, DurableSequence: f.rpc.applied}}}, nil
+		}
 		return nil, syscall.EIO
 	}
 	f.rpc.mu.Unlock()
