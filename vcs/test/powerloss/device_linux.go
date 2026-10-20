@@ -239,24 +239,17 @@ func (d *LogWrites) Mark(label string) error {
 // what flushes the last queued entries and rewrites the superblock with the
 // final entry count, so a log read before it has run is short by an
 // unpredictable amount - and a short log is a log that understates what
-// reached the device, which would make every cut optimistic. It retries
-// because a just-unmounted filesystem can hold the device briefly.
+// reached the device, which would make every cut optimistic. dmsetup's bounded
+// retry handles transient udev opens without hiding a persistent holder.
 func (d *LogWrites) Release() error {
 	if d == nil || d.Name == "" {
 		return nil
 	}
-	var removeErr error
-	for attempt := range 25 {
-		if _, removeErr = d.runner.Run("dmsetup", "remove", d.Name); removeErr == nil {
-			d.Name = ""
-			return nil
-		}
-		if attempt == 24 {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
+	if _, err := d.runner.Run("dmsetup", "remove", "--retry", d.Name); err != nil {
+		return err
 	}
-	return removeErr
+	d.Name = ""
+	return nil
 }
 
 // Remove tears the whole stack down. It reports the first failure rather than
