@@ -3,6 +3,8 @@
 # xfs-required-tiered-tests.txt to run to a PASS; load_required_tests there
 # defines the line format and validation.
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeCompletesInit
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeUnmountRefusalTerminatesConnection
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeRollsBackFailedNewServer
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelAbortCaptureBeforeServing
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelInvalidationProof
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestBarrierDeliveryProof

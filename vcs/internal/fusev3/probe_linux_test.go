@@ -11,6 +11,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"golang.org/x/sys/unix"
 )
@@ -150,5 +153,147 @@ func TestKernelFUSEProbeRejectsHiddenFusectl(t *testing.T) {
 	entries, err := os.ReadDir(probeRoot)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("failed probe left its mountpoint behind: %v, %v", entries, err)
+	}
+}
+
+// A retained root forces a real EBUSY refusal. It stays open until after the
+// probe returns, so only abort plus lazy detach can finish the probe teardown.
+func TestKernelFUSEProbeUnmountRefusalTerminatesConnection(t *testing.T) {
+	if os.Getenv(envFUSE) != "1" {
+		t.Skip("set PORTABLEFS_FUSE_TEST=1 for the real kernel lifecycle proof")
+	}
+	probeRoot := t.TempDir()
+	t.Setenv("TMPDIR", probeRoot)
+	type busyMount struct {
+		server    *fuse.Server
+		root      *os.File
+		installed kernelMount
+	}
+	type result struct {
+		probe KernelProbe
+		err   error
+	}
+	ready := make(chan busyMount)
+	done := make(chan result, 1)
+	connectionDone := make(chan struct{})
+	go func() {
+		probe, err := probeKernelFUSE(func(raw fuse.RawFileSystem, point string, options *fuse.MountOptions) (*fuse.Server, error) {
+			server, err := fuse.NewServer(probeUnmountObserver{RawFileSystem: raw, done: connectionDone}, point, options)
+			if err != nil {
+				return nil, err
+			}
+			installed, captureErr := captureKernelMount(options.FsName, point)
+			root, rootErr := os.OpenFile(point, unix.O_PATH|unix.O_DIRECTORY, 0)
+			// The probe must acquire and close its own descriptor, independently
+			// of this fixture's observation of the original control inode.
+			closeErr := installed.abortFile.close()
+			ready <- busyMount{server: server, root: root, installed: installed}
+			return server, errors.Join(captureErr, rootErr, closeErr)
+		})
+		done <- result{probe, err}
+	}()
+	var mounted busyMount
+	select {
+	case mounted = <-ready:
+	case result := <-done:
+		t.Fatalf("probe failed before installing the busy fixture: %v", result.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("probe did not install the busy fixture")
+	}
+	t.Cleanup(func() {
+		if mounted.root != nil {
+			_ = mounted.root.Close()
+		}
+		_ = mounted.server.UnmountLazy()
+	})
+	select {
+	case result := <-done:
+		if result.err == nil || !strings.Contains(result.err.Error(), "remove FUSE probe mount") || !strings.Contains(strings.ToLower(result.err.Error()), "busy") {
+			t.Fatalf("busy probe = %+v, %v", result.probe, result.err)
+		}
+		if result.probe != (KernelProbe{}) {
+			t.Fatalf("refused cleanup published kernel evidence: %+v", result.probe)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("probe hung after ordinary unmount was refused")
+	}
+	select {
+	case <-connectionDone:
+	default:
+		t.Fatal("probe returned before Serve terminated")
+	}
+	if _, err := mounted.installed.absent(); err != nil {
+		t.Fatalf("refused unmount left the probe installed: %v", err)
+	}
+	if mounted.installed.abortFile == nil {
+		t.Fatal("fixture did not observe the original abort inode")
+	}
+	abortPath := mounted.installed.abortFile.file.Name()
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
+		if err == nil && (target == abortPath || target == abortPath+" (deleted)") {
+			t.Fatalf("probe retained abort descriptor %s: %s", fd.Name(), target)
+		}
+	}
+	if entries, err := os.ReadDir(probeRoot); err != nil || len(entries) != 0 {
+		t.Fatalf("refused unmount left its mountpoint: %v, %v", entries, err)
+	}
+}
+
+type probeUnmountObserver struct {
+	fuse.RawFileSystem
+	done chan struct{}
+}
+
+func (p probeUnmountObserver) OnUnmount() { close(p.done) }
+
+func TestKernelFUSEProbeRollsBackFailedNewServer(t *testing.T) {
+	if os.Getenv(envFUSE) != "1" {
+		t.Skip("set PORTABLEFS_FUSE_TEST=1 for the real kernel lifecycle proof")
+	}
+	probeRoot := t.TempDir()
+	t.Setenv("TMPDIR", probeRoot)
+	initErr := errors.New("injected NewServer INIT failure")
+	var fsName, mountpoint string
+	probe, err := probeKernelFUSE(func(raw fuse.RawFileSystem, point string, options *fuse.MountOptions) (*fuse.Server, error) {
+		server, err := fuse.NewServer(raw, point, options)
+		if err != nil {
+			return nil, err
+		}
+		fsName, mountpoint = options.FsName, point
+		t.Cleanup(func() { _ = server.UnmountLazy() })
+		installed, captureErr := captureKernelMount(fsName, mountpoint)
+		served := make(chan struct{})
+		go func() { server.Serve(); close(served) }()
+		if captureErr != nil {
+			return nil, captureErr
+		}
+		defer installed.abortFile.close()
+		if err := installed.abortKernelConnection(); err != nil {
+			return nil, err
+		}
+		<-served
+		// Model NewServer's failed-INIT boundary exactly: the device is closed
+		// but the real kernel mount is still installed when it returns error.
+		if _, err := observeExactPlannedKernelMount(fsName, mountpoint); err != nil {
+			return nil, err
+		}
+		return nil, initErr
+	})
+	if !errors.Is(err, initErr) || probe != (KernelProbe{}) {
+		t.Fatalf("post-install NewServer failure = %+v, %v", probe, err)
+	}
+	if fsName == "" {
+		t.Fatal("fixture never installed the kernel mount")
+	}
+	if _, err := observePlannedKernelMountAbsent(fsName, mountpoint); err != nil {
+		t.Fatalf("failed NewServer left a stray kernel mount: %v", err)
+	}
+	if entries, err := os.ReadDir(probeRoot); err != nil || len(entries) != 0 {
+		t.Fatalf("failed NewServer left its mountpoint: %v, %v", entries, err)
 	}
 }

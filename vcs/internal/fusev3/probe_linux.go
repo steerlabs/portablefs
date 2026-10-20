@@ -57,6 +57,10 @@ const probeMaxBackground = 8
 // nothing. Only INIT, the negotiated capability set, the fusectl control
 // prerequisite, and the mount/unmount lifecycle are exercised.
 func ProbeKernelFUSE() (KernelProbe, error) {
+	return probeKernelFUSE(fuse.NewServer)
+}
+
+func probeKernelFUSE(newServer func(fuse.RawFileSystem, string, *fuse.MountOptions) (*fuse.Server, error)) (KernelProbe, error) {
 	mountpoint, err := os.MkdirTemp("", "portablefs-fuse-probe-")
 	if err != nil {
 		return KernelProbe{}, fmt.Errorf("fusev3: create FUSE probe mountpoint: %w", err)
@@ -84,9 +88,9 @@ func ProbeKernelFUSE() (KernelProbe, error) {
 		return KernelProbe{}, err
 	}
 
-	server, err := fuse.NewServer(probeFileSystem{fuse.NewDefaultRawFileSystem()}, mountpoint, options)
+	server, err := newServer(probeFileSystem{fuse.NewDefaultRawFileSystem()}, mountpoint, options)
 	if err != nil {
-		return KernelProbe{}, fmt.Errorf("fusev3: install FUSE probe mount: %w", err)
+		return KernelProbe{}, errors.Join(fmt.Errorf("fusev3: install FUSE probe mount: %w", err), removeMountInstalledByFailedHelper(options.FsName, mountpoint))
 	}
 	installed, probeErr := captureKernelMount(options.FsName, mountpoint)
 	// NewServer prepares a request-loop reference; even failed startup must
@@ -102,11 +106,31 @@ func ProbeKernelFUSE() (KernelProbe, error) {
 		probe, probeErr = completeProbeInit(server)
 	}
 	unmountErr := server.Unmount()
-	<-served
-	closeErr := installed.abortFile.close()
+	joinServe := unmountErr == nil
 	if unmountErr != nil {
 		unmountErr = fmt.Errorf("fusev3: remove FUSE probe mount: %w", unmountErr)
+		// A refused normal unmount leaves Serve running. As in live terminal
+		// withdrawal, abort the retained connection before an identity-checked
+		// lazy detach. The refusal remains a failed probe even after cleanup.
+		abortErr := installed.abortKernelConnection()
+		joinServe = abortErr == nil
+		if abortErr != nil {
+			abortErr = fmt.Errorf("fusev3: abort FUSE probe connection: %w", abortErr)
+		}
+		present, detachErr := installed.detachTargetInstalled()
+		if detachErr == nil && present {
+			detachErr = server.UnmountLazy()
+		}
+		_, absenceErr := installed.absent()
+		unmountErr = errors.Join(unmountErr, abortErr, detachErr, absenceErr)
 	}
+	// Only successful unmount or abort establishes connection termination.
+	// If neither succeeded, report cleanup failure and release the descriptor
+	// without waiting on a connection that may still be serving.
+	if joinServe {
+		<-served
+	}
+	closeErr := installed.abortFile.close()
 	if err := errors.Join(probeErr, unmountErr, closeErr); err != nil {
 		return KernelProbe{}, err
 	}

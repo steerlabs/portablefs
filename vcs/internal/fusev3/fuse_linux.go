@@ -435,23 +435,31 @@ var unmountFailedHelperMount = func(mountpoint string) error {
 }
 
 func releaseMountInstalledByFailedHelper(rpc RPC, fsName, mountpoint string) error {
-	if _, err := observePlannedKernelMountAbsent(fsName, mountpoint); err == nil {
-		return releaseUninstalledSession(rpc, fsName, mountpoint)
-	}
-	installed, err := observeExactPlannedKernelMount(fsName, mountpoint)
-	if err != nil {
+	if err := removeMountInstalledByFailedHelper(fsName, mountpoint); err != nil {
 		rpc.FinishLocalSessionEnforcement()
 		return errors.Join(err, rpc.Close())
 	}
-	if err := unmountFailedHelperMount(installed.point); err != nil {
-		// The helper may have removed the mount before failing to update its
-		// userspace mount table. Only the kernel observation decides cleanup.
-		if _, absenceErr := observePlannedKernelMountAbsent(fsName, mountpoint); absenceErr != nil {
-			rpc.FinishLocalSessionEnforcement()
-			return errors.Join(err, absenceErr, rpc.Close())
-		}
-	}
 	return releaseUninstalledSession(rpc, fsName, mountpoint)
+}
+
+// removeMountInstalledByFailedHelper owns rollback even when NewServer closed
+// its device after failed INIT: closing the connection does not unmount it.
+// Both live mounts and probes must prove the exact planned mount absent.
+func removeMountInstalledByFailedHelper(fsName, mountpoint string) error {
+	if _, err := observePlannedKernelMountAbsent(fsName, mountpoint); err == nil {
+		return nil
+	}
+	installed, err := observeExactPlannedKernelMount(fsName, mountpoint)
+	if err != nil {
+		return err
+	}
+	unmountErr := unmountFailedHelperMount(installed.point)
+	// The helper may have removed the mount before failing to update its
+	// userspace mount table. Only the kernel observation decides cleanup.
+	if _, absenceErr := observePlannedKernelMountAbsent(fsName, mountpoint); absenceErr != nil {
+		return errors.Join(unmountErr, fmt.Errorf("fusev3: establish failed-startup mount absence: %w", absenceErr))
+	}
+	return nil
 }
 
 func observeExactPlannedKernelMount(fsName, mountpoint string) (kernelMount, error) {
