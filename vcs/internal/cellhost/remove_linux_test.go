@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestRemoveTreeRemovesSymlinksWithoutFollowingThem is the confinement test.
@@ -111,6 +113,28 @@ func TestRemoveTreeEmptiesDirectoriesLargerThanOneBatch(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "tree")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("wide tree survived removal: %v", err)
+	}
+}
+
+// getdents may return a short batch: under load a 32 KiB read of a one-file
+// directory was observed returning only "." and "..". A buffer too small for
+// the next entry forces the same shape deterministically. Such a batch is not
+// end-of-directory, so the pass must keep reading and find the entry.
+func TestRemoveDirectoryPassReadsPastAShortBatch(t *testing.T) {
+	directory := t.TempDir()
+	writeTestFile(t, filepath.Join(directory, "10-portablefs.conf"), "[Socket]\n")
+	fd, err := unix.Open(directory, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	// "." and ".." take 24 bytes each; the 40-byte file entry does not fit.
+	child, seen, err := drainDirectoryPass(fd, make([]byte, 64))
+	if err != nil || child != "" || seen != 1 {
+		t.Fatalf("pass = (%q, %d, %v), want the file seen and removed", child, seen, err)
+	}
+	if _, err := os.Lstat(filepath.Join(directory, "10-portablefs.conf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file survived the pass: %v", err)
 	}
 }
 
