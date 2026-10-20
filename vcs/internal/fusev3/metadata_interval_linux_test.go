@@ -3,7 +3,9 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -409,12 +411,13 @@ func TestMetadataSamplingAndSourceAdmissionAreAtomic(t *testing.T) {
 	}()
 	// The sampler must close the raw source-admission edge before reading its
 	// overlay. Pausing at the metadata mutex proves these are one transaction.
+	// raw.mu being held is not that evidence: flush completion and the
+	// callback's own earlier steps take it too, and a WRITE started then is
+	// legitimately sampled first. Only a goroutine parked in the overlay
+	// render holds raw.mu past the source-admission check.
 	waitUntil(t, time.Second, "metadata source transaction", func() bool {
-		if f.raw.mu.TryLock() {
-			f.raw.mu.Unlock()
-			return false
-		}
-		return true
+		stacks := make([]byte, 1<<20)
+		return bytes.Contains(stacks[:runtime.Stack(stacks, true)], []byte(".(*rawFileSystem).renderMetadataLocked("))
 	})
 	written := make(chan struct{})
 	go func() { writeDelegated(t, f, entry.NodeId, opened.Fh, 8192, []byte("later")); close(written) }()
