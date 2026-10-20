@@ -495,7 +495,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
                     switch transition.coherency {
                     case .noCache: coherency = .noCache
                     case .readCache: coherency = .readCache
-                    case .writeBack: coherency = .writeBack
+                    case .writeThrough: coherency = .writeThrough
                     }
                     let action: FSVolume.KernelCacheCoherencyAction
                     switch transition.action {
@@ -652,7 +652,7 @@ public class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWrite
         // cleanup only, not durability, kernel absence or daemon reconciliation.
         // Keep serving durable WRITE callbacks while the healthy kernel drains.
         // Failure fences the session; this errorless completion cannot certify
-        // durability or turn failed dirty writeback into successful withdrawal.
+        // durability or turn a failed dirty push into successful withdrawal.
         do { try await kernelCache?.drainForUnmount() }
         catch { logger.error("unmount drain failed: \(String(describing: error), privacy: .public)") }
         await shutdown()
@@ -1753,7 +1753,7 @@ final class PortableFSVolumeV3: PortableFSVolume, FSVolume.DataCacheHandler, @un
             switch grant {
             case .noCache: return .noCache
             case .readCache: return .readCache
-            case .writeBack: return .writeBack
+            case .writeThrough: return .writeThrough
             }
         }, reply: { result in
             switch result {

@@ -9,7 +9,7 @@ import OSLog
 /// call. Pins keep reentrant final-close/reclaim cleanup behind its completion.
 final class PfsKernelCache: @unchecked Sendable {
     enum Mode: Sendable { case none, readWithCache, readWriteWithCache }
-    enum Coherency: Sendable { case noCache, readCache, writeBack }
+    enum Coherency: Sendable { case noCache, readCache, writeThrough }
     enum Action: Sendable { case push, pushInvalidate, revoke }
     struct Transition: Sendable {
         let mode: Mode
@@ -111,6 +111,9 @@ final class PfsKernelCache: @unchecked Sendable {
     /// Called inside the publication gate, at the actual framework reply.
     /// Cache fills require an authority-granted retained read description,
     /// including when the application descriptor itself is O_WRONLY.
+    /// Writers get writeThrough: each write(2) reaches the authority before it
+    /// returns, so quota, space and I/O errors surface at that write instead
+    /// of as a deferred EIO at fsync or close.
     func grant(_ item: PortableFSItem, requested: Mode) throws -> Coherency {
         let now: UInt64
         do { now = try clock() } catch { throw AdmissionFailure.clock(error) }
@@ -122,14 +125,14 @@ final class PfsKernelCache: @unchecked Sendable {
             guard requested != .none, entry.access.grantsRead, item.kind == .file, !revoked,
                   !unmounting, withdrawing == 0, horizon > now else { return .noCache }
             let coherency: Coherency = requested == .readWriteWithCache && entry.access.grantsWrite
-                ? .writeBack : .readCache
+                ? .writeThrough : .readCache
             entries[ObjectIdentifier(item)]?.mode = requested
             entries[ObjectIdentifier(item)]?.coherency = coherency
             return coherency
         }
     }
 
-    /// Avoid acquiring optional rights when a writeBack grant is already
+    /// Avoid acquiring optional rights when a cache grant is already
     /// ineligible. This is only an acquisition check: grant rechecks everything
     /// at publication after the authority await and any intervening withdrawal.
     func canAcquireRead(_ item: PortableFSItem) throws -> Bool {
@@ -151,6 +154,9 @@ final class PfsKernelCache: @unchecked Sendable {
 
     /// No callback slot or source/lifecycle gate may span this wait. The push
     /// itself reenters ordinary durable WRITE callbacks on the same connection.
+    /// writeThrough delivers write(2) synchronously; a push covers whatever
+    /// the kernel still holds dirty for a write-cached item, such as pages
+    /// stored through a writable mapping.
     func push(_ items: [PortableFSItem]) async throws {
         try await change(.push, items: items)
     }
@@ -274,7 +280,7 @@ final class PfsKernelCache: @unchecked Sendable {
                 let selected = items.map { Set($0.map(ObjectIdentifier.init)) }
                 let work: [Work] = entries.keys.compactMap { id in
                     guard let entry = entries[id], selected == nil || selected?.contains(id) == true,
-                          action == .revoke || (action == .push ? entry.coherency == .writeBack : entry.coherency != .noCache)
+                          action == .revoke || (action == .push ? entry.coherency == .writeThrough : entry.coherency != .noCache)
                     else { return nil }
                     entries[id]?.pins += 1
                     let transition = Transition(mode: action == .push ? entry.mode : .none,

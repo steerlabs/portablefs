@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Interactive r3l writeBack proof on an exact, separately deployed signed build.
+"""Interactive r3l kernel-cache write proof on an exact, separately deployed signed build.
+
+macOS 27 grants writeThrough, never writeBack. The held-WRITE cases below were
+written for writeBack and expect write(2) to return while a covered WRITE is
+held; under writeThrough that write blocks, so those cases stay OPEN.
 
 Never deploy or run against the lab without separate authorization. This driver
 performs local POSIX operations only. An operator supplies target-WRITE holds,
@@ -162,7 +166,7 @@ def prepare_mount(mount, output, phase, identities, adapter="V3"):
     expected = {"faults_restored": True, "adapter": adapter}
     if adapter == "V3":
         fields.append("grant_evidence")
-        expected.update(requested_mode="readWriteWithCache", granted_mode="writeBack")
+        expected.update(requested_mode="readWriteWithCache", granted_mode="writeThrough")
     else:
         fields.append("adapter_evidence")
     proof = proof_checkpoint(output, f"Prepare fresh healthy signed {adapter} mount for {phase}. Restore every fault; "
@@ -219,7 +223,7 @@ def hold_proof(directory, output_dir, output, hold, barrier, fault=None):
     checkpoint(output, f"{label}: verify fixture independently at authority; arm targeted WRITE hold {hold}. "
                "Keep KeepAlive/authorization live. Trace every covered callback/chunk and its durable result. "
                "Prove all seed CREATE/read descriptions retired before the worker O_WRONLY reopen, and trace its combined "
-               "access-only OPEN. Require requested readWriteWithCache and granted writeBack on the exact signed artifact.")
+               "access-only OPEN. Require requested readWriteWithCache and granted writeThrough on the exact signed artifact.")
     artifact = output_dir / (label + ".jsonl")
     with artifact.open("x") as stream, (output_dir / (label + ".stderr")).open("x") as errors:
         process = subprocess.Popen([sys.executable, __file__, "--worker", str(path)], stdin=subprocess.PIPE,
@@ -282,7 +286,7 @@ def buffered_writeonly_shapes(directory, output):
         assert file.write(expected) == len(expected)
         os.fsync(file.fileno())
     checkpoint(output, f"{path}: persist fixture and prove all CREATE/read descriptions retired before the O_WRONLY "
-               "reopen; trace a combined access-only OPEN and writeBack grant. Arm a delayed pre-write attribute reply "
+               "reopen; trace a combined access-only OPEN and writeThrough grant. Arm a delayed pre-write attribute reply "
                "without blocking writes, then release it after the dirty extension and record its sequence.")
     fd = os.open(path, os.O_WRONLY)
     try:
@@ -318,7 +322,7 @@ def buffered_writeonly_shapes(directory, output):
         assert file.write(b"seed") == 4
         os.fsync(file.fileno())
     checkpoint(output, f"{path}: persist and retire fixture descriptions, then trace two O_WRONLY|O_APPEND descriptors "
-               "with authorized backing reads/writeBack. No fsync or close may interleave with the append loops.")
+               "with authorized backing reads/writeThrough. No fsync or close may interleave with the append loops.")
     descriptors = [os.open(path, os.O_WRONLY | os.O_APPEND) for _ in range(2)]
     failures = []
     start = threading.Barrier(2)
@@ -453,7 +457,7 @@ def permission_shapes(directory, output):
             proof_checkpoint(output, f"{path}: new O_CREAT|O_WRONLY flags={os.O_CREAT | effects | os.O_WRONLY} with legitimate CREATE read/write backing "
                              "description retained. Record application EBADF and V3 grant/ownership traces.",
                              evidence_fields=("grant_evidence", "description_evidence"),
-                             requested_mode="readWriteWithCache", granted_mode="writeBack", retained_read_description=True)
+                             requested_mode="readWriteWithCache", granted_mode="writeThrough", retained_read_description=True)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -483,7 +487,7 @@ def permission_shapes(directory, output):
                 os.fsync(fd)
             finally:
                 os.close(fd)
-            expected = dict(requested_mode="readWriteWithCache", granted_mode="noCache" if denied else "writeBack",
+            expected = dict(requested_mode="readWriteWithCache", granted_mode="noCache" if denied else "writeThrough",
                             successful_read_description=not denied,
                             authority_opens=([{"access": "readWrite", "result": "EACCES"},
                                               {"access": "write", "result": "success"}] if denied else
@@ -494,7 +498,7 @@ def permission_shapes(directory, output):
             proof_checkpoint(output, f"{path} {trial}: record exact authority OPEN access/results for the SAME canonical "
                              "capability and requested/granted cache modes. A denied case may issue a FAILED read-capable "
                              "OPEN, but must retain no successful read-capable description and issue no cache-fill READ. "
-                             "Readable cases require writeBack. Verify CREATE/TRUNC happened exactly once on their original "
+                             "Readable cases require writeThrough. Verify CREATE/TRUNC happened exactly once on their original "
                              "paths, never in optional access acquisition or its retry.",
                              evidence_fields=("grant_evidence", "open_trace", "description_evidence", "canonical_item_evidence"),
                              fixture=str(path), trial=trial, **expected)
@@ -518,7 +522,7 @@ def collect_proofs(mount, output_dir, output):
     healthy_shapes(directory, output)
     for case in LIFECYCLE:
         prepare_mount(mount, output, case, identities)
-        checkpoint(output, f"{case}: accept dirty kernel pages, record real writeBack grant; "
+        checkpoint(output, f"{case}: accept dirty kernel pages, record real writeThrough grant; "
                    "for healthy proof-only expiry/unmount require completed pushInvalidate, all reentrant durable WRITE replies, "
                    "pinned descriptions and no deadlock under grant renewal/final-close/reclaim/namespace overlap. "
                    "In the separate pushInvalidate-failure case inject a failed action: unchanged kernel state must "
@@ -532,7 +536,7 @@ def collect_proofs(mount, output_dir, output):
                "Require the same fresh signed actual-mount/session/epoch preparation after each destructive case; "
                "record V2 adapter evidence rather than claiming a V3 grant. "
                "Preserve unchanged acceptance runs and their deadlines/failures; no qualification inherited from build 5008. "
-               "Review every callback cut, native error and independent hash. Any missing proof leaves writeBack unqualified.")
+               "Review every callback cut, native error and independent hash. Any missing proof leaves writeThrough unqualified.")
 
 
 def main():
@@ -558,7 +562,7 @@ def main():
                    "path/load, trace setup and independent authority hash command. Keep fresh identities per failure. "
                    "Start bounded grant/callback size/count/durability/final-close tracing; retain raw logs outside the mount.")
         collect_proofs(args.mount, args.output, output)
-    print("Evidence collected. Native writeBack qualification requires review; no automatic pass claimed.")
+    print("Evidence collected. Native writeThrough qualification requires review; no automatic pass claimed.")
 
 
 if __name__ == "__main__":

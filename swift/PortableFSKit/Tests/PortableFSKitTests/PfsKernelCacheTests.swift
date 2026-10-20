@@ -158,7 +158,7 @@ extension PfsLocalMockDaemonTests {
         #expect(error == nil); upgraded.change { $0 = grant }
     }
     try await cacheEventually { upgraded.value != nil }
-    #expect(upgraded.value == .writeBack)
+    #expect(upgraded.value == .writeThrough)
     #expect(await daemon.stats().openRequests == 0)
     #expect(await core.testingDebugState().openHandleCount == 1)
     let data = try await core.read(item: created.item, offset: 0, length: 1)
@@ -183,7 +183,7 @@ extension PfsLocalMockDaemonTests {
         #expect(error == nil); writable.change { $0 = grant }
     }
     try await cacheEventually { writable.value != nil }
-    #expect(writable.value == .writeBack)
+    #expect(writable.value == .writeThrough)
     #expect(await daemon.stats().openModes == [.read, .write])
     #expect(await core.testingDebugState().openHandleCount == 2)
     await volume.shutdown()
@@ -628,7 +628,7 @@ private func checkAuthorizationExpiryCommit(renewalWins: Bool) async throws {
             cache.ownership(item, access: access)
             cache.proof(1_000_000_000_000)
             let expected: PfsKernelCache.Coherency = mode == .none || access == .write ? .noCache
-                : (mode == .readWriteWithCache && access == .readWrite ? .writeBack : .readCache)
+                : (mode == .readWriteWithCache && access == .readWrite ? .writeThrough : .readCache)
             #expect(try cache.grant(item, requested: mode) == expected)
             await cache.withdraw(.revoke)
         }
@@ -653,7 +653,7 @@ private func reentrantDirtyWrite(_ volume: PortableFSVolume, item: PortableFSIte
 
 extension PfsLocalMockDaemonTests {
 @available(macOS 27, *)
-@Test func v3WriteBackExpiryPushesReentrantDurableWritesAndBlocksRenewedGrants() async throws {
+@Test func v3WriteThroughExpiryPushesReentrantDurableWritesAndBlocksRenewedGrants() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -664,7 +664,7 @@ extension PfsLocalMockDaemonTests {
     let client = await core.client
     let created = try await core.createFile(in: core.rootItem(), name: Data("dirty-expiry".utf8), mode: 0o600)
     cache.proof(1_000_000_000_000)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
     let actions = CacheBox<[PfsKernelCache.Action]>([])
     cache.install { item, transition in
         actions.change { $0.append(transition.action) }
@@ -683,12 +683,12 @@ extension PfsLocalMockDaemonTests {
     #expect(await daemon.stats().writeRequests == 1)
     #expect(try await core.read(item: created.item, offset: 0, length: 4096) == Data(repeating: 65, count: 4096))
     #expect(client.publicationGate.terminalError == nil)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
     await volume.shutdown()
 }
 
 @available(macOS 27, *)
-@Test func v3WriteBackFailedDrainFencesAndOldDirtyCallbackFails() async throws {
+@Test func v3WriteThroughFailedDrainFencesAndOldDirtyCallbackFails() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -697,7 +697,7 @@ extension PfsLocalMockDaemonTests {
     let client = await core.client
     let created = try await core.createFile(in: core.rootItem(), name: Data("failed-drain".utf8), mode: 0o600)
     cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
     let actions = CacheBox<[PfsKernelCache.Action]>([])
     cache.install { _, transition in
         actions.change { $0.append(transition.action) }
@@ -717,7 +717,7 @@ extension PfsLocalMockDaemonTests {
 }
 
 @available(macOS 27, *)
-@Test func v3WriteBackNamespacePushPrecedesLinkRenameAndUnlinkWithoutSlotOrSourceHold() async throws {
+@Test func v3WriteThroughNamespacePushPrecedesLinkRenameAndUnlinkWithoutSlotOrSourceHold() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let requests = CacheBox<[String]>([])
@@ -733,12 +733,12 @@ extension PfsLocalMockDaemonTests {
     let created = try await core.createFile(in: root, name: Data("source".utf8), mode: 0o600)
     let replaced = try await core.createFile(in: root, name: Data("target".utf8), mode: 0o600)
     cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
-    #expect(try cache.grant(replaced.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
+    #expect(try cache.grant(replaced.item, requested: .readWriteWithCache) == .writeThrough)
     let pushed = CacheBox<[UInt64]>([])
     cache.install { item, transition in
         guard transition.action == .push else { return nil }
-        #expect(transition.mode == .readWriteWithCache && transition.coherency == .writeBack)
+        #expect(transition.mode == .readWriteWithCache && transition.coherency == .writeThrough)
         pushed.change { $0.append(item.fileID) }
         return reentrantDirtyWrite(volume, item: item)
     }
@@ -769,7 +769,7 @@ extension PfsLocalMockDaemonTests {
 }
 
 @available(macOS 27, *)
-@Test func v3WriteBackUnmountDrainsBeforeClosingOwnership() async throws {
+@Test func v3WriteThroughUnmountDrainsBeforeClosingOwnership() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -779,7 +779,7 @@ extension PfsLocalMockDaemonTests {
     let client = await core.client
     let created = try await core.createFile(in: core.rootItem(), name: Data("unmount-dirty".utf8), mode: 0o600)
     cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
     let drained = CacheBox(false)
     cache.install { item, transition in
         guard transition.action == .pushInvalidate else { return nil }
@@ -831,7 +831,7 @@ extension PfsLocalMockDaemonTests {
     cache.retain(item)
     cache.ownership(item, access: .readWrite)
     cache.proof(1_000_000_000_000)
-    #expect(try cache.grant(item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(item, requested: .readWriteWithCache) == .writeThrough)
     cache.install { item, transition in
         if transition.action == .push { cache.ownership(item, access: .unspecified) }
         return nil
@@ -847,7 +847,7 @@ extension PfsLocalMockDaemonTests {
     cache.retain(item)
     cache.ownership(item, access: .readWrite)
     cache.proof(1_000_000_000_000)
-    #expect(try cache.grant(item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(item, requested: .readWriteWithCache) == .writeThrough)
     let entered = CacheBox(false)
     let release = DispatchSemaphore(value: 0)
     let actions = CacheBox<[PfsKernelCache.Action]>([])
@@ -877,7 +877,7 @@ extension PfsLocalMockDaemonTests {
 
 extension PfsLocalMockDaemonTests {
 @available(macOS 27, *)
-@Test func v3WriteBackNamespacePushFailureNeverDispatchesPublication() async throws {
+@Test func v3WriteThroughNamespacePushFailureNeverDispatchesPublication() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let requests = CacheBox<[String]>([])
@@ -891,7 +891,7 @@ extension PfsLocalMockDaemonTests {
     let root = try await core.rootItem()
     let created = try await core.createFile(in: root, name: Data("failed-push".utf8), mode: 0o600)
     cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
     cache.install { _, transition in transition.action == .push ? POSIXError(.EIO) : nil }
     requests.change { $0.removeAll() }
     let error = CacheBox<Error?>(nil)
@@ -905,7 +905,7 @@ extension PfsLocalMockDaemonTests {
 }
 
 @available(macOS 27, *)
-@Test func v3WriteBackDrainWaitsForDeliveredReplyAndPinsReentrantFinalClose() async throws {
+@Test func v3WriteThroughDrainWaitsForDeliveredReplyAndPinsReentrantFinalClose() async throws {
     let daemon = try PfsLocalMockDaemon()
     defer { daemon.stop() }
     let core = try await VolumeCore.connect(socketPath: daemon.socketPath, attachRef: "mock")
@@ -914,7 +914,7 @@ extension PfsLocalMockDaemonTests {
     let cache = try #require(volume.kernelCache)
     let created = try await core.createFile(in: core.rootItem(), name: Data("held-drain".utf8), mode: 0o600)
     cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
-    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(created.item, requested: .readWriteWithCache) == .writeThrough)
     let held = CachePause()
     await daemon.holdNextReply { envelope in
         if case .writeReply? = envelope.body { await held.wait() }
@@ -948,7 +948,7 @@ extension PfsLocalMockDaemonTests {
     cache.retain(item)
     cache.ownership(item, access: .readWrite)
     cache.proof(1_000_000_000_000)
-    #expect(try cache.grant(item, requested: .readWriteWithCache) == .writeBack)
+    #expect(try cache.grant(item, requested: .readWriteWithCache) == .writeThrough)
     let entered = CacheBox(false)
     let release = DispatchSemaphore(value: 0)
     let actions = CacheBox<[PfsKernelCache.Action]>([])

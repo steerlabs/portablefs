@@ -28,6 +28,11 @@ is not yet qualified.
   volume's only writer, Linux mounts read, and a second Mac is refused. Peer
   repair, fragmented FSKit writes, publication retraction, the cache-policy
   names, and the separately built macOS 27 native lane are removed.
+- macOS 27 grants the `writeThrough` kernel cache to writers instead of
+  `writeBack`, so `write(2)` returns after its callback is durable and reports
+  its own error. A native Phase III quota observation on macOS 27.0.1 accepted
+  every write into the kernel cache, then surfaced quota exhaustion as a
+  deferred EIO at fsync and close instead of EDQUOT. macOS 26 is unchanged.
 - Every successful FSKit mutation reply is durable: handle-backed mutations
   fsync their retained description and handleless mutations use syncfs on the
   volume root. A shared XFS cell is one durability-error and latency domain.

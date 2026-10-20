@@ -37,7 +37,7 @@ one device share device contention and media failure. See
 
 **macOS cache withdrawal has platform and execution limits.** On macOS 27,
 PortableFS adopts `FSVolume.DataCacheHandler`. A compatible
-`readWriteWithCache` request receives `writeBack` only with live exclusive-writer
+`readWriteWithCache` request receives `writeThrough` only with live exclusive-writer
 and authorization proof and legitimately retained read/write descriptions.
 Read-only requests/rights receive `readCache`; no-cache requests receive
 `noCache`. For an eligible regular-file V3 `readWriteWithCache` write open,
@@ -59,13 +59,15 @@ changes until retirement; each new acquisition checks current storage access.
 No local mode-bit decision, privileged helper, permission TTL or per-write
 retry supplies cache-fill rights.
 
-macOS 27 buffers ordinary writes in the kernel like V2; every delivered FSKit
-mutation callback still waits for authority-storage durability. Native fsync
-must cover buffered data and callback errors, pending native proof; `writeBack`
-is **unqualified until those proofs pass**. Writer loss may lose undelivered
-dirty data, as on V2 and a local disk without fsync. A failed in-flight write
-may already have applied. Linux peers see delivered state only, not newer
-bytes retained solely in Mac kernel pages.
+macOS 27 never grants `writeBack`. A native Phase III observation on macOS
+27.0.1 (case 399) failed: with project-quota headroom of 4 MiB, 32 x 1 MiB
+writes were all accepted into the kernel cache, then fsync and close returned
+EIO, not EDQUOT. Under writeBack quota exhaustion surfaced late, as a generic
+error at flush. With `writeThrough`, `write(2)` returns only after its FSKit
+WRITE callback is durable at the authority, so the authority's error reaches
+that write; this write-time delivery is **pending native proof**. A failed
+in-flight write may already have applied. Pages dirtied through a writable
+mapping still reach the authority only when the kernel pushes them.
 
 Usable-session cache-proof expiry stops grants and completes `pushInvalidate`
 before downgrade to `noCache`; ordinary unmount drains before ownership is
@@ -146,7 +148,7 @@ against supported macOS releases before Attach.
 Both macOS releases retain `FSVolume.Operations` and
 `FSVolume.ReadWriteOperations` as the native operation boundary. macOS 27
 adopts `FSVolume.DataCacheHandler` separately for the package B/C cache
-lifecycle and writeBack work, with the qualification limits above. It does
+lifecycle and writeThrough grants, with the qualification limits above. It does
 not adopt `FSVolume.Handler` or `FSVolume.ReadWriteHandler`. Package D part 1
 is the selected implementation; part 2 is cancelled for protocol 8.
 
@@ -314,12 +316,15 @@ Foundation/cgo daemon built inside the app. The deployment target remains macOS
   observation; overflow or uncertainty discards the record. These daemon
   metadata caches are separate from macOS 27 kernel data-cache control; its
   limits are stated at the top of this document.
-- On macOS 27, writeBack buffers ordinary writes in the kernel like V2 on
-  macOS 26. Delivered callbacks remain durable. Native `fsync`, `F_FULLFSYNC`
-  and ordinary unmount must cover buffered pages and callback errors, pending
-  native proof; writeBack is unqualified until those proofs pass. Writer loss
-  or forced unmount may lose undelivered dirty data, as on V2 and a local disk
-  without fsync. Linux peers see delivered state only.
+- On macOS 27, write-capable cache grants are `writeThrough`: `write(2)`
+  returns after its callback is durable and reports its error, pending native
+  proof. writeBack was disabled after a native quota observation surfaced
+  quota exhaustion as deferred EIO at fsync and close. On macOS 26, V2
+  buffers ordinary writes in the kernel; native `fsync`, `F_FULLFSYNC` and
+  ordinary unmount must cover buffered pages and callback errors, pending
+  native proof. Writer loss or forced unmount may lose undelivered dirty
+  data, as on a local disk without fsync. Linux peers see delivered state
+  only.
 - `umount` makes one unforced attempt and returns the real `EBUSY` when
   something holds the mount. Only an explicit user `--force` ever forces an
   unmount: no daemon failure, terminal session, timeout, or proven daemon

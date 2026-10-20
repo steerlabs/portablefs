@@ -61,7 +61,7 @@ extension PfsLocalMockDaemonTests {
 @Test func cacheReadFreshWriteOnlyUsesOneCombinedOpen() async throws {
     for mode in [UInt32(0o644), 0o600] {
         let f = try await ReadAcquisitionFixture(mode: mode)
-        #expect(try await f.open() == .writeBack)
+        #expect(try await f.open() == .writeThrough)
         let stats = await f.daemon.stats()
         #expect(stats.openModes == [.readWrite])
         #expect(stats.grantedOpenModes == [.readWrite])
@@ -120,7 +120,7 @@ extension PfsLocalMockDaemonTests {
         #expect(try await f.open([.write], .none) == .noCache)
         // The retained writer survives chmod; only the missing read is checked.
         _ = try await f.core.setattr(item: f.item, attributes: PfsSetAttributes(mode: denied ? 0o000 : 0o400))
-        #expect(try await f.open(upgrade ? nil : [.write]) == (denied ? .noCache : .writeBack))
+        #expect(try await f.open(upgrade ? nil : [.write]) == (denied ? .noCache : .writeThrough))
         let stats = await f.daemon.stats()
         #expect(stats.openModes == [.write, .read])
         #expect(stats.grantedOpenModes == (denied ? [.write] : [.write, .read]))
@@ -142,7 +142,7 @@ extension PfsLocalMockDaemonTests {
     #expect(await reader.daemon.stats().openModes == [.read])
     await reader.finish()
     let created = try await ReadAcquisitionFixture(mode: 0o200, retainCreation: true)
-    #expect(try await created.open() == .writeBack)
+    #expect(try await created.open() == .writeThrough)
     #expect(await created.daemon.stats().openModes.isEmpty)
     await created.finish()
 }
@@ -225,10 +225,10 @@ extension PfsLocalMockDaemonTests {
 @available(macOS 27, *)
 @Test func cacheReadAcquiredRightsSurviveChmodAndACLUntilRetirement() async throws {
     let f = try await ReadAcquisitionFixture()
-    #expect(try await f.open() == .writeBack)
+    #expect(try await f.open() == .writeThrough)
     _ = try await f.core.setattr(item: f.item, attributes: PfsSetAttributes(mode: 0o000))
     await f.daemon.denyReadOpen(item: f.item.identity, denied: true)
-    #expect(try await f.open(nil) == .writeBack)
+    #expect(try await f.open(nil) == .writeThrough)
     #expect(try await f.core.read(item: f.item, offset: 0, length: 1).isEmpty)
     #expect(await f.daemon.stats().openModes == [.readWrite])
     try await f.core.close(item: f.item)
@@ -247,7 +247,7 @@ extension PfsLocalMockDaemonTests {
     try await f.core.close(item: f.item)
     for _ in 0..<16 {
         f.cache.proof(try PfsKernelCache.continuousNanos() + 30_000_000_000)
-        #expect(try await f.open() == .writeBack)
+        #expect(try await f.open() == .writeThrough)
         #expect(await f.core.testingDebugState().openHandleCount == 1)
         try await f.core.close(item: f.item)
         #expect(await f.daemon.stats().activeHandles == 0)
@@ -260,7 +260,7 @@ extension PfsLocalMockDaemonTests {
 @Test func cacheReadSeparateDescriptionsStayPinnedAfterAliasesUnlinkAndReplacement() async throws {
     let f = try await ReadAcquisitionFixture()
     #expect(try await f.open([.write], .none) == .noCache)
-    #expect(try await f.open(nil) == .writeBack)
+    #expect(try await f.open(nil) == .writeThrough)
     let root = try await f.core.rootItem()
     _ = try await f.core.hardLink(item: f.item, in: root, name: Data("alias".utf8))
     let alias = try await f.core.lookup(in: root, name: Data("alias".utf8))

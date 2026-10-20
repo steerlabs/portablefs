@@ -112,7 +112,7 @@ The normative model and verbatim design residuals are in
 | Platform | Profile and status |
 | --- | --- |
 | Linux FUSE 7.31+ | `FRONTEND_PROFILE_LINUX`: subscriptions and file write delegations. Protocol-8 real-mount qualification pending. |
-| macOS 26/27 FSKit | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`: the volume's only writer while mounted; Linux peers read; a second Mac is refused. Successful mutation replies are durable on authority storage; no kernel cache revocation, append intent, or advisory locks. Native qualification pending. |
+| macOS 26/27 FSKit | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`: the volume's only writer while mounted; Linux peers read; a second Mac is refused. Successful mutation replies are durable on authority storage; macOS 27 writers get the writeThrough kernel cache, never writeBack; no kernel cache revocation, append intent, or advisory locks. Native qualification pending. |
 | Files gateway | `FRONTEND_PROFILE_CACHELESS_READER`: authenticated read-only peer; breaks delegated files for read and does not exclude writers. |
 | Windows | No declared transport or production frontend. |
 
