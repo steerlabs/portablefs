@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
-	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/readonlyfs"
 )
 
-// The cleanup lane cannot admit CLOSE before its bounded session context ends.
-// No replay assignment occurs and the authority session remains healthy.
+// The cleanup lane cannot send CLOSE before its bounded session context ends.
+// Nothing reaches the authority, so the transport returns the bare context
+// error and the authority session remains healthy.
 type reviewCleanupRPC struct {
 	mu                            sync.Mutex
 	items, handles, closeAttempts int
@@ -38,16 +38,13 @@ func (r *reviewCleanupRPC) Close() error {
 func (*reviewCleanupRPC) CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error) {
 	return &authoritypb.Response{}, nil
 }
-func (r *reviewCleanupRPC) CallMutationWithIdentity(ctx context.Context, req *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+func (r *reviewCleanupRPC) CallMutation(ctx context.Context, req *authoritypb.Request) (*authoritypb.Response, error) {
 	if req.GetClose() != nil {
 		r.mu.Lock()
 		r.closeAttempts++
 		r.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
-	}
-	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
-		return nil, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
