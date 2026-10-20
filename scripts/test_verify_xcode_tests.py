@@ -8,6 +8,8 @@ import pathlib
 import tempfile
 import unittest
 
+from print_xcode_failures import issue_lines
+
 
 SCRIPT = pathlib.Path(__file__).with_name("verify_xcode_tests.py")
 SPEC = importlib.util.spec_from_file_location("verify_xcode_tests", SCRIPT)
@@ -139,6 +141,35 @@ class XcodeEvidenceTests(unittest.TestCase):
             json.dumps(results(*(pair for pair in ((name, "Passed") for name in self.identifiers))))
         )
         self.assertIn("all=Passed", verify_xcode_tests.verify(enum, result, "arm64"))
+
+    def test_swift_testing_issue_messages_have_source_locations(self) -> None:
+        details = {"testRuns": [{"nodeType": "Device", "children": [
+            {"nodeType": "Test Case Run", "result": "Failed",
+             "name": "Expectation failed: hash == otherHash",
+             "sourceLocation": {"filePath": "/src/RunningImage.swift", "lineNumber": 197}},
+            {"nodeType": "Test Case Run", "result": "Failed",
+             "name": "Caught error: connect failed with errno 61",
+             "sourceLocation": {"filePath": "/src/Socket.swift", "lineNumber": 31}},
+        ]}]}
+        self.assertEqual(list(issue_lines(details)), [
+            "/src/RunningImage.swift:197: Expectation failed: hash == otherHash",
+            "/src/Socket.swift:31: Caught error: connect failed with errno 61",
+        ])
+
+    def test_xctest_issues_and_locationless_crashes_are_reported(self) -> None:
+        details = {"testRuns": [
+            {"nodeType": "Test Case Run", "result": "Failed", "name": "Run 1", "children": [
+                {"nodeType": "Failure Message", "name": "XCTAssertEqual failed", "children": [
+                    {"nodeType": "Source Code Reference",
+                     "sourceLocation": {"filePath": "/src/Tests.swift", "lineNumber": 12}},
+                ]},
+            ]},
+            {"nodeType": "Test Case Run", "result": "Failed", "name": "Test crashed with signal term."},
+        ]}
+        self.assertEqual(list(issue_lines(details)), [
+            "/src/Tests.swift:12: XCTAssertEqual failed",
+            "<no recorded file>:0: Test crashed with signal term.",
+        ])
 
 
 if __name__ == "__main__":

@@ -81,7 +81,16 @@ jobs:
           test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
           test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
       - name: Xcode-native complete Swift suite
+        id: swift-tests
         run: bash scripts/test-swift-xcode.sh
+      - name: Retain Swift failure evidence
+        if: failure() && steps.swift-tests.outputs.failure-evidence != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: swift-xcode-failure-evidence
+          path: ${{ steps.swift-tests.outputs.failure-evidence }}
+          retention-days: 14
+          if-no-files-found: error
       - name: Exercise macOS installer ZIP boundary
         run: sh scripts/test-macos-installer-zip-namespace.sh
 

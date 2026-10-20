@@ -8,10 +8,19 @@ import Testing
 // The running-image rule against the real kernel primitive: socket peers are
 // real processes, and every verdict comes from csops_audittoken and
 // proc_pidpath_audittoken on the captured LOCAL_PEERTOKEN. The listeners are
-// ad hoc signed copies of /usr/bin/nc, which differ only in their code
+// ad hoc signed native fixtures, which differ only in their code
 // signatures, so a CodeDirectory hash names exactly one of them.
 
 private typealias Coordinator = PortableFSDServiceCoordinator
+
+@_silgen_name("csops_audittoken")
+private func fixtureCSOps(
+    _ pid: pid_t,
+    _ operation: UInt32,
+    _ buffer: UnsafeMutableRawPointer?,
+    _ size: Int,
+    _ token: UnsafeMutablePointer<audit_token_t>
+) -> Int32
 
 /// These tests spawn listener processes and bind sockets, so they run one at
 /// a time.
@@ -20,7 +29,7 @@ struct PortableFSDRunningImageTests {}
 
 private enum RunningImageFixtureError: Error {
     case command(String)
-    case listenerDidNotStart
+    case listenerDidNotStart(String)
     case signingInformation
 }
 
@@ -28,30 +37,37 @@ private func run(_ executable: String, _ arguments: [String]) throws {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
-    process.standardOutput = FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = output
     try process.run()
+    let diagnostics = output.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     guard process.terminationStatus == 0 else {
-        throw RunningImageFixtureError.command("\(executable) \(arguments.joined(separator: " "))")
+        throw RunningImageFixtureError.command(
+            "\(executable) \(arguments.joined(separator: " ")): status=\(process.terminationStatus) " +
+            String(decoding: diagnostics.prefix(8_192), as: UTF8.self)
+        )
     }
 }
 
-/// A distinct, ad hoc signed copy of nc. `identifier` changes the signature
-/// and therefore the CodeDirectory hash; `hardenedRuntime` sets CS_RUNTIME.
+/// Sign code built for the same supported architecture as the test process.
+/// System utilities can use arm64e slices and platform launch policy that an
+/// ad hoc fixture does not own, particularly on virtualized macOS hosts.
 private func signedListenerImage(at url: URL, identifier: String, hardenedRuntime: Bool = true) throws {
-    try? FileManager.default.removeItem(at: url)
-    // One slice, the one this machine's kernel runs, so the static hash and
-    // the running image's hash describe the same code.
-    #if arch(arm64)
-    let slice = "arm64e"
-    #else
-    let slice = "x86_64"
-    #endif
-    try run("/usr/bin/lipo", ["/usr/bin/nc", "-thin", slice, "-output", url.path])
+    try FileManager.default.copyItem(at: url.deletingLastPathComponent().appendingPathComponent("listener"), to: url)
     var arguments = ["-f", "-s", "-", "-i", identifier]
     if hardenedRuntime { arguments += ["-o", "runtime"] }
     try run("/usr/bin/codesign", arguments + [url.path])
+    var code: SecStaticCode?
+    var information: CFDictionary?
+    let created = SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(), &code)
+    let staticCode = try #require(code, "fixture SecStaticCode status=\(created)")
+    try #require(SecStaticCodeCheckValidity(staticCode, SecCSFlags(), nil) == errSecSuccess)
+    let status = SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information)
+    let flags = try #require((information as? [CFString: Any])?[kSecCodeInfoFlags] as? UInt32,
+                             "fixture signing flags status=\(status)")
+    try #require((flags & Coordinator.hardenedRuntimeFlag != 0) == hardenedRuntime)
 }
 
 /// The static CodeDirectory hash a release check would derive from disk.
@@ -69,25 +85,29 @@ private func staticCDHash(_ url: URL) throws -> String {
 
 private final class Listener {
     let process: Process
-    let input = Pipe()
+    let image: URL
     let socket: String
 
     init(image: URL, socket: String) throws {
+        self.image = image
         self.socket = socket
         process = Process()
         process.executableURL = image
-        process.arguments = ["-lU", socket]
-        process.standardInput = input
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
+        process.arguments = [socket]
+        let ready = Pipe()
+        process.standardOutput = ready
+        process.standardError = ready
         try process.run()
-        let deadline = Date().addingTimeInterval(5)
-        while !FileManager.default.fileExists(atPath: socket) {
-            guard Date() < deadline, process.isRunning else {
-                stop()
-                throw RunningImageFixtureError.listenerDidNotStart
-            }
-            Thread.sleep(forTimeInterval: 0.01)
+        var descriptor = pollfd(fd: ready.fileHandleForReading.fileDescriptor, events: Int16(POLLIN), revents: 0)
+        let result = Darwin.poll(&descriptor, 1, 5_000)
+        let message = result > 0 ? try ready.fileHandleForReading.read(upToCount: 1) : nil
+        guard message == Data("R".utf8) else {
+            stop()
+            let diagnostics = (message ?? Data()) + ready.fileHandleForReading.readDataToEndOfFile()
+            throw RunningImageFixtureError.listenerDidNotStart(
+                "\(image.path): poll=\(result) reason=\(process.terminationReason.rawValue) " +
+                "status=\(process.terminationStatus) output=\(String(decoding: diagnostics.prefix(8_192), as: UTF8.self))"
+            )
         }
     }
 
@@ -96,7 +116,6 @@ private final class Listener {
             process.terminate()
             process.waitUntilExit()
         }
-        try? input.fileHandleForWriting.close()
     }
 
     deinit { stop() }
@@ -113,13 +132,43 @@ private func withRunningImageFixture(_ body: (URL) throws -> Void) throws {
     let root = URL(fileURLWithPath: String(cString: real), isDirectory: true)
     free(real)
     defer { try? FileManager.default.removeItem(at: root) }
+    let source = try #require(Bundle.module.url(forResource: "running-image-listener", withExtension: "c", subdirectory: "Fixtures"))
+    #if arch(arm64)
+    let architecture = "arm64"
+    #else
+    let architecture = "x86_64"
+    #endif
+    try run("/usr/bin/xcrun", ["--sdk", "macosx", "clang", "-arch", architecture,
+                              "-Wall", "-Wextra", "-Werror", source.path,
+                              "-o", root.appendingPathComponent("listener").path])
     try body(root)
 }
 
-private func capturePeer(_ listener: Listener) throws -> (Int32, Coordinator.DaemonPeer) {
+private func kernelSigningInformation(_ peer: Coordinator.DaemonPeer) throws -> (flags: UInt32, cdhash: String) {
+    var token = peer.auditToken
+    var flags: UInt32 = 0
+    let status = fixtureCSOps(peer.processWitness.pid, 0, &flags, MemoryLayout<UInt32>.size, &token)
+    try #require(status == 0, "fixture CS_OPS_STATUS result=\(status) errno=\(errno)")
+    var cdhash = [UInt8](repeating: 0, count: 20)
+    let hashStatus = fixtureCSOps(peer.processWitness.pid, 5, &cdhash, cdhash.count, &token)
+    try #require(hashStatus == 0, "fixture CS_OPS_CDHASH result=\(hashStatus) errno=\(errno) flags=\(String(flags, radix: 16))")
+    return (flags, cdhash.map { String(format: "%02x", $0) }.joined())
+}
+
+private func capturePeer(_ listener: Listener, hardenedRuntime: Bool = true) throws -> (Int32, Coordinator.DaemonPeer) {
     let fd = try PfsUnixSocket.connect(path: listener.socket)
     do {
-        return (fd, try Coordinator.captureDaemonPeer(fd))
+        let peer = try Coordinator.captureDaemonPeer(fd)
+        // A negative runtime verdict must not pass because of an unrelated
+        // bad hash, path, or invalid signature. Prove those premises first.
+        try #require(peer.executableURL.path == listener.image.path)
+        let signing = try kernelSigningInformation(peer)
+        try #require(signing.flags & 1 != 0, "fixture lacks CS_VALID: flags=\(String(signing.flags, radix: 16))")
+        try #require((signing.flags & Coordinator.hardenedRuntimeFlag != 0) == hardenedRuntime,
+                     "fixture runtime mismatch: flags=\(String(signing.flags, radix: 16))")
+        let expectedHash = try staticCDHash(listener.image)
+        try #require(signing.cdhash == expectedHash)
+        return (fd, peer)
     } catch {
         PfsUnixSocket.close(fd)
         throw error
@@ -154,7 +203,7 @@ extension PortableFSDRunningImageTests {
         defer { PfsUnixSocket.close(fd) }
         #expect(peer.executableURL.path == image.path)
 
-        #expect(authenticates(peer, path: image.path, cdhash: cdhash))
+        try Coordinator.requireRunningImage(peer, expectedPath: image.path, expectedCDHash: cdhash)
         #expect(!authenticates(peer, path: image.path, cdhash: otherCDHash))
         #expect(!authenticates(peer, path: other.path, cdhash: cdhash))
         #expect(!authenticates(peer, path: image.path, cdhash: String(repeating: "0", count: 40)))
@@ -201,10 +250,13 @@ extension PortableFSDRunningImageTests {
 
         let (fd, peer) = try capturePeer(listener)
         defer { PfsUnixSocket.close(fd) }
-        #expect(authenticates(peer, path: image.path, cdhash: try staticCDHash(image)))
+        let original = try staticCDHash(image)
+        try Coordinator.requireRunningImage(peer, expectedPath: image.path, expectedCDHash: original)
 
-        #expect(Darwin.rename(replacement.path, image.path) == 0)
+        try #require(Darwin.rename(replacement.path, image.path) == 0, "rename errno=\(errno)")
         let installed = try staticCDHash(image)
+        #expect(installed != original)
+        #expect(try kernelSigningInformation(peer).cdhash == original)
         #expect(!authenticates(peer, path: image.path, cdhash: installed))
     }
 }
@@ -222,7 +274,7 @@ extension PortableFSDRunningImageTests {
         let cdhash = try staticCDHash(image)
         let listener = try Listener(image: image, socket: root.appendingPathComponent("s").path)
         defer { listener.stop() }
-        let (fd, peer) = try capturePeer(listener)
+        let (fd, peer) = try capturePeer(listener, hardenedRuntime: false)
         defer { PfsUnixSocket.close(fd) }
         #expect(!authenticates(peer, path: image.path, cdhash: cdhash))
     }
