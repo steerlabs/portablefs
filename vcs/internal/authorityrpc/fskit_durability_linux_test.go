@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
@@ -133,13 +134,22 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 		{name: "ENOSPC", committed: 4, errorSync: syscall.ENOSPC, terminal: true},
 		{name: "EDQUOT", committed: 4, errorSync: syscall.EDQUOT, terminal: true},
 	} {
-		t.Run(test.name, func(t *testing.T) {
+		run := func(t *testing.T) {
 			h, cred, store, target := newDirectFskitHarness(t)
 			var observations []MutationObservation
 			h.OnMutation = func(o MutationObservation) { observations = append(observations, o) }
 			target.committed = test.committed
 			target.err = test.applyErr
 			store.syncErr = test.errorSync
+			// Apply and durability advance the synthetic clock by distinct
+			// amounts, so each phase must be measured around its own region.
+			target.started, target.release = make(chan struct{}), make(chan struct{})
+			go func() {
+				<-target.started
+				time.Sleep(2 * time.Millisecond)
+				close(target.release)
+			}()
+			store.barrier = func() { time.Sleep(time.Millisecond) }
 			req := directFskitRequest()
 			ctx := context.WithValue(t.Context(), coherenceOperationKey{}, &coherenceOperation{})
 			response := h.handleWrite(ctx, req, cred, req.GetWrite())
@@ -172,11 +182,12 @@ func TestFskitDirectWriteDurabilityAndExactReplay(t *testing.T) {
 			if len(observations) != 2 || observations[0].Disposition != "executed" || observations[1].Disposition != "replayed" || observations[0].Sequence != observations[1].Sequence || observations[0].Session != cred.ID {
 				t.Fatalf("mutation trace lost exact replay identity: %v", observations)
 			}
-			if observations[0].StorageWait <= 0 || observations[0].ApplyDuration <= 0 || observations[0].DurabilityKind != "handle" || observations[0].DurabilityWait <= 0 || observations[1].DurabilityWait != 0 {
+			if observations[0].StorageWait != 0 || observations[0].ApplyDuration != 2*time.Millisecond || observations[0].WithdrawalWait != 0 || observations[0].DurabilityKind != "handle" || observations[0].DurabilityWait != time.Millisecond || observations[1].DurabilityWait != 0 {
 				t.Fatalf("trace lost direct durability timing or charged replay: %v", observations)
 			}
 
-		})
+		}
+		t.Run(test.name, func(t *testing.T) { synctest.Test(t, run) })
 	}
 }
 

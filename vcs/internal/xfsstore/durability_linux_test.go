@@ -628,12 +628,16 @@ func TestStorageSyncObserverCountsPhysicalBatchesAfterFencing(t *testing.T) {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
+		} else {
+			// Give the measured call a known minimum duration, independent of clock resolution.
+			time.Sleep(time.Millisecond)
 		}
 		return nil
 	}
 	first := make(chan error, 1)
 	go func() { first <- v.SyncFS() }()
 	<-started
+	heldSince := time.Now()
 	followers := make(chan error, 3)
 	for i := 0; i < 3; i++ {
 		go func() { followers <- v.SyncFS() }()
@@ -651,6 +655,7 @@ func TestStorageSyncObserverCountsPhysicalBatchesAfterFencing(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+	held := time.Since(heldSince)
 	close(release)
 	if err := <-first; err != nil {
 		t.Fatal(err)
@@ -661,7 +666,7 @@ func TestStorageSyncObserverCountsPhysicalBatchesAfterFencing(t *testing.T) {
 		}
 	}
 	one, two := <-observations, <-observations
-	if calls.Load() != 2 || one.Kind != "syncfs" || two.Kind != "syncfs" || one.Waiters != 1 || two.Waiters != 3 || one.Elapsed <= 0 || two.Elapsed <= 0 {
+	if calls.Load() != 2 || one.Kind != "syncfs" || two.Kind != "syncfs" || one.Waiters != 1 || two.Waiters != 3 || one.Elapsed < held || two.Elapsed < time.Millisecond {
 		t.Fatalf("physical batches=%v %v calls=%d", one, two, calls.Load())
 	}
 	// Observation is after the sticky failure boundary, before failed waiters
