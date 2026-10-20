@@ -32,6 +32,9 @@ func TestSharedXFSWritebackDomain(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Fatal("shared-domain provisioning requires root")
 	}
+	// The container manages its own device nodes; no local udev completes cookies.
+	// Host udev can still probe these kernel-global devices.
+	t.Setenv("DM_DISABLE_UDEV", "1")
 	for _, name := range []string{"losetup", "dmsetup", "mkfs.xfs", "mount", "umount", "blockdev", "xfs_quota", "xfs_io"} {
 		if _, err := exec.LookPath(name); err != nil {
 			t.Fatalf("fault fixture dependency %s: %v", name, err)
@@ -84,12 +87,13 @@ func TestSharedXFSWritebackDomain(t *testing.T) {
 	mapper := fmt.Sprintf("pfs-p2-%d-%s", os.Getpid(), filepath.Base(filepath.Dir(dir)))
 	linear := fmt.Sprintf("0 %d linear %s 0", sectors, sharedLoop)
 	command("dmsetup", "create", mapper, "--table", linear)
-	command("dmsetup", "mknodes", mapper)
 	t.Cleanup(func() {
-		if out, err := exec.Command("dmsetup", "remove", mapper).CombinedOutput(); err != nil {
+		// Retry transient udev opens, but fail if a persistent holder remains.
+		if out, err := exec.Command("dmsetup", "remove", "--retry", mapper).CombinedOutput(); err != nil {
 			t.Errorf("remove owned mapper: %v %s", err, out)
 		}
 	})
+	command("dmsetup", "mknodes", mapper)
 	device := filepath.Join("/dev/mapper", mapper)
 	shared, control := filepath.Join(dir, "shared"), filepath.Join(dir, "control")
 	for _, pair := range [][2]string{{device, shared}, {controlLoop, control}} {

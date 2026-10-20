@@ -54,11 +54,15 @@ func (f *orderedFlushFake) CallMutationSegments(ctx context.Context, r *authorit
 	}
 	w := r.GetWrite()
 	// The client takes the ordinal inside replay assignment, before dispatch.
+	// The record shares the assignment's critical section: the manager
+	// launches a successor as soon as its predecessor's assignment returns, so
+	// a record taken afterwards could land out of admission order.
+	f.muOrder.Lock()
 	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
+		f.muOrder.Unlock()
 		return nil, err
 	}
 	ordinal := w.GetFlushSequence()
-	f.muOrder.Lock()
 	f.assigned = append(f.assigned, ordinal)
 	f.muOrder.Unlock()
 	f.entered <- ordinal
