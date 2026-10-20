@@ -2373,7 +2373,10 @@ func signalMountProcess(st *mountState, signal syscall.Signal) error {
 func stopMountDaemon(st *mountState) error {
 	if st.Strategy != "fskit" {
 		if err := signalMountProcess(st, syscall.SIGTERM); err != nil {
-			return err
+			// An exited supervisor needs no signal, including when exit raced it.
+			if mountProcessMatches(st) {
+				return err
+			}
 		}
 	}
 	deadline := time.Now().Add(daemonStopTimeout)

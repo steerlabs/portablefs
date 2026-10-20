@@ -94,6 +94,8 @@ Reverse d_path/getcwd rendering of retained dentries is outside the contract.
 
 ## Process failure and completion
 
+An exited, unreaped mount supervisor counts as stopped.
+
 A dead mount daemon loses its volatile accepted tail and the kernel eventually
 aborts its FUSE connection. A missed delegation budget can lose data that was
 accepted but not durable. Neither fsync-completed data nor namespace operations
