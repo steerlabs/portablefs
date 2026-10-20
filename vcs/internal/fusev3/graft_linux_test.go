@@ -91,7 +91,7 @@ func newGraftFixture(t *testing.T, routes localroutes.RuleSet, strict bool) *gra
 		cfg.NameCacheCapacity, cfg.WithdrawalTimeout = 32, 5*time.Second
 	}
 	mount := newMount(context.Background(), rpc, cfg)
-	t.Cleanup(mount.cancel)
+	t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
 	grafts, err := localdirs.New(localdirs.Config{BackingRoot: backing, Rules: routes})
 	if err != nil {
 		t.Fatalf("build machine-local routes: %v", err)
