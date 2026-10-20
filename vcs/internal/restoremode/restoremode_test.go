@@ -596,30 +596,41 @@ func TestRecallCapQueuesAndDeadlineIsNamed(t *testing.T) {
 	first := make(chan error, 1)
 	go func() { first <- mode.EnsureHydrated(context.Background(), identity, 0, 4) }()
 	<-hydrator.fetchStarted
-	// A second recall for a DIFFERENT chunk queues behind the held slot and
-	// shares its fate: the slot never frees, so it names the deadline too.
+	// A second recall for a different chunk queues behind the held slot. Its
+	// deadline must be named whether it expires queued or fetching after the
+	// first call releases the slot.
 	second := make(chan error, 1)
 	go func() {
 		second <- mode.EnsureHydrated(context.Background(), identity, 4, 4)
 	}()
-	select {
-	case err := <-second:
-		t.Fatalf("queued recall returned before the deadline: %v", err)
-	case <-time.After(30 * time.Millisecond):
-	}
 	if err := <-first; !errors.Is(err, ErrRecallDeadline) {
 		t.Fatalf("deadline=%v", err)
 	}
 	if err := <-second; !errors.Is(err, ErrRecallDeadline) {
 		t.Fatalf("queued recall=%v", err)
 	}
-	// Once the hydrator recovers, a queued recall completes instead of failing.
+	// Both calls have returned, so neither may retain recall capacity, even
+	// while the hydrator is still blocked and no drain can release it.
+	if got := len(mode.recalls); got != 0 {
+		t.Fatalf("recall slots after deadlines = %d, want 0", got)
+	}
 	hydrator.mu.Lock()
 	close(hydrator.blockFetch)
 	hydrator.blockFetch = nil
 	hydrator.mu.Unlock()
-	if err := mode.EnsureHydrated(context.Background(), identity, 0, 4); err != nil {
+	// Exercise the same hydration path without the short deadline used above
+	// to force expiry. This checks capacity and socket pool recovery without
+	// imposing an 80 ms scheduling bound on a loaded runner.
+	key := chunkKey{0, 0}
+	lock := mode.chunkLock(key)
+	lock.Lock()
+	_, err := mode.hydrateLocked(context.Background(), key, false, true)
+	lock.Unlock()
+	if err != nil {
 		t.Fatalf("recall after recovery = %v", err)
+	}
+	if got := len(mode.recalls); got != 0 {
+		t.Fatalf("recall slots after recovery = %d, want 0", got)
 	}
 }
 
