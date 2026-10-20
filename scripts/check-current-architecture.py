@@ -723,6 +723,20 @@ def check_control_lifecycle() -> None:
     finish(problems)
 
 
+@check("macos-build-contract", "macOS builds require Xcode 27.1 and the macOS 27 SDK while deploying to macOS 26")
+def check_macos_build_contract() -> None:
+    problems: List[str] = []
+    for project in sorted(XCODE_PROJECTS):
+        targets = re.findall(r"\bMACOSX_DEPLOYMENT_TARGET\s*=\s*([^;]+);", read(project + "/project.pbxproj"))
+        require(problems, bool(targets) and set(targets) == {"26.0"}, f"{project}: deployment targets must all remain 26.0")
+    require(problems, ".macOS(.v26)" in read("swift/PortableFSKit/Package.swift"), "Swift package must deploy to macOS 26")
+    for filename in ("AGENTS.md", "COMPATIBILITY.md", "docs/local-dev.md", "docs/release-identity.md"):
+        source = read(filename)
+        for statement in ("Xcode 27.1", "27A9275", "macOS 27 SDK"):
+            require(problems, statement in source, f"{filename}: missing macOS build requirement {statement}")
+    finish(problems)
+
+
 @check("macos-cli-layouts", "each Darwin CLI selects one compiled product contract and both variants stay gated")
 def check_macos_cli_layouts() -> None:
     problems: List[str] = []

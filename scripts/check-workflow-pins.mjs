@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 //    commit SHA with a trailing `# <version>` evidence comment. Local `./`
 //    composite actions and `docker://` images pinned by digest are allowed.
 // 2. `runs-on:` must name an explicitly versioned runner image (for example
-//    ubuntu-24.04), never a mutable `-latest` alias.
+//    ubuntu-24.04), never a mutable `-latest` alias. macOS jobs use xcode-27;
+//    check-install-release-trust.mjs enforces their exact Xcode/SDK selection.
 // 3. Every workflow must declare top-level `permissions:` (least privilege)
 //    and `concurrency:`.
 //
@@ -48,6 +49,9 @@ export async function verifyWorkflowPins(workflowsDir) {
         const image = runsOn[1].replace(/["']/g, "");
         if (image.includes("latest") || image.includes("${{")) {
           failures.push(`${location}: runs-on must pin a versioned image, got "${image}"`);
+        }
+        if (/^(?:macos|xcode)-/.test(image) && image !== "xcode-27") {
+          failures.push(`${location}: macOS jobs must use xcode-27, got "${image}"`);
         }
       }
       const uses = USES_PATTERN.exec(line);

@@ -291,6 +291,11 @@ barrier, and replay never repeats apply or sync.
 
 ## macOS
 
+Builds require Xcode 27.1 (build 27A9275) and the macOS 27 SDK (27.0) for FSKit
+V3 APIs. CI and release select that toolchain on `xcode-27`, including the
+Foundation/cgo daemon built inside the app. The deployment target remains macOS
+26.0: V2 runs on macOS 26 and V3 runs on macOS 27.
+
 - macOS 26 and 27 mount through `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`. A mounted
   Mac is the volume's only writer; Linux peers can remain mounted and read,
   and their visible mutations return `EBUSY`. A clean Mac unmount lets Linux

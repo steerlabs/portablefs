@@ -3,6 +3,10 @@
 This directory contains the macOS FSKit frontend for PortableFS: one Swift
 package and two Xcode projects.
 
+Build with Xcode 27.1 (build 27A9275) and the macOS 27 SDK (27.0); see
+[Local Development](../docs/local-dev.md) for toolchain selection. The deployment
+target remains macOS 26, using V2 there and V3 on macOS 27.
+
 ## Layout
 
 - **`PortableFSKit`** — the SwiftPM package (`swift-tools-version: 6.2`,

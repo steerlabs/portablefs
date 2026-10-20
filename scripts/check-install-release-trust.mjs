@@ -858,6 +858,24 @@ for (const ciGate of [
 ]) {
   requireText(ciWorkflow, ciGate, `CI Xcode-native Swift gate ${ciGate}`);
 }
+// The release app embeds the cgo daemon, so its correctness lane must use the
+// same image and SDK as the Swift tests, packaging and signing lanes.
+for (const [filename, source, jobs] of [
+  ["ci.yml", ciWorkflow, ["swift-xcode-native", "go-darwin", "macos-app-unsigned"]],
+  ["release.yml", workflow, ["macos-app"]],
+]) {
+  for (const job of jobs) {
+    const body = new RegExp(`\n  ${job}:\n([\\s\\S]*?)(?=\n  [\\w-]+:\n|$)`).exec(source)?.[1] ?? "";
+    for (const contract of [
+      "    runs-on: xcode-27\n",
+      "    env:\n      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer\n",
+      "          test \"$(xcodebuild -version)\" = $'Xcode 27.1\\nBuild version 27A9275'\n",
+      '          test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0\n',
+    ]) {
+      requireText(body, contract, `${filename} ${job} pinned macOS toolchain ${contract.trim()}`);
+    }
+  }
+}
 for (const gateContract of [
   "-enumerate-tests",
   "-test-enumeration-format json",

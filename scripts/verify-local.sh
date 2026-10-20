@@ -142,8 +142,8 @@ else
 fi
 
 # 6. Workflow semantics and release-trust policy. actionlint is version-pinned
-# exactly like CI and reads .github/actionlint.yaml for the one approved custom
-# runner label. The two project checkers are dependency-free single-file node
+# exactly like CI and reads .github/actionlint.yaml for approved runner labels.
+# The two project checkers are dependency-free single-file node
 # programs (the repository carries no JavaScript packages); they read the
 # installer, the workflows and .goreleaser.yaml as text.
 step "release trust policy"

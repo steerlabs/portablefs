@@ -202,6 +202,15 @@ silently enter the installer's trust boundary.
 
 ## macOS: signing, notarization, and bundle identity
 
+The macOS release job and all macOS CI jobs use `xcode-27`, with job-level
+`DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer`. Each asserts
+Xcode 27.1 (build 27A9275) and SDK 27.0 before building. The macOS 27 SDK is
+required for FSKit V3 APIs; the app and extension still deploy to macOS 26,
+using V2 there and V3 on macOS 27. The release builds the embedded Foundation/cgo
+daemon on the app's runner, so `go-darwin` verifies the same image and toolchain.
+The [runner inventory](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md)
+documents the installation; the assertions reject image drift.
+
 There is **no attestation on the macOS path.** The macOS app is not built by
 GoReleaser; it comes from `scripts/package-macos-app.sh` as
 `portablefs_<version>_darwin_universal_app.zip` and is not listed in
@@ -491,7 +500,9 @@ the notarized macOS app — and the journal-era control-plane images are gone.
 **`scripts/check-workflow-pins.mjs`** governs what a workflow may execute.
 Every workflow file must declare a top-level `permissions:` block and a
 top-level `concurrency:` block. `runs-on:` must pin a versioned image: `latest`
-or an expression is rejected. Third-party actions must be pinned to a 40-hex
+or an expression is rejected; macOS jobs must use `xcode-27`. The release-trust
+checker enforces each macOS job's exact Xcode/SDK selection and assertions.
+Third-party actions must be pinned to a 40-hex
 commit SHA *and* carry a trailing `# vX.Y.Z` evidence comment; a SHA pin with no
 comment is rejected as unreviewable. First-party `actions/*` may float on a
 major tag. A `docker://` action must be digest-pinned. Local `./` composites are

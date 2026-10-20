@@ -4,6 +4,20 @@ This is a two-language tree — the Go data plane under `vcs/` and the Swift
 FSKit/app package under `swift/PortableFSKit` — with no build system above them
 and no package manager to install.
 
+macOS builds require Xcode 27.1 (build 27A9275) and the macOS 27 SDK (27.0) for
+FSKit V3 APIs. Select that installation before running the gate:
+
+```bash
+export DEVELOPER_DIR=/Applications/Xcode_27.1.app/Contents/Developer
+xcodebuild -version # Xcode 27.1, Build version 27A9275
+xcrun --sdk macosx --show-sdk-version # 27.0
+```
+
+Use the path to your Xcode 27.1 installation if it differs. CI and release use
+the `xcode-27` image and assert the exact build and SDK version. The app,
+extension, and Swift package still deploy to macOS 26, using V2 there and V3 on
+macOS 27.
+
 ## The merge gate
 
 ```bash

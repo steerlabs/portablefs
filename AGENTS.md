@@ -6,6 +6,12 @@ agent that *uses* PortableFS workspaces, read
 
 ## Build And Test
 
+macOS builds require Xcode 27.1 (build 27A9275) and the macOS 27 SDK for FSKit
+V3 APIs. Select it with `DEVELOPER_DIR` before running the gates. CI and release
+use `xcode-27` with `/Applications/Xcode_27.1.app/Contents/Developer` and assert
+the exact build and SDK 27.0. The app and extension still deploy to macOS 26,
+using V2 there and V3 on macOS 27.
+
 There is no build system above the two languages and nothing to install:
 
 ```bash
