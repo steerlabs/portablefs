@@ -180,15 +180,18 @@ REQUIRED_TEST_LISTS = (
 
 # The privileged suite's root invocation: the cell helper's root-owned volume
 # provisioning proved against real XFS project quota, and the shared-cell
-# writeback-domain fault proof. The invocation is provisioned for exactly these
+# writeback-domain fault proof, and the FUSE probe's private-mount-namespace
+# prerequisite proof. The invocation is provisioned for exactly these
 # packages, so every root entry must name a top-level test in one of them.
 ROOT_TEST_PACKAGES = {
     "github.com/steerlabs/portablefs/vcs/internal/cellhost",
     "github.com/steerlabs/portablefs/vcs/internal/xfsstore",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3",
 }
 ROOT_REQUIRED = {
     "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement",
     "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestSharedXFSWritebackDomain",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeRejectsHiddenFusectl",
 }
 
 # The device-level power-cut harness must cover both durability contracts:

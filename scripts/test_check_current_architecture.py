@@ -221,7 +221,7 @@ class RootInventory(unittest.TestCase):
 
     def test_foreign_package_duplicate_and_missing_validation_fail(self) -> None:
         current = sorted(checker.ROOT_REQUIRED)
-        foreign = self.suite(current + ["github.com/steerlabs/portablefs/vcs/internal/fusev3:TestA"])
+        foreign = self.suite(current + ["github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestA"])
         self.assertTrue(any("is not a top-level test" in p for p in checker.root_inventory_problems(foreign)))
         duplicate = self.suite(current + current)
         self.assertTrue(any("repeats an entry" in p for p in checker.root_inventory_problems(duplicate)))

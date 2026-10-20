@@ -14,7 +14,7 @@ type mountCheckEnvelope struct {
 	SchemaVersion int              `json:"schemaVersion"`
 	Facts         *mounthost.Facts `json:"facts,omitempty"`
 	// KernelProbe is present only for --probe-mount, and only when a real
-	// throwaway mount completed the kernel INIT handshake.
+	// throwaway mount completed INIT and the live-mount fusectl prerequisite.
 	KernelProbe any              `json:"kernelProbe,omitempty"`
 	Error       *mountCheckError `json:"error,omitempty"`
 }
@@ -114,7 +114,7 @@ func cmdMountCheck(e *cmdEnv, args []string) int {
 	addCommonFlags(fs, &common)
 	var probeMount bool
 	fs.StringVar(&strategy, "strategy", "auto", "mount strategy: auto (fskit on macOS, fuse on Linux), fskit, or fuse")
-	fs.BoolVar(&probeMount, "probe-mount", false, "install one real throwaway FUSE mount, complete the kernel INIT handshake, and unmount")
+	fs.BoolVar(&probeMount, "probe-mount", false, "install one real throwaway FUSE mount, verify kernel INIT and writable fusectl control, and unmount")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		if argsRequestJSON(args) {

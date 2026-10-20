@@ -78,8 +78,9 @@ async function smoke(template, expectedRelease) {
 
     // The device node existing, opening, CAP_SYS_ADMIN being held and a helper
     // being installed are all equally true of a client that can never complete
-    // FUSE INIT. --probe-mount installs one real throwaway mount instead, so
-    // that failure class fails here rather than at a tenant's first mount.
+    // FUSE INIT or retain its writable fusectl abort descriptor. --probe-mount
+    // installs one real throwaway mount and proves both through the live
+    // startup path, so these failures reach the gate before a tenant's mount.
     const probeResult = await sandbox.commands.run(
       "test -c /dev/fuse && /opt/opensteer/portablefs/portablefs mount-check --strategy fuse --probe-mount --json",
       { timeoutMs: 60_000, user: "root" },

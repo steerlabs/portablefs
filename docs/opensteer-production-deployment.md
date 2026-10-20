@@ -218,11 +218,13 @@ It proves:
   on a private temporary directory using the client's own mount options, checks
   the capabilities the coherence contract requires — atomic `O_TRUNC`, explicit
   data-cache control, forwarded POSIX and BSD locks, entry and inode
-  invalidation, a 1 MiB request bound — and unmounts. This is the one check
-  that a client which can never complete FUSE INIT cannot pass. The device node
+  invalidation, a 1 MiB request bound — captures the mount identity, retains its
+  writable abort descriptor on verified fusectl at `/sys/fs/fuse/connections`
+  through the same startup path as a live mount, and unmounts. A missing or
+  unwritable fusectl control fails the probe. The device node
   existing, the device opening, `CAP_SYS_ADMIN` being held, and a helper being
-  installed are all equally true of such a client, which is how that failure
-  class previously reached a tenant's first mount instead of the gate.
+  installed cannot prove these startup prerequisites, which is how failures
+  previously reached a tenant's first mount instead of the gate.
 
 It does not prove anything about the authority, the wire protocol, visibility,
 durability, locking across mounts, subscriptions, delegations, or any workload.

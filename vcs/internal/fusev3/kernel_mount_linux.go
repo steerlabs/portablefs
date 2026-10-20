@@ -27,7 +27,7 @@ type kernelAbortFile struct {
 func openKernelAbortFile(path string) (*kernelAbortFile, error) {
 	file, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return nil, fmt.Errorf("fusev3: retain original FUSE abort descriptor: %w", err)
+		return nil, fmt.Errorf("fusev3: retain original FUSE abort descriptor (mount fusectl at /sys/fs/fuse/connections writable by the mount owner): %w", err)
 	}
 	identity, err := file.Stat()
 	if err != nil {
@@ -134,8 +134,10 @@ func (k kernelMount) detachTargetInstalled() (bool, error) {
 	return present, nil
 }
 
-// captureKernelMount runs before Serve and before any background teardown can
-// start. O_PATH pins the superblock during capture: /dev/fuse alone does not
+// captureKernelMount is the shared live-mount and probe startup prerequisite:
+// it captures the installed identity and retains a writable, verified fusectl
+// abort descriptor before Serve or any background teardown can start.
+// O_PATH pins the superblock during capture: /dev/fuse alone does not
 // prevent kill_anon_super from releasing its anonymous device number. The
 // temporary root reference is released before serving, so it cannot keep an
 // ordinary or external unmount busy.

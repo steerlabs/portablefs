@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -41,23 +42,40 @@ const probeMaxBackground = 8
 
 // ProbeKernelFUSE installs one real FUSE mount on a private, empty temporary
 // directory, completes the kernel INIT handshake against this binary's own
-// mount options, verifies the same kernel guarantees a live mount requires,
-// and unmounts.
+// mount options, captures the mount identity and retains its verified writable
+// fusectl abort descriptor through the same startup path as a live mount,
+// verifies the kernel guarantees, and unmounts.
 //
 // It exists because every cheaper check — the /dev/fuse node existing, the
 // device opening, CAP_SYS_ADMIN being held, a helper being installed — is
-// satisfied by a client that can never complete FUSE INIT. That is exactly the
-// failure that reaches production silently: the mount command starts, attaches
-// to an authority, installs a kernel mount, and only then discovers that the
-// interface it asked for is not one this kernel will speak.
+// satisfied by a client that can never complete FUSE INIT or retain its abort
+// descriptor. These startup failures must reach the probe before a tenant's
+// first mount.
 //
 // It proves nothing about the authority, the wire protocol, or coherence. No
 // authority is contacted and no file is served; the mounted filesystem answers
-// nothing. Only INIT, the negotiated capability set, and the mount/unmount
-// lifecycle are exercised.
+// nothing. Only INIT, the negotiated capability set, the fusectl control
+// prerequisite, and the mount/unmount lifecycle are exercised.
 func ProbeKernelFUSE() (KernelProbe, error) {
+	mountpoint, err := os.MkdirTemp("", "portablefs-fuse-probe-")
+	if err != nil {
+		return KernelProbe{}, fmt.Errorf("fusev3: create FUSE probe mountpoint: %w", err)
+	}
+	defer os.Remove(mountpoint)
+	// Mountinfo names the kernel-resolved absolute path, even when TMPDIR is
+	// relative or contains a symlink.
+	mountpoint, err = filepath.Abs(mountpoint)
+	if err != nil {
+		return KernelProbe{}, fmt.Errorf("fusev3: resolve FUSE probe mountpoint: %w", err)
+	}
+	mountpoint, err = filepath.EvalSymlinks(mountpoint)
+	if err != nil {
+		return KernelProbe{}, fmt.Errorf("fusev3: resolve FUSE probe mountpoint: %w", err)
+	}
+
 	options := mountOptions(Config{
-		MountInstanceID: "fuse-probe",
+		// Identity capture must distinguish concurrent probe mounts.
+		MountInstanceID: filepath.Base(mountpoint),
 		MaxBackground:   probeMaxBackground,
 	}, probeMaxIO, probeMaxIO)
 	// The probe must not be able to pass by asking for a weaker interface than
@@ -66,30 +84,31 @@ func ProbeKernelFUSE() (KernelProbe, error) {
 		return KernelProbe{}, err
 	}
 
-	mountpoint, err := os.MkdirTemp("", "portablefs-fuse-probe-")
-	if err != nil {
-		return KernelProbe{}, fmt.Errorf("fusev3: create FUSE probe mountpoint: %w", err)
-	}
-	defer os.Remove(mountpoint)
-
 	server, err := fuse.NewServer(probeFileSystem{fuse.NewDefaultRawFileSystem()}, mountpoint, options)
 	if err != nil {
 		return KernelProbe{}, fmt.Errorf("fusev3: install FUSE probe mount: %w", err)
 	}
+	installed, probeErr := captureKernelMount(options.FsName, mountpoint)
+	// NewServer prepares a request-loop reference; even failed startup must
+	// run Serve once before normal Unmount can finish.
 	served := make(chan struct{})
 	go func() {
 		server.Serve()
 		close(served)
 	}()
 
-	probe, probeErr := completeProbeInit(server)
+	var probe KernelProbe
+	if probeErr == nil {
+		probe, probeErr = completeProbeInit(server)
+	}
 	unmountErr := server.Unmount()
 	<-served
-	if probeErr != nil {
-		return KernelProbe{}, probeErr
-	}
+	closeErr := installed.abortFile.close()
 	if unmountErr != nil {
-		return KernelProbe{}, fmt.Errorf("fusev3: remove FUSE probe mount: %w", unmountErr)
+		unmountErr = fmt.Errorf("fusev3: remove FUSE probe mount: %w", unmountErr)
+	}
+	if err := errors.Join(probeErr, unmountErr, closeErr); err != nil {
+		return KernelProbe{}, err
 	}
 	return probe, nil
 }

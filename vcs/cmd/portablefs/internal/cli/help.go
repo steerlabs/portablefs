@@ -320,11 +320,12 @@ and other automation. BLOCKED exits 1; VERIFIED and UNVERIFIED exit 0.
 --probe-mount is the one exception to "changes nothing". On Linux it installs
 one real FUSE mount on a private temporary directory, completes the kernel
 INIT handshake with this binary's own mount options, checks the same kernel
-guarantees a live mount requires, and unmounts. That is the only check here
-that can fail for a client which can never complete FUSE INIT — every other
-signal (the device node, opening it, CAP_SYS_ADMIN, an installed helper) is
-equally satisfied by such a client. It contacts no authority and serves no
-file, so it proves nothing about the wire protocol or coherence. JSON output
+guarantees and fusectl control prerequisite a live mount requires, and unmounts.
+It captures the installed mount's identity and retains its writable abort
+descriptor on verified fusectl at /sys/fs/fuse/connections. The device node,
+opening it, CAP_SYS_ADMIN, and an installed helper cannot prove these startup
+prerequisites. It contacts no authority and serves no file, so it proves nothing
+about the wire protocol or coherence. JSON output
 adds a kernelProbe object with the negotiated protocol version and the
 capability flags the kernel offered. It is refused for the fskit transport,
 whose mount is installed by the system extension.

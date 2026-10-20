@@ -42,13 +42,16 @@ REQUIRED_TESTS=()
 #     requires a second volume on the same filesystem to observe the shared
 #     error at its next syncfs and fence, while a volume on a separate
 #     filesystem stays healthy. It needs losetup, dmsetup and the production
-#     provisioner.
+#     provisioner;
+#   - the FUSE probe's missing-fusectl prerequisite: a child private mount
+#     namespace hides fusectl without changing the service suite's mounts.
 # Keeping an exact, nonempty required list prevents a renamed, skipped or
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestSharedXFSWritebackDomain"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeRejectsHiddenFusectl"
 )
 
 fail() {
@@ -114,15 +117,15 @@ load_required_tests() {
 # validate_root_tests fails closed on an empty, malformed or duplicated root
 # inventory. The root invocation derives both its packages and its -run
 # selector from this list, so an empty list would otherwise select no test and
-# "pass" zero requirements. Only the two packages whose root-only tests the
+# "pass" zero requirements. Only the packages whose root-only tests the
 # invocation is provisioned for may appear.
 validate_root_tests() {
   local entry seen=" "
   [[ ${#REQUIRED_ROOT_TESTS[@]} -gt 0 ]] ||
     fail "REQUIRED_ROOT_TESTS is empty; the root boundary must require at least one test" 70
   for entry in "${REQUIRED_ROOT_TESTS[@]}"; do
-    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore):Test[A-Za-z0-9_]+$ ]] ||
-      fail "REQUIRED_ROOT_TESTS entry is not a cellhost or xfsstore top-level test: $entry" 70
+    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore|fusev3):Test[A-Za-z0-9_]+$ ]] ||
+      fail "REQUIRED_ROOT_TESTS entry is not a cellhost, xfsstore or fusev3 top-level test: $entry" 70
     [[ $seen != *" ${entry} "* ]] ||
       fail "REQUIRED_ROOT_TESTS names a test twice: $entry" 70
     seen="${seen}${entry} "
@@ -423,6 +426,7 @@ run_root_boundary_suite() {
     PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
     PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
     PORTABLEFS_XFS_DOMAIN_TEST=1 \
+    PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_TEST_PROVISIONER=/work/scripts/provision-xfs-volume.sh \
     go -C /work/vcs test -v -count=1 -p 1 -timeout 15m \
     -run "^(${pattern})\$" \
