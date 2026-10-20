@@ -247,10 +247,23 @@ func TestFullHolderMetadataTerminalizationJoinsPhysicalPin(t *testing.T) {
 			if !f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second)) {
 				t.Fatal("terminalization did not join holder reply")
 			}
-			if !s.admission.TryLock() {
+			// Releasing the pin wakes the idle collector, and the dirty fixture's
+			// flush path also takes this lock, so a failed TryLock does not prove
+			// a retained pin. Only the pin can hold admission indefinitely; the
+			// bound only turns that hang into a failure.
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			locked := make(chan struct{})
+			go func() {
+				s.admission.Lock()
+				s.admission.Unlock()
+				close(locked)
+			}()
+			select {
+			case <-locked:
+			case <-ctx.Done():
 				t.Fatal("physical completion retained holder pin")
 			}
-			s.admission.Unlock()
 			f.raw.mu.Lock()
 			defer f.raw.mu.Unlock()
 			if len(f.raw.replyPublications) != 0 {

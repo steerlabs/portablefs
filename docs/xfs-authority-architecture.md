@@ -48,7 +48,7 @@ semantics.
 
 The native Mac operation boundary remains `FSVolume.Operations` and
 `FSVolume.ReadWriteOperations` on macOS 26 and 27. macOS 27 separately retains
-package B/C's `FSVolume.DataCacheHandler` cache lifecycle and writeBack work,
+package B/C's `FSVolume.DataCacheHandler` cache lifecycle and writeThrough grants,
 with the limits in [fskit-mount.md](./fskit-mount.md). Neither
 `FSVolume.Handler` nor `FSVolume.ReadWriteHandler` is adopted. Package D part 1
 is selected; part 2 is cancelled for protocol 8.

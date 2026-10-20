@@ -5,25 +5,28 @@ and no qualified performance result for the LAN targets below. Measurements take
 earlier protocols are not evidence for protocol 8 and are not reproduced here;
 git history holds them.
 
-macOS 27 writeBack buffers ordinary writes in the kernel like V2. Every
+macOS 27 grants writeThrough, never writeBack: each `write(2)` waits for its
+durable authority callback, so small-write throughput pays one round trip and
+one storage durability cost per callback. writeBack was disabled after a
+native quota observation surfaced quota exhaustion as deferred EIO at fsync
+and close. V2 on macOS 26 buffers ordinary writes in the kernel; every
 successful delivered FSKit mutation callback remains durable on authority
-storage; coalescing can reduce callbacks, not their durability cost. Native
-fsync must cover buffered data and callback errors, pending native proof;
-writeBack is not qualified until those proofs pass. Writer loss may lose
-undelivered dirty data, as on V2 and a local disk without fsync. Linux peers see
-delivered state only. Namespace publication pushes earlier dirty data, and
-ordinary unmount drains before ownership release.
+storage, and coalescing can reduce callbacks, not their durability cost.
+Native fsync must cover buffered data and callback errors, pending native
+proof. Writer loss may lose undelivered dirty data, as on a local disk without
+fsync. Linux peers see delivered state only. Namespace publication pushes
+earlier dirty data, and ordinary unmount drains before ownership release.
 
 An eligible readable existing file opened O_WRONLY or O_APPEND can receive
-writeBack after one combined authority read/write OPEN. If read access is
+writeThrough after one combined authority read/write OPEN. If read access is
 denied by mode or ACL, at most one extra write-only OPEN preserves write
 success with noCache; it retains the durable callback cost. A retained writer
 needs only one missing-read OPEN on cache upgrade and never loses its existing
 description on denial. CREATE can supply legitimate read/write backing rights
 even for mode 0200. These are authority access checks, not predictions from
 mode bits. Application descriptors remain O_WRONLY and cannot read. Record
-actual grants and callback counts when measuring; buffering does not establish
-a coalescing size or speedup.
+actual grants and callback counts when measuring; neither cache grant
+establishes a coalescing size or speedup.
 
 `scripts/diagnose-small-writes.py` is a supplemental diagnostic for separate
 review, leaving the fixed acceptance runner unchanged: exactly 10,000

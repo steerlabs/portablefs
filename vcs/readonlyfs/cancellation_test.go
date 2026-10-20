@@ -15,14 +15,16 @@ import (
 // Closing the session is the terminal transfer of all outstanding resources.
 type cancellationRPC struct {
 	*capabilityLedger
-	after          func(*authoritypb.Request)
-	before         func(context.Context, *authoritypb.Request) error
-	uncertain      func(*authoritypb.Request) bool
-	uncertainError error
-	ended          bool
+	after     func(*authoritypb.Request)
+	before    func(context.Context, *authoritypb.Request) error
+	uncertain func(*authoritypb.Request) bool
+	ended     bool
 }
 
-func (r *cancellationRPC) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+// CallMutation keeps the transport's cancellation contract: a context error
+// means nothing was sent, while a sent attempt without an exact outcome is
+// ErrTransportUncertain.
+func (r *cancellationRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -31,17 +33,11 @@ func (r *cancellationRPC) CallMutationWithIdentity(ctx context.Context, request 
 			return nil, err
 		}
 	}
-	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
-		return nil, err
-	}
 	response, err := r.capabilityLedger.CallMutation(ctx, request)
 	if r.after != nil {
 		r.after(request)
 	}
 	if r.uncertain != nil && r.uncertain(request) {
-		if r.uncertainError != nil {
-			return nil, r.uncertainError
-		}
 		return nil, authorityrpc.ErrTransportUncertain
 	}
 	return response, err
@@ -181,7 +177,7 @@ func TestGatewayDescriptionCloseRetainsOwnerUntilSettled(t *testing.T) {
 }
 
 func TestGatewayAbandonedCleanupFailureEndsSession(t *testing.T) {
-	for _, operation := range []string{"reclaim", "open", "EOF close", "canceled after assignment"} {
+	for _, operation := range []string{"reclaim", "open", "EOF close"} {
 		t.Run(operation, func(t *testing.T) {
 			rpc := &cancellationRPC{capabilityLedger: newCapabilityLedger()}
 			rpc.kinds["file"] = authoritypb.Attr_REGULAR
@@ -192,10 +188,7 @@ func TestGatewayAbandonedCleanupFailureEndsSession(t *testing.T) {
 				return nil
 			}
 			rpc.uncertain = func(request *authoritypb.Request) bool {
-				return (operation == "open" || operation == "canceled after assignment") && request.GetOpen() != nil
-			}
-			if operation == "canceled after assignment" {
-				rpc.uncertainError = context.Canceled
+				return operation == "open" && request.GetOpen() != nil
 			}
 			client := newClient(rpc, time.Second)
 			t.Cleanup(func() { _ = client.Close() })
@@ -207,6 +200,52 @@ func TestGatewayAbandonedCleanupFailureEndsSession(t *testing.T) {
 			}
 			if err == nil || client.Err() == nil || !rpc.ended {
 				t.Fatalf("operation=%v session=%v ended=%v", err, client.Err(), rpc.ended)
+			}
+			rpc.assertNoResources(t)
+		})
+	}
+}
+
+// A caller canceled before its mutation was sent refuses only that caller. The
+// authority recorded nothing and the replay slot did not advance, so the session
+// stays live for every other reader; ending it here would let one abandoned
+// files request disconnect the whole gateway.
+func TestGatewayCancellationBeforeSendKeepsSession(t *testing.T) {
+	for _, stage := range []string{"lookup", "open", "directory read"} {
+		t.Run(stage, func(t *testing.T) {
+			rpc := &cancellationRPC{capabilityLedger: newCapabilityLedger()}
+			rpc.kinds["file"] = authoritypb.Attr_REGULAR
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			rpc.before = func(_ context.Context, request *authoritypb.Request) error {
+				if stage == "lookup" && request.GetLookup() != nil || stage == "open" && request.GetOpen() != nil || stage == "directory read" && request.GetReadDir() != nil {
+					cancel()
+					return ctx.Err()
+				}
+				return nil
+			}
+			client := newClient(rpc, time.Second)
+			t.Cleanup(func() { _ = client.Close() })
+			var err error
+			if stage == "directory read" {
+				_, err = client.List(ctx, pathKey(t, "dir"), 1, nil)
+			} else {
+				_, err = client.OpenFile(ctx, pathKey(t, "a", "file"))
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("operation = %v, want the caller's cancellation", err)
+			}
+			if client.Err() != nil {
+				t.Fatalf("an unsent cancellation ended the session: %v", client.Err())
+			}
+			rpc.assertNoResources(t)
+			rpc.before = nil
+			file, err := client.OpenFile(t.Context(), pathKey(t, "a", "file"))
+			if err != nil {
+				t.Fatalf("the session refused a later reader: %v", err)
+			}
+			if err := file.Close(t.Context()); err != nil {
+				t.Fatal(err)
 			}
 			rpc.assertNoResources(t)
 		})

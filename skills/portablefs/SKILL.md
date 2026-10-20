@@ -20,8 +20,8 @@ Everything you need is the `portablefs` CLI and this file. Every command accepts
   (create, rename, unlink, mkdir) is applied there before it returns. File data
   can be accepted earlier: on Linux an uncontended writer's bytes may wait in a
   bounded daemon buffer until `fsync`, a peer read, or unmount flushes them, and
-  on macOS `write(2)` returns at kernel page-cache acceptance, as on a local
-  disk.
+  on macOS 26 `write(2)` returns at kernel page-cache acceptance, as on a local
+  disk. On macOS 27 `write(2)` returns after the authority has the bytes.
 - **Mount.** One machine's live view of a volume. Several Linux mounts can be
   live at once, on different machines, and they see one filesystem. A macOS
   mount is the volume's only writer while it is mounted: Linux mounts keep
@@ -168,7 +168,7 @@ identity.
 ## Safety notes
 
 - **A returned `write(2)` is accepted, not yet durable.** It may still sit in
-  the macOS page cache or a Linux delegated write buffer, as on a local disk.
+  the macOS 26 page cache or a Linux delegated write buffer, as on a local disk.
   Every successful FSKit mutation reply certifies authority-storage durability.
   Whether `fsync` forces delivery of every dirty page is not yet qualified.
   [Teardown completion](../../docs/fskit-mount.md#callback-publication-and-local-teardown)

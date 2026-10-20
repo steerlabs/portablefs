@@ -18,8 +18,8 @@ const (
 	// rather than being partially removed or exhausting descriptors.
 	maxRemoveDepth = 256
 	// removeDirentBuffer is one getdents batch. The walk rescans a directory
-	// from the start after each batch, which stays near-linear because the
-	// entries it already removed are gone from the front of the directory.
+	// from the start after each pass that removed something, which stays
+	// near-linear because the removed entries are gone from the directory.
 	removeDirentBuffer = 32 << 10
 )
 
@@ -117,7 +117,7 @@ func removeDirectoryContents(topFD int, device uint64) error {
 	buffer := make([]byte, removeDirentBuffer)
 	for len(stack) > 0 {
 		frame := stack[len(stack)-1]
-		child, seen, err := drainDirectoryBatch(frame.fd, buffer)
+		child, seen, err := drainDirectoryPass(frame.fd, buffer)
 		if err != nil {
 			return err
 		}
@@ -145,7 +145,7 @@ func removeDirectoryContents(topFD int, device uint64) error {
 			continue
 		}
 		if seen > 0 {
-			// The batch made progress; rescan this directory for the rest.
+			// The pass made progress; rescan this directory for the rest.
 			continue
 		}
 		stack = stack[:len(stack)-1]
@@ -160,46 +160,48 @@ func removeDirectoryContents(topFD int, device uint64) error {
 	return nil
 }
 
-// drainDirectoryBatch reads one batch of entries, unlinks every non-directory
-// in it, and returns the first subdirectory it meets so the caller can descend.
-// The count of entries seen distinguishes "this directory is empty" from "this
-// batch is done": only a batch with no entries at all proves emptiness.
-func drainDirectoryBatch(fd int, buffer []byte) (string, int, error) {
+// drainDirectoryPass reads the directory from its start to end-of-directory,
+// unlinks every non-directory it meets, and returns the first subdirectory so
+// the caller can descend. getdents may return a short batch (one holding only
+// "." is legal), so only a pass that reached end-of-directory without seeing
+// an entry proves emptiness.
+func drainDirectoryPass(fd int, buffer []byte) (string, int, error) {
 	if _, err := unix.Seek(fd, 0, unix.SEEK_SET); err != nil {
 		return "", 0, fmt.Errorf("cellhost: rewind directory for removal: %w", err)
 	}
-	read, err := unix.ReadDirent(fd, buffer)
-	if err != nil {
-		return "", 0, fmt.Errorf("cellhost: read directory for removal: %w", err)
-	}
-	if read <= 0 {
-		return "", 0, nil
-	}
-	var names []string
-	_, _, names = unix.ParseDirent(buffer[:read], -1, names)
 	seen := 0
-	for _, name := range names {
-		if name == "." || name == ".." {
-			continue
+	var names []string
+	for {
+		read, err := unix.ReadDirent(fd, buffer)
+		if err != nil {
+			return "", seen, fmt.Errorf("cellhost: read directory for removal: %w", err)
 		}
-		seen++
-		var stat unix.Stat_t
-		if err := unix.Fstatat(fd, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			if errors.Is(err, unix.ENOENT) {
+		if read <= 0 {
+			return "", seen, nil
+		}
+		_, _, names = unix.ParseDirent(buffer[:read], -1, names[:0])
+		for _, name := range names {
+			if name == "." || name == ".." {
 				continue
 			}
-			return "", seen, fmt.Errorf("cellhost: stat %s for removal: %w", name, err)
-		}
-		if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
-			return name, seen, nil
-		}
-		// Symlinks land here and are unlinked as themselves: unlinkat with a
-		// zero flag removes the link, never its target.
-		if err := unlinkAbsentOK(fd, name, 0); err != nil {
-			return "", seen, err
+			seen++
+			var stat unix.Stat_t
+			if err := unix.Fstatat(fd, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+				if errors.Is(err, unix.ENOENT) {
+					continue
+				}
+				return "", seen, fmt.Errorf("cellhost: stat %s for removal: %w", name, err)
+			}
+			if stat.Mode&unix.S_IFMT == unix.S_IFDIR {
+				return name, seen, nil
+			}
+			// Symlinks land here and are unlinked as themselves: unlinkat with a
+			// zero flag removes the link, never its target.
+			if err := unlinkAbsentOK(fd, name, 0); err != nil {
+				return "", seen, err
+			}
 		}
 	}
-	return "", seen, nil
 }
 
 func openDirectoryBeneath(parentFD int, name string) (int, error) {

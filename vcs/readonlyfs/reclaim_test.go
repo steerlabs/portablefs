@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
-	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
 // capabilityLedger is an authority that mints a distinct item capability per
@@ -233,14 +232,4 @@ func TestGatewayReclaimsEveryResolvedCapabilityExactlyOnce(t *testing.T) {
 			}
 		})
 	}
-}
-
-func (f *capabilityLedger) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
-		return nil, err
-	}
-	return f.CallMutation(ctx, request)
 }

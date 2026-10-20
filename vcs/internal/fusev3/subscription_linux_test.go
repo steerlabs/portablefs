@@ -793,7 +793,15 @@ func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := mount.delegations.state(id)
+	// Install queued this state for the idle collector, which holds its
+	// admission lock while it inspects it. sharedCacheAllowed deliberately
+	// refuses caching on that contention, so pin the state the way a real
+	// holder does: a referenced state is never locked by the collector.
+	state := mount.delegations.retainState(id, false)
+	if state == nil {
+		t.Fatal("installed delegation has no state")
+	}
+	defer mount.delegations.releaseState(state)
 	state.admission.Lock()
 	state.clearGrantLocked()
 	state.admission.Unlock()

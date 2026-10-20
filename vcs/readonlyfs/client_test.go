@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
-	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
 func TestClientReadsByOpaqueLookupAndReleasesEveryAuthorityHandle(t *testing.T) {
@@ -124,7 +123,10 @@ type fakeAuthority struct {
 	root                   *authoritypb.Item
 }
 
-func (f *fakeAuthority) CallMutation(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+func (f *fakeAuthority) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch body := request.GetBody().(type) {
@@ -223,14 +225,4 @@ func TestClientDetachesBeforeClosingTheTransport(t *testing.T) {
 	if released := rpc.releases.Load(); released != 1 {
 		t.Fatalf("a repeated close sent %d detaches, want the first one only", released)
 	}
-}
-
-func (f *fakeAuthority) CallMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := assigned(authorityrpc.MutationIdentity{}); err != nil {
-		return nil, err
-	}
-	return f.CallMutation(ctx, request)
 }

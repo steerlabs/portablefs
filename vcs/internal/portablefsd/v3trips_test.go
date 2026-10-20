@@ -236,10 +236,10 @@ func TestV3DisjointOneTripCallbacksOverlap(t *testing.T) {
 	}
 }
 
-// The kernel chooses the batching, not the daemon. Each delivered writeBack
+// The kernel chooses the batching, not the daemon. Each delivered cached-write
 // chunk still needs exactly one durable positioned WRITE reply; the later
 // namespace callback adds its own single trip, with no OPEN or extra barrier.
-func TestV3WriteBackDeliveredCutAuthorityTrips(t *testing.T) {
+func TestV3CachedWriteDeliveredCutAuthorityTrips(t *testing.T) {
 	for _, namespace := range []string{"link", "rename", "unlink"} {
 		t.Run(namespace, func(t *testing.T) {
 			f := newCachedV3Fixture(t, v3FileObjects())

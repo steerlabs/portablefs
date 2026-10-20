@@ -11,8 +11,8 @@ before Attach through the platform-support check.
 
 Both releases use the existing `FSVolume.Operations` and
 `FSVolume.ReadWriteOperations` boundary. macOS 27's separate
-`FSVolume.DataCacheHandler` owns the package B/C cache lifecycle and writeBack
-work; it does not imply adoption of `FSVolume.Handler` or
+`FSVolume.DataCacheHandler` owns the package B/C cache lifecycle and its
+writeThrough grants; it does not imply adoption of `FSVolume.Handler` or
 `FSVolume.ReadWriteHandler`. Package D part 1 is the selected implementation,
 and part 2 is cancelled for protocol 8.
 
@@ -65,7 +65,7 @@ releases. Construction selects the native lifecycle adapter once with
 macOS 27 adopts `FSVolume.DataCacheHandler` as its only open/upgrade/final-close
 owner. A macOS 27 error never retries through the macOS 26 adapter.
 
-On macOS 27, `readWriteWithCache` receives `writeBack` only with live
+On macOS 27, `readWriteWithCache` receives `writeThrough` only with live
 exclusive-writer/authorization proof and legitimately retained read/write
 rights. `readWithCache` and read-only rights can receive `readCache`; `none`
 receives `noCache`. An eligible V3 `O_WRONLY`/`O_APPEND` write open requests
@@ -212,24 +212,35 @@ Delivered writes are direct: each callback chunk of up to the negotiated
 maximum write is one positioned authority WRITE, without append, sync, delegation, flush
 sequence, or lock owner. There is no fragmented or staged write.
 
-On macOS 27, writeBack buffers ordinary writes in the kernel like V2 on
-macOS 26. `write(2)` can return at kernel page-cache acceptance; every delivered
-FSKit callback remains durable at the authority before successful reply. The
-kernel pushes pages for barriers, close, unmount or memory pressure. Writer
-loss or forced unmount may lose undelivered dirty data, as on V2 and a local
-disk without fsync. An unacknowledged in-flight write may already have applied;
-this does not imply prefix-atomic recovery. Linux peers see delivered state
-only while newer bytes remain solely in Mac pages. Neither longer deferred
-retention nor close timing is qualified as exactly equivalent to V2.
+On macOS 27, a write-capable cache grant is `writeThrough`, never
+`writeBack`. `write(2)` returns only after its FSKit WRITE callback is durable
+at the authority, so ENOSPC, EDQUOT and I/O errors reach the write that caused
+them. writeBack was disabled after a native Phase III observation on macOS
+27.0.1 (case 399): with 4 MiB of project-quota headroom, 32 x 1 MiB writes were
+all accepted into the kernel cache, then fsync and close returned EIO rather
+than EDQUOT, and the reopen check was never reached. Write-time error delivery
+under writeThrough is itself pending native proof. Pages dirtied through a
+writable mapping still reach the authority only when the kernel pushes them.
+
+On macOS 26, V2 buffers ordinary writes in the kernel. `write(2)` can return
+at kernel page-cache acceptance; every delivered FSKit callback remains durable
+at the authority before successful reply. The kernel pushes pages for barriers,
+close, unmount or memory pressure. Writer loss or forced unmount may lose
+undelivered dirty data, as on a local disk without fsync. An unacknowledged
+in-flight write may already have applied on either release; this does not
+imply prefix-atomic recovery. Linux peers see delivered state only while newer
+bytes remain solely in Mac pages.
 
 A native `fsync` or `F_FULLFSYNC` must cover buffered data by delivering every
 covered callback, waiting for all durable replies and reporting errors. That
-host-kernel contract is pending native proof on both releases; writeBack is
-**not qualified until those proofs pass**. Per-callback durability alone does
-not prove it. `scripts/test-macos27-writeback.py` collects two held-WRITE
+host-kernel contract is pending native proof. Per-callback durability alone
+does not prove it. `scripts/test-macos27-writeback.py` collects held-WRITE
 barrier proofs, faults and close/reopen error delivery on an exact signed
-artifact. The kernel-cache observer separately records page geometry and
-stopped/sleep/wake residuals. Neither collector claims an automatic pass.
+artifact. Its held cases were written for writeBack and expect `write(2)` to
+return while a covered WRITE is held; under writeThrough that write blocks, so
+those cases stay OPEN until the collector is reworked. The kernel-cache
+observer separately records page geometry and stopped/sleep/wake residuals.
+Neither collector claims an automatic pass.
 
 ## CREATE and OPEN
 

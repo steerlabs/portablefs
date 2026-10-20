@@ -43,13 +43,16 @@ Visibility does not imply power-loss durability.
   their ordinary file-and-directory fsync discipline.
 - FSKit has no fsync callback. Each successful FSKit mutation reply waits for
   its storage effect to be durable, covering data, attributes, and namespace
-  changes. macOS 27 writeBack buffers ordinary writes in the kernel like V2;
-  `write(2)` may return before delivery. Native fsync must cover buffered data,
-  await every covered durable callback and report errors, pending native proof.
-  writeBack is not qualified until those proofs pass. Writer loss may lose
-  undelivered dirty data, as on V2 and a local disk without fsync; an
-  unacknowledged in-flight write may already have applied. Linux peers see
-  delivered state only, not newer bytes held solely in Mac pages. Mac link,
+  changes. macOS 27 grants writeThrough, never writeBack: `write(2)` returns
+  after its callback is durable and reports its error, pending native proof.
+  writeBack was disabled after a native quota observation surfaced quota
+  exhaustion as deferred EIO at fsync and close instead of at the write. V2 on
+  macOS 26 buffers ordinary writes in the kernel; `write(2)` may return before
+  delivery. Native fsync must cover buffered data, await every covered durable
+  callback and report errors, pending native proof. Writer loss may lose
+  undelivered dirty data, as on a local disk without fsync; an unacknowledged
+  in-flight write may already have applied. Linux peers see delivered state
+  only, not newer bytes held solely in Mac pages. Mac link,
   rename and unlink push the earlier dirty cut before namespace dispatch;
   usable proof expiry and ordinary unmount drain before releasing cache/owner
   rights. Terminal loss revokes without pushing into another owner/session/epoch.
@@ -117,7 +120,7 @@ exclusion and its reads break for read without blocking Linux writers.
 
 On macOS 27, the extension controls retained kernel data through
 `FSVolume.DataCacheHandler`. A compatible readWriteWithCache request can
-receive writeBack with live writer/authorization proof and legitimately
+receive writeThrough with live writer/authorization proof and legitimately
 retained read/write rights; read requests/rights can receive readCache, while
 no-cache requests receive noCache. An eligible V3 write-only application open
 may acquire separately authorized backing read access for cache fills. A fresh
@@ -138,7 +141,7 @@ into another owner/session/epoch. Calls run without module locks or gates
 needed by reentrant writes, pin descriptions through completion and revalidate
 ownership. Failed actions leave kernel state unchanged and fail/fence.
 Ordinary open-unlinked files remain accessible. Every delivered successful
-mutation callback remains authority-durable; native writeBack is unqualified.
+mutation callback remains authority-durable; native writeThrough is unqualified.
 
 A stopped extension cannot revoke, and cached reads can race wake before the
 extension executes. Per-item control does not prove exact negative-name,

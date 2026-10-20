@@ -67,7 +67,7 @@ type Page struct {
 }
 
 type authorityClient interface {
-	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
+	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	Close() error
 	// ReleaseBeforeMount is the authenticated detach for an ACTIVE session that
@@ -331,15 +331,14 @@ func (c *Client) mutate(ctx context.Context, request *authoritypb.Request) (*aut
 	}
 	callContext, cancel := c.operationContext(ctx)
 	defer cancel()
-	assigned := false
-	response, err := c.rpc.CallMutationWithIdentity(callContext, request, func(authorityrpc.MutationIdentity) error {
-		assigned = true
-		return nil
-	})
-	// Before replay assignment a context error proves no dispatch. Afterwards
-	// an unresolved allocation or close must end the session; only the transport
-	// can replay the exact request, and it has already attempted that here.
-	if err != nil && (assigned || !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+	response, err := c.rpc.CallMutation(callContext, request)
+	// The transport settles cancellation itself: once any attempt may have
+	// reached the authority, a cancellation it cannot settle ends the session as
+	// ErrTransportUncertain. A bare context error therefore proves nothing was
+	// sent, even after a replay slot was assigned, so it refuses only this
+	// caller. Any other failure leaves an allocation or close unresolved, and
+	// only ending the session returns it.
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		c.fail(err)
 	} else if err == nil && (response == nil || response.GetUncertain() || response.GetSessionTerminal()) {
 		err = errors.New("readonlyfs: authority mutation outcome is not settled")

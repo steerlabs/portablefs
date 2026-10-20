@@ -32,12 +32,12 @@ def mount_proof(index, adapter="V3"):
             "signed_daemon": "daemon hash/log", "signature_evidence": "codesign log",
             "session_id": f"session-{index}", "epoch_id": f"epoch-{index}", "mount_evidence": "mount log",
             "faults_restored": True, "adapter": adapter, "adapter_evidence": "V2 trace",
-            "grant_evidence": "V3 grant trace", "requested_mode": "readWriteWithCache", "granted_mode": "writeBack"}
+            "grant_evidence": "V3 grant trace", "requested_mode": "readWriteWithCache", "granted_mode": "writeThrough"}
 
 
 def permission_answers(directory):
     answers = [{"grant_evidence": "CREATE grant", "description_evidence": "live CREATE read/write rights",
-                "requested_mode": "readWriteWithCache", "granted_mode": "writeBack", "retained_read_description": True}
+                "requested_mode": "readWriteWithCache", "granted_mode": "writeThrough", "retained_read_description": True}
                for _ in range(4)]
     for name, mode, denied in native.PERMISSION_FIXTURES:
         for trial, _ in native.PERMISSION_TRIALS:
@@ -46,7 +46,7 @@ def permission_answers(directory):
                             "final_close_evidence": "FSKit final close", "retirement_evidence": "all descriptions released",
                             "permission_evidence": "effective storage access check", "read_denied": denied,
                             "write_allowed": True, "storage_acl": name == "existing-acl"})
-            proof = {**common, "requested_mode": "readWriteWithCache", "granted_mode": "noCache" if denied else "writeBack",
+            proof = {**common, "requested_mode": "readWriteWithCache", "granted_mode": "noCache" if denied else "writeThrough",
                      "grant_evidence": "grant trace", "open_trace": "authority OPEN trace",
                      "description_evidence": "authority access ownership", "canonical_item_evidence": "same capability",
                      "successful_read_description": not denied, "application_read_errno": "EBADF", "no_destructive_repeat": True,
@@ -273,8 +273,8 @@ class WriteBackProbeTests(unittest.TestCase):
                                             for trial, _ in native.PERMISSION_TRIALS])
             proofs = [row["proof"] for row in rows(output) if row["event"] == "proof"]
             self.assertEqual(proofs, answers)
-            self.assertEqual(proofs[0]["granted_mode"], "writeBack")
-            self.assertTrue(all(proof["granted_mode"] == ("noCache" if "0200" in proof["fixture"] or "acl" in proof["fixture"] else "writeBack")
+            self.assertEqual(proofs[0]["granted_mode"], "writeThrough")
+            self.assertTrue(all(proof["granted_mode"] == ("noCache" if "0200" in proof["fixture"] or "acl" in proof["fixture"] else "writeThrough")
                                 for proof in proofs[5::2]))
 
     def test_missing_retirement_evidence_prevents_writeonly_open(self):
@@ -313,7 +313,7 @@ class WriteBackProbeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "OPEN"):
                     native.permission_shapes(Path(temporary), io.StringIO())
 
-    def test_create_with_retained_rights_requires_writeback_evidence(self):
+    def test_create_with_retained_rights_requires_writethrough_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
             proof = permission_answers(Path(temporary))[0]
             proof["granted_mode"] = "noCache"

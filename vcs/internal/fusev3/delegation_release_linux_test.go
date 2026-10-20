@@ -333,13 +333,17 @@ func TestMountDeferredCoherenceCloseUsesReplacementSubscription(t *testing.T) {
 	if err := mount.delegations.QueueClose(id, delegationTestToken(89, 2), 0, false); err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, time.Second, "coherence close refusal", func() bool {
-		rpc.mu.Lock()
-		defer rpc.mu.Unlock()
-		return closeCalls == 1
+	// The fake counts the refusal before its reply reaches the close
+	// dispatcher, which deactivates the subscription only afterwards. Wait for
+	// that deactivation itself, not for the RPC, before asserting on it.
+	waitUntil(t, time.Second, "coherence close refusal to deactivate the subscription", func() bool {
+		return mount.subscription.stamp() == (subscriptionStamp{})
 	})
-	if stamp := mount.subscription.stamp(); stamp != (subscriptionStamp{}) {
-		t.Fatalf("coherence close refusal retained subscription %+v", stamp)
+	rpc.mu.Lock()
+	refusals := closeCalls
+	rpc.mu.Unlock()
+	if refusals != 1 {
+		t.Fatalf("close calls before replacement subscription = %d, want 1", refusals)
 	}
 	mount.delegations.closeMu.Lock()
 	pending := mount.delegations.closePending
