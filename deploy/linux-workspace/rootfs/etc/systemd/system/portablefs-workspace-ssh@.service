@@ -1,0 +1,8 @@
+[Unit]
+Description=PortableFS SSH session
+Requires=portablefs-workspace-bootstrap.service
+After=portablefs-workspace-bootstrap.service
+[Service]
+ExecStart=/usr/sbin/sshd -i -e -f /etc/ssh/sshd_config
+StandardInput=socket
+StandardError=journal

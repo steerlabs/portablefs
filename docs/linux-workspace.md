@@ -22,8 +22,10 @@ the menu app leaves that service running. Only this service receives the virtual
 Workspace setup does not require the FSKit extension.
 
 The selected guest is Debian 13 arm64 with a pinned 6.12 kernel, glibc, systemd,
-OpenSSH and a development toolchain. The exact image lock, kernel configuration,
-packages and digests remain to be built and qualified. Use an immutable system
+OpenSSH and a development toolchain. The development image is pinned by
+`deploy/linux-workspace/image.lock.json`; the builder records its actual kernel
+configuration, package/source inventory and output hashes. Release attestation
+and sealed-app insertion remain Stage 2 work. Use an immutable system
 disk and sparse persistent ext4 data disk; keep home, editor installations,
 guest identity and machine-local route backing on the data disk. Never share
 the Mac home through virtiofs. Each volume mounts at `/workspaces/<volume-id>`;
@@ -254,9 +256,12 @@ IDs within a paired channel; each response echoes its request ID and expected
 body. Hello is the only request before pairing. One suspend generation and at
 most one resume authorization are outstanding. A malformed frame, mismatched
 response, unequal version or broken channel closes the channel and invalidates
-eligibility; do not transparently reconnect and reuse a token. Stage 1a supplies
-the grammar/codecs and typed model interfaces; the real correlated vsock
-transport, authentication and dispatch remain pending.
+eligibility; do not transparently reconnect and reuse a token. Stage 1b connects these codecs and models to a correlated vsock stream. The
+guest accepts only host CID 2 on port 1024, requires its independently seeded
+boot/service identity and exact release, and consumes one paired stream per
+boot. Disconnect discards its model; supervisor restart within that boot is
+refused. Provision, Mount and Umount return `unavailable`. The dev process is
+the sole host caller; the signed-process local service API is Stage 2 work.
 
 Host-side callers must pass the existing same-user signed-process/audit-token
 check. The guest channel must bind to the app-owned VM and fresh boot nonce.
@@ -295,22 +300,113 @@ host relay, bridged-network substitution or hidden authority proxy. Local
 Network privacy must qualify the installed signed VM owner, including app
 replacement and exact old-process termination.
 
-The planned SSH entry `portablefs-workspace` binds a host listener to loopback
-and bridges vsock to guest-loopback sshd, avoiding unstable guest IPs and LAN
-SSH exposure. Use separate SSH credentials and a pinned, persistent guest host
+The dev SSH entry `portablefs-workspace` binds a host listener to 127.0.0.1
+and bridges directly to vsock port 22. A systemd `ListenStream=vsock::22` socket
+starts OpenSSH in inetd mode; no guest TCP SSH listener exists. Use separate SSH credentials and a pinned, persistent guest host
 key. Install an app-owned include only through explicit setup, preserving
 unrelated SSH configuration. Qualify VS Code/Cursor, Zed and JetBrains Linux
 arm64 backends independently; local UI or AI networking does not establish that
 file tools execute in Linux.
 
+## Development artifact and boot path
+
+Run from an Apple-silicon Mac with macOS 26+, Xcode and Docker:
+
+```sh
+GOTOOLCHAIN=go1.26.10 bash scripts/build-linux-workspace-image.sh /absolute/image
+bash scripts/build-linux-workspace-dev.sh
+swift/PortableFSKit/.build/out/Products/Debug/portablefs-workspace-dev /absolute/image /absolute/state
+```
+
+The builder uses mmdebstrap in its own privileged container from the digest in
+`image.lock.json`, with Debian trixie at one snapshot timestamp and
+`SOURCE_DATE_EPOCH`. It checks the complete installed binary/source version
+inventory against that lock. `--update-lock` explicitly refreshes that inventory;
+`--reuse` reuses only matching input identity and package inventory. There is no
+boot-time package installation, upgrade or fetch. Debian's archive signatures
+check the snapshot indexes, including the builder bootstrap over HTTP.
+
+The artifact directory contains `kernel` (an uncompressed Debian arm64 Image),
+`initramfs`, `system.ext4`, `kernel.config`, `initramfs.inventory`,
+`packages.json`, `packages.tsv`, `source-manifest.json`, `licenses.tar.gz`,
+`bin/{portablefs,portablefsd,portablefs-workspaced}`, `image-inputs.json`, `release.json` and
+`manifest.json`. The kernel is on Debian's maintained 6.12 line. Required block,
+network, console, vsock, entropy, FUSE and ext4 drivers must be built in or
+present in the initramfs; source configuration alone is insufficient for modules.
+Package copyright/source notices remain in the system image under
+`/usr/share/doc`. `packages.json` records binary and corresponding source names
+and versions at the pinned snapshot. Release source redistribution and the
+attested client archive insertion are not implemented by this development build.
+
+`image-inputs.json` canonically hashes the pinned snapshot/builder recipe,
+image overlay and exact static Linux/arm64 client/supervisor binaries. Its SHA-256
+is the noncircular image identity embedded in `release.json`; `manifest.json`
+additionally binds the actual generated disk, kernel, initramfs and inventories.
+The owner verifies exact manifest membership and every output hash before VZ
+configuration. The dev build script compiles the host source commit into the
+executable before ad-hoc signing with only `com.apple.security.virtualization`.
+An unconfigured SwiftPM executable or unequal host/guest commit refuses boot.
+Development images do not have release attestation or a signed resource seal.
+
+The VZ owner uses the main serial dispatch queue for configuration, operations
+and completion callbacks. Devices are Linux direct boot, read-only virtio system
+block disk, writable data block disk, NAT, vsock, two virtio serial consoles and
+entropy. No shared directory, RAM save/restore, bridged network or host authority
+relay is configured. IOKit power notification registration must succeed before
+start. A controlled pause enters the existing coordinator; only confirmed cold
+pause creates single-use resume eligibility. The real adapter uses host
+sleep-inclusive continuous time for deadlines and releases sleep participation
+within its bounded budget. This does not establish the unfenced-sleep invariant.
+
+The state directory has an exclusive owner lock, a 64 GiB sparse `data.ext4`,
+a separate persisted host SSH client key, pinned guest host public key,
+`known_hosts`, `ssh_config` and `serial.log`. Only an explicit new-disk marker
+authorizes first-boot ext4 formatting; unrecognized data is never reformatted.
+The data filesystem retains format 8, home/editor installs, SSH host identity,
+guest identity and reserved mount/local backing directories. `/var`, `/tmp` and
+`/run` are volatile. `/workspaces` denies user access while no mount exists.
+
+The second virtio console provisions only fresh boot/service nonces and the host
+client public key. The guest generates and persists its private SSH host key on
+the data disk and returns the public key over that VM-bound console. The owner
+checks the persisted pin before opening TCP, and fails on a changed key. The
+control Hello then pairs app version, commit, image digest, protocol 8 and both
+service incarnations. No host private key or Mac FSKit identity enters Linux.
+
+The executable prints a JSON `ready` event containing the SSH stanza and its
+config path. Use `ssh -F /absolute/state/ssh_config portablefs-workspace`.
+No global SSH configuration is edited. Standard input accepts one JSON command
+per line: `{"command":"pause"}`, `resume`, `status` or `stop`. Pause/resume use
+the real coordinator; a repeated resume is refused. A normal running stop asks
+the guest to shut down and waits for VZ's guest-stopped delegate callback. Unsafe
+or paused instances take the coordinator's confirmed stop path instead.
+
+Run the native gate with explicit artifact and evidence directories:
+
+```sh
+GOTOOLCHAIN=go1.26.10 bash scripts/test-linux-workspace-native.sh /absolute/image /absolute/evidence
+```
+
+It builds or verifies/reuses the pinned image, builds and signs the owner, then
+requires exact equality with `scripts/linux-workspace-required-native-tests.txt`.
+It boots twice, proves real FUSE INIT >= 7.31 on a throwaway filesystem, checks
+UID/GID 1000 and tool execution through pinned SSH, read-only root and no TCP
+SSH listener, unmounted-path denial, data/key persistence, cold VZ pause completion,
+closed no-mount recovery, repeated-resume refusal and clean guest shutdown.
+`results.json` records boot time, idle guest memory and owner RSS; `events.jsonl`
+and serial logs retain the transaction. The no-mount recovery is not authority
+validation or real FUSE withdrawal evidence. Unsupported virtualization is a
+named **UNAVAILABLE** gate with nonzero exit status, never a passing skip.
+
 ## Remaining construction and qualification
 
-Stage 1a contains no VM/image, VZ or power adapter, vsock listener, signed service,
-real mount suspension, durable guest inventory, provisioning dispatcher, CLI
-workspace commands, SSH bridge, editor integration, release asset or installer
-change. The guest daemon command remains absent from product registration
-until Stage 1b supplies its real transport. No new runtime environment switches,
-fallback paths or authority behavior accompany it.
+Stage 1b adds a development image, public VZ and IOKit adapters, VM-bound
+bootstrap console, exact vsock control, pinned SSH bridge and native gate. It
+creates no PortableFS mount. Its single `NoMount` participant proves cold
+absence, never opens admission and returns `authorization-required` on recovery.
+The real daemon suspension boundary, durable mount inventory and provisioning
+remain Stage 1c work. Production service registration, app UI, workspace CLI,
+release packaging, update coordination and editor qualification remain pending.
 
 All new workspace surfaces are pending and unreleased: the control grammar,
 service identity/entitlements, guest paths, inventory format, image manifest,
@@ -322,15 +418,16 @@ sources/licenses, PortableFS commit and sealed app resources.
 
 | Gate | Status and evidence required |
 | --- | --- |
-| Controlled fence | Model tests only in Stage 1a. Real daemon withdrawal, initial-renewal readiness and VZ completion ordering remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
+| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with a no-mount participant. Real daemon withdrawal, initial-renewal readiness and the full duration/fault matrix remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
 | Unfenced host sleep | OPEN. Identify the clock/execution mechanism and ordering, then qualify actual lid/menu/idle sleep on exact supported OS/hardware/image digests with independently advancing remote authority and peer. Delay the service past the notification timeout. A finite successful sample cannot replace the mechanism. |
 | Short-sleep availability | Root cause identified: authority replay-before-coherence admission ordering. Fix and regression work are in progress in a separate PR. This stage does not change the authority or Linux data plane. |
 | Image, lifecycle and persistence | Pin Debian artifact; prove boot/FUSE INIT and kernel notification/durability behavior. Prove exact teardown/remount with cwd, fd, mapping and editor holders, no empty-directory writes, ENOSPC/image-corruption handling, signed updates and same-volume exclusion. |
 | Protocol-8 correctness | Full privileged Linux integration and coherence matrix, root barriers, dirty-tail loss, authority restart and power-loss qualification. The experiment's 22 passes, 7 skips and relay topology do not qualify the product. |
 | Network, editors and performance | Installed signed-owner NAT/privacy/VPN/IPv6 tests and each claimed editor. Measure direct product-topology RPC RTT, latency tails, Git/search/index/save and resource use without the lab relay. No performance SLO follows from the experiment. |
 
-Default local verification is appropriate for Stage 1a's isolated model targets;
-it touches no authority, frontend or coherence execution path. Stage 1c and
+Default local verification plus the separate native workspace gate covers
+Stage 1b's transport and VM owner; it touches no authority or real PortableFS
+frontend/coherence execution path. Stage 1c and
 real product integration require full verification and native workspace gates.
 Neither this document nor model success qualifies the planned feature. Intel,
 multiple VMs, custom images, RAM snapshots/migration, Rosetta, root-system

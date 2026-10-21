@@ -1,0 +1,11 @@
+# These must exist before root and serial console discovery under VZ direct boot.
+virtio
+virtio_pci
+virtio_mmio
+virtio_blk
+virtio_net
+virtio_console
+vmw_vsock_virtio_transport
+virtio_rng
+fuse
+ext4

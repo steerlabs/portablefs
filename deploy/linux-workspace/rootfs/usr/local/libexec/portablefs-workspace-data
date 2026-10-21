@@ -1,0 +1,35 @@
+#!/bin/bash
+set -euo pipefail
+# Only the explicit new-disk marker authorizes first-boot formatting. An
+# unrecognized or corrupt disk without that marker is never reformatted.
+if ! blkid -p /dev/vdb >/dev/null; then
+  [[ "$(head -c 20 /dev/vdb)" == PFS-WORKSPACE-DATA-8 ]]
+  mkfs.ext4 -q -F -L portablefs-data /dev/vdb
+fi
+[[ "$(blkid -s TYPE -o value /dev/vdb)" == ext4 ]]
+[[ "$(blkid -s LABEL -o value /dev/vdb)" == portablefs-data ]]
+mount -t ext4 -o nosuid,nodev /dev/vdb /data
+if [[ ! -e /data/format ]]; then
+  mkdir -p /data/home/workspace /data/ssh /data/mounts /data/local
+  chmod 700 /data/ssh /data/mounts /data/local
+  chown 1000:1000 /data/home/workspace
+  # Interrupted initialization preserves any completed private identity.
+  if [[ ! -e /data/ssh/ssh_host_ed25519_key ]]; then
+    rm -f /data/ssh/initializing /data/ssh/initializing.pub
+    ssh-keygen -q -t ed25519 -N '' -f /data/ssh/initializing
+    mv /data/ssh/initializing /data/ssh/ssh_host_ed25519_key
+  fi
+  ssh-keygen -y -f /data/ssh/ssh_host_ed25519_key >/data/ssh/ssh_host_ed25519_key.pub
+  if [[ ! -s /data/machine-id ]]; then
+    cat /proc/sys/kernel/random/uuid | tr -d '-' >/data/machine-id.initializing
+    mv /data/machine-id.initializing /data/machine-id
+  fi
+  sync -f /data
+  printf '8\n' >/data/format.initializing
+  mv /data/format.initializing /data/format
+  sync -f /data
+fi
+[[ "$(cat /data/format)" == 8 ]]
+[[ -s /data/ssh/ssh_host_ed25519_key && -s /data/machine-id ]]
+mount --bind /data/home /home
+mkdir -p /run/sshd

@@ -1,0 +1,11 @@
+[Unit]
+Description=PortableFS persistent data format and mounts
+After=local-fs.target dev-vdb.device
+Requires=dev-vdb.device
+Before=portablefs-workspace-bootstrap.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/portablefs-workspace-data
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
