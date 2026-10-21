@@ -47,16 +47,28 @@ cp "$staging/image-inputs.json" "$staging/release.json" "$out/"
 # Notices for the exact linked Go module graph accompany Debian's copyrights.
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "$repo/vcs" list -m -json all >"$staging/modules.json"
 python3 - "$staging" "$repo" <<'PYNOTICES'
-import json,pathlib,shutil,sys
+import json,pathlib,shutil,subprocess,sys
 p=pathlib.Path(sys.argv[1]); raw=(p/'modules.json').read_text(); decoder=json.JSONDecoder(); modules=[]
 while raw.strip():
     value,end=decoder.raw_decode(raw.lstrip()); raw=raw.lstrip()[end:]; modules.append(value)
+linked=set()
+for binary in (p/'bin').iterdir():
+    for line in subprocess.check_output(['go','version','-m',str(binary)],text=True).splitlines():
+        fields=line.split()
+        if fields and fields[0] in ('mod','dep'): linked.add(fields[1])
+modules=[module for module in modules if module['Path'] in linked]
+assert {module['Path'] for module in modules} == linked
 for module in modules:
     source=pathlib.Path(module.get('Replace',module).get('Dir',sys.argv[2]+'/vcs'))
     dest=p/'go-notices'/module['Path']; dest.mkdir(parents=True,exist_ok=True)
     if module.get('Main'): source=pathlib.Path(sys.argv[2])
-    for name in ('LICENSE','LICENSE.txt','COPYING','NOTICE','PATENTS'):
-        if (source/name).is_file(): shutil.copyfile(source/name,dest/name)
+    copied=[]
+    for name in ('LICENSE','LICENSE.txt','LICENSE.md','COPYING','NOTICE','PATENTS'):
+        if (source/name).is_file(): shutil.copyfile(source/name,dest/name); copied.append(name)
+    assert copied, 'missing license notices for linked module '+module['Path']
+runtime=p/'go-notices'/'go-runtime'; runtime.mkdir()
+goro=pathlib.Path(subprocess.check_output(['go','-C',sys.argv[2]+'/vcs','env','GOROOT'],text=True).strip())
+for name in ('LICENSE','PATENTS'): shutil.copyfile(goro/name,runtime/name)
 records=[]
 for module in modules:
     record={key:module[key] for key in ('Path','Version','Sum') if key in module}

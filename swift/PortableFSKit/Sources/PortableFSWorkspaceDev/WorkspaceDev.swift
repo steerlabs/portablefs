@@ -126,7 +126,7 @@ import PortableFSWorkspaceCore
     }
     func fail(_ error: Error) { event("failure", ["error": String(describing: error)]); stop(exitCode: 1) }
     func stop(exitCode: Int32) {
-        guard !stopping else { return }; stopping = true; self.exitCode = exitCode
+        guard !stopping else { coordinator.discardUnknown(); return }; stopping = true; self.exitCode = exitCode
         FileHandle.standardInput.readabilityHandler = nil
         bridge.close(); channel.onFailure = nil
         coordinator.stop(); scheduleUpdate()

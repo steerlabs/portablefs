@@ -155,3 +155,40 @@ func TestTransportMountUnavailableAndStatusCorrelated(t *testing.T) {
 		t.Fatal("disconnect not discarded")
 	}
 }
+
+func TestTransportRetiredOutcomeAcknowledgementUsesPairedGrammar(t *testing.T) {
+	c, s, done := transportRig(t)
+	pairTransport(t, c)
+	ctx := context.Background()
+	old := mountID(4)
+	replacement := proto.Clone(old).(*pb.MountID)
+	replacement.Incarnation = id(5)
+	if err := s.Register(ctx, old, Witness{}, &fakeMount{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Terminal(old, "test terminal outcome", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Cleanup(old, CleanupProof{ProcessExited: true, KernelAbsent: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Replace(ctx, old, replacement, Witness{}, &fakeMount{}); err != nil {
+		t.Fatal(err)
+	}
+	status := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}).GetStatusReply()
+	if len(status.Retired) != 1 || !proto.Equal(status.Retired[0].Mount, old) {
+		t.Fatalf("missing retired outcome: %v", status)
+	}
+	result := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{Outcomes: status.Retired}}})
+	if result.GetResult().GetCode() != "accepted" {
+		t.Fatalf("retirement acknowledgement refused: %v", result)
+	}
+	status = exchange(t, c, &pb.Envelope{Version: 8, RequestId: 4, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}).GetStatusReply()
+	if len(status.Retired) != 0 || len(status.Mounts) != 1 || !proto.Equal(status.Mounts[0].Mount, replacement) {
+		t.Fatalf("wrong inventory after acknowledgement: %v", status)
+	}
+	c.Close()
+	if err := <-done; err == nil {
+		t.Fatal("disconnect succeeded")
+	}
+}

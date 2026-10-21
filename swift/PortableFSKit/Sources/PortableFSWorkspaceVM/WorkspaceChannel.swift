@@ -26,7 +26,7 @@ import PortableFSWorkspaceCore
     public func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         let start = { [weak self] in
             guard let self, !self.failed else { completion(.failure(WorkspaceVMError("control startup unavailable"))); return }
-            self.vm.connect(port: 1023) { result in
+            self.vm.connect(port: 1023) { [self] result in
                 do {
                     let connection = try result.get(); self.connection = connection
                     let stream = try WorkspaceStream(fd: connection.fileDescriptor, label: "portablefs.workspace.control", onLost: { [weak self] in self?.lost($0) })
@@ -111,7 +111,7 @@ import PortableFSWorkspaceCore
     }
     public func acknowledgeRetired(_ outcomes: [WorkspaceMountStatus], deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) {
         var ack = WorkspaceRetireAck(); ack.outcomes = outcomes
-        exchange(.retireAck(ack), deadline: deadline) { result in completion(result.flatMap { $0.result.code == "ok" ? .success(()) : .failure(WorkspaceVMError("retirement refused")) }) }
+        exchange(.retireAck(ack), deadline: deadline) { result in completion(result.flatMap { $0.result.code == "accepted" ? .success(()) : .failure(WorkspaceVMError("retirement refused")) }) }
     }
     public func close() { onFailure = nil; lost("owner closed channel") }
 }
