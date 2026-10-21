@@ -45,12 +45,28 @@ public enum WorkspaceControl {
         }
         return true
     }
+    public static func validRenewal(_ r: WorkspaceRenewalReadiness) -> Bool {
+        switch r.state {
+        case "pending", "not-required": return r.installedSequence == 0
+        case "installed": return r.installedSequence > 0
+        default: return false
+        }
+    }
+    public static func validOutcome(_ o: WorkspaceMountOutcome) -> Bool {
+        ["durable", "lost", "unresolved"].contains(o.durability) &&
+        ["observed", "unobserved"].contains(o.observation) &&
+        ["released", "expired", "abandoned", "unresolved"].contains(o.release) &&
+        (o.observation != "unobserved" || (o.durability == "unresolved" && o.release == "unresolved"))
+    }
     public static func validColdAck(_ ack: WorkspaceSuspendAck) -> Bool {
-        validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) }
+        validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
     }
     private static func validStatuses(_ mounts: [WorkspaceMountStatus], retired: Bool = false) -> Bool {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {
             ($0.retirementSequence > 0) == retired &&
+            $0.hasOutcome && validOutcome($0.outcome) &&
+            (!$0.hasRenewal || validRenewal($0.renewal)) &&
+            ($0.state != "ready" || ($0.hasRenewal && $0.renewal.state != "pending")) &&
             ["closed", "ready", "suspended-cold", "recovering", "terminal", "authorization-required"].contains($0.state) &&
             ["retained", "process-exited", "kernel-absent", "complete"].contains($0.cleanup) &&
             $0.reason.utf8.count <= maxReason && validLoss($0.loss) &&

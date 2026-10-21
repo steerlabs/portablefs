@@ -70,6 +70,76 @@ Expose explicit reopen actions and report holders that prevent cleanup. Do not
 silently restart arbitrary processes or describe lazy unmount as recovery.
 Preserve old barrier failures even if the new mount serves successfully.
 
+## Stage 1c control boundary
+
+The first Stage 1c unit adds control contracts and renewal ownership. Real
+workspace Mount, Umount and Provision remain unavailable in the paired guest
+transport. It does not enable managed mounts or qualify host sleep.
+
+The existing random abstract mount socket retains ordinary reauthorization and
+loss snapshots. Ordinary requests are bounded by `(32 << 10) + (256 << 10) +
+4096` bytes; responses by 4096 bytes. Their handler/socket deadlines remain
+30/35 seconds. Workspace requests and responses each have a 64 KiB bound.
+Peers are classified before capacity reservation: the exact seeded root
+UID/PID/start identity has two reserved connections, with separate phase and
+observation lanes; same-UID ordinary clients retain eight connections and their
+accepted renewal order. Workspace phases bypass that ordinary queue. Managed
+manual renewal requires an explicit current permit; loss observation remains
+available while closed.
+
+Local workspace format 8 uses strict JSON keys and string-encoded canonical
+uint64 values. Prepare, Recover, Suspend and Cleanup begin an operation with
+`operationId=requestId`; observation, kernel installation and removal evidence
+have distinct request IDs. Suspend carries the complete guest-fixed Suspension;
+Recover carries the complete ResumeToken. Their protobuf bodies use the paired
+canonical scanner, independently of the host Suspend rule that forbids a roster.
+The finite response states are accepted, preparing, kernel-required,
+pending-recovery, pending-suspend, prepared, cold, install-complete,
+unmount-required, unmount-recorded, cleanup-finalized and failed. Only prepared
+carries readiness. Each response is immutable: a new observation ID obtains a
+later snapshot. Missing lifecycle handlers return unavailable.
+
+The replay owner retains at most the active start receipt, latest completed
+phase and latest observation, with a request high-water mark. Observations do
+not evict installation receipts. Retired IDs never execute again; changed
+retained requests close permission. Retry socket budgets do not change immutable
+transaction identity or extend the captured Suspend deadline. A write-half-close
+frames a request and permits its response. Full hangup or exact process death
+cancels the waiter; generation-owned jobs and assigned cleanup survive it.
+Only install-kernel carries rights: exactly two ordered, distinct descriptors,
+FUSE then the duplicate abort witness. Receipt uses close-on-exec recvmsg;
+rejections and duplicate deliveries close all newly received descriptors.
+Actual device/bootstrap qualification belongs to the later protected-path driver.
+
+One persistent renewer retains session, next sequence, installed deadline and
+exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
+joins in-flight source/installation work. An unknown installation retries its
+same sequence and bytes. A known remote success advances the sequence even
+when a later Close suppresses readiness. The managed installer itself rejects
+missing or stale generation/serial permits. Hosted CLI readiness requires the
+first successful installer and exact Manager/installed deadline equality;
+explicit standalone readiness is not-required. Starting a goroutine or exposing
+a socket provides no renewal evidence.
+
+Paired status uses renewal states pending, installed with a positive sequence,
+and explicit standalone not-required with sequence zero. Every status/cold
+entry carries durability (`durable`, `lost`, `unresolved`), observation
+(`observed`, `unobserved`), release (`released`, `expired`, `abandoned`,
+`unresolved`) and counted cleanup debt. Initial unknown evidence is
+unresolved/unobserved. Known loss remains separately cumulative and survives
+failed or overtaken Prepare/Recover, cold completion, replacement and retirement.
+Unknown observation cannot certify durability or release.
+
+Close advances an exact serial even within one generation. It immediately denies
+new admission and defeats delayed prepared publication; it does not retract an
+already admitted operation. Completed withdrawal requires Suspend's joins.
+Prepare/Recover belong to their generation, retry classified transient failures
+with bounded attempts/backoff, and have no 45-second logical deadline. Only
+current session/authorization validation, a functioning renewal owner and fresh
+subscription evidence can authorize publication. An actual failed recovery ends
+that incarnation. The supervisor does not renew sessions. These remain typed
+driver contracts until the real admission, clock and lifecycle owners exist.
+
 ## Controlled suspension transaction
 
 All app-initiated pauses must use this transaction. Power notifications must
@@ -99,9 +169,10 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    invalidation earns no cold acknowledgement. Serialize Prepare, Recover,
    Suspend and admission publication per mount. A new suspension cancels the
    preceding generation and waits for overtaken driver calls before withdrawal.
-   Each driver must atomically check the latest close generation and cancellation
-   before installing any subscription or renewal; failed or overtaken calls install
-   nothing, including background renewal.
+   Each reusable proof must retain and recheck the exact generation/close serial.
+   A close racing local installation leaves that result inert; it cannot forget
+   a known remote renewal sequence. Suspend joins and retires raced work before
+   acknowledgement.
    Only exact process exit plus kernel absence makes a terminal mount trivially
    cold. Other terminal mounts still require withdrawal. The Go
    `workspaceguest.Mount` interface defines this boundary; Stage 1c must implement
@@ -450,7 +521,7 @@ sources/licenses, PortableFS commit and sealed app resources.
 
 | Gate | Status and evidence required |
 | --- | --- |
-| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with an empty roster. Real daemon withdrawal, initial-renewal readiness and the full duration/fault matrix remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
+| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with an empty roster. Real managed-daemon withdrawal and the full duration/fault matrix remain pending. Typed initial-renewal readiness is covered at the control boundary. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
 | Unfenced host sleep | OPEN. Identify the clock/execution mechanism and ordering, then qualify actual lid/menu/idle sleep on exact supported OS/hardware/image digests with independently advancing remote authority and peer. Delay the service past the notification timeout. A finite successful sample cannot replace the mechanism. |
 | Short-sleep availability | Root cause identified: authority replay-before-coherence admission ordering. Fix and regression work are in progress in a separate PR. This stage does not change the authority or Linux data plane. |
 | Image, lifecycle and persistence | Pin Debian artifact; prove boot/FUSE INIT and kernel notification/durability behavior. Prove exact teardown/remount with cwd, fd, mapping and editor holders, no empty-directory writes, ENOSPC/image-corruption handling, signed updates and same-volume exclusion. |

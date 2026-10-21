@@ -39,17 +39,18 @@ import (
 const mountTokenEnv = "PORTABLEFS_MOUNT_TOKEN"
 
 type mountReady struct {
-	OK                     bool     `json:"ok"`
-	Cleaned                bool     `json:"cleaned,omitempty"`
-	Error                  string   `json:"error,omitempty"`
-	PID                    int      `json:"pid,omitempty"`
-	Strategy               string   `json:"strategy,omitempty"`
-	MountPath              string   `json:"mountPath,omitempty"`
-	VolumeID               string   `json:"volumeId,omitempty"`
-	AttachRef              string   `json:"attachRef,omitempty"`
-	AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
-	LocalRoutes            []string `json:"localRoutes,omitempty"`
-	LocalRouteRevision     string   `json:"localRouteRevision,omitempty"`
+	Renewal                *mountenrollment.RenewalReadiness `json:"renewal,omitempty"`
+	OK                     bool                              `json:"ok"`
+	Cleaned                bool                              `json:"cleaned,omitempty"`
+	Error                  string                            `json:"error,omitempty"`
+	PID                    int                               `json:"pid,omitempty"`
+	Strategy               string                            `json:"strategy,omitempty"`
+	MountPath              string                            `json:"mountPath,omitempty"`
+	VolumeID               string                            `json:"volumeId,omitempty"`
+	AttachRef              string                            `json:"attachRef,omitempty"`
+	AuthorizationSessionID string                            `json:"authorizationSessionId,omitempty"`
+	LocalRoutes            []string                          `json:"localRoutes,omitempty"`
+	LocalRouteRevision     string                            `json:"localRouteRevision,omitempty"`
 }
 
 type mountOpts struct {
@@ -1302,6 +1303,8 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		var reauthorizationControl fuseReauthorizationControl
 		var renewalCancel context.CancelFunc
 		var renewalDone chan error
+		var renewalOwner *mountenrollment.Renewer
+		initialRenewal := make(chan struct{}, 1)
 		stopRenewal := func() error {
 			if renewalCancel == nil {
 				return nil
@@ -1402,14 +1405,20 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			if eventLogErr != nil {
 				return cleanupMountedFUSE(fmt.Errorf("initialize per-mount renewal event log: %w", eventLogErr))
 			}
-			renewer := &mountenrollment.Renewer{
+			renewalOwner = &mountenrollment.Renewer{
 				Source: enrollmentClient,
 				Observe: func(event mountenrollment.RenewalEvent) {
 					recordFUSERenewalEvent(renewalEvents, stateDir, mountPath, o.enrollmentID, event, m.WritebackStats())
+					if event.Kind == mountenrollment.RenewalSucceeded {
+						select {
+						case initialRenewal <- struct{}{}:
+						default:
+						}
+					}
 				},
 			}
 			go func() {
-				renewErr := renewer.Run(renewalCtx, authorizationSessionID, initialAuthorizationDeadline, m.Reauthorize)
+				renewErr := renewalOwner.Run(renewalCtx, authorizationSessionID, initialAuthorizationDeadline, m.Reauthorize)
 				if renewErr != nil {
 					setMountStatus(stateDir, mountPath, mountStatusCredentialExpired, time.Now().UnixMilli())
 					log.Printf("portablefs mount: automatic reauthorization ended the mount: %v", renewErr)
@@ -1448,6 +1457,27 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				renewalDone <- renewErr
 			}()
 		}
+		if enrollmentClient != nil {
+			// The owner signals a completed installer; its typed snapshot remains
+			// the authority for publication, independently of event logs/sockets.
+			select {
+			case <-initialRenewal:
+			case renewErr := <-renewalDone:
+				renewalDone <- renewErr
+				if renewErr == nil {
+					renewErr = errors.New("renewal stopped before initial installation")
+				}
+				return cleanupMountedFUSE(renewErr)
+			}
+			proof := renewalOwner.Readiness()
+			if err := validateFUSERenewalReadiness(proof, true, authorizationSessionID, m.AuthorizationDeadline(), time.Now()); err != nil {
+				return cleanupMountedFUSE(errors.New("initial renewal readiness unavailable"))
+			}
+			ready.Renewal = &proof
+		} else {
+			proof := mountenrollment.RenewalReadiness{State: "not-required"}
+			ready.Renewal = &proof
+		}
 		if err := operation.writeIntent("live", os.Getpid(), processIdentity); err != nil {
 			return cleanupMountedFUSE(err)
 		}
@@ -1459,10 +1489,9 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		go func() {
 			for range sig {
-				// EBUSY keeps the mount up; the next signal retries. There is no
-				// write-back tail in v3 — every acknowledged write is already
-				// durable at the authority — so there is nothing to park and no
-				// forced variant of this teardown.
+				// EBUSY keeps the mount up; the next signal retries. Accepted
+				// delegated writes can still be buffered. Exact teardown owns
+				// their drain and reports any durability failure or loss.
 				if err := requestUnmount(); err != nil {
 					log.Printf("portablefs mount: shutdown request refused: %v", err)
 					continue
@@ -1721,6 +1750,13 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	default:
 		return failReady(fmt.Errorf("unknown strategy %q", strategy))
 	}
+}
+
+func validateFUSERenewalReadiness(proof mountenrollment.RenewalReadiness, hosted bool, session string, deadline, now time.Time) error {
+	if !proof.Ready(!hosted, mountenrollment.Permit{}, session, deadline) || hosted && !deadline.After(now) {
+		return errors.New("initial renewal installation and deadline not proven")
+	}
+	return nil
 }
 
 func recordFUSERenewalEvent(events *mountlog.Writer, stateDir, mountPath, enrollmentID string, event mountenrollment.RenewalEvent, writeback *mountlog.WritebackStats) {

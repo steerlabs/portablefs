@@ -72,7 +72,7 @@ private func rrGolden(_ name: String) throws -> Data {
     let h = try WorkspaceControl.decode(rrGolden("hello")).hello
     status.bootID = h.bootID; status.hostServiceID = h.hostServiceID; status.guestServiceID = Data(repeating: 6, count: 16)
     status.state = "running"; status.generation = c.generation
-    var old = WorkspaceMountStatus(); old.mount.authorityID = Data(repeating: 1, count: 32); old.mount.volumeID = "v"; old.mount.incarnation = Data(repeating: 3, count: 16)
+    var old = WorkspaceMountStatus(); old.outcome = unknownTestOutcome(); old.mount.authorityID = Data(repeating: 1, count: 32); old.mount.volumeID = "v"; old.mount.incarnation = Data(repeating: 3, count: 16)
     old.retirementSequence = 1; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     status.retired = [old]
     ch.statuses.removeFirst()(.success(status))
@@ -104,7 +104,7 @@ private func rrGolden(_ name: String) throws -> Data {
     let h = try WorkspaceControl.decode(rrGolden("hello")).hello
     status.bootID = h.bootID; status.hostServiceID = h.hostServiceID; status.guestServiceID = Data(repeating: 6, count: 16)
     status.state = "running"; status.generation = c.generation
-    var r = WorkspaceMountStatus(); r.mount.authorityID = Data(repeating: 1, count: 32); r.mount.volumeID = "v"; r.mount.incarnation = Data(repeating: 3, count: 16)
+    var r = WorkspaceMountStatus(); r.outcome = unknownTestOutcome(); r.mount.authorityID = Data(repeating: 1, count: 32); r.mount.volumeID = "v"; r.mount.incarnation = Data(repeating: 3, count: 16)
     r.state = "terminal"; r.reason = "x"; r.cleanup = "complete"
     r.retirementSequence = 1; status.retired = [r]
     ch.statuses.removeFirst()(.success(status))

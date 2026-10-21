@@ -50,6 +50,7 @@ func (m *invariantMount) proof(ctx context.Context, g uint64) (Recovery, error) 
 	r := m.result
 	if r.Generation != math.MaxUint64 {
 		r.Generation = g
+		m.bindProof(&r)
 	}
 	return r, m.failure
 }
@@ -59,11 +60,11 @@ func (m *invariantMount) Prepare(ctx context.Context, g uint64) (Recovery, error
 func (m *invariantMount) Recover(ctx context.Context, tok *pb.ResumeToken) (Recovery, error) {
 	return m.proof(ctx, tok.Suspension.Generation)
 }
-func (m *invariantMount) OpenAdmission(g uint64) error {
+func (m *invariantMount) OpenAdmission(g, serial uint64) error {
 	if m.openFailure {
 		return errors.New("admission publication refused")
 	}
-	return m.fakeMount.OpenAdmission(g)
+	return m.fakeMount.OpenAdmission(g, serial)
 }
 
 // Exercise every recovery outcome and every public transition, checking the
@@ -78,7 +79,7 @@ func TestGuestEveryTransitionReplyEncodes(t *testing.T) {
 		{"stale-generation", func(m *invariantMount) { m.result.Generation = math.MaxUint64 }},
 		{"session", func(m *invariantMount) { m.result.SessionValidated = false }},
 		{"authorization", func(m *invariantMount) { m.result.AuthorizationValidated = false }},
-		{"renewal", func(m *invariantMount) { m.result.InitialRenewalInstalled = false }},
+		{"renewal", func(m *invariantMount) { m.result.Renewal.State = "pending" }},
 		{"subscription", func(m *invariantMount) { m.result.ColdSubscriptionInstalled = false }},
 		{"terminal", func(m *invariantMount) { m.result.State = "terminal" }},
 		{"authorization-required", func(m *invariantMount) { m.result.State = "authorization-required" }},

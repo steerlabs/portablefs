@@ -5,12 +5,18 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 )
+
+// ErrObsoleteInstallation reports a known remote success whose permission was
+// closed before local publication. The sequence advances, readiness does not.
+var ErrObsoleteInstallation = errors.New("renewal installation belongs to an obsolete permit")
 
 type GrantSource interface {
 	Refresh(context.Context, string, uint64) (controlplane.MountAuthorization, error)
@@ -18,7 +24,43 @@ type GrantSource interface {
 
 type GrantInstaller func(context.Context, string, uint64, []byte) (time.Time, error)
 
+// Permit identifies one permission interval, including repeated closes within a
+// generation. CheckPermit must be nonblocking; installers recheck it themselves.
+type Permit struct {
+	Generation uint64 `json:"generation,string"`
+	GateSerial uint64 `json:"gateSerial,string"`
+}
+type permitKey struct{}
+
+func WithPermit(ctx context.Context, p Permit) context.Context {
+	return context.WithValue(ctx, permitKey{}, p)
+}
+func PermitFromContext(ctx context.Context) (Permit, bool) {
+	p, ok := ctx.Value(permitKey{}).(Permit)
+	return p, ok
+}
+
+type RenewalReadiness struct {
+	State                 string    `json:"state"`
+	InstalledSequence     uint64    `json:"installedSequence,string"`
+	Permit                Permit    `json:"permit"`
+	SessionID             string    `json:"sessionId,omitempty"`
+	AuthorizationDeadline time.Time `json:"authorizationDeadline"`
+}
+
+func (r RenewalReadiness) Ready(standalone bool, p Permit, session string, deadline time.Time) bool {
+	if r.Permit != p {
+		return false
+	}
+	if r.State == "not-required" {
+		return standalone && r.InstalledSequence == 0
+	}
+	return !standalone && r.State == "installed" && r.InstalledSequence > 0 && r.SessionID == session && session != "" && r.AuthorizationDeadline.Equal(deadline) && !deadline.IsZero()
+}
+
 type RenewalStatus struct {
+	Readiness RenewalReadiness
+
 	AuthorizationDeadline time.Time
 	LastSuccess           time.Time
 	NextAttempt           time.Time
@@ -48,6 +90,25 @@ type RenewalEvent struct {
 }
 
 type Renewer struct {
+	// Managed requires an explicit Resume permit before dispatch. No implicit
+	// ordinary permit is available on this branch.
+	Managed                      bool
+	CheckPermit                  func(Permit) bool
+	mu                           sync.Mutex
+	running, initialized, parked bool
+	permit                       Permit
+	wake                         chan struct{}
+	attemptCancel                context.CancelFunc
+	attemptDone                  chan struct{}
+	session                      string
+	deadline, authorizedAt       time.Time
+	sequence                     uint64
+	pending                      *controlplane.MountAuthorization
+	readiness                    RenewalReadiness
+	status                       RenewalStatus
+	force                        bool
+	waitHook                     func(context.Context, time.Time, <-chan struct{}) error
+
 	Source  GrantSource
 	Now     func() time.Time
 	Observe func(RenewalEvent)
@@ -58,128 +119,279 @@ type Renewer struct {
 	MinimumSafetyMargin time.Duration
 }
 
-// Run owns the one monotonic reauthorization sequence for a mount. It refreshes
-// immediately, then once near the middle of each installed grant. A failed
-// request is retried with the same sequence and therefore the same durable
-// Manager response until the safe cutoff, at which point the mount owner must
-// fail closed while the last authorization is still valid.
-func (renewer *Renewer) Run(ctx context.Context, sessionID string, initialDeadline time.Time, install GrantInstaller) error {
-	if renewer == nil || renewer.Source == nil || sessionID == "" || !initialDeadline.After(renewer.now()) || install == nil {
+// Park revokes local dispatch immediately and joins the current source/installer.
+// An uncooperative installer retains its owner until it actually returns.
+func (r *Renewer) Park(ctx context.Context) error {
+	r.mu.Lock()
+	r.parked = true
+	r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+	if r.attemptCancel != nil {
+		r.attemptCancel()
+	}
+	done := r.attemptDone
+	r.signalLocked()
+	r.mu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+func (r *Renewer) Resume(p Permit) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Managed && (r.CheckPermit == nil || !r.CheckPermit(p)) {
+		return errors.New("renewal resume requires a current permit")
+	}
+	if r.parked && r.attemptDone != nil {
+		return errors.New("renewal resume waits for the parked installation owner")
+	}
+	r.permit = p
+	r.parked = false
+	r.force = true
+	r.readiness = RenewalReadiness{State: "pending", Permit: p}
+	r.signalLocked()
+	return nil
+}
+func (r *Renewer) RefreshNow() { r.mu.Lock(); r.force = true; r.signalLocked(); r.mu.Unlock() }
+func (r *Renewer) Readiness() RenewalReadiness {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running || !r.allowedLocked() || !r.readiness.AuthorizationDeadline.After(r.now()) {
+		return RenewalReadiness{State: "pending", Permit: r.permit}
+	}
+	return r.readiness
+}
+func (r *Renewer) signalLocked() {
+	if r.wake == nil {
+		r.wake = make(chan struct{}, 1)
+	}
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+func (r *Renewer) allowedLocked() bool {
+	return !r.parked && (!r.Managed || (r.CheckPermit != nil && r.CheckPermit(r.permit)))
+}
+func (r *Renewer) wait(ctx context.Context, target time.Time) error {
+	r.mu.Lock()
+	if r.wake == nil {
+		r.wake = make(chan struct{}, 1)
+	}
+	wake := r.wake
+	r.mu.Unlock()
+	if r.waitHook != nil {
+		return r.waitHook(ctx, target, wake)
+	}
+	var tick <-chan time.Time
+	if !target.IsZero() {
+		timer := time.NewTimer(max(time.Duration(0), target.Sub(r.now())))
+		defer timer.Stop()
+		tick = timer.C
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-wake:
+		return nil
+	case <-tick:
+		return nil
+	}
+}
+
+// Run is the sole dispatcher. Reentry continues the same session, sequence and
+// exact pending grant; a second concurrent runner or a new session is refused.
+func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline time.Time, install GrantInstaller) error {
+	if r == nil || r.Source == nil || sessionID == "" || install == nil {
 		return errors.New("complete automatic mount renewal configuration is required")
 	}
-	timeout := renewer.Timeout
+	r.mu.Lock()
+	if r.running || (r.initialized && r.session != sessionID) {
+		r.mu.Unlock()
+		return errors.New("renewal owner already bound")
+	}
+	if !r.initialized {
+		if !initialDeadline.After(r.now()) {
+			r.mu.Unlock()
+			return errors.New("live initial authorization required")
+		}
+		r.initialized = true
+		r.session = sessionID
+		r.sequence = 1
+		r.deadline = initialDeadline
+		r.authorizedAt = r.now()
+		r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+		r.status = RenewalStatus{AuthorizationDeadline: initialDeadline, Sequence: 1}
+	}
+	r.running = true
+	r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+	r.force = true
+	r.mu.Unlock()
+	defer func() { r.mu.Lock(); r.running = false; r.mu.Unlock() }()
+	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	deadline := initialDeadline
-	authorizedAt := renewer.now()
-	var sequence uint64 = 1
-	status := RenewalStatus{AuthorizationDeadline: deadline, Sequence: sequence}
-	stop := func() error {
-		status.NextAttempt = time.Time{}
-		status.ConsecutiveFailures = 0
-		status.LastError = ""
-		renewer.observe(RenewalStopped, status)
-		return nil
-	}
+	backoff := 500 * time.Millisecond
 	for {
 		if ctx.Err() != nil {
-			return stop()
+			r.emit(RenewalStopped, time.Time{}, "", 0)
+			return nil
 		}
-		status.AuthorizationDeadline = deadline
-		status.Sequence = sequence
-		if sequence > 1 {
-			next := refreshTime(renewer.now(), deadline, sessionID, sequence)
-			status.NextAttempt = next
-			status.ConsecutiveFailures = 0
-			status.LastError = ""
-			renewer.observe(RenewalScheduled, status)
-			if err := waitUntil(ctx, renewer.now, next); err != nil {
-				return stop()
+		r.mu.Lock()
+		if !r.allowedLocked() {
+			r.mu.Unlock()
+			if r.wait(ctx, time.Time{}) != nil {
+				continue
 			}
+			continue
 		}
-		backoff := 500 * time.Millisecond
-		var failures uint64
-		cutoff := safeCutoff(authorizedAt, deadline, renewer.MinimumSafetyMargin)
-		for {
-			if ctx.Err() != nil {
-				return stop()
-			}
-			now := renewer.now()
-			if !now.Before(cutoff) {
-				err := errors.New("automatic mount reauthorization reached its safe cutoff")
-				status.NextAttempt = time.Time{}
-				status.ConsecutiveFailures = failures
-				status.LastError = boundedError(err)
-				renewer.observe(RenewalCutoff, status)
-				return err
-			}
-			attemptDeadline := now.Add(timeout)
-			if cutoff.Before(attemptDeadline) {
-				attemptDeadline = cutoff
-			}
-			attemptCtx, cancel := context.WithDeadline(ctx, attemptDeadline)
-			grant, err := renewer.Source.Refresh(attemptCtx, sessionID, sequence)
+		cutoff := safeCutoff(r.authorizedAt, r.deadline, r.MinimumSafetyMargin)
+		next := r.status.NextAttempt
+		if r.force {
+			next = time.Time{}
+			r.force = false
+		}
+		if next.After(r.now()) {
+			r.mu.Unlock()
+			_ = r.wait(ctx, next)
+			continue
+		}
+		if !r.now().Before(cutoff) {
+			r.mu.Unlock()
+			err := errors.New("automatic mount reauthorization reached its safe cutoff")
+			r.emit(RenewalCutoff, time.Time{}, boundedError(err), r.statusFailures())
+			return err
+		}
+		p, seq, session := r.permit, r.sequence, r.session
+		deadline := minTime(r.now().Add(timeout), cutoff)
+		attemptCtx, cancel := context.WithDeadline(WithPermit(ctx, p), deadline)
+		r.attemptCancel = cancel
+		done := make(chan struct{})
+		r.attemptDone = done
+		pending := r.pending
+		r.mu.Unlock()
+		var err error
+		if pending == nil {
+			var grant controlplane.MountAuthorization
+			grant, err = r.Source.Refresh(attemptCtx, session, seq)
 			if err == nil {
-				var installed time.Time
-				installed, err = install(attemptCtx, grant.Capability, sequence, []byte(grant.ClientCertificatePEM))
-				if err == nil {
-					if installed.Unix() != grant.ExpiresUnix || !installed.After(renewer.now()) {
-						err = errors.New("authority installed a deadline different from the Manager grant")
-					} else {
-						deadline = installed
-						authorizedAt = renewer.now()
-					}
-				}
-			}
-			cancel()
-			if ctx.Err() != nil {
-				return stop()
-			}
-			if err == nil {
-				status.AuthorizationDeadline = deadline
-				status.LastSuccess = authorizedAt
-				status.NextAttempt = time.Time{}
-				status.ConsecutiveFailures = 0
-				status.LastError = ""
-				renewer.observe(RenewalSucceeded, status)
-				sequence++
-				break
-			}
-			if errors.Is(err, ErrDefinitiveDenial) {
-				resultErr := fmt.Errorf("automatic mount enrollment was denied: %w", err)
-				status.NextAttempt = time.Time{}
-				status.ConsecutiveFailures = failures + 1
-				status.LastError = boundedError(resultErr)
-				renewer.observe(RenewalDenied, status)
-				return resultErr
-			}
-			failures++
-			now = renewer.now()
-			if !now.Add(backoff).Before(cutoff) {
-				resultErr := fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
-				status.NextAttempt = time.Time{}
-				status.ConsecutiveFailures = failures
-				status.LastError = boundedError(resultErr)
-				renewer.observe(RenewalCutoff, status)
-				return resultErr
-			}
-			next := now.Add(backoff)
-			status.NextAttempt = next
-			status.ConsecutiveFailures = failures
-			status.LastError = boundedError(err)
-			renewer.observe(RenewalRetrying, status)
-			if err := waitUntil(ctx, renewer.now, next); err != nil {
-				return stop()
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
+				if grant.Sequence != seq || (grant.SessionID != "" && grant.SessionID != session) || grant.Capability == "" || grant.ExpiresUnix <= 0 {
+					err = fmt.Errorf("invalid Manager renewal grant: %w", ErrDefinitiveDenial)
+				} else {
+					r.mu.Lock()
+					r.pending = &grant
+					pending = r.pending
+					r.mu.Unlock()
 				}
 			}
 		}
+		r.mu.Lock()
+		allowed := r.allowedLocked() && r.permit == p && attemptCtx.Err() == nil
+		r.mu.Unlock()
+		installed := time.Time{}
+		if err == nil && allowed {
+			installed, err = install(attemptCtx, pending.Capability, seq, []byte(pending.ClientCertificatePEM))
+		}
+		r.mu.Lock()
+		// A successful installer is a known remote installation even if Park/Close
+		// raced it. Keep that sequence before considering readiness publication.
+		obsolete := errors.Is(err, ErrObsoleteInstallation)
+		known := (err == nil || obsolete) && allowed
+		if known {
+			if obsolete {
+				err = nil
+			}
+			r.pending = nil
+			if seq == math.MaxUint64 {
+				err = fmt.Errorf("renewal sequence exhausted: %w", ErrDefinitiveDenial)
+			} else {
+				r.sequence++
+			}
+			if !installed.Equal(time.Unix(pending.ExpiresUnix, 0)) || !installed.After(r.now()) {
+				err = fmt.Errorf("authority installed a deadline different from the Manager grant: %w", ErrDefinitiveDenial)
+			} else {
+				r.deadline = installed
+				r.authorizedAt = r.now()
+				if r.allowedLocked() && r.permit == p && ctx.Err() == nil && !obsolete {
+					r.readiness = RenewalReadiness{State: "installed", InstalledSequence: seq, Permit: p, SessionID: session, AuthorizationDeadline: installed}
+				}
+			}
+		}
+		r.attemptCancel = nil
+		r.attemptDone = nil
+		cancel()
+		close(done)
+		current := r.allowedLocked() && r.permit == p
+		r.mu.Unlock()
+		if !current {
+			continue
+		}
+		if ctx.Err() != nil {
+			continue
+		}
+		if err == nil && !known {
+			continue
+		}
+		if err == nil {
+			backoff = 500 * time.Millisecond
+			r.emit(RenewalSucceeded, time.Time{}, "", 0)
+			r.mu.Lock()
+			next = refreshTime(r.now(), r.deadline, session, r.sequence)
+			r.mu.Unlock()
+			if ctx.Err() == nil {
+				r.emit(RenewalScheduled, next, "", 0)
+			}
+			continue
+		}
+		failures := r.statusFailures() + 1
+		if errors.Is(err, ErrDefinitiveDenial) {
+			r.emit(RenewalDenied, time.Time{}, boundedError(err), failures)
+			return err
+		}
+		next = r.now().Add(backoff)
+		if !next.Before(cutoff) {
+			resultErr := fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
+			r.emit(RenewalCutoff, time.Time{}, boundedError(resultErr), failures)
+			return resultErr
+		}
+		r.emit(RenewalRetrying, next, boundedError(err), failures)
+		backoff = min(30*time.Second, backoff*2)
 	}
+}
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+func (r *Renewer) statusFailures() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status.ConsecutiveFailures
+}
+func (r *Renewer) emit(kind RenewalEventKind, next time.Time, message string, failures uint64) {
+	r.mu.Lock()
+	r.status.AuthorizationDeadline = r.deadline
+	r.status.Sequence = r.sequence
+	if kind == RenewalSucceeded {
+		r.status.Sequence--
+		r.status.LastSuccess = r.authorizedAt
+	}
+	r.status.NextAttempt = next
+	r.status.LastError = message
+	r.status.ConsecutiveFailures = failures
+	r.status.Readiness = r.readiness
+	if !r.allowedLocked() || kind == RenewalStopped || kind == RenewalCutoff || kind == RenewalDenied {
+		r.status.Readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+	}
+	status := r.status
+	r.mu.Unlock()
+	r.observe(kind, status)
 }
 
 func boundedError(err error) string {

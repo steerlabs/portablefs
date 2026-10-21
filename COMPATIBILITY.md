@@ -106,6 +106,7 @@ another, and none is bumped to match another.
 | Linux kernel FUSE | protocol 7.31 or newer | Refused during FUSE INIT below 7.31. |
 | Authority host kernel | Linux 5.17 final or newer | Refused at storage startup below 5.17 and for 5.17 release candidates; later release candidates are accepted. |
 | `pfslocal` (daemon to FSKit extension) | 2.0 | Exact major and minor; paired within one signed release. |
+| Linux workspace control | `8` | Exact paired, unreleased host/guest and local mount controls; typed renewal and outcome evidence. No older decoder. |
 | Daemon operational control | `2` | Exact; `X-PortableFS-Control-Protocol` header and `/v2/` paths; paired within one signed release. |
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |

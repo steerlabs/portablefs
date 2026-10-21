@@ -6,9 +6,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -63,8 +66,11 @@ func fuseRevocation(report fusev3.RevocationReport) mountRevocation {
 // fuseV3Mount is one live fusev3 kernel mount plus the routing it was
 // admitted with.
 type fuseV3Mount struct {
-	mount  *fusev3.Mount
-	client *authorityrpc.Client
+	renewalMu   sync.Mutex
+	managed     bool
+	checkPermit func(mountenrollment.Permit) bool
+	mount       *fusev3.Mount
+	client      *authorityrpc.Client
 	// routes is the volume-declared route set this mount serves and the
 	// declaration revision the authority pinned the attach to. Never
 	// per-machine: the v3 attach protocol admits only the volume's topology.
@@ -97,11 +103,43 @@ func (m *fuseV3Mount) AuthorizationSessionID() string {
 	}
 	return base64.RawURLEncoding.EncodeToString(id[:])
 }
+func (m *fuseV3Mount) AuthorizationDeadline() time.Time { return m.client.AuthorizationDeadline() }
 func (m *fuseV3Mount) InitialAuthorizationDeadline() time.Time {
 	return m.client.InitialAuthorizationDeadline()
 }
 func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
-	return m.client.ReauthorizeWithCertificate(ctx, []byte(token), sequence, certificatePEM, time.Now())
+	m.renewalMu.Lock()
+	defer m.renewalMu.Unlock()
+	permitted := func() bool {
+		if !m.managed {
+			return true
+		}
+		p, ok := mountenrollment.PermitFromContext(ctx)
+		return ok && m.checkPermit != nil && m.checkPermit(p)
+	}
+	if !permitted() {
+		return time.Time{}, errors.New("managed reauthorization requires current generation/serial permit")
+	}
+	session, changed, err := m.mount.CurrentAuthorizationSession()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if session != m.client {
+		return time.Time{}, errors.New("reauthorization session changed")
+	}
+	deadline, err := m.client.ReauthorizeWithCertificate(ctx, []byte(token), sequence, certificatePEM, time.Now())
+	if err != nil {
+		return deadline, err
+	}
+	select {
+	case <-changed:
+		return deadline, mountenrollment.ErrObsoleteInstallation
+	default:
+	}
+	if !permitted() {
+		return deadline, mountenrollment.ErrObsoleteInstallation
+	}
+	return deadline, nil
 }
 
 // mountFUSEv3 attaches the authority under the exact declared transport and

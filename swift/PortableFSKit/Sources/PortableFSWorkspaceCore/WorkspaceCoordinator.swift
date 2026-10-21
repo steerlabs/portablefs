@@ -259,7 +259,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             }
             self.mountStatus = ack.mounts.map {
                 var status = WorkspaceMountStatus(); status.mount = $0.mount
-                status.state = "suspended-cold"; status.cleanup = "retained"; status.loss = $0.loss; return status
+                status.state = "suspended-cold"; status.cleanup = "retained"; status.loss = $0.loss; status.outcome = $0.outcome; return status
             }
             self.pause(cold: ack.suspension)
         }
