@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,11 +30,26 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 		}
 	}
 	run("create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest", image)
-	// Spotlight, fseventsd and Disk Arbitration may briefly open a freshly
-	// attached volume, so an unforced detach of this private fixture can return
-	// EBUSY. This test proves EVFILT_FS delivery and inventory absence, not
-	// unmount politeness, so the fixture always forces its own detach.
-	detach := func() { run("detach", "-quiet", "-force", mount) }
+	// Disk Arbitration and system scanners can keep a freshly attached image
+	// busy on hosted runners, refusing even a forced detach with EBUSY (exit
+	// 16) for a short time. This test proves EVFILT_FS delivery and inventory
+	// absence, not detach latency, so the fixture waits until Disk Arbitration
+	// releases its own private image. Any other failure is reported at once.
+	detach := func() {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			out, err := exec.Command("/usr/bin/hdiutil", "detach", "-quiet", "-force", mount).CombinedOutput()
+			var exit *exec.ExitError
+			if err == nil {
+				return
+			}
+			if !errors.As(err, &exit) || exit.ExitCode() != 16 || time.Now().After(deadline) {
+				t.Fatalf("hdiutil detach %s: %v: %s", mount, err, out)
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
 	mounted := false
 	t.Cleanup(func() {
 		if mounted {
