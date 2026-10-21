@@ -100,70 +100,6 @@ func TestGuestOvertakenPrepareRetainsLossAndUnobservedOutcome(t *testing.T) {
 		t.Fatal("failed prepare evidence lost", status)
 	}
 }
-func TestGuestPrepareAndRecoverOwnLogicalTransientOutageBeyond45Seconds(t *testing.T) {
-	for _, initial := range []bool{true, false} {
-		t.Run(map[bool]string{true: "prepare", false: "recover"}[initial], func(t *testing.T) {
-			s, m, mid := registeredForReadiness(t)
-			start := time.Unix(100, 0)
-			now := start
-			attempts := 0
-			retry := func(ctx context.Context, g uint64) (Recovery, error) {
-				// Bounded network attempts advance injected elapsed time. The same valid
-				// session, generation and renewal object remain owned throughout the job.
-				for attempts < 6 {
-					if ctx.Err() != nil {
-						return Recovery{}, ctx.Err()
-					}
-					now = now.Add(10 * time.Second)
-					attempts++
-				}
-				r := ready()
-				r.Generation = g
-				m.bindProof(&r)
-				return r, nil
-			}
-			if initial {
-				im := &transientPrepareMount{prepare: retry}
-				im.CloseAdmission(0)
-				// Rebind to the actual embedded owner; the fixture has never activated.
-				retryOwner := func(ctx context.Context, g uint64) (Recovery, error) {
-					r, err := retry(ctx, g)
-					im.bindProof(&r)
-					return r, err
-				}
-				im.prepare = retryOwner
-				s.mounts[control.MountKey(mid)].driver = im
-				if err := s.Activate(context.Background(), mid, 0); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if err := s.Activate(context.Background(), mid, 0); err != nil {
-					t.Fatal(err)
-				}
-				x := cold(t, s, mid)
-				m.recover = func(ctx context.Context, tok *pb.ResumeToken) (Recovery, error) {
-					return retry(ctx, tok.Suspension.Generation)
-				}
-				if _, err := resumeAndWait(t, s, context.Background(), token(x)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if now.Sub(start) <= 45*time.Second || attempts != 6 || s.Status().Mounts[0].State != "ready" {
-				t.Fatal("logical recovery timed out")
-			}
-		})
-	}
-}
-
-type transientPrepareMount struct {
-	fakeMount
-	prepare func(context.Context, uint64) (Recovery, error)
-}
-
-func (m *transientPrepareMount) Prepare(c context.Context, g uint64) (Recovery, error) {
-	return m.prepare(c, g)
-}
-
 func TestGuestPreparationOutlivesObservationContext(t *testing.T) {
 	s, _, mid := registeredForReadiness(t)
 	m := &invariantMount{entered: make(chan struct{}), proceed: make(chan struct{}), result: ready()}
@@ -173,9 +109,58 @@ func TestGuestPreparationOutlivesObservationContext(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.Activate(ctx, mid, 0) }()
 	<-m.entered
+	if _, ok := m.context.Deadline(); ok {
+		t.Fatal("Prepare inherited a waiter deadline")
+	}
 	cancel()
 	close(m.proceed)
 	if err := <-done; err != nil || s.Status().Mounts[0].State != "ready" {
 		t.Fatal("observer canceled generation-owned Prepare", err)
+	}
+}
+
+func TestGuestOutcomeEvidenceAndDebtAreMonotonic(t *testing.T) {
+	s, _, mid := registeredForReadiness(t)
+	e := s.mounts[control.MountKey(mid)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, o := range []*pb.MountOutcome{
+		{Durability: "durable", Observation: "observed", Release: "released", CleanupDebt: 5},
+		{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: 1},
+		{Durability: "unresolved", Observation: "observed", Release: "unresolved", CleanupDebt: 2},
+	} {
+		if err := s.mergeEvidenceLocked(e, nil, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := e.status.Outcome
+	if got.Durability != "durable" || got.Observation != "observed" || got.Release != "released" || got.CleanupDebt != 5 {
+		t.Fatal("evidence regressed", got)
+	}
+	if err := s.mergeEvidenceLocked(e, nil, &pb.MountOutcome{Durability: "lost", Observation: "observed", Release: "abandoned", CleanupDebt: 7}); err == nil {
+		t.Fatal("contradictory outcome accepted")
+	}
+	if got := e.status.Outcome; got.Durability != "durable" || got.Release != "released" || got.CleanupDebt != 7 {
+		t.Fatal("contradiction discarded prior evidence or debt", got)
+	}
+}
+func TestGuestFailedOpenPreservesOutcomeEvidence(t *testing.T) {
+	s, _, mid := registeredForReadiness(t)
+	m := &invariantMount{openFailure: true}
+	m.CloseAdmission(0)
+	e := s.mounts[control.MountKey(mid)]
+	e.driver = m
+	e.status.Outcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released", CleanupDebt: 4}
+	r := ready()
+	m.bindProof(&r)
+	s.mu.Lock()
+	err := s.publishRecoveryLocked(context.Background(), e, 0, r, nil)
+	s.mu.Unlock()
+	if err == nil {
+		t.Fatal("failed Open published")
+	}
+	got := s.Status().Mounts[0].Outcome
+	if got.Durability != "durable" || got.Observation != "observed" || got.Release != "released" || got.CleanupDebt != 4 {
+		t.Fatal("failed Open reset outcome", got)
 	}
 }

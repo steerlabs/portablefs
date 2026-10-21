@@ -59,8 +59,7 @@ func Credentials(c *net.UnixConn) (Peer, error) {
 	if u == nil {
 		return Peer{}, ErrGrammar
 	}
-	start, err := ProcessStart(u.Pid)
-	return Peer{UID: u.Uid, PID: u.Pid, Start: start}, err
+	return Peer{UID: u.Uid, PID: u.Pid}, nil
 }
 func Classify(peer Peer, user uint32, supervisor *Peer) PeerClass {
 	if supervisor != nil && supervisor.UID == 0 && supervisor.PID > 0 && supervisor.Start > 0 && peer == *supervisor {
@@ -129,6 +128,25 @@ func receiveAncillary(rights *Rights, raw []byte, flags int) error {
 		return ErrGrammar
 	}
 	return nil
+}
+
+// FullHangup excludes POLLRDHUP: only a write-half-close frames a request.
+func FullHangup(c *net.UnixConn) (bool, error) {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return false, err
+	}
+	var gone bool
+	var inner error
+	err = raw.Control(func(fd uintptr) {
+		p := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLHUP | unix.POLLERR}}
+		_, inner = unix.Poll(p, 0)
+		gone = p[0].Revents&(unix.POLLHUP|unix.POLLERR|unix.POLLNVAL) != 0
+	})
+	if err != nil {
+		return false, err
+	}
+	return gone, inner
 }
 
 // WatchDisconnect ignores POLLRDHUP (the required framing half-close). It

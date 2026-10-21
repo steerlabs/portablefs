@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"io"
 	"os"
 	"syscall"
@@ -13,7 +14,7 @@ import (
 
 // maxClientIdentityBytes bounds each identity PEM file. A real manager-issued
 // certificate or key is a few kilobytes; anything near this bound is not one.
-const maxClientIdentityBytes = 256 << 10
+const maxClientIdentityBytes = mountenrollment.MaxClientIdentityBytes
 
 // clientTLSIdentity is the manager-issued mutual-TLS identity a v3 mount
 // presents to the authority. Both the parsed pair (the Linux dial installs it

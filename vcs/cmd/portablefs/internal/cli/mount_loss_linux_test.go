@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"io"
 	"net"
 	"os"
@@ -136,10 +137,11 @@ func TestMountLossValidatesRequestAndKernelPeerCredentials(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := requireSameUserPeer(connection); err != nil {
+		peer, err := mountcontrol.Credentials(connection)
+		if err != nil || mountcontrol.Classify(peer, uint32(os.Geteuid()), nil) != mountcontrol.Ordinary {
 			t.Fatalf("kernel same-user peer: %v", err)
 		}
-		if err := requireUserPeer(connection, uint32(os.Geteuid())+1); err == nil {
+		if mountcontrol.Classify(peer, uint32(os.Geteuid())+1, nil) != mountcontrol.Refused {
 			t.Fatal("different required uid accepted the kernel peer credential")
 		}
 		_ = connection.SetDeadline(time.Now().Add(time.Second))

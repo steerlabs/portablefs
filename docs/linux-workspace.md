@@ -84,8 +84,9 @@ Peers are classified before capacity reservation: the exact seeded root
 UID/PID/start identity has two reserved connections, with separate phase and
 observation lanes; same-UID ordinary clients retain eight connections and their
 accepted renewal order. Workspace phases bypass that ordinary queue. Managed
-manual renewal requires an explicit current permit; loss observation remains
-available while closed.
+manual renewal is explicitly refused: the automatic renewal owner is exclusive.
+Loss observation remains available while closed. Ordinary peers are classified
+by UID alone; only the seeded root PID requires a readable start witness.
 
 Local workspace format 8 uses strict JSON keys and string-encoded canonical
 uint64 values. Prepare, Recover, Suspend and Cleanup begin an operation with
@@ -95,21 +96,36 @@ Recover carries the complete ResumeToken. Their protobuf bodies use the paired
 canonical scanner, independently of the host Suspend rule that forbids a roster.
 The finite response states are accepted, preparing, kernel-required,
 pending-recovery, pending-suspend, prepared, cold, install-complete,
-unmount-required, unmount-recorded, cleanup-finalized and failed. Only prepared
+unmount-required, unmount-recorded, cleanup-finalized, failed and refused. Only prepared
 carries readiness. Each response is immutable: a new observation ID obtains a
-later snapshot. Missing lifecycle handlers return unavailable.
+later snapshot. A refusal has `ok=false`, state `refused`, the exact compact
+request binding and one finite code: unavailable, occupied, retired, invalid,
+handler-failed, deadline, stopped or peer-refused. It carries unknown disposition evidence,
+never an unbounded diagnostic or successful readiness. Successful responses have
+`ok=true`. Both variants use the same exact codec. Compact bindings omit the
+transaction and phase payload; each witness totals at most 512 bytes, each
+phase's options total at most 256 bytes, and reason/loss limits bound the
+response before dispatch.
 
 The replay owner retains at most the active start receipt, latest completed
-phase and latest observation, with a request high-water mark. Observations do
+phase and latest observation, with a high-water mark per lane. Observations do
 not evict installation receipts. Retired IDs never execute again; changed
 retained requests close permission. Retry socket budgets do not change immutable
 transaction identity or extend the captured Suspend deadline. A write-half-close
 frames a request and permits its response. Full hangup or exact process death
-cancels the waiter; generation-owned jobs and assigned cleanup survive it.
+cancels the waiter; dispatched handlers own their first receipt deadline and
+outlive waiter cancellation. Generation-owned jobs and assigned cleanup survive
+it. Suspend's first receipt deadline bounds only that Suspend request, never
+later observations. A full hangup during framing is transport loss; a malformed
+half-closed frame closes admission.
 Only install-kernel carries rights: exactly two ordered, distinct descriptors,
 FUSE then the duplicate abort witness. Receipt uses close-on-exec recvmsg;
 rejections and duplicate deliveries close all newly received descriptors.
-Actual device/bootstrap qualification belongs to the later protected-path driver.
+The bounded install receipt retains duplicate owners and compares open
+descriptions with same-process `kcmp(KCMP_FILE)`. Fresh opens of the same inode
+are refused; an unavailable comparison never certifies a replay. Control
+shutdown joins dispatches and closes the retained owners. Completed jobs clear
+outstanding kernel actions. Actual device/bootstrap qualification belongs to the later protected-path driver.
 
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
@@ -119,7 +135,21 @@ when a later Close suppresses readiness. The managed installer itself rejects
 missing or stale generation/serial permits. Hosted CLI readiness requires the
 first successful installer and exact Manager/installed deadline equality;
 explicit standalone readiness is not-required. Starting a goroutine or exposing
-a socket provides no renewal evidence.
+a socket provides no renewal evidence. Kernel termination and SIGINT/SIGTERM
+are supervised during the first renewal. The child bounds startup at two
+minutes from entry, leaving rollback time inside the parent's three-minute
+limit; renewal failure is delivered before detach retries finish.
+
+Managed Resume republishes a recorded, still-valid installation under the new
+permit without obtaining a new Manager sequence. RefreshNow preserves the normal
+mid-window refresh schedule, beyond the Manager minimum interval. Pending unknown installs reconcile their
+exact sequence/body even past the previous authorization deadline. Managed
+closed preparation retries transient failures with bounded attempts and backoff
+until a definitive outcome or generation cancellation; it grants no serving
+extension. Ordinary renewal retains its safety cutoff. All owners invalidate
+readiness atomically on terminal denial or cutoff and before stop observation.
+Malformed Manager grants and installed-deadline mismatches terminate automatic
+renewal on Linux and macOS rather than retrying an untrustworthy grant.
 
 Paired status uses renewal states pending, installed with a positive sequence,
 and explicit standalone not-required with sequence zero. Every status/cold
@@ -128,7 +158,10 @@ entry carries durability (`durable`, `lost`, `unresolved`), observation
 `unresolved`) and counted cleanup debt. Initial unknown evidence is
 unresolved/unobserved. Known loss remains separately cumulative and survives
 failed or overtaken Prepare/Recover, cold completion, replacement and retirement.
-Unknown observation cannot certify durability or release.
+Unknown observation cannot certify durability or release. Within an interval,
+new evidence cannot erase a known disposition or reduce cleanup debt. Only a
+successful admission publication starts fresh disposition evidence; failed Open
+retains it. Cleanup debt and loss remain cumulative across intervals.
 
 Close advances an exact serial even within one generation. It immediately denies
 new admission and defeats delayed prepared publication; it does not retract an

@@ -119,11 +119,16 @@ func TestWorkspaceRootReserveBypassesPartialOrdinarySaturation(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection.CloseWrite()
-	var response mountcontrol.Response
-	if err := json.NewDecoder(connection).Decode(&response); err != nil {
+	body, rights, err := mountcontrol.Receive(connection, mountcontrol.MaxWorkspaceResponse)
+	defer rights.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if response.OK || !strings.Contains(response.Error, "unavailable") {
+	response, err := mountcontrol.DecodeResponse(body, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.OK || response.Workspace.Refusal != "unavailable" {
 		t.Fatal("real workspace handler unexpectedly enabled", response)
 	}
 }

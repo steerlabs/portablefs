@@ -35,3 +35,13 @@ func TestHostedReadyRequiresInstalledRenewalAndExactDeadline(t *testing.T) {
 		t.Fatal("sequence zero ready")
 	}
 }
+
+func TestInitialRenewalCannotPublishAfterStartupBound(t *testing.T) {
+	installed := make(chan struct{})
+	close(installed)
+	for i := 0; i < 100; i++ {
+		if err := awaitInitialFUSERenewal(installed, nil, nil, nil, time.Now().Add(-time.Second)); err == nil {
+			t.Fatal("queued installation crossed the startup deadline")
+		}
+	}
+}

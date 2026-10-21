@@ -320,7 +320,25 @@ func (s *Supervisor) mergeEvidenceLocked(e *entry, loss []*pb.Loss, outcome *pb.
 	if outcome != nil {
 		outcomeErr = control.Outcome(outcome)
 		if outcomeErr == nil {
-			e.status.Outcome = clone(outcome)
+			old := e.status.Outcome
+			merged := clone(old)
+			merged.CleanupDebt = max(old.CleanupDebt, outcome.CleanupDebt)
+			if outcome.Observation == "observed" {
+				merged.Observation = "observed"
+				for _, pair := range [][2]*string{{&merged.Durability, &outcome.Durability}, {&merged.Release, &outcome.Release}} {
+					if *pair[0] == "unresolved" {
+						*pair[0] = *pair[1]
+					} else if *pair[1] != "unresolved" && *pair[0] != *pair[1] {
+						outcomeErr = refused("contradictory outcome evidence")
+					}
+				}
+			}
+			// Debt survives even a contradictory snapshot; it is cumulative evidence.
+			if outcomeErr != nil {
+				old.CleanupDebt = merged.CleanupDebt
+			} else {
+				e.status.Outcome = merged
+			}
 		}
 	}
 	return errors.Join(outcomeErr, s.mergeLossLocked(e, loss))
@@ -434,11 +452,12 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 		err = ctx.Err()
 	}
 	if err == nil && r.ready(g, e.gateSerial) {
-		outcome := control.UnknownOutcome()
-		outcome.CleanupDebt = e.status.Outcome.CleanupDebt
-		e.status.Outcome = outcome
 		err = e.driver.OpenAdmission(g, e.gateSerial)
 		if err == nil {
+			// Only a published serving interval starts fresh disposition evidence.
+			outcome := control.UnknownOutcome()
+			outcome.CleanupDebt = e.status.Outcome.CleanupDebt
+			e.status.Outcome = outcome
 			e.status.Renewal = &pb.RenewalReadiness{State: r.Renewal.State, InstalledSequence: r.Renewal.InstalledSequence}
 			e.setStatus("ready", "", "")
 			e.cold = false

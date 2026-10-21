@@ -57,7 +57,9 @@ func TestRenewerParkRetainsExactUnknownGrantAndSequence(t *testing.T) {
 	entered := make(chan uint64, 3)
 	release := make(chan struct{})
 	succeeded := make(chan RenewalEvent, 3)
-	r := &Renewer{Managed: true, CheckPermit: func(p Permit) bool { return p.Generation == 9 && p.GateSerial == current.Load() }}
+	var elapsed atomic.Int64
+	start := time.Now()
+	r := &Renewer{Managed: true, Now: func() time.Time { return start.Add(time.Duration(elapsed.Load())) }, CheckPermit: func(p Permit) bool { return p.Generation == 9 && p.GateSerial == current.Load() }}
 	r.Source = sourceFunc(func(_ context.Context, s string, n uint64) (controlplane.MountAuthorization, error) {
 		refreshes.Add(1)
 		return grantFor(s, n, deadline), nil
@@ -121,6 +123,7 @@ func TestRenewerParkRetainsExactUnknownGrantAndSequence(t *testing.T) {
 	if e.Status.Readiness.Permit != (Permit{9, 2}) || refreshes.Load() != 1 {
 		t.Fatalf("grant was refreshed instead of reconciled: %+v, calls=%d", e, refreshes.Load())
 	}
+	elapsed.Store(int64(4 * time.Minute))
 	r.RefreshNow()
 	if await(t, entered) != 2 {
 		t.Fatal("accepted sequence reset to one")

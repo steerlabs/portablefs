@@ -19,8 +19,6 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
-
-	"golang.org/x/sys/unix"
 )
 
 const maxLocalReauthorizationRequestBytes = mountcontrol.MaxOrdinaryRequest
@@ -34,10 +32,9 @@ type localReauthorizationResponse = mountcontrol.Response
 // Workspace handlers stay nil until the real lifecycle, kernel and clock
 // owners exist. A seeded supervisor alone never enables managed mounts.
 type workspaceControlConfig struct {
-	Supervisor   mountcontrol.Peer
-	Handler      mountcontrol.Handler
-	Replay       mountcontrol.Replay
-	ManualPermit func(context.Context) bool
+	Supervisor mountcontrol.Peer
+	Handler    mountcontrol.Handler
+	Replay     mountcontrol.Replay
 }
 
 type unixReauthorizationControl struct {
@@ -91,7 +88,7 @@ func startFuseMountControl(handler fuseReauthorizationHandler, lossSnapshot fuse
 // to durable mount state: an abstract address disappears with its listener and
 // cannot leave a stale filesystem node after a crash. A cryptographic nonce
 // prevents another process from predicting and pre-binding the address, while
-// requireSameUserPeer remains the authorization boundary after connect.
+// SO_PEERCRED supplies the UID authorization boundary after connect.
 //
 // Keeping the address independent of stateDir is also correctness-critical:
 // sockaddr_un.sun_path is bounded even when a valid home or XDG state path is
@@ -127,6 +124,9 @@ func (c *unixReauthorizationControl) Close() error {
 		}
 		c.mu.Unlock()
 		<-c.done
+		if c.workspace != nil {
+			c.workspace.Replay.Close()
+		}
 	})
 	if errors.Is(c.closeErr, net.ErrClosed) {
 		return nil
@@ -150,8 +150,15 @@ func (c *unixReauthorizationControl) serve() {
 		if c.workspace != nil {
 			supervisor = &c.workspace.Supervisor
 		}
+		// Only the seeded root candidate needs a process-start witness. Ordinary
+		// same-UID peers may legitimately be outside our /proc PID namespace.
+		if peerErr == nil && supervisor != nil && peer.UID == 0 && peer.PID == supervisor.PID {
+			peer.Start, peerErr = mountcontrol.ProcessStart(peer.PID)
+		}
 		class := mountcontrol.Classify(peer, uint32(os.Geteuid()), supervisor)
 		if peerErr != nil || class == mountcontrol.Refused {
+			_ = connection.SetWriteDeadline(time.Now().Add(time.Second))
+			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "peer refused"})
 			_ = connection.Close()
 			continue
 		}
@@ -218,14 +225,6 @@ func (c *unixReauthorizationControl) waitForEarlierConnections(ctx context.Conte
 	}
 }
 
-func (c *unixReauthorizationControl) handle(connection *net.UnixConn, arrival uint64) {
-	peer, err := mountcontrol.Credentials(connection)
-	if err != nil || peer.UID != uint32(os.Geteuid()) {
-		_ = connection.Close()
-		return
-	}
-	c.handlePeer(connection, arrival, mountcontrol.Ordinary, peer)
-}
 func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arrival uint64, class mountcontrol.PeerClass, peer mountcontrol.Peer) {
 	defer connection.Close()
 	attemptStarted := time.Now()
@@ -242,6 +241,14 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request"})
 		return
 	}
+	// A fully closed root socket lost its attempt, including a truncated body.
+	// Only a framing half-close may establish a workspace grammar violation.
+	if class == mountcontrol.WorkspacePeer {
+		gone, err := mountcontrol.FullHangup(connection)
+		if err != nil || gone {
+			return
+		}
+	}
 	request, err := mountcontrol.DecodeRequest(body)
 	if err != nil {
 		if class == mountcontrol.WorkspacePeer && c.workspace.Replay.CloseAdmission != nil {
@@ -252,7 +259,7 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 	}
 	if request.Workspace != nil {
 		if class != mountcontrol.WorkspacePeer || c.workspace == nil {
-			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "workspace peer refused"})
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, mountcontrol.ErrPeerRefused))
 			return
 		}
 		c.mu.Lock()
@@ -262,7 +269,13 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		}
 		if *lane {
 			c.mu.Unlock()
-			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "workspace phase lane occupied"})
+			// Suspend closes permission before any lane contention can delay it.
+			if request.Operation == "workspace-suspend" || request.Operation == "workspace-cleanup" {
+				if close := c.workspace.Replay.CloseAdmission; close != nil {
+					close()
+				}
+			}
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, mountcontrol.ErrOccupied))
 			return
 		}
 		*lane = true
@@ -280,7 +293,7 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		defer stop()
 		response, err := c.workspace.Replay.Do(ctx, request, rights, c.workspace.Handler)
 		if err != nil {
-			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: err.Error()})
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
 			return
 		}
 		writeLocalReauthorizationResponse(connection, response)
@@ -313,8 +326,8 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "reauthorization unavailable", OK: false})
 		return
 	}
-	if c.workspace != nil && (c.workspace.ManualPermit == nil || !c.workspace.ManualPermit(ctx)) {
-		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "managed reauthorization requires current permit"})
+	if c.workspace != nil {
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "managed manual reauthorization is unavailable; the renewal owner is exclusive"})
 		return
 	}
 	deadline, err := c.handler(ctx, request.Capability, request.Sequence, []byte(request.ClientCertificatePEM))
@@ -325,31 +338,6 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 	writeLocalReauthorizationResponse(connection, localReauthorizationResponse{
 		AuthorizationDeadlineUnixMs: deadline.UnixMilli(), OK: true, Sequence: request.Sequence,
 	})
-}
-
-func requireSameUserPeer(connection *net.UnixConn) error {
-	return requireUserPeer(connection, uint32(os.Geteuid()))
-}
-
-func requireUserPeer(connection *net.UnixConn, uid uint32) error {
-	raw, err := connection.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var credential *unix.Ucred
-	var controlErr error
-	if err := raw.Control(func(fd uintptr) {
-		credential, controlErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	}); err != nil {
-		return err
-	}
-	if controlErr != nil {
-		return controlErr
-	}
-	if credential == nil || credential.Uid != uid {
-		return errors.New("reauthorization peer uid mismatch")
-	}
-	return nil
 }
 
 func writeLocalReauthorizationResponse(writer io.Writer, response localReauthorizationResponse) {

@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -36,6 +37,17 @@ import (
 // inventory and hosted renewer. The e2e tag changes only account-home lookup;
 // protocol, frontend, renewal, and exact unmount all use production code.
 func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
+	shippingCLILifecycle(t, "")
+}
+
+// These run the actual runMountForeground composition, including signals,
+// kernel Wait, Manager cancellation, durable intent and exact teardown.
+func TestShippingCLIInitialRenewalSupervision(t *testing.T) {
+	for _, scenario := range []string{"denied-busy", "unavailable-term", "unavailable-int", "external-unmount"} {
+		t.Run(scenario, func(t *testing.T) { shippingCLILifecycle(t, scenario) })
+	}
+}
+func shippingCLILifecycle(t *testing.T, scenario string) {
 	requireIntegrationEnvironment(t)
 	home := t.TempDir()
 	binary := filepath.Join(home, "portablefs")
@@ -86,6 +98,8 @@ func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
 	// that manager_mount_replacement_test proves against the real durable Manager.
 	var mu sync.Mutex
 	sessions := make(map[string]string)
+	refreshEntered, refreshRelease := make(chan struct{}), make(chan struct{})
+	var enteredOnce sync.Once
 	manager := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.PeerCertificates[0].URIs) != 1 {
 			http.Error(w, "missing enrollment", 401)
@@ -117,6 +131,19 @@ func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
 		mu.Unlock()
 		if bound != "" && bound != request.SessionID {
 			http.Error(w, "session changed", 409)
+			return
+		}
+		if scenario != "" {
+			enteredOnce.Do(func() { close(refreshEntered) })
+			if scenario == "denied-busy" {
+				select {
+				case <-refreshRelease:
+					http.Error(w, "enrollment denied", http.StatusForbidden)
+				case <-r.Context().Done():
+				}
+			} else {
+				<-r.Context().Done()
+			}
 			return
 		}
 		expires := time.Now().Add(time.Minute).Truncate(time.Second)
@@ -180,6 +207,9 @@ func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
 		completed := done
 		cmd := running
 		go func() { _ = cmd.Wait(); close(completed) }()
+		if scenario != "" {
+			return expires
+		}
 		waitShippingCLI(t, 10*time.Second, func() bool {
 			row := inventory()
 			return row != nil && row.Health == "live" && row.MountEnrollmentID == enrollment && row.LastReauthorizationAtMs > 0
@@ -201,6 +231,69 @@ func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
 			_ = exec.Command("fusermount3", "-u", "-z", path).Run()
 		}
 	})
+	if scenario != "" {
+		start("startup-enrollment", 10*time.Minute)
+		select {
+		case <-refreshEntered:
+		case <-time.After(15 * time.Second):
+			t.Fatal("first renewal did not reach Manager")
+		}
+		var retained *os.File
+		switch scenario {
+		case "denied-busy":
+			retained, err = os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer retained.Close()
+			close(refreshRelease)
+		case "unavailable-term":
+			if err := running.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+		case "unavailable-int":
+			if err := running.Process.Signal(syscall.SIGINT); err != nil {
+				t.Fatal(err)
+			}
+		case "external-unmount":
+			if out, err := exec.Command("fusermount3", "-u", path).CombinedOutput(); err != nil {
+				t.Fatalf("external unmount: %s %v", out, err)
+			}
+		}
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("startup failed to supervise first renewal")
+		}
+		data, err := os.ReadFile(filepath.Join(home, "startup-enrollment.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(data)
+		if strings.Contains(text, "Ctrl-C unmounts") {
+			t.Fatal("published readiness before first renewal", text)
+		}
+		if scenario == "denied-busy" {
+			if !strings.Contains(text, "initial automatic renewal failed") || !strings.Contains(text, "transactional startup FUSE unmount failed") || !isMounted(t, path) {
+				t.Fatal("busy denial was not independently reported with retained mount intent", text)
+			}
+			retained.Close()
+			if out, err := exec.Command("fusermount3", "-u", path).CombinedOutput(); err != nil {
+				t.Fatalf("release busy startup mount: %s %v", out, err)
+			}
+		} else {
+			if isMounted(t, path) || f.membership.activeCount() != 0 {
+				t.Fatal("startup shutdown did not release exact mount/session", text)
+			}
+			if scenario == "external-unmount" && !strings.Contains(text, "kernel mount ended before initial renewal") {
+				t.Fatal("external unmount not observed", text)
+			}
+			if scenario != "external-unmount" && !strings.Contains(text, "mount startup interrupted") {
+				t.Fatal("signal took default termination path", text)
+			}
+		}
+		return
+	}
 	expires := start("old-enrollment", 12*time.Second)
 	old := *inventory()
 	if old.AuthorizationSessionID == "" || old.MountInstanceID == "" {

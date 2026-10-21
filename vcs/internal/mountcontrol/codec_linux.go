@@ -9,18 +9,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"io"
 	"reflect"
 	"unicode/utf8"
 )
 
-const MaxIdentityBytes = 256 << 10
+const MaxIdentityBytes = mountenrollment.MaxClientIdentityBytes
 const MaxOrdinaryRequest = (32 << 10) + MaxIdentityBytes + 4096
 const MaxOrdinaryResponse = 4096
 const MaxWorkspaceRequest = 64 << 10
 const MaxWorkspaceResponse = 64 << 10
 
 var ErrGrammar = errors.New("mount control: invalid exact grammar")
+var ErrPeerRefused = errors.New("workspace peer refused")
+var ErrOccupied = errors.New("workspace lane occupied")
+var ErrRetired = errors.New("workspace request retired")
 var ErrUnavailable = errors.New("workspace lifecycle unavailable")
 
 type Request struct {

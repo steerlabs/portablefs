@@ -9,6 +9,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -95,6 +98,7 @@ type WorkspaceResponse struct {
 	Readiness                      *Prepared `json:"readiness,omitempty"`
 	Action                         *Phase    `json:"action,omitempty"`
 	Reason                         string    `json:"reason,omitempty"`
+	Refusal                        string    `json:"refusal,omitempty"`
 }
 
 func decimal(s string, positive bool) (uint64, error) {
@@ -137,6 +141,9 @@ func (r Request) ValidateWorkspace() error {
 	}
 	if err := w.validate(); err != nil {
 		return err
+	}
+	if !boundedPhase(w.Phase) {
+		return ErrGrammar
 	}
 	start := false
 	transaction := false
@@ -211,8 +218,21 @@ func (r Request) ValidateWorkspace() error {
 	return nil
 }
 func mode(s string) bool { return s == "voluntary" || s == "terminal" }
+func boundedWitness(w Witness) bool {
+	return len(w.Process)+len(w.Source)+len(w.Target)+len(w.Kernel)+len(w.Session)+len(w.Enrollment)+len(w.RoutesRevision) <= 512
+}
+func boundedPhase(p *Phase) bool {
+	if p == nil {
+		return true
+	}
+	size := 0
+	for _, option := range p.Options {
+		size += len(option)
+	}
+	return boundedWitness(p.Witness) && size <= 256 && len(p.Options) <= 32 && len(p.Reason) <= control.MaxReason
+}
 func boundWitness(w Witness) bool {
-	return w.Process != "" && w.Source != "" && strings.HasPrefix(w.Target, "/")
+	return boundedWitness(w) && w.Process != "" && w.Source != "" && strings.HasPrefix(w.Target, "/")
 }
 func action(p *Phase) bool {
 	_, err := decimal(p.ActionID, true)
@@ -220,7 +240,27 @@ func action(p *Phase) bool {
 }
 func (r Response) ValidateWorkspace() error {
 	w := r.Workspace
-	if w == nil || w.Binding.validate() != nil || !mountid.ValidMountInstance(r.MountInstanceID) || r.Sequence != 0 || r.LossSequence != "" || r.AuthorizationDeadlineUnixMs != 0 || r.Error != "" || !r.OK {
+	if w == nil || w.Binding.validate() != nil || !mountid.ValidMountInstance(r.MountInstanceID) || r.Sequence != 0 || r.LossSequence != "" || r.AuthorizationDeadlineUnixMs != 0 || r.Error != "" {
+		return ErrGrammar
+	}
+	if w.Binding != w.Binding.ResponseBinding() {
+		return ErrGrammar
+	}
+	if w.State == "refused" {
+		switch w.Refusal {
+		case "unavailable", "occupied", "retired", "invalid", "handler-failed", "deadline", "stopped", "peer-refused":
+		default:
+			return ErrGrammar
+		}
+		if r.OK || w.Readiness != nil || w.Action != nil || w.ColdComplete || len(w.Loss) != 0 || w.Reason != "" || w.Witness != (Witness{}) || w.AuthorizationDeadlineUnixNanos != "0" || w.Outcome != (Outcome{"unresolved", "unobserved", "unresolved", "0"}) {
+			return ErrGrammar
+		}
+		return nil
+	}
+	if !r.OK || w.Refusal != "" {
+		return ErrGrammar
+	}
+	if !boundedWitness(w.Witness) || !boundedPhase(w.Action) {
 		return ErrGrammar
 	}
 	debt, err := decimal(w.Outcome.CleanupDebt, false)
@@ -311,24 +351,39 @@ func (r *Rights) Close() {
 }
 func (r *Rights) Take() []int { fds := r.FDs; r.FDs = nil; return fds }
 
-type fileIdentity struct {
-	Dev, Ino, Rdev uint64
-	Mode           uint32
+// sameDescription compares kernel struct file owners, including /dev/fuse
+// connections. kcmp compares within this process; no other process is inspected.
+func sameDescription(a, b int) (bool, error) {
+	result, _, errno := unix.Syscall6(unix.SYS_KCMP, uintptr(os.Getpid()), uintptr(os.Getpid()), 0, uintptr(a), uintptr(b), 0)
+	if errno != 0 {
+		return false, fmt.Errorf("compare descriptor owners: %w", errno)
+	}
+	return result == 0, nil
 }
 
-func (r *Rights) identities() ([]fileIdentity, error) {
-	var out []fileIdentity
+func (r *Rights) retain() (*Rights, error) {
+	out := &Rights{}
 	for _, fd := range r.FDs {
-		var s unix.Stat_t
-		if err := unix.Fstat(fd, &s); err != nil {
+		copy, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
+		if err != nil {
+			out.Close()
 			return nil, err
 		}
-		out = append(out, fileIdentity{uint64(s.Dev), s.Ino, uint64(s.Rdev), s.Mode})
-	}
-	if len(out) == 2 && out[0] == out[1] {
-		return nil, ErrGrammar
+		out.FDs = append(out.FDs, copy)
 	}
 	return out, nil
+}
+func (r *Rights) same(other *Rights) bool {
+	if len(r.FDs) != len(other.FDs) {
+		return false
+	}
+	for i, fd := range r.FDs {
+		same, err := sameDescription(fd, other.FDs[i])
+		if err != nil || !same {
+			return false
+		}
+	}
+	return true
 }
 func (r *Rights) Validate(op string) error {
 	want := 0
@@ -338,8 +393,16 @@ func (r *Rights) Validate(op string) error {
 	if len(r.FDs) != want {
 		return ErrGrammar
 	}
-	_, err := r.identities()
-	return err
+	if want == 2 {
+		same, err := sameDescription(r.FDs[0], r.FDs[1])
+		if err != nil {
+			return err
+		}
+		if same {
+			return ErrGrammar
+		}
+	}
+	return nil
 }
 
 // Handler owns jobs independently of request waiters. It must return bounded
@@ -350,13 +413,14 @@ type Handler interface {
 type receipt struct {
 	id       uint64
 	body     []byte
-	files    []fileIdentity
+	files    *Rights
 	response []byte
-	err      error
+	done     chan struct{}
+	cancel   context.CancelFunc
 }
 type Replay struct {
 	mu                        sync.Mutex
-	high                      uint64
+	high                      [3]uint64 // start, phase and observation lanes advance independently
 	operation                 string
 	instance                  string
 	active                    bool
@@ -366,8 +430,8 @@ type Replay struct {
 	nextAction                *Phase
 	actionKind                string
 	binding                   *Workspace
-	deadline                  time.Time
 	start, phase, observation *receipt
+	closed                    bool
 	Now                       func() time.Time
 	CloseAdmission            func()
 }
@@ -385,55 +449,101 @@ func immutable(req Request) []byte {
 	raw, _ := json.Marshal(req)
 	return raw
 }
-func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler) (result Response, resultErr error) {
+func (r *Replay) closeAdmission() {
+	if r.CloseAdmission != nil {
+		r.CloseAdmission()
+	}
+}
+func (r *Replay) Close() {
+	r.mu.Lock()
+	r.closed = true
+	retained := []*receipt{r.start, r.phase, r.observation}
+	for _, old := range retained {
+		if old != nil {
+			old.cancel()
+		}
+	}
+	r.mu.Unlock()
+	for _, old := range retained {
+		if old != nil {
+			<-old.done
+			old.files.Close()
+		}
+	}
+}
+func inFlight(old *receipt) bool {
+	if old == nil {
+		return false
+	}
+	select {
+	case <-old.done:
+		return false
+	default:
+		return true
+	}
+}
+func waitReceipt(ctx context.Context, old *receipt) (Response, error) {
+	select {
+	case <-ctx.Done():
+		return Response{}, ctx.Err()
+	case <-old.done:
+		return DecodeResponse(old.response, true)
+	}
+}
+func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler) (Response, error) {
 	defer rights.Close()
 	if err := req.ValidateWorkspace(); err != nil {
-		if r.CloseAdmission != nil {
-			r.CloseAdmission()
-		}
+		r.closeAdmission()
 		return Response{}, err
 	}
 	if err := rights.Validate(req.Operation); err != nil {
-		if r.CloseAdmission != nil {
-			r.CloseAdmission()
-		}
+		r.closeAdmission()
 		return Response{}, err
 	}
-	files, err := rights.identities()
-	if err != nil {
-		return Response{}, err
+	// Close permission before even waiting for replay bookkeeping or a lane.
+	if req.Operation == "workspace-suspend" || req.Operation == "workspace-cleanup" {
+		r.closeAdmission()
 	}
 	receivedAt := r.now()
 	budget, _ := decimal(req.Workspace.BudgetNanos, true)
-	receiptDeadline := receivedAt.Add(time.Duration(budget))
-	if deadline, ok := ctx.Deadline(); ok && deadline.Before(receiptDeadline) {
-		receiptDeadline = deadline
+	deadline := receivedAt.Add(time.Duration(budget))
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
 	}
 	body := immutable(req)
 	id, _ := decimal(req.Workspace.RequestID, true)
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	if r.closed {
+		r.mu.Unlock()
+		return Response{}, ErrUnavailable
+	}
 	for _, old := range []*receipt{r.start, r.phase, r.observation} {
 		if old != nil && old.id == id {
-			if !bytes.Equal(body, old.body) || !reflectFiles(files, old.files) {
-				if r.CloseAdmission != nil {
-					r.CloseAdmission()
-				}
+			same := bytes.Equal(body, old.body) && rights.same(old.files)
+			r.mu.Unlock()
+			if !same {
+				r.closeAdmission()
 				return Response{}, ErrGrammar
 			}
-			if old.err != nil {
-				return Response{}, old.err
-			}
-			return DecodeResponse(old.response, true)
+			return waitReceipt(ctx, old)
 		}
 	}
-	if id <= r.high {
-		return Response{}, ErrGrammar
+	refuse := func(err error) (Response, error) { r.mu.Unlock(); return Response{}, err }
+	if err := ctx.Err(); err != nil {
+		return refuse(err)
 	}
-	r.high = id
 	start := req.Workspace.RequestID == req.Workspace.OperationID
+	lane := 1
+	if start {
+		lane = 0
+	} else if req.Operation == "workspace-observe" {
+		lane = 2
+	}
+	if id <= r.high[lane] {
+		return refuse(ErrRetired)
+	}
 	if !start && (r.binding == nil || req.MountInstanceID != r.instance || req.Workspace.OperationID != r.operation || !sameBinding(*r.binding, *req.Workspace)) {
-		return Response{}, ErrGrammar
+		return refuse(ErrGrammar)
 	}
 	generation, _ := decimal(req.Workspace.Generation, false)
 	if start && r.binding != nil {
@@ -441,17 +551,14 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 		serial, _ := decimal(req.Workspace.GateSerial, false)
 		oldSerial, _ := decimal(r.binding.GateSerial, false)
 		if req.MountInstanceID != r.instance || req.Workspace.BootID != r.binding.BootID || req.Workspace.HostServiceID != r.binding.HostServiceID || req.Workspace.GuestServiceID != r.binding.GuestServiceID || generation < oldGeneration || serial < oldSerial {
-			return Response{}, ErrGrammar
+			return refuse(ErrGrammar)
 		}
 	}
-	if req.Operation == "workspace-recover" && generation <= r.recoveredGeneration {
-		return Response{}, ErrGrammar
+	if req.Operation == "workspace-recover" && (generation <= r.recoveredGeneration || r.lastResume == sha256.Sum256([]byte(req.Workspace.Transaction))) {
+		return refuse(ErrGrammar)
 	}
 	if req.Operation == "workspace-prepare" && r.prepareStarted {
-		return Response{}, ErrGrammar
-	}
-	if req.Operation == "workspace-recover" && r.lastResume == sha256.Sum256([]byte(req.Workspace.Transaction)) {
-		return Response{}, ErrGrammar
+		return refuse(ErrGrammar)
 	}
 	if req.Operation == "workspace-install-kernel" || req.Operation == "workspace-unmount-complete" {
 		expected := "kernel-required"
@@ -460,23 +567,35 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 		}
 		p := *req.Workspace.Phase
 		p.Removal = nil
-		if r.nextAction == nil || r.actionKind != expected || !reflect.DeepEqual(p, *r.nextAction) {
-			return Response{}, ErrGrammar
+		if !r.active || r.nextAction == nil || r.actionKind != expected || !reflect.DeepEqual(p, *r.nextAction) {
+			return refuse(ErrGrammar)
 		}
 	}
 	if start && r.active && req.Operation != "workspace-suspend" && req.Operation != "workspace-cleanup" {
-		return Response{}, ErrGrammar
+		return refuse(ErrOccupied)
+	}
+	if lane == 2 && inFlight(r.observation) || lane != 2 && (inFlight(r.start) || inFlight(r.phase)) {
+		return refuse(ErrOccupied)
 	}
 	if h == nil {
-		return Response{}, ErrUnavailable
+		return refuse(ErrUnavailable)
+	}
+	files, err := rights.retain()
+	if err != nil {
+		return refuse(err)
+	}
+	// Neither socket hangup nor its cancellation becomes job cancellation. The
+	// first receipt deadline bounds this dispatch, including Suspend retries.
+	job, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	retained := &receipt{id: id, body: body, files: files, done: make(chan struct{}), cancel: cancel}
+	retire := func(old *receipt) {
+		if old != nil {
+			old.files.Close()
+		}
 	}
 	if start {
-		if r.active && r.CloseAdmission != nil {
-			r.CloseAdmission()
-		}
 		r.active = true
-		r.nextAction = nil
-		r.actionKind = ""
+		r.nextAction, r.actionKind = nil, ""
 		if req.Operation == "workspace-prepare" {
 			r.prepareStarted = true
 		}
@@ -484,105 +603,120 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 			r.lastResume = sha256.Sum256([]byte(req.Workspace.Transaction))
 			r.recoveredGeneration = generation
 		}
-		r.instance = req.MountInstanceID
-		r.operation = req.Workspace.OperationID
-		copy := *req.Workspace
+		r.instance, r.operation = req.MountInstanceID, req.Workspace.OperationID
+		copy := req.Workspace.ResponseBinding()
 		r.binding = &copy
-		r.start = nil
-		r.phase = nil
-		r.observation = nil
-		r.deadline = time.Time{}
-		if req.Operation == "workspace-suspend" {
-			r.deadline = receiptDeadline
-		}
+		retire(r.start)
+		retire(r.phase)
+		r.start, r.phase = retained, nil
+		// An observation of the overtaken operation may still finish. It owns no
+		// descriptors, and its result cannot update the new operation's actions.
+	} else if lane == 2 {
+		retire(r.observation)
+		r.observation = retained
+	} else {
+		retire(r.phase)
+		r.phase = retained
 	}
-	deadline := receiptDeadline
-	if !r.deadline.IsZero() && r.deadline.Before(deadline) {
-		deadline = r.deadline
-	}
-	attempt, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
-	// Once dispatched, even an error receipt is immutable. Losing a waiter or
-	// rejecting a handler result cannot permit a second execution of its phase.
-	retained := &receipt{id: id, body: body, files: files}
-	defer func() {
-		if resultErr != nil {
-			retained.err = resultErr
-		}
-		if start {
-			r.start = retained
-		} else if req.Operation == "workspace-observe" {
-			r.observation = retained
+	r.high[lane] = id
+	owned := &Rights{FDs: rights.Take()}
+	r.mu.Unlock()
+	go r.dispatch(job, req, owned, h, retained)
+	return waitReceipt(ctx, retained)
+}
+func (r *Replay) dispatch(ctx context.Context, req Request, rights *Rights, h Handler, retained *receipt) {
+	defer retained.cancel()
+	response, err := h.Handle(ctx, req, rights)
+	// Received duplicates are disposed before the receipt becomes observable.
+	rights.Close()
+	if err == nil {
+		if response.Workspace == nil {
+			err = ErrGrammar
 		} else {
-			r.phase = retained
+			state := response.Workspace.State
+			switch req.Operation {
+			case "workspace-prepare", "workspace-recover", "workspace-suspend", "workspace-cleanup":
+				if state != "accepted" && state != "failed" {
+					err = ErrGrammar
+				}
+			case "workspace-install-kernel":
+				if state != "install-complete" && state != "failed" {
+					err = ErrGrammar
+				}
+			case "workspace-unmount-complete":
+				if state != "unmount-recorded" && state != "failed" {
+					err = ErrGrammar
+				}
+			case "workspace-observe":
+				if state == "accepted" || state == "install-complete" || state == "unmount-recorded" {
+					err = ErrGrammar
+				}
+			}
+			if response.MountInstanceID != req.MountInstanceID || !reflect.DeepEqual(response.Workspace.Binding, req.Workspace.ResponseBinding()) {
+				err = ErrGrammar
+			}
 		}
-	}()
-	response, err := h.Handle(attempt, req, rights)
+	}
+	var raw []byte
+	if err == nil {
+		raw, err = EncodeResponse(response)
+	}
 	if err != nil {
-		return Response{}, err
+		response = WorkspaceRefusal(req, err)
+		raw, _ = EncodeResponse(response)
 	}
-
-	state := response.Workspace
-	if state == nil {
-		return Response{}, ErrGrammar
-	}
-	switch req.Operation {
-	case "workspace-prepare", "workspace-recover", "workspace-suspend", "workspace-cleanup":
-		if state.State != "accepted" && state.State != "failed" {
-			return Response{}, ErrGrammar
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.binding != nil && sameBinding(*r.binding, *req.Workspace) {
+		state := response.Workspace
+		// An older observation may finish after a phase completed this job.
+		// Its immutable snapshot cannot restore permission to perform an action.
+		if state.Action != nil && r.active {
+			rawAction, _ := json.Marshal(state.Action)
+			var copy Phase
+			_ = json.Unmarshal(rawAction, &copy)
+			r.nextAction, r.actionKind = &copy, state.State
 		}
-	case "workspace-install-kernel":
-		if state.State != "install-complete" && state.State != "failed" {
-			return Response{}, ErrGrammar
+		if req.Operation == "workspace-install-kernel" || req.Operation == "workspace-unmount-complete" {
+			r.nextAction, r.actionKind = nil, ""
 		}
-	case "workspace-unmount-complete":
-		if state.State != "unmount-recorded" && state.State != "failed" {
-			return Response{}, ErrGrammar
+		if state.State == "prepared" || state.State == "cold" || state.State == "cleanup-finalized" || state.State == "failed" || !response.OK {
+			r.active = false
+			r.nextAction, r.actionKind = nil, ""
 		}
-	case "workspace-observe":
-		if state.State == "accepted" || state.State == "install-complete" || state.State == "unmount-recorded" {
-			return Response{}, ErrGrammar
-		}
-	}
-	raw, err := EncodeResponse(response)
-	if err != nil {
-		return Response{}, err
-	}
-	bound := req
-	bound.Workspace = &response.Workspace.Binding
-	if response.MountInstanceID != req.MountInstanceID || !bytes.Equal(immutable(bound), body) {
-		return Response{}, ErrGrammar
-	}
-	if state.Action != nil {
-		raw, _ := json.Marshal(state.Action)
-		var copy Phase
-		_ = json.Unmarshal(raw, &copy)
-		r.nextAction = &copy
-		r.actionKind = state.State
-	}
-	if req.Operation == "workspace-install-kernel" || req.Operation == "workspace-unmount-complete" {
-		r.nextAction = nil
-		r.actionKind = ""
-	}
-	if state.State == "prepared" || state.State == "cold" || state.State == "cleanup-finalized" || state.State == "failed" {
-		r.active = false
 	}
 	retained.response = raw
-	return DecodeResponse(raw, true)
+	close(retained.done)
 }
 func sameBinding(a, b Workspace) bool {
 	return a.Version == b.Version && a.BootID == b.BootID && a.HostServiceID == b.HostServiceID && a.GuestServiceID == b.GuestServiceID && a.Generation == b.Generation && a.GateSerial == b.GateSerial && a.OperationID == b.OperationID
 }
-func reflectFiles(a, b []fileIdentity) bool {
-	if len(a) != len(b) {
-		return false
+
+// ResponseBinding contains only bounded correlation fields. Transaction bodies
+// and phase payloads are retained in the receipt, never echoed on the wire.
+func (w Workspace) ResponseBinding() Workspace {
+	w.Transaction, w.HostRequestID, w.Phase = "", "", nil
+	return w
+}
+func WorkspaceRefusal(req Request, err error) Response {
+	code := "handler-failed"
+	switch {
+	case errors.Is(err, ErrPeerRefused):
+		code = "peer-refused"
+	case errors.Is(err, ErrUnavailable):
+		code = "unavailable"
+	case errors.Is(err, ErrOccupied):
+		code = "occupied"
+	case errors.Is(err, ErrRetired):
+		code = "retired"
+	case errors.Is(err, ErrGrammar):
+		code = "invalid"
+	case errors.Is(err, context.DeadlineExceeded):
+		code = "deadline"
+	case errors.Is(err, context.Canceled):
+		code = "stopped"
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return Response{MountInstanceID: req.MountInstanceID, Workspace: &WorkspaceResponse{Binding: req.Workspace.ResponseBinding(), State: "refused", Refusal: code, AuthorizationDeadlineUnixNanos: "0", Outcome: Outcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: "0"}}}
 }
 
 // EncodeTransaction retains the strict body grammar, independently of the host

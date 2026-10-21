@@ -3,6 +3,7 @@ package mountenrollment
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -46,6 +47,27 @@ type RenewalReadiness struct {
 	Permit                Permit    `json:"permit"`
 	SessionID             string    `json:"sessionId,omitempty"`
 	AuthorizationDeadline time.Time `json:"authorizationDeadline"`
+}
+
+// Standalone readiness has no renewal sequence, permit, session or deadline.
+// Pending proofs carry only their permit, never a zero-time installed claim.
+func (r RenewalReadiness) MarshalJSON() ([]byte, error) {
+	type proof struct {
+		State                 string     `json:"state"`
+		InstalledSequence     uint64     `json:"installedSequence,string,omitempty"`
+		Permit                *Permit    `json:"permit,omitempty"`
+		SessionID             string     `json:"sessionId,omitempty"`
+		AuthorizationDeadline *time.Time `json:"authorizationDeadline,omitempty"`
+	}
+	out := proof{State: r.State}
+	if r.State != "not-required" && r.Permit != (Permit{}) {
+		out.Permit = &r.Permit
+	}
+	if r.State == "installed" {
+		out.InstalledSequence, out.SessionID = r.InstalledSequence, r.SessionID
+		out.AuthorizationDeadline = &r.AuthorizationDeadline
+	}
+	return json.Marshal(out)
 }
 
 func (r RenewalReadiness) Ready(standalone bool, p Permit, session string, deadline time.Time) bool {
@@ -104,7 +126,7 @@ type Renewer struct {
 	deadline, authorizedAt       time.Time
 	sequence                     uint64
 	pending                      *controlplane.MountAuthorization
-	readiness                    RenewalReadiness
+	readiness, installed         RenewalReadiness
 	status                       RenewalStatus
 	force                        bool
 	terminal                     error
@@ -155,8 +177,12 @@ func (r *Renewer) Resume(p Permit) error {
 	}
 	r.permit = p
 	r.parked = false
-	r.force = true
+	r.force = r.pending != nil || !r.installed.AuthorizationDeadline.After(r.now())
 	r.readiness = RenewalReadiness{State: "pending", Permit: p}
+	if r.installed.AuthorizationDeadline.After(r.now()) && r.pending == nil {
+		r.readiness = r.installed
+		r.readiness.Permit = p
+	}
 	r.signalLocked()
 	return nil
 }
@@ -164,7 +190,7 @@ func (r *Renewer) RefreshNow() { r.mu.Lock(); r.force = true; r.signalLocked(); 
 func (r *Renewer) Readiness() RenewalReadiness {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.running || !r.allowedLocked() || !r.readiness.AuthorizationDeadline.After(r.now()) {
+	if r.terminal != nil || !r.running || !r.allowedLocked() || !r.readiness.AuthorizationDeadline.After(r.now()) {
 		return RenewalReadiness{State: "pending", Permit: r.permit}
 	}
 	return r.readiness
@@ -238,9 +264,19 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 	}
 	r.running = true
 	r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
-	r.force = true
+	if r.Managed && r.allowedLocked() && r.pending == nil && r.installed.AuthorizationDeadline.After(r.now()) {
+		r.readiness = r.installed
+		r.readiness.Permit = r.permit
+	} else {
+		r.force = true
+	}
 	r.mu.Unlock()
-	defer func() { r.mu.Lock(); r.running = false; r.mu.Unlock() }()
+	defer func() {
+		r.mu.Lock()
+		r.running = false
+		r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+		r.mu.Unlock()
+	}()
 	timeout := r.Timeout
 	if timeout <= 0 {
 		timeout = 20 * time.Second
@@ -265,19 +301,36 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 			next = time.Time{}
 			r.force = false
 		}
+		// A managed wakeup preserves the normal mid-window refresh schedule,
+		// safely beyond Manager's minimum interval. Pending exact retries need
+		// no Manager refresh and must remain immediately reconcilable.
+		if r.Managed && r.pending == nil && r.installed.InstalledSequence > 0 {
+			earliest := refreshTime(r.authorizedAt, r.deadline, r.session, r.sequence)
+			if next.Before(earliest) {
+				next = earliest
+			}
+		}
 		if next.After(r.now()) {
 			r.mu.Unlock()
 			_ = r.wait(ctx, next)
 			continue
 		}
-		if !r.now().Before(cutoff) {
-			r.mu.Unlock()
+		if !r.Managed && !r.now().Before(cutoff) {
 			err := errors.New("automatic mount reauthorization reached its safe cutoff")
+			r.terminal = err
+			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+			r.mu.Unlock()
 			r.emit(RenewalCutoff, time.Time{}, boundedError(err), r.statusFailures())
 			return err
 		}
 		p, seq, session := r.permit, r.sequence, r.session
-		deadline := minTime(r.now().Add(timeout), cutoff)
+		deadline := r.now().Add(timeout)
+		// Managed preparation runs behind closed admission. Its attempts remain
+		// bounded, but the previous serving window cannot retire a live pending
+		// grant or end transient recovery. The generation owns cancellation.
+		if !r.Managed {
+			deadline = minTime(deadline, cutoff)
+		}
 		attemptCtx, cancel := context.WithDeadline(WithPermit(ctx, p), deadline)
 		r.attemptCancel = cancel
 		done := make(chan struct{})
@@ -326,13 +379,15 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 			} else {
 				r.deadline = installed
 				r.authorizedAt = r.now()
+				r.installed = RenewalReadiness{State: "installed", InstalledSequence: seq, Permit: p, SessionID: session, AuthorizationDeadline: installed}
 				if r.allowedLocked() && r.permit == p && ctx.Err() == nil && !obsolete {
-					r.readiness = RenewalReadiness{State: "installed", InstalledSequence: seq, Permit: p, SessionID: session, AuthorizationDeadline: installed}
+					r.readiness = r.installed
 				}
 			}
 		}
 		if errors.Is(err, ErrDefinitiveDenial) {
 			r.terminal = err
+			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
 		}
 		r.attemptCancel = nil
 		r.attemptDone = nil
@@ -366,8 +421,12 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		}
 		failures := r.statusFailures() + 1
 		next = r.now().Add(backoff)
-		if !next.Before(cutoff) {
+		if !r.Managed && !next.Before(cutoff) {
 			resultErr := fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
+			r.mu.Lock()
+			r.terminal = resultErr
+			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+			r.mu.Unlock()
 			r.emit(RenewalCutoff, time.Time{}, boundedError(resultErr), failures)
 			return resultErr
 		}
@@ -399,7 +458,8 @@ func (r *Renewer) emit(kind RenewalEventKind, next time.Time, message string, fa
 	r.status.ConsecutiveFailures = failures
 	r.status.Readiness = r.readiness
 	if !r.allowedLocked() || kind == RenewalStopped || kind == RenewalCutoff || kind == RenewalDenied {
-		r.status.Readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+		r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+		r.status.Readiness = r.readiness
 	}
 	status := r.status
 	r.mu.Unlock()
@@ -462,19 +522,4 @@ func safeCutoff(authorizedAt, deadline time.Time, minimum time.Duration) time.Ti
 		margin = time.Minute
 	}
 	return deadline.Add(-margin)
-}
-
-func waitUntil(ctx context.Context, now func() time.Time, target time.Time) error {
-	delay := target.Sub(now())
-	if delay <= 0 {
-		return nil
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

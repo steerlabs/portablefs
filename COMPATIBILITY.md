@@ -470,6 +470,24 @@ scoped issuance supersedes only the prior active enrollment for the same
 product issuer, scope, and volume, and advancing the scope epoch revokes every
 lower-epoch enrollment in the scope.
 
+Automatic renewal fails closed on malformed Manager grants, definitive denial,
+sequence exhaustion, or a deadline different from the signed grant; these are
+terminal trust failures, not transient retries. This applies to Linux mount
+owners and the macOS daemon. Ordinary renewal keeps its existing safety cutoff.
+Hosted Linux startup requires the first verified renewal and supervises kernel
+termination and SIGINT/SIGTERM while waiting, with a two-minute child startup
+bound inside the parent's three-minute limit. Explicit standalone `mount
+--json` renewal evidence is only `{"state":"not-required"}`; it claims no
+sequence, permit or authorization deadline.
+
+Paired, unreleased Linux workspace local controls use finite `refused` responses
+through the same exact codec as successes. Refusals bind the request and report
+unavailable, occupied, retired, invalid, handler-failed, deadline, stopped or peer-refused;
+transaction/phase payloads are not echoed. Managed manual renewal is refused by
+design: its single automatic owner retains sequence and grant ownership.
+Resume may republish a still-valid recorded installation; exact pending install
+reconciliation survives the old serving deadline behind closed admission.
+
 The installer reads `PORTABLEFS_VERSION`, `PORTABLEFS_GITHUB_REPO`,
 `PORTABLEFS_INSTALL_DIR`, and, for a repository other than
 `steerlabs/portablefs`, the five `PORTABLEFS_EXPECTED_*` identity values.

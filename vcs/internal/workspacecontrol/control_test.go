@@ -119,6 +119,14 @@ func invalidFixtures() map[string][]byte {
 		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 		negative[tc.name] = framed(raw)
 	}
+	readyPending := fixtures()["renewal_pending"]
+	readyPending.GetResumeAck().Mounts[0].State = "ready"
+	raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(readyPending)
+	negative["ready_with_pending_renewal"] = framed(raw)
+	coldMissing := fixtures()["suspend_ack"]
+	coldMissing.GetSuspendAck().Mounts[0].Outcome = nil
+	raw, _ = proto.MarshalOptions{Deterministic: true}.Marshal(coldMissing)
+	negative["cold_missing_outcome"] = framed(raw)
 	base := map[string][]byte{
 		"unequal_version":    framed([]byte{8, 9, 16, 1, 0x82, 1, 0}),
 		"unknown_body":       framed([]byte{8, 8, 16, 1, 0xb2, 1, 0}),

@@ -52,7 +52,7 @@ func transaction(t *testing.T, r *Request) {
 	}
 }
 func response(r Request, state string) Response {
-	return Response{OK: true, MountInstanceID: r.MountInstanceID, Workspace: &WorkspaceResponse{Binding: *r.Workspace, State: state, AuthorizationDeadlineUnixNanos: "0", Outcome: Outcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: "0"}}}
+	return Response{OK: true, MountInstanceID: r.MountInstanceID, Workspace: &WorkspaceResponse{Binding: r.Workspace.ResponseBinding(), State: state, AuthorizationDeadlineUnixNanos: "0", Outcome: Outcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: "0"}}}
 }
 func TestEveryWorkspaceRequestAndMaximumRoster(t *testing.T) {
 	for _, op := range []string{"workspace-prepare", "workspace-observe", "workspace-install-kernel", "workspace-recover", "workspace-suspend", "workspace-cleanup", "workspace-unmount-complete"} {
@@ -265,7 +265,7 @@ func TestWorkspaceReplayRetainsOnlyStartPhaseAndLatestObservation(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if replay.start.id != 1 || replay.phase.id != 3 || replay.observation.id != 1003 || replay.high != 1003 {
+	if replay.start.id != 1 || replay.phase.id != 3 || replay.observation.id != 1003 || replay.high[2] != 1003 {
 		t.Fatal("unbounded or wrong replay ownership")
 	}
 	if _, err := replay.Do(context.Background(), obs, &Rights{}, h); err == nil {
@@ -305,11 +305,12 @@ func TestWorkspaceChangedIDClosesAndRetryCannotExtendSuspend(t *testing.T) {
 	if _, err := replay.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h); err != nil {
 		t.Fatal(err)
 	}
-	if !deadlines[0].Equal(deadlines[1]) {
-		t.Fatal("drain deadline extended")
+	if !deadlines[1].After(deadlines[0]) {
+		t.Fatal("observation inherited the Suspend drain deadline")
 	}
+	before := closed
 	r.Workspace.GateSerial = "1"
-	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err == nil || closed != 1 {
+	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err == nil || closed <= before {
 		t.Fatal("changed retry did not close")
 	}
 }
@@ -481,21 +482,23 @@ func TestWorkspaceActionsAndResumeAuthorizationCannotBeRebound(t *testing.T) {
 		t.Fatal("unsolicited bootstrap action")
 	}
 }
-func TestWorkspaceErrorReceiptCannotExecuteAgainAfterWaiterLoss(t *testing.T) {
+func TestWorkspaceHandlerErrorReceiptIsFiniteAndImmutable(t *testing.T) {
 	calls := 0
 	r := &Replay{}
+	defer r.Close()
 	h := handlerFunc(func(context.Context, Request, *Rights) (Response, error) {
 		calls++
-		return Response{}, context.Canceled
+		return Response{}, errors.New("private handler diagnostic")
 	})
 	q := request("workspace-prepare", 1, 1)
 	for i := 0; i < 2; i++ {
-		if _, err := r.Do(context.Background(), q, &Rights{}, h); !errors.Is(err, context.Canceled) {
-			t.Fatal(err)
+		out, err := r.Do(context.Background(), q, &Rights{}, h)
+		if err != nil || out.OK || out.Workspace.Refusal != "handler-failed" {
+			t.Fatal(out, err)
 		}
 	}
 	if calls != 1 {
-		t.Fatal("lost waiter restarted assigned phase")
+		t.Fatal("handler error restarted assigned phase")
 	}
 }
 
