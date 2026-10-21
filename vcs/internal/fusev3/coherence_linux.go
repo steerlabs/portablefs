@@ -78,6 +78,11 @@ type mutationCallback struct {
 	publication replyPublication
 	mount       *Mount
 	operationID uint64
+	// Cleanup reservations already own their descriptors. Dispatch may wait
+	// for capacity only after this callback releases the cold-reset fence.
+	closeDispatch []func()
+	// Test scheduling at the index-cleanup/fence boundary; nil in production.
+	beforeHistoryEnd func()
 }
 
 func (c *mutationCallback) finish() {
@@ -198,8 +203,24 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 	callback.publication.metadataSample = r.mount.delegations.metadataClock.Load()
 	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
 	return ctx, func() {
-		defer r.mount.delegations.endGrantRequest(history)
+		defer func() {
+			for _, dispatch := range callback.closeDispatch {
+				// The counted producer already owns one relinquished descriptor.
+				// Let this callback return so a physical reply/metadata pin cannot
+				// become a second fence between queue space and cold activation.
+				go dispatch()
+			}
+		}()
 		defer r.mount.epochMu.RUnlock()
+		// Reset holds the manager index while joining physical metadata pins.
+		// Finish every index dependency before it can acquire the epoch writer;
+		// the physical reply must be able to settle after this callback returns.
+		defer func() {
+			if callback.beforeHistoryEnd != nil {
+				callback.beforeHistoryEnd()
+			}
+			r.mount.delegations.endGrantRequest(history)
+		}()
 		defer cancel()
 		r.publishPostStateAttrs(ctx)
 		callback.finish()

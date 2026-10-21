@@ -492,7 +492,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	}
 	if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
 		profile, _ := h.sessionFrontendProfile(cred.ID)
-		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && req.GetDetach() == nil {
+		// Assigned mutations resolve under their replay-slot lock before current
+		// coherence admission. Reads have no retained outcome to resolve.
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && req.GetDetach() == nil && !requestHasMutationReplay(req) {
 			token, tokenErr := h.coherenceToken(cred.ID)
 			if tokenErr == nil {
 				tokenErr = h.Coherence.CheckSession(token)
@@ -2744,6 +2746,7 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		}
 	}()
 	var ordered *volumeserver.OrderedFlush
+	var coherenceRefusal *authoritypb.Response
 	defer func() { ordered.Abort() }()
 	out, err := h.Runtime.ExecuteMutationAdmitted(ctx, cred, id, func() error {
 		// A retained exact outcome precedes current writer admission. Only a new
@@ -2751,6 +2754,16 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		profile, profileErr := h.sessionFrontendProfile(cred.ID)
 		if profileErr != nil {
 			return profileErr
+		}
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
+			token, err := h.coherenceToken(cred.ID)
+			if err == nil {
+				err = h.Coherence.CheckSession(token)
+			}
+			if err != nil {
+				coherenceRefusal = h.coherenceError(req.GetRequestId(), err)
+				return err
+			}
 		}
 		// SyncFS and advisory locks do not mutate storage and hold no shared
 		// profile admission. Only ordinary writes and write-capable OPENs need
@@ -2816,6 +2829,9 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		}
 	})
 	if err != nil {
+		if coherenceRefusal != nil {
+			return coherenceRefusal
+		}
 		if req.GetWrite() != nil && errors.Is(err, volumeserver.ErrAdmission) {
 			// Unadmitted WRITE: outer errno zero, Error=-ENOMEM, no post-state,
 			// no MutationState. The daemon must recognize this before committing

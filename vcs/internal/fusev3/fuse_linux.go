@@ -175,6 +175,8 @@ type Config struct {
 	Debug bool
 	// latencies is installed before Serve for in-package kernel timing proofs.
 	latencies fuse.LatencyMap
+	// subscriptionClock is installed before workers start for clock-jump tests.
+	subscriptionClock subscriptionClock
 
 	// OnRevoked is called exactly once, from the teardown goroutine, when this
 	// mount self-revokes and its kernel-state withdrawal has finished. It is a
@@ -567,6 +569,9 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		mount.cleanupFailed("deferred close", err, nil)
 	})
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
+	if cfg.subscriptionClock != nil {
+		mount.subscription.config.clock = cfg.subscriptionClock
+	}
 	mount.delegations.subscription = mount.subscription
 	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	return mount
@@ -1655,10 +1660,12 @@ func (n *node) Lookup(ctx context.Context, name string) (*authoritypb.Item, sysc
 		return nil, syscall.ENOENT
 	}
 	if item.GetAttr() == nil || item.GetObjectVersion() == 0 || item.GetSnapshotSequence() == 0 || item.GetObjectVersion() > item.GetSnapshotSequence() {
+		n.mount.deferReclaim(item.GetToken())
 		return nil, syscall.EIO
 	}
 	publication := replyPublicationFromContext(ctx)
 	if publication == nil || publication.cacheStamp != nil {
+		n.mount.deferReclaim(item.GetToken())
 		return nil, syscall.EIO
 	}
 	publication.cacheStamp = &cacheSnapshot{
@@ -1762,28 +1769,36 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	if errno != 0 {
 		return nil, 0, errno
 	}
+	owner, err := n.mount.ownDescriptor(n.item.GetStableIdentity(), response.GetOpen().GetHandle())
+	if err != nil {
+		return nil, 0, syscall.EIO
+	}
+	defer owner.dispatch(ctx)
 	if openFlags.GetTruncate() {
 		if err := expectPostStateItem(ctx, n.item, postStateRoleTarget); err != nil {
 			return nil, 0, syscall.EIO
 		}
 	}
-	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
-		return nil, 0, syscall.EIO
+	current := n.mount.currentOpenResponse(ctx)
+	grant := response.GetOpen().GetDelegation()
+	if !current {
+		grant = nil
 	}
-	kernelFlags := portableOpenFlags(flags, response.GetOpen().GetCacheCapable())
+	kernelFlags := portableOpenFlags(flags, current && response.GetOpen().GetCacheCapable())
 	handle := &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := n.registerDelegatedHandle(handle, response.GetOpen().GetDelegation(), response.GetAppliedSequence()); err != nil {
+	if err := n.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, 0, syscall.EIO
 	}
-	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response); err != nil {
-		_ = handle.closeForCleanup(ctx, 0, false)
+	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response, current); err != nil {
+		handle.endLossObservation()
 		return nil, 0, bufferErrno(err)
 	}
-	if openFlags.GetTruncate() {
+	if current && openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
 			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 		}
 	}
+	owner.transfer()
 	return handle, kernelFlags, 0
 }
 
@@ -1929,19 +1944,7 @@ func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, floc
 		return resourceCleanupError{cause: syscall.EIO}
 	}
 	h.once.Do(func() {
-		if h.node.mount.delegations.TracksHandle(h.node.item.GetStableIdentity(), h.token) {
-			if err := h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock); err != nil {
-				h.closeOutcome.cause = err
-			}
-			return
-		}
-		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token), LockOwner: lockOwner, FlockUnlock: flockUnlock}}})
-		if errno != 0 {
-			h.closeOutcome.cause = errno
-			if response != nil {
-				h.closeOutcome.failure = response.GetFailure()
-			}
-		}
+		h.closeOutcome.cause = h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock)
 	})
 	return h.closeOutcome
 }
@@ -1957,9 +1960,6 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
-		return nil, 0, syscall.EIO
-	}
 	if _, ok := publicationIdentityFromItem(n.item); !ok {
 		// An item with no stable identity has no coordinate to be covered by, so
 		// no lease could name it and no recall could reach it. That is a genuine
@@ -1967,7 +1967,13 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 		n.mount.revoke(errors.New("fusev3: successful directory OPEN carried no stable identity"))
 		return nil, 0, syscall.ENOTCONN
 	}
+	owner, err := n.mount.ownDescriptor(n.item.GetStableIdentity(), response.GetOpen().GetHandle())
+	if err != nil {
+		return nil, 0, syscall.EIO
+	}
+	defer owner.dispatch(ctx)
 	root := bytes.Equal(n.item.GetStableIdentity(), n.mount.rpc.Root().GetStableIdentity())
+	owner.transfer()
 	return &dirHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), rootBarrier: root, barrierLoss: n.mount.delegations.LossSequence()}, 0, 0
 }
 
@@ -2382,13 +2388,7 @@ func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 		h.mu.Lock()
 		h.discardPageItemsLocked()
 		h.mu.Unlock()
-		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
-		if errno != 0 {
-			h.closeOutcome.cause = errno
-			if response != nil {
-				h.closeOutcome.failure = response.GetFailure()
-			}
-		}
+		h.closeOutcome.cause = h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, 0, false)
 	})
 	return h.closeOutcome
 }
@@ -2446,7 +2446,18 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		return nil, nil, 0, errno
 	}
 	created := response.GetCreate()
-	if created == nil || created.GetItem() == nil || created.GetItem().GetAttr() == nil || len(created.GetHandle()) == 0 {
+	owner, ownerErr := n.mount.ownDescriptor(created.GetItem().GetStableIdentity(), created.GetHandle())
+	if ownerErr != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	defer owner.dispatch(ctx)
+	retained := false
+	defer func() {
+		if !retained {
+			n.mount.deferReclaim(created.GetItem().GetToken())
+		}
+	}()
+	if created.GetItem().GetAttr() == nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	item := cloneItem(created.GetItem())
@@ -2465,22 +2476,29 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		}
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
-	kernelFlags := portableOpenFlags(flags, created.GetCacheCapable())
+	current := n.mount.currentOpenResponse(ctx)
+	grant := created.GetDelegation()
+	if !current {
+		grant = nil
+	}
+	kernelFlags := portableOpenFlags(flags, current && created.GetCacheCapable())
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := child.registerDelegatedHandle(handle, created.GetDelegation(), response.GetAppliedSequence()); err != nil {
+	if err := child.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
-	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response); err != nil {
-		_ = handle.closeForCleanup(ctx, 0, false)
+	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response, current); err != nil {
+		handle.endLossObservation()
 		return nil, nil, 0, bufferErrno(err)
 	}
 	object := postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleTarget)
 	if object == nil {
 		object = postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleCreated)
 	}
-	if object != nil {
+	if current && object != nil {
 		n.mount.delegations.SetBaseAttr(item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 	}
+	owner.transfer()
+	retained = true
 	return item, handle, kernelFlags, 0
 }
 
@@ -2525,7 +2543,18 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 		return nil, nil, 0, errno
 	}
 	created := response.GetTmpfile()
-	if created == nil || created.GetItem() == nil || created.GetItem().GetAttr() == nil || len(created.GetHandle()) == 0 {
+	owner, ownerErr := n.mount.ownDescriptor(created.GetItem().GetStableIdentity(), created.GetHandle())
+	if ownerErr != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	defer owner.dispatch(ctx)
+	retained := false
+	defer func() {
+		if !retained {
+			n.mount.deferReclaim(created.GetItem().GetToken())
+		}
+	}()
+	if created.GetItem().GetAttr() == nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	item := cloneItem(created.GetItem())
@@ -2542,6 +2571,8 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 	if err := child.registerDelegatedHandle(handle, nil, 0); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
+	owner.transfer()
+	retained = true
 	return item, handle, portableOpenFlags(flags, false), 0
 }
 
@@ -2580,7 +2611,18 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 		return nil, errno
 	}
 	created := response.GetCreate()
-	if created == nil || created.GetItem() == nil || created.GetItem().GetAttr() == nil || len(created.GetHandle()) == 0 {
+	owner, ownerErr := n.mount.ownDescriptor(created.GetItem().GetStableIdentity(), created.GetHandle())
+	if ownerErr != nil {
+		return nil, syscall.EIO
+	}
+	defer owner.dispatch(ctx)
+	retained := false
+	defer func() {
+		if !retained {
+			n.mount.deferReclaim(created.GetItem().GetToken())
+		}
+	}()
+	if created.GetItem().GetAttr() == nil {
 		return nil, syscall.EIO
 	}
 	item := cloneItem(created.GetItem())
@@ -2589,18 +2631,8 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
 		return nil, syscall.EIO
 	}
-	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
-	// mknod(2) does not hand an open file description to the caller, so the one
-	// the authority just created is this frontend's to release immediately.
-	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle())}
-	if outcome := handle.closeForCleanup(ctx, 0, false); outcome.failed() {
-		n.mount.cleanupFailed("open-file close after mknod", outcome, func() {
-			handle.stale.Store(true)
-			handle.node.stale.Store(true)
-			n.mount.delegations.failCleanupIdentity(handle.node.item.GetStableIdentity(), "mknod handle cleanup refused")
-		})
-		return nil, outcome.errno()
-	}
+	// mknod returns only the item; the reserved descriptor goes to cleanup.
+	retained = true
 	return item, 0
 }
 
@@ -2619,11 +2651,13 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32) (*authorityp
 	// observation in the mkdir reply has no consumer here.
 	item := response.GetMkdir().GetItem()
 	if item == nil || item.GetAttr() == nil {
+		n.mount.deferReclaim(item.GetToken())
 		return nil, syscall.EIO
 	}
 	createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
 	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
 	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
+		n.mount.deferReclaim(item.GetToken())
 		return nil, syscall.EIO
 	}
 	return cloneItem(item), 0
@@ -2801,11 +2835,13 @@ func (n *node) Symlink(ctx context.Context, target, name string) (*authoritypb.I
 	}
 	item := response.GetLookup().GetItem()
 	if item == nil || item.GetAttr() == nil {
+		n.mount.deferReclaim(item.GetToken())
 		return nil, syscall.EIO
 	}
 	createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
 	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
 	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
+		n.mount.deferReclaim(item.GetToken())
 		return nil, syscall.EIO
 	}
 	return cloneItem(item), 0
@@ -2869,9 +2905,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		acquired := &acquiredDelegationHandle{}
 		ctx = context.WithValue(ctx, acquiredDelegationHandleKey{}, acquired)
 		defer func() {
-			if len(acquired.token) > 0 {
-				_ = n.mount.delegations.QueueClose(n.item.GetStableIdentity(), acquired.token, 0, false)
-			}
+			acquired.cleanup.dispatch(ctx)
 		}()
 		if request.Size != nil {
 			if err := n.ensureWriteDelegation(ctx, fh); err != nil {

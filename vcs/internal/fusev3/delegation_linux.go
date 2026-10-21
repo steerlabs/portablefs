@@ -124,6 +124,7 @@ type delegationState struct {
 
 	identity                            writeback.Identity
 	ref                                 *authoritypb.DelegationRef
+	sessionCtx                          context.Context // admission; assigned flushes outlive cache cancellation
 	mode                                authoritypb.DelegationMode
 	item                                []byte
 	handles                             map[string][]byte
@@ -159,11 +160,13 @@ type delegationManager struct {
 	timeout      time.Duration
 	maxWrite     int
 
-	epoch    sync.RWMutex
-	epochCtx context.Context
-	epochEnd context.CancelFunc
-	frontend sync.RWMutex
-	mu       sync.RWMutex
+	epoch      sync.RWMutex
+	epochCtx   context.Context
+	epochEnd   context.CancelFunc
+	sessionCtx context.Context
+	sessionEnd context.CancelFunc
+	frontend   sync.RWMutex
+	mu         sync.RWMutex
 	// A CREATE may receive its stable identity only after CONTROL retires its grant.
 	// Keep tombstones until every such response has been registered.
 	grantRequests     map[uint64]struct{}
@@ -226,12 +229,16 @@ type delegationClose struct {
 }
 
 func newDelegationManager(rpc delegationRPC, timeout time.Duration, incarnation uint64, opts writeback.Options) (*delegationManager, error) {
-	if rpc == nil || timeout <= 0 {
+	return newDelegationManagerWithCloseCapacity(rpc, timeout, incarnation, opts, 4096)
+}
+
+func newDelegationManagerWithCloseCapacity(rpc delegationRPC, timeout time.Duration, incarnation uint64, opts writeback.Options, closeCapacity int) (*delegationManager, error) {
+	if rpc == nil || timeout <= 0 || closeCapacity <= 0 {
 		return nil, errors.New("fusev3: delegation manager requires an authority and request timeout")
 	}
 	m := &delegationManager{
 		rpc: rpc, timeout: timeout, byID: make(map[writeback.Identity]*delegationState), identityLoss: make(map[writeback.Identity]uint64), epochSerial: 1, sessionSerial: 1,
-		maxWrite: writeback.MaxPayload, durableKick: make(chan struct{}, 1), tokens: make(map[uint64]delegationFlushProgress), closeQueue: make(chan delegationClose, 4096),
+		maxWrite: writeback.MaxPayload, durableKick: make(chan struct{}, 1), tokens: make(map[uint64]delegationFlushProgress), closeQueue: make(chan delegationClose, closeCapacity),
 	}
 	m.grantRequests = make(map[uint64]struct{})
 	m.reclaim = make(map[*delegationState]struct{})
@@ -244,6 +251,7 @@ func newDelegationManager(rpc delegationRPC, timeout time.Duration, incarnation 
 	}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.epochCtx, m.epochEnd = context.WithCancel(m.ctx)
+	m.sessionCtx, m.sessionEnd = context.WithCancel(m.ctx)
 	b, err := writeback.New(m, opts)
 	if err != nil {
 		m.cancel()
@@ -488,7 +496,7 @@ func (m *delegationManager) install(identity, item, handle []byte, grant *author
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	if m.incarnation() == 0 {
-		return errors.New("fusev3: cannot install delegation while subscription is fenced")
+		return errDelegationRetired
 	}
 	m.frontend.RLock()
 	defer m.frontend.RUnlock()
@@ -528,6 +536,7 @@ func (m *delegationManager) install(identity, item, handle []byte, grant *author
 	s.applied = max(s.applied, applied)
 	s.meta.Unlock()
 	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
+	s.sessionCtx = m.sessionCtx
 	close(s.grantChanged)
 	s.grantChanged = make(chan struct{})
 	s.handles[string(handle)] = cloneBytes(handle)
@@ -1012,7 +1021,7 @@ func (m *delegationManager) kickDurability() {
 func (m *delegationManager) advanceDurability() {
 	for {
 		m.epoch.RLock()
-		epoch, epochCtx := m.epochSerial, m.epochCtx
+		epoch, epochCtx, sessionCtx := m.epochSerial, m.epochCtx, m.sessionCtx
 		m.durabilityMu.Lock()
 		buffer, cut, durable := m.durableBuffer, m.appliedHigh, m.durableHigh
 		m.durabilityMu.Unlock()
@@ -1021,9 +1030,9 @@ func (m *delegationManager) advanceDurability() {
 			return
 		}
 		// Background completion has no foreground operation deadline. The
-		// transport keeps its exact request through reconnect until the epoch
-		// or mount ends; a local timeout must not strand this retained cut.
-		ctx, cancel := context.WithCancel(epochCtx)
+		// transport keeps its exact request through reconnect until the session
+		// or mount ends. A cold cache reset cannot abandon its replay identity.
+		ctx, cancel := context.WithCancel(sessionCtx)
 		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{CutSequence: cut}}})
 		if err == nil {
 			err = successfulDelegationResponse(response)
@@ -1032,6 +1041,10 @@ func (m *delegationManager) advanceDurability() {
 			reply := response.GetBarrier()
 			if reply == nil || reply.GetAppliedSequence() < reply.GetDurableSequence() || reply.GetDurableSequence() < cut {
 				err = errors.New("fusev3: malformed background durability receipt")
+			} else if !m.epochCurrent(epoch, buffer) || epochCtx.Err() != nil {
+				// This receipt settles the old request, not the new buffer's cut.
+				cancel()
+				return
 			} else {
 				var visible uint64
 				visible, err = m.visibilityCompletion(ctx, cut)
@@ -1046,13 +1059,13 @@ func (m *delegationManager) advanceDurability() {
 			// Include applications that arrived while this owner was busy.
 			continue
 		}
-		if epochCtx.Err() != nil || !m.epochCurrent(epoch, buffer) {
-			return
-		}
 		var classified cleanupClassified
 		coherence := response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || errors.Is(err, authorityrpc.ErrSubscriptionReset) || errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
 		if !coherence {
 			m.unknownCloseOutcome(fmt.Errorf("background durability: %w", err))
+			return
+		}
+		if epochCtx.Err() != nil || !m.epochCurrent(epoch, buffer) {
 			return
 		}
 		m.hookMu.RLock()
@@ -1078,6 +1091,7 @@ func (m *delegationManager) flushMetadata(ctx context.Context, id writeback.Iden
 	defer m.releaseState(s)
 	s.admission.RLock()
 	binding, ok := s.bindings[entry.Generation]
+	sessionCtx := s.sessionCtx
 	current := ok && sameDelegation(s.ref, binding.ref)
 	handle := firstDelegatedHandle(s.handles)
 	// ftruncate requires a writable descriptor. A read-only handle can join
@@ -1119,7 +1133,7 @@ func (m *delegationManager) flushMetadata(ctx context.Context, id writeback.Iden
 		set.MtimeNs = &a.MTimeNS
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: set}}
-	response, err := m.rpc.CallMutation(ctx, request)
+	response, err := m.rpc.CallMutation(authorityrpc.RetainMutationForSession(ctx, sessionCtx), request)
 	s.admission.Lock()
 	if !sameDelegation(s.ref, binding.ref) {
 		s.admission.Unlock()
@@ -1376,8 +1390,8 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	return response, nil
 }
 
-func (m *delegationManager) openedVisibility(ctx context.Context, identity []byte, response *authoritypb.Response) error {
-	if response.GetAppliedSequence() == 0 {
+func (m *delegationManager) openedVisibility(ctx context.Context, identity []byte, response *authoritypb.Response, current bool) error {
+	if !current || response.GetAppliedSequence() == 0 {
 		return nil
 	}
 	id, err := delegationIdentity(identity)
@@ -2083,11 +2097,24 @@ func (m *delegationManager) changePendingCloses(delta int) {
 // server handle alive through application. Unknown descriptor outcomes trigger
 // terminal session cleanup.
 func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
+	return m.queueClose(context.Background(), identity, handle, lockOwner, flockUnlock)
+}
+
+// A descriptor reservation has one callback-local owner until it is transferred
+// to a retained frontend handle or dispatched to session cleanup. Both debt and
+// producer admission are reserved immediately, including while grant installation
+// can still fail. Its methods run on that owner's goroutine exactly once.
+type descriptorCleanup struct {
+	manager *delegationManager
+	pending delegationClose
+}
+
+func (m *delegationManager) reserveClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) (*descriptorCleanup, error) {
 	if _, err := delegationIdentity(identity); err != nil {
-		return err
+		return nil, err
 	}
 	if len(handle) != 16 {
-		return errors.New("fusev3: invalid queued server handle")
+		return nil, errors.New("fusev3: invalid queued server handle")
 	}
 	m.epoch.RLock()
 	pending := delegationClose{
@@ -2096,21 +2123,68 @@ func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64
 	}
 	m.epoch.RUnlock()
 	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
 	if m.closeStopped || m.ctx.Err() != nil {
-		m.closeMu.Unlock()
-		return writeback.ErrClosed
+		return nil, writeback.ErrClosed
 	}
 	m.closePending++
 	m.closeProducers.Add(1)
-	m.closeMu.Unlock()
-	defer m.closeProducers.Done()
-	select {
-	case m.closeQueue <- pending:
-		return nil
-	case <-m.ctx.Done():
-		m.changePendingCloses(-1)
-		return writeback.ErrClosed
+	return &descriptorCleanup{manager: m, pending: pending}, nil
+}
+
+// transfer discharges the temporary reservation when a retained frontend handle
+// takes ownership. Its eventual RELEASE will reserve cleanup independently.
+func (owner *descriptorCleanup) transfer() {
+	if owner == nil || owner.manager == nil {
+		return
 	}
+	m := owner.manager
+	owner.manager = nil
+	m.changePendingCloses(-1)
+	m.closeProducers.Done()
+}
+
+func (owner *descriptorCleanup) dispatch(ctx context.Context) {
+	if owner == nil || owner.manager == nil {
+		return
+	}
+	m, pending := owner.manager, owner.pending
+	owner.manager = nil
+	dispatch := func() {
+		defer m.closeProducers.Done()
+		select {
+		case m.closeQueue <- pending:
+		case <-m.ctx.Done():
+			m.changePendingCloses(-1)
+		}
+	}
+	if callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback); callback != nil {
+		callback.closeDispatch = append(callback.closeDispatch, dispatch)
+	} else {
+		dispatch()
+	}
+}
+
+// queueClose reserves session cleanup ownership before returning to RELEASE.
+// A counted producer waits for queue space only after the callback fence ends.
+func (m *delegationManager) queueClose(ctx context.Context, identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
+	owner, err := m.reserveClose(identity, handle, lockOwner, flockUnlock)
+	if err != nil {
+		return err
+	}
+	owner.dispatch(ctx)
+	return nil
+}
+
+// A malformed allocation cannot be named for cleanup; terminal session teardown
+// must own the table instead. All valid allocating results reserve before any
+// grant, visibility, or post-state validation can return them to their caller.
+func (m *Mount) ownDescriptor(identity, handle []byte) (*descriptorCleanup, error) {
+	owner, err := m.delegations.reserveClose(identity, handle, 0, false)
+	if err != nil {
+		m.revoke(fmt.Errorf("fusev3: allocated descriptor has no cleanup owner: %w", err))
+	}
+	return owner, err
 }
 
 func (m *delegationManager) closeLoop() {
@@ -2170,38 +2244,50 @@ func (m *delegationManager) drainCloseQueue() {
 func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 	defer m.changePendingCloses(-len(batch))
 	for {
-		// A background close retains its exact replay identity through an outage.
-		// The queue is bounded, and mount shutdown cancels this work.
-		ctx, cancel := context.WithTimeout(m.ctx, m.timeout)
+		// Stop transfers the descriptor table to mount/session teardown. Joining
+		// its producers must not turn canceled preparation into a new failure.
+		if m.ctx.Err() != nil {
+			return
+		}
+		m.epoch.RLock()
+		sessionCtx := m.sessionCtx
+		m.epoch.RUnlock()
 		var scopes []delegationCloseScope
-		err := m.closeHandles(ctx, batch, &scopes)
-		cancel()
-		if err != nil {
-			var cleanup delegationCleanupError
-			var finalized delegationReleaseFinalizedError
-			if errors.As(err, &cleanup) || errors.As(err, &finalized) {
-				m.failCloseScopes(scopes, "deferred descriptor cleanup refused", true)
-				m.hookMu.RLock()
-				report := m.cleanupFailure
-				m.hookMu.RUnlock()
-				if report != nil {
-					report(err)
-				}
-				var classified cleanupClassified
-				m.hookMu.RLock()
-				waitRetry := m.cleanupRetry
-				m.hookMu.RUnlock()
-				if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && waitRetry != nil && waitRetry(m.ctx) == nil {
-					// This dispatcher remains the bounded owner of the refused
-					// batch. Recovery may replace a subscription, but cannot move
-					// descriptors to another session. closeHandles retires old-epoch
-					// debt locally after the old session has ended.
-					continue
-				}
-				log.Printf("portablefs: deferred close failed: %v", err)
-				return
-			}
-			m.failCloseScopes(scopes, "asynchronous delegated close failed", false)
+		err := m.closeHandles(m.ctx, batch, &scopes)
+		if err == nil || m.ctx.Err() != nil || sessionCtx.Err() != nil || errors.Is(err, writeback.ErrLost) || errors.Is(err, authorityrpc.ErrAuthorityChanged) {
+			return
+		}
+		var classified cleanupClassified
+		if !errors.As(err, &classified) {
+			err = m.unknownCloseOutcome(err)
+			errors.As(err, &classified)
+		}
+		retryable := classified != nil && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+		m.failCloseScopes(scopes, "deferred descriptor cleanup refused", retryable)
+		m.hookMu.RLock()
+		report, waitRetry := m.cleanupFailure, m.cleanupRetry
+		m.hookMu.RUnlock()
+		if report != nil {
+			report(err)
+		}
+		if retryable && waitRetry != nil && waitRetry(m.ctx) == nil {
+			// This worker remains the counted owner through interrupted cache
+			// preparation and cold activation. The exact session still owns
+			// the descriptors, even before the buffer serial changes.
+			continue
+		}
+		if !retryable && classified != nil && !classified.cleanupIsTerminal() {
+			// Every failed descriptor in this result was proven retired.
+			return
+		}
+		if retryable && m.ctx.Err() == nil && sessionCtx.Err() == nil {
+			m.unknownCloseOutcome(err)
+		}
+		// Terminal teardown now owns the table. Keep this batch counted until
+		// that session ends or the mount joins its cleanup worker at Stop.
+		select {
+		case <-sessionCtx.Done():
+		case <-m.ctx.Done():
 		}
 		return
 	}
@@ -2224,6 +2310,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	epochSerial := m.epochSerial
 	sessionSerial := m.sessionSerial
 	epochCtx := m.epochCtx
+	sessionCtx := m.sessionCtx
 	incarnation := m.incarnation()
 	groupsByID := make(map[writeback.Identity]*delegationReleaseGroup)
 	current := make([]delegationClose, 0, len(closes))
@@ -2268,21 +2355,27 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 		return nil
 	}
 	callCtx, cancel := context.WithCancel(ctx)
-	stopEpochCancel := context.AfterFunc(epochCtx, cancel)
+	stopSessionCancel := context.AfterFunc(sessionCtx, cancel)
 	defer func() {
-		stopEpochCancel()
+		stopSessionCancel()
 		cancel()
 	}()
+	// Grant retirement belongs to the cache incarnation; descriptor CLOSE and
+	// its replay identity belong to the session. Only the preparation is bounded
+	// by the cache-work deadline and interrupted by a cold reset.
+	prepareCtx, stopPrepare := context.WithTimeout(callCtx, m.timeout)
+	stopEpochCancel := context.AfterFunc(epochCtx, stopPrepare)
+	defer func() { stopEpochCancel(); stopPrepare() }()
 	groups := make([]*delegationReleaseGroup, 0, len(groupsByID))
 	for _, g := range groupsByID {
 		groups = append(groups, g)
 	}
-	batch, err := m.prepareReleaseBatch(callCtx, buf, epochSerial, incarnation, groups)
+	batch, err := m.prepareReleaseBatch(prepareCtx, buf, epochSerial, incarnation, groups)
 	if err != nil {
-		if !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
 			return m.closeResetOutcome(sessionSerial)
 		}
-		return err
+		return m.unknownCloseOutcome(err)
 	}
 	if scopes != nil {
 		for _, group := range groups {
@@ -2292,17 +2385,21 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 		}
 	}
 	defer batch.finish()
-	if err := batch.applyAndRelease(callCtx); err != nil {
-		if !m.epochCurrent(epochSerial, buf) {
+	if err := batch.applyAndRelease(prepareCtx); err != nil {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
 			return m.closeResetOutcome(sessionSerial)
 		}
-		return err
+		var classified cleanupClassified
+		if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return err
+		}
+		return m.unknownCloseOutcome(err)
 	}
 	response, err := m.rpc.CallMutation(callCtx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
 	if err == nil {
 		err = successfulDelegationResponse(response)
 	}
-	if !m.epochCurrent(epochSerial, buf) {
+	if sessionCtx.Err() != nil {
 		return m.closeResetOutcome(sessionSerial)
 	}
 	if err != nil {
@@ -2325,6 +2422,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	var firstErr error
 	var firstFailure authoritypb.FailureClass
+	liveDebt, retryDebt := false, true
 	for i, result := range results {
 		errno := responseErrno(&authoritypb.Response{Errno: result.GetErrno(), Failure: result.GetFailure()})
 		if result == nil {
@@ -2336,10 +2434,13 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 				firstFailure = result.GetFailure()
 			}
 			if !result.GetRetired() {
+				liveDebt = true
+				retryDebt = retryDebt && result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
 				continue
 			}
 		}
 		id, _ := delegationIdentity(current[i].identity)
+		// These are the captured states, never the successor incarnation's.
 		s := groupsByID[id].state
 		s.admission.Lock()
 		delete(s.handles, string(current[i].handle))
@@ -2347,6 +2448,12 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 		s.admission.Unlock()
 	}
 	if firstErr != nil {
+		if liveDebt {
+			if !retryDebt {
+				return m.unknownCloseOutcome(firstErr)
+			}
+			firstFailure = authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+		}
 		return delegationCleanupError{cause: firstErr, failure: firstFailure}
 	}
 	return nil
@@ -2382,6 +2489,8 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	defer m.epoch.Unlock()
 	m.epochSerial++
 	if sessionChanged {
+		m.sessionEnd()
+		m.sessionCtx, m.sessionEnd = context.WithCancel(m.ctx)
 		m.sessionSerial++
 		for {
 			select {

@@ -3515,3 +3515,171 @@ func TestUncertainDelegationReleaseRequiresColdSubscriptionWithoutEndingSession(
 		t.Fatalf("new replay domain: %v", request)
 	}
 }
+
+type repeatedReplayLossHandler struct {
+	*replayHandler
+	entered chan *authoritypb.Request
+	release chan struct{}
+}
+
+func (h *repeatedReplayLossHandler) Handle(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+	response := h.replayHandler.Handle(ctx, r)
+	if r.GetMutation() != nil {
+		h.entered <- proto.Clone(r).(*authoritypb.Request)
+		<-h.release
+	}
+	return response
+}
+
+func TestMutationResolverRetainsIdentityAcrossRepeatedTransportLoss(t *testing.T) {
+	runtime, err := volumeserver.New("repeated-replay", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 9, MaxSessions: 4, MaxLockRecords: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &repeatedReplayLossHandler{replayHandler: &replayHandler{runtime: runtime, access: volumeserver.AccessRead}, entered: make(chan *authoritypb.Request, 1), release: make(chan struct{})}
+	address, tlsConfig, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
+	defer stop()
+	defer close(handler.release)
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "repeated-replay", 9, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	done := make(chan error, 1)
+	assigned := 0
+	go func() {
+		response, err := client.CallMutationWithIdentity(t.Context(), &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{bytes.Repeat([]byte{0x91}, 16)}}}}, func(MutationIdentity) error { assigned++; return nil })
+		if err == nil && response.GetMutation().GetAcceptedSequence() != 1 {
+			err = errors.New("replay omitted accepted sequence")
+		}
+		done <- err
+	}()
+	var first *authoritypb.Request
+	for i := 0; i < 4; i++ {
+		var r *authoritypb.Request
+		select {
+		case r = <-handler.entered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("resolver abandoned retained identity")
+		}
+		if first == nil {
+			first = r
+		} else if !proto.Equal(first.Mutation, r.Mutation) || !proto.Equal(&authoritypb.Request{Body: first.Body}, &authoritypb.Request{Body: r.Body}) {
+			t.Fatal("replay identity or exact body changed")
+		}
+		if len(client.ordinary.permits) != 1 || cap(client.ordinary.permits) != 1 {
+			t.Fatal("unresolved replay released its bounded lane ownership")
+		}
+		if i == 1 {
+			var pressure sync.WaitGroup
+			for range 16 {
+				pressure.Add(1)
+				go func() {
+					defer pressure.Done()
+					ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+					defer cancel()
+					_, err := client.CallMutationWithIdentity(ctx, &authoritypb.Request{Body: first.Body}, func(MutationIdentity) error {
+						t.Error("pressure caller reused an unresolved slot")
+						return syscall.EINVAL
+					})
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("pressure admission=%v", err)
+					}
+				}()
+			}
+			pressure.Wait()
+		}
+		if i == 3 {
+			handler.release <- struct{}{}
+			break
+		}
+		client.data.pendingMu.Lock()
+		conn := client.data.conn
+		client.data.pendingMu.Unlock()
+		client.failConnection(client.data, conn, ErrTransportUncertain)
+		handler.release <- struct{}{}
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("exact replay never settled")
+	}
+	if assigned != 1 || handler.applyCalls.Load() != 1 || handler.mutationCalls.Load() != 4 {
+		t.Fatalf("assignments=%d applications=%d attempts=%d", assigned, handler.applyCalls.Load(), handler.mutationCalls.Load())
+	}
+	if client.SessionEndCause() != nil {
+		t.Fatal(client.SessionEndCause())
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := client.CallMutationWithIdentity(ctx, &authoritypb.Request{Body: first.Body}, func(MutationIdentity) error { t.Error("canceled unsent caller assigned"); return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("unsent cancellation=%v", err)
+	}
+	if client.SessionEndCause() != nil {
+		t.Fatal("unsent cancellation poisoned client")
+	}
+}
+
+func TestAssignedMutationOutlivesCacheCancellation(t *testing.T) {
+	runtime, err := volumeserver.New("cache-cancellation", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 9, MaxSessions: 4, MaxLockRecords: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &repeatedReplayLossHandler{replayHandler: &replayHandler{runtime: runtime, access: volumeserver.AccessRead}, entered: make(chan *authoritypb.Request, 1), release: make(chan struct{})}
+	address, tlsConfig, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
+	defer stop()
+	defer close(handler.release)
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "cache-cancellation", 9, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	session, cancelSession := context.WithCancel(t.Context())
+	defer cancelSession()
+	cache, cancelCache := context.WithCancel(t.Context())
+	defer cancelCache()
+	done := make(chan error, 1)
+	request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: [][]byte{bytes.Repeat([]byte{0x91}, 16)}}}}
+	go func() {
+		response, err := client.CallMutation(RetainMutationForSession(cache, session), request)
+		if err == nil && response.GetMutation().GetAcceptedSequence() != 1 {
+			err = errors.New("assigned replay did not settle")
+		}
+		done <- err
+	}()
+	select {
+	case <-handler.entered:
+	case <-time.After(time.Second):
+		t.Fatal("mutation not assigned")
+	}
+	cancelCache()
+	select {
+	case err := <-done:
+		t.Fatalf("cache cancellation abandoned assigned operation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if len(client.ordinary.permits) != 1 || client.SessionEndCause() != nil {
+		t.Fatal("cache reset surrendered replay ownership")
+	}
+	handler.release <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retained mutation did not resolve")
+	}
+	if _, err := client.CallMutationWithIdentity(RetainMutationForSession(cache, session), &authoritypb.Request{Body: request.Body}, func(MutationIdentity) error {
+		t.Error("canceled cache work assigned a new operation")
+		return syscall.EINVAL
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("unsent cache cancellation=%v", err)
+	}
+	if client.SessionEndCause() != nil {
+		t.Fatal(client.SessionEndCause())
+	}
+}

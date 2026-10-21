@@ -135,6 +135,7 @@ type fakeRPC struct {
 	// response is returned to the frontend, allowing ordering tests to place a
 	// raw callback precisely on either side of transport delivery.
 	mutationStates       []*authoritypb.MutationState
+	unrecordedRefusals   bool
 	applied              uint64
 	mutationSeq          uint64
 	afterMutation        func()
@@ -285,7 +286,9 @@ func (f *fakeRPC) CallMutationWithIdentity(ctx context.Context, request *authori
 		return response, err
 	}
 	f.mu.Lock()
-	if len(f.mutationStates) != 0 {
+	if f.unrecordedRefusals && response.GetErrno() != 0 {
+		response.Mutation = nil
+	} else if len(f.mutationStates) != 0 {
 		response.Mutation = proto.Clone(f.mutationStates[0]).(*authoritypb.MutationState)
 		f.mutationStates = f.mutationStates[1:]
 	} else {
@@ -433,7 +436,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		results := make([]*authoritypb.CloseBatchResult, len(request.GetCloseBatch().Closes))
 		for i, close := range request.GetCloseBatch().Closes {
 			f.fileCloses = append(f.fileCloses, proto.Clone(close).(*authoritypb.CloseRequest))
-			results[i] = &authoritypb.CloseBatchResult{Errno: int32(f.closeFailure)}
+			results[i] = &authoritypb.CloseBatchResult{Errno: int32(f.closeFailure), Retired: true}
 		}
 		return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
 	case request.GetClose() != nil:
@@ -1375,11 +1378,12 @@ func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	if frontend.ReplyWriteTracked(unique) {
 		frontend.ReplyWritten(unique, fuse.OK)
 	}
+	waitUntil(t, time.Second, "refused close retirement", func() bool { return pendingCloses(mount.delegations) == 0 })
 	if err := mount.fatalError(); err != nil {
-		t.Fatalf("definite close refusal revoked mount: %v", err)
+		t.Fatalf("proven descriptor retirement revoked mount: %v", err)
 	}
-	if !record.node.stale.Load() {
-		t.Fatal("refused close did not stale the affected identity")
+	if _, exists := frontend.handles[id]; exists {
+		t.Fatal("released handle remains accessible")
 	}
 }
 
@@ -1399,11 +1403,12 @@ func TestReleaseDirSurfacesARefusedClose(t *testing.T) {
 	if frontend.ReplyWriteTracked(unique) {
 		frontend.ReplyWritten(unique, fuse.OK)
 	}
+	waitUntil(t, time.Second, "refused directory close retirement", func() bool { return pendingCloses(mount.delegations) == 0 })
 	if err := mount.fatalError(); err != nil {
-		t.Fatalf("definite directory close refusal revoked mount: %v", err)
+		t.Fatalf("proven directory retirement revoked mount: %v", err)
 	}
-	if !record.node.stale.Load() {
-		t.Fatal("refused directory close did not stale the affected identity")
+	if _, exists := frontend.handles[id]; exists {
+		t.Fatal("released directory remains accessible")
 	}
 }
 
@@ -1590,6 +1595,7 @@ func TestMknodCreatesRegularFilesAndRefusesUnrepresentableTypes(t *testing.T) {
 	if errno != 0 || item == nil {
 		t.Fatalf("mknod regular = (%v, %v)", item, errno)
 	}
+	waitUntil(t, time.Second, "mknod descriptor retirement", func() bool { return pendingCloses(mount.delegations) == 0 })
 	rpc.snapshot(func(f *fakeRPC) {
 		if len(f.fileCloses) != 1 {
 			t.Fatalf("mknod left %d open file descriptions behind, want 0", len(f.fileCloses))
@@ -2098,6 +2104,7 @@ func TestFlushAndReleaseCarryKernelLockOwners(t *testing.T) {
 		t.Fatal(errno)
 	}
 	finishClose(false)
+	waitUntil(t, time.Second, "lock-owner close retirement", func() bool { return pendingCloses(mount.delegations) == 0 })
 	rpc.mu.Lock()
 	defer rpc.mu.Unlock()
 	if len(rpc.flushes) != 1 || rpc.flushes[0].GetLockOwner() != 41 {

@@ -196,8 +196,33 @@ A missed five-second recall budget or rejected stale-generation flush marks
 loss and returns EIO on affected handles; it does not disconnect the mount.
 A lost subscription withdraws all cache permission and resubscribes cold after
 invalidation. During withdrawal, new uncached reads fail rather than return bytes
-under an expired permission. Authentication and exact assigned-mutation outcome
-invariants still fail closed; operator unmount remains explicit.
+under an expired permission. An authenticated live session resolves an assigned
+DATA mutation's exact replay before current coherence admission, returning its
+retained outcome and mutation state without executing again. New operations
+still require current permission. Replay does not restore an expired grant,
+cache contents, or a discarded volatile tail.
+
+Cold reset cancels old cache and grant work, but preserves session-owned CLOSE,
+CLOSE_BATCH, RECLAIM, and Barrier resolution. Each unresolved mutation retains
+its exact body, replay slot, and lane permit through bounded transport attempts.
+A buffer flush transfers resolution to the session before its assignment callback
+publishes an ordinal; stopping its old buffer joins exact resolution before
+releasing its immutable bytes. Every allocated descriptor immediately reserves
+counted cleanup ownership before grant installation or result validation. A
+retained frontend handle takes ownership on success; every other exit, including
+temporary write-delegation OPENs, hands the exact descriptor to session cleanup.
+File and directory RELEASE use the same counted worker. Rejected item metadata
+and failed interning keep their capabilities on the RECLAIM cleanup lane.
+Callback completion
+finishes grant-history and index bookkeeping before releasing its epoch reader;
+only then can reserved producers dispatch. Physical metadata pins remain held
+until reply settlement. Interrupted cache preparation retains debt through cold
+activation, even before the buffer serial changes; only proven retirement or
+terminal session cleanup discharges it.
+Old receipts cannot advance the replacement buffer, and recorded loss remains
+observable on affected handles and the pre-loss root barrier. Authentication,
+session expiry, and unprovable assigned outcomes still fail closed; operator
+unmount remains explicit.
 
 An Authority epoch change invalidates every old file and directory handle,
 capability, and lock. Shipping `portablefs mount` withdraws the old mount and

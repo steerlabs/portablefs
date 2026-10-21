@@ -57,7 +57,9 @@ inode fences this store at its next barrier; the authority treats it as storage
 failure and never relabels it, retries to clear it, or rotates the root
 description. Separate filesystems are separate error domains.
 
-Same-epoch exact replay returns the retained result without re-execution.
+Same-epoch exact replay on an authenticated live session returns the retained
+result and mutation state before current subscription or delegation admission,
+without re-execution. Expired cache permission still refuses new execution.
 Reusing an operation identity with a different canonical body or skipping its
 sequence fences the session. A reply lost across Authority death may be
 UNCERTAIN; it is not resubmitted in the new epoch. The application inspects
@@ -77,6 +79,15 @@ cold on recovery. The Authority waits for acknowledgment or the old horizon
 before proceeding. Renewal cannot revive a fenced incarnation. CONTROL polls,
 renewal, and acknowledgments have independent lanes; assigned mutation replay
 still preserves exact outcomes across a same-epoch reconnect.
+
+Subscription expiry does not end the session or abandon an assigned DATA replay
+slot. Deferred descriptor cleanup and background Barrier keep their exact bodies
+and bounded lane ownership through transport recovery and cold reset. Only new
+cache/grant work uses the replacement incarnation; an old reply cannot reinstall
+a grant or cache contents, replay a lost volatile tail, or clear recorded loss.
+An unresolved outcome after caller cancellation, session expiry, authorization
+expiry, or epoch loss retains its terminal handling. None of the request or
+transport timeouts defines a general 45-second idle-session lifetime.
 
 Cold reset first interrupts old admission, waking writers parked on buffer
 capacity, then drains callbacks and physical replies before replacing ownership.

@@ -51,6 +51,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 	defer m.releaseState(s)
 	s.admission.RLock()
 	binding, ok := s.bindings[entries[0].Generation]
+	sessionCtx := s.sessionCtx
 	current := ok && sameDelegation(s.ref, binding.ref)
 	handle := firstDelegatedHandle(s.writers)
 	s.admission.RUnlock()
@@ -116,7 +117,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		go func(i int, request *authoritypb.Request) {
 			defer joined.Done()
 			defer close(done)
-			results[i].response, results[i].err = m.rpc.CallMutationSegments(ctx, request, spans[i], func(authorityrpc.MutationIdentity) error {
+			results[i].response, results[i].err = m.rpc.CallMutationSegments(authorityrpc.RetainMutationForSession(ctx, sessionCtx), request, spans[i], func(authorityrpc.MutationIdentity) error {
 				if err := m.assignFlushOrdinal(s, binding.ref, request.GetWrite()); err != nil {
 					return err
 				}

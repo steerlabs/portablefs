@@ -102,6 +102,16 @@ type MutationIdentity struct {
 // sends nothing and leaves the replay slot unadvanced.
 type MutationAssigned func(MutationIdentity) error
 
+type mutationSessionKey struct{}
+
+// RetainMutationForSession separates revocable cache work from an assigned
+// session replay. Before assignment ctx still controls lane admission. After
+// assignment the session owns resolution, including the immutable WRITE spans;
+// retiring a cache buffer must join that resolution rather than cancel it.
+func RetainMutationForSession(ctx, session context.Context) context.Context {
+	return context.WithValue(ctx, mutationSessionKey{}, session)
+}
+
 // ResponseConsumption retains one parsed authority mutation response through
 // the frontend boundary which makes that response locally observable. For a
 // strict Linux state-bearing result, that boundary is the physical write of
@@ -151,9 +161,9 @@ type callResult struct {
 // lane is one admission class. Ordinary operations and blocking POSIX lock
 // waits never share permits, and each lane owns a private, disjoint range of
 // replay slots sized at least as large as its own permit count. A caller takes
-// its permit before it takes a slot index, so at most one caller can hold any
-// slot at a time: slot ownership cannot contend, and a parked lock waiter can
-// neither consume an ordinary permit nor stall an ordinary mutation.
+// its permit before selecting a slot. Uneven completions can revisit a busy
+// round-robin slot; that wait remains cancelable before assignment. A parked
+// lock waiter cannot consume an ordinary permit.
 type lane struct {
 	permits  chan struct{}
 	slots    []clientSlot
@@ -223,12 +233,33 @@ type Client struct {
 }
 
 type clientSlot struct {
-	mu sync.Mutex
+	mu replaySlotMutex
 	// sequence mirrors what the authority reported as recorded for this slot.
 	// It is only ever assigned from a MutationState the authority returned, so
 	// the two counters cannot drift apart.
 	sequence uint64
 }
+
+// replaySlotMutex keeps slot waiting inside cancelable pre-assignment
+// admission. Its zero value is usable.
+type replaySlotMutex struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (m *replaySlotMutex) LockContext(ctx context.Context) error {
+	m.once.Do(func() { m.gate = make(chan struct{}, 1) })
+	select {
+	case m.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *replaySlotMutex) Lock() { _ = m.LockContext(context.Background()) }
+
+func (m *replaySlotMutex) Unlock() { <-m.gate }
 
 // clientSessionCacheEntries bounds the TLS 1.3 tickets one client keeps. Every
 // dial this client makes uses the same authority server name, so the cache holds
@@ -1841,7 +1872,8 @@ func (c *Client) callRetained(
 // The client never infers that the authority advanced a slot: every rejection
 // the authority makes before recording an outcome leaves both counters equal.
 // Cancellation after send without an exact outcome poisons the client because
-// the outcome is genuinely uncertain to the caller.
+// the outcome is genuinely uncertain to the caller. A frontend may explicitly
+// retain an assigned cache flush for session-owned resolution instead.
 func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
@@ -1918,14 +1950,19 @@ func (c *Client) CallMutationWithIdentityRetained(
 	}
 	defer func() { <-admitted.permits }()
 
-	// The permit is held, so at most cap(permits) callers can be between here
-	// and the matching release, and the lane owns at least that many slots.
-	// Round-robin therefore hands every concurrent caller a distinct slot.
+	// A permit bounds concurrent owners, but does not make round-robin slots
+	// distinct when earlier calls complete unevenly. Slot waiting is still
+	// unassigned work and must observe caller cancellation.
 	local := (admitted.nextSlot.Add(1) - 1) % uint32(len(admitted.slots))
 	slot := &admitted.slots[local]
 	index := admitted.base + local
-	slot.mu.Lock()
+	if err := slot.mu.LockContext(ctx); err != nil {
+		return nil, nil, err
+	}
 	defer slot.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 
 	sequence := slot.sequence + 1
 	request.Mutation = &authoritypb.Mutation{Slot: index, Sequence: sequence}
@@ -1939,21 +1976,54 @@ func (c *Client) CallMutationWithIdentityRetained(
 			consumption.Consume()
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
+		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		stop := context.AfterFunc(session, cancel)
+		defer func() { stop(); cancel() }()
+		if session.Err() != nil {
+			cancel()
+		}
+		ctx = owned
+	}
+	// A successful callback may publish a dense ordinal and start its successor.
+	// Session ownership must already exist before that publication.
 	if assigned != nil {
 		if err := assigned(MutationIdentity{Slot: index, Sequence: sequence}); err != nil {
 			return nil, nil, err
 		}
 	}
-	response, releaseFrame, submitted, err := c.dispatchOwnedFrame(ctx, request)
-	if errors.Is(err, ErrTransportUncertain) {
+	var response *authoritypb.Response
+	var releaseFrame func()
+	submitted := false
+	for {
+		var attemptSubmitted bool
+		response, releaseFrame, attemptSubmitted, err = c.dispatchOwnedFrame(ctx, request)
+		submitted = submitted || attemptSubmitted
+		if !errors.Is(err, ErrTransportUncertain) {
+			break
+		}
 		if releaseFrame != nil {
 			releaseFrame()
+			releaseFrame = nil
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
 			// Recovery may have returned the already-recorded verdict. Only a
 			// live session's establishment failure can become uncertainty.
 			if terminalErr := c.checkCallEntry(); terminalErr != nil {
 				return nil, nil, terminalErr
+			}
+			// Each establishment attempt stays bounded. Its subscription-sized
+			// budget says nothing about a live session's retained replay outcome:
+			// keep this exact body, slot, and lane permit until it resolves.
+			if errors.Is(reconnectErr, ErrTransportUncertain) && ctx.Err() == nil {
+				retryErr := waitTransportRetry(ctx)
+				if retryErr == nil {
+					continue
+				}
+				reconnectErr = retryErr
 			}
 			if !submitted && (errors.Is(reconnectErr, context.Canceled) || errors.Is(reconnectErr, context.DeadlineExceeded)) {
 				return nil, nil, reconnectErr
@@ -1964,9 +2034,6 @@ func (c *Client) CallMutationWithIdentityRetained(
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
-		var replaySubmitted bool
-		response, releaseFrame, replaySubmitted, err = c.dispatchOwnedFrame(ctx, request)
-		submitted = submitted || replaySubmitted
 	}
 	consumption.releaseFrame = releaseFrame
 	// Refusing an unsent attempt leaves its slot unchanged. Once any attempt

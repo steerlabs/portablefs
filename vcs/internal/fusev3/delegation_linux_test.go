@@ -1634,8 +1634,9 @@ func TestDeferredCloseBacklogBlocksNewHandleAdmissionUntilCleanup(t *testing.T) 
 	}
 }
 
-func TestDeferredCloseBatchUsesRequestDeadline(t *testing.T) {
-	fake := &delegationFakeRPC{block: make(chan struct{})}
+func TestDeferredCloseBatchRetainsDebtUntilSessionResolution(t *testing.T) {
+	release := make(chan struct{})
+	fake := &delegationFakeRPC{block: release}
 	m, err := newDelegationManager(fake, 50*time.Millisecond, 7, writeback.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -1644,15 +1645,15 @@ func TestDeferredCloseBatchUsesRequestDeadline(t *testing.T) {
 	if err := m.QueueClose(delegationTestIdentity(18), delegationTestToken(18, 2), 0, false); err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
-	waitUntil(t, time.Second, "deadline-scoped deferred close", func() bool {
-		m.closeMu.Lock()
-		defer m.closeMu.Unlock()
-		return m.closePending == 0
-	})
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("deferred close exceeded request deadline: %s", elapsed)
+	time.Sleep(2 * m.timeout)
+	m.closeMu.Lock()
+	pending := m.closePending
+	m.closeMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("unresolved close debt=%d", pending)
 	}
+	close(release)
+	waitUntil(t, time.Second, "resolved deferred close", func() bool { m.closeMu.Lock(); defer m.closeMu.Unlock(); return m.closePending == 0 })
 }
 
 func TestDeferredCloseShutdownJoinsRacingEnqueues(t *testing.T) {

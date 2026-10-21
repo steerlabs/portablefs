@@ -854,7 +854,6 @@ func TestCoherencePermanentSessionEndDuringRecall(t *testing.T) {
 	guard.Release()
 	position := c.OnCommit([]ChangeEntry{{Kind: AttributesChanged, Identity: other, VolumeVersion: 1}})
 	withdrawn := make(chan error, 1)
-	go func() { withdrawn <- c.WaitWithdrawn(t.Context(), position, peer.Session) }()
 	c.ExpireSession(holder.Session)
 	if err := cv2Result(t, recalled); err != nil {
 		t.Fatal(err)
@@ -874,6 +873,12 @@ func TestCoherencePermanentSessionEndDuringRecall(t *testing.T) {
 	if handlesRemain {
 		t.Fatal("terminal handles retained")
 	}
+	// Start the horizon waiter after terminal recall notifications settle. Wait
+	// for its timer registration before advancing the relative fake clock; an
+	// advance between Now and NewTimer would otherwise shift that timer past
+	// the intended horizon and leave this test waiting for a second advance.
+	go func() { withdrawn <- c.WaitWithdrawn(t.Context(), position, peer.Session) }()
+	clock.waitForTimers(t, 1)
 	select {
 	case <-withdrawn:
 		t.Fatal("terminal runtime shortened cache horizon")
