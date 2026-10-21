@@ -107,6 +107,7 @@ type Renewer struct {
 	readiness                    RenewalReadiness
 	status                       RenewalStatus
 	force                        bool
+	terminal                     error
 	waitHook                     func(context.Context, time.Time, <-chan struct{}) error
 
 	Source  GrantSource
@@ -143,6 +144,9 @@ func (r *Renewer) Park(ctx context.Context) error {
 func (r *Renewer) Resume(p Permit) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.terminal != nil {
+		return r.terminal
+	}
 	if r.Managed && (r.CheckPermit == nil || !r.CheckPermit(p)) {
 		return errors.New("renewal resume requires a current permit")
 	}
@@ -210,6 +214,11 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		return errors.New("complete automatic mount renewal configuration is required")
 	}
 	r.mu.Lock()
+	if r.terminal != nil {
+		err := r.terminal
+		r.mu.Unlock()
+		return err
+	}
 	if r.running || (r.initialized && r.session != sessionID) {
 		r.mu.Unlock()
 		return errors.New("renewal owner already bound")
@@ -322,12 +331,19 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 				}
 			}
 		}
+		if errors.Is(err, ErrDefinitiveDenial) {
+			r.terminal = err
+		}
 		r.attemptCancel = nil
 		r.attemptDone = nil
 		cancel()
 		close(done)
 		current := r.allowedLocked() && r.permit == p
 		r.mu.Unlock()
+		if errors.Is(err, ErrDefinitiveDenial) {
+			r.emit(RenewalDenied, time.Time{}, boundedError(err), r.statusFailures()+1)
+			return err
+		}
 		if !current {
 			continue
 		}
@@ -349,10 +365,6 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 			continue
 		}
 		failures := r.statusFailures() + 1
-		if errors.Is(err, ErrDefinitiveDenial) {
-			r.emit(RenewalDenied, time.Time{}, boundedError(err), failures)
-			return err
-		}
 		next = r.now().Add(backoff)
 		if !next.Before(cutoff) {
 			resultErr := fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)

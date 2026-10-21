@@ -297,3 +297,29 @@ func TestRenewerRetainsKnownObsoleteInstallationWithoutReady(t *testing.T) {
 		t.Fatal("obsolete remote success forgotten", sequence, pending)
 	}
 }
+
+func TestRenewerCloseCannotEraseDefinitiveFailure(t *testing.T) {
+	deadline := time.Now().Add(time.Minute).Truncate(time.Second)
+	var serial atomic.Uint64
+	serial.Store(1)
+	r := &Renewer{Managed: true, CheckPermit: func(p Permit) bool { return p.GateSerial == serial.Load() }, Source: sourceFunc(func(context.Context, string, uint64) (controlplane.MountAuthorization, error) {
+		serial.Store(2)
+		return controlplane.MountAuthorization{}, ErrDefinitiveDenial
+	})}
+	if err := r.Resume(Permit{GateSerial: 1}); err != nil {
+		t.Fatal(err)
+	}
+	install := func(context.Context, string, uint64, []byte) (time.Time, error) {
+		t.Fatal("denied source reached installer")
+		return time.Time{}, nil
+	}
+	if err := r.Run(context.Background(), "session", deadline, install); !errors.Is(err, ErrDefinitiveDenial) {
+		t.Fatal("Close erased denial", err)
+	}
+	if err := r.Resume(Permit{GateSerial: 2}); !errors.Is(err, ErrDefinitiveDenial) {
+		t.Fatal("terminal owner resumed", err)
+	}
+	if err := r.Run(context.Background(), "session", deadline, install); !errors.Is(err, ErrDefinitiveDenial) {
+		t.Fatal("terminal owner restarted", err)
+	}
+}

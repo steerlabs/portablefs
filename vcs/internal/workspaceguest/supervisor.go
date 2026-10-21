@@ -434,11 +434,11 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 		err = ctx.Err()
 	}
 	if err == nil && r.ready(g, e.gateSerial) {
+		outcome := control.UnknownOutcome()
+		outcome.CleanupDebt = e.status.Outcome.CleanupDebt
+		e.status.Outcome = outcome
 		err = e.driver.OpenAdmission(g, e.gateSerial)
 		if err == nil {
-			outcome := control.UnknownOutcome()
-			outcome.CleanupDebt = e.status.Outcome.CleanupDebt
-			e.status.Outcome = outcome
 			e.status.Renewal = &pb.RenewalReadiness{State: r.Renewal.State, InstalledSequence: r.Renewal.InstalledSequence}
 			e.setStatus("ready", "", "")
 			e.cold = false

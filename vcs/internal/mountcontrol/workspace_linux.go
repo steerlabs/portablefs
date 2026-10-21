@@ -402,6 +402,12 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 	if err != nil {
 		return Response{}, err
 	}
+	receivedAt := r.now()
+	budget, _ := decimal(req.Workspace.BudgetNanos, true)
+	receiptDeadline := receivedAt.Add(time.Duration(budget))
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(receiptDeadline) {
+		receiptDeadline = deadline
+	}
 	body := immutable(req)
 	id, _ := decimal(req.Workspace.RequestID, true)
 	r.mu.Lock()
@@ -486,12 +492,10 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 		r.observation = nil
 		r.deadline = time.Time{}
 		if req.Operation == "workspace-suspend" {
-			n, _ := decimal(req.Workspace.BudgetNanos, true)
-			r.deadline = r.now().Add(time.Duration(n))
+			r.deadline = receiptDeadline
 		}
 	}
-	n, _ := decimal(req.Workspace.BudgetNanos, true)
-	deadline := r.now().Add(time.Duration(n))
+	deadline := receiptDeadline
 	if !r.deadline.IsZero() && r.deadline.Before(deadline) {
 		deadline = r.deadline
 	}

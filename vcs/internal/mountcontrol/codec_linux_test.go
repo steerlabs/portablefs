@@ -11,6 +11,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -494,5 +496,37 @@ func TestWorkspaceErrorReceiptCannotExecuteAgainAfterWaiterLoss(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatal("lost waiter restarted assigned phase")
+	}
+}
+
+func TestWorkspaceSuspendChargesReplayLaneDelay(t *testing.T) {
+	base := time.Now()
+	received := make(chan struct{})
+	var elapsed atomic.Int64
+	var first sync.Once
+	r := &Replay{Now: func() time.Time {
+		now := base.Add(time.Duration(elapsed.Load()))
+		first.Do(func() { close(received) })
+		return now
+	}}
+	r.mu.Lock()
+	q := request("workspace-suspend", 1, 1)
+	transaction(t, &q)
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Do(context.Background(), q, &Rights{}, handlerFunc(func(ctx context.Context, q Request, _ *Rights) (Response, error) {
+			deadline, _ := ctx.Deadline()
+			if !deadline.Equal(base.Add(45 * time.Second)) {
+				t.Error("queue delay extended drain deadline", deadline)
+			}
+			return response(q, "accepted"), nil
+		}))
+		done <- err
+	}()
+	<-received
+	elapsed.Store(int64(20 * time.Second))
+	r.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
