@@ -18,6 +18,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     func pause(completion: @escaping (Result<Void, Error>) -> Void)
     func resume(completion: @escaping (Result<Void, Error>) -> Void)
     func stop(completion: @escaping (Result<Void, Error>) -> Void)
+    func shutdown(completion: @escaping (Result<Void, Error>) -> Void)
     func inspect(completion: @escaping (WorkspaceVMState) -> Void)
 }
 @MainActor public protocol WorkspacePowerNotifications {
@@ -32,11 +33,11 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     // and proof reads may still have an armed deadline during startup; the
     // coordinator cannot reach pause before Hello completes.
     var isIdle: Bool { get }
-    func hello(_ host: WorkspaceHello, completion: @escaping (Result<WorkspaceHello, Error>) -> Void)
-    func suspend(_ request: WorkspaceSuspension, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void)
-    func resume(_ token: WorkspaceResumeToken, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void)
-    func acknowledgeRetired(through sequence: UInt64, completion: @escaping (Result<Void, Error>) -> Void)
-    func status(completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void)
+    func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void)
+    func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void)
+    func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void)
+    func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void)
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void)
 }
 // Continuous nanoseconds include host sleep. Deliver deadlines even if a
 // channel never replies; late callbacks must still compare now with the deadline.
@@ -76,7 +77,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         case recovering(WorkspaceResumeToken)
         case stopping(StopTransaction), unknown(StopTransaction?)
     }
-    private var state: State
+    public var onChange: (() -> Void)?
+    private var state: State { didSet { onChange?() } }
     public var phase: WorkspacePhase {
         switch state {
         case .idle, .stopped: .stopped
@@ -108,17 +110,19 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     private var retirementAckInFlight: UInt64?
     private var acknowledgedRetirement: UInt64 = 0
     private var notifications: [UInt64: UInt64] = [:]
+    private let startBudget: UInt64
     private let drainBudget: UInt64
     private let totalBudget: UInt64
 
     public init(host: WorkspaceHello, oldInstanceAbsent: Bool = false,
                 vm: any WorkspaceVirtualMachine, power: any WorkspacePowerNotifications,
                 channel: any WorkspaceGuestChannel, clock: any WorkspaceContinuousClock,
-                nonces: any WorkspaceNonceSource, drainBudget: UInt64 = 15_000_000_000,
+                nonces: any WorkspaceNonceSource, startBudget: UInt64 = 20_000_000_000, drainBudget: UInt64 = 15_000_000_000,
                 totalBudget: UInt64 = 20_000_000_000) throws {
         guard WorkspaceControl.validRelease(host.release), WorkspaceControl.id(host.bootID),
               WorkspaceControl.id(host.hostServiceID), host.guestServiceID.isEmpty,
               drainBudget > 0, totalBudget > drainBudget, totalBudget < 30_000_000_000 else { throw WorkspaceControlError.grammar }
+        self.startBudget = startBudget
         self.host = host; self.vm = vm; self.power = power; self.channel = channel
         self.clock = clock; self.nonces = nonces; self.drainBudget = drainBudget; self.totalBudget = totalBudget
         state = oldInstanceAbsent ? .idle : .unknown(nil)
@@ -129,20 +133,21 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         return Window(drain: arrival + drainBudget, pause: arrival + drainBudget + (totalBudget - drainBudget) / 2, total: total)
     }
     public func start() throws {
-        guard case .idle = state, let window = window(at: clock.now) else { throw WorkspaceControlError.transition }
+        guard case .idle = state, startBudget > 0, clock.now <= UInt64.max - startBudget else { throw WorkspaceControlError.transition }
+        let startDeadline = clock.now + startBudget
         try power.register { [weak self] in self?.powerEvent($0) }
         state = .starting
-        clock.schedule(at: window.total) { [weak self] in
+        clock.schedule(at: startDeadline) { [weak self] in
             guard let self, case .starting = self.state else { return }
             self.stopUnsafe("VM start or guest hello deadline expired")
         }
         vm.start { [weak self] result in
             guard let self, case .starting = self.state else { return }
-            guard case .success = result, self.clock.now < window.total else { self.stopUnsafe("VM startup not proven within deadline"); return }
-            self.channel.hello(self.host) { [weak self] reply in
+            guard case .success = result, self.clock.now < startDeadline else { self.stopUnsafe("VM startup not proven within deadline"); return }
+            self.channel.hello(self.host, deadline: startDeadline) { [weak self] reply in
                 guard let self, case .starting = self.state else { return }
                 do {
-                    guard self.clock.now < window.total else { throw WorkspaceControlError.transition }
+                    guard self.clock.now < startDeadline else { throw WorkspaceControlError.transition }
                     let guest = try reply.get()
                     try WorkspaceControl.pair(host: self.host, guest: guest)
                     self.guestServiceID = guest.guestServiceID
@@ -208,7 +213,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         let fenced = phase == .stopped || phase == .pausedCold || phase == .pausedDiscard
         power.acknowledgeSleep(notificationID: id, fenced: fenced)
         if !fenced {
-            stopUnsafe("sleep deadline expired without confirmed fence")
+            reason = "sleep notification released unfenced: deadline expired"
+            stopUnsafe(reason)
             if case .stopping(let transaction) = state { state = .unknown(transaction) }
         }
     }
@@ -239,7 +245,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             default: break
             }
         }
-        channel.suspend(request) { [weak self] reply in
+        channel.suspend(request, deadline: window.drain) { [weak self] reply in
             guard let self, case .draining(let current, _) = self.state, current.request == request else { return }
             guard case .success(let ack) = reply, self.clock.now < window.drain,
                   WorkspaceControl.validColdAck(ack), WorkspaceControl.acknowledges(ack.suspension, request: request) else {
@@ -293,7 +299,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             guard case .success = result, self.clock.now < transaction.deadline else { self.stopUnsafe("VM resume not confirmed within deadline"); return }
             if let (window, intent) = pending { self.beginSuspend(window, intent: intent); return }
             self.state = .recovering(token)
-            self.channel.resume(token) { [weak self] reply in
+            self.channel.resume(token, deadline: transaction.deadline) { [weak self] reply in
                 guard let self, case .recovering(let current) = self.state, current == token else { return }
                 guard case .success(let ack) = reply, ack.token == token, WorkspaceControl.validResumeAck(ack) else {
                     self.reason = "guest recovery reply unavailable or invalid; mounts remain unavailable"; return
@@ -320,7 +326,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         if retirementAckInFlight == through { return }
         guard retirementAckInFlight == nil else { throw WorkspaceControlError.transition }
         retirementAckInFlight = through
-        channel.acknowledgeRetired(through: through) { [weak self] result in
+        channel.acknowledgeRetired(through: through, deadline: clock.now + totalBudget) { [weak self] result in
             guard let self, self.retirementAckInFlight == through else { return }
             self.retirementAckInFlight = nil
             guard case .success = result else { return }
@@ -333,7 +339,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public func refreshStatus() {
         guard phase == .running || phase == .recovering else { return }
         let gen = generation
-        channel.status { [weak self] reply in
+        channel.status(deadline: clock.now + totalBudget) { [weak self] reply in
             guard let self, self.generation == gen, self.phase == .running || self.phase == .recovering,
                   case .success(let status) = reply, WorkspaceControl.validStatus(status),
                   status.bootID == self.host.bootID, status.hostServiceID == self.host.hostServiceID,
@@ -364,7 +370,13 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         default: stopUnsafe(failure)
         }
     }
-    private func stopUnsafe(_ why: String) {
+    public func vmStopped(reason: String) { finishStop() }
+    public func stop() {
+        if case .unknown = state { reconcileUnknown(); return }
+        let clean = phase == .running
+        stopUnsafe("owner requested stop", clean: clean)
+    }
+    private func stopUnsafe(_ why: String, clean: Bool = false) {
         switch state {
         case .stopped: acknowledgeAll(fenced: true); return
         case .stopping, .unknown(.some): return
@@ -380,7 +392,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 self.acknowledgeAll(fenced: false)
             }
         }
-        vm.stop { [weak self] result in
+        let completion: (Result<Void, Error>) -> Void = { [weak self] result in
             guard let self else { return }
             switch self.state {
             case .stopping(let current), .unknown(.some(let current)):
@@ -390,10 +402,12 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 case .failure:
                     transaction.outcome = .failed; self.state = .unknown(transaction)
                     self.acknowledgeAll(fenced: false)
+                    if clean { self.reconcileUnknown() }
                 }
             default: break
             }
         }
+        if clean { vm.shutdown(completion: completion) } else { vm.stop(completion: completion) }
     }
     private func reconcileUnknown() {
         guard case .unknown(let attempt) = state else { return }

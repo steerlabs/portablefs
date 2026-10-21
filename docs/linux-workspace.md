@@ -257,7 +257,7 @@ body. Hello is the only request before pairing. One suspend generation and at
 most one resume authorization are outstanding. A malformed frame, mismatched
 response, unequal version or broken channel closes the channel and invalidates
 eligibility; do not transparently reconnect and reuse a token. Stage 1b connects these codecs and models to a correlated vsock stream. The
-guest accepts only host CID 2 on port 1024, requires its independently seeded
+guest accepts only host CID 2 on reserved port 1023, requires its independently seeded
 boot/service identity and exact release, and consumes one paired stream per
 boot. Disconnect discards its model; supervisor restart within that boot is
 refused. Provision, Mount and Umount return `unavailable`. The dev process is
@@ -313,14 +313,16 @@ file tools execute in Linux.
 Run from an Apple-silicon Mac with macOS 26+, Xcode and Docker:
 
 ```sh
-GOTOOLCHAIN=go1.26.10 bash scripts/build-linux-workspace-image.sh /absolute/image
+bash scripts/build-linux-workspace-image.sh /absolute/image
 bash scripts/build-linux-workspace-dev.sh
 swift/PortableFSKit/.build/out/Products/Debug/portablefs-workspace-dev /absolute/image /absolute/state
 ```
 
-The builder uses mmdebstrap in its own privileged container from the digest in
+The builder uses mmdebstrap in its own container with SYS_ADMIN for mmdebstrap mounts from the digest in
 `image.lock.json`, with Debian trixie at one snapshot timestamp and
-`SOURCE_DATE_EPOCH`. It checks the complete installed binary/source version
+`SOURCE_DATE_EPOCH` and a fixed ext4 creation clock. Security and updates use the
+same snapshot timestamp; hostname and hosts are explicit. The native gate builds
+twice and compares every manifest hash. It checks the complete installed binary/source version
 inventory against that lock. `--update-lock` explicitly refreshes that inventory;
 `--reuse` reuses only matching input identity and package inventory. There is no
 boot-time package installation, upgrade or fetch. Debian's archive signatures
@@ -360,31 +362,46 @@ within its bounded budget. This does not establish the unfenced-sleep invariant.
 
 The state directory has an exclusive owner lock, a 64 GiB sparse `data.ext4`,
 a separate persisted host SSH client key, pinned guest host public key,
-`known_hosts`, `ssh_config` and `serial.log`. Only an explicit new-disk marker
-authorizes first-boot ext4 formatting; unrecognized data is never reformatted.
+`known_hosts`, `ssh_config` and `serial.log`. Durable host format authorization
+is console-seeded on every boot until the guest reports format 8 complete.
+Interrupted formatting can retry within that authorization; after its removal,
+unrecognized or corrupt data is never reformatted. Disk, keys and state files
+are fsynced under temporary names, renamed, then directory-fsynced. The guest
+validates SSH private keys with `ssh-keygen -y` and fscks data before mounting.
 The data filesystem retains format 8, home/editor installs, SSH host identity,
-guest identity and reserved mount/local backing directories. `/var`, `/tmp` and
-`/run` are volatile. `/workspaces` denies user access while no mount exists.
+home and SSH identity. A persisted host-side machine ID and locally administered
+MAC fix the guest network identity. `/var`, `/tmp` and
+`/run` are volatile. `/workspaces` is a root-owned mode-0755 tmpfs; Stage 1c
+creates each volume mount point root-owned mode 000, so unmounted volume roots
+deny access while mounted roots remain traversable.
 
 The second virtio console provisions only fresh boot/service nonces and the host
 client public key. The guest generates and persists its private SSH host key on
 the data disk and returns the public key over that VM-bound console. The owner
-checks the persisted pin before opening TCP, and fails on a changed key. The
-control Hello then pairs app version, commit, image digest, protocol 8 and both
+checks the persisted pin before opening its mode-0600 Unix socket in the
+validated mode-0700 owner directory, and fails on a changed key. The
+guest proves knowledge of its seeded nonce before the host sends Hello, which pairs app version, commit, image digest, protocol 8 and both
 service incarnations. No host private key or Mac FSKit identity enters Linux.
 
 The executable prints a JSON `ready` event containing the SSH stanza and its
 config path. Use `ssh -F /absolute/state/ssh_config portablefs-workspace`.
-No global SSH configuration is edited. Standard input accepts one JSON command
-per line: `{"command":"pause"}`, `resume`, `status` or `stop`. Pause/resume use
-the real coordinator; a repeated resume is refused. A normal running stop asks
+The stanza uses `ProxyCommand /usr/bin/nc -U` for standard OpenSSH transports,
+including Remote-SSH. This preserves the generated-config workflow and excludes
+other local users, so there is no loopback TCP listener. Full editor qualification
+remains pending. Relay descriptors use nonblocking dispatch sources, bounded
+buffers and dedicated serial queues; the cap includes pending vsock connects.
+The control stream has a separate queue and ordered requests with deadlines
+supplied by the coordinator. No global SSH configuration is edited. Standard input accepts one JSON command
+per line: `{"command":"pause"}`, `resume`, `status` or `stop`. Pause/resume and stop use
+the real coordinator. The native gate resends an already-consumed token over
+the paired stream and proves guest refusal followed by discard. A normal running stop asks
 the guest to shut down and waits for VZ's guest-stopped delegate callback. Unsafe
 or paused instances take the coordinator's confirmed stop path instead.
 
 Run the native gate with explicit artifact and evidence directories:
 
 ```sh
-GOTOOLCHAIN=go1.26.10 bash scripts/test-linux-workspace-native.sh /absolute/image /absolute/evidence
+bash scripts/test-linux-workspace-native.sh /absolute/image /absolute/evidence
 ```
 
 It builds or verifies/reuses the pinned image, builds and signs the owner, then
@@ -392,18 +409,27 @@ requires exact equality with `scripts/linux-workspace-required-native-tests.txt`
 It boots twice, proves real FUSE INIT >= 7.31 on a throwaway filesystem, checks
 UID/GID 1000 and tool execution through pinned SSH, read-only root and no TCP
 SSH listener, unmounted-path denial, data/key persistence, cold VZ pause completion,
-closed no-mount recovery, repeated-resume refusal and clean guest shutdown.
+empty-roster recovery, actual token-replay refusal and clean guest shutdown.
 `results.json` records boot time, idle guest memory and owner RSS; `events.jsonl`
 and serial logs retain the transaction. The no-mount recovery is not authority
 validation or real FUSE withdrawal evidence. Unsupported virtualization is a
 named **UNAVAILABLE** gate with nonzero exit status, never a passing skip.
 
+Guest wall-clock correction after a host pause is Stage 1c work. No RTC, wall
+clock or NTP observation is used to assert sleep safety. The unfenced host-sleep
+gate remains OPEN; the separate PL031 experiment is not part of this change.
+The coordinator owns each native notification's arrival-relative deadline;
+IOKit has no second release timer. An expired notification is explicitly released
+unfenced and cannot later earn cold eligibility. Unexpected VZ stops unregister
+power participation and revoke resume eligibility.
+
 ## Remaining construction and qualification
 
 Stage 1b adds a development image, public VZ and IOKit adapters, VM-bound
 bootstrap console, exact vsock control, pinned SSH bridge and native gate. It
-creates no PortableFS mount. Its single `NoMount` participant proves cold
-absence, never opens admission and returns `authorization-required` on recovery.
+creates no PortableFS mount and registers no synthetic participant. Cold proof
+and recovery use the empty guest-owned roster. The FUSE probe is invoked only
+by the native gate as the ordinary workspace user, never by a boot service.
 The real daemon suspension boundary, durable mount inventory and provisioning
 remain Stage 1c work. Production service registration, app UI, workspace CLI,
 release packaging, update coordination and editor qualification remain pending.
@@ -418,7 +444,7 @@ sources/licenses, PortableFS commit and sealed app resources.
 
 | Gate | Status and evidence required |
 | --- | --- |
-| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with a no-mount participant. Real daemon withdrawal, initial-renewal readiness and the full duration/fault matrix remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
+| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with an empty roster. Real daemon withdrawal, initial-renewal readiness and the full duration/fault matrix remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
 | Unfenced host sleep | OPEN. Identify the clock/execution mechanism and ordering, then qualify actual lid/menu/idle sleep on exact supported OS/hardware/image digests with independently advancing remote authority and peer. Delay the service past the notification timeout. A finite successful sample cannot replace the mechanism. |
 | Short-sleep availability | Root cause identified: authority replay-before-coherence admission ordering. Fix and regression work are in progress in a separate PR. This stage does not change the authority or Linux data plane. |
 | Image, lifecycle and persistence | Pin Debian artifact; prove boot/FUSE INIT and kernel notification/durability behavior. Prove exact teardown/remount with cwd, fd, mapping and editor holders, no empty-directory writes, ENOSPC/image-corruption handling, signed updates and same-volume exclusion. |

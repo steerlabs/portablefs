@@ -30,10 +30,12 @@ import Security
     private var connection: io_connect_t = 0
     private var port: IONotificationPortRef?
     private var notifier: io_object_t = 0
-    private var pending: Int?
+    private var pending: [UInt64: Int] = [:]
+    private var nextID: UInt64 = 0
+    public var onRecord: ((String) -> Void)?
     private var handler: ((WorkspacePowerEvent) -> Void)?
     public private(set) var registered = false
-    public private(set) var acknowledgements: [(UInt64, Bool)] = []
+    public private(set) var lastAcknowledgement: (UInt64, Bool)?
     public init() {}
     public func register(handler: @escaping (WorkspacePowerEvent) -> Void) throws {
         guard !registered else { throw WorkspaceVMError("power notifications already registered") }
@@ -44,39 +46,37 @@ import Security
                 Unmanaged<WorkspaceSystemPower>.fromOpaque(context).takeUnretainedValue().receive(message, argument)
             }
         }, &notifier)
-        guard connection != 0, let port else { close(); throw WorkspaceVMError("IORegisterForSystemPower unavailable") }
+        guard connection != 0, let port else { unregister(); throw WorkspaceVMError("IORegisterForSystemPower unavailable") }
         IONotificationPortSetDispatchQueue(port, .main)
-        registered = true
+        registered = true; onRecord?("power-registered")
     }
     private func receive(_ message: UInt32, _ argument: UnsafeMutableRawPointer?) {
         let notification = Int(bitPattern: argument)
         switch message {
         case PFSCanSystemSleep: IOAllowPowerChange(connection, notification)
         case PFSSystemWillSleep:
-            if let pending { IOAllowPowerChange(connection, pending) }
-            pending = notification
-            handler?(.sleep)
-            // Release participation even when the coordinator is stalled. This
-            // timeout is not a fence and makes no unfenced-sleep safety claim.
-            let clock = WorkspaceSystemClock()
-            clock.schedule(at: clock.now + 21_000_000_000) { [weak self] in
-                guard let self, self.pending == notification else { return }
-                self.releasePending()
-            }
-        case PFSSystemWillPowerOn: handler?(.darkWake)
+            let arrivedAt = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+            guard nextID < UInt64.max else { handler?(.unknown); IOAllowPowerChange(connection, notification); return }
+            nextID += 1; pending[nextID] = notification
+            handler?(.sleep(WorkspaceSleepNotification(id: nextID, arrivedAt: arrivedAt)))
+        case PFSSystemWillPowerOn: break // This is advance wake notice, not evidence of dark wake.
         case PFSSystemHasPoweredOn: handler?(.wake)
         case PFSSystemWillNotSleep: handler?(.cancelledSleep)
         default: break
         }
     }
-    public func acknowledgeSleep(generation: UInt64, fenced: Bool) {
-        acknowledgements.append((generation, fenced)); releasePending()
+    public func acknowledgeSleep(notificationID: UInt64, fenced: Bool) {
+        lastAcknowledgement = (notificationID, fenced)
+        onRecord?(fenced ? "sleep-fenced" : "sleep-released-unfenced")
+        if let notification = pending.removeValue(forKey: notificationID) { IOAllowPowerChange(connection, notification) }
     }
-    private func releasePending() {
-        if let pending { IOAllowPowerChange(connection, pending); self.pending = nil }
+    // Development controlled pauses share the adapter's monotone ID space.
+    public func controlledSleep() {
+        nextID += 1
+        handler?(.sleep(WorkspaceSleepNotification(id: nextID, arrivedAt: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW))))
     }
-    public func close() {
-        releasePending()
+    public func unregister() {
+        for id in pending.keys.sorted() { acknowledgeSleep(notificationID: id, fenced: false) }
         if notifier != 0 { IODeregisterForSystemPower(&notifier); notifier = 0 }
         if let port { IONotificationPortDestroy(port); self.port = nil }
         if connection != 0 { IOServiceClose(connection); connection = 0 }

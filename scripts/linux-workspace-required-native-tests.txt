@@ -5,7 +5,7 @@ fuse-init-7.31
 ssh-workspace-user
 immutable-root
 vsock-only-ssh
-unmounted-workspaces-inaccessible
+workspace-root-layout
 controlled-cold-pause
 resume-single-use
 data-disk-reboot-persistence

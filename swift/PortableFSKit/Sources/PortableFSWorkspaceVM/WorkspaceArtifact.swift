@@ -60,20 +60,3 @@ public func unhex(_ value: String) throws -> Data {
     }
     return result
 }
-
-// A blocking operation owns its inputs and completion until it returns. No VZ
-// API runs here; framework calls and result delivery stay on the main VM queue.
-final class WorkspaceIO<Value>: @unchecked Sendable {
-    let work: @Sendable () throws -> Value
-    let completion: @MainActor (Result<Value, Error>) -> Void
-    var result: Result<Value, Error>?
-    init(_ work: @escaping @Sendable () throws -> Value, completion: @escaping @MainActor (Result<Value, Error>) -> Void) { self.work = work; self.completion = completion }
-    func start() {
-        DispatchQueue.global().async { [self] in
-            result = Result { try work() }
-            DispatchQueue.main.async { [self] in
-                if let result { completion(result) }
-            }
-        }
-    }
-}

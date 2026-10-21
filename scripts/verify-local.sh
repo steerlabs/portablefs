@@ -220,6 +220,7 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
   echo "  still NOT run by --full:"
   echo "    - scripts/package-manager-matrix.sh   third Docker suite; a workload"
   echo "                                         soak, run on demand, not in CI"
+  echo "    - scripts/test-linux-workspace-native.sh native VZ Linux workspace gate"
   echo "    - scripts/coherence-matrix-macos.sh   live macOS FSKit mount matrix;"
   echo "                                         needs a user-enabled extension"
   echo "    - scripts/run-powerloss.sh            dm-log-writes power-cut harness"
@@ -234,6 +235,7 @@ echo
 echo "verify-local: ok (default mode) — this is NOT full verification"
 echo
 echo "NOT RUN by this invocation:"
+echo "  - scripts/test-linux-workspace-native.sh native VZ Linux workspace gate"
 echo "  - scripts/xfs-fuse-integration.sh   real XFS + real kernel FUSE mounts"
 echo "  - scripts/coherence-matrix-linux.sh two real mounts against one volume"
 echo "  - scripts/package-manager-matrix.sh concurrent package-manager readers"

@@ -13,8 +13,14 @@ fi
 image="$1" evidence="$2"
 mkdir -p "$evidence"
 evidence="$(cd "$evidence" && pwd -P)"
+bash "$repo/scripts/test-linux-workspace-image.sh"
 bash "$repo/scripts/build-linux-workspace-dev.sh"
 bin="$(swift build --package-path "$repo/swift/PortableFSKit" --show-bin-path)/portablefs-workspace-dev"
 "$bin" --check-virtualization
 bash "$repo/scripts/build-linux-workspace-image.sh" "$image" --reuse
+comparison="$(mktemp -d "$evidence/repro.XXXXXX")"
+trap 'rm -r "$comparison"' EXIT
+bash "$repo/scripts/build-linux-workspace-image.sh" "$comparison"
+cmp "$image/manifest.json" "$comparison/manifest.json"
+echo 'PASS: reproducible-image-build-twice'
 python3 "$repo/scripts/test-linux-workspace-native.py" "$bin" "$image" "$evidence" "$repo/scripts/linux-workspace-required-native-tests.txt"

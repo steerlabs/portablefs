@@ -3,6 +3,7 @@ package workspaceguest
 import (
 	"bytes"
 	"context"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -26,12 +27,16 @@ func transportRig(t *testing.T) (net.Conn, *Supervisor, <-chan error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.Register(mountID(4), Witness{}, NoMount{}); err != nil {
-		t.Fatal(err)
-	}
 	done := make(chan error, 1)
 	go func() { done <- Serve(context.Background(), guest, transportHello(), s, nil); guest.Close() }()
 	t.Cleanup(func() { host.Close() })
+	proof := make([]byte, 32)
+	if _, err := io.ReadFull(host, proof); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(proof, PairingProof(transportHello())) {
+		t.Fatal("guest did not prove seeded nonce")
+	}
 	return host, s, done
 }
 func exchange(t *testing.T, c net.Conn, e *pb.Envelope) *pb.Envelope {
@@ -88,13 +93,14 @@ func TestTransportColdResumeSingleUseAndDisconnect(t *testing.T) {
 	c, s, done := transportRig(t)
 	pairTransport(t, c)
 	x := suspension(s)
+	x.Roster = nil
 	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Suspend{Suspend: x}})
-	if r.GetSuspendAck() == nil || !r.GetSuspendAck().Mounts[0].ColdComplete {
+	if r.GetSuspendAck() == nil || len(r.GetSuspendAck().Mounts) != 0 {
 		t.Fatal("no cold proof")
 	}
-	token := &pb.ResumeToken{Suspension: x, WakeNonce: id(9)}
+	token := &pb.ResumeToken{Suspension: r.GetSuspendAck().Suspension, WakeNonce: id(9)}
 	r = exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_Resume{Resume: token}})
-	if r.GetResumeAck() == nil || r.GetResumeAck().Mounts[0].State != "authorization-required" {
+	if r.GetResumeAck() == nil || len(r.GetResumeAck().Mounts) != 0 {
 		t.Fatal("no-mount opened admission")
 	}
 	if err := control.Write(c, &pb.Envelope{Version: 8, RequestId: 4, Body: &pb.Envelope_Resume{Resume: token}}); err != nil {

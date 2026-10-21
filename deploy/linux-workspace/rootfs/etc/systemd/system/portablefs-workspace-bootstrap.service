@@ -1,8 +1,7 @@
 [Unit]
-Description=PortableFS VM-bound boot identity and SSH public material
-Requires=portablefs-workspace-data.service portablefs-workspace-fuse-probe.service
-After=portablefs-workspace-data.service portablefs-workspace-fuse-probe.service dev-hvc1.device
-Requires=dev-hvc1.device
+Description=PortableFS VM-bound seed and persistent data initialization
+After=local-fs.target dev-vdb.device dev-hvc1.device
+Requires=dev-vdb.device dev-hvc1.device
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/portablefs-workspaced bootstrap

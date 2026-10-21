@@ -6,7 +6,7 @@ import Testing
 
 private func temporaryDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-vm-" + UUID().uuidString)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     return directory
 }
 
@@ -16,7 +16,7 @@ private func temporaryDirectory() throws -> URL {
         let inputs = Data("exact-inputs".utf8)
         let release: [String: Any] = ["app_version":"dev", "commit":String(repeating:"a",count:40), "image_digest":hex(Data(SHA256.hash(data:inputs))), "authority_major":8]
         var files: [String: Any] = [:]
-        try FileManager.default.createDirectory(at: directory.appendingPathComponent("bin"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("bin"), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         for name in names {
             let data = name == "release.json" ? try JSONSerialization.data(withJSONObject:release) : (name == "image-inputs.json" ? inputs : Data(name.utf8))
             try data.write(to:directory.appendingPathComponent(name))
@@ -28,8 +28,9 @@ private func temporaryDirectory() throws -> URL {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         try artifact(directory)
         #expect(try WorkspaceArtifact(directory:directory).release.authorityMajor == 8)
-        try Data("corruption".utf8).write(to:directory.appendingPathComponent("kernel"))
-        #expect(throws: (any Error).self) { try WorkspaceArtifact(directory:directory) }
+        try Data("xxxxxx".utf8).write(to:directory.appendingPathComponent("kernel"))
+        do { _ = try WorkspaceArtifact(directory: directory); Issue.record("corrupt artifact accepted") }
+        catch let error as WorkspaceVMError { #expect(error.description == "artifact hash mismatch: kernel") }
     }
     @Test func manifestCannotNameExtraPaths() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
@@ -51,39 +52,77 @@ private func temporaryDirectory() throws -> URL {
 }
 
 @Suite(.serialized) struct WorkspaceSocketAndIdentityTests {
-    @MainActor @Test func transportWorkerLeavesOwnerQueueAndReturns() async throws {
-        let value: Bool = try await withCheckedThrowingContinuation { continuation in
-            WorkspaceIO({ !Thread.isMainThread }, completion: { result in
-                #expect(Thread.isMainThread)
-                continuation.resume(with: result)
-            }).start()
-        }
-        #expect(value)
-    }
-    @Test func socketPartialFrameAndEOF() throws {
+    @Test @MainActor func nonblockingStreamPartialFrameAndEOF() async throws {
         var fds: [Int32] = [-1,-1]
-        #expect(socketpair(AF_UNIX,SOCK_STREAM,0,&fds) == 0)
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
         defer { close(fds[0]); close(fds[1]) }
+        let stream = try WorkspaceStream(fd: fds[1], label: "workspace.test", onLost: { _ in })
+        defer { stream.close() }
         let data = Data([0,0,0,2,8,8])
-        try WorkspaceSocket.write(fds[0],data:data,deadline:clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000)
-        #expect(try WorkspaceSocket.read(fds[1],count:4,deadline:clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) == data.prefix(4))
-        #expect(try WorkspaceSocket.read(fds[1],count:2,deadline:clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) == data.suffix(2))
-        shutdown(fds[0],SHUT_WR)
-        #expect(throws: (any Error).self) { try WorkspaceSocket.read(fds[1],count:1,deadline:clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) }
+        _ = data.withUnsafeBytes { Darwin.write(fds[0], $0.baseAddress, $0.count) }
+        let first: Data = try await withCheckedThrowingContinuation { continuation in
+            stream.read(count: 4, deadline: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) { continuation.resume(with: $0) }
+        }
+        #expect(first == data.prefix(4))
+        let second: Data = try await withCheckedThrowingContinuation { continuation in
+            stream.read(count: 2, deadline: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) { continuation.resume(with: $0) }
+        }
+        #expect(second == data.suffix(2))
+        shutdown(fds[0], SHUT_WR)
+        do {
+            let _: Data = try await withCheckedThrowingContinuation { continuation in
+                stream.read(count: 1, deadline: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) { continuation.resume(with: $0) }
+            }
+            Issue.record("EOF accepted as data")
+        } catch {}
     }
-    @Test func expiredSocketDeadlineRefused() throws {
-        #expect(throws: (any Error).self) { try WorkspaceSocket.read(-1,count:1,deadline:0) }
+    @Test @MainActor func idleRelaysCannotStarveControlStream() async throws {
+        var relays: [WorkspaceRelay] = []; var peers: [Int32] = []
+        defer { relays.forEach { $0.close() }; peers.forEach { close($0) } }
+        for _ in 0..<64 {
+            var client: [Int32] = [-1,-1]; var guest: [Int32] = [-1,-1]
+            #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &client) == 0)
+            #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &guest) == 0)
+            relays.append(try WorkspaceRelay(client: client[0], guest: guest[0], completion: {}))
+            close(guest[0]); peers += [client[1], guest[1]]
+        }
+        var control: [Int32] = [-1,-1]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &control) == 0)
+        defer { close(control[0]); close(control[1]) }
+        let stream = try WorkspaceStream(fd: control[1], label: "workspace.test.control", onLost: { _ in })
+        defer { stream.close() }
+        var byte: UInt8 = 42; #expect(Darwin.write(control[0], &byte, 1) == 1)
+        let reply: Data = try await withCheckedThrowingContinuation { continuation in
+            stream.read(count: 1, deadline: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) { continuation.resume(with: $0) }
+        }
+        #expect(reply == Data([42]))
+    }
+    @Test func missingClientPublicKeyIsReconstructedFromDurableIdentity() throws {
+        let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let before: String
+        do { let state = try WorkspaceDevState(directory: directory); before = try state.authorizedKey }
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("client_ed25519.pub"))
+        let reopened = try WorkspaceDevState(directory: directory)
+        #expect(try reopened.authorizedKey == before)
+        #expect(reopened.formatAuthorized == "8")
+        try reopened.formatCompleted()
+        #expect(reopened.formatAuthorized.isEmpty)
+    }
+    @Test func unsafeStateDirectoryRefused() throws {
+        let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
+        #expect(throws: (any Error).self) { try WorkspaceDevState(directory: directory) }
     }
     @Test func persistentHostPinAndExclusiveOwner() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let state = try WorkspaceDevState(directory:directory)
         #expect(throws: (any Error).self) { try WorkspaceDevState(directory:directory) }
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample"
-        _ = try state.pin(hostKey:key,port:12345)
-        _ = try state.pin(hostKey:key,port:23456)
-        #expect(throws: (any Error).self) { try state.pin(hostKey:key+"changed",port:23456) }
+        _ = try state.pin(hostKey:key)
+        _ = try state.pin(hostKey:key)
+        #expect(throws: (any Error).self) { try state.pin(hostKey:key+"changed") }
         let config = try String(contentsOf:directory.appendingPathComponent("ssh_config"),encoding:.utf8)
-        #expect(config.contains("HostName 127.0.0.1")); #expect(config.contains("StrictHostKeyChecking yes"))
+        #expect(config.contains("ProxyCommand /usr/bin/nc -U")); #expect(config.contains("StrictHostKeyChecking yes"))
         #expect(!config.contains("PRIVATE KEY"))
         withExtendedLifetime(state) {}
     }

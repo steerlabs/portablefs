@@ -612,3 +612,20 @@ func (s *Supervisor) AcknowledgeRetired(through uint64) error {
 	s.acknowledgedSequence = through
 	return nil
 }
+
+// ChannelLost permanently withdraws this boot's control authorization. No
+// replacement stream can restore eligibility or reopen a daemon.
+func (s *Supervisor) ChannelLost() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cancel()
+	s.phase = "discard-only"
+	s.suspension = nil
+	for _, e := range s.mounts {
+		e.driver.CloseAdmission(s.generation)
+		e.cold = false
+		if !e.terminal {
+			e.status.State = "closed"
+		}
+	}
+}

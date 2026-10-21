@@ -13,9 +13,15 @@ import PortableFSWorkspaceCore
     private var seedBuffer = Data()
     public var onSeed: (([String: String]) -> Void)?
     public private(set) var operations: [String] = []
+    public var onStopped: ((String) -> Void)?
+    public func record(_ operation: String) {
+        if operations.count == 256 { operations.removeFirst() }
+        operations.append(operation)
+    }
+    private var shutdownID: UUID?
     private var shutdownCompletion: ((Result<Void, Error>) -> Void)?
 
-    public init(artifact: WorkspaceArtifact, dataDisk: URL, serialLog: URL) throws {
+    public init(artifact: WorkspaceArtifact, dataDisk: URL, serialLog: URL, machineID: String, macAddress: String) throws {
         guard VZVirtualMachine.isSupported else { throw WorkspaceVMError("UNAVAILABLE: native-workspace-virtualization") }
         #if !arch(arm64)
         throw WorkspaceVMError("UNAVAILABLE: native-workspace-apple-silicon")
@@ -23,7 +29,7 @@ import PortableFSWorkspaceCore
         let config = VZVirtualMachineConfiguration()
         let boot = VZLinuxBootLoader(kernelURL: artifact.directory.appendingPathComponent("kernel"))
         boot.initialRamdiskURL = artifact.directory.appendingPathComponent("initramfs")
-        boot.commandLine = "console=hvc0 root=/dev/vda ro rootfstype=ext4 panic=-1 systemd.show_status=1"
+        boot.commandLine = "console=hvc0 root=/dev/vda ro rootfstype=ext4 panic=-1 systemd.show_status=1 systemd.machine_id=\(machineID)"
         config.bootLoader = boot
         config.platform = VZGenericPlatformConfiguration()
         let large = ProcessInfo.processInfo.physicalMemory >= 16 * 1024 * 1024 * 1024
@@ -34,6 +40,8 @@ import PortableFSWorkspaceCore
             VZVirtioBlockDeviceConfiguration(attachment: VZDiskImageStorageDeviceAttachment(url: dataDisk, readOnly: false))
         ]
         let network = VZVirtioNetworkDeviceConfiguration()
+        guard let address = VZMACAddress(string: macAddress) else { throw WorkspaceVMError("invalid persistent MAC") }
+        network.macAddress = address
         network.attachment = VZNATNetworkDeviceAttachment()
         config.networkDevices = [network]
         config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
@@ -51,10 +59,13 @@ import PortableFSWorkspaceCore
         let log = try FileHandle(forWritingTo: serialLog)
         serialOutput.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            if !data.isEmpty { try? log.write(contentsOf: data) }
+            if data.isEmpty { handle.readabilityHandler = nil; try? log.close(); return }
+            // The serial transcript is diagnostic, never an unbounded disk sink.
+            if let offset = try? log.offset(), offset < 8 * 1024 * 1024 { try? log.write(contentsOf: data.prefix(Int(8 * 1024 * 1024 - offset))) }
         }
         seedOutput.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
+            if data.isEmpty { handle.readabilityHandler = nil; return }
             Task { @MainActor in self?.receiveSeed(data) }
         }
     }
@@ -73,82 +84,60 @@ import PortableFSWorkspaceCore
     }
     public func connect(port: UInt32, completion: @escaping (Result<VZVirtioSocketConnection, Error>) -> Void) {
         guard let socket = machine.socketDevices.first as? VZVirtioSocketDevice else { completion(.failure(WorkspaceVMError("missing vsock"))); return }
-        socket.connect(toPort: port, completionHandler: completion)
+        socket.connect(toPort: port) { result in Task { @MainActor in completion(result) } }
     }
     public func start(completion: @escaping (Result<Void, Error>) -> Void) {
-        operations.append("start-request")
-        machine.start { [weak self] result in self?.operations.append("start-completed"); completion(result) }
+        record("start-request")
+        machine.start { [weak self] result in self?.record("start-completed"); completion(result) }
     }
     public func pause(completion: @escaping (Result<Void, Error>) -> Void) {
-        operations.append("pause-request")
-        machine.pause { [weak self] result in self?.operations.append("pause-completed"); completion(result) }
+        record("pause-request")
+        machine.pause { [weak self] result in self?.record("pause-completed"); completion(result) }
     }
     public func resume(completion: @escaping (Result<Void, Error>) -> Void) {
-        operations.append("resume-request")
-        machine.resume { [weak self] result in self?.operations.append("resume-completed"); completion(result) }
+        record("resume-request")
+        machine.resume { [weak self] result in self?.record("resume-completed"); completion(result) }
     }
     public func stop(completion: @escaping (Result<Void, Error>) -> Void) {
         if machine.state == .stopped { completion(.success(())); return }
-        operations.append("stop-request")
+        record("stop-request")
         machine.stop { [weak self] error in
-            self?.operations.append("stop-completed")
+            self?.record("stop-completed")
             if let error { completion(.failure(error)) } else { completion(.success(())) }
+        }
+    }
+    public func inspect(completion: @escaping (WorkspaceVMState) -> Void) {
+        switch machine.state {
+        case .stopped: completion(.stopped)
+        case .running: completion(.running)
+        case .paused: completion(.paused)
+        default: completion(.unknown)
         }
     }
     public func shutdown(completion: @escaping (Result<Void, Error>) -> Void) {
         guard machine.canRequestStop, shutdownCompletion == nil else { completion(.failure(WorkspaceVMError("guest shutdown unavailable"))); return }
+        let id = UUID(); shutdownID = id
         shutdownCompletion = completion
         do {
-            operations.append("shutdown-request")
+            record("shutdown-request")
             try machine.requestStop()
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(20)) { [weak self] in
-                guard let self, let callback = self.shutdownCompletion else { return }
+                guard let self, self.shutdownID == id, let callback = self.shutdownCompletion else { return }
                 self.shutdownCompletion = nil
-                self.stop { _ in callback(.failure(WorkspaceVMError("clean guest shutdown timed out"))) }
+                callback(.failure(WorkspaceVMError("clean guest shutdown timed out")))
             }
         } catch { shutdownCompletion = nil; completion(.failure(error)) }
     }
     public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         guard virtualMachine === machine else { return }
-        operations.append("shutdown-completed")
-        let callback = shutdownCompletion; shutdownCompletion = nil
-        callback?(.success(()))
+        let callback = shutdownCompletion; shutdownCompletion = nil; shutdownID = nil
+        record(callback == nil ? "vm-stopped" : "shutdown-completed")
+        if let callback { callback(.success(())) } else { onStopped?("guest stopped unexpectedly") }
     }
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-        let callback = shutdownCompletion; shutdownCompletion = nil
-        callback?(.failure(error))
-    }
-}
-
-enum WorkspaceSocket {
-    static func wait(_ fd: Int32, _ event: Int16, deadline: UInt64) throws {
-        while true {
-            let now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-            guard now < deadline else { throw WorkspaceVMError("vsock operation timed out") }
-            var p = pollfd(fd: fd, events: event, revents: 0)
-            let result = poll(&p, 1, Int32(min((deadline - now) / 1_000_000 + 1, 1000)))
-            if result > 0 { return }
-            if result < 0 && errno != EINTR { throw WorkspaceVMError("vsock poll failed: \(errno)") }
-        }
-    }
-    static func read(_ fd: Int32, count: Int, deadline: UInt64) throws -> Data {
-        var data = Data(count: count)
-        var offset = 0
-        while offset < count {
-            try wait(fd, Int16(POLLIN), deadline: deadline)
-            let n = data.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress?.advanced(by: offset), count - offset) }
-            if n < 0 && [EINTR, EAGAIN].contains(errno) { continue }
-            guard n > 0 else { throw WorkspaceVMError("control channel closed") }; offset += n
-        }
-        return data
-    }
-    static func write(_ fd: Int32, data: Data, deadline: UInt64) throws {
-        var offset = 0
-        while offset < data.count {
-            try wait(fd, Int16(POLLOUT), deadline: deadline)
-            let n = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress?.advanced(by: offset), data.count - offset) }
-            if n < 0 && [EINTR, EAGAIN].contains(errno) { continue }
-            guard n > 0 else { throw WorkspaceVMError("control write failed: \(errno)") }; offset += n
-        }
+        guard virtualMachine === machine else { return }
+        record("vm-stopped-error")
+        let callback = shutdownCompletion; shutdownCompletion = nil; shutdownID = nil
+        callback?(.failure(error)); onStopped?("VM stopped: \(error)")
     }
 }

@@ -1,115 +1,114 @@
 import Foundation
 import Darwin
+import CryptoKit
 @preconcurrency import Virtualization
 import PortableFSWorkspaceCore
 
 @MainActor public final class WorkspaceVsockChannel: WorkspaceGuestChannel {
+    private struct Request {
+        let body: WorkspaceEnvelope.OneOf_Body
+        let deadline: UInt64
+        let completion: (Result<WorkspaceEnvelope, Error>) -> Void
+    }
     private let vm: WorkspaceMachine
     private var connection: VZVirtioSocketConnection?
+    private var stream: WorkspaceStream?
     private var requestID: UInt64 = 0
-    private var busy = false
+    private var queue: [Request] = []
+    private var active: Request?
     private var failed = false
-    private var idleMonitor: DispatchSourceRead?
-    public var onFailure: (() -> Void)?
+    private var ready = false
+    private var pendingHello: (() -> Void)?
+    public private(set) var lastResume: WorkspaceResumeToken?
+    public var onFailure: ((String) -> Void)?
     public init(vm: WorkspaceMachine) { self.vm = vm }
-    public func hello(_ host: WorkspaceHello, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
-        let deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + 120_000_000_000
-        connect(deadline: deadline) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error): completion(.failure(error))
-            case .success:
-                self.exchange(.hello(host)) { result in
-                    completion(result.flatMap { e in
-                        guard case .helloAck(let ack) = e.body else { return .failure(WorkspaceVMError("expected HelloAck")) }
-                        do { try WorkspaceControl.pair(host: host, guest: ack); return .success(ack) } catch { return .failure(error) }
-                    })
+    public func controlReady() { ready = true; let start = pendingHello; pendingHello = nil; start?() }
+    public func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
+        let start = { [weak self] in
+            guard let self, !self.failed else { completion(.failure(WorkspaceVMError("control startup unavailable"))); return }
+            self.vm.connect(port: 1023) { result in
+                do {
+                    let connection = try result.get(); self.connection = connection
+                    let stream = try WorkspaceStream(fd: connection.fileDescriptor, label: "portablefs.workspace.control", onLost: { [weak self] in self?.lost($0) })
+                    self.stream = stream
+                    stream.read(count: 32, deadline: deadline) { result in
+                        do {
+                            let proof = try result.get()
+                            let expected = Data(HMAC<SHA256>.authenticationCode(for: Data("portablefs-workspace-control-8".utf8) + host.hostServiceID, using: SymmetricKey(data: host.bootID)))
+                            guard proof == expected else { throw WorkspaceVMError("guest seeded-nonce proof refused") }
+                            self.exchange(.hello(host), deadline: deadline) { result in completion(result.flatMap { envelope in
+                                guard case .helloAck(let ack) = envelope.body else { return .failure(WorkspaceVMError("expected HelloAck")) }
+                                return .success(ack) // The coordinator performs the one release pairing check.
+                            }) }
+                        } catch { self.lost(String(describing: error)); completion(.failure(error)) }
+                    }
+                } catch { self.lost(String(describing: error)); completion(.failure(error)) }
+            }
+        }
+        if ready { start() } else { pendingHello = start }
+    }
+    private func exchange(_ body: WorkspaceEnvelope.OneOf_Body, deadline: UInt64, completion: @escaping (Result<WorkspaceEnvelope, Error>) -> Void) {
+        guard !failed, queue.count < 128 else { completion(.failure(WorkspaceVMError("control queue unavailable"))); return }
+        queue.append(Request(body: body, deadline: deadline, completion: completion)); advance()
+    }
+    private func advance() {
+        guard active == nil, !failed, !queue.isEmpty, let stream else { return }
+        let request = queue.removeFirst()
+        guard clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < request.deadline, requestID < UInt64.max else { request.completion(.failure(WorkspaceVMError("queued control deadline expired"))); advance(); return }
+        requestID += 1; let expected = requestID; active = request
+        var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = expected; envelope.body = request.body
+        do {
+            try stream.write(WorkspaceControl.encode(envelope), deadline: request.deadline) { result in
+                switch result {
+                case .failure(let error): self.finish(.failure(error))
+                case .success:
+                    stream.read(count: 4, deadline: request.deadline) { result in
+                        do {
+                            let header = try result.get(); let size = header.reduce(0) { ($0 << 8) | Int($1) }
+                            guard size > 0, size <= WorkspaceControl.maxFrame else { throw WorkspaceVMError("invalid frame length") }
+                            stream.read(count: size, deadline: request.deadline) { result in
+                                do {
+                                    let reply = try WorkspaceControl.decode(header + result.get())
+                                    guard reply.requestID == expected else { throw WorkspaceVMError("control response correlation failed") }
+                                    switch (request.body, reply.body) {
+                                    case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result): break
+                                    default: throw WorkspaceVMError("unexpected control reply")
+                                    }
+                                    self.finish(.success(reply))
+                                } catch { self.finish(.failure(error)) }
+                            }
+                        } catch { self.finish(.failure(error)) }
+                    }
                 }
             }
-        }
+        } catch { finish(.failure(error)) }
     }
-    private func connect(deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !failed, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < deadline else { completion(.failure(WorkspaceVMError("guest control startup timed out"))); return }
-        vm.connect(port: 1024) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success(let connection):
-                self.connection = connection
-                let fd = connection.fileDescriptor
-                var flag: Int32 = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flag, socklen_t(MemoryLayout.size(ofValue: flag)))
-                _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
-                completion(.success(()))
-            case .failure:
-                // Only pre-pair listener discovery retries. A paired stream is
-                // never replaced and a token is never resent.
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { self.connect(deadline: deadline, completion: completion) }
-            }
-        }
+    private func finish(_ result: Result<WorkspaceEnvelope, Error>) {
+        guard let current = active else { return }; active = nil
+        current.completion(result)
+        if case .failure(let error) = result { lost(String(describing: error)) } else { advance() }
     }
-    private func exchange(_ body: WorkspaceEnvelope.OneOf_Body, completion: @escaping (Result<WorkspaceEnvelope, Error>) -> Void) {
-        guard !failed, !busy, requestID < UInt64.max, let connection else { completion(.failure(WorkspaceVMError("control channel unavailable or busy"))); return }
-        idleMonitor?.cancel(); idleMonitor = nil
-        requestID += 1; busy = true
-        let expected = requestID
-        var request = WorkspaceEnvelope(); request.version = 8; request.requestID = expected; request.body = body
-        let outgoing = request
-        let fd = connection.fileDescriptor
-        WorkspaceIO({
-            let deadline = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + 10_000_000_000
-            try WorkspaceSocket.write(fd, data: WorkspaceControl.encode(outgoing), deadline: deadline)
-            let header = try WorkspaceSocket.read(fd, count: 4, deadline: deadline)
-            let size = header.reduce(0) { ($0 << 8) | Int($1) }
-            guard size > 0, size <= WorkspaceControl.maxFrame else { throw WorkspaceVMError("invalid frame length") }
-            let reply = try WorkspaceControl.decode(header + WorkspaceSocket.read(fd, count: size, deadline: deadline))
-            guard reply.requestID == expected else { throw WorkspaceVMError("control response correlation failed") }
-            switch (body, reply.body) {
-            case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck): break
-            default: throw WorkspaceVMError("unexpected control reply")
-            }
-            return reply
-        }, completion: { [weak self] result in
-            guard let self else { return }; self.busy = false
-            if case .failure = result { self.failed = true }
-            if self.failed { self.connection?.close(); self.connection = nil }
-            if !self.failed { self.monitorIdle() }
-            completion(result)
-            if self.failed { self.onFailure?() }
-        }).start()
+    private func lost(_ reason: String) {
+        guard !failed else { return }; failed = true
+        stream?.close(); connection?.close(); connection = nil
+        let waiting = queue; queue = []; let current = active; active = nil
+        current?.completion(.failure(WorkspaceVMError(reason)))
+        for request in waiting { request.completion(.failure(WorkspaceVMError(reason))) }
+        onFailure?(reason)
     }
-    private func monitorIdle() {
-        guard !failed, !busy, let connection else { return }
-        let fd = connection.fileDescriptor
-        let monitor = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
-        monitor.setEventHandler { [weak self] in
-            guard let self, !self.busy else { return }
-            var byte: UInt8 = 0
-            let count = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
-            if count >= 0 || (errno != EAGAIN && errno != EINTR) {
-                self.close(); self.onFailure?()
-            }
-        }
-        idleMonitor = monitor; monitor.resume()
+    public func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
+        exchange(.status(WorkspaceStatusRequest()), deadline: deadline) { completion($0.map { $0.statusReply }) }
     }
-    public func status(completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
-        exchange(.status(WorkspaceStatusRequest())) { result in completion(result.flatMap { e in
-            guard case .statusReply(let value) = e.body else { return .failure(WorkspaceVMError("expected status")) }; return .success(value)
-        }) }
+    public func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {
+        exchange(.suspend(request), deadline: deadline) { completion($0.map { $0.suspendAck }) }
     }
-    public func suspend(_ request: WorkspaceSuspension, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {
-        exchange(.suspend(request)) { result in completion(result.flatMap { e in
-            guard case .suspendAck(let value) = e.body else { return .failure(WorkspaceVMError("expected SuspendAck")) }; return .success(value)
-        }) }
+    public func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) {
+        lastResume = token
+        exchange(.resume(token), deadline: deadline) { completion($0.map { $0.resumeAck }) }
     }
-    public func resume(_ token: WorkspaceResumeToken, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) {
-        exchange(.resume(token)) { result in completion(result.flatMap { e in
-            guard case .resumeAck(let value) = e.body else { return .failure(WorkspaceVMError("expected ResumeAck")) }; return .success(value)
-        }) }
+    public func acknowledgeRetired(_ outcomes: [WorkspaceMountStatus], deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) {
+        var ack = WorkspaceRetireAck(); ack.outcomes = outcomes
+        exchange(.retireAck(ack), deadline: deadline) { result in completion(result.flatMap { $0.result.code == "ok" ? .success(()) : .failure(WorkspaceVMError("retirement refused")) }) }
     }
-    public func close() {
-        failed = true; idleMonitor?.cancel(); idleMonitor = nil
-        // Wake an in-flight worker before closing. Its captured descriptor may
-        // not be reused until the worker has finished its last system call.
-        if busy, let connection { shutdown(connection.fileDescriptor, SHUT_RDWR) }
-        else { connection?.close(); connection = nil }
-    }
+    public func close() { onFailure = nil; lost("owner closed channel") }
 }

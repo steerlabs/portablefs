@@ -14,6 +14,7 @@ private enum InjectedFailure: Error { case failed }
     var inspections = 0
     var beforeStart: (() -> Void)?
     func start(completion: @escaping (Result<Void, Error>) -> Void) { beforeStart?(); calls.append("start"); if holdStart { starts.append(completion) } else { completion(.success(())) } }
+    func shutdown(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("shutdown"); stops.append(completion) }
     func inspect(completion: @escaping (WorkspaceVMState) -> Void) { inspections += 1; completion(actual) }
     func pause(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("pause"); pauses.append(completion) }
     func resume(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("resume"); resumes.append(completion) }
@@ -55,18 +56,18 @@ private enum InjectedFailure: Error { case failed }
     var hellos: [(Result<WorkspaceHello, Error>) -> Void] = []
     var roster: [WorkspaceMountID] = []
     var retiredAcks: [(UInt64, (Result<Void, Error>) -> Void)] = []
-    func acknowledgeRetired(through sequence: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((sequence, completion)) }
+    func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((sequence, completion)) }
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
     var resumes: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
-    func hello(_ host: WorkspaceHello, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
+    func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         var guest = host; guest.guestServiceID = Data(repeating: 6, count: 16)
         if wrongRelease { guest.release.appVersion = "other" }
         if holdHello { hellos.append(completion) } else { completion(.success(guest)) }
     }
-    func status(completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
-    func suspend(_ request: WorkspaceSuspension, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
-    func resume(_ token: WorkspaceResumeToken, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
+    func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
+    func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
     func acknowledge(_ index: Int = 0, cold: Bool = true, loss: Bool = false) {
         var ack = WorkspaceSuspendAck(); ack.suspension = suspensions[index].0; ack.suspension.roster = roster
         ack.mounts = ack.suspension.roster.map {
@@ -509,4 +510,47 @@ private enum InjectedFailure: Error { case failed }
     status.retired = [old]
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
+}
+
+@Test @MainActor func workspaceChannelLossPausesDiscardOnlyAndPreservesReason() throws {
+    let r = try Rig()
+    r.coordinator.channelLost("peer EOF")
+    #expect(r.coordinator.phase == .pausing)
+    #expect(r.vm.calls == ["start", "pause"])
+    r.vm.pauses.removeFirst()(.success(()))
+    #expect(r.coordinator.phase == .pausedDiscard)
+    r.coordinator.powerEvent(.wake)
+    #expect(r.coordinator.phase == .stopping)
+    #expect(r.coordinator.reason.contains("peer EOF"))
+    #expect(r.vm.resumes.isEmpty)
+}
+@Test @MainActor func workspaceUnexpectedStopUnregistersAndRevokesEligibility() throws {
+    let r = try Rig(); r.cold()
+    r.coordinator.vmStopped(reason: "guest panic")
+    #expect(r.coordinator.phase == .stopped)
+    #expect(!r.power.registered)
+    r.coordinator.powerEvent(.wake)
+    #expect(r.vm.resumes.isEmpty)
+    #expect(r.coordinator.reason == "guest panic")
+}
+@Test @MainActor func workspaceReleasedUnfencedCannotBecomeColdOnLateCompletion() throws {
+    let r = try Rig(); r.sleep(); r.channel.acknowledge()
+    r.clock.advance(20_000_000_000)
+    #expect(r.power.acknowledgements.count == 1)
+    #expect(!r.power.acknowledgements[0].1)
+    r.vm.pauses.removeFirst()(.success(()))
+    #expect(r.coordinator.phase != .pausedCold)
+    r.coordinator.powerEvent(.wake)
+    #expect(r.vm.resumes.isEmpty)
+}
+@Test @MainActor func workspaceOwnerStopUsesCoordinatedShutdownAndRetriesFailure() throws {
+    let r = try Rig()
+    r.coordinator.stop()
+    #expect(r.vm.calls == ["start", "shutdown"])
+    r.vm.stops.removeFirst()(.failure(InjectedFailure.failed))
+    #expect(r.vm.inspections == 1)
+    #expect(r.vm.calls == ["start", "shutdown", "stop"])
+    r.vm.stops.removeFirst()(.success(()))
+    #expect(r.coordinator.phase == .stopped)
+    #expect(r.power.unregisters == 1)
 }

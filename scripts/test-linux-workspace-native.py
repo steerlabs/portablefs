@@ -7,10 +7,13 @@ import sys
 import threading
 import time
 import uuid
+import tempfile
+import re
+import shutil
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
-state = root / ('state-' + uuid.uuid4().hex)
+state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-ws-', dir='/tmp'))
 required = pathlib.Path(inventory).read_text().splitlines()
 assert required and len(required) == len(set(required))
 passed = []
@@ -34,6 +37,7 @@ class Guest:
 
         def read():
             for line in self.p.stdout:
+                assert events.tell() + len(line) <= 8*1024*1024, 'event log bound exceeded'
                 events.write(line); events.flush()
                 self.lines.put(json.loads(line))
             self.lines.put({'event': 'eof', 'returncode': self.p.wait()})
@@ -85,25 +89,43 @@ class Guest:
 guest = None
 try:
     guest = Guest()
+    corrupt = pathlib.Path(tempfile.mkdtemp(prefix='pfs-corrupt-', dir='/tmp')) / 'image'
+    try:
+        subprocess.run(['/bin/cp', '-cR', image, str(corrupt)], check=True)
+        manifest = json.loads((corrupt/'manifest.json').read_text())
+        manifest['files']['kernel']['sha256'] = '0'*64
+        (corrupt/'manifest.json').write_text(json.dumps(manifest))
+        refused = subprocess.run([binary, '--verify-artifact', str(corrupt)], text=True, capture_output=True, timeout=30)
+        assert refused.returncode != 0 and 'artifact hash mismatch: kernel' in refused.stderr
+    finally:
+        shutil.rmtree(corrupt.parent)
     record('artifact-verification')
-    assert guest.starting['power_registered'] is True
+    operations = guest.starting['operations']
+    assert operations.index('power-registered') < operations.index('start-request')
     record('power-before-start')
-    assert guest.ready['mounts'] == 1
+    assert guest.ready['mounts'] == 0
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    subprocess.run(['go', '-C', str(repo/'vcs'), 'test', './internal/workspaceguest', '-run', '^TestTransportExactReleaseAndBootPairing$', '-count=1'], check=True)
     record('exact-handshake')
-    fuse = json.loads(guest.ssh('cat /run/portablefs-fuse-init.json'))
-    assert fuse['negotiated_major'] == 7 and fuse['negotiated_minor'] >= 31
+    fuse = json.loads(guest.ssh('timeout 15 portablefs-workspaced probe-fuse'))
+    assert fuse['kernel_major'] == 7 and fuse['kernel_minor'] >= 31
+    assert fuse['negotiated_major'] == 7 and fuse['negotiated_minor'] >= 31 and fuse['initialized'] is True
     measurements[-1]['fuse'] = fuse
     record('fuse-init-7.31')
     assert guest.ssh('id -u; id -g; whoami').splitlines() == ['1000', '1000', 'workspace']
-    assert guest.ssh("python3 -c 'print(6*7)'; git --version; cc --version | head -1").splitlines()[0] == '42'
+    assert guest.ssh("set -e; command -v python3 git cc; python3 -c 'print(6*7)'; git --version; cc --version").splitlines()[3] == '42'
     record('ssh-workspace-user')
-    assert guest.ssh("findmnt -n -o OPTIONS /; test ! -w /usr; test ! -w /etc").split(',')[0] == 'ro'
+    assert guest.ssh('cat /sys/block/vda/ro') == '1'
+    assert 'ro' in guest.ssh('findmnt -n -o OPTIONS /').split(',')
     record('immutable-root')
-    assert guest.ssh("ss -ltnH '( sport = :22 )' | wc -l") == '0'
+    listeners = guest.ssh("ss -ltnH | awk '{print $4}'").splitlines()
+    assert all(address in ('127.0.0.53%lo:53', '127.0.0.54:53', '127.0.0.53:53') for address in listeners), listeners
     assert ':22' in guest.ssh('ss -l --vsock')
     record('vsock-only-ssh')
-    assert guest.ssh('test ! -r /workspaces && test ! -x /workspaces && test ! -w /workspaces && echo denied') == 'denied'
-    record('unmounted-workspaces-inaccessible')
+    assert guest.ssh('stat -c %a:%u:%g /workspaces') == '755:0:0'
+    assert guest.ssh('findmnt -n -o FSTYPE /workspaces') == 'tmpfs'
+    assert guest.ssh('test -x /workspaces && test ! -w /workspaces && echo traversable') == 'traversable'
+    record('workspace-root-layout')
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
@@ -118,11 +140,8 @@ try:
     guest.command('resume')
     resumed = guest.wait('resumed', 25)
     assert resumed['operations'][-1] == 'resume-completed'
-    assert resumed['mount_states'] == ['authorization-required']
-    guest.command('resume')
-    assert guest.wait('refused')['command'] == 'resume'
+    assert resumed['mount_states'] == []
     assert guest.ssh('cat ~/persistence') == token
-    record('resume-single-use')
     memory = guest.ssh("awk '/MemTotal:|MemAvailable:/ {print}' /proc/meminfo")
     measurements[-1]['guest_memory'] = memory
     measurements[-1]['owner_rss_kib'] = int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(guest.p.pid)], text=True).strip())
@@ -130,10 +149,24 @@ try:
     guest = Guest()
     assert guest.ssh('cat ~/persistence') == token
     record('data-disk-reboot-persistence')
-    assert (state / 'guest_host_key.pub').read_text() == old_key
+    assert guest.ready['host_key'].split()[:2] == old_key.split()[:2]
+    debug = subprocess.run(['/usr/bin/ssh', '-vv', '-F', guest.ready['ssh_config'], 'portablefs-workspace', 'true'], text=True, capture_output=True, timeout=30)
+    fingerprint = subprocess.check_output(['/usr/bin/ssh-keygen', '-lf', str(state/'guest_host_key.pub')], text=True).split()[1]
+    assert debug.returncode == 0 and 'Server host key: ssh-ed25519 ' + fingerprint in debug.stderr
     record('guest-host-key-persistence')
     guest.stop()
     record('clean-stop')
+    guest = Guest()
+    guest.command('pause'); guest.wait('paused', 25)
+    guest.command('resume'); guest.wait('resumed', 25)
+    guest.command('replay-resume')
+    assert guest.wait('replay-refused', 25)['generation'] == 1
+    # This is a real replay on the paired stream; the guest closes it and the
+    # coordinator discards the now-unpaired VM. No dev input guard refused it.
+    guest.wait('failure', 25)
+    guest.wait('stopped', 25)
+    assert guest.p.wait(timeout=10) == 1
+    record('resume-single-use')
     assert sorted(passed) == sorted(required), (passed, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state)}, indent=2) + '\n')
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)

@@ -1,0 +1,7 @@
+# Sourced by the data initializer. Only durable host authorization permits a
+# destructive format; it remains valid until the complete guest format is acked.
+format_workspace_disk() {
+  [[ "${PFS_FORMAT_AUTHORIZED:-}" == 8 ]] || return 1
+  mkfs.ext4 -q -F -L portablefs-data "$1" || return
+  sync -f "$1"
+}
