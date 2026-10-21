@@ -119,7 +119,9 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    system posting and native callback execution. Sleep during VM resume carries
    the same deadlines, and insufficient remaining time attempts stop. Every
    notification receives exactly one acknowledgement, including during startup,
-   stop and unknown state. Confirmed termination unregisters participation. A failed drain
+   stop and unknown state. A non-increasing notification ID violates the power
+   adapter contract and takes the unknown-transition stop path. Confirmed
+   termination unregisters participation. A failed drain
    still attempts pause but marks the VM discard-only. A failed or late pause
    attempts stop. Neither an invocation nor a stop request establishes a fence;
    an unconfirmed stop leaves unsafe/unknown state and acknowledges no fence.

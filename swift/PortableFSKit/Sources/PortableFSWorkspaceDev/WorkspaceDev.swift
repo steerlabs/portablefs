@@ -125,7 +125,7 @@ import PortableFSWorkspaceCore
                 event("resumed", ["generation": coordinator.generation, "operations": vm.operations, "mount_states": coordinator.mountStatus.map(\.state)])
             }
         }
-        if !stopping, [.unknown, .pausedDiscard, .stopping, .stopped].contains(coordinator.phase) { fail(WorkspaceVMError("VM unavailable: \(coordinator.phase): \(coordinator.reason)")) }
+        if !stopping, [.unknown, .pausedDiscard, .stopped].contains(coordinator.phase) { fail(WorkspaceVMError("VM unavailable: \(coordinator.phase): \(coordinator.reason)")) }
     }
     func input(_ data: Data) {
         if data.isEmpty { stop(exitCode: 0); return }

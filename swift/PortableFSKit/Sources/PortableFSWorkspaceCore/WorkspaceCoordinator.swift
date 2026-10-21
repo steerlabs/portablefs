@@ -163,6 +163,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         case .sleep(let notification):
             guard notification.id > lastNotificationID else {
                 notifications.removeValue(forKey: notification.id)
+                powerEvent(.unknown)
                 power.acknowledgeSleep(notificationID: notification.id,
                     fenced: phase == .stopped || phase == .pausedCold || phase == .pausedDiscard)
                 return
@@ -375,7 +376,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         default: stopUnsafe(failure)
         }
     }
-    public func vmStopped(reason: String) { finishStop(); self.reason = reason }
+    public func vmStopped(reason: String) { self.reason = reason; finishStop() }
     public func stop() {
         if case .unknown = state { reconcileUnknown(); return }
         let clean = phase == .running

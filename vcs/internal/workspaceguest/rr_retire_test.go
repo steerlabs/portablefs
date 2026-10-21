@@ -9,9 +9,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Host coordinator permits two acknowledgeRetired calls for the same observed
-// prefix before the first completes (no in-flight guard); the FIFO delivers both.
-func TestRRDuplicateRetireAckKillsChannel(t *testing.T) {
+// Repeated retirement acknowledgements and future-sequence refusals keep the
+// paired stream available for subsequent status observations.
+func TestTransportDuplicateRetirementAcknowledgementKeepsChannel(t *testing.T) {
 	c, s, done := transportRig(t)
 	pairTransport(t, c)
 	ctx := context.Background()

@@ -8,14 +8,14 @@ import (
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
 
-func TestRRTransportFailedPrepareKillsChannelOnResume(t *testing.T) {
+func TestTransportFailedPrepareRetainsTerminalOutcomeOnResume(t *testing.T) {
 	c, s, done := transportRig(t)
 	m := &fakeMount{cold: ColdResult{ColdComplete: true}, recoverResult: ready(), prepareResult: &Recovery{State: "closed"}}
 	mid := mountID(4)
 	if err := s.Register(context.Background(), mid, Witness{}, m); err != nil {
 		t.Fatal(err)
 	}
-	_ = s.Activate(context.Background(), mid, 0) // fails: closed with reason
+	_ = s.Activate(context.Background(), mid, 0) // invalid closed proof terminalizes this incarnation
 	pairTransport(t, c)
 	x := suspension(s)
 	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Suspend{Suspend: x}})

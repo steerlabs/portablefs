@@ -178,15 +178,34 @@ private func rrGolden(_ name: String) throws -> Data {
     #expect(throws: Never.self, "UI retry after successful acknowledgement throws") { try c.acknowledgeRetired([old]) }
 }
 
-@Test @MainActor func workspaceAcknowledgesNonIncreasingNotificationIDs() throws {
-    let (c, vm, power, _, ch) = try rrRig()
+@Test @MainActor func workspaceNonIncreasingNotificationIDsStopVM() throws {
+    for id in [UInt64(0), 4, 5] {
+        let (c, vm, power, _, ch) = try rrRig()
+        c.powerEvent(.sleep(WorkspaceSleepNotification(id: 5, arrivedAt: 1_000)))
+        c.powerEvent(.sleep(WorkspaceSleepNotification(id: id, arrivedAt: 1_000)))
+        #expect(c.phase == .stopping)
+        #expect(vm.calls.last == "stop")
+        #expect(c.reason == "unknown power transition")
+        #expect(power.acknowledgements.count == 1)
+        #expect(power.acknowledgements[0].0 == id && !power.acknowledgements[0].1)
+        var ack = WorkspaceSuspendAck(); ack.suspension = ch.suspensions[0].0
+        ch.suspensions[0].1(.success(ack))
+        #expect(vm.pauses.isEmpty)
+        vm.stops.removeFirst()(.success(()))
+        #expect(c.phase == .stopped)
+        #expect(c.reason == "unknown power transition")
+        #expect(power.acknowledgements.filter { $0.0 == 5 }.count == 1)
+    }
+}
+
+// B. Duplicate (non-increasing) notification while draining: unfenced release without unsafe transition?
+@Test @MainActor func workspaceDuplicateNotificationStopsBeforeUnfencedRelease() throws {
+    let (c, vm, power, _, _) = try rrRig()
     c.powerEvent(.sleep(WorkspaceSleepNotification(id: 5, arrivedAt: 1_000)))
-    c.powerEvent(.sleep(WorkspaceSleepNotification(id: 4, arrivedAt: 1_000)))
-    #expect(power.acknowledgements.count == 1)
-    #expect(power.acknowledgements[0].0 == 4 && !power.acknowledgements[0].1)
-    var ack = WorkspaceSuspendAck(); ack.suspension = ch.suspensions[0].0
-    ch.suspensions[0].1(.success(ack)); vm.pauses.removeFirst()(.success(()))
-    #expect(power.acknowledgements.map { $0.0 } == [4, 5])
-    c.powerEvent(.sleep(WorkspaceSleepNotification(id: 3, arrivedAt: 1_000)))
-    #expect(power.acknowledgements.last?.0 == 3 && power.acknowledgements.last?.1 == true)
+    #expect(c.phase == .draining)
+    c.powerEvent(.sleep(WorkspaceSleepNotification(id: 5, arrivedAt: 1_000)))
+    #expect(power.acknowledgements.count == 1 && power.acknowledgements[0] == (5, false))
+    #expect(c.phase == .stopping)
+    #expect(vm.calls.last == "stop")
+    #expect(c.reason == "unknown power transition")
 }
