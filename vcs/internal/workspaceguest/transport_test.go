@@ -3,6 +3,7 @@ package workspaceguest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -179,7 +180,7 @@ func TestTransportRetiredOutcomeAcknowledgementUsesPairedGrammar(t *testing.T) {
 	if len(status.Retired) != 1 || !proto.Equal(status.Retired[0].Mount, old) {
 		t.Fatalf("missing retired outcome: %v", status)
 	}
-	result := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{Outcomes: status.Retired}}})
+	result := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{ThroughSequence: status.Retired[len(status.Retired)-1].RetirementSequence}}})
 	if result.GetResult().GetCode() != "accepted" {
 		t.Fatalf("retirement acknowledgement refused: %v", result)
 	}
@@ -190,5 +191,20 @@ func TestTransportRetiredOutcomeAcknowledgementUsesPairedGrammar(t *testing.T) {
 	c.Close()
 	if err := <-done; err == nil {
 		t.Fatal("disconnect succeeded")
+	}
+}
+
+func TestTransportChannelLossStatusStillEncodes(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprint(terminal), func(t *testing.T) {
+			s, _, mid := fixture(t)
+			if terminal {
+				if err := s.Terminal(mid, "session ended", nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s.ChannelLost()
+			encodable(t, s.Status())
+		})
 	}
 }

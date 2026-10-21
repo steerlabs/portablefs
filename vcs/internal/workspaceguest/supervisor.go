@@ -625,7 +625,7 @@ func (s *Supervisor) ChannelLost() {
 		e.driver.CloseAdmission(s.generation)
 		e.cold = false
 		if !e.terminal {
-			e.status.State = "closed"
+			e.setStatus("closed", "", "")
 		}
 	}
 }

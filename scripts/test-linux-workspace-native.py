@@ -14,7 +14,7 @@ import signal
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
-state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-ws-', dir='/tmp'))
+state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-ws-%h-%d-', dir='/tmp'))
 required = pathlib.Path(inventory).read_text().splitlines()
 assert required and len(required) == len(set(required))
 passed = []
@@ -106,8 +106,34 @@ try:
     assert operations.index('power-registered') < operations.index('start-request')
     record('power-before-start')
     assert guest.ready['mounts'] == 0
-    repo = pathlib.Path(__file__).resolve().parent.parent
-    subprocess.run(['go', '-C', str(repo/'vcs'), 'test', './internal/workspaceguest', '-run', '^TestTransportExactReleaseAndBootPairing$', '-count=1'], check=True)
+    # Each negative case boots the paired image and exchanges a valid but
+    # mismatched Hello with the real guest over its authenticated vsock stream.
+    # No host-only model test can satisfy this case.
+    for field in ('version', 'commit', 'digest'):
+        mismatch_state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-ws-mismatch-', dir='/tmp'))
+        try:
+            process = subprocess.Popen([binary, image, str(mismatch_state), '--pairing-mismatch', field],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                process.wait(timeout=180)
+                stdout = process.stdout.read(); stderr = process.stderr.read()
+                mismatch = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+            finally:
+                if process.poll() is None:
+                    process.terminate(); process.wait(timeout=30)
+                process.stdin.close(); process.stdout.close(); process.stderr.close()
+            (root / ('handshake-' + field + '.stdout')).write_text(mismatch.stdout)
+            (root / ('handshake-' + field + '.stderr')).write_text(mismatch.stderr)
+            frames = [json.loads(line) for line in mismatch.stdout.splitlines()]
+            names = [frame['event'] for frame in frames]
+            assert mismatch.returncode == 1, (field, mismatch.returncode, frames, mismatch.stderr)
+            assert 'control-ready' in names and 'hello-refused' in names, (field, frames)
+            refusal = next(frame for frame in frames if frame['event'] == 'hello-refused')
+            assert 'peer closed' in refusal['reason'], (field, refusal)
+            assert 'ready' not in names and names[-1] == 'stopped', (field, frames)
+            assert frames[-1]['operations'][-1] == 'stop-completed', (field, frames)
+        finally:
+            shutil.rmtree(mismatch_state)
     record('exact-handshake')
     fuse = json.loads(guest.ssh('timeout 15 portablefs-workspaced probe-fuse'))
     assert fuse['kernel_major'] == 7 and fuse['kernel_minor'] >= 31

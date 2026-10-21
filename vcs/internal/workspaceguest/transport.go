@@ -86,10 +86,12 @@ func Serve(ctx context.Context, stream io.ReadWriter, expected *pb.Hello, superv
 			}
 			reply.Body = &pb.Envelope_ResumeAck{ResumeAck: ack}
 		case *pb.Envelope_RetireAck:
-			if err := supervisor.AcknowledgeRetired(body.RetireAck.Outcomes); err != nil {
-				return fmt.Errorf("acknowledge retired outcomes: %w", err)
+			result := &pb.Result{Code: "accepted"}
+			if err := supervisor.AcknowledgeRetired(body.RetireAck.ThroughSequence); err != nil {
+				result.Code = "refused"
+				result.Reason = control.BoundedReason(err.Error())
 			}
-			reply.Body = &pb.Envelope_Result{Result: &pb.Result{Code: "accepted"}}
+			reply.Body = &pb.Envelope_Result{Result: result}
 		case *pb.Envelope_Provision, *pb.Envelope_Mount, *pb.Envelope_Umount:
 			reply.Body = &pb.Envelope_Result{Result: &pb.Result{Code: "unavailable", Reason: "real mount integration pending"}}
 		default:

@@ -512,15 +512,12 @@ private enum InjectedFailure: Error { case failed }
     #expect(r.coordinator.mountStatus == [replacement])
 }
 
-@Test @MainActor func workspaceChannelLossPausesDiscardOnlyAndPreservesReason() throws {
+@Test @MainActor func workspaceChannelLossStopsWithoutWaitingForWake() throws {
     let r = try Rig()
     r.coordinator.channelLost("peer EOF")
-    #expect(r.coordinator.phase == .pausing)
-    #expect(r.vm.calls == ["start", "pause"])
-    r.vm.pauses.removeFirst()(.success(()))
-    #expect(r.coordinator.phase == .pausedDiscard)
-    r.coordinator.powerEvent(.wake)
     #expect(r.coordinator.phase == .stopping)
+    #expect(r.vm.calls == ["start", "stop"])
+    #expect(r.vm.pauses.isEmpty)
     #expect(r.coordinator.reason.contains("peer EOF"))
     #expect(r.vm.resumes.isEmpty)
 }

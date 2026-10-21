@@ -96,7 +96,7 @@ public final class WorkspaceDevState {
         try Self.atomic(Data(("portablefs-workspace " + canonical).utf8), to: known)
         func quote(_ text: String) throws -> String {
             guard !text.contains("\n"), !text.contains("\r") else { throw WorkspaceVMError("invalid SSH state path") }
-            return "\"" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+            return "\"" + text.replacingOccurrences(of: "%", with: "%%").replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
         }
         let shellPath = "'" + socket.path.replacingOccurrences(of: "'", with: "'\\''").replacingOccurrences(of: "%", with: "%%") + "'"
         let config = """

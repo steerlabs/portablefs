@@ -10,6 +10,7 @@ import Testing
     var stops: [(Result<Void, Error>) -> Void] = []
     func start(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("start"); completion(.success(())) }
     
+    func shutdown(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("shutdown"); stops.append(completion) }
     func inspect(completion: @escaping (WorkspaceVMState) -> Void) { completion(.running) }
     func pause(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("pause"); pauses.append(completion) }
     func resume(completion: @escaping (Result<Void, Error>) -> Void) { calls.append("resume"); resumes.append(completion) }
@@ -43,13 +44,13 @@ import Testing
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
     var resumes: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
-    func hello(_ host: WorkspaceHello, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
+    func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         var guest = host; guest.guestServiceID = Data(repeating: 6, count: 16); completion(.success(guest))
     }
-    func acknowledgeRetired(through sequence: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((sequence, completion)) }
-    func status(completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
-    func suspend(_ request: WorkspaceSuspension, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
-    func resume(_ token: WorkspaceResumeToken, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
+    func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((sequence, completion)) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
+    func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
+    func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
 }
 private func rrGolden(_ name: String) throws -> Data {
     let url = try #require(Bundle.module.url(forResource: name, withExtension: "hex", subdirectory: "Goldens"))
@@ -175,4 +176,17 @@ private func rrGolden(_ name: String) throws -> Data {
     ch.retiredAcks.removeFirst().1(.success(()))
     #expect(c.retiredStatus.isEmpty)
     #expect(throws: Never.self, "UI retry after successful acknowledgement throws") { try c.acknowledgeRetired([old]) }
+}
+
+@Test @MainActor func workspaceAcknowledgesNonIncreasingNotificationIDs() throws {
+    let (c, vm, power, _, ch) = try rrRig()
+    c.powerEvent(.sleep(WorkspaceSleepNotification(id: 5, arrivedAt: 1_000)))
+    c.powerEvent(.sleep(WorkspaceSleepNotification(id: 4, arrivedAt: 1_000)))
+    #expect(power.acknowledgements.count == 1)
+    #expect(power.acknowledgements[0].0 == 4 && !power.acknowledgements[0].1)
+    var ack = WorkspaceSuspendAck(); ack.suspension = ch.suspensions[0].0
+    ch.suspensions[0].1(.success(ack)); vm.pauses.removeFirst()(.success(()))
+    #expect(power.acknowledgements.map { $0.0 } == [4, 5])
+    c.powerEvent(.sleep(WorkspaceSleepNotification(id: 3, arrivedAt: 1_000)))
+    #expect(power.acknowledgements.last?.0 == 3 && power.acknowledgements.last?.1 == true)
 }

@@ -19,7 +19,7 @@ import PortableFSWorkspaceCore
     private var failed = false
     private var ready = false
     private var pendingHello: (() -> Void)?
-    public private(set) var lastResume: WorkspaceResumeToken?
+    public var isIdle: Bool { active == nil && queue.isEmpty && pendingHello == nil }
     public var onFailure: ((String) -> Void)?
     public init(vm: WorkspaceMachine) { self.vm = vm }
     public func controlReady() { ready = true; let start = pendingHello; pendingHello = nil; start?() }
@@ -106,11 +106,10 @@ import PortableFSWorkspaceCore
         exchange(.suspend(request), deadline: deadline) { completion($0.map { $0.suspendAck }) }
     }
     public func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) {
-        lastResume = token
         exchange(.resume(token), deadline: deadline) { completion($0.map { $0.resumeAck }) }
     }
-    public func acknowledgeRetired(_ outcomes: [WorkspaceMountStatus], deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) {
-        var ack = WorkspaceRetireAck(); ack.outcomes = outcomes
+    public func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) {
+        var ack = WorkspaceRetireAck(); ack.throughSequence = sequence
         exchange(.retireAck(ack), deadline: deadline) { result in completion(result.flatMap { $0.result.code == "accepted" ? .success(()) : .failure(WorkspaceVMError("retirement refused")) }) }
     }
     public func close() { onFailure = nil; lost("owner closed channel") }

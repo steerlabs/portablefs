@@ -158,7 +158,8 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    state stops without resuming old RAM; only exact termination permits a new
    coordinator with a new boot identity. A cancelled sleep reconciles the current
    generation by the same cold recovery path. Dark wake stays paused. Startup
-   and the paired Hello share a 20-second deadline. Unknown stop state retains
+   and the paired Hello share one deadline: the model defaults to 20 seconds;
+   the development driver sets 150 seconds for first boot and data formatting. Unknown stop state retains
    any outstanding stop and queries the exact VM state before another attempt;
    another wake never duplicates a pending stop.
 
@@ -300,7 +301,7 @@ host relay, bridged-network substitution or hidden authority proxy. Local
 Network privacy must qualify the installed signed VM owner, including app
 replacement and exact old-process termination.
 
-The dev SSH entry `portablefs-workspace` binds a host listener to 127.0.0.1
+The dev SSH entry `portablefs-workspace` uses an owner-only host Unix socket
 and bridges directly to vsock port 22. A systemd `ListenStream=vsock::22` socket
 starts OpenSSH in inetd mode; no guest TCP SSH listener exists. Use separate SSH credentials and a pinned, persistent guest host
 key. Install an app-owned include only through explicit setup, preserving
@@ -390,7 +391,8 @@ including Remote-SSH. This preserves the generated-config workflow and excludes
 other local users, so there is no loopback TCP listener. Full editor qualification
 remains pending. Relay descriptors use nonblocking dispatch sources, bounded
 buffers and dedicated serial queues; the cap includes pending vsock connects.
-The control stream has a separate queue and ordered requests with deadlines
+The control stream uses a dedicated descriptor-I/O queue; its FIFO request
+queue runs on MainActor with the VZ owner. Requests carry deadlines
 supplied by the coordinator. No global SSH configuration is edited. Standard input accepts one JSON command
 per line: `{"command":"pause"}`, `resume`, `status` or `stop`. Pause/resume and stop use
 the real coordinator. The native gate resends an already-consumed token over
@@ -406,8 +408,10 @@ bash scripts/test-linux-workspace-native.sh /absolute/image /absolute/evidence
 
 It builds or verifies/reuses the pinned image, builds and signs the owner, then
 requires exact equality with `scripts/linux-workspace-required-native-tests.txt`.
-It boots twice, proves real FUSE INIT >= 7.31 on a throwaway filesystem, checks
-UID/GID 1000 and tool execution through pinned SSH, read-only root and no TCP
+It boots fresh guests, proves real FUSE INIT >= 7.31 on a throwaway filesystem, and checks
+fresh in-VM Hello refusals for mismatched app version, commit and image digest,
+UID/GID 1000 and tool execution through pinned SSH (including literal percent
+characters in every generated path), read-only root and no TCP
 SSH listener, unmounted-path denial, data/key persistence, cold VZ pause completion,
 empty-roster recovery, actual token-replay refusal and clean guest shutdown.
 `results.json` records boot time, idle guest memory and owner RSS; `events.jsonl`
@@ -460,3 +464,19 @@ multiple VMs, custom images, RAM snapshots/migration, Rosetta, root-system
 customization and Linux desktops remain deferred. No Finder mirror, native Mac
 re-export, synchronization engine or automatic remote-workspace substitution
 belongs to this product.
+
+### Stage 1c drain dispatch
+
+The current guest transport drains its roster serially. Stage 1b registers no
+real mounts, so native suspension exercises an empty roster. Stage 1c must
+start mount drains in parallel under the coordinator's remaining drain budget,
+cancel unfinished work at expiry, and prove whole-roster completion before
+acknowledging cold state. The current suspension grammar carries no drain
+budget; the transport's service-lifetime context does not bound each request.
+Parallel dispatch alone would not establish this deadline contract. Real mount
+integration must supply both deadline propagation and cancellation before it
+can qualify the 15-second boundary.
+
+Data formatting relies on mke2fs's device flush before successful exit. The
+initializer treats that completion as its format boundary; it does not use
+`sync -f /dev/vdb`, which would synchronize devtmpfs rather than the device.

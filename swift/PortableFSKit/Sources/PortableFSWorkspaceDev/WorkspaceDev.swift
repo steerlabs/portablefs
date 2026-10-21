@@ -3,6 +3,26 @@ import Darwin
 import PortableFSWorkspaceVM
 import PortableFSWorkspaceCore
 
+// Native probe observation belongs to the development executable. The product
+// channel retains no tokens or public replay/test hooks.
+@MainActor private final class ObservedChannel: WorkspaceGuestChannel {
+    let base: WorkspaceVsockChannel
+    var lastResume: WorkspaceResumeToken?
+    var onHelloFailure: ((String) -> Void)?
+    init(_ base: WorkspaceVsockChannel) { self.base = base }
+    var isIdle: Bool { base.isIdle }
+    func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
+        base.hello(host, deadline: deadline) { [weak self] result in
+            if case .failure(let error) = result { self?.onHelloFailure?(String(describing: error)) }
+            completion(result)
+        }
+    }
+    func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { base.suspend(request, deadline: deadline, completion: completion) }
+    func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { lastResume = token; base.resume(token, deadline: deadline, completion: completion) }
+    func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { base.acknowledgeRetired(through: sequence, deadline: deadline, completion: completion) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { base.status(deadline: deadline, completion: completion) }
+}
+
 @MainActor final class Driver {
     let state: WorkspaceDevState
     let vm: WorkspaceMachine
@@ -10,6 +30,7 @@ import PortableFSWorkspaceCore
     let clock = WorkspaceSystemClock()
     let random = WorkspaceRandom()
     let channel: WorkspaceVsockChannel
+    private let observed: ObservedChannel
     let coordinator: WorkspaceCoordinator
     let bridge: WorkspaceSSHBridge
     let boot: WorkspaceHello
@@ -23,18 +44,26 @@ import PortableFSWorkspaceCore
     var pendingCommand: String?
     var signals: [DispatchSourceSignal] = []
     var updateQueued = false
-    init(image: URL, stateDirectory: URL) throws {
+    init(image: URL, stateDirectory: URL, pairingMismatch: String? = nil) throws {
         let artifact = try WorkspaceArtifact(directory: image)
         guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit, artifact.release.appVersion == "dev" else { throw WorkspaceVMError("host executable and guest release differ; rebuild the paired dev executable") }
         state = try WorkspaceDevState(directory: stateDirectory)
         vm = try WorkspaceMachine(artifact: artifact, dataDisk: stateDirectory.appendingPathComponent("data.ext4"), serialLog: stateDirectory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress)
-        channel = WorkspaceVsockChannel(vm: vm); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)
+        channel = WorkspaceVsockChannel(vm: vm); observed = ObservedChannel(channel); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)
         var hello = WorkspaceHello(); hello.release = artifact.release; hello.bootID = random.next(); hello.hostServiceID = random.next()
+        switch pairingMismatch {
+        case "version": hello.release.appVersion += "-mismatch"
+        case "commit": hello.release.commit = String(repeating: hello.release.commit == String(repeating: "a", count: 40) ? "b" : "a", count: 40)
+        case "digest": hello.release.imageDigest[hello.release.imageDigest.startIndex] ^= 1
+        case nil: break
+        default: throw WorkspaceVMError("invalid pairing mismatch field")
+        }
         boot = hello
-        coordinator = try WorkspaceCoordinator(host: hello, oldInstanceAbsent: true, vm: vm, power: power, channel: channel, clock: clock, nonces: random, startBudget: 150_000_000_000)
+        coordinator = try WorkspaceCoordinator(host: hello, oldInstanceAbsent: true, vm: vm, power: power, channel: observed, clock: clock, nonces: random, startBudget: 150_000_000_000)
         vm.onSeed = { [weak self] event in self?.seedEvent(event) }
         power.onRecord = { [weak vm] in vm?.record($0) }
         vm.onStopped = { [weak self] in self?.coordinator.vmStopped(reason: $0) }
+        observed.onHelloFailure = { [weak self] in self?.event("hello-refused", ["reason": $0]) }
         channel.onFailure = { [weak self] in self?.coordinator.channelLost($0) }
         coordinator.onChange = { [weak self] in self?.scheduleUpdate() }
     }
@@ -49,7 +78,7 @@ import PortableFSWorkspaceCore
             case "seeded":
                 guard value["boot_id"] == hex(boot.bootID), value["format_complete"] == "8", let key = value["host_key"] else { throw WorkspaceVMError("seed identity or format mismatch") }
                 try state.formatCompleted(); hostKey = key; seeded = true; scheduleUpdate()
-            case "control-ready": channel.controlReady()
+            case "control-ready": event("control-ready"); channel.controlReady()
             case "boot-failed": throw WorkspaceVMError(value["reason"] ?? "guest bootstrap failed")
             default: throw WorkspaceVMError("invalid boot console message")
             }
@@ -96,7 +125,7 @@ import PortableFSWorkspaceCore
                 event("resumed", ["generation": coordinator.generation, "operations": vm.operations, "mount_states": coordinator.mountStatus.map(\.state)])
             }
         }
-        if !stopping, [.unknown, .pausedDiscard, .stopped].contains(coordinator.phase) { fail(WorkspaceVMError("VM unavailable: \(coordinator.phase): \(coordinator.reason)")) }
+        if !stopping, [.unknown, .pausedDiscard, .stopping, .stopped].contains(coordinator.phase) { fail(WorkspaceVMError("VM unavailable: \(coordinator.phase): \(coordinator.reason)")) }
     }
     func input(_ data: Data) {
         if data.isEmpty { stop(exitCode: 0); return }
@@ -113,7 +142,7 @@ import PortableFSWorkspaceCore
                 guard coordinator.phase == .pausedCold, pendingCommand == nil else { event("refused", ["command": command]); continue }
                 pendingCommand = command; coordinator.powerEvent(.wake)
             case "replay-resume":
-                guard let token = channel.lastResume else { event("refused", ["command": command]); continue }
+                guard let token = observed.lastResume else { event("refused", ["command": command]); continue }
                 channel.resume(token, deadline: clock.now + 20_000_000_000) { [weak self] result in
                     if case .failure(let error) = result { self?.event("replay-refused", ["generation": token.suspension.generation, "reason": String(describing: error)]) }
                     else { self?.fail(WorkspaceVMError("guest accepted consumed token")) }
@@ -143,9 +172,10 @@ import PortableFSWorkspaceCore
             guard WorkspaceMachine.virtualizationSupported else { fputs("UNAVAILABLE: native-workspace-virtualization\n", stderr); exit(3) }
             exit(0)
         }
-        guard CommandLine.arguments.count == 3 else { fputs("usage: portablefs-workspace-dev IMAGE_DIRECTORY STATE_DIRECTORY\n", stderr); exit(2) }
+        let args = CommandLine.arguments
+        guard args.count == 3 || (args.count == 5 && args[3] == "--pairing-mismatch") else { fputs("usage: portablefs-workspace-dev IMAGE_DIRECTORY STATE_DIRECTORY [--pairing-mismatch version|commit|digest]\n", stderr); exit(2) }
         do {
-            let driver = try Driver(image: URL(fileURLWithPath: CommandLine.arguments[1]), stateDirectory: URL(fileURLWithPath: CommandLine.arguments[2]))
+            let driver = try Driver(image: URL(fileURLWithPath: args[1]), stateDirectory: URL(fileURLWithPath: args[2]), pairingMismatch: args.count == 5 ? args[4] : nil)
             try driver.start(); RunLoop.main.run(); withExtendedLifetime(driver) {}
         } catch { fputs("portablefs-workspace-dev: \(error)\n", stderr); exit(1) }
     }

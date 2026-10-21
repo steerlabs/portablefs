@@ -131,6 +131,18 @@ private func temporaryDirectory() throws -> URL {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
         #expect(throws: (any Error).self) { try WorkspaceDevState(directory: directory) }
     }
+    @Test func sshConfigEscapesPercentInEveryPath() throws {
+        let parent = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: parent) }
+        let directory = parent.appendingPathComponent("literal %h %d")
+        let state = try WorkspaceDevState(directory: directory)
+        let path = try state.pin(hostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample")
+        let config = try String(contentsOf: path, encoding: .utf8)
+        for directive in ["ProxyCommand", "IdentityFile", "UserKnownHostsFile"] {
+            let line = try #require(config.split(separator: "\n").first { $0.contains(directive) })
+            #expect(line.contains("literal %%h %%d"))
+        }
+        withExtendedLifetime(state) {}
+    }
     @Test func persistentHostPinAndExclusiveOwner() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let state = try WorkspaceDevState(directory:directory)

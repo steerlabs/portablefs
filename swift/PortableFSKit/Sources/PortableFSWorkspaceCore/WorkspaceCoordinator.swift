@@ -161,7 +161,12 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public func powerEvent(_ event: WorkspacePowerEvent) {
         switch event {
         case .sleep(let notification):
-            guard notification.id > lastNotificationID else { return }
+            guard notification.id > lastNotificationID else {
+                notifications.removeValue(forKey: notification.id)
+                power.acknowledgeSleep(notificationID: notification.id,
+                    fenced: phase == .stopped || phase == .pausedCold || phase == .pausedDiscard)
+                return
+            }
             lastNotificationID = notification.id
             guard let window = window(at: notification.arrivedAt) else {
                 power.acknowledgeSleep(notificationID: notification.id, fenced: phase == .stopped || phase == .pausedCold || phase == .pausedDiscard)
@@ -370,7 +375,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         default: stopUnsafe(failure)
         }
     }
-    public func vmStopped(reason: String) { finishStop() }
+    public func vmStopped(reason: String) { finishStop(); self.reason = reason }
     public func stop() {
         if case .unknown = state { reconcileUnknown(); return }
         let clean = phase == .running
