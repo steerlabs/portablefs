@@ -151,6 +151,7 @@ func TestCoherenceStaleHandleStillClosesAuthorityResource(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("coherence-stale close errno = %v", errno)
 	}
+	waitUntil(t, time.Second, "coherence-stale descriptor retirement", func() bool { return pendingCloses(mount.delegations) == 0 })
 	rpc.mu.Lock()
 	closed := len(rpc.fileCloses)
 	rpc.mu.Unlock()
