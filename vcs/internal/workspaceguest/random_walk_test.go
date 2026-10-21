@@ -262,6 +262,8 @@ func TestGuestConcurrentRandomWalkRepliesEncode(t *testing.T) {
 					break
 				}
 			}
+			s.ChannelLost()
+			check("channel lost", s.Status())
 			async.Wait()
 			time.Sleep(5 * time.Millisecond)
 			check("final", s.Status())

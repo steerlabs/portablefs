@@ -40,9 +40,11 @@ type invariantMount struct {
 	result           Recovery
 	failure          error
 	openFailure      bool
+	context          context.Context
 }
 
-func (m *invariantMount) proof(g uint64) (Recovery, error) {
+func (m *invariantMount) proof(ctx context.Context, g uint64) (Recovery, error) {
+	m.context = ctx
 	close(m.entered)
 	<-m.proceed
 	r := m.result
@@ -51,9 +53,11 @@ func (m *invariantMount) proof(g uint64) (Recovery, error) {
 	}
 	return r, m.failure
 }
-func (m *invariantMount) Prepare(_ context.Context, g uint64) (Recovery, error) { return m.proof(g) }
-func (m *invariantMount) Recover(_ context.Context, tok *pb.ResumeToken) (Recovery, error) {
-	return m.proof(tok.Suspension.Generation)
+func (m *invariantMount) Prepare(ctx context.Context, g uint64) (Recovery, error) {
+	return m.proof(ctx, g)
+}
+func (m *invariantMount) Recover(ctx context.Context, tok *pb.ResumeToken) (Recovery, error) {
+	return m.proof(ctx, tok.Suspension.Generation)
 }
 func (m *invariantMount) OpenAdmission(g uint64) error {
 	if m.openFailure {
@@ -302,7 +306,7 @@ func TestGuestFailedDrainsRemainEncodableAndCannotAcknowledgeCold(t *testing.T) 
 }
 
 func TestGuestOvertakenProofTransitionsRemainEncodable(t *testing.T) {
-	for _, mode := range []string{"prepare-suspend", "recover-suspend", "recover-terminal"} {
+	for _, mode := range []string{"prepare-suspend", "recover-suspend", "recover-terminal", "prepare-channel-loss", "recover-channel-loss"} {
 		t.Run(mode, func(t *testing.T) {
 			s, err := New(id(1), id(2), id(3), true)
 			if err != nil {
@@ -315,7 +319,7 @@ func TestGuestOvertakenProofTransitionsRemainEncodable(t *testing.T) {
 				t.Fatal(err)
 			}
 			var activated chan error
-			if mode == "prepare-suspend" {
+			if mode == "prepare-suspend" || mode == "prepare-channel-loss" {
 				activated = make(chan error, 1)
 				go func() { activated <- s.Activate(context.Background(), mid, 0) }()
 			} else {
@@ -334,7 +338,12 @@ func TestGuestOvertakenProofTransitionsRemainEncodable(t *testing.T) {
 			<-m.entered
 			encodable(t, s.Status())
 			var x *pb.Suspension
-			if mode == "recover-terminal" {
+			if mode == "prepare-channel-loss" || mode == "recover-channel-loss" {
+				s.ChannelLost()
+				if m.context.Err() == nil {
+					t.Fatal("channel loss did not cancel generation context")
+				}
+			} else if mode == "recover-terminal" {
 				if err := s.Terminal(mid, "session ended during recovery", nil); err != nil {
 					t.Fatal(err)
 				}
@@ -361,7 +370,7 @@ func TestGuestOvertakenProofTransitionsRemainEncodable(t *testing.T) {
 					t.Fatal(err)
 				}
 				release(e)
-				if s.Status().Mounts[0].Reason != "session ended during recovery" {
+				if mode == "recover-terminal" && s.Status().Mounts[0].Reason != "session ended during recovery" {
 					t.Fatal("late recovery erased terminal reason")
 				}
 			}

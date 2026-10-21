@@ -1,0 +1,12 @@
+[Unit]
+Description=PortableFS SSH over vsock only
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+Requires=portablefs-workspace-bootstrap.service
+After=portablefs-workspace-bootstrap.service
+[Socket]
+ListenStream=vsock::22
+Accept=yes
+[Install]
+WantedBy=multi-user.target

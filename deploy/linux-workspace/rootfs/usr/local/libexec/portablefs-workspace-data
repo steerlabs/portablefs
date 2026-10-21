@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+# The host retains authorization across interrupted mkfs/initialization until it
+# observes format 8 complete. After that, corruption must fail, never reformat.
+source /usr/local/libexec/portablefs-workspace-format
+disk=/dev/vdb
+mounted=false
+if [[ "$(blkid -s TYPE -o value "$disk" || true)" == ext4 && "$(blkid -s LABEL -o value "$disk" || true)" == portablefs-data ]]; then
+  result=0
+  e2fsck -p "$disk" || result=$?
+  if (( result <= 1 )); then
+    mount -t ext4 -o nosuid,nodev,errors=remount-ro "$disk" /data
+    mounted=true
+  fi
+fi
+if ! $mounted; then
+  [[ "${PFS_FORMAT_AUTHORIZED:-}" == 8 ]]
+  format_workspace_disk "$disk"
+  mount -t ext4 -o nosuid,nodev,errors=remount-ro "$disk" /data
+fi
+# fsync before rename, then fsync the containing directory.
+commit_file() {
+  python3 - "$1" "$2" <<'PY'
+import os,sys
+source,target=sys.argv[1:]
+with open(source,'rb') as f: os.fsync(f.fileno())
+os.replace(source,target)
+fd=os.open(os.path.dirname(target),os.O_RDONLY|os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+if [[ ! -e /data/format ]]; then
+  [[ "${PFS_FORMAT_AUTHORIZED:-}" == 8 ]]
+  mkdir -p /data/home/workspace /data/ssh
+  chmod 700 /data/ssh
+  chown 1000:1000 /data/home/workspace
+  if ! ssh-keygen -y -f /data/ssh/ssh_host_ed25519_key >/dev/null 2>&1; then
+    rm -f /data/ssh/initializing /data/ssh/initializing.pub
+    ssh-keygen -q -t ed25519 -N '' -f /data/ssh/initializing
+    ssh-keygen -y -f /data/ssh/initializing >/dev/null
+    commit_file /data/ssh/initializing /data/ssh/ssh_host_ed25519_key
+    rm -f /data/ssh/initializing.pub
+  fi
+  sync -f /data
+  printf '8\n' >/data/format.initializing
+  commit_file /data/format.initializing /data/format
+fi
+[[ "$(cat /data/format)" == 8 ]]
+ssh-keygen -y -f /data/ssh/ssh_host_ed25519_key >/data/ssh/host-key.pub.initializing
+commit_file /data/ssh/host-key.pub.initializing /data/ssh/ssh_host_ed25519_key.pub
+mount --bind /data/home /home

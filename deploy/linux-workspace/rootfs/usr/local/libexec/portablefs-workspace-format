@@ -1,0 +1,8 @@
+# Sourced by the data initializer. Only durable host authorization permits a
+# destructive format; it remains valid until the complete guest format is acked.
+format_workspace_disk() {
+  [[ "${PFS_FORMAT_AUTHORIZED:-}" == 8 ]] || return 1
+  # mke2fs flushes the output device before successful exit. Its completion
+  # is the format boundary; sync -f on a device would only sync devtmpfs.
+  mkfs.ext4 -q -F -L portablefs-data "$1"
+}

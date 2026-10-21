@@ -1,0 +1,1887 @@
+{
+  "format": 8,
+  "architecture": "arm64",
+  "suite": "trixie",
+  "snapshot": "20261001T000000Z",
+  "source_date_epoch": 1790812800,
+  "builder": "debian@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad",
+  "include": [
+    "linux-image-arm64",
+    "initramfs-tools",
+    "systemd-sysv",
+    "systemd-resolved",
+    "openssh-server",
+    "openssh-client",
+    "bash",
+    "git",
+    "python3",
+    "build-essential",
+    "curl",
+    "ca-certificates",
+    "ripgrep",
+    "less",
+    "vim-tiny",
+    "iproute2",
+    "e2fsprogs",
+    "fuse3",
+    "kmod"
+  ],
+  "packages": [
+    {
+      "package": "adduser",
+      "version": "3.152",
+      "source": "adduser",
+      "source_version": "3.152",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "apt",
+      "version": "3.0.3",
+      "source": "apt",
+      "source_version": "3.0.3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "base-files",
+      "version": "13.8+deb13u7",
+      "source": "base-files",
+      "source_version": "13.8+deb13u7",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "base-passwd",
+      "version": "3.6.7",
+      "source": "base-passwd",
+      "source_version": "3.6.7",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "bash",
+      "version": "5.2.37-2+b10",
+      "source": "bash",
+      "source_version": "5.2.37-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "binutils",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "binutils-aarch64-linux-gnu",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "binutils-common:arm64",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "bsdutils",
+      "version": "1:2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "build-essential",
+      "version": "12.12",
+      "source": "build-essential",
+      "source_version": "12.12",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "bzip2",
+      "version": "1.0.8-6",
+      "source": "bzip2",
+      "source_version": "1.0.8-6",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "ca-certificates",
+      "version": "20250419",
+      "source": "ca-certificates",
+      "source_version": "20250419",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "coreutils",
+      "version": "9.7-3",
+      "source": "coreutils",
+      "source_version": "9.7-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "cpio",
+      "version": "2.15+dfsg-2",
+      "source": "cpio",
+      "source_version": "2.15+dfsg-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "cpp",
+      "version": "4:14.2.0-1",
+      "source": "gcc-defaults",
+      "source_version": "1.220",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "cpp-14",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "cpp-14-aarch64-linux-gnu",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "cpp-aarch64-linux-gnu",
+      "version": "4:14.2.0-1",
+      "source": "gcc-defaults",
+      "source_version": "1.220",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "curl",
+      "version": "8.14.1-2+deb13u5",
+      "source": "curl",
+      "source_version": "8.14.1-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dash",
+      "version": "0.5.12-12",
+      "source": "dash",
+      "source_version": "0.5.12-12",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dbus",
+      "version": "1.16.2-2",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dbus-bin",
+      "version": "1.16.2-2",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dbus-daemon",
+      "version": "1.16.2-2",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dbus-session-bus-common",
+      "version": "1.16.2-2",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dbus-system-bus-common",
+      "version": "1.16.2-2",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "debconf",
+      "version": "1.5.91",
+      "source": "debconf",
+      "source_version": "1.5.91",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "debian-archive-keyring",
+      "version": "2025.1",
+      "source": "debian-archive-keyring",
+      "source_version": "2025.1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "debianutils",
+      "version": "5.23.2",
+      "source": "debianutils",
+      "source_version": "5.23.2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "diffutils",
+      "version": "1:3.10-4",
+      "source": "diffutils",
+      "source_version": "1:3.10-4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dpkg",
+      "version": "1.22.22",
+      "source": "dpkg",
+      "source_version": "1.22.22",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dpkg-dev",
+      "version": "1.22.22",
+      "source": "dpkg",
+      "source_version": "1.22.22",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "dracut-install",
+      "version": "106-6",
+      "source": "dracut",
+      "source_version": "106-6",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "e2fsprogs",
+      "version": "1.47.2-3+b12",
+      "source": "e2fsprogs",
+      "source_version": "1.47.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "findutils",
+      "version": "4.10.0-3",
+      "source": "findutils",
+      "source_version": "4.10.0-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "fuse3",
+      "version": "3.17.2-3",
+      "source": "fuse3",
+      "source_version": "3.17.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "g++",
+      "version": "4:14.2.0-1",
+      "source": "gcc-defaults",
+      "source_version": "1.220",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "g++-14",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "g++-14-aarch64-linux-gnu",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "g++-aarch64-linux-gnu",
+      "version": "4:14.2.0-1",
+      "source": "gcc-defaults",
+      "source_version": "1.220",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "gcc",
+      "version": "4:14.2.0-1",
+      "source": "gcc-defaults",
+      "source_version": "1.220",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "gcc-14",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "gcc-14-aarch64-linux-gnu",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "gcc-14-base:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "gcc-aarch64-linux-gnu",
+      "version": "4:14.2.0-1",
+      "source": "gcc-defaults",
+      "source_version": "1.220",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "git",
+      "version": "1:2.47.3-0+deb13u1",
+      "source": "git",
+      "source_version": "1:2.47.3-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "git-man",
+      "version": "1:2.47.3-0+deb13u1",
+      "source": "git",
+      "source_version": "1:2.47.3-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "grep",
+      "version": "3.11-4+b1",
+      "source": "grep",
+      "source_version": "3.11-4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "gzip",
+      "version": "1.13-1+deb13u1",
+      "source": "gzip",
+      "source_version": "1.13-1+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "hostname",
+      "version": "3.25",
+      "source": "hostname",
+      "source_version": "3.25",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "init-system-helpers",
+      "version": "1.69~deb13u1",
+      "source": "init-system-helpers",
+      "source_version": "1.69~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "initramfs-tools",
+      "version": "0.148.4",
+      "source": "initramfs-tools",
+      "source_version": "0.148.4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "initramfs-tools-bin",
+      "version": "0.148.4",
+      "source": "initramfs-tools",
+      "source_version": "0.148.4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "initramfs-tools-core",
+      "version": "0.148.4",
+      "source": "initramfs-tools",
+      "source_version": "0.148.4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "iproute2",
+      "version": "6.15.0-1",
+      "source": "iproute2",
+      "source_version": "6.15.0-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "klibc-utils",
+      "version": "2.0.14-1",
+      "source": "klibc",
+      "source_version": "2.0.14-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "kmod",
+      "version": "34.2-2",
+      "source": "kmod",
+      "source_version": "34.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "less",
+      "version": "668-1",
+      "source": "less",
+      "source_version": "668-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libacl1:arm64",
+      "version": "2.3.2-2+b1",
+      "source": "acl",
+      "source_version": "2.3.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libapparmor1:arm64",
+      "version": "4.1.0-1",
+      "source": "apparmor",
+      "source_version": "4.1.0-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libapt-pkg7.0:arm64",
+      "version": "3.0.3",
+      "source": "apt",
+      "source_version": "3.0.3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libasan8:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libatomic1:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libattr1:arm64",
+      "version": "1:2.5.2-3",
+      "source": "attr",
+      "source_version": "1:2.5.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libaudit-common",
+      "version": "1:4.0.2-2+deb13u1",
+      "source": "audit",
+      "source_version": "1:4.0.2-2+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libaudit1:arm64",
+      "version": "1:4.0.2-2+deb13u1",
+      "source": "audit",
+      "source_version": "1:4.0.2-2+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libbinutils:arm64",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libblkid1:arm64",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libbpf1:arm64",
+      "version": "1:1.5.0-3",
+      "source": "libbpf",
+      "source_version": "1.5.0-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libbrotli1:arm64",
+      "version": "1.1.0-2+b7",
+      "source": "brotli",
+      "source_version": "1.1.0-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libbsd0:arm64",
+      "version": "0.12.2-2",
+      "source": "libbsd",
+      "source_version": "0.12.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libbz2-1.0:arm64",
+      "version": "1.0.8-6",
+      "source": "bzip2",
+      "source_version": "1.0.8-6",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libc-bin",
+      "version": "2.41-12+deb13u4",
+      "source": "glibc",
+      "source_version": "2.41-12+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libc-dev-bin",
+      "version": "2.41-12+deb13u4",
+      "source": "glibc",
+      "source_version": "2.41-12+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libc6:arm64",
+      "version": "2.41-12+deb13u4",
+      "source": "glibc",
+      "source_version": "2.41-12+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libc6-dev:arm64",
+      "version": "2.41-12+deb13u4",
+      "source": "glibc",
+      "source_version": "2.41-12+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcap-ng0:arm64",
+      "version": "0.8.5-4+b1",
+      "source": "libcap-ng",
+      "source_version": "0.8.5-4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcap2:arm64",
+      "version": "1:2.75-10+deb13u1+b3",
+      "source": "libcap2",
+      "source_version": "1:2.75-10+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcap2-bin",
+      "version": "1:2.75-10+deb13u1+b3",
+      "source": "libcap2",
+      "source_version": "1:2.75-10+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcbor0.10:arm64",
+      "version": "0.10.2-2",
+      "source": "libcbor",
+      "source_version": "0.10.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcc1-0:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcom-err2:arm64",
+      "version": "1.47.2-3+b12",
+      "source": "e2fsprogs",
+      "source_version": "1.47.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcrypt-dev:arm64",
+      "version": "1:4.4.38-1",
+      "source": "libxcrypt",
+      "source_version": "1:4.4.38-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcrypt1:arm64",
+      "version": "1:4.4.38-1",
+      "source": "libxcrypt",
+      "source_version": "1:4.4.38-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libctf-nobfd0:arm64",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libctf0:arm64",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcurl3t64-gnutls:arm64",
+      "version": "8.14.1-2+deb13u5",
+      "source": "curl",
+      "source_version": "8.14.1-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libcurl4t64:arm64",
+      "version": "8.14.1-2+deb13u5",
+      "source": "curl",
+      "source_version": "8.14.1-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libdb5.3t64:arm64",
+      "version": "5.3.28+dfsg2-9",
+      "source": "db5.3",
+      "source_version": "5.3.28+dfsg2-9",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libdbus-1-3:arm64",
+      "version": "1.16.2-2",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libdebconfclient0:arm64",
+      "version": "0.280",
+      "source": "cdebconf",
+      "source_version": "0.280",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libdpkg-perl",
+      "version": "1.22.22",
+      "source": "dpkg",
+      "source_version": "1.22.22",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libedit2:arm64",
+      "version": "3.1-20250104-1",
+      "source": "libedit",
+      "source_version": "3.1-20250104-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libelf1t64:arm64",
+      "version": "0.192-4",
+      "source": "elfutils",
+      "source_version": "0.192-4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "liberror-perl",
+      "version": "0.17030-1",
+      "source": "liberror-perl",
+      "source_version": "0.17030-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libexpat1:arm64",
+      "version": "2.8.3-1~deb13u1",
+      "source": "expat",
+      "source_version": "2.8.3-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libext2fs2t64:arm64",
+      "version": "1.47.2-3+b12",
+      "source": "e2fsprogs",
+      "source_version": "1.47.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libffi8:arm64",
+      "version": "3.4.8-2",
+      "source": "libffi",
+      "source_version": "3.4.8-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libfido2-1:arm64",
+      "version": "1.15.0-1+b1",
+      "source": "libfido2",
+      "source_version": "1.15.0-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libfuse3-4:arm64",
+      "version": "3.17.2-3",
+      "source": "fuse3",
+      "source_version": "3.17.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgcc-14-dev:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgcc-s1:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgdbm-compat4t64:arm64",
+      "version": "1.24-2",
+      "source": "gdbm",
+      "source_version": "1.24-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgdbm6t64:arm64",
+      "version": "1.24-2",
+      "source": "gdbm",
+      "source_version": "1.24-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgmp10:arm64",
+      "version": "2:6.3.0+dfsg-3",
+      "source": "gmp",
+      "source_version": "2:6.3.0+dfsg-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgnutls30t64:arm64",
+      "version": "3.8.9-3+deb13u4",
+      "source": "gnutls28",
+      "source_version": "3.8.9-3+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgomp1:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgprofng0:arm64",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libgssapi-krb5-2:arm64",
+      "version": "1.21.3-5+deb13u1",
+      "source": "krb5",
+      "source_version": "1.21.3-5+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libhogweed6t64:arm64",
+      "version": "3.10.1-1",
+      "source": "nettle",
+      "source_version": "3.10.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libhwasan0:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libidn2-0:arm64",
+      "version": "2.3.8-2",
+      "source": "libidn2",
+      "source_version": "2.3.8-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libisl23:arm64",
+      "version": "0.27-1",
+      "source": "isl",
+      "source_version": "0.27-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libitm1:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libjansson4:arm64",
+      "version": "2.14-2+b3",
+      "source": "jansson",
+      "source_version": "2.14-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libk5crypto3:arm64",
+      "version": "1.21.3-5+deb13u1",
+      "source": "krb5",
+      "source_version": "1.21.3-5+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libkeyutils1:arm64",
+      "version": "1.6.3-6",
+      "source": "keyutils",
+      "source_version": "1.6.3-6",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libklibc:arm64",
+      "version": "2.0.14-1",
+      "source": "klibc",
+      "source_version": "2.0.14-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libkmod2:arm64",
+      "version": "34.2-2",
+      "source": "kmod",
+      "source_version": "34.2-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libkrb5-3:arm64",
+      "version": "1.21.3-5+deb13u1",
+      "source": "krb5",
+      "source_version": "1.21.3-5+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libkrb5support0:arm64",
+      "version": "1.21.3-5+deb13u1",
+      "source": "krb5",
+      "source_version": "1.21.3-5+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "liblastlog2-2:arm64",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libldap2:arm64",
+      "version": "2.6.10+dfsg-1",
+      "source": "openldap",
+      "source_version": "2.6.10+dfsg-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "liblsan0:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "liblz4-1:arm64",
+      "version": "1.10.0-4",
+      "source": "lz4",
+      "source_version": "1.10.0-4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "liblzma5:arm64",
+      "version": "5.8.1-1+deb13u1",
+      "source": "xz-utils",
+      "source_version": "5.8.1-1+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libmd0:arm64",
+      "version": "1.1.0-2+b1",
+      "source": "libmd",
+      "source_version": "1.1.0-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libmnl0:arm64",
+      "version": "1.0.5-3",
+      "source": "libmnl",
+      "source_version": "1.0.5-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libmount1:arm64",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libmpc3:arm64",
+      "version": "1.3.1-1+b3",
+      "source": "mpclib3",
+      "source_version": "1.3.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libmpfr6:arm64",
+      "version": "4.2.2-1",
+      "source": "mpfr4",
+      "source_version": "4.2.2-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libncursesw6:arm64",
+      "version": "6.5+20250216-2",
+      "source": "ncurses",
+      "source_version": "6.5+20250216-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libnettle8t64:arm64",
+      "version": "3.10.1-1",
+      "source": "nettle",
+      "source_version": "3.10.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libnghttp2-14:arm64",
+      "version": "1.64.0-1.1+deb13u1",
+      "source": "nghttp2",
+      "source_version": "1.64.0-1.1+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libnghttp3-9:arm64",
+      "version": "1.8.0-1",
+      "source": "nghttp3",
+      "source_version": "1.8.0-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libngtcp2-16:arm64",
+      "version": "1.11.0-1+deb13u1",
+      "source": "ngtcp2",
+      "source_version": "1.11.0-1+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libngtcp2-crypto-gnutls8:arm64",
+      "version": "1.11.0-1+deb13u1",
+      "source": "ngtcp2",
+      "source_version": "1.11.0-1+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libp11-kit0:arm64",
+      "version": "0.25.5-3",
+      "source": "p11-kit",
+      "source_version": "0.25.5-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpam-modules:arm64",
+      "version": "1.7.0-5",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpam-modules-bin",
+      "version": "1.7.0-5",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpam-runtime",
+      "version": "1.7.0-5",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpam0g:arm64",
+      "version": "1.7.0-5",
+      "source": "pam",
+      "source_version": "1.7.0-5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpcre2-8-0:arm64",
+      "version": "10.46-1~deb13u3",
+      "source": "pcre2",
+      "source_version": "10.46-1~deb13u3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libperl5.40:arm64",
+      "version": "5.40.1-6+deb13u1",
+      "source": "perl",
+      "source_version": "5.40.1-6+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libproc2-0:arm64",
+      "version": "2:4.0.4-9",
+      "source": "procps",
+      "source_version": "2:4.0.4-9",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpsl5t64:arm64",
+      "version": "0.21.2-1.1+b1",
+      "source": "libpsl",
+      "source_version": "0.21.2-1.1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpython3-stdlib:arm64",
+      "version": "3.13.5-1",
+      "source": "python3-defaults",
+      "source_version": "3.13.5-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpython3.13-minimal:arm64",
+      "version": "3.13.5-2+deb13u5",
+      "source": "python3.13",
+      "source_version": "3.13.5-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libpython3.13-stdlib:arm64",
+      "version": "3.13.5-2+deb13u5",
+      "source": "python3.13",
+      "source_version": "3.13.5-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libreadline8t64:arm64",
+      "version": "8.2-6",
+      "source": "readline",
+      "source_version": "8.2-6",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "librtmp1:arm64",
+      "version": "2.4+20151223.gitfa8646d.1-2+b5",
+      "source": "rtmpdump",
+      "source_version": "2.4+20151223.gitfa8646d.1-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsasl2-2:arm64",
+      "version": "2.1.28+dfsg1-9",
+      "source": "cyrus-sasl2",
+      "source_version": "2.1.28+dfsg1-9",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsasl2-modules-db:arm64",
+      "version": "2.1.28+dfsg1-9",
+      "source": "cyrus-sasl2",
+      "source_version": "2.1.28+dfsg1-9",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libseccomp2:arm64",
+      "version": "2.6.0-2",
+      "source": "libseccomp",
+      "source_version": "2.6.0-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libselinux1:arm64",
+      "version": "3.8.1-1",
+      "source": "libselinux",
+      "source_version": "3.8.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsemanage-common",
+      "version": "3.8.1-1",
+      "source": "libsemanage",
+      "source_version": "3.8.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsemanage2:arm64",
+      "version": "3.8.1-1",
+      "source": "libsemanage",
+      "source_version": "3.8.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsepol2:arm64",
+      "version": "3.8.1-1",
+      "source": "libsepol",
+      "source_version": "3.8.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsframe1:arm64",
+      "version": "2.44-3",
+      "source": "binutils",
+      "source_version": "2.44-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsmartcols1:arm64",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsqlite3-0:arm64",
+      "version": "3.46.1-7+deb13u2",
+      "source": "sqlite3",
+      "source_version": "3.46.1-7+deb13u2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libss2:arm64",
+      "version": "1.47.2-3+b12",
+      "source": "e2fsprogs",
+      "source_version": "1.47.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libssh2-1t64:arm64",
+      "version": "1.11.1-1+deb13u2",
+      "source": "libssh2",
+      "source_version": "1.11.1-1+deb13u2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libssl3t64:arm64",
+      "version": "3.5.7-1~deb13u3",
+      "source": "openssl",
+      "source_version": "3.5.7-1~deb13u3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libstdc++-14-dev:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libstdc++6:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsystemd-shared:arm64",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libsystemd0:arm64",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtasn1-6:arm64",
+      "version": "4.20.0-2+deb13u1",
+      "source": "libtasn1-6",
+      "source_version": "4.20.0-2+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtext-charwidth-perl:arm64",
+      "version": "0.04-11+b4",
+      "source": "libtext-charwidth-perl",
+      "source_version": "0.04-11",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtext-wrapi18n-perl",
+      "version": "0.06-10",
+      "source": "libtext-wrapi18n-perl",
+      "source_version": "0.06-10",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtinfo6:arm64",
+      "version": "6.5+20250216-2",
+      "source": "ncurses",
+      "source_version": "6.5+20250216-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtirpc-common",
+      "version": "1.3.6+ds-1",
+      "source": "libtirpc",
+      "source_version": "1.3.6+ds-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtirpc3t64:arm64",
+      "version": "1.3.6+ds-1",
+      "source": "libtirpc",
+      "source_version": "1.3.6+ds-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libtsan2:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libubsan1:arm64",
+      "version": "14.2.0-19",
+      "source": "gcc-14",
+      "source_version": "14.2.0-19",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libudev1:arm64",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libunistring5:arm64",
+      "version": "1.3-2",
+      "source": "libunistring",
+      "source_version": "1.3-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libuuid1:arm64",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libwrap0:arm64",
+      "version": "7.6.q-36",
+      "source": "tcp-wrappers",
+      "source_version": "7.6.q-36",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libwtmpdb0:arm64",
+      "version": "0.73.0-3+deb13u1",
+      "source": "wtmpdb",
+      "source_version": "0.73.0-3+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libxtables12:arm64",
+      "version": "1.8.11-2",
+      "source": "iptables",
+      "source_version": "1.8.11-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libxxhash0:arm64",
+      "version": "0.8.3-2",
+      "source": "xxhash",
+      "source_version": "0.8.3-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "libzstd1:arm64",
+      "version": "1.5.7+dfsg-1",
+      "source": "libzstd",
+      "source_version": "1.5.7+dfsg-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "linux-base",
+      "version": "4.12.1",
+      "source": "linux-base",
+      "source_version": "4.12.1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "linux-image-6.12.111+deb13-arm64",
+      "version": "6.12.111-1",
+      "source": "linux-signed-arm64",
+      "source_version": "6.12.111+1",
+      "built_using": "linux (= 6.12.111-1)",
+      "static_built_using": ""
+    },
+    {
+      "package": "linux-image-arm64",
+      "version": "6.12.111-1",
+      "source": "linux-signed-arm64",
+      "source_version": "6.12.111+1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "linux-libc-dev",
+      "version": "6.12.111-1",
+      "source": "linux",
+      "source_version": "6.12.111-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "login",
+      "version": "1:4.16.0-2+really2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "login.defs",
+      "version": "1:4.17.4-2",
+      "source": "shadow",
+      "source_version": "1:4.17.4-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "logsave",
+      "version": "1.47.2-3+b12",
+      "source": "e2fsprogs",
+      "source_version": "1.47.2-3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "make",
+      "version": "4.4.1-2",
+      "source": "make-dfsg",
+      "source_version": "4.4.1-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "mawk",
+      "version": "1.3.4.20250131-1",
+      "source": "mawk",
+      "source_version": "1.3.4.20250131-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "media-types",
+      "version": "13.0.0",
+      "source": "media-types",
+      "source_version": "13.0.0",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "mount",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "ncurses-base",
+      "version": "6.5+20250216-2",
+      "source": "ncurses",
+      "source_version": "6.5+20250216-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "ncurses-bin",
+      "version": "6.5+20250216-2",
+      "source": "ncurses",
+      "source_version": "6.5+20250216-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "netbase",
+      "version": "6.5",
+      "source": "netbase",
+      "source_version": "6.5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "openssh-client",
+      "version": "1:10.0p1-7+deb13u4",
+      "source": "openssh",
+      "source_version": "1:10.0p1-7+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "openssh-server",
+      "version": "1:10.0p1-7+deb13u4",
+      "source": "openssh",
+      "source_version": "1:10.0p1-7+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "openssh-sftp-server",
+      "version": "1:10.0p1-7+deb13u4",
+      "source": "openssh",
+      "source_version": "1:10.0p1-7+deb13u4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "openssl",
+      "version": "3.5.7-1~deb13u3",
+      "source": "openssl",
+      "source_version": "3.5.7-1~deb13u3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "openssl-provider-legacy",
+      "version": "3.5.7-1~deb13u3",
+      "source": "openssl",
+      "source_version": "3.5.7-1~deb13u3",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "passwd",
+      "version": "1:4.17.4-2",
+      "source": "shadow",
+      "source_version": "1:4.17.4-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "patch",
+      "version": "2.8-2",
+      "source": "patch",
+      "source_version": "2.8-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "perl",
+      "version": "5.40.1-6+deb13u1",
+      "source": "perl",
+      "source_version": "5.40.1-6+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "perl-base",
+      "version": "5.40.1-6+deb13u1",
+      "source": "perl",
+      "source_version": "5.40.1-6+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "perl-modules-5.40",
+      "version": "5.40.1-6+deb13u1",
+      "source": "perl",
+      "source_version": "5.40.1-6+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "procps",
+      "version": "2:4.0.4-9",
+      "source": "procps",
+      "source_version": "2:4.0.4-9",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "python3",
+      "version": "3.13.5-1",
+      "source": "python3-defaults",
+      "source_version": "3.13.5-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "python3-minimal",
+      "version": "3.13.5-1",
+      "source": "python3-defaults",
+      "source_version": "3.13.5-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "python3.13",
+      "version": "3.13.5-2+deb13u5",
+      "source": "python3.13",
+      "source_version": "3.13.5-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "python3.13-minimal",
+      "version": "3.13.5-2+deb13u5",
+      "source": "python3.13",
+      "source_version": "3.13.5-2+deb13u5",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "readline-common",
+      "version": "8.2-6",
+      "source": "readline",
+      "source_version": "8.2-6",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "ripgrep",
+      "version": "14.1.1-1+b4",
+      "source": "rust-ripgrep",
+      "source_version": "14.1.1-1",
+      "built_using": "rustc (= 1.85.0+dfsg3-1)",
+      "static_built_using": ""
+    },
+    {
+      "package": "rpcsvc-proto",
+      "version": "1.4.3-1+b1",
+      "source": "rpcsvc-proto",
+      "source_version": "1.4.3-1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "runit-helper",
+      "version": "2.16.4",
+      "source": "dh-runit",
+      "source_version": "2.16.4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "sed",
+      "version": "4.9-2+deb13u1",
+      "source": "sed",
+      "source_version": "4.9-2+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "sensible-utils",
+      "version": "0.0.25",
+      "source": "sensible-utils",
+      "source_version": "0.0.25",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "sqv",
+      "version": "1.3.0-3+b2",
+      "source": "rust-sequoia-sqv",
+      "source_version": "1.3.0-3",
+      "built_using": "rust-buffered-reader (= 1.3.1-2), rust-nettle (= 7.3.0-1), rust-nettle-sys (= 2.3.1-1), rust-sequoia-openpgp (= 2.0.0-2+deb13u1), rust-sequoia-policy-config (= 0.8.0-1), rustc (= 1.85.0+dfsg3-1)",
+      "static_built_using": "rust-aho-corasick (= 1.1.3-1), rust-anstream (= 0.6.15-1), rust-anstyle (= 1.0.8-1), rust-anstyle-parse (= 0.2.1-1), rust-anstyle-query (= 1.0.0-1), rust-anyhow (= 1.0.95-1), rust-argon2 (= 0.5.3-1), rust-base64 (= 0.22.1-1), rust-base64ct (= 1.6.0-1), rust-bitflags (= 2.8.0-1), rust-blake2 (= 0.10.6-3), rust-block-buffer (= 0.10.4-1), rust-buffered-reader (= 1.3.1-2), rust-cfg-if (= 1.0.0-1), rust-chrono (= 0.4.39-2), rust-clap (= 4.5.23-1), rust-clap-builder (= 4.5.23-1), rust-clap-lex (= 0.7.4-1), rust-colorchoice (= 1.0.0-1), rust-crypto-common (= 0.1.6-1), rust-digest (= 0.10.7-2), rust-dyn-clone (= 1.0.16-1), rust-generic-array (= 0.14.7-1), rust-getrandom (= 0.2.15-1), rust-iana-time-zone (= 0.1.63-1), rust-idna (= 1.0.3-2), rust-idna-adapter (= 1.1.0-1), rust-idna-mapping (= 1.0.0-1), rust-lalrpop-util (= 0.20.0-1), rust-lazy-static (= 1.5.0-1), rust-libc (= 0.2.169-1), rust-linux-raw-sys (= 0.4.14-1), rust-memchr (= 2.7.4-1), rust-memsec (= 0.7.0-1), rust-nettle (= 7.3.0-1), rust-nettle-sys (= 2.3.1-1), rust-num-traits (= 0.2.19-2), rust-password-hash (= 0.5.0-1), rust-rand-core (= 0.6.4-2), rust-regex (= 1.11.1-2), rust-regex-automata (= 0.4.9-2), rust-regex-syntax (= 0.8.5-1), rust-rustix (= 0.38.37-4), rust-sequoia-openpgp (= 2.0.0-2+deb13u1), rust-sequoia-policy-config (= 0.8.0-1), rust-serde (= 1.0.217-1), rust-sha1collisiondetection (= 0.3.2-1), rust-smallvec (= 1.13.2-1), rust-strsim-0.10 (= 0.10.0-4), rust-subtle (= 2.6.1-1), rust-terminal-size (= 0.4.1-2), rust-thiserror (= 2.0.11-1), rust-thiserror-1 (= 1.0.69-1), rust-tinyvec (= 1.6.0-2), rust-tinyvec-macros (= 0.1.0-1), rust-toml-0.5 (= 0.5.11-4), rust-typenum (= 1.17.0-3), rust-unicode-bidi (= 0.3.17-1), rust-unicode-joining-type (= 1.0.0-1), rust-unicode-normalization (= 0.1.24-1), rust-utf8-iter (= 1.0.4-1), rust-utf8parse (= 0.2.1-1), rust-xxhash-rust (= 0.8.15-1), rustc (= 1.85.0+dfsg3-1)"
+    },
+    {
+      "package": "systemd",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "systemd-resolved",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "systemd-sysv",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "sysvinit-utils",
+      "version": "3.14-4",
+      "source": "sysvinit",
+      "source_version": "3.14-4",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "tar",
+      "version": "1.35+dfsg-3.1",
+      "source": "tar",
+      "source_version": "1.35+dfsg-3.1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "tzdata",
+      "version": "2026c-0+deb13u1",
+      "source": "tzdata",
+      "source_version": "2026c-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "ucf",
+      "version": "3.0052",
+      "source": "ucf",
+      "source_version": "3.0052",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "udev",
+      "version": "257.13-1~deb13u1",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "util-linux",
+      "version": "2.41.5-0+deb13u1",
+      "source": "util-linux",
+      "source_version": "2.41.5-0+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "vim-common",
+      "version": "2:9.1.1230-2",
+      "source": "vim",
+      "source_version": "2:9.1.1230-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "vim-tiny",
+      "version": "2:9.1.1230-2",
+      "source": "vim",
+      "source_version": "2:9.1.1230-2",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "xz-utils",
+      "version": "5.8.1-1+deb13u1",
+      "source": "xz-utils",
+      "source_version": "5.8.1-1+deb13u1",
+      "built_using": "",
+      "static_built_using": ""
+    },
+    {
+      "package": "zlib1g:arm64",
+      "version": "1:1.3.dfsg+really1.3.1-1+b1",
+      "source": "zlib",
+      "source_version": "1:1.3.dfsg+really1.3.1-1",
+      "built_using": "",
+      "static_built_using": ""
+    }
+  ]
+}

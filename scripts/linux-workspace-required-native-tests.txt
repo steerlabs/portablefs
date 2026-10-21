@@ -1,0 +1,13 @@
+artifact-verification
+power-before-start
+exact-handshake
+fuse-init-7.31
+ssh-workspace-user
+immutable-root
+vsock-only-ssh
+workspace-root-layout
+controlled-cold-pause
+resume-single-use
+data-disk-reboot-persistence
+guest-host-key-persistence
+clean-stop
