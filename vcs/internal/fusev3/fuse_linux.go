@@ -1960,11 +1960,6 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	owner, err := n.mount.ownDescriptor(n.item.GetStableIdentity(), response.GetOpen().GetHandle())
-	if err != nil {
-		return nil, 0, syscall.ENOTCONN
-	}
-	defer owner.dispatch(ctx)
 	if _, ok := publicationIdentityFromItem(n.item); !ok {
 		// An item with no stable identity has no coordinate to be covered by, so
 		// no lease could name it and no recall could reach it. That is a genuine
@@ -1972,6 +1967,11 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 		n.mount.revoke(errors.New("fusev3: successful directory OPEN carried no stable identity"))
 		return nil, 0, syscall.ENOTCONN
 	}
+	owner, err := n.mount.ownDescriptor(n.item.GetStableIdentity(), response.GetOpen().GetHandle())
+	if err != nil {
+		return nil, 0, syscall.EIO
+	}
+	defer owner.dispatch(ctx)
 	root := bytes.Equal(n.item.GetStableIdentity(), n.mount.rpc.Root().GetStableIdentity())
 	owner.transfer()
 	return &dirHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), rootBarrier: root, barrierLoss: n.mount.delegations.LossSequence()}, 0, 0
