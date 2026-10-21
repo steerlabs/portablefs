@@ -70,6 +70,9 @@ import PortableFSWorkspaceCore
                                 do {
                                     let reply = try WorkspaceControl.decode(header + result.get())
                                     guard reply.requestID == expected else { throw WorkspaceVMError("control response correlation failed") }
+                                    if case .resume = request.body, case .result(let refusal) = reply.body, refusal.code == "refused" {
+                                        throw WorkspaceVMError("guest refused resume: " + refusal.reason)
+                                    }
                                     switch (request.body, reply.body) {
                                     case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result): break
                                     default: throw WorkspaceVMError("unexpected control reply")

@@ -132,7 +132,7 @@ try:
     guest.command('pause')
     paused = guest.wait('paused', 25)
     assert paused['fenced'] and not paused['attach_allowed'] and paused['generation'] == 1
-    assert paused['operations'][-1] == 'pause-completed'
+    assert paused['operations'].index('pause-completed') < paused['operations'].index('sleep-fenced')
     guest.command('status')
     assert guest.wait('status')['phase'] == 'pausedCold'
     time.sleep(1)
@@ -160,7 +160,8 @@ try:
     guest.command('pause'); guest.wait('paused', 25)
     guest.command('resume'); guest.wait('resumed', 25)
     guest.command('replay-resume')
-    assert guest.wait('replay-refused', 25)['generation'] == 1
+    refusal = guest.wait('replay-refused', 25)
+    assert refusal['generation'] == 1 and 'guest refused resume: resume token consumed' in refusal['reason'], refusal
     # This is a real replay on the paired stream; the guest closes it and the
     # coordinator discards the now-unpaired VM. No dev input guard refused it.
     guest.wait('failure', 25)

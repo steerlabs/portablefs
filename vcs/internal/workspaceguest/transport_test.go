@@ -106,6 +106,10 @@ func TestTransportColdResumeSingleUseAndDisconnect(t *testing.T) {
 	if err := control.Write(c, &pb.Envelope{Version: 8, RequestId: 4, Body: &pb.Envelope_Resume{Resume: token}}); err != nil {
 		t.Fatal(err)
 	}
+	refusal, err := control.Read(c)
+	if err != nil || refusal.GetResult().GetCode() != "refused" || !strings.Contains(refusal.GetResult().GetReason(), "token consumed") {
+		t.Fatalf("missing explicit guest token refusal: %v: %v", refusal, err)
+	}
 	if err := <-done; err == nil {
 		t.Fatal("token replay accepted")
 	}

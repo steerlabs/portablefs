@@ -78,7 +78,11 @@ func Serve(ctx context.Context, stream io.ReadWriter, expected *pb.Hello, superv
 		case *pb.Envelope_Resume:
 			ack, err := supervisor.Resume(ctx, body.Resume)
 			if err != nil {
-				return fmt.Errorf("workspace control stream: %w", err)
+				refusal := &pb.Envelope{Version: 8, RequestId: prior, Body: &pb.Envelope_Result{Result: &pb.Result{Code: "refused", Reason: err.Error()}}}
+				if writeErr := control.Write(stream, refusal); writeErr != nil {
+					return fmt.Errorf("write resume refusal: %w (resume: %v)", writeErr, err)
+				}
+				return fmt.Errorf("workspace resume refused: %w", err)
 			}
 			reply.Body = &pb.Envelope_ResumeAck{ResumeAck: ack}
 		case *pb.Envelope_RetireAck:

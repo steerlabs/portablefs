@@ -114,7 +114,7 @@ import PortableFSWorkspaceCore
             case "replay-resume":
                 guard let token = channel.lastResume else { event("refused", ["command": command]); continue }
                 channel.resume(token, deadline: clock.now + 20_000_000_000) { [weak self] result in
-                    if case .failure = result { self?.event("replay-refused", ["generation": token.suspension.generation]) }
+                    if case .failure(let error) = result { self?.event("replay-refused", ["generation": token.suspension.generation, "reason": String(describing: error)]) }
                     else { self?.fail(WorkspaceVMError("guest accepted consumed token")) }
                 }
             case "status": event("status", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])

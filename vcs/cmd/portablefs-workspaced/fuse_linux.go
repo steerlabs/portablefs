@@ -52,7 +52,7 @@ func probeFuse() error {
 	}
 	f := os.NewFile(uintptr(rights[0]), "fuse-native-probe")
 	defer f.Close()
-	request := make([]byte, 65536)
+	request := make([]byte, 1<<20)
 	n, err = f.Read(request)
 	if err != nil {
 		return fmt.Errorf("read kernel FUSE INIT: %w", err)
