@@ -203,7 +203,10 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 	return ctx, func() {
 		defer func() {
 			for _, dispatch := range callback.closeDispatch {
-				dispatch()
+				// The counted producer already owns one relinquished descriptor.
+				// Let this callback return so a physical reply/metadata pin cannot
+				// become a second fence between queue space and cold activation.
+				go dispatch()
 			}
 		}()
 		defer r.mount.delegations.endGrantRequest(history)

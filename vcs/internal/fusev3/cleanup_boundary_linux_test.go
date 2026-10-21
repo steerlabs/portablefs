@@ -119,6 +119,8 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 	for _, directory := range []bool{false, true} {
 		t.Run(fmt.Sprintf("directory_%t", directory), func(t *testing.T) {
 			f := newStockFixture(t)
+			entry := f.lookup(t, 1, "file")
+			record := f.raw.nodesByID[entry.NodeId]
 			f.mount.delegations.Stop()
 			m, err := newDelegationManagerWithCloseCapacity(f.mount.rpc, time.Second, 7, writeback.Options{}, 1)
 			if err != nil {
@@ -178,6 +180,12 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 						return status
 					}
 					defer finish()
+					// A cleanup handoff can accompany a state-bearing callback. Its
+					// physical reply must release metadata pins even with no queue space.
+					var attr fuse.Attr
+					if _, _, err := f.raw.holderMetadata(ctx, unique, nil, "", record, record.node.item.Attr, record.node.item.ObjectVersion, &attr, false); err != nil {
+						t.Error(err)
+					}
 					var outcome resourceCleanupError
 					if directory {
 						outcome = (&dirHandle{node: n, token: testToken(102)}).closeForCleanup(ctx)
@@ -195,6 +203,12 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 			case <-handed:
 			case <-time.After(time.Second):
 				t.Fatal("full queue blocked ownership transfer under callback fence")
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				m.cancel()
+				t.Fatal("full dispatch queue blocked the callback's physical reply")
 			}
 			recovered := make(chan struct{})
 			go func() {

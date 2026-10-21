@@ -2102,7 +2102,9 @@ func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64
 
 // queueClose reserves session cleanup ownership before returning to RELEASE.
 // A raw callback retains this bounded reservation until its fence is released;
-// its own goroutine then waits for queue space, without blocking cold activation.
+// a counted producer then waits for queue space without holding callback or
+// physical-reply fences. There is at most one producer per released descriptor;
+// the session descriptor limit and new-open watermark bound these owners.
 func (m *delegationManager) queueClose(ctx context.Context, identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
 	if _, err := delegationIdentity(identity); err != nil {
 		return err
