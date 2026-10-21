@@ -178,6 +178,7 @@ type integrationConfig struct {
 	// the existing 4,096-name test profile.
 	NameCacheCapacity int
 	wrapListener      func(net.Listener) net.Listener
+	beforeServe       func(*integrationFixture)
 	clockOffset       *atomic.Int64
 
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
@@ -588,6 +589,9 @@ func (f *integrationFixture) start() {
 		MaxInFlight: integrationServerInFlight, MaxConnections: 16,
 		MaxFrameBytesInFlight: integrationAllocationBudget,
 		HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
+	}
+	if f.cfg.beforeServe != nil {
+		f.cfg.beforeServe(f)
 	}
 	go func() {
 		pprof.Do(ctx, pprof.Labels("component", "authority"), func(ctx context.Context) { served <- f.server.Serve(ctx, listener, f.serverTLS) })

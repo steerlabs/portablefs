@@ -2100,17 +2100,21 @@ func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64
 	return m.queueClose(context.Background(), identity, handle, lockOwner, flockUnlock)
 }
 
-// queueClose reserves session cleanup ownership before returning to RELEASE.
-// A raw callback retains this bounded reservation until its fence is released;
-// a counted producer then waits for queue space without holding callback or
-// physical-reply fences. There is at most one producer per released descriptor;
-// the session descriptor limit and new-open watermark bound these owners.
-func (m *delegationManager) queueClose(ctx context.Context, identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
+// A descriptor reservation has one callback-local owner until it is transferred
+// to a retained frontend handle or dispatched to session cleanup. Both debt and
+// producer admission are reserved immediately, including while grant installation
+// can still fail. Its methods run on that owner's goroutine exactly once.
+type descriptorCleanup struct {
+	manager *delegationManager
+	pending delegationClose
+}
+
+func (m *delegationManager) reserveClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) (*descriptorCleanup, error) {
 	if _, err := delegationIdentity(identity); err != nil {
-		return err
+		return nil, err
 	}
 	if len(handle) != 16 {
-		return errors.New("fusev3: invalid queued server handle")
+		return nil, errors.New("fusev3: invalid queued server handle")
 	}
 	m.epoch.RLock()
 	pending := delegationClose{
@@ -2119,13 +2123,33 @@ func (m *delegationManager) queueClose(ctx context.Context, identity, handle []b
 	}
 	m.epoch.RUnlock()
 	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
 	if m.closeStopped || m.ctx.Err() != nil {
-		m.closeMu.Unlock()
-		return writeback.ErrClosed
+		return nil, writeback.ErrClosed
 	}
 	m.closePending++
 	m.closeProducers.Add(1)
-	m.closeMu.Unlock()
+	return &descriptorCleanup{manager: m, pending: pending}, nil
+}
+
+// transfer discharges the temporary reservation when a retained frontend handle
+// takes ownership. Its eventual RELEASE will reserve cleanup independently.
+func (owner *descriptorCleanup) transfer() {
+	if owner == nil || owner.manager == nil {
+		return
+	}
+	m := owner.manager
+	owner.manager = nil
+	m.changePendingCloses(-1)
+	m.closeProducers.Done()
+}
+
+func (owner *descriptorCleanup) dispatch(ctx context.Context) {
+	if owner == nil || owner.manager == nil {
+		return
+	}
+	m, pending := owner.manager, owner.pending
+	owner.manager = nil
 	dispatch := func() {
 		defer m.closeProducers.Done()
 		select {
@@ -2139,7 +2163,28 @@ func (m *delegationManager) queueClose(ctx context.Context, identity, handle []b
 	} else {
 		dispatch()
 	}
+}
+
+// queueClose reserves session cleanup ownership before returning to RELEASE.
+// A counted producer waits for queue space only after the callback fence ends.
+func (m *delegationManager) queueClose(ctx context.Context, identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
+	owner, err := m.reserveClose(identity, handle, lockOwner, flockUnlock)
+	if err != nil {
+		return err
+	}
+	owner.dispatch(ctx)
 	return nil
+}
+
+// A malformed allocation cannot be named for cleanup; terminal session teardown
+// must own the table instead. All valid allocating results reserve before any
+// grant, visibility, or post-state validation can return them to their caller.
+func (m *Mount) ownDescriptor(identity, handle []byte) (*descriptorCleanup, error) {
+	owner, err := m.delegations.reserveClose(identity, handle, 0, false)
+	if err != nil {
+		m.revoke(fmt.Errorf("fusev3: allocated descriptor has no cleanup owner: %w", err))
+	}
+	return owner, err
 }
 
 func (m *delegationManager) closeLoop() {
@@ -2199,12 +2244,17 @@ func (m *delegationManager) drainCloseQueue() {
 func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 	defer m.changePendingCloses(-len(batch))
 	for {
+		// Stop transfers the descriptor table to mount/session teardown. Joining
+		// its producers must not turn canceled preparation into a new failure.
+		if m.ctx.Err() != nil {
+			return
+		}
 		m.epoch.RLock()
 		sessionCtx := m.sessionCtx
 		m.epoch.RUnlock()
 		var scopes []delegationCloseScope
 		err := m.closeHandles(m.ctx, batch, &scopes)
-		if err == nil || errors.Is(err, writeback.ErrLost) || errors.Is(err, authorityrpc.ErrAuthorityChanged) {
+		if err == nil || m.ctx.Err() != nil || sessionCtx.Err() != nil || errors.Is(err, writeback.ErrLost) || errors.Is(err, authorityrpc.ErrAuthorityChanged) {
 			return
 		}
 		var classified cleanupClassified
@@ -2230,7 +2280,7 @@ func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 			// Every failed descriptor in this result was proven retired.
 			return
 		}
-		if retryable {
+		if retryable && m.ctx.Err() == nil && sessionCtx.Err() == nil {
 			m.unknownCloseOutcome(err)
 		}
 		// Terminal teardown now owns the table. Keep this batch counted until

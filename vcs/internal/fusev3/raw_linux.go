@@ -2008,6 +2008,15 @@ func (r *rawFileSystem) newNode(item *authoritypb.Item) *node {
 // backpressure that slows a lookup is correct, discarding a capability is not,
 // and neither is destroying the mount because the backlog grew.
 func (r *rawFileSystem) intern(ctx context.Context, item *authoritypb.Item) (*inodeRecord, syscall.Errno) {
+	// Intern consumes the newly allocated capability on every exit. A failed
+	// validation or admission still leaves an authority resource to reclaim.
+	transport, token := r.mount.currentReclaimTransport(), cloneBytes(item.GetToken())
+	retained := false
+	defer func() {
+		if !retained {
+			r.mount.deferReclaimOn(transport, token)
+		}
+	}()
 	if !validItem(item) {
 		return nil, syscall.EIO
 	}
@@ -2038,11 +2047,9 @@ func (r *rawFileSystem) intern(ctx context.Context, item *authoritypb.Item) (*in
 			return nil, syscall.EIO
 		}
 		existing.lookups++
-		discarded := cloneBytes(item.GetToken())
 		r.mu.Unlock()
-		// The authority mints a new capability on every Lookup. This one lost
-		// the race for the record, so it is dead the moment it was created.
-		r.mount.deferReclaim(discarded)
+		// The existing record retains its own capability; this candidate goes
+		// to the same reclaim owner as a rejected allocation.
 		return existing, 0
 	}
 	if r.nextNodeID == 0 || r.nextNodeID == fuse.FUSE_ROOT_ID {
@@ -2057,6 +2064,7 @@ func (r *rawFileSystem) intern(ctx context.Context, item *authoritypb.Item) (*in
 	r.nodesByIdentity[identity] = record
 	r.nodesByKey[key] = record
 	r.mu.Unlock()
+	retained = true
 	return record, 0
 }
 
@@ -3809,7 +3817,6 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 			} else {
 				record, errno = r.intern(ctx, item)
 				if errno != 0 {
-					r.mount.deferReclaim(item.GetToken())
 					return fuse.Status(errno)
 				}
 			}

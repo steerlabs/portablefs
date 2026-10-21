@@ -62,7 +62,7 @@ func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.De
 }
 
 type acquiredDelegationHandleKey struct{}
-type acquiredDelegationHandle struct{ token []byte }
+type acquiredDelegationHandle struct{ cleanup *descriptorCleanup }
 
 // A recalled open description remains usable. A subsequent mutation obtains a
 // fresh grant, but the old grant is never used to admit another buffer entry.
@@ -72,6 +72,12 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 	}
 	id, err := delegationIdentity(n.item.GetStableIdentity())
 	if err != nil {
+		return err
+	}
+	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
+		return nil
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
 		return err
 	}
 	state := n.mount.delegations.retainState(id, true)
@@ -89,7 +95,14 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 			return errno
 		}
 		opened := response.GetOpen()
-		if opened == nil || opened.GetDelegation() == nil || len(opened.GetHandle()) == 0 {
+		owner, err := n.mount.ownDescriptor(n.item.GetStableIdentity(), opened.GetHandle())
+		if err != nil {
+			return err
+		}
+		// Every retry owns its scratch descriptor before validating or installing
+		// the grant. Only handle-less SETATTR may retain it beyond this helper.
+		defer func() { owner.dispatch(ctx) }()
+		if opened.GetDelegation() == nil {
 			return syscall.EIO
 		}
 		token := opened.GetHandle()
@@ -97,25 +110,18 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 			token = handle.token
 		}
 		if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
-			_, closeErrno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
-			if closeErrno != 0 {
-				return closeErrno
-			}
 			if errors.Is(err, errDelegationRetired) {
 				continue
 			}
 			return err
 		}
 		if handle == nil {
-			if acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle); acquired != nil {
-				acquired.token = cloneBytes(token)
+			acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle)
+			if acquired == nil {
+				return errors.New("fusev3: write delegation has no temporary descriptor owner")
 			}
-		}
-		if handle != nil {
-			_, errno = n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
-			if errno != 0 {
-				return errno
-			}
+			acquired.cleanup.dispatch(ctx)
+			acquired.cleanup, owner = owner, nil
 		}
 		return nil
 	}

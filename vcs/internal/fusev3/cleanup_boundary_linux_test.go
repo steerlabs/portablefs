@@ -14,6 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
@@ -278,5 +279,178 @@ func TestClosePreparationFailureRetainsDebtUntilTerminalCleanup(t *testing.T) {
 	m.Stop()
 	if pendingCloses(m) != 0 {
 		t.Fatal("terminal cleanup retained debt")
+	}
+}
+
+func TestAllocatingDescriptorValidationKeepsCleanupOwner(t *testing.T) {
+	for _, operation := range []string{"OPEN", "CREATE", "TMPFILE"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newStockFixture(t)
+			m := f.mount.delegations
+			child := testItem(101, authoritypb.Attr_REGULAR, 101)
+			badGrant := testDelegation()
+			badGrant.Generation = 0
+			token := testToken(100)
+			var retired atomic.Int32
+			f.rpc.mu.Lock()
+			f.rpc.replyOverride = func(req *authoritypb.Request) (*authoritypb.Response, error) {
+				if req.GetOpen() != nil {
+					return &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: token, Delegation: badGrant}}}, nil
+				}
+				if req.GetCreate() != nil || req.GetTmpfile() != nil {
+					post := exactTestPostState(41, struct {
+						item  *authoritypb.Item
+						roles uint32
+					}{child, postStateRoleCreated}, struct {
+						item  *authoritypb.Item
+						roles uint32
+					}{f.rpc.root, postStateRoleParent})
+					if req.GetCreate() != nil {
+						return &authoritypb.Response{PostState: post, Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: child, Handle: token, Delegation: badGrant}}}, nil
+					}
+					// Reserve the descriptor before rejecting TMPFILE's wrong
+					// returned object kind.
+					child.Attr.Kind = authoritypb.Attr_DIRECTORY
+					return &authoritypb.Response{PostState: post, Body: &authoritypb.Response_Tmpfile{Tmpfile: &authoritypb.TmpfileReply{Item: child, Handle: token}}}, nil
+				}
+				if batch := req.GetCloseBatch(); batch != nil {
+					if len(batch.Closes) != 1 || string(batch.Closes[0].Handle) != string(token) {
+						t.Error("validation cleanup changed descriptor")
+					}
+					retired.Add(1)
+					return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: []*authoritypb.CloseBatchResult{{Retired: true}}}}}, nil
+				}
+				return &authoritypb.Response{}, nil
+			}
+			f.rpc.mu.Unlock()
+			unique := f.unique.Add(2)
+			ctx, finish, status := f.raw.mutationContext(unique)
+			if !status.Ok() {
+				t.Fatal(status)
+			}
+			var errno syscall.Errno
+			n := f.raw.nodesByID[1].node
+			switch operation {
+			case "OPEN":
+				_, _, errno = testNode(f.mount).Open(ctx, syscall.O_RDONLY)
+			case "CREATE":
+				_, _, _, errno = n.Create(ctx, "invalid-grant", syscall.O_RDONLY|syscall.O_CREAT, 0600)
+			case "TMPFILE":
+				_, _, _, errno = n.Tmpfile(ctx, syscall.O_RDWR, 0600)
+			}
+			if errno == 0 || pendingCloses(m) != 1 || retired.Load() != 0 {
+				t.Errorf("errno=%v pending=%d retired=%d", errno, pendingCloses(m), retired.Load())
+			}
+			finish()
+			completeTestReply(t, f.raw, unique, fuse.OK)
+			waitUntil(t, time.Second, "abandoned allocating result retired", func() bool { return pendingCloses(m) == 0 })
+			if count := retired.Load(); count != 1 && (count != 0 || !f.mount.isRevoked() || m.ctx.Err() == nil) {
+				t.Fatalf("descriptor has neither proven retirement nor terminal cleanup: retired=%d revoked=%t", count, f.mount.isRevoked())
+			}
+		})
+	}
+}
+
+func TestTemporaryDescriptorUnprovenCleanupRetainsDebt(t *testing.T) {
+	f := newStockFixture(t)
+	m := f.mount.delegations
+	reported := make(chan error, 8)
+	m.SetCleanupFailureReporter(func(err error) { reported <- err })
+	token := testToken(100)
+	var attempts atomic.Int32
+	f.rpc.mu.Lock()
+	f.rpc.replyOverride = func(req *authoritypb.Request) (*authoritypb.Response, error) {
+		if req.GetOpen() != nil {
+			// A valid allocation whose absent grant rejects reacquisition.
+			return &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: token}}}, nil
+		}
+		if batch := req.GetCloseBatch(); batch != nil {
+			if len(batch.Closes) != 1 || string(batch.Closes[0].Handle) != string(token) {
+				t.Error("terminal cleanup changed descriptor")
+			}
+			attempts.Add(1)
+			return nil, authorityrpc.ErrTransportUncertain
+		}
+		return &authoritypb.Response{}, nil
+	}
+	f.rpc.mu.Unlock()
+	f.rawCall(func(unique uint64) fuse.Status {
+		ctx, finish, status := f.raw.mutationContext(unique)
+		if !status.Ok() {
+			return status
+		}
+		defer finish()
+		n := testNode(f.mount)
+		if err := n.ensureWriteDelegation(ctx, &fileHandle{node: n, token: testToken(99)}); err == nil {
+			t.Error("reacquisition accepted an absent grant")
+		}
+		if pendingCloses(m) != 1 {
+			t.Error("temporary allocation has no counted owner")
+		}
+		return fuse.EIO
+	})
+	var outcome error
+	select {
+	case outcome = <-reported:
+		var classified cleanupClassified
+		if !errors.As(outcome, &classified) || !classified.cleanupIsTerminal() {
+			t.Fatalf("unproven outcome was not terminal: %v", outcome)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unproven temporary CLOSE has no terminal owner")
+	}
+	if pendingCloses(m) != 1 || attempts.Load() != 1 {
+		t.Fatalf("pending=%d attempts=%d", pendingCloses(m), attempts.Load())
+	}
+	f.mount.cleanupFailed("unproven temporary descriptor", outcome, nil)
+	if !f.mount.isRevoked() {
+		t.Fatal("unproven descriptor did not end serving")
+	}
+	m.Stop()
+	if pendingCloses(m) != 0 {
+		t.Fatal("shutdown failed to join terminal cleanup")
+	}
+}
+
+func TestRejectedItemAllocationKeepsReclaimOwner(t *testing.T) {
+	for _, boundary := range []string{"metadata_validation", "intern_validation", "intern_admission"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newStockFixture(t)
+			item := testItem(42, authoritypb.Attr_REGULAR, 42)
+			if boundary == "metadata_validation" {
+				item.ObjectVersion = 0
+			}
+			if boundary == "intern_validation" {
+				item.StableIdentity = nil
+			}
+			if boundary == "intern_admission" {
+				f.mount.reclaim.watermark = 1
+				f.mount.deferReclaim(testToken(500))
+				f.raw.requestTimeout = 20 * time.Millisecond
+			}
+			f.rpc.mu.Lock()
+			f.rpc.replyOverride = func(req *authoritypb.Request) (*authoritypb.Response, error) {
+				return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}}, nil
+			}
+			f.rpc.mu.Unlock()
+			status := f.rawCall(func(unique uint64) fuse.Status {
+				return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "rejected", &fuse.EntryOut{})
+			})
+			if status.Ok() {
+				t.Fatal("invalid allocation/admission was accepted")
+			}
+			q := f.mount.reclaim
+			q.mu.Lock()
+			count := 0
+			for _, entry := range q.tokens[q.head:] {
+				if string(entry.token) == string(item.Token) {
+					count++
+				}
+			}
+			q.mu.Unlock()
+			if count != 1 || f.mount.isRevoked() {
+				t.Fatalf("reclaim owners=%d revoked=%t", count, f.mount.isRevoked())
+			}
+		})
 	}
 }

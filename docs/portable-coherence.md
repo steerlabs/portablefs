@@ -207,11 +207,18 @@ CLOSE_BATCH, RECLAIM, and Barrier resolution. Each unresolved mutation retains
 its exact body, replay slot, and lane permit through bounded transport attempts.
 A buffer flush transfers resolution to the session before its assignment callback
 publishes an ordinal; stopping its old buffer joins exact resolution before
-releasing its immutable bytes. Descriptor cleanup reserves counted session debt
-before returning from RELEASE. Queue dispatch waits outside the callback epoch
-fence. Interrupted cache preparation retains that debt through cold activation,
-even before the buffer serial changes; only proven retirement or terminal
-session cleanup discharges it.
+releasing its immutable bytes. Every allocated descriptor immediately reserves
+counted cleanup ownership before grant installation or result validation. A
+retained frontend handle takes ownership on success; every other exit, including
+temporary write-delegation OPENs, hands the exact descriptor to session cleanup.
+File and directory RELEASE use the same counted worker. Rejected item metadata
+and failed interning keep their capabilities on the RECLAIM cleanup lane.
+Callback completion
+finishes grant-history and index bookkeeping before releasing its epoch reader;
+only then can reserved producers dispatch. Physical metadata pins remain held
+until reply settlement. Interrupted cache preparation retains debt through cold
+activation, even before the buffer serial changes; only proven retirement or
+terminal session cleanup discharges it.
 Old receipts cannot advance the replacement buffer, and recorded loss remains
 observable on affected handles and the pre-loss root barrier. Authentication,
 session expiry, and unprovable assigned outcomes still fail closed; operator
