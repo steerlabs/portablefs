@@ -26,6 +26,7 @@ chroot "$root" groupadd -g 1000 workspace
 chroot "$root" useradd -u 1000 -g 1000 -d /home/workspace -s /bin/bash workspace
 # Password login is disabled, but OpenSSH also refuses a locked account.
 chroot "$root" usermod -p '*' workspace
+chroot "$root" chage -d 2026-10-01 workspace
 rm -f "$root/etc/ssh/ssh_host_"* "$root/etc/machine-id" "$root/var/lib/dbus/machine-id"
 touch "$root/etc/machine-id"
 mkdir -p "$root/data" "$root/workspaces" "$root/home/workspace"

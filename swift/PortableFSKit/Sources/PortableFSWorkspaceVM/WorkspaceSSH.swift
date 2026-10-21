@@ -37,7 +37,7 @@ import Darwin
             let id = UUID(); pending[id] = client
             vm.connect(port: 22) { [weak self] result in
                 guard let self else { Darwin.close(client); return }
-                self.pending.removeValue(forKey: id)
+                guard self.pending.removeValue(forKey: id) != nil else { if case .success(let guest) = result { guest.close() }; return }
                 guard self.listener >= 0 else { Darwin.close(client); if case .success(let guest) = result { guest.close() }; return }
                 do {
                     let guest = try result.get()
@@ -51,7 +51,8 @@ import Darwin
     }
     public func close() {
         listener = -1; source?.cancel(); source = nil; unlink(path.path)
-        for client in pending.values { shutdown(client, SHUT_RDWR) }
+        for client in pending.values { Darwin.close(client) }
+        pending.removeAll()
         for session in sessions.values { session.relay.close() }
     }
 }

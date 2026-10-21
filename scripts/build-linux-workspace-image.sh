@@ -57,7 +57,12 @@ for module in modules:
     if module.get('Main'): source=pathlib.Path(sys.argv[2])
     for name in ('LICENSE','LICENSE.txt','COPYING','NOTICE','PATENTS'):
         if (source/name).is_file(): shutil.copyfile(source/name,dest/name)
-(p/'go-notices'/'modules.json').write_text(json.dumps(modules,indent=2)+'\n')
+records=[]
+for module in modules:
+    record={key:module[key] for key in ('Path','Version','Sum') if key in module}
+    if 'Replace' in module: record['Replace']={key:module['Replace'][key] for key in ('Path','Version','Sum') if key in module['Replace']}
+    records.append(record)
+(p/'go-notices'/'modules.json').write_text(json.dumps(records,indent=2)+'\n')
 PYNOTICES
 rm -rf "$out/go-notices"
 cp -R "$staging/go-notices" "$out/"

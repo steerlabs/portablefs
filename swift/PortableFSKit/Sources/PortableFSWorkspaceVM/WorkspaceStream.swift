@@ -23,9 +23,9 @@ final class WorkspaceStream: @unchecked Sendable {
         guard fd >= 0 else { throw WorkspaceVMError("duplicate stream: \(errno)") }
         queue = DispatchQueue(label: label)
         self.onLost = onLost
+        guard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) == 0 else { Darwin.close(fd); throw WorkspaceVMError("nonblocking stream: \(errno)") }
         reader = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         writer = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
-        guard fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) == 0 else { Darwin.close(fd); throw WorkspaceVMError("nonblocking stream: \(errno)") }
         var flag: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &flag, socklen_t(MemoryLayout.size(ofValue: flag)))
         let group = DispatchGroup(); group.enter(); group.enter()
@@ -38,7 +38,7 @@ final class WorkspaceStream: @unchecked Sendable {
     }
     func read(count: Int, deadline: UInt64, completion: @escaping @MainActor (Result<Data, Error>) -> Void) {
         queue.async { [self] in
-            guard !closed, readCompletion == nil else { DispatchQueue.main.async { completion(.failure(WorkspaceVMError("stream unavailable"))) }; return }
+            guard !closed, readCompletion == nil, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < deadline else { DispatchQueue.main.async { completion(.failure(WorkspaceVMError("stream unavailable"))) }; return }
             readCount = count; readCompletion = completion
             arm(deadline)
             deliverRead()
@@ -46,7 +46,7 @@ final class WorkspaceStream: @unchecked Sendable {
     }
     func write(_ data: Data, deadline: UInt64, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
         queue.async { [self] in
-            guard !closed, writeCompletion == nil else { DispatchQueue.main.async { completion(.failure(WorkspaceVMError("stream unavailable"))) }; return }
+            guard !closed, writeCompletion == nil, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < deadline else { DispatchQueue.main.async { completion(.failure(WorkspaceVMError("stream unavailable"))) }; return }
             outgoing = data; writeCompletion = completion
             arm(deadline)
             writerActive = true; writer.resume()
