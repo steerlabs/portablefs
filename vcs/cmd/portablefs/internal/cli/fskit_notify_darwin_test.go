@@ -29,10 +29,15 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 		}
 	}
 	run("create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest", image)
+	// Spotlight, fseventsd and Disk Arbitration may briefly open a freshly
+	// attached volume, so an unforced detach of this private fixture can return
+	// EBUSY. This test proves EVFILT_FS delivery and inventory absence, not
+	// unmount politeness, so the fixture always forces its own detach.
+	detach := func() { run("detach", "-quiet", "-force", mount) }
 	mounted := false
 	t.Cleanup(func() {
 		if mounted {
-			run("detach", "-quiet", mount)
+			detach()
 		}
 	})
 	wait := func(w fsKitMountWatcher) {
@@ -70,7 +75,7 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.close()
-	run("detach", "-quiet", mount)
+	detach()
 	mounted = false
 	wait(watcher)
 	wait(second)
@@ -92,7 +97,7 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	// may coalesce; the wake is never a receipt for this attach's absence.
 	run("attach", "-quiet", "-nobrowse", "-mountpoint", mount, image)
 	mounted = true
-	run("detach", "-quiet", mount)
+	detach()
 	mounted = false
 	wait(late)
 	if present, err := recordedKernelMountPresent(&st); err != nil || present {
