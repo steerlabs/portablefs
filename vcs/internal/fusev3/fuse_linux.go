@@ -175,6 +175,8 @@ type Config struct {
 	Debug bool
 	// latencies is installed before Serve for in-package kernel timing proofs.
 	latencies fuse.LatencyMap
+	// subscriptionClock is installed before workers start for clock-jump tests.
+	subscriptionClock subscriptionClock
 
 	// OnRevoked is called exactly once, from the teardown goroutine, when this
 	// mount self-revokes and its kernel-state withdrawal has finished. It is a
@@ -567,6 +569,9 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		mount.cleanupFailed("deferred close", err, nil)
 	})
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
+	if cfg.subscriptionClock != nil {
+		mount.subscription.config.clock = cfg.subscriptionClock
+	}
 	mount.delegations.subscription = mount.subscription
 	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	return mount
@@ -1770,16 +1775,21 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
 	}
-	kernelFlags := portableOpenFlags(flags, response.GetOpen().GetCacheCapable())
+	current := n.mount.currentOpenResponse(ctx)
+	grant := response.GetOpen().GetDelegation()
+	if !current {
+		grant = nil
+	}
+	kernelFlags := portableOpenFlags(flags, current && response.GetOpen().GetCacheCapable())
 	handle := &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := n.registerDelegatedHandle(handle, response.GetOpen().GetDelegation(), response.GetAppliedSequence()); err != nil {
+	if err := n.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, 0, syscall.EIO
 	}
-	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response); err != nil {
+	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response, current); err != nil {
 		_ = handle.closeForCleanup(ctx, 0, false)
 		return nil, 0, bufferErrno(err)
 	}
-	if openFlags.GetTruncate() {
+	if current && openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
 			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 		}
@@ -1936,6 +1946,12 @@ func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, floc
 			return
 		}
 		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token), LockOwner: lockOwner, FlockUnlock: flockUnlock}}})
+		if errno != 0 && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && response.GetMutation() == nil && !response.GetSessionTerminal() && h.node.mount.rpc.SessionEndCause() == nil {
+			// Admission refused this CLOSE before recording it. Keep its live
+			// session descriptor as bounded cleanup debt through cold recovery.
+			h.closeOutcome.cause = h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock)
+			return
+		}
 		if errno != 0 {
 			h.closeOutcome.cause = errno
 			if response != nil {
@@ -2383,6 +2399,10 @@ func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 		h.discardPageItemsLocked()
 		h.mu.Unlock()
 		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
+		if errno != 0 && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && response.GetMutation() == nil && !response.GetSessionTerminal() && h.node.mount.rpc.SessionEndCause() == nil {
+			h.closeOutcome.cause = h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, 0, false)
+			return
+		}
 		if errno != 0 {
 			h.closeOutcome.cause = errno
 			if response != nil {
@@ -2465,12 +2485,17 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		}
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
-	kernelFlags := portableOpenFlags(flags, created.GetCacheCapable())
+	current := n.mount.currentOpenResponse(ctx)
+	grant := created.GetDelegation()
+	if !current {
+		grant = nil
+	}
+	kernelFlags := portableOpenFlags(flags, current && created.GetCacheCapable())
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := child.registerDelegatedHandle(handle, created.GetDelegation(), response.GetAppliedSequence()); err != nil {
+	if err := child.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
-	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response); err != nil {
+	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response, current); err != nil {
 		_ = handle.closeForCleanup(ctx, 0, false)
 		return nil, nil, 0, bufferErrno(err)
 	}
@@ -2478,7 +2503,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	if object == nil {
 		object = postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleCreated)
 	}
-	if object != nil {
+	if current && object != nil {
 		n.mount.delegations.SetBaseAttr(item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 	}
 	return item, handle, kernelFlags, 0

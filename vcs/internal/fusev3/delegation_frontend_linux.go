@@ -38,6 +38,13 @@ func captureServedVersion(ctx context.Context, response *authoritypb.Response) {
 	}
 }
 
+// A replayed allocating result still owns its descriptor, but its grant and
+// cache hints belong to the subscription that admitted the original callback.
+func (m *Mount) currentOpenResponse(ctx context.Context) bool {
+	p := replyPublicationFromContext(ctx)
+	return p != nil && p.stamp.incarnation != 0 && p.stamp.incarnation == m.delegations.incarnation()
+}
+
 func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation, applied uint64) error {
 	manager := n.mount.delegations
 	if grant != nil {

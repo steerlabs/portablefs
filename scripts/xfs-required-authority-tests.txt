@@ -46,3 +46,8 @@ performance github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestShared
 # Subscription receipt checks retain the original continuous request anchor.
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSubscriptionReplyAfterSuspendIsRejected
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSubscriptionProofUsesContinuousRequestAnchor
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMutationReplayPrecedesCoherenceAdmission
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestReplayAdmissionTerminalControls
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestReplayRuntimeLeaseBoundary
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestMutationResolverRetainsIdentityAcrossRepeatedTransportLoss
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestAssignedMutationOutlivesCacheCancellation

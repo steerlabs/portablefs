@@ -228,6 +228,26 @@ func requestIsVisibleMutation(req *authoritypb.Request) bool {
 	}
 }
 
+// Only operations which enter the replay runtime may defer coherence admission.
+// A mutation header on a read cannot confer a retained outcome on that read.
+func requestHasMutationReplay(req *authoritypb.Request) bool {
+	if req.GetMutation() == nil {
+		return false
+	}
+	if requestIsVisibleMutation(req) {
+		return true
+	}
+	switch req.GetBody().(type) {
+	case *authoritypb.Request_Lookup, *authoritypb.Request_ReadDir,
+		*authoritypb.Request_Open, *authoritypb.Request_Close, *authoritypb.Request_CloseBatch,
+		*authoritypb.Request_Reclaim, *authoritypb.Request_SyncFs,
+		*authoritypb.Request_SetLock, *authoritypb.Request_Barrier:
+		return true
+	default:
+		return false
+	}
+}
+
 // requestRequiresAdmin classifies an operation as volume-wide configuration
 // rather than filesystem work. Write access covers file contents; it does not
 // cover the declaration that decides which subtrees exist for every machine at

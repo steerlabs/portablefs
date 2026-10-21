@@ -135,6 +135,7 @@ type fakeRPC struct {
 	// response is returned to the frontend, allowing ordering tests to place a
 	// raw callback precisely on either side of transport delivery.
 	mutationStates       []*authoritypb.MutationState
+	unrecordedRefusals   bool
 	applied              uint64
 	mutationSeq          uint64
 	afterMutation        func()
@@ -285,7 +286,9 @@ func (f *fakeRPC) CallMutationWithIdentity(ctx context.Context, request *authori
 		return response, err
 	}
 	f.mu.Lock()
-	if len(f.mutationStates) != 0 {
+	if f.unrecordedRefusals && response.GetErrno() != 0 {
+		response.Mutation = nil
+	} else if len(f.mutationStates) != 0 {
 		response.Mutation = proto.Clone(f.mutationStates[0]).(*authoritypb.MutationState)
 		f.mutationStates = f.mutationStates[1:]
 	} else {

@@ -102,6 +102,16 @@ type MutationIdentity struct {
 // sends nothing and leaves the replay slot unadvanced.
 type MutationAssigned func(MutationIdentity) error
 
+type mutationSessionKey struct{}
+
+// RetainMutationForSession separates revocable cache work from an assigned
+// session replay. Before assignment ctx still controls lane admission. After
+// assignment the session owns resolution, including the immutable WRITE spans;
+// retiring a cache buffer must join that resolution rather than cancel it.
+func RetainMutationForSession(ctx, session context.Context) context.Context {
+	return context.WithValue(ctx, mutationSessionKey{}, session)
+}
+
 // ResponseConsumption retains one parsed authority mutation response through
 // the frontend boundary which makes that response locally observable. For a
 // strict Linux state-bearing result, that boundary is the physical write of
@@ -1841,7 +1851,8 @@ func (c *Client) callRetained(
 // The client never infers that the authority advanced a slot: every rejection
 // the authority makes before recording an outcome leaves both counters equal.
 // Cancellation after send without an exact outcome poisons the client because
-// the outcome is genuinely uncertain to the caller.
+// the outcome is genuinely uncertain to the caller. A frontend may explicitly
+// retain an assigned cache flush for session-owned resolution instead.
 func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
@@ -1926,6 +1937,9 @@ func (c *Client) CallMutationWithIdentityRetained(
 	index := admitted.base + local
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 
 	sequence := slot.sequence + 1
 	request.Mutation = &authoritypb.Mutation{Slot: index, Sequence: sequence}
@@ -1944,16 +1958,47 @@ func (c *Client) CallMutationWithIdentityRetained(
 			return nil, nil, err
 		}
 	}
-	response, releaseFrame, submitted, err := c.dispatchOwnedFrame(ctx, request)
-	if errors.Is(err, ErrTransportUncertain) {
+	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		stop := context.AfterFunc(session, cancel)
+		defer func() { stop(); cancel() }()
+		if session.Err() != nil {
+			cancel()
+		}
+		ctx = owned
+	}
+	var response *authoritypb.Response
+	var releaseFrame func()
+	submitted := false
+	for {
+		var attemptSubmitted bool
+		response, releaseFrame, attemptSubmitted, err = c.dispatchOwnedFrame(ctx, request)
+		submitted = submitted || attemptSubmitted
+		if !errors.Is(err, ErrTransportUncertain) {
+			break
+		}
 		if releaseFrame != nil {
 			releaseFrame()
+			releaseFrame = nil
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
 			// Recovery may have returned the already-recorded verdict. Only a
 			// live session's establishment failure can become uncertainty.
 			if terminalErr := c.checkCallEntry(); terminalErr != nil {
 				return nil, nil, terminalErr
+			}
+			// Each establishment attempt stays bounded. Its subscription-sized
+			// budget says nothing about a live session's retained replay outcome:
+			// keep this exact body, slot, and lane permit until it resolves.
+			if errors.Is(reconnectErr, ErrTransportUncertain) && ctx.Err() == nil {
+				retryErr := waitTransportRetry(ctx)
+				if retryErr == nil {
+					continue
+				}
+				reconnectErr = retryErr
 			}
 			if !submitted && (errors.Is(reconnectErr, context.Canceled) || errors.Is(reconnectErr, context.DeadlineExceeded)) {
 				return nil, nil, reconnectErr
@@ -1964,9 +2009,6 @@ func (c *Client) CallMutationWithIdentityRetained(
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
-		var replaySubmitted bool
-		response, releaseFrame, replaySubmitted, err = c.dispatchOwnedFrame(ctx, request)
-		submitted = submitted || replaySubmitted
 	}
 	consumption.releaseFrame = releaseFrame
 	// Refusing an unsent attempt leaves its slot unchanged. Once any attempt

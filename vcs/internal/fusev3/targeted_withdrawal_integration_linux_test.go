@@ -93,6 +93,9 @@ func (t *integrationTransport) NextControlEvent(ctx context.Context, incarnation
 
 func (t *integrationTransport) RenewSubscription(ctx context.Context, incarnation uint64) (time.Time, error) {
 	horizon, err := t.Client.RenewSubscription(ctx, incarnation)
+	if t.clockOffset != nil {
+		horizon = horizon.Add(time.Duration(t.clockOffset.Load()))
+	}
 	t.hookMu.Lock()
 	hook := t.afterSubscriptionRenewal
 	t.hookMu.Unlock()

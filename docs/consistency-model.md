@@ -175,6 +175,16 @@ client-owned replay slot and sequence; exact replay returns the retained outcome
 does not re-execute. Identity reuse with a different canonical request or a
 sequence gap fences the session.
 
+For an authenticated live Linux session, retained replay precedes current
+subscription and delegation admission. It returns the original outcome and
+accepted mutation sequence even after subscription expiry; a new operation
+under expired permission still fails before storage. Cold recovery preserves
+assigned replay and descriptor cleanup ownership while withdrawing all old
+cache and grant state. An old result cannot revive that state, reapply a lost
+volatile tail, or clear the loss seen by affected handles and the pre-loss root
+barrier. Session or authorization expiry and epoch loss remain terminal for
+the old operation.
+
 There is no honest atomic transaction spanning an arbitrary XFS syscall and a
 separate durable replay database. A mutation whose reply is lost across
 authority death is reported `UNCERTAIN`; it is never silently retried in a new

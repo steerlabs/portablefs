@@ -273,9 +273,13 @@ anchors the returned duration at request start, so transit delay only shortens
 local permission.
 The client must stop serving and finish invalidating caches by its conservative
 horizon. A late response cannot revive expired permission. The authority fences
-all ordinary requests at expiry; only cold subscription and required transport/
-session recovery plumbing may establish a usable incarnation again. Renewal
-cannot revive an expired incarnation.
+new ordinary execution at expiry. An authenticated live session first resolves
+an assigned DATA mutation under its replay-slot lock: a matching retained body
+returns the original outcome plus MutationState, without new execution or
+coherence admission. Cold Subscribe may precede or follow that resolution.
+Reads without mutation replay retain the cold-admission check. Only cold
+subscription and required transport/session recovery plumbing may establish a
+usable incarnation again; a retained grant or late renewal cannot revive one.
 
 Only one poll may be outstanding per incarnation. Retrying the same poll cursor returns
 the same event until a subsequent cursor proves receipt. Receipt is independent of
@@ -475,6 +479,11 @@ cannot leave an unfillable gap. Subscription loss, recall expiry, and transport
 cancellation also terminate waiting ordinals. Metadata flushes separate WRITE
 waves.
 
+Before replay assignment, cache-buffer cancellation remains local. Once a flush
+has an assigned identity, the session retains its exact request and immutable
+spans until resolution. Cold buffer replacement joins that resolver; a retained
+result settles the old slot without restoring its retired grant or local tail.
+
 The client admits each predecessor to its transport lane before launching the
 next chunk and joins the wave before changing local ownership. Transport
 retries keep the same mutation identity, ordinal, and immutable scatter spans;
@@ -578,8 +587,9 @@ may cover later work, but need not wait for entries accepted after the client
 cut. The durability operation also covers namespace mutations acknowledged before
 this barrier, including when the data cut is zero; the authority uses its
 ordered volume syncfs operation, with the shared-cell error and latency scope
-stated in COMPATIBILITY.md. A replay returns the
-same or an already sufficient retained result.
+stated in COMPATIBILITY.md. Exact replay returns the original retained result.
+Its receipt settles that session-owned request even across cold reset, but
+cannot advance a replacement buffer's application or durability cut.
 
 The client reports EIO if loss advanced since the root handle opened, even if
 the authority barrier succeeded. Loss sequence stays local and monotonic
@@ -608,8 +618,12 @@ fails. The store consumes its capability before reporting a final close error;
 the authority removes session accounting and sets `retired` even then. An
 already-stale session handle is also retired. Other pre-close refusal does not
 claim retirement. Clients remove retired handles while preserving the error for
-diagnostics. Unknown transport outcomes or malformed replies revoke the mounted
-session; terminal session cleanup owns its remaining descriptors.
+diagnostics. A transient transport loss retains the exact body, replay slot and
+lane permit through bounded same-session recovery attempts. Cold subscription
+reset cannot cancel or discharge that ownership. A genuinely unprovable outcome
+or malformed reply revokes the mounted session; terminal session cleanup owns
+its remaining descriptors. Individual CLOSE and RECLAIM follow the same
+session ownership rule.
 
 Linux final-handle cleanup first applies each buffered cut and releases the
 grants in one CONTROL batch; it does not wait for durability. Applied records
@@ -752,8 +766,9 @@ proof until exact absence or operator reconciliation.
 
 Refusals use the response `errno` and `failure` envelope. Malformed coordinates,
 unknown enum values, inconsistent flags, an undelivered ack position, an
-unissued application ticket, or a conflicting retry receive EINVAL with no
-state change. Wrong/expired incarnations and stale delegation references
+unissued application ticket receive EINVAL with no state change. Reusing a
+mutation identity with a different canonical body or a sequence gap fences the
+session, even when its subscription expired. Wrong/expired incarnations and stale delegation references
 receive EIO with `FAILURE_CLASS_COHERENCE`; the client invalidates or reports
 loss for the affected state, without interpreting it as storage death. A
 stale-generation flush fails whole before apply. Ordinary storage errors keep

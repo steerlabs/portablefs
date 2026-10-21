@@ -76,7 +76,7 @@ func TestSynchronousOpenPublishesGrantBeforeWaitingForVisibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	visible := make(chan error, 1)
-	go func() { visible <- m.openedVisibility(ctx, id, response) }()
+	go func() { visible <- m.openedVisibility(ctx, id, response, true) }()
 	select {
 	case err := <-visible:
 		if err != nil {
@@ -135,7 +135,7 @@ func TestOpenedApplicationCutBelongsToItsReturnedGrant(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- m.openedVisibility(ctx, fake.id, response) }()
+	go func() { done <- m.openedVisibility(ctx, fake.id, response, true) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -340,7 +340,7 @@ func TestPublicAllocatingApplicationServicesControlBeforeWithdrawal(t *testing.T
 					err = m.install(id, delegationTestToken(121, 1), delegationTestToken(121, 3), grant, response.AppliedSequence)
 				}
 				if err == nil {
-					err = m.openedVisibility(applyCtx, id, response)
+					err = m.openedVisibility(applyCtx, id, response, true)
 				}
 				outcome <- err
 			}()

@@ -196,8 +196,21 @@ A missed five-second recall budget or rejected stale-generation flush marks
 loss and returns EIO on affected handles; it does not disconnect the mount.
 A lost subscription withdraws all cache permission and resubscribes cold after
 invalidation. During withdrawal, new uncached reads fail rather than return bytes
-under an expired permission. Authentication and exact assigned-mutation outcome
-invariants still fail closed; operator unmount remains explicit.
+under an expired permission. An authenticated live session resolves an assigned
+DATA mutation's exact replay before current coherence admission, returning its
+retained outcome and mutation state without executing again. New operations
+still require current permission. Replay does not restore an expired grant,
+cache contents, or a discarded volatile tail.
+
+Cold reset cancels old cache and grant work, but preserves session-owned CLOSE,
+CLOSE_BATCH, RECLAIM, and Barrier resolution. Each unresolved mutation retains
+its exact body, replay slot, and lane permit through bounded transport attempts.
+An assigned buffer flush also retains session ownership; stopping its old buffer
+joins exact resolution before releasing its immutable bytes.
+Old receipts cannot advance the replacement buffer, and recorded loss remains
+observable on affected handles and the pre-loss root barrier. Authentication,
+session expiry, and unprovable assigned outcomes still fail closed; operator
+unmount remains explicit.
 
 An Authority epoch change invalidates every old file and directory handle,
 capability, and lock. Shipping `portablefs mount` withdraws the old mount and

@@ -176,6 +176,7 @@ type integrationConfig struct {
 	// the existing 4,096-name test profile.
 	NameCacheCapacity int
 	wrapListener      func(net.Listener) net.Listener
+	clockOffset       *atomic.Int64
 
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
 	rules localroutes.RuleSet
@@ -243,6 +244,15 @@ type integrationTransport struct {
 	afterMutation            func(*authoritypb.Request, *authoritypb.Response, error)
 	afterControlEvent        func(context.Context, *authoritypb.ControlEvent) error
 	afterSubscriptionRenewal func(time.Time, error)
+	clockOffset              *atomic.Int64
+}
+
+func (t *integrationTransport) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+	r, horizon, err := t.Client.Subscribe(ctx, snapshot, after)
+	if t.clockOffset != nil {
+		horizon = horizon.Add(time.Duration(t.clockOffset.Load()))
+	}
+	return r, horizon, err
 }
 
 // The partition test can stall DATA admission before assigning a replay slot.
@@ -608,6 +618,7 @@ func (f *integrationFixture) mountAll() {
 			WithdrawalTimeout: integrationWithdrawalTimeout,
 			Routes:            f.cfg.rules, LocalBacking: f.backing[i],
 			Debug: os.Getenv(envFUSEDebug) == "1", latencies: f.cfg.latencies,
+			subscriptionClock: replaySubscriptionClockFor(f.cfg.clockOffset),
 		})
 		if err != nil {
 			t.Fatalf("mount %s: %v", f.paths[i], err)
@@ -643,7 +654,7 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 	if err != nil {
 		f.t.Fatalf("dial authority: %v", err)
 	}
-	transport := &integrationTransport{Client: client}
+	transport := &integrationTransport{Client: client, clockOffset: f.cfg.clockOffset}
 	id, ok := f.membership.last()
 	if !ok {
 		f.t.Fatal("attach registered no visibility participant")

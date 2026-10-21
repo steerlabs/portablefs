@@ -113,3 +113,11 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionSuspendRejec
 # Permission denial must preserve and finish the kernel withdrawal inventory.
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestColdSubscriptionRetainsFailedKernelWithdrawal
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSubscriptionExpiryCompletionJoinsKernelWithdrawal
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelMutationReplayAcrossColdRecovery
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelOpenReplayBeforeColdSubscribe
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelStoppedClient45SecondsWithoutSocketLoss
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionCleanupSurvivesInFlightColdReset
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOldOpenResponseCannotRestoreCacheAuthority
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnrecordedCloseRefusalRetainsSessionDescriptor
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelStoppedClientLostOpenReplay
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelAssignedFlushReplaySurvivesColdReset
