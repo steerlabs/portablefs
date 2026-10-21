@@ -52,12 +52,13 @@ class XcodeEvidenceTests(unittest.TestCase):
     identifiers = (
         "PortableFSAppCoreTests/appCorePasses()",
         "PortableFSKitTests/PfsLocalMockDaemonTests/kitPasses()",
+        "PortableFSWorkspaceCoreTests/workspacePasses()",
     )
 
     def test_exact_enumeration_and_results_pass(self) -> None:
         enum = enumeration(*self.identifiers)
         result = results(*(pair for pair in ((name, "Passed") for name in self.identifiers)))
-        self.assertIn("tests=2 unique=2", verify_xcode_tests.verify(enum, result, "arm64"))
+        self.assertIn("tests=3 unique=3", verify_xcode_tests.verify(enum, result, "arm64"))
 
     def test_enumeration_rejects_errors_disabled_duplicates_and_unknown_modules(self) -> None:
         bad_error = enumeration(*self.identifiers)
@@ -77,6 +78,7 @@ class XcodeEvidenceTests(unittest.TestCase):
         accepted = (
             "PortableFSKitTests/kitPasses()",
             "PortableFSKitTests/PfsLocalMockDaemonTests/kitPasses()",
+            "PortableFSWorkspaceCoreTests/workspacePasses()",
             "PortableFSKitTests/OuterSuite/InnerSuite/kitPasses()",
         )
         for identifier in accepted:

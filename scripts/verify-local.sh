@@ -105,6 +105,9 @@ go -C vcs run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 step "pfslocal schema freshness (uncached)"
 go -C vcs test -count=1 ./internal/pfslocal -run '^TestLocalGrammarGeneratedFromCurrentSchema$'
 
+step "workspace schema and paired binding freshness (uncached)"
+go -C vcs test -count=1 ./internal/workspacecontrol -run '^TestWorkspaceSchemaFreshness$'
+
 step "go suite (native)"
 go -C vcs test ./...
 

@@ -29,6 +29,10 @@ stock Linux FUSE 7.31+ mounts      macOS FSKit mount      files gateway
                    one XFS project directory (PROJINHERIT)
 ```
 
+The pending [Linux workspace on macOS](./linux-workspace.md) executes tools in
+a guest using the Linux profile. It is unreleased and unsupported; the
+unfenced host-sleep clock gate remains open.
+
 ## Product invariants
 
 1. **The state selects one authority.** READY and RESTORING volumes have exactly

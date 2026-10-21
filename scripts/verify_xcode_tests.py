@@ -13,7 +13,7 @@ from typing import Any
 
 
 TEST_URL_PREFIX = "test://com.apple.xcode/PortableFSKit/"
-EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests"})
+EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests", "PortableFSWorkspaceCoreTests"})
 MAX_JSON_BYTES = 16 * 1024 * 1024
 SUITE_COMPONENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 TEST_COMPONENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\(\)\Z")

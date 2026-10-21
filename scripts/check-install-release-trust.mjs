@@ -901,7 +901,7 @@ if (!kitProtobuf || !appProtobuf ||
   failures.push("shipping app and tested Swift package must pin the same SwiftProtobuf revision");
 }
 for (const evidenceContract of [
-  'EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests"})',
+  'EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests", "PortableFSWorkspaceCoreTests"})',
   'value.get("disabledTests") != []',
   'value.get("nodeType") == "Test Case"',
   'result != "Passed"',

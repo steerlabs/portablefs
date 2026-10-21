@@ -223,6 +223,8 @@ unprivileged reference image.
 | macOS 26 and 27 | FSKit (`swift/PortableFSKit`) | `FRONTEND_PROFILE_FSKIT_EXCLUSIVE`, the same product and profile on both releases. The Mac is the volume's only writer while mounted; successful mutation replies are durable on authority storage; no exact namespace/attribute withdrawal, append intent, or distributed locks. Native qualification is pending. |
 
 The macOS contract and its open gates are in [docs/fskit-mount.md](./docs/fskit-mount.md).
+The planned [Linux workspace on macOS](./docs/linux-workspace.md) is unreleased
+and unsupported; Stage 1a contains control and suspension models only.
 
 ## Development and verification
 
@@ -275,6 +277,8 @@ handler; see [docs/power-loss-testing.md](./docs/power-loss-testing.md).
   encoding and handshake.
 - [docs/portable-coherence.md](./docs/portable-coherence.md) — the Linux
   subscription/delegation contract, kernel proofs, and accepted residuals.
+- [docs/linux-workspace.md](./docs/linux-workspace.md) — the pending Linux
+  workspace contract, suspension transaction and open host-sleep gate.
 - [docs/fskit-mount.md](./docs/fskit-mount.md) — the macOS exclusive-writer
   mount and its platform limits.
 - [docs/consistency-model.md](./docs/consistency-model.md) — the exact

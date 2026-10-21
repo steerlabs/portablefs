@@ -1,0 +1,120 @@
+syntax = "proto3";
+package portablefs.workspace.v8;
+option go_package = "github.com/steerlabs/portablefs/vcs/internal/workspacepb";
+option swift_prefix = "Workspace";
+
+// Paired, unreleased control grammar. No authority operations or private keys.
+message Release {
+  string app_version = 1;
+  string commit = 2;
+  bytes image_digest = 3;
+  uint32 authority_major = 4;
+}
+message Hello {
+  Release release = 1;
+  bytes boot_id = 2;
+  bytes host_service_id = 3;
+  // Empty in the host Hello; freshly generated in the guest HelloAck.
+  bytes guest_service_id = 4;
+}
+message MountID {
+  bytes authority_id = 1;
+  string volume_id = 2;
+  bytes incarnation = 3;
+}
+message Suspension {
+  bytes boot_id = 1;
+  bytes host_service_id = 2;
+  bytes guest_service_id = 3;
+  uint64 generation = 4;
+  // Empty in Suspend requests; guest-owned fixed membership in ack/token.
+  repeated MountID roster = 5;
+  bytes nonce = 6;
+}
+message Loss {
+  uint64 sequence = 1;
+  uint64 accepted_entries = 2;
+  uint64 accepted_bytes = 3;
+  string reason = 4;
+  // Final bounded cumulative summary; counters saturate at uint64 max.
+  bool aggregated = 5;
+}
+message MountCold {
+  MountID mount = 1;
+  // An ack exists only after whole-roster cold completion.
+  reserved 2;
+  repeated Loss loss = 3;
+}
+message SuspendAck {
+  Suspension suspension = 1;
+  repeated MountCold mounts = 2;
+}
+message ResumeToken {
+  Suspension suspension = 1;
+  bytes wake_nonce = 2;
+}
+message MountStatus {
+  MountID mount = 1;
+  // closed, ready, suspended-cold, recovering, terminal, authorization-required.
+  string state = 2;
+  string reason = 3;
+  repeated Loss loss = 4;
+  // retained, process-exited, kernel-absent, complete; never inferred from errno.
+  string cleanup = 5;
+  // Zero for active mounts; strictly increasing for retired outcomes per guest.
+  uint64 retirement_sequence = 6;
+}
+message ResumeAck {
+  ResumeToken token = 1;
+  repeated MountStatus mounts = 2;
+}
+message StatusRequest {}
+message StatusReply {
+  bytes boot_id = 1;
+  bytes host_service_id = 2;
+  bytes guest_service_id = 3;
+  uint64 generation = 4;
+  // running (including per-mount recovery), suspending, suspended-cold, discard-only.
+  string state = 5;
+  repeated MountStatus mounts = 6;
+  // First 16 unacknowledged retired outcomes, in retirement order.
+  repeated MountStatus retired = 7;
+}
+// Idempotently acknowledge all retired outcomes through this sequence.
+message RetireAck { uint64 through_sequence = 1; }
+message Provision {
+  MountID mount = 1;
+  string authority_endpoint = 2;
+  bytes ca_certificate = 3;
+  bytes client_certificate = 4;
+  bytes capability = 5;
+  bytes routes_revision = 6;
+  // A guest-generated public identity, never a private-key import.
+  bytes public_key = 7;
+}
+message MountRequest { MountID mount = 1; }
+message UmountRequest { MountID mount = 1; }
+message Result {
+  // accepted, unavailable, authorization-required, refused.
+  string code = 1;
+  string reason = 2;
+}
+message Envelope {
+  uint32 version = 1;
+  uint64 request_id = 2;
+  oneof body {
+    Hello hello = 10;
+    Hello hello_ack = 11;
+    Suspension suspend = 12;
+    SuspendAck suspend_ack = 13;
+    ResumeToken resume = 14;
+    ResumeAck resume_ack = 15;
+    StatusRequest status = 16;
+    StatusReply status_reply = 17;
+    Provision provision = 18;
+    MountRequest mount = 19;
+    UmountRequest umount = 20;
+    Result result = 21;
+    RetireAck retire_ack = 22;
+  }
+}
