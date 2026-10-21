@@ -15,14 +15,14 @@ func workspaceGolden(_ name: String) throws -> Data {
     return bytes
 }
 @Test func workspaceGoldensCoverEveryMessageAndRejectMalformedFrames() throws {
-    let names = ["hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result"]
+    let names = ["hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack"]
     for name in names {
         let raw = try workspaceGolden(name)
         let envelope = try WorkspaceControl.decode(raw)
         #expect(envelope.version == 8)
         #expect(try WorkspaceControl.encode(envelope) == raw)
     }
-    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing"]
+    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated"]
     for name in invalid {
         let raw = try workspaceGolden(name + ".invalid")
         #expect(throws: (any Error).self) { try WorkspaceControl.decode(raw) }
@@ -46,15 +46,45 @@ func workspaceGolden(_ name: String) throws -> Data {
         #expect(throws: (any Error).self) { try WorkspaceControl.pair(host: host, guest: bad) }
     }
 }
-@Test func workspaceSemanticBoundsAndPrivateKeyImportRefusal() throws {
+@Test func workspaceSemanticBoundsUseStructuralProvisioningGrammar() throws {
     var envelope = try WorkspaceControl.decode(workspaceGolden("provision"))
     var provision = envelope.provision
     provision.publicKey = Data("-----BEGIN PRIVATE KEY-----".utf8)
     envelope.body = .provision(provision)
-    #expect(throws: (any Error).self) { try WorkspaceControl.encode(envelope) }
-    var s = try WorkspaceControl.decode(workspaceGolden("suspend")).suspend
+    _ = try WorkspaceControl.encode(envelope)
+    var s = try WorkspaceControl.decode(workspaceGolden("suspend_ack")).suspendAck.suspension
     s.roster.append(s.roster[0])
     #expect(!WorkspaceControl.validSuspension(s))
     s.roster = Array(repeating: s.roster[0], count: 65)
     #expect(!WorkspaceControl.validSuspension(s))
+}
+
+@Test func workspaceMaximumStatusFitsFrameAndConstrainsStateCombinations() throws {
+    let template = try WorkspaceControl.decode(workspaceGolden("status_reply")).statusReply
+    var status = template
+    status.mounts = (0..<64).map { index in
+        var m = template.mounts[0]
+        m.mount.volumeID = String(format: "%03d", index) + String(repeating: "v", count: 125)
+        m.reason = String(repeating: "r", count: WorkspaceControl.maxReason)
+        m.cleanup = "complete"
+        m.loss = (1...WorkspaceControl.maxLosses).map { sequence in
+            var loss = WorkspaceLoss(); loss.sequence = UInt64(sequence)
+            loss.acceptedEntries = UInt64.max; loss.acceptedBytes = UInt64.max
+            loss.reason = String(repeating: "r", count: WorkspaceControl.maxReason); return loss
+        }
+        return m
+    }
+    status.retired = Array(status.mounts.prefix(16)).map { old in
+        var retired = old; retired.mount.incarnation = Data(repeating: 99, count: 16); return retired
+    }
+    var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = UInt64.max; envelope.body = .statusReply(status)
+    let frame = try WorkspaceControl.encode(envelope)
+    #expect(frame.count <= WorkspaceControl.maxFrame + 4)
+    #expect(try WorkspaceControl.decode(frame) == envelope)
+    var bad = template; bad.state = "suspended-cold"; bad.mounts[0].state = "ready"
+    #expect(!WorkspaceControl.validStatus(bad))
+    bad = template; bad.mounts[0].state = "ready"; bad.mounts[0].cleanup = "complete"
+    #expect(!WorkspaceControl.validStatus(bad))
+    bad = template; bad.mounts[0].reason = ""
+    #expect(!WorkspaceControl.validStatus(bad))
 }

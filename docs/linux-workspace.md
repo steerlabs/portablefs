@@ -14,8 +14,11 @@ remains the sole authority; the guest is a mount host using authority protocol
 
 One signed `PortableFSWorkspaceService.app`, nested in PortableFS.app and
 registered through SMAppService, will own one persistent VM per Mac user on its
-serialized Virtualization.framework queue. Closing the menu app leaves that
-service running. Only this service receives the virtualization entitlement.
+serialized Virtualization.framework queue. The coordinator and adapter entry
+points run on MainActor. VZ adapters dispatch framework calls to the VM owner
+queue and return completions to MainActor without blocking either queue. Power
+adapters capture the continuous arrival timestamp before the actor hop. Closing
+the menu app leaves that service running. Only this service receives the virtualization entitlement.
 Workspace setup does not require the FSKit extension.
 
 The selected guest is Debian 13 arm64 with a pinned 6.12 kernel, glibc, systemd,
@@ -51,9 +54,10 @@ mount incarnation, exact process-start and kernel-mount witnesses, session,
 enrollment, route revision, cleanup phase and the old run's loss outcome.
 A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
-Stage 1a models these identities and cleanup in memory, retaining at most 128
-retired mount outcomes before refusing further replacement; crash-safe inventory and
-real cleanup remain pending.
+Stage 1a models these identities and cleanup in memory. It retains up to 128
+retired outcomes until the observer acknowledges their exact contents. Full
+capacity applies temporary replacement backpressure; acknowledgement frees it.
+Crash-safe inventory and real cleanup remain pending.
 
 A replacement at the same pathname cannot transfer old fd, cwd, mapping or lock
 references. Old operations fail under the terminal contract. A shell must leave
@@ -71,10 +75,14 @@ replacement. These rules are independent of the unresolved uncontrolled path.
 
 1. **Close admission and fix membership.** Invalidate prior resume eligibility,
    close attach/restart admission, and capture boot, host and guest service
-   incarnations, a new monotonically increasing generation, exact sorted mount
-   roster and fresh suspend nonce. Register each daemon closed before admitting
-   it to membership. Reject a mount start racing a fixed roster, leaving it
-   closed, and reject replies for older generations.
+   incarnations, a new monotonically increasing generation and fresh suspend
+   nonce. The guest alone owns membership: the host sends no roster, and the
+   guest fixes it atomically with closure and returns it in the acknowledgement.
+   Every daemon starts closed and cannot acquire permission before registration.
+   A refused start receives exact process/kernel cleanup; failed cleanup retains
+   its witness for retry. Any identity-matching Suspend closes every daemon and
+   cancels the generation before other checks; refusal leaves admission closed.
+   Reject replies for older generations.
 2. **Prove SUSPENDED-COLD.** Every daemon atomically denies ordinary serving,
    cache publication and delegation admission while retaining drain/control.
    Interrupt capacity-blocked writers, settle admitted work and physical FUSE
@@ -84,14 +92,27 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    exact delegation release within the old valid generation. An unprovable tail
    advances the loss ledger and fails affected barriers; never replay it after
    resume. Report cold completion and loss separately. Blocked or failed
-   invalidation earns no cold acknowledgement. The Go `workspaceguest.Mount`
-   interface defines this boundary; Stage 1c must implement it in the daemon.
+   invalidation earns no cold acknowledgement. Serialize Prepare, Recover,
+   Suspend and admission publication per mount. A new suspension cancels the
+   preceding generation and waits for overtaken driver calls before withdrawal.
+   Each driver must atomically check the latest close generation and cancellation
+   before installing any subscription or renewal; late calls install nothing.
+   Only exact process exit plus kernel absence makes a terminal mount trivially
+   cold. Other terminal mounts still require withdrawal. The Go
+   `workspaceguest.Mount` interface defines this boundary; Stage 1c must implement
+   it in the daemon.
 3. **Confirm pause before acknowledging sleep.** Await VZ's successful pause
    completion on its serial queue. Eligibility requires the complete roster's
    cold acknowledgement and confirmed pause for the same generation. Host
    continuous time measures every budget, including delayed callbacks. The
-   model defaults to 15 seconds for drain, 17.5 seconds for confirmed pause and
-   20 seconds total, reserving stop time within the same budget. A failed drain
+   model defaults to absolute deadlines of 15 seconds for drain, 17.5 seconds
+   for confirmed pause and 20 seconds total after native notification arrival,
+   reserving stop time within that budget. The timestamp precedes the MainActor
+   hop; queue delay consumes the budget. This does not bound the gap between
+   system posting and native callback execution. Sleep during VM resume carries
+   the same deadlines, and insufficient remaining time attempts stop. Every
+   notification receives exactly one acknowledgement, including during startup,
+   stop and unknown state. Confirmed termination unregisters participation. A failed drain
    still attempts pause but marks the VM discard-only. A failed or late pause
    attempts stop. Neither an invocation nor a stop request establishes a fence;
    an unconfirmed stop leaves unsafe/unknown state and acknowledges no fence.
@@ -100,16 +121,29 @@ replacement. These rules are independent of the unresolved uncontrolled path.
 4. **Resume cold or discard.** Consume eligibility once. Only a confirmed cold,
    paused VM may execute old guest RAM, with every mount still closed. Send a
    single-use token bound to boot, both service incarnations, generation,
-   roster, suspend nonce and a fresh wake nonce. It permits recovery only:
+   guest-acknowledged roster, suspend nonce and a fresh wake nonce. The guest
+   accepts any nonzero correctly sized wake nonce; exact suspension equality and
+   the consume-once phase transition enforce single use. It permits recovery only:
    validate live authority session and authorization, install initial renewal
    and a fresh cold subscription with new request anchors/incarnation, then
    reopen admission. Terminal mounts require supervised authorization/remount.
    A second sleep invalidates pending authorization; serialize VM completions
    and run a newer suspension before sending any delayed token. A stale
-   recovery result cannot reopen the newer generation. Discard-only/uncertain
+   recovery result cannot reopen the newer generation. A repeated notification
+   while already cold and paused acknowledges that fence directly; it needs no
+   extra resume/drain/pause cycle. Bound only VM resume completion on wake, not
+   authority recovery. The guest consumes the token, returns per-mount recovering
+   status and recovers mounts independently. A slow or unavailable authority
+   leaves its mount closed without discarding shells or other mounts. Status
+   polling reconciles a lost recovery reply. Initial activation and replacement
+   obtain generation-tagged proofs from the driver, never from the caller.
+   Discard-only/uncertain
    state stops without resuming old RAM; only exact termination permits a new
    coordinator with a new boot identity. A cancelled sleep reconciles the current
-   generation by the same cold recovery path. Dark wake stays paused.
+   generation by the same cold recovery path. Dark wake stays paused. Startup
+   and the paired Hello share a 20-second deadline. Unknown stop state retains
+   any outstanding stop and queries the exact VM state before another attempt;
+   another wake never duplicates a pending stop.
 
 Voluntary updates require a clean drain and shutdown; defer an undrainable
 update. Forced sleep may report loss and discard. Neither policy converts
@@ -168,28 +202,36 @@ oneof members, incorrect wire types and noncanonical encoding before dispatch.
 The descriptor-generated scanner bounds repeated fields at 128 and nesting at
 16 before protobuf allocation. Semantic validation further limits rosters to
 64 mounts, byte/string fields to 65,536 bytes, volume IDs to 128 ASCII bytes,
-release versions to 128 bytes, and reasons/endpoints to 4,096 bytes. IDs/nonces
+release versions to 128 bytes, reasons to 256 UTF-8 bytes and endpoints to
+4,096 bytes. IDs/nonces
 are nonzero 16-byte values; authority, image and route digests are nonzero
 32-byte values. Commits are 40 lowercase hexadecimal bytes. Volume IDs use letters, digits, dot, underscore and hyphen; they must be
 nonempty single path components other than dot/dot-dot. Release versions use
 printable ASCII without spaces. These restrictions make identity comparisons
 byte-exact in both languages.
 
-A roster sorts by lowercase authority digest, volume ID, then lowercase mount
-incarnation, separated by slash; one authority/volume appears once. Repeated
-per-mount results must equal that ordered roster exactly. Loss sequences are
-strictly increasing, at most 128 records per mount, and cumulative for that
-mount incarnation. Capacity exhaustion keeps the mount closed; it never erases
-an old failure. A loss record carries sequence, accepted-entry and byte counts,
-and reason. Cold completion never implies loss-free durability.
+A roster sorts by byte order of the joined lowercase `hex/volume/hex` key;
+this is not tuple order when a volume is a prefix of another. One
+authority/volume appears once. Repeated per-mount results equal that ordered
+roster exactly. Loss sequences increase strictly and remain cumulative for the
+mount incarnation. Reports carry at most 32 records per mount with 256-byte
+reasons. On overflow the first 31 records remain fixed and the final record
+aggregates the remainder, retaining the highest sequence and saturating
+accepted-entry/byte counters. The driver retains exact barrier outcomes.
+Overflow terminalizes only that mount for exact cleanup/replacement; its cold
+withdrawal still counts toward suspension. Later reports cannot reduce a
+reported aggregate. Even 64 active and 16 retired maximum-size mount ledgers, statuses and identities
+fit a 1 MiB frame by construction. Cold completion never implies loss-free
+durability.
 
 | Body | Required meaning |
 | --- | --- |
 | Hello / HelloAck | First paired exchange: app version, commit, image digest and authority major 8, boot nonce and host-service incarnation. Host leaves guest-service ID empty; guest responds with its fresh incarnation. Exact release/boot/host equality is required before other requests. Restart invalidates the pairing and all old tokens. |
-| Suspend / SuspendAck | Full bound suspension identity and fixed roster. Ack echoes it and reports each mount's cold-complete bit and loss ledger. Incomplete cold proof cannot create eligibility. |
+| Suspend / SuspendAck | Request carries transaction identity with an empty roster. The guest fixes membership and returns it with every mount's loss ledger only after whole-roster cold completion. There is no partial cold acknowledgement or redundant cold bit; Status reports progress. |
 | Resume / ResumeAck | Full suspension plus new wake nonce. Consume once; reply echoes the exact token with each mount's recovery/cleanup status and retained loss. It grants no authority permission itself. |
 | Status / StatusReply | Typed boot/service/generation state and mount statuses. Terminal authorization and retained cleanup remain distinct. |
-| Provision | Mount identity, authority endpoint, CA, client certificate, signed capability, route revision and guest-generated public key only. No private-key or issuer-key field or import path. |
+| RetireAck / Result | Status reports the first 16 unacknowledged retired outcomes. An observer acknowledges their exact contents in retirement order only after retaining them; the guest frees that capacity. No unobserved outcome is evicted. |
+| Provision | Mount identity, authority endpoint, CA, client certificate, signed capability, route revision and guest-generated public key only. No private-key or issuer-key field or import path. The guest compares public-key bytes with its locally generated identity before accepting provisioned material; a substring scan does not establish key identity. |
 | Mount / Umount / Result | Exact mount identity; typed accepted, unavailable, authorization-required or refused result with a reason. Admission remains subject to the fixed-roster and local-volume reservation rules. |
 
 Every envelope has a nonzero request ID. The host allocates strictly increasing
@@ -251,8 +293,9 @@ file tools execute in Linux.
 Stage 1a contains no VM/image, VZ or power adapter, vsock listener, signed service,
 real mount suspension, durable guest inventory, provisioning dispatcher, CLI
 workspace commands, SSH bridge, editor integration, release asset or installer
-change. The reserved guest command refuses startup explicitly. No new runtime
-environment switches, fallback paths or authority behavior accompany it.
+change. The guest daemon command remains absent from product registration
+until Stage 1b supplies its real transport. No new runtime environment switches,
+fallback paths or authority behavior accompany it.
 
 All new workspace surfaces are pending and unreleased: the control grammar,
 service identity/entitlements, guest paths, inventory format, image manifest,
@@ -266,7 +309,7 @@ sources/licenses, PortableFS commit and sealed app resources.
 | --- | --- |
 | Controlled fence | Model tests only in Stage 1a. Real daemon withdrawal, initial-renewal readiness and VZ completion ordering remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
 | Unfenced host sleep | OPEN. Identify the clock/execution mechanism and ordering, then qualify actual lid/menu/idle sleep on exact supported OS/hardware/image digests with independently advancing remote authority and peer. Delay the service past the notification timeout. A finite successful sample cannot replace the mechanism. |
-| Short-sleep availability | OPEN separate 45-second terminal-failure root cause and regression. Do not infer session expiry from its duration; do not duplicate that investigation in this stage. |
+| Short-sleep availability | Root cause identified: authority replay-before-coherence admission ordering. Fix and regression work are in progress in a separate PR. This stage does not change the authority or Linux data plane. |
 | Image, lifecycle and persistence | Pin Debian artifact; prove boot/FUSE INIT and kernel notification/durability behavior. Prove exact teardown/remount with cwd, fd, mapping and editor holders, no empty-directory writes, ENOSPC/image-corruption handling, signed updates and same-volume exclusion. |
 | Protocol-8 correctness | Full privileged Linux integration and coherence matrix, root barriers, dirty-tail loss, authority restart and power-loss qualification. The experiment's 22 passes, 7 skips and relay topology do not qualify the product. |
 | Network, editors and performance | Installed signed-owner NAT/privacy/VPN/IPv6 tests and each claimed editor. Measure direct product-topology RPC RTT, latency tails, Git/search/index/save and resource use without the lab relay. No performance SLO follows from the experiment. |

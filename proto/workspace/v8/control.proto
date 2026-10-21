@@ -27,6 +27,7 @@ message Suspension {
   bytes host_service_id = 2;
   bytes guest_service_id = 3;
   uint64 generation = 4;
+  // Empty in Suspend requests; guest-owned fixed membership in ack/token.
   repeated MountID roster = 5;
   bytes nonce = 6;
 }
@@ -35,10 +36,13 @@ message Loss {
   uint64 accepted_entries = 2;
   uint64 accepted_bytes = 3;
   string reason = 4;
+  // Final bounded cumulative summary; counters saturate at uint64 max.
+  bool aggregated = 5;
 }
 message MountCold {
   MountID mount = 1;
-  bool cold_complete = 2;
+  // An ack exists only after whole-roster cold completion.
+  reserved 2;
   repeated Loss loss = 3;
 }
 message SuspendAck {
@@ -68,10 +72,13 @@ message StatusReply {
   bytes host_service_id = 2;
   bytes guest_service_id = 3;
   uint64 generation = 4;
-  // running, suspending, suspended-cold, recovering, discard-only.
+  // running (including per-mount recovery), suspending, suspended-cold, discard-only.
   string state = 5;
   repeated MountStatus mounts = 6;
+  // First 16 unacknowledged retired outcomes, in retirement order.
+  repeated MountStatus retired = 7;
 }
+message RetireAck { repeated MountStatus outcomes = 1; }
 message Provision {
   MountID mount = 1;
   string authority_endpoint = 2;
@@ -105,5 +112,6 @@ message Envelope {
     MountRequest mount = 19;
     UmountRequest umount = 20;
     Result result = 21;
+    RetireAck retire_ack = 22;
   }
 }

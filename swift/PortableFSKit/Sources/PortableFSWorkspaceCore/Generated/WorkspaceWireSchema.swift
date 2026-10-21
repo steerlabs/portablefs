@@ -2,7 +2,6 @@
 import Foundation
 
 enum WorkspaceWireSchema {
-    static let digest = "57d93dd515cf48ffa0550f0b8840b6ebdc2f04f2559c17d7da943016721e67ca"
     static let messages: [String: [UInt64: WorkspaceWireField]] = [
         "Release": [
             1: .init(kind: "$", repeated: false, oneof: false),
@@ -34,10 +33,10 @@ enum WorkspaceWireSchema {
             2: .init(kind: "", repeated: false, oneof: false),
             3: .init(kind: "", repeated: false, oneof: false),
             4: .init(kind: "$", repeated: false, oneof: false),
+            5: .init(kind: "", repeated: false, oneof: false),
         ],
         "MountCold": [
             1: .init(kind: "MountID", repeated: false, oneof: false),
-            2: .init(kind: "", repeated: false, oneof: false),
             3: .init(kind: "Loss", repeated: true, oneof: false),
         ],
         "SuspendAck": [
@@ -69,6 +68,10 @@ enum WorkspaceWireSchema {
             4: .init(kind: "", repeated: false, oneof: false),
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "MountStatus", repeated: true, oneof: false),
+            7: .init(kind: "MountStatus", repeated: true, oneof: false),
+        ],
+        "RetireAck": [
+            1: .init(kind: "MountStatus", repeated: true, oneof: false),
         ],
         "Provision": [
             1: .init(kind: "MountID", repeated: false, oneof: false),
@@ -104,6 +107,7 @@ enum WorkspaceWireSchema {
             19: .init(kind: "MountRequest", repeated: false, oneof: true),
             20: .init(kind: "UmountRequest", repeated: false, oneof: true),
             21: .init(kind: "Result", repeated: false, oneof: true),
+            22: .init(kind: "RetireAck", repeated: false, oneof: true),
         ],
     ]
 }

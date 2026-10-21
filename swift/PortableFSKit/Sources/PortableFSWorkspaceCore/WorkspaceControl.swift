@@ -6,6 +6,9 @@ public enum WorkspaceControlError: Error { case grammar, pairing, transition }
 public enum WorkspaceControl {
     public static let version: UInt32 = 8
     public static let maxFrame = 1 << 20
+    public static let maxLosses = 32
+    public static let maxReason = 256
+    public static let aggregateReason = "additional accepted-tail loss (aggregated)"
     public static func id(_ value: Data) -> Bool { value.count == 16 && value.contains { $0 != 0 } }
     public static func digest(_ value: Data) -> Bool { value.count == 32 && value.contains { $0 != 0 } }
     public static func mountKey(_ mount: WorkspaceMountID) -> String {
@@ -34,9 +37,10 @@ public enum WorkspaceControl {
     }
     private static func validLoss(_ loss: [WorkspaceLoss]) -> Bool {
         var sequence: UInt64 = 0
-        guard loss.count <= 128 else { return false }
-        for item in loss {
-            guard item.sequence > sequence, !item.reason.isEmpty, item.reason.utf8.count <= 4096 else { return false }
+        guard loss.count <= maxLosses else { return false }
+        for (index, item) in loss.enumerated() {
+            guard item.sequence > sequence, !item.reason.isEmpty, item.reason.utf8.count <= maxReason,
+                  !item.aggregated || (index == maxLosses - 1 && index == loss.count - 1 && item.reason == aggregateReason) else { return false }
             sequence = item.sequence
         }
         return true
@@ -48,7 +52,48 @@ public enum WorkspaceControl {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {
             ["closed", "ready", "suspended-cold", "recovering", "terminal", "authorization-required"].contains($0.state) &&
             ["retained", "process-exited", "kernel-absent", "complete"].contains($0.cleanup) &&
-            $0.reason.utf8.count <= 4096 && validLoss($0.loss)
+            $0.reason.utf8.count <= maxReason && validLoss($0.loss) &&
+            ((["terminal", "authorization-required"].contains($0.state) && !$0.reason.isEmpty) ||
+             (!["terminal", "authorization-required"].contains($0.state) && ($0.reason.isEmpty || $0.state == "closed"))) &&
+            ($0.cleanup == "retained" || ["terminal", "authorization-required"].contains($0.state))
+        }
+    }
+    public static func validRetired(_ mounts: [WorkspaceMountStatus]) -> Bool {
+        mounts.count <= 16 && Set(mounts.map { mountKey($0.mount) }).count == mounts.count && mounts.allSatisfy {
+            validStatuses([$0]) && $0.cleanup == "complete" && ["terminal", "authorization-required"].contains($0.state)
+        }
+    }
+    public static func validResumeAck(_ ack: WorkspaceResumeAck) -> Bool {
+        validToken(ack.token) && ack.mounts.map(\.mount) == ack.token.suspension.roster && validStatuses(ack.mounts) && ack.mounts.allSatisfy { $0.state != "suspended-cold" }
+    }
+    public static func acknowledges(_ fixed: WorkspaceSuspension, request: WorkspaceSuspension) -> Bool {
+        var identity = fixed; identity.roster = []
+        return request.roster.isEmpty && identity == request
+    }
+    public static func retainsLoss(_ current: [WorkspaceLoss], prior: [WorkspaceLoss]) -> Bool {
+        guard current.count >= prior.count else { return false }
+        for (index, old) in prior.enumerated() {
+            let next = current[index]
+            if old == next { continue }
+            guard index == maxLosses - 1, next.aggregated, next.reason == aggregateReason,
+                  next.sequence >= old.sequence, next.acceptedEntries >= old.acceptedEntries,
+                  next.acceptedBytes >= old.acceptedBytes else { return false }
+        }
+        return true
+    }
+    public static func validStatus(_ status: WorkspaceStatusReply) -> Bool {
+        guard id(status.bootID), id(status.hostServiceID), id(status.guestServiceID),
+              ["running", "suspending", "suspended-cold", "discard-only"].contains(status.state), validStatuses(status.mounts), validRetired(status.retired),
+              !["suspending", "suspended-cold"].contains(status.state) || status.generation > 0 else { return false }
+        return status.mounts.allSatisfy { mount in
+            if ["terminal", "authorization-required"].contains(mount.state) { return true }
+            switch status.state {
+            case "suspended-cold": return mount.state == "suspended-cold"
+            case "suspending": return ["closed", "suspended-cold"].contains(mount.state)
+            case "discard-only": return mount.state == "closed"
+            case "running": return mount.state != "suspended-cold"
+            default: return true
+            }
         }
     }
     public static func validToken(_ token: WorkspaceResumeToken) -> Bool { validSuspension(token.suspension) && id(token.wakeNonce) }
@@ -57,21 +102,21 @@ public enum WorkspaceControl {
         switch e.body {
         case .hello(let h): ok = validRelease(h.release) && id(h.bootID) && id(h.hostServiceID) && h.guestServiceID.isEmpty
         case .helloAck(let h): ok = validRelease(h.release) && id(h.bootID) && id(h.hostServiceID) && id(h.guestServiceID)
-        case .suspend(let s): ok = validSuspension(s)
+        case .suspend(let s): ok = validSuspension(s) && s.roster.isEmpty
         case .suspendAck(let a): ok = validColdAck(a)
         case .resume(let t): ok = validToken(t)
-        case .resumeAck(let a): ok = validToken(a.token) && a.mounts.map(\.mount) == a.token.suspension.roster && validStatuses(a.mounts)
+        case .resumeAck(let a): ok = validResumeAck(a)
         case .status: ok = true
         case .statusReply(let s):
-            ok = id(s.bootID) && id(s.hostServiceID) && id(s.guestServiceID) &&
-                ["running", "suspending", "suspended-cold", "recovering", "discard-only"].contains(s.state) && validStatuses(s.mounts)
+            ok = validStatus(s)
+        case .retireAck(let ack): ok = !ack.outcomes.isEmpty && validRetired(ack.outcomes)
         case .provision(let p):
             let material = [p.caCertificate, p.clientCertificate, p.capability, p.publicKey]
             ok = validMount(p.mount) && !p.authorityEndpoint.isEmpty && p.authorityEndpoint.utf8.count <= 4096 &&
-                digest(p.routesRevision) && material.allSatisfy { !$0.isEmpty && $0.count <= 65536 && $0.range(of: Data("PRIVATE KEY".utf8)) == nil }
+                digest(p.routesRevision) && material.allSatisfy { !$0.isEmpty && $0.count <= 65536 }
         case .mount(let m): ok = validMount(m.mount)
         case .umount(let m): ok = validMount(m.mount)
-        case .result(let r): ok = ["accepted", "unavailable", "authorization-required", "refused"].contains(r.code) && r.reason.utf8.count <= 4096
+        case .result(let r): ok = ["accepted", "unavailable", "authorization-required", "refused"].contains(r.code) && r.reason.utf8.count <= maxReason
         case nil: break
         }
         guard e.version == version, e.requestID > 0, ok else { throw WorkspaceControlError.grammar }

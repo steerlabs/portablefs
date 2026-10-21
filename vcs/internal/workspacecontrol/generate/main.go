@@ -23,29 +23,26 @@ func run() error {
 	}
 	raw, err := os.ReadFile(os.Args[1])
 	if err != nil {
-		return err
+		return fmt.Errorf("workspace generator: %w", err)
 	}
 	var set descriptorpb.FileDescriptorSet
 	if err = proto.Unmarshal(raw, &set); err != nil {
-		return err
+		return fmt.Errorf("workspace generator: %w", err)
 	}
 	schema, err := os.ReadFile(os.Args[2])
 	if err != nil {
-		return err
+		return fmt.Errorf("workspace generator: %w", err)
 	}
 	digest := fmt.Sprintf("%x", sha256.Sum256(schema))
 	var b strings.Builder
-	fmt.Fprintf(&b, "// Code generated from proto/workspace/v8/control.proto. DO NOT EDIT.\nimport Foundation\n\nenum WorkspaceWireSchema {\n    static let digest = %q\n    static let messages: [String: [UInt64: WorkspaceWireField]] = [\n", digest)
+	fmt.Fprintf(&b, "// Code generated from proto/workspace/v8/control.proto. DO NOT EDIT.\nimport Foundation\n\nenum WorkspaceWireSchema {\n    static let messages: [String: [UInt64: WorkspaceWireField]] = [\n")
 	for _, file := range set.File {
 		for _, m := range file.MessageType {
 			fmt.Fprintf(&b, "        %q: [\n", m.GetName())
 			for _, f := range m.Field {
-				kind := "$"
-				if f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_MESSAGE {
-					parts := strings.Split(f.GetTypeName(), ".")
-					kind = parts[len(parts)-1]
-				} else if f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_UINT64 || f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_UINT32 || f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_BOOL {
-					kind = ""
+				kind, err := fieldKind(f)
+				if err != nil {
+					return fmt.Errorf("generate %s.%s: %w", m.GetName(), f.GetName(), err)
 				}
 				fmt.Fprintf(&b, "            %d: .init(kind: %q, repeated: %t, oneof: %t),\n", f.GetNumber(), kind, f.GetLabel() == descriptorpb.FieldDescriptorProto_LABEL_REPEATED, f.OneofIndex != nil)
 			}
@@ -57,15 +54,29 @@ func run() error {
 	}
 	b.WriteString("    ]\n}\n")
 	if err = os.WriteFile(os.Args[3], []byte(b.String()), 0644); err != nil {
-		return err
+		return fmt.Errorf("workspace generator: %w", err)
 	}
 	var bindingHashes []string
 	for _, path := range []string{os.Args[5], os.Args[6]} {
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return err
+			return fmt.Errorf("workspace generator: %w", err)
 		}
 		bindingHashes = append(bindingHashes, fmt.Sprintf("%x", sha256.Sum256(raw)))
 	}
 	return os.WriteFile(os.Args[4], fmt.Appendf(nil, "// Code generated from proto/workspace/v8/control.proto. DO NOT EDIT.\npackage workspacecontrol\n\nconst SchemaSHA256 = %q\nconst GoBindingSHA256 = %q\nconst SwiftBindingSHA256 = %q\nconst SwiftWireSchemaSHA256 = %q\n", digest, bindingHashes[0], bindingHashes[1], fmt.Sprintf("%x", sha256.Sum256([]byte(b.String())))), 0644)
+}
+
+func fieldKind(f *descriptorpb.FieldDescriptorProto) (string, error) {
+	switch f.GetType() {
+	case descriptorpb.FieldDescriptorProto_TYPE_MESSAGE:
+		parts := strings.Split(f.GetTypeName(), ".")
+		return parts[len(parts)-1], nil
+	case descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptorpb.FieldDescriptorProto_TYPE_BYTES:
+		return "$", nil
+	case descriptorpb.FieldDescriptorProto_TYPE_UINT32, descriptorpb.FieldDescriptorProto_TYPE_UINT64, descriptorpb.FieldDescriptorProto_TYPE_BOOL:
+		return "", nil
+	default:
+		return "", fmt.Errorf("unsupported field type %s", f.GetType())
+	}
 }
