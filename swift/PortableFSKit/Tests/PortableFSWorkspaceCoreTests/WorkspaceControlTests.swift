@@ -74,8 +74,8 @@ func workspaceGolden(_ name: String) throws -> Data {
         }
         return m
     }
-    status.retired = Array(status.mounts.prefix(16)).map { old in
-        var retired = old; retired.mount.incarnation = Data(repeating: 99, count: 16); return retired
+    status.retired = Array(status.mounts.prefix(16)).enumerated().map { index, old in
+        var retired = old; retired.retirementSequence = UInt64(index + 1); retired.mount.incarnation = Data(repeating: 99, count: 16); return retired
     }
     var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = UInt64.max; envelope.body = .statusReply(status)
     let frame = try WorkspaceControl.encode(envelope)

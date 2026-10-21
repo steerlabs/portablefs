@@ -336,7 +336,7 @@ func TestGuestRecoveryRequiresEveryFreshProof(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if m.isOpen() || a.Mounts[0].State != "closed" {
+			if m.isOpen() || a.Mounts[0].State != "terminal" {
 				t.Fatal("incomplete proof reopened mount")
 			}
 		})
@@ -387,10 +387,20 @@ func TestGuestTerminalReplacementRequiresExactCleanupAndAuthorization(t *testing
 		t.Fatal("missing driver proof accepted")
 	}
 	m.prepareResult = nil
-	if err := s.Activate(context.Background(), replacement, 0); err != nil {
+	if err := s.Activate(context.Background(), replacement, 0); err == nil {
+		t.Fatal("failed Prepare retried on terminal incarnation")
+	}
+	if err := s.Cleanup(replacement, CleanupProof{ProcessExited: true, KernelAbsent: true}); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Retired()) != 1 || s.Retired()[0].Loss[0].Sequence != 1 {
+	next := mountID(11)
+	if err := s.Replace(context.Background(), replacement, next, Witness{}, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Activate(context.Background(), next, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Retired()) != 2 || s.Retired()[0].Loss[0].Sequence != 1 {
 		t.Fatal("replacement erased old run")
 	}
 }
@@ -781,14 +791,12 @@ func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 				t.Fatal("unobserved retired outcomes discarded")
 			}
 			observed := s.Retired()
-			altered := clone(observed[0])
-			altered.Reason = "different"
-			if err := s.AcknowledgeRetired([]*pb.MountStatus{altered}); err == nil {
+			if err := s.AcknowledgeRetired(s.retirementSequence + 1); err == nil {
 				t.Fatal("unchecked acknowledgement erased loss")
 			}
 			for len(observed) > 0 {
 				batch := min(len(observed), control.MaxRetiredBatch)
-				if err := s.AcknowledgeRetired(observed[:batch]); err != nil {
+				if err := s.AcknowledgeRetired(observed[batch-1].RetirementSequence); err != nil {
 					t.Fatal(err)
 				}
 				observed = observed[batch:]

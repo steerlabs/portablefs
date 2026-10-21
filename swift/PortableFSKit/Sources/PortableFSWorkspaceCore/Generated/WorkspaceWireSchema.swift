@@ -53,6 +53,7 @@ enum WorkspaceWireSchema {
             3: .init(kind: "$", repeated: false, oneof: false),
             4: .init(kind: "Loss", repeated: true, oneof: false),
             5: .init(kind: "$", repeated: false, oneof: false),
+            6: .init(kind: "", repeated: false, oneof: false),
         ],
         "ResumeAck": [
             1: .init(kind: "ResumeToken", repeated: false, oneof: false),
@@ -71,7 +72,7 @@ enum WorkspaceWireSchema {
             7: .init(kind: "MountStatus", repeated: true, oneof: false),
         ],
         "RetireAck": [
-            1: .init(kind: "MountStatus", repeated: true, oneof: false),
+            1: .init(kind: "", repeated: false, oneof: false),
         ],
         "Provision": [
             1: .init(kind: "MountID", repeated: false, oneof: false),

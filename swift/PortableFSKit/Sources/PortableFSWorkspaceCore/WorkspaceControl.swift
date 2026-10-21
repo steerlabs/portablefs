@@ -48,8 +48,9 @@ public enum WorkspaceControl {
     public static func validColdAck(_ ack: WorkspaceSuspendAck) -> Bool {
         validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) }
     }
-    private static func validStatuses(_ mounts: [WorkspaceMountStatus]) -> Bool {
+    private static func validStatuses(_ mounts: [WorkspaceMountStatus], retired: Bool = false) -> Bool {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {
+            ($0.retirementSequence > 0) == retired &&
             ["closed", "ready", "suspended-cold", "recovering", "terminal", "authorization-required"].contains($0.state) &&
             ["retained", "process-exited", "kernel-absent", "complete"].contains($0.cleanup) &&
             $0.reason.utf8.count <= maxReason && validLoss($0.loss) &&
@@ -59,8 +60,9 @@ public enum WorkspaceControl {
         }
     }
     public static func validRetired(_ mounts: [WorkspaceMountStatus]) -> Bool {
+        zip(mounts, mounts.dropFirst()).allSatisfy { $0.retirementSequence < UInt64.max && $1.retirementSequence == $0.retirementSequence + 1 } &&
         mounts.count <= 16 && Set(mounts.map { mountKey($0.mount) }).count == mounts.count && mounts.allSatisfy {
-            validStatuses([$0]) && $0.cleanup == "complete" && ["terminal", "authorization-required"].contains($0.state)
+            validStatuses([$0], retired: true) && $0.cleanup == "complete" && ["terminal", "authorization-required"].contains($0.state)
         }
     }
     public static func validResumeAck(_ ack: WorkspaceResumeAck) -> Bool {
@@ -109,7 +111,7 @@ public enum WorkspaceControl {
         case .status: ok = true
         case .statusReply(let s):
             ok = validStatus(s)
-        case .retireAck(let ack): ok = !ack.outcomes.isEmpty && validRetired(ack.outcomes)
+        case .retireAck(let ack): ok = ack.throughSequence > 0
         case .provision(let p):
             let material = [p.caCertificate, p.clientCertificate, p.capability, p.publicKey]
             ok = validMount(p.mount) && !p.authorityEndpoint.isEmpty && p.authorityEndpoint.utf8.count <= 4096 &&

@@ -49,12 +49,13 @@ private enum InjectedFailure: Error { case failed }
     func next() -> Data { value += 1; return Data(repeating: value, count: 16) }
 }
 @MainActor private final class FakeChannel: WorkspaceGuestChannel {
+    var isIdle = true
     var wrongRelease = false
     var holdHello = false
     var hellos: [(Result<WorkspaceHello, Error>) -> Void] = []
     var roster: [WorkspaceMountID] = []
-    var retiredAcks: [([WorkspaceMountStatus], (Result<Void, Error>) -> Void)] = []
-    func acknowledgeRetired(_ outcomes: [WorkspaceMountStatus], completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((outcomes, completion)) }
+    var retiredAcks: [(UInt64, (Result<Void, Error>) -> Void)] = []
+    func acknowledgeRetired(through sequence: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((sequence, completion)) }
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
     var resumes: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
@@ -449,6 +450,7 @@ private enum InjectedFailure: Error { case failed }
     var old = r.coordinator.mountStatus[0]; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
     replacement.state = "ready"; replacement.reason = ""; replacement.cleanup = "retained"
+    old.retirementSequence = 1
     status.mounts = [replacement]; status.retired = [old]
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
@@ -498,6 +500,7 @@ private enum InjectedFailure: Error { case failed }
     var earlier = old; earlier.mount.volumeID = "earlier"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
     replacement.state = "ready"; replacement.reason = ""; replacement.cleanup = "retained"
+    earlier.retirementSequence = 1; old.retirementSequence = 2
     status.mounts = [replacement]; status.retired = [earlier]
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.retiredStatus == [earlier])

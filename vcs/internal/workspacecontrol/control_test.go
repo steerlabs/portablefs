@@ -42,6 +42,10 @@ func fixtures() map[string]*pb.Envelope {
 	loss := []*pb.Loss{{Sequence: 1, AcceptedEntries: 1, AcceptedBytes: 4096, Reason: "accepted tail unprovable"}}
 	token := &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}
 	status := &pb.MountStatus{Mount: fixtureMount(), State: "terminal", Reason: "session ended; reopen required", Loss: loss, Cleanup: "retained"}
+	retired := proto.Clone(status).(*pb.MountStatus)
+	retired.Mount.Incarnation = fixtureID(10)
+	retired.Cleanup = "complete"
+	retired.RetirementSequence = 1
 	bodies := map[string]*pb.Envelope{
 		"hello": {Body: &pb.Envelope_Hello{Hello: h}}, "hello_ack": {Body: &pb.Envelope_HelloAck{HelloAck: guest}},
 		"suspend":      {Body: &pb.Envelope_Suspend{Suspend: request}},
@@ -49,11 +53,11 @@ func fixtures() map[string]*pb.Envelope {
 		"resume":       {Body: &pb.Envelope_Resume{Resume: token}},
 		"resume_ack":   {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{status}}}},
 		"status":       {Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}},
-		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}}}},
+		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}, Retired: []*pb.MountStatus{retired}}}},
 		"provision":    {Body: &pb.Envelope_Provision{Provision: &pb.Provision{Mount: fixtureMount(), AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("public CA"), ClientCertificate: []byte("public certificate"), Capability: []byte("signed capability"), PublicKey: []byte("guest public key"), RoutesRevision: bytes.Repeat([]byte{9}, 32)}}},
 		"mount":        {Body: &pb.Envelope_Mount{Mount: &pb.MountRequest{Mount: fixtureMount()}}},
 		"umount":       {Body: &pb.Envelope_Umount{Umount: &pb.UmountRequest{Mount: fixtureMount()}}},
-		"retire_ack":   {Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{Outcomes: []*pb.MountStatus{{Mount: fixtureMount(), State: "terminal", Reason: "session ended", Cleanup: "complete"}}}}},
+		"retire_ack":   {Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{ThroughSequence: 1}}},
 		"result":       {Body: &pb.Envelope_Result{Result: &pb.Result{Code: "unavailable", Reason: "mount integration pending"}}},
 	}
 	for _, e := range bodies {
@@ -299,6 +303,7 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 	for i := 0; i < MaxRetiredBatch; i++ {
 		r := proto.Clone(statuses[i]).(*pb.MountStatus)
 		r.Mount.Incarnation = fixtureID(30)
+		r.RetirementSequence = uint64(i + 1)
 		retired = append(retired, r)
 	}
 	for name, e := range map[string]*pb.Envelope{

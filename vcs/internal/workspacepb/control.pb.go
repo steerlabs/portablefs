@@ -545,9 +545,11 @@ type MountStatus struct {
 	Reason string  `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
 	Loss   []*Loss `protobuf:"bytes,4,rep,name=loss,proto3" json:"loss,omitempty"`
 	// retained, process-exited, kernel-absent, complete; never inferred from errno.
-	Cleanup       string `protobuf:"bytes,5,opt,name=cleanup,proto3" json:"cleanup,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Cleanup string `protobuf:"bytes,5,opt,name=cleanup,proto3" json:"cleanup,omitempty"`
+	// Zero for active mounts; strictly increasing for retired outcomes per guest.
+	RetirementSequence uint64 `protobuf:"varint,6,opt,name=retirement_sequence,json=retirementSequence,proto3" json:"retirement_sequence,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *MountStatus) Reset() {
@@ -613,6 +615,13 @@ func (x *MountStatus) GetCleanup() string {
 		return x.Cleanup
 	}
 	return ""
+}
+
+func (x *MountStatus) GetRetirementSequence() uint64 {
+	if x != nil {
+		return x.RetirementSequence
+	}
+	return 0
 }
 
 type ResumeAck struct {
@@ -797,11 +806,12 @@ func (x *StatusReply) GetRetired() []*MountStatus {
 	return nil
 }
 
+// Idempotently acknowledge all retired outcomes through this sequence.
 type RetireAck struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Outcomes      []*MountStatus         `protobuf:"bytes,1,rep,name=outcomes,proto3" json:"outcomes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ThroughSequence uint64                 `protobuf:"varint,1,opt,name=through_sequence,json=throughSequence,proto3" json:"through_sequence,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RetireAck) Reset() {
@@ -834,11 +844,11 @@ func (*RetireAck) Descriptor() ([]byte, []int) {
 	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{12}
 }
 
-func (x *RetireAck) GetOutcomes() []*MountStatus {
+func (x *RetireAck) GetThroughSequence() uint64 {
 	if x != nil {
-		return x.Outcomes
+		return x.ThroughSequence
 	}
-	return nil
+	return 0
 }
 
 type Provision struct {
@@ -1401,13 +1411,14 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"suspension\x18\x01 \x01(\v2#.portablefs.workspace.v8.SuspensionR\n" +
 	"suspension\x12\x1d\n" +
 	"\n" +
-	"wake_nonce\x18\x02 \x01(\fR\twakeNonce\"\xc0\x01\n" +
+	"wake_nonce\x18\x02 \x01(\fR\twakeNonce\"\xf1\x01\n" +
 	"\vMountStatus\x126\n" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\x121\n" +
 	"\x04loss\x18\x04 \x03(\v2\x1d.portablefs.workspace.v8.LossR\x04loss\x12\x18\n" +
-	"\acleanup\x18\x05 \x01(\tR\acleanup\"\x85\x01\n" +
+	"\acleanup\x18\x05 \x01(\tR\acleanup\x12/\n" +
+	"\x13retirement_sequence\x18\x06 \x01(\x04R\x12retirementSequence\"\x85\x01\n" +
 	"\tResumeAck\x12:\n" +
 	"\x05token\x18\x01 \x01(\v2$.portablefs.workspace.v8.ResumeTokenR\x05token\x12<\n" +
 	"\x06mounts\x18\x02 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\"\x0f\n" +
@@ -1421,9 +1432,9 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"generation\x12\x14\n" +
 	"\x05state\x18\x05 \x01(\tR\x05state\x12<\n" +
 	"\x06mounts\x18\x06 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\x12>\n" +
-	"\aretired\x18\a \x03(\v2$.portablefs.workspace.v8.MountStatusR\aretired\"M\n" +
-	"\tRetireAck\x12@\n" +
-	"\boutcomes\x18\x01 \x03(\v2$.portablefs.workspace.v8.MountStatusR\boutcomes\"\xb0\x02\n" +
+	"\aretired\x18\a \x03(\v2$.portablefs.workspace.v8.MountStatusR\aretired\"6\n" +
+	"\tRetireAck\x12)\n" +
+	"\x10through_sequence\x18\x01 \x01(\x04R\x0fthroughSequence\"\xb0\x02\n" +
 	"\tProvision\x126\n" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x12-\n" +
 	"\x12authority_endpoint\x18\x02 \x01(\tR\x11authorityEndpoint\x12%\n" +
@@ -1512,28 +1523,27 @@ var file_proto_workspace_v8_control_proto_depIdxs = []int32{
 	8,  // 10: portablefs.workspace.v8.ResumeAck.mounts:type_name -> portablefs.workspace.v8.MountStatus
 	8,  // 11: portablefs.workspace.v8.StatusReply.mounts:type_name -> portablefs.workspace.v8.MountStatus
 	8,  // 12: portablefs.workspace.v8.StatusReply.retired:type_name -> portablefs.workspace.v8.MountStatus
-	8,  // 13: portablefs.workspace.v8.RetireAck.outcomes:type_name -> portablefs.workspace.v8.MountStatus
-	2,  // 14: portablefs.workspace.v8.Provision.mount:type_name -> portablefs.workspace.v8.MountID
-	2,  // 15: portablefs.workspace.v8.MountRequest.mount:type_name -> portablefs.workspace.v8.MountID
-	2,  // 16: portablefs.workspace.v8.UmountRequest.mount:type_name -> portablefs.workspace.v8.MountID
-	1,  // 17: portablefs.workspace.v8.Envelope.hello:type_name -> portablefs.workspace.v8.Hello
-	1,  // 18: portablefs.workspace.v8.Envelope.hello_ack:type_name -> portablefs.workspace.v8.Hello
-	3,  // 19: portablefs.workspace.v8.Envelope.suspend:type_name -> portablefs.workspace.v8.Suspension
-	6,  // 20: portablefs.workspace.v8.Envelope.suspend_ack:type_name -> portablefs.workspace.v8.SuspendAck
-	7,  // 21: portablefs.workspace.v8.Envelope.resume:type_name -> portablefs.workspace.v8.ResumeToken
-	9,  // 22: portablefs.workspace.v8.Envelope.resume_ack:type_name -> portablefs.workspace.v8.ResumeAck
-	10, // 23: portablefs.workspace.v8.Envelope.status:type_name -> portablefs.workspace.v8.StatusRequest
-	11, // 24: portablefs.workspace.v8.Envelope.status_reply:type_name -> portablefs.workspace.v8.StatusReply
-	13, // 25: portablefs.workspace.v8.Envelope.provision:type_name -> portablefs.workspace.v8.Provision
-	14, // 26: portablefs.workspace.v8.Envelope.mount:type_name -> portablefs.workspace.v8.MountRequest
-	15, // 27: portablefs.workspace.v8.Envelope.umount:type_name -> portablefs.workspace.v8.UmountRequest
-	16, // 28: portablefs.workspace.v8.Envelope.result:type_name -> portablefs.workspace.v8.Result
-	12, // 29: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
-	30, // [30:30] is the sub-list for method output_type
-	30, // [30:30] is the sub-list for method input_type
-	30, // [30:30] is the sub-list for extension type_name
-	30, // [30:30] is the sub-list for extension extendee
-	0,  // [0:30] is the sub-list for field type_name
+	2,  // 13: portablefs.workspace.v8.Provision.mount:type_name -> portablefs.workspace.v8.MountID
+	2,  // 14: portablefs.workspace.v8.MountRequest.mount:type_name -> portablefs.workspace.v8.MountID
+	2,  // 15: portablefs.workspace.v8.UmountRequest.mount:type_name -> portablefs.workspace.v8.MountID
+	1,  // 16: portablefs.workspace.v8.Envelope.hello:type_name -> portablefs.workspace.v8.Hello
+	1,  // 17: portablefs.workspace.v8.Envelope.hello_ack:type_name -> portablefs.workspace.v8.Hello
+	3,  // 18: portablefs.workspace.v8.Envelope.suspend:type_name -> portablefs.workspace.v8.Suspension
+	6,  // 19: portablefs.workspace.v8.Envelope.suspend_ack:type_name -> portablefs.workspace.v8.SuspendAck
+	7,  // 20: portablefs.workspace.v8.Envelope.resume:type_name -> portablefs.workspace.v8.ResumeToken
+	9,  // 21: portablefs.workspace.v8.Envelope.resume_ack:type_name -> portablefs.workspace.v8.ResumeAck
+	10, // 22: portablefs.workspace.v8.Envelope.status:type_name -> portablefs.workspace.v8.StatusRequest
+	11, // 23: portablefs.workspace.v8.Envelope.status_reply:type_name -> portablefs.workspace.v8.StatusReply
+	13, // 24: portablefs.workspace.v8.Envelope.provision:type_name -> portablefs.workspace.v8.Provision
+	14, // 25: portablefs.workspace.v8.Envelope.mount:type_name -> portablefs.workspace.v8.MountRequest
+	15, // 26: portablefs.workspace.v8.Envelope.umount:type_name -> portablefs.workspace.v8.UmountRequest
+	16, // 27: portablefs.workspace.v8.Envelope.result:type_name -> portablefs.workspace.v8.Result
+	12, // 28: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
+	29, // [29:29] is the sub-list for method output_type
+	29, // [29:29] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_proto_workspace_v8_control_proto_init() }

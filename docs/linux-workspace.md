@@ -14,9 +14,9 @@ remains the sole authority; the guest is a mount host using authority protocol
 
 One signed `PortableFSWorkspaceService.app`, nested in PortableFS.app and
 registered through SMAppService, will own one persistent VM per Mac user on its
-serialized Virtualization.framework queue. The coordinator and adapter entry
-points run on MainActor. VZ adapters dispatch framework calls to the VM owner
-queue and return completions to MainActor without blocking either queue. Power
+main serial dispatch queue, which also runs the MainActor coordinator and
+adapter entry points. Descriptor I/O runs on dedicated serial queues without
+blocking the VM-owner queue. Power
 adapters capture the continuous arrival timestamp before the actor hop. Closing
 the menu app leaves that service running. Only this service receives the virtualization entitlement.
 Workspace setup does not require the FSKit extension.
@@ -55,7 +55,9 @@ enrollment, route revision, cleanup phase and the old run's loss outcome.
 A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
 Stage 1a models these identities and cleanup in memory. It retains up to 128
-retired outcomes until the observer acknowledges their exact contents. Full
+retired outcomes with monotonic, guest-incarnation-scoped sequence numbers.
+The observer retains exact outcomes, then acknowledges through a sequence;
+duplicate or older acknowledgements succeed without erasing newer outcomes. Full
 capacity applies temporary replacement backpressure; acknowledgement frees it.
 Crash-safe inventory and real cleanup remain pending.
 
@@ -105,7 +107,9 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    completion on its serial queue. Eligibility requires the complete roster's
    cold acknowledgement and confirmed pause for the same generation. Host
    continuous time measures every budget, including delayed callbacks. The
-   model defaults to absolute deadlines of 15 seconds for drain, 17.5 seconds
+   control queue must be empty before pause. Retirement acknowledgement is
+   permitted only while running or recovering. The model defaults to absolute
+   deadlines of 15 seconds for drain, 17.5 seconds
    for confirmed pause and 20 seconds total after native notification arrival,
    reserving stop time within that budget. The timestamp precedes the MainActor
    hop; queue delay consumes the budget. This does not bound the gap between
@@ -134,8 +138,11 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    extra resume/drain/pause cycle. Bound only VM resume completion on wake, not
    authority recovery. The guest consumes the token, returns per-mount recovering
    status and recovers mounts independently. A slow or unavailable authority
-   leaves its mount closed without discarding shells or other mounts. Status
-   polling reconciles a lost recovery reply. Initial activation and replacement
+   keeps its mount recovering while its driver is pending. A failed Prepare or
+   Recover terminalizes that mount; exact cleanup and replacement with a new
+   incarnation obtain a fresh Prepare proof. There is no same-incarnation retry.
+   Other mounts and shells continue. Status polling reconciles an invalid but
+   decodable recovery reply; paired-channel loss discards the VM. Initial activation and replacement
    obtain generation-tagged proofs from the driver, never from the caller.
    Discard-only/uncertain
    state stops without resuming old RAM; only exact termination permits a new
@@ -230,7 +237,7 @@ durability.
 | Suspend / SuspendAck | Request carries transaction identity with an empty roster. The guest fixes membership and returns it with every mount's loss ledger only after whole-roster cold completion. There is no partial cold acknowledgement or redundant cold bit; Status reports progress. |
 | Resume / ResumeAck | Full suspension plus new wake nonce. Consume once; reply echoes the exact token with each mount's recovery/cleanup status and retained loss. It grants no authority permission itself. |
 | Status / StatusReply | Typed boot/service/generation state and mount statuses. Terminal authorization and retained cleanup remain distinct. |
-| RetireAck / Result | Status reports the first 16 unacknowledged retired outcomes. An observer acknowledges their exact contents in retirement order only after retaining them; the guest frees that capacity. No unobserved outcome is evicted. |
+| RetireAck / Result | Status reports the first 16 unacknowledged retired outcomes. Each outcome has a monotonic retirement sequence. After retaining the outcomes, the observer acknowledges through a sequence in the exposed batch; duplicate/older acknowledgements succeed, future acknowledgements are refused without closing the channel. The host keeps one acknowledgement in flight; the guest frees only acknowledged capacity. No unobserved outcome is evicted. |
 | Provision | Mount identity, authority endpoint, CA, client certificate, signed capability, route revision and guest-generated public key only. No private-key or issuer-key field or import path. The guest compares public-key bytes with its locally generated identity before accepting provisioned material; a substring scan does not establish key identity. |
 | Mount / Umount / Result | Exact mount identity; typed accepted, unavailable, authorization-required or refused result with a reason. Admission remains subject to the fixed-roster and local-volume reservation rules. |
 

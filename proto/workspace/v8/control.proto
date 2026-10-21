@@ -61,6 +61,8 @@ message MountStatus {
   repeated Loss loss = 4;
   // retained, process-exited, kernel-absent, complete; never inferred from errno.
   string cleanup = 5;
+  // Zero for active mounts; strictly increasing for retired outcomes per guest.
+  uint64 retirement_sequence = 6;
 }
 message ResumeAck {
   ResumeToken token = 1;
@@ -78,7 +80,8 @@ message StatusReply {
   // First 16 unacknowledged retired outcomes, in retirement order.
   repeated MountStatus retired = 7;
 }
-message RetireAck { repeated MountStatus outcomes = 1; }
+// Idempotently acknowledge all retired outcomes through this sequence.
+message RetireAck { uint64 through_sequence = 1; }
 message Provision {
   MountID mount = 1;
   string authority_endpoint = 2;

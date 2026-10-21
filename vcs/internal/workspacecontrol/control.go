@@ -242,10 +242,10 @@ func ColdAck(a *pb.SuspendAck) error {
 	}
 	return nil
 }
-func statuses(ms []*pb.MountStatus) error {
+func statuses(ms []*pb.MountStatus, retired bool) error {
 	roster := make([]*pb.MountID, 0, len(ms))
 	for _, m := range ms {
-		if m == nil {
+		if m == nil || (m.RetirementSequence != 0) != retired {
 			return invalid("statuses: invalid field or state combination")
 		}
 		roster = append(roster, m.Mount)
@@ -277,15 +277,17 @@ func RetiredStatuses(ms []*pb.MountStatus) error {
 		return invalid("retired outcome batch exceeds limit")
 	}
 	seen := map[string]bool{}
+	var sequence uint64
 	for _, m := range ms {
-		if err := statuses([]*pb.MountStatus{m}); err != nil {
+		if err := statuses([]*pb.MountStatus{m}, true); err != nil {
 			return fmt.Errorf("retired outcome: %w", err)
 		}
 		key := MountKey(m.Mount)
-		if seen[key] || m.Cleanup != "complete" || (m.State != "terminal" && m.State != "authorization-required") {
+		if seen[key] || m.RetirementSequence <= sequence || (sequence != 0 && m.RetirementSequence != sequence+1) || m.Cleanup != "complete" || (m.State != "terminal" && m.State != "authorization-required") {
 			return invalid("retired outcome requires unique, exactly cleaned terminal incarnation")
 		}
 		seen[key] = true
+		sequence = m.RetirementSequence
 	}
 	return nil
 }
@@ -304,7 +306,7 @@ func ResumeAck(a *pb.ResumeAck) error {
 			return fmt.Errorf("resume acknowledgement roster member %d: %w", i, ErrGrammar)
 		}
 	}
-	if err := statuses(a.Mounts); err != nil {
+	if err := statuses(a.Mounts, false); err != nil {
 		return fmt.Errorf("resume statuses: %w", err)
 	}
 	for _, m := range a.Mounts {
@@ -358,7 +360,7 @@ func Validate(e *pb.Envelope) error {
 		if err := RetiredStatuses(s.Retired); err != nil {
 			return fmt.Errorf("status retired: %w", err)
 		}
-		if err := statuses(s.Mounts); err != nil {
+		if err := statuses(s.Mounts, false); err != nil {
 			return fmt.Errorf("status mounts: %w", err)
 		}
 		if (s.State == "suspending" || s.State == "suspended-cold") && s.Generation == 0 {
@@ -386,10 +388,10 @@ func Validate(e *pb.Envelope) error {
 		}
 		return nil
 	case *pb.Envelope_RetireAck:
-		if b.RetireAck == nil || len(b.RetireAck.Outcomes) == 0 {
-			return invalid("retire acknowledgement missing outcomes")
+		if b.RetireAck == nil || b.RetireAck.ThroughSequence == 0 {
+			return invalid("retire acknowledgement missing sequence")
 		}
-		return RetiredStatuses(b.RetireAck.Outcomes)
+		return nil
 	case *pb.Envelope_Provision:
 		return Provision(b.Provision)
 	case *pb.Envelope_Mount:

@@ -10,8 +10,8 @@ public enum WorkspacePhase: String { case stopped, starting, running, draining, 
 public enum WorkspaceVMState { case stopped, running, paused, unknown }
 
 // The model, adapter entry points and every callback execute on MainActor.
-// A VZ adapter dispatches framework work to its own serial VM-owner queue, then
-// hops back to MainActor before calling completion. It never blocks either queue.
+// The VZ adapter uses the main serial dispatch queue as its VM-owner queue.
+// Descriptor I/O uses dedicated queues; no operation blocks MainActor.
 // Completion proves the framework finished the operation on this exact VM.
 @MainActor public protocol WorkspaceVirtualMachine {
     func start(completion: @escaping (Result<Void, Error>) -> Void)
@@ -28,10 +28,13 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     func unregister()
 }
 @MainActor public protocol WorkspaceGuestChannel {
+    // True only after all queued/active control work has completed. The owner
+    // must not pause a VM while a sleep-inclusive stream deadline is armed.
+    var isIdle: Bool { get }
     func hello(_ host: WorkspaceHello, completion: @escaping (Result<WorkspaceHello, Error>) -> Void)
     func suspend(_ request: WorkspaceSuspension, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void)
     func resume(_ token: WorkspaceResumeToken, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void)
-    func acknowledgeRetired(_ outcomes: [WorkspaceMountStatus], completion: @escaping (Result<Void, Error>) -> Void)
+    func acknowledgeRetired(through sequence: UInt64, completion: @escaping (Result<Void, Error>) -> Void)
     func status(completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void)
 }
 // Continuous nanoseconds include host sleep. Deliver deadlines even if a
@@ -101,6 +104,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     private let host: WorkspaceHello
     private var guestServiceID = Data()
     private var lastNotificationID: UInt64 = 0
+    private var retirementAckInFlight: UInt64?
+    private var acknowledgedRetirement: UInt64 = 0
     private var notifications: [UInt64: UInt64] = [:]
     private let drainBudget: UInt64
     private let totalBudget: UInt64
@@ -140,7 +145,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                     let guest = try reply.get()
                     try WorkspaceControl.pair(host: self.host, guest: guest)
                     self.guestServiceID = guest.guestServiceID
-                    self.state = .running
+                    self.state = .running; self.reason = ""
                 } catch { self.stopUnsafe("exact guest release pairing not proven within deadline") }
             }
         }
@@ -249,12 +254,14 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     private func pause(cold: WorkspaceSuspension?) {
         guard case .draining(let transaction, let intent) = state else { return }
         guard clock.now < transaction.window.pause else { stopUnsafe("no time left to pause"); return }
+        guard channel.isIdle else { stopUnsafe("control queue not empty before VM pause"); return }
         state = .pausing(transaction, cold, intent)
         vm.pause { [weak self] result in
             guard let self, case .pausing(let current, let proof, let intent) = self.state,
                   current.request == transaction.request else { return }
             guard case .success = result, self.clock.now < current.window.pause else { self.stopUnsafe("VM pause not confirmed within budget"); return }
             self.state = proof.map(State.pausedCold) ?? .pausedDiscard
+            if proof != nil { self.reason = "" }
             self.acknowledgeAll(fenced: true)
             if case .awake = intent {
                 if let proof { self.resumeCold(proof) } else { self.stopUnsafe("cold drain incomplete; discard VM") }
@@ -291,7 +298,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                     self.reason = "guest recovery reply unavailable or invalid; mounts remain unavailable"; return
                 }
                 guard self.retainsLoss(ack.mounts) else { self.reason = "guest recovery erased retained loss"; return }
-                self.mountStatus = ack.mounts; self.state = .running
+                self.mountStatus = ack.mounts; self.state = .running; self.reason = ""
             }
         }
     }
@@ -301,19 +308,26 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             return WorkspaceControl.retainsLoss(current.loss, prior: old.loss)
         }
     }
-    // The observer calls this only after retaining the exact outcomes. Batches
-    // free guest inventory capacity without erasing unobserved loss.
+    // The observer retains exact outcomes before acknowledging their sequence.
+    // One in-flight ack avoids duplicate UI actions and bounds the control queue.
     public func acknowledgeRetired(_ observed: [WorkspaceMountStatus]) throws {
-        guard !observed.isEmpty, observed.count <= 16,
-              Array(retiredStatus.prefix(observed.count)) == observed else { throw WorkspaceControlError.transition }
-        channel.acknowledgeRetired(observed) { [weak self] result in
-            guard let self, case .success = result,
-                  Array(self.retiredStatus.prefix(observed.count)) == observed else { return }
-            self.retiredStatus.removeFirst(observed.count)
+        guard phase == .running || phase == .recovering,
+              !observed.isEmpty, observed.count <= 16,
+              Array(retiredStatus.prefix(observed.count)) == observed,
+              let through = observed.last?.retirementSequence, through > 0 else { throw WorkspaceControlError.transition }
+        if retirementAckInFlight == through { return }
+        guard retirementAckInFlight == nil else { throw WorkspaceControlError.transition }
+        retirementAckInFlight = through
+        channel.acknowledgeRetired(through: through) { [weak self] result in
+            guard let self, self.retirementAckInFlight == through else { return }
+            self.retirementAckInFlight = nil
+            guard case .success = result else { return }
+            self.acknowledgedRetirement = max(self.acknowledgedRetirement, through)
+            self.retiredStatus.removeAll { $0.retirementSequence <= through }
         }
     }
     // Called by the status UI/poller. Authority recovery has no VM-killing
-    // deadline; a lost ResumeAck can also be reconciled by exact guest status.
+    // deadline; an invalid decoded ResumeAck can be reconciled by exact guest status.
     public func refreshStatus() {
         guard phase == .running || phase == .recovering else { return }
         let gen = generation
@@ -323,22 +337,40 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                   status.bootID == self.host.bootID, status.hostServiceID == self.host.hostServiceID,
                   status.guestServiceID == self.guestServiceID, status.generation == gen,
                   status.state == "running" else { return }
-            let added = status.retired.filter { retired in !self.retiredStatus.contains(where: { $0.mount == retired.mount }) }
+            let unacknowledged = status.retired.filter { $0.retirementSequence > self.acknowledgedRetirement }
+            let knownThrough = self.retiredStatus.last?.retirementSequence ?? self.acknowledgedRetirement
+            let added = unacknowledged.filter { $0.retirementSequence > knownThrough }
+            guard unacknowledged.allSatisfy({ next in
+                next.retirementSequence > knownThrough || self.retiredStatus.contains(next)
+            }), added.isEmpty || (knownThrough < UInt64.max && added[0].retirementSequence == knownThrough + 1) else {
+                self.reason = "retired outcome sequence mismatch"; return
+            }
             guard self.retiredStatus.count + added.count <= 128 else { self.reason = "retired outcome acknowledgement required"; return }
             self.retiredStatus.append(contentsOf: added)
             guard self.retainsLoss(status.mounts, retired: status.retired + self.retiredStatus) else {
                 self.reason = "waiting for earlier retired outcomes before replacing active status"; return
             }
-            self.mountStatus = status.mounts; self.state = .running
+            self.mountStatus = status.mounts; self.state = .running; self.reason = ""
+        }
+    }
+    // A lost paired channel cannot restore eligibility. While awake, terminate
+    // the VM here rather than leaving a paused VM waiting for a power event.
+    public func channelLost(_ why: String) {
+        let failure = "control channel lost: " + why
+        switch state {
+        case .draining, .pausing, .pausedCold, .pausedDiscard:
+            stopUnsafe(failure)
+        case .stopped, .stopping, .unknown: break
+        default: stopUnsafe(failure)
         }
     }
     private func stopUnsafe(_ why: String) {
-        reason = why
         switch state {
         case .stopped: acknowledgeAll(fenced: true); return
         case .stopping, .unknown(.some): return
         default: break
         }
+        reason = why
         let transaction = StopTransaction()
         state = .stopping(transaction)
         if let window = window(at: clock.now) {
@@ -376,7 +408,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         }
     }
     private func finishStop() {
-        state = .stopped; acknowledgeAll(fenced: true); power.unregister()
+        state = .stopped; reason = ""; acknowledgeAll(fenced: true); power.unregister()
         guestServiceID = Data(); mountStatus = []
     }
 }

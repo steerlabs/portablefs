@@ -225,6 +225,9 @@ public nonisolated struct WorkspaceMountStatus: Sendable {
   /// retained, process-exited, kernel-absent, complete; never inferred from errno.
   public var cleanup: String = String()
 
+  /// Zero for active mounts; strictly increasing for retired outcomes per guest.
+  public var retirementSequence: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -291,12 +294,13 @@ public nonisolated struct WorkspaceStatusReply: Sendable {
   public init() {}
 }
 
+/// Idempotently acknowledge all retired outcomes through this sequence.
 public nonisolated struct WorkspaceRetireAck: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  public var outcomes: [WorkspaceMountStatus] = []
+  public var throughSequence: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -893,7 +897,7 @@ nonisolated extension WorkspaceResumeToken: SwiftProtobuf.Message, SwiftProtobuf
 
 nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MountStatus"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{1}state\0\u{1}reason\0\u{1}loss\0\u{1}cleanup\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{1}state\0\u{1}reason\0\u{1}loss\0\u{1}cleanup\0\u{3}retirement_sequence\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -906,6 +910,7 @@ nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf
       case 3: try { try decoder.decodeSingularStringField(value: &self.reason) }()
       case 4: try { try decoder.decodeRepeatedMessageField(value: &self.loss) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.cleanup) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.retirementSequence) }()
       default: break
       }
     }
@@ -931,6 +936,9 @@ nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf
     if !self.cleanup.isEmpty {
       try visitor.visitSingularStringField(value: self.cleanup, fieldNumber: 5)
     }
+    if self.retirementSequence != 0 {
+      try visitor.visitSingularUInt64Field(value: self.retirementSequence, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -940,6 +948,7 @@ nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf
     if lhs.reason != rhs.reason {return false}
     if lhs.loss != rhs.loss {return false}
     if lhs.cleanup != rhs.cleanup {return false}
+    if lhs.retirementSequence != rhs.retirementSequence {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1065,7 +1074,7 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
 
 nonisolated extension WorkspaceRetireAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RetireAck"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}outcomes\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}through_sequence\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1073,21 +1082,21 @@ nonisolated extension WorkspaceRetireAck: SwiftProtobuf.Message, SwiftProtobuf._
       // allocates stack space for every case branch when no optimizations are
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
-      case 1: try { try decoder.decodeRepeatedMessageField(value: &self.outcomes) }()
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.throughSequence) }()
       default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.outcomes.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.outcomes, fieldNumber: 1)
+    if self.throughSequence != 0 {
+      try visitor.visitSingularUInt64Field(value: self.throughSequence, fieldNumber: 1)
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: WorkspaceRetireAck, rhs: WorkspaceRetireAck) -> Bool {
-    if lhs.outcomes != rhs.outcomes {return false}
+    if lhs.throughSequence != rhs.throughSequence {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

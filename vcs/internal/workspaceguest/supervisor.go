@@ -25,7 +25,9 @@ func refused(why string) error { return fmt.Errorf("%s: %w", why, ErrState) }
 // Mount is the Stage 1c boundary. Daemons start closed and cannot acquire any
 // permission before registration and Prepare. CloseAdmission is synchronous,
 // nonblocking and generation-monotone, covering workers and physical replies.
-// It may interrupt any other call. Every installation in Prepare/Recover must
+// OpenAdmission is also synchronous and nonblocking: it only publishes a
+// previously prepared proof, performs no I/O, and must not call the supervisor.
+// CloseAdmission may interrupt any other call. Prepare/Recover installations must
 // atomically recheck cancellation and the latest CloseAdmission generation;
 // an overtaken call must install nothing, including background renewal.
 // The supervisor serializes all other driver calls per mount. Suspend waits
@@ -79,19 +81,39 @@ type entry struct {
 
 func newEntry(id *pb.MountID, w Witness, m Mount, generation uint64) *entry {
 	return &entry{driver: m, witness: w, registration: generation, serial: make(chan struct{}, 1),
-		status: &pb.MountStatus{Mount: clone(id), State: "closed", Cleanup: "retained"}}
+		status: initialStatus(id)}
+}
+
+// setState is the sole mount-state writer. Reasons belong to this transition;
+// only terminal states and closed may carry one on the paired wire.
+func (e *entry) setState(state, reason string) {
+	e.status.State = state
+	e.status.Reason = ""
+	if state == "terminal" || state == "authorization-required" || state == "closed" {
+		e.status.Reason = control.BoundedReason(reason)
+		if e.status.Reason == "" && (state == "terminal" || state == "authorization-required") {
+			e.status.Reason = "mount ended; exact cleanup and replacement required"
+		}
+	}
+}
+func initialStatus(id *pb.MountID) *pb.MountStatus {
+	e := &entry{status: &pb.MountStatus{Mount: clone(id), Cleanup: "retained"}}
+	e.setState("closed", "")
+	return e.status
 }
 
 type Supervisor struct {
-	mu                sync.Mutex
-	boot, host, guest []byte
-	generation        uint64
-	phase             string
-	suspension        *pb.Suspension
-	generationContext context.Context
-	cancel            context.CancelFunc
-	mounts            map[string]*entry
-	retired           []*pb.MountStatus
+	mu                   sync.Mutex
+	boot, host, guest    []byte
+	generation           uint64
+	phase                string
+	suspension           *pb.Suspension
+	generationContext    context.Context
+	cancel               context.CancelFunc
+	mounts               map[string]*entry
+	retired              []*pb.MountStatus
+	retirementSequence   uint64
+	acknowledgedSequence uint64
 }
 
 // A restarted service cannot infer safety while old mount processes may survive.
@@ -141,6 +163,8 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 	var err error
 	if invalid := control.Mount(id); invalid != nil {
 		err = fmt.Errorf("register identity: %w", invalid)
+	} else if s.retainedIncarnationLocked(id) {
+		err = refused("register previously retired incarnation")
 	} else if s.phase != "running" {
 		err = refused("register outside running phase")
 	} else if len(s.mounts) >= control.MaxMounts {
@@ -209,7 +233,7 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 		s.mu.Unlock()
 		return refused("activate overtaken before prepare")
 	}
-	e.status.State = "recovering"
+	e.setState("recovering", "")
 	s.mu.Unlock()
 	r, err := e.driver.Prepare(ctx, generation)
 	s.mu.Lock()
@@ -235,7 +259,7 @@ func (s *Supervisor) BeginSuspend(request *pb.Suspension) (*pb.Suspension, error
 		e.driver.CloseAdmission(max(s.generation, request.Generation))
 		e.cold = false
 		if !e.terminal {
-			e.status.State = "closed"
+			e.setState("closed", "")
 		}
 	}
 	previous := s.phase
@@ -282,8 +306,7 @@ func (s *Supervisor) mergeLossLocked(e *entry, loss []*pb.Loss) error {
 	if overflow {
 		e.terminal = true
 		e.driver.CloseAdmission(s.generation)
-		e.status.State = "terminal"
-		e.status.Reason = "loss ledger capacity reached; exact cleanup and replacement required"
+		e.setState("terminal", "loss ledger capacity reached; exact cleanup and replacement required")
 	}
 	return nil
 }
@@ -338,7 +361,7 @@ func (s *Supervisor) Drain(parent context.Context, x *pb.Suspension, id *pb.Moun
 	}
 	e.cold = true
 	if !e.terminal {
-		e.status.State = "suspended-cold"
+		e.setState("suspended-cold", "")
 	}
 	return nil
 }
@@ -368,32 +391,33 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	if e.terminal {
 		return errors.Join(refused("recovery mount is terminal"), err)
 	}
-	e.status.State = "closed"
+	e.setState("closed", "")
 	if err == nil {
 		err = ctx.Err()
 	}
 	if err == nil && r.ready(g) {
 		err = e.driver.OpenAdmission(g)
 		if err == nil {
-			e.status.State = "ready"
-			e.status.Reason = ""
+			e.setState("ready", "")
 			e.cold = false
 			return nil
 		}
 	}
 	if err == nil && (r.State == "terminal" || r.State == "authorization-required") && r.Generation == g {
 		e.terminal = true
-		e.status.State = r.State
-		e.status.Reason = control.BoundedReason(r.Reason)
-		if e.status.Reason == "" {
-			e.status.Reason = "fresh authorization required"
-		}
+		e.driver.CloseAdmission(g)
+		e.setState(r.State, r.Reason)
 		return nil
 	}
 	if err == nil {
 		err = refused("fresh generation-tagged authority recovery not proven")
 	}
-	e.status.Reason = control.BoundedReason(err.Error())
+	// A failed Prepare/Recover ends this incarnation. There is no current-
+	// generation retry: exact cleanup and a newly registered replacement obtain
+	// a fresh Prepare proof through the same supervised path as other failures.
+	e.driver.CloseAdmission(g)
+	e.terminal = true
+	e.setState("terminal", err.Error())
 	return fmt.Errorf("prepare mount %s: %w", e.status.Mount.VolumeId, err)
 }
 
@@ -419,7 +443,7 @@ func (s *Supervisor) Resume(parent context.Context, t *pb.ResumeToken) (*pb.Resu
 	for _, id := range t.Suspension.Roster {
 		e := s.mounts[control.MountKey(id)]
 		if !e.terminal {
-			e.status.State = "recovering"
+			e.setState("recovering", "")
 			ctx, done := context.WithCancel(s.generationContext)
 			go s.recoverMount(ctx, done, e, clone(t))
 		}
@@ -470,8 +494,7 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 	}
 	e.driver.CloseAdmission(s.generation)
 	e.terminal = true
-	e.status.State = "terminal"
-	e.status.Reason = control.BoundedReason(reason)
+	e.setState("terminal", reason)
 	return s.mergeLossLocked(e, loss)
 }
 func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
@@ -510,6 +533,10 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		err = fmt.Errorf("replace identity: %w", invalid)
 	} else if s.phase != "running" || e == nil || !e.cleaned {
 		err = refused("replace requires running phase and exact cleanup")
+	} else if s.retainedIncarnationLocked(id) {
+		err = refused("replace previously retired incarnation")
+	} else if s.retirementSequence == math.MaxUint64 {
+		err = refused("retired outcome sequence exhausted")
 	} else if len(s.retired) >= MaxRetired {
 		err = refused("replace waiting for retired outcome acknowledgement")
 	} else if !bytes.Equal(old.AuthorityId, id.AuthorityId) || old.VolumeId != id.VolumeId || bytes.Equal(old.Incarnation, id.Incarnation) {
@@ -523,7 +550,10 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		}
 	}
 	if err == nil {
-		s.retired = append(s.retired, clone(e.status))
+		s.retirementSequence++
+		outcome := clone(e.status)
+		outcome.RetirementSequence = s.retirementSequence
+		s.retired = append(s.retired, outcome)
 		delete(s.mounts, control.MountKey(old))
 		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation)
 	}
@@ -542,17 +572,31 @@ func (s *Supervisor) Retired() []*pb.MountStatus {
 	}
 	return out
 }
-func (s *Supervisor) AcknowledgeRetired(observed []*pb.MountStatus) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(observed) == 0 || len(observed) > control.MaxRetiredBatch || len(observed) > len(s.retired) {
-		return refused("retired acknowledgement exceeds retained outcomes")
-	}
-	for i, v := range observed {
-		if !proto.Equal(v, s.retired[i]) {
-			return refused("retired acknowledgement differs from exact outcome")
+func (s *Supervisor) retainedIncarnationLocked(id *pb.MountID) bool {
+	for _, outcome := range s.retired {
+		if proto.Equal(outcome.Mount, id) {
+			return true
 		}
 	}
-	s.retired = append([]*pb.MountStatus(nil), s.retired[len(observed):]...)
+	return false
+}
+
+// Duplicate and older acknowledgements are harmless. A future sequence cannot
+// free anything, and one request cannot skip the bounded batch Status exposed.
+func (s *Supervisor) AcknowledgeRetired(through uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if through == 0 || through > s.retirementSequence {
+		return refused("retired acknowledgement exceeds exposed outcomes")
+	}
+	if through <= s.acknowledgedSequence {
+		return nil
+	}
+	if through-s.acknowledgedSequence > control.MaxRetiredBatch {
+		return refused("retired acknowledgement exceeds exposed batch")
+	}
+	count := int(through - s.acknowledgedSequence)
+	s.retired = append([]*pb.MountStatus(nil), s.retired[count:]...)
+	s.acknowledgedSequence = through
 	return nil
 }
