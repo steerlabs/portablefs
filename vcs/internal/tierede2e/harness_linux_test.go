@@ -452,7 +452,7 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 	if !ok {
 		t.Fatal("attach recorded no mount membership")
 	}
-	mount, err := fusev3.MountVolume(context.Background(), s.mountPath, &transport{
+	mount, err := fusev3.MountVolume(context.Background(), context.Background(), s.mountPath, &transport{
 		Client: client, session: append([]byte(nil), session[:]...),
 	}, fusev3.Config{
 		MountInstanceID: instance, RequestTimeout: harnessRequestTimeout,

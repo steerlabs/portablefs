@@ -180,7 +180,7 @@ func TestDisconnectWatcherChecksExactPeerStart(t *testing.T) {
 func TestTruncatedAncillaryDisposesOfEveryDecodedRight(t *testing.T) {
 	for _, flags := range []int{unix.MSG_CTRUNC, unix.MSG_TRUNC} {
 		d, fds := descriptors(t)
-		raw := unix.UnixRights(d.Take()...)
+		raw := unix.UnixRights(d.FDs...)
 		got := &Rights{}
 		if receiveAncillary(got, raw, flags) == nil {
 			t.Fatal("truncated ancillary accepted")

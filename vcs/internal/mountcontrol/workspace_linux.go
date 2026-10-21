@@ -341,15 +341,34 @@ func (r Response) ValidateWorkspace() error {
 
 // Rights owns every received descriptor until a handler explicitly takes it.
 // Rejections, duplicate phases and lost pre-acceptance sockets close this owner.
-type Rights struct{ FDs []int }
+type Rights struct {
+	// FDs may be used only by the current owner. Close and replay comparison
+	// share mu so a closed descriptor number can never bind a reused file.
+	FDs   []int
+	mu    sync.Mutex
+	taken bool
+}
 
 func (r *Rights) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, fd := range r.FDs {
 		_ = unix.Close(fd)
 	}
 	r.FDs = nil
 }
-func (r *Rights) Take() []int { fds := r.FDs; r.FDs = nil; return fds }
+
+// Take transfers disposal to the handler without creating redundant owners.
+// The handler must close this owner, rather than closing its raw FD numbers.
+func (r *Rights) Take() *Rights {
+	r.taken = true
+	return r
+}
+func (r *Rights) closeUntaken() {
+	if !r.taken {
+		r.Close()
+	}
+}
 
 // sameDescription compares kernel struct file owners, including /dev/fuse
 // connections. kcmp compares within this process; no other process is inspected.
@@ -361,19 +380,9 @@ func sameDescription(a, b int) (bool, error) {
 	return result == 0, nil
 }
 
-func (r *Rights) retain() (*Rights, error) {
-	out := &Rights{}
-	for _, fd := range r.FDs {
-		copy, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
-		if err != nil {
-			out.Close()
-			return nil, err
-		}
-		out.FDs = append(out.FDs, copy)
-	}
-	return out, nil
-}
 func (r *Rights) same(other *Rights) bool {
+	other.mu.Lock()
+	defer other.mu.Unlock()
 	if len(r.FDs) != len(other.FDs) {
 		return false
 	}
@@ -427,6 +436,7 @@ type Replay struct {
 	prepareStarted            bool
 	lastResume                [32]byte
 	recoveredGeneration       uint64
+	consumedActions           map[string]bool
 	nextAction                *Phase
 	actionKind                string
 	binding                   *Workspace
@@ -467,7 +477,6 @@ func (r *Replay) Close() {
 	for _, old := range retained {
 		if old != nil {
 			<-old.done
-			old.files.Close()
 		}
 	}
 }
@@ -490,20 +499,35 @@ func waitReceipt(ctx context.Context, old *receipt) (Response, error) {
 		return DecodeResponse(old.response, true)
 	}
 }
-func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler) (Response, error) {
-	defer rights.Close()
+
+// AdmitFrame owns the admission close for one authenticated, fully framed
+// request. Closing is independent of dispatch acceptance, transport survival,
+// lane availability and budget. Call DoAdmitted exactly once afterward if live.
+func (r *Replay) AdmitFrame(req Request, rights *Rights) error {
 	if err := req.ValidateWorkspace(); err != nil {
 		r.closeAdmission()
-		return Response{}, err
+		return err
 	}
 	if err := rights.Validate(req.Operation); err != nil {
 		r.closeAdmission()
-		return Response{}, err
+		return err
 	}
-	// Close permission before even waiting for replay bookkeeping or a lane.
 	if req.Operation == "workspace-suspend" || req.Operation == "workspace-cleanup" {
 		r.closeAdmission()
 	}
+	return nil
+}
+func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler) (Response, error) {
+	if err := r.AdmitFrame(req, rights); err != nil {
+		rights.Close()
+		return Response{}, err
+	}
+	return r.DoAdmitted(ctx, req, rights, h)
+}
+
+// DoAdmitted accepts a previously validated frame; it never repeats its Close.
+func (r *Replay) DoAdmitted(ctx context.Context, req Request, rights *Rights, h Handler) (Response, error) {
+	defer rights.Close()
 	receivedAt := r.now()
 	budget, _ := decimal(req.Workspace.BudgetNanos, true)
 	deadline := receivedAt.Add(time.Duration(budget))
@@ -522,7 +546,9 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 			same := bytes.Equal(body, old.body) && rights.same(old.files)
 			r.mu.Unlock()
 			if !same {
-				r.closeAdmission()
+				if req.Operation != "workspace-suspend" && req.Operation != "workspace-cleanup" {
+					r.closeAdmission()
+				}
 				return Response{}, ErrGrammar
 			}
 			return waitReceipt(ctx, old)
@@ -531,6 +557,9 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 	refuse := func(err error) (Response, error) { r.mu.Unlock(); return Response{}, err }
 	if err := ctx.Err(); err != nil {
 		return refuse(err)
+	}
+	if !r.now().Before(deadline) {
+		return refuse(context.DeadlineExceeded)
 	}
 	start := req.Workspace.RequestID == req.Workspace.OperationID
 	lane := 1
@@ -567,7 +596,7 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 		}
 		p := *req.Workspace.Phase
 		p.Removal = nil
-		if !r.active || r.nextAction == nil || r.actionKind != expected || !reflect.DeepEqual(p, *r.nextAction) {
+		if !r.active || r.consumedActions[p.ActionID] || r.nextAction == nil || r.actionKind != expected || !reflect.DeepEqual(p, *r.nextAction) {
 			return refuse(ErrGrammar)
 		}
 	}
@@ -580,21 +609,15 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 	if h == nil {
 		return refuse(ErrUnavailable)
 	}
-	files, err := rights.retain()
-	if err != nil {
-		return refuse(err)
-	}
-	// Neither socket hangup nor its cancellation becomes job cancellation. The
-	// first receipt deadline bounds this dispatch, including Suspend retries.
+	// The receipt borrows the handler's synchronized owner. It holds no extra
+	// open descriptions that could keep FUSE alive after the real owners close.
+	owned := &Rights{FDs: rights.FDs}
+	rights.FDs = nil
 	job, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
-	retained := &receipt{id: id, body: body, files: files, done: make(chan struct{}), cancel: cancel}
-	retire := func(old *receipt) {
-		if old != nil {
-			old.files.Close()
-		}
-	}
+	retained := &receipt{id: id, body: body, files: owned, done: make(chan struct{}), cancel: cancel}
 	if start {
 		r.active = true
+		r.consumedActions = make(map[string]bool)
 		r.nextAction, r.actionKind = nil, ""
 		if req.Operation == "workspace-prepare" {
 			r.prepareStarted = true
@@ -606,20 +629,20 @@ func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler)
 		r.instance, r.operation = req.MountInstanceID, req.Workspace.OperationID
 		copy := req.Workspace.ResponseBinding()
 		r.binding = &copy
-		retire(r.start)
-		retire(r.phase)
 		r.start, r.phase = retained, nil
 		// An observation of the overtaken operation may still finish. It owns no
 		// descriptors, and its result cannot update the new operation's actions.
 	} else if lane == 2 {
-		retire(r.observation)
 		r.observation = retained
 	} else {
-		retire(r.phase)
 		r.phase = retained
 	}
 	r.high[lane] = id
-	owned := &Rights{FDs: rights.Take()}
+	if req.Workspace.Phase != nil && !start {
+		// Reserve at dispatch, including while a successful phase is in flight.
+		r.consumedActions[req.Workspace.Phase.ActionID] = true
+		r.nextAction, r.actionKind = nil, ""
+	}
 	r.mu.Unlock()
 	go r.dispatch(job, req, owned, h, retained)
 	return waitReceipt(ctx, retained)
@@ -628,7 +651,10 @@ func (r *Replay) dispatch(ctx context.Context, req Request, rights *Rights, h Ha
 	defer retained.cancel()
 	response, err := h.Handle(ctx, req, rights)
 	// Received duplicates are disposed before the receipt becomes observable.
-	rights.Close()
+	rights.closeUntaken()
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	if err == nil {
 		if response.Workspace == nil {
 			err = ErrGrammar
@@ -671,7 +697,7 @@ func (r *Replay) dispatch(ctx context.Context, req Request, rights *Rights, h Ha
 		state := response.Workspace
 		// An older observation may finish after a phase completed this job.
 		// Its immutable snapshot cannot restore permission to perform an action.
-		if state.Action != nil && r.active {
+		if state.Action != nil && r.active && !r.consumedActions[state.Action.ActionID] {
 			rawAction, _ := json.Marshal(state.Action)
 			var copy Phase
 			_ = json.Unmarshal(rawAction, &copy)
@@ -680,8 +706,13 @@ func (r *Replay) dispatch(ctx context.Context, req Request, rights *Rights, h Ha
 		if req.Operation == "workspace-install-kernel" || req.Operation == "workspace-unmount-complete" {
 			r.nextAction, r.actionKind = nil, ""
 		}
-		if state.State == "prepared" || state.State == "cold" || state.State == "cleanup-finalized" || state.State == "failed" || !response.OK {
+		if state.State == "prepared" || state.State == "cold" || state.State == "cleanup-finalized" || state.State == "failed" || (!response.OK && req.Operation != "workspace-observe") {
 			r.active = false
+			// A refusal to accept Prepare is not a failed preparation result.
+			// Its receipt remains immutable, but a new start may try acceptance.
+			if req.Operation == "workspace-prepare" && !response.OK {
+				r.prepareStarted = false
+			}
 			r.nextAction, r.actionKind = nil, ""
 		}
 	}

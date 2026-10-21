@@ -150,7 +150,7 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 // authorityAttached stays true even when later startup fails. That distinction
 // keeps a Manager enrollment alive when cleanup is ambiguous, while a failure
 // before attach can close an enrollment that was never handed to a session.
-func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ error) {
+func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ error) {
 	tlsCfg, err := cfg.transport.tlsConfig()
 	if err != nil {
 		return nil, false, fmt.Errorf("data-plane transport: %w", err)
@@ -175,7 +175,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		RequireMountEnrollmentReauthorization: cfg.requireMountEnrollment,
 		ObservePreKernelMountAbsence:          preKernelAbsence,
 	}
-	client, rules, err := mountv3.AttachWithRoutes(context.Background(), attach, true)
+	client, rules, err := mountv3.AttachWithRoutes(ctx, attach, true)
 	if err != nil {
 		// A routing refusal names both revisions and the volume's declaration.
 		// It is surfaced exactly as it arrived: the operator is told what the
@@ -188,7 +188,7 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		backing = cfg.backingRoot
 	}
 	transport := mountv3.NewTransport(client)
-	mount, err := fusev3.MountVolume(context.Background(), cfg.mountPath, transport, fusev3.Config{
+	mount, err := fusev3.MountVolume(context.Background(), ctx, cfg.mountPath, transport, fusev3.Config{
 		// The mount core derives "portablefs:<mountInstanceID>", the same
 		// instance-bound kernel source mount_identity_linux.go verifies.
 		MountInstanceID: cfg.mountInstanceID, RequestTimeout: mountv3.RequestTimeout,

@@ -116,16 +116,29 @@ frames a request and permits its response. Full hangup or exact process death
 cancels the waiter; dispatched handlers own their first receipt deadline and
 outlive waiter cancellation. Generation-owned jobs and assigned cleanup survive
 it. Suspend's first receipt deadline bounds only that Suspend request, never
-later observations. A full hangup during framing is transport loss; a malformed
-half-closed frame closes admission.
+later observations. The authenticated socket handler owns exactly one admission
+close for each complete, valid Suspend or Cleanup frame, before inspecting lane
+availability, remaining budget or full hangup. Root death after such a frame
+cannot leave permission open; failure to accept still consumes no receipt or
+job. A truncated full hangup remains transport loss; a malformed half-closed
+frame closes admission.
 Only install-kernel carries rights: exactly two ordered, distinct descriptors,
 FUSE then the duplicate abort witness. Receipt uses close-on-exec recvmsg;
 rejections and duplicate deliveries close all newly received descriptors.
-The bounded install receipt retains duplicate owners and compares open
-descriptions with same-process `kcmp(KCMP_FILE)`. Fresh opens of the same inode
-are refused; an unavailable comparison never certifies a replay. Control
-shutdown joins dispatches and closes the retained owners. Completed jobs clear
-outstanding kernel actions. Actual device/bootstrap qualification belongs to the later protected-path driver.
+The bounded install receipt borrows the handler-owned descriptor container and
+compares open descriptions with same-process `kcmp(KCMP_FILE)`. Handler teardown
+and comparison serialize on that container; closing a descriptor cannot let a
+reused descriptor number bind a different connection. The handler transfers
+ownership through Rights.Take and closes through Rights.Close. Replay retains
+no redundant FUSE or abort copies after acknowledgement. Fresh opens of the
+same inode, closed handler owners and unavailable comparisons refuse replay;
+they never dispatch the action again. Control shutdown joins dispatches, while
+the handler owns device teardown. Consumed and in-flight action IDs remain
+ineligible throughout the job, independently of late immutable observations.
+Only explicit terminal snapshots or start/phase refusals end a job. Observation
+refusals leave it active. A Prepare acceptance deadline miss retains a refusal
+receipt but permits a fresh acceptance request; it is no recovery result.
+Actual device/bootstrap qualification belongs to the later protected-path driver.
 
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
@@ -136,17 +149,26 @@ missing or stale generation/serial permits. Hosted CLI readiness requires the
 first successful installer and exact Manager/installed deadline equality;
 explicit standalone readiness is not-required. Starting a goroutine or exposing
 a socket provides no renewal evidence. Kernel termination and SIGINT/SIGTERM
-are supervised during the first renewal. The child bounds startup at two
+cancel pre-kernel dial, attach and initial subscription independently of the
+serving lifetime, and supervise the first renewal.
+A queued startup signal prevents publishing mounted readiness. The child bounds startup at two
 minutes from entry, leaving rollback time inside the parent's three-minute
 limit; renewal failure is delivered before detach retries finish.
 
-Managed Resume republishes a recorded, still-valid installation under the new
-permit without obtaining a new Manager sequence. RefreshNow preserves the normal
-mid-window refresh schedule, beyond the Manager minimum interval. Pending unknown installs reconcile their
+Managed Resume republishes a recorded installation under the new permit only
+while its deadline remains beyond the ordinary safety cutoff. It obtains no
+new Manager sequence for that proof. RefreshNow means an immediate scheduling
+decision: ordinary owners can refresh early; managed owners preserve the normal
+mid-window Manager refresh time for a recorded install. Pending unknown installs reconcile their
 exact sequence/body even past the previous authorization deadline. Managed
 closed preparation retries transient failures with bounded attempts and backoff
 until a definitive outcome or generation cancellation; it grants no serving
-extension. Ordinary renewal retains its safety cutoff. All owners invalidate
+extension. This no-cutoff policy ends when readiness is published in the current
+permission interval. Serving managed owners and ordinary owners enforce the
+same safety cutoff, bounded attempt deadline and retry cutoff. Readiness checks
+the cutoff synchronously, even before the scheduling loop wakes. Park withdraws
+readiness before joining work; Resume near expiry remains pending and recovers
+behind closed admission. All owners invalidate
 readiness atomically on terminal denial or cutoff and before stop observation.
 Malformed Manager grants and installed-deadline mismatches terminate automatic
 renewal on Linux and macOS rather than retrying an untrustworthy grant.

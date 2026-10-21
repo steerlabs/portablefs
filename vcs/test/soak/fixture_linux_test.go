@@ -561,7 +561,7 @@ func (f *integrationFixture) mountAll() {
 		if err != nil {
 			t.Fatalf("create mount %d identity: %v", i, err)
 		}
-		mount, err := fusev3.MountVolume(context.Background(), f.paths[i], transport, fusev3.Config{
+		mount, err := fusev3.MountVolume(context.Background(), context.Background(), f.paths[i], transport, fusev3.Config{
 			MountInstanceID: mountInstanceID, RequestTimeout: integrationRequestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend reserves its liveness, cleanup, and visibility lanes

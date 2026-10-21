@@ -1245,6 +1245,8 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		defer signal.Stop(sig)
+		attachCtx, stopAttachSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stopAttachSignals()
 		if err := revalidatePinnedMountTarget(mountPath, mountTargetIdentity); err != nil {
 			return failReady(err)
 		}
@@ -1268,7 +1270,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 					"the authority's strict membership for this session must be discharged explicitly", mountPath)
 			}
 		}
-		m, authorityAttached, err := mountFUSEv3(fuseV3Config{
+		m, authorityAttached, err := mountFUSEv3(attachCtx, fuseV3Config{
 			addr: authorityURL, token: mountToken, transport: transport,
 			identity: clientIdentity,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
@@ -1276,8 +1278,13 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			requireMountEnrollment: enrollmentClient != nil,
 			onRevoked:              recordRevocation,
 		})
+		attachInterrupted := attachCtx.Err()
+		stopAttachSignals()
 		automaticOwnerEstablished = enrollmentClient != nil && authorityAttached
 		if err != nil {
+			if attachInterrupted != nil {
+				err = errors.Join(errors.New("mount startup interrupted"), err)
+			}
 			if failedFUSEStartupClean(err) {
 				return finalizeCleanedStartup(err)
 			}
@@ -1483,6 +1490,11 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		} else {
 			proof := mountenrollment.RenewalReadiness{State: "not-required"}
 			ready.Renewal = &proof
+		}
+		select {
+		case <-sig:
+			return cleanupMountedFUSE(errors.New("mount startup interrupted"))
+		default:
 		}
 		if err := operation.writeIntent("live", os.Getpid(), processIdentity); err != nil {
 			return cleanupMountedFUSE(err)

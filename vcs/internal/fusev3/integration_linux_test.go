@@ -1347,7 +1347,7 @@ func TestFailedKernelMountDischargesDurableMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mount, err := MountVolume(context.Background(), mountpoint, transport, Config{
+	mount, err := MountVolume(context.Background(), context.Background(), mountpoint, transport, Config{
 		MountInstanceID: mountInstanceID, RequestTimeout: integrationRequestTimeout,
 		MaxBackground: 64, MaxInFlight: integrationMaxInFlight, ReclaimQueue: 1024,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),

@@ -97,7 +97,11 @@ func TestObservationHighWaterDoesNotRetireUnexecutedInstall(t *testing.T) {
 // Imported Opus probe C: the first Suspend receipt deadline belongs only to
 // that request; a final observation gets its own live socket budget.
 func TestFinalObservationOutlivesSuspendReceiptDeadline(t *testing.T) {
-	r := &Replay{}
+	// Keep actual dispatch deadlines live while advancing only the replay
+	// clock past the captured Suspend deadline. The deadline comparison below
+	// falsifies inheritance without a one-millisecond acceptance race.
+	clock := time.Now().Add(time.Hour)
+	r := &Replay{Now: func() time.Time { return clock }}
 	defer r.Close()
 	var suspendDeadline time.Time
 	h := handlerFunc(func(ctx context.Context, q Request, _ *Rights) (Response, error) {
@@ -122,7 +126,7 @@ func TestFinalObservationOutlivesSuspendReceiptDeadline(t *testing.T) {
 	if _, err := r.Do(context.Background(), q, &Rights{}, h); err != nil {
 		t.Fatal(err)
 	}
-	<-time.After(time.Until(suspendDeadline))
+	clock = suspendDeadline.Add(time.Second)
 	out, err := r.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h)
 	if err != nil || out.Workspace.State != "failed" {
 		t.Fatal(out, err)
@@ -262,13 +266,20 @@ func TestInstallReplayBindsOpenDescriptions(t *testing.T) {
 	defer r.Close()
 	var closed atomic.Int32
 	r.CloseAdmission = func() { closed.Add(1) }
-	h := handlerFunc(func(_ context.Context, q Request, _ *Rights) (Response, error) {
+	var handlerOwner *Rights
+	defer func() {
+		if handlerOwner != nil {
+			handlerOwner.Close()
+		}
+	}()
+	h := handlerFunc(func(_ context.Context, q Request, d *Rights) (Response, error) {
 		switch q.Operation {
 		case "workspace-observe":
 			out := response(q, "kernel-required")
 			out.Workspace.Action = phase()
 			return out, nil
 		case "workspace-install-kernel":
+			handlerOwner = d.Take()
 			out := response(q, "install-complete")
 			out.Workspace.Witness = witness()
 			return out, nil
@@ -315,9 +326,15 @@ func TestInstallReplayBindsOpenDescriptions(t *testing.T) {
 		t.Fatal("same-inode substitute accepted", err, closed.Load())
 	}
 	assertClosed(t, freshFDs)
-	retained := append([]int{}, r.phase.files.FDs...)
+	handlerFDs := append([]int{}, handlerOwner.FDs...)
 	r.Close()
-	assertClosed(t, retained)
+	for _, fd := range handlerFDs {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
+			t.Fatal("replay closed handler owner", err)
+		}
+	}
+	handlerOwner.Close()
+	assertClosed(t, handlerFDs)
 }
 
 func TestWorkspaceResponseMaximumIsBoundedBeforeDispatch(t *testing.T) {

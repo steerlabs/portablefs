@@ -206,6 +206,13 @@ func assertClosed(t *testing.T, fds []int) {
 }
 func TestWorkspaceReplayRetainsOnlyStartPhaseAndLatestObservation(t *testing.T) {
 	var replay Replay
+	defer replay.Close()
+	var handlerOwner *Rights
+	defer func() {
+		if handlerOwner != nil {
+			handlerOwner.Close()
+		}
+	}()
 	calls := 0
 	state := "kernel-required"
 	h := handlerFunc(func(_ context.Context, r Request, d *Rights) (Response, error) {
@@ -216,6 +223,7 @@ func TestWorkspaceReplayRetainsOnlyStartPhaseAndLatestObservation(t *testing.T) 
 		}
 		if r.Operation == "workspace-install-kernel" {
 			result = "install-complete"
+			handlerOwner = d.Take()
 		}
 		out := response(r, result)
 		if result == "install-complete" {
@@ -254,7 +262,6 @@ func TestWorkspaceReplayRetainsOnlyStartPhaseAndLatestObservation(t *testing.T) 
 	if _, err := replay.Do(context.Background(), install, d, h); err != nil {
 		t.Fatal(err)
 	}
-	assertClosed(t, fds)
 	dupeFDs := append([]int{}, duplicates.FDs...)
 	if _, err := replay.Do(context.Background(), install, duplicates, h); err != nil {
 		t.Fatal(err)
@@ -310,7 +317,7 @@ func TestWorkspaceChangedIDClosesAndRetryCannotExtendSuspend(t *testing.T) {
 	}
 	before := closed
 	r.Workspace.GateSerial = "1"
-	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err == nil || closed <= before {
+	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err == nil || closed != before+1 {
 		t.Fatal("changed retry did not close")
 	}
 }
@@ -387,7 +394,7 @@ func TestPeerClassificationRequiresExactRootProcess(t *testing.T) {
 
 func TestWorkspaceLostInstallResponseReconcilesActionAndOwnership(t *testing.T) {
 	replay := &Replay{}
-	var accepted []int
+	var accepted *Rights
 	installs := 0
 	h := handlerFunc(func(_ context.Context, r Request, d *Rights) (Response, error) {
 		switch r.Operation {
@@ -430,18 +437,16 @@ func TestWorkspaceLostInstallResponseReconcilesActionAndOwnership(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer func() {
-		for _, fd := range accepted {
-			unix.Close(fd)
-		}
+		accepted.Close()
 	}()
 	if WriteResponse(server, receipt) == nil {
 		t.Fatal("lost socket unexpectedly wrote")
 	}
 	retried, err := replay.Do(context.Background(), r, duplicates, h)
-	if err != nil || retried.Workspace.State != "install-complete" || installs != 1 || len(accepted) != 2 {
+	if err != nil || retried.Workspace.State != "install-complete" || installs != 1 || len(accepted.FDs) != 2 {
 		t.Fatal("lost receipt changed owner", err, installs)
 	}
-	for _, fd := range accepted {
+	for _, fd := range accepted.FDs {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
 			t.Fatal("accepted owner lost descriptor", err)
 		}

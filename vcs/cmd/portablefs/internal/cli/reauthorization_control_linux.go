@@ -241,16 +241,14 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request"})
 		return
 	}
-	// A fully closed root socket lost its attempt, including a truncated body.
-	// Only a framing half-close may establish a workspace grammar violation.
-	if class == mountcontrol.WorkspacePeer {
-		gone, err := mountcontrol.FullHangup(connection)
-		if err != nil || gone {
-			return
-		}
-	}
 	request, err := mountcontrol.DecodeRequest(body)
 	if err != nil {
+		if class == mountcontrol.WorkspacePeer {
+			gone, pollErr := mountcontrol.FullHangup(connection)
+			if pollErr != nil || gone {
+				return
+			}
+		}
 		if class == mountcontrol.WorkspacePeer && c.workspace.Replay.CloseAdmission != nil {
 			c.workspace.Replay.CloseAdmission()
 		}
@@ -262,6 +260,16 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, mountcontrol.ErrPeerRefused))
 			return
 		}
+		// A complete authenticated Close survives root death; partial frames do
+		// not establish one. Admission closure does not accept a job or receipt.
+		if err := c.workspace.Replay.AdmitFrame(request, rights); err != nil {
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
+			return
+		}
+		gone, pollErr := mountcontrol.FullHangup(connection)
+		if pollErr != nil || gone {
+			return
+		}
 		c.mu.Lock()
 		lane := &c.workspacePhase
 		if request.Operation == "workspace-observe" {
@@ -269,12 +277,6 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		}
 		if *lane {
 			c.mu.Unlock()
-			// Suspend closes permission before any lane contention can delay it.
-			if request.Operation == "workspace-suspend" || request.Operation == "workspace-cleanup" {
-				if close := c.workspace.Replay.CloseAdmission; close != nil {
-					close()
-				}
-			}
 			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, mountcontrol.ErrOccupied))
 			return
 		}
@@ -291,7 +293,7 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		}
 		stop := mountcontrol.WatchDisconnect(ctx, connection, peer, cancel)
 		defer stop()
-		response, err := c.workspace.Replay.Do(ctx, request, rights, c.workspace.Handler)
+		response, err := c.workspace.Replay.DoAdmitted(ctx, request, rights, c.workspace.Handler)
 		if err != nil {
 			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
 			return

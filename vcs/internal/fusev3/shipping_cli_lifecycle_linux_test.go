@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -43,7 +44,7 @@ func TestShippingCLIEpochReplacementRequiresFreshRenewedMount(t *testing.T) {
 // These run the actual runMountForeground composition, including signals,
 // kernel Wait, Manager cancellation, durable intent and exact teardown.
 func TestShippingCLIInitialRenewalSupervision(t *testing.T) {
-	for _, scenario := range []string{"denied-busy", "unavailable-term", "unavailable-int", "external-unmount"} {
+	for _, scenario := range []string{"denied-busy", "unavailable-term", "unavailable-int", "external-unmount", "pre-attach-term", "pre-attach-int"} {
 		t.Run(scenario, func(t *testing.T) { shippingCLILifecycle(t, scenario) })
 	}
 }
@@ -61,6 +62,23 @@ func shippingCLILifecycle(t *testing.T, scenario string) {
 		return &volumecap.Authorizer{PublicKey: managerKey.Public().(ed25519.PublicKey), ProductPublicKey: productKey.Public().(ed25519.PublicKey), ProductIssuer: "test-host", ProductAudience: "portablefs", AuthorizationDomain: "test-domain", Owner: "test-owner", CellID: "test-cell", AuthorityID: "test-authority", AuthorityGeneration: 1, MaxLifetime: time.Hour, MaxRetainedNonces: 100}
 	}})
 	f.cfg.listenAddress = f.listener.Addr().String()
+	preAttach := strings.HasPrefix(scenario, "pre-attach-")
+	attachEntered := make(chan net.Conn, 1)
+	if preAttach {
+		// A standalone foreground CLI has entered its pre-kernel TLS attach.
+		// Keep the peer silent; cancellation must interrupt it before its timeout.
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		f.cfg.listenAddress = listener.Addr().String()
+		go func() {
+			if conn, err := listener.Accept(); err == nil {
+				attachEntered <- conn
+			}
+		}()
+	}
 	path := f.mountPath(0)
 	write := func(name string, data []byte) string {
 		t.Helper()
@@ -196,7 +214,11 @@ func shippingCLILifecycle(t *testing.T, scenario string) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = log.Close() })
-		running = exec.Command(binary, "mount", integrationVolumeID, path, "--foreground", "--addr", f.cfg.listenAddress, "--mount-token", sign(enrollment, "", 0, expires), "--data-plane-transport", "tls-private-ca", "--data-plane-server-name", "localhost", "--data-plane-ca", ca, "--client-cert", cert, "--client-key", key, "--manager-url", manager.URL, "--manager-server-name", "localhost", "--manager-ca", ca, "--mount-enrollment-id", enrollment, "--mount-enrollment-cert", enrollmentCert, "--authority-generation", "1", "--auth-expires-at-ms", strconv.FormatInt(expires.UnixMilli(), 10))
+		args := []string{"mount", integrationVolumeID, path, "--foreground", "--addr", f.cfg.listenAddress, "--mount-token", sign(enrollment, "", 0, expires), "--data-plane-transport", "tls-private-ca", "--data-plane-server-name", "localhost", "--data-plane-ca", ca, "--client-cert", cert, "--client-key", key}
+		if !preAttach {
+			args = append(args, "--manager-url", manager.URL, "--manager-server-name", "localhost", "--manager-ca", ca, "--mount-enrollment-id", enrollment, "--mount-enrollment-cert", enrollmentCert, "--authority-generation", "1", "--auth-expires-at-ms", strconv.FormatInt(expires.UnixMilli(), 10))
+		}
+		running = exec.Command(binary, args...)
 		running.Env = env
 		running.Stdout = log
 		running.Stderr = log
@@ -231,6 +253,35 @@ func shippingCLILifecycle(t *testing.T, scenario string) {
 			_ = exec.Command("fusermount3", "-u", "-z", path).Run()
 		}
 	})
+	if preAttach {
+		start("startup-enrollment", 10*time.Minute)
+		select {
+		case conn := <-attachEntered:
+			defer conn.Close()
+		case <-time.After(15 * time.Second):
+			t.Fatal("CLI did not enter pre-kernel attach")
+		}
+		sig := syscall.SIGTERM
+		if scenario == "pre-attach-int" {
+			sig = syscall.SIGINT
+		}
+		if err := running.Process.Signal(sig); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("signal did not cancel pre-kernel attach")
+		}
+		data, err := os.ReadFile(filepath.Join(home, "startup-enrollment.log"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "Ctrl-C unmounts") || !strings.Contains(string(data), "mount startup interrupted") || isMounted(t, path) || f.membership.activeCount() != 0 {
+			t.Fatal("pre-kernel signal published mounted or left a session", string(data))
+		}
+		return
+	}
 	if scenario != "" {
 		start("startup-enrollment", 10*time.Minute)
 		select {

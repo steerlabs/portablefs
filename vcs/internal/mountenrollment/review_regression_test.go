@@ -165,10 +165,24 @@ func TestResumeReusesInstalledGrantWithoutManagerConflict(t *testing.T) {
 		refreshes.Add(1)
 		return grantFor(s, n, deadline), nil
 	})
-	// A scheduling wait is an observable barrier: RefreshNow has been consumed.
-	waiting := make(chan struct{}, 8)
+	// Block and acknowledge the scheduling decision for permit 2 itself. Old
+	// wait notifications cannot satisfy this barrier, and an early Manager call
+	// is a test failure even if Run has not dispatched it yet.
+	initial, initialRelease := make(chan struct{}), make(chan struct{})
+	initialSeen := false
+	decision, release := make(chan time.Time, 1), make(chan struct{})
+	r.scheduleHook = func(p Permit, next time.Time) {
+		if p.GateSerial == 1 && !next.IsZero() && !initialSeen {
+			initialSeen = true
+			close(initial)
+			<-initialRelease
+		}
+		if p.GateSerial == 2 {
+			decision <- next
+			<-release
+		}
+	}
 	r.waitHook = func(ctx context.Context, _ time.Time, wake <-chan struct{}) error {
-		waiting <- struct{}{}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -192,7 +206,7 @@ func TestResumeReusesInstalledGrantWithoutManagerConflict(t *testing.T) {
 		done <- r.Run(ctx, "session", deadline, func(context.Context, string, uint64, []byte) (time.Time, error) { return deadline, nil })
 	}()
 	await(t, success)
-	await(t, waiting)
+	await(t, initial)
 	if err := r.Park(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -202,15 +216,20 @@ func TestResumeReusesInstalledGrantWithoutManagerConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.RefreshNow()
+	close(initialRelease)
 	proof := r.Readiness()
 	if !proof.Ready(false, Permit{GateSerial: 2}, "session", deadline) {
 		t.Fatal(proof)
 	}
-	await(t, waiting)
+	next := await(t, decision)
+	if next.Before(start.Add(15 * time.Minute)) {
+		t.Error("managed wake bypassed the Manager refresh schedule", next)
+	}
 	if refreshes.Load() != 1 || conflicts.Load() != 0 {
 		t.Fatal("Resume forced a rate-limited refresh", refreshes.Load(), conflicts.Load())
 	}
 	cancel()
+	close(release)
 	await(t, done)
 }
 

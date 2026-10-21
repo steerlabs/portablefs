@@ -617,7 +617,7 @@ func (f *integrationFixture) mountAll() {
 		if err != nil {
 			t.Fatalf("create mount %d identity: %v", i, err)
 		}
-		mount, err := MountVolume(context.Background(), f.paths[i], transport, Config{
+		mount, err := MountVolume(context.Background(), context.Background(), f.paths[i], transport, Config{
 			MountInstanceID: mountInstanceID, RequestTimeout: requestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend carves its cleanup workers out of this number, so it
