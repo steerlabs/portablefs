@@ -80,7 +80,6 @@ python3 - <<'PYMODULES'
 import re
 config = open('/output/kernel.config').read()
 inventory = open('/output/initramfs.inventory').read()
-assert 'CONFIG_KCMP=y\n' in config, 'KCMP_FILE replay binding requires CONFIG_KCMP=y'
 for module, symbol in {'virtio_blk':'VIRTIO_BLK', 'virtio_net':'VIRTIO_NET', 'virtio_console':'VIRTIO_CONSOLE', 'vmw_vsock_virtio_transport':'VIRTIO_VSOCKETS', 'virtio_rng':'HW_RANDOM_VIRTIO', 'fuse':'FUSE_FS', 'ext4':'EXT4_FS'}.items():
     if 'CONFIG_' + symbol + '=y\n' in config:
         continue

@@ -11,10 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
@@ -43,6 +40,7 @@ func transaction(t *testing.T, r *Request) {
 	var err error
 	r.Workspace.HostRequestID = "7"
 	if r.Operation == "workspace-suspend" {
+		r.Workspace.DrainBudgetNanos = "15000000000"
 		r.Workspace.Transaction, err = EncodeTransaction(suspension(t))
 	} else {
 		r.Workspace.Transaction, err = EncodeTransaction(&pb.ResumeToken{Suspension: suspension(t), WakeNonce: bytes.Repeat([]byte{7}, 16)})
@@ -129,22 +127,32 @@ func TestLocalCodecStrictGrammarAndBounds(t *testing.T) {
 		t.Fatal("response overrun")
 	}
 }
-func TestEveryWorkspaceResponseIsImmutableTypedEvidence(t *testing.T) {
-	for _, state := range []string{"accepted", "preparing", "kernel-required", "pending-recovery", "pending-suspend", "prepared", "cold", "unmount-required", "install-complete", "unmount-recorded", "cleanup-finalized", "failed"} {
+func TestEveryWorkspaceResponseIsTypedEvidence(t *testing.T) {
+	for _, state := range []string{"accepted", "preparing", "kernel-required", "pending-recovery", "pending-suspend", "prepared", "cold", "unmount-required", "unmount-recorded", "cleanup-finalized", "failed"} {
 		t.Run(state, func(t *testing.T) {
 			r := response(request("workspace-observe", 2, 1), state)
 			w := r.Workspace
+			if state != "accepted" && state != "unmount-recorded" {
+				w.Phases = absentPhases()
+			}
 			switch state {
-			case "install-complete", "unmount-recorded", "cleanup-finalized":
+			case "unmount-recorded", "cleanup-finalized":
 				w.Witness = witness()
 			case "kernel-required":
-				w.Action = phase()
+				w.Witness = witness()
+				w.Phases.Install = ActionStatus{Progress: "offered", Action: kernelAction(*phase())}
 			case "unmount-required":
-				w.Action = phase()
-				w.Action.Options = nil
-				w.Action.Mode = "terminal"
-				w.Action.Reason = "revoked"
+				w.Witness = witness()
+				w.Phases.Install = ActionStatus{Progress: "offered", Action: kernelAction(*phase())}
+				p := phase()
+				p.Options = nil
+				p.Mode = "terminal"
+				p.Reason = "revoked"
+				w.Phases.Install = ActionStatus{Progress: "absent"}
+				w.Phases.TerminalRemoval = ActionStatus{Progress: "offered", Action: kernelAction(*p)}
 			case "prepared":
+				w.Witness = witness()
+				w.Phases.Install = ActionStatus{Progress: "complete", Action: kernelAction(*phase())}
 				w.AuthorizationDeadlineUnixNanos = "2000000000000000000"
 				w.Witness.Session = "session"
 				w.Readiness = &Prepared{SessionValidated: true, AuthorizationValidated: true, Renewal: Renewal{State: "installed", InstalledSequence: "1"}, SubscriptionIncarnation: "1"}
@@ -174,11 +182,6 @@ func TestEveryWorkspaceResponseIsImmutableTypedEvidence(t *testing.T) {
 	}
 }
 
-type handlerFunc func(context.Context, Request, *Rights) (Response, error)
-
-func (f handlerFunc) Handle(c context.Context, r Request, d *Rights) (Response, error) {
-	return f(c, r, d)
-}
 func descriptors(t *testing.T) (*Rights, []int) {
 	t.Helper()
 	var fds []int
@@ -204,123 +207,6 @@ func assertClosed(t *testing.T, fds []int) {
 		}
 	}
 }
-func TestWorkspaceReplayRetainsOnlyStartPhaseAndLatestObservation(t *testing.T) {
-	var replay Replay
-	defer replay.Close()
-	var handlerOwner *Rights
-	defer func() {
-		if handlerOwner != nil {
-			handlerOwner.Close()
-		}
-	}()
-	calls := 0
-	state := "kernel-required"
-	h := handlerFunc(func(_ context.Context, r Request, d *Rights) (Response, error) {
-		calls++
-		result := "accepted"
-		if r.Operation == "workspace-observe" {
-			result = state
-		}
-		if r.Operation == "workspace-install-kernel" {
-			result = "install-complete"
-			handlerOwner = d.Take()
-		}
-		out := response(r, result)
-		if result == "install-complete" {
-			out.Workspace.Witness = witness()
-		}
-		if result == "kernel-required" {
-			out.Workspace.Action = phase()
-		}
-		return out, nil
-	})
-	start := request("workspace-prepare", 1, 1)
-	if _, err := replay.Do(context.Background(), start, &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	obs := request("workspace-observe", 2, 1)
-	a, err := replay.Do(context.Background(), obs, &Rights{}, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state = "preparing"
-	again, err := replay.Do(context.Background(), obs, &Rights{}, h)
-	if err != nil || again.Workspace.State != a.Workspace.State || calls != 2 {
-		t.Fatal("observation mutated")
-	}
-	install := request("workspace-install-kernel", 3, 1)
-	install.Workspace.Phase = phase()
-	d, fds := descriptors(t)
-	duplicates := &Rights{}
-	for _, fd := range fds {
-		x, err := unix.Dup(fd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		duplicates.FDs = append(duplicates.FDs, x)
-	}
-	if _, err := replay.Do(context.Background(), install, d, h); err != nil {
-		t.Fatal(err)
-	}
-	dupeFDs := append([]int{}, duplicates.FDs...)
-	if _, err := replay.Do(context.Background(), install, duplicates, h); err != nil {
-		t.Fatal(err)
-	}
-	assertClosed(t, dupeFDs)
-	for n := uint64(4); n < 1004; n++ {
-		if _, err := replay.Do(context.Background(), request("workspace-observe", n, 1), &Rights{}, h); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if replay.start.id != 1 || replay.phase.id != 3 || replay.observation.id != 1003 || replay.high[2] != 1003 {
-		t.Fatal("unbounded or wrong replay ownership")
-	}
-	if _, err := replay.Do(context.Background(), obs, &Rights{}, h); err == nil {
-		t.Fatal("retired observation executed")
-	}
-	if _, err := replay.Do(context.Background(), install, &Rights{}, h); err == nil {
-		t.Fatal("missing descriptors on duplicate")
-	}
-}
-func TestWorkspaceChangedIDClosesAndRetryCannotExtendSuspend(t *testing.T) {
-	now := time.Now()
-	var deadlines []time.Time
-	closed := 0
-	replay := Replay{Now: func() time.Time { return now }, CloseAdmission: func() { closed++ }}
-	h := handlerFunc(func(c context.Context, r Request, _ *Rights) (Response, error) {
-		d, _ := c.Deadline()
-		deadlines = append(deadlines, d)
-		state := "accepted"
-		if r.Operation == "workspace-observe" {
-			state = "pending-suspend"
-		}
-		return response(r, state), nil
-	})
-	r := request("workspace-suspend", 1, 1)
-	transaction(t, &r)
-	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(20 * time.Second)
-	r.Workspace.BudgetNanos = "25000000000"
-	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	if len(deadlines) != 1 {
-		t.Fatal("retry dispatched")
-	}
-	if _, err := replay.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	if !deadlines[1].After(deadlines[0]) {
-		t.Fatal("observation inherited the Suspend drain deadline")
-	}
-	before := closed
-	r.Workspace.GateSerial = "1"
-	if _, err := replay.Do(context.Background(), r, &Rights{}, h); err == nil || closed != before+1 {
-		t.Fatal("changed retry did not close")
-	}
-}
 func TestWorkspaceUnavailableAndDescriptorRejectionOwnEveryRight(t *testing.T) {
 	for _, op := range []string{"workspace-prepare", "workspace-install-kernel"} {
 		for _, count := range []int{0, 1, 2, 3} {
@@ -343,23 +229,13 @@ func TestWorkspaceUnavailableAndDescriptorRejectionOwnEveryRight(t *testing.T) {
 					unix.Close(d.FDs[len(d.FDs)-1])
 					d.FDs = d.FDs[:len(d.FDs)-1]
 				}
-				if _, err := (&Replay{}).Do(context.Background(), r, d, nil); err == nil {
+				if _, err := (&Owner{}).Do(context.Background(), r, d); err == nil {
 					t.Fatal("unavailable lifecycle succeeded")
 				}
 				assertClosed(t, all)
 			})
 		}
 	}
-	d, fds := descriptors(t)
-	unix.Close(d.FDs[1])
-	x, _ := unix.Dup(d.FDs[0])
-	d.FDs[1] = x
-	fds = append(fds, x)
-	if d.Validate("workspace-install-kernel") == nil {
-		t.Fatal("same open description accepted twice")
-	}
-	d.Close()
-	assertClosed(t, fds)
 }
 func TestWorkspaceTransactionUsesFixedRosterBodyAndCanonicalScanner(t *testing.T) {
 	r := request("workspace-suspend", 1, 1)
@@ -392,149 +268,55 @@ func TestPeerClassificationRequiresExactRootProcess(t *testing.T) {
 	}
 }
 
-func TestWorkspaceLostInstallResponseReconcilesActionAndOwnership(t *testing.T) {
-	replay := &Replay{}
-	var accepted *Rights
-	installs := 0
-	h := handlerFunc(func(_ context.Context, r Request, d *Rights) (Response, error) {
-		switch r.Operation {
-		case "workspace-prepare":
-			return response(r, "accepted"), nil
-		case "workspace-observe":
-			out := response(r, "kernel-required")
-			out.Workspace.Action = phase()
-			return out, nil
-		case "workspace-install-kernel":
-			installs++
-			accepted = d.Take()
-			out := response(r, "install-complete")
-			out.Workspace.Witness = witness()
-			return out, nil
-		}
-		return Response{}, ErrGrammar
-	})
-	if _, err := replay.Do(context.Background(), request("workspace-prepare", 1, 1), &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := replay.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	r := request("workspace-install-kernel", 3, 1)
-	r.Workspace.Phase = phase()
-	d, _ := descriptors(t)
-	duplicates := &Rights{}
-	for _, fd := range d.FDs {
-		x, err := unix.Dup(fd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		duplicates.FDs = append(duplicates.FDs, x)
-	}
-	client, server := sockets(t)
-	client.Close()
-	receipt, err := replay.Do(context.Background(), r, d, h)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		accepted.Close()
-	}()
-	if WriteResponse(server, receipt) == nil {
-		t.Fatal("lost socket unexpectedly wrote")
-	}
-	retried, err := replay.Do(context.Background(), r, duplicates, h)
-	if err != nil || retried.Workspace.State != "install-complete" || installs != 1 || len(accepted.FDs) != 2 {
-		t.Fatal("lost receipt changed owner", err, installs)
-	}
-	for _, fd := range accepted.FDs {
-		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
-			t.Fatal("accepted owner lost descriptor", err)
+func TestDrainAllowanceIsCanonicalAndOnlyOnSuspend(t *testing.T) {
+	for _, allowance := range []string{"", "0", "01", "+1", "15000000001", "18446744073709551616"} {
+		q := request("workspace-suspend", 1, 1)
+		transaction(t, &q)
+		q.Workspace.DrainBudgetNanos = allowance
+		if q.ValidateWorkspace() == nil {
+			t.Fatal("invalid drain allowance", allowance)
 		}
 	}
-}
-func TestWorkspaceActionsAndResumeAuthorizationCannotBeRebound(t *testing.T) {
-	r := &Replay{}
-	calls := 0
-	h := handlerFunc(func(_ context.Context, q Request, _ *Rights) (Response, error) {
-		calls++
-		state := "accepted"
-		if q.Operation == "workspace-observe" {
-			state = "failed"
+	for _, op := range []string{"workspace-prepare", "workspace-recover", "workspace-observe"} {
+		q := request(op, 1, 1)
+		if op == "workspace-recover" {
+			transaction(t, &q)
 		}
-		out := response(q, state)
-		if state == "failed" {
-			out.Workspace.Reason = "terminal"
+		if op == "workspace-observe" {
+			q.Workspace.RequestID = "2"
 		}
-		return out, nil
-	})
-	recover := request("workspace-recover", 1, 1)
-	transaction(t, &recover)
-	if _, err := r.Do(context.Background(), recover, &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	recover.Workspace.RequestID = "3"
-	recover.Workspace.OperationID = "3"
-	if _, err := r.Do(context.Background(), recover, &Rights{}, h); err == nil || calls != 2 {
-		t.Fatal("Resume authorization consumed twice")
-	}
-	install := request("workspace-install-kernel", 4, 1)
-	install.Workspace.Phase = phase()
-	d, _ := descriptors(t)
-	if _, err := r.Do(context.Background(), install, d, h); err == nil || calls != 2 {
-		t.Fatal("unsolicited bootstrap action")
-	}
-}
-func TestWorkspaceHandlerErrorReceiptIsFiniteAndImmutable(t *testing.T) {
-	calls := 0
-	r := &Replay{}
-	defer r.Close()
-	h := handlerFunc(func(context.Context, Request, *Rights) (Response, error) {
-		calls++
-		return Response{}, errors.New("private handler diagnostic")
-	})
-	q := request("workspace-prepare", 1, 1)
-	for i := 0; i < 2; i++ {
-		out, err := r.Do(context.Background(), q, &Rights{}, h)
-		if err != nil || out.OK || out.Workspace.Refusal != "handler-failed" {
-			t.Fatal(out, err)
+		q.Workspace.DrainBudgetNanos = "1"
+		if q.ValidateWorkspace() == nil {
+			t.Fatal("unexpected drain allowance", op)
 		}
-	}
-	if calls != 1 {
-		t.Fatal("handler error restarted assigned phase")
 	}
 }
 
-func TestWorkspaceSuspendChargesReplayLaneDelay(t *testing.T) {
-	base := time.Now()
-	received := make(chan struct{})
-	var elapsed atomic.Int64
-	var first sync.Once
-	r := &Replay{Now: func() time.Time {
-		now := base.Add(time.Duration(elapsed.Load()))
-		first.Do(func() { close(received) })
-		return now
-	}}
-	r.mu.Lock()
-	q := request("workspace-suspend", 1, 1)
-	transaction(t, &q)
-	done := make(chan error, 1)
-	go func() {
-		_, err := r.Do(context.Background(), q, &Rights{}, handlerFunc(func(ctx context.Context, q Request, _ *Rights) (Response, error) {
-			deadline, _ := ctx.Deadline()
-			if !deadline.Equal(base.Add(45 * time.Second)) {
-				t.Error("queue delay extended drain deadline", deadline)
-			}
-			return response(q, "accepted"), nil
-		}))
-		done <- err
-	}()
-	<-received
-	elapsed.Store(int64(20 * time.Second))
-	r.mu.Unlock()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+func TestFinitePhaseAndRefusalGrammar(t *testing.T) {
+	q := request("workspace-observe", 2, 1)
+	for _, err := range []error{ErrUnavailable, ErrOccupied, ErrRetired, ErrGrammar, ErrActionConsumed, ErrNotAccepted, ErrPeerRefused, context.Canceled, context.DeadlineExceeded, errors.New("private")} {
+		if _, err := EncodeResponse(WorkspaceRefusal(q, err)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, progress := range []string{"", "queued", "consumed", "success"} {
+		out := response(q, "preparing")
+		out.Workspace.Phases = absentPhases()
+		out.Workspace.Phases.Install.Progress = progress
+		if _, err := EncodeResponse(out); err == nil {
+			t.Fatal("unknown phase progress", progress)
+		}
+	}
+	out := response(q, "preparing")
+	out.Workspace.Witness = witness()
+	out.Workspace.Phases = absentPhases()
+	out.Workspace.Phases.Install = ActionStatus{Progress: "failed", Action: kernelAction(*phase()), Failure: "private diagnostic"}
+	if _, err := EncodeResponse(out); err == nil {
+		t.Fatal("unbounded failure grammar")
+	}
+	out = WorkspaceRefusal(q, ErrActionConsumed)
+	out.Workspace.Refusal = "private diagnostic"
+	if _, err := EncodeResponse(out); err == nil {
+		t.Fatal("unbounded refusal")
 	}
 }

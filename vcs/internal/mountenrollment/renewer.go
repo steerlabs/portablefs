@@ -132,6 +132,7 @@ type Renewer struct {
 	force                        bool
 	terminal                     error
 	waitHook                     func(context.Context, time.Time, <-chan struct{}) error
+	attemptDispositionHook       func(Permit)            // pauses before the joined disposition in tests
 	scheduleHook                 func(Permit, time.Time) // acknowledges a specific scheduling decision in tests
 
 	Source  GrantSource
@@ -390,6 +391,9 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		if err == nil && allowed {
 			installed, err = install(attemptCtx, pending.Capability, seq, []byte(pending.ClientCertificatePEM))
 		}
+		if r.attemptDispositionHook != nil {
+			r.attemptDispositionHook(p)
+		}
 		r.mu.Lock()
 		// A successful installer is a known remote installation even if Park/Close
 		// raced it. Keep that sequence before considering readiness publication.
@@ -417,53 +421,60 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 				}
 			}
 		}
+		// Error policy is part of the attempt Park joins. No captured serving
+		// cutoff or retry can be applied after releasing this ownership.
+		type event struct {
+			kind   RenewalEventKind
+			status RenewalStatus
+		}
+		var events []event
+		record := func(kind RenewalEventKind, target time.Time, message string, failures uint64) {
+			events = append(events, event{kind, r.eventLocked(kind, target, message, failures)})
+		}
+		var terminal error
+		current := r.allowedLocked() && r.permit == p
 		if errors.Is(err, ErrDefinitiveDenial) {
 			r.terminal = err
-			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+			terminal = err
+			record(RenewalDenied, time.Time{}, boundedError(err), r.status.ConsecutiveFailures+1)
+		} else if current && ctx.Err() == nil && (err != nil || known) {
+			if err == nil {
+				backoff = 500 * time.Millisecond
+				record(RenewalSucceeded, time.Time{}, "", 0)
+				next = refreshTime(r.now(), r.deadline, session, r.sequence)
+				record(RenewalScheduled, next, "", 0)
+			} else {
+				failures := r.status.ConsecutiveFailures + 1
+				next = r.now().Add(backoff)
+				// Recompute the policy from this still-owned permission
+				// interval; Park/Resume cannot splice in closed recovery.
+				bounded = !r.Managed || r.serving
+				cutoff = safeCutoff(r.authorizedAt, r.deadline, r.MinimumSafetyMargin)
+				if bounded && !next.Before(cutoff) {
+					terminal = fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
+					r.terminal = terminal
+					record(RenewalCutoff, time.Time{}, boundedError(terminal), failures)
+				} else {
+					record(RenewalRetrying, next, boundedError(err), failures)
+					backoff = min(30*time.Second, backoff*2)
+				}
+			}
 		}
 		r.attemptCancel = nil
 		r.attemptDone = nil
 		cancel()
 		close(done)
-		current := r.allowedLocked() && r.permit == p
 		r.mu.Unlock()
-		if errors.Is(err, ErrDefinitiveDenial) {
-			r.emit(RenewalDenied, time.Time{}, boundedError(err), r.statusFailures()+1)
-			return err
-		}
-		if !current {
-			continue
-		}
-		if ctx.Err() != nil {
-			continue
-		}
-		if err == nil && !known {
-			continue
-		}
-		if err == nil {
-			backoff = 500 * time.Millisecond
-			r.emit(RenewalSucceeded, time.Time{}, "", 0)
-			r.mu.Lock()
-			next = refreshTime(r.now(), r.deadline, session, r.sequence)
-			r.mu.Unlock()
-			if ctx.Err() == nil {
-				r.emit(RenewalScheduled, next, "", 0)
+		for _, event := range events {
+			if event.kind == RenewalScheduled && ctx.Err() != nil {
+				continue
 			}
-			continue
+			r.observe(event.kind, event.status)
 		}
-		failures := r.statusFailures() + 1
-		next = r.now().Add(backoff)
-		if bounded && !next.Before(cutoff) {
-			resultErr := fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
-			r.mu.Lock()
-			r.terminal = resultErr
-			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
-			r.mu.Unlock()
-			r.emit(RenewalCutoff, time.Time{}, boundedError(resultErr), failures)
-			return resultErr
+		if terminal != nil {
+			return terminal
 		}
-		r.emit(RenewalRetrying, next, boundedError(err), failures)
-		backoff = min(30*time.Second, backoff*2)
+
 	}
 }
 func minTime(a, b time.Time) time.Time {
@@ -479,6 +490,13 @@ func (r *Renewer) statusFailures() uint64 {
 }
 func (r *Renewer) emit(kind RenewalEventKind, next time.Time, message string, failures uint64) {
 	r.mu.Lock()
+	status := r.eventLocked(kind, next, message, failures)
+	r.mu.Unlock()
+	r.observe(kind, status)
+}
+
+// eventLocked commits scheduling and readiness before attempt ownership ends.
+func (r *Renewer) eventLocked(kind RenewalEventKind, next time.Time, message string, failures uint64) RenewalStatus {
 	r.status.AuthorizationDeadline = r.deadline
 	r.status.Sequence = r.sequence
 	if kind == RenewalSucceeded {
@@ -493,9 +511,7 @@ func (r *Renewer) emit(kind RenewalEventKind, next time.Time, message string, fa
 		r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
 		r.status.Readiness = r.readiness
 	}
-	status := r.status
-	r.mu.Unlock()
-	r.observe(kind, status)
+	return r.status
 }
 
 func boundedError(err error) string {

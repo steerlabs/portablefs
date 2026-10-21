@@ -3,16 +3,10 @@
 package mountcontrol
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,18 +20,19 @@ import (
 )
 
 type Workspace struct {
-	Version        uint32 `json:"version"`
-	RequestID      string `json:"requestId"`
-	OperationID    string `json:"operationId"`
-	BootID         string `json:"bootId"`
-	HostServiceID  string `json:"hostServiceId"`
-	GuestServiceID string `json:"guestServiceId"`
-	Generation     string `json:"generation"`
-	GateSerial     string `json:"gateSerial"`
-	BudgetNanos    string `json:"budgetNanos"`
-	HostRequestID  string `json:"hostRequestId,omitempty"`
-	Transaction    string `json:"transaction,omitempty"`
-	Phase          *Phase `json:"phase,omitempty"`
+	Version          uint32 `json:"version"`
+	RequestID        string `json:"requestId"`
+	OperationID      string `json:"operationId"`
+	BootID           string `json:"bootId"`
+	HostServiceID    string `json:"hostServiceId"`
+	GuestServiceID   string `json:"guestServiceId"`
+	Generation       string `json:"generation"`
+	GateSerial       string `json:"gateSerial"`
+	BudgetNanos      string `json:"budgetNanos"`
+	DrainBudgetNanos string `json:"drainBudgetNanos,omitempty"`
+	HostRequestID    string `json:"hostRequestId,omitempty"`
+	Transaction      string `json:"transaction,omitempty"`
+	Phase            *Phase `json:"phase,omitempty"`
 }
 
 // Witness is partial until bootstrap supplies kernel/session evidence. Existing
@@ -87,18 +82,49 @@ type Prepared struct {
 	Renewal                 Renewal `json:"renewal"`
 	SubscriptionIncarnation string  `json:"subscriptionIncarnation"`
 }
+
+// ActionStatus is a fixed lifecycle slot, never a response receipt.
+// Absent slots are explicit; a failed slot remains consumed.
+// KernelAction binds to the response mount witness; repeating that witness in
+// every fixed slot would exceed the maximum loss-ledger frame.
+type KernelAction struct {
+	ActionID string   `json:"actionId"`
+	Mode     string   `json:"mode,omitempty"`
+	Reason   string   `json:"reason,omitempty"`
+	Options  []string `json:"options,omitempty"`
+	Removal  *Removal `json:"removal,omitempty"`
+}
+
+func (a KernelAction) WithWitness(w Witness) *Phase {
+	return &Phase{ActionID: a.ActionID, Mode: a.Mode, Reason: a.Reason, Options: append([]string(nil), a.Options...), Removal: a.Removal, Witness: w}
+}
+func kernelAction(p Phase) *KernelAction {
+	return &KernelAction{ActionID: p.ActionID, Mode: p.Mode, Reason: p.Reason, Options: append([]string(nil), p.Options...), Removal: p.Removal}
+}
+
+type ActionStatus struct {
+	Progress string        `json:"progress"`
+	Action   *KernelAction `json:"action,omitempty"`
+	Failure  string        `json:"failure,omitempty"`
+}
+type PhaseFacts struct {
+	Install          ActionStatus `json:"install"`
+	VoluntaryRemoval ActionStatus `json:"voluntaryRemoval"`
+	TerminalRemoval  ActionStatus `json:"terminalRemoval"`
+}
+
 type WorkspaceResponse struct {
-	Binding                        Workspace `json:"binding"`
-	State                          string    `json:"state"`
-	Witness                        Witness   `json:"witness"`
-	AuthorizationDeadlineUnixNanos string    `json:"authorizationDeadlineUnixNanos"`
-	Outcome                        Outcome   `json:"outcome"`
-	Loss                           []Loss    `json:"loss,omitempty"`
-	ColdComplete                   bool      `json:"coldComplete,omitempty"`
-	Readiness                      *Prepared `json:"readiness,omitempty"`
-	Action                         *Phase    `json:"action,omitempty"`
-	Reason                         string    `json:"reason,omitempty"`
-	Refusal                        string    `json:"refusal,omitempty"`
+	Binding                        Workspace   `json:"binding"`
+	State                          string      `json:"state"`
+	Witness                        Witness     `json:"witness"`
+	AuthorizationDeadlineUnixNanos string      `json:"authorizationDeadlineUnixNanos"`
+	Outcome                        Outcome     `json:"outcome"`
+	Loss                           []Loss      `json:"loss,omitempty"`
+	ColdComplete                   bool        `json:"coldComplete,omitempty"`
+	Readiness                      *Prepared   `json:"readiness,omitempty"`
+	Phases                         *PhaseFacts `json:"phases,omitempty"`
+	Reason                         string      `json:"reason,omitempty"`
+	Refusal                        string      `json:"refusal,omitempty"`
 }
 
 func decimal(s string, positive bool) (uint64, error) {
@@ -141,6 +167,14 @@ func (r Request) ValidateWorkspace() error {
 	}
 	if err := w.validate(); err != nil {
 		return err
+	}
+	if r.Operation == "workspace-suspend" {
+		n, err := decimal(w.DrainBudgetNanos, true)
+		if err != nil || n > uint64(15*time.Second) {
+			return ErrGrammar
+		}
+	} else if w.DrainBudgetNanos != "" {
+		return ErrGrammar
 	}
 	if !boundedPhase(w.Phase) {
 		return ErrGrammar
@@ -248,11 +282,11 @@ func (r Response) ValidateWorkspace() error {
 	}
 	if w.State == "refused" {
 		switch w.Refusal {
-		case "unavailable", "occupied", "retired", "invalid", "handler-failed", "deadline", "stopped", "peer-refused":
+		case "unavailable", "occupied", "retired", "invalid", "handler-failed", "deadline", "stopped", "peer-refused", "action-consumed", "not-accepted":
 		default:
 			return ErrGrammar
 		}
-		if r.OK || w.Readiness != nil || w.Action != nil || w.ColdComplete || len(w.Loss) != 0 || w.Reason != "" || w.Witness != (Witness{}) || w.AuthorizationDeadlineUnixNanos != "0" || w.Outcome != (Outcome{"unresolved", "unobserved", "unresolved", "0"}) {
+		if r.OK || w.Readiness != nil || w.Phases != nil || w.ColdComplete || len(w.Loss) != 0 || w.Reason != "" || w.Witness != (Witness{}) || w.AuthorizationDeadlineUnixNanos != "0" || w.Outcome != (Outcome{"unresolved", "unobserved", "unresolved", "0"}) {
 			return ErrGrammar
 		}
 		return nil
@@ -260,7 +294,7 @@ func (r Response) ValidateWorkspace() error {
 	if !r.OK || w.Refusal != "" {
 		return ErrGrammar
 	}
-	if !boundedWitness(w.Witness) || !boundedPhase(w.Action) {
+	if !boundedWitness(w.Witness) || !validPhases(w.Phases, w.Witness) {
 		return ErrGrammar
 	}
 	debt, err := decimal(w.Outcome.CleanupDebt, false)
@@ -273,38 +307,19 @@ func (r Response) ValidateWorkspace() error {
 	if _, err := decimal(w.AuthorizationDeadlineUnixNanos, false); err != nil {
 		return err
 	}
-	if len(w.Reason) > control.MaxReason || len(w.Loss) > control.MaxLosses {
+	if len(w.Reason) > control.MaxReason || validLoss(w.Loss) != nil {
 		return ErrGrammar
 	}
-	var seq uint64
-	for i, l := range w.Loss {
-		n, err := decimal(l.Sequence, true)
-		if err != nil || n <= seq || l.Reason == "" || len(l.Reason) > control.MaxReason {
-			return ErrGrammar
-		}
-		seq = n
-		if l.Aggregated && (i != control.MaxLosses-1 || i != len(w.Loss)-1 || l.Reason != control.AggregateReason) {
-			return ErrGrammar
-		}
-		for _, v := range []string{l.AcceptedEntries, l.AcceptedBytes} {
-			if _, err := decimal(v, false); err != nil {
-				return err
-			}
-		}
-	}
+
 	switch w.State {
 	case "accepted", "preparing", "pending-recovery", "pending-suspend":
-	case "install-complete":
-		if !boundWitness(w.Witness) || w.Witness.Kernel == "" {
-			return ErrGrammar
-		}
 	case "unmount-recorded", "cleanup-finalized":
 		if !boundWitness(w.Witness) {
 			return ErrGrammar
 		}
 	case "prepared":
 		p := w.Readiness
-		if p == nil || !p.SessionValidated || !p.AuthorizationValidated || !positiveDecimal(p.SubscriptionIncarnation) || w.Witness.Session == "" || w.AuthorizationDeadlineUnixNanos == "0" {
+		if w.Phases == nil || w.Phases.Install.Progress != "complete" || !boundWitness(w.Witness) || w.Witness.Kernel == "" || p == nil || !p.SessionValidated || !p.AuthorizationValidated || !positiveDecimal(p.SubscriptionIncarnation) || w.Witness.Session == "" || w.AuthorizationDeadlineUnixNanos == "0" {
 			return ErrGrammar
 		}
 		n, err := decimal(p.Renewal.InstalledSequence, false)
@@ -316,11 +331,11 @@ func (r Response) ValidateWorkspace() error {
 			return ErrGrammar
 		}
 	case "kernel-required":
-		if w.Action == nil || !action(w.Action) || len(w.Action.Options) == 0 || w.Action.Mode != "" || w.Action.Removal != nil {
+		if w.Phases == nil || w.Phases.Install.Progress != "offered" {
 			return ErrGrammar
 		}
 	case "unmount-required":
-		if w.Action == nil || !action(w.Action) || !mode(w.Action.Mode) || w.Action.Reason == "" || len(w.Action.Options) != 0 || w.Action.Removal != nil {
+		if w.Phases == nil || w.Phases.VoluntaryRemoval.Progress != "offered" && w.Phases.TerminalRemoval.Progress != "offered" {
 			return ErrGrammar
 		}
 	case "failed":
@@ -330,7 +345,10 @@ func (r Response) ValidateWorkspace() error {
 	default:
 		return ErrGrammar
 	}
-	if (w.Readiness != nil) != (w.State == "prepared") || w.ColdComplete != (w.State == "cold") || (w.Action != nil) != (w.State == "kernel-required" || w.State == "unmount-required") {
+	if (w.Readiness != nil) != (w.State == "prepared") || w.ColdComplete != (w.State == "cold") {
+		return ErrGrammar
+	}
+	if (w.Phases == nil) != (w.State == "accepted" || w.State == "unmount-recorded") {
 		return ErrGrammar
 	}
 	if w.State != "failed" && w.Reason != "" {
@@ -339,60 +357,88 @@ func (r Response) ValidateWorkspace() error {
 	return nil
 }
 
-// Rights owns every received descriptor until a handler explicitly takes it.
-// Rejections, duplicate phases and lost pre-acceptance sockets close this owner.
+func validLoss(loss []Loss) error {
+	if len(loss) > control.MaxLosses {
+		return ErrGrammar
+	}
+	var seq uint64
+	for i, l := range loss {
+		n, err := decimal(l.Sequence, true)
+		if err != nil || n <= seq || l.Reason == "" || len(l.Reason) > control.MaxReason {
+			return ErrGrammar
+		}
+		seq = n
+		if l.Aggregated && (i != control.MaxLosses-1 || i != len(loss)-1 || l.Reason != control.AggregateReason) {
+			return ErrGrammar
+		}
+		for _, v := range []string{l.AcceptedEntries, l.AcceptedBytes} {
+			if _, err := decimal(v, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validPhases(f *PhaseFacts, witness Witness) bool {
+	if f == nil {
+		return true
+	}
+	var ids [3]string
+	for i, s := range []ActionStatus{f.Install, f.VoluntaryRemoval, f.TerminalRemoval} {
+		if s.Progress == "absent" {
+			if s.Action != nil || s.Failure != "" {
+				return false
+			}
+			continue
+		}
+		if s.Progress != "offered" && s.Progress != "running" && s.Progress != "complete" && s.Progress != "failed" {
+			return false
+		}
+		if s.Action == nil || !boundedPhase(s.Action.WithWitness(witness)) || !action(s.Action.WithWitness(witness)) || (i > 0 && ids[0] == s.Action.ActionID || i > 1 && ids[1] == s.Action.ActionID) || !phaseFailure(s.Failure) || (s.Progress == "failed") != (s.Failure != "") {
+			return false
+		}
+		ids[i] = s.Action.ActionID
+		p := s.Action
+		if i == 0 {
+			if p.Mode != "" || p.Reason != "" || len(p.Options) == 0 || p.Removal != nil {
+				return false
+			}
+		} else {
+			expected := "voluntary"
+			if i == 2 {
+				expected = "terminal"
+			}
+			if p.Mode != expected || p.Reason == "" || len(p.Options) != 0 || (p.Removal != nil) != (s.Progress == "complete") {
+				return false
+			}
+			if p.Removal != nil && (!p.Removal.KernelAbsent || i == 2 && !p.Removal.AbortCompleted) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func phaseFailure(s string) bool {
+	return s == "" || s == "handler-failed" || s == "stopped" || s == "deadline"
+}
+
+// Rights owns received descriptors. Acceptance moves the inventory into the
+// job under its state lock; rejected attempts dispose only their own inventory.
 type Rights struct {
-	// FDs may be used only by the current owner. Close and replay comparison
-	// share mu so a closed descriptor number can never bind a reused file.
-	FDs   []int
-	mu    sync.Mutex
-	taken bool
+	FDs []int
+	mu  sync.Mutex
 }
 
 func (r *Rights) Close() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, fd := range r.FDs {
+	fds := r.FDs
+	r.FDs = nil
+	r.mu.Unlock()
+	for _, fd := range fds {
 		_ = unix.Close(fd)
 	}
-	r.FDs = nil
-}
-
-// Take transfers disposal to the handler without creating redundant owners.
-// The handler must close this owner, rather than closing its raw FD numbers.
-func (r *Rights) Take() *Rights {
-	r.taken = true
-	return r
-}
-func (r *Rights) closeUntaken() {
-	if !r.taken {
-		r.Close()
-	}
-}
-
-// sameDescription compares kernel struct file owners, including /dev/fuse
-// connections. kcmp compares within this process; no other process is inspected.
-func sameDescription(a, b int) (bool, error) {
-	result, _, errno := unix.Syscall6(unix.SYS_KCMP, uintptr(os.Getpid()), uintptr(os.Getpid()), 0, uintptr(a), uintptr(b), 0)
-	if errno != 0 {
-		return false, fmt.Errorf("compare descriptor owners: %w", errno)
-	}
-	return result == 0, nil
-}
-
-func (r *Rights) same(other *Rights) bool {
-	other.mu.Lock()
-	defer other.mu.Unlock()
-	if len(r.FDs) != len(other.FDs) {
-		return false
-	}
-	for i, fd := range r.FDs {
-		same, err := sameDescription(fd, other.FDs[i])
-		if err != nil || !same {
-			return false
-		}
-	}
-	return true
 }
 func (r *Rights) Validate(op string) error {
 	want := 0
@@ -402,331 +448,19 @@ func (r *Rights) Validate(op string) error {
 	if len(r.FDs) != want {
 		return ErrGrammar
 	}
-	if want == 2 {
-		same, err := sameDescription(r.FDs[0], r.FDs[1])
-		if err != nil {
-			return err
-		}
-		if same {
-			return ErrGrammar
-		}
-	}
+	// The real bootstrap validator checks ordered FUSE/abort roles before
+	// acceptance. Descriptor replay identity is deliberately irrelevant.
 	return nil
 }
 
-// Handler owns jobs independently of request waiters. It must return bounded
-// phase receipts/snapshots, never wait for the lifetime of Prepare or Recover.
-type Handler interface {
-	Handle(context.Context, Request, *Rights) (Response, error)
-}
-type receipt struct {
-	id       uint64
-	body     []byte
-	files    *Rights
-	response []byte
-	done     chan struct{}
-	cancel   context.CancelFunc
-}
-type Replay struct {
-	mu                        sync.Mutex
-	high                      [3]uint64 // start, phase and observation lanes advance independently
-	operation                 string
-	instance                  string
-	active                    bool
-	prepareStarted            bool
-	lastResume                [32]byte
-	recoveredGeneration       uint64
-	consumedActions           map[string]bool
-	nextAction                *Phase
-	actionKind                string
-	binding                   *Workspace
-	start, phase, observation *receipt
-	closed                    bool
-	Now                       func() time.Time
-	CloseAdmission            func()
-}
-
-func (r *Replay) now() time.Time {
-	if r.Now != nil {
-		return r.Now()
-	}
-	return time.Now()
-}
-func immutable(req Request) []byte {
-	copy := *req.Workspace
-	copy.BudgetNanos = ""
-	req.Workspace = &copy
-	raw, _ := json.Marshal(req)
-	return raw
-}
-func (r *Replay) closeAdmission() {
-	if r.CloseAdmission != nil {
-		r.CloseAdmission()
-	}
-}
-func (r *Replay) Close() {
-	r.mu.Lock()
-	r.closed = true
-	retained := []*receipt{r.start, r.phase, r.observation}
-	for _, old := range retained {
-		if old != nil {
-			old.cancel()
-		}
-	}
-	r.mu.Unlock()
-	for _, old := range retained {
-		if old != nil {
-			<-old.done
-		}
-	}
-}
-func inFlight(old *receipt) bool {
-	if old == nil {
-		return false
-	}
-	select {
-	case <-old.done:
-		return false
-	default:
-		return true
-	}
-}
-func waitReceipt(ctx context.Context, old *receipt) (Response, error) {
-	select {
-	case <-ctx.Done():
-		return Response{}, ctx.Err()
-	case <-old.done:
-		return DecodeResponse(old.response, true)
-	}
-}
-
-// AdmitFrame owns the admission close for one authenticated, fully framed
-// request. Closing is independent of dispatch acceptance, transport survival,
-// lane availability and budget. Call DoAdmitted exactly once afterward if live.
-func (r *Replay) AdmitFrame(req Request, rights *Rights) error {
-	if err := req.ValidateWorkspace(); err != nil {
-		r.closeAdmission()
-		return err
-	}
-	if err := rights.Validate(req.Operation); err != nil {
-		r.closeAdmission()
-		return err
-	}
-	if req.Operation == "workspace-suspend" || req.Operation == "workspace-cleanup" {
-		r.closeAdmission()
-	}
-	return nil
-}
-func (r *Replay) Do(ctx context.Context, req Request, rights *Rights, h Handler) (Response, error) {
-	if err := r.AdmitFrame(req, rights); err != nil {
-		rights.Close()
-		return Response{}, err
-	}
-	return r.DoAdmitted(ctx, req, rights, h)
-}
-
-// DoAdmitted accepts a previously validated frame; it never repeats its Close.
-func (r *Replay) DoAdmitted(ctx context.Context, req Request, rights *Rights, h Handler) (Response, error) {
-	defer rights.Close()
-	receivedAt := r.now()
-	budget, _ := decimal(req.Workspace.BudgetNanos, true)
-	deadline := receivedAt.Add(time.Duration(budget))
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	body := immutable(req)
-	id, _ := decimal(req.Workspace.RequestID, true)
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return Response{}, ErrUnavailable
-	}
-	for _, old := range []*receipt{r.start, r.phase, r.observation} {
-		if old != nil && old.id == id {
-			same := bytes.Equal(body, old.body) && rights.same(old.files)
-			r.mu.Unlock()
-			if !same {
-				if req.Operation != "workspace-suspend" && req.Operation != "workspace-cleanup" {
-					r.closeAdmission()
-				}
-				return Response{}, ErrGrammar
-			}
-			return waitReceipt(ctx, old)
-		}
-	}
-	refuse := func(err error) (Response, error) { r.mu.Unlock(); return Response{}, err }
-	if err := ctx.Err(); err != nil {
-		return refuse(err)
-	}
-	if !r.now().Before(deadline) {
-		return refuse(context.DeadlineExceeded)
-	}
-	start := req.Workspace.RequestID == req.Workspace.OperationID
-	lane := 1
-	if start {
-		lane = 0
-	} else if req.Operation == "workspace-observe" {
-		lane = 2
-	}
-	if id <= r.high[lane] {
-		return refuse(ErrRetired)
-	}
-	if !start && (r.binding == nil || req.MountInstanceID != r.instance || req.Workspace.OperationID != r.operation || !sameBinding(*r.binding, *req.Workspace)) {
-		return refuse(ErrGrammar)
-	}
-	generation, _ := decimal(req.Workspace.Generation, false)
-	if start && r.binding != nil {
-		oldGeneration, _ := decimal(r.binding.Generation, false)
-		serial, _ := decimal(req.Workspace.GateSerial, false)
-		oldSerial, _ := decimal(r.binding.GateSerial, false)
-		if req.MountInstanceID != r.instance || req.Workspace.BootID != r.binding.BootID || req.Workspace.HostServiceID != r.binding.HostServiceID || req.Workspace.GuestServiceID != r.binding.GuestServiceID || generation < oldGeneration || serial < oldSerial {
-			return refuse(ErrGrammar)
-		}
-	}
-	if req.Operation == "workspace-recover" && (generation <= r.recoveredGeneration || r.lastResume == sha256.Sum256([]byte(req.Workspace.Transaction))) {
-		return refuse(ErrGrammar)
-	}
-	if req.Operation == "workspace-prepare" && r.prepareStarted {
-		return refuse(ErrGrammar)
-	}
-	if req.Operation == "workspace-install-kernel" || req.Operation == "workspace-unmount-complete" {
-		expected := "kernel-required"
-		if req.Operation == "workspace-unmount-complete" {
-			expected = "unmount-required"
-		}
-		p := *req.Workspace.Phase
-		p.Removal = nil
-		if !r.active || r.consumedActions[p.ActionID] || r.nextAction == nil || r.actionKind != expected || !reflect.DeepEqual(p, *r.nextAction) {
-			return refuse(ErrGrammar)
-		}
-	}
-	if start && r.active && req.Operation != "workspace-suspend" && req.Operation != "workspace-cleanup" {
-		return refuse(ErrOccupied)
-	}
-	if lane == 2 && inFlight(r.observation) || lane != 2 && (inFlight(r.start) || inFlight(r.phase)) {
-		return refuse(ErrOccupied)
-	}
-	if h == nil {
-		return refuse(ErrUnavailable)
-	}
-	// The receipt borrows the handler's synchronized owner. It holds no extra
-	// open descriptions that could keep FUSE alive after the real owners close.
-	owned := &Rights{FDs: rights.FDs}
-	rights.FDs = nil
-	job, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
-	retained := &receipt{id: id, body: body, files: owned, done: make(chan struct{}), cancel: cancel}
-	if start {
-		r.active = true
-		r.consumedActions = make(map[string]bool)
-		r.nextAction, r.actionKind = nil, ""
-		if req.Operation == "workspace-prepare" {
-			r.prepareStarted = true
-		}
-		if req.Operation == "workspace-recover" {
-			r.lastResume = sha256.Sum256([]byte(req.Workspace.Transaction))
-			r.recoveredGeneration = generation
-		}
-		r.instance, r.operation = req.MountInstanceID, req.Workspace.OperationID
-		copy := req.Workspace.ResponseBinding()
-		r.binding = &copy
-		r.start, r.phase = retained, nil
-		// An observation of the overtaken operation may still finish. It owns no
-		// descriptors, and its result cannot update the new operation's actions.
-	} else if lane == 2 {
-		r.observation = retained
-	} else {
-		r.phase = retained
-	}
-	r.high[lane] = id
-	if req.Workspace.Phase != nil && !start {
-		// Reserve at dispatch, including while a successful phase is in flight.
-		r.consumedActions[req.Workspace.Phase.ActionID] = true
-		r.nextAction, r.actionKind = nil, ""
-	}
-	r.mu.Unlock()
-	go r.dispatch(job, req, owned, h, retained)
-	return waitReceipt(ctx, retained)
-}
-func (r *Replay) dispatch(ctx context.Context, req Request, rights *Rights, h Handler, retained *receipt) {
-	defer retained.cancel()
-	response, err := h.Handle(ctx, req, rights)
-	// Received duplicates are disposed before the receipt becomes observable.
-	rights.closeUntaken()
-	if err == nil && ctx.Err() != nil {
-		err = ctx.Err()
-	}
-	if err == nil {
-		if response.Workspace == nil {
-			err = ErrGrammar
-		} else {
-			state := response.Workspace.State
-			switch req.Operation {
-			case "workspace-prepare", "workspace-recover", "workspace-suspend", "workspace-cleanup":
-				if state != "accepted" && state != "failed" {
-					err = ErrGrammar
-				}
-			case "workspace-install-kernel":
-				if state != "install-complete" && state != "failed" {
-					err = ErrGrammar
-				}
-			case "workspace-unmount-complete":
-				if state != "unmount-recorded" && state != "failed" {
-					err = ErrGrammar
-				}
-			case "workspace-observe":
-				if state == "accepted" || state == "install-complete" || state == "unmount-recorded" {
-					err = ErrGrammar
-				}
-			}
-			if response.MountInstanceID != req.MountInstanceID || !reflect.DeepEqual(response.Workspace.Binding, req.Workspace.ResponseBinding()) {
-				err = ErrGrammar
-			}
-		}
-	}
-	var raw []byte
-	if err == nil {
-		raw, err = EncodeResponse(response)
-	}
-	if err != nil {
-		response = WorkspaceRefusal(req, err)
-		raw, _ = EncodeResponse(response)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.binding != nil && sameBinding(*r.binding, *req.Workspace) {
-		state := response.Workspace
-		// An older observation may finish after a phase completed this job.
-		// Its immutable snapshot cannot restore permission to perform an action.
-		if state.Action != nil && r.active && !r.consumedActions[state.Action.ActionID] {
-			rawAction, _ := json.Marshal(state.Action)
-			var copy Phase
-			_ = json.Unmarshal(rawAction, &copy)
-			r.nextAction, r.actionKind = &copy, state.State
-		}
-		if req.Operation == "workspace-install-kernel" || req.Operation == "workspace-unmount-complete" {
-			r.nextAction, r.actionKind = nil, ""
-		}
-		if state.State == "prepared" || state.State == "cold" || state.State == "cleanup-finalized" || state.State == "failed" || (!response.OK && req.Operation != "workspace-observe") {
-			r.active = false
-			// A refusal to accept Prepare is not a failed preparation result.
-			// Its receipt remains immutable, but a new start may try acceptance.
-			if req.Operation == "workspace-prepare" && !response.OK {
-				r.prepareStarted = false
-			}
-			r.nextAction, r.actionKind = nil, ""
-		}
-	}
-	retained.response = raw
-	close(retained.done)
-}
 func sameBinding(a, b Workspace) bool {
 	return a.Version == b.Version && a.BootID == b.BootID && a.HostServiceID == b.HostServiceID && a.GuestServiceID == b.GuestServiceID && a.Generation == b.Generation && a.GateSerial == b.GateSerial && a.OperationID == b.OperationID
 }
 
-// ResponseBinding contains only bounded correlation fields. Transaction bodies
-// and phase payloads are retained in the receipt, never echoed on the wire.
+// ResponseBinding omits transaction, phase and drain allowance. Socket attempt
+// correlation never authorizes a lifecycle transition.
 func (w Workspace) ResponseBinding() Workspace {
-	w.Transaction, w.HostRequestID, w.Phase = "", "", nil
+	w.Transaction, w.HostRequestID, w.Phase, w.DrainBudgetNanos = "", "", nil, ""
 	return w
 }
 func WorkspaceRefusal(req Request, err error) Response {
@@ -740,6 +474,10 @@ func WorkspaceRefusal(req Request, err error) Response {
 		code = "occupied"
 	case errors.Is(err, ErrRetired):
 		code = "retired"
+	case errors.Is(err, ErrActionConsumed):
+		code = "action-consumed"
+	case errors.Is(err, ErrNotAccepted):
+		code = "not-accepted"
 	case errors.Is(err, ErrGrammar):
 		code = "invalid"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -747,7 +485,7 @@ func WorkspaceRefusal(req Request, err error) Response {
 	case errors.Is(err, context.Canceled):
 		code = "stopped"
 	}
-	return Response{MountInstanceID: req.MountInstanceID, Workspace: &WorkspaceResponse{Binding: req.Workspace.ResponseBinding(), State: "refused", Refusal: code, AuthorizationDeadlineUnixNanos: "0", Outcome: Outcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: "0"}}}
+	return Response{MountInstanceID: req.MountInstanceID, Workspace: &WorkspaceResponse{Binding: req.Workspace.ResponseBinding(), State: "refused", Refusal: code, AuthorizationDeadlineUnixNanos: "0", Outcome: unknownOutcome()}}
 }
 
 // EncodeTransaction retains the strict body grammar, independently of the host

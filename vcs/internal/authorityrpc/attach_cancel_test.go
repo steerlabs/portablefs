@@ -1,11 +1,14 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"io"
 	"net"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -104,5 +107,77 @@ func TestCanceledInitialPublicationJoinsBothNegotiations(t *testing.T) {
 	client := &Client{}
 	if err := client.publishInitialPair(a, b, 1, 1); !errors.Is(err, context.Canceled) || stopped != 2 {
 		t.Fatal("committed cleanup could race a negotiation cancellation", err, stopped)
+	}
+}
+
+// Cancellation is deliberately fired after Detach installs its independent
+// deadline. Only joining both startup writers at the common ACTIVE boundary
+// can prevent their overwrite on the local-validation failure path.
+type cleanupDeadlineConn struct {
+	net.Conn
+	cancel    context.CancelFunc
+	settled   <-chan struct{}
+	joined    *atomic.Int32
+	installed chan struct{}
+}
+
+func (c *cleanupDeadlineConn) SetDeadline(deadline time.Time) error {
+	err := c.Conn.SetDeadline(deadline)
+	if !deadline.IsZero() && deadline.After(time.Now()) {
+		c.cancel()
+		<-c.settled
+		close(c.installed)
+	}
+	return err
+}
+func TestInvalidActiveCleanupJoinsStartupCancellation(t *testing.T) {
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settled := make(chan struct{})
+	var joined atomic.Int32
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { local.SetDeadline(time.Now()); close(interrupted); close(settled) })
+	stopCancellation := func() error {
+		if stop() {
+			joined.Add(1)
+			close(interrupted)
+			close(settled)
+		}
+		<-interrupted
+		return ctx.Err()
+	}
+	conn := &cleanupDeadlineConn{Conn: local, cancel: cancel, settled: settled, joined: &joined, installed: make(chan struct{})}
+	epoch := bytes.Repeat([]byte{0x76}, 16)
+	proof := &authoritypb.SessionProof{Id: bytes.Repeat([]byte{0x77}, 16), Generation: 4, ResumeSecret: bytes.Repeat([]byte{0x78}, 32)}
+	client := &Client{cfg: ClientConfig{CancelDrainTimeout: time.Second, ObservePreKernelMountAbsence: testPreKernelMountAbsence}, epoch: epoch, proof: proof}
+	var dataJoined atomic.Bool
+	data := &transportNegotiation{stopCancellation: func() error { dataJoined.Store(true); return nil }}
+	control := &transportNegotiation{conn: conn, maxFrame: testMaxFrame, stopCancellation: stopCancellation}
+	result := make(chan error, 1)
+	go func() {
+		<-conn.installed
+		q := new(authoritypb.Request)
+		if err := readFrame(peer, testMaxFrame, nil, 0, q); err != nil {
+			result <- err
+			return
+		}
+		if q.GetDetach() == nil || q.GetDetach().GetMountAbsence() == nil {
+			result <- errors.New("missing exact Detach")
+			return
+		}
+		result <- writeFrame(peer, testMaxFrame, &authoritypb.Response{RequestId: q.RequestId, Epoch: epoch})
+	}()
+	err := client.publishCommittedActivation(&authoritypb.ActivateReply{State: authoritypb.SessionState_SESSION_STATE_PROVISIONAL}, data, control, 1, 1, 19)
+	if err == nil || strings.Contains(err.Error(), "release ACTIVE session") {
+		t.Fatal("independent cleanup failed", err)
+	}
+	if joined.Load() != 1 || !dataJoined.Load() {
+		t.Fatal("committed cleanup preceded cancellation join")
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }

@@ -33,8 +33,7 @@ type localReauthorizationResponse = mountcontrol.Response
 // owners exist. A seeded supervisor alone never enables managed mounts.
 type workspaceControlConfig struct {
 	Supervisor mountcontrol.Peer
-	Handler    mountcontrol.Handler
-	Replay     mountcontrol.Replay
+	Owner      mountcontrol.Owner
 }
 
 type unixReauthorizationControl struct {
@@ -125,7 +124,7 @@ func (c *unixReauthorizationControl) Close() error {
 		c.mu.Unlock()
 		<-c.done
 		if c.workspace != nil {
-			c.workspace.Replay.Close()
+			c.workspace.Owner.Close()
 		}
 	})
 	if errors.Is(c.closeErr, net.ErrClosed) {
@@ -249,8 +248,8 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 				return
 			}
 		}
-		if class == mountcontrol.WorkspacePeer && c.workspace.Replay.CloseAdmission != nil {
-			c.workspace.Replay.CloseAdmission()
+		if class == mountcontrol.WorkspacePeer && c.workspace.Owner.CloseAdmission != nil {
+			c.workspace.Owner.CloseAdmission()
 		}
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request"})
 		return
@@ -261,8 +260,8 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 			return
 		}
 		// A complete authenticated Close survives root death; partial frames do
-		// not establish one. Admission closure does not accept a job or receipt.
-		if err := c.workspace.Replay.AdmitFrame(request, rights); err != nil {
+		// not establish one. Admission closure does not accept a job.
+		if err := c.workspace.Owner.AdmitFrame(request, rights); err != nil {
 			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
 			return
 		}
@@ -293,7 +292,7 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		}
 		stop := mountcontrol.WatchDisconnect(ctx, connection, peer, cancel)
 		defer stop()
-		response, err := c.workspace.Replay.DoAdmitted(ctx, request, rights, c.workspace.Handler)
+		response, err := c.workspace.Owner.DoAdmitted(ctx, request, rights, attemptStarted)
 		if err != nil {
 			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
 			return

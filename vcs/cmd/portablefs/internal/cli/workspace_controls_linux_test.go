@@ -151,9 +151,9 @@ func TestManagedInstallerRefusesMissingAndStalePermit(t *testing.T) {
 
 type unavailableWorkspaceHandler struct{ calls atomic.Int32 }
 
-func (h *unavailableWorkspaceHandler) Handle(context.Context, mountcontrol.Request, *mountcontrol.Rights) (mountcontrol.Response, error) {
+func (h *unavailableWorkspaceHandler) Run(context.Context, *mountcontrol.Job) error {
 	h.calls.Add(1)
-	return mountcontrol.Response{}, mountcontrol.ErrUnavailable
+	return mountcontrol.ErrUnavailable
 }
 func TestWorkspaceSocketBudgetIncludesPartialRequestRead(t *testing.T) {
 	if os.Geteuid() != 0 {
@@ -164,7 +164,7 @@ func TestWorkspaceSocketBudgetIncludesPartialRequestRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := &unavailableWorkspaceHandler{}
-	c, err := startFuseMountControl(nil, nil, &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Handler: handler})
+	c, err := startFuseMountControl(nil, nil, &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Owner: mountcontrol.Owner{Driver: mountcontrol.Driver{Run: handler.Run}, CheckPermit: func(mountcontrol.Workspace) bool { return true }}})
 	if err != nil {
 		t.Fatal(err)
 	}

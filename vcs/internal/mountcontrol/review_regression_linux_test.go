@@ -5,14 +5,12 @@ package mountcontrol
 import (
 	"context"
 	"errors"
-	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 func awaitResult[T any](t *testing.T, ch <-chan T) T {
@@ -21,347 +19,327 @@ func awaitResult[T any](t *testing.T, ch <-chan T) T {
 	case v := <-ch:
 		return v
 	case <-time.After(3 * time.Second):
-		t.Fatal("replay did not progress")
+		t.Fatal("owner did not progress")
 		var zero T
 		return zero
 	}
 }
-
-// Imported Opus probe A: separate lanes must dispatch independently, and a
-// spent waiter cannot cause a handler to receive an already-canceled context.
-func TestObservationDoesNotWaitBehindPhase(t *testing.T) {
-	r := &Replay{}
-	defer r.Close()
-	entered, release := make(chan struct{}), make(chan struct{})
-	h := handlerFunc(func(ctx context.Context, q Request, _ *Rights) (Response, error) {
-		switch q.Operation {
-		case "workspace-cleanup":
-			close(entered)
-			<-release
-		case "workspace-observe":
-			if ctx.Err() != nil {
-				t.Error("observation dispatched canceled", ctx.Err())
-			}
-			return response(q, "preparing"), nil
-		}
-		return response(q, "accepted"), nil
-	})
-	r.Do(context.Background(), request("workspace-prepare", 1, 1), &Rights{}, h)
-	cleanup := request("workspace-cleanup", 2, 2)
-	cleanup.Workspace.Phase = &Phase{Mode: "voluntary", Witness: witness()}
-	done := make(chan error, 1)
-	go func() { _, err := r.Do(context.Background(), cleanup, &Rights{}, h); done <- err }()
-	awaitResult(t, entered)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, err := r.Do(ctx, request("workspace-observe", 3, 2), &Rights{}, h)
-	close(release)
+func absentPhases() *PhaseFacts {
+	return &PhaseFacts{Install: ActionStatus{Progress: "absent"}, VoluntaryRemoval: ActionStatus{Progress: "absent"}, TerminalRemoval: ActionStatus{Progress: "absent"}}
+}
+func testOwner(t *testing.T, run func(context.Context, *Job) error) *Owner {
+	t.Helper()
+	o := &Owner{Driver: Driver{Run: run, ValidateInstall: func(*Rights, Phase) error { return nil }, Install: func(context.Context, *Job, *Rights) (Witness, error) { return witness(), nil }}, CheckPermit: func(Workspace) bool { return true }}
+	t.Cleanup(o.Close)
+	return o
+}
+func do(t *testing.T, o *Owner, q Request, d *Rights) Response {
+	t.Helper()
+	out, err := o.Do(context.Background(), q, d)
 	if err != nil {
-		t.Fatal("observation blocked by phase", err)
+		t.Fatal(q.Operation, err)
 	}
-	if err := awaitResult(t, done); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// Imported Opus probe B: an observation must not retire a phase that never ran.
-func TestObservationHighWaterDoesNotRetireUnexecutedInstall(t *testing.T) {
-	r := &Replay{}
-	defer r.Close()
-	installs := 0
-	h := handlerFunc(func(_ context.Context, q Request, _ *Rights) (Response, error) {
-		switch q.Operation {
-		case "workspace-observe":
-			out := response(q, "kernel-required")
-			out.Workspace.Action = phase()
-			return out, nil
-		case "workspace-install-kernel":
-			installs++
-			out := response(q, "install-complete")
-			out.Workspace.Witness = witness()
-			return out, nil
-		}
-		return response(q, "accepted"), nil
-	})
-	r.Do(context.Background(), request("workspace-prepare", 1, 1), &Rights{}, h)
-	r.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h)
-	r.Do(context.Background(), request("workspace-observe", 4, 1), &Rights{}, h)
-	q := request("workspace-install-kernel", 3, 1)
-	q.Workspace.Phase = phase()
-	d, _ := descriptors(t)
-	if _, err := r.Do(context.Background(), q, d, h); err != nil || installs != 1 {
-		t.Fatal("never executed phase retired", err, installs)
-	}
-}
-
-// Imported Opus probe C: the first Suspend receipt deadline belongs only to
-// that request; a final observation gets its own live socket budget.
-func TestFinalObservationOutlivesSuspendReceiptDeadline(t *testing.T) {
-	// Keep actual dispatch deadlines live while advancing only the replay
-	// clock past the captured Suspend deadline. The deadline comparison below
-	// falsifies inheritance without a one-millisecond acceptance race.
-	clock := time.Now().Add(time.Hour)
-	r := &Replay{Now: func() time.Time { return clock }}
-	defer r.Close()
-	var suspendDeadline time.Time
-	h := handlerFunc(func(ctx context.Context, q Request, _ *Rights) (Response, error) {
-		if q.Operation == "workspace-observe" {
-			if ctx.Err() != nil {
-				t.Error("final observation expired", ctx.Err())
-			}
-			d, _ := ctx.Deadline()
-			if !d.After(suspendDeadline) {
-				t.Error("inherited drain deadline")
-			}
-			out := response(q, "failed")
-			out.Workspace.Reason = "drain overran"
-			return out, nil
-		}
-		suspendDeadline, _ = ctx.Deadline()
-		return response(q, "accepted"), nil
-	})
-	q := request("workspace-suspend", 1, 1)
-	q.Workspace.BudgetNanos = "1000000"
-	transaction(t, &q)
-	if _, err := r.Do(context.Background(), q, &Rights{}, h); err != nil {
-		t.Fatal(err)
-	}
-	clock = suspendDeadline.Add(time.Second)
-	out, err := r.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h)
-	if err != nil || out.Workspace.State != "failed" {
+	raw, err := EncodeResponse(out)
+	if err != nil {
 		t.Fatal(out, err)
 	}
-}
-
-// Imported Opus probe D: loss of a waiter after dispatch cannot freeze Prepare
-// as context.Canceled, nor execute a second job on an exact retry.
-func TestLostWaiterReconcilesJobOwnedPrepare(t *testing.T) {
-	r := &Replay{}
-	defer r.Close()
-	entered, release := make(chan struct{}), make(chan struct{})
-	var calls atomic.Int32
-	h := handlerFunc(func(ctx context.Context, q Request, _ *Rights) (Response, error) {
-		calls.Add(1)
-		close(entered)
-		<-release
-		if ctx.Err() != nil {
-			return Response{}, ctx.Err()
-		}
-		return response(q, "accepted"), nil
-	})
-	q := request("workspace-prepare", 1, 1)
-	lost, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { _, err := r.Do(lost, q, &Rights{}, h); done <- err }()
-	awaitResult(t, entered)
-	cancel()
-	if err := awaitResult(t, done); !errors.Is(err, context.Canceled) {
+	out, err = DecodeResponse(raw, true)
+	if err != nil {
 		t.Fatal(err)
 	}
-	close(release)
-	out, err := r.Do(context.Background(), q, &Rights{}, h)
-	if err != nil || out.Workspace.State != "accepted" || calls.Load() != 1 {
-		t.Fatal(out, err, calls.Load())
-	}
-	// Cancellation before acceptance consumes no ID or operation at all.
-	r2 := &Replay{}
-	defer r2.Close()
-	if _, err := r2.Do(lost, q, &Rights{}, h); !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
-	}
-	if r2.prepareStarted || r2.start != nil {
-		t.Fatal("canceled pre-acceptance waiter consumed Prepare")
-	}
+	return out
+}
+func observe(t *testing.T, o *Owner, n, id uint64) Response {
+	t.Helper()
+	return do(t, o, request("workspace-observe", n, id), &Rights{})
+}
+func start(t *testing.T, o *Owner, q Request) *Job {
+	t.Helper()
+	do(t, o, q, &Rights{})
+	o.mu.Lock()
+	j := o.job
+	o.mu.Unlock()
+	return j
+}
+func installRequest(n, id uint64) Request {
+	q := request("workspace-install-kernel", n, id)
+	q.Workspace.Phase = phase()
+	return q
+}
+func cleanupRequest(n uint64, mode string) Request {
+	q := request("workspace-cleanup", n, n)
+	q.Workspace.Phase = &Phase{Mode: mode, Witness: witness()}
+	return q
+}
+func readyFacts() Facts {
+	w := witness()
+	w.Session = "session"
+	return Facts{Witness: w, AuthorizationDeadlineUnixNanos: "2000000000000000000", Readiness: &Prepared{SessionValidated: true, AuthorizationValidated: true, Renewal: Renewal{"installed", "1"}, SubscriptionIncarnation: "1"}}
 }
 
-// Imported Opus probe E: Suspend closes admission while an observation still
-// owns its lane. No synchronous driver call may hold Replay.mu.
-func TestSuspendClosesBeforeBlockedObservationFinishes(t *testing.T) {
-	r := &Replay{}
-	defer r.Close()
-	entered, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
-	r.CloseAdmission = func() { closed <- struct{}{} }
-	h := handlerFunc(func(_ context.Context, q Request, _ *Rights) (Response, error) {
-		if q.Operation == "workspace-observe" {
-			close(entered)
-			<-release
-			return response(q, "preparing"), nil
-		}
-		return response(q, "accepted"), nil
-	})
-	r.Do(context.Background(), request("workspace-prepare", 1, 1), &Rights{}, h)
-	done := make(chan error, 1)
-	go func() {
-		_, err := r.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h)
-		done <- err
-	}()
-	awaitResult(t, entered)
-	q := request("workspace-suspend", 3, 3)
-	transaction(t, &q)
-	suspended := make(chan error, 1)
-	go func() { _, err := r.Do(context.Background(), q, &Rights{}, h); suspended <- err }()
-	awaitResult(t, closed)
-	if err := awaitResult(t, suspended); err != nil {
-		t.Error(err)
-	}
-	close(release)
-	awaitResult(t, done)
-}
-
-// Imported Opus probe F: completion consumes the outstanding kernel action.
-func TestCompletedJobClearsPendingKernelAction(t *testing.T) {
-	for _, state := range []string{"prepared", "cold", "cleanup-finalized", "failed"} {
-		t.Run(state, func(t *testing.T) {
-			r := &Replay{}
-			defer r.Close()
-			observations, installs := 0, 0
-			h := handlerFunc(func(_ context.Context, q Request, _ *Rights) (Response, error) {
-				if q.Operation == "workspace-install-kernel" {
-					installs++
+// Replaces receipt-deadline and lost-waiter expectations: the linearization
+// point is the job reservation, before any driver work or response delivery.
+func TestJobAcceptanceSurvivesSocketLossAndExpiry(t *testing.T) {
+	for _, loss := range []string{"before-acceptance", "after-acceptance", "after-expiry"} {
+		t.Run(loss, func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var calls atomic.Int32
+			o := testOwner(t, func(ctx context.Context, j *Job) error {
+				calls.Add(1)
+				close(entered)
+				<-release
+				if ctx.Err() != nil {
+					t.Error("socket canceled lifecycle", ctx.Err())
 				}
-				if q.Operation != "workspace-observe" {
-					return response(q, "accepted"), nil
-				}
-				observations++
-				if observations == 1 {
-					out := response(q, "kernel-required")
-					out.Workspace.Action = phase()
-					return out, nil
-				}
-				out := response(q, state)
-				switch state {
-				case "failed":
-					out.Workspace.Reason = "unrecoverable"
-				case "cold":
-					out.Workspace.ColdComplete = true
-				case "cleanup-finalized":
-					out.Workspace.Witness = witness()
-				case "prepared":
-					out.Workspace.Witness = witness()
-					out.Workspace.Witness.Session = "s"
-					out.Workspace.AuthorizationDeadlineUnixNanos = "2000000000000000000"
-					out.Workspace.Readiness = &Prepared{SessionValidated: true, AuthorizationValidated: true, Renewal: Renewal{"installed", "1"}, SubscriptionIncarnation: "1"}
-				}
-				return out, nil
+				return j.OfferInstall(*phase())
 			})
-			for _, q := range []Request{request("workspace-prepare", 1, 1), request("workspace-observe", 2, 1), request("workspace-observe", 3, 1)} {
-				if _, err := r.Do(context.Background(), q, &Rights{}, h); err != nil {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			q := request("workspace-prepare", 1, 1)
+			if loss == "before-acceptance" {
+				cancel()
+				if _, err := o.Do(ctx, q, &Rights{}); !errors.Is(err, context.Canceled) {
 					t.Fatal(err)
 				}
+				if _, err := o.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}); !errors.Is(err, ErrNotAccepted) {
+					t.Fatal(err)
+				}
+				ctx = context.Background()
 			}
-			q := request("workspace-install-kernel", 4, 1)
-			q.Workspace.Phase = phase()
-			d, _ := descriptors(t)
-			if _, err := r.Do(context.Background(), q, d, h); !errors.Is(err, ErrGrammar) || installs != 0 || r.nextAction != nil {
-				t.Fatal("completed action dispatched", err, installs)
+			var elapsed atomic.Int64
+			base := time.Now().Add(time.Hour)
+			o.Now = func() time.Time { return base.Add(time.Duration(elapsed.Load())) }
+			j := start(t, o, q)
+			awaitResult(t, entered)
+			cancel()
+			if loss == "after-expiry" {
+				elapsed.Store(int64(time.Minute))
+			}
+			out := do(t, o, q, &Rights{})
+			if out.Workspace.State != "accepted" {
+				t.Fatal(out)
+			}
+			close(release)
+			awaitResult(t, j.done)
+			// This fixture deliberately returns without completing readiness. The job
+			// fails, but its acquired install slot and one-shot Prepare survive.
+			snap := observe(t, o, 2, 1)
+			if snap.Workspace.State != "failed" || snap.Workspace.Phases.Install.Progress != "offered" || calls.Load() != 1 {
+				t.Fatal(snap, calls.Load())
+			}
+			if _, err := o.Do(context.Background(), request("workspace-prepare", 3, 3), &Rights{}); !errors.Is(err, ErrGrammar) {
+				t.Fatal("Prepare rearmed", err)
 			}
 		})
 	}
 }
 
-// Astra P2-4: SCM_RIGHTS/dup copies retain an open description; fresh opens of
-// the same inode do not. Every received duplicate closes on either verdict.
-func TestInstallReplayBindsOpenDescriptions(t *testing.T) {
-	r := &Replay{}
-	defer r.Close()
-	var closed atomic.Int32
-	r.CloseAdmission = func() { closed.Add(1) }
-	var handlerOwner *Rights
-	defer func() {
-		if handlerOwner != nil {
-			handlerOwner.Close()
+func TestObservationsAreSnapshotsWithoutRetainedGrowth(t *testing.T) {
+	offered, release := make(chan struct{}), make(chan struct{})
+	o := testOwner(t, func(ctx context.Context, j *Job) error {
+		if err := j.OfferInstall(*phase()); err != nil {
+			return err
 		}
-	}()
-	h := handlerFunc(func(_ context.Context, q Request, d *Rights) (Response, error) {
-		switch q.Operation {
-		case "workspace-observe":
-			out := response(q, "kernel-required")
-			out.Workspace.Action = phase()
-			return out, nil
-		case "workspace-install-kernel":
-			handlerOwner = d.Take()
-			out := response(q, "install-complete")
-			out.Workspace.Witness = witness()
-			return out, nil
-		}
-		return response(q, "accepted"), nil
+		close(offered)
+		<-release
+		return nil
 	})
-	r.Do(context.Background(), request("workspace-prepare", 1, 1), &Rights{}, h)
-	r.Do(context.Background(), request("workspace-observe", 2, 1), &Rights{}, h)
-	owned, duplicates, fresh := &Rights{}, &Rights{}, &Rights{}
-	for i := 0; i < 2; i++ {
-		file, err := os.CreateTemp(t.TempDir(), "same-node")
-		if err != nil {
-			t.Fatal(err)
+	j := start(t, o, request("workspace-prepare", 1, 1))
+	awaitResult(t, offered)
+	old := observe(t, o, 5000, 1)
+	o.mu.Lock()
+	before := o.job
+	body := cloneRequest(o.job.start)
+	slots := [3]ActionStatus{status(o.install), status(o.voluntary), status(o.terminal)}
+	o.mu.Unlock()
+	for i := 0; i < 4096; i++ {
+		out := observe(t, o, 2, 1)
+		if out.Workspace.Phases.Install.Progress != "offered" {
+			t.Fatal(out)
 		}
-		a, err := unix.Dup(int(file.Fd()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		b, err := unix.Dup(a)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, err := unix.Open(file.Name(), unix.O_RDWR|unix.O_CLOEXEC, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		file.Close()
-		owned.FDs = append(owned.FDs, a)
-		duplicates.FDs = append(duplicates.FDs, b)
-		fresh.FDs = append(fresh.FDs, c)
 	}
-	q := request("workspace-install-kernel", 3, 1)
-	q.Workspace.Phase = phase()
-	if _, err := r.Do(context.Background(), q, owned, h); err != nil {
+	o.mu.Lock()
+	unchanged := before == o.job && reflect.DeepEqual(body, o.job.start) && reflect.DeepEqual(slots, [3]ActionStatus{status(o.install), status(o.voluntary), status(o.terminal)})
+	o.mu.Unlock()
+	if !unchanged {
+		t.Fatal("observations mutated retained ownership")
+	}
+	d, _ := descriptors(t)
+	do(t, o, installRequest(3, 1), d)
+	o.mu.Lock()
+	done := o.install.done
+	o.mu.Unlock()
+	awaitResult(t, done)
+	newer := observe(t, o, 5000, 1)
+	if newer.Workspace.Phases.Install.Progress != "complete" || reflect.DeepEqual(old, newer) {
+		t.Fatal("request ID froze observation")
+	}
+	close(release)
+	awaitResult(t, j.done)
+}
+
+func TestStaleActionsRetiredStartsAndChangedBodiesRefuse(t *testing.T) {
+	var closes atomic.Int32
+	entered := make(chan struct{})
+	o := testOwner(t, func(ctx context.Context, j *Job) error {
+		if j.start.Operation == "workspace-prepare" {
+			j.OfferInstall(*phase())
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return errors.New("cleanup failed")
+	})
+	o.CloseAdmission = func() { closes.Add(1) }
+	q := request("workspace-prepare", 1, 1)
+	j := start(t, o, q)
+	awaitResult(t, entered)
+	changed := cloneRequest(q)
+	changed.Workspace.GateSerial = "1"
+	if _, err := o.Do(context.Background(), changed, &Rights{}); !errors.Is(err, ErrGrammar) || closes.Load() != 1 {
+		t.Fatal(err, closes.Load())
+	}
+	// An unknown snapshot and an obsolete binding have no lifecycle effect.
+	if _, err := o.Do(context.Background(), request("workspace-observe", 3, 4), &Rights{}); !errors.Is(err, ErrNotAccepted) {
 		t.Fatal(err)
 	}
-	dupFDs := append([]int{}, duplicates.FDs...)
-	if _, err := r.Do(context.Background(), q, duplicates, h); err != nil {
-		t.Fatal("dup refused", err)
+	bad := installRequest(4, 1)
+	bad.Workspace.Phase.ActionID = "2"
+	d, fd := descriptors(t)
+	if _, err := o.Do(context.Background(), bad, d); !errors.Is(err, ErrGrammar) {
+		t.Fatal(err)
 	}
-	assertClosed(t, dupFDs)
-	freshFDs := append([]int{}, fresh.FDs...)
-	if _, err := r.Do(context.Background(), q, fresh, h); !errors.Is(err, ErrGrammar) || closed.Load() != 1 {
-		t.Fatal("same-inode substitute accepted", err, closed.Load())
+	assertClosed(t, fd)
+	closeQ := cleanupRequest(5, "voluntary")
+	o.AdmitFrame(closeQ, &Rights{})
+	awaitResult(t, j.done)
+	next := start(t, o, closeQ)
+	awaitResult(t, next.done)
+	if _, err := o.Do(context.Background(), q, &Rights{}); !errors.Is(err, ErrRetired) {
+		t.Fatal(err)
 	}
-	assertClosed(t, freshFDs)
-	handlerFDs := append([]int{}, handlerOwner.FDs...)
-	r.Close()
-	for _, fd := range handlerFDs {
-		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
-			t.Fatal("replay closed handler owner", err)
+	d, fd = descriptors(t)
+	if _, err := o.Do(context.Background(), installRequest(6, 1), d); !errors.Is(err, ErrRetired) {
+		t.Fatal(err)
+	}
+	assertClosed(t, fd)
+	if _, err := o.Do(context.Background(), request("workspace-observe", 7, 1), &Rights{}); !errors.Is(err, ErrRetired) {
+		t.Fatal(err)
+	}
+}
+
+func TestSuspendClosesCancelsAndRetainsOccupiedWorker(t *testing.T) {
+	entered, canceled, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}, 4)
+	o := testOwner(t, func(ctx context.Context, j *Job) error {
+		if j.start.Operation == "workspace-prepare" {
+			close(entered)
+			<-ctx.Done()
+			close(canceled)
+			<-release
+			return ctx.Err()
 		}
+		return j.Publish("cold", Facts{})
+	})
+	o.CloseAdmission = func() { closed <- struct{}{} }
+	old := start(t, o, request("workspace-prepare", 1, 1))
+	awaitResult(t, entered)
+	q := request("workspace-suspend", 3, 3)
+	transaction(t, &q)
+	if _, err := o.Do(context.Background(), q, &Rights{}); !errors.Is(err, ErrOccupied) {
+		t.Fatal(err)
 	}
-	handlerOwner.Close()
-	assertClosed(t, handlerFDs)
+	awaitResult(t, closed)
+	awaitResult(t, canceled)
+	if snap := observe(t, o, 4, 1); snap.Workspace.State != "preparing" {
+		t.Fatal(snap)
+	}
+	close(release)
+	awaitResult(t, old.done)
+	next := start(t, o, q)
+	awaitResult(t, next.done)
+	if snap := observe(t, o, 5, 3); snap.Workspace.State != "cold" {
+		t.Fatal(snap)
+	}
+}
+
+func TestFixedDrainDeadlineChargesAdmissionAndAllowsLaterObservation(t *testing.T) {
+	base := time.Now().Add(time.Hour)
+	var elapsed atomic.Int64
+	entered, release := make(chan time.Time, 1), make(chan struct{})
+	o := testOwner(t, func(ctx context.Context, j *Job) error {
+		d, _ := ctx.Deadline()
+		entered <- d
+		<-release
+		return errors.New("drain failed")
+	})
+	o.Now = func() time.Time { return base.Add(time.Duration(elapsed.Load())) }
+	q := request("workspace-suspend", 1, 1)
+	transaction(t, &q)
+	q.Workspace.DrainBudgetNanos = "10000000000"
+	// Framing and lock delay are charged to the original receipt, never to
+	// acceptance. The allowance is outside immutable transaction identity.
+	o.AdmitFrame(q, &Rights{})
+	elapsed.Store(int64(3 * time.Second))
+	if _, err := o.DoAdmitted(context.Background(), q, &Rights{}, base); err != nil {
+		t.Fatal(err)
+	}
+	deadline := awaitResult(t, entered)
+	if !deadline.Equal(base.Add(10 * time.Second)) {
+		t.Fatal(deadline)
+	}
+	elapsed.Store(int64(20 * time.Second))
+	q.Workspace.DrainBudgetNanos = "15000000000"
+	do(t, o, q, &Rights{})
+	o.mu.Lock()
+	j := o.job
+	if !j.drainDeadline.Equal(deadline) {
+		t.Error("retry extended drain")
+	}
+	o.mu.Unlock()
+	snap := observe(t, o, 2, 1)
+	if snap.Workspace.State != "pending-suspend" {
+		t.Fatal(snap)
+	}
+	close(release)
+	awaitResult(t, j.done)
+	if observe(t, o, 2, 1).Workspace.State != "failed" {
+		t.Fatal("snapshot did not advance")
+	}
 }
 
 func TestWorkspaceResponseMaximumIsBoundedBeforeDispatch(t *testing.T) {
 	q := request("workspace-recover", 1, 1)
 	transaction(t, &q)
-	// Near-limit requests do not echo any transaction bytes in their response.
 	q.Workspace.Transaction = strings.Repeat("x", MaxWorkspaceRequest-1024)
 	out := response(q, "failed")
+	out.Workspace.Phases = absentPhases()
 	out.Workspace.Reason = strings.Repeat("\x00", 256)
-	out.Workspace.Witness.Target = strings.Repeat("\x00", 512)
+	out.Workspace.Witness = Witness{Process: "p", Source: "s", Target: "/" + strings.Repeat("\x00", 509)}
 	for i := 1; i <= 32; i++ {
-		out.Workspace.Loss = append(out.Workspace.Loss, Loss{Sequence: strconv.FormatUint(uint64(i), 10), AcceptedEntries: "18446744073709551615", AcceptedBytes: "18446744073709551615", Reason: strings.Repeat("\x00", 256)})
+		out.Workspace.Loss = append(out.Workspace.Loss, Loss{Sequence: strconv.Itoa(i), AcceptedEntries: "18446744073709551615", AcceptedBytes: "18446744073709551615", Reason: strings.Repeat("\x00", 256)})
+	}
+	f := out.Workspace.Phases
+	for i, s := range []*ActionStatus{&f.Install, &f.VoluntaryRemoval, &f.TerminalRemoval} {
+		p := &Phase{ActionID: strconv.Itoa(i + 1), Witness: Witness{Process: "p", Source: "s", Target: "/" + strings.Repeat("\x00", 509)}}
+		s.Progress = "failed"
+		s.Failure = "handler-failed"
+		if i == 0 {
+			p.Options = []string{strings.Repeat("\x00", 256)}
+		} else {
+			p.Mode = "voluntary"
+			if i == 2 {
+				p.Mode = "terminal"
+			}
+			p.Reason = strings.Repeat("\x00", 256)
+		}
+		s.Action = kernelAction(*p)
 	}
 	raw, err := EncodeResponse(out)
 	if err != nil || len(raw) > MaxWorkspaceResponse {
-		t.Fatal("valid bounded evidence exceeded response frame", len(raw), err)
+		t.Fatal(len(raw), err)
 	}
 	if strings.Contains(string(raw), strings.Repeat("x", 100)) {
 		t.Fatal("transaction echoed")
-	}
-	// The largest action variant must fit with the same maximum loss ledger.
-	action := response(q, "kernel-required")
-	action.Workspace.Loss = out.Workspace.Loss
-	action.Workspace.Witness = out.Workspace.Witness
-	action.Workspace.Action = &Phase{ActionID: "18446744073709551615", Witness: Witness{Process: "p", Source: "s", Target: "/" + strings.Repeat("\x00", 509)}, Options: []string{strings.Repeat("\x00", 256)}}
-	if raw, err := EncodeResponse(action); err != nil || len(raw) > MaxWorkspaceResponse {
-		t.Fatal("maximum action exceeded frame", len(raw), err)
 	}
 	out.Workspace.Witness.Target += "x"
 	if _, err := EncodeResponse(out); err == nil {
@@ -369,53 +347,22 @@ func TestWorkspaceResponseMaximumIsBoundedBeforeDispatch(t *testing.T) {
 	}
 }
 
-func TestLateObservationCannotRestoreCompletedKernelAction(t *testing.T) {
-	r := &Replay{}
-	defer r.Close()
-	entered, release := make(chan struct{}), make(chan struct{})
-	installs := 0
-	h := handlerFunc(func(_ context.Context, q Request, _ *Rights) (Response, error) {
-		switch q.Operation {
-		case "workspace-observe":
-			if q.Workspace.RequestID == "3" {
-				close(entered)
-				<-release
-			}
-			out := response(q, "kernel-required")
-			out.Workspace.Action = phase()
-			return out, nil
-		case "workspace-install-kernel":
-			installs++
-			out := response(q, "failed")
-			out.Workspace.Reason = "installation failed"
-			return out, nil
-		}
-		return response(q, "accepted"), nil
-	})
-	for _, q := range []Request{request("workspace-prepare", 1, 1), request("workspace-observe", 2, 1)} {
-		if _, err := r.Do(context.Background(), q, &Rights{}, h); err != nil {
-			t.Fatal(err)
-		}
+func TestOperationIDExhaustionNeverWraps(t *testing.T) {
+	o := testOwner(t, func(context.Context, *Job) error { return errors.New("finished") })
+	q := request("workspace-prepare", ^uint64(0), ^uint64(0))
+	j := start(t, o, q)
+	awaitResult(t, j.done)
+	do(t, o, q, &Rights{})
+	if _, err := o.Do(context.Background(), request("workspace-prepare", 1, 1), &Rights{}); !errors.Is(err, ErrRetired) {
+		t.Fatal("operation ID wrapped", err)
 	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := r.Do(context.Background(), request("workspace-observe", 3, 1), &Rights{}, h)
-		done <- err
-	}()
-	awaitResult(t, entered)
-	q := request("workspace-install-kernel", 4, 1)
-	q.Workspace.Phase = phase()
-	d, _ := descriptors(t)
-	if _, err := r.Do(context.Background(), q, d, h); err != nil {
-		t.Fatal(err)
+	overflow := cloneRequest(q)
+	overflow.Workspace.RequestID = "18446744073709551616"
+	overflow.Workspace.OperationID = overflow.Workspace.RequestID
+	if _, err := o.Do(context.Background(), overflow, &Rights{}); !errors.Is(err, ErrGrammar) {
+		t.Fatal("overflow accepted", err)
 	}
-	close(release)
-	if err := awaitResult(t, done); err != nil {
-		t.Fatal(err)
-	}
-	q.Workspace.RequestID = "5"
-	d, _ = descriptors(t)
-	if _, err := r.Do(context.Background(), q, d, h); !errors.Is(err, ErrGrammar) || installs != 1 || r.nextAction != nil {
-		t.Fatal("late observation revived a completed action", err, installs)
+	if observe(t, o, 1, ^uint64(0)).Workspace.State != "failed" {
+		t.Fatal("retired/overflow changed job")
 	}
 }

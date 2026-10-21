@@ -20,18 +20,10 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 )
 
-type workspaceHandlerFunc func(context.Context, mountcontrol.Request, *mountcontrol.Rights) (mountcontrol.Response, error)
-
-func (f workspaceHandlerFunc) Handle(c context.Context, q mountcontrol.Request, d *mountcontrol.Rights) (mountcontrol.Response, error) {
-	return f(c, q, d)
-}
 func workspaceRequest(n, op string) mountcontrol.Request {
 	return mountcontrol.Request{Operation: op, MountInstanceID: lossTestInstance, Workspace: &mountcontrol.Workspace{Version: 8, RequestID: n, OperationID: "1", BootID: strings.Repeat("01", 16), HostServiceID: strings.Repeat("02", 16), GuestServiceID: strings.Repeat("03", 16), Generation: "0", GateSerial: "0", BudgetNanos: "1000000000"}}
 }
-func workspaceResponse(q mountcontrol.Request, state string) mountcontrol.Response {
-	return mountcontrol.Response{OK: true, MountInstanceID: q.MountInstanceID, Workspace: &mountcontrol.WorkspaceResponse{Binding: q.Workspace.ResponseBinding(), State: state, AuthorizationDeadlineUnixNanos: "0", Outcome: mountcontrol.Outcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: "0"}}}
-}
-func rootWorkspace(t *testing.T, h mountcontrol.Handler) (*unixReauthorizationControl, *workspaceControlConfig) {
+func rootWorkspace(t *testing.T, run func(context.Context, *mountcontrol.Job) error, configure ...func(*workspaceControlConfig)) (*unixReauthorizationControl, *workspaceControlConfig) {
 	t.Helper()
 	if os.Geteuid() != 0 {
 		t.Skip("owned root Linux test container")
@@ -40,7 +32,10 @@ func rootWorkspace(t *testing.T, h mountcontrol.Handler) (*unixReauthorizationCo
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Handler: h}
+	cfg := &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Owner: mountcontrol.Owner{Driver: mountcontrol.Driver{Run: run}, CheckPermit: func(mountcontrol.Workspace) bool { return true }}}
+	for _, configure := range configure {
+		configure(cfg)
+	}
 	control, err := startFuseMountControl(nil, nil, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -93,37 +88,38 @@ func TestWorkspaceRefusalsRoundTripExactTransport(t *testing.T) {
 			t.Fatal(out)
 		}
 	})
-	t.Run("retired", func(t *testing.T) {
-		h := workspaceHandlerFunc(func(_ context.Context, q mountcontrol.Request, _ *mountcontrol.Rights) (mountcontrol.Response, error) {
-			if q.Operation == "workspace-observe" {
-				return workspaceResponse(q, "preparing"), nil
-			}
-			return workspaceResponse(q, "accepted"), nil
-		})
-		c, _ := rootWorkspace(t, h)
-		for _, q := range []mountcontrol.Request{workspaceRequest("1", "workspace-prepare"), workspaceRequest("2", "workspace-observe"), workspaceRequest("3", "workspace-observe")} {
-			workspaceRoundtrip(t, c, q)
-		}
+	t.Run("not-accepted", func(t *testing.T) {
+		c, _ := rootWorkspace(t, nil)
 		out := workspaceRoundtrip(t, c, workspaceRequest("2", "workspace-observe"))
-		if out.OK || out.Workspace.Refusal != "retired" {
+		if out.OK || out.Workspace.Refusal != "not-accepted" {
 			t.Fatal(out)
 		}
 	})
-	t.Run("retained-handler-error", func(t *testing.T) {
+	t.Run("accepted-failure-is-observed", func(t *testing.T) {
 		var calls atomic.Int32
-		c, _ := rootWorkspace(t, workspaceHandlerFunc(func(context.Context, mountcontrol.Request, *mountcontrol.Rights) (mountcontrol.Response, error) {
+		c, _ := rootWorkspace(t, func(context.Context, *mountcontrol.Job) error {
 			calls.Add(1)
-			return mountcontrol.Response{}, errors.New("private unbounded error")
-		}))
+			return errors.New("private unbounded diagnostic")
+		})
 		q := workspaceRequest("1", "workspace-prepare")
 		for i := 0; i < 2; i++ {
 			out := workspaceRoundtrip(t, c, q)
-			if out.OK || out.Workspace.Refusal != "handler-failed" {
+			if !out.OK || out.Workspace.State != "accepted" {
 				t.Fatal(out)
 			}
 		}
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			out := workspaceRoundtrip(t, c, workspaceRequest("2", "workspace-observe"))
+			if out.Workspace.State == "failed" {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("failure not observable")
+			}
+		}
 		if calls.Load() != 1 {
-			t.Fatal("error receipt executed twice", calls.Load())
+			t.Fatal("accepted job restarted", calls.Load())
 		}
 	})
 }
@@ -133,9 +129,8 @@ func TestWorkspaceRefusalsRoundTripExactTransport(t *testing.T) {
 func TestTruncatedWorkspaceDistinguishesFullAndHalfClose(t *testing.T) {
 	for _, half := range []bool{false, true} {
 		t.Run(map[bool]string{false: "full-hangup", true: "framing-half-close"}[half], func(t *testing.T) {
-			c, cfg := rootWorkspace(t, nil)
 			var closed atomic.Int32
-			cfg.Replay.CloseAdmission = func() { closed.Add(1) }
+			c, _ := rootWorkspace(t, nil, func(cfg *workspaceControlConfig) { cfg.Owner.CloseAdmission = func() { closed.Add(1) } })
 			body, _ := json.Marshal(workspaceRequest("1", "workspace-prepare"))
 			conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: c.SocketPath(), Net: "unix"})
 			if err != nil {

@@ -213,3 +213,104 @@ func TestManagedReadinessWithdrawsAtServingCutoff(t *testing.T) {
 		t.Fatal("extended serving permission")
 	}
 }
+
+// Park must join policy disposition as well as the source/installer. The old
+// serving cutoff cannot apply to the subsequent closed recovery interval.
+func TestParkJoinsAttemptDispositionBeforeResume(t *testing.T) {
+	start := time.Now().Add(time.Hour).Truncate(time.Second)
+	var clock atomic.Int64
+	now := func() time.Time { return start.Add(time.Duration(clock.Load())) }
+	deadline := start.Add(10 * time.Minute)
+	entered, release, installed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	var serial atomic.Uint64
+	serial.Store(1)
+	r := &Renewer{Managed: true, Now: now, CheckPermit: func(p Permit) bool { return p.GateSerial == serial.Load() }}
+	r.Source = sourceFunc(func(_ context.Context, s string, n uint64) (controlplane.MountAuthorization, error) {
+		if n == 1 {
+			return grantFor(s, n, deadline), nil
+		}
+		return controlplane.MountAuthorization{}, errors.New("HTTP 503")
+	})
+	var dispositions atomic.Int32
+	r.attemptDispositionHook = func(Permit) {
+		if dispositions.Add(1) == 2 {
+			close(entered)
+			<-release
+		}
+	}
+	r.Observe = func(e RenewalEvent) {
+		if e.Kind == RenewalSucceeded {
+			installed <- struct{}{}
+		}
+	}
+	step := make(chan struct{}, 1)
+	r.waitHook = func(ctx context.Context, target time.Time, wake <-chan struct{}) error {
+		select {
+		case <-step:
+			return nil
+		case <-wake:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := r.Resume(Permit{GateSerial: 1}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- r.Run(ctx, "session", start.Add(5*time.Minute), func(context.Context, string, uint64, []byte) (time.Time, error) { return deadline, nil })
+	}()
+	await(t, installed)
+	clock.Store(int64(9*time.Minute - time.Millisecond))
+	r.RefreshNow()
+	step <- struct{}{}
+	await(t, entered)
+	parked := make(chan error, 1)
+	go func() { parked <- r.Park(context.Background()) }()
+	// Readiness synchronizes with Park's closed interval. Resume must still
+	// refuse until the old attempt's decision owner has joined.
+	parkDeadline := time.After(3 * time.Second)
+	for {
+		r.mu.Lock()
+		parkedNow := r.parked
+		r.mu.Unlock()
+		if parkedNow {
+			break
+		}
+		select {
+		case <-time.After(time.Millisecond):
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-parkDeadline:
+			t.Fatal("Park did not close the interval")
+		}
+	}
+	serial.Store(2)
+	if err := r.Resume(Permit{GateSerial: 2}); err == nil {
+		t.Fatal("Resume bypassed unjoined disposition")
+	}
+	clock.Store(int64(9*time.Minute + time.Second))
+	close(release)
+	if err := await(t, parked); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Resume(Permit{GateSerial: 2}); err != nil {
+		t.Fatal("obsolete cutoff terminalized recovery", err)
+	}
+	if r.Readiness().State != "pending" {
+		t.Fatal("near-cutoff recovery became ready")
+	}
+	r.mu.Lock()
+	terminal := r.terminal
+	r.mu.Unlock()
+	if terminal != nil {
+		t.Fatal(terminal)
+	}
+	cancel()
+	if err := await(t, done); err != nil {
+		t.Fatal(err)
+	}
+}

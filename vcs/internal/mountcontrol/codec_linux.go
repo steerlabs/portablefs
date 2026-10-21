@@ -1,7 +1,7 @@
 //go:build linux
 
 // Package mountcontrol owns the exact local mount control grammar. Workspace
-// controls are paired format 8; they do not implement a mount lifecycle.
+// controls are paired format 8; real workspace mount handlers remain unavailable.
 package mountcontrol
 
 import (
@@ -25,6 +25,8 @@ var ErrGrammar = errors.New("mount control: invalid exact grammar")
 var ErrPeerRefused = errors.New("workspace peer refused")
 var ErrOccupied = errors.New("workspace lane occupied")
 var ErrRetired = errors.New("workspace request retired")
+var ErrActionConsumed = errors.New("workspace action consumed")
+var ErrNotAccepted = errors.New("workspace operation not accepted")
 var ErrUnavailable = errors.New("workspace lifecycle unavailable")
 
 type Request struct {

@@ -525,8 +525,21 @@ func (c *Client) publishCommittedActivation(
 	data, control *transportNegotiation,
 	dataGeneration, controlGeneration, cleanupRequestID uint64,
 ) error {
+	// ACTIVE owns exact cleanup even when local validation fails. Join every
+	// startup cancellation writer before cleanup installs its independent
+	// deadline, while retaining both connections for the authenticated Detach.
+	var cancellation error
+	for _, opened := range []*transportNegotiation{data, control} {
+		if opened != nil && opened.stopCancellation != nil {
+			cancellation = errors.Join(cancellation, opened.stopCancellation())
+			opened.stopCancellation = nil
+		}
+	}
 	if err := c.installActiveState(active); err != nil {
-		return c.releaseCommittedBeforePublication(err, control, cleanupRequestID)
+		return c.releaseCommittedBeforePublication(errors.Join(err, cancellation), control, cleanupRequestID)
+	}
+	if cancellation != nil {
+		return c.releaseCommittedBeforePublication(cancellation, control, cleanupRequestID)
 	}
 	c.initializeExecutionLanes()
 	if err := c.publishInitialPair(data, control, dataGeneration, controlGeneration); err != nil {

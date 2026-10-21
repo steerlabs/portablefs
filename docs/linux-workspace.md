@@ -88,61 +88,63 @@ manual renewal is explicitly refused: the automatic renewal owner is exclusive.
 Loss observation remains available while closed. Ordinary peers are classified
 by UID alone; only the seeded root PID requires a readable start witness.
 
-Local workspace format 8 uses strict JSON keys and string-encoded canonical
-uint64 values. Prepare, Recover, Suspend and Cleanup begin an operation with
-`operationId=requestId`; observation, kernel installation and removal evidence
-have distinct request IDs. Suspend carries the complete guest-fixed Suspension;
-Recover carries the complete ResumeToken. Their protobuf bodies use the paired
-canonical scanner, independently of the host Suspend rule that forbids a roster.
-The finite response states are accepted, preparing, kernel-required,
-pending-recovery, pending-suspend, prepared, cold, install-complete,
-unmount-required, unmount-recorded, cleanup-finalized, failed and refused. Only prepared
-carries readiness. Each response is immutable: a new observation ID obtains a
-later snapshot. A refusal has `ok=false`, state `refused`, the exact compact
-request binding and one finite code: unavailable, occupied, retired, invalid,
-handler-failed, deadline, stopped or peer-refused. It carries unknown disposition evidence,
-never an unbounded diagnostic or successful readiness. Successful responses have
-`ok=true`. Both variants use the same exact codec. Compact bindings omit the
-transaction and phase payload; each witness totals at most 512 bytes, each
-phase's options total at most 256 bytes, and reason/loss limits bound the
-response before dispatch.
+Local workspace format 8 uses strict JSON keys and canonical string uint64s.
+Its exact paired, unreleased contract is
+[linux-workspace-local-control.md](./linux-workspace-local-control.md).
+Prepare, Recover, Suspend and Cleanup acknowledge acceptance; observations
+report actual lifecycle progress, including fixed install and removal slots.
+Request IDs correlate socket attempts. They retain no encoded responses,
+request history or execution high-water marks. One current job retains its
+immutable start identity; older operations refuse as retired, and future
+observations report not-accepted. A consumed action always refuses, including
+when a later delivery carries fresh descriptors.
 
-The replay owner retains at most the active start receipt, latest completed
-phase and latest observation, with a high-water mark per lane. Observations do
-not evict installation receipts. Retired IDs never execute again; changed
-retained requests close permission. Retry socket budgets do not change immutable
-transaction identity or extend the captured Suspend deadline. A write-half-close
-frames a request and permits its response. Full hangup or exact process death
-cancels the waiter; dispatched handlers own their first receipt deadline and
-outlive waiter cancellation. Generation-owned jobs and assigned cleanup survive
-it. Suspend's first receipt deadline bounds only that Suspend request, never
-later observations. The authenticated socket handler owns exactly one admission
-close for each complete, valid Suspend or Cleanup frame, before inspecting lane
-availability, remaining budget or full hangup. Root death after such a frame
-cannot leave permission open; failure to accept still consumes no receipt or
-job. A truncated full hangup remains transport loss; a malformed half-closed
-frame closes admission.
-Only install-kernel carries rights: exactly two ordered, distinct descriptors,
-FUSE then the duplicate abort witness. Receipt uses close-on-exec recvmsg;
-rejections and duplicate deliveries close all newly received descriptors.
-The bounded install receipt borrows the handler-owned descriptor container and
-compares open descriptions with same-process `kcmp(KCMP_FILE)`. Handler teardown
-and comparison serialize on that container; closing a descriptor cannot let a
-reused descriptor number bind a different connection. The handler transfers
-ownership through Rights.Take and closes through Rights.Close. Replay retains
-no redundant FUSE or abort copies after acknowledgement. Fresh opens of the
-same inode, closed handler owners and unavailable comparisons refuse replay;
-they never dispatch the action again. Control shutdown joins dispatches, while
-the handler owns device teardown. Consumed and in-flight action IDs remain
-ineligible throughout the job, independently of late immutable observations.
-Only explicit terminal snapshots or start/phase refusals end a job. Observation
-refusals leave it active. A Prepare acceptance deadline miss retains a refusal
-receipt but permits a fresh acceptance request; it is no recovery result.
-Actual device/bootstrap qualification belongs to the later protected-path driver.
+Acceptance reserves the real job/action state and moves received rights under
+one short lock. Driver work, descriptor disposal, joins and socket I/O run
+outside that lock. Prepare runs at most once per incarnation; Recover consumes
+its exact Resume authorization once. Suspend and Cleanup close admission and
+signal old work before returning occupied until that owner joins. Fixed slots
+allow one install and voluntary removal followed by terminal escalation;
+successful removal cannot reverse. Observations cannot publish actions or change
+admission. Install completion remains distinct from prepared readiness, and
+recorded removal remains distinct from final cleanup.
+
+Socket attempts have a maximum 45-second budget. Losing or expiring a socket
+cannot cancel accepted work or erase its resources and outcomes. Suspend alone
+also carries a positive `drainBudgetNanos` of at most 15 seconds. Acceptance
+captures its receipt-relative deadline after charging framing and admission
+delay; retry allowances cannot extend it. Observation gets its own socket
+budget after the drain expires. The host transaction retains its original
+cold acknowledgment and pause deadlines.
+
+`AdmitFrame` owns the immediate admission invalidation for each authenticated,
+fully framed Suspend or Cleanup, before checking lanes, remaining budget or
+full hangup. A truncated full hangup remains transport loss; malformed
+half-closed input closes admission. The hook does not write the supervisor's
+memfd. Only actual owner-pipe EOF or process death takes permanent owner-loss
+cleanup; full socket loss ends its waiter. These rules retain the later
+closed-start gate and lifetime-pipe implementation as dependencies.
+
+Only install-kernel carries rights: exactly two ordered descriptors, FUSE then
+abort. Close-on-exec recvmsg accounts for all ancillary input. First delivery
+requires the real driver's role/bootstrap validation; every rejected delivery
+closes its received inventory. Acceptance transfers rights into the job without
+adding copies. Later installs refuse action-consumed regardless of descriptor
+identity. No KCMP support is required.
+
+The root bootstrap owner records its one attempt before the mount syscall,
+retains original descriptions and partial witness, and retransmits only copies
+of those descriptions while child ownership remains unknown. Observing accepted
+child ownership closes the redundant root FUSE copy; the original abort owner
+survives through independent process-exit and kernel/source/alias-absence proof.
+Death preserves uncertain inventory and blocks replacement. The control-boundary
+tests use owned descriptors; actual device/bootstrap qualification still belongs
+to the later protected-path driver.
 
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
-joins in-flight source/installation work. An unknown installation retries its
+joins in-flight source/installation work and its synchronized policy disposition.
+An old serving attempt cannot apply its cutoff to a later Park/Resume interval. An unknown installation retries its
 same sequence and bytes. A known remote success advances the sequence even
 when a later Close suppresses readiness. The managed installer itself rejects
 missing or stale generation/serial permits. Hosted CLI readiness requires the
