@@ -20,7 +20,7 @@ import (
 // Both authority clocks move explicitly. No timer delivery supplies expiry proof.
 func replayAdmissionHarness(t *testing.T, deadline time.Duration) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability, *applicationClock, *replayAdmissionStore) {
 	t.Helper()
-	clock := &applicationClock{topologyFrozenClock{time.Now()}, make(chan time.Duration, 64)}
+	clock := newApplicationClock()
 	base := clock.Now()
 	a, err := volumeserver.New("replay-admission", volumeserver.Config{Now: clock.Now, ContinuousNow: func() (time.Duration, error) { return clock.Now().Sub(base), nil }, SessionLease: 2 * time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8})
 	if err != nil {
@@ -195,7 +195,7 @@ func TestMutationReplayPrecedesCoherenceAdmission(t *testing.T) {
 							t.Fatal(err)
 						}
 						oldToken, _ := h.coherenceToken(cred.ID)
-						clock.now = clock.now.Add(elapsed)
+						clock.advance(elapsed)
 						if err := h.Coherence.CheckSession(oldToken); err == nil {
 							t.Fatal("subscription did not expire")
 						}
@@ -280,7 +280,7 @@ func TestReplayAdmissionTerminalControls(t *testing.T) {
 				t.Fatal(first)
 			}
 			terminal, _ := h.Runtime.SessionTerminal(cred.ID)
-			clock.now = clock.now.Add(15 * time.Second)
+			clock.advance(15 * time.Second)
 			switch kind {
 			case "changed_body":
 				r.GetOpen().Flags.Truncate = true
@@ -289,7 +289,7 @@ func TestReplayAdmissionTerminalControls(t *testing.T) {
 			case "epoch":
 				r.Epoch = make([]byte, 16)
 			case "lease_120s":
-				clock.now = clock.now.Add(105 * time.Second)
+				clock.advance(105 * time.Second)
 			}
 
 			response := h.Handle(ctx, r)
@@ -312,7 +312,7 @@ func TestReplayRuntimeLeaseBoundary(t *testing.T) {
 		t.Run(elapsed.String(), func(t *testing.T) {
 			h, _, cred, _, clock, _ := replayAdmissionHarness(t, time.Hour)
 			terminal, _ := h.Runtime.SessionTerminal(cred.ID)
-			clock.now = clock.now.Add(elapsed)
+			clock.advance(elapsed)
 			err := h.Runtime.Resume(cred)
 			if elapsed < 2*time.Minute {
 				if err != nil {
@@ -340,7 +340,7 @@ func TestColdReplayRejectsSequenceGapAndMutationHeaderReads(t *testing.T) {
 			if r := h.Handle(ctx, first); r.GetMutation().GetAcceptedSequence() != 1 {
 				t.Fatal(r)
 			}
-			clock.now = clock.now.Add(15 * time.Second)
+			clock.advance(15 * time.Second)
 			r := proto.Clone(first).(*authoritypb.Request)
 			r.Mutation.Sequence = 3
 			switch kind {

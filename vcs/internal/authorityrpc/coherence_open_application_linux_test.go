@@ -19,9 +19,28 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// applicationClock is fake authority time. Background coherence waiters started
+// by a mutation read it while the test advances it, so access is serialized.
 type applicationClock struct {
-	topologyFrozenClock
+	mu     sync.Mutex
+	now    time.Time
 	timers chan time.Duration
+}
+
+func newApplicationClock() *applicationClock {
+	return &applicationClock{now: time.Now(), timers: make(chan time.Duration, 64)}
+}
+
+func (c *applicationClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *applicationClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
 }
 
 func (c *applicationClock) NewTimer(d time.Duration) volumeserver.CoherenceTimer {
@@ -150,7 +169,7 @@ func applicationHarness(t *testing.T, store *applicationOpenStore) (*VolumeHandl
 	t.Helper()
 	store.handles = make(map[xfsstore.Capability]xfsstore.Capability)
 	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 16, 16)
-	clock := &applicationClock{topologyFrozenClock{time.Now()}, make(chan time.Duration, 64)}
+	clock := newApplicationClock()
 	// Replace the otherwise unused fixture coordinator before any filesystem
 	// work, then cold-subscribe the source into the frozen-clock coordinator.
 	h.Coherence = volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{Clock: clock})
