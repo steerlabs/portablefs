@@ -136,6 +136,7 @@ PRODUCT_COMMANDS = {
     "portablefs-manager",
     "portablefs-mount-v3",
     "portablefsd",
+    "portablefs-workspaced",
 }
 GO_MODULES = {"vcs/go.mod", "vcs/third_party/go-fuse/go.mod"}
 SWIFT_PACKAGES = {"swift/PortableFSKit/Package.swift"}
