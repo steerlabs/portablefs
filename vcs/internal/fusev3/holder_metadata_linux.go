@@ -34,7 +34,7 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 	for {
 		m.epoch.RLock()
 		s := m.retainState(writeback.Identity(record.identity), base != nil)
-		if m.incarnation() == 0 {
+		if m.incarnation() == 0 && (publication == nil || publication.postState == nil) {
 			m.releaseState(s)
 			m.epoch.RUnlock()
 			if fast {
@@ -45,6 +45,10 @@ func (r *rawFileSystem) holderMetadata(ctx context.Context, unique uint64, paren
 			// reset accounts for it and could publish an older inode size.
 			return false, false, errMetadataInterrupted
 		}
+		// An accepted mutation must still publish its exact result after cache
+		// withdrawal. Its callback fence retains this old buffer, and the
+		// metadata pin preserves any earlier accepted overlay until the physical
+		// reply. The expired subscription supplies no reusable cache lifetime.
 		if s == nil {
 			m.epoch.RUnlock()
 			return false, false, nil

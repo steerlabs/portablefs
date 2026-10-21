@@ -184,6 +184,8 @@ func TestKernelMutationReplayAcrossColdRecovery(t *testing.T) {
 					f.waitForDelegationReleases(t)
 					held := mustOpenFile(t, f.join(0, "tail"), os.O_RDWR, 0)
 					defer held.Close()
+					otherAffected := mustOpenFile(t, f.join(0, "tail"), os.O_RDWR, 0)
+					defer otherAffected.Close()
 					// The close-target keeps its write grant, so RELEASE uses deferred CLOSE_BATCH.
 					doomed := mustOpenFile(t, f.join(0, "close-target"), os.O_RDWR, 0)
 					cached := mustOpenFile(t, f.join(0, "cached"), os.O_RDONLY, 0)
@@ -226,6 +228,7 @@ func TestKernelMutationReplayAcrossColdRecovery(t *testing.T) {
 						return nil
 					}
 					f.transports[0].hookMu.Unlock()
+					lossBefore := m.delegations.LossSequence()
 					if _, err := held.WriteAt([]byte("volatile"), 0); err != nil {
 						t.Fatal(err)
 					}
@@ -320,14 +323,34 @@ func TestKernelMutationReplayAcrossColdRecovery(t *testing.T) {
 					f.transports[0].hookMu.Lock()
 					f.transports[0].beforeDelegatedMutation = nil
 					f.transports[0].hookMu.Unlock()
-					if m.delegations.LossSequence() == 0 {
-						t.Fatal("accepted-tail loss disappeared")
+					if got := m.delegations.LossSequence(); got != lossBefore+1 {
+						t.Fatalf("accepted-tail loss=%d, want %d", got, lossBefore+1)
 					}
 					if err := held.Sync(); !errors.Is(err, syscall.EIO) {
 						t.Fatalf("affected handle fsync=%v, want EIO", err)
 					}
 					if err := root.Sync(); !errors.Is(err, syscall.EIO) {
 						t.Fatalf("pre-loss root barrier=%v, want EIO", err)
+					}
+					if err := otherAffected.Sync(); !errors.Is(err, syscall.EIO) {
+						t.Fatalf("second affected handle fsync=%v", err)
+					}
+					for range 3 {
+						if err := held.Sync(); err != nil {
+							t.Fatalf("repeated affected handle fsync=%v", err)
+						}
+						if err := otherAffected.Sync(); err != nil {
+							t.Fatalf("repeated second handle fsync=%v", err)
+						}
+						if err := cached.Sync(); err != nil {
+							t.Fatalf("unaffected handle fsync=%v", err)
+						}
+						if err := root.Sync(); !errors.Is(err, syscall.EIO) {
+							t.Fatalf("pre-loss root forgot retained loss: %v", err)
+						}
+						if got := m.delegations.LossSequence(); got != lossBefore+1 {
+							t.Fatalf("observation changed loss counter: %d", got)
+						}
 					}
 					if _, err := os.Stat(f.join(0, "gone")); !errors.Is(err, os.ErrNotExist) {
 						t.Fatalf("stale positive survived withdrawal: %v", err)

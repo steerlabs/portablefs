@@ -111,6 +111,13 @@ func TestSessionCleanupSurvivesInFlightColdReset(t *testing.T) {
 				}
 				close(f.release)
 				if operation == "close" {
+					if unresolved {
+						waitUntil(t, time.Second, "terminal cleanup transfer", func() bool { return len(failures) != 0 })
+						if pendingCloses(m) != 1 {
+							t.Fatal("terminal cleanup lost counted descriptor debt")
+						}
+						m.Stop()
+					}
 					waitUntil(t, time.Second, "exact close resolution", func() bool { m.closeMu.Lock(); defer m.closeMu.Unlock(); return m.closePending == 0 })
 				} else {
 					select {

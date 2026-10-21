@@ -78,6 +78,9 @@ type mutationCallback struct {
 	publication replyPublication
 	mount       *Mount
 	operationID uint64
+	// Cleanup reservations already own their descriptors. Dispatch may wait
+	// for capacity only after this callback releases the cold-reset fence.
+	closeDispatch []func()
 }
 
 func (c *mutationCallback) finish() {
@@ -198,6 +201,11 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 	callback.publication.metadataSample = r.mount.delegations.metadataClock.Load()
 	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
 	return ctx, func() {
+		defer func() {
+			for _, dispatch := range callback.closeDispatch {
+				dispatch()
+			}
+		}()
 		defer r.mount.delegations.endGrantRequest(history)
 		defer r.mount.epochMu.RUnlock()
 		defer cancel()

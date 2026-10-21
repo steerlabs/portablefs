@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -290,6 +291,7 @@ func TestReplayAdmissionTerminalControls(t *testing.T) {
 			case "lease_120s":
 				clock.now = clock.now.Add(105 * time.Second)
 			}
+
 			response := h.Handle(ctx, r)
 			if response.GetErrno() == 0 || response.GetMutation() != nil {
 				t.Fatalf("terminal/refused replay succeeded: %v", response)
@@ -323,6 +325,138 @@ func TestReplayRuntimeLeaseBoundary(t *testing.T) {
 				}
 			} else if !errors.Is(err, volumeserver.ErrSessionExpired) {
 				t.Fatalf("expired resume=%v", err)
+			}
+		})
+	}
+}
+
+func TestColdReplayRejectsSequenceGapAndMutationHeaderReads(t *testing.T) {
+	for _, kind := range []string{"gap", "getattr", "read"} {
+		t.Run(kind, func(t *testing.T) {
+			h, ctx, cred, root, clock, _ := replayAdmissionHarness(t, time.Hour)
+			first := coherenceReadRequest(cred)
+			first.Mutation = &authoritypb.Mutation{Slot: 0, Sequence: 1}
+			first.Body = &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{}}
+			if r := h.Handle(ctx, first); r.GetMutation().GetAcceptedSequence() != 1 {
+				t.Fatal(r)
+			}
+			clock.now = clock.now.Add(15 * time.Second)
+			r := proto.Clone(first).(*authoritypb.Request)
+			r.Mutation.Sequence = 3
+			switch kind {
+			case "getattr":
+				r.Body = &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Item: root[:]}}
+			case "read":
+				r.Body = &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{Handle: make([]byte, 16), Length: 1}}
+			}
+			terminal, _ := h.Runtime.SessionTerminal(cred.ID)
+			response := h.Handle(ctx, r)
+			if response.GetErrno() == 0 || response.GetMutation() != nil {
+				t.Fatalf("cold request admitted: %v", response)
+			}
+			if kind == "gap" {
+				select {
+				case <-terminal:
+				default:
+					t.Fatal("cold sequence gap did not fence session")
+				}
+			} else {
+				if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+					t.Fatalf("header bypassed cold read admission: %v", response)
+				}
+				select {
+				case <-terminal:
+					t.Fatal("cold read ended live session")
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestReplayOverlapsColdSubscribeRecallAndFence(t *testing.T) {
+	for _, fence := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fence_%t", fence), func(t *testing.T) {
+			h, ctx, cred, root, _, store := replayAdmissionHarness(t, time.Hour)
+			r := applicationRequest(cred, root, "open", false)
+			first := h.Handle(ctx, r)
+			if first.GetErrno() != 0 || first.GetMutation() == nil || applicationGrant(first) == nil {
+				t.Fatal(first)
+			}
+			calls := store.storageCalls()
+			token, _ := h.coherenceToken(cred.ID)
+			recallDone := make(chan error, 1)
+			go func() { recallDone <- h.Coherence.Recall(ctx, [16]byte{0x22}) }()
+			pollCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			events, _, err := h.Coherence.PollControl(pollCtx, token, 0, nil, 8)
+			if err != nil || len(events) == 0 {
+				t.Fatalf("recall did not enter: %v %v", events, err)
+			}
+			resolved, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			defer unblock()
+			h.OnMutation = func(o MutationObservation) {
+				if o.Disposition == "replayed" {
+					close(resolved)
+					<-release
+				}
+			}
+			replayDone := make(chan *authoritypb.Response, 1)
+			go func() { replayDone <- h.Handle(ctx, proto.Clone(r).(*authoritypb.Request)) }()
+			select {
+			case <-resolved:
+			case <-time.After(time.Second):
+				t.Fatal("recall blocked retained replay")
+			}
+			coldDone := make(chan *authoritypb.Response, 1)
+			go func() { coldDone <- h.handleCoherenceSubscribe(0, cred.ID, &authoritypb.SubscribeRequest{}) }()
+			select {
+			case cold := <-coldDone:
+				if cold.GetErrno() != 0 {
+					t.Fatal(cold)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cold subscribe blocked on retained replay/recall")
+			}
+			select {
+			case err := <-recallDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cold subscribe did not settle recall")
+			}
+			fenced := make(chan struct{})
+			if fence {
+				go func() { h.Runtime.FenceSession(cred.ID); close(fenced) }()
+			} else {
+				close(fenced)
+			}
+			unblock()
+			select {
+			case replay := <-replayDone:
+				if !proto.Equal(first, replay) {
+					t.Fatalf("retained outcome changed: %v", replay)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("overlapped replay did not finish")
+			}
+			<-fenced
+			h.OnMutation = nil
+			after := store.storageCalls()
+			for _, i := range []int{0, 1, 2, 5, 6} {
+				if after[i] != calls[i] {
+					t.Fatal("overlap re-executed storage")
+				}
+			}
+			if fence {
+				if replay := h.Handle(ctx, r); replay.GetErrno() == 0 || replay.GetMutation() != nil {
+					t.Fatal("terminal fence admitted replay")
+				}
+			} else if replay := h.Handle(ctx, r); !proto.Equal(first, replay) {
+				t.Fatal("cold subscribe rewrote retained outcome")
 			}
 		})
 	}

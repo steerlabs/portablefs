@@ -3099,6 +3099,13 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 			return fuse.EIO
 		}
 	}
+	// A read-cache CREATE hands out the same retained-data permission as OPEN.
+	// Register its physical reply so expiry can strip KEEP_CACHE and withdrawal
+	// accounts for the descriptor before admitting a successor subscription.
+	if flags&fuse.FOPEN_KEEP_CACHE != 0 && !r.beginBufferedRead(ctx, record) {
+		r.mount.revoke(errors.New("fusev3: read-cache CREATE escaped reply ownership"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	r.bindPath(record, parent, name)
 	if err := r.publishEntry(ctx, &out.EntryOut, parent, name, record, item.GetAttr()); err != nil {
 		r.mount.revoke(err)

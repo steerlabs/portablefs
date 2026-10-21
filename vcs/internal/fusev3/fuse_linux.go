@@ -1940,7 +1940,7 @@ func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, floc
 	}
 	h.once.Do(func() {
 		if h.node.mount.delegations.TracksHandle(h.node.item.GetStableIdentity(), h.token) {
-			if err := h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock); err != nil {
+			if err := h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock); err != nil {
 				h.closeOutcome.cause = err
 			}
 			return
@@ -1949,7 +1949,7 @@ func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, floc
 		if errno != 0 && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && response.GetMutation() == nil && !response.GetSessionTerminal() && h.node.mount.rpc.SessionEndCause() == nil {
 			// Admission refused this CLOSE before recording it. Keep its live
 			// session descriptor as bounded cleanup debt through cold recovery.
-			h.closeOutcome.cause = h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock)
+			h.closeOutcome.cause = h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock)
 			return
 		}
 		if errno != 0 {
@@ -2400,7 +2400,7 @@ func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 		h.mu.Unlock()
 		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
 		if errno != 0 && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && response.GetMutation() == nil && !response.GetSessionTerminal() && h.node.mount.rpc.SessionEndCause() == nil {
-			h.closeOutcome.cause = h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, 0, false)
+			h.closeOutcome.cause = h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, 0, false)
 			return
 		}
 		if errno != 0 {
@@ -2895,7 +2895,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		ctx = context.WithValue(ctx, acquiredDelegationHandleKey{}, acquired)
 		defer func() {
 			if len(acquired.token) > 0 {
-				_ = n.mount.delegations.QueueClose(n.item.GetStableIdentity(), acquired.token, 0, false)
+				_ = n.mount.delegations.queueClose(ctx, n.item.GetStableIdentity(), acquired.token, 0, false)
 			}
 		}()
 		if request.Size != nil {

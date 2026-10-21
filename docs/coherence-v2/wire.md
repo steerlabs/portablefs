@@ -479,10 +479,13 @@ cannot leave an unfillable gap. Subscription loss, recall expiry, and transport
 cancellation also terminate waiting ordinals. Metadata flushes separate WRITE
 waves.
 
-Before replay assignment, cache-buffer cancellation remains local. Once a flush
-has an assigned identity, the session retains its exact request and immutable
-spans until resolution. Cold buffer replacement joins that resolver; a retained
-result settles the old slot without restoring its retired grant or local tail.
+Before replay assignment, cache-buffer cancellation remains local, including
+waits for a busy replay slot. The client establishes session resolution ownership
+before invoking the assignment callback that publishes a dense ordinal. After
+that callback succeeds, cache cancellation cannot abandon the assigned request;
+the session retains its exact request and immutable spans until resolution. Cold
+buffer replacement joins that resolver; a retained result settles the old slot
+without restoring its retired grant or local tail.
 
 The client admits each predecessor to its transport lane before launching the
 next chunk and joins the wave before changing local ownership. Transport

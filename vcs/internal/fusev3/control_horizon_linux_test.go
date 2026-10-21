@@ -95,7 +95,9 @@ func (n *recordingKernelNotifier) InodeNotify(inode uint64, off, length int64) f
 
 func TestControlTransportLossWithdrawsEveryCacheAtHorizon(t *testing.T) {
 	var listener *controlFaultListener
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, wrapListener: func(l net.Listener) net.Listener {
+	// OPEN must still complete visibility after waiting the full 10-second
+	// subscription TTL. This test needs operation budget beyond that horizon.
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, RequestTimeout: 30 * time.Second, wrapListener: func(l net.Listener) net.Listener {
 		listener = &controlFaultListener{Listener: l}
 		return listener
 	}})

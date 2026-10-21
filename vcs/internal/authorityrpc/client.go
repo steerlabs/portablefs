@@ -161,9 +161,9 @@ type callResult struct {
 // lane is one admission class. Ordinary operations and blocking POSIX lock
 // waits never share permits, and each lane owns a private, disjoint range of
 // replay slots sized at least as large as its own permit count. A caller takes
-// its permit before it takes a slot index, so at most one caller can hold any
-// slot at a time: slot ownership cannot contend, and a parked lock waiter can
-// neither consume an ordinary permit nor stall an ordinary mutation.
+// its permit before selecting a slot. Uneven completions can revisit a busy
+// round-robin slot; that wait remains cancelable before assignment. A parked
+// lock waiter cannot consume an ordinary permit.
 type lane struct {
 	permits  chan struct{}
 	slots    []clientSlot
@@ -233,12 +233,33 @@ type Client struct {
 }
 
 type clientSlot struct {
-	mu sync.Mutex
+	mu replaySlotMutex
 	// sequence mirrors what the authority reported as recorded for this slot.
 	// It is only ever assigned from a MutationState the authority returned, so
 	// the two counters cannot drift apart.
 	sequence uint64
 }
+
+// replaySlotMutex keeps slot waiting inside cancelable pre-assignment
+// admission. Its zero value is usable.
+type replaySlotMutex struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (m *replaySlotMutex) LockContext(ctx context.Context) error {
+	m.once.Do(func() { m.gate = make(chan struct{}, 1) })
+	select {
+	case m.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *replaySlotMutex) Lock() { _ = m.LockContext(context.Background()) }
+
+func (m *replaySlotMutex) Unlock() { <-m.gate }
 
 // clientSessionCacheEntries bounds the TLS 1.3 tickets one client keeps. Every
 // dial this client makes uses the same authority server name, so the cache holds
@@ -1929,13 +1950,15 @@ func (c *Client) CallMutationWithIdentityRetained(
 	}
 	defer func() { <-admitted.permits }()
 
-	// The permit is held, so at most cap(permits) callers can be between here
-	// and the matching release, and the lane owns at least that many slots.
-	// Round-robin therefore hands every concurrent caller a distinct slot.
+	// A permit bounds concurrent owners, but does not make round-robin slots
+	// distinct when earlier calls complete unevenly. Slot waiting is still
+	// unassigned work and must observe caller cancellation.
 	local := (admitted.nextSlot.Add(1) - 1) % uint32(len(admitted.slots))
 	slot := &admitted.slots[local]
 	index := admitted.base + local
-	slot.mu.Lock()
+	if err := slot.mu.LockContext(ctx); err != nil {
+		return nil, nil, err
+	}
 	defer slot.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -1953,15 +1976,10 @@ func (c *Client) CallMutationWithIdentityRetained(
 			consumption.Consume()
 		}
 	}()
-	if assigned != nil {
-		if err := assigned(MutationIdentity{Slot: index, Sequence: sequence}); err != nil {
-			return nil, nil, err
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
 		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		stop := context.AfterFunc(session, cancel)
 		defer func() { stop(); cancel() }()
@@ -1969,6 +1987,13 @@ func (c *Client) CallMutationWithIdentityRetained(
 			cancel()
 		}
 		ctx = owned
+	}
+	// A successful callback may publish a dense ordinal and start its successor.
+	// Session ownership must already exist before that publication.
+	if assigned != nil {
+		if err := assigned(MutationIdentity{Slot: index, Sequence: sequence}); err != nil {
+			return nil, nil, err
+		}
 	}
 	var response *authoritypb.Response
 	var releaseFrame func()

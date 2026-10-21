@@ -205,8 +205,13 @@ cache contents, or a discarded volatile tail.
 Cold reset cancels old cache and grant work, but preserves session-owned CLOSE,
 CLOSE_BATCH, RECLAIM, and Barrier resolution. Each unresolved mutation retains
 its exact body, replay slot, and lane permit through bounded transport attempts.
-An assigned buffer flush also retains session ownership; stopping its old buffer
-joins exact resolution before releasing its immutable bytes.
+A buffer flush transfers resolution to the session before its assignment callback
+publishes an ordinal; stopping its old buffer joins exact resolution before
+releasing its immutable bytes. Descriptor cleanup reserves counted session debt
+before returning from RELEASE. Queue dispatch waits outside the callback epoch
+fence. Interrupted cache preparation retains that debt through cold activation,
+even before the buffer serial changes; only proven retirement or terminal
+session cleanup discharges it.
 Old receipts cannot advance the replacement buffer, and recorded loss remains
 observable on affected handles and the pre-loss root barrier. Authentication,
 session expiry, and unprovable assigned outcomes still fail closed; operator

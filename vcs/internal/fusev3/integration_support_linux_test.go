@@ -160,6 +160,8 @@ type integrationConfig struct {
 	// Mounts is the number of independent kernel FUSE mounts of the same
 	// volume. Defaults to two, the minimum needed to observe coherence.
 	Mounts int
+	// RequestTimeout permits tests that deliberately wait a complete cache horizon.
+	RequestTimeout time.Duration
 	// SessionLease overrides the authority session lease. Only the session
 	// lifecycle tests need a short one.
 	SessionLease time.Duration
@@ -601,6 +603,10 @@ func (f *integrationFixture) start() {
 func (f *integrationFixture) mountAll() {
 	t := f.t
 	t.Helper()
+	requestTimeout := f.cfg.RequestTimeout
+	if requestTimeout == 0 {
+		requestTimeout = integrationRequestTimeout
+	}
 	for i := range f.paths {
 		client, transport := f.dialClient()
 		mountInstanceID, err := mountid.NewMountInstance()
@@ -608,7 +614,7 @@ func (f *integrationFixture) mountAll() {
 			t.Fatalf("create mount %d identity: %v", i, err)
 		}
 		mount, err := MountVolume(context.Background(), f.paths[i], transport, Config{
-			MountInstanceID: mountInstanceID, RequestTimeout: integrationRequestTimeout,
+			MountInstanceID: mountInstanceID, RequestTimeout: requestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend carves its cleanup workers out of this number, so it
 			// must be exactly the transport's bound.

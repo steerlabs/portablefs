@@ -229,12 +229,16 @@ type delegationClose struct {
 }
 
 func newDelegationManager(rpc delegationRPC, timeout time.Duration, incarnation uint64, opts writeback.Options) (*delegationManager, error) {
-	if rpc == nil || timeout <= 0 {
+	return newDelegationManagerWithCloseCapacity(rpc, timeout, incarnation, opts, 4096)
+}
+
+func newDelegationManagerWithCloseCapacity(rpc delegationRPC, timeout time.Duration, incarnation uint64, opts writeback.Options, closeCapacity int) (*delegationManager, error) {
+	if rpc == nil || timeout <= 0 || closeCapacity <= 0 {
 		return nil, errors.New("fusev3: delegation manager requires an authority and request timeout")
 	}
 	m := &delegationManager{
 		rpc: rpc, timeout: timeout, byID: make(map[writeback.Identity]*delegationState), identityLoss: make(map[writeback.Identity]uint64), epochSerial: 1, sessionSerial: 1,
-		maxWrite: writeback.MaxPayload, durableKick: make(chan struct{}, 1), tokens: make(map[uint64]delegationFlushProgress), closeQueue: make(chan delegationClose, 4096),
+		maxWrite: writeback.MaxPayload, durableKick: make(chan struct{}, 1), tokens: make(map[uint64]delegationFlushProgress), closeQueue: make(chan delegationClose, closeCapacity),
 	}
 	m.grantRequests = make(map[uint64]struct{})
 	m.reclaim = make(map[*delegationState]struct{})
@@ -2093,6 +2097,13 @@ func (m *delegationManager) changePendingCloses(delta int) {
 // server handle alive through application. Unknown descriptor outcomes trigger
 // terminal session cleanup.
 func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
+	return m.queueClose(context.Background(), identity, handle, lockOwner, flockUnlock)
+}
+
+// queueClose reserves session cleanup ownership before returning to RELEASE.
+// A raw callback retains this bounded reservation until its fence is released;
+// its own goroutine then waits for queue space, without blocking cold activation.
+func (m *delegationManager) queueClose(ctx context.Context, identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
 	if _, err := delegationIdentity(identity); err != nil {
 		return err
 	}
@@ -2113,14 +2124,20 @@ func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64
 	m.closePending++
 	m.closeProducers.Add(1)
 	m.closeMu.Unlock()
-	defer m.closeProducers.Done()
-	select {
-	case m.closeQueue <- pending:
-		return nil
-	case <-m.ctx.Done():
-		m.changePendingCloses(-1)
-		return writeback.ErrClosed
+	dispatch := func() {
+		defer m.closeProducers.Done()
+		select {
+		case m.closeQueue <- pending:
+		case <-m.ctx.Done():
+			m.changePendingCloses(-1)
+		}
 	}
+	if callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback); callback != nil {
+		callback.closeDispatch = append(callback.closeDispatch, dispatch)
+	} else {
+		dispatch()
+	}
+	return nil
 }
 
 func (m *delegationManager) closeLoop() {
@@ -2180,36 +2197,45 @@ func (m *delegationManager) drainCloseQueue() {
 func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 	defer m.changePendingCloses(-len(batch))
 	for {
-		// A background close retains its exact replay identity through an outage.
-		// The queue is bounded, and mount shutdown cancels this work.
+		m.epoch.RLock()
+		sessionCtx := m.sessionCtx
+		m.epoch.RUnlock()
 		var scopes []delegationCloseScope
 		err := m.closeHandles(m.ctx, batch, &scopes)
-		if err != nil {
-			var cleanup delegationCleanupError
-			var finalized delegationReleaseFinalizedError
-			if errors.As(err, &cleanup) || errors.As(err, &finalized) {
-				m.failCloseScopes(scopes, "deferred descriptor cleanup refused", true)
-				m.hookMu.RLock()
-				report := m.cleanupFailure
-				m.hookMu.RUnlock()
-				if report != nil {
-					report(err)
-				}
-				var classified cleanupClassified
-				m.hookMu.RLock()
-				waitRetry := m.cleanupRetry
-				m.hookMu.RUnlock()
-				if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && waitRetry != nil && waitRetry(m.ctx) == nil {
-					// This dispatcher remains the bounded owner of the refused
-					// batch. Recovery may replace a subscription, but cannot move
-					// descriptors to another session. closeHandles retires old-epoch
-					// debt locally after the old session has ended.
-					continue
-				}
-				log.Printf("portablefs: deferred close failed: %v", err)
-				return
-			}
-			m.failCloseScopes(scopes, "asynchronous delegated close failed", false)
+		if err == nil || errors.Is(err, writeback.ErrLost) || errors.Is(err, authorityrpc.ErrAuthorityChanged) {
+			return
+		}
+		var classified cleanupClassified
+		if !errors.As(err, &classified) {
+			err = m.unknownCloseOutcome(err)
+			errors.As(err, &classified)
+		}
+		retryable := classified != nil && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+		m.failCloseScopes(scopes, "deferred descriptor cleanup refused", retryable)
+		m.hookMu.RLock()
+		report, waitRetry := m.cleanupFailure, m.cleanupRetry
+		m.hookMu.RUnlock()
+		if report != nil {
+			report(err)
+		}
+		if retryable && waitRetry != nil && waitRetry(m.ctx) == nil {
+			// This worker remains the counted owner through interrupted cache
+			// preparation and cold activation. The exact session still owns
+			// the descriptors, even before the buffer serial changes.
+			continue
+		}
+		if !retryable && classified != nil && !classified.cleanupIsTerminal() {
+			// Every failed descriptor in this result was proven retired.
+			return
+		}
+		if retryable {
+			m.unknownCloseOutcome(err)
+		}
+		// Terminal teardown now owns the table. Keep this batch counted until
+		// that session ends or the mount joins its cleanup worker at Stop.
+		select {
+		case <-sessionCtx.Done():
+		case <-m.ctx.Done():
 		}
 		return
 	}
@@ -2294,10 +2320,10 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	batch, err := m.prepareReleaseBatch(prepareCtx, buf, epochSerial, incarnation, groups)
 	if err != nil {
-		if !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
 			return m.closeResetOutcome(sessionSerial)
 		}
-		return err
+		return m.unknownCloseOutcome(err)
 	}
 	if scopes != nil {
 		for _, group := range groups {
@@ -2308,10 +2334,14 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	defer batch.finish()
 	if err := batch.applyAndRelease(prepareCtx); err != nil {
-		if !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
 			return m.closeResetOutcome(sessionSerial)
 		}
-		return err
+		var classified cleanupClassified
+		if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return err
+		}
+		return m.unknownCloseOutcome(err)
 	}
 	response, err := m.rpc.CallMutation(callCtx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
 	if err == nil {
@@ -2340,6 +2370,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	var firstErr error
 	var firstFailure authoritypb.FailureClass
+	liveDebt, retryDebt := false, true
 	for i, result := range results {
 		errno := responseErrno(&authoritypb.Response{Errno: result.GetErrno(), Failure: result.GetFailure()})
 		if result == nil {
@@ -2351,6 +2382,8 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 				firstFailure = result.GetFailure()
 			}
 			if !result.GetRetired() {
+				liveDebt = true
+				retryDebt = retryDebt && result.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
 				continue
 			}
 		}
@@ -2363,6 +2396,12 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 		s.admission.Unlock()
 	}
 	if firstErr != nil {
+		if liveDebt {
+			if !retryDebt {
+				return m.unknownCloseOutcome(firstErr)
+			}
+			firstFailure = authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+		}
 		return delegationCleanupError{cause: firstErr, failure: firstFailure}
 	}
 	return nil
