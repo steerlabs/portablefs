@@ -56,6 +56,12 @@ import PortableFSWorkspaceCore
         } catch { fail(error) }
     }
     func start() throws {
+        for number in [SIGINT, SIGTERM] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { [weak self] in self?.stop(exitCode: 0) }
+            source.resume(); signals.append(source)
+        }
         started = clock.now
         try coordinator.start()
         event("starting", ["pid": getpid(), "image_digest": hex(boot.release.imageDigest), "operations": vm.operations])
@@ -64,12 +70,7 @@ import PortableFSWorkspaceCore
             if data.isEmpty { handle.readabilityHandler = nil }
             Task { @MainActor in self?.input(data) }
         }
-        for number in [SIGINT, SIGTERM] {
-            signal(number, SIG_IGN)
-            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
-            source.setEventHandler { [weak self] in self?.stop(exitCode: 0) }
-            source.resume(); signals.append(source)
-        }
+
     }
     func scheduleUpdate() {
         guard !updateQueued else { return }; updateQueued = true
@@ -117,7 +118,7 @@ import PortableFSWorkspaceCore
                     if case .failure(let error) = result { self?.event("replay-refused", ["generation": token.suspension.generation, "reason": String(describing: error)]) }
                     else { self?.fail(WorkspaceVMError("guest accepted consumed token")) }
                 }
-            case "status": event("status", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
+            case "status": coordinator.refreshStatus(); event("status", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
             case "stop": stop(exitCode: 0)
             default: event("refused", ["command": command])
             }

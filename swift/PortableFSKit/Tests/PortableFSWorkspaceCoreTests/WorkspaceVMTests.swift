@@ -76,6 +76,24 @@ private func temporaryDirectory() throws -> URL {
             Issue.record("EOF accepted as data")
         } catch {}
     }
+    @Test @MainActor func finalBufferedFrameSurvivesImmediatePeerEOF() async throws {
+        var fds: [Int32] = [-1,-1]
+        #expect(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+        defer { close(fds[0]); close(fds[1]) }
+        let stream = try WorkspaceStream(fd: fds[1], label: "workspace.test.final-frame", onLost: { _ in })
+        defer { stream.close() }
+        let frame = Data([0,0,0,2,8,8])
+        _ = frame.withUnsafeBytes { Darwin.write(fds[0], $0.baseAddress, $0.count) }
+        shutdown(fds[0], SHUT_WR)
+        let header: Data = try await withCheckedThrowingContinuation { continuation in
+            stream.read(count: 4, deadline: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) { continuation.resume(with: $0) }
+        }
+        #expect(header == frame.prefix(4))
+        let body: Data = try await withCheckedThrowingContinuation { continuation in
+            stream.read(count: 2, deadline: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)+1_000_000_000) { continuation.resume(with: $0) }
+        }
+        #expect(body == frame.suffix(2))
+    }
     @Test @MainActor func idleRelaysCannotStarveControlStream() async throws {
         var relays: [WorkspaceRelay] = []; var peers: [Int32] = []
         defer { relays.forEach { $0.close() }; peers.forEach { close($0) } }

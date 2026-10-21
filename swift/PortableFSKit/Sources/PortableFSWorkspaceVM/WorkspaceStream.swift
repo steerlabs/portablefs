@@ -8,6 +8,8 @@ final class WorkspaceStream: @unchecked Sendable {
     private let fd: Int32
     private let reader: DispatchSourceRead
     private let writer: DispatchSourceWrite
+    private var readerActive = true
+    private var peerEOF = false
     private var writerActive = false
     private var closed = false
     private var incoming = Data()
@@ -42,6 +44,7 @@ final class WorkspaceStream: @unchecked Sendable {
             readCount = count; readCompletion = completion
             arm(deadline)
             deliverRead()
+            if peerEOF, readCompletion != nil { fail("control peer closed with incomplete frame") }
         }
     }
     func write(_ data: Data, deadline: UInt64, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
@@ -69,7 +72,14 @@ final class WorkspaceStream: @unchecked Sendable {
             let n = Darwin.read(fd, &bytes, bytes.count)
             if n < 0 && errno == EINTR { continue }
             if n < 0 && errno == EAGAIN { return }
-            guard n > 0 else { fail(n == 0 ? "control peer closed" : "control read failed: \(errno)"); return }
+            guard n > 0 else {
+                if n < 0 { fail("control read failed: \(errno)"); return }
+                peerEOF = true; reader.suspend(); readerActive = false
+                // A peer may write its final frame and close immediately. Keep
+                // complete buffered bytes until the actor consumes them.
+                if incoming.isEmpty || readCompletion != nil { fail("control peer closed with incomplete frame") }
+                return
+            }
             incoming.append(contentsOf: bytes.prefix(n))
             guard incoming.count <= 1_048_580 else { fail("control input exceeds frame limit"); return }
             deliverRead()
@@ -80,6 +90,7 @@ final class WorkspaceStream: @unchecked Sendable {
         let data = Data(incoming.prefix(readCount)); incoming.removeFirst(readCount)
         readCompletion = nil; serial += 1
         DispatchQueue.main.async { completion(.success(data)) }
+        if peerEOF, incoming.isEmpty { fail("control peer closed") }
     }
     private func writeReady() {
         while !outgoing.isEmpty, !closed {
@@ -99,6 +110,7 @@ final class WorkspaceStream: @unchecked Sendable {
         guard !closed else { return }; closed = true
         shutdown(fd, SHUT_RDWR)
         if !writerActive { writer.resume(); writerActive = true }
+        if !readerActive { reader.resume(); readerActive = true }
         reader.cancel(); writer.cancel()
         let read = readCompletion; let write = writeCompletion
         readCompletion = nil; writeCompletion = nil

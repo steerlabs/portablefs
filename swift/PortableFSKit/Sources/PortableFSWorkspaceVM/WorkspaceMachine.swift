@@ -18,6 +18,21 @@ import PortableFSWorkspaceCore
         if operations.count == 256 { operations.removeFirst() }
         operations.append(operation)
     }
+    // VZ rejects overlapping lifecycle operations even on its serial owner
+    // queue. Completion, not submission order, releases the next operation.
+    private var operationQueue: [() -> Void] = []
+    private var operationActive = false
+    private func enqueue(_ operation: @escaping (@escaping () -> Void) -> Void) {
+        operationQueue.append { operation {
+            self.operationActive = false; self.advance()
+        } }
+        advance()
+    }
+    private func advance() {
+        guard !operationActive, !operationQueue.isEmpty else { return }
+        operationActive = true
+        operationQueue.removeFirst()()
+    }
     private var shutdownID: UUID?
     private var shutdownCompletion: ((Result<Void, Error>) -> Void)?
 
@@ -88,22 +103,24 @@ import PortableFSWorkspaceCore
     }
     public func start(completion: @escaping (Result<Void, Error>) -> Void) {
         record("start-request")
-        machine.start { [weak self] result in self?.record("start-completed"); completion(result) }
+        enqueue { done in self.machine.start { result in self.record("start-completed"); completion(result); done() } }
     }
     public func pause(completion: @escaping (Result<Void, Error>) -> Void) {
         record("pause-request")
-        machine.pause { [weak self] result in self?.record("pause-completed"); completion(result) }
+        enqueue { done in self.machine.pause { result in self.record("pause-completed"); completion(result); done() } }
     }
     public func resume(completion: @escaping (Result<Void, Error>) -> Void) {
         record("resume-request")
-        machine.resume { [weak self] result in self?.record("resume-completed"); completion(result) }
+        enqueue { done in self.machine.resume { result in self.record("resume-completed"); completion(result); done() } }
     }
     public func stop(completion: @escaping (Result<Void, Error>) -> Void) {
-        if machine.state == .stopped { completion(.success(())); return }
         record("stop-request")
-        machine.stop { [weak self] error in
-            self?.record("stop-completed")
-            if let error { completion(.failure(error)) } else { completion(.success(())) }
+        enqueue { done in
+            if self.machine.state == .stopped { completion(.success(())); done(); return }
+            self.machine.stop { error in
+                self.record("stop-completed")
+                completion(error.map { .failure($0) } ?? .success(())); done()
+            }
         }
     }
     public func inspect(completion: @escaping (WorkspaceVMState) -> Void) {
@@ -115,6 +132,9 @@ import PortableFSWorkspaceCore
         }
     }
     public func shutdown(completion: @escaping (Result<Void, Error>) -> Void) {
+        enqueue { done in self.requestShutdown { result in completion(result); done() } }
+    }
+    private func requestShutdown(completion: @escaping (Result<Void, Error>) -> Void) {
         guard machine.canRequestStop, shutdownCompletion == nil else { completion(.failure(WorkspaceVMError("guest shutdown unavailable"))); return }
         let id = UUID(); shutdownID = id
         shutdownCompletion = completion

@@ -10,6 +10,7 @@ import uuid
 import tempfile
 import re
 import shutil
+import signal
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
@@ -69,9 +70,10 @@ class Guest:
         assert result.returncode == 0, (command, result.returncode, result.stderr, result.stdout)
         return result.stdout.strip()
 
-    def stop(self):
+    def stop(self, interrupt=False):
         self.ssh('sync')
-        self.command('stop')
+        if interrupt: self.p.send_signal(signal.SIGINT)
+        else: self.command('stop')
         value = self.wait('stopped', 30)
         assert value['operations'][-1] == 'shutdown-completed'
         assert self.p.wait(timeout=10) == 0
@@ -129,7 +131,8 @@ try:
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
-    guest.command('pause')
+    # One input batch makes Status in flight when Suspend is enqueued.
+    guest.p.stdin.write(json.dumps({'command':'status'})+'\n'+json.dumps({'command':'pause'})+'\n'); guest.p.stdin.flush()
     paused = guest.wait('paused', 25)
     assert paused['fenced'] and not paused['attach_allowed'] and paused['generation'] == 1
     assert paused['operations'].index('pause-completed') < paused['operations'].index('sleep-fenced')
@@ -154,8 +157,7 @@ try:
     fingerprint = subprocess.check_output(['/usr/bin/ssh-keygen', '-lf', str(state/'guest_host_key.pub')], text=True).split()[1]
     assert debug.returncode == 0 and 'Server host key: ssh-ed25519 ' + fingerprint in debug.stderr
     record('guest-host-key-persistence')
-    guest.stop()
-    record('clean-stop')
+    guest.stop(interrupt=True)
     guest = Guest()
     guest.command('pause'); guest.wait('paused', 25)
     guest.command('resume'); guest.wait('resumed', 25)
@@ -168,6 +170,12 @@ try:
     guest.wait('stopped', 25)
     assert guest.p.wait(timeout=10) == 1
     record('resume-single-use')
+    guest = Guest()
+    guest.p.stdin.close()
+    stopped = guest.wait('stopped', 30)
+    assert stopped['operations'][-1] == 'shutdown-completed'
+    assert guest.p.wait(timeout=10) == 0
+    record('clean-stop')
     assert sorted(passed) == sorted(required), (passed, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state)}, indent=2) + '\n')
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)
