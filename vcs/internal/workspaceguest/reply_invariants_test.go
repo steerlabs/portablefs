@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
@@ -141,6 +142,13 @@ func TestGuestEveryTransitionReplyEncodes(t *testing.T) {
 					waitRecovered(t, s)
 				}
 				encodable(t, s.Status())
+				status := s.Status().Mounts[0]
+				if tc.name == "closed" && status.State != "terminal" {
+					t.Fatal("closed recovery accepted")
+				}
+				if tc.name == "authorization-required" && status.Reason != "fresh authorization required" {
+					t.Fatal("missing authorization-specific reason")
+				}
 				// A second sleep/wake must remain encodable even after failed proof.
 				x := begin(t, s, suspension(s))
 				encodable(t, s.Status())
@@ -169,7 +177,7 @@ func TestGuestEveryTransitionReplyEncodes(t *testing.T) {
 					t.Fatal(err)
 				}
 				encodable(t, s.Status())
-				for _, p := range []CleanupProof{{ProcessExited: true}, {KernelAbsent: true}, {ProcessExited: true, KernelAbsent: true}} {
+				for _, p := range []CleanupProof{{ProcessExited: true}, {KernelAbsent: true}, {ProcessExited: true, KernelAbsent: true}, {ProcessExited: true}, {}} {
 					_ = s.Cleanup(mid, p)
 					encodable(t, s.Status())
 				}
@@ -246,5 +254,121 @@ func TestGuestRefusesRetainedIncarnationReuse(t *testing.T) {
 			t.Fatal("retired incarnation reused or refused daemon not cleaned")
 		}
 		encodable(t, s.Status())
+	}
+}
+
+func TestGuestFailedDrainsRemainEncodableAndCannotAcknowledgeCold(t *testing.T) {
+	for _, mode := range []string{"suspend-error", "incomplete", "wrong-generation", "timeout", "loss-overflow"} {
+		t.Run(mode, func(t *testing.T) {
+			s, m, mid := fixture(t)
+			x := begin(t, s, suspension(s))
+			encodable(t, s.Status())
+			m.suspend = func(ctx context.Context, x *pb.Suspension) (ColdResult, error) {
+				r := ColdResult{Generation: x.Generation, ColdComplete: true}
+				switch mode {
+				case "suspend-error":
+					return r, errors.New("withdrawal failed")
+				case "incomplete":
+					r.ColdComplete = false
+				case "wrong-generation":
+					r.Generation++
+				case "timeout":
+					<-ctx.Done()
+					return r, ctx.Err()
+				case "loss-overflow":
+					r.Loss = randomWalkLoss(129)
+				}
+				return r, nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+			defer cancel()
+			err := s.Drain(ctx, x, mid)
+			encodable(t, s.Status())
+			ack, ackErr := s.SuspendAck(x)
+			if mode == "loss-overflow" {
+				if err != nil || ackErr != nil {
+					t.Fatalf("cold proof with loss: %v, %v", err, ackErr)
+				}
+				encodable(t, ack)
+				if s.Status().Mounts[0].State != "terminal" {
+					t.Fatal("overflow did not terminalize")
+				}
+			} else if err == nil || ackErr == nil {
+				t.Fatalf("failed withdrawal earned cold acknowledgement: %v, %v", err, ackErr)
+			}
+			encodable(t, s.Status())
+		})
+	}
+}
+
+func TestGuestOvertakenProofTransitionsRemainEncodable(t *testing.T) {
+	for _, mode := range []string{"prepare-suspend", "recover-suspend", "recover-terminal"} {
+		t.Run(mode, func(t *testing.T) {
+			s, err := New(id(1), id(2), id(3), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := &invariantMount{entered: make(chan struct{}), proceed: make(chan struct{}), result: ready()}
+			m.cold.ColdComplete = true
+			mid := mountID(4)
+			if err := s.Register(context.Background(), mid, Witness{}, m); err != nil {
+				t.Fatal(err)
+			}
+			var activated chan error
+			if mode == "prepare-suspend" {
+				activated = make(chan error, 1)
+				go func() { activated <- s.Activate(context.Background(), mid, 0) }()
+			} else {
+				close(m.proceed)
+				if err := s.Activate(context.Background(), mid, 0); err != nil {
+					t.Fatal(err)
+				}
+				m.entered, m.proceed = make(chan struct{}), make(chan struct{})
+				x := cold(t, s, mid)
+				ack, err := s.Resume(context.Background(), token(x))
+				if err != nil {
+					t.Fatal(err)
+				}
+				encodable(t, ack)
+			}
+			<-m.entered
+			encodable(t, s.Status())
+			var x *pb.Suspension
+			if mode == "recover-terminal" {
+				if err := s.Terminal(mid, "session ended during recovery", nil); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				x = begin(t, s, suspension(s))
+			}
+			encodable(t, s.Status())
+			close(m.proceed)
+			if activated != nil && <-activated == nil {
+				t.Fatal("overtaken Prepare accepted")
+			}
+			if x != nil {
+				if err := s.Drain(context.Background(), x, mid); err != nil {
+					t.Fatal(err)
+				}
+				ack, err := s.SuspendAck(x)
+				if err != nil {
+					t.Fatal(err)
+				}
+				encodable(t, ack)
+			} else {
+				e := s.mounts[control.MountKey(mid)]
+				if err := acquire(context.Background(), e); err != nil {
+					t.Fatal(err)
+				}
+				release(e)
+				if s.Status().Mounts[0].Reason != "session ended during recovery" {
+					t.Fatal("late recovery erased terminal reason")
+				}
+			}
+			if m.isOpen() {
+				t.Fatal("overtaken proof reopened admission")
+			}
+			encodable(t, s.Status())
+		})
 	}
 }

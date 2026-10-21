@@ -28,8 +28,9 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     func unregister()
 }
 @MainActor public protocol WorkspaceGuestChannel {
-    // True only after all queued/active control work has completed. The owner
-    // must not pause a VM while a sleep-inclusive stream deadline is armed.
+    // True when no queued or active control exchange remains. Hello connection
+    // and proof reads may still have an armed deadline during startup; the
+    // coordinator cannot reach pause before Hello completes.
     var isIdle: Bool { get }
     func hello(_ host: WorkspaceHello, completion: @escaping (Result<WorkspaceHello, Error>) -> Void)
     func suspend(_ request: WorkspaceSuspension, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void)
@@ -313,8 +314,9 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public func acknowledgeRetired(_ observed: [WorkspaceMountStatus]) throws {
         guard phase == .running || phase == .recovering,
               !observed.isEmpty, observed.count <= 16,
-              Array(retiredStatus.prefix(observed.count)) == observed,
               let through = observed.last?.retirementSequence, through > 0 else { throw WorkspaceControlError.transition }
+        if observed.allSatisfy({ $0.retirementSequence > 0 && $0.retirementSequence <= acknowledgedRetirement }) { return }
+        guard Array(retiredStatus.prefix(observed.count)) == observed else { throw WorkspaceControlError.transition }
         if retirementAckInFlight == through { return }
         guard retirementAckInFlight == nil else { throw WorkspaceControlError.transition }
         retirementAckInFlight = through
@@ -358,8 +360,6 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public func channelLost(_ why: String) {
         let failure = "control channel lost: " + why
         switch state {
-        case .draining, .pausing, .pausedCold, .pausedDiscard:
-            stopUnsafe(failure)
         case .stopped, .stopping, .unknown: break
         default: stopUnsafe(failure)
         }
@@ -408,7 +408,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         }
     }
     private func finishStop() {
-        state = .stopped; reason = ""; acknowledgeAll(fenced: true); power.unregister()
+        state = .stopped; acknowledgeAll(fenced: true); power.unregister()
         guestServiceID = Data(); mountStatus = []
     }
 }

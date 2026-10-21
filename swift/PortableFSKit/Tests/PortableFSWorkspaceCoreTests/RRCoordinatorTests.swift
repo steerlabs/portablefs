@@ -78,15 +78,15 @@ private func rrGolden(_ name: String) throws -> Data {
     return old
 }
 
-@Test @MainActor func rrConcurrentRetireAcksBothReachGuest() throws {
+@Test @MainActor func workspaceConcurrentRetirementAcknowledgementsCoalesce() throws {
     let (c, _, _, _, ch) = try rrRig()
     let old = try runningWithRetired(c, ch)
     #expect(c.retiredStatus == [old])
     try c.acknowledgeRetired([old])
     try c.acknowledgeRetired([old]) // UI double action / retry before the first completes
-    #expect(ch.retiredAcks.count == 1, "second identical RetireAck was sent; guest treats it as fatal")
+    #expect(ch.retiredAcks.count == 1, "second identical RetireAck was sent")
 }
-@Test @MainActor func rrRetireAckAllowedWhilePausedCold() throws {
+@Test @MainActor func workspaceRetirementAcknowledgementRefusedWhilePausedCold() throws {
     let (c, vm, power, _, ch) = try rrRig()
     let old = try runningWithRetired(c, ch)
     power.handler?(.sleep(WorkspaceSleepNotification(id: 1, arrivedAt: 1_000)))
@@ -95,7 +95,7 @@ private func rrGolden(_ name: String) throws -> Data {
     #expect(c.phase == .pausedCold)
     #expect(throws: (any Error).self, "acknowledgeRetired accepted while VM is paused") { try c.acknowledgeRetired([old]) }
 }
-@Test @MainActor func rrReasonIsStickyAcrossUnrelatedLaterFailure() throws {
+@Test @MainActor func workspacePauseFailureReplacesEarlierStatusReason() throws {
     let (c, _, _, clock, ch) = try rrRig()
     // Benign informational reason during normal running.
     c.refreshStatus()
@@ -113,7 +113,7 @@ private func rrGolden(_ name: String) throws -> Data {
     #expect(c.phase == .stopping)
     #expect(c.reason.contains("pause"), "reason was \(c.reason)")
 }
-@Test @MainActor func rrChannelLossWhileAwakeLeavesVMPausedIndefinitely() throws {
+@Test @MainActor func workspaceChannelLossWhileAwakeStopsVM() throws {
     let (c, vm, _, clock, _) = try rrRig()
     c.channelLost("peer EOF")
     #expect(vm.calls.last == "stop")
@@ -141,4 +141,38 @@ private func rrGolden(_ name: String) throws -> Data {
     #expect(!c.reason.isEmpty)
     _ = try runningWithRetired(c, ch)
     #expect(c.reason.isEmpty)
+}
+
+// A. Failure-driven stop: is the reason still visible once the stop completes?
+@Test @MainActor func workspaceStopReasonSurvivesConfirmedStop() throws {
+    let (c, vm, _, _, _) = try rrRig()
+    c.channelLost("peer EOF")
+    #expect(c.phase == .stopping)
+    #expect(c.reason.contains("control channel lost"))
+    vm.stops.removeFirst()(.success(()))
+    #expect(c.phase == .stopped)
+    #expect(c.reason == "control channel lost: peer EOF")
+}
+// A2. Unfenced release reason after the stop completes.
+@Test @MainActor func workspaceUnfencedReleaseReasonSurvivesStop() throws {
+    let (c, vm, power, clock, ch) = try rrRig()
+    power.handler?(.sleep(WorkspaceSleepNotification(id: 1, arrivedAt: clock.now)))
+    _ = ch
+    clock.advance(20_000_000_001)
+    #expect(power.acknowledgements.last?.1 == false)
+    #expect(c.reason.contains("unfenced") || c.reason.contains("pause"), "reason was \(c.reason)")
+    let reason = c.reason
+    while !vm.stops.isEmpty { vm.stops.removeFirst()(.success(())) }
+    #expect(c.phase == .stopped)
+    #expect(c.reason == reason)
+}
+
+// D. Host-side idempotency after completion.
+@Test @MainActor func workspaceRetirementRetryAfterCompletionIsIdempotent() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    let old = try runningWithRetired(c, ch)
+    try c.acknowledgeRetired([old])
+    ch.retiredAcks.removeFirst().1(.success(()))
+    #expect(c.retiredStatus.isEmpty)
+    #expect(throws: Never.self, "UI retry after successful acknowledgement throws") { try c.acknowledgeRetired([old]) }
 }

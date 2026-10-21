@@ -98,7 +98,8 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    Suspend and admission publication per mount. A new suspension cancels the
    preceding generation and waits for overtaken driver calls before withdrawal.
    Each driver must atomically check the latest close generation and cancellation
-   before installing any subscription or renewal; late calls install nothing.
+   before installing any subscription or renewal; failed or overtaken calls install
+   nothing, including background renewal.
    Only exact process exit plus kernel absence makes a terminal mount trivially
    cold. Other terminal mounts still require withdrawal. The Go
    `workspaceguest.Mount` interface defines this boundary; Stage 1c must implement
@@ -138,12 +139,19 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    extra resume/drain/pause cycle. Bound only VM resume completion on wake, not
    authority recovery. The guest consumes the token, returns per-mount recovering
    status and recovers mounts independently. A slow or unavailable authority
-   keeps its mount recovering while its driver is pending. A failed Prepare or
+   keeps its mount recovering while its driver is pending. Prepare and Recover
+   return only when ready is proven, terminal or authorization-required state is
+   proven, or their context is cancelled. Drivers retry transient transport
+   failures internally under the supplied generation context, holding the
+   per-mount lane and using fresh request anchors for each attempt. BeginSuspend
+   or ChannelLost cancels that context. A failed Prepare or
    Recover terminalizes that mount; exact cleanup and replacement with a new
-   incarnation obtain a fresh Prepare proof. There is no same-incarnation retry.
+   incarnation obtain a fresh Prepare proof. The supervisor does not retry a failed call.
    Other mounts and shells continue. Status polling reconciles an invalid but
    decodable recovery reply; paired-channel loss discards the VM. Initial activation and replacement
    obtain generation-tagged proofs from the driver, never from the caller.
+   Stage 1c must dispatch an initial Prepare outside Serve's serial request loop:
+   a long retry there would queue a sleep's Suspend behind authority recovery.
    Discard-only/uncertain
    state stops without resuming old RAM; only exact termination permits a new
    coordinator with a new boot identity. A cancelled sleep reconciles the current

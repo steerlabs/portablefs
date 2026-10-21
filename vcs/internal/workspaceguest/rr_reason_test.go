@@ -9,10 +9,8 @@ import (
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
 
-// A once-failed post-wake recovery leaves State "closed" with a Reason. The next
-// sleep/wake builds a ResumeAck whose "recovering" status still carries that
-// reason, which the fixed grammar now rejects, so the guest cannot send it.
-func TestRRFailedRecoveryReasonPoisonsNextResumeAck(t *testing.T) {
+// Failed recovery retains a terminal reason across the next encodable sleep/wake.
+func TestGuestFailedRecoveryRetainsEncodableTerminalReason(t *testing.T) {
 	s, m, mid := fixture(t)
 	x := cold(t, s, mid)
 	m.recover = func(context.Context, *pb.ResumeToken) (Recovery, error) {
@@ -40,7 +38,7 @@ func TestRRFailedRecoveryReasonPoisonsNextResumeAck(t *testing.T) {
 }
 
 // Same for a failed initial Prepare.
-func TestRRFailedPrepareReasonPoisonsResumeAck(t *testing.T) {
+func TestGuestFailedPrepareRetainsEncodableTerminalReason(t *testing.T) {
 	s, err := New(id(1), id(2), id(3), true)
 	if err != nil {
 		t.Fatal(err)

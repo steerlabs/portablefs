@@ -29,7 +29,11 @@ func refused(why string) error { return fmt.Errorf("%s: %w", why, ErrState) }
 // previously prepared proof, performs no I/O, and must not call the supervisor.
 // CloseAdmission may interrupt any other call. Prepare/Recover installations must
 // atomically recheck cancellation and the latest CloseAdmission generation;
-// an overtaken call must install nothing, including background renewal.
+// a failed or overtaken call must install nothing, including background renewal.
+// Prepare/Recover return only with proven ready, proven terminal or authorization-
+// required state, or context cancellation. They retry transient transport failures
+// internally with fresh request anchors under the supplied generation context,
+// holding the per-mount lane until they return. Errors terminalize the incarnation.
 // The supervisor serializes all other driver calls per mount. Suspend waits
 // for full kernel withdrawal, reply settlement, renewal quiescence and exact
 // delegation release. A terminal daemon with a retained kernel mount must still
@@ -84,21 +88,29 @@ func newEntry(id *pb.MountID, w Witness, m Mount, generation uint64) *entry {
 		status: initialStatus(id)}
 }
 
-// setState is the sole mount-state writer. Reasons belong to this transition;
+// setStatus is the sole state, reason and cleanup writer. Empty cleanup retains
+// its previous value. Reasons belong to this transition;
 // only terminal states and closed may carry one on the paired wire.
-func (e *entry) setState(state, reason string) {
+func (e *entry) setStatus(state, reason, cleanup string) {
+	if cleanup != "" {
+		e.status.Cleanup = cleanup
+	}
 	e.status.State = state
 	e.status.Reason = ""
 	if state == "terminal" || state == "authorization-required" || state == "closed" {
 		e.status.Reason = control.BoundedReason(reason)
 		if e.status.Reason == "" && (state == "terminal" || state == "authorization-required") {
-			e.status.Reason = "mount ended; exact cleanup and replacement required"
+			if state == "authorization-required" {
+				e.status.Reason = "fresh authorization required"
+			} else {
+				e.status.Reason = "mount ended; exact cleanup and replacement required"
+			}
 		}
 	}
 }
 func initialStatus(id *pb.MountID) *pb.MountStatus {
-	e := &entry{status: &pb.MountStatus{Mount: clone(id), Cleanup: "retained"}}
-	e.setState("closed", "")
+	e := &entry{status: &pb.MountStatus{Mount: clone(id)}}
+	e.setStatus("closed", "", "retained")
 	return e.status
 }
 
@@ -233,7 +245,7 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 		s.mu.Unlock()
 		return refused("activate overtaken before prepare")
 	}
-	e.setState("recovering", "")
+	e.setStatus("recovering", "", "")
 	s.mu.Unlock()
 	r, err := e.driver.Prepare(ctx, generation)
 	s.mu.Lock()
@@ -259,7 +271,7 @@ func (s *Supervisor) BeginSuspend(request *pb.Suspension) (*pb.Suspension, error
 		e.driver.CloseAdmission(max(s.generation, request.Generation))
 		e.cold = false
 		if !e.terminal {
-			e.setState("closed", "")
+			e.setStatus("closed", "", "")
 		}
 	}
 	previous := s.phase
@@ -306,7 +318,7 @@ func (s *Supervisor) mergeLossLocked(e *entry, loss []*pb.Loss) error {
 	if overflow {
 		e.terminal = true
 		e.driver.CloseAdmission(s.generation)
-		e.setState("terminal", "loss ledger capacity reached; exact cleanup and replacement required")
+		e.setStatus("terminal", "loss ledger capacity reached; exact cleanup and replacement required", "")
 	}
 	return nil
 }
@@ -361,7 +373,7 @@ func (s *Supervisor) Drain(parent context.Context, x *pb.Suspension, id *pb.Moun
 	}
 	e.cold = true
 	if !e.terminal {
-		e.setState("suspended-cold", "")
+		e.setStatus("suspended-cold", "", "")
 	}
 	return nil
 }
@@ -391,14 +403,14 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	if e.terminal {
 		return errors.Join(refused("recovery mount is terminal"), err)
 	}
-	e.setState("closed", "")
+	e.setStatus("closed", "", "")
 	if err == nil {
 		err = ctx.Err()
 	}
 	if err == nil && r.ready(g) {
 		err = e.driver.OpenAdmission(g)
 		if err == nil {
-			e.setState("ready", "")
+			e.setStatus("ready", "", "")
 			e.cold = false
 			return nil
 		}
@@ -406,7 +418,7 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	if err == nil && (r.State == "terminal" || r.State == "authorization-required") && r.Generation == g {
 		e.terminal = true
 		e.driver.CloseAdmission(g)
-		e.setState(r.State, r.Reason)
+		e.setStatus(r.State, r.Reason, "")
 		return nil
 	}
 	if err == nil {
@@ -417,7 +429,7 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	// a fresh Prepare proof through the same supervised path as other failures.
 	e.driver.CloseAdmission(g)
 	e.terminal = true
-	e.setState("terminal", err.Error())
+	e.setStatus("terminal", err.Error(), "")
 	return fmt.Errorf("prepare mount %s: %w", e.status.Mount.VolumeId, err)
 }
 
@@ -443,7 +455,7 @@ func (s *Supervisor) Resume(parent context.Context, t *pb.ResumeToken) (*pb.Resu
 	for _, id := range t.Suspension.Roster {
 		e := s.mounts[control.MountKey(id)]
 		if !e.terminal {
-			e.setState("recovering", "")
+			e.setStatus("recovering", "", "")
 			ctx, done := context.WithCancel(s.generationContext)
 			go s.recoverMount(ctx, done, e, clone(t))
 		}
@@ -494,26 +506,26 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 	}
 	e.driver.CloseAdmission(s.generation)
 	e.terminal = true
-	e.setState("terminal", reason)
+	e.setStatus("terminal", reason, "")
 	return s.mergeLossLocked(e, loss)
 }
 func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.mounts[control.MountKey(id)]
-	if e == nil || !e.terminal || p.Witness != e.witness {
+	if e == nil || !e.terminal {
 		return refused("cleanup terminal identity mismatch")
 	}
-	if p.ProcessExited {
-		e.status.Cleanup = "process-exited"
+	if e.cleaned {
+		return nil
 	}
-	if p.KernelAbsent {
-		e.status.Cleanup = "kernel-absent"
+	if p.Witness != e.witness {
+		return refused("cleanup terminal identity mismatch")
 	}
 	if !p.ProcessExited || !p.KernelAbsent {
 		return refused("cleanup requires process exit and kernel absence")
 	}
-	e.status.Cleanup = "complete"
+	e.setStatus(e.status.State, e.status.Reason, "complete")
 	e.cleaned = true
 	return nil
 }
