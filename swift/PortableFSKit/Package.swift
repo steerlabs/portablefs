@@ -10,12 +10,24 @@ let package = Package(
     products: [
         .library(name: "PortableFSKit", targets: ["PortableFSKit"]),
         .library(name: "PortableFSKitMockDaemon", targets: ["PortableFSKitMockDaemon"]),
-        .library(name: "PortableFSAppCore", targets: ["PortableFSAppCore"])
+        .library(name: "PortableFSAppCore", targets: ["PortableFSAppCore"]),
+        .library(name: "PortableFSWorkspaceCore", targets: ["PortableFSWorkspaceCore"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.38.1")
     ],
     targets: [
+        .target(
+            name: "PortableFSWorkspaceCore",
+            dependencies: [
+                .product(name: "SwiftProtobuf", package: "swift-protobuf")
+            ]
+        ),
+        .testTarget(
+            name: "PortableFSWorkspaceCoreTests",
+            dependencies: ["PortableFSWorkspaceCore"],
+            resources: [.copy("Goldens")]
+        ),
         .target(
             name: "PortableFSKit",
             dependencies: [

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Execute the complete PortableFSKit Swift test inventory through Xcode's native
-# test runner, then prove the xcresult is an exact all-passing realization of
-# the separately enumerated inventory.
+# test runner, including PortableFSWorkspaceCoreTests, then prove the xcresult
+# is an exact all-passing realization of the separately enumerated inventory.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
