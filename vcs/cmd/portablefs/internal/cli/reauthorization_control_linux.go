@@ -228,11 +228,14 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn, arrival ui
 }
 func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arrival uint64, class mountcontrol.PeerClass, peer mountcontrol.Peer) {
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(35 * time.Second))
+	attemptStarted := time.Now()
+	socketBudget := 35 * time.Second
 	limit := mountcontrol.MaxOrdinaryRequest
 	if class == mountcontrol.WorkspacePeer {
 		limit = mountcontrol.MaxWorkspaceRequest
+		socketBudget = 45 * time.Second
 	}
+	_ = connection.SetDeadline(attemptStarted.Add(socketBudget))
 	body, rights, err := mountcontrol.Receive(connection, limit)
 	defer rights.Close()
 	if err != nil {
@@ -266,9 +269,13 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 		c.mu.Unlock()
 		defer func() { c.mu.Lock(); *lane = false; c.mu.Unlock() }()
 		budget, _ := strconv.ParseUint(request.Workspace.BudgetNanos, 10, 64)
-		_ = connection.SetDeadline(time.Now().Add(time.Duration(budget)))
-		ctx, cancel := context.WithTimeout(c.ctx, time.Duration(budget))
+		deadline := attemptStarted.Add(time.Duration(budget))
+		_ = connection.SetDeadline(deadline)
+		ctx, cancel := context.WithDeadline(c.ctx, deadline)
 		defer cancel()
+		if ctx.Err() != nil {
+			return
+		}
 		stop := mountcontrol.WatchDisconnect(ctx, connection, peer, cancel)
 		defer stop()
 		response, err := c.workspace.Replay.Do(ctx, request, rights, c.workspace.Handler)

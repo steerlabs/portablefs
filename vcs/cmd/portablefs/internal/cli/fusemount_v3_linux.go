@@ -124,8 +124,8 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 	if err != nil {
 		return time.Time{}, err
 	}
-	if session != m.client {
-		return time.Time{}, errors.New("reauthorization session changed")
+	if session.AuthorizationSessionID() != m.client.AuthorizationSessionID() {
+		return time.Time{}, fmt.Errorf("reauthorization session changed: %w", mountenrollment.ErrDefinitiveDenial)
 	}
 	deadline, err := m.client.ReauthorizeWithCertificate(ctx, []byte(token), sequence, certificatePEM, time.Now())
 	if err != nil {

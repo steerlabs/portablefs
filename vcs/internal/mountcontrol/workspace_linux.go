@@ -104,6 +104,7 @@ func decimal(s string, positive bool) (uint64, error) {
 	}
 	return n, nil
 }
+func positiveDecimal(s string) bool { _, err := decimal(s, true); return err == nil }
 func identifier(s string) bool {
 	raw, err := hex.DecodeString(s)
 	return err == nil && hex.EncodeToString(raw) == s && control.ID(raw)
@@ -263,7 +264,7 @@ func (r Response) ValidateWorkspace() error {
 		}
 	case "prepared":
 		p := w.Readiness
-		if p == nil || !p.SessionValidated || !p.AuthorizationValidated || !identifier(p.SubscriptionIncarnation) || w.Witness.Session == "" || w.AuthorizationDeadlineUnixNanos == "0" {
+		if p == nil || !p.SessionValidated || !p.AuthorizationValidated || !positiveDecimal(p.SubscriptionIncarnation) || w.Witness.Session == "" || w.AuthorizationDeadlineUnixNanos == "0" {
 			return ErrGrammar
 		}
 		n, err := decimal(p.Renewal.InstalledSequence, false)

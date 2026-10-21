@@ -147,7 +147,7 @@ func TestEveryWorkspaceResponseIsImmutableTypedEvidence(t *testing.T) {
 			case "prepared":
 				w.AuthorizationDeadlineUnixNanos = "2000000000000000000"
 				w.Witness.Session = "session"
-				w.Readiness = &Prepared{SessionValidated: true, AuthorizationValidated: true, Renewal: Renewal{State: "installed", InstalledSequence: "1"}, SubscriptionIncarnation: strings.Repeat("01", 16)}
+				w.Readiness = &Prepared{SessionValidated: true, AuthorizationValidated: true, Renewal: Renewal{State: "installed", InstalledSequence: "1"}, SubscriptionIncarnation: "1"}
 			case "cold":
 				w.ColdComplete = true
 			case "failed":

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -140,5 +141,52 @@ func TestManagedInstallerRefusesMissingAndStalePermit(t *testing.T) {
 		if _, err := m.Reauthorize(ctx, "grant", 1, []byte("cert")); err == nil {
 			t.Fatal("stale installer")
 		}
+	}
+}
+
+type unavailableWorkspaceHandler struct{ calls atomic.Int32 }
+
+func (h *unavailableWorkspaceHandler) Handle(context.Context, mountcontrol.Request, *mountcontrol.Rights) (mountcontrol.Response, error) {
+	h.calls.Add(1)
+	return mountcontrol.Response{}, mountcontrol.ErrUnavailable
+}
+func TestWorkspaceSocketBudgetIncludesPartialRequestRead(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("exact root supervisor boundary requires the owned Linux test container")
+	}
+	start, err := mountcontrol.ProcessStart(int32(os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &unavailableWorkspaceHandler{}
+	c, err := startFuseMountControl(nil, nil, &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Handler: handler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	connection, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: c.SocketPath(), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	connection.SetDeadline(time.Now().Add(2 * time.Second))
+	q := mountcontrol.Request{Operation: "workspace-prepare", MountInstanceID: lossTestInstance, Workspace: &mountcontrol.Workspace{Version: 8, RequestID: "1", OperationID: "1", BootID: strings.Repeat("01", 16), HostServiceID: strings.Repeat("02", 16), GuestServiceID: strings.Repeat("03", 16), Generation: "0", GateSerial: "0", BudgetNanos: "50000000"}}
+	body, err := json.Marshal(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Write(body[:1]); err != nil {
+		t.Fatal(err)
+	}
+	waitForFuseMountControlConnections(t, c, 1)
+	// The framing read consumes the whole attempt budget before dispatch.
+	time.Sleep(100 * time.Millisecond)
+	if _, err := connection.Write(body[1:]); err != nil {
+		t.Fatal(err)
+	}
+	connection.CloseWrite()
+	io.Copy(io.Discard, connection)
+	if handler.calls.Load() != 0 {
+		t.Fatal("partial framing restarted the socket attempt budget")
 	}
 }
