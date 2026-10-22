@@ -52,6 +52,7 @@ type Owner struct {
 	mu                           sync.Mutex
 	job                          *Job
 	prepareUsed, closed          bool
+	servingFailure               string // terminal for this incarnation, independent of jobs/cold transactions
 	recoveredGeneration          uint64
 	lastResume                   [32]byte
 	install, voluntary, terminal actionSlot
@@ -325,6 +326,9 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 		if err := o.successorLocked(q); err != nil {
 			return Response{}, nil, err
 		}
+		if !o.permitted(q) {
+			return Response{}, nil, ErrGrammar
+		}
 		if o.job.running || o.install.status.Progress == "running" {
 			return Response{}, nil, ErrOccupied
 		}
@@ -333,6 +337,9 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 		return Response{}, nil, ErrUnavailable
 	}
 	if !o.permitted(q) {
+		return Response{}, nil, ErrGrammar
+	}
+	if o.servingFailure != "" && (q.Operation == "workspace-prepare" || q.Operation == "workspace-recover") {
 		return Response{}, nil, ErrGrammar
 	}
 	switch q.Operation {
@@ -429,8 +436,23 @@ func (o *Owner) run(j *Job) {
 	err := o.Driver.Run(j.ctx, j)
 	o.mu.Lock()
 	if err != nil || j.state != "prepared" && j.state != "cold" && j.state != "cleanup-finalized" && j.state != "failed" {
+		// Only cancellation actually caused by this generation's context is an
+		// overtaking disposition. An unrelated error remains terminal even if Close
+		// raced its return; cancellation-looking errors with a live context do too.
+		canceled := (j.stopping || j.ctx.Err() != nil) && (err == nil || errors.Is(err, context.Canceled) || errors.Is(err, j.ctx.Err()))
+		if !canceled && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && o.servingFailure == "" {
+			o.servingFailure = "mount incarnation preparation/recovery failed"
+		}
 		j.state, j.reason = "failed", "lifecycle work failed"
+		if o.servingFailure != "" {
+			j.reason = o.servingFailure
+		}
 		o.facts.Readiness = nil
+	}
+	// Withdrawal can complete after a serving failure, but cannot publish a
+	// new cold recovery opportunity or erase the incarnation's terminal fact.
+	if o.servingFailure != "" && j.start.Operation == "workspace-suspend" {
+		j.state, j.reason = "failed", o.servingFailure
 	}
 	j.running = false
 	if j.start.Operation == "workspace-prepare" && o.install.status.Progress == "offered" {
@@ -487,6 +509,10 @@ func (o *Owner) observeLocked(q Request) (Response, error) {
 	w.Phases = &PhaseFacts{status(o.install), status(o.voluntary), status(o.terminal)}
 	w.Reason = j.reason
 	w.ColdComplete = j.state == "cold"
+	if o.servingFailure != "" && j.start.Operation == "workspace-suspend" {
+		// Job progress cannot hide the incarnation's terminal serving verdict.
+		w.State, w.Reason, w.ColdComplete = "failed", o.servingFailure, false
+	}
 	if j.state == "prepared" && o.facts.Readiness != nil {
 		p := *o.facts.Readiness
 		w.Readiness = &p
@@ -511,7 +537,16 @@ func (j *Job) Publish(state string, f Facts) error {
 	}
 	switch state {
 	case "prepared":
-		if j.start.Operation != "workspace-prepare" && j.start.Operation != "workspace-recover" || j.stopping || j.ctx.Err() != nil || !o.permitted(j.start) || o.install.status.Progress != "complete" {
+		if j.start.Operation != "workspace-prepare" && j.start.Operation != "workspace-recover" {
+			return ErrGrammar
+		}
+		if j.stopping || j.ctx.Err() != nil || !o.permitted(j.start) {
+			// Losing the publication race to Close is generation cancellation, not
+			// a failed preparation. Preserve unrelated driver failures in run.
+			j.stopping = true
+			return context.Canceled
+		}
+		if o.install.status.Progress != "complete" {
 			return ErrGrammar
 		}
 	case "cold":
@@ -528,6 +563,7 @@ func (j *Job) Publish(state string, f Facts) error {
 	}
 	out, _ := o.observeLocked(j.start)
 	out.Workspace.State = state
+	out.Workspace.Reason = ""
 	out.Workspace.ColdComplete = state == "cold"
 	out.Workspace.Readiness = f.Readiness
 	if state != "prepared" {

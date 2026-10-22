@@ -49,7 +49,7 @@ func TestDeathAtEveryBootstrapAndHandoffBoundary(t *testing.T) {
 				if err := b.Finish(originals, witness()); err != nil {
 					t.Fatal(err)
 				}
-				defer b.Finalize(Absence{true, true, true, true})
+				defer func() { _ = b.Finalize(absentBootstrap(&b)) }()
 				if boundary == "after-mount" || boundary == "before-handoff" {
 					lost()
 					if _, err := b.Handoff(); !errors.Is(err, ErrRetired) {
@@ -107,7 +107,7 @@ func TestDeathAtEveryBootstrapAndHandoffBoundary(t *testing.T) {
 				if _, err := unix.FcntlInt(uintptr(fds[1]), unix.F_GETFD, 0); err != nil {
 					t.Fatal("abort owner lost before finalization", err)
 				}
-				if err := b.Finalize(Absence{true, true, true, true}); err != nil {
+				if err := b.Finalize(absentBootstrap(&b)); err != nil {
 					t.Fatal(err)
 				}
 				assertClosed(t, fds)
@@ -125,7 +125,7 @@ func TestBootstrapNeverRemountsToRepairUnknownDelivery(t *testing.T) {
 	if err := b.Finish(rights, witness()); err != nil {
 		t.Fatal(err)
 	}
-	defer b.Finalize(Absence{true, true, true, true})
+	defer func() { _ = b.Finalize(absentBootstrap(&b)) }()
 	for i := 0; i < 16; i++ {
 		copy, err := b.Handoff()
 		if err != nil {
@@ -165,7 +165,7 @@ func TestRootRemovalJoinsBeforeTerminalEscalation(t *testing.T) {
 	if err := b.BeginRemoval(terminal, witness()); !errors.Is(err, ErrOccupied) {
 		t.Fatal("terminal overtook root action", err)
 	}
-	if err := b.Finalize(Absence{true, true, true, true}); !errors.Is(err, ErrOccupied) {
+	if err := b.Finalize(absentBootstrap(&b)); !errors.Is(err, ErrOccupied) {
 		t.Fatal("cleanup bypassed root join", err)
 	}
 	if err := b.FinishRemoval("voluntary", Removal{}, unix.EBUSY); !errors.Is(err, unix.EBUSY) {
@@ -185,8 +185,17 @@ func TestRootRemovalJoinsBeforeTerminalEscalation(t *testing.T) {
 	if err := b.BeginRemoval(terminal, witness()); !errors.Is(err, ErrActionConsumed) {
 		t.Fatal("removal reversed", err)
 	}
-	if err := b.Finalize(Absence{true, true, true, true}); err != nil {
+	if err := b.Finalize(absentBootstrap(&b)); err != nil {
 		t.Fatal(err)
 	}
 	assertClosed(t, fds)
+}
+
+// This fixture models an independent exact-inventory observation, never an
+// acknowledgment. Production must supply actual process and mount inventories.
+func absentBootstrap(b *Bootstrap) Absence {
+	proof, _ := b.ObserveAbsence(func(w Witness) (Absence, error) {
+		return Absence{Witness: w, ProcessExited: true, KernelAbsent: true, SourceAbsent: true, AliasesAbsent: true}, nil
+	})
+	return proof
 }

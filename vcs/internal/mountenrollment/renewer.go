@@ -15,9 +15,12 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 )
 
-// ErrObsoleteInstallation reports a known remote success whose permission was
-// closed before local publication. The sequence advances, readiness does not.
-var ErrObsoleteInstallation = errors.New("renewal installation belongs to an obsolete permit")
+// Both outcomes are known remote successes and invalidate the older proof.
+// Only a permit-closed installation may be republished under a later permit.
+var (
+	ErrPermitClosedInstallation   = errors.New("renewal installation completed under a closed permit")
+	ErrSessionChangedInstallation = errors.New("renewal installation belongs to a changed session")
+)
 
 type GrantSource interface {
 	Refresh(context.Context, string, uint64) (controlplane.MountAuthorization, error)
@@ -111,6 +114,15 @@ type RenewalEvent struct {
 	Status     RenewalStatus
 }
 
+type installationDisposition uint8
+
+const (
+	installationUnknown installationDisposition = iota
+	installationCurrent
+	installationPermitClosed
+	installationSessionChanged
+)
+
 type Renewer struct {
 	// Managed requires an explicit Resume permit before dispatch. No implicit
 	// ordinary permit is available on this branch.
@@ -128,7 +140,7 @@ type Renewer struct {
 	sequence                     uint64
 	pending                      *controlplane.MountAuthorization
 	readiness, installed         RenewalReadiness
-	installedPublishable         bool
+	installedDisposition         installationDisposition
 	status                       RenewalStatus
 	force                        bool
 	terminal                     error
@@ -210,7 +222,8 @@ func (r *Renewer) Readiness() RenewalReadiness {
 
 // A proof is publishable only outside the serving withdrawal margin.
 func (r *Renewer) installationSafeLocked() bool {
-	return r.installedPublishable && r.installed.State == "installed" && r.installed.SessionID == r.session && r.installed.AuthorizationDeadline.Equal(r.deadline) && r.installed.InstalledSequence > 0 && r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin))
+	publishable := r.installedDisposition == installationCurrent || r.installedDisposition == installationPermitClosed && r.permit != r.installed.Permit
+	return publishable && r.installed.State == "installed" && r.installed.SessionID == r.session && r.installed.AuthorizationDeadline.Equal(r.deadline) && r.installed.InstalledSequence > 0 && r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin))
 }
 func (r *Renewer) signalLocked() {
 	if r.wake == nil {
@@ -398,11 +411,13 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		r.mu.Lock()
 		// A successful installer is a known remote installation even if Park/Close
 		// raced it. Keep that sequence before considering readiness publication.
-		obsolete := errors.Is(err, ErrObsoleteInstallation)
+		permitClosed := errors.Is(err, ErrPermitClosedInstallation)
+		sessionChanged := errors.Is(err, ErrSessionChangedInstallation)
+		obsolete := permitClosed || sessionChanged
 		known := (err == nil || obsolete) && allowed
 		if known {
 			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
-			r.installedPublishable = false
+			r.installedDisposition = installationUnknown
 			if obsolete {
 				err = nil
 			}
@@ -417,7 +432,13 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 			} else {
 				r.deadline = installed
 				r.authorizedAt = r.now()
-				r.installedPublishable = !obsolete
+				r.installedDisposition = installationCurrent
+				if permitClosed {
+					r.installedDisposition = installationPermitClosed
+				}
+				if sessionChanged {
+					r.installedDisposition = installationSessionChanged
+				}
 				r.installed = RenewalReadiness{State: "installed", InstalledSequence: seq, Permit: p, SessionID: session, AuthorizationDeadline: installed}
 				if r.allowedLocked() && r.permit == p && ctx.Err() == nil && !obsolete && r.installationSafeLocked() {
 					r.readiness = r.installed

@@ -19,6 +19,7 @@ type Bootstrap struct {
 	finished, childOwns, stopped, finalized bool
 	rights                                  *Rights
 	removal                                 [2]ActionStatus
+	absenceRevision                         uint64
 }
 
 func (b *Bootstrap) Begin(p Phase) error {
@@ -151,23 +152,66 @@ func (b *Bootstrap) ObserveInstall(s ActionStatus, w Witness) error {
 func (b *Bootstrap) OwnerLost() { b.mu.Lock(); b.stopped = true; b.mu.Unlock() }
 func (b *Bootstrap) ChildLost() { b.mu.Lock(); b.stopped = true; b.mu.Unlock() }
 
-// Absence is independent root observation, not a child cleanup acknowledgment.
-type Absence struct{ ProcessExited, KernelAbsent, SourceAbsent, AliasesAbsent bool }
+// Absence names the exact root-observed inventory. The private binding is
+// issued only by ObserveAbsence after the bootstrap owner has settled.
+type Absence struct {
+	Witness                                                  Witness
+	ProcessExited, KernelAbsent, SourceAbsent, AliasesAbsent bool
+	owner                                                    *Bootstrap
+	revision                                                 uint64
+}
 
-func (b *Bootstrap) Finalize(proof Absence) error {
-	if !proof.ProcessExited || !proof.KernelAbsent || !proof.SourceAbsent || !proof.AliasesAbsent {
-		return ErrGrammar
-	}
-	b.mu.Lock()
-	if b.action != nil && !b.finished {
-		b.mu.Unlock()
-		return ErrOccupied
+func (b *Bootstrap) settledLocked() bool {
+	if b.action == nil || !b.finished {
+		return false
 	}
 	for _, s := range b.removal {
 		if s.Progress == "running" {
-			b.mu.Unlock()
-			return ErrOccupied
+			return false
 		}
+	}
+	return true
+}
+
+// ObserveAbsence starts independent observation only after Finish and removal
+// owners have joined. No lock crosses observation. A new action invalidates any
+// earlier proof, including an observation still in flight.
+func (b *Bootstrap) ObserveAbsence(observe func(Witness) (Absence, error)) (Absence, error) {
+	b.mu.Lock()
+	if !b.settledLocked() {
+		b.mu.Unlock()
+		return Absence{}, ErrOccupied
+	}
+	w, revision := b.action.Witness, b.absenceRevision
+	b.mu.Unlock()
+	if observe == nil {
+		return Absence{}, ErrGrammar
+	}
+	proof, err := observe(w)
+	if err != nil {
+		return Absence{}, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.settledLocked() || b.absenceRevision != revision {
+		return Absence{}, ErrOccupied
+	}
+	if proof.Witness != w || !proof.ProcessExited || !proof.KernelAbsent || !proof.SourceAbsent || !proof.AliasesAbsent {
+		return Absence{}, ErrGrammar
+	}
+	proof.owner, proof.revision = b, revision
+	return proof, nil
+}
+
+func (b *Bootstrap) Finalize(proof Absence) error {
+	b.mu.Lock()
+	if !b.settledLocked() {
+		b.mu.Unlock()
+		return ErrOccupied
+	}
+	if proof.owner != b || proof.revision != b.absenceRevision || proof.Witness != b.action.Witness || !proof.ProcessExited || !proof.KernelAbsent || !proof.SourceAbsent || !proof.AliasesAbsent {
+		b.mu.Unlock()
+		return ErrGrammar
 	}
 	b.stopped = true
 	b.finalized = true
@@ -219,6 +263,7 @@ func (b *Bootstrap) BeginRemoval(s ActionStatus, w Witness) error {
 	s.Action = kernelAction(*p)
 	s.Progress = "running"
 	s.Failure = ""
+	b.absenceRevision++
 	b.removal[index] = s
 	return nil
 }

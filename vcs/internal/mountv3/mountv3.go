@@ -111,15 +111,15 @@ func AttachWithRoutes(ctx context.Context, attach authorityrpc.ClientConfig, ado
 	}
 	adopted, parseErr := localroutes.Parse(mismatch.Canonical)
 	if parseErr != nil {
-		return nil, rules, fmt.Errorf("the volume's active %s declaration could not be compiled: %w", localroutes.ConfigPath, parseErr)
+		return nil, rules, &authorityrpc.AttachError{Disposition: authorityrpc.AttachNotCommitted, Cause: fmt.Errorf("the volume's active %s declaration could not be compiled: %w", localroutes.ConfigPath, parseErr)}
 	}
 	if adopted.Revision() != mismatch.Active {
 		// The rules and the revision on one refusal have to agree, or this mount
 		// would attach claiming a topology it did not derive from what it was
 		// handed. Echoing the authority's own number back would make the check
 		// that admits it vacuous.
-		return nil, rules, fmt.Errorf("the authority's active %s rules hash to %x but it reports %x as active; refusing to attach against a routing declaration that does not describe itself",
-			localroutes.ConfigPath, adopted.Revision(), mismatch.Active)
+		return nil, rules, &authorityrpc.AttachError{Disposition: authorityrpc.AttachNotCommitted, Cause: fmt.Errorf("the authority's active %s rules hash to %x but it reports %x as active; refusing to attach against a routing declaration that does not describe itself",
+			localroutes.ConfigPath, adopted.Revision(), mismatch.Active)}
 	}
 	attach.RoutesRevision = adopted.Revision()
 	client, err = dialOnce(ctx, attach)

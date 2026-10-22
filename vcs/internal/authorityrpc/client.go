@@ -172,8 +172,9 @@ type lane struct {
 }
 
 type Client struct {
-	flush lane
-	cfg   ClientConfig
+	attachDisposition AttachDisposition // pre-publication ownership; only the attach owner writes it
+	flush             lane
+	cfg               ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
@@ -269,21 +270,50 @@ func (m *replaySlotMutex) Unlock() { <-m.gate }
 // identity into another's handshake.
 const clientSessionCacheEntries = 8
 
+// DialClient can retain a sent Activate after caller cancellation. Worst-case
+// ownership settlement is DialTimeout + 2*CancelDrainTimeout: initial negotiation,
+// independent reconciliation, then exact pre-publication release.
 func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if cfg.Purpose != authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
-		return nil, errors.New("authorityrpc: mount client requires explicit MOUNT purpose")
+		return nil, &AttachError{Disposition: AttachNotCommitted, Cause: errors.New("authorityrpc: mount client requires explicit MOUNT purpose")}
 	}
 	return dialClient(ctx, cfg)
 }
 
 func DialRouteAdminClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if cfg.Purpose != authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
-		return nil, errors.New("authorityrpc: route-admin client requires explicit ROUTE_ADMIN purpose")
+		return nil, &AttachError{Disposition: AttachNotCommitted, Cause: errors.New("authorityrpc: route-admin client requires explicit ROUTE_ADMIN purpose")}
 	}
 	return dialClient(ctx, cfg)
 }
 
-func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
+// AttachDisposition is the explicit pre-publication ownership verdict. Its zero
+// value retains cleanup debt; an unclassified error can never prove release.
+type AttachDisposition uint8
+
+const (
+	AttachCleanupRequired AttachDisposition = iota
+	AttachNotCommitted
+	AttachReleased
+)
+
+// AttachError survives wrapper errors through AttachWithRoutes to startup.
+// Transport uncertainty and cancellation describe causes, not ownership.
+type AttachError struct {
+	Disposition AttachDisposition
+	Cause       error
+}
+
+func (e *AttachError) Error() string { return e.Cause.Error() }
+func (e *AttachError) Unwrap() error { return e.Cause }
+
+func dialClient(ctx context.Context, cfg ClientConfig) (_ *Client, resultErr error) {
+	c := &Client{attachDisposition: AttachNotCommitted}
+	defer func() {
+		if resultErr != nil {
+			resultErr = &AttachError{Disposition: c.attachDisposition, Cause: resultErr}
+		}
+	}()
 	if cfg.Address == "" || cfg.TLS == nil || cfg.VolumeID == "" || len(cfg.AccessToken) == 0 ||
 		cfg.ReplaySlots == 0 || cfg.MaxFrame == 0 || cfg.MaxInFlight <= 0 || cfg.DialTimeout <= 0 || cfg.CancelDrainTimeout <= 0 {
 		return nil, errors.New("authorityrpc: complete client configuration is required")
@@ -327,8 +357,9 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS.NextProtos = []string{protocolALPN}
 	cfg.TLS.DynamicRecordSizingDisabled = true
 	cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
-	c := &Client{
-		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
+	c = &Client{
+		attachDisposition: AttachNotCommitted,
+		cfg:               cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:        newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:     newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
 		controlPoll: lane{permits: make(chan struct{}, 1)},
@@ -473,6 +504,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	dataGeneration := provisional.GetDataBindingGeneration()
 	controlGeneration := provisional.GetControlBindingGeneration()
 	requestID := uint64(2)
+	c.attachDisposition = AttachCleanupRequired
 	activateResponse, err := rawRoundTrip(control.conn, control.maxFrame, activateRequest(requestID, dataGeneration, controlGeneration))
 	var recoveryCtx context.Context
 	var recoveryCancel context.CancelFunc
@@ -506,7 +538,8 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	if !equalBytes(activateResponse.GetEpoch(), data.epoch) {
 		return fail(ErrAuthorityChanged)
 	}
-	if activateResponse.GetErrno() != 0 || activateResponse.GetActivate() == nil {
+	if activateResponse.GetErrno() != 0 {
+		c.attachDisposition = AttachNotCommitted
 		activationErr := fmt.Errorf("authorityrpc: activation refused with errno %d", activateResponse.GetErrno())
 		// Even if an earlier response was lost, this exact replay has now
 		// learned the attempt's non-committed result. Abort is safe only after
@@ -515,6 +548,10 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 		return fail(activationErr)
 	}
 	active := activateResponse.GetActivate()
+	if active == nil {
+		// A malformed success cannot prove that activation was refused.
+		return fail(fmt.Errorf("%w: activation returned no committed outcome", ErrTransportBinding))
+	}
 	// A successful Activate response is the commit witness: the server validates
 	// ACTIVE and commits strict membership before that response can be written.
 	// Every local body validation after this point, including State, therefore
@@ -570,6 +607,7 @@ func (c *Client) releaseCommittedBeforePublication(cause error, control *transpo
 		if detachErr := c.detachActiveRaw(ctx, control, requestID, nil); detachErr != nil {
 			return errors.Join(cause, fmt.Errorf("%w: release route-admin session before client publication: %w", ErrTransportUncertain, detachErr))
 		}
+		c.attachDisposition = AttachReleased
 		return cause
 	}
 	proof, observeErr := c.observePreKernelMountAbsence(ctx)
@@ -579,6 +617,7 @@ func (c *Client) releaseCommittedBeforePublication(cause error, control *transpo
 	if detachErr := c.detachActiveRaw(ctx, control, requestID, proof); detachErr != nil {
 		return errors.Join(cause, fmt.Errorf("%w: release ACTIVE session before client publication: %w", ErrTransportUncertain, detachErr))
 	}
+	c.attachDisposition = AttachReleased
 	return cause
 }
 

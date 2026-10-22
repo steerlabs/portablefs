@@ -51,7 +51,7 @@ func TestR4BootstrapConcurrentHandoffObserveFinalize(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for b.Finalize(Absence{true, true, true, true}) != nil {
+			for b.Finalize(absentBootstrap(&b)) != nil {
 			}
 			finalized.Store(true)
 		}()

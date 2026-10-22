@@ -21,7 +21,7 @@ func TestBootstrapSettlesCanceledAndPartialAcquisitions(t *testing.T) {
 				t.Fatal(err)
 			}
 			b.OwnerLost()
-			if err := b.Finalize(Absence{true, true, true, true}); !errors.Is(err, ErrOccupied) {
+			if err := b.Finalize(absentBootstrap(&b)); !errors.Is(err, ErrOccupied) {
 				t.Fatal(err)
 			}
 			r := &Rights{}
@@ -44,7 +44,7 @@ func TestBootstrapSettlesCanceledAndPartialAcquisitions(t *testing.T) {
 			if err := b.Finalize(Absence{ProcessExited: true}); !errors.Is(err, ErrGrammar) {
 				t.Fatal("stale absence replaced observation", err)
 			}
-			if err := b.Finalize(Absence{true, true, true, true}); err != nil {
+			if err := b.Finalize(absentBootstrap(&b)); err != nil {
 				t.Fatal(err)
 			}
 			if len(fds) > 0 {
@@ -278,7 +278,7 @@ func TestStoppedInstallOfferRetainsRootOwnershipAndEndsHandoff(t *testing.T) {
 			t.Fatal("stopped offer dropped original root owner", err)
 		}
 	}
-	if err := b.Finalize(Absence{true, true, true, true}); err != nil {
+	if err := b.Finalize(absentBootstrap(&b)); err != nil {
 		t.Fatal(err)
 	}
 	assertClosed(t, fds)

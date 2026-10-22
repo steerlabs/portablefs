@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"os"
 	"strings"
 	"sync"
@@ -17,6 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
@@ -133,11 +133,11 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 	}
 	select {
 	case <-changed:
-		return deadline, mountenrollment.ErrObsoleteInstallation
+		return deadline, mountenrollment.ErrSessionChangedInstallation
 	default:
 	}
 	if !permitted() {
-		return deadline, mountenrollment.ErrObsoleteInstallation
+		return deadline, mountenrollment.ErrPermitClosedInstallation
 	}
 	return deadline, nil
 }
@@ -181,7 +181,10 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		// It is surfaced exactly as it arrived: the operator is told what the
 		// volume routes and what this mount asked for, and retrying in a loop
 		// against a volume that is being reconfigured is not an answer.
-		return nil, false, err
+		var failure *authorityrpc.AttachError
+		// Missing classification is cleanup debt, never evidence of no ownership.
+		retained := !errors.As(err, &failure) || failure.Disposition == authorityrpc.AttachCleanupRequired
+		return nil, retained, err
 	}
 	backing := ""
 	if !rules.Empty() {
@@ -226,5 +229,6 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 }
 
 func failedFUSEStartupClean(err error) bool {
-	return fusev3.FailedStartupClean(err)
+	var failure *authorityrpc.AttachError
+	return fusev3.FailedStartupClean(err) || errors.As(err, &failure) && failure.Disposition == authorityrpc.AttachReleased
 }

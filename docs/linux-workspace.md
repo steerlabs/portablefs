@@ -115,7 +115,11 @@ also carries a positive `drainBudgetNanos` of at most 15 seconds. Acceptance
 captures its receipt-relative deadline after charging framing and admission
 delay; retry allowances cannot extend it. Observation gets its own socket
 budget after the drain expires. The host transaction retains its original
-cold acknowledgment and pause deadlines.
+cold acknowledgment and pause deadlines. A fully framed current Suspend closes
+admission and cancels a legal predecessor before its drain budget is checked.
+If that budget is already spent, the start is refused after the predecessor
+joins; the predecessor may remain failed. The root must escalate to Cleanup,
+not retry recovery or treat refusal as withdrawal completion.
 
 `AdmitFrame` owns the immediate admission invalidation for each authenticated,
 fully framed Suspend or Cleanup, before checking lanes, remaining budget or
@@ -137,6 +141,10 @@ retains original descriptions and partial witness, and retransmits only copies
 of those descriptions while child ownership remains unknown. Observing accepted
 child ownership closes the redundant root FUSE copy; the original abort owner
 survives through independent process-exit and kernel/source/alias-absence proof.
+`ObserveAbsence` starts that observation only after the bootstrap and removal
+owners settle. Its proof binds the exact process, kernel, source and target
+alias inventory to this bootstrap owner. Finalize rejects unbound, foreign or
+stale proofs, including observation overtaken by another removal action.
 Death preserves uncertain inventory and blocks replacement. The control-boundary
 tests use owned descriptors; actual device/bootstrap qualification still belongs
 to the later protected-path driver.
@@ -149,7 +157,11 @@ Park/Resume interval. An unknown installation retries its same sequence and
 bytes. A known remote success advances the sequence even when a later Close
 suppresses readiness. Recording an installation that cannot be published
 invalidates the prior proof; Readiness validates the exact returned proof's
-session, permit, sequence and deadline. The managed installer itself rejects
+session, permit, sequence and deadline. A permit-closed installation remains
+recorded and can be republished under a later current permit after Park joins
+its owner. An installation for a changed session is never publishable; Resume
+cannot relabel it as belonging to the current session. Both outcomes invalidate
+the older proof immediately. The managed installer itself rejects
 missing or stale generation/serial permits. Hosted CLI readiness requires the
 first successful installer and exact Manager/installed deadline equality;
 explicit standalone readiness is not-required. Starting a goroutine or
@@ -160,8 +172,24 @@ Activate may have committed, the shared authority client retains that attempt
 under an independent bounded reconciliation lifetime. It rebinds the same
 session and replays the exact Activate; startup cancellation joins before an
 independently bounded exact Detach. Unresolved reconciliation returns explicit
-transport uncertainty. This ownership also applies to ordinary mounts. A
-queued startup signal prevents publishing mounted readiness. The child bounds
+transport uncertainty. An explicit attach disposition survives the shared
+routing wrapper and ordinary mount startup: proven exact release permits intent
+finalization and enrollment closure; possible commitment or failed release
+retains authority ownership, enrollment and cleanup debt. Cancellation, a nil
+client and the absence of transport uncertainty cannot prove cleanup.
+
+The shared client's worst-case attach settlement bound is approximately
+`DialTimeout + 2 * CancelDrainTimeout`: initial negotiation, independent
+activation reconciliation, then exact pre-publication release. Production uses
+10 seconds for each budget, about 30 seconds total. Caller cancellation does
+not shorten the latter two owners. `RecoverEpoch` uses the same attach bound.
+The macOS FSKit initial attach runs through the CLI's 60-second daemon HTTP
+client; the daemon sets no shorter handler deadline. Preflight's separate
+10-second socket deadline follows completed attach and does not perform it.
+FSKit frontend operations have a 50-second daemon admission budget and a longer
+announced request deadline; the macOS data plane does not call RecoverEpoch.
+These caller budgets accommodate the shared-client bound without adjustment.
+A queued startup signal prevents publishing mounted readiness. The child bounds
 startup at two minutes from entry, leaving rollback time inside the parent's
 three-minute limit; renewal failure is delivered before detach retries finish.
 
@@ -205,9 +233,15 @@ already admitted operation. Completed withdrawal requires Suspend's joins.
 Prepare/Recover belong to their generation, retry classified transient failures
 with bounded attempts/backoff, and have no 45-second logical deadline. Only
 current session/authorization validation, a functioning renewal owner and fresh
-subscription evidence can authorize publication. An actual failed recovery ends
-that incarnation. The supervisor does not renew sessions. These remain typed
-driver contracts until the real admission, clock and lifecycle owners exist.
+subscription evidence can authorize publication. A genuine failed Prepare or
+Recover permanently ends serving preparation for that mount incarnation. The
+terminal fact survives replacement of its job and cold transaction. Later Suspend may withdraw state, but reports the retained
+failure instead of a new cold recovery opportunity; exact Cleanup remains
+available. A worker canceled by its own overtaking generation does not create
+this terminal fact. An unrelated error still does, including one racing Close
+or a cancellation-looking error returned while the worker context is live.
+The supervisor does not renew sessions. These remain typed driver contracts
+until the real admission, clock and lifecycle owners exist.
 
 ## Controlled suspension transaction
 

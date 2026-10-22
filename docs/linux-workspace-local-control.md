@@ -30,6 +30,11 @@ Other request IDs only correlate socket attempts.
 | `workspace-unmount-complete` | Exact removal `phase` plus `removal.kernelAbsent=true`; terminal also requires `abortCompleted=true` | `unmount-recorded` |
 | `workspace-observe` | None | Current snapshot |
 
+A current legal Suspend invalidates admission and cancels its predecessor
+before checking the receipt-relative drain deadline. A spent drain therefore
+refuses the start after cancellation, possibly leaving that predecessor failed.
+The root escalates to Cleanup; refusal does not prove completed withdrawal.
+
 Transactions retain the paired canonical protobuf scanner and full fixed
 roster. Their boot/services/generation must equal the local binding. Only
 Suspend carries the drain allowance; that allowance and the socket budget sit

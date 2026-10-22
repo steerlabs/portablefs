@@ -145,7 +145,7 @@ func TestR3ReadinessReturnsStaleProofAfterObsoleteInstall(t *testing.T) {
 				firstDeadline = d
 				return d, nil
 			}
-			return d, ErrObsoleteInstallation // authorization session changed during install
+			return d, ErrSessionChangedInstallation // authorization session changed during install
 		})
 	}()
 	select {
@@ -266,7 +266,7 @@ func TestReadinessValidatesTheExactPublishedProof(t *testing.T) {
 			p := Permit{1, 1}
 			deadline := now.Add(time.Hour)
 			proof := RenewalReadiness{State: "installed", InstalledSequence: 2, Permit: p, SessionID: "session", AuthorizationDeadline: deadline}
-			r := &Renewer{Managed: true, running: true, session: "session", permit: p, installed: proof, readiness: proof, installedPublishable: true, deadline: deadline, authorizedAt: now, Now: func() time.Time { return now }, CheckPermit: func(Permit) bool { return true }}
+			r := &Renewer{Managed: true, running: true, session: "session", permit: p, installed: proof, readiness: proof, installedDisposition: installationCurrent, deadline: deadline, authorizedAt: now, Now: func() time.Time { return now }, CheckPermit: func(Permit) bool { return true }}
 			switch field {
 			case "sequence":
 				r.readiness.InstalledSequence = 1

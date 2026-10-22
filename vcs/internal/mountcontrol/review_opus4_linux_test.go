@@ -104,7 +104,14 @@ func TestR4RetiredCloseFrameCancelsCurrentJob(t *testing.T) {
 			o := testOwner(t, func(ctx context.Context, j *Job) error {
 				switch j.start.Operation {
 				case "workspace-prepare":
-					return j.Publish("preparing", Facts{})
+					if err := j.OfferInstall(*phase()); err != nil {
+						return err
+					}
+					offered <- "install"
+					if err := j.WaitInstall(ctx); err != nil {
+						return err
+					}
+					return j.Publish("prepared", readyFacts())
 				case "workspace-suspend":
 					return j.Publish("cold", Facts{})
 				case "workspace-recover":
@@ -163,6 +170,11 @@ func TestR4RetiredCloseFrameCancelsCurrentJob(t *testing.T) {
 				}
 			case "retired-suspend-vs-recovered-serving":
 				pj := start(t, o, request("workspace-prepare", 1, 1))
+				if got := awaitResult(t, offered); got != "install" {
+					t.Fatal(got)
+				}
+				rights, _ := descriptors(t)
+				do(t, o, installRequest(8, 1), rights)
 				awaitResult(t, pj.done)
 				s := request("workspace-suspend", 2, 2)
 				transaction(t, &s)
@@ -205,7 +217,7 @@ func TestR4BootstrapFinalizeBeforeFinishLeaksRights(t *testing.T) {
 	if err := b.Begin(p); err != nil {
 		t.Fatal(err)
 	}
-	ferr := b.Finalize(Absence{true, true, true, true})
+	ferr := b.Finalize(absentBootstrap(&b))
 	d, fds := descriptors(t)
 	err := b.Finish(d, witness())
 	t.Logf("R4-3 Finalize-before-Finish=%v Finish-after-Finalize=%v", ferr, err)
@@ -221,7 +233,7 @@ func TestR4BootstrapFinalizeBeforeFinishLeaksRights(t *testing.T) {
 	if !errors.Is(ferr, ErrOccupied) || err != nil {
 		t.Fatalf("outstanding owner not joined: finalize=%v finish=%v", ferr, err)
 	}
-	if err := b.Finalize(Absence{true, true, true, true}); err != nil {
+	if err := b.Finalize(absentBootstrap(&b)); err != nil {
 		t.Fatal(err)
 	}
 	assertClosed(t, fds)
@@ -244,7 +256,7 @@ func TestR4BootstrapRemovalBeforeFinish(t *testing.T) {
 	if err := b.Finish(&Rights{}, Witness{}); !errors.Is(err, ErrGrammar) {
 		t.Fatal(err)
 	}
-	if err := b.Finalize(Absence{true, true, true, true}); err != nil {
+	if err := b.Finalize(absentBootstrap(&b)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -271,7 +283,7 @@ func TestR4BootstrapObserveBeforeFinishLatchesChildOwns(t *testing.T) {
 	if err == nil || herr != nil {
 		t.Fatalf("early observation=%v subsequent handoff=%v", err, herr)
 	}
-	b.Finalize(Absence{true, true, true, true})
+	b.Finalize(absentBootstrap(&b))
 	assertClosed(t, fds)
 }
 
@@ -468,14 +480,9 @@ func TestR4StaleActionIDsDoNotConsume(t *testing.T) {
 
 // R4-7: Publish from a stray goroutine after Run returned mutates a finished job.
 func TestR4PublishAfterRunReturned(t *testing.T) {
-	var held *Job
 	o := testOwner(t, func(ctx context.Context, j *Job) error {
-		held = j
 		return j.Publish("cold", Facts{})
 	})
-	pj := start(t, o, request("workspace-prepare", 1, 1))
-	awaitResult(t, pj.done)
-	_ = held
 	s := request("workspace-suspend", 2, 2)
 	transaction(t, &s)
 	sj := start(t, o, s)

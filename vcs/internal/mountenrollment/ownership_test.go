@@ -288,7 +288,7 @@ func TestRenewerRetainsKnownObsoleteInstallationWithoutReady(t *testing.T) {
 	err := r.Run(ctx, "session", deadline, func(context.Context, string, uint64, []byte) (time.Time, error) {
 		serial.Store(2)
 		cancel()
-		return deadline, ErrObsoleteInstallation
+		return deadline, ErrSessionChangedInstallation
 	})
 	if err != nil {
 		t.Fatal(err)

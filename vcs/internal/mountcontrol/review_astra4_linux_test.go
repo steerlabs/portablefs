@@ -19,14 +19,14 @@ func TestR4FinalizationJoinsBootstrap(t *testing.T) {
 	}
 	// The child can have exited while the reserved root mount has not returned.
 	b.ChildLost()
-	if err := b.Finalize(Absence{true, true, true, true}); !errors.Is(err, ErrOccupied) {
+	if err := b.Finalize(absentBootstrap(&b)); !errors.Is(err, ErrOccupied) {
 		t.Errorf("finalized before mount owner joined: %v", err)
 	}
 	rights, fds := descriptors(t)
 	if err := b.Finish(rights, witness()); err != nil {
 		t.Error(err)
 	}
-	defer b.Finalize(Absence{true, true, true, true})
+	defer func() { _ = b.Finalize(absentBootstrap(&b)) }()
 	if b.finalized && b.rights != nil {
 		t.Errorf("late mount published descriptors after finalization: fds=%v kernel=%q", fds, b.action.Witness.Kernel)
 	}
@@ -43,7 +43,7 @@ func TestR4BootstrapRetainsPartialWitness(t *testing.T) {
 	rights.FDs = rights.FDs[:1]
 	// Mount acquired its kernel identity; opening the abort description failed.
 	err := b.Finish(rights, witness())
-	defer b.Finalize(Absence{true, true, true, true})
+	defer func() { _ = b.Finalize(absentBootstrap(&b)) }()
 	if err == nil {
 		t.Fatal("expected incomplete handoff failure")
 	}
