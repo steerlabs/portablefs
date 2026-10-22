@@ -155,10 +155,12 @@ type delegationFlushProgress struct {
 // Its methods return ordinary errors so the raw FUSE layer can make the errno
 // policy at the callback boundary.
 type delegationManager struct {
-	subscription *subscriptionRegistry
-	rpc          delegationRPC
-	timeout      time.Duration
-	maxWrite     int
+	// Nil in production; tests place Close after the final proof load.
+	beforeWorkspaceInstall func()
+	subscription           *subscriptionRegistry
+	rpc                    delegationRPC
+	timeout                time.Duration
+	maxWrite               int
 
 	epoch      sync.RWMutex
 	epochCtx   context.Context
@@ -482,6 +484,9 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 // An allocating mutation can carry an application cut of its returned grant.
 // Publish both under admission before CONTROL can observe that generation.
 func (m *delegationManager) install(identity, item, handle []byte, grant *authoritypb.Delegation, applied uint64) error {
+	return m.installContext(context.Background(), identity, item, handle, grant, applied)
+}
+func (m *delegationManager) installContext(ctx context.Context, identity, item, handle []byte, grant *authoritypb.Delegation, applied uint64) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
 		return err
@@ -509,6 +514,13 @@ func (m *delegationManager) install(identity, item, handle []byte, grant *author
 	defer s.operation.Unlock()
 	s.admission.Lock()
 	defer s.admission.Unlock()
+	bound := m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspace != nil
+	if bound {
+		p := replyPublicationFromContext(ctx)
+		if p == nil || !p.workspaceBound || p.workspace.Check() != nil {
+			return errDelegationRetired
+		}
+	}
 	if ref.GetGeneration() <= s.retiredGeneration {
 		return errDelegationRetired
 	}
@@ -535,6 +547,9 @@ func (m *delegationManager) install(identity, item, handle []byte, grant *author
 	s.meta.Lock()
 	s.applied = max(s.applied, applied)
 	s.meta.Unlock()
+	if m.beforeWorkspaceInstall != nil {
+		m.beforeWorkspaceInstall()
+	}
 	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
 	s.sessionCtx = m.sessionCtx
 	close(s.grantChanged)
@@ -597,6 +612,9 @@ func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bo
 type delegationPrepareContextKey struct{}
 
 func prepareDelegationAdmission(ctx context.Context) error {
+	if err := workspaceAcceptance(ctx); err != nil {
+		return err
+	}
 	if prepare, ok := ctx.Value(delegationPrepareContextKey{}).(func() error); ok {
 		return prepare()
 	}
@@ -682,7 +700,17 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
-	cut, err := b.WriteInGeneration(ctx, id, generation, off, data, opts)
+	var handle *handleAcceptedCut
+	if m.subscription != nil && m.subscription.mount.workspace != nil {
+		handle, err = prepareHandleAcceptance(ctx, b, m.epochSerial)
+		if err != nil {
+			return writeback.Cut{}, err
+		}
+	}
+	cut, err := b.WriteInGeneration(workspaceAdmissionContext(ctx), id, generation, off, data, opts)
+	if handle != nil {
+		handle.noteAcceptedCut(cut)
+	}
 	s.admission.RLock()
 	if err == nil {
 		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {
@@ -730,12 +758,14 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 }
 
 func (m *delegationManager) Truncate(ctx context.Context, identity []byte, size int64) (writeback.Cut, error) {
+	ctx = workspaceAdmissionContext(ctx)
 	return m.admitMetadata(ctx, identity, func(b *writeback.Buffer, id writeback.Identity, generation uint64) (writeback.Cut, error) {
 		return b.TruncateInGeneration(ctx, id, generation, size)
 	})
 }
 
 func (m *delegationManager) SetAttr(ctx context.Context, identity []byte, attrs writeback.Attributes) (writeback.Cut, error) {
+	ctx = workspaceAdmissionContext(ctx)
 	return m.admitMetadata(ctx, identity, func(b *writeback.Buffer, id writeback.Identity, generation uint64) (writeback.Cut, error) {
 		return b.SetAttrInGeneration(ctx, id, generation, attrs)
 	})
@@ -777,7 +807,17 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
+	var handle *handleAcceptedCut
+	if m.subscription != nil && m.subscription.mount.workspace != nil {
+		handle, err = prepareHandleAcceptance(ctx, b, m.epochSerial)
+		if err != nil {
+			return writeback.Cut{}, err
+		}
+	}
 	cut, err := admit(b, id, generation)
+	if handle != nil {
+		handle.noteAcceptedCut(cut)
+	}
 	s.admission.RLock()
 	if err == nil {
 		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {

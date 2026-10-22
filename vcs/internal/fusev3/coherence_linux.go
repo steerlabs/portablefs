@@ -14,6 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 )
 
 const (
@@ -177,17 +178,26 @@ func completeDefiniteNoChangePublication(ctx context.Context) error {
 }
 
 func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(), fuse.Status) {
+	return r.callbackContext(unique, true)
+}
+func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Context, func(), fuse.Status) {
 	r.mount.epochMu.RLock()
 	ctx, cancel := context.WithTimeout(r.opContext(), r.requestTimeout)
 	callback := &mutationCallback{mount: r.mount, operationID: unique}
-	if err := r.registerReplyPublication(unique, &callback.publication); err != nil {
+	err := r.transferReplyPublication(unique, serving, &callback.publication)
+	if err != nil {
 		// Registration is the ownership reservation for every fact this callback
 		// could make cacheable. It happens before any lookup/mutation RPC, so an
 		// impossible zero/reused FUSE identity cannot race an untracked success
 		// reply onto /dev/fuse.
-		r.mount.revoke(err)
+		if !errors.Is(err, workspaceadmission.ErrClosed) {
+			r.mount.revoke(err)
+		}
 		r.mount.epochMu.RUnlock()
 		cancel()
+		if errors.Is(err, workspaceadmission.ErrClosed) {
+			return ctx, func() {}, fuse.EIO
+		}
 		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
 	}
 	// Metadata responses can discover their identity only after a concurrent
@@ -226,6 +236,10 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 		callback.finish()
 		r.finishReplyPublicationRegistration(unique, &callback.publication)
 	}, fuse.OK
+}
+
+func (r *rawFileSystem) cleanupContext(unique uint64) (context.Context, func(), fuse.Status) {
+	return r.callbackContext(unique, false)
 }
 
 // kernelMount records the installed filesystem as well as its owned abort inode.

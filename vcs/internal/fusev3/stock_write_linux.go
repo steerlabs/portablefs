@@ -64,7 +64,7 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 			return lease.markAssigned()
 		})
 		for {
-			_, err = r.mount.delegations.WriteWithOptions(ctx, identity, int64(placement.position), data, syncWrite, writeback.WriteOptions{Flags: input.WriteFlags, LockOwner: input.LockOwner, KillPrivileges: input.WriteFlags&fuse.WRITE_KILL_SUIDGID != 0})
+			_, err = r.mount.delegations.WriteWithOptions(withHandleAcceptance(ctx, handle), identity, int64(placement.position), data, syncWrite, writeback.WriteOptions{Flags: input.WriteFlags, LockOwner: input.LockOwner, KillPrivileges: input.WriteFlags&fuse.WRITE_KILL_SUIDGID != 0})
 			if !errors.Is(err, errDelegationNotOwned) {
 				break
 			}

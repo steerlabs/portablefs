@@ -70,6 +70,7 @@ type namespaceBounds struct {
 type sourcePublicationLease struct {
 	completeParent       publicationIdentity
 	completeProof        *directoryCompleteness
+	workspaceCheck       func() error
 	r                    *rawFileSystem
 	coordinates          map[publicationCoordinate]struct{}
 	names                map[publicationNamespace]namespaceBounds
@@ -364,6 +365,9 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		return nil, err
 	}
 	lease := &sourcePublicationLease{r: r, names: names, preBindings: make(map[publicationNamespace]publicationIdentity)}
+	if r.mount.workspace != nil {
+		lease.workspaceCheck = workspaceAcceptanceCheck(ctx)
+	}
 	for _, bounds := range names {
 		if bounds.attributes {
 			lease.unresolvedAttributes++
@@ -373,6 +377,9 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		}
 	}
 	for {
+		if err := workspaceAcceptance(ctx); err != nil {
+			return nil, err
+		}
 		coordinates := make(map[publicationCoordinate]struct{}, len(base)+len(names)*2)
 		for coordinate := range base {
 			coordinates[coordinate] = struct{}{}
@@ -418,15 +425,27 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		break
 	}
 	if err := lease.drain(ctx); err != nil {
-		lease.release()
+		lease.cancelAcquisition()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		lease.cancelAcquisition()
 		return nil, err
 	}
 	// A cacheable LOOKUP may have been admitted before the cut and completed
 	// while the namespace coordinate was draining. Refresh under the closed
 	// gate so that unlink/rename also retain the exact child which became the
 	// locally bound pre-state during that drain.
+	if err := workspaceAcceptance(ctx); err != nil {
+		lease.cancelAcquisition()
+		return nil, err
+	}
 	if err := lease.refreshPreBindings(ctx); err != nil {
-		lease.release()
+		lease.cancelAcquisition()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		lease.cancelAcquisition()
 		return nil, err
 	}
 	return lease, nil
@@ -496,10 +515,18 @@ func (l *sourcePublicationLease) markAssigned() error {
 	if l == nil {
 		return nil
 	}
+	if l.r.beforeSourceAssignment != nil {
+		l.r.beforeSourceAssignment(l)
+	}
 	l.r.mu.Lock()
 	defer l.r.mu.Unlock()
 	if l.released || l.revoked || l.assigned {
 		return errors.New("fusev3: source publication lease has an invalid replay-assignment transition")
+	}
+	if l.workspaceCheck != nil {
+		if err := l.workspaceCheck(); err != nil {
+			return err
+		}
 	}
 	l.assigned = true
 	return nil
@@ -777,6 +804,22 @@ func (l *sourcePublicationLease) release() {
 	if l.released || l.revoked || !l.ready {
 		return
 	}
+	l.removeHoldsLocked()
+}
+
+// Acquisition has not handed the lease to a callback or assigned an effect.
+// Refusal therefore cancels only this lease's holds, without inventing an
+// assigned result or retaining a terminally revoked coordinate.
+func (l *sourcePublicationLease) cancelAcquisition() {
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	if l.released || l.revoked || l.assigned || l.ready {
+		return
+	}
+	l.removeHoldsLocked()
+}
+
+func (l *sourcePublicationLease) removeHoldsLocked() {
 	l.released = true
 	for coordinate := range l.coordinates {
 		shared := l.r.sourceSharedHolds[coordinate]

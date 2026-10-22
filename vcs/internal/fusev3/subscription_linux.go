@@ -17,6 +17,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 )
 
 const (
@@ -94,11 +95,13 @@ func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
 func (t wallSubscriptionTimer) Stop() bool          { return t.timer.Stop() }
 
 type subscriptionConfig struct {
-	clock          subscriptionClock
-	retryDelay     time.Duration
-	withdrawalLead time.Duration
-	maxPages       int
-	invalidator    subscriptionInvalidator
+	// Deterministic test schedule at the last proof check/local-store boundary.
+	beforeWorkspaceInstall func()
+	clock                  subscriptionClock
+	retryDelay             time.Duration
+	withdrawalLead         time.Duration
+	maxPages               int
+	invalidator            subscriptionInvalidator
 }
 
 type subscriptionCoordinateState struct {
@@ -116,6 +119,8 @@ type subscriptionRegistry struct {
 	config  subscriptionConfig
 
 	mu              sync.RWMutex
+	workspaceProof  *workspaceadmission.RecoveryPermit
+	workspaceDrain  *workspaceDrainPermit
 	active          bool
 	paused          bool
 	incarnation     uint64
@@ -220,9 +225,11 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.liveLocked() {
+	if !s.liveLocked() || s.mount != nil && s.mount.workspace != nil && !s.workspaceServingLocked() {
 		return subscriptionStamp{}
 	}
+	// The publication owns the entry's serving permit. Cache facts need only
+	// the subscription generation, which changes at every cold installation.
 	return subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
 }
 
@@ -255,7 +262,7 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.liveLocked() || stamp.incarnation != s.incarnation {
+	if !s.liveLocked() || s.mount != nil && s.mount.workspace != nil && !s.workspaceServingLocked() || stamp.incarnation != s.incarnation {
 		return 0
 	}
 	if coordinate.kind == publicationNamespaceName {
@@ -398,6 +405,14 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	if s == nil || s.rpc == nil {
 		return errors.New("fusev3: subscription transport is required")
 	}
+	var proof *workspaceadmission.RecoveryPermit
+	if s.mount != nil && s.mount.workspace != nil {
+		p, ok := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
+		if !ok || s.mount.workspace.Recover(p) != nil {
+			return workspaceadmission.ErrClosed
+		}
+		proof = &p
+	}
 	s.mu.RLock()
 	paused := s.paused
 	s.mu.RUnlock()
@@ -476,10 +491,15 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				set[identity] = 0
 			}
 			s.mu.Lock()
-			if s.paused {
+			if s.paused || proof != nil && s.mount.workspace.Recover(*proof) != nil {
 				s.mu.Unlock()
 				return errSubscriptionPaused
 			}
+			if s.config.beforeWorkspaceInstall != nil {
+				s.config.beforeWorkspaceInstall()
+			}
+			s.workspaceDrain = nil
+			s.workspaceProof = proof
 			s.active = true
 			s.incarnation = incarnation
 			s.generation++
@@ -512,8 +532,12 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 func (s *subscriptionRegistry) currentIncarnation() (uint64, time.Time, <-chan struct{}, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	live := s.liveLocked()
-	return s.incarnation, s.cacheUntil, s.horizonChanged, live
+	live := s.controlLiveLocked()
+	deadline := s.cacheUntil
+	if s.workspaceDrain != nil {
+		deadline = s.workspaceDrain.deadline
+	}
+	return s.incarnation, deadline, s.horizonChanged, live
 }
 
 func (s *subscriptionRegistry) waitActive(ctx context.Context) error {
@@ -1001,6 +1025,12 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			timer.Stop()
 			return ctx.Err()
 		}
+		s.mu.Lock()
+		live := s.incarnation == incarnation && s.renewalLiveLocked()
+		s.mu.Unlock()
+		if !live {
+			continue
+		}
 		deadline, err := s.rpc.RenewSubscription(ctx, incarnation)
 		if err != nil {
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
@@ -1025,7 +1055,7 @@ func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.T
 	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.liveLocked() || s.paused || s.incarnation != incarnation {
+	if !s.renewalLiveLocked() || s.paused || s.incarnation != incarnation {
 		return false
 	}
 	now := s.config.clock.Now()
@@ -1117,7 +1147,10 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		}
 	}
 	for _, publication := range r.replyPublications {
-		if publication == nil {
+		// Unfinalized callbacks still construct their slices outside raw.mu.
+		// Their pending cache coordinates are in cacheReservations above;
+		// final preparation revalidates the inactive subscription before use.
+		if publication == nil || !publication.originalFinalized {
 			continue
 		}
 		for _, coordinate := range publication.cachedCoordinates[:publication.cachedCount] {
@@ -1333,9 +1366,37 @@ func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
 	if incarnation == 0 || incarnation != s.incarnation {
 		return false
 	}
+	if s.workspaceDrain != nil && s.workspaceDrain.incarnation == incarnation && s.config.clock.Now().Before(s.workspaceDrain.deadline) {
+		return true
+	}
 	if !s.config.clock.Now().Before(s.cacheUntil) {
 		s.liveLocked()
 		return false
 	}
 	return true
+}
+
+// Only managed subscriptions need the cold proof. Keep its large Installed
+// check out of the ordinary horizon caller's stack frame.
+//
+//go:noinline
+func (s *subscriptionRegistry) workspaceServingLocked() bool {
+	return s.workspaceDrain == nil && s.workspaceProof != nil && s.mount.workspace.Installed(*s.workspaceProof)
+}
+func (s *subscriptionRegistry) controlLiveLocked() bool {
+	if s.workspaceDrain != nil {
+		return s.workspaceDrain.incarnation == s.incarnation && s.config.clock.Now().Before(s.workspaceDrain.deadline)
+	}
+	if !s.liveLocked() {
+		return false
+	}
+	if s.mount == nil || s.mount.workspace == nil {
+		return true
+	}
+	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
+}
+
+// A drain may finish the old CONTROL cut, but may not extend its exclusion.
+func (s *subscriptionRegistry) renewalLiveLocked() bool {
+	return s.workspaceDrain == nil && s.controlLiveLocked()
 }

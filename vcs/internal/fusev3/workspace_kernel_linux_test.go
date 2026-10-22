@@ -1,0 +1,226 @@
+//go:build linux
+
+package fusev3
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
+)
+
+// Root owns the real sealed page and only pipe writer. The actual XFS authority
+// and kernel frontend run under the provisioned unprivileged service identity.
+// This qualifies the gate on an ordinary mount, not the future workspace driver.
+func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
+	if os.Getenv("PFS_WORKSPACE_KERNEL_CHILD") == "1" {
+		workspaceKernelChild(t)
+		return
+	}
+	if os.Getenv(envFUSE) != "1" || os.Getenv("PORTABLEFS_SERVICE_UID") == "" {
+		t.Skip("privileged root workspace gate inventory is not configured")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("root parent is required by the separate privileged root inventory")
+	}
+	start, err := mountcontrol.ProcessStart(int32(os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := workspaceadmission.Binding{Boot: [16]byte{1}, HostService: [16]byte{2}, GuestService: [16]byte{3}, Incarnation: [16]byte{4}, SupervisorPID: int32(os.Getpid()), SupervisorStart: start}
+	g, err := workspaceadmission.New(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Dispose()
+	proof, err := g.Recovery(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := g.ChildFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("/var/tmp", "workspace-kernel-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	target := filepath.Join(dir, "frontend.test")
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0555)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(out, source)
+	if err := errors.Join(copyErr, out.Close()); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := strconv.ParseUint(os.Getenv("PORTABLEFS_SERVICE_UID"), 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid, err := strconv.ParseUint(os.Getenv("PORTABLEFS_SERVICE_GID"), 10, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(target, "-test.run=^TestKernelWorkspaceGateAndOwnerLifetime$", "-test.timeout=2m")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
+	cmd.Env = append(os.Environ(), "PFS_WORKSPACE_KERNEL_CHILD=1", fmt.Sprintf("PFS_WORKSPACE_KERNEL_PID=%d", binding.SupervisorPID), fmt.Sprintf("PFS_WORKSPACE_KERNEL_START=%d", binding.SupervisorStart), envRequired+"=1")
+	cmd.ExtraFiles = files[:]
+	cmd.Stderr = os.Stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	for _, f := range files {
+		_ = f.Close()
+	}
+	lines := bufio.NewScanner(stdout)
+	expect := func(want string) {
+		t.Helper()
+		var diagnostics []string
+		for lines.Scan() {
+			if lines.Text() == want {
+				return
+			}
+			diagnostics = append(diagnostics, lines.Text())
+		}
+		t.Fatalf("kernel child did not reach %s: %s", want, strings.Join(diagnostics, "\n"))
+	}
+
+	expect("prepared")
+	if err := g.Prepared(proof); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Open(1, proof.Serial()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.Write([]byte{'O'}); err != nil {
+		t.Fatal(err)
+	}
+	expect("served")
+	g.Close(1)
+	if _, err := stdin.Write([]byte{'C'}); err != nil {
+		t.Fatal(err)
+	}
+	expect("closed")
+	// Closing the sole writer requires no socket/control handler. Child teardown
+	// must prove its real connection is gone before reporting completion.
+	if err := g.Dispose(); err != nil {
+		t.Fatal(err)
+	}
+	expect("owner-exit")
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func workspaceKernelChild(t *testing.T) {
+	pid, _ := strconv.ParseInt(os.Getenv("PFS_WORKSPACE_KERNEL_PID"), 10, 32)
+	start, _ := strconv.ParseUint(os.Getenv("PFS_WORKSPACE_KERNEL_START"), 10, 64)
+	binding := workspaceadmission.Binding{Boot: [16]byte{1}, HostService: [16]byte{2}, GuestService: [16]byte{3}, Incarnation: [16]byte{4}, SupervisorPID: int32(pid), SupervisorStart: start}
+	var mounted atomic.Pointer[Mount]
+	reader, err := workspaceadmission.Adopt(os.NewFile(3, "gate"), os.NewFile(4, "owner"), binding, func() {
+		if m := mounted.Load(); m != nil {
+			m.revoke(errors.New("workspace test owner EOF"))
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Retire()
+	proof, err := reader.Recovery(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, workspace: reader, workspaceRecovery: &proof})
+	mounted.Store(f.mounts[0])
+	// Closed INIT and cold Subscribe must finish without serving permission.
+	if _, err := os.Stat(f.join(0, "missing")); !errors.Is(err, syscall.EIO) {
+		t.Fatal("closed-start kernel lookup served", err)
+	}
+	fmt.Println("prepared")
+	command := func(want byte) {
+		t.Helper()
+		var b [1]byte
+		if _, err := io.ReadFull(os.Stdin, b[:]); err != nil || b[0] != want {
+			t.Fatal("supervisor command", b, err)
+		}
+	}
+	command('O')
+	path := f.join(0, "data")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "accepted" {
+		t.Fatal(string(data), err)
+	}
+	local := f.join(0, "node_modules")
+	if err := os.Mkdir(local, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("served")
+	command('C')
+	if _, err := os.Stat(path); !errors.Is(err, syscall.EIO) {
+		t.Fatal("cached kernel getattr bypassed Close", err)
+	}
+	if _, err := os.ReadDir(f.mountPath(0)); !errors.Is(err, syscall.EIO) {
+		t.Fatal("kernel READDIR bypassed Close", err)
+	}
+	if err := os.WriteFile(f.join(0, "new"), []byte("refused"), 0600); !errors.Is(err, syscall.EIO) {
+		t.Fatal("closed kernel create applied", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.volumeRoot, "new")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("closed CREATE changed XFS", err)
+	}
+	fmt.Println("closed")
+	select {
+	case <-reader.Done():
+	case <-time.After(15 * time.Second):
+		t.Fatal("owner EOF did not initiate teardown")
+	}
+	select {
+	case <-f.mounts[0].kernelConnectionDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("owner EOF stranded kernel connection")
+	}
+	fmt.Println("owner-exit")
+}

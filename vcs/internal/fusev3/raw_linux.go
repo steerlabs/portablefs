@@ -19,6 +19,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -203,8 +204,12 @@ type replyDataPublication struct {
 // RawFileSystem method returns. They settle after their physical /dev/fuse
 // write, which is the stock-kernel publication edge available to userspace.
 type replyPublication struct {
-	cachedNext  *replyPublication
-	cachedArena bool
+	workspace      workspaceadmission.ServingPermit
+	workspaceBound bool
+	callbackOwned  bool
+	workspaceDone  chan struct{}
+	cachedNext     *replyPublication
+	cachedArena    bool
 	// A read using retained cache or holder permission must stay tracked and
 	// revalidate that permission at physical publication, regardless of arena.
 	retainedAnswer bool
@@ -256,16 +261,19 @@ type replyPublication struct {
 	// Physical reply state is protected by rawFileSystem.mu.
 	owner             *rawFileSystem
 	requestUnique     uint64
-	nodeid            uint64
 	opcode            uint32
 	originalDone      chan struct{}
 	originalFinalized bool
 	originalWrote     bool
 	originalStatus    fuse.Status
+	// The registry lock grants physical settlement exactly once, independently
+	// of callback response consumption. The claimant retains storage through
+	// every unlocked cleanup step.
+	settlementClaimed bool
 }
 
 func (p *replyPublication) empty() bool {
-	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
+	return p == nil || p.workspaceDone == nil && len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 && p.cachedCount == 0 && p.holderAdmission == nil &&
 		!p.retainedAnswer && p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
@@ -490,6 +498,9 @@ type rawFileSystem struct {
 	replyTerminal       bool
 	replyTerminalDone   chan struct{}
 	replyLifecycleArmed bool
+	// Deterministic tests pause outside registry and lifecycle locks.
+	beforeSourceAssignment func(*sourcePublicationLease)
+	beforeReplySettlement  func(*replyPublication)
 
 	// Source-owned gates close publication before the mutation gets a replay
 	// identity or can put bytes on the wire. They are keyed only by stable
@@ -957,6 +968,7 @@ type terminalReplyCompletion struct {
 	dirPlus             dirPlusLookupCompletion
 	responseConsumption responseConsumptionClaim
 	physical            bool
+	lookupReference     *inodeRecord
 }
 
 // terminalizeReplyCacheOwnership joins physical writer callbacks only until
@@ -1043,18 +1055,29 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 	}
 	completions := make([]terminalReplyCompletion, 0, len(seen))
 	for publication := range seen {
-		delete(r.replyPublications, publication.requestUnique)
+		if publication.settlementClaimed {
+			continue
+		}
+		publication.settlementClaimed = true
+		if publication.workspaceDone == nil {
+			delete(r.replyPublications, publication.requestUnique)
+		}
 		physical := !connectionGone && publication.originalWrote && publication.originalStatus.Ok()
-		if connectionGone && !publication.originalWrote {
+		if !publication.originalWrote {
 			publication.closeOriginalDoneLocked()
 		}
 		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
 		responseConsumption := r.settleReplyPublicationLocked(publication, physical)
+		var lookupReference *inodeRecord
+		if !physical || publication.cacheRejected {
+			lookupReference, publication.lookupReference = publication.lookupReference, nil
+		}
 		completions = append(completions, terminalReplyCompletion{
 			publication:         publication,
 			dirPlus:             dirPlus,
 			responseConsumption: responseConsumption,
 			physical:            physical,
+			lookupReference:     lookupReference,
 		})
 	}
 	r.replyTerminal = true
@@ -1064,11 +1087,30 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 	r.mu.Unlock()
 
 	for _, completion := range completions {
+		if completion.publication.workspaceDone != nil && r.beforeReplySettlement != nil {
+			r.beforeReplySettlement(completion.publication)
+		}
 		r.finishDirPlusLookupCompletion(completion.dirPlus)
+		if completion.lookupReference != nil {
+			r.Forget(completion.lookupReference.id, 1)
+		}
 		if completion.publication.source != nil {
 			completion.publication.source.revoke()
 		}
 		consumeClaimedAuthorityResponses(completion.responseConsumption)
+		if completion.publication.responseConsumptionDone != nil {
+			<-completion.publication.responseConsumptionDone
+		}
+		if completion.publication.workspaceDone != nil || completion.publication.cachedArena {
+			r.mu.Lock()
+			if completion.publication.workspaceDone != nil {
+				close(completion.publication.workspaceDone)
+			}
+			delete(r.replyPublications, completion.publication.requestUnique)
+			r.signalSourceChangedLocked()
+			r.recycleReplyLocked(completion.publication)
+			r.mu.Unlock()
+		}
 	}
 	return true
 }
@@ -1484,7 +1526,7 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 }
 
 func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublication, successful bool, owner *replyPublication) {
-	if successful && (publication.reservation == nil || !publication.reservation.revoked) {
+	if successful && (!owner.workspaceBound || owner.workspace.Check() == nil) && (publication.reservation == nil || !publication.reservation.revoked) {
 		if publication.negative {
 			// A materializing callback may have superseded this mount's absence
 			// before the kernel returned the lookup's merged receipt. Settling still
@@ -1569,12 +1611,13 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 	// Failure before the physical edge and receipt settlement both pass here.
 	// The former still owns capacity; the latter finds it already consumed.
 	r.releaseReplyCapacityLocked(publication)
+	reusable := successful && (!publication.workspaceBound || publication.workspace.Check() == nil)
 	for _, name := range publication.names {
-		r.settleNamePublicationLocked(name, successful, publication)
+		r.settleNamePublicationLocked(name, reusable, publication)
 	}
-	r.settleCompleteDirectoriesLocked(publication, successful)
+	r.settleCompleteDirectoriesLocked(publication, reusable)
 	for _, attr := range publication.attrs {
-		r.settleAttrPublicationLocked(attr, successful)
+		r.settleAttrPublicationLocked(attr, reusable)
 	}
 	for _, data := range publication.data {
 		r.settleDataPublicationLocked(data, successful)
@@ -1647,6 +1690,7 @@ func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, public
 		r.releaseReplyCapacityLocked(publication)
 		r.releaseReplyReservationsLocked(publication)
 		delete(r.replyPublications, unique)
+		publication.closeOriginalDoneLocked()
 		r.signalSourceChangedLocked()
 	}
 	r.mu.Unlock()
@@ -1689,6 +1733,16 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
+	if publication.workspaceBound {
+		publication.opcode = opcode
+	}
+	// This precedes both the arena shortcut and empty candidate sets. An
+	// assigned effect is still its original operation; denial cannot fabricate a
+	// definite no-change CREATE/WRITE result. READ still owes physical purge.
+	workspaceClosed := publication.workspaceBound && publication.workspace.Check() != nil
+	if workspaceClosed && publication.retainedAnswer && publication.source == nil && opcode != 15 {
+		publication.cacheRejected = true
+	}
 	if publication.retainedAnswer {
 		live := r.mount.subscription.stamp()
 		if live.incarnation == 0 || live.incarnation != publication.stamp.incarnation {
@@ -1701,7 +1755,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		// usable so the ordinary cold-withdrawal path can complete.
 		return 0, fuse.EIO, fuse.OK
 	}
-	if publication.cachedArena {
+	if publication.cachedArena && publication.originalFinalized {
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
@@ -1716,7 +1770,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 			if reservation.publication != publication {
 				continue
 			}
-			if r.publicationRemaining(publication, reservation.coordinate) <= 0 {
+			if workspaceClosed || r.publicationRemaining(publication, reservation.coordinate) <= 0 {
 				reservation.revoked = true
 			}
 			if reservation.state != cacheReservationPending {
@@ -1756,7 +1810,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		for _, candidate := range publication.data {
 			// A delayed READ may still finish after its subscription permission
 			// closes. Its physical reply must precede the withdrawing notification.
-			if candidate.revoked || r.publicationRemaining(publication, candidate.coordinate) <= 0 {
+			if workspaceClosed || candidate.revoked || r.publicationRemaining(publication, candidate.coordinate) <= 0 {
 				// A READ whose coordinate was recalled while it was in flight
 				// still delivers its bytes. It cannot be turned into a retry:
 				// the only retryable errno is EAGAIN and read(2) may not return
@@ -1778,12 +1832,13 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		}
 		publication.data = retained
 	}
+	zeroAttributes := len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity]
 	r.mu.Unlock()
 
 	if nameDropped {
 		zeroEntryLifetime(opcode, outData)
 	}
-	if len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity] {
+	if zeroAttributes {
 		zeroAttrLifetime(opcode, outData)
 	}
 	if dropKeepCache {
@@ -1852,19 +1907,24 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 			publication.originalWrote = true
 			publication.originalStatus = status
 			publication.closeOriginalDoneLocked()
-			if status.Ok() {
-				r.releaseReplyCapacityLocked(publication)
-			}
 			r.signalSourceChangedLocked()
 		}
 		r.mu.Unlock()
 		return
 	}
 	publication := r.replyPublications[unique]
-	if publication == nil || publication.originalWrote {
+	if publication == nil || publication.settlementClaimed {
 		r.mu.Unlock()
 		r.mount.revoke(fmt.Errorf("fusev3: tracked FUSE reply %d lost its publication ownership", unique))
 		return
+	}
+	publication.settlementClaimed = true
+	if status.Ok() && publication.workspaceBound && publication.workspace.Check() != nil && publication.opcode == 15 {
+		for _, candidate := range publication.data {
+			r.settleDataPublicationLocked(candidate, false)
+			publication.unlicensed = append(publication.unlicensed, candidate)
+		}
+		publication.data = nil
 	}
 	if status.Ok() && len(publication.unlicensed) > 0 {
 		pending := publication.unlicensed
@@ -1890,8 +1950,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 				r.markIdentityStale(candidate.coordinate.item)
 			}
 		}
-		r.ReplyWritten(unique, status)
-		return
+		r.mu.Lock()
 	}
 	publication.originalWrote = true
 	publication.originalStatus = status
@@ -1902,14 +1961,48 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		r.releaseReplyCapacityLocked(publication)
 	}
 	r.signalSourceChangedLocked()
+	if publication.workspaceBound && publication.workspace.Check() != nil {
+		for _, set := range r.cacheReservations {
+			for reservation := range set {
+				if reservation.publication == publication {
+					reservation.revoked = true
+				}
+			}
+		}
+	}
 	successful := status.Ok() && !publication.cacheRejected
 	dirPlusCompletion := r.settleDirPlusLookupTransactionLocked(publication, successful)
-	delete(r.replyPublications, unique)
+	if publication.workspaceDone == nil {
+		delete(r.replyPublications, unique)
+	}
 	responseConsumption := r.settleReplyPublicationLocked(publication, successful)
+	var lookupReference *inodeRecord
+	if !successful {
+		lookupReference, publication.lookupReference = publication.lookupReference, nil
+	}
+	if successful && publication.workspaceBound && publication.workspace.Check() != nil {
+		// Physical delivery still creates withdrawal duties. These entries carry
+		// the obsolete stamp and no reusable attribute payload, so an observed Close
+		// cannot turn them into fresh daemon cache authority.
+		for _, candidate := range publication.attrs {
+			if candidate.record != nil && !candidate.record.reclaimed {
+				r.cachedAttrs[candidate.identity] = candidate.record
+				delete(r.cachedAttrPayloads, candidate.identity)
+			}
+		}
+		for _, candidate := range publication.names {
+			if !candidate.negative && candidate.record != nil && !candidate.record.reclaimed {
+				r.bindCachedNameLocked(candidate.key, candidate.stable, candidate.record, candidate.stamp, false)
+			}
+		}
+	}
 	r.mu.Unlock()
+	if publication.workspaceDone != nil && r.beforeReplySettlement != nil {
+		r.beforeReplySettlement(publication)
+	}
 	r.finishDirPlusLookupCompletion(dirPlusCompletion)
-	if publication.cacheRejected && publication.lookupReference != nil {
-		r.Forget(publication.lookupReference.id, 1)
+	if lookupReference != nil {
+		r.Forget(lookupReference.id, 1)
 	}
 	if publication.source != nil {
 		if status.Ok() {
@@ -1923,10 +2016,17 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 
 	consumeClaimedAuthorityResponses(responseConsumption)
-	if publication.cachedArena {
+	if publication.responseConsumptionDone != nil {
+		<-publication.responseConsumptionDone
+	}
+	if publication.workspaceDone != nil || publication.cachedArena {
 		r.mu.Lock()
-		*publication = replyPublication{cachedNext: r.cachedReplyFree}
-		r.cachedReplyFree = publication
+		if publication.workspaceDone != nil {
+			close(publication.workspaceDone)
+			delete(r.replyPublications, unique)
+			r.signalSourceChangedLocked()
+		}
+		r.recycleReplyLocked(publication)
 		r.mu.Unlock()
 	}
 }
@@ -2364,6 +2464,10 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 			return nil, nil, false
 		}
 		r.mu.Lock()
+		if p.settlementClaimed {
+			r.mu.Unlock()
+			return nil, nil, false
+		}
 		if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
 			r.mu.Unlock()
 			return nil, nil, false
@@ -2405,7 +2509,7 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 				retry = true
 				return false
 			}
-			if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
+			if p.settlementClaimed || r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
 				r.mount.subscription.remaining(coordinate, stamp, stamp.version) <= 0 || r.withdrawingCoordinates[coordinate] {
 				return false
 			}
@@ -2583,6 +2687,7 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 		out.SetEntryTimeout(0)
 		return fuse.OK
 	}
+	lookupRegistered := record != nil
 	if record == nil {
 		item, errno := parent.node.Lookup(ctx, name)
 		if errno != 0 {
@@ -2609,7 +2714,16 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	publication := replyPublicationFromContext(ctx)
 	// Both cached and authority lookups transfer their reference only with the
 	// physical reply. A holder overlay can lose permission after either sample.
+	r.mu.Lock()
+	if publication.settlementClaimed {
+		r.mu.Unlock()
+		if !lookupRegistered {
+			r.Forget(record.id, 1)
+		}
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	publication.lookupReference = record
+	r.mu.Unlock()
 	r.bindPath(record, parent, name)
 	if err := r.publishEntry(ctx, out, parent, name, record, attr); err != nil {
 		if errors.Is(err, errMetadataInterrupted) {
@@ -2692,6 +2806,14 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 }
 
 func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -2785,6 +2907,14 @@ func (r *rawFileSystem) cancelBufferedRead(ctx context.Context, record *inodeRec
 }
 
 func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -2882,6 +3012,14 @@ func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) 
 	if input.Offset > math.MaxInt64 {
 		return nil, fuse.EINVAL
 	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return nil, entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -2935,19 +3073,32 @@ func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byt
 	if input == nil || input.Offset > math.MaxInt64 || uint64(len(data)) != uint64(input.Size) || input.Size == 0 || input.Size > r.maxWrite {
 		return 0, fuse.EINVAL
 	}
+	var held *handleRecord
+	var local *graftHandle
 	if r.grafts != nil {
-		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
+		held, local = r.acquireGraftFileHandle(input.Fh)
+		if local != nil {
 			defer r.releaseHandleOperation(held)
-			count, err := unix.Pwrite(handle.fd, data, int64(input.Offset))
-			if err != nil {
-				return 0, fuse.Status(errnoOfError(err))
-			}
-			return uint32(count), fuse.OK
 		}
 	}
-	if input.WriteFlags&fuse.WRITE_CACHE != 0 || input.WriteFlags&^(uint32(fuse.WRITE_LOCKOWNER)|uint32(fuse.WRITE_KILL_SUIDGID)) != 0 {
+	if local == nil && (input.WriteFlags&fuse.WRITE_CACHE != 0 || input.WriteFlags&^(uint32(fuse.WRITE_LOCKOWNER)|uint32(fuse.WRITE_KILL_SUIDGID)) != 0) {
 		r.mount.revoke(errors.New("fusev3: stock FUSE_WRITE violated the negotiated kernel-writeback-disabled profile"))
 		return 0, fuse.Status(syscall.ENOTCONN)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return 0, entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
+	if local != nil {
+		count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
+		if err != nil {
+			return 0, fuse.Status(errnoOfError(err))
+		}
+		return uint32(count), fuse.OK
 	}
 	return r.writeStock(input, data)
 }
@@ -2968,7 +3119,7 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 		return fuse.EBADF
 	}
 	defer r.releaseHandleOperation(handleRecord)
-	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
 	}
@@ -2977,6 +3128,14 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 }
 
 func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -3017,7 +3176,7 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	}
 	defer r.unpin(handle.inode)
 	defer handle.file.endLossObservation()
-	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
 	if !lifecycle.Ok() {
 		return
 	}
@@ -3043,6 +3202,14 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 }
 
 func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3132,6 +3299,14 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 	if name != "/" {
 		r.mount.revoke(fmt.Errorf("fusev3: TMPFILE carried noncanonical slash name %q", name))
 		return fuse.Status(syscall.ENOTCONN)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
 	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
@@ -3223,6 +3398,24 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 // ENOSYS. mkfifo(3) and bind(2) on a unix domain socket both arrive here, and
 // build systems, container runtimes, and agent sockets all do one or the other.
 func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name string, out *fuse.EntryOut) fuse.Status {
+	switch input.Mode & syscall.S_IFMT {
+	case 0, syscall.S_IFREG:
+	case syscall.S_IFIFO, syscall.S_IFSOCK:
+		return fuse.Status(syscall.EOPNOTSUPP)
+	default:
+		return fuse.Status(syscall.EPERM)
+	}
+	if input.Rdev != 0 {
+		return fuse.Status(syscall.EPERM)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3234,19 +3427,6 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 			return fuse.Status(errno)
 		}
 		if resolved.root != "" {
-			// The machine-local side answers mknod exactly as the authority
-			// side does, so the errno a caller sees does not depend on which
-			// side of a route boundary the name happens to fall on.
-			switch input.Mode & syscall.S_IFMT {
-			case 0, syscall.S_IFREG:
-			case syscall.S_IFIFO, syscall.S_IFSOCK:
-				return fuse.Status(syscall.EOPNOTSUPP)
-			default:
-				return fuse.Status(syscall.EPERM)
-			}
-			if input.Rdev != 0 {
-				return fuse.Status(syscall.EPERM)
-			}
 			_, handle, _, errno := r.graftCreate(parent, resolved, uint32(syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL), input.Mode, out)
 			if errno != 0 {
 				return fuse.Status(errno)
@@ -3283,6 +3463,14 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 }
 
 func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3339,6 +3527,14 @@ func (r *rawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, nam
 }
 
 func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name string, directory bool) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+	}
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3391,6 +3587,14 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 }
 
 func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	oldParent := r.acquire(input.NodeId)
 	if oldParent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3460,6 +3664,14 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 }
 
 func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	newParent := r.acquire(input.NodeId)
 	if newParent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3507,6 +3719,14 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 }
 
 func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointedTo, linkName string, out *fuse.EntryOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+	}
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3550,6 +3770,14 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 }
 
 func (r *rawFileSystem) Readlink(_ <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return nil, entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+	}
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return nil, fuse.Status(syscall.ESTALE)
@@ -3576,6 +3804,14 @@ func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name 
 	if record.graft {
 		return 0, fuse.Status(graftXattrErrno)
 	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return 0, entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
 		return 0, lifecycle
@@ -3594,6 +3830,14 @@ func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name
 	if record.graft {
 		return fuse.Status(graftXattrErrno)
 	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -3610,6 +3854,14 @@ func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest
 	defer r.release(record)
 	if record.graft {
 		return 0, fuse.Status(graftXattrErrno)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return 0, entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
 	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
@@ -3628,6 +3880,14 @@ func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, na
 	defer r.release(record)
 	if record.graft {
 		return fuse.Status(graftXattrErrno)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
 	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
@@ -3650,10 +3910,18 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 		return fuse.Status(syscall.ESTALE)
 	}
 	defer r.release(record)
-	if record.graft {
-		if input.Flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY) {
-			return fuse.Status(syscall.EISDIR)
+	if record.graft && input.Flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY) {
+		return fuse.Status(syscall.EISDIR)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
 		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
+	if record.graft {
 		handle, errno := r.graftReaddir(record)
 		if errno != 0 {
 			return fuse.Status(errno)
@@ -3707,6 +3975,14 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 }
 
 func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -3752,6 +4028,14 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 	if r.grafts != nil {
 		return fuse.ENOSYS
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
 	}
 	held, handle := r.acquireDirHandle(input.Fh)
 	if handle == nil {
@@ -3849,6 +4133,14 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 }
 
 func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -3886,7 +4178,7 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 		return
 	}
 	defer r.unpin(handle.inode)
-	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
 	if !lifecycle.Ok() {
 		return
 	}
@@ -3902,6 +4194,14 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 }
 
 func (r *rawFileSystem) StatFs(_ <-chan struct{}, header *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+	}
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3926,6 +4226,14 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 	if input == nil || input.Padding != 0 || input.NodeId != fuse.FUSE_ROOT_ID {
 		r.mount.revoke(errors.New("fusev3: malformed FUSE_SYNCFS request"))
 		return fuse.Status(syscall.ENOTCONN)
+	}
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
 	}
 	root := r.acquire(fuse.FUSE_ROOT_ID)
 	if root == nil || root.graft {
@@ -3953,6 +4261,14 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 }
 
 func (r *rawFileSystem) GetLk(_ <-chan struct{}, input *fuse.LkIn, out *fuse.LkOut) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3994,6 +4310,14 @@ func (r *rawFileSystem) SetLkw(cancel <-chan struct{}, input *fuse.LkIn) fuse.St
 }
 
 func (r *rawFileSystem) setLock(_ <-chan struct{}, input *fuse.LkIn, wait bool) fuse.Status {
+
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)

@@ -24,6 +24,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
@@ -128,6 +129,10 @@ type RPC interface {
 type WritebackDropReport = writeback.DropReport
 
 type Config struct {
+	// workspace is private until the protected-path lifecycle driver exists.
+	// Tests may bind the real gate to the ordinary kernel frontend; the CLI
+	// cannot launch a managed mount through this field.
+	workspace *workspaceadmission.Reader
 	// MountInstanceID is the random identity created before attach. MountVolume
 	// derives the kernel source from it, so every attempt is distinguishable even
 	// when several clients mount the same volume. Product supervisors persist it
@@ -216,6 +221,8 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
+	workspace *workspaceadmission.Reader
+
 	posixMu       sync.Mutex
 	posixLocks    map[posixLockKey]uint64
 	posixSequence uint64
@@ -256,6 +263,7 @@ type Mount struct {
 	nameCapacity      int
 	withdrawalTimeout time.Duration
 	raw               *rawFileSystem
+	managed           *workspaceFileSystem
 	kernelMount       kernelMount
 	// The withdrawal ladder must finish before its owned abort descriptor closes.
 	kernelWithdrawalMu     sync.Mutex
@@ -312,7 +320,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
 	}
-	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) {
+	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) || cfg.workspace != nil && cfg.workspace.MountInstanceID() != cfg.MountInstanceID {
 		rpc.FinishLocalSessionEnforcement()
 		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
@@ -375,7 +383,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 		m.delegations.Stop()
 		return failBeforeKernelMount(errors.Join(err, grafts.Close()))
 	}
-	server, err := fuse.NewServer(raw, mountpoint, options)
+	server, err := fuse.NewServer(raw.fileSystemForServer(), mountpoint, options)
 	if err != nil {
 		m.cancel()
 		cause := errors.Join(fmt.Errorf("mount PortableFS v3: %w", err), grafts.Close())
@@ -413,7 +421,11 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	// which must never observe a counter that is still being raised from zero.
 	m.start(lease)
 	m.startKernelConnection()
-	if err := server.WaitMount(); err != nil {
+	waitMount := server.WaitMount
+	if cfg.workspace != nil {
+		waitMount = server.WaitMountReady
+	}
+	if err := waitMount(); err != nil {
 		// NewServer has already installed the kernel mount. If INIT or the
 		// readiness probe fails, remove it before releasing the authority
 		// session so callers can never observe a mounted but unserved path.
@@ -549,7 +561,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	// whose permits are each held for one RPC, so cleanup keeps its turn
 	// however long kernel requests wait for bulk slots.
 	mount := &Mount{
-		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel,
+		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel, workspace: cfg.workspace,
 		kernelConnectionDone: make(chan struct{}),
 		reclaim:              newReclaimQueue(cfg.ReclaimQueue),
 		reclaimWorkers:       workers,
@@ -1348,6 +1360,7 @@ type fileHandle struct {
 	token            []byte
 	openFlags        uint32
 	buffered         bool
+	acceptedCut      atomic.Pointer[handleAcceptedCut]
 	stale            atomic.Bool
 	lossMu           sync.Mutex
 	lossObserved     uint64
@@ -1522,9 +1535,11 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	assignmentFailed := false
 	response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(ctx, request, func(authorityrpc.MutationIdentity) error {
 		if err := lease.markAssigned(); err != nil {
-			assignmentFailed = true
-			lease.revoke()
-			m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
+			if !errors.Is(err, workspaceadmission.ErrClosed) {
+				assignmentFailed = true
+				lease.revoke()
+				m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
+			}
 			return err
 		}
 		return nil
@@ -1792,7 +1807,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	kernelFlags := portableOpenFlags(flags, current && response.GetOpen().GetCacheCapable())
 	handle := &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := n.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
+	if err := n.registerDelegatedHandleContext(ctx, handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, 0, syscall.EIO
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response, current); err != nil {
@@ -1869,24 +1884,115 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	if handle == nil {
 		return syscall.EBADF
 	}
+	key := n.posixLockKey(lockOwner)
+	generation := n.mount.possiblePOSIXLock(key)
 	if handle.stale.Load() || n.stale.Load() {
 		return syscall.EIO
 	}
-	if errno := handle.observeLoss(); errno != 0 {
-		return errno
-	}
-	key := n.posixLockKey(lockOwner)
-	generation := n.mount.possiblePOSIXLock(key)
+	loss := handle.observeLoss()
+	closed := !n.mount.workspaceServing()
 	if generation == 0 {
+		if loss != 0 {
+			return loss
+		}
+		if closed {
+			return handle.closedFlushResult()
+		}
 		if local, errno := handle.flushLocally(); local {
 			return errno
 		}
 	}
+	// FLUSH's POSIX unlock is an exact cleanup obligation even when serving or
+	// durability has failed. Preserve that failure after discharging the lock.
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
 	if errno == 0 {
 		n.mount.dischargePOSIXLock(key, generation)
 	}
+	if loss != 0 {
+		return loss
+	}
+	if closed {
+		if pending := handle.closedFlushResult(); pending != 0 {
+			return pending
+		}
+	}
 	return errno
+}
+
+// Closed admission still permits a clean close. Accepted data which has not
+// reached durability must remain visible as a failure to the closing caller.
+func (h *fileHandle) closedFlushResult() syscall.Errno {
+	cut := h.acceptedCut.Load()
+	if cut == nil {
+		return 0
+	}
+	cut.mu.Lock()
+	defer cut.mu.Unlock()
+	if cut.buffer == nil || cut.sequence == 0 {
+		return 0
+	}
+	id, err := delegationIdentity(h.node.item.GetStableIdentity())
+	if err != nil || cut.buffer.HasRetainedThrough(id, cut.sequence) {
+		return syscall.EIO
+	}
+	return 0
+}
+
+// Sequences are local to one buffer epoch. resetBuffer disposes of the old
+// prefix through durability or loss before installing its successor; the loss
+// observer remains responsible for reporting that disposition to this handle.
+type handleAcceptedCut struct {
+	mu       sync.Mutex
+	buffer   *writeback.Buffer
+	epoch    uint64
+	sequence uint64
+}
+
+type handleAcceptanceKey struct{}
+
+func withHandleAcceptance(ctx context.Context, h *fileHandle) context.Context {
+	if h == nil || h.node.mount.workspace == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, handleAcceptanceKey{}, h)
+}
+
+// The manager calls this with its epoch reader and identity operation lock
+// held, before buffer acceptance. It cannot mistake a successor's sequence for
+// old work or discard an old prefix which still requires disposition.
+func prepareHandleAcceptance(ctx context.Context, b *writeback.Buffer, epoch uint64) (*handleAcceptedCut, error) {
+	h, _ := ctx.Value(handleAcceptanceKey{}).(*fileHandle)
+	if h == nil {
+		return nil, nil
+	}
+	cut := h.acceptedCut.Load()
+	if cut == nil {
+		h.acceptedCut.CompareAndSwap(nil, &handleAcceptedCut{})
+		cut = h.acceptedCut.Load()
+	}
+	cut.mu.Lock()
+	defer cut.mu.Unlock()
+	if cut.buffer == b && cut.epoch == epoch {
+		return cut, nil
+	}
+	id, err := delegationIdentity(h.node.item.GetStableIdentity())
+	if err != nil {
+		return nil, err
+	}
+	if cut.buffer != nil && cut.buffer.HasRetainedThrough(id, cut.sequence) {
+		return nil, writeback.ErrLost
+	}
+	cut.buffer, cut.epoch, cut.sequence = b, epoch, 0
+	return cut, nil
+}
+
+func (accepted *handleAcceptedCut) noteAcceptedCut(cut writeback.Cut) {
+	if accepted == nil || cut.Sequence == 0 {
+		return
+	}
+	accepted.mu.Lock()
+	defer accepted.mu.Unlock()
+	accepted.sequence = max(accepted.sequence, cut.Sequence)
 }
 
 func (h *fileHandle) observeLoss() syscall.Errno {
@@ -2489,7 +2595,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	}
 	kernelFlags := portableOpenFlags(flags, current && created.GetCacheCapable())
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := child.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
+	if err := child.registerDelegatedHandleContext(ctx, handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response, current); err != nil {
@@ -2574,7 +2680,7 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags}
-	if err := child.registerDelegatedHandle(handle, nil, 0); err != nil {
+	if err := child.registerDelegatedHandleContext(ctx, handle, nil, 0); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	owner.transfer()
@@ -2953,8 +3059,9 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			attrs.MTimeNS = *request.MtimeNs
 		}
 		var admissionErr error
+		var cut writeback.Cut
 		for {
-			_, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
+			cut, admissionErr = n.mount.delegations.SetAttr(withHandleAcceptance(ctx, fh), n.item.GetStableIdentity(), attrs)
 			if !errors.Is(admissionErr, errDelegationNotOwned) {
 				break
 			}
@@ -2967,12 +3074,23 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		}
 		if admissionErr != nil {
 			if lease != nil {
-				_ = lease.markCallbackPublicationReady()
+				var transitionErr error
+				if cut.Sequence == 0 {
+					transitionErr = completeDefiniteNoChangePublication(ctx)
+				} else {
+					transitionErr = lease.markCallbackPublicationReady()
+				}
+				if transitionErr != nil {
+					n.mount.revoke(fmt.Errorf("fusev3: settle delegated SETATTR refusal: %w", transitionErr))
+					return syscall.EIO
+				}
 			}
 			return bufferErrno(admissionErr)
 		}
 		if err := n.invalidateOwnData(ctx, 0, 0); err != nil {
-			_ = lease.markCallbackPublicationReady()
+			if transitionErr := lease.markCallbackPublicationReady(); transitionErr != nil {
+				n.mount.revoke(fmt.Errorf("fusev3: settle accepted SETATTR after invalidation failure: %w", transitionErr))
+			}
 			return syscall.EIO
 		}
 		return n.Getattr(ctx, fh, out)

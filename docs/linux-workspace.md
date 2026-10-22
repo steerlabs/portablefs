@@ -686,3 +686,7 @@ can qualify the 15-second boundary.
 Data formatting relies on mke2fs's device flush before successful exit. The
 initializer treats that completion as its format boundary; it does not use
 `sync -f /dev/vdb`, which would synchronize devtmpfs rather than the device.
+
+The Linux frontend admission substrate is described in
+[Linux workspace admission](linux-workspace-admission.md). Managed launch remains
+unavailable until the lifecycle, clock and protected-path driver are integrated.

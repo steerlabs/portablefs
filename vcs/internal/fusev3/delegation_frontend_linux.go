@@ -46,9 +46,12 @@ func (m *Mount) currentOpenResponse(ctx context.Context) bool {
 }
 
 func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation, applied uint64) error {
+	return n.registerDelegatedHandleContext(context.Background(), handle, grant, applied)
+}
+func (n *node) registerDelegatedHandleContext(ctx context.Context, handle *fileHandle, grant *authoritypb.Delegation, applied uint64) error {
 	manager := n.mount.delegations
 	if grant != nil {
-		if err := manager.install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant, applied); err != nil && !errors.Is(err, errDelegationRetired) {
+		if err := manager.installContext(ctx, n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant, applied); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
 	} else {
@@ -90,6 +93,12 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 		return nil
 	}
 	for {
+		if err := workspaceAcceptance(ctx); err != nil {
+			return err
+		}
+		if !n.mount.workspaceServing() {
+			return syscall.EIO
+		}
 		response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
 		if errno != 0 {
 			return errno
@@ -109,7 +118,7 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 		if handle != nil {
 			token = handle.token
 		}
-		if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
+		if err := n.mount.delegations.installContext(ctx, n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation(), 0); err != nil {
 			if errors.Is(err, errDelegationRetired) {
 				continue
 			}

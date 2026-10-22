@@ -1044,7 +1044,7 @@ func (in *InitIn) supportsRenameSwap() bool {
 // avoid racing between accessing the (empty or not yet mounted)
 // mountpoint, and the OS trying to setup the user-space mount.
 func (ms *Server) WaitMount() error {
-	err := <-ms.ready
+	err := ms.WaitMountReady()
 	if err != nil {
 		return err
 	}
@@ -1058,6 +1058,12 @@ func (ms *Server) WaitMount() error {
 	}
 	return pollHack(ms.mountPoint)
 }
+
+// WaitMountReady waits for the platform mount helper without issuing filesystem
+// operations. NewServer has already completed FUSE INIT. A closed-start owner
+// must validate that negotiated kernel contract before it opens serving; it
+// cannot run WaitMount's ordinary path-based polling probe while still closed.
+func (ms *Server) WaitMountReady() error { return <-ms.ready }
 
 // parseFuseFd checks if `mountPoint` is the special form /dev/fd/N (with N >= 0),
 // and returns N in this case. Returns -1 otherwise.
