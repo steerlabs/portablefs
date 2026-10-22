@@ -380,10 +380,12 @@ func TestCopyFileRangeLocksResolvedIdentitiesThroughBothSnapshots(t *testing.T) 
 	}
 
 	competitorAcquired := make(chan struct{})
+	competitorDone := make(chan struct{})
 	go func() {
 		unlock := store.LockMutation([][16]byte{sourceIdentity})
 		close(competitorAcquired)
 		unlock()
+		close(competitorDone)
 	}()
 	select {
 	case <-competitorAcquired:
@@ -403,6 +405,13 @@ func TestCopyFileRangeLocksResolvedIdentitiesThroughBothSnapshots(t *testing.T) 
 	case <-competitorAcquired:
 	case <-time.After(time.Second):
 		t.Fatal("source mutation lock was not released")
+	}
+	// Acquisition is not completion: the competing owner must relinquish its
+	// own lock before the final leak assertion samples the shared lock table.
+	select {
+	case <-competitorDone:
+	case <-time.After(time.Second):
+		t.Fatal("competing source mutation did not finish")
 	}
 	store.lockStateMu.Lock()
 	sourceSampleUnderLock := store.sourceSampleUnderLock

@@ -88,7 +88,7 @@ func TestSharedCacheOwnershipRequiresKnownUnownedIdentity(t *testing.T) {
 			case "retired":
 				_ = m.state(id)
 			case "owned":
-				m.state(id).ref = &authoritypb.DelegationRef{}
+				m.state(id).setGrantLocked(&authoritypb.DelegationRef{})
 			case "inactive":
 				m.SetIncarnation(0)
 			case "invalid":
@@ -112,7 +112,7 @@ func TestSharedCacheAdmissionSurvivesUnrelatedRegistryWriter(t *testing.T) {
 			if kind != "absent" {
 				s := m.state(id)
 				if kind == "owned" {
-					s.ref = &authoritypb.DelegationRef{}
+					s.setGrantLocked(&authoritypb.DelegationRef{})
 				}
 			}
 			m.mu.Lock()
@@ -133,28 +133,45 @@ func TestSharedCacheAdmissionSurvivesUnrelatedRegistryWriter(t *testing.T) {
 	}
 }
 
-func TestSharedCacheStateIndexClearsOnEpochReplacement(t *testing.T) {
+func TestSharedCacheOwnershipIndexClearsOnEpochReplacement(t *testing.T) {
 	m := newDelegationTestManager(t, &delegationFakeRPC{})
 	id := writeback.Identity{32}
 	old := m.state(id)
-	if value, ok := m.stateIndex.Load(id); !ok || value != old {
+	old.setGrantLocked(&authoritypb.DelegationRef{})
+	if value, ok := m.cacheOwners.Load(id); !ok || value != old {
 		t.Fatal("state was not indexed before publication")
 	}
 	m.EpochChanged("index epoch test")
-	if _, ok := m.stateIndex.Load(id); ok {
+	if _, ok := m.cacheOwners.Load(id); ok {
 		t.Fatal("old epoch state remains indexed")
 	}
 	if m.lookupState(id) != nil {
 		t.Fatal("old epoch remains in canonical registry")
 	}
 	current := m.state(id)
+	current.setGrantLocked(&authoritypb.DelegationRef{})
 	if current == old {
 		t.Fatal("epoch reused old state")
 	}
-	if value, ok := m.stateIndex.Load(id); !ok || value != current {
+	if value, ok := m.cacheOwners.Load(id); !ok || value != current {
 		t.Fatal("new epoch index is inconsistent")
 	}
 	if allocations := testing.AllocsPerRun(1000, func() { _ = m.sharedCacheAllowed(id[:]) }); allocations != 0 {
 		t.Fatalf("indexed ownership allocated %g times", allocations)
+	}
+}
+
+// The collector locks unowned states too. That bookkeeping must not turn a
+// cache-capable OPEN into permanent direct I/O or discard exact post-state.
+func TestSharedCacheAdmissionSurvivesIdleStateCollection(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	id := writeback.Identity{33}
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	s.admission.Lock()
+	allowed := m.sharedCacheAllowed(id[:])
+	s.admission.Unlock()
+	if !allowed {
+		t.Fatal("idle-state collection refused cache admission for an unowned identity")
 	}
 }

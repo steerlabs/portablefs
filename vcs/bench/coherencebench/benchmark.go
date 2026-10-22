@@ -262,7 +262,9 @@ func PeerWriteRead(rootA, rootB string, fileCount int) (WorkloadResult, error) {
 	readerReady := make(chan struct{})
 	firstObserved := make(chan struct{})
 	var stats peerStats
-	go func() { readerDone <- readPublishedFiles(ctx, rootB, fileCount, &stats, readerReady, firstObserved) }()
+	go func() {
+		readerDone <- readPublishedFiles(ctx, rootB, fileCount, &stats, readerReady, func() { close(firstObserved) })
+	}()
 	select {
 	case <-readerReady:
 	case err := <-readerDone:
@@ -336,7 +338,7 @@ func readPublishedFiles(
 	fileCount int,
 	stats *peerStats,
 	ready chan<- struct{},
-	firstObserved chan<- struct{},
+	firstObserved func(),
 ) error {
 	seen := make(map[string]struct{}, fileCount)
 	deadline := time.Now().Add(10 * time.Minute)
@@ -389,10 +391,12 @@ func readPublishedFiles(
 				return fmt.Errorf("peer file %s content mismatch", name)
 			}
 			seen[name] = struct{}{}
-			observedOnce.Do(func() { close(firstObserved) })
 			if !stats.writerDone.Load() {
 				stats.observedDuringWrite.Add(1)
 			}
+			// The writer may finish as soon as this notification arrives. Commit
+			// its evidence before releasing that writer.
+			observedOnce.Do(firstObserved)
 		}
 		if len(seen) == fileCount {
 			break

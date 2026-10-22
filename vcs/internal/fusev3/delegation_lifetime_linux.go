@@ -29,7 +29,6 @@ func (m *delegationManager) retainState(id writeback.Identity, create bool) *del
 	if s == nil && create {
 		s = &delegationState{manager: m, grantChanged: make(chan struct{}), identity: id, handles: make(map[string][]byte), writers: make(map[string][]byte), bindings: make(map[uint64]delegationBinding)}
 		m.byID[id] = s
-		m.stateIndex.Store(id, s)
 	}
 	if s != nil {
 		s.users.Add(1)
@@ -188,7 +187,6 @@ func (m *delegationManager) reapStateLocked(s *delegationState, oldestRequest ui
 	if !m.buf.Forget(s.identity) {
 		return
 	}
-	s.collected = true
 	// Authority generations are volume-global. The grant-request cut above
 	// proved that no unreported older generation can still arrive, so one
 	// scalar preserves stale-CONTROL rejection after this identity is erased.
@@ -196,7 +194,6 @@ func (m *delegationManager) reapStateLocked(s *delegationState, oldestRequest ui
 	delete(m.identityLoss, s.identity)
 	delete(m.byID, s.identity)
 	delete(m.retainedStates, s)
-	m.stateIndex.Delete(s.identity)
 	delete(m.reclaim, s)
 }
 

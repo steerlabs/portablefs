@@ -98,7 +98,6 @@ type delegationState struct {
 	manager          *delegationManager
 	ownershipVersion uint64       // admission; clocks grant installation and retirement
 	users            atomic.Int64 // index read lock joins; scoped operations and physical reply publications
-	collected        bool         // admission; refuses cache admission through a removed index entry
 	collectThrough   uint64       // manager.mu; grant requests already started when idle
 	collectCut       bool         // manager.mu
 
@@ -181,9 +180,9 @@ type delegationManager struct {
 	observers         map[writeback.Identity]int
 	buf               *writeback.Buffer
 	byID              map[writeback.Identity]*delegationState
-	// stateIndex mirrors creation, collection and both epoch resets of byID. Shared cache
-	// admission must not miss merely because another identity is being created.
-	stateIndex sync.Map // writeback.Identity -> *delegationState
+	// cacheOwners mirrors live grants, independently of idle-state collection.
+	// Shared cache admission runs under raw.mu and cannot take state locks.
+	cacheOwners sync.Map // writeback.Identity -> *delegationState
 	// identityLoss retains the latest loss ticket after an epoch-scoped Buffer
 	// is replaced. Existing handles compare against it once; newly registered
 	// handles start at the retained value.
@@ -368,9 +367,10 @@ func (m *delegationManager) Owns(identity []byte) bool {
 	return s.ref != nil
 }
 
-// sharedCacheAllowed is called under the raw registry lock. A retirement may
-// already be waiting for a holder reply pinned until its raw-locked settlement.
-// Never wait for ownership here: uncertain ownership simply refuses caching.
+// sharedCacheAllowed is called under the raw registry lock. Ownership changes
+// publish their exclusion before installing a grant and remove it only after
+// retirement. Idle collection cannot change that decision or make OPEN choose
+// permanent direct I/O merely because its bookkeeping lock is contended.
 func (m *delegationManager) sharedCacheAllowed(identity []byte) bool {
 	id, err := delegationIdentity(identity)
 	if err != nil || m == nil || !m.epoch.TryRLock() {
@@ -380,21 +380,20 @@ func (m *delegationManager) sharedCacheAllowed(identity []byte) bool {
 	if m.incarnation() == 0 {
 		return false
 	}
-	value, present := m.stateIndex.Load(id)
-	if !present {
-		return true
+	_, owned := m.cacheOwners.Load(id)
+	return !owned
+}
+
+// setGrantLocked keeps the nonblocking cache predicate at least as restrictive
+// as ref. The caller owns admission; epoch replacement excludes cache readers.
+func (s *delegationState) setGrantLocked(ref *authoritypb.DelegationRef) {
+	if ref != nil {
+		s.manager.cacheOwners.Store(s.identity, s)
 	}
-	s := value.(*delegationState)
-	if !s.admission.TryRLock() {
-		return false
+	s.ref = ref
+	if ref == nil {
+		s.manager.cacheOwners.CompareAndDelete(s.identity, s)
 	}
-	// Collection may have deferred this idle state while our read lock was held.
-	// Wake it after releasing the lock; owned states cannot be collected.
-	if s.ref == nil {
-		defer m.kickReclaim()
-	}
-	defer s.admission.RUnlock()
-	return !s.collected && s.ref == nil
 }
 
 func (m *delegationManager) SetBaseAttr(identity []byte, attr *authoritypb.Attr, version uint64) error {
@@ -550,7 +549,8 @@ func (m *delegationManager) installContext(ctx context.Context, identity, item, 
 	if m.beforeWorkspaceInstall != nil {
 		m.beforeWorkspaceInstall()
 	}
-	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
+	s.setGrantLocked(ref)
+	s.mode, s.item = grant.GetMode(), cloneBytes(item)
 	s.sessionCtx = m.sessionCtx
 	close(s.grantChanged)
 	s.grantChanged = make(chan struct{})
@@ -630,7 +630,7 @@ func (s *delegationState) clearGrantLocked() {
 		}
 		s.retiredGeneration = max(s.retiredGeneration, s.ref.GetGeneration())
 	}
-	s.ref = nil
+	s.setGrantLocked(nil)
 	s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
 	close(s.grantChanged)
 	s.grantChanged = make(chan struct{})
@@ -2557,7 +2557,7 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 		}
 		s.meta.Unlock()
 		s.admission.Lock()
-		s.ref = nil
+		s.setGrantLocked(nil)
 		s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
 		s.admission.Unlock()
 		s.meta.Lock()
@@ -2567,7 +2567,7 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	loss := old.LossSequence()
 	m.byID = make(map[writeback.Identity]*delegationState)
 	m.retiredGrantFloor = 0
-	m.stateIndex.Clear()
+	m.cacheOwners.Clear()
 	m.reclaim = make(map[*delegationState]struct{})
 	m.retainedStates = make(map[*delegationState]struct{})
 	m.mu.Unlock()
@@ -2578,7 +2578,7 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	m.mu.Lock()
 	m.byID = make(map[writeback.Identity]*delegationState)
 	m.retiredGrantFloor = 0
-	m.stateIndex.Clear()
+	m.cacheOwners.Clear()
 	m.reclaim = make(map[*delegationState]struct{})
 	m.retainedStates = make(map[*delegationState]struct{})
 	m.mu.Unlock()

@@ -2,6 +2,7 @@ package coherencebench
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -155,5 +156,26 @@ func TestPeerSingleFileDoesNotConsumeCompletionAtFirstObservation(t *testing.T) 
 		if err != nil || result.Files != 1 || result.Operations != 2 {
 			t.Fatalf("single-file peer workload: result=%+v error=%v", result, err)
 		}
+	}
+}
+
+// The notification releases the writer; its callback models the writer
+// completing immediately, before the reader can take another step.
+func TestPeerFirstObservationCommitsEvidenceBeforeReleasingWriter(t *testing.T) {
+	root := t.TempDir()
+	payload := make([]byte, FileBytes)
+	fillPayload(payload, 0)
+	if err := createPayload(filepath.Join(root, "file-000000.dat"), payload); err != nil {
+		t.Fatal(err)
+	}
+	var stats peerStats
+	err := readPublishedFiles(context.Background(), root, 1, &stats, make(chan struct{}), func() {
+		stats.writerDone.Store(true)
+		if got := stats.observedDuringWrite.Load(); got != 1 {
+			t.Errorf("first observation released writer with %d committed observations, want 1", got)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
