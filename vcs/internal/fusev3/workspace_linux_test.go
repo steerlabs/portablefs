@@ -556,8 +556,13 @@ func TestWorkspaceCloseAfterLastInstallationCheckIsInert(t *testing.T) {
 				if err := f.mount.subscription.subscribe(context.WithValue(t.Context(), workspaceRecoveryKey{}, proof)); err != nil {
 					t.Fatal(err)
 				}
-				if _, _, _, live := f.mount.subscription.currentIncarnation(); live {
-					t.Fatal("post-check subscription store became usable")
+				if stamp := f.mount.subscription.stamp(); stamp.incarnation != 0 {
+					t.Fatal("post-check subscription store became usable for serving")
+				}
+				// currentIncarnation describes old CONTROL, not cache-serving
+				// authority. Closing the gate cannot create a CONTROL gap.
+				if _, _, _, live := f.mount.subscription.currentIncarnation(); !live {
+					t.Fatal("post-check Close revoked the retained CONTROL capability")
 				}
 				if err := g.Prepared(proof); !errors.Is(err, workspaceadmission.ErrClosed) {
 					t.Fatal("obsolete local install opened gate")

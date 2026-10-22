@@ -785,7 +785,7 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 			return
 		case <-timer.C:
 			callCtx, cancel := context.WithTimeout(ctx, interval)
-			var finish func()
+			var finish func(func(bool))
 			if m.workspace != nil && m.workspaceLifecycle != nil {
 				var started bool
 				callCtx, finish, started = m.workspaceLifecycle.keepalive.start(callCtx)
@@ -798,38 +798,52 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 			// carries it on its dedicated CONTROL liveness lane.
 			response, err := m.rpc.CallRead(callCtx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
 			cancel()
+			stop := false
+			settle := func(parked bool) { stop = m.settleKeepAlive(ctx, callCtx, response, err, parked) }
 			if finish != nil {
-				finish()
+				finish(settle)
+			} else {
+				settle(false)
 			}
-			if ctx.Err() != nil {
-				// The mount is shutting down. A call that lost the race with
-				// cancellation says nothing about the authority.
+			if stop {
 				return
 			}
-			if errors.Is(err, authorityrpc.ErrAuthorityChanged) || errors.Is(m.rpc.SessionEndCause(), authorityrpc.ErrAuthorityChanged) {
-				continue
-			}
-			// A local timeout says nothing about the remote epoch or session.
-			// Subscription expiry independently withdraws every cached item.
-			if err != nil && m.rpc.SessionEndCause() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, authorityrpc.ErrTransportUncertain)) {
-				continue
-			}
-			if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
-				m.subscription.deactivate()
-				continue
-			}
-			if err != nil || responseErrno(response) != 0 {
-				// A failed renewal is terminal. Keeping the path mounted would let
-				// callers observe a long tail of unrelated per-operation failures.
-				if err == nil {
-					err = fmt.Errorf("keepalive refused: %w", responseErrno(response))
-				}
-				m.failAsync(fmt.Errorf("fusev3: authority keepalive failed: %w", err))
-				return
-			}
-			m.subscription.madeProgress()
 		}
 	}
+}
+
+// The attempt join includes classification and every policy effect. A Park
+// cancellation carries no authority verdict; an independent refusal still wins.
+func (m *Mount) settleKeepAlive(ctx, attempt context.Context, response *authoritypb.Response, err error, parked bool) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(err, authorityrpc.ErrAuthorityChanged) || errors.Is(m.rpc.SessionEndCause(), authorityrpc.ErrAuthorityChanged) {
+		return false
+	}
+	if m.rpc.SessionEndCause() == nil && !response.GetSessionTerminal() {
+		if parked && (err != nil && authorityrpc.LifecycleCompletion(attempt, err).Disposition == authorityrpc.LifecycleOvertaken || err == nil && response.GetFailure() == 0 && (response.GetErrno() == int32(syscall.ECANCELED) || response.GetErrno() == int32(syscall.EINTR))) {
+			return false
+		}
+		if err != nil && authorityrpc.TransientTransport(err) {
+			return false
+		}
+	}
+	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && !response.GetSessionTerminal() {
+		m.subscription.deactivate()
+		return false
+	}
+	if err != nil || responseErrno(response) != 0 || response.GetSessionTerminal() {
+		if err == nil {
+			err = fmt.Errorf("keepalive refused: %w", responseErrno(response))
+		}
+		m.revoke(fmt.Errorf("fusev3: authority keepalive failed: %w", err))
+		return true
+	}
+	if !parked {
+		m.subscription.madeProgress()
+	}
+	return false
 }
 
 // keepAliveInterval reserves regular contact for runtime session and signed
@@ -861,17 +875,27 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 		m.recordFatalCause(errors.New("fusev3: reclaim worker requires the epoch RPC facade"))
 		return
 	}
-	var retained []queuedReclaim
+	var retained, owned []queuedReclaim
+	defer func() {
+		if len(owned) != 0 {
+			m.reclaim.complete(len(owned))
+		}
+	}()
 	for {
 		batch := retained
 		retained = nil
 		if len(batch) == 0 {
+			if len(owned) != 0 {
+				m.reclaim.complete(len(owned))
+				owned = nil
+			}
 			var ok bool
 			batch, ok = m.reclaim.popBatch(ctx, authorityrpc.MaxReclaimBatch)
 			if !ok {
 				return
 			}
 		}
+		owned = batch
 		transport := batch[0].transport
 		if transport != rpc.current() {
 			continue
@@ -1084,9 +1108,10 @@ type reclaimQueue struct {
 	watermark int
 	batchMu   sync.Mutex
 
-	mu     sync.Mutex
-	tokens []queuedReclaim
-	head   int
+	mu          sync.Mutex
+	tokens      []queuedReclaim
+	outstanding int
+	head        int
 	// wake carries "the backlog is non-empty" to the drain workers.
 	wake chan struct{}
 	// room is closed (and replaced) when the backlog falls back under the
@@ -1106,6 +1131,7 @@ func newReclaimQueue(watermark int) *reclaimQueue {
 func (q *reclaimQueue) push(entry queuedReclaim) {
 	q.mu.Lock()
 	q.tokens = append(q.tokens, entry)
+	q.outstanding++
 	q.mu.Unlock()
 	q.signal()
 }
@@ -1116,6 +1142,10 @@ func (q *reclaimQueue) signal() {
 	default:
 	}
 }
+
+// Debt includes queued tokens and every dequeued lane owner exactly once.
+func (q *reclaimQueue) debt() int      { q.mu.Lock(); defer q.mu.Unlock(); return q.outstanding }
+func (q *reclaimQueue) complete(n int) { q.mu.Lock(); q.outstanding -= n; q.mu.Unlock() }
 
 func (q *reclaimQueue) pending() int {
 	q.mu.Lock()
@@ -1921,6 +1951,21 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 		if local, errno := handle.flushLocally(); local {
 			return errno
 		}
+	}
+	if closed && generation != 0 && n.mount.workspaceDispatchParked() {
+		if loss != 0 {
+			return loss
+		}
+		if pending := handle.closedFlushResult(); pending != 0 {
+			return pending
+		}
+		if loss := handle.observeLoss(); loss != 0 {
+			return loss
+		}
+		// Cold dispatch is parked. Report a prompt retryable refusal while
+		// retaining the tracked lock; RELEASE's session-owned cleanup still
+		// carries its exact unlock obligation. Never wait out a syscall here.
+		return syscall.EAGAIN
 	}
 	// FLUSH's POSIX unlock is an exact cleanup obligation even when serving or
 	// durability has failed. Preserve that failure after discharging the lock.

@@ -183,8 +183,8 @@ func TestWorkspaceDrainKeepsWithdrawalLead(t *testing.T) {
 	_, deadline, _, liveDrain := s.currentIncarnation()
 	t.Logf("live=%v liveAfterClose=%v renewalAccepted=%v liveWithDrain=%v cacheUntil=%v horizon=%v drainDeadline=%v (drain-cacheUntil=%v)",
 		live, liveAfter, renewed, liveDrain, cacheUntil.Format(time.RFC3339Nano), horizon.Format(time.RFC3339Nano), deadline.Format(time.RFC3339Nano), drain.deadline.Sub(cacheUntil))
-	if !live || liveAfter || renewed || !liveDrain || !deadline.Equal(cacheUntil) {
-		t.Errorf("NOTE: drain horizon loop deadline %v exceeds local withdrawal deadline by %v", deadline, deadline.Sub(cacheUntil))
+	if !live || !liveAfter || renewed || !liveDrain || !deadline.Equal(cacheUntil) {
+		t.Errorf("old CONTROL permission changed or extended its fixed withdrawal deadline: %v", deadline)
 	}
 }
 

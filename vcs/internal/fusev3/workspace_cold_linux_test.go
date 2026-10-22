@@ -69,7 +69,7 @@ func (r *coldTestRPC) CallRead(ctx context.Context, q *authoritypb.Request) (*au
 }
 func (r *coldTestRPC) Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error) {
 	n := r.subscriptions.Add(1)
-	return &authoritypb.SubscribeReply{Incarnation: 100 + n, Watermark: n, SnapshotId: []byte{byte(n)}, HorizonNanos: uint64(time.Minute)}, continuous.Time().Add(time.Minute), nil
+	return &authoritypb.SubscribeReply{Incarnation: 100 + n, Watermark: 1, SnapshotId: []byte{byte(n)}, HorizonNanos: uint64(time.Minute)}, continuous.Time().Add(time.Minute), nil
 }
 func coldFixture(t *testing.T) (*stockFixture, *workspaceadmission.Supervisor, *coldTestRPC) {
 	t.Helper()
@@ -247,8 +247,8 @@ func TestWorkspaceOvertakenColdRetainsLoss(t *testing.T) {
 	if err == nil || o.ColdComplete || len(o.Loss) != 1 || o.Loss[0].AcceptedBytes != 17 {
 		t.Fatal("overtaken cold proof erased outcome", o, err)
 	}
-	if f.mount.workspaceLifecycle.cold {
-		t.Fatal("failed proof retained recovery eligibility")
+	if !f.mount.workspaceLifecycle.cold {
+		t.Fatal("publication refusal erased the completed physical cut")
 	}
 }
 func TestWorkspaceRecoveryClassifiesTerminalEvidence(t *testing.T) {

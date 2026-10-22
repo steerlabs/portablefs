@@ -165,6 +165,9 @@ func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublicat
 		r.recycleReplyLocked(p)
 		return nil, fuse.EIO
 	}
+	if life := r.mount.workspaceLifecycle; life != nil {
+		life.servedSinceCold.Store(true)
+	}
 	p.workspace, p.workspaceBound = permit, true
 	return p, fuse.OK
 }
@@ -235,6 +238,9 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, ne
 			close(p.workspaceDone)
 			return err
 		}
+		if life := r.mount.workspaceLifecycle; life != nil {
+			life.servedSinceCold.Store(true)
+		}
 		p.workspace, p.workspaceBound = permit, true
 		r.mu.Unlock()
 	}
@@ -250,6 +256,10 @@ func (r *workspaceFileSystem) captureWorkspaceDrain(deadline time.Time) workspac
 	s := m.subscription
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.workspaceDrain != nil {
+		return *s.workspaceDrain
+	}
+	s.workspaceOwned = true
 	if s.cacheUntil.Before(deadline) {
 		deadline = s.cacheUntil
 	}

@@ -11,24 +11,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
 
 // LifecycleDisposition describes all retained causes, independently of Err's
 // diagnostic chain. The zero value fails closed.
-type LifecycleDisposition uint8
+type LifecycleDisposition = authorityrpc.LifecycleDisposition
 
 const (
-	LifecycleFailed LifecycleDisposition = iota
-	LifecycleCompleted
-	LifecycleOvertaken
+	LifecycleFailed    = authorityrpc.LifecycleFailed
+	LifecycleCompleted = authorityrpc.LifecycleCompleted
+	LifecycleOvertaken = authorityrpc.LifecycleOvertaken
 )
 
-type LifecycleResult struct {
-	Disposition LifecycleDisposition
-	Err         error
-}
+type LifecycleResult = authorityrpc.LifecycleResult
 
 // Driver runs lifecycle work, never socket requests. Run returns Completed only
 // after successful publication with no error. Overtaken means cancellation-only:

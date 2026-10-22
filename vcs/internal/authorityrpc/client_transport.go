@@ -545,6 +545,13 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 // Even a caller without a deadline cannot retry beyond one subscription TTL.
 func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
 	defer c.reportSessionError(&resultErr)
+	if c.cfg.DispatchFence != nil {
+		done, err := c.cfg.DispatchFence.begin(ctx, false)
+		if err != nil {
+			return err
+		}
+		defer done()
+	}
 	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, volumeserver.SubscriptionTTL)
 	defer cancel()
@@ -578,13 +585,6 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 }
 
 func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
-	if c.cfg.DispatchFence != nil {
-		done, err := c.cfg.DispatchFence.begin(ctx, false)
-		if err != nil {
-			return err
-		}
-		defer done()
-	}
 	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return err

@@ -35,7 +35,7 @@ func TestLifecycleRetryOutlivesSocketBudget(t *testing.T) {
 					}
 					return nil
 				})
-				if err != nil || time.Since(start) < 46*time.Second || calls < 2 {
+				if err.Err != nil || time.Since(start) < 46*time.Second || calls < 2 {
 					t.Fatal("logical recovery ended at socket deadline", err, calls, time.Since(start))
 				}
 			})
@@ -61,7 +61,7 @@ func TestLifecycleRetryClassifiesEvidence(t *testing.T) {
 			}
 			return io.EOF
 		})
-		if !errors.Is(err, context.Canceled) || calls != 60 {
+		if !errors.Is(err.Err, context.Canceled) || calls != 60 {
 			t.Fatal(err, calls)
 		}
 	})
@@ -235,13 +235,20 @@ func TestLifecycleParkedCleanupReplaysSameIdentityAtWake(t *testing.T) {
 
 type lifecycleVisibilityHandler struct {
 	clientTestHandler
-	calls   atomic.Int32
-	started chan struct{}
-	release chan struct{}
-	ready   sync.Once
+	calls          atomic.Int32
+	started        chan struct{}
+	release        chan struct{}
+	ready          sync.Once
+	reconnectUntil atomic.Int64
 }
 
 func (h *lifecycleVisibilityHandler) Handle(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+	if r.GetResume() != nil && time.Now().UnixNano() < h.reconnectUntil.Load() {
+		entry, _ := transportConnectionFromContext(ctx)
+		_ = entry.close()
+		return h.clientTestHandler.Handle(ctx, r)
+	}
+
 	if wait := r.GetWaitVisibility(); wait != nil {
 		h.calls.Add(1)
 		h.ready.Do(func() { close(h.started) })
@@ -296,6 +303,16 @@ func TestLifecycleParkedVisibilityRetainsImmutableCut(t *testing.T) {
 	if len(now.Owners) != 1 || string(now.Owners[0].Body) != string(old.Owners[0].Body) {
 		t.Fatal("park lost immutable visibility request")
 	}
+	select {
+	case err := <-result:
+		t.Fatalf("park ended logical visibility owner: %v", err)
+	case <-time.After(volumeserver.SubscriptionTTL + time.Second):
+	}
+	afterPark := c.DispatchSnapshot()
+	if len(afterPark.Owners) != 1 || string(afterPark.Owners[0].Body) != string(old.Owners[0].Body) {
+		t.Fatal("park budget changed immutable cut", afterPark)
+	}
+	h.reconnectUntil.Store(time.Now().Add(volumeserver.SubscriptionTTL + time.Second).UnixNano())
 	close(h.release)
 	if err = c.ResumeDispatch(func() error { return nil }); err != nil {
 		t.Fatal(err)
@@ -305,7 +322,7 @@ func TestLifecycleParkedVisibilityRetainsImmutableCut(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(2 * volumeserver.SubscriptionTTL):
 		t.Fatal("visibility did not retry at wake")
 	}
 	if h.calls.Load() != 2 || c.SessionEndCause() != nil || len(c.DispatchSnapshot().Owners) != 0 {
@@ -359,4 +376,78 @@ func TestLifecycleInitialActivationOutageRetainsAttachOwner(t *testing.T) {
 	if time.Since(start) < 46*time.Second || attaches != 1 || activations != 2 || aborts != 0 || c.attachDisposition != AttachCleanupRequired {
 		t.Fatal("outage replaced or abandoned the original possible commitment", time.Since(start), attaches, activations, aborts, c.attachDisposition)
 	}
+}
+
+func TestLifecycleJoinedFailureIsNotTransient(t *testing.T) {
+	local := errors.New("independent local failure")
+	for _, cause := range []error{errors.Join(io.EOF, local), errors.Join(context.DeadlineExceeded, ErrSessionEnded), errors.Join(&net.DNSError{Err: "DNS unavailable"}, ErrFrameEncoding)} {
+		if TransientTransport(cause) {
+			t.Fatal("independent cause hidden by transient sibling", cause)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		result := RetryLifecycle(ctx, time.Second, func(context.Context) error { cancel(); return cause })
+		if result.Disposition != LifecycleFailed || !errors.Is(result.Err, cause) {
+			t.Fatal("cancellation erased failure", result)
+		}
+	}
+}
+
+func TestDispatchFenceInitiallyParked(t *testing.T) {
+	h := &clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}
+	address, tls, stop := startTestServer(t, h, testMaxInFlight, time.Minute)
+	defer stop()
+	cfg := coherentTestClientConfig(address, tls, "volume", 9, 9)
+	cfg.DispatchFence = NewDispatchFence()
+	result := make(chan *Client, 1)
+	failed := make(chan error, 1)
+	go func() {
+		c, err := DialClient(t.Context(), cfg)
+		if err != nil {
+			failed <- err
+		} else {
+			result <- c
+		}
+	}()
+	select {
+	case c := <-result:
+		c.Close()
+		t.Fatal("startup dispatch escaped parked fence")
+	case err := <-failed:
+		t.Fatal("startup park ended logical attach", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	snapshot := cfg.DispatchFence.Snapshot()
+	if !snapshot.Parked || snapshot.InFlightIO != 0 {
+		t.Fatal(snapshot)
+	}
+	if err := cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-result:
+		defer c.Close()
+	case err := <-failed:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup attach did not resume")
+	}
+}
+
+func TestLifecycleColdResetHasExplicitDisposition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		if TransientTransport(ErrSubscriptionReset) {
+			t.Fatal("cold reset was classified as transport failure")
+		}
+		attempts := 0
+		result := RetryLifecycleAttempts(t.Context(), time.Second, func(context.Context) LifecycleAttempt {
+			attempts++
+			if attempts < 3 {
+				return LifecycleAttempt{Disposition: AttemptColdReset, Err: ErrSubscriptionReset}
+			}
+			return LifecycleAttempt{Disposition: AttemptComplete}
+		})
+		if result.Disposition != LifecycleCompleted || result.Err != nil || attempts != 3 {
+			t.Fatal("cold reset ended or replaced the logical job", result, attempts)
+		}
+	})
 }

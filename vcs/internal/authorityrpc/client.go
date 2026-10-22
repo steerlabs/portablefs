@@ -441,6 +441,16 @@ func recoveryFailure(phase string, err error) error {
 }
 
 func (c *Client) attachAndActivate(ctx context.Context) error {
+	// Bootstrap owns its raw handshakes as one applying interval. Waiting on
+	// the startup fence precedes every network timeout and possible Attach
+	// commitment; Park cannot acknowledge until this interval settles.
+	if c.cfg.DispatchFence != nil {
+		done, err := c.cfg.DispatchFence.begin(ctx, true)
+		if err != nil {
+			return err
+		}
+		defer done()
+	}
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
 	if c.cfg.LifecycleRetry {
 		handshakeCancel()
@@ -1662,6 +1672,18 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 			return nil, nil, false, err
 		}
 	}
+	var endIO func()
+	if c.cfg.DispatchFence != nil && request.GetCancel() == nil && request.GetDetach() == nil && request.GetTerminalDeliveryReceipt() == nil {
+		endIO, err = c.cfg.DispatchFence.begin(ctx, false)
+		if err != nil {
+			return nil, nil, false, err
+		}
+	}
+	defer func() {
+		if endIO != nil {
+			endIO()
+		}
+	}()
 	// Request IDs are physical-connection envelopes, not replay identities. A
 	// same-session mutation retry keeps its Mutation slot/sequence and body but
 	// must take a fresh ID on the replacement socket; another caller may already
@@ -1687,6 +1709,11 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 
 	submitted = true
 	err = c.writeRequest(ctx, transport, conn, request)
+	if endIO != nil {
+		endIO()
+		endIO = nil
+	}
+
 	if err != nil {
 		c.failConnection(transport, conn, ErrTransportUncertain)
 	}
@@ -1794,13 +1821,6 @@ func (c *Client) sendCancel(transport *clientTransport, target uint64, conn net.
 }
 
 func (c *Client) writeRequest(ctx context.Context, transport *clientTransport, conn net.Conn, request *authoritypb.Request) error {
-	if c.cfg.DispatchFence != nil && request.GetCancel() == nil && request.GetDetach() == nil && request.GetTerminalDeliveryReceipt() == nil {
-		done, err := c.cfg.DispatchFence.begin(ctx, false)
-		if err != nil {
-			return err
-		}
-		defer done()
-	}
 	transport.writeMu.Lock()
 	defer transport.writeMu.Unlock()
 	deadline := time.Now().Add(c.cfg.CancelDrainTimeout)
@@ -1902,23 +1922,38 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		return nil, nil, ownerErr
 	}
 	defer releaseOwner()
-	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
-	if !errors.Is(err, ErrTransportUncertain) {
-		return response, releaseFrame, err
+	for {
+		response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
+		if !errors.Is(err, ErrTransportUncertain) {
+			return response, releaseFrame, err
+		}
+		if releaseFrame != nil {
+			releaseFrame()
+			releaseFrame = nil
+		}
+		role, roleErr := roleForRequest(request)
+		if roleErr != nil {
+			return nil, nil, syscall.EINVAL
+		}
+		for {
+			reconnectErr := c.reconnectTransport(ctx, role)
+			if reconnectErr == nil {
+				break
+			}
+			// Managed logical owners outlive individual establishment attempts,
+			// including a park longer than the network retry budget.
+			if c.cfg.DispatchFence == nil || !TransientTransport(reconnectErr) || ctx.Err() != nil {
+				return nil, nil, reconnectErr
+			}
+			if err := waitTransportRetry(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+		if c.cfg.DispatchFence == nil {
+			response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
+			return response, releaseFrame, err
+		}
 	}
-	if releaseFrame != nil {
-		releaseFrame()
-		releaseFrame = nil
-	}
-	role, roleErr := roleForRequest(request)
-	if roleErr != nil {
-		return nil, nil, syscall.EINVAL
-	}
-	if err := c.reconnectTransport(ctx, role); err != nil {
-		return nil, nil, err
-	}
-	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
-	return response, releaseFrame, err
 }
 
 // CallIdempotentRetained retains the response until the frontend physically

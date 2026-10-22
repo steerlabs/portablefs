@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"google.golang.org/protobuf/proto"
@@ -92,30 +93,47 @@ func (f *DispatchFence) Snapshot() DispatchSnapshot {
 	}
 	return s
 }
+
+// A readiness refusal is a local admission barrier, never a transport or
+// session verdict. No request or I/O is registered until it passes. The check
+// owner has no notification API; bounded resampling also observes cancellation.
+func (f *DispatchFence) waitReadyLocked(ctx context.Context, assigning bool) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if f.parked || assigning && f.draining || f.check == nil {
+			changed := f.changed
+			f.mu.Unlock()
+			select {
+			case <-changed:
+			case <-ctx.Done():
+			}
+			f.mu.Lock()
+			continue
+		}
+		if f.check() == nil {
+			return nil
+		}
+		changed := f.changed
+		f.mu.Unlock()
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-changed:
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		timer.Stop()
+		f.mu.Lock()
+	}
+}
+
 func (f *DispatchFence) begin(ctx context.Context, assigning bool) (func(), error) {
 	if f == nil {
 		return func() {}, nil
 	}
 	f.mu.Lock()
-	for f.parked || assigning && f.draining {
-		changed := f.changed
-		f.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		f.mu.Lock()
-	}
-	if err := ctx.Err(); err != nil {
-		f.mu.Unlock()
-		return nil, err
-	}
-	if f.check == nil {
-		f.mu.Unlock()
-		return nil, errors.New("authorityrpc: dispatch has no readiness owner")
-	}
-	if err := f.check(); err != nil {
+	if err := f.waitReadyLocked(ctx, assigning); err != nil {
 		f.mu.Unlock()
 		return nil, err
 	}
@@ -133,21 +151,7 @@ func (f *DispatchFence) own(ctx context.Context, r *authoritypb.Request) (func()
 		return nil, err
 	}
 	f.mu.Lock()
-	for f.parked || applying && f.draining {
-		changed := f.changed
-		f.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		f.mu.Lock()
-	}
-	if err := ctx.Err(); err != nil {
-		f.mu.Unlock()
-		return nil, err
-	}
-	if err := f.check(); err != nil {
+	if err := f.waitReadyLocked(ctx, applying); err != nil {
 		f.mu.Unlock()
 		return nil, err
 	}

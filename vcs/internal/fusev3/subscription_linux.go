@@ -511,8 +511,11 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			return fmt.Errorf("fusev3: subscribe page %d: %w", page, err)
 		}
 		if reply == nil || reply.GetIncarnation() == 0 || reply.GetHorizonNanos() == 0 ||
-			len(reply.GetSnapshotId()) == 0 || !pageHorizon.After(s.config.clock.Now()) {
+			len(reply.GetSnapshotId()) == 0 {
 			return fmt.Errorf("%w: malformed page %d", errSubscriptionInvalid, page)
+		}
+		if !pageHorizon.After(s.config.clock.Now()) {
+			return fmt.Errorf("%w: aged page %d", errSubscriptionExpired, page)
 		}
 		if page == 0 {
 			watermark, incarnation, horizonNanos = reply.GetWatermark(), reply.GetIncarnation(), reply.GetHorizonNanos()
@@ -713,6 +716,11 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 		defer close(renewalDone)
 		err := s.renewLoop(renewalCtx, incarnation)
 		if renewalCtx.Err() != nil {
+			if result := authorityrpc.LifecycleCompletion(renewalCtx, err); result.Disposition == authorityrpc.LifecycleFailed {
+				s.mu.Lock()
+				s.workspaceFailure = errors.Join(s.workspaceFailure, result.Err)
+				s.mu.Unlock()
+			}
 			return nil
 		}
 		return err
@@ -1140,7 +1148,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 		}
 		deadline, err := s.rpc.RenewSubscription(ctx, incarnation)
 		if err != nil {
-			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+			if errors.Is(err, authorityrpc.ErrSubscriptionReset) || !authorityrpc.TransientTransport(err) {
 				return err
 			}
 			continue
@@ -1500,10 +1508,19 @@ func (s *subscriptionRegistry) controlLiveLocked() bool {
 	if s.mount == nil || s.mount.workspace == nil {
 		return true
 	}
-	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
+	// Installation bound this proof to this reader and incarnation. Closing
+	// serving never revokes the old CONTROL capability before its fixed
+	// conservative horizon; takeover may only shorten it with workspaceDrain.
+	return s.workspaceProof != nil
 }
 
 // A drain may finish the old CONTROL cut, but may not extend its exclusion.
 func (s *subscriptionRegistry) renewalLiveLocked() bool {
-	return !s.workspaceOwned && s.workspaceDrain == nil && s.controlLiveLocked()
+	if s.workspaceOwned || s.workspaceDrain != nil || !s.controlLiveLocked() {
+		return false
+	}
+	if s.mount == nil || s.mount.workspace == nil {
+		return true
+	}
+	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
 }

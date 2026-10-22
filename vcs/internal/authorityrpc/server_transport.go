@@ -282,6 +282,13 @@ func (s *Server) executeTransportResume(ctx context.Context, entry *transportCon
 	before, err := s.registry.resumeWitness(entry, session)
 	if err != nil {
 		pair.operation.Unlock()
+		if state, known := s.Handler.SessionStateForTransport(session); !known || state != volumeserver.SessionStateActive && state != volumeserver.SessionStateProvisional {
+			response := s.dispatchRequest(ctx, request)
+			defer finishHandlerResponse(s.Handler, request, response)()
+			if response.GetErrno() == int32(syscall.ESTALE) && response.GetSessionTerminal() {
+				return writeResponse(request, response)
+			}
+		}
 		return err
 	}
 	response := s.dispatchRequest(ctx, request)

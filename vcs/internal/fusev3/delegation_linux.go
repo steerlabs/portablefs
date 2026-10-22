@@ -876,7 +876,7 @@ func (m *delegationManager) Size(identity []byte, base int64) (int64, error) {
 	defer m.epoch.RUnlock()
 	s := m.retainState(id, false)
 	defer m.releaseState(s)
-	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+	if s == nil || !delegationStateOwned(s) {
 		return base, nil
 	}
 	return m.buf.Size(id, base), nil
@@ -891,7 +891,7 @@ func (m *delegationManager) OverlayAttributes(identity []byte, base writeback.At
 	defer m.epoch.RUnlock()
 	s := m.retainState(id, false)
 	defer m.releaseState(s)
-	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+	if s == nil || !delegationStateOwned(s) {
 		return base, nil
 	}
 	return m.buf.OverlayAttributes(id, base), nil

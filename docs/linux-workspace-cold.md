@@ -11,8 +11,12 @@ them. Authority protocol 8 and ordinary mount dispatch remain unchanged.
 Close precedes the lifecycle call. The transition takes ownership of the
 subscription runner before deactivation, joins initial/cold Subscribe and
 subscription renewal, and parks the same enrollment renewer and KeepAlive
-attempt. It captures the old buffer, incarnation and the earlier of the supplied
-continuous-clock deadline and cacheUntil. No shutdown budget extends that cut.
+attempt. The ownership handoff captures the old buffer, incarnation and the
+earlier of the supplied continuous-clock deadline and cacheUntil before any
+blocking join. It freezes renewal installation at that boundary. Closing serving
+keeps the old CONTROL capability until this fixed deadline; it cannot renew that
+capability. No shutdown budget extends the cut. KeepAlive retains its park
+cancellation disposition through result classification and terminal policy.
 
 FenceAdmissions wakes capacity waiters. The callback fence joins their history
 cleanup, then releases before the fixed physical-reply cohort joins. Raw cache
@@ -27,8 +31,12 @@ The dispatch fence refuses cold proof until applying mutation owners settle.
 Transport cancellation does not discharge a session-owned submitted write.
 Parked non-applying requests retain their exact body, replay slot and sequence;
 response readers may observe a result while dispatch and reconnect are parked.
-Parking does not cancel the CLOSE_BATCH owner or take its unknown-close failure
-path. Callback settlement never acquires the lifecycle lane.
+Parking does not cancel the CLOSE_BATCH or visibility owner or take its
+unknown-close failure path. Logical owners retain their exact requests through
+transient reconnect failures; parked waiting consumes no network-attempt budget.
+A readiness refusal blocks before request submission and cannot break a healthy
+transport. Initial bootstrap also waits on the startup fence before its network
+budget starts. Callback settlement never acquires the lifecycle lane.
 
 | Owner | Cold disposition |
 | --- | --- |
@@ -49,9 +57,12 @@ path. Callback settlement never acquires the lifecycle lane.
 | Spawned terminal withdrawal/close work | No healthy cold proof after terminalization |
 
 Partial barrier/release outcomes remain observed even when a later phase fails.
-Unknown release authority is abandoned, never reported as released; it refuses a
-healthy cold proof. A failed condition remains unresolved. A bounded waiter never substitutes for a
-worker's completion. Kernel machine-local caches keep their ordinary local
+Unknown release authority is abandoned, never reported as released. Accounted
+abandonment belongs to the current interval and appears in its outcome; it does
+not by itself refuse coldness. A new cold Subscribe starts a fresh interval.
+Independent failures remain unresolved. A bounded waiter never substitutes for
+a worker's completion; retained notification and callback joins use their own
+mount context. Kernel machine-local caches keep their ordinary local
 semantics; this proof withdraws authority-derived cache authority.
 
 ## Preparation and recovery
@@ -63,8 +74,23 @@ consumption. A socket attempt cannot repeat Attach or logical Recover.
 Initial attachment retains its connection-set/Attach identity and explicit
 ownership disposition across retry. Recovery validates the existing session and
 authorization through real traffic, then installs a fresh cold subscription with
-fresh anchors. Epoch change, authenticated refusal, protocol defects and genuine
-local failure end recovery. Offline time alone proves none of those outcomes.
+fresh anchors. An expired/reset subscription attempt withdraws again and retries
+from an empty cursor inside the same pending job. This includes an aged first
+page, pagination horizon, or withdrawal lead. Structural refusal remains a
+failure. Epoch change, authenticated refusal, protocol defects and independent
+local failure end recovery. Protocol 8 already defines errno and session_terminal;
+Resume now returns that existing terminal refusal for an unknown or ended
+session, so real lease expiry ends recovery with ErrSessionEnded. Ordinary
+mounts receive the same definitive expiry verdict. No wire or schema changes.
+
+Cold state lasts until Prepared actually publishes. An interrupted Prepare or
+Recover re-parks every owner it resumed. A later Suspend re-acknowledges the
+retained cut when no callback has served since that cut, without draining again
+or consulting the old horizon. A persistence failure also retains the physical
+cut for a later acknowledgment. Cold POSIX FLUSH returns EAGAIN promptly while
+keeping the tracked unlock obligation for session-owned RELEASE cleanup; a
+closed serving gate whose dispatch still runs keeps its existing cleanup path.
+Known loss still wins the FLUSH result.
 
 A serving managed driver must close admission and Park the renewer before its
 safe cutoff. Resume is not a way to clear a latched terminal cutoff. Park joins
@@ -76,11 +102,22 @@ remains outside renewal ownership.
 ## Retained evidence
 
 Every transition completion returns cumulative loss and outcome evidence, even
-when it fails or loses its generation. Drop tickets identify accepted entries
+when it fails or loses its generation. Prepare and Recover return an explicit
+Completed, Overtaken or Failed result for the local owner. Cancellation-only
+completion may be Overtaken; any independent cause, including a cause joined
+with transport loss or cancellation, remains Failed and sets the owner's
+incarnation terminal latch. Drop tickets identify accepted entries
 and bytes; a repeated reset cannot create another loss for the same discarded
 records. Recording the in-memory fact performs no inventory fsync or RPC under
 buffer/index/state locks. Persistence precedes cold acknowledgment and the
-publication of a new prepared serving interval.
+publication of a new prepared serving interval. The bounded final loss aggregate
+is valid evidence; a codec refusal remains an error and cannot erase the ledger.
+Cleanup debt counts deferred descriptions and outstanding reclaim tokens once,
+including tokens already dequeued by a lane. Request dispositions enumerate
+retained exact owners; passive services retain session ownership behind the
+joined dispatch fence. The empty successor is checked for retained entries.
+Publication checks run before persistence and again after it. If persistence
+outlives a proof, the owner persists the refusal before returning it.
 
 A new interval persists unresolved/unobserved while retaining earlier known
 loss. The workspace outcome inventory uses a synced temporary file, atomic

@@ -3164,11 +3164,6 @@ func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Statu
 }
 
 func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
-	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
-	if !lifecycle.Ok() {
-		return
-	}
-	defer finish()
 	if r.grafts != nil {
 		if held, ok := r.takeHandle(input.Fh, handleLocalFile); ok {
 			// A failed close(2) has released the descriptor regardless, and
@@ -3180,6 +3175,11 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 			return
 		}
 	}
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
+	defer finish()
 	handle, ok := r.takeHandle(input.Fh, handleAuthorityFile)
 	if !ok {
 		return
@@ -4170,11 +4170,6 @@ func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.St
 }
 
 func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
-	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
-	if !lifecycle.Ok() {
-		return
-	}
-	defer finish()
 	if r.grafts != nil {
 		if held, ok := r.takeHandle(input.Fh, handleLocalDir); ok {
 			// The snapshot is memory this process owns; nothing outside it is
@@ -4183,6 +4178,11 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 			return
 		}
 	}
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
+	defer finish()
 	handle, ok := r.takeHandle(input.Fh, handleAuthorityDir)
 	if !ok {
 		return
