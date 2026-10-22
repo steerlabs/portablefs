@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -234,7 +235,7 @@ func TestO5AuthorityGoneAfterActivateBoundedUncertainty(t *testing.T) {
 // attempt: success => no Detach/Abort; Activate reached and failure => exactly
 // one Detach or explicit uncertainty; Activate reached => no Abort.
 func TestO5RandomCancellationDialStress(t *testing.T) {
-	base := o5FDCount(t)
+	base := o5Sockets(t)
 	goroutines := runtime.NumGoroutine()
 	type result struct {
 		ok, committed, uncertain bool
@@ -307,19 +308,31 @@ func TestO5RandomCancellationDialStress(t *testing.T) {
 			t.Logf("goroutines %3d at %s", v, k)
 		}
 	}
-	t.Logf("cancel stress: attempts=%d ok=%d committedThenFailed=%d (detached=%d uncertain=%d) violations=%d fdDelta=%d goroutineDelta=%d", len(results), ok, committedFail, detached, uncertain, bad, o5FDCount(t)-base, runtime.NumGoroutine()-goroutines)
+	t.Logf("cancel stress: attempts=%d ok=%d committedThenFailed=%d (detached=%d uncertain=%d) violations=%d goroutineDelta=%d", len(results), ok, committedFail, detached, uncertain, bad, runtime.NumGoroutine()-goroutines)
 	if bad != 0 {
 		t.Errorf("%d attempts violated committed-activation ownership", bad)
 	}
-	if o5FDCount(t) != base {
-		t.Errorf("fd leak: %d -> %d", base, o5FDCount(t))
+	// Only sockets opened during this test can leak from it. Earlier tests may
+	// still be closing their own connections, so a process-wide descriptor
+	// count can move in either direction without saying anything here.
+	for socket := range o5Sockets(t) {
+		if _, ok := base[socket]; !ok {
+			t.Errorf("socket %s opened by the stress attempts is still open", socket)
+		}
 	}
 }
 
-func o5FDCount(t *testing.T) int {
+func o5Sockets(t *testing.T) map[string]struct{} {
 	ents, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Skip("no /proc/self/fd")
 	}
-	return len(ents)
+	sockets := map[string]struct{}{}
+	for _, ent := range ents {
+		target, err := os.Readlink("/proc/self/fd/" + ent.Name())
+		if err == nil && strings.HasPrefix(target, "socket:") {
+			sockets[target] = struct{}{}
+		}
+	}
+	return sockets
 }
