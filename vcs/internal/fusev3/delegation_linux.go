@@ -1813,9 +1813,8 @@ func (m *delegationManager) SetDropReporter(reporter func(writeback.DropReport))
 
 func (m *delegationManager) reportDrop(report writeback.DropReport) {
 	log.Printf("portablefs: dropped delegated writeback identity=%x bytes=%d entries=%d loss_sequence=%d errno=%d reason=%q", report.Identity, report.Bytes, report.Entries, report.LossSequence, report.Errno, report.Reason)
-	// Drop also advances an identity ticket when an uncertain operation loses a
-	// clean delegation. That is observable by handles, but it is not a retained
-	// writeback loss and must not produce a zero-entry data-loss report.
+	// The buffer observer records every completion ticket in the lifecycle
+	// ledger. This data-loss callback counts only forfeited retained records.
 	if report.Entries == 0 {
 		return
 	}

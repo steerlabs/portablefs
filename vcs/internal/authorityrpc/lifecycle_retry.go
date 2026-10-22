@@ -19,7 +19,11 @@ const (
 	LifecycleOvertaken
 )
 
+// LifecyclePermitLoss identifies the exact job defeated by a newer gate serial.
+type LifecyclePermitLoss struct{ Generation, Serial, Successor uint64 }
+
 type LifecycleResult struct {
+	PermitLoss  *LifecyclePermitLoss
 	Disposition LifecycleDisposition
 	Err         error
 }
@@ -42,10 +46,21 @@ func LifecycleOwnerOvertaken(ctx context.Context) bool {
 	return owner.Overtaken()
 }
 
+// LifecycleIndependentFailure retains a failure already established by its
+// owner. Its diagnostic may itself be cancellation; that does not make the
+// independent operation's failure into job overtaking.
+type LifecycleIndependentFailure struct{ Err error }
+
+func (e *LifecycleIndependentFailure) Error() string { return e.Err.Error() }
+func (e *LifecycleIndependentFailure) Unwrap() error { return e.Err }
+
 // everyCause requires every branch of a joined error to satisfy the predicate.
 // Wrappers add context; they do not erase an independent sibling cause.
 func everyCause(err error, accept func(error) bool) bool {
 	if err == nil {
+		return false
+	}
+	if _, independent := err.(*LifecycleIndependentFailure); independent {
 		return false
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
@@ -86,6 +101,29 @@ func TransientTransport(err error) bool {
 	})
 }
 
+// A typed gate loss can travel with cancellation, but never erases an
+// independent sibling cause. Every attributed branch must name the same job.
+func lifecyclePermitLoss(err error) *LifecyclePermitLoss {
+	var attributed interface{ LifecyclePermitLoss() LifecyclePermitLoss }
+	if !errors.As(err, &attributed) {
+		return nil
+	}
+	loss := attributed.LifecyclePermitLoss()
+	if loss.Generation == 0 || loss.Successor <= loss.Serial {
+		return nil
+	}
+	if !everyCause(err, func(e error) bool {
+		if e == context.Canceled || e == context.DeadlineExceeded {
+			return true
+		}
+		cause, ok := e.(interface{ LifecyclePermitLoss() LifecyclePermitLoss })
+		return ok && cause.LifecyclePermitLoss() == loss
+	}) {
+		return nil
+	}
+	return &loss
+}
+
 // LifecycleCompletion is called where cancellation is owned. Drivers consume
 // Disposition directly; errors.Is on Err cannot reconstruct this decision.
 func LifecycleCompletion(ctx context.Context, err error) LifecycleResult {
@@ -93,6 +131,9 @@ func LifecycleCompletion(ctx context.Context, err error) LifecycleResult {
 		return LifecycleResult{Disposition: LifecycleCompleted}
 	}
 	cancellation := ctx.Err()
+	if loss := lifecyclePermitLoss(err); loss != nil {
+		return LifecycleResult{Disposition: LifecycleOvertaken, Err: errors.Join(err, cancellation), PermitLoss: loss}
+	}
 	if cancellation != nil && (err == nil || everyCause(err, func(e error) bool { return e == cancellation })) {
 		if err == nil {
 			err = cancellation
@@ -122,6 +163,9 @@ type LifecycleAttempt struct {
 func ClassifyLifecycleAttempt(err error) LifecycleAttempt {
 	if err == nil {
 		return LifecycleAttempt{Disposition: AttemptComplete}
+	}
+	if lifecyclePermitLoss(err) != nil {
+		return LifecycleAttempt{Disposition: AttemptOvertaken, Err: err}
 	}
 	if TransientTransport(err) {
 		return LifecycleAttempt{Disposition: AttemptPending, Err: err}
@@ -159,7 +203,9 @@ func RetryLifecycleAttempts(ctx context.Context, timeout time.Duration, attempt 
 				return LifecycleCompletion(ctx, result.Err)
 			}
 		case AttemptOvertaken:
-			return LifecycleResult{Disposition: LifecycleOvertaken, Err: result.Err}
+			completion := LifecycleCompletion(ctx, result.Err)
+			completion.Disposition = LifecycleOvertaken
+			return completion
 		case AttemptPending, AttemptColdReset:
 			// The phase owner has classified these causes as nonterminal.
 		default:

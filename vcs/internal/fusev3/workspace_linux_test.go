@@ -14,6 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
@@ -532,8 +533,10 @@ func TestWorkspaceInitialSubscribeLosesToPark(t *testing.T) {
 	g.Close(1)
 	f.mount.subscription.suspend()
 	close(barrier.release)
-	if err := <-done; !errors.Is(err, errSubscriptionPaused) {
-		t.Fatal("Subscribe installed across park", err)
+	err = <-done
+	var loss *workspaceadmission.PermitOvertaken
+	if !errors.As(err, &loss) || loss.Generation != 1 || loss.Serial != proof.Serial() || loss.Successor != proof.Serial()+1 || workspaceSubscribeAttempt(err).Disposition != authorityrpc.AttemptOvertaken {
+		t.Fatal("Subscribe lost its exact overtaking disposition", err)
 	}
 	if f.mount.subscription.stamp().incarnation != 0 {
 		t.Fatal("parked initial Subscribe served")

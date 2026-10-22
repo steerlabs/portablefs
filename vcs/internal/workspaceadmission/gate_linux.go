@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"golang.org/x/sys/unix"
 )
@@ -26,6 +27,18 @@ const wordOffset = 128
 const requiredSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_FUTURE_WRITE | unix.F_SEAL_SEAL | unix.F_SEAL_EXEC
 
 var ErrClosed = errors.New("workspace admission: closed or obsolete permit")
+
+// PermitOvertaken attributes a refusal to the supervisor's newer serial. Owner
+// death and malformed proofs remain independent failures.
+type PermitOvertaken struct{ Generation, Serial, Successor uint64 }
+
+func (e *PermitOvertaken) Error() string {
+	return fmt.Sprintf("workspace admission: generation %d serial %d overtaken by %d", e.Generation, e.Serial, e.Successor)
+}
+func (e *PermitOvertaken) Unwrap() error { return ErrClosed }
+func (e *PermitOvertaken) LifecyclePermitLoss() authorityrpc.LifecyclePermitLoss {
+	return authorityrpc.LifecyclePermitLoss{Generation: e.Generation, Serial: e.Serial, Successor: e.Successor}
+}
 
 // Binding is immutable for one child. Service IDs and incarnation are the exact
 // 128-bit identities used by paired workspace control, never filesystem names.
@@ -340,7 +353,14 @@ func (r *Reader) Check() (ServingPermit, error) {
 	return p, p.Check()
 }
 func (r *Reader) Recover(p RecoveryPermit) error {
-	if r.dead.Load() || p.Serial() == math.MaxUint64>>1 || p.binding != r.binding || p.generation == 0 || p.word&1 != 0 || r.word.Load() != p.word {
+	if r.dead.Load() || p.Serial() == math.MaxUint64>>1 || p.binding != r.binding || p.generation == 0 || p.word&1 != 0 {
+		return ErrClosed
+	}
+	word := r.word.Load()
+	if word != p.word {
+		if word>>1 > p.Serial() {
+			return &PermitOvertaken{p.generation, p.Serial(), word >> 1}
+		}
 		return ErrClosed
 	}
 	return nil

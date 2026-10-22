@@ -141,3 +141,4 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelReadDuringInterrup
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelCachedWriterJoinsTerminalWithdrawal
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryTearingDownReleaseClosesLocalFD
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelOrdinaryExpiredSessionIsTerminal
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2OrdinaryLeaseExpiryOverOutage

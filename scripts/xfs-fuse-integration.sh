@@ -52,6 +52,9 @@ REQUIRED_TESTS=()
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceZeroEntryLossTicketRecorded"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspacePersistenceFailureSurvivesPermitLoss"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceManagedResumePermitLoss"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKeepAliveParkRetainsIndependentFailure"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReviewCancelledRecoverThenSuspend"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReviewCycleLeaks"
@@ -129,6 +132,42 @@ REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestSharedXFSWritebackDomain"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeRejectsHiddenFusectl"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1CancelledRecoverThenSuspend"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1CycleLeaks"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1DuplicateSuspendAfterCold"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1InterruptedInitialPrepareThenSuspend"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1KernelChurn"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1KernelClockReadiness"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1KernelFrozenLeasePause"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1KernelInterruptedRecover"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1KernelLeaseExpiry"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1KernelSessionExpired"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1LookupAfterRecover"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1LossAggregationLatchesFailure"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1RetryAfterCanceledWithdrawal"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR1StickyAbandonedRefusesCold"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2ClockFlapDuringRecover"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2IncompleteSuspendThenLaterTransition"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2KernelCancelledSleep"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2KernelClockDiag"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2KernelIncompleteSuspend"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2PreparedUnservedReacknowledgeEvidence"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR3GateCloseBeforeFrameDuringPublication"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR3KernelLateApplyCoherence"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR3KernelLongGapAccounted"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR3KernelStressIntegrity"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelAssignedWriteColdCut"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelReadinessBudget10Seconds"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelReadinessBudget45Seconds"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelReparkResnapshotsRealCleanup"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelUnassignedWriteColdCut"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceOvertakenBeforeInitialCut"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceOwnerCloseAtPermitBoundaries"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceOwnerCloseDuringPublication"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspacePollFailureSurvivesPark"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspacePublicationRenewsAgedProofInOriginalJob"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRealSemanticPollFailureSurvivesPark"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRetirementFenceIsUnsubmitted"
 )
 
 fail() {
@@ -515,6 +554,11 @@ run_root_boundary_suite() {
   cat -- "$log"
   [[ $status -eq 0 ]] || fail "root boundary tests exited $status" "$status"
   verify_exact_tests "$log" "${REQUIRED_ROOT_TESTS[@]}"
+  for entry in "${REQUIRED_ROOT_TESTS[@]}"; do
+    if grep -Eq -- "--- SKIP: ${entry##*:}(/| \()" "$log"; then
+      fail "required root test skipped a subtest: $entry" 70
+    fi
+  done
   echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
 }
 

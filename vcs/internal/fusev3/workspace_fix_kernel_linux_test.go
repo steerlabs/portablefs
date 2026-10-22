@@ -153,7 +153,7 @@ func (c *reviewChild) req(cmd string) string {
 func (c *reviewChild) fail(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	c.bad = append(c.bad, msg)
-	fmt.Println("REVIEW-FINDING: " + msg)
+	fmt.Println("" + msg)
 }
 func (c *reviewChild) now() time.Time { return replaySubscriptionClock{c.off}.Now() }
 func (c *reviewChild) suspend() uint64 {

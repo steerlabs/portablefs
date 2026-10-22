@@ -34,7 +34,17 @@ type workspaceDispatch interface {
 	AuthorizationDeadline() time.Time
 }
 type workspaceWorker struct{ Name, Disposition string }
+type WorkspaceState uint8
+
+const (
+	WorkspaceIdle WorkspaceState = iota
+	WorkspacePrepared
+	WorkspaceRecoveryRequired
+	WorkspaceCold
+)
+
 type WorkspaceObservation struct {
+	State WorkspaceState
 	// Result is authoritative; the separately returned error is diagnostic only.
 	Result                                          authorityrpc.LifecycleResult
 	Generation, GateSerial, SubscriptionIncarnation uint64
@@ -50,13 +60,14 @@ type workspaceEvidence struct {
 	abandoned bool
 }
 type workspaceLifecycle struct {
-	observation atomic.Pointer[WorkspaceObservation]
-	lane        chan struct{}
-	clock       workspaceClock
-	renewer     *mountenrollment.Renewer
-	standalone  bool
-	persist     func(WorkspaceObservation) error
-	evidence    atomic.Pointer[workspaceEvidence]
+	beforeRecoveryProof func()
+	observation         atomic.Pointer[WorkspaceObservation]
+	lane                chan struct{}
+	clock               workspaceClock
+	renewer             *mountenrollment.Renewer
+	standalone          bool
+	persist             func(WorkspaceObservation) error
+	evidence            atomic.Pointer[workspaceEvidence]
 	// Lane-owned facts. Joins survive cancellation of their waiter.
 	preparedOnce    bool
 	cold            bool
@@ -159,9 +170,6 @@ func (a *workspaceAttempt) park(ctx context.Context) error {
 func (a *workspaceAttempt) resume() { a.mu.Lock(); a.parked = false; a.mu.Unlock() }
 
 func (w *workspaceLifecycle) recordDrop(r writeback.DropReport) {
-	if r.Entries == 0 {
-		return
-	}
 	for {
 		old := w.evidence.Load()
 		next := &workspaceEvidence{}
@@ -270,12 +278,20 @@ func (m *Mount) WorkspaceObservation() WorkspaceObservation {
 	}
 	o := m.workspaceObservation(prior.Generation, prior.GateSerial)
 	o.Prepared, o.ColdComplete = prior.Prepared, prior.ColdComplete
+	o.State = WorkspaceIdle
+	if o.ColdComplete {
+		o.State = WorkspaceCold
+	}
+	if o.Prepared {
+		o.State = WorkspacePrepared
+	}
 	if o.Prepared {
 		proof, err := m.workspace.Recovery(o.Generation, o.GateSerial)
 		permit := mountenrollment.Permit{Generation: o.Generation, GateSerial: o.GateSerial}
 		_, _, _, live := m.subscription.currentIncarnation()
 		if err != nil && !m.workspace.Installed(proof) || !live || m.workspaceLifecycle.clock.Check(permit) != nil || m.isRevoked() {
 			o.Prepared = false
+			o.State = WorkspaceRecoveryRequired
 		}
 	}
 	return o
@@ -314,7 +330,7 @@ func (w *workspaceLifecycle) enter(ctx context.Context) error {
 // owner's overtaking bit applies only to permit loss, never independent facts.
 func (m *Mount) workspacePublication(ctx context.Context, g, serial uint64, prepared bool) authorityrpc.LifecycleAttempt {
 	failed := func(err error) authorityrpc.LifecycleAttempt {
-		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: err}
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: &authorityrpc.LifecycleIndependentFailure{Err: err}}
 	}
 	if m.isRevoked() || m.ctx.Err() != nil {
 		return failed(errors.New("fusev3: terminal mount before lifecycle publication"))
@@ -334,7 +350,7 @@ func (m *Mount) workspacePublication(ctx context.Context, g, serial uint64, prep
 		if authorityrpc.LifecycleOwnerOvertaken(ctx) {
 			return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptOvertaken, Err: err}
 		}
-		return failed(err)
+		return authorityrpc.ClassifyLifecycleAttempt(err)
 	}
 	if ctx.Err() != nil {
 		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptOvertaken, Err: ctx.Err()}
@@ -369,7 +385,9 @@ func (m *Mount) workspacePublication(ctx context.Context, g, serial uint64, prep
 
 func workspaceResult(ctx context.Context, phase authorityrpc.LifecycleAttempt) authorityrpc.LifecycleResult {
 	if phase.Disposition == authorityrpc.AttemptOvertaken {
-		return authorityrpc.LifecycleResult{Disposition: authorityrpc.LifecycleOvertaken, Err: phase.Err}
+		result := authorityrpc.LifecycleCompletion(ctx, phase.Err)
+		result.Disposition = authorityrpc.LifecycleOvertaken
+		return result
 	}
 	return authorityrpc.LifecycleCompletion(ctx, phase.Err)
 }
@@ -399,11 +417,19 @@ func (m *Mount) publishWorkspace(ctx context.Context, g, serial uint64, ready, c
 		request.Body = append([]byte(nil), request.Body...)
 		o.ParkedRequests = append(o.ParkedRequests, request)
 	}
+	o.State = WorkspaceIdle
+	if o.Prepared {
+		o.State = WorkspacePrepared
+	}
+	if o.ColdComplete {
+		o.State = WorkspaceCold
+	}
 	o.Result = workspaceResult(ctx, phase)
 	persist := func() bool {
 		if err := w.persist(o); err != nil {
-			phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: errors.Join(phase.Err, fmt.Errorf("persist workspace outcome: %w", err))}
+			phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: errors.Join(phase.Err, &authorityrpc.LifecycleIndependentFailure{Err: fmt.Errorf("persist workspace outcome: %w", err)})}
 			o.Prepared, o.ColdComplete = false, false
+			o.State = WorkspaceIdle
 			o.Result = workspaceResult(ctx, phase)
 			return false
 		}
@@ -414,6 +440,7 @@ func (m *Mount) publishWorkspace(ctx context.Context, g, serial uint64, ready, c
 		o.Result = workspaceResult(ctx, phase)
 		if phase.Disposition != authorityrpc.AttemptComplete {
 			o.Prepared, o.ColdComplete = false, false
+			o.State = WorkspaceIdle
 			persist()
 		}
 	}
@@ -476,9 +503,13 @@ func (m *Mount) prepareWorkspace(ctx context.Context, g, serial uint64, recover 
 	if phase.Disposition != authorityrpc.AttemptComplete {
 		return o, phase.Err
 	}
+	if w.beforeRecoveryProof != nil {
+		w.beforeRecoveryProof()
+	}
 	proof, err := m.workspace.Recovery(g, serial)
 	if err != nil {
-		return o, fail(err)
+		phase = authorityrpc.ClassifyLifecycleAttempt(err)
+		return o, err
 	}
 	if err = m.subscription.takeWorkspaceOwnership(ctx); err != nil {
 		return o, fail(err)
@@ -566,6 +597,12 @@ func (m *Mount) prepareWorkspace(ctx context.Context, g, serial uint64, recover 
 	recoveryCtx := context.WithValue(ctx, workspaceRecoveryKey{}, proof)
 	if w.renewer != nil {
 		if err = w.renewer.Resume(p); err != nil {
+			if errors.Is(err, mountenrollment.ErrPermitObsolete) {
+				if _, lost := m.workspace.Recovery(g, serial); lost != nil {
+					phase = authorityrpc.ClassifyLifecycleAttempt(lost)
+					return o, lost
+				}
+			}
 			return o, fail(err)
 		}
 		w.renewer.RefreshNow()

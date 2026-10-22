@@ -51,7 +51,7 @@ func TestOpusR2IncompleteSuspendThenLaterTransition(t *testing.T) {
 				o, err = f.mount.RecoverWorkspace(t.Context(), 1, serial)
 				t.Logf("Recover after cancelled Suspend: prepared=%v result=%v err=%v", o.Prepared, o.Result.Disposition, err)
 				if err != nil || !o.Prepared {
-					t.Errorf("FINDING cancel-then-recover: incomplete cut cannot be reconciled by Recover: %v", err)
+					t.Errorf("cancel-then-recover: incomplete cut cannot be reconciled by Recover: %v", err)
 				}
 				return
 			}
@@ -65,7 +65,7 @@ func TestOpusR2IncompleteSuspendThenLaterTransition(t *testing.T) {
 			o3, err3 := f.mount.SuspendWorkspace(t.Context(), 1, serial3, continuous.Time().Add(5*time.Second))
 			t.Logf("third Suspend (fresh deadline): cold=%v err=%v", o3.ColdComplete, err3)
 			if err != nil || !o.ColdComplete || err2 != nil || !o2.Prepared || err3 != nil || !o3.ColdComplete {
-				t.Errorf("FINDING %s: incarnation stranded after an incomplete Suspend: retry=%v recover=%v third=%v", variant, err, err2, err3)
+				t.Errorf("%s: incarnation stranded after an incomplete Suspend: retry=%v recover=%v third=%v", variant, err, err2, err3)
 			}
 		})
 	}
@@ -114,10 +114,10 @@ func TestOpusR2PreparedUnservedReacknowledgeEvidence(t *testing.T) {
 		t.Fatal("re-ack failed", o.Result, err)
 	}
 	if len(o.Workers) == 0 {
-		t.Errorf("FINDING: ColdComplete re-acknowledgment carries no worker dispositions (full cut carried %d)", len(full.Workers))
+		t.Errorf("ColdComplete re-acknowledgment carries no worker dispositions (full cut carried %d)", len(full.Workers))
 	}
 	if o.ColdComplete && (active || proof || writeback) {
-		t.Errorf("FINDING: re-acknowledged cold left subscription active=%v proof=%v writebackStarted=%v", active, proof, writeback)
+		t.Errorf("re-acknowledged cold left subscription active=%v proof=%v writebackStarted=%v", active, proof, writeback)
 	}
 	o2, err := f.mount.RecoverWorkspace(t.Context(), 1, serial2)
 	t.Logf("Recover after re-ack: prepared=%v err=%v", o2.Prepared, err)
@@ -167,6 +167,6 @@ func TestOpusR2ClockFlapDuringRecover(t *testing.T) {
 	o, err := f.mount.RecoverWorkspace(ctx, 1, serial)
 	t.Logf("Recover across a 1s readiness loss: prepared=%v result=%v err=%v", o.Prepared, o.Result.Disposition, err)
 	if err != nil || !o.Prepared || o.Result.Disposition != authorityrpc.LifecycleCompleted {
-		t.Errorf("FINDING: transient clock unavailability produced a Failed (incarnation-terminal) Recover result: %v", err)
+		t.Errorf("transient clock unavailability produced a Failed (incarnation-terminal) Recover result: %v", err)
 	}
 }

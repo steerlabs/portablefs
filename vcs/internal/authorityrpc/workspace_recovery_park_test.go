@@ -67,7 +67,7 @@ func TestOpusParkLatencyDuringFailingReconnect(t *testing.T) {
 	elapsed := time.Since(start)
 	t.Logf("ParkDispatch returned after %v err=%v (failed Resume attempts so far %d, DialTimeout %v)", elapsed.Round(10*time.Millisecond), err, h.resumes.Load(), cfg.DialTimeout)
 	if elapsed > 250*time.Millisecond {
-		t.Errorf("FINDING: one failing reconnect held Park for %v", elapsed.Round(10*time.Millisecond))
+		t.Errorf("one failing reconnect held Park for %v", elapsed.Round(10*time.Millisecond))
 	}
 	cancelCall()
 	select {

@@ -15,6 +15,7 @@ import (
 // an applying operation must settle before Park can certify quiescence.
 // Ordinary clients have no fence and keep their existing dispatch path.
 type DispatchFence struct {
+	waitingApplying  int
 	mu               sync.Mutex
 	parked, draining bool
 	check            func() error
@@ -30,9 +31,10 @@ type DispatchOwner struct {
 }
 
 type DispatchSnapshot struct {
-	Parked     bool
-	InFlightIO int
-	Owners     []DispatchOwner
+	WaitingApplying int
+	Parked          bool
+	InFlightIO      int
+	Owners          []DispatchOwner
 }
 
 type dispatchTimeoutKey struct{}
@@ -94,7 +96,7 @@ func (f *DispatchFence) Park(ctx context.Context) error {
 func (f *DispatchFence) Snapshot() DispatchSnapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s := DispatchSnapshot{Parked: f.parked, InFlightIO: f.io}
+	s := DispatchSnapshot{Parked: f.parked, InFlightIO: f.io, WaitingApplying: f.waitingApplying}
 	for _, o := range f.owners {
 		o.Body = append([]byte(nil), o.Body...)
 		s.Owners = append(s.Owners, o)
@@ -159,7 +161,14 @@ func (f *DispatchFence) own(ctx context.Context, r *authoritypb.Request) (func()
 		return nil, err
 	}
 	f.mu.Lock()
-	if err := f.waitReadyLocked(ctx, applying); err != nil {
+	if applying {
+		f.waitingApplying++
+	}
+	err = f.waitReadyLocked(ctx, applying)
+	if applying {
+		f.waitingApplying--
+	}
+	if err != nil {
 		f.mu.Unlock()
 		return nil, err
 	}

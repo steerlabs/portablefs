@@ -11,6 +11,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -277,11 +278,22 @@ func TestWorkspaceRealVisibilityOwnerOutlivesPark(t *testing.T) {
 func TestKernelOrdinaryExpiredSessionIsTerminal(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, SessionLease: 20 * time.Second})
 	f.advanceClock(time.Minute)
-	f.sweepSessions()
+	if removed := f.sweepSessions(); removed == 0 {
+		t.Fatal("session expiry probe did not sweep an expired session")
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	_, err := f.clients[0].CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
-	if !errors.Is(err, authorityrpc.ErrSessionEnded) || !errors.Is(f.clients[0].SessionEndCause(), authorityrpc.ErrSessionEnded) {
-		t.Fatal("ordinary expiry remained a transient transport failure", err, f.clients[0].SessionEndCause())
+	response, err := f.clients[0].CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+	// The first observer retains the exact terminal refusal; a later caller
+	// sees the already-published terminal error at entry. Both end the session.
+	if err == nil {
+		if response.GetErrno() != int32(syscall.ESTALE) || !response.GetSessionTerminal() {
+			t.Fatal("expired session probe did not return its terminal refusal", response)
+		}
+	} else if !errors.Is(err, authorityrpc.ErrSessionEnded) {
+		t.Fatal("ordinary expiry remained a transient transport failure", err)
+	}
+	if !errors.Is(f.clients[0].SessionEndCause(), authorityrpc.ErrSessionEnded) {
+		t.Fatal("ordinary expiry did not latch its terminal cause", f.clients[0].SessionEndCause())
 	}
 }

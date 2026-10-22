@@ -1678,16 +1678,16 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 		if err != nil {
 			return nil, nil, false, err
 		}
-	}
-	defer func() {
-		if endIO != nil {
-			endIO()
+		defer func() {
+			if endIO != nil {
+				endIO()
+			}
+		}()
+		if timeout, _ := ctx.Value(dispatchTimeoutKey{}).(time.Duration); timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
 		}
-	}()
-	if timeout, _ := ctx.Value(dispatchTimeoutKey{}).(time.Duration); timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
 	}
 	// Request IDs are physical-connection envelopes, not replay identities. A
 	// same-session mutation retry keeps its Mutation slot/sequence and body but
@@ -2121,6 +2121,14 @@ func (c *Client) CallMutationWithIdentityRetained(
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
+	// Readiness waiting is still buffer/epoch-owned. Registration under the
+	// fence is the handoff: Park now joins this applying owner, and no caller
+	// cancellation check can discard its identity/body before session retention.
+	releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
+	if ownerErr != nil {
+		return nil, nil, ownerErr
+	}
+	defer releaseOwner()
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
 		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		stop := context.AfterFunc(session, cancel)
@@ -2130,11 +2138,6 @@ func (c *Client) CallMutationWithIdentityRetained(
 		}
 		ctx = owned
 	}
-	releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
-	if ownerErr != nil {
-		return nil, nil, ownerErr
-	}
-	defer releaseOwner()
 	// A successful callback may publish a dense ordinal and start its successor.
 	// Session ownership must already exist before that publication.
 	if assigned != nil {

@@ -42,7 +42,7 @@ func TestReviewRetryAfterCanceledWithdrawal(t *testing.T) {
 	o, err = f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(10*time.Second))
 	t.Logf("healthy retry: cold=%v err=%v", o.ColdComplete, err)
 	if err != nil || !o.ColdComplete {
-		t.Fatalf("REPRO R1: healthy retry after a cancelled waiter can never prove cold: %v", err)
+		t.Fatalf("R1: healthy retry after a cancelled waiter can never prove cold: %v", err)
 	}
 }
 
@@ -77,7 +77,7 @@ func TestReviewCancelledRecoverThenSuspend(t *testing.T) {
 			o2, err2 := f.mount.RecoverWorkspace(t.Context(), 1, serial2)
 			t.Logf("later Recover: prepared=%v err=%v", o2.Prepared, err2)
 			if err != nil || !o.ColdComplete || err2 != nil || !o2.Prepared {
-				t.Fatalf("REPRO R2(%s): interrupted Recover leaves the incarnation unrecoverable: suspend=%v recover=%v", variant, err, err2)
+				t.Fatalf("R2(%s): interrupted Recover leaves the incarnation unrecoverable: suspend=%v recover=%v", variant, err, err2)
 			}
 		})
 	}
@@ -106,7 +106,7 @@ func TestReviewDuplicateSuspendAfterCold(t *testing.T) {
 			o2, err2 := f.mount.RecoverWorkspace(t.Context(), 1, serial)
 			t.Logf("Recover: prepared=%v err=%v", o2.Prepared, err2)
 			if err != nil || !o.ColdComplete || err2 != nil || !o2.Prepared {
-				t.Fatalf("REPRO R3(%s): retried Suspend destroyed the cold proof: suspend=%v recover=%v", variant, err, err2)
+				t.Fatalf("R3(%s): retried Suspend destroyed the cold proof: suspend=%v recover=%v", variant, err, err2)
 			}
 		})
 	}
@@ -166,7 +166,7 @@ func TestReviewCycleLeaks(t *testing.T) {
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
 		t.Logf("%s", buf[:n])
-		t.Fatalf("REPRO R4: leak over cycles goroutines %d->%d fds %d->%d", g0, g1, fd0, fd1)
+		t.Fatalf("R4: leak over cycles goroutines %d->%d fds %d->%d", g0, g1, fd0, fd1)
 	}
 }
 
@@ -211,7 +211,7 @@ func TestReviewStickyAbandonedRefusesCold(t *testing.T) {
 	o, err := f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(5*time.Second))
 	t.Logf("Suspend after earlier lost delegation: cold=%v err=%v loss=%d outcome=%v", o.ColdComplete, err, len(o.Loss), o.Outcome)
 	if err != nil || !o.ColdComplete {
-		t.Fatalf("REPRO R5: earlier accounted delegation loss permanently refuses cold: %v", err)
+		t.Fatalf("R5: earlier accounted delegation loss permanently refuses cold: %v", err)
 	}
 	if o.Outcome.Release != "abandoned" {
 		t.Fatal("cold erased current interval abandonment", o)
@@ -251,7 +251,7 @@ func TestReviewLossAggregationLatchesFailure(t *testing.T) {
 	o, err := f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(5*time.Second))
 	t.Logf("Suspend after 33 accounted losses: cold=%v err=%v losses=%d", o.ColdComplete, err, len(o.Loss))
 	if err != nil || !o.ColdComplete {
-		t.Fatalf("REPRO R6: aggregated (bounded) loss refuses cold: %v", err)
+		t.Fatalf("R6: aggregated (bounded) loss refuses cold: %v", err)
 	}
 	var entries, bytes uint64
 	for _, loss := range o.Loss {
@@ -289,6 +289,6 @@ func TestReviewInterruptedInitialPrepareThenSuspend(t *testing.T) {
 	o2, err2 := f.mount.RecoverWorkspace(t.Context(), 1, serial2)
 	t.Logf("Recover after wake: prepared=%v err=%v", o2.Prepared, err2)
 	if err != nil || !o.ColdComplete || err2 != nil || !o2.Prepared {
-		t.Fatalf("REPRO R7: interrupted initial Prepare strands the incarnation: suspend=%v recover=%v", err, err2)
+		t.Fatalf("R7: interrupted initial Prepare strands the incarnation: suspend=%v recover=%v", err, err2)
 	}
 }

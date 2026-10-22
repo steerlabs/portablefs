@@ -57,3 +57,7 @@ github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSessionOwnedAssign
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestColdReplayRejectsSequenceGapAndMutationHeaderReads
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestReplayOverlapsColdSubscribeRecallAndFence
 github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestSessionOwnedAssignmentPreservesTerminalCancellation
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestOpusParkLatencyDuringFailingReconnect
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestOpusR3ResumeProbeUniform
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestOpusR3LegitLiveResumeUnaffected
+github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestLifecyclePermitLossPreservesIndependentFailure

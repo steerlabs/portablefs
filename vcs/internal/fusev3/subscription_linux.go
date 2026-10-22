@@ -95,6 +95,7 @@ func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
 func (t wallSubscriptionTimer) Stop() bool          { return t.timer.Stop() }
 
 type subscriptionConfig struct {
+	beforeRecoveryProof func(install bool)
 	// Deterministic test schedule at the last proof check/local-store boundary.
 	beforeWorkspaceInstall func()
 	clock                  subscriptionClock
@@ -454,9 +455,15 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	}()
 	var proof *workspaceadmission.RecoveryPermit
 	if s.mount != nil && s.mount.workspace != nil {
+		if s.config.beforeRecoveryProof != nil {
+			s.config.beforeRecoveryProof(false)
+		}
 		p, ok := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
-		if !ok || s.mount.workspace.Recover(p) != nil {
+		if !ok {
 			return workspaceadmission.ErrClosed
+		}
+		if err := s.mount.workspace.Recover(p); err != nil {
+			return err
 		}
 		proof = &p
 	}
@@ -549,7 +556,16 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				s.mu.Unlock()
 				return err
 			}
-			if s.paused || s.workspaceOwned && proof == nil || proof != nil && s.mount.workspace.Recover(*proof) != nil {
+			if proof != nil {
+				if s.config.beforeRecoveryProof != nil {
+					s.config.beforeRecoveryProof(true)
+				}
+				if err := s.mount.workspace.Recover(*proof); err != nil {
+					s.mu.Unlock()
+					return err
+				}
+			}
+			if s.paused || s.workspaceOwned && proof == nil {
 				s.mu.Unlock()
 				return errSubscriptionPaused
 			}
@@ -703,7 +719,7 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 				independent := disposition.Disposition == authorityrpc.LifecycleFailed && !reset
 				s.mu.Lock()
 				if independent {
-					s.workspaceFailure = errors.Join(s.workspaceFailure, disposition.Err)
+					s.workspaceFailure = errors.Join(s.workspaceFailure, &authorityrpc.LifecycleIndependentFailure{Err: disposition.Err})
 				}
 				if reset {
 					s.workspaceReset = true

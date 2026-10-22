@@ -153,7 +153,7 @@ func (c *opusChild) req(cmd string) string {
 func (c *opusChild) fail(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	c.bad = append(c.bad, msg)
-	fmt.Println("REVIEW-FINDING: " + msg)
+	fmt.Println("REVIEW-" + msg)
 }
 func (c *opusChild) now() time.Time { return replaySubscriptionClock{c.off}.Now() }
 func (c *opusChild) suspend() uint64 {
@@ -431,6 +431,9 @@ func opusKernelSessionExpiredChild(t *testing.T) {
 	o, err := c.m.RecoverWorkspace(ctx, 1, serial)
 	cancel()
 	fmt.Printf("expired-session Recover after %v: prepared=%v err=%v cause=%v\n", time.Since(begin), o.Prepared, err, c.m.rpc.SessionEndCause())
+	if o.Prepared || !errors.Is(err, authorityrpc.ErrSessionEnded) || !errors.Is(c.m.rpc.SessionEndCause(), authorityrpc.ErrSessionEnded) {
+		t.Fatal("expired session lost its terminal verdict", o.Result, err)
+	}
 	c.req("dispose")
 	select {
 	case <-c.m.kernelConnectionDone:

@@ -61,6 +61,6 @@ func TestOpusR2OrdinaryLeaseExpiryOverOutage(t *testing.T) {
 		t.Error("expired ordinary mount did not enforce its terminal session", f.clients[0].SessionEndCause(), rerr, ferr)
 	}
 	if verdict == "none within 60s" {
-		t.Errorf("FINDING: ordinary mount never reached a session verdict after real lease expiry")
+		t.Errorf("ordinary mount never reached a session verdict after real lease expiry")
 	}
 }

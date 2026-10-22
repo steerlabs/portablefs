@@ -242,10 +242,12 @@ terminal fact survives replacement of its job and cold transaction. Later
 Suspend may withdraw state, but reports the retained failure instead of a new
 cold recovery opportunity; exact Cleanup remains available. The Mount driver returns an explicit lifecycle disposition:
 Completed requires successful publication and no error; Overtaken asserts only
-job-overtaking cancellation, with no independent work or teardown failure;
+job overtaking, with no independent work or teardown failure;
 Failed includes independent failures even when joined with cancellation.
-Overtaken avoids the terminal latch only when the owner recorded cancelling
-that exact job. Error-chain membership never determines the outcome. A
+Overtaken avoids the terminal latch when the owner recorded cancelling
+that exact job or the typed result attributes permit loss to its generation,
+serial and a newer supervisor serial. Gate Close can precede its control frame.
+An untyped cancellation error alone never establishes that attribution. A
 cancellation-only teardown may omit the context error without ending the
 incarnation. Missing dispositions and unrecorded cancellation fail closed.
 Recover on a terminal incarnation refuses `incarnation-terminal` in the local
@@ -690,3 +692,13 @@ initializer treats that completion as its format boundary; it does not use
 The Linux frontend admission substrate is described in
 [Linux workspace admission](linux-workspace-admission.md). Managed launch remains
 unavailable until the lifecycle, clock and protected-path driver are integrated.
+
+The private lifecycle observation reports `WorkspaceRecoveryRequired` when a
+prepared mount loses its subscription or clock proof. The root driver must
+observe that state while awake, close the shared gate, and drive the authorized
+Close/Suspend/Recover/Open sequence. Restoring clock readiness alone cannot
+republish serving permission. Grant expiry within a live authorized session
+forfeits its accepted non-durable cut exactly once; recovery preserves the
+cumulative loss tickets and old description/root barrier baselines. It neither
+replays forfeited bytes under a successor grant nor ends a valid session.
+The production driver and its awake clock maintenance remain integration work.

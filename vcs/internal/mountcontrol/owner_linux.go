@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -32,8 +33,8 @@ type LifecycleResult = authorityrpc.LifecycleResult
 // after successful publication with no error. Overtaken means cancellation-only:
 // no independent failure occurred, including during teardown, even if Err loses
 // the cancellation chain. Any independent failure, including one joined with
-// cancellation, must return Failed. Only an owner-recorded cancellation of this
-// exact job makes Overtaken nonterminal; context/error inspection cannot do so.
+// cancellation, must return Failed. Only an owner-recorded cancellation or typed newer-serial loss of this
+// exact job makes Overtaken nonterminal. The gate can lead its control frame.
 // ValidateInstall verifies first-delivery roles/bootstrap without taking
 // ownership. All three callbacks and CheckPermit must exist before this
 // boundary can accept a real job.
@@ -459,7 +460,9 @@ func (o *Owner) run(j *Job) {
 	result := o.Driver.Run(j.ctx, j)
 	o.mu.Lock()
 	if result.Disposition != LifecycleCompleted || result.Err != nil || j.state != "prepared" && j.state != "cold" && j.state != "cleanup-finalized" {
-		canceled := j.lifecycleOwner.Overtaken() && result.Disposition == LifecycleOvertaken
+		loss := result.PermitLoss
+		permitLost := loss != nil && strconv.FormatUint(loss.Generation, 10) == j.start.Workspace.Generation && strconv.FormatUint(loss.Serial, 10) == j.start.Workspace.GateSerial && loss.Successor > loss.Serial
+		canceled := (j.lifecycleOwner.Overtaken() || permitLost) && result.Disposition == LifecycleOvertaken
 		if !canceled && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && o.servingFailure == "" {
 			o.servingFailure = "mount incarnation preparation/recovery failed"
 		}

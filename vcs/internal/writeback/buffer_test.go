@@ -183,17 +183,33 @@ func TestSetAttrResolvesNowOnceAtAdmission(t *testing.T) {
 	}
 }
 
+type dropRecordingFlusher struct {
+	recordingFlusher
+	drops []DropReport
+}
+
+func (f *dropRecordingFlusher) RecordWritebackDrop(r DropReport) { f.drops = append(f.drops, r) }
+
 func TestInitialLossSequenceIsPreservedAndAdvanced(t *testing.T) {
-	b := newTestBuffer(t, &recordingFlusher{}, Options{InitialLossSequence: 41, MaxBytes: 1024, MaxEntries: 8})
+	flusher := &dropRecordingFlusher{}
+	b := newTestBuffer(t, flusher, Options{InitialLossSequence: 41, MaxBytes: 1024, MaxEntries: 8})
 	if got := b.Snapshot(); got.LossSequence != 41 || got.Sequence != 0 {
 		t.Fatalf("initial cut = %+v, want sequence 0 and loss 41", got)
 	}
 	if got := b.Stats().LossSequence; got != 41 {
 		t.Fatalf("initial Stats loss = %d, want 41", got)
 	}
-	report := b.Drop(testIdentity(40), "epoch replacement")
-	if report.LossSequence != 42 || b.LossSequence() != 42 {
-		t.Fatalf("loss after Drop = report %d buffer %d, want 42", report.LossSequence, b.LossSequence())
+	id := testIdentity(40)
+	if report := b.Drop(id, "uncertain clean grant"); report.Entries != 0 || report.LossSequence != 42 || b.LossSequence() != 42 || len(flusher.drops) != 1 || flusher.drops[0] != report {
+		t.Fatal("zero-entry ticket advanced without its authoritative record", report, flusher.drops)
+	}
+	b.ClearLost(id)
+	if _, err := b.Write(context.Background(), id, 0, []byte("lost")); err != nil {
+		t.Fatal(err)
+	}
+	report := b.Drop(id, "epoch replacement")
+	if report.LossSequence != 43 || b.LossSequence() != 43 || len(flusher.drops) != 2 || flusher.drops[1] != report {
+		t.Fatalf("loss after Drop = report %+v buffer %d records %+v, want 43", report, b.LossSequence(), flusher.drops)
 	}
 }
 
@@ -1753,6 +1769,8 @@ func TestCapacityRefusalKeepsErrnoAcrossDropDuringFlush(t *testing.T) {
 	if loss != 1 || errno != syscall.ENOSPC || b.ErrnoSince(0) != syscall.ENOSPC || b.ErrnoSince(1) != 0 {
 		t.Fatalf("failure = %d/%v", loss, errno)
 	}
+	b.ClearLost(id)
+	mustWrite(t, b, id, 0, "unprovable")
 	report = b.Drop(id, "fenced")
 	loss, errno = b.IdentityFailure(id, 0)
 	if loss != 2 || errno != 0 || report.Errno != 0 || b.ErrnoSince(0) != 0 {
@@ -1765,11 +1783,17 @@ func TestMixedLossesCannotHideUncertainDataBehindCapacityErrno(t *testing.T) {
 		t.Run(fmt.Sprint(capacityFirst), func(t *testing.T) {
 			b := newTestBuffer(t, &recordingFlusher{})
 			id := testIdentity(92)
+			mustWrite(t, b, id, 0, "first")
 			if capacityFirst {
 				b.DropWithErrno(id, "full", syscall.ENOSPC)
-				b.Drop(id, "coherence")
 			} else {
 				b.Drop(id, "coherence")
+			}
+			b.ClearLost(id)
+			mustWrite(t, b, id, 0, "second")
+			if capacityFirst {
+				b.Drop(id, "coherence")
+			} else {
 				b.DropWithErrno(id, "full", syscall.ENOSPC)
 			}
 			if loss, errno := b.IdentityFailure(id, 0); loss != 2 || errno != 0 {

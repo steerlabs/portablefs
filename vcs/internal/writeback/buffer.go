@@ -527,6 +527,8 @@ func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) Dro
 			barrier.errno = errno
 		}
 	}
+	// A forfeited grant retains its conservative completion ticket even when
+	// its accepted tail has drained. Every ticket must reach the loss observer.
 	b.loss++
 	f.lastLoss = b.loss
 	f.lastErrno, b.lastErrno = errno, errno
@@ -557,7 +559,7 @@ func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) Dro
 	delete(b.active, id)
 	f.generation++
 	b.signal()
-	if observer, ok := b.flusher.(DropObserver); ok && report.Entries != 0 {
+	if observer, ok := b.flusher.(DropObserver); ok {
 		observer.RecordWritebackDrop(report)
 	}
 	return report
