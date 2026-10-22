@@ -237,6 +237,11 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 	body, rights, err := mountcontrol.Receive(connection, limit)
 	defer rights.Close()
 	if err != nil {
+		// Bounds/ancillary violations prove malformed authenticated input even
+		// without a complete JSON body. Transport loss alone proves no frame.
+		if class == mountcontrol.WorkspacePeer && errors.Is(err, mountcontrol.ErrGrammar) && c.workspace.Owner.CloseAdmission != nil {
+			c.workspace.Owner.CloseAdmission()
+		}
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request"})
 		return
 	}

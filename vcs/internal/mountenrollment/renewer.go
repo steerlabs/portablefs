@@ -128,6 +128,7 @@ type Renewer struct {
 	sequence                     uint64
 	pending                      *controlplane.MountAuthorization
 	readiness, installed         RenewalReadiness
+	installedPublishable         bool
 	status                       RenewalStatus
 	force                        bool
 	terminal                     error
@@ -201,7 +202,7 @@ func (r *Renewer) RefreshNow() { r.mu.Lock(); r.force = true; r.signalLocked(); 
 func (r *Renewer) Readiness() RenewalReadiness {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.terminal != nil || !r.running || !r.allowedLocked() || !r.installationSafeLocked() {
+	if r.terminal != nil || !r.running || !r.allowedLocked() || !r.installationSafeLocked() || !r.readiness.Ready(false, r.permit, r.session, r.installed.AuthorizationDeadline) || r.readiness.InstalledSequence != r.installed.InstalledSequence {
 		return RenewalReadiness{State: "pending", Permit: r.permit}
 	}
 	return r.readiness
@@ -209,7 +210,7 @@ func (r *Renewer) Readiness() RenewalReadiness {
 
 // A proof is publishable only outside the serving withdrawal margin.
 func (r *Renewer) installationSafeLocked() bool {
-	return r.installed.InstalledSequence > 0 && r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin))
+	return r.installedPublishable && r.installed.State == "installed" && r.installed.SessionID == r.session && r.installed.AuthorizationDeadline.Equal(r.deadline) && r.installed.InstalledSequence > 0 && r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin))
 }
 func (r *Renewer) signalLocked() {
 	if r.wake == nil {
@@ -400,6 +401,8 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		obsolete := errors.Is(err, ErrObsoleteInstallation)
 		known := (err == nil || obsolete) && allowed
 		if known {
+			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+			r.installedPublishable = false
 			if obsolete {
 				err = nil
 			}
@@ -414,6 +417,7 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 			} else {
 				r.deadline = installed
 				r.authorizedAt = r.now()
+				r.installedPublishable = !obsolete
 				r.installed = RenewalReadiness{State: "installed", InstalledSequence: seq, Permit: p, SessionID: session, AuthorizationDeadline: installed}
 				if r.allowedLocked() && r.permit == p && ctx.Err() == nil && !obsolete && r.installationSafeLocked() {
 					r.readiness = r.installed

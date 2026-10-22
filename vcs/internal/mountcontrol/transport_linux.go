@@ -85,7 +85,7 @@ func Receive(c *net.UnixConn, limit int) (body []byte, rights *Rights, err error
 		return nil, rights, e
 	}
 	data := make([]byte, 8192)
-	oob := make([]byte, unix.CmsgSpace(256*4))
+	oob := make([]byte, unix.CmsgSpace(2*4))
 	for {
 		var n, on, flags int
 		var inner error

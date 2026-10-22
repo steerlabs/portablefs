@@ -389,7 +389,7 @@ func TestObservationAfterDrainExpiry(t *testing.T) {
 	})
 	q := request("workspace-suspend", 1, 1)
 	transaction(t, &q)
-	q.Workspace.DrainBudgetNanos = "1"
+	q.Workspace.DrainBudgetNanos = "10000000"
 	j := start(t, o, q)
 	awaitResult(t, expired)
 	if snap := observe(t, o, 2, 1); snap.Workspace.State != "pending-suspend" {
@@ -537,7 +537,7 @@ func TestCloseInvalidatesAdmissionButRequiresCurrentPermitToStart(t *testing.T) 
 	}
 }
 
-// A failed start can retain an unaccepted offer as evidence. That evidence
+// A failed start retains its stopped install action as evidence. That evidence
 // cannot authorize new effects after the worker has ended.
 func TestFailedJobCannotAcceptItsUnacceptedInstallOffer(t *testing.T) {
 	offered, release := make(chan struct{}), make(chan struct{})
@@ -564,7 +564,7 @@ func TestFailedJobCannotAcceptItsUnacceptedInstallOffer(t *testing.T) {
 	}
 	assertClosed(t, fds)
 	snap := observe(t, o, 2, 1)
-	if snap.Workspace.State != "failed" || snap.Workspace.Phases.Install.Progress != "offered" || installs.Load() != 0 {
+	if snap.Workspace.State != "failed" || snap.Workspace.Phases.Install.Progress != "failed" || snap.Workspace.Phases.Install.Failure != "stopped" || installs.Load() != 0 {
 		t.Fatal("unaccepted evidence misreported as accepted", snap, installs.Load())
 	}
 }

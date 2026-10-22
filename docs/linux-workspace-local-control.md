@@ -43,7 +43,9 @@ replaces it. Equal operation ID and content acknowledge the same acceptance;
 changed content refuses and closes admission. Older operations refuse retired.
 A larger number alone grants no transition. Prepare is single-use, including
 failure or cancellation. Recover requires cold state, a current permit and an
-unconsumed exact Resume authorization with advancing generation.
+unconsumed exact Resume authorization with advancing generation. Before
+consuming the token, its complete canonical Suspension, including nonce and
+fixed roster, must equal the Suspension retained by the exact cold job.
 
 Under the owner lock, acceptance reserves a job or consumes an offered action.
 Only then does the owner dispatch work on its lifecycle context. No handler,
@@ -53,17 +55,36 @@ resources and partial witness for cleanup; it cannot offer the action again.
 
 The mount has one install slot and one removal lifecycle, represented by fixed
 voluntary and terminal slots. Each mode has at most one action identity, so an
-incarnation has at most three identities. Terminal escalation waits for the old
-worker/root action to join and retires its voluntary offer. Successful removal
-is irreversible. Suspend/Cleanup invalidate admission and cancel old work
-before waiting; occupied means the caller must retry that same start after the
-old owner joins. Socket disappearance never replaces a worker.
+incarnation has at most three identities. Terminal escalation waits for the
+old worker/root action to join and retires its voluntary offer. Successful
+removal is irreversible. Suspend/Cleanup invalidate admission and cancel old
+work before waiting; occupied means the caller must retry that same start
+after the old owner joins. Socket disappearance never replaces a worker. An
+ended Prepare changes its unaccepted install offer to failed/stopped; it
+retains that action as evidence and cannot invite another handoff. Publish and
+Offer require a running job.
 
-`AdmitFrame` invalidates admission once for a fully framed authenticated Close,
-before lane, hangup or budget exits. It performs no supervisor memfd write.
-Malformed half-closed input also invalidates admission; truncated full loss
-creates no request. Configuration, including callbacks, precedes listener
-publication.
+`AdmitFrame` invalidates daemon admission exactly once for every fully framed,
+authenticated Suspend/Cleanup, including an equal retry, retired operation or
+foreign binding, before lane, hangup or budget exits. This is a local safety
+action; it never accepts, cancels, replaces or erases a job by itself and
+writes no supervisor memfd. A valid Close may additionally cancel the current
+worker only as a legal successor: matching mount, boot and both service
+identities; strictly higher operation ID; generation and gate serial no older
+than the current job; current closed permit; and a legal lifecycle transition.
+Suspend cannot succeed Cleanup. Voluntary Cleanup cannot interrupt terminal
+Cleanup; terminal escalation may interrupt voluntary Cleanup.
+Retired/foreign/changed same-ID frames never cancel accepted work. The old
+worker remains owned until it joins; the new start then revalidates
+acceptance.
+
+Malformed authenticated write-half-closed input invalidates admission as well.
+Receive-level body bounds, excess rights and ancillary truncation are proven
+grammar failures and invalidate even if the peer subsequently disconnects.
+Incomplete full socket loss, reset and timeout alone prove no frame and do not
+invalidate. Every Receive error disposes of all received rights; the kernel
+closes rights truncated from the ancillary buffer. Configuration, including
+callbacks, precedes listener publication.
 
 ## Observation
 
@@ -82,19 +103,29 @@ slots carry one finite `failure`: handler-failed, stopped or deadline. Reason
 and option limits remain 256 bytes; a witness totals at most 512 bytes. The
 maximum fixed-slot/loss fixture fits the existing frame bound.
 
-Snapshots retain cumulative Loss, durability, observed disposition and cleanup
-debt through job changes. Install complete does not imply prepared; removal
-complete does not imply cleanup-finalized. An observation beyond the current
-operation refuses not-accepted, and one before it refuses retired. Those facts
-apply at the snapshot instant. Repeated IDs may return newer snapshots. The
-owner retains no observations and accepts no snapshot as an action permit.
+Snapshots retain cumulative Loss, immutable acquired witness and cleanup debt
+through job changes. Durability/observation/release describe the current
+serving interval. Successful prepared publication starts a new
+unresolved/unobserved interval while preserving Loss and debt; failed or
+overtaken preparation does not claim a new interval. Valid cumulative Loss
+merges independently of any conflicting disposition or other invalid
+publication field. Install complete does not imply prepared; removal complete
+does not imply cleanup-finalized. A late exact removal result updates its slot
+even after the job fails, preserving the failed state and reason. It advances
+progress only for a live worker waiting in unmount-required. A failed job with
+successful removal may accept a legal Cleanup successor for remaining
+session/connection cleanup; no successor can repeat successful removal. An
+observation beyond the current operation refuses not-accepted, and one before
+it refuses retired. Those facts apply at the snapshot instant. Repeated IDs
+may return newer snapshots. The owner retains no observations and accepts no
+snapshot as an action permit.
 
 After a lost start response, observe before resending the same semantic start.
 After lost phase delivery on a live job, offered permits another copy of the
 same action; running/complete/failed never permits re-execution. A failed job
-can retain an unaccepted offer as evidence, but cannot accept that handoff. The root preserves monotone
-ownership facts and rechecks the current permit before Open, including after a
-delayed kernel-required observation.
+retains an unaccepted install action as failed/stopped evidence. The root
+preserves monotone ownership facts and rechecks the current permit before
+Open, including after a delayed kernel-required observation.
 
 All refusals have `ok=false`, state refused, compact correlation and one code:
 unavailable, occupied, retired, invalid, handler-failed, deadline, stopped,
@@ -107,10 +138,11 @@ erases an earlier accepted job.
 Socket expiry bounds admission/delivery only. Accepted Prepare/Recover have
 bounded network attempts without an outer socket-derived recovery timeout.
 Suspend captures the root's shrinking drain remainder from original attempt
-receipt, charging framing and admission delay. Retries cannot extend that
-captured deadline; later observations use independent socket budgets. Host
-cold acknowledgment/pause, authorization, renewal and withdrawal deadlines keep
-their existing meanings.
+receipt, charging framing and admission delay. An already-spent drain deadline
+refuses before acceptance and consumes no operation ID. Retries cannot extend
+that captured deadline; later observations use independent socket budgets.
+Host cold acknowledgment/pause, authorization, renewal and withdrawal
+deadlines keep their existing meanings.
 
 Only install receives rights, in FUSE/abort order. Account for all ancillary
 input and set close-on-exec at recvmsg. Before acceptance the real driver
@@ -120,11 +152,21 @@ atomically moves rights into the job. Every later install refuses
 of the same inode. There is no descriptor comparison or retained replay copy.
 
 The root records bootstrap in progress before its single mount syscall and
-retains original descriptions and partial effects. Unknown delivery permits
-copies of those originals, never a second mount. Observed child ownership ends
-the redundant root FUSE copy while retaining the original abort description.
-Exact finalization requires independent process exit and kernel/source/alias
-absence. Voluntary EBUSY remains a real error owned by root removal.
+retains original descriptions and partial effects. Begin owns an outstanding
+attempt until Finish settles, including cancellation before the syscall.
+BeginRemoval and Finalize refuse occupied while it remains outstanding. The
+caller must reobserve absence after it settles; observations from the refused
+finalization cannot establish later absence. Finish retains every
+nonconflicting acquired witness field before testing handoff completeness,
+even on partial descriptor acquisition or owner loss. No effect may appear
+behind completed finalization. Unknown delivery permits copies of those
+originals, never a second mount. Observed child ownership ends the redundant
+root FUSE copy while retaining the original abort description. An install
+observation cannot transfer child ownership until the root confirms that its
+original rights exist. Failed/stopped denotes an unaccepted offer: it ends
+retransmission while the root retains both original descriptions. Exact
+finalization requires independent process exit and kernel/source/alias absence. Voluntary EBUSY remains a real error owned by
+root removal.
 
 Full socket loss discards an unaccepted request or accepted response waiter.
 Actual supervisor death/owner-pipe EOF permanently closes the child and takes

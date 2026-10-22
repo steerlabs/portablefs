@@ -143,37 +143,49 @@ to the later protected-path driver.
 
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
-joins in-flight source/installation work and its synchronized policy disposition.
-An old serving attempt cannot apply its cutoff to a later Park/Resume interval. An unknown installation retries its
-same sequence and bytes. A known remote success advances the sequence even
-when a later Close suppresses readiness. The managed installer itself rejects
+joins in-flight source/installation work and its synchronized policy
+disposition. An old serving attempt cannot apply its cutoff to a later
+Park/Resume interval. An unknown installation retries its same sequence and
+bytes. A known remote success advances the sequence even when a later Close
+suppresses readiness. Recording an installation that cannot be published
+invalidates the prior proof; Readiness validates the exact returned proof's
+session, permit, sequence and deadline. The managed installer itself rejects
 missing or stale generation/serial permits. Hosted CLI readiness requires the
 first successful installer and exact Manager/installed deadline equality;
-explicit standalone readiness is not-required. Starting a goroutine or exposing
-a socket provides no renewal evidence. Kernel termination and SIGINT/SIGTERM
-cancel pre-kernel dial, attach and initial subscription independently of the
-serving lifetime, and supervise the first renewal.
-A queued startup signal prevents publishing mounted readiness. The child bounds startup at two
-minutes from entry, leaving rollback time inside the parent's three-minute
-limit; renewal failure is delivered before detach retries finish.
+explicit standalone readiness is not-required. Starting a goroutine or
+exposing a socket provides no renewal evidence. Kernel termination and
+SIGINT/SIGTERM cancel pre-kernel dial, attach and initial subscription
+independently of the serving lifetime, and supervise the first renewal. Once
+Activate may have committed, the shared authority client retains that attempt
+under an independent bounded reconciliation lifetime. It rebinds the same
+session and replays the exact Activate; startup cancellation joins before an
+independently bounded exact Detach. Unresolved reconciliation returns explicit
+transport uncertainty. This ownership also applies to ordinary mounts. A
+queued startup signal prevents publishing mounted readiness. The child bounds
+startup at two minutes from entry, leaving rollback time inside the parent's
+three-minute limit; renewal failure is delivered before detach retries finish.
 
 Managed Resume republishes a recorded installation under the new permit only
 while its deadline remains beyond the ordinary safety cutoff. It obtains no
 new Manager sequence for that proof. RefreshNow means an immediate scheduling
-decision: ordinary owners can refresh early; managed owners preserve the normal
-mid-window Manager refresh time for a recorded install. Pending unknown installs reconcile their
-exact sequence/body even past the previous authorization deadline. Managed
-closed preparation retries transient failures with bounded attempts and backoff
-until a definitive outcome or generation cancellation; it grants no serving
-extension. This no-cutoff policy ends when readiness is published in the current
-permission interval. Serving managed owners and ordinary owners enforce the
-same safety cutoff, bounded attempt deadline and retry cutoff. Readiness checks
-the cutoff synchronously, even before the scheduling loop wakes. Park withdraws
-readiness before joining work; Resume near expiry remains pending and recovers
-behind closed admission. All owners invalidate
-readiness atomically on terminal denial or cutoff and before stop observation.
-Malformed Manager grants and installed-deadline mismatches terminate automatic
-renewal on Linux and macOS rather than retrying an untrustworthy grant.
+decision: ordinary owners can refresh early; managed owners preserve the
+normal mid-window Manager refresh time for a recorded install. Pending unknown
+installs reconcile their exact sequence/body even past the previous
+authorization deadline. Managed closed preparation retries transient failures
+with bounded attempts and backoff until a definitive outcome or generation
+cancellation; it grants no serving extension. This no-cutoff policy ends when
+readiness is published in the current permission interval. Serving managed
+owners and ordinary owners enforce the same safety cutoff, bounded attempt
+deadline and retry cutoff. The future managed driver must Park its serving
+renewal owner before the cutoff, or accept terminal cleanup and replacement
+afterward. Park/Resume cannot revive a terminal owner, even when Manager
+service returns. Readiness checks the cutoff synchronously, even before the
+scheduling loop wakes. Park withdraws readiness before joining work; Resume
+near expiry remains pending and recovers behind closed admission. All owners
+invalidate readiness atomically on terminal denial or cutoff and before stop
+observation. Malformed Manager grants and installed-deadline mismatches
+terminate automatic renewal on Linux and macOS rather than retrying an
+untrustworthy grant.
 
 Paired status uses renewal states pending, installed with a positive sequence,
 and explicit standalone not-required with sequence zero. Every status/cold

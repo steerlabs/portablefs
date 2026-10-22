@@ -50,12 +50,12 @@ func (b *Bootstrap) Finish(rights *Rights, w Witness) error {
 	b.rights = &Rights{FDs: rights.FDs}
 	rights.FDs = nil
 	merged, err := mergeWitness(b.action.Witness, w)
+	b.action.Witness = merged
 	if err != nil || w.Kernel == "" || b.rights.Validate("workspace-install-kernel") != nil {
 		b.stopped = true
 		b.mu.Unlock()
 		return ErrGrammar
 	}
-	b.action.Witness = merged
 	b.mu.Unlock()
 	return nil
 }
@@ -111,24 +111,38 @@ func (b *Bootstrap) ObserveInstall(s ActionStatus, w Witness) error {
 	case "offered":
 		b.mu.Unlock()
 		return nil
-	case "running", "complete", "failed":
+	case "failed":
+		if s.Failure == "stopped" {
+			// The offering worker ended before accepting the handoff. The root
+			// still owns both descriptions, but must stop retransmission.
+			b.stopped = true
+			b.mu.Unlock()
+			return nil
+		}
+	case "running", "complete":
 	default:
 		b.mu.Unlock()
 		return ErrGrammar
 	}
-	b.childOwns = true
 	rights := b.rights
-	b.mu.Unlock()
 	if rights == nil {
+		b.mu.Unlock()
 		return ErrGrammar
 	}
 	rights.mu.Lock()
+	if len(rights.FDs) != 2 {
+		rights.mu.Unlock()
+		b.mu.Unlock()
+		return ErrGrammar
+	}
+	b.childOwns = true
 	fd := -1
 	if len(rights.FDs) == 2 {
 		fd = rights.FDs[0]
 		rights.FDs[0] = -1
 	}
 	rights.mu.Unlock()
+	b.mu.Unlock()
 	if fd >= 0 {
 		_ = unix.Close(fd)
 	}
@@ -145,6 +159,10 @@ func (b *Bootstrap) Finalize(proof Absence) error {
 		return ErrGrammar
 	}
 	b.mu.Lock()
+	if b.action != nil && !b.finished {
+		b.mu.Unlock()
+		return ErrOccupied
+	}
 	for _, s := range b.removal {
 		if s.Progress == "running" {
 			b.mu.Unlock()
@@ -174,6 +192,9 @@ func (b *Bootstrap) BeginRemoval(s ActionStatus, w Witness) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.action != nil && !b.finished {
+		return ErrOccupied
+	}
 	if b.finalized || b.action == nil || w.Process != b.action.Witness.Process || w.Source != b.action.Witness.Source || w.Target != b.action.Witness.Target || w.Kernel != b.action.Witness.Kernel || p.ActionID == b.action.ActionID {
 		return ErrGrammar
 	}

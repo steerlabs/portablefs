@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,15 +16,27 @@ import (
 
 type cancelAttachHandler struct {
 	clientTestHandler
-	stage   string
-	entered chan struct{}
-	release chan struct{}
+	once        sync.Once
+	stage       string
+	entered     chan struct{}
+	release     chan struct{}
+	releaseOnce sync.Once
 }
 
 func (h *cancelAttachHandler) Handle(ctx context.Context, q *authoritypb.Request) *authoritypb.Response {
+	if h.stage == "activate" && q.GetHello() != nil {
+		select {
+		case <-h.entered:
+			h.releaseOnce.Do(func() { close(h.release) })
+		default:
+		}
+	}
 	if h.stage == "hello" && q.GetHello() != nil || h.stage == "attach" && q.GetAttach() != nil || h.stage == "activate" && q.GetActivate() != nil {
-		close(h.entered)
-		<-h.release
+		first := false
+		h.once.Do(func() { first = true; close(h.entered) })
+		if first {
+			<-h.release
+		}
 	}
 	return h.clientTestHandler.Handle(ctx, q)
 }
@@ -33,7 +46,7 @@ func TestAttachCancellationInterruptsNegotiationReads(t *testing.T) {
 			h := &cancelAttachHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, stage: stage, entered: make(chan struct{}), release: make(chan struct{})}
 			addr, tls, stop := startTestServer(t, h, 9, time.Minute)
 			defer stop()
-			defer close(h.release)
+			defer h.releaseOnce.Do(func() { close(h.release) })
 			cfg := coherentTestClientConfig(addr, tls, "volume", 9, 9)
 			cfg.DialTimeout = 30 * time.Second
 			ctx, cancel := context.WithCancel(context.Background())
@@ -170,7 +183,7 @@ func TestInvalidActiveCleanupJoinsStartupCancellation(t *testing.T) {
 		}
 		result <- writeFrame(peer, testMaxFrame, &authoritypb.Response{RequestId: q.RequestId, Epoch: epoch})
 	}()
-	err := client.publishCommittedActivation(&authoritypb.ActivateReply{State: authoritypb.SessionState_SESSION_STATE_PROVISIONAL}, data, control, 1, 1, 19)
+	err := client.publishCommittedActivation(context.Background(), &authoritypb.ActivateReply{State: authoritypb.SessionState_SESSION_STATE_PROVISIONAL}, data, control, 1, 1, 19)
 	if err == nil || strings.Contains(err.Error(), "release ACTIVE session") {
 		t.Fatal("independent cleanup failed", err)
 	}

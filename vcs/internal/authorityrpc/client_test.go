@@ -749,7 +749,7 @@ func TestSuccessfulActivateWithCorruptStateUsesCommittedCleanupBoundary(t *testi
 	// errno=0 plus an Activate body is the wire-level commit witness. State is
 	// deliberately corrupt here to prove it is validated inside, not before,
 	// the committed-ownership cleanup guard.
-	err = client.publishCommittedActivation(
+	err = client.publishCommittedActivation(context.Background(),
 		&authoritypb.ActivateReply{State: authoritypb.SessionState_SESSION_STATE_PROVISIONAL},
 		nil,
 		&transportNegotiation{conn: clientConn, maxFrame: testMaxFrame},
@@ -811,6 +811,9 @@ func TestCommittedActiveCleanupFailureNeverInventsFallback(t *testing.T) {
 			if err == nil {
 				_ = client.Close()
 				t.Fatal("cleanup failure produced a usable client")
+			}
+			if !errors.Is(err, ErrTransportUncertain) {
+				t.Fatalf("unfinished committed cleanup omitted uncertainty: %v", err)
 			}
 			if test.want != nil && !errors.Is(err, test.want) {
 				t.Fatalf("cleanup error = %v, want %v", err, test.want)

@@ -474,13 +474,21 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	controlGeneration := provisional.GetControlBindingGeneration()
 	requestID := uint64(2)
 	activateResponse, err := rawRoundTrip(control.conn, control.maxFrame, activateRequest(requestID, dataGeneration, controlGeneration))
+	var recoveryCtx context.Context
+	var recoveryCancel context.CancelFunc
 	for err != nil && !frameDefect(err) {
 		// Once any Activate frame may have reached the authority, Abort is
 		// forbidden. Rebind both roles with proof, because loss of DATA can be
 		// the reason CONTROL's activation response disappeared, then replay the
 		// same attempt until its exact committed/refused result is learned.
 		closeNegotiations(data, control)
-		data, control, err = c.resumeRawPairForActivation(handshakeCtx)
+		if recoveryCtx == nil {
+			// The sent Activate owns a possible commitment. Startup cancellation
+			// cannot cancel reconciliation or turn it into AbortAttach.
+			recoveryCtx, recoveryCancel = context.WithTimeout(context.Background(), c.cfg.CancelDrainTimeout)
+			defer recoveryCancel()
+		}
+		data, control, err = c.resumeRawPairForActivation(recoveryCtx)
 		if err != nil {
 			return fail(recoveryFailure("activation", err))
 		}
@@ -511,7 +519,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	// ACTIVE and commits strict membership before that response can be written.
 	// Every local body validation after this point, including State, therefore
 	// owns an authenticated Detach if publication cannot finish.
-	if err := c.publishCommittedActivation(active, data, control, dataGeneration, controlGeneration, requestID+1); err != nil {
+	if err := c.publishCommittedActivation(handshakeCtx, active, data, control, dataGeneration, controlGeneration, requestID+1); err != nil {
 		return fail(err)
 	}
 	return nil
@@ -521,6 +529,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 // server-committed ACTIVE session and a locally usable Client. Every failure
 // here must release that ownership with exact mount-absence evidence.
 func (c *Client) publishCommittedActivation(
+	startup context.Context,
 	active *authoritypb.ActivateReply,
 	data, control *transportNegotiation,
 	dataGeneration, controlGeneration, cleanupRequestID uint64,
@@ -535,6 +544,7 @@ func (c *Client) publishCommittedActivation(
 			opened.stopCancellation = nil
 		}
 	}
+	cancellation = errors.Join(cancellation, startup.Err())
 	if err := c.installActiveState(active); err != nil {
 		return c.releaseCommittedBeforePublication(errors.Join(err, cancellation), control, cleanupRequestID)
 	}
@@ -558,16 +568,16 @@ func (c *Client) releaseCommittedBeforePublication(cause error, control *transpo
 	defer cancel()
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
 		if detachErr := c.detachActiveRaw(ctx, control, requestID, nil); detachErr != nil {
-			return errors.Join(cause, fmt.Errorf("authorityrpc: release route-admin session before client publication: %w", detachErr))
+			return errors.Join(cause, fmt.Errorf("%w: release route-admin session before client publication: %w", ErrTransportUncertain, detachErr))
 		}
 		return cause
 	}
 	proof, observeErr := c.observePreKernelMountAbsence(ctx)
 	if observeErr != nil {
-		return errors.Join(cause, fmt.Errorf("authorityrpc: observe ACTIVE session before client publication: %w", observeErr))
+		return errors.Join(cause, fmt.Errorf("%w: observe ACTIVE session before client publication: %w", ErrTransportUncertain, observeErr))
 	}
 	if detachErr := c.detachActiveRaw(ctx, control, requestID, proof); detachErr != nil {
-		return errors.Join(cause, fmt.Errorf("authorityrpc: release ACTIVE session before client publication: %w", detachErr))
+		return errors.Join(cause, fmt.Errorf("%w: release ACTIVE session before client publication: %w", ErrTransportUncertain, detachErr))
 	}
 	return cause
 }

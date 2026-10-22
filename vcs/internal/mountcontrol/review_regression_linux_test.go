@@ -124,7 +124,7 @@ func TestJobAcceptanceSurvivesSocketLossAndExpiry(t *testing.T) {
 			// This fixture deliberately returns without completing readiness. The job
 			// fails, but its acquired install slot and one-shot Prepare survive.
 			snap := observe(t, o, 2, 1)
-			if snap.Workspace.State != "failed" || snap.Workspace.Phases.Install.Progress != "offered" || calls.Load() != 1 {
+			if snap.Workspace.State != "failed" || snap.Workspace.Phases.Install.Progress != "failed" || snap.Workspace.Phases.Install.Failure != "stopped" || calls.Load() != 1 {
 				t.Fatal(snap, calls.Load())
 			}
 			if _, err := o.Do(context.Background(), request("workspace-prepare", 3, 3), &Rights{}); !errors.Is(err, ErrGrammar) {
