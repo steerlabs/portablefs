@@ -11,9 +11,11 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/proto"
+	"time"
 )
 
 const MaxRetired = 128
@@ -22,47 +24,50 @@ var ErrState = errors.New("workspace guest: transition refused")
 
 func refused(why string) error { return fmt.Errorf("%s: %w", why, ErrState) }
 
-// Mount is the Stage 1c boundary. Daemons start closed and cannot acquire any
-// permission before registration and Prepare. CloseAdmission is synchronous,
-// nonblocking and generation-monotone, covering workers and physical replies.
-// OpenAdmission is also synchronous and nonblocking: it only publishes a
-// previously prepared proof, performs no I/O, and must not call the supervisor.
-// CloseAdmission may interrupt any other call. Prepare/Recover installations must
-// atomically recheck cancellation and the latest CloseAdmission generation;
-// a failed or overtaken call must install nothing, including background renewal.
-// Prepare/Recover return only with proven ready, proven terminal or authorization-
-// required state, or context cancellation. They retry transient transport failures
-// internally with fresh request anchors under the supplied generation context,
-// holding the per-mount lane until they return. Errors terminalize the incarnation.
-// The supervisor serializes all other driver calls per mount. Suspend waits
-// for full kernel withdrawal, reply settlement, renewal quiescence and exact
-// delegation release. A terminal daemon with a retained kernel mount must still
-// withdraw it; only exact process exit AND kernel absence make it trivially cold.
-// Cleanup terminates a refused, never-admitted daemon using its exact witness.
-// No method may replay uncertain mutations into a replacement mount.
-// Cold and recovery proofs carry the exact generation that the driver validated.
+// Mount is the Stage 1c boundary. CloseAdmission immediately advances a serial
+// (even on repeated same-generation Close), clears prepared publication and
+// closes new serving admission without I/O or joins. It does not retract an
+// already admitted callback or physical reply; Suspend joins that fixed cohort.
+// OpenAdmission only CAS-publishes the exact prepared generation/serial proof.
+// It performs no I/O and never calls the supervisor. Raced local assignments
+// remain inert under a later Close and are retired before Suspend acknowledges.
+// Prepare/Recover retry classified transient failures inside one generation-
+// owned job with bounded attempts/backoff and no logical recovery timeout.
+// Real failure ends the incarnation. Recovery never attaches a replacement
+// session or resets an existing renewal owner's sequence. Cancellation closes
+// permission, then joins the actual job; it cannot erase assigned work.
+// Suspend proves withdrawal, physical settlement and worker dispositions.
+// Cleanup uses the exact retained witness. No method may replay an uncertain
+// mutation into a replacement. No real driver is enabled by this interface.
 type Mount interface {
-	CloseAdmission(generation uint64)
+	CloseAdmission(generation uint64) uint64
 	Prepare(context.Context, uint64) (Recovery, error)
 	Suspend(context.Context, *pb.Suspension) (ColdResult, error)
 	Recover(context.Context, *pb.ResumeToken) (Recovery, error)
-	OpenAdmission(generation uint64) error
+	OpenAdmission(generation, gateSerial uint64) error
 	Cleanup(context.Context, Witness) (CleanupProof, error)
 }
 type ColdResult struct {
 	Generation   uint64
 	ColdComplete bool
 	Loss         []*pb.Loss
+	Outcome      *pb.MountOutcome
 }
 type Recovery struct {
-	Generation                                                                                   uint64
-	State, Reason                                                                                string
-	SessionValidated, AuthorizationValidated, InitialRenewalInstalled, ColdSubscriptionInstalled bool
-	Loss                                                                                         []*pb.Loss
+	Generation, GateSerial                                              uint64
+	State, Reason                                                       string
+	SessionValidated, AuthorizationValidated, ColdSubscriptionInstalled bool
+	Standalone                                                          bool
+	Renewal                                                             mountenrollment.RenewalReadiness
+	SessionID                                                           string
+	AuthorizationDeadline                                               time.Time
+	Loss                                                                []*pb.Loss
+	Outcome                                                             *pb.MountOutcome
 }
 
-func (r Recovery) ready(g uint64) bool {
-	return r.Generation == g && r.State == "ready" && r.SessionValidated && r.AuthorizationValidated && r.InitialRenewalInstalled && r.ColdSubscriptionInstalled
+func (r Recovery) ready(g, serial uint64) bool {
+	return r.Generation == g && r.GateSerial == serial && r.State == "ready" && r.SessionValidated && r.AuthorizationValidated && r.ColdSubscriptionInstalled &&
+		r.Renewal.Ready(r.Standalone, mountenrollment.Permit{Generation: g, GateSerial: serial}, r.SessionID, r.AuthorizationDeadline)
 }
 
 type Witness struct {
@@ -78,13 +83,14 @@ type entry struct {
 	driver                  Mount
 	witness                 Witness
 	registration            uint64
+	gateSerial              uint64
 	cleaned, terminal, cold bool
 	draining                uint64
 	serial                  chan struct{}
 }
 
-func newEntry(id *pb.MountID, w Witness, m Mount, generation uint64) *entry {
-	return &entry{driver: m, witness: w, registration: generation, serial: make(chan struct{}, 1),
+func newEntry(id *pb.MountID, w Witness, m Mount, generation, serial uint64) *entry {
+	return &entry{driver: m, witness: w, registration: generation, gateSerial: serial, serial: make(chan struct{}, 1),
 		status: initialStatus(id)}
 }
 
@@ -96,6 +102,9 @@ func (e *entry) setStatus(state, reason, cleanup string) {
 		e.status.Cleanup = cleanup
 	}
 	e.status.State = state
+	if state != "ready" {
+		e.status.Renewal = &pb.RenewalReadiness{State: "pending"}
+	}
 	e.status.Reason = ""
 	if state == "terminal" || state == "authorization-required" || state == "closed" {
 		e.status.Reason = control.BoundedReason(reason)
@@ -109,7 +118,7 @@ func (e *entry) setStatus(state, reason, cleanup string) {
 	}
 }
 func initialStatus(id *pb.MountID) *pb.MountStatus {
-	e := &entry{status: &pb.MountStatus{Mount: clone(id)}}
+	e := &entry{status: &pb.MountStatus{Mount: clone(id), Outcome: control.UnknownOutcome(), Renewal: &pb.RenewalReadiness{State: "pending"}}}
 	e.setStatus("closed", "", "retained")
 	return e.status
 }
@@ -171,7 +180,7 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 		return fmt.Errorf("register missing driver: %w", control.ErrGrammar)
 	}
 	s.mu.Lock()
-	m.CloseAdmission(s.generation)
+	serial := m.CloseAdmission(s.generation)
 	var err error
 	if invalid := control.Mount(id); invalid != nil {
 		err = fmt.Errorf("register identity: %w", invalid)
@@ -190,7 +199,7 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 		}
 	}
 	if err == nil {
-		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation)
+		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -219,6 +228,9 @@ func release(e *entry) { <-e.serial }
 // Initial activation can only use a driver proof for the registration generation.
 // It cannot be reused to bypass a failed token-bound post-wake recovery.
 func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	e := s.mounts[control.MountKey(id)]
 	if e == nil {
@@ -233,7 +245,7 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 		s.mu.Unlock()
 		return refused("activate mount not initially closed")
 	}
-	ctx, done := callContext(ctx, s.generationContext)
+	ctx, done := context.WithCancel(s.generationContext)
 	s.mu.Unlock()
 	defer done()
 	if err := acquire(ctx, e); err != nil {
@@ -250,8 +262,11 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 	r, err := e.driver.Prepare(ctx, generation)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if evidenceErr := s.mergeEvidenceLocked(e, r.Loss, r.Outcome); evidenceErr != nil {
+		err = errors.Join(err, evidenceErr)
+	}
 	if s.phase != "running" || generation != s.generation {
-		return refused("activate overtaken during prepare")
+		return errors.Join(refused("activate overtaken during prepare"), err)
 	}
 	return s.publishRecoveryLocked(ctx, e, generation, r, err)
 }
@@ -268,7 +283,7 @@ func (s *Supervisor) BeginSuspend(request *pb.Suspension) (*pb.Suspension, error
 	}
 	s.cancel()
 	for _, e := range s.mounts {
-		e.driver.CloseAdmission(max(s.generation, request.Generation))
+		e.gateSerial = e.driver.CloseAdmission(max(s.generation, request.Generation))
 		e.cold = false
 		if !e.terminal {
 			e.setStatus("closed", "", "")
@@ -300,6 +315,35 @@ func cloneLoss(loss []*pb.Loss) []*pb.Loss {
 	}
 	return out
 }
+func (s *Supervisor) mergeEvidenceLocked(e *entry, loss []*pb.Loss, outcome *pb.MountOutcome) error {
+	var outcomeErr error
+	if outcome != nil {
+		outcomeErr = control.Outcome(outcome)
+		if outcomeErr == nil {
+			old := e.status.Outcome
+			merged := clone(old)
+			merged.CleanupDebt = max(old.CleanupDebt, outcome.CleanupDebt)
+			if outcome.Observation == "observed" {
+				merged.Observation = "observed"
+				for _, pair := range [][2]*string{{&merged.Durability, &outcome.Durability}, {&merged.Release, &outcome.Release}} {
+					if *pair[0] == "unresolved" {
+						*pair[0] = *pair[1]
+					} else if *pair[1] != "unresolved" && *pair[0] != *pair[1] {
+						outcomeErr = refused("contradictory outcome evidence")
+					}
+				}
+			}
+			// Debt survives even a contradictory snapshot; it is cumulative evidence.
+			if outcomeErr != nil {
+				old.CleanupDebt = merged.CleanupDebt
+			} else {
+				e.status.Outcome = merged
+			}
+		}
+	}
+	return errors.Join(outcomeErr, s.mergeLossLocked(e, loss))
+}
+
 func (s *Supervisor) mergeLossLocked(e *entry, loss []*pb.Loss) error {
 	if len(loss) == 0 {
 		return nil
@@ -317,7 +361,7 @@ func (s *Supervisor) mergeLossLocked(e *entry, loss []*pb.Loss) error {
 	e.status.Loss = bounded
 	if overflow {
 		e.terminal = true
-		e.driver.CloseAdmission(s.generation)
+		e.gateSerial = e.driver.CloseAdmission(s.generation)
 		e.setStatus("terminal", "loss ledger capacity reached; exact cleanup and replacement required", "")
 	}
 	return nil
@@ -355,7 +399,7 @@ func (s *Supervisor) Drain(parent context.Context, x *pb.Suspension, id *pb.Moun
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if lossErr := s.mergeLossLocked(e, result.Loss); lossErr != nil {
+	if lossErr := s.mergeEvidenceLocked(e, result.Loss, result.Outcome); lossErr != nil {
 		return lossErr
 	}
 	if s.phase != "suspending" || !proto.Equal(s.suspension, x) {
@@ -389,7 +433,7 @@ func (s *Supervisor) SuspendAck(x *pb.Suspension) (*pb.SuspendAck, error) {
 		if !e.cold {
 			return nil, refused("ack waiting for whole roster cold proof")
 		}
-		a.Mounts = append(a.Mounts, &pb.MountCold{Mount: clone(id), Loss: cloneLoss(e.status.Loss)})
+		a.Mounts = append(a.Mounts, &pb.MountCold{Mount: clone(id), Loss: cloneLoss(e.status.Loss), Outcome: clone(e.status.Outcome)})
 	}
 	s.phase = "suspended-cold"
 	return a, nil
@@ -397,7 +441,7 @@ func (s *Supervisor) SuspendAck(x *pb.Suspension) (*pb.SuspendAck, error) {
 func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint64, r Recovery, err error) error {
 	// Terminalization wins admission, but cannot erase a late cumulative loss
 	// snapshot from the driver call it overtook.
-	if lossErr := s.mergeLossLocked(e, r.Loss); lossErr != nil {
+	if lossErr := s.mergeEvidenceLocked(e, r.Loss, r.Outcome); lossErr != nil {
 		err = errors.Join(err, lossErr)
 	}
 	if e.terminal {
@@ -407,9 +451,14 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	if err == nil {
 		err = ctx.Err()
 	}
-	if err == nil && r.ready(g) {
-		err = e.driver.OpenAdmission(g)
+	if err == nil && r.ready(g, e.gateSerial) {
+		err = e.driver.OpenAdmission(g, e.gateSerial)
 		if err == nil {
+			// Only a published serving interval starts fresh disposition evidence.
+			outcome := control.UnknownOutcome()
+			outcome.CleanupDebt = e.status.Outcome.CleanupDebt
+			e.status.Outcome = outcome
+			e.status.Renewal = &pb.RenewalReadiness{State: r.Renewal.State, InstalledSequence: r.Renewal.InstalledSequence}
 			e.setStatus("ready", "", "")
 			e.cold = false
 			return nil
@@ -417,7 +466,7 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	}
 	if err == nil && (r.State == "terminal" || r.State == "authorization-required") && r.Generation == g {
 		e.terminal = true
-		e.driver.CloseAdmission(g)
+		e.gateSerial = e.driver.CloseAdmission(g)
 		e.setStatus(r.State, r.Reason, "")
 		return nil
 	}
@@ -427,7 +476,7 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	// A failed Prepare/Recover ends this incarnation. There is no current-
 	// generation retry: exact cleanup and a newly registered replacement obtain
 	// a fresh Prepare proof through the same supervised path as other failures.
-	e.driver.CloseAdmission(g)
+	e.gateSerial = e.driver.CloseAdmission(g)
 	e.terminal = true
 	e.setStatus("terminal", err.Error(), "")
 	return fmt.Errorf("prepare mount %s: %w", e.status.Mount.VolumeId, err)
@@ -479,7 +528,7 @@ func (s *Supervisor) recoverMount(ctx context.Context, done func(), e *entry, t 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.phase != "running" || !proto.Equal(s.suspension, t.Suspension) {
-		_ = s.mergeLossLocked(e, r.Loss)
+		_ = s.mergeEvidenceLocked(e, r.Loss, r.Outcome)
 		return
 	}
 	_ = s.publishRecoveryLocked(ctx, e, t.Suspension.Generation, r, err)
@@ -504,7 +553,7 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 	if e == nil || s.phase != "running" || reason == "" {
 		return refused("terminal unknown mount, phase or missing reason")
 	}
-	e.driver.CloseAdmission(s.generation)
+	e.gateSerial = e.driver.CloseAdmission(s.generation)
 	e.terminal = true
 	e.setStatus("terminal", reason, "")
 	return s.mergeLossLocked(e, loss)
@@ -538,7 +587,7 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		return fmt.Errorf("replace missing driver: %w", control.ErrGrammar)
 	}
 	s.mu.Lock()
-	m.CloseAdmission(s.generation)
+	serial := m.CloseAdmission(s.generation)
 	e := s.mounts[control.MountKey(old)]
 	var err error
 	if invalid := control.Mount(id); invalid != nil {
@@ -567,7 +616,7 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		outcome.RetirementSequence = s.retirementSequence
 		s.retired = append(s.retired, outcome)
 		delete(s.mounts, control.MountKey(old))
-		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation)
+		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -622,7 +671,7 @@ func (s *Supervisor) ChannelLost() {
 	s.phase = "discard-only"
 	s.suspension = nil
 	for _, e := range s.mounts {
-		e.driver.CloseAdmission(s.generation)
+		e.gateSerial = e.driver.CloseAdmission(s.generation)
 		e.cold = false
 		if !e.terminal {
 			e.setStatus("closed", "", "")

@@ -306,8 +306,9 @@ func (m *Mount) publishAttr(ctx context.Context, out *fuse.AttrOut, item *author
 
 // MountVolume mounts one Linux subscription and delegation buffer. Kernel
 // writeback remains disabled: FULL writes are accepted by the daemon buffer,
-// while read caching follows explicit subscription permission.
-func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
+// while read caching follows explicit subscription permission. Startup bounds
+// pre-kernel preparation independently of the serving lifetime parent.
+func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
 	}
@@ -364,7 +365,12 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	m.grafts, m.backing = grafts, cfg.LocalBacking
 	root := &node{mount: m, item: cloneItem(rootItem), requestTimeout: cfg.RequestTimeout, maxRead: maxRead, maxWrite: maxWrite}
 	raw := newRawFileSystem(m, root)
-	if err := m.subscription.subscribe(parent); err != nil {
+	if err := m.subscription.subscribe(startup); err != nil {
+		m.cancel()
+		m.delegations.Stop()
+		return failBeforeKernelMount(errors.Join(err, grafts.Close()))
+	}
+	if err := startup.Err(); err != nil {
 		m.cancel()
 		m.delegations.Stop()
 		return failBeforeKernelMount(errors.Join(err, grafts.Close()))

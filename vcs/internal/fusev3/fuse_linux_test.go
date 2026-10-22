@@ -956,7 +956,7 @@ func TestMountVolumeRefusesMaxInFlightBelowTheLinuxMinimumBeforeKernelMount(t *t
 	rpc := newFakeRPC()
 	cfg := testConfig(8)
 	cfg.MaxInFlight = authorityrpc.MinimumLinuxInFlight - 1
-	_, err := MountVolume(context.Background(), t.TempDir(), rpc, cfg)
+	_, err := MountVolume(context.Background(), context.Background(), t.TempDir(), rpc, cfg)
 	if err == nil || !strings.Contains(err.Error(), "below the Linux minimum") {
 		t.Fatalf("undersized max-in-flight error = %v, want the Linux minimum refusal", err)
 	}
@@ -1514,7 +1514,7 @@ func TestOpendirCapacityRefusalDoesNotPublishAHandle(t *testing.T) {
 func TestMountVolumeRejectsBoundsBelowTheKernelWriteFloor(t *testing.T) {
 	rpc := newFakeRPC()
 	rpc.maxRead, rpc.maxWrite = 1024, 1024
-	_, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, testConfig(8))
+	_, err := MountVolume(context.Background(), context.Background(), "/nonexistent-portablefs-mountpoint", rpc, testConfig(8))
 	if err == nil || !strings.Contains(err.Error(), "floor") {
 		t.Fatalf("MountVolume with a 1 KiB max_write = %v, want a refusal naming the kernel floor", err)
 	}
@@ -1524,7 +1524,7 @@ func TestMountVolumeRequiresACompleteConfiguration(t *testing.T) {
 	cfg := testConfig(8)
 	cfg.MountInstanceID = "volume-wide-source"
 	rpc := newFakeRPC()
-	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg); err == nil {
+	if _, err := MountVolume(context.Background(), context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg); err == nil {
 		t.Fatal("a non-random mount identity must be refused")
 	}
 	rpc.mu.Lock()
@@ -1535,17 +1535,17 @@ func TestMountVolumeRequiresACompleteConfiguration(t *testing.T) {
 	}
 	cfg = testConfig(8)
 	cfg.MaxInFlight = 0
-	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
+	if _, err := MountVolume(context.Background(), context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
 		t.Fatal("a mount without the authority in-flight budget must be refused")
 	}
 	cfg = testConfig(8)
 	cfg.MaxInFlight = authorityrpc.MinimumLinuxInFlight - 1
-	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
+	if _, err := MountVolume(context.Background(), context.Background(), "/nonexistent-portablefs-mountpoint", newFakeRPC(), cfg); err == nil {
 		t.Fatal("an in-flight budget below the Linux ordered-flush minimum must be refused")
 	}
 	rpc = newFakeRPC()
 	rpc.root = nil
-	if _, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, testConfig(8)); err == nil {
+	if _, err := MountVolume(context.Background(), context.Background(), "/nonexistent-portablefs-mountpoint", rpc, testConfig(8)); err == nil {
 		t.Fatal("a missing authority root must be refused")
 	}
 }
@@ -1564,7 +1564,7 @@ func TestFailedStartupCleanRequiresExactSessionRelease(t *testing.T) {
 			rpc.detachErr = test.detachErr
 			cfg := testConfig(8)
 			cfg.MaxInFlight = 0
-			_, err := MountVolume(context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg)
+			_, err := MountVolume(context.Background(), context.Background(), "/nonexistent-portablefs-mountpoint", rpc, cfg)
 			if err == nil {
 				t.Fatal("an incomplete mount configuration was accepted")
 			}

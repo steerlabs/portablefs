@@ -222,6 +222,43 @@ func losses(ls []*pb.Loss) error {
 	}
 	return nil
 }
+
+// Renewal validates typed evidence; only the mount owner can establish that a
+// not-required result belongs to an explicitly standalone mount.
+func Renewal(r *pb.RenewalReadiness) error {
+	if r == nil {
+		return invalid("missing renewal evidence")
+	}
+	switch r.State {
+	case "pending", "not-required":
+		return valid(r.InstalledSequence == 0)
+	case "installed":
+		return valid(r.InstalledSequence > 0)
+	default:
+		return invalid("renewal state")
+	}
+}
+func Outcome(o *pb.MountOutcome) error {
+	if o == nil {
+		return invalid("missing outcome evidence")
+	}
+	if o.Durability != "durable" && o.Durability != "lost" && o.Durability != "unresolved" {
+		return invalid("durability outcome")
+	}
+	if o.Observation != "observed" && o.Observation != "unobserved" {
+		return invalid("outcome observation")
+	}
+	if o.Release != "released" && o.Release != "expired" && o.Release != "abandoned" && o.Release != "unresolved" {
+		return invalid("release outcome")
+	}
+	if o.Observation == "unobserved" && (o.Durability != "unresolved" || o.Release != "unresolved") {
+		return invalid("unobserved outcome cannot certify disposition")
+	}
+	return nil
+}
+func UnknownOutcome() *pb.MountOutcome {
+	return &pb.MountOutcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved"}
+}
 func ColdAck(a *pb.SuspendAck) error {
 	if a == nil {
 		return invalid("ColdAck: invalid field or state combination")
@@ -236,6 +273,9 @@ func ColdAck(a *pb.SuspendAck) error {
 		if m == nil || !proto.Equal(m.Mount, a.Suspension.Roster[i]) {
 			return invalid("ColdAck: invalid field or state combination")
 		}
+		if err := Outcome(m.Outcome); err != nil {
+			return err
+		}
 		if err := losses(m.Loss); err != nil {
 			return fmt.Errorf("ColdAck: %w", err)
 		}
@@ -247,6 +287,14 @@ func statuses(ms []*pb.MountStatus, retired bool) error {
 	for _, m := range ms {
 		if m == nil || (m.RetirementSequence != 0) != retired {
 			return invalid("statuses: invalid field or state combination")
+		}
+		if m.Renewal != nil {
+			if err := Renewal(m.Renewal); err != nil {
+				return err
+			}
+		}
+		if m.State == "ready" && (m.Renewal == nil || m.Renewal.State == "pending") {
+			return invalid("ready requires renewal evidence")
 		}
 		roster = append(roster, m.Mount)
 		switch m.State {
@@ -263,6 +311,9 @@ func statuses(ms []*pb.MountStatus, retired bool) error {
 		if len(m.Reason) > MaxReason || !utf8.ValidString(m.Reason) ||
 			(terminal != (m.Reason != "") && m.State != "closed") || (m.Cleanup != "retained" && !terminal) {
 			return invalid("statuses: invalid field or state combination")
+		}
+		if err := Outcome(m.Outcome); err != nil {
+			return err
 		}
 		if err := losses(m.Loss); err != nil {
 			return fmt.Errorf("statuses: %w", err)
@@ -502,6 +553,25 @@ func Encode(e *pb.Envelope) ([]byte, error) {
 	out := make([]byte, 4, len(raw)+4)
 	binary.BigEndian.PutUint32(out, uint32(len(raw)))
 	return append(out, raw...), nil
+}
+
+// DecodeBody applies the same canonical scanner to a local fixed-roster body.
+// The caller applies its body validator, independently of host Envelope rules.
+func DecodeBody(raw []byte, m proto.Message) error {
+	if len(raw) == 0 || len(raw) > 65536 {
+		return ErrGrammar
+	}
+	if err := grammar(raw, m.ProtoReflect().Descriptor(), 0); err != nil {
+		return err
+	}
+	if err := (proto.UnmarshalOptions{RecursionLimit: 16}).Unmarshal(raw, m); err != nil {
+		return err
+	}
+	canonical, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return ErrGrammar
+	}
+	return nil
 }
 func Decode(frame []byte) (*pb.Envelope, error) {
 	if len(frame) < 4 {

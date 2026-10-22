@@ -45,6 +45,8 @@ type Config struct {
 	Timeout                  time.Duration
 }
 
+const MaxClientIdentityBytes = 256 << 10
+
 type Client struct {
 	baseURL             *url.URL
 	http                *http.Client

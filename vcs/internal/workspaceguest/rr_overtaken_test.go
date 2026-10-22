@@ -32,6 +32,7 @@ func (m *rrRecordingMount) Recover(ctx context.Context, t *pb.ResumeToken) (Reco
 	m.mu2.Unlock()
 	r := ready()
 	r.Generation = t.Suspension.Generation
+	m.bindProof(&r)
 	return r, nil
 }
 

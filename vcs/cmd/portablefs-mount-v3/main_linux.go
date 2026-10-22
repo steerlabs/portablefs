@@ -144,7 +144,7 @@ func run() error {
 		return releaseClientBeforeKernelMount(client, *cancelDrainTimeout, cause)
 	}
 	transport := mountv3.NewTransport(client)
-	mount, err := fusev3.MountVolume(context.Background(), absoluteMount, transport, fusev3.Config{
+	mount, err := fusev3.MountVolume(context.Background(), context.Background(), absoluteMount, transport, fusev3.Config{
 		MountInstanceID: mountInstanceID, RequestTimeout: *requestTimeout,
 		MaxBackground: *maxBackground, MaxInFlight: *maxInFlight, ReclaimQueue: *reclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),

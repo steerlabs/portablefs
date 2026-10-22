@@ -132,6 +132,42 @@ public nonisolated struct WorkspaceLoss: Sendable {
   public init() {}
 }
 
+public nonisolated struct WorkspaceRenewalReadiness: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// pending, installed, not-required (explicit standalone only).
+  public var state: String = String()
+
+  public var installedSequence: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct WorkspaceMountOutcome: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// durable, lost, unresolved.
+  public var durability: String = String()
+
+  /// observed, unobserved.
+  public var observation: String = String()
+
+  /// released, expired, abandoned, unresolved.
+  public var release: String = String()
+
+  public var cleanupDebt: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public nonisolated struct WorkspaceMountCold: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -148,11 +184,21 @@ public nonisolated struct WorkspaceMountCold: Sendable {
 
   public var loss: [WorkspaceLoss] = []
 
+  public var outcome: WorkspaceMountOutcome {
+    get {_outcome ?? WorkspaceMountOutcome()}
+    set {_outcome = newValue}
+  }
+  /// Returns true if `outcome` has been explicitly set.
+  public var hasOutcome: Bool {self._outcome != nil}
+  /// Clears the value of `outcome`. Subsequent reads from it will return its default value.
+  public mutating func clearOutcome() {self._outcome = nil}
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _mount: WorkspaceMountID? = nil
+  fileprivate var _outcome: WorkspaceMountOutcome? = nil
 }
 
 public nonisolated struct WorkspaceSuspendAck: Sendable {
@@ -228,11 +274,31 @@ public nonisolated struct WorkspaceMountStatus: Sendable {
   /// Zero for active mounts; strictly increasing for retired outcomes per guest.
   public var retirementSequence: UInt64 = 0
 
+  public var renewal: WorkspaceRenewalReadiness {
+    get {_renewal ?? WorkspaceRenewalReadiness()}
+    set {_renewal = newValue}
+  }
+  /// Returns true if `renewal` has been explicitly set.
+  public var hasRenewal: Bool {self._renewal != nil}
+  /// Clears the value of `renewal`. Subsequent reads from it will return its default value.
+  public mutating func clearRenewal() {self._renewal = nil}
+
+  public var outcome: WorkspaceMountOutcome {
+    get {_outcome ?? WorkspaceMountOutcome()}
+    set {_outcome = newValue}
+  }
+  /// Returns true if `outcome` has been explicitly set.
+  public var hasOutcome: Bool {self._outcome != nil}
+  /// Clears the value of `outcome`. Subsequent reads from it will return its default value.
+  public mutating func clearOutcome() {self._outcome = nil}
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _mount: WorkspaceMountID? = nil
+  fileprivate var _renewal: WorkspaceRenewalReadiness? = nil
+  fileprivate var _outcome: WorkspaceMountOutcome? = nil
 }
 
 public nonisolated struct WorkspaceResumeAck: Sendable {
@@ -778,9 +844,89 @@ nonisolated extension WorkspaceLoss: SwiftProtobuf.Message, SwiftProtobuf._Messa
   }
 }
 
+nonisolated extension WorkspaceRenewalReadiness: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".RenewalReadiness"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}state\0\u{3}installed_sequence\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularStringField(value: &self.state) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.installedSequence) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.state.isEmpty {
+      try visitor.visitSingularStringField(value: self.state, fieldNumber: 1)
+    }
+    if self.installedSequence != 0 {
+      try visitor.visitSingularUInt64Field(value: self.installedSequence, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: WorkspaceRenewalReadiness, rhs: WorkspaceRenewalReadiness) -> Bool {
+    if lhs.state != rhs.state {return false}
+    if lhs.installedSequence != rhs.installedSequence {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension WorkspaceMountOutcome: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".MountOutcome"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}durability\0\u{1}observation\0\u{1}release\0\u{3}cleanup_debt\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularStringField(value: &self.durability) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.observation) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.release) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.cleanupDebt) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.durability.isEmpty {
+      try visitor.visitSingularStringField(value: self.durability, fieldNumber: 1)
+    }
+    if !self.observation.isEmpty {
+      try visitor.visitSingularStringField(value: self.observation, fieldNumber: 2)
+    }
+    if !self.release.isEmpty {
+      try visitor.visitSingularStringField(value: self.release, fieldNumber: 3)
+    }
+    if self.cleanupDebt != 0 {
+      try visitor.visitSingularUInt64Field(value: self.cleanupDebt, fieldNumber: 4)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: WorkspaceMountOutcome, rhs: WorkspaceMountOutcome) -> Bool {
+    if lhs.durability != rhs.durability {return false}
+    if lhs.observation != rhs.observation {return false}
+    if lhs.release != rhs.release {return false}
+    if lhs.cleanupDebt != rhs.cleanupDebt {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension WorkspaceMountCold: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MountCold"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{2}\u{2}loss\0\u{c}\u{2}\u{1}")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{2}\u{2}loss\0\u{1}outcome\0\u{c}\u{2}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -790,6 +936,7 @@ nonisolated extension WorkspaceMountCold: SwiftProtobuf.Message, SwiftProtobuf._
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._mount) }()
       case 3: try { try decoder.decodeRepeatedMessageField(value: &self.loss) }()
+      case 4: try { try decoder.decodeSingularMessageField(value: &self._outcome) }()
       default: break
       }
     }
@@ -806,12 +953,16 @@ nonisolated extension WorkspaceMountCold: SwiftProtobuf.Message, SwiftProtobuf._
     if !self.loss.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.loss, fieldNumber: 3)
     }
+    try { if let v = self._outcome {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
+    } }()
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: WorkspaceMountCold, rhs: WorkspaceMountCold) -> Bool {
     if lhs._mount != rhs._mount {return false}
     if lhs.loss != rhs.loss {return false}
+    if lhs._outcome != rhs._outcome {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -897,7 +1048,7 @@ nonisolated extension WorkspaceResumeToken: SwiftProtobuf.Message, SwiftProtobuf
 
 nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MountStatus"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{1}state\0\u{1}reason\0\u{1}loss\0\u{1}cleanup\0\u{3}retirement_sequence\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{1}state\0\u{1}reason\0\u{1}loss\0\u{1}cleanup\0\u{3}retirement_sequence\0\u{1}renewal\0\u{1}outcome\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -911,6 +1062,8 @@ nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf
       case 4: try { try decoder.decodeRepeatedMessageField(value: &self.loss) }()
       case 5: try { try decoder.decodeSingularStringField(value: &self.cleanup) }()
       case 6: try { try decoder.decodeSingularUInt64Field(value: &self.retirementSequence) }()
+      case 7: try { try decoder.decodeSingularMessageField(value: &self._renewal) }()
+      case 8: try { try decoder.decodeSingularMessageField(value: &self._outcome) }()
       default: break
       }
     }
@@ -939,6 +1092,12 @@ nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf
     if self.retirementSequence != 0 {
       try visitor.visitSingularUInt64Field(value: self.retirementSequence, fieldNumber: 6)
     }
+    try { if let v = self._renewal {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
+    } }()
+    try { if let v = self._outcome {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
+    } }()
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -949,6 +1108,8 @@ nonisolated extension WorkspaceMountStatus: SwiftProtobuf.Message, SwiftProtobuf
     if lhs.loss != rhs.loss {return false}
     if lhs.cleanup != rhs.cleanup {return false}
     if lhs.retirementSequence != rhs.retirementSequence {return false}
+    if lhs._renewal != rhs._renewal {return false}
+    if lhs._outcome != rhs._outcome {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

@@ -3,7 +3,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -18,53 +17,51 @@ import (
 	"sync"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
-
-	"golang.org/x/sys/unix"
 )
 
-const maxLocalReauthorizationRequestBytes = (32 << 10) + maxClientIdentityBytes + 4096
+const maxLocalReauthorizationRequestBytes = mountcontrol.MaxOrdinaryRequest
 const maxFuseMountControlConnections = 8
 
 const fuseReauthorizationSocketPrefix = "@portablefs-reauthorization-"
 
-type localReauthorizationRequest struct {
-	Operation            string `json:"operation,omitempty"`
-	MountInstanceID      string `json:"mountInstanceId,omitempty"`
-	Capability           string `json:"capability"`
-	ClientCertificatePEM string `json:"clientCertificatePem"`
-	Sequence             uint64 `json:"sequence"`
-}
+type localReauthorizationRequest = mountcontrol.Request
+type localReauthorizationResponse = mountcontrol.Response
 
-type localReauthorizationResponse struct {
-	MountInstanceID             string `json:"mountInstanceId,omitempty"`
-	LossSequence                string `json:"lossSequence,omitempty"`
-	AuthorizationDeadlineUnixMs int64  `json:"authorizationDeadlineUnixMs,omitempty"`
-	Error                       string `json:"error,omitempty"`
-	OK                          bool   `json:"ok"`
-	Sequence                    uint64 `json:"sequence,omitempty"`
+// Workspace handlers stay nil until the real lifecycle, kernel and clock
+// owners exist. A seeded supervisor alone never enables managed mounts.
+type workspaceControlConfig struct {
+	Supervisor mountcontrol.Peer
+	Owner      mountcontrol.Owner
 }
 
 type unixReauthorizationControl struct {
-	done         chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
-	handler      fuseReauthorizationHandler
-	lossSnapshot fuseLossSnapshotHandler
-	listener     *net.UnixListener
-	mu           sync.Mutex
-	connections  map[*net.UnixConn]uint64
-	nextArrival  uint64
-	changed      chan struct{}
-	workers      sync.WaitGroup
-	closed       bool
-	closeErr     error
-	once         sync.Once
-	path         string
+	workspace                            *workspaceControlConfig
+	workspaceConnections                 map[*net.UnixConn]bool
+	workspacePhase, workspaceObservation bool
+	done                                 chan struct{}
+	ctx                                  context.Context
+	cancel                               context.CancelFunc
+	handler                              fuseReauthorizationHandler
+	lossSnapshot                         fuseLossSnapshotHandler
+	listener                             *net.UnixListener
+	mu                                   sync.Mutex
+	connections                          map[*net.UnixConn]uint64
+	nextArrival                          uint64
+	changed                              chan struct{}
+	workers                              sync.WaitGroup
+	closed                               bool
+	closeErr                             error
+	once                                 sync.Once
+	path                                 string
 }
 
 func startFuseReauthorizationControl(handler fuseReauthorizationHandler, lossSnapshot fuseLossSnapshotHandler) (fuseReauthorizationControl, error) {
-	if handler == nil && lossSnapshot == nil {
+	return startFuseMountControl(handler, lossSnapshot, nil)
+}
+func startFuseMountControl(handler fuseReauthorizationHandler, lossSnapshot fuseLossSnapshotHandler, workspace *workspaceControlConfig) (fuseReauthorizationControl, error) {
+	if handler == nil && lossSnapshot == nil && workspace == nil {
 		return nil, errors.New("mount control handler is required")
 	}
 	path, err := newFuseReauthorizationSocketName()
@@ -77,7 +74,7 @@ func startFuseReauthorizationControl(handler fuseReauthorizationHandler, lossSna
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	control := &unixReauthorizationControl{
-		done: make(chan struct{}), ctx: ctx, cancel: cancel,
+		done: make(chan struct{}), ctx: ctx, cancel: cancel, workspace: workspace, workspaceConnections: make(map[*net.UnixConn]bool),
 		handler: handler, lossSnapshot: lossSnapshot, listener: listener,
 		connections: make(map[*net.UnixConn]uint64), changed: make(chan struct{}), path: path,
 	}
@@ -90,7 +87,7 @@ func startFuseReauthorizationControl(handler fuseReauthorizationHandler, lossSna
 // to durable mount state: an abstract address disappears with its listener and
 // cannot leave a stale filesystem node after a crash. A cryptographic nonce
 // prevents another process from predicting and pre-binding the address, while
-// requireSameUserPeer remains the authorization boundary after connect.
+// SO_PEERCRED supplies the UID authorization boundary after connect.
 //
 // Keeping the address independent of stateDir is also correctness-critical:
 // sockaddr_un.sun_path is bounded even when a valid home or XDG state path is
@@ -126,6 +123,9 @@ func (c *unixReauthorizationControl) Close() error {
 		}
 		c.mu.Unlock()
 		<-c.done
+		if c.workspace != nil {
+			c.workspace.Owner.Close()
+		}
 	})
 	if errors.Is(c.closeErr, net.ErrClosed) {
 		return nil
@@ -143,13 +143,31 @@ func (c *unixReauthorizationControl) serve() {
 		if err != nil {
 			return
 		}
+		// Peer identity is classified before either capacity pool is reserved.
+		peer, peerErr := mountcontrol.Credentials(connection)
+		var supervisor *mountcontrol.Peer
+		if c.workspace != nil {
+			supervisor = &c.workspace.Supervisor
+		}
+		// Only the seeded root candidate needs a process-start witness. Ordinary
+		// same-UID peers may legitimately be outside our /proc PID namespace.
+		if peerErr == nil && supervisor != nil && peer.UID == 0 && peer.PID == supervisor.PID {
+			peer.Start, peerErr = mountcontrol.ProcessStart(peer.PID)
+		}
+		class := mountcontrol.Classify(peer, uint32(os.Geteuid()), supervisor)
+		if peerErr != nil || class == mountcontrol.Refused {
+			_ = connection.SetWriteDeadline(time.Now().Add(time.Second))
+			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "peer refused"})
+			_ = connection.Close()
+			continue
+		}
 		c.mu.Lock()
 		if c.closed {
 			c.mu.Unlock()
 			_ = connection.Close()
 			return
 		}
-		if len(c.connections) >= maxFuseMountControlConnections {
+		if class == mountcontrol.WorkspacePeer && len(c.workspaceConnections) >= 2 || class == mountcontrol.Ordinary && len(c.connections)-len(c.workspaceConnections) >= maxFuseMountControlConnections {
 			c.mu.Unlock()
 			_ = connection.Close()
 			continue
@@ -164,13 +182,17 @@ func (c *unixReauthorizationControl) serve() {
 		c.nextArrival++
 		arrival := c.nextArrival
 		c.connections[connection] = arrival
+		if class == mountcontrol.WorkspacePeer {
+			c.workspaceConnections[connection] = true
+		}
 		c.workers.Add(1)
 		c.mu.Unlock()
 		go func() {
 			defer c.workers.Done()
-			c.handle(connection, arrival)
+			c.handlePeer(connection, arrival, class, peer)
 			c.mu.Lock()
 			delete(c.connections, connection)
+			delete(c.workspaceConnections, connection)
 			close(c.changed)
 			c.changed = make(chan struct{})
 			c.mu.Unlock()
@@ -182,8 +204,8 @@ func (c *unixReauthorizationControl) waitForEarlierConnections(ctx context.Conte
 	for {
 		c.mu.Lock()
 		var earlier bool
-		for _, accepted := range c.connections {
-			if accepted < arrival {
+		for connection, accepted := range c.connections {
+			if accepted < arrival && !c.workspaceConnections[connection] {
 				earlier = true
 				break
 			}
@@ -202,28 +224,89 @@ func (c *unixReauthorizationControl) waitForEarlierConnections(ctx context.Conte
 	}
 }
 
-func (c *unixReauthorizationControl) handle(connection *net.UnixConn, arrival uint64) {
+func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arrival uint64, class mountcontrol.PeerClass, peer mountcontrol.Peer) {
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(35 * time.Second))
-	if err := requireSameUserPeer(connection); err != nil {
-		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "peer refused", OK: false})
+	attemptStarted := time.Now()
+	socketBudget := 35 * time.Second
+	limit := mountcontrol.MaxOrdinaryRequest
+	if class == mountcontrol.WorkspacePeer {
+		limit = mountcontrol.MaxWorkspaceRequest
+		socketBudget = 45 * time.Second
+	}
+	_ = connection.SetDeadline(attemptStarted.Add(socketBudget))
+	body, rights, err := mountcontrol.Receive(connection, limit)
+	defer rights.Close()
+	if err != nil {
+		// Bounds/ancillary violations prove malformed authenticated input even
+		// without a complete JSON body. Transport loss alone proves no frame.
+		if class == mountcontrol.WorkspacePeer && errors.Is(err, mountcontrol.ErrGrammar) && c.workspace.Owner.CloseAdmission != nil {
+			c.workspace.Owner.CloseAdmission()
+		}
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(connection, maxLocalReauthorizationRequestBytes+1))
-	if err != nil || len(body) > maxLocalReauthorizationRequestBytes {
-		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request", OK: false})
+	request, err := mountcontrol.DecodeRequest(body)
+	if err != nil {
+		if class == mountcontrol.WorkspacePeer {
+			gone, pollErr := mountcontrol.FullHangup(connection)
+			if pollErr != nil || gone {
+				return
+			}
+		}
+		if class == mountcontrol.WorkspacePeer && c.workspace.Owner.CloseAdmission != nil {
+			c.workspace.Owner.CloseAdmission()
+		}
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request"})
 		return
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	var request localReauthorizationRequest
-	if err := decoder.Decode(&request); err != nil {
-		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request", OK: false})
+	if request.Workspace != nil {
+		if class != mountcontrol.WorkspacePeer || c.workspace == nil {
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, mountcontrol.ErrPeerRefused))
+			return
+		}
+		// A complete authenticated Close survives root death; partial frames do
+		// not establish one. Admission closure does not accept a job.
+		if err := c.workspace.Owner.AdmitFrame(request, rights); err != nil {
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
+			return
+		}
+		gone, pollErr := mountcontrol.FullHangup(connection)
+		if pollErr != nil || gone {
+			return
+		}
+		c.mu.Lock()
+		lane := &c.workspacePhase
+		if request.Operation == "workspace-observe" {
+			lane = &c.workspaceObservation
+		}
+		if *lane {
+			c.mu.Unlock()
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, mountcontrol.ErrOccupied))
+			return
+		}
+		*lane = true
+		c.mu.Unlock()
+		defer func() { c.mu.Lock(); *lane = false; c.mu.Unlock() }()
+		budget, _ := strconv.ParseUint(request.Workspace.BudgetNanos, 10, 64)
+		deadline := attemptStarted.Add(time.Duration(budget))
+		_ = connection.SetDeadline(deadline)
+		ctx, cancel := context.WithDeadline(c.ctx, deadline)
+		defer cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		stop := mountcontrol.WatchDisconnect(ctx, connection, peer, cancel)
+		defer stop()
+		response, err := c.workspace.Owner.DoAdmitted(ctx, request, rights, attemptStarted)
+		if err != nil {
+			writeLocalReauthorizationResponse(connection, mountcontrol.WorkspaceRefusal(request, err))
+			return
+		}
+		writeLocalReauthorizationResponse(connection, response)
 		return
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request", OK: false})
+	if class != mountcontrol.Ordinary || rights.Validate(request.Operation) != nil {
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid ordinary peer or descriptors"})
 		return
 	}
 	if request.Operation == "loss-snapshot" {
@@ -249,6 +332,10 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn, arrival ui
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "reauthorization unavailable", OK: false})
 		return
 	}
+	if c.workspace != nil {
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "managed manual reauthorization is unavailable; the renewal owner is exclusive"})
+		return
+	}
 	deadline, err := c.handler(ctx, request.Capability, request.Sequence, []byte(request.ClientCertificatePEM))
 	if err != nil {
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "authority refused reauthorization", OK: false})
@@ -259,33 +346,8 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn, arrival ui
 	})
 }
 
-func requireSameUserPeer(connection *net.UnixConn) error {
-	return requireUserPeer(connection, uint32(os.Geteuid()))
-}
-
-func requireUserPeer(connection *net.UnixConn, uid uint32) error {
-	raw, err := connection.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var credential *unix.Ucred
-	var controlErr error
-	if err := raw.Control(func(fd uintptr) {
-		credential, controlErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
-	}); err != nil {
-		return err
-	}
-	if controlErr != nil {
-		return controlErr
-	}
-	if credential == nil || credential.Uid != uid {
-		return errors.New("reauthorization peer uid mismatch")
-	}
-	return nil
-}
-
 func writeLocalReauthorizationResponse(writer io.Writer, response localReauthorizationResponse) {
-	_ = json.NewEncoder(writer).Encode(response)
+	_ = mountcontrol.WriteResponse(writer, response)
 }
 
 func reauthorizeFuseMount(ctx context.Context, state *mountState, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
@@ -313,14 +375,16 @@ func reauthorizeFuseMount(ctx context.Context, state *mountState, token string, 
 	if err := unixConnection.CloseWrite(); err != nil {
 		return time.Time{}, err
 	}
-	responseBody, err := io.ReadAll(io.LimitReader(connection, 4097))
+	responseBody, responseRights, err := mountcontrol.Receive(unixConnection, mountcontrol.MaxOrdinaryResponse)
+	defer responseRights.Close()
+	if responseRights.Validate("") != nil {
+		return time.Time{}, errors.New("mount reauthorization response carried descriptors")
+	}
 	if err != nil || len(responseBody) > 4096 {
 		return time.Time{}, errors.New("mount reauthorization response exceeded its bound")
 	}
-	var response localReauthorizationResponse
-	decoder := json.NewDecoder(bytes.NewReader(responseBody))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&response); err != nil {
+	response, err := mountcontrol.DecodeResponse(responseBody, false)
+	if err != nil {
 		return time.Time{}, fmt.Errorf("decode mount reauthorization response: %w", err)
 	}
 	if !response.OK || response.Error != "" || response.Sequence != sequence || response.AuthorizationDeadlineUnixMs <= time.Now().UnixMilli() {
@@ -348,19 +412,17 @@ func readFuseMountLoss(ctx context.Context, state *mountState, instance string) 
 	if err := connection.(*net.UnixConn).CloseWrite(); err != nil {
 		return mountLossSnapshot{}, err
 	}
-	body, err := io.ReadAll(io.LimitReader(connection, 4097))
+	body, responseRights, err := mountcontrol.Receive(connection.(*net.UnixConn), mountcontrol.MaxOrdinaryResponse)
+	defer responseRights.Close()
+	if responseRights.Validate("") != nil {
+		return mountLossSnapshot{}, errors.New("mount loss snapshot response carried descriptors")
+	}
 	if err != nil || len(body) > 4096 {
 		return mountLossSnapshot{}, errors.New("mount loss snapshot response unavailable or oversized")
 	}
-	var response localReauthorizationResponse
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&response); err != nil {
+	response, err := mountcontrol.DecodeResponse(body, false)
+	if err != nil {
 		return mountLossSnapshot{}, fmt.Errorf("decode mount loss snapshot: %w", err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return mountLossSnapshot{}, errors.New("trailing mount loss snapshot response")
 	}
 	if !response.OK || response.Error != "" || response.MountInstanceID != instance || !validLossSequence(response.LossSequence) || response.Sequence != 0 || response.AuthorizationDeadlineUnixMs != 0 {
 		return mountLossSnapshot{}, errors.New("exact live mount loss snapshot refused")

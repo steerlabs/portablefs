@@ -19,9 +19,17 @@ type AuthorizationSession interface {
 }
 
 func (m *Mount) CurrentAuthorizationSession() (AuthorizationSession, <-chan struct{}, error) {
-	e := m.rpc.(*epochRPC)
+	e, ok := m.rpc.(*epochRPC)
+	if !ok {
+		return nil, nil, errors.New("fusev3: authorization epoch owner unavailable")
+	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	select {
+	case <-e.authorizationChanged:
+		return nil, nil, errors.New("fusev3: authorization session retired")
+	default:
+	}
 	session, ok := e.rpc.(AuthorizationSession)
 	if !ok {
 		return nil, nil, errors.New("fusev3: transport has no authorization session")

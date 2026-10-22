@@ -71,7 +71,7 @@ private enum InjectedFailure: Error { case failed }
     func acknowledge(_ index: Int = 0, cold: Bool = true, loss: Bool = false) {
         var ack = WorkspaceSuspendAck(); ack.suspension = suspensions[index].0; ack.suspension.roster = roster
         ack.mounts = ack.suspension.roster.map {
-            var mount = WorkspaceMountCold(); mount.mount = $0
+            var mount = WorkspaceMountCold(); mount.outcome = unknownTestOutcome(); mount.mount = $0
             if loss { var item = WorkspaceLoss(); item.sequence = 1; item.acceptedBytes = 4096; item.reason = "accepted tail unprovable"; mount.loss = [item] }
             return mount
         }
@@ -80,7 +80,7 @@ private enum InjectedFailure: Error { case failed }
     }
     func recovered(_ index: Int = 0, state: String = "ready") {
         var ack = WorkspaceResumeAck(); ack.token = resumes[index].0
-        ack.mounts = ack.token.suspension.roster.map { var m = WorkspaceMountStatus(); m.mount = $0; m.state = state; if state == "terminal" || state == "authorization-required" { m.reason = "fresh authorization required" }; m.cleanup = "retained"; return m }
+        ack.mounts = ack.token.suspension.roster.map { var m = WorkspaceMountStatus(); m.outcome = unknownTestOutcome(); m.mount = $0; m.state = state; if state == "ready" { m.renewal = installedTestRenewal() }; if state == "terminal" || state == "authorization-required" { m.reason = "fresh authorization required" }; m.cleanup = "retained"; return m }
         resumes[index].1(.success(ack))
     }
 }
@@ -433,7 +433,7 @@ private enum InjectedFailure: Error { case failed }
     status.bootID = token.suspension.bootID; status.hostServiceID = token.suspension.hostServiceID
     status.guestServiceID = token.suspension.guestServiceID; status.generation = token.suspension.generation
     status.state = "running"
-    status.mounts = token.suspension.roster.map { var m = WorkspaceMountStatus(); m.mount = $0; m.state = "recovering"; m.cleanup = "retained"; return m }
+    status.mounts = token.suspension.roster.map { var m = WorkspaceMountStatus(); m.outcome = unknownTestOutcome(); m.mount = $0; m.state = "recovering"; m.cleanup = "retained"; return m }
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.phase == .running)
     #expect(r.coordinator.mountStatus[0].state == "recovering")
@@ -450,7 +450,7 @@ private enum InjectedFailure: Error { case failed }
     status.state = "running"
     var old = r.coordinator.mountStatus[0]; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
-    replacement.state = "ready"; replacement.reason = ""; replacement.cleanup = "retained"
+    replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
     old.retirementSequence = 1
     status.mounts = [replacement]; status.retired = [old]
     r.channel.statuses.removeFirst()(.success(status))
@@ -500,7 +500,7 @@ private enum InjectedFailure: Error { case failed }
     var old = r.coordinator.mountStatus[0]; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     var earlier = old; earlier.mount.volumeID = "earlier"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
-    replacement.state = "ready"; replacement.reason = ""; replacement.cleanup = "retained"
+    replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
     earlier.retirementSequence = 1; old.retirementSequence = 2
     status.mounts = [replacement]; status.retired = [earlier]
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))

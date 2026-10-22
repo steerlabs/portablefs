@@ -35,9 +35,20 @@ enum WorkspaceWireSchema {
             4: .init(kind: "$", repeated: false, oneof: false),
             5: .init(kind: "", repeated: false, oneof: false),
         ],
+        "RenewalReadiness": [
+            1: .init(kind: "$", repeated: false, oneof: false),
+            2: .init(kind: "", repeated: false, oneof: false),
+        ],
+        "MountOutcome": [
+            1: .init(kind: "$", repeated: false, oneof: false),
+            2: .init(kind: "$", repeated: false, oneof: false),
+            3: .init(kind: "$", repeated: false, oneof: false),
+            4: .init(kind: "", repeated: false, oneof: false),
+        ],
         "MountCold": [
             1: .init(kind: "MountID", repeated: false, oneof: false),
             3: .init(kind: "Loss", repeated: true, oneof: false),
+            4: .init(kind: "MountOutcome", repeated: false, oneof: false),
         ],
         "SuspendAck": [
             1: .init(kind: "Suspension", repeated: false, oneof: false),
@@ -54,6 +65,8 @@ enum WorkspaceWireSchema {
             4: .init(kind: "Loss", repeated: true, oneof: false),
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "", repeated: false, oneof: false),
+            7: .init(kind: "RenewalReadiness", repeated: false, oneof: false),
+            8: .init(kind: "MountOutcome", repeated: false, oneof: false),
         ],
         "ResumeAck": [
             1: .init(kind: "ResumeToken", repeated: false, oneof: false),

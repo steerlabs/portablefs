@@ -70,6 +70,189 @@ Expose explicit reopen actions and report holders that prevent cleanup. Do not
 silently restart arbitrary processes or describe lazy unmount as recovery.
 Preserve old barrier failures even if the new mount serves successfully.
 
+## Stage 1c control boundary
+
+The first Stage 1c unit adds control contracts and renewal ownership. Real
+workspace Mount, Umount and Provision remain unavailable in the paired guest
+transport. It does not enable managed mounts or qualify host sleep.
+
+The existing random abstract mount socket retains ordinary reauthorization and
+loss snapshots. Ordinary requests are bounded by `(32 << 10) + (256 << 10) +
+4096` bytes; responses by 4096 bytes. Their handler/socket deadlines remain
+30/35 seconds. Workspace requests and responses each have a 64 KiB bound.
+Peers are classified before capacity reservation: the exact seeded root
+UID/PID/start identity has two reserved connections, with separate phase and
+observation lanes; same-UID ordinary clients retain eight connections and their
+accepted renewal order. Workspace phases bypass that ordinary queue. Managed
+manual renewal is explicitly refused: the automatic renewal owner is exclusive.
+Loss observation remains available while closed. Ordinary peers are classified
+by UID alone; only the seeded root PID requires a readable start witness.
+
+Local workspace format 8 uses strict JSON keys and canonical string uint64s.
+Its exact paired, unreleased contract is
+[linux-workspace-local-control.md](./linux-workspace-local-control.md).
+Prepare, Recover, Suspend and Cleanup acknowledge acceptance; observations
+report actual lifecycle progress, including fixed install and removal slots.
+Request IDs correlate socket attempts. They retain no encoded responses,
+request history or execution high-water marks. One current job retains its
+immutable start identity; older operations refuse as retired, and future
+observations report not-accepted. A consumed action always refuses, including
+when a later delivery carries fresh descriptors.
+
+Acceptance reserves the real job/action state and moves received rights under
+one short lock. Driver work, descriptor disposal, joins and socket I/O run
+outside that lock. Prepare runs at most once per incarnation; Recover consumes
+its exact Resume authorization once. Suspend and Cleanup close admission and
+signal old work before returning occupied until that owner joins. Fixed slots
+allow one install and voluntary removal followed by terminal escalation;
+successful removal cannot reverse. Observations cannot publish actions or change
+admission. Install completion remains distinct from prepared readiness, and
+recorded removal remains distinct from final cleanup.
+
+Socket attempts have a maximum 45-second budget. Losing or expiring a socket
+cannot cancel accepted work or erase its resources and outcomes. Suspend alone
+also carries a positive `drainBudgetNanos` of at most 15 seconds. Acceptance
+captures its receipt-relative deadline after charging framing and admission
+delay; retry allowances cannot extend it. Observation gets its own socket
+budget after the drain expires. The host transaction retains its original
+cold acknowledgment and pause deadlines. A fully framed current Suspend closes
+admission and cancels a legal predecessor before its drain budget is checked.
+If that budget is already spent, the start is refused after the predecessor
+joins; the predecessor may remain failed. The root must escalate to Cleanup,
+not retry recovery or treat refusal as withdrawal completion.
+
+`AdmitFrame` owns the immediate admission invalidation for each authenticated,
+fully framed Suspend or Cleanup, before checking lanes, remaining budget or
+full hangup. A truncated full hangup remains transport loss; malformed
+half-closed input closes admission. The hook does not write the supervisor's
+memfd. Only actual owner-pipe EOF or process death takes permanent owner-loss
+cleanup; full socket loss ends its waiter. These rules retain the later
+closed-start gate and lifetime-pipe implementation as dependencies.
+
+Only install-kernel carries rights: exactly two ordered descriptors, FUSE then
+abort. Close-on-exec recvmsg accounts for all ancillary input. First delivery
+requires the real driver's role/bootstrap validation; every rejected delivery
+closes its received inventory. Acceptance transfers rights into the job without
+adding copies. Later installs refuse action-consumed regardless of descriptor
+identity. No KCMP support is required.
+
+The root bootstrap owner records its one attempt before the mount syscall,
+retains original descriptions and partial witness, and retransmits only copies
+of those descriptions while child ownership remains unknown. Observing accepted
+child ownership closes the redundant root FUSE copy; the original abort owner
+survives through independent process-exit and kernel/source/alias-absence proof.
+`ObserveAbsence` starts that observation only after the bootstrap and removal
+owners settle. Its proof binds the exact process, kernel, source and target
+alias inventory to this bootstrap owner. Finalize rejects unbound, foreign or
+stale proofs, including observation overtaken by another removal action.
+Death preserves uncertain inventory and blocks replacement. The control-boundary
+tests use owned descriptors; actual device/bootstrap qualification still belongs
+to the later protected-path driver.
+
+One persistent renewer retains session, next sequence, installed deadline and
+exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
+joins in-flight source/installation work and its synchronized policy
+disposition. An old serving attempt cannot apply its cutoff to a later
+Park/Resume interval. An unknown installation retries its same sequence and
+bytes. A known remote success advances the sequence even when a later Close
+suppresses readiness. Recording an installation that cannot be published
+invalidates the prior proof; Readiness validates the exact returned proof's
+session, permit, sequence and deadline. A permit-closed installation remains
+recorded and can be republished under a later current permit after Park joins
+its owner. An installation for a changed session is never publishable; Resume
+cannot relabel it as belonging to the current session. Both outcomes invalidate
+the older proof immediately. The managed installer itself rejects
+missing or stale generation/serial permits. Hosted CLI readiness requires the
+first successful installer and exact Manager/installed deadline equality;
+explicit standalone readiness is not-required. Starting a goroutine or
+exposing a socket provides no renewal evidence. Kernel termination and
+SIGINT/SIGTERM cancel pre-kernel dial, attach and initial subscription
+independently of the serving lifetime, and supervise the first renewal. Once
+Activate may have committed, the shared authority client retains that attempt
+under an independent bounded reconciliation lifetime. It rebinds the same
+session and replays the exact Activate; startup cancellation joins before an
+independently bounded exact Detach. Unresolved reconciliation returns explicit
+transport uncertainty. An explicit attach disposition survives the shared
+routing wrapper. Ordinary startup decides its clean verdict at the attach or
+kernel-startup return boundary, before callers add diagnostic errors; a later
+AttachReleased member elsewhere in an error tree cannot certify cleanup. Proven
+exact release permits intent finalization and enrollment closure; possible
+commitment or failed release
+retains authority ownership, enrollment and cleanup debt. Cancellation, a nil
+client and the absence of transport uncertainty cannot prove cleanup.
+
+The shared client's worst-case attach settlement bound is approximately
+`DialTimeout + 2 * CancelDrainTimeout`: initial negotiation, independent
+activation reconciliation, then exact pre-publication release. Production uses
+10 seconds for each budget, about 30 seconds total. Caller cancellation does
+not shorten the latter two owners. `RecoverEpoch` uses the same attach bound.
+The macOS FSKit initial attach runs through the CLI's 60-second daemon HTTP
+client; the daemon sets no shorter handler deadline. Preflight's separate
+10-second socket deadline follows completed attach and does not perform it.
+FSKit frontend operations have a 50-second daemon admission budget and a longer
+announced request deadline; the macOS data plane does not call RecoverEpoch.
+These caller budgets accommodate the shared-client bound without adjustment.
+A queued startup signal prevents publishing mounted readiness. The child bounds
+startup at two minutes from entry, leaving rollback time inside the parent's
+three-minute limit; renewal failure is delivered before detach retries finish.
+
+Managed Resume republishes a recorded installation under the new permit only
+while its deadline remains beyond the ordinary safety cutoff. It obtains no
+new Manager sequence for that proof. RefreshNow means an immediate scheduling
+decision: ordinary owners can refresh early; managed owners preserve the
+normal mid-window Manager refresh time for a recorded install. Pending unknown
+installs reconcile their exact sequence/body even past the previous
+authorization deadline. Managed closed preparation retries transient failures
+with bounded attempts and backoff until a definitive outcome or generation
+cancellation; it grants no serving extension. This no-cutoff policy ends when
+readiness is published in the current permission interval. Serving managed
+owners and ordinary owners enforce the same safety cutoff, bounded attempt
+deadline and retry cutoff. The future managed driver must Park its serving
+renewal owner before the cutoff, or accept terminal cleanup and replacement
+afterward. Park/Resume cannot revive a terminal owner, even when Manager
+service returns. Readiness checks the cutoff synchronously, even before the
+scheduling loop wakes. Park withdraws readiness before joining work; Resume
+near expiry remains pending and recovers behind closed admission. All owners
+invalidate readiness atomically on terminal denial or cutoff and before stop
+observation. Malformed Manager grants and installed-deadline mismatches
+terminate automatic renewal on Linux and macOS rather than retrying an
+untrustworthy grant.
+
+Paired status uses renewal states pending, installed with a positive sequence,
+and explicit standalone not-required with sequence zero. Every status/cold
+entry carries durability (`durable`, `lost`, `unresolved`), observation
+(`observed`, `unobserved`), release (`released`, `expired`, `abandoned`,
+`unresolved`) and counted cleanup debt. Initial unknown evidence is
+unresolved/unobserved. Known loss remains separately cumulative and survives
+failed or overtaken Prepare/Recover, cold completion, replacement and retirement.
+Unknown observation cannot certify durability or release. Within an interval,
+new evidence cannot erase a known disposition or reduce cleanup debt. Only a
+successful admission publication starts fresh disposition evidence; failed Open
+retains it. Cleanup debt and loss remain cumulative across intervals.
+
+Close advances an exact serial even within one generation. It immediately denies
+new admission and defeats delayed prepared publication; it does not retract an
+already admitted operation. Completed withdrawal requires Suspend's joins.
+Prepare/Recover belong to their generation, retry classified transient failures
+with bounded attempts/backoff, and have no 45-second logical deadline. Only
+current session/authorization validation, a functioning renewal owner and fresh
+subscription evidence can authorize publication. A genuine failed Prepare or
+Recover permanently ends serving preparation for that mount incarnation. The
+terminal fact survives replacement of its job and cold transaction. Later
+Suspend may withdraw state, but reports the retained failure instead of a new
+cold recovery opportunity; exact Cleanup remains available. The Mount driver returns an explicit lifecycle disposition:
+Completed requires successful publication and no error; Overtaken asserts only
+job-overtaking cancellation, with no independent work or teardown failure;
+Failed includes independent failures even when joined with cancellation.
+Overtaken avoids the terminal latch only when the owner recorded cancelling
+that exact job. Error-chain membership never determines the outcome. A
+cancellation-only teardown may omit the context error without ending the
+incarnation. Missing dispositions and unrecorded cancellation fail closed.
+Recover on a terminal incarnation refuses `incarnation-terminal` in the local
+mount-control grammar, separately from malformed-frame `invalid`. The supervisor
+does not renew sessions. These remain typed driver contracts until the real
+admission, clock and lifecycle owners exist.
+
 ## Controlled suspension transaction
 
 All app-initiated pauses must use this transaction. Power notifications must
@@ -99,9 +282,10 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    invalidation earns no cold acknowledgement. Serialize Prepare, Recover,
    Suspend and admission publication per mount. A new suspension cancels the
    preceding generation and waits for overtaken driver calls before withdrawal.
-   Each driver must atomically check the latest close generation and cancellation
-   before installing any subscription or renewal; failed or overtaken calls install
-   nothing, including background renewal.
+   Each reusable proof must retain and recheck the exact generation/close serial.
+   A close racing local installation leaves that result inert; it cannot forget
+   a known remote renewal sequence. Suspend joins and retires raced work before
+   acknowledgement.
    Only exact process exit plus kernel absence makes a terminal mount trivially
    cold. Other terminal mounts still require withdrawal. The Go
    `workspaceguest.Mount` interface defines this boundary; Stage 1c must implement
@@ -450,7 +634,7 @@ sources/licenses, PortableFS commit and sealed app resources.
 
 | Gate | Status and evidence required |
 | --- | --- |
-| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with an empty roster. Real daemon withdrawal, initial-renewal readiness and the full duration/fault matrix remain pending. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
+| Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with an empty roster. Real managed-daemon withdrawal and the full duration/fault matrix remain pending. Typed initial-renewal readiness is covered at the control boundary. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
 | Unfenced host sleep | OPEN. Identify the clock/execution mechanism and ordering, then qualify actual lid/menu/idle sleep on exact supported OS/hardware/image digests with independently advancing remote authority and peer. Delay the service past the notification timeout. A finite successful sample cannot replace the mechanism. |
 | Short-sleep availability | Root cause identified: authority replay-before-coherence admission ordering. Fix and regression work are in progress in a separate PR. This stage does not change the authority or Linux data plane. |
 | Image, lifecycle and persistence | Pin Debian artifact; prove boot/FUSE INIT and kernel notification/durability behavior. Prove exact teardown/remount with cwd, fd, mapping and editor holders, no empty-directory writes, ENOSPC/image-corruption handling, signed updates and same-volume exclusion. |
@@ -466,6 +650,26 @@ multiple VMs, custom images, RAM snapshots/migration, Rosetta, root-system
 customization and Linux desktops remain deferred. No Finder mirror, native Mac
 re-export, synchronization engine or automatic remote-workspace substitution
 belongs to this product.
+
+### Later PR obligations from the Stage 1c control review
+
+- macOS enrollment closure (Opus r6 note 1): when portablefsd consumes the
+  attach disposition, `registry.go` must retain the Manager enrollment on
+  AttachCleanupRequired until exact cleanup proves release. Qualify both
+  successful Detach and failed/uncertain release through the daemon path.
+- Prepared-publication cancellation (note 3): this control owner now cancels
+  its job context when a permit rejects publication. The protected-path Mount
+  driver PR must join that cancellation, return Overtaken only without an
+  independent failure, and prove a retry cannot remain pending or publish under
+  the closed permit.
+- Managed renewal observation (note 6): the managed consumer PR must publish
+  the retained permit-closed remote install and its Resume republication to
+  observers, including RenewalSucceeded semantics. Prove readiness and Observe
+  agree on the exact session, sequence, deadline and current permit.
+- Bootstrap entry ordering (note 7): the protected-path root driver PR must
+  distinguish a never-begun Bootstrap from outstanding work at Finalize and
+  prove its callers never interpret occupied as an accepted Begin or as
+  evidence of absence. This boundary currently returns occupied in both cases.
 
 ### Stage 1c drain dispatch
 

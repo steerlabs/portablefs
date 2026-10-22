@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 type fakeMount struct {
 	mu            sync.Mutex
 	generation    uint64
+	gateSerial    uint64
 	open          bool
 	opens         int
 	cold          ColdResult
@@ -27,21 +29,34 @@ type fakeMount struct {
 	recover       func(context.Context, *pb.ResumeToken) (Recovery, error)
 }
 
-func ready() Recovery {
-	return Recovery{State: "ready", SessionValidated: true, AuthorizationValidated: true, InitialRenewalInstalled: true, ColdSubscriptionInstalled: true}
+var testDeadline = time.Unix(2000000000, 0)
+
+func testRenewal() mountenrollment.RenewalReadiness {
+	return mountenrollment.RenewalReadiness{State: "installed", InstalledSequence: 1, SessionID: "test-session", AuthorizationDeadline: testDeadline}
 }
-func (m *fakeMount) CloseAdmission(g uint64) {
+func (m *fakeMount) bindProof(r *Recovery) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r.GateSerial = m.gateSerial
+	r.Renewal.Permit = mountenrollment.Permit{Generation: r.Generation, GateSerial: m.gateSerial}
+}
+func ready() Recovery {
+	return Recovery{State: "ready", SessionValidated: true, AuthorizationValidated: true, Renewal: testRenewal(), SessionID: "test-session", AuthorizationDeadline: testDeadline, ColdSubscriptionInstalled: true}
+}
+func (m *fakeMount) CloseAdmission(g uint64) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if g >= m.generation {
 		m.generation = g
 		m.open = false
 	}
+	m.gateSerial++
+	return m.gateSerial
 }
-func (m *fakeMount) OpenAdmission(g uint64) error {
+func (m *fakeMount) OpenAdmission(g, serial uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if g != m.generation {
+	if g != m.generation || serial != m.gateSerial {
 		return ErrState
 	}
 	m.open = true
@@ -66,6 +81,7 @@ func (m *fakeMount) Recover(ctx context.Context, t *pb.ResumeToken) (Recovery, e
 	}
 	r := m.recoverResult
 	r.Generation = t.Suspension.Generation
+	m.bindProof(&r)
 	return r, nil
 }
 func (m *fakeMount) Prepare(_ context.Context, g uint64) (Recovery, error) {
@@ -74,6 +90,7 @@ func (m *fakeMount) Prepare(_ context.Context, g uint64) (Recovery, error) {
 	}
 	r := ready()
 	r.Generation = g
+	m.bindProof(&r)
 	return r, nil
 }
 func (m *fakeMount) Cleanup(_ context.Context, w Witness) (CleanupProof, error) {
@@ -328,7 +345,7 @@ func TestGuestRecoveryRequiresEveryFreshProof(t *testing.T) {
 			case "authorization":
 				m.recoverResult.AuthorizationValidated = false
 			case "renewal":
-				m.recoverResult.InitialRenewalInstalled = false
+				m.recoverResult.Renewal.State = "pending"
 			case "subscription":
 				m.recoverResult.ColdSubscriptionInstalled = false
 			}
@@ -561,6 +578,7 @@ func TestReviewOvertakenRecoverCannotUndoNewColdProof(t *testing.T) {
 		effectsMu.Unlock()
 		r := ready()
 		r.Generation = tok.Suspension.Generation
+		m.bindProof(&r)
 		return r, nil
 	}
 	m.suspend = func(_ context.Context, _ *pb.Suspension) (ColdResult, error) {
@@ -703,6 +721,7 @@ func TestGuestMountRecoveryIsIndependent(t *testing.T) {
 		<-release
 		r := ready()
 		r.Generation = tok.Suspension.Generation
+		m.bindProof(&r)
 		return r, nil
 	}
 	ack, err := s.Resume(context.Background(), token(x))
@@ -847,6 +866,7 @@ func TestGuestRecoveryOutlivesCompletedResumeRequest(t *testing.T) {
 		}
 		r := ready()
 		r.Generation = tok.Suspension.Generation
+		m.bindProof(&r)
 		return r, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())

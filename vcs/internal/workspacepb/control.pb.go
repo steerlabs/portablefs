@@ -381,17 +381,142 @@ func (x *Loss) GetAggregated() bool {
 	return false
 }
 
+type RenewalReadiness struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// pending, installed, not-required (explicit standalone only).
+	State             string `protobuf:"bytes,1,opt,name=state,proto3" json:"state,omitempty"`
+	InstalledSequence uint64 `protobuf:"varint,2,opt,name=installed_sequence,json=installedSequence,proto3" json:"installed_sequence,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *RenewalReadiness) Reset() {
+	*x = RenewalReadiness{}
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RenewalReadiness) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RenewalReadiness) ProtoMessage() {}
+
+func (x *RenewalReadiness) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RenewalReadiness.ProtoReflect.Descriptor instead.
+func (*RenewalReadiness) Descriptor() ([]byte, []int) {
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *RenewalReadiness) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *RenewalReadiness) GetInstalledSequence() uint64 {
+	if x != nil {
+		return x.InstalledSequence
+	}
+	return 0
+}
+
+type MountOutcome struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// durable, lost, unresolved.
+	Durability string `protobuf:"bytes,1,opt,name=durability,proto3" json:"durability,omitempty"`
+	// observed, unobserved.
+	Observation string `protobuf:"bytes,2,opt,name=observation,proto3" json:"observation,omitempty"`
+	// released, expired, abandoned, unresolved.
+	Release       string `protobuf:"bytes,3,opt,name=release,proto3" json:"release,omitempty"`
+	CleanupDebt   uint64 `protobuf:"varint,4,opt,name=cleanup_debt,json=cleanupDebt,proto3" json:"cleanup_debt,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MountOutcome) Reset() {
+	*x = MountOutcome{}
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MountOutcome) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MountOutcome) ProtoMessage() {}
+
+func (x *MountOutcome) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MountOutcome.ProtoReflect.Descriptor instead.
+func (*MountOutcome) Descriptor() ([]byte, []int) {
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *MountOutcome) GetDurability() string {
+	if x != nil {
+		return x.Durability
+	}
+	return ""
+}
+
+func (x *MountOutcome) GetObservation() string {
+	if x != nil {
+		return x.Observation
+	}
+	return ""
+}
+
+func (x *MountOutcome) GetRelease() string {
+	if x != nil {
+		return x.Release
+	}
+	return ""
+}
+
+func (x *MountOutcome) GetCleanupDebt() uint64 {
+	if x != nil {
+		return x.CleanupDebt
+	}
+	return 0
+}
+
 type MountCold struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Mount         *MountID               `protobuf:"bytes,1,opt,name=mount,proto3" json:"mount,omitempty"`
 	Loss          []*Loss                `protobuf:"bytes,3,rep,name=loss,proto3" json:"loss,omitempty"`
+	Outcome       *MountOutcome          `protobuf:"bytes,4,opt,name=outcome,proto3" json:"outcome,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MountCold) Reset() {
 	*x = MountCold{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[5]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -403,7 +528,7 @@ func (x *MountCold) String() string {
 func (*MountCold) ProtoMessage() {}
 
 func (x *MountCold) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[5]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -416,7 +541,7 @@ func (x *MountCold) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MountCold.ProtoReflect.Descriptor instead.
 func (*MountCold) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{5}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *MountCold) GetMount() *MountID {
@@ -433,6 +558,13 @@ func (x *MountCold) GetLoss() []*Loss {
 	return nil
 }
 
+func (x *MountCold) GetOutcome() *MountOutcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
 type SuspendAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Suspension    *Suspension            `protobuf:"bytes,1,opt,name=suspension,proto3" json:"suspension,omitempty"`
@@ -443,7 +575,7 @@ type SuspendAck struct {
 
 func (x *SuspendAck) Reset() {
 	*x = SuspendAck{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[6]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -455,7 +587,7 @@ func (x *SuspendAck) String() string {
 func (*SuspendAck) ProtoMessage() {}
 
 func (x *SuspendAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[6]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -468,7 +600,7 @@ func (x *SuspendAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendAck.ProtoReflect.Descriptor instead.
 func (*SuspendAck) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{6}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *SuspendAck) GetSuspension() *Suspension {
@@ -495,7 +627,7 @@ type ResumeToken struct {
 
 func (x *ResumeToken) Reset() {
 	*x = ResumeToken{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[7]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -507,7 +639,7 @@ func (x *ResumeToken) String() string {
 func (*ResumeToken) ProtoMessage() {}
 
 func (x *ResumeToken) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[7]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -520,7 +652,7 @@ func (x *ResumeToken) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeToken.ProtoReflect.Descriptor instead.
 func (*ResumeToken) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{7}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ResumeToken) GetSuspension() *Suspension {
@@ -547,14 +679,16 @@ type MountStatus struct {
 	// retained, process-exited, kernel-absent, complete; never inferred from errno.
 	Cleanup string `protobuf:"bytes,5,opt,name=cleanup,proto3" json:"cleanup,omitempty"`
 	// Zero for active mounts; strictly increasing for retired outcomes per guest.
-	RetirementSequence uint64 `protobuf:"varint,6,opt,name=retirement_sequence,json=retirementSequence,proto3" json:"retirement_sequence,omitempty"`
+	RetirementSequence uint64            `protobuf:"varint,6,opt,name=retirement_sequence,json=retirementSequence,proto3" json:"retirement_sequence,omitempty"`
+	Renewal            *RenewalReadiness `protobuf:"bytes,7,opt,name=renewal,proto3" json:"renewal,omitempty"`
+	Outcome            *MountOutcome     `protobuf:"bytes,8,opt,name=outcome,proto3" json:"outcome,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
 func (x *MountStatus) Reset() {
 	*x = MountStatus{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[8]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -566,7 +700,7 @@ func (x *MountStatus) String() string {
 func (*MountStatus) ProtoMessage() {}
 
 func (x *MountStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[8]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -579,7 +713,7 @@ func (x *MountStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MountStatus.ProtoReflect.Descriptor instead.
 func (*MountStatus) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{8}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *MountStatus) GetMount() *MountID {
@@ -624,6 +758,20 @@ func (x *MountStatus) GetRetirementSequence() uint64 {
 	return 0
 }
 
+func (x *MountStatus) GetRenewal() *RenewalReadiness {
+	if x != nil {
+		return x.Renewal
+	}
+	return nil
+}
+
+func (x *MountStatus) GetOutcome() *MountOutcome {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
+}
+
 type ResumeAck struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Token         *ResumeToken           `protobuf:"bytes,1,opt,name=token,proto3" json:"token,omitempty"`
@@ -634,7 +782,7 @@ type ResumeAck struct {
 
 func (x *ResumeAck) Reset() {
 	*x = ResumeAck{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[9]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -646,7 +794,7 @@ func (x *ResumeAck) String() string {
 func (*ResumeAck) ProtoMessage() {}
 
 func (x *ResumeAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[9]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -659,7 +807,7 @@ func (x *ResumeAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeAck.ProtoReflect.Descriptor instead.
 func (*ResumeAck) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{9}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ResumeAck) GetToken() *ResumeToken {
@@ -684,7 +832,7 @@ type StatusRequest struct {
 
 func (x *StatusRequest) Reset() {
 	*x = StatusRequest{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[10]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -696,7 +844,7 @@ func (x *StatusRequest) String() string {
 func (*StatusRequest) ProtoMessage() {}
 
 func (x *StatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[10]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -709,7 +857,7 @@ func (x *StatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
 func (*StatusRequest) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{10}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{12}
 }
 
 type StatusReply struct {
@@ -729,7 +877,7 @@ type StatusReply struct {
 
 func (x *StatusReply) Reset() {
 	*x = StatusReply{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[11]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -741,7 +889,7 @@ func (x *StatusReply) String() string {
 func (*StatusReply) ProtoMessage() {}
 
 func (x *StatusReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[11]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -754,7 +902,7 @@ func (x *StatusReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusReply.ProtoReflect.Descriptor instead.
 func (*StatusReply) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{11}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *StatusReply) GetBootId() []byte {
@@ -816,7 +964,7 @@ type RetireAck struct {
 
 func (x *RetireAck) Reset() {
 	*x = RetireAck{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[12]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -828,7 +976,7 @@ func (x *RetireAck) String() string {
 func (*RetireAck) ProtoMessage() {}
 
 func (x *RetireAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[12]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -841,7 +989,7 @@ func (x *RetireAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetireAck.ProtoReflect.Descriptor instead.
 func (*RetireAck) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{12}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *RetireAck) GetThroughSequence() uint64 {
@@ -867,7 +1015,7 @@ type Provision struct {
 
 func (x *Provision) Reset() {
 	*x = Provision{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[13]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -879,7 +1027,7 @@ func (x *Provision) String() string {
 func (*Provision) ProtoMessage() {}
 
 func (x *Provision) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[13]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -892,7 +1040,7 @@ func (x *Provision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Provision.ProtoReflect.Descriptor instead.
 func (*Provision) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{13}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Provision) GetMount() *MountID {
@@ -953,7 +1101,7 @@ type MountRequest struct {
 
 func (x *MountRequest) Reset() {
 	*x = MountRequest{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -965,7 +1113,7 @@ func (x *MountRequest) String() string {
 func (*MountRequest) ProtoMessage() {}
 
 func (x *MountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -978,7 +1126,7 @@ func (x *MountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MountRequest.ProtoReflect.Descriptor instead.
 func (*MountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{14}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *MountRequest) GetMount() *MountID {
@@ -997,7 +1145,7 @@ type UmountRequest struct {
 
 func (x *UmountRequest) Reset() {
 	*x = UmountRequest{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1009,7 +1157,7 @@ func (x *UmountRequest) String() string {
 func (*UmountRequest) ProtoMessage() {}
 
 func (x *UmountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1022,7 +1170,7 @@ func (x *UmountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UmountRequest.ProtoReflect.Descriptor instead.
 func (*UmountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{15}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *UmountRequest) GetMount() *MountID {
@@ -1043,7 +1191,7 @@ type Result struct {
 
 func (x *Result) Reset() {
 	*x = Result{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1055,7 +1203,7 @@ func (x *Result) String() string {
 func (*Result) ProtoMessage() {}
 
 func (x *Result) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1068,7 +1216,7 @@ func (x *Result) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Result.ProtoReflect.Descriptor instead.
 func (*Result) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{16}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *Result) GetCode() string {
@@ -1111,7 +1259,7 @@ type Envelope struct {
 
 func (x *Envelope) Reset() {
 	*x = Envelope{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1123,7 +1271,7 @@ func (x *Envelope) String() string {
 func (*Envelope) ProtoMessage() {}
 
 func (x *Envelope) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1136,7 +1284,7 @@ func (x *Envelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Envelope.ProtoReflect.Descriptor instead.
 func (*Envelope) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{17}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Envelope) GetVersion() uint32 {
@@ -1396,10 +1544,21 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\x06reason\x18\x04 \x01(\tR\x06reason\x12\x1e\n" +
 	"\n" +
 	"aggregated\x18\x05 \x01(\bR\n" +
-	"aggregated\"|\n" +
+	"aggregated\"W\n" +
+	"\x10RenewalReadiness\x12\x14\n" +
+	"\x05state\x18\x01 \x01(\tR\x05state\x12-\n" +
+	"\x12installed_sequence\x18\x02 \x01(\x04R\x11installedSequence\"\x8d\x01\n" +
+	"\fMountOutcome\x12\x1e\n" +
+	"\n" +
+	"durability\x18\x01 \x01(\tR\n" +
+	"durability\x12 \n" +
+	"\vobservation\x18\x02 \x01(\tR\vobservation\x12\x18\n" +
+	"\arelease\x18\x03 \x01(\tR\arelease\x12!\n" +
+	"\fcleanup_debt\x18\x04 \x01(\x04R\vcleanupDebt\"\xbd\x01\n" +
 	"\tMountCold\x126\n" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x121\n" +
-	"\x04loss\x18\x03 \x03(\v2\x1d.portablefs.workspace.v8.LossR\x04lossJ\x04\b\x02\x10\x03\"\x8d\x01\n" +
+	"\x04loss\x18\x03 \x03(\v2\x1d.portablefs.workspace.v8.LossR\x04loss\x12?\n" +
+	"\aoutcome\x18\x04 \x01(\v2%.portablefs.workspace.v8.MountOutcomeR\aoutcomeJ\x04\b\x02\x10\x03\"\x8d\x01\n" +
 	"\n" +
 	"SuspendAck\x12C\n" +
 	"\n" +
@@ -1411,14 +1570,16 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"suspension\x18\x01 \x01(\v2#.portablefs.workspace.v8.SuspensionR\n" +
 	"suspension\x12\x1d\n" +
 	"\n" +
-	"wake_nonce\x18\x02 \x01(\fR\twakeNonce\"\xf1\x01\n" +
+	"wake_nonce\x18\x02 \x01(\fR\twakeNonce\"\xf7\x02\n" +
 	"\vMountStatus\x126\n" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x12\x14\n" +
 	"\x05state\x18\x02 \x01(\tR\x05state\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\x121\n" +
 	"\x04loss\x18\x04 \x03(\v2\x1d.portablefs.workspace.v8.LossR\x04loss\x12\x18\n" +
 	"\acleanup\x18\x05 \x01(\tR\acleanup\x12/\n" +
-	"\x13retirement_sequence\x18\x06 \x01(\x04R\x12retirementSequence\"\x85\x01\n" +
+	"\x13retirement_sequence\x18\x06 \x01(\x04R\x12retirementSequence\x12C\n" +
+	"\arenewal\x18\a \x01(\v2).portablefs.workspace.v8.RenewalReadinessR\arenewal\x12?\n" +
+	"\aoutcome\x18\b \x01(\v2%.portablefs.workspace.v8.MountOutcomeR\aoutcome\"\x85\x01\n" +
 	"\tResumeAck\x12:\n" +
 	"\x05token\x18\x01 \x01(\v2$.portablefs.workspace.v8.ResumeTokenR\x05token\x12<\n" +
 	"\x06mounts\x18\x02 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\"\x0f\n" +
@@ -1488,62 +1649,67 @@ func file_proto_workspace_v8_control_proto_rawDescGZIP() []byte {
 	return file_proto_workspace_v8_control_proto_rawDescData
 }
 
-var file_proto_workspace_v8_control_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_proto_workspace_v8_control_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_proto_workspace_v8_control_proto_goTypes = []any{
-	(*Release)(nil),       // 0: portablefs.workspace.v8.Release
-	(*Hello)(nil),         // 1: portablefs.workspace.v8.Hello
-	(*MountID)(nil),       // 2: portablefs.workspace.v8.MountID
-	(*Suspension)(nil),    // 3: portablefs.workspace.v8.Suspension
-	(*Loss)(nil),          // 4: portablefs.workspace.v8.Loss
-	(*MountCold)(nil),     // 5: portablefs.workspace.v8.MountCold
-	(*SuspendAck)(nil),    // 6: portablefs.workspace.v8.SuspendAck
-	(*ResumeToken)(nil),   // 7: portablefs.workspace.v8.ResumeToken
-	(*MountStatus)(nil),   // 8: portablefs.workspace.v8.MountStatus
-	(*ResumeAck)(nil),     // 9: portablefs.workspace.v8.ResumeAck
-	(*StatusRequest)(nil), // 10: portablefs.workspace.v8.StatusRequest
-	(*StatusReply)(nil),   // 11: portablefs.workspace.v8.StatusReply
-	(*RetireAck)(nil),     // 12: portablefs.workspace.v8.RetireAck
-	(*Provision)(nil),     // 13: portablefs.workspace.v8.Provision
-	(*MountRequest)(nil),  // 14: portablefs.workspace.v8.MountRequest
-	(*UmountRequest)(nil), // 15: portablefs.workspace.v8.UmountRequest
-	(*Result)(nil),        // 16: portablefs.workspace.v8.Result
-	(*Envelope)(nil),      // 17: portablefs.workspace.v8.Envelope
+	(*Release)(nil),          // 0: portablefs.workspace.v8.Release
+	(*Hello)(nil),            // 1: portablefs.workspace.v8.Hello
+	(*MountID)(nil),          // 2: portablefs.workspace.v8.MountID
+	(*Suspension)(nil),       // 3: portablefs.workspace.v8.Suspension
+	(*Loss)(nil),             // 4: portablefs.workspace.v8.Loss
+	(*RenewalReadiness)(nil), // 5: portablefs.workspace.v8.RenewalReadiness
+	(*MountOutcome)(nil),     // 6: portablefs.workspace.v8.MountOutcome
+	(*MountCold)(nil),        // 7: portablefs.workspace.v8.MountCold
+	(*SuspendAck)(nil),       // 8: portablefs.workspace.v8.SuspendAck
+	(*ResumeToken)(nil),      // 9: portablefs.workspace.v8.ResumeToken
+	(*MountStatus)(nil),      // 10: portablefs.workspace.v8.MountStatus
+	(*ResumeAck)(nil),        // 11: portablefs.workspace.v8.ResumeAck
+	(*StatusRequest)(nil),    // 12: portablefs.workspace.v8.StatusRequest
+	(*StatusReply)(nil),      // 13: portablefs.workspace.v8.StatusReply
+	(*RetireAck)(nil),        // 14: portablefs.workspace.v8.RetireAck
+	(*Provision)(nil),        // 15: portablefs.workspace.v8.Provision
+	(*MountRequest)(nil),     // 16: portablefs.workspace.v8.MountRequest
+	(*UmountRequest)(nil),    // 17: portablefs.workspace.v8.UmountRequest
+	(*Result)(nil),           // 18: portablefs.workspace.v8.Result
+	(*Envelope)(nil),         // 19: portablefs.workspace.v8.Envelope
 }
 var file_proto_workspace_v8_control_proto_depIdxs = []int32{
 	0,  // 0: portablefs.workspace.v8.Hello.release:type_name -> portablefs.workspace.v8.Release
 	2,  // 1: portablefs.workspace.v8.Suspension.roster:type_name -> portablefs.workspace.v8.MountID
 	2,  // 2: portablefs.workspace.v8.MountCold.mount:type_name -> portablefs.workspace.v8.MountID
 	4,  // 3: portablefs.workspace.v8.MountCold.loss:type_name -> portablefs.workspace.v8.Loss
-	3,  // 4: portablefs.workspace.v8.SuspendAck.suspension:type_name -> portablefs.workspace.v8.Suspension
-	5,  // 5: portablefs.workspace.v8.SuspendAck.mounts:type_name -> portablefs.workspace.v8.MountCold
-	3,  // 6: portablefs.workspace.v8.ResumeToken.suspension:type_name -> portablefs.workspace.v8.Suspension
-	2,  // 7: portablefs.workspace.v8.MountStatus.mount:type_name -> portablefs.workspace.v8.MountID
-	4,  // 8: portablefs.workspace.v8.MountStatus.loss:type_name -> portablefs.workspace.v8.Loss
-	7,  // 9: portablefs.workspace.v8.ResumeAck.token:type_name -> portablefs.workspace.v8.ResumeToken
-	8,  // 10: portablefs.workspace.v8.ResumeAck.mounts:type_name -> portablefs.workspace.v8.MountStatus
-	8,  // 11: portablefs.workspace.v8.StatusReply.mounts:type_name -> portablefs.workspace.v8.MountStatus
-	8,  // 12: portablefs.workspace.v8.StatusReply.retired:type_name -> portablefs.workspace.v8.MountStatus
-	2,  // 13: portablefs.workspace.v8.Provision.mount:type_name -> portablefs.workspace.v8.MountID
-	2,  // 14: portablefs.workspace.v8.MountRequest.mount:type_name -> portablefs.workspace.v8.MountID
-	2,  // 15: portablefs.workspace.v8.UmountRequest.mount:type_name -> portablefs.workspace.v8.MountID
-	1,  // 16: portablefs.workspace.v8.Envelope.hello:type_name -> portablefs.workspace.v8.Hello
-	1,  // 17: portablefs.workspace.v8.Envelope.hello_ack:type_name -> portablefs.workspace.v8.Hello
-	3,  // 18: portablefs.workspace.v8.Envelope.suspend:type_name -> portablefs.workspace.v8.Suspension
-	6,  // 19: portablefs.workspace.v8.Envelope.suspend_ack:type_name -> portablefs.workspace.v8.SuspendAck
-	7,  // 20: portablefs.workspace.v8.Envelope.resume:type_name -> portablefs.workspace.v8.ResumeToken
-	9,  // 21: portablefs.workspace.v8.Envelope.resume_ack:type_name -> portablefs.workspace.v8.ResumeAck
-	10, // 22: portablefs.workspace.v8.Envelope.status:type_name -> portablefs.workspace.v8.StatusRequest
-	11, // 23: portablefs.workspace.v8.Envelope.status_reply:type_name -> portablefs.workspace.v8.StatusReply
-	13, // 24: portablefs.workspace.v8.Envelope.provision:type_name -> portablefs.workspace.v8.Provision
-	14, // 25: portablefs.workspace.v8.Envelope.mount:type_name -> portablefs.workspace.v8.MountRequest
-	15, // 26: portablefs.workspace.v8.Envelope.umount:type_name -> portablefs.workspace.v8.UmountRequest
-	16, // 27: portablefs.workspace.v8.Envelope.result:type_name -> portablefs.workspace.v8.Result
-	12, // 28: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
-	29, // [29:29] is the sub-list for method output_type
-	29, // [29:29] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	6,  // 4: portablefs.workspace.v8.MountCold.outcome:type_name -> portablefs.workspace.v8.MountOutcome
+	3,  // 5: portablefs.workspace.v8.SuspendAck.suspension:type_name -> portablefs.workspace.v8.Suspension
+	7,  // 6: portablefs.workspace.v8.SuspendAck.mounts:type_name -> portablefs.workspace.v8.MountCold
+	3,  // 7: portablefs.workspace.v8.ResumeToken.suspension:type_name -> portablefs.workspace.v8.Suspension
+	2,  // 8: portablefs.workspace.v8.MountStatus.mount:type_name -> portablefs.workspace.v8.MountID
+	4,  // 9: portablefs.workspace.v8.MountStatus.loss:type_name -> portablefs.workspace.v8.Loss
+	5,  // 10: portablefs.workspace.v8.MountStatus.renewal:type_name -> portablefs.workspace.v8.RenewalReadiness
+	6,  // 11: portablefs.workspace.v8.MountStatus.outcome:type_name -> portablefs.workspace.v8.MountOutcome
+	9,  // 12: portablefs.workspace.v8.ResumeAck.token:type_name -> portablefs.workspace.v8.ResumeToken
+	10, // 13: portablefs.workspace.v8.ResumeAck.mounts:type_name -> portablefs.workspace.v8.MountStatus
+	10, // 14: portablefs.workspace.v8.StatusReply.mounts:type_name -> portablefs.workspace.v8.MountStatus
+	10, // 15: portablefs.workspace.v8.StatusReply.retired:type_name -> portablefs.workspace.v8.MountStatus
+	2,  // 16: portablefs.workspace.v8.Provision.mount:type_name -> portablefs.workspace.v8.MountID
+	2,  // 17: portablefs.workspace.v8.MountRequest.mount:type_name -> portablefs.workspace.v8.MountID
+	2,  // 18: portablefs.workspace.v8.UmountRequest.mount:type_name -> portablefs.workspace.v8.MountID
+	1,  // 19: portablefs.workspace.v8.Envelope.hello:type_name -> portablefs.workspace.v8.Hello
+	1,  // 20: portablefs.workspace.v8.Envelope.hello_ack:type_name -> portablefs.workspace.v8.Hello
+	3,  // 21: portablefs.workspace.v8.Envelope.suspend:type_name -> portablefs.workspace.v8.Suspension
+	8,  // 22: portablefs.workspace.v8.Envelope.suspend_ack:type_name -> portablefs.workspace.v8.SuspendAck
+	9,  // 23: portablefs.workspace.v8.Envelope.resume:type_name -> portablefs.workspace.v8.ResumeToken
+	11, // 24: portablefs.workspace.v8.Envelope.resume_ack:type_name -> portablefs.workspace.v8.ResumeAck
+	12, // 25: portablefs.workspace.v8.Envelope.status:type_name -> portablefs.workspace.v8.StatusRequest
+	13, // 26: portablefs.workspace.v8.Envelope.status_reply:type_name -> portablefs.workspace.v8.StatusReply
+	15, // 27: portablefs.workspace.v8.Envelope.provision:type_name -> portablefs.workspace.v8.Provision
+	16, // 28: portablefs.workspace.v8.Envelope.mount:type_name -> portablefs.workspace.v8.MountRequest
+	17, // 29: portablefs.workspace.v8.Envelope.umount:type_name -> portablefs.workspace.v8.UmountRequest
+	18, // 30: portablefs.workspace.v8.Envelope.result:type_name -> portablefs.workspace.v8.Result
+	14, // 31: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
+	32, // [32:32] is the sub-list for method output_type
+	32, // [32:32] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_proto_workspace_v8_control_proto_init() }
@@ -1551,7 +1717,7 @@ func file_proto_workspace_v8_control_proto_init() {
 	if File_proto_workspace_v8_control_proto != nil {
 		return
 	}
-	file_proto_workspace_v8_control_proto_msgTypes[17].OneofWrappers = []any{
+	file_proto_workspace_v8_control_proto_msgTypes[19].OneofWrappers = []any{
 		(*Envelope_Hello)(nil),
 		(*Envelope_HelloAck)(nil),
 		(*Envelope_Suspend)(nil),
@@ -1572,7 +1738,7 @@ func file_proto_workspace_v8_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_workspace_v8_control_proto_rawDesc), len(file_proto_workspace_v8_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

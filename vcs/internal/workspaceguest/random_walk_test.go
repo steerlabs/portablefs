@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -19,26 +20,35 @@ type randomWalkMount struct {
 	mu         sync.Mutex
 	rng        *rand.Rand
 	generation uint64
+	gateSerial uint64
 	open       bool
 	w          Witness
 }
 
+func (m *randomWalkMount) bindProof(r *Recovery) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r.GateSerial = m.gateSerial
+	r.Renewal.Permit = mountenrollment.Permit{Generation: r.Generation, GateSerial: m.gateSerial}
+}
 func (m *randomWalkMount) r() int { m.mu.Lock(); defer m.mu.Unlock(); return m.rng.Intn(1000) }
-func (m *randomWalkMount) CloseAdmission(g uint64) {
+func (m *randomWalkMount) CloseAdmission(g uint64) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if g >= m.generation {
 		m.generation = g
 		m.open = false
 	}
+	m.gateSerial++
+	return m.gateSerial
 }
-func (m *randomWalkMount) OpenAdmission(g uint64) error {
+func (m *randomWalkMount) OpenAdmission(g, serial uint64) error {
 	if m.r() < 100 {
 		return errors.New("open refused")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if g != m.generation {
+	if g != m.generation || serial != m.gateSerial {
 		return ErrState
 	}
 	m.open = true
@@ -62,6 +72,7 @@ func (m *randomWalkMount) proof(ctx context.Context, g uint64) (Recovery, error)
 	m.delay(ctx)
 	r := ready()
 	r.Generation = g
+	m.bindProof(&r)
 	switch m.r() % 13 {
 	case 0:
 		return r, nil
@@ -72,7 +83,7 @@ func (m *randomWalkMount) proof(ctx context.Context, g uint64) (Recovery, error)
 	case 3:
 		r.SessionValidated = false
 	case 4:
-		r.InitialRenewalInstalled = false
+		r.Renewal.State = "pending"
 	case 5:
 		r.State = "terminal"
 	case 6:

@@ -39,17 +39,18 @@ import (
 const mountTokenEnv = "PORTABLEFS_MOUNT_TOKEN"
 
 type mountReady struct {
-	OK                     bool     `json:"ok"`
-	Cleaned                bool     `json:"cleaned,omitempty"`
-	Error                  string   `json:"error,omitempty"`
-	PID                    int      `json:"pid,omitempty"`
-	Strategy               string   `json:"strategy,omitempty"`
-	MountPath              string   `json:"mountPath,omitempty"`
-	VolumeID               string   `json:"volumeId,omitempty"`
-	AttachRef              string   `json:"attachRef,omitempty"`
-	AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
-	LocalRoutes            []string `json:"localRoutes,omitempty"`
-	LocalRouteRevision     string   `json:"localRouteRevision,omitempty"`
+	Renewal                *mountenrollment.RenewalReadiness `json:"renewal,omitempty"`
+	OK                     bool                              `json:"ok"`
+	Cleaned                bool                              `json:"cleaned,omitempty"`
+	Error                  string                            `json:"error,omitempty"`
+	PID                    int                               `json:"pid,omitempty"`
+	Strategy               string                            `json:"strategy,omitempty"`
+	MountPath              string                            `json:"mountPath,omitempty"`
+	VolumeID               string                            `json:"volumeId,omitempty"`
+	AttachRef              string                            `json:"attachRef,omitempty"`
+	AuthorizationSessionID string                            `json:"authorizationSessionId,omitempty"`
+	LocalRoutes            []string                          `json:"localRoutes,omitempty"`
+	LocalRouteRevision     string                            `json:"localRouteRevision,omitempty"`
 }
 
 type mountOpts struct {
@@ -978,6 +979,9 @@ func canonicalOrigin(raw string) (string, error) {
 // runMountForeground performs the actual mount in this process: resolve the
 // session, pick a strategy, attach, record state, then serve until unmounted.
 func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir string, operation *mountOperation) int {
+	// Leave a full minute for exact rollback before the parent's three-minute
+	// startup limit. This bound starts before attach and enrollment work.
+	startupDeadline := time.Now().Add(2 * time.Minute)
 	defer func() {
 		if operation != nil {
 			if err := operation.close(false); err != nil {
@@ -1238,6 +1242,11 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 
 	switch strategy {
 	case "fuse":
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sig)
+		attachCtx, stopAttachSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stopAttachSignals()
 		if err := revalidatePinnedMountTarget(mountPath, mountTargetIdentity); err != nil {
 			return failReady(err)
 		}
@@ -1261,7 +1270,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 					"the authority's strict membership for this session must be discharged explicitly", mountPath)
 			}
 		}
-		m, authorityAttached, err := mountFUSEv3(fuseV3Config{
+		m, authorityAttached, startupClean, err := mountFUSEv3(attachCtx, fuseV3Config{
 			addr: authorityURL, token: mountToken, transport: transport,
 			identity: clientIdentity,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
@@ -1269,13 +1278,20 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			requireMountEnrollment: enrollmentClient != nil,
 			onRevoked:              recordRevocation,
 		})
+		attachInterrupted := attachCtx.Err()
+		stopAttachSignals()
 		automaticOwnerEstablished = enrollmentClient != nil && authorityAttached
 		if err != nil {
-			if failedFUSEStartupClean(err) {
+			if attachInterrupted != nil {
+				err = errors.Join(errors.New("mount startup interrupted"), err)
+			}
+			if startupClean {
 				return finalizeCleanedStartup(err)
 			}
 			return failReady(err)
 		}
+		mountGone := make(chan struct{})
+		go func() { m.Wait(); close(mountGone) }()
 		kernelMountID, err := captureFUSEKernelMountID(mountPath, mountInstanceID)
 		if err != nil {
 			// A path-based unmount is unsafe when the kernel table is absent,
@@ -1296,12 +1312,12 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			defer unmountMu.Unlock()
 			return m.Unmount()
 		}
-		mountGone := make(chan struct{})
-		var mountGoneOnce sync.Once
-		markMountGone := func() { mountGoneOnce.Do(func() { close(mountGone) }) }
 		var reauthorizationControl fuseReauthorizationControl
 		var renewalCancel context.CancelFunc
 		var renewalDone chan error
+		renewalFailedEarly := make(chan error, 1)
+		var renewalOwner *mountenrollment.Renewer
+		initialRenewal := make(chan struct{}, 1)
 		stopRenewal := func() error {
 			if renewalCancel == nil {
 				return nil
@@ -1329,11 +1345,14 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			}
 			// Startup rollback runs the same exact teardown as a live unmount:
 			// kernel detach, then session release with its recorded verdict.
-			if unmountErr := requestUnmount(); unmountErr != nil {
-				return failReady(errors.Join(cause, fmt.Errorf("transactional startup FUSE unmount failed: %w", unmountErr)))
+			select {
+			case <-mountGone:
+			default:
+				if unmountErr := requestUnmount(); unmountErr != nil {
+					return failReady(errors.Join(cause, fmt.Errorf("transactional startup FUSE unmount failed: %w", unmountErr)))
+				}
 			}
-			m.Wait()
-			markMountGone()
+			<-mountGone
 			if teardownErr := m.Close(); teardownErr != nil {
 				return failReady(errors.Join(cause, fmt.Errorf("close failed-startup FUSE resources: %w", teardownErr)))
 			}
@@ -1402,15 +1421,24 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			if eventLogErr != nil {
 				return cleanupMountedFUSE(fmt.Errorf("initialize per-mount renewal event log: %w", eventLogErr))
 			}
-			renewer := &mountenrollment.Renewer{
+			renewalOwner = &mountenrollment.Renewer{
 				Source: enrollmentClient,
 				Observe: func(event mountenrollment.RenewalEvent) {
 					recordFUSERenewalEvent(renewalEvents, stateDir, mountPath, o.enrollmentID, event, m.WritebackStats())
+					if event.Kind == mountenrollment.RenewalSucceeded {
+						select {
+						case initialRenewal <- struct{}{}:
+						default:
+						}
+					}
 				},
 			}
 			go func() {
-				renewErr := renewer.Run(renewalCtx, authorizationSessionID, initialAuthorizationDeadline, m.Reauthorize)
+				renewErr := renewalOwner.Run(renewalCtx, authorizationSessionID, initialAuthorizationDeadline, m.Reauthorize)
 				if renewErr != nil {
+					// Failure is observable before busy detach retries finish. Startup can
+					// now cancel that loop and own one exact rollback attempt.
+					renewalFailedEarly <- renewErr
 					setMountStatus(stateDir, mountPath, mountStatusCredentialExpired, time.Now().UnixMilli())
 					log.Printf("portablefs mount: automatic reauthorization ended the mount: %v", renewErr)
 					backoff := 250 * time.Millisecond
@@ -1448,6 +1476,26 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				renewalDone <- renewErr
 			}()
 		}
+		if enrollmentClient != nil {
+			// The owner signals a completed installer; its typed snapshot remains
+			// the authority for publication, independently of event logs/sockets.
+			if err := awaitInitialFUSERenewal(initialRenewal, renewalFailedEarly, mountGone, sig, startupDeadline); err != nil {
+				return cleanupMountedFUSE(err)
+			}
+			proof := renewalOwner.Readiness()
+			if err := validateFUSERenewalReadiness(proof, true, authorizationSessionID, m.AuthorizationDeadline(), time.Now()); err != nil {
+				return cleanupMountedFUSE(errors.New("initial renewal readiness unavailable"))
+			}
+			ready.Renewal = &proof
+		} else {
+			proof := mountenrollment.RenewalReadiness{State: "not-required"}
+			ready.Renewal = &proof
+		}
+		select {
+		case <-sig:
+			return cleanupMountedFUSE(errors.New("mount startup interrupted"))
+		default:
+		}
 		if err := operation.writeIntent("live", os.Getpid(), processIdentity); err != nil {
 			return cleanupMountedFUSE(err)
 		}
@@ -1455,14 +1503,16 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			return cleanupMountedFUSE(fmt.Errorf("release mount operation lock before readiness: %w", err))
 		}
 		report(ready)
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		go func() {
-			for range sig {
-				// EBUSY keeps the mount up; the next signal retries. There is no
-				// write-back tail in v3 — every acknowledged write is already
-				// durable at the authority — so there is nothing to park and no
-				// forced variant of this teardown.
+			for {
+				select {
+				case <-mountGone:
+					return
+				case <-sig:
+				}
+				// EBUSY keeps the mount up; the next signal retries. Accepted
+				// delegated writes can still be buffered. Exact teardown owns
+				// their drain and reports any durability failure or loss.
 				if err := requestUnmount(); err != nil {
 					log.Printf("portablefs mount: shutdown request refused: %v", err)
 					continue
@@ -1470,9 +1520,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				return
 			}
 		}()
-		m.Wait() // returns when the kernel mount is gone (signal or external umount)
-		markMountGone()
-		signal.Stop(sig)
+		<-mountGone // signal or external umount; supervision began at kernel install
 		renewalErr := stopRenewal()
 		renewalStopTimedOut := errors.Is(renewalErr, errAutomaticRenewalStopTimeout)
 		renewalFailed := renewalErr != nil && !renewalStopTimedOut
@@ -1721,6 +1769,35 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	default:
 		return failReady(fmt.Errorf("unknown strategy %q", strategy))
 	}
+}
+
+// Kernel lifetime and shutdown remain supervised during initial network renewal.
+func awaitInitialFUSERenewal(installed <-chan struct{}, failed <-chan error, gone <-chan struct{}, signals <-chan os.Signal, deadline time.Time) error {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-installed:
+		// A queued success cannot win a select against an already elapsed bound.
+		if !time.Now().Before(deadline) {
+			return errors.New("initial automatic renewal exceeded the two-minute startup bound")
+		}
+		return nil
+	case err := <-failed:
+		return fmt.Errorf("initial automatic renewal failed: %w", err)
+	case <-gone:
+		return errors.New("kernel mount ended before initial renewal")
+	case <-signals:
+		return errors.New("mount startup interrupted")
+	case <-timer.C:
+		return errors.New("initial automatic renewal exceeded the two-minute startup bound")
+	}
+}
+
+func validateFUSERenewalReadiness(proof mountenrollment.RenewalReadiness, hosted bool, session string, deadline, now time.Time) error {
+	if !proof.Ready(!hosted, mountenrollment.Permit{}, session, deadline) || hosted && !deadline.After(now) {
+		return errors.New("initial renewal installation and deadline not proven")
+	}
+	return nil
 }
 
 func recordFUSERenewalEvent(events *mountlog.Writer, stateDir, mountPath, enrollmentID string, event mountenrollment.RenewalEvent, writeback *mountlog.WritebackStats) {

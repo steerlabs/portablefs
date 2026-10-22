@@ -41,7 +41,7 @@ func fixtures() map[string]*pb.Envelope {
 	request.Roster = nil
 	loss := []*pb.Loss{{Sequence: 1, AcceptedEntries: 1, AcceptedBytes: 4096, Reason: "accepted tail unprovable"}}
 	token := &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}
-	status := &pb.MountStatus{Mount: fixtureMount(), State: "terminal", Reason: "session ended; reopen required", Loss: loss, Cleanup: "retained"}
+	status := &pb.MountStatus{Mount: fixtureMount(), State: "terminal", Reason: "session ended; reopen required", Loss: loss, Cleanup: "retained", Outcome: UnknownOutcome()}
 	retired := proto.Clone(status).(*pb.MountStatus)
 	retired.Mount.Incarnation = fixtureID(10)
 	retired.Cleanup = "complete"
@@ -49,7 +49,7 @@ func fixtures() map[string]*pb.Envelope {
 	bodies := map[string]*pb.Envelope{
 		"hello": {Body: &pb.Envelope_Hello{Hello: h}}, "hello_ack": {Body: &pb.Envelope_HelloAck{HelloAck: guest}},
 		"suspend":      {Body: &pb.Envelope_Suspend{Suspend: request}},
-		"suspend_ack":  {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: []*pb.MountCold{{Mount: fixtureMount(), Loss: loss}}}}},
+		"suspend_ack":  {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: []*pb.MountCold{{Mount: fixtureMount(), Loss: loss, Outcome: UnknownOutcome()}}}}},
 		"resume":       {Body: &pb.Envelope_Resume{Resume: token}},
 		"resume_ack":   {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{status}}}},
 		"status":       {Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}},
@@ -59,6 +59,19 @@ func fixtures() map[string]*pb.Envelope {
 		"umount":       {Body: &pb.Envelope_Umount{Umount: &pb.UmountRequest{Mount: fixtureMount()}}},
 		"retire_ack":   {Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{ThroughSequence: 1}}},
 		"result":       {Body: &pb.Envelope_Result{Result: &pb.Result{Code: "unavailable", Reason: "mount integration pending"}}},
+	}
+	for _, state := range []string{"pending", "installed", "not-required"} {
+		entry := proto.Clone(status).(*pb.MountStatus)
+		entry.State = "ready"
+		entry.Reason = ""
+		entry.Renewal = &pb.RenewalReadiness{State: state}
+		if state == "pending" {
+			entry.State = "recovering"
+		}
+		if state == "installed" {
+			entry.Renewal.InstalledSequence = 2
+		}
+		bodies["renewal_"+strings.ReplaceAll(state, "-", "_")] = &pb.Envelope{Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{entry}}}}
 	}
 	for _, e := range bodies {
 		e.Version = 8
@@ -88,7 +101,33 @@ func invalidFixtures() map[string][]byte {
 	}
 	repeated = protowire.AppendBytes(protowire.AppendTag(repeated, 12, protowire.BytesType), body)
 
-	return map[string][]byte{
+	negative := map[string][]byte{}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*pb.MountStatus)
+	}{
+		{"missing_outcome", func(m *pb.MountStatus) { m.Outcome = nil }},
+		{"missing_renewal", func(m *pb.MountStatus) { m.Renewal = nil }},
+		{"zero_installed_sequence", func(m *pb.MountStatus) { m.Renewal.InstalledSequence = 0 }},
+		{"pending_with_sequence", func(m *pb.MountStatus) { m.Renewal.State = "pending" }},
+		{"not_required_with_sequence", func(m *pb.MountStatus) { m.Renewal.State = "not-required" }},
+		{"unobserved_durable", func(m *pb.MountStatus) { m.Outcome.Durability = "durable" }},
+		{"invalid_release_outcome", func(m *pb.MountStatus) { m.Outcome.Release = "forgotten" }},
+	} {
+		e := fixtures()["renewal_installed"]
+		tc.mutate(e.GetResumeAck().Mounts[0])
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		negative[tc.name] = framed(raw)
+	}
+	readyPending := fixtures()["renewal_pending"]
+	readyPending.GetResumeAck().Mounts[0].State = "ready"
+	raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(readyPending)
+	negative["ready_with_pending_renewal"] = framed(raw)
+	coldMissing := fixtures()["suspend_ack"]
+	coldMissing.GetSuspendAck().Mounts[0].Outcome = nil
+	raw, _ = proto.MarshalOptions{Deterministic: true}.Marshal(coldMissing)
+	negative["cold_missing_outcome"] = framed(raw)
+	base := map[string][]byte{
 		"unequal_version":    framed([]byte{8, 9, 16, 1, 0x82, 1, 0}),
 		"unknown_body":       framed([]byte{8, 8, 16, 1, 0xb2, 1, 0}),
 		"duplicate_version":  framed([]byte{8, 8, 8, 8, 16, 1, 0x82, 1, 0}),
@@ -105,6 +144,10 @@ func invalidFixtures() map[string][]byte {
 		"excessive_repeated": framed(repeated),
 		"oversized_length":   {0, 0x10, 0, 1}, "truncated": status[:len(status)-1], "trailing": append(status, 0),
 	}
+	for name, raw := range negative {
+		base[name] = raw
+	}
+	return base
 }
 func golden(t *testing.T, name string, raw []byte) {
 	t.Helper()
@@ -296,8 +339,8 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 		for n := 1; n <= MaxLosses; n++ {
 			loss = append(loss, &pb.Loss{Sequence: uint64(n), AcceptedEntries: math.MaxUint64, AcceptedBytes: math.MaxUint64, Reason: strings.Repeat("r", MaxReason)})
 		}
-		statuses = append(statuses, &pb.MountStatus{Mount: mid, State: "terminal", Reason: strings.Repeat("r", MaxReason), Cleanup: "complete", Loss: loss})
-		cold = append(cold, &pb.MountCold{Mount: mid, Loss: loss})
+		statuses = append(statuses, &pb.MountStatus{Mount: mid, State: "terminal", Reason: strings.Repeat("r", MaxReason), Cleanup: "complete", Loss: loss, Outcome: UnknownOutcome()})
+		cold = append(cold, &pb.MountCold{Mount: mid, Loss: loss, Outcome: UnknownOutcome()})
 	}
 	var retired []*pb.MountStatus
 	for i := 0; i < MaxRetiredBatch; i++ {

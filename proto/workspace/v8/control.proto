@@ -39,11 +39,26 @@ message Loss {
   // Final bounded cumulative summary; counters saturate at uint64 max.
   bool aggregated = 5;
 }
+message RenewalReadiness {
+  // pending, installed, not-required (explicit standalone only).
+  string state = 1;
+  uint64 installed_sequence = 2;
+}
+message MountOutcome {
+  // durable, lost, unresolved.
+  string durability = 1;
+  // observed, unobserved.
+  string observation = 2;
+  // released, expired, abandoned, unresolved.
+  string release = 3;
+  uint64 cleanup_debt = 4;
+}
 message MountCold {
   MountID mount = 1;
   // An ack exists only after whole-roster cold completion.
   reserved 2;
   repeated Loss loss = 3;
+  MountOutcome outcome = 4;
 }
 message SuspendAck {
   Suspension suspension = 1;
@@ -63,6 +78,8 @@ message MountStatus {
   string cleanup = 5;
   // Zero for active mounts; strictly increasing for retired outcomes per guest.
   uint64 retirement_sequence = 6;
+  RenewalReadiness renewal = 7;
+  MountOutcome outcome = 8;
 }
 message ResumeAck {
   ResumeToken token = 1;

@@ -36,13 +36,14 @@ type clientTransport struct {
 }
 
 type transportNegotiation struct {
-	conn        net.Conn
-	epoch       []byte
-	maxFrame    uint32
-	maxRead     uint32
-	maxWrite    uint32
-	maxInFlight uint32
-	role        authoritypb.TransportRole
+	stopCancellation func() error
+	conn             net.Conn
+	epoch            []byte
+	maxFrame         uint32
+	maxRead          uint32
+	maxWrite         uint32
+	maxInFlight      uint32
+	role             authoritypb.TransportRole
 	// Set only by proof-bearing Resume during pre-publication activation
 	// recovery. Hello itself never conveys a binding generation.
 	resumedBindingGeneration uint64
@@ -201,16 +202,29 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*transportNegotiation, error) {
-		_ = conn.Close()
-		return nil, err
-	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(c.cfg.DialTimeout)
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
-		return fail(err)
+		_ = conn.Close()
+		return nil, err
+	}
+	// Caller cancellation interrupts Hello/Attach/Activate reads too. Join this
+	// callback before clearing deadlines and publishing a serving transport.
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()); close(interrupted) })
+	stopCancellation := func() error {
+		if stop() {
+			close(interrupted)
+		}
+		<-interrupted
+		return ctx.Err()
+	}
+	fail := func(err error) (*transportNegotiation, error) {
+		_ = stopCancellation()
+		_ = conn.Close()
+		return nil, err
 	}
 	request := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
 		ProtocolMajor:   ProtocolMajor,
@@ -270,7 +284,8 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 		))
 	}
 	return &transportNegotiation{
-		conn: conn, epoch: append([]byte(nil), response.GetEpoch()...),
+		stopCancellation: stopCancellation,
+		conn:             conn, epoch: append([]byte(nil), response.GetEpoch()...),
 		maxFrame: negotiatedFrame,
 		maxRead:  hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(),
 		maxInFlight: hello.GetMaxInFlight(), role: role,
@@ -383,6 +398,9 @@ func rawRoundTrip(conn net.Conn, frameMax uint32, request *authoritypb.Request) 
 func closeNegotiations(opened ...*transportNegotiation) {
 	for _, transport := range opened {
 		if transport != nil && transport.conn != nil {
+			if transport.stopCancellation != nil {
+				_ = transport.stopCancellation()
+			}
 			_ = transport.conn.Close()
 		}
 	}
@@ -418,6 +436,12 @@ func (c *Client) publishTransport(transport *clientTransport, opened *transportN
 	if transport == nil || opened == nil || opened.conn == nil || transport.role != opened.role || generation == 0 {
 		return ErrTransportBinding
 	}
+	if opened.stopCancellation != nil {
+		if err := opened.stopCancellation(); err != nil {
+			_ = opened.conn.Close()
+			return err
+		}
+	}
 	if err := opened.conn.SetDeadline(time.Time{}); err != nil {
 		_ = opened.conn.Close()
 		return err
@@ -452,6 +476,18 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 		control.role != authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL ||
 		dataGeneration == 0 || controlGeneration == 0 {
 		return ErrTransportBinding
+	}
+	// Join both callbacks before any independent committed-session cleanup.
+	// Returning after the first canceled role could race the other role's
+	// cancellation with the cleanup deadline installed on its connection.
+	var cancellation error
+	for _, opened := range []*transportNegotiation{data, control} {
+		if opened.stopCancellation != nil {
+			cancellation = errors.Join(cancellation, opened.stopCancellation())
+		}
+	}
+	if cancellation != nil {
+		return cancellation
 	}
 	if err := data.conn.SetDeadline(time.Time{}); err != nil {
 		return err

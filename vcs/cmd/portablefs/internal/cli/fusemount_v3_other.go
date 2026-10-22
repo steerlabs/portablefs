@@ -38,13 +38,12 @@ func (m *fuseV3Mount) Wait()                                    {}
 func (m *fuseV3Mount) Close() error                             { return fmt.Errorf("the v3 FUSE engine requires Linux") }
 func (m *fuseV3Mount) WritebackStats() *mountlog.WritebackStats { return nil }
 func (m *fuseV3Mount) AuthorizationSessionID() string           { return "" }
+func (m *fuseV3Mount) AuthorizationDeadline() time.Time         { return time.Time{} }
 func (m *fuseV3Mount) InitialAuthorizationDeadline() time.Time  { return time.Time{} }
 func (m *fuseV3Mount) Reauthorize(context.Context, string, uint64, []byte) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("the v3 FUSE engine requires Linux")
 }
 
-func mountFUSEv3(fuseV3Config) (*fuseV3Mount, bool, error) {
-	return nil, false, fmt.Errorf("the v3 FUSE engine requires Linux")
+func mountFUSEv3(context.Context, fuseV3Config) (*fuseV3Mount, bool, bool, error) {
+	return nil, false, false, fmt.Errorf("the v3 FUSE engine requires Linux")
 }
-
-func failedFUSEStartupClean(error) bool { return false }

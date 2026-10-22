@@ -15,14 +15,14 @@ func workspaceGolden(_ name: String) throws -> Data {
     return bytes
 }
 @Test func workspaceGoldensCoverEveryMessageAndRejectMalformedFrames() throws {
-    let names = ["hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack"]
+    let names = ["hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required"]
     for name in names {
         let raw = try workspaceGolden(name)
         let envelope = try WorkspaceControl.decode(raw)
         #expect(envelope.version == 8)
         #expect(try WorkspaceControl.encode(envelope) == raw)
     }
-    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated"]
+    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated", "missing_outcome", "missing_renewal", "zero_installed_sequence", "pending_with_sequence", "not_required_with_sequence", "unobserved_durable", "invalid_release_outcome", "ready_with_pending_renewal", "cold_missing_outcome"]
     for name in invalid {
         let raw = try workspaceGolden(name + ".invalid")
         #expect(throws: (any Error).self) { try WorkspaceControl.decode(raw) }
@@ -87,4 +87,29 @@ func workspaceGolden(_ name: String) throws -> Data {
     #expect(!WorkspaceControl.validStatus(bad))
     bad = template; bad.mounts[0].reason = ""
     #expect(!WorkspaceControl.validStatus(bad))
+}
+
+func unknownTestOutcome() -> WorkspaceMountOutcome {
+    var o = WorkspaceMountOutcome(); o.durability = "unresolved"; o.observation = "unobserved"; o.release = "unresolved"; return o
+}
+func installedTestRenewal() -> WorkspaceRenewalReadiness {
+    var r = WorkspaceRenewalReadiness(); r.state = "installed"; r.installedSequence = 1; return r
+}
+@Test func workspaceTypedReadinessAndOutcomeCombinations() throws {
+    var e = try WorkspaceControl.decode(workspaceGolden("status_reply"))
+    var s = e.statusReply; s.retired = []; s.mounts[0].state = "ready"; s.mounts[0].reason = ""
+    #expect(!WorkspaceControl.validStatus(s))
+    for state in ["pending", "installed", "not-required"] {
+        for sequence: UInt64 in [0, 1] {
+            var r = WorkspaceRenewalReadiness(); r.state = state; r.installedSequence = sequence
+            s.mounts[0].renewal = r
+            #expect(WorkspaceControl.validStatus(s) == ((state == "installed" && sequence == 1) || (state == "not-required" && sequence == 0)))
+        }
+    }
+    s.mounts[0].outcome.durability = "durable"
+    #expect(!WorkspaceControl.validStatus(s))
+    s.mounts[0].outcome.observation = "observed"
+    s.mounts[0].renewal = installedTestRenewal()
+    #expect(WorkspaceControl.validStatus(s))
+    e.body = .statusReply(s); _ = try WorkspaceControl.encode(e)
 }
