@@ -38,11 +38,9 @@ var (
 // Keeping it alongside the stamp lets daemon-resident cache entries be checked
 // without a second side table.
 type subscriptionStamp struct {
-	incarnation    uint64
-	generation     uint64
-	version        uint64
-	workspace      workspaceadmission.ServingPermit
-	workspaceBound bool
+	incarnation uint64
+	generation  uint64
+	version     uint64
 }
 
 func (s subscriptionStamp) withVersion(version uint64) subscriptionStamp {
@@ -230,15 +228,9 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	if !s.servingLocked() {
 		return subscriptionStamp{}
 	}
-	stamp := subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
-	if s.mount != nil && s.mount.workspace != nil {
-		p, err := s.mount.workspace.Check()
-		if err != nil {
-			return subscriptionStamp{}
-		}
-		stamp.workspace, stamp.workspaceBound = p, true
-	}
-	return stamp
+	// The publication owns the entry's serving permit. Cache facts need only
+	// the subscription generation, which changes at every cold installation.
+	return subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
 }
 
 // remaining is the sole cache-admission predicate. A change advances only its
@@ -270,7 +262,7 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.servingLocked() || stamp.incarnation != s.incarnation || stamp.workspaceBound && stamp.workspace.Check() != nil {
+	if !s.servingLocked() || stamp.incarnation != s.incarnation {
 		return 0
 	}
 	if coordinate.kind == publicationNamespaceName {
@@ -1033,6 +1025,12 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			timer.Stop()
 			return ctx.Err()
 		}
+		s.mu.Lock()
+		live := s.incarnation == incarnation && s.controlLiveLocked()
+		s.mu.Unlock()
+		if !live {
+			continue
+		}
 		deadline, err := s.rpc.RenewSubscription(ctx, incarnation)
 		if err != nil {
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
@@ -1149,7 +1147,10 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		}
 	}
 	for _, publication := range r.replyPublications {
-		if publication == nil {
+		// Unfinalized callbacks still construct their slices outside raw.mu.
+		// Their pending cache coordinates are in cacheReservations above;
+		// final preparation revalidates the inactive subscription before use.
+		if publication == nil || !publication.originalFinalized {
 			continue
 		}
 		for _, coordinate := range publication.cachedCoordinates[:publication.cachedCount] {

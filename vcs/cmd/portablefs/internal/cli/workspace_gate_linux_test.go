@@ -36,6 +36,8 @@ func TestWorkspaceGateFlagsCannotEnableManagedMount(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer unix.Close(gate)
+			defer unix.Close(owner)
 			opts := mountOpts{foreground: true, workspaceGateFD: gate, workspaceOwnerFD: owner}
 			switch kind {
 			case "single":
@@ -56,8 +58,8 @@ func TestWorkspaceGateFlagsCannotEnableManagedMount(t *testing.T) {
 			}
 			for _, fd := range []int{opts.workspaceGateFD, opts.workspaceOwnerFD} {
 				if fd > 2 {
-					if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err == nil {
-						t.Fatal("managed refusal leaked inherited fd")
+					if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
+						t.Fatal("managed refusal closed caller descriptor")
 					}
 				}
 			}

@@ -24,31 +24,25 @@ func (r *rawFileSystem) recycleReplyLocked(p *replyPublication) {
 type workspaceReplyCohort struct{ replies []<-chan struct{} }
 
 func (r *rawFileSystem) captureWorkspaceReplies() workspaceReplyCohort {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	var cut workspaceReplyCohort
 	for _, p := range r.replyPublications {
-		if !p.servingEntry {
+		if p.workspaceDone == nil {
 			continue
 		}
-		// The write observation precedes lookup rollback, source release and
-		// response consumption. Join that existing settlement owner as well.
-		if p.responseConsumptionOwner == responseConsumptionUnregistered {
-			p.responseConsumptionOwner = responseConsumptionPublication
-			p.responseConsumptionDone = make(chan struct{})
-		}
-		cut.replies = append(cut.replies, p.originalDoneLocked(), p.responseConsumptionDone)
+		// The existing physical settlement owner remains indexed through source
+		// release, rollback and response consumption, including terminalization.
+		cut.replies = append(cut.replies, p.workspaceDone)
 	}
 	return cut
 }
 func (cut workspaceReplyCohort) wait(ctx context.Context) error {
-	for _, set := range [][]<-chan struct{}{cut.replies} {
-		for _, done := range set {
-			select {
-			case <-done:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+	for _, done := range cut.replies {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return nil
@@ -60,6 +54,22 @@ func workspaceAcceptance(ctx context.Context) error {
 	p := replyPublicationFromContext(ctx)
 	if p != nil && p.workspaceBound {
 		return p.workspace.Check()
+	}
+	return nil
+}
+
+// Ordinary mounts retain their original context and allocate no gate closure.
+func workspaceAdmissionContext(ctx context.Context) context.Context {
+	if check := workspaceAcceptanceCheck(ctx); check != nil {
+		return writeback.WithAdmissionCheck(ctx, check)
+	}
+	return ctx
+}
+
+func workspaceAcceptanceCheck(ctx context.Context) func() error {
+	p := replyPublicationFromContext(ctx)
+	if p != nil && p.workspaceBound {
+		return p.workspace.Check
 	}
 	return nil
 }
@@ -92,6 +102,9 @@ type workspaceRecoveryKey struct{}
 // beginWorkspaceEntry reserves one existing physical-reply owner before the
 // first answer or effect. The slow callback transfers this owner explicitly.
 func (r *rawFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
+	if r.mount.workspace == nil {
+		return nil, fuse.OK
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil {
@@ -106,7 +119,7 @@ func (r *rawFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, f
 		p = &replyPublication{}
 	}
 	p.owner, p.requestUnique = r, unique
-	p.servingEntry = r.mount.workspace != nil
+	p.workspaceDone = make(chan struct{})
 	r.replyPublications[unique] = p
 	if r.mount.workspace != nil {
 		permit, err := r.mount.workspace.Check()
@@ -119,7 +132,10 @@ func (r *rawFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, f
 	}
 	return p, fuse.OK
 }
-func (r *rawFileSystem) finishWorkspaceEntry(unique uint64, _ *replyPublication) {
+func (r *rawFileSystem) finishWorkspaceEntry(unique uint64, entry *replyPublication) {
+	if entry == nil {
+		return
+	}
 	r.mu.RLock()
 	p := r.replyPublications[unique]
 	r.mu.RUnlock()
@@ -134,20 +150,23 @@ func (r *rawFileSystem) finishWorkspaceEntry(unique uint64, _ *replyPublication)
 	r.mu.Unlock()
 }
 
-func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool) (*replyPublication, error) {
+func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, next *replyPublication) error {
+	if r.mount.workspace == nil {
+		next.callbackOwned = true
+		return r.registerReplyPublication(unique, next)
+	}
 	r.mu.Lock()
 	p := r.replyPublications[unique]
 	if p != nil {
 		if p.callbackOwned {
 			r.mu.Unlock()
-			return nil, fmt.Errorf("fusev3: duplicate reply owner %d", unique)
+			return fmt.Errorf("fusev3: duplicate reply owner %d", unique)
 		}
 		// Slow callbacks retain their original heap lifetime. Their contexts also
 		// reach counted descriptor cleanup after physical settlement; an arena slot
 		// cannot be reused while those callbacks still identify this operation.
-		next := new(replyPublication)
 		*next = *p
-		next.cachedArena, next.cachedAnswer, next.cachedNext = false, false, nil
+		next.cachedArena, next.cachedNext = false, nil
 		next.callbackOwned = true
 		next.responseConsumptionOwner = responseConsumptionPublication
 		if next.responseConsumptionDone == nil {
@@ -157,12 +176,16 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool) (*
 		r.replyPublications[unique] = next
 		r.recycleReplyLocked(p)
 		r.mu.Unlock()
-		return next, nil
+		return nil
 	}
 	r.mu.Unlock()
-	p = &replyPublication{callbackOwned: true, servingEntry: serving && r.mount.workspace != nil}
+	p = next
+	p.callbackOwned = true
+	if serving {
+		p.workspaceDone = make(chan struct{})
+	}
 	if err := r.registerReplyPublication(unique, p); err != nil {
-		return nil, err
+		return err
 	}
 	if serving && r.mount.workspace != nil {
 		r.mu.Lock()
@@ -173,12 +196,13 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool) (*
 			claim, _ := r.takeAuthorityResponsesLocked(p)
 			r.mu.Unlock()
 			consumeClaimedAuthorityResponses(claim)
-			return nil, err
+			close(p.workspaceDone)
+			return err
 		}
 		p.workspace, p.workspaceBound = permit, true
 		r.mu.Unlock()
 	}
-	return p, nil
+	return nil
 }
 
 // The lifecycle owner captures this before retiring the old buffer. Control
@@ -189,8 +213,8 @@ func (m *delegationManager) captureWorkspaceDrain(deadline time.Time) workspaceD
 	s := m.subscription
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.horizon.Before(deadline) {
-		deadline = s.horizon
+	if s.cacheUntil.Before(deadline) {
+		deadline = s.cacheUntil
 	}
 	p := workspaceDrainPermit{manager: m, buffer: m.buf, incarnation: s.incarnation, deadline: deadline}
 	s.workspaceDrain = &p

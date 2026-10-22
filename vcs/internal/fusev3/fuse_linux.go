@@ -1894,7 +1894,7 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 			return loss
 		}
 		if closed {
-			return syscall.EIO
+			return handle.closedFlushResult()
 		}
 		if local, errno := handle.flushLocally(); local {
 			return errno
@@ -1910,9 +1910,37 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 		return loss
 	}
 	if closed {
-		return syscall.EIO
+		if pending := handle.closedFlushResult(); pending != 0 {
+			return pending
+		}
 	}
 	return errno
+}
+
+// Closed admission still permits a clean close. Accepted data which has not
+// reached durability must remain visible as a failure to the closing caller.
+func (h *fileHandle) closedFlushResult() syscall.Errno {
+	m := h.node.mount.delegations
+	id, err := delegationIdentity(h.node.item.GetStableIdentity())
+	if err != nil {
+		return syscall.EIO
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		return 0
+	}
+	s.meta.Lock()
+	defer s.meta.Unlock()
+	m.durabilityMu.Lock()
+	durable := m.durableHigh
+	m.durabilityMu.Unlock()
+	if s.dirty && (s.appliedCut < s.acceptedCut || s.applied == 0 || s.applied > durable) {
+		return syscall.EIO
+	}
+	return 0
 }
 
 func (h *fileHandle) observeLoss() syscall.Errno {
@@ -2979,8 +3007,9 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			attrs.MTimeNS = *request.MtimeNs
 		}
 		var admissionErr error
+		var cut writeback.Cut
 		for {
-			_, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
+			cut, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
 			if !errors.Is(admissionErr, errDelegationNotOwned) {
 				break
 			}
@@ -2993,12 +3022,23 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		}
 		if admissionErr != nil {
 			if lease != nil {
-				_ = lease.markCallbackPublicationReady()
+				var transitionErr error
+				if cut.Sequence == 0 {
+					transitionErr = completeDefiniteNoChangePublication(ctx)
+				} else {
+					transitionErr = lease.markCallbackPublicationReady()
+				}
+				if transitionErr != nil {
+					n.mount.revoke(fmt.Errorf("fusev3: settle delegated SETATTR refusal: %w", transitionErr))
+					return syscall.EIO
+				}
 			}
 			return bufferErrno(admissionErr)
 		}
 		if err := n.invalidateOwnData(ctx, 0, 0); err != nil {
-			_ = lease.markCallbackPublicationReady()
+			if transitionErr := lease.markCallbackPublicationReady(); transitionErr != nil {
+				n.mount.revoke(fmt.Errorf("fusev3: settle accepted SETATTR after invalidation failure: %w", transitionErr))
+			}
 			return syscall.EIO
 		}
 		return n.Getattr(ctx, fh, out)

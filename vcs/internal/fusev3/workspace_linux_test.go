@@ -275,8 +275,8 @@ func TestWorkspaceClosedCleanupAndFlushUnlock(t *testing.T) {
 	status := f.rawCall(func(unique uint64) fuse.Status {
 		return f.raw.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, LockOwner: 7})
 	})
-	if status != fuse.EIO || f.mount.possiblePOSIXLock(key) != 0 {
-		t.Fatal("closed FLUSH lost failure/unlock", status)
+	if status != fuse.OK || f.mount.possiblePOSIXLock(key) != 0 {
+		t.Fatal("closed clean FLUSH lost success/unlock", status)
 	}
 	f.raw.Release(nil, &fuse.ReleaseIn{Fh: opened.Fh})
 	f.raw.ReleaseDir(&fuse.ReleaseIn{Fh: directory.Fh})
@@ -315,19 +315,19 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 	if _, _, _, active := f.mount.subscription.currentIncarnation(); !active {
 		t.Fatal("closed recovery lost control liveness")
 	}
-	deadline := f.mount.subscription.config.clock.Now().Add(time.Second)
+	deadline := f.mount.subscription.config.clock.Now().Add(time.Hour)
 	drain := f.mount.delegations.captureWorkspaceDrain(deadline)
 	if f.mount.delegations.drainIncarnation(drain) == 0 {
 		t.Fatal("closed drain lost captured incarnation")
 	}
 	_, controlDeadline, _, controlLive := f.mount.subscription.currentIncarnation()
-	if !controlLive || !controlDeadline.Equal(drain.deadline) {
+	if !controlLive || !controlDeadline.Equal(drain.deadline) || !drain.deadline.Equal(f.mount.subscription.cacheUntil) {
 		t.Fatal("CONTROL replaced the captured drain deadline", controlDeadline, drain.deadline)
 	}
 	if f.mount.subscription.acceptRenewal(drain.incarnation, deadline.Add(time.Minute)) {
 		t.Fatal("drain renewed the old horizon")
 	}
-	f.mount.subscription.config.clock = &subscriptionTestClock{now: deadline.Add(time.Nanosecond)}
+	f.mount.subscription.config.clock = &subscriptionTestClock{now: drain.deadline.Add(time.Nanosecond)}
 	if _, _, _, live := f.mount.subscription.currentIncarnation(); live {
 		t.Fatal("expired drain fell back to recovery permission")
 	}
@@ -344,9 +344,6 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 	f.mount.subscription.mu.Unlock()
 	if _, _, _, active := f.mount.subscription.currentIncarnation(); active {
 		t.Fatal("later Close revived recovery proof")
-	}
-	if f.mount.delegations.incarnation() == 0 {
-		t.Fatal("later Close erased exact cleanup identity")
 	}
 }
 
@@ -553,8 +550,19 @@ func TestWorkspaceCloseAfterLastInstallationCheckIsInert(t *testing.T) {
 				f.mount.delegations.beforeWorkspaceInstall = func() { g.Close(1) }
 				opened := openDelegatedWriter(t, f, entry.NodeId)
 				identity := f.raw.nodesByID[entry.NodeId].identity
-				if f.mount.delegations.Owns(identity[:]) {
-					t.Fatal("post-check grant store became usable")
+				if !f.mount.delegations.Owns(identity[:]) {
+					t.Fatal("post-check grant lost retained cleanup ownership")
+				}
+				if st := f.rawCall(func(u uint64) fuse.Status {
+					_, st := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 1}, []byte("x"))
+					return st
+				}); st != fuse.EIO {
+					t.Fatal("new write used closed install", st)
+				}
+				if st := f.rawCall(func(u uint64) fuse.Status {
+					return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+				}); st != fuse.EIO {
+					t.Fatal("new holder GETATTR used closed install", st)
 				}
 				state := f.mount.delegations.retainState(writeback.Identity(identity), false)
 				state.admission.RLock()

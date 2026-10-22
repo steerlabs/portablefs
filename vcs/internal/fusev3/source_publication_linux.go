@@ -364,7 +364,10 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 	if err != nil {
 		return nil, err
 	}
-	lease := &sourcePublicationLease{workspaceCheck: func() error { return workspaceAcceptance(ctx) }, r: r, names: names, preBindings: make(map[publicationNamespace]publicationIdentity)}
+	lease := &sourcePublicationLease{r: r, names: names, preBindings: make(map[publicationNamespace]publicationIdentity)}
+	if r.mount.workspace != nil {
+		lease.workspaceCheck = workspaceAcceptanceCheck(ctx)
+	}
 	for _, bounds := range names {
 		if bounds.attributes {
 			lease.unresolvedAttributes++
@@ -503,6 +506,9 @@ func (l *sourcePublicationLease) drain(ctx context.Context) error {
 func (l *sourcePublicationLease) markAssigned() error {
 	if l == nil {
 		return nil
+	}
+	if l.r.beforeSourceAssignment != nil {
+		l.r.beforeSourceAssignment(l)
 	}
 	l.r.mu.Lock()
 	defer l.r.mu.Unlock()

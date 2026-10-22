@@ -2785,11 +2785,6 @@ func refuseManagedWorkspaceMount(o *mountOpts) error {
 	if o.workspaceGateFD == 0 && o.workspaceOwnerFD == 0 {
 		return nil
 	}
-	for i, fd := range []int{o.workspaceGateFD, o.workspaceOwnerFD} {
-		if fd > 2 && (i == 0 || fd != o.workspaceGateFD) {
-			_ = os.NewFile(uintptr(fd), "workspace-launch").Close()
-		}
-	}
 	if runtime.GOOS != "linux" || !o.foreground || o.workspaceGateFD <= 2 || o.workspaceOwnerFD <= 2 || o.workspaceGateFD == o.workspaceOwnerFD {
 		return errors.New("managed workspace launch requires Linux foreground mode and two distinct inherited descriptors")
 	}

@@ -76,7 +76,7 @@ type nameKey struct {
 type mutationCallbackKey struct{}
 
 type mutationCallback struct {
-	publication *replyPublication
+	publication replyPublication
 	mount       *Mount
 	operationID uint64
 	// Cleanup reservations already own their descriptors. Dispatch may wait
@@ -128,7 +128,7 @@ func replyPublicationFromContext(ctx context.Context) *replyPublication {
 	if callback == nil {
 		return nil
 	}
-	return callback.publication
+	return &callback.publication
 }
 
 func retainAuthorityResponse(ctx context.Context, consumption authorityrpc.ResponseConsumption) error {
@@ -183,8 +183,8 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Context, func(), fuse.Status) {
 	r.mount.epochMu.RLock()
 	ctx, cancel := context.WithTimeout(r.opContext(), r.requestTimeout)
-	publication, err := r.transferReplyPublication(unique, serving)
-	callback := &mutationCallback{mount: r.mount, operationID: unique, publication: publication}
+	callback := &mutationCallback{mount: r.mount, operationID: unique}
+	err := r.transferReplyPublication(unique, serving, &callback.publication)
 	if err != nil {
 		// Registration is the ownership reservation for every fact this callback
 		// could make cacheable. It happens before any lookup/mutation RPC, so an
@@ -234,7 +234,7 @@ func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Co
 		defer cancel()
 		r.publishPostStateAttrs(ctx)
 		callback.finish()
-		r.finishReplyPublicationRegistration(unique, callback.publication)
+		r.finishReplyPublicationRegistration(unique, &callback.publication)
 	}, fuse.OK
 }
 
@@ -245,7 +245,7 @@ func (r *rawFileSystem) cleanupContext(unique uint64) (context.Context, func(), 
 func (r *rawFileSystem) noReplyCleanupContext() (context.Context, func()) {
 	r.mount.epochMu.RLock()
 	ctx, cancel := context.WithTimeout(r.opContext(), r.requestTimeout)
-	callback := &mutationCallback{mount: r.mount, publication: &replyPublication{}}
+	callback := &mutationCallback{mount: r.mount}
 	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
 	return ctx, func() {
 		cancel()

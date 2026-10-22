@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -391,9 +393,38 @@ func TestRetireInterruptsOwnerReadWhileSupervisorLives(t *testing.T) {
 	if err := unix.SetNonblock(fd, false); err != nil {
 		t.Fatal(err)
 	}
-	r, err := Adopt(files[0], os.NewFile(uintptr(fd), "inherited-owner"), b, nil)
+	var teardown atomic.Int32
+	r, err := Adopt(files[0], os.NewFile(uintptr(fd), "inherited-owner"), b, func() { teardown.Add(1) })
 	if err != nil {
 		t.Fatal(err)
+	}
+	proof, err := g.Recovery(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Prepared(proof); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Open(1, proof.Serial()); err != nil {
+		t.Fatal(err)
+	}
+	permit, err := r.Check()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var readers sync.WaitGroup
+	stop := make(chan struct{})
+	for range 16 {
+		readers.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = permit.Check()
+				}
+			}
+		})
 	}
 	done := make(chan error, 1)
 	go func() { done <- r.Retire() }()
@@ -404,5 +435,14 @@ func TestRetireInterruptsOwnerReadWhileSupervisorLives(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("retirement waited for the live supervisor writer")
+	}
+	close(stop)
+	readers.Wait()
+	if teardown.Load() != 0 || !errors.Is(permit.Check(), ErrClosed) {
+		t.Fatal("retirement reported owner death or retained serving")
+	}
+	// A retained permit can still address the mapped word even after retirement.
+	if r.word.Load()&1 != 1 {
+		t.Fatal("retirement changed supervisor-owned state")
 	}
 }

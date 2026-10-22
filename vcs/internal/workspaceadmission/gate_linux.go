@@ -23,7 +23,7 @@ import (
 
 const Format = 8
 const wordOffset = 128
-const requiredSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_FUTURE_WRITE | unix.F_SEAL_SEAL
+const requiredSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_FUTURE_WRITE | unix.F_SEAL_SEAL | unix.F_SEAL_EXEC
 
 var ErrClosed = errors.New("workspace admission: closed or obsolete permit")
 
@@ -75,7 +75,7 @@ func New(binding Binding) (_ *Supervisor, err error) {
 	if err != nil || binding.SupervisorPID != int32(os.Getpid()) || binding.SupervisorStart != start || os.Geteuid() != 0 {
 		return nil, errors.New("workspace admission: exact root supervisor required")
 	}
-	fd, err := unix.MemfdCreate("portablefs-workspace-gate", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	fd, err := unix.MemfdCreate("portablefs-workspace-gate", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING|unix.MFD_NOEXEC_SEAL)
 	if err != nil {
 		return nil, fmt.Errorf("create admission page: %w", err)
 	}
@@ -228,6 +228,7 @@ type Reader struct {
 	page    []byte
 	word    *atomic.Uint64
 	dead    atomic.Bool
+	retired atomic.Bool
 	owner   *os.File
 	done    chan struct{}
 }
@@ -324,7 +325,7 @@ func Adopt(gate, owner *os.File, binding Binding, teardown func()) (_ *Reader, e
 		// cleanup; no control handler or later supervisor can unlatch this reader.
 		_, _ = owner.Read(b[:])
 		r.dead.Store(true)
-		if teardown != nil {
+		if teardown != nil && !r.retired.Load() {
 			teardown()
 		}
 	}()
@@ -346,12 +347,14 @@ func (r *Reader) Recover(p RecoveryPermit) error {
 }
 func (r *Reader) Done() <-chan struct{} { return r.done }
 
-// Retire joins the independent watcher before unmapping. Frontend owners must
-// join their readers before calling this; permissions never outlive the mapping.
+// Retire stops the watcher without reporting owner death. Keep the read-only
+// page mapped for the process lifetime: retained permits may still check it.
 func (r *Reader) Retire() error {
+	r.retired.Store(true)
+	r.dead.Store(true)
 	err := r.owner.Close()
 	<-r.done
-	return errors.Join(err, unix.Munmap(r.page))
+	return err
 }
 
 // Recovery names the authenticated control request's exact closed serial. The

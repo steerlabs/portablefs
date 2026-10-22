@@ -207,8 +207,7 @@ type replyPublication struct {
 	workspace      workspaceadmission.ServingPermit
 	workspaceBound bool
 	callbackOwned  bool
-	servingEntry   bool
-	cachedAnswer   bool
+	workspaceDone  chan struct{}
 	cachedNext     *replyPublication
 	cachedArena    bool
 	// A read using retained cache or holder permission must stay tracked and
@@ -262,7 +261,6 @@ type replyPublication struct {
 	// Physical reply state is protected by rawFileSystem.mu.
 	owner             *rawFileSystem
 	requestUnique     uint64
-	nodeid            uint64
 	opcode            uint32
 	originalDone      chan struct{}
 	originalFinalized bool
@@ -271,7 +269,7 @@ type replyPublication struct {
 }
 
 func (p *replyPublication) empty() bool {
-	return p == nil || !p.servingEntry && len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
+	return p == nil || p.workspaceDone == nil && len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 && p.cachedCount == 0 && p.holderAdmission == nil &&
 		!p.retainedAnswer && p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
@@ -496,6 +494,9 @@ type rawFileSystem struct {
 	replyTerminal       bool
 	replyTerminalDone   chan struct{}
 	replyLifecycleArmed bool
+	// Deterministic tests pause outside registry and lifecycle locks.
+	beforeSourceAssignment func(*sourcePublicationLease)
+	beforeReplySettlement  func(*replyPublication)
 
 	// Source-owned gates close publication before the mutation gets a replay
 	// identity or can put bytes on the wire. They are keyed only by stable
@@ -1049,9 +1050,16 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 	}
 	completions := make([]terminalReplyCompletion, 0, len(seen))
 	for publication := range seen {
-		delete(r.replyPublications, publication.requestUnique)
+		// ReplyWritten already transferred this operation to its settlement owner.
+		// Keep it discoverable until that owner releases source and responses.
+		if publication.originalWrote && publication.responseConsumptionOwner == responseConsumptionTransferred {
+			continue
+		}
+		if publication.workspaceDone == nil {
+			delete(r.replyPublications, publication.requestUnique)
+		}
 		physical := !connectionGone && publication.originalWrote && publication.originalStatus.Ok()
-		if connectionGone && !publication.originalWrote {
+		if !publication.originalWrote {
 			publication.closeOriginalDoneLocked()
 		}
 		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
@@ -1071,10 +1079,20 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 
 	for _, completion := range completions {
 		r.finishDirPlusLookupCompletion(completion.dirPlus)
+		if (!completion.physical || completion.publication.cacheRejected) && completion.publication.lookupReference != nil {
+			r.Forget(completion.publication.lookupReference.id, 1)
+		}
 		if completion.publication.source != nil {
 			completion.publication.source.revoke()
 		}
 		consumeClaimedAuthorityResponses(completion.responseConsumption)
+		if completion.publication.workspaceDone != nil {
+			r.mu.Lock()
+			close(completion.publication.workspaceDone)
+			delete(r.replyPublications, completion.publication.requestUnique)
+			r.recycleReplyLocked(completion.publication)
+			r.mu.Unlock()
+		}
 	}
 	return true
 }
@@ -1680,7 +1698,7 @@ func (r *rawFileSystem) ReplyWriteTracked(unique uint64) bool {
 // candidates here or observes a finalized installer and waits for ReplyWritten.
 // go-fuse deliberately permits a notification syscall to overlap this reply,
 // because the kernel notification may need the reply to release a folio.
-func (r *rawFileSystem) PrepareReplyPayload(unique, nodeid uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, fuse.Status, fuse.Status) {
+func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, fuse.Status, fuse.Status) {
 	r.mu.Lock()
 	if r.replyTerminal || r.replyTerminalizing {
 		r.mu.Unlock()
@@ -1697,7 +1715,9 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, nodeid uint64, opcode uint32
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
-	publication.opcode, publication.nodeid = opcode, nodeid
+	if publication.workspaceBound {
+		publication.opcode = opcode
+	}
 	// This precedes both the arena shortcut and empty candidate sets. An
 	// assigned effect is still its original operation; denial cannot fabricate a
 	// definite no-change CREATE/WRITE result. READ still owes physical purge.
@@ -1717,7 +1737,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, nodeid uint64, opcode uint32
 		// usable so the ordinary cold-withdrawal path can complete.
 		return 0, fuse.EIO, fuse.OK
 	}
-	if publication.cachedAnswer {
+	if publication.cachedArena && publication.originalFinalized {
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
@@ -1936,7 +1956,9 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 	successful := status.Ok() && !publication.cacheRejected
 	dirPlusCompletion := r.settleDirPlusLookupTransactionLocked(publication, successful)
-	delete(r.replyPublications, unique)
+	if publication.workspaceDone == nil {
+		delete(r.replyPublications, unique)
+	}
 	responseConsumption := r.settleReplyPublicationLocked(publication, successful)
 	if successful && publication.workspaceBound && publication.workspace.Check() != nil {
 		// Physical delivery still creates withdrawal duties. These entries carry
@@ -1955,6 +1977,9 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		}
 	}
 	r.mu.Unlock()
+	if publication.workspaceDone != nil && r.beforeReplySettlement != nil {
+		r.beforeReplySettlement(publication)
+	}
 	r.finishDirPlusLookupCompletion(dirPlusCompletion)
 	if (publication.cacheRejected || !status.Ok()) && publication.lookupReference != nil {
 		r.Forget(publication.lookupReference.id, 1)
@@ -1971,9 +1996,15 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 
 	consumeClaimedAuthorityResponses(responseConsumption)
-	r.mu.Lock()
-	r.recycleReplyLocked(publication)
-	r.mu.Unlock()
+	if publication.workspaceDone != nil || publication.cachedArena {
+		r.mu.Lock()
+		if publication.workspaceDone != nil {
+			close(publication.workspaceDone)
+			delete(r.replyPublications, unique)
+		}
+		r.recycleReplyLocked(publication)
+		r.mu.Unlock()
+	}
 }
 
 func (r *rawFileSystem) Init(server *fuse.Server) {
@@ -2604,12 +2635,22 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 }
 
 func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
+	if r.mount.workspace != nil {
+		return r.workspaceLookup(header, name, out)
+	}
+	return r.lookupAdmitted(header, name, out)
+}
 
+func (r *rawFileSystem) workspaceLookup(header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
 	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
 	if !entryStatus.Ok() {
 		return entryStatus
 	}
 	defer r.finishWorkspaceEntry(header.Unique, entry)
+	return r.lookupAdmitted(header, name, out)
+}
+
+func (r *rawFileSystem) lookupAdmitted(header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -2696,12 +2737,22 @@ func (r *rawFileSystem) graftDescriptor(id uint64, present bool, record *inodeRe
 }
 
 func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
+	if r.mount.workspace != nil {
+		return r.workspaceGetAttr(input, out)
+	}
+	return r.getAttrAdmitted(input, out)
+}
 
+func (r *rawFileSystem) workspaceGetAttr(input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
 	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
 	if !entryStatus.Ok() {
 		return entryStatus
 	}
 	defer r.finishWorkspaceEntry(input.Unique, entry)
+	return r.getAttrAdmitted(input, out)
+}
+
+func (r *rawFileSystem) getAttrAdmitted(input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -2750,11 +2801,13 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 
 func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -2849,11 +2902,13 @@ func (r *rawFileSystem) cancelBufferedRead(ctx context.Context, record *inodeRec
 
 func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -2952,11 +3007,13 @@ func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) 
 		return nil, fuse.EINVAL
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return nil, entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return nil, entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -3023,11 +3080,13 @@ func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byt
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return 0, entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return 0, entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	if local != nil {
 		count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
 		if err != nil {
@@ -3064,11 +3123,13 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 
 func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -3134,11 +3195,13 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 
 func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3230,11 +3293,13 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.Status(syscall.ENOTCONN)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3336,11 +3401,13 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 		return fuse.Status(syscall.EPERM)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3389,11 +3456,13 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 
 func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3451,11 +3520,13 @@ func (r *rawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, nam
 
 func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name string, directory bool) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3509,11 +3580,13 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 
 func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	oldParent := r.acquire(input.NodeId)
 	if oldParent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3584,11 +3657,13 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 
 func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	newParent := r.acquire(input.NodeId)
 	if newParent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3637,11 +3712,13 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 
 func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointedTo, linkName string, out *fuse.EntryOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3686,11 +3763,13 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 
 func (r *rawFileSystem) Readlink(_ <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return nil, entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return nil, entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return nil, fuse.Status(syscall.ESTALE)
@@ -3718,11 +3797,13 @@ func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name 
 		return 0, fuse.Status(graftXattrErrno)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return 0, entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return 0, entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
 		return 0, lifecycle
@@ -3742,11 +3823,13 @@ func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name
 		return fuse.Status(graftXattrErrno)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -3765,11 +3848,13 @@ func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest
 		return 0, fuse.Status(graftXattrErrno)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return 0, entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return 0, entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
 		return 0, lifecycle
@@ -3789,11 +3874,13 @@ func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, na
 		return fuse.Status(graftXattrErrno)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
@@ -3819,11 +3906,13 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 		return fuse.Status(syscall.EISDIR)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	if record.graft {
 		handle, errno := r.graftReaddir(record)
 		if errno != 0 {
@@ -3879,11 +3968,13 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 
 func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -3931,11 +4022,13 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		return fuse.ENOSYS
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	held, handle := r.acquireDirHandle(input.Fh)
 	if handle == nil {
 		return fuse.EBADF
@@ -4033,11 +4126,13 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 
 func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
 			defer r.releaseHandleOperation(held)
@@ -4090,11 +4185,13 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 
 func (r *rawFileSystem) StatFs(_ <-chan struct{}, header *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(header.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(header.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(header.Unique, entry)
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -4121,11 +4218,13 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 		return fuse.Status(syscall.ENOTCONN)
 	}
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	root := r.acquire(fuse.FUSE_ROOT_ID)
 	if root == nil || root.graft {
 		if root != nil {
@@ -4153,11 +4252,13 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 
 func (r *rawFileSystem) GetLk(_ <-chan struct{}, input *fuse.LkIn, out *fuse.LkOut) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -4200,11 +4301,13 @@ func (r *rawFileSystem) SetLkw(cancel <-chan struct{}, input *fuse.LkIn) fuse.St
 
 func (r *rawFileSystem) setLock(_ <-chan struct{}, input *fuse.LkIn, wait bool) fuse.Status {
 
-	entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
-	if !entryStatus.Ok() {
-		return entryStatus
+	if r.mount.workspace != nil {
+		entry, entryStatus := r.beginWorkspaceEntry(input.Unique)
+		if !entryStatus.Ok() {
+			return entryStatus
+		}
+		defer r.finishWorkspaceEntry(input.Unique, entry)
 	}
-	defer r.finishWorkspaceEntry(input.Unique, entry)
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
