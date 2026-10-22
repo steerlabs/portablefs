@@ -3261,6 +3261,10 @@ func TestCanonicalFormIsPinnedByValue(t *testing.T) {
 }
 
 func testTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
+	server, client, _ := testTLSIdentityConfigs(t)
+	return server, client
+}
+func testTLSIdentityConfigs(t testing.TB) (*tls.Config, *tls.Config, *tls.Config) {
 	t.Helper()
 	now := time.Now()
 	caPub, caKey, _ := ed25519.GenerateKey(rand.Reader)
@@ -3294,9 +3298,10 @@ func testTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	}
 	serverCert := issue(2, "server", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []string{"localhost"})
 	clientCert := issue(3, "client", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
+	secondCert := issue(4, "second client", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
-	return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{serverCert}}, &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCert}, ServerName: "localhost"}
+	return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{serverCert}}, &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCert}, ServerName: "localhost"}, &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{secondCert}, ServerName: "localhost"}
 }
 
 type releaseReceiptTestHandler struct {

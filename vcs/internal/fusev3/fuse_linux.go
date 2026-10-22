@@ -1482,7 +1482,7 @@ type dirPlusCursorTransaction struct {
 }
 
 func (n *node) opContext(parent context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(parent, n.requestTimeout)
+	return n.mount.operationContext(parent, n.requestTimeout)
 }
 
 func (n *node) read(parent context.Context, request *authoritypb.Request) (*authoritypb.Response, syscall.Errno) {

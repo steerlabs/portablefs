@@ -366,6 +366,48 @@ func TestWorkspaceCleanupDebtCountsObligationsOnce(t *testing.T) {
 	if exact != len(owners) || len(o.ParkedRequests) != len(owners) {
 		t.Fatal("worker dispositions lacked per-instance evidence", o.Workers)
 	}
+	// New cleanup obligations arrive after the first cold acknowledgment.
+	f.mount.delegations.closeMu.Lock()
+	f.mount.delegations.closePending++
+	f.mount.delegations.closeMu.Unlock()
+	f.mount.reclaim.push(queuedReclaim{token: []byte("three"), transport: rpc})
+	var persisted WorkspaceObservation
+	f.mount.workspaceLifecycle.persist = func(o WorkspaceObservation) error { persisted = o; return nil }
+	again, err := f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(-time.Second))
+	if err != nil || !again.ColdComplete || again.Outcome.CleanupDebt != 6 || persisted.Outcome.CleanupDebt != 6 {
+		t.Fatal("re-ack reused old cleanup debt", again, err)
+	}
+	// Recovery settles one request while publication is held, then a newer
+	// Close defeats it. Inventory cannot be erased before final publication.
+	ctx, cancel := context.WithCancel(t.Context())
+	entered, release := make(chan struct{}), make(chan struct{})
+	var held sync.Once
+	f.mount.workspaceLifecycle.persist = func(o WorkspaceObservation) error {
+		persisted = o
+		if o.Prepared {
+			held.Do(func() { close(entered); <-release })
+		}
+		return nil
+	}
+	recovered := make(chan WorkspaceObservation, 1)
+	go func() { o, _ := f.mount.RecoverWorkspace(ctx, 1, serial); recovered <- o }()
+	<-entered
+	if len(f.mount.workspaceLifecycle.parkedRequests) != len(owners) {
+		t.Fatal("recovery erased retained inventory before publication")
+	}
+	r.owners = r.owners[1:]
+	f.mount.delegations.closeMu.Lock()
+	f.mount.delegations.closePending--
+	f.mount.delegations.closeMu.Unlock()
+	f.mount.reclaim.complete(1)
+	serial = g.Close(1)
+	cancel()
+	close(release)
+	<-recovered
+	again, err = f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(time.Second))
+	if err != nil || !again.ColdComplete || again.Outcome.CleanupDebt != 4 || len(again.ParkedRequests) != len(owners)-1 || len(persisted.ParkedRequests) != len(owners)-1 {
+		t.Fatal("re-park reused settled request/debt evidence", again, err)
+	}
 	f.mount.delegations.closeMu.Lock()
 	f.mount.delegations.closePending = 0
 	f.mount.delegations.closeMu.Unlock()

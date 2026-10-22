@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,6 +22,24 @@ const (
 type LifecycleResult struct {
 	Disposition LifecycleDisposition
 	Err         error
+}
+
+type lifecycleOwnerKey struct{}
+type LifecycleOwner struct{ overtaken atomic.Bool }
+
+func WithLifecycleOwner(ctx context.Context) (context.Context, *LifecycleOwner) {
+	owner := &LifecycleOwner{}
+	return context.WithValue(ctx, lifecycleOwnerKey{}, owner), owner
+}
+func (o *LifecycleOwner) Overtake() {
+	if o != nil {
+		o.overtaken.Store(true)
+	}
+}
+func (o *LifecycleOwner) Overtaken() bool { return o != nil && o.overtaken.Load() }
+func LifecycleOwnerOvertaken(ctx context.Context) bool {
+	owner, _ := ctx.Value(lifecycleOwnerKey{}).(*LifecycleOwner)
+	return owner.Overtaken()
 }
 
 // everyCause requires every branch of a joined error to satisfy the predicate.
@@ -92,6 +111,7 @@ const (
 	AttemptComplete
 	AttemptPending
 	AttemptColdReset
+	AttemptOvertaken
 )
 
 type LifecycleAttempt struct {
@@ -138,6 +158,8 @@ func RetryLifecycleAttempts(ctx context.Context, timeout time.Duration, attempt 
 			if result.Err != nil {
 				return LifecycleCompletion(ctx, result.Err)
 			}
+		case AttemptOvertaken:
+			return LifecycleResult{Disposition: LifecycleOvertaken, Err: result.Err}
 		case AttemptPending, AttemptColdReset:
 			// The phase owner has classified these causes as nonterminal.
 		default:

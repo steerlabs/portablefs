@@ -282,14 +282,11 @@ func (s *Server) executeTransportResume(ctx context.Context, entry *transportCon
 	before, err := s.registry.resumeWitness(entry, session)
 	if err != nil {
 		pair.operation.Unlock()
-		if state, known := s.Handler.SessionStateForTransport(session); !known || state != volumeserver.SessionStateActive && state != volumeserver.SessionStateProvisional {
-			response := s.dispatchRequest(ctx, request)
-			defer finishHandlerResponse(s.Handler, request, response)()
-			if response.GetErrno() == int32(syscall.ESTALE) && response.GetSessionTerminal() {
-				return writeResponse(request, response)
-			}
-		}
-		return err
+		// A foreign/unbound credential receives the same exact-session refusal
+		// as an expired credential whose bounded authentication evidence is gone.
+		// Never consult an unauthenticated target's state or dispatch it into
+		// runtime Resume: that operation may renew/fence the target lease.
+		return writeResponse(request, &authoritypb.Response{RequestId: request.GetRequestId(), Epoch: s.Handler.Epoch(), Errno: int32(syscall.ESTALE), SessionTerminal: true})
 	}
 	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()

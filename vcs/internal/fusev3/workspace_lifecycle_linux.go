@@ -310,20 +310,86 @@ func (w *workspaceLifecycle) enter(ctx context.Context) error {
 
 // Every completion, including an overtaken/failed one, snapshots cumulative
 // evidence. Persistence happens on the lifecycle lane, outside data-plane locks.
-func (m *Mount) completeWorkspace(ctx context.Context, g, serial uint64, ready, cold bool, err error) (WorkspaceObservation, error) {
-	o := m.workspaceObservation(g, serial)
+// publication keeps readiness/reset dispositions separate from failures. An
+// owner's overtaking bit applies only to permit loss, never independent facts.
+func (m *Mount) workspacePublication(ctx context.Context, g, serial uint64, prepared bool) authorityrpc.LifecycleAttempt {
+	failed := func(err error) authorityrpc.LifecycleAttempt {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: err}
+	}
+	if m.isRevoked() || m.ctx.Err() != nil {
+		return failed(errors.New("fusev3: terminal mount before lifecycle publication"))
+	}
+	if cause := m.rpc.SessionEndCause(); cause != nil {
+		return failed(cause)
+	}
 	w := m.workspaceLifecycle
-	if w == nil {
-		return o, err
+	if e := w.evidence.Load(); e != nil && e.failure != nil {
+		return failed(e.failure)
 	}
-	if e := w.evidence.Load(); e != nil {
-		err = errors.Join(err, e.failure)
+	if w.renewer != nil && w.renewer.Failure() != nil {
+		return failed(w.renewer.Failure())
 	}
-	o.Prepared, o.ColdComplete = ready && err == nil, cold && err == nil
+	proof, err := m.workspace.Recovery(g, serial)
+	if err != nil {
+		if authorityrpc.LifecycleOwnerOvertaken(ctx) {
+			return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptOvertaken, Err: err}
+		}
+		return failed(err)
+	}
+	if ctx.Err() != nil {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptOvertaken, Err: ctx.Err()}
+	}
+	if !prepared {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+	}
+	p := mountenrollment.Permit{Generation: g, GateSerial: serial}
+	if err := w.clock.Check(p); err != nil {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending, Err: err}
+	}
+	_, d, err := m.workspaceDependencies()
+	if err != nil {
+		return failed(err)
+	}
+	deadline := d.AuthorizationDeadline()
+	if !deadline.After(time.Now()) {
+		return failed(mountenrollment.ErrDefinitiveDenial)
+	}
+	if w.renewer != nil && !w.renewer.Readiness().Ready(false, p, base64.RawURLEncoding.EncodeToString(m.rpc.SessionID()), deadline) {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending}
+	}
+	m.subscription.mu.Lock()
+	live := m.subscription.controlLiveLocked()
+	same := m.subscription.workspaceProof != nil && m.subscription.workspaceProof.Serial() == proof.Serial()
+	m.subscription.mu.Unlock()
+	if !live || !same {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptColdReset, Err: errSubscriptionExpired}
+	}
+	return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+}
+
+func workspaceResult(ctx context.Context, phase authorityrpc.LifecycleAttempt) authorityrpc.LifecycleResult {
+	if phase.Disposition == authorityrpc.AttemptOvertaken {
+		return authorityrpc.LifecycleResult{Disposition: authorityrpc.LifecycleOvertaken, Err: phase.Err}
+	}
+	return authorityrpc.LifecycleCompletion(ctx, phase.Err)
+}
+
+// A defeated persisted candidate is followed by a persisted refusal before the
+// same logical job waits/retries. Storage errors remain independent failures.
+func (m *Mount) publishWorkspace(ctx context.Context, g, serial uint64, ready, cold bool, phase authorityrpc.LifecycleAttempt) (WorkspaceObservation, authorityrpc.LifecycleAttempt) {
+	w := m.workspaceLifecycle
+	o := m.workspaceObservation(g, serial)
+	if e := w.evidence.Load(); e != nil && e.failure != nil {
+		phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: errors.Join(phase.Err, e.failure)}
+	}
+	if phase.Disposition == authorityrpc.AttemptComplete {
+		phase = m.workspacePublication(ctx, g, serial, ready)
+	}
+	o.Prepared, o.ColdComplete = ready && phase.Disposition == authorityrpc.AttemptComplete, cold && phase.Disposition == authorityrpc.AttemptComplete
 	if w.outcome != nil {
 		o.Outcome = proto.Clone(w.outcome).(*pb.MountOutcome)
 	}
-	if evidence := w.evidence.Load(); evidence != nil && evidence.abandoned {
+	if e := w.evidence.Load(); e != nil && e.abandoned {
 		o.Outcome.Release = "abandoned"
 		o.Outcome.Observation = "observed"
 	}
@@ -333,78 +399,26 @@ func (m *Mount) completeWorkspace(ctx context.Context, g, serial uint64, ready, 
 		request.Body = append([]byte(nil), request.Body...)
 		o.ParkedRequests = append(o.ParkedRequests, request)
 	}
-	err = errors.Join(err, m.validateWorkspacePublication(g, serial, o.Prepared || o.ColdComplete, o.Prepared))
-	o.Result = authorityrpc.LifecycleCompletion(ctx, err)
-	err = o.Result.Err
-	if o.Result.Disposition != authorityrpc.LifecycleCompleted {
-		o.Prepared, o.ColdComplete = false, false
-	}
-	persistedPrepared, persistedCold := o.Prepared, o.ColdComplete
-	if persistErr := w.persist(o); persistErr != nil {
-		o.Prepared, o.ColdComplete = false, false
-		err = errors.Join(err, fmt.Errorf("persist workspace outcome: %w", persistErr))
-	} else {
-		// Persistence is I/O. Recheck the exact proof and persist a refusal if
-		// any independent owner changed it while the record was being written.
-		err = errors.Join(err, m.validateWorkspacePublication(g, serial, o.Prepared || o.ColdComplete, o.Prepared))
-		o.Result = authorityrpc.LifecycleCompletion(ctx, err)
-		err = o.Result.Err
-		if o.Result.Disposition != authorityrpc.LifecycleCompleted {
+	o.Result = workspaceResult(ctx, phase)
+	persist := func() bool {
+		if err := w.persist(o); err != nil {
+			phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: errors.Join(phase.Err, fmt.Errorf("persist workspace outcome: %w", err))}
 			o.Prepared, o.ColdComplete = false, false
+			o.Result = workspaceResult(ctx, phase)
+			return false
 		}
-		if persistedPrepared != o.Prepared || persistedCold != o.ColdComplete {
-			if persistErr := w.persist(o); persistErr != nil {
-				err = errors.Join(err, fmt.Errorf("persist workspace refusal: %w", persistErr))
-			}
+		return true
+	}
+	if persist() && (o.Prepared || o.ColdComplete) {
+		phase = m.workspacePublication(ctx, g, serial, o.Prepared)
+		o.Result = workspaceResult(ctx, phase)
+		if phase.Disposition != authorityrpc.AttemptComplete {
+			o.Prepared, o.ColdComplete = false, false
+			persist()
 		}
 	}
-	o.Result = authorityrpc.LifecycleCompletion(ctx, err)
 	w.observation.Store(&o)
-	return o, err
-}
-
-func (m *Mount) validateWorkspacePublication(g, serial uint64, publish, prepared bool) error {
-	if !publish {
-		return nil
-	}
-	proof, err := m.workspace.Recovery(g, serial)
-	if err != nil {
-		return err
-	}
-	if m.isRevoked() || m.ctx.Err() != nil {
-		return errors.New("fusev3: terminal mount before lifecycle publication")
-	}
-	if cause := m.rpc.SessionEndCause(); cause != nil {
-		return cause
-	}
-	if !prepared {
-		return nil
-	} // A completed cold cut has no live-cache horizon.
-	w := m.workspaceLifecycle
-	p := mountenrollment.Permit{Generation: g, GateSerial: serial}
-	if err := w.clock.Check(p); err != nil {
-		return err
-	}
-	_, d, err := m.workspaceDependencies()
-	if err != nil {
-		return err
-	}
-	deadline := d.AuthorizationDeadline()
-	if !deadline.After(time.Now()) {
-		return mountenrollment.ErrDefinitiveDenial
-	}
-	if w.renewer != nil && !w.renewer.Readiness().Ready(false, p, base64.RawURLEncoding.EncodeToString(m.rpc.SessionID()), deadline) {
-		return errors.Join(errors.New("fusev3: enrollment readiness changed before publication"), w.renewer.Failure())
-	}
-	// Expiry advances the subscription generation; this is a writer check.
-	m.subscription.mu.Lock()
-	live := m.subscription.controlLiveLocked()
-	same := m.subscription.workspaceProof != nil && m.subscription.workspaceProof.Serial() == proof.Serial()
-	m.subscription.mu.Unlock()
-	if !live || !same {
-		return errSubscriptionExpired
-	}
-	return nil
+	return o, phase
 }
 
 func (m *Mount) PrepareWorkspace(ctx context.Context, g, serial uint64) (o WorkspaceObservation, err error) {
@@ -426,154 +440,189 @@ func (m *Mount) prepareWorkspace(ctx context.Context, g, serial uint64, recover 
 		return o, err
 	}
 	defer func() { <-w.lane }()
-	ready := false
+	phase := authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+	published := false
 	defer func() {
-		if !ready {
-			err = errors.Join(err, m.parkWorkspace(m.ctx, w, d))
+		if published {
+			return
 		}
-		o, err = m.completeWorkspace(ctx, g, serial, ready, false, err)
-		if o.Prepared {
-			w.cold = false
-			w.coldOutcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released"}
-			m.delegations.StartWriteback()
-			m.subscription.releaseWorkspaceOwnership()
-			w.keepalive.resume()
-		} else {
-			parkErr := m.parkWorkspace(m.ctx, w, d)
-			if parkErr != nil {
-				o, err = m.completeWorkspace(ctx, g, serial, false, false, errors.Join(err, parkErr))
-			}
+		parkErr := m.parkWorkspace(m.ctx, w, d)
+		if parkErr != nil {
+			phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: errors.Join(phase.Err, parkErr)}
 		}
+		if phase.Disposition == authorityrpc.AttemptComplete {
+			phase = authorityrpc.ClassifyLifecycleAttempt(err)
+		}
+		o, _ = m.publishWorkspace(ctx, g, serial, false, false, phase)
+		err = o.Result.Err
 	}()
-	if recover {
-		if !w.cold {
-			return o, errors.New("fusev3: recovery requires a completed cold cut")
+	fail := func(cause error) error {
+		phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: cause}
+		return cause
+	}
+	if !recover && w.preparedOnce {
+		return o, fail(errors.New("fusev3: Prepare is consumed"))
+	}
+	w.preparedOnce = true
+	// Recover also finishes a retained incomplete cut. It never extends that
+	// cut's old drain capability; an expired tail is fenced and accounted below.
+	if !w.cold {
+		_, phase = m.suspendWorkspace(ctx, w, d, g, serial, m.subscription.config.clock.Now().Add(m.requestTimeout))
+		if phase.Disposition != authorityrpc.AttemptComplete {
+			return o, phase.Err
 		}
-		w.preparedOnce = true
-	} else {
-		if w.preparedOnce {
-			return o, errors.New("fusev3: Prepare is consumed")
-		}
-		w.preparedOnce = true
-		// Initial preparation also owns an interruptible, retained cold cut.
-		if _, err = m.suspendWorkspace(ctx, w, d, g, serial, m.subscription.config.clock.Now().Add(m.requestTimeout)); err != nil {
-			return o, err
-		}
+	}
+	phase = m.workspacePublication(ctx, g, serial, false)
+	if phase.Disposition != authorityrpc.AttemptComplete {
+		return o, phase.Err
 	}
 	proof, err := m.workspace.Recovery(g, serial)
 	if err != nil {
-		return o, err
+		return o, fail(err)
 	}
 	if err = m.subscription.takeWorkspaceOwnership(ctx); err != nil {
-		return o, err
+		return o, fail(err)
 	}
 	p := mountenrollment.Permit{Generation: g, GateSerial: serial}
-	if err = w.clock.Wait(ctx, p); err != nil {
-		return o, err
-	}
-	check := func() error {
+	check := func() authorityrpc.LifecycleAttempt {
+		result := m.workspacePublication(ctx, g, serial, false)
+		if result.Disposition != authorityrpc.AttemptComplete {
+			return result
+		}
 		if err := w.clock.Check(p); err != nil {
-			return err
+			return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending, Err: err}
 		}
-		if m.workspace.Installed(proof) {
-			return nil
-		}
-		return m.workspace.Recover(proof)
-	}
-	// Entry/installer admission owns the exact serial. The transport's
-	// check must also admit settlement of already-assigned old operations
-	// after Close; applying that serving serial to replay would erase them.
-	if err = check(); err != nil {
-		return o, err
-	}
-	if err = d.ResumeDispatch(func() error { return w.clock.Check(p) }); err != nil {
-		return o, err
-	}
-	// KeepAlive is real same-session authorization validation; never recoverEpoch
-	// or Attach. A bounded attempt timeout cannot become a terminal verdict.
-	retry := authorityrpc.RetryLifecycle(ctx, m.requestTimeout, func(attempt context.Context) error {
-		if err := check(); err != nil {
-			return err
-		}
-		if cause := m.rpc.SessionEndCause(); cause != nil {
-			return cause
-		}
-		r, err := m.rpc.CallRead(attempt, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
-		if err != nil {
-			return err
-		}
-		if r != nil && r.GetSessionTerminal() {
-			return authorityrpc.ErrSessionEnded
-		}
-		if r == nil || r.GetUncertain() {
-			return authorityrpc.ErrTransportUncertain
-		}
-		// Runtime credential/authorization validation precedes the Linux
-		// coherence check. Its nonterminal coherence refusal validates this
-		// session, while requiring the fresh cold Subscribe below.
-		if r.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && !r.GetSessionTerminal() {
-			return nil
-		}
-		if r.GetFailure() != 0 || r.GetErrno() != 0 {
-			return fmt.Errorf("fusev3: workspace session validation refused: %w", authorityrpc.ErrSessionEnded)
-		}
-		return nil
-	})
-	err = retry.Err
-	if err != nil {
-		return o, err
-	}
-	if !d.AuthorizationDeadline().After(time.Now()) {
-		return o, mountenrollment.ErrDefinitiveDenial
-	}
-	recoveryCtx := context.WithValue(ctx, workspaceRecoveryKey{}, proof)
-	if retry = m.retryWorkspaceSubscribe(recoveryCtx); retry.Err != nil {
-		err = retry.Err
-		return o, err
-	}
-	if w.renewer != nil {
-		if err = w.renewer.Resume(p); err != nil {
-			return o, err
-		}
-		w.renewer.RefreshNow()
-		retry = authorityrpc.RetryLifecycleAttempts(recoveryCtx, m.requestTimeout, func(attempt context.Context) authorityrpc.LifecycleAttempt {
-			if err := check(); err != nil {
-				return authorityrpc.ClassifyLifecycleAttempt(err)
-			}
-			_, _, _, live := m.subscription.currentIncarnation()
-			if !live {
-				result := workspaceSubscribeAttempt(m.subscription.subscribe(attempt))
+		if !m.workspace.Installed(proof) {
+			if err := m.workspace.Recover(proof); err != nil {
+				result = m.workspacePublication(ctx, g, serial, false)
 				if result.Disposition != authorityrpc.AttemptComplete {
 					return result
 				}
+				return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: err}
 			}
-			if err := w.renewer.Failure(); err != nil {
-				return authorityrpc.ClassifyLifecycleAttempt(err)
+		}
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+	}
+	waitReady := func() authorityrpc.LifecycleResult {
+		return authorityrpc.RetryLifecycleAttempts(ctx, m.requestTimeout, func(attempt context.Context) authorityrpc.LifecycleAttempt {
+			result := check()
+			if result.Disposition == authorityrpc.AttemptPending || result.Disposition == authorityrpc.AttemptComplete {
+				// Wait is only a readiness owner. Its diagnostic cannot terminalize a
+				// healthy session, even if correction raced its initial return.
+				if err := w.clock.Wait(attempt, p); err != nil {
+					return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending, Err: err}
+				}
+				result = check()
 			}
-			if w.renewer.Readiness().Ready(false, p, base64.RawURLEncoding.EncodeToString(m.rpc.SessionID()), d.AuthorizationDeadline()) {
-				return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+			if result.Disposition != authorityrpc.AttemptComplete {
+				return result
 			}
-			return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending}
+			if err := d.ResumeDispatch(func() error { return w.clock.Check(p) }); err != nil {
+				return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending, Err: err}
+			}
+			return result
 		})
-		err = retry.Err
-		if err != nil {
-			return o, err
+	}
+	setResult := func(result authorityrpc.LifecycleResult) {
+		disposition := authorityrpc.AttemptFailed
+		if result.Disposition == authorityrpc.LifecycleOvertaken {
+			disposition = authorityrpc.AttemptOvertaken
+		}
+		phase = authorityrpc.LifecycleAttempt{Disposition: disposition, Err: result.Err}
+	}
+	if result := waitReady(); result.Disposition != authorityrpc.LifecycleCompleted {
+		setResult(result)
+		return o, result.Err
+	}
+	validation := authorityrpc.RetryLifecycleAttempts(ctx, m.requestTimeout, func(attempt context.Context) authorityrpc.LifecycleAttempt {
+		if result := check(); result.Disposition != authorityrpc.AttemptComplete {
+			return result
+		}
+		r, callErr := m.rpc.CallRead(attempt, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+		if callErr != nil {
+			return authorityrpc.ClassifyLifecycleAttempt(callErr)
+		}
+		if r != nil && r.GetSessionTerminal() {
+			return authorityrpc.ClassifyLifecycleAttempt(authorityrpc.ErrSessionEnded)
+		}
+		if r == nil || r.GetUncertain() {
+			return authorityrpc.ClassifyLifecycleAttempt(authorityrpc.ErrTransportUncertain)
+		}
+		if r.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+		}
+		if r.GetFailure() != 0 || r.GetErrno() != 0 {
+			return authorityrpc.ClassifyLifecycleAttempt(authorityrpc.ErrSessionEnded)
+		}
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+	})
+	if validation.Disposition != authorityrpc.LifecycleCompleted {
+		setResult(validation)
+		return o, validation.Err
+	}
+	if !d.AuthorizationDeadline().After(time.Now()) {
+		return o, fail(mountenrollment.ErrDefinitiveDenial)
+	}
+	recoveryCtx := context.WithValue(ctx, workspaceRecoveryKey{}, proof)
+	if w.renewer != nil {
+		if err = w.renewer.Resume(p); err != nil {
+			return o, fail(err)
+		}
+		w.renewer.RefreshNow()
+	}
+	for {
+		if result := waitReady(); result.Disposition != authorityrpc.LifecycleCompleted {
+			setResult(result)
+			return o, result.Err
+		}
+		result := m.retryWorkspaceSubscribe(recoveryCtx)
+		if result.Disposition != authorityrpc.LifecycleCompleted {
+			setResult(result)
+			return o, result.Err
+		}
+		if w.renewer != nil {
+			result = authorityrpc.RetryLifecycleAttempts(recoveryCtx, m.requestTimeout, func(attempt context.Context) authorityrpc.LifecycleAttempt {
+				if result := check(); result.Disposition != authorityrpc.AttemptComplete {
+					return result
+				}
+				if err := w.renewer.Failure(); err != nil {
+					return authorityrpc.ClassifyLifecycleAttempt(err)
+				}
+				_, _, _, live := m.subscription.currentIncarnation()
+				if !live {
+					return workspaceSubscribeAttempt(m.subscription.subscribe(attempt))
+				}
+				if w.renewer.Readiness().Ready(false, p, base64.RawURLEncoding.EncodeToString(m.rpc.SessionID()), d.AuthorizationDeadline()) {
+					return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete}
+				}
+				return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptPending}
+			})
+			if result.Disposition != authorityrpc.LifecycleCompleted {
+				setResult(result)
+				return o, result.Err
+			}
+		}
+		// Persist unresolved/unobserved before any usable prepared publication.
+		// Retained worker/request inventory lives until publication succeeds.
+		w.outcome = control.UnknownOutcome()
+		w.newInterval()
+		o, phase = m.publishWorkspace(ctx, g, serial, true, false, authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptComplete})
+		switch phase.Disposition {
+		case authorityrpc.AttemptPending, authorityrpc.AttemptColdReset:
+			continue
+		case authorityrpc.AttemptComplete:
+			w.cold = false
+			w.coldOutcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released"}
+			w.workers, w.parkedRequests = nil, nil
+			m.delegations.StartWriteback()
+			m.subscription.releaseWorkspaceOwnership()
+			w.keepalive.resume()
+			published = true
+			return o, nil
+		default:
+			return o, phase.Err
 		}
 	}
-
-	// Persist the new interval as unobserved BEFORE its proof can be opened.
-	w.outcome = control.UnknownOutcome()
-	w.newInterval()
-	m.subscription.mu.Lock()
-	m.subscription.workspaceFailure = nil
-	m.subscription.mu.Unlock()
-	if err = check(); err != nil {
-		return o, err
-	}
-	w.workers = nil
-	w.parkedRequests = nil
-	ready = true
-	return o, nil
 }
 
 func (m *Mount) SuspendWorkspace(ctx context.Context, g, serial uint64, deadline time.Time) (o WorkspaceObservation, err error) {
@@ -589,33 +638,54 @@ func (m *Mount) SuspendWorkspace(ctx context.Context, g, serial uint64, deadline
 		return o, err
 	}
 	defer func() { <-w.lane }()
-	cold, runErr := m.suspendWorkspace(ctx, w, d, g, serial, deadline)
-	o, err = m.completeWorkspace(ctx, g, serial, false, cold, runErr)
-	return o, err
+	cold, phase := m.suspendWorkspace(ctx, w, d, g, serial, deadline)
+	o, _ = m.publishWorkspace(ctx, g, serial, false, cold, phase)
+	return o, o.Result.Err
 }
 
-func (m *Mount) suspendWorkspace(ctx context.Context, w *workspaceLifecycle, d workspaceDispatch, g, serial uint64, deadline time.Time) (cold bool, err error) {
-	if _, err = m.workspace.Recovery(g, serial); err != nil {
-		return false, err
+func (m *Mount) suspendWorkspace(ctx context.Context, w *workspaceLifecycle, d workspaceDispatch, g, serial uint64, deadline time.Time) (bool, authorityrpc.LifecycleAttempt) {
+	phase := m.workspacePublication(ctx, g, serial, false)
+	if phase.Disposition != authorityrpc.AttemptComplete {
+		return false, phase
 	}
-	// A completed cut remains valid until a new Prepared interval publishes.
-	// A repeated Suspend only has to re-park work that recovery resumed.
-	if w.cold || w.coldOutcome != nil && !w.servedSinceCold.Load() {
+	cold, err := m.cutWorkspace(ctx, w, d, deadline)
+	if err != nil {
+		phase = authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: err}
+	}
+	return cold, phase
+}
+
+func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d workspaceDispatch, deadline time.Time) (cold bool, err error) {
+	// Entry admission and the served decision share raw.mu. Fence the buffer
+	// before releasing it, so a concurrent first entry cannot escape re-park.
+	m.raw.mu.Lock()
+	unserved := !w.servedSinceCold.Load()
+	repark := w.cold || w.coldOutcome != nil && unserved
+	var p workspaceDrainPermit
+	if !repark {
+		p = m.workspaceFS().captureWorkspaceDrain(deadline)
+	}
+	m.delegations.epoch.RLock()
+	m.delegations.buf.FenceAdmissions()
+	m.delegations.epoch.RUnlock()
+	m.raw.mu.Unlock()
+	if repark {
 		if err = m.parkWorkspace(ctx, w, d); err != nil {
 			return false, err
 		}
-		w.cold = true
+		if err = m.workspaceFS().captureWorkspaceReplies().wait(ctx); err != nil {
+			return false, err
+		}
 		if w.coldOutcome != nil {
 			w.outcome = proto.Clone(w.coldOutcome).(*pb.MountOutcome)
 		}
-		return true, nil
+		return m.finishWorkspaceCold(w, d)
 	}
 	w.outcome = control.UnknownOutcome()
 	w.workers = nil
 	for group := 0; group < 6; group++ {
 		w.workerDisposition(group, "unresolved")
 	}
-	p := m.workspaceFS().captureWorkspaceDrain(deadline)
 	if err = m.subscription.takeWorkspaceOwnership(ctx); err != nil {
 		return false, err
 	}
@@ -632,11 +702,6 @@ func (m *Mount) suspendWorkspace(ctx context.Context, w *workspaceLifecycle, d w
 		return false, err
 	}
 	w.workerDisposition(1, "parked")
-	if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
-		return false, errSubscriptionExpired
-	}
-	ctx, cancel := context.WithTimeout(ctx, p.deadline.Sub(m.subscription.config.clock.Now()))
-	defer cancel()
 	p.buffer.FenceAdmissions()
 	cohort := m.workspaceFS().captureWorkspaceReplies()
 	if w.callbacks == nil {
@@ -659,7 +724,15 @@ func (m *Mount) suspendWorkspace(ctx context.Context, w *workspaceLifecycle, d w
 	cut, cutErr := m.delegations.SuspendCut(ctx, p)
 	w.outcome = &pb.MountOutcome{Durability: cut.durability, Observation: "observed", Release: cut.release}
 	if cutErr != nil {
-		return false, cutErr
+		if ctx.Err() != nil {
+			return false, cutErr
+		}
+		if !errors.Is(cutErr, errSubscriptionExpired) && !errors.Is(cutErr, context.DeadlineExceeded) {
+			return false, cutErr
+		}
+		// No elapsed drain is renewed. Withdrawal has completed; reset below
+		// accounts for any unprovable accepted tail and abandons the old grant.
+		w.abandonGrant()
 	}
 	w.workerDisposition(4, "settled")
 	if err = m.subscription.parkWorkspaceControl(ctx); err != nil {
@@ -676,11 +749,12 @@ func (m *Mount) suspendWorkspace(ctx context.Context, w *workspaceLifecycle, d w
 	if m.isRevoked() || m.ctx.Err() != nil {
 		return false, errors.New("fusev3: terminal worker prevents healthy cold proof")
 	}
-	if !m.subscription.config.clock.Now().Before(p.deadline) {
-		return false, errSubscriptionExpired
-	}
-	// No applying owner or callback remains. Retire under the existing reset and
-	// settlement order; the successor must not dispatch a background flush.
+	return m.finishWorkspaceCold(w, d)
+}
+
+// Both a full cut and a re-acknowledgment retire cache ownership, then capture
+// current cleanup and exact-request evidence. The physical cut is not repeated.
+func (m *Mount) finishWorkspaceCold(w *workspaceLifecycle, d workspaceDispatch) (bool, error) {
 	m.delegations.epoch.Lock()
 	m.delegations.writebackStarted = false
 	m.delegations.epoch.Unlock()
@@ -688,10 +762,32 @@ func (m *Mount) suspendWorkspace(ctx context.Context, w *workspaceLifecycle, d w
 	m.subscription.mu.Lock()
 	m.subscription.active = false
 	m.subscription.workspaceProof = nil
+	failure := m.subscription.workspaceFailure
 	m.subscription.mu.Unlock()
-	w.outcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released"}
-	if e := w.evidence.Load(); e != nil && len(e.loss) > 0 {
-		w.outcome.Durability = "lost"
+	if failure != nil {
+		return false, failure
+	}
+	if w.outcome == nil {
+		w.outcome = control.UnknownOutcome()
+	}
+	w.outcome.Observation = "observed"
+	if w.outcome.Durability == "unresolved" {
+		w.outcome.Durability = "durable"
+	}
+	if w.outcome.Release == "unresolved" {
+		w.outcome.Release = "abandoned"
+	}
+	if e := w.evidence.Load(); e != nil {
+		if len(e.loss) > 0 {
+			w.outcome.Durability = "lost"
+		}
+		if e.abandoned {
+			w.outcome.Release = "abandoned"
+		}
+	}
+	w.workers = nil
+	for group := 0; group < 6; group++ {
+		w.workerDisposition(group, "joined; cache ownership withdrawn")
 	}
 
 	w.parkedRequests = d.DispatchSnapshot().Owners

@@ -66,6 +66,12 @@ func (s *subscriptionRegistry) parkWorkspaceControl(ctx context.Context) error {
 	}
 	if q != nil {
 		for {
+			s.mu.RLock()
+			reset := s.workspaceReset
+			s.mu.RUnlock()
+			if reset {
+				break
+			} // Cache withdrawal/fencing accounts the unprovable tail.
 			q.mu.Lock()
 			if q.completed >= q.accepted {
 				q.mu.Unlock()
@@ -86,7 +92,16 @@ func (s *subscriptionRegistry) parkWorkspaceControl(ctx context.Context) error {
 			select {
 			case <-changed:
 			case <-done:
-				return errors.New("fusev3: CONTROL cut did not settle")
+				s.mu.RLock()
+				reset := s.workspaceReset
+				failure := s.workspaceFailure
+				s.mu.RUnlock()
+				if failure != nil {
+					return failure
+				}
+				if !reset {
+					return errors.New("fusev3: CONTROL cut did not settle")
+				}
 			case <-ctx.Done():
 				return ctx.Err()
 			}

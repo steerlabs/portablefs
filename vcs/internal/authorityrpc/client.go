@@ -1684,6 +1684,11 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 			endIO()
 		}
 	}()
+	if timeout, _ := ctx.Value(dispatchTimeoutKey{}).(time.Duration); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	// Request IDs are physical-connection envelopes, not replay identities. A
 	// same-session mutation retry keeps its Mutation slot/sequence and body but
 	// must take a fresh ID on the replacement socket; another caller may already

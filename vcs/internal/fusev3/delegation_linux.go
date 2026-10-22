@@ -1739,6 +1739,11 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 		p := registry.workspaceDrain
 		now := registry.config.clock.Now()
 		registry.mu.RUnlock()
+		if p != nil && p.manager == m && p.buffer == buf && !now.Before(p.deadline) {
+			// No release request was submitted. The elapsed cut belongs to
+			// lifecycle fencing, not descriptor-unknown terminal policy.
+			return nil, delegationCleanupError{cause: authorityrpc.ErrSubscriptionReset, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+		}
 		if p != nil && p.manager == m && p.allows(buf, m.inc.Load(), now) {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, p.deadline.Sub(now))
@@ -1747,6 +1752,18 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 		}
 	}
 	r, err := begin(ctx, &s.identity)
+	if err == writeback.ErrClosed && m.subscription != nil {
+		m.subscription.mu.RLock()
+		p := m.subscription.workspaceDrain
+		closing := p != nil && p.manager == m && p.buffer == buf
+		m.subscription.mu.RUnlock()
+		if closing {
+			// Drain capture may overtake the initial capability sample before
+			// BeginRetire observes fenced admission. No release was submitted;
+			// the lifecycle owns this cut and descriptor cleanup stays retained.
+			return nil, delegationCleanupError{cause: authorityrpc.ErrSubscriptionReset, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+		}
+	}
 	if err == nil {
 		s.retire = r
 	}
@@ -2423,7 +2440,13 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	// Grant retirement belongs to the cache incarnation; descriptor CLOSE and
 	// its replay identity belong to the session. Only the preparation is bounded
 	// by the cache-work deadline and interrupted by a cold reset.
-	prepareCtx, stopPrepare := context.WithTimeout(callCtx, m.timeout)
+	prepareCtx, stopPrepare := context.WithCancel(callCtx)
+	if m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspace != nil {
+		prepareCtx = authorityrpc.WithDispatchTimeout(prepareCtx, m.timeout)
+	} else {
+		stopPrepare()
+		prepareCtx, stopPrepare = context.WithTimeout(callCtx, m.timeout)
+	}
 	stopEpochCancel := context.AfterFunc(epochCtx, stopPrepare)
 	defer func() { stopEpochCancel(); stopPrepare() }()
 	groups := make([]*delegationReleaseGroup, 0, len(groupsByID))
@@ -2434,6 +2457,9 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	if err != nil {
 		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
 			return m.closeResetOutcome(sessionSerial)
+		}
+		if classified, ok := err.(cleanupClassified); ok && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return err
 		}
 		return m.unknownCloseOutcome(err)
 	}
@@ -2537,8 +2563,10 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	for {
 		m.epoch.RLock()
 		old = m.buf
-		old.FenceAdmissions()
+		// Cancellation records the old epoch's disposition before local
+		// admission can return ErrClosed to its retained cleanup owners.
 		m.epochEnd()
+		old.FenceAdmissions()
 		m.epoch.RUnlock()
 		m.epoch.Lock()
 		if m.buf == old {
@@ -2565,17 +2593,27 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	m.durabilityMu.Lock()
 	durable := m.durableHigh
 	m.durabilityMu.Unlock()
+	// A completing flush holds state admission while it retires receipts
+	// through the manager index. Never hold that index across state locks.
 	m.mu.Lock()
+	states := make([]*delegationState, 0, len(m.byID))
 	for _, s := range m.byID {
+		s.users.Add(1)
+		states = append(states, s)
+	}
+	m.mu.Unlock()
+	for _, s := range states {
 		s.meta.Lock()
 		atRisk := s.dirty && (s.appliedCut < s.acceptedCut || s.applied == 0 || s.applied > durable)
 		if atRisk {
 			m.reportDrop(old.Drop(s.identity, reason))
 		}
+		s.meta.Unlock()
+		m.mu.Lock()
 		if loss := max(m.identityLoss[s.identity], old.IdentityLoss(s.identity)); loss != 0 && m.observers[s.identity] != 0 {
 			m.identityLoss[s.identity] = loss
 		}
-		s.meta.Unlock()
+		m.mu.Unlock()
 		s.admission.Lock()
 		s.setGrantLocked(nil)
 		s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
@@ -2583,7 +2621,9 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 		s.meta.Lock()
 		s.dirty = false
 		s.meta.Unlock()
+		m.releaseState(s)
 	}
+	m.mu.Lock()
 	loss := old.LossSequence()
 	m.byID = make(map[writeback.Identity]*delegationState)
 	m.retiredGrantFloor = 0

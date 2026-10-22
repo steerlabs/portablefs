@@ -9,8 +9,20 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+// Managed callbacks retain their logical owner while dispatch is locally
+// unavailable. Each submitted attempt gets its bounded network budget only
+// after fence admission; mount cancellation still releases the callback.
+func (m *Mount) operationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if m == nil || m.workspace == nil {
+		return context.WithTimeout(parent, timeout)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return authorityrpc.WithDispatchTimeout(ctx, timeout), cancel
+}
 
 // Construction selects admission dispatch once. Embedding promotes the exact
 // physical-reply interfaces discovered by go-fuse, without an ordinary entry

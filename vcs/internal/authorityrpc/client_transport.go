@@ -545,13 +545,6 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 // Even a caller without a deadline cannot retry beyond one subscription TTL.
 func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
 	defer c.reportSessionError(&resultErr)
-	if c.cfg.DispatchFence != nil {
-		done, err := c.cfg.DispatchFence.begin(ctx, false)
-		if err != nil {
-			return err
-		}
-		defer done()
-	}
 	caller := ctx
 	ctx, cancel := context.WithTimeout(ctx, volumeserver.SubscriptionTTL)
 	defer cancel()
@@ -562,7 +555,14 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 		return fmt.Errorf("%w: reconnect exceeded subscription horizon", ErrTransportUncertain)
 	}
 	for {
-		err := c.reconnectTransportOnce(ctx, role)
+		err := func() error {
+			done, err := c.cfg.DispatchFence.begin(ctx, false)
+			if err != nil {
+				return err
+			}
+			defer done()
+			return c.reconnectTransportOnce(ctx, role)
+		}()
 		// A session's terminal verdict applies to every admitted caller, even
 		// one whose context expired while its transport outcome was unsettled.
 		if terminalErr := c.checkCallEntry(); terminalErr != nil {

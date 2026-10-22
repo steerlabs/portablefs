@@ -131,6 +131,7 @@ type subscriptionRegistry struct {
 	pollDone               chan struct{}
 	controlQueue           *subscriptionChangeQueue
 	workspaceFailure       error
+	workspaceReset         bool
 	ordinaryWithdrawalDone chan struct{}
 	active                 bool
 	paused                 bool
@@ -306,7 +307,7 @@ func (s *subscriptionRegistry) signalHorizonChangedLocked() {
 func (s *subscriptionRegistry) deactivate() {
 	s.mu.Lock()
 	if s.workspaceOwned {
-		s.workspaceFailure = errSubscriptionExpired
+		s.workspaceReset = true
 		s.mu.Unlock()
 		return
 	}
@@ -556,6 +557,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				s.config.beforeWorkspaceInstall()
 			}
 			s.workspaceDrain = nil
+			s.workspaceReset = false
 			s.workspaceProof = proof
 			s.active = true
 			s.incarnation = incarnation
@@ -691,11 +693,25 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 	s.pollCancel, s.pollDone, s.controlQueue = pollCancel, pollDone, changeQueue
 	s.mu.Unlock()
 	var workers sync.WaitGroup
-	start := func(run func(context.Context) error) {
+	start := func(workerCtx context.Context, run func(context.Context) error) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			if err := run(ctx); err != nil && ctx.Err() == nil {
+			if err := run(workerCtx); err != nil {
+				disposition := authorityrpc.LifecycleCompletion(workerCtx, err)
+				reset := subscriptionResetAttempt(err)
+				independent := disposition.Disposition == authorityrpc.LifecycleFailed && !reset
+				s.mu.Lock()
+				if independent {
+					s.workspaceFailure = errors.Join(s.workspaceFailure, disposition.Err)
+				}
+				if reset {
+					s.workspaceReset = true
+				}
+				s.mu.Unlock()
+				if !independent && workerCtx.Err() != nil {
+					return
+				}
 				select {
 				case failures <- err:
 				default:
@@ -703,29 +719,13 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 			}
 		}()
 	}
-	start(func(context.Context) error {
+	start(pollCtx, func(ctx context.Context) error {
 		defer close(pollDone)
-		err := s.pollLoop(pollCtx, incarnation, changeQueue)
-		if pollCtx.Err() != nil {
-			return nil
-		}
-		return err
+		return s.pollLoop(ctx, incarnation, changeQueue)
 	})
-	start(func(ctx context.Context) error { return s.changeLoop(ctx, incarnation, changeQueue) })
-	start(func(context.Context) error {
-		defer close(renewalDone)
-		err := s.renewLoop(renewalCtx, incarnation)
-		if renewalCtx.Err() != nil {
-			if result := authorityrpc.LifecycleCompletion(renewalCtx, err); result.Disposition == authorityrpc.LifecycleFailed {
-				s.mu.Lock()
-				s.workspaceFailure = errors.Join(s.workspaceFailure, result.Err)
-				s.mu.Unlock()
-			}
-			return nil
-		}
-		return err
-	})
-	start(func(ctx context.Context) error { return s.horizonLoop(ctx, incarnation) })
+	start(ctx, func(ctx context.Context) error { return s.changeLoop(ctx, incarnation, changeQueue) })
+	start(renewalCtx, func(ctx context.Context) error { defer close(renewalDone); return s.renewLoop(ctx, incarnation) })
+	start(ctx, func(ctx context.Context) error { return s.horizonLoop(ctx, incarnation) })
 
 	var result error
 	select {
@@ -740,11 +740,6 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 	owned := s.workspaceOwned
 	s.mu.RUnlock()
 	if owned {
-		s.mu.Lock()
-		if !errors.Is(result, context.Canceled) {
-			s.workspaceFailure = result
-		}
-		s.mu.Unlock()
 		return result
 	}
 	if parent.Err() != nil {
@@ -869,6 +864,11 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 		event, err := s.rpc.NextControlEvent(ctx, incarnation, after, changes.completedThrough())
 		if err != nil {
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+				return err
+			}
+			// Semantic, local and authority errors remain independent even
+			// when the lifecycle cancels this poll before it returns.
+			if !authorityrpc.TransientTransport(err) {
 				return err
 			}
 			if ctx.Err() != nil {

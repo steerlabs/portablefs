@@ -35,6 +35,14 @@ type DispatchSnapshot struct {
 	Owners     []DispatchOwner
 }
 
+type dispatchTimeoutKey struct{}
+
+// WithDispatchTimeout bounds submitted I/O without spending its budget behind
+// a local readiness fence. The parent still owns cancellation of the job.
+func WithDispatchTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	return context.WithValue(ctx, dispatchTimeoutKey{}, timeout)
+}
+
 func NewDispatchFence() *DispatchFence {
 	return &DispatchFence{parked: true, owners: make(map[*authoritypb.Request]DispatchOwner), changed: make(chan struct{})}
 }

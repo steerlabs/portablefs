@@ -87,7 +87,7 @@ type Job struct {
 	cancel            context.CancelFunc
 	done              chan struct{}
 	running, stopping bool
-	ownerCanceled     bool
+	lifecycleOwner    *authorityrpc.LifecycleOwner
 	state, reason     string
 	drainDeadline     time.Time
 }
@@ -131,7 +131,7 @@ func (o *Owner) cancelJob(q Request) {
 	var cancel context.CancelFunc
 	if o.job != nil && o.job.running && o.successorLocked(q) == nil && o.permitted(q) {
 		o.job.stopping = true
-		o.job.ownerCanceled = true
+		o.job.lifecycleOwner.Overtake()
 		cancel = o.job.cancel
 	}
 	o.mu.Unlock()
@@ -370,7 +370,7 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 		}
 	case "workspace-recover":
 		generation, _ := decimal(q.Workspace.Generation, false)
-		if o.job == nil || o.job.state != "cold" || generation <= o.recoveredGeneration || o.lastResume == sha256.Sum256([]byte(q.Workspace.Transaction)) {
+		if o.job == nil || o.job.start.Operation != "workspace-suspend" || o.job.state != "cold" && o.job.state != "failed" || generation <= o.recoveredGeneration || o.lastResume == sha256.Sum256([]byte(q.Workspace.Transaction)) {
 			return Response{}, nil, ErrGrammar
 		}
 		raw, err := base64.RawURLEncoding.DecodeString(q.Workspace.Transaction)
@@ -393,8 +393,10 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 			return Response{}, nil, err
 		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	j := &Job{owner: o, start: cloneRequest(q), ctx: ctx, cancel: cancel, done: make(chan struct{}), running: true, state: "preparing"}
+	ctx, lifecycleOwner := authorityrpc.WithLifecycleOwner(context.Background())
+	ownerCtx := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	j := &Job{lifecycleOwner: lifecycleOwner, owner: o, start: cloneRequest(q), ctx: ctx, cancel: cancel, done: make(chan struct{}), running: true, state: "preparing"}
 	if q.Operation == "workspace-recover" {
 		j.state = "pending-recovery"
 	}
@@ -402,7 +404,7 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 		drain, _ := decimal(q.Workspace.DrainBudgetNanos, true)
 		j.drainDeadline = receivedAt.Add(time.Duration(drain))
 		cancel()
-		j.ctx, j.cancel = context.WithDeadline(context.Background(), j.drainDeadline)
+		j.ctx, j.cancel = context.WithDeadline(ownerCtx, j.drainDeadline)
 		j.state = "pending-suspend"
 	}
 	if o.facts.Outcome == (Outcome{}) {
@@ -457,7 +459,7 @@ func (o *Owner) run(j *Job) {
 	result := o.Driver.Run(j.ctx, j)
 	o.mu.Lock()
 	if result.Disposition != LifecycleCompleted || result.Err != nil || j.state != "prepared" && j.state != "cold" && j.state != "cleanup-finalized" {
-		canceled := j.ownerCanceled && result.Disposition == LifecycleOvertaken
+		canceled := j.lifecycleOwner.Overtaken() && result.Disposition == LifecycleOvertaken
 		if !canceled && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && o.servingFailure == "" {
 			o.servingFailure = "mount incarnation preparation/recovery failed"
 		}
@@ -562,7 +564,7 @@ func (j *Job) Publish(state string, f Facts) error {
 			// Losing the publication race to Close is generation cancellation, not
 			// a failed preparation. Preserve unrelated driver failures in run.
 			j.stopping = true
-			j.ownerCanceled = true
+			j.lifecycleOwner.Overtake()
 			j.cancel()
 			return context.Canceled
 		}
@@ -719,7 +721,7 @@ func (o *Owner) Close() {
 	}
 	if j != nil {
 		j.stopping = true
-		j.ownerCanceled = true
+		j.lifecycleOwner.Overtake()
 	}
 	o.mu.Unlock()
 	if j != nil {

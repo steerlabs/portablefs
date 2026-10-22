@@ -43,3 +43,23 @@ func TestLifecycleAttemptFailureAtCancellationSetsTerminalLatch(t *testing.T) {
 		})
 	}
 }
+
+// A cancelled sleep can consume a fresh token for the exact incomplete
+// suspension. The frontend owns finishing withdrawal/fencing before Subscribe.
+func TestRecoverReconcilesIncompleteSuspendWithFreshToken(t *testing.T) {
+	entered := make(chan Request, 2)
+	owner := testOwnerResult(t, func(ctx context.Context, j *Job) LifecycleResult {
+		entered <- j.Request()
+		return LifecycleResult{Disposition: LifecycleOvertaken, Err: context.Canceled}
+	})
+	suspend := r5Transaction(t, "workspace-suspend", 1, 1)
+	job := start(t, owner, suspend)
+	awaitResult(t, entered)
+	awaitResult(t, job.done)
+	recover := r5Transaction(t, "workspace-recover", 2, 1)
+	job = start(t, owner, recover)
+	if q := awaitResult(t, entered); q.Operation != "workspace-recover" {
+		t.Fatal(q.Operation)
+	}
+	awaitResult(t, job.done)
+}

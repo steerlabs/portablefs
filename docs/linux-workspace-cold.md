@@ -23,7 +23,10 @@ cleanup, then releases before the fixed physical-reply cohort joins. Raw cache
 withdrawal retains its notification inventory through failure. A blocked
 notification retains its join after the waiter times out; it cannot certify
 coldness. SuspendCut drains the captured accepted cut and releases the captured
-grants under the original horizon. The old CONTROL runner can still process
+grants under the original horizon. An elapsed or incomplete drain never gains a
+new deadline: withdrawal and epoch fencing account for its unprovable tail,
+then permit a cold acknowledgment. Recover can finish that retained cut before
+using its fresh token to subscribe. The old CONTROL runner can still process
 recalls and changes and acknowledge them; stopping its poller captures a finite
 sequence, which must finish before its remaining workers stop.
 
@@ -35,8 +38,10 @@ Parking does not cancel the CLOSE_BATCH or visibility owner or take its
 unknown-close failure path. Logical owners retain their exact requests through
 transient reconnect failures; parked waiting consumes no network-attempt budget.
 A readiness refusal blocks before request submission and cannot break a healthy
-transport. Initial bootstrap also waits on the startup fence before its network
-budget starts. Callback settlement never acquires the lifecycle lane.
+transport. Managed callbacks, nested operations and deferred cleanup retain
+cancelable logical contexts; their network budgets begin at dispatch admission.
+Initial bootstrap also waits on the startup fence before its network budget
+starts. Callback settlement never acquires the lifecycle lane.
 
 | Owner | Cold disposition |
 | --- | --- |
@@ -68,7 +73,10 @@ semantics; this proof withdraws authority-derived cache authority.
 ## Preparation and recovery
 
 Both operations keep one logical owner through classified transport/DNS failures,
-with bounded network attempts and capped backoff. There is no outer 45-second
+with bounded network attempts and capped backoff. Publication belongs to that
+same job: a proof aged during persistence withdraws and subscribes again, while
+clock unreadiness waits for correction. The job persists the defeated
+candidate's refusal before retrying. There is no outer 45-second
 recovery deadline. The local control job owns acceptance, observation and token
 consumption. A socket attempt cannot repeat Attach or logical Recover.
 Initial attachment retains its connection-set/Attach identity and explicit
@@ -79,14 +87,20 @@ from an empty cursor inside the same pending job. This includes an aged first
 page, pagination horizon, or withdrawal lead. Structural refusal remains a
 failure. Epoch change, authenticated refusal, protocol defects and independent
 local failure end recovery. Protocol 8 already defines errno and session_terminal;
-Resume now returns that existing terminal refusal for an unknown or ended
-session, so real lease expiry ends recovery with ErrSessionEnded. Ordinary
-mounts receive the same definitive expiry verdict. No wire or schema changes.
+Resume uses the same existing refusal for foreign/unbound credentials and
+unknown or ended sessions, without querying the unowned target's state. A
+bound Resume authenticates its credential before the runtime chooses a state
+or renews a lease. Real lease expiry therefore ends recovery with
+ErrSessionEnded, including on ordinary mounts. The refusal does not fence a
+foreign target. The wire and schema remain unchanged.
 
 Cold state lasts until Prepared actually publishes. An interrupted Prepare or
 Recover re-parks every owner it resumed. A later Suspend re-acknowledges the
 retained cut when no callback has served since that cut, without draining again
-or consulting the old horizon. A persistence failure also retains the physical
+or consulting the old horizon. Entry admission and this decision share the raw
+registry lock. Each park deactivates the subscription, stops writeback and
+captures current cleanup debt and exact retained requests; recovery retains the
+prior inventory until final publication. A persistence failure also retains the physical
 cut for a later acknowledgment. Cold POSIX FLUSH returns EAGAIN promptly while
 keeping the tracked unlock obligation for session-owned RELEASE cleanup; a
 closed serving gate whose dispatch still runs keeps its existing cleanup path.
@@ -104,7 +118,9 @@ remains outside renewal ownership.
 Every transition completion returns cumulative loss and outcome evidence, even
 when it fails or loses its generation. Prepare and Recover return an explicit
 Completed, Overtaken or Failed result for the local owner. Cancellation-only
-completion may be Overtaken; any independent cause, including a cause joined
+completion may be Overtaken. The local owner records overtaking separately
+from the diagnostic, so an obsolete permit cannot turn a known newer Close into
+a failed incarnation. Any independent cause, including a cause joined
 with transport loss or cancellation, remains Failed and sets the owner's
 incarnation terminal latch. Drop tickets identify accepted entries
 and bytes; a repeated reset cannot create another loss for the same discarded

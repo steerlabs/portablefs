@@ -324,6 +324,7 @@ func reviewKernelPauseChild(t *testing.T) {
 	if r := c.req("open"); r != "<nil>" {
 		t.Fatal(r)
 	}
+	opusPollHack(t, f.mountPath(0))
 
 	// Phase A: lease clock frozen across a 15 s pause; guest time resumes from
 	// the frozen value (lags real time), peer completes writes while cold.
@@ -418,6 +419,7 @@ func reviewKernelSessionExpiredChild(t *testing.T) {
 	if r := c.req("open"); r != "<nil>" {
 		t.Fatal(r)
 	}
+	opusPollHack(t, f.mountPath(0))
 	c.write(f.join(0, "e"), "v", 0644)
 	serial := c.suspend()
 	f.advanceClock(3 * time.Minute)
@@ -455,6 +457,7 @@ func reviewKernelLeaseExpiryChild(t *testing.T) {
 	if r := c.req("open"); r != "<nil>" {
 		t.Fatal(r)
 	}
+	opusPollHack(t, f.mountPath(0))
 	c.write(f.join(0, "e"), "v", 0644)
 	serial := c.suspend()
 	time.Sleep(26 * time.Second)
@@ -485,7 +488,7 @@ func reviewKernelClockReadinessChild(t *testing.T) {
 	reader, proof, mounted := reviewAdopt(t)
 	defer reader.Retire()
 	var off atomic.Int64
-	clock := &workspaceTestClockOwner{}
+	clock := &workspaceTestClockOwner{refused: make(chan struct{})}
 	life := &workspaceLifecycle{lane: make(chan struct{}, 1), clock: clock, standalone: true, persist: func(WorkspaceObservation) error { return nil }}
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, SessionLease: 2 * time.Minute, workspace: reader, workspaceRecovery: proof, workspaceFirstOnly: true, workspaceLifecycle: life, workspaceDispatch: true, workspaceClock: replaySubscriptionClock{&off}})
 	c := &reviewChild{t: t, in: bufio.NewReader(os.Stdin), f: f, m: f.mounts[0], off: &off}
@@ -493,6 +496,7 @@ func reviewKernelClockReadinessChild(t *testing.T) {
 	if r := c.req("open"); r != "<nil>" {
 		t.Fatal(r)
 	}
+	opusPollHack(t, f.mountPath(0))
 	c.write(f.join(0, "e"), "v", 0644)
 	// Install the lifecycle-owned dispatch check through a real cold/recover.
 	c.recover(c.suspend())
@@ -505,15 +509,16 @@ func reviewKernelClockReadinessChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.unavailable.Store(true)
+	corrected := clock.restoreAfter(3 * time.Second)
 	closed := make(chan error, 1)
 	go func() { closed <- held.Close() }()
 	// The readiness refusal owns no network submission and cannot destroy the
 	// accepted buffer, cleanup obligation, or healthy session.
-	time.Sleep(200 * time.Millisecond)
+	<-clock.refused
 	if c.m.isRevoked() || c.m.rpc.SessionEndCause() != nil || c.m.delegations.LossSequence() != 0 {
 		t.Fatal("readiness refusal became terminal or lost data")
 	}
-	clock.unavailable.Store(false)
+	<-corrected
 	select {
 	case err := <-closed:
 		if err != nil {
@@ -548,6 +553,7 @@ func reviewKernelChurnChild(t *testing.T) {
 	if r := c.req("open"); r != "<nil>" {
 		t.Fatal(r)
 	}
+	opusPollHack(t, f.mountPath(0))
 	for i := 0; i < 8; i++ {
 		c.write(f.join(0, fmt.Sprintf("churn%d", i)), "seed", 0644)
 	}
@@ -609,7 +615,7 @@ func reviewKernelChurnChild(t *testing.T) {
 	}
 	fmt.Printf("churn ops=%d failed-opens=%d revoked=%v\n", ops.Load(), fails.Load(), c.m.isRevoked())
 	if c.m.isRevoked() {
-		c.fail("mount revoked under churn")
+		c.fail("mount revoked under churn: fatal=%v session=%v", c.m.fatalError(), c.m.rpc.SessionEndCause())
 	}
 	for _, b := range c.bad {
 		t.Error(b)
@@ -637,6 +643,7 @@ func reviewKernelInterruptedRecoverChild(t *testing.T) {
 	if r := c.req("open"); r != "<nil>" {
 		t.Fatal(r)
 	}
+	opusPollHack(t, f.mountPath(0))
 	c.write(f.join(0, "e"), "v", 0644)
 	serial := c.suspend()
 	// Wake: the TLS clock has not been corrected yet; a newer sleep cancels

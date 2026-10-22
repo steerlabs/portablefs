@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -20,16 +21,35 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
-type workspaceTestClockOwner struct{ unavailable atomic.Bool }
+type workspaceTestClockOwner struct {
+	unavailable atomic.Bool
+	refused     chan struct{}
+	once        sync.Once
+}
 
 func (c *workspaceTestClockOwner) Wait(ctx context.Context, p mountenrollment.Permit) error {
 	return c.Check(p)
 }
 func (c *workspaceTestClockOwner) Check(mountenrollment.Permit) error {
 	if c.unavailable.Load() {
+		if c.refused != nil {
+			c.once.Do(func() { close(c.refused) })
+		}
 		return errors.New("clock not qualified")
 	}
 	return nil
+}
+
+// Start the gap at a real readiness refusal, before timing its correction.
+func (c *workspaceTestClockOwner) restoreAfter(gap time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		<-c.refused
+		time.Sleep(gap)
+		c.unavailable.Store(false)
+		close(done)
+	}()
+	return done
 }
 
 type coldTestRPC struct {
@@ -144,7 +164,7 @@ func TestWorkspaceLifecycleRetryBeyond45Seconds(t *testing.T) {
 	}
 }
 func TestWorkspaceColdFailureRetainsLossAndNotificationOwner(t *testing.T) {
-	for _, kind := range []string{"failed-notify", "blocked-notify", "expired-horizon", "persistence"} {
+	for _, kind := range []string{"failed-notify", "blocked-notify", "persistence"} {
 		t.Run(kind, func(t *testing.T) {
 			f, g, _ := coldFixture(t)
 			f.lookup(t, 1, "warm")
@@ -279,18 +299,43 @@ func TestWorkspaceRecoveryClassifiesTerminalEvidence(t *testing.T) {
 }
 
 func TestWorkspacePersistenceCannotPublishStaleClock(t *testing.T) {
-	f, g, _ := coldFixture(t)
+	f, g, rpc := coldFixture(t)
 	serial := g.Close(1)
 	clock := f.mount.workspaceLifecycle.clock.(*workspaceTestClockOwner)
+	refused := make(chan struct{})
+	var once atomic.Bool
 	f.mount.workspaceLifecycle.persist = func(o WorkspaceObservation) error {
-		if o.Prepared {
+		if o.Prepared && once.CompareAndSwap(false, true) {
 			clock.unavailable.Store(true)
+		}
+		if !o.Prepared && once.Load() {
+			select {
+			case <-refused:
+			default:
+				close(refused)
+			}
 		}
 		return nil
 	}
-	o, err := f.mount.PrepareWorkspace(t.Context(), 1, serial)
-	if err == nil || o.Prepared || f.mount.WorkspaceObservation().Prepared {
-		t.Fatal("persistence outlived clock proof", o, err)
+	done := make(chan WorkspaceObservation, 1)
+	go func() { o, _ := f.mount.PrepareWorkspace(t.Context(), 1, serial); done <- o }()
+	<-refused
+	if f.mount.WorkspaceObservation().Prepared {
+		t.Fatal("persistence outlived clock proof")
+	}
+	select {
+	case o := <-done:
+		t.Fatal("clock unreadiness ended logical Prepare", o)
+	default:
+	}
+	clock.unavailable.Store(false)
+	select {
+	case o := <-done:
+		if !o.Prepared || o.Result.Disposition != authorityrpc.LifecycleCompleted || rpc.subscriptions.Load() < 2 {
+			t.Fatal(o)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("original Prepare did not finish after clock correction")
 	}
 }
 

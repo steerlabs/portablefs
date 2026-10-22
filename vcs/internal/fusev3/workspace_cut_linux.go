@@ -69,5 +69,8 @@ func (m *delegationManager) SuspendCut(ctx context.Context, p workspaceDrainPerm
 		return result, err
 	}
 	result.release = "released"
-	return result, p.buffer.StopContext(ctx)
+	// The lifecycle retires the epoch and joins the scheduler together in
+	// FenceSubscription. Stopping a still-current buffer here would let a late
+	// session-owned CLOSE select it and mistake ErrStopped for an unknown RPC.
+	return result, nil
 }
