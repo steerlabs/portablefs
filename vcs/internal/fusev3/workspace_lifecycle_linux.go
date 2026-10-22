@@ -61,6 +61,7 @@ type workspaceEvidence struct {
 }
 type workspaceLifecycle struct {
 	beforeRecoveryProof func()
+	afterFlushLoss      func(*fileHandle) // deterministic reset boundary; nil in production
 	observation         atomic.Pointer[WorkspaceObservation]
 	lane                chan struct{}
 	clock               workspaceClock

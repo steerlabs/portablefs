@@ -240,7 +240,11 @@ func TestWorkspaceClosedFlushReobservesResetLoss(t *testing.T) {
 	h := f.raw.handles[opened.Fh].file
 	f.raw.mu.RUnlock()
 	g.Close(1)
-	h.afterFlushLoss = func() { f.mount.delegations.FenceSubscription("reset after first loss observation") }
+	f.mount.workspaceLifecycle.afterFlushLoss = func(flushed *fileHandle) {
+		if flushed == h {
+			f.mount.delegations.FenceSubscription("reset after first loss observation")
+		}
+	}
 	if got := h.node.Flush(t.Context(), h, 0); got != syscall.EIO {
 		t.Fatal("closed FLUSH hid reset loss", got)
 	}

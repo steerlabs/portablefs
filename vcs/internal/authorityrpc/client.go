@@ -1922,11 +1922,13 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 			c.releaseInvalidIncarnation.Store(body.GetIncarnation())
 		}()
 	}
-	releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
-	if ownerErr != nil {
-		return nil, nil, ownerErr
+	if c.cfg.DispatchFence != nil {
+		releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
+		if ownerErr != nil {
+			return nil, nil, ownerErr
+		}
+		defer releaseOwner()
 	}
-	defer releaseOwner()
 	for {
 		response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
 		if !errors.Is(err, ErrTransportUncertain) {
@@ -2124,11 +2126,13 @@ func (c *Client) CallMutationWithIdentityRetained(
 	// Readiness waiting is still buffer/epoch-owned. Registration under the
 	// fence is the handoff: Park now joins this applying owner, and no caller
 	// cancellation check can discard its identity/body before session retention.
-	releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
-	if ownerErr != nil {
-		return nil, nil, ownerErr
+	if c.cfg.DispatchFence != nil {
+		releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
+		if ownerErr != nil {
+			return nil, nil, ownerErr
+		}
+		defer releaseOwner()
 	}
-	defer releaseOwner()
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
 		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		stop := context.AfterFunc(session, cancel)

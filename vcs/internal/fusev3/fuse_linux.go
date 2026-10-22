@@ -222,8 +222,7 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	workspace          *workspaceadmission.Reader
-	workspaceLifecycle *workspaceLifecycle
+	workspace *workspaceadmission.Reader
 
 	posixMu       sync.Mutex
 	posixLocks    map[posixLockKey]uint64
@@ -262,10 +261,11 @@ type Mount struct {
 	// cached-name registry and the publication gate; kernelMount is the
 	// installed mount's identity, which is what makes both self-revocation and
 	// a mount-absence proof exact rather than path-shaped guesses.
-	nameCapacity      int
-	withdrawalTimeout time.Duration
-	raw               *rawFileSystem
-	kernelMount       kernelMount
+	nameCapacity       int
+	withdrawalTimeout  time.Duration
+	raw                *rawFileSystem
+	workspaceLifecycle *workspaceLifecycle
+	kernelMount        kernelMount
 	// The withdrawal ladder must finish before its owned abort descriptor closes.
 	kernelWithdrawalMu     sync.Mutex
 	kernelWithdrawalClosed bool
@@ -1399,7 +1399,6 @@ type node struct {
 }
 
 type fileHandle struct {
-	afterFlushLoss   func() // deterministic reset boundary in tests; nil in production
 	node             *node
 	token            []byte
 	openFlags        uint32
@@ -1935,8 +1934,10 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	}
 	loss := handle.observeLoss()
 	closed := !n.mount.workspaceServing()
-	if closed && handle.afterFlushLoss != nil {
-		handle.afterFlushLoss()
+	if closed {
+		if w := n.mount.workspaceLifecycle; w != nil && w.afterFlushLoss != nil {
+			w.afterFlushLoss(handle)
+		}
 	}
 	if generation == 0 {
 		if loss != 0 {
