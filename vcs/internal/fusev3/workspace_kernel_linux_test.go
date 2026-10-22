@@ -25,8 +25,14 @@ import (
 // and kernel frontend run under the provisioned unprivileged service identity.
 // This qualifies the gate on an ordinary mount, not the future workspace driver.
 func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
+	runWorkspaceKernelParent(t, workspaceKernelChild)
+}
+func TestKernelWorkspaceControlledPause(t *testing.T) {
+	runWorkspaceKernelParent(t, workspaceKernelPauseChild)
+}
+func runWorkspaceKernelParent(t *testing.T, child func(*testing.T)) {
 	if os.Getenv("PFS_WORKSPACE_KERNEL_CHILD") == "1" {
-		workspaceKernelChild(t)
+		child(t)
 		return
 	}
 	if os.Getenv(envFUSE) != "1" || os.Getenv("PORTABLEFS_SERVICE_UID") == "" {
@@ -83,7 +89,7 @@ func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(target, "-test.run=^TestKernelWorkspaceGateAndOwnerLifetime$", "-test.timeout=2m")
+	cmd := exec.Command(target, "-test.run=^"+t.Name()+"$", "-test.timeout=2m")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 	cmd.Env = append(os.Environ(), "PFS_WORKSPACE_KERNEL_CHILD=1", fmt.Sprintf("PFS_WORKSPACE_KERNEL_PID=%d", binding.SupervisorPID), fmt.Sprintf("PFS_WORKSPACE_KERNEL_START=%d", binding.SupervisorStart), envRequired+"=1")
 	cmd.ExtraFiles = files[:]
@@ -132,6 +138,26 @@ func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect("closed")
+	if t.Name() == "TestKernelWorkspaceControlledPause" {
+		if _, err := stdin.Write([]byte{'R'}); err != nil {
+			t.Fatal(err)
+		}
+		expect("reprepared")
+		p, err := g.Recovery(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = g.Prepared(p); err != nil {
+			t.Fatal(err)
+		}
+		if err = g.Open(1, p.Serial()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stdin.Write([]byte{'O'}); err != nil {
+			t.Fatal(err)
+		}
+		expect("resumed")
+	}
 	// Closing the sole writer requires no socket/control handler. Child teardown
 	// must prove its real connection is gone before reporting completion.
 	if err := g.Dispose(); err != nil {

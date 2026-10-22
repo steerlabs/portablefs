@@ -56,7 +56,7 @@ func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoor
 // mount's source gate must join their physical reply before completing.
 func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
 	if r.mount.workspace != nil {
-		return r.mount.managed.registerWorkspaceCachedReplyLocked(unique, first, second, count)
+		return r.mount.workspaceFS().registerWorkspaceCachedReplyLocked(unique, first, second, count)
 	}
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil || r.mount.revoked.Load() || r.cachedReplyFree == nil {
 		return false

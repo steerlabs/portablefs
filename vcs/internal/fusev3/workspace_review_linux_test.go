@@ -133,11 +133,11 @@ func TestWorkspaceCohortJoinsTerminalSettlement(t *testing.T) {
 			f := newStockFixture(t)
 			bindWorkspaceTestGate(t, f.mount)
 			u := f.unique.Add(2)
-			entry, status := f.mount.managed.beginWorkspaceEntry(u)
+			entry, status := f.mount.workspaceFS().beginWorkspaceEntry(u)
 			if status != fuse.OK {
 				t.Fatal(status)
 			}
-			cut := f.mount.managed.captureWorkspaceReplies()
+			cut := f.mount.workspaceFS().captureWorkspaceReplies()
 			if boundary == "before-prepare" {
 				if !f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second)) {
 					t.Fatal("terminalization did not complete")
@@ -156,7 +156,7 @@ func TestWorkspaceCohortJoinsTerminalSettlement(t *testing.T) {
 					f.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
 				}
 			}
-			f.mount.managed.finishWorkspaceEntry(u, entry)
+			f.mount.workspaceFS().finishWorkspaceEntry(u, entry)
 			f.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
@@ -179,7 +179,7 @@ func TestWorkspaceDrainKeepsWithdrawalLead(t *testing.T) {
 	cacheUntil, horizon := s.cacheUntil, s.horizon
 	s.mu.RUnlock()
 	renewed := s.acceptRenewal(inc, horizon.Add(time.Minute))
-	drain := f.mount.managed.captureWorkspaceDrain(time.Now().Add(time.Hour))
+	drain := f.mount.workspaceFS().captureWorkspaceDrain(time.Now().Add(time.Hour))
 	_, deadline, _, liveDrain := s.currentIncarnation()
 	t.Logf("live=%v liveAfterClose=%v renewalAccepted=%v liveWithDrain=%v cacheUntil=%v horizon=%v drainDeadline=%v (drain-cacheUntil=%v)",
 		live, liveAfter, renewed, liveDrain, cacheUntil.Format(time.RFC3339Nano), horizon.Format(time.RFC3339Nano), deadline.Format(time.RFC3339Nano), drain.deadline.Sub(cacheUntil))
@@ -352,7 +352,7 @@ func TestWorkspaceCohortIncludesWrittenSettlement(t *testing.T) {
 			go func() { f.raw.ReplyWritten(u, fuse.OK); close(settled) }()
 			<-entered
 			g.Close(1)
-			cut := f.mount.managed.captureWorkspaceReplies()
+			cut := f.mount.workspaceFS().captureWorkspaceReplies()
 			if len(cut.replies) != 1 {
 				t.Fatalf("cut has %d replies, want the settling publication", len(cut.replies))
 			}
@@ -444,7 +444,7 @@ func TestWorkspaceRenewLoopSkipsClosedControl(t *testing.T) {
 			timer := <-timers
 			g.Close(1)
 			if mode == "captured-drain" {
-				drain := f.mount.managed.captureWorkspaceDrain(remoteHorizon)
+				drain := f.mount.workspaceFS().captureWorkspaceDrain(remoteHorizon)
 				if _, deadline, _, live := s.currentIncarnation(); !live || !deadline.Equal(drain.deadline) {
 					t.Fatal("drain lost old CONTROL permission")
 				}
@@ -540,7 +540,7 @@ func TestWorkspaceClosedCleanFlushSucceeds(t *testing.T) {
 
 func TestOrdinaryEntrySkipsWorkspaceAndPreservesRefusals(t *testing.T) {
 	f := newStockFixture(t)
-	if f.raw.fileSystemForServer() != f.raw || f.mount.managed != nil {
+	if f.raw.fileSystemForServer() != f.raw || f.mount.workspaceFS() != nil {
 		t.Fatal("ordinary mount selected managed dispatch")
 	}
 	if _, ok := any(f.raw).(interface {

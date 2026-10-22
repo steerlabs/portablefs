@@ -166,3 +166,8 @@ type DropReport struct {
 // Fetch returns bytes starting at off. Short reads (with nil or io.EOF) denote
 // EOF; other errors propagate. Read never changes the returned storage.
 type Fetch func(context.Context, int64, int) ([]byte, error)
+
+// DropObserver records the authoritative ticket in buffer order. It must be
+// nonblocking: Drop invokes it under the buffer mutex and frontend state locks.
+// Persistent inventory writes belong to the lifecycle owner after these locks.
+type DropObserver interface{ RecordWritebackDrop(DropReport) }

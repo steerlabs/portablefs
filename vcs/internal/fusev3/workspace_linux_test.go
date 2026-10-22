@@ -132,7 +132,7 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 		t.Fatal("fast answer lost arena/reference owner")
 	}
 	g.Close(1)
-	cut := f.mount.managed.captureWorkspaceReplies()
+	cut := f.mount.workspaceFS().captureWorkspaceReplies()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	if err := cut.wait(ctx); !errors.Is(err, context.Canceled) {
@@ -162,12 +162,12 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 		f := newStockFixture(t)
 		g := bindWorkspaceTestGate(t, f.mount)
 		unique := f.unique.Add(2)
-		reservation, status := f.mount.managed.beginWorkspaceEntry(unique)
+		reservation, status := f.mount.workspaceFS().beginWorkspaceEntry(unique)
 		if status != fuse.OK {
 			t.Fatal(status)
 		}
 		g.Close(1)
-		cut := f.mount.managed.captureWorkspaceReplies()
+		cut := f.mount.workspaceFS().captureWorkspaceReplies()
 		ctx, finish, status := f.raw.mutationContext(unique)
 		if status != fuse.OK {
 			t.Fatal(status)
@@ -177,7 +177,7 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 			t.Fatal(err)
 		}
 		finish()
-		f.mount.managed.finishWorkspaceEntry(unique, reservation)
+		f.mount.workspaceFS().finishWorkspaceEntry(unique, reservation)
 		f.raw.PrepareReplyPayload(unique, 1, 20, nil, nil, 0)
 		settled := make(chan struct{})
 		go func() { f.raw.ReplyWritten(unique, fuse.OK); close(settled) }()
@@ -202,7 +202,7 @@ func TestWorkspaceEmptyPublicationsRetainOwner(t *testing.T) {
 			f := newStockFixture(t)
 			g := bindWorkspaceTestGate(t, f.mount)
 			unique := f.unique.Add(2)
-			entry, status := f.mount.managed.beginWorkspaceEntry(unique)
+			entry, status := f.mount.workspaceFS().beginWorkspaceEntry(unique)
 			if status != fuse.OK {
 				t.Fatal(status)
 			}
@@ -211,12 +211,12 @@ func TestWorkspaceEmptyPublicationsRetainOwner(t *testing.T) {
 				t.Fatal(status)
 			}
 			finish()
-			f.mount.managed.finishWorkspaceEntry(unique, entry)
+			f.mount.workspaceFS().finishWorkspaceEntry(unique, entry)
 			if p := f.raw.replyPublications[unique]; p == nil || !p.callbackOwned || !p.workspaceBound {
 				t.Fatal("empty admitted reply lost transferred owner")
 			}
 			g.Close(1)
-			cut := f.mount.managed.captureWorkspaceReplies()
+			cut := f.mount.workspaceFS().captureWorkspaceReplies()
 			_, reply, prepare := f.raw.PrepareReplyPayload(unique, 1, opcode, nil, nil, 0)
 			if reply != fuse.OK || prepare != fuse.OK {
 				t.Fatal("empty accepted result fabricated no-change failure")
@@ -288,8 +288,14 @@ func TestWorkspaceClosedCleanupAndFlushUnlock(t *testing.T) {
 	if status != fuse.OK || f.mount.possiblePOSIXLock(key) != 0 {
 		t.Fatal("closed clean FLUSH lost success/unlock", status)
 	}
-	f.raw.Release(nil, &fuse.ReleaseIn{Fh: opened.Fh})
-	f.raw.ReleaseDir(&fuse.ReleaseIn{Fh: directory.Fh})
+	f.rawCall(func(unique uint64) fuse.Status {
+		f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: unique}, Fh: opened.Fh})
+		return fuse.OK
+	})
+	f.rawCall(func(unique uint64) fuse.Status {
+		f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: unique}, Fh: directory.Fh})
+		return fuse.OK
+	})
 	f.raw.mu.RLock()
 	_, filePresent := f.raw.handles[opened.Fh]
 	_, dirPresent := f.raw.handles[directory.Fh]
@@ -326,8 +332,8 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 		t.Fatal("closed recovery lost control liveness")
 	}
 	deadline := f.mount.subscription.config.clock.Now().Add(time.Hour)
-	drain := f.mount.managed.captureWorkspaceDrain(deadline)
-	if f.mount.managed.drainIncarnation(drain) == 0 {
+	drain := f.mount.workspaceFS().captureWorkspaceDrain(deadline)
+	if f.mount.workspaceFS().drainIncarnation(drain) == 0 {
 		t.Fatal("closed drain lost captured incarnation")
 	}
 	_, controlDeadline, _, controlLive := f.mount.subscription.currentIncarnation()
@@ -341,7 +347,7 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 	if _, _, _, live := f.mount.subscription.currentIncarnation(); live {
 		t.Fatal("expired drain fell back to recovery permission")
 	}
-	if f.mount.managed.drainIncarnation(drain) != 0 {
+	if f.mount.workspaceFS().drainIncarnation(drain) != 0 {
 		t.Fatal("expired drain remained usable")
 	}
 
@@ -373,7 +379,7 @@ func TestWorkspaceCapacityWaitChecksActualAcceptance(t *testing.T) {
 			opened := openDelegatedWriter(t, f, entry.NodeId)
 			writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("old"))
 			unique := f.unique.Add(2)
-			reservation, status := f.mount.managed.beginWorkspaceEntry(unique)
+			reservation, status := f.mount.workspaceFS().beginWorkspaceEntry(unique)
 			if status != fuse.OK {
 				t.Fatal(status)
 			}
@@ -408,7 +414,7 @@ func TestWorkspaceCapacityWaitChecksActualAcceptance(t *testing.T) {
 				t.Fatal("closed waiter assigned a sequence")
 			}
 			finish()
-			f.mount.managed.finishWorkspaceEntry(unique, reservation)
+			f.mount.workspaceFS().finishWorkspaceEntry(unique, reservation)
 			f.raw.PrepareReplyPayload(unique, entry.NodeId, 16, nil, nil, 0)
 			f.raw.ReplyWritten(unique, fuse.OK)
 		})
@@ -478,7 +484,7 @@ func TestWorkspaceAcceptedCreateAndWriteKeepPhysicalOwner(t *testing.T) {
 			if p == nil || p.source == nil {
 				t.Fatal("accepted effect lost physical/source owner")
 			}
-			cut := f.mount.managed.captureWorkspaceReplies()
+			cut := f.mount.workspaceFS().captureWorkspaceReplies()
 			_, reply, prepare := f.raw.PrepareReplyPayload(unique, entry.NodeId, opcode, nil, nil, 0)
 			if reply != fuse.OK || prepare != fuse.OK {
 				t.Fatal("accepted effect became no-change error", reply, prepare)

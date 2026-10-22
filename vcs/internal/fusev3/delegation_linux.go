@@ -182,7 +182,8 @@ type delegationManager struct {
 	byID              map[writeback.Identity]*delegationState
 	// cacheOwners mirrors live grants, independently of idle-state collection.
 	// Shared cache admission runs under raw.mu and cannot take state locks.
-	cacheOwners sync.Map // writeback.Identity -> *delegationState
+	cacheOwners  sync.Map // writeback.Identity -> *delegationState
+	acceptedCuts sync.Map // *handleAcceptedCut; retired epochs release description references
 	// identityLoss retains the latest loss ticket after an epoch-scoped Buffer
 	// is replaced. Existing handles compare against it once; newly registered
 	// handles start at the retained value.
@@ -1701,6 +1702,7 @@ func (m *delegationManager) retireTimedOutControl(s *delegationState, ref *autho
 	matched := sameDelegation(s.ref, ref)
 	var report writeback.DropReport
 	if matched {
+		m.workspaceGrantAbandoned()
 		s.clearGrantLocked()
 		report = m.buf.Drop(s.identity, "delegation control expired before its transition")
 		s.meta.Lock()
@@ -1731,7 +1733,20 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 	if s.retire != nil {
 		return s.retire, nil
 	}
-	r, err := buf.BeginRetire(ctx, &s.identity)
+	begin := buf.BeginRetire
+	if registry := m.subscription; registry != nil {
+		registry.mu.RLock()
+		p := registry.workspaceDrain
+		now := registry.config.clock.Now()
+		registry.mu.RUnlock()
+		if p != nil && p.manager == m && p.allows(buf, m.inc.Load(), now) {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, p.deadline.Sub(now))
+			defer cancel()
+			begin = buf.BeginDrainRetire
+		}
+	}
+	r, err := begin(ctx, &s.identity)
 	if err == nil {
 		s.retire = r
 	}
@@ -1787,6 +1802,7 @@ func (m *delegationManager) reportDrop(report writeback.DropReport) {
 	if report.Entries == 0 {
 		return
 	}
+
 	m.hookMu.RLock()
 	reporter := m.dropReporter
 	m.hookMu.RUnlock()
@@ -1836,6 +1852,7 @@ func (m *delegationManager) loseDelegationIfCurrent(s *delegationState, ref *aut
 // Releasing admission between them would let a successor install and lose its
 // writes to this grant's drop. A flusher cannot BeginRetire: it would join itself.
 func (m *delegationManager) loseDelegationLocked(s *delegationState, reason string) writeback.DropReport {
+	m.workspaceGrantAbandoned()
 	s.clearGrantLocked()
 	report := m.buf.Drop(s.identity, reason)
 	s.meta.Lock()
@@ -1857,6 +1874,7 @@ func (m *delegationManager) failCleanupIdentity(identity []byte, reason string) 
 		return
 	}
 	s.admission.Lock()
+	m.workspaceGrantAbandoned()
 	s.clearGrantLocked()
 	var report writeback.DropReport
 	dropped := false
@@ -2574,6 +2592,18 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	m.retainedStates = make(map[*delegationState]struct{})
 	m.mu.Unlock()
 	old.Stop()
+	m.acceptedCuts.Range(func(key, value any) bool {
+		cut := key.(*handleAcceptedCut)
+		cut.mu.Lock()
+		if cut.buffer == old && old.Stats().Entries == 0 {
+			cut.buffer = nil
+			cut.sequence = 0
+			m.acceptedCuts.Delete(cut)
+		}
+		cut.mu.Unlock()
+		return true
+	})
+	_ = old.ReleaseStorage() // all retained records have a durable receipt or drop ticket
 	// An in-flight old-buffer callback may have looked up its state after the
 	// first reset while Stop was joining it. Discard that epoch-scoped residue
 	// only after every old callback is gone.
@@ -2640,5 +2670,19 @@ func (m *delegationManager) FlushCycleCompleted(ctx context.Context, id writebac
 	defer cancel()
 	if err := invalidate(ctx, id[:]); err != nil && ref != nil {
 		m.loseDelegationIfCurrent(state, ref, "holder flush-cycle invalidation failed")
+	}
+}
+
+// RecordWritebackDrop runs in authoritative buffer-ticket order. Its CAS-only
+// bounded ledger performs no filesystem operation, RPC or lock acquisition.
+func (m *delegationManager) RecordWritebackDrop(report writeback.DropReport) {
+	if m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspaceLifecycle != nil {
+		m.subscription.mount.workspaceLifecycle.recordDrop(report)
+	}
+}
+
+func (m *delegationManager) workspaceGrantAbandoned() {
+	if m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspaceLifecycle != nil {
+		m.subscription.mount.workspaceLifecycle.abandonGrant()
 	}
 }

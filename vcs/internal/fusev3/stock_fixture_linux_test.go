@@ -185,8 +185,8 @@ func (f *stockFixture) openForData(t *testing.T, node uint64) *fuse.OpenOut {
 // The same construction-time selection used by fuse.NewServer is retained by
 // bindWorkspaceTestGate. Warmup before binding remains an ordinary mount.
 func testEntryFileSystem(r *rawFileSystem) fuse.RawFileSystem {
-	if r.mount.managed != nil {
-		return r.mount.managed
+	if r.mount.workspaceFS() != nil {
+		return r.mount.workspaceFS()
 	}
 	return r
 }

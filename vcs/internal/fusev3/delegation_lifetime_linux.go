@@ -230,6 +230,9 @@ func (m *delegationManager) endLossObserver(identity []byte) {
 }
 
 func (h *fileHandle) endLossObservation() {
+	if cut := h.acceptedCut.Load(); cut != nil {
+		h.node.mount.delegations.acceptedCuts.Delete(cut)
+	}
 	if h != nil && h.lossObserver != nil {
 		h.lossObserverOnce.Do(h.lossObserver)
 	}

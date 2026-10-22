@@ -25,8 +25,14 @@ func (r *rawFileSystem) fileSystemForServer() fuse.RawFileSystem {
 	if r.mount.workspace == nil {
 		return r
 	}
-	r.mount.managed = &workspaceFileSystem{rawFileSystem: r}
-	return r.mount.managed
+	return &workspaceFileSystem{rawFileSystem: r}
+}
+
+func (m *Mount) workspaceFS() *workspaceFileSystem {
+	if m.workspace == nil {
+		return nil
+	}
+	return &workspaceFileSystem{rawFileSystem: m.raw}
 }
 
 func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {

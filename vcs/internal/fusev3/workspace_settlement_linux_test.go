@@ -75,7 +75,7 @@ func TestReviewR2TerminalRacesWrittenTail(t *testing.T) {
 			}
 			if variant == "heap-estale" || variant == "heap-graft" {
 				for i := range r.cachedReplyArena {
-					if _, st := r.mount.managed.beginWorkspaceEntry(1<<50 + uint64(i)); st != fuse.OK {
+					if _, st := r.mount.workspaceFS().beginWorkspaceEntry(1<<50 + uint64(i)); st != fuse.OK {
 						t.Fatal(st)
 					}
 				}
@@ -111,7 +111,7 @@ func TestReviewR2TerminalRacesWrittenTail(t *testing.T) {
 			pin := p.holderAdmission
 			done := p.workspaceDone
 			r.mu.Unlock()
-			cut := r.mount.managed.captureWorkspaceReplies()
+			cut := r.mount.workspaceFS().captureWorkspaceReplies()
 			r.PrepareReplyPayload(unique, node, opcode, nil, nil, 0)
 			entered, release := make(chan struct{}), make(chan struct{})
 			r.beforeReplySettlement = func(q *replyPublication) {
@@ -190,7 +190,7 @@ func TestWorkspaceConsumedResponseThenTerminalWrite(t *testing.T) {
 	finish()
 	p.consumeAuthorityResponse()
 	f.raw.PrepareReplyPayload(u, entry.NodeId, 4, nil, nil, 0)
-	cut := f.mount.managed.captureWorkspaceReplies()
+	cut := f.mount.workspaceFS().captureWorkspaceReplies()
 	if f.raw.terminalizeReplyCacheOwnership(time.Now()) {
 		t.Fatal("unwritten reply unexpectedly joined")
 	}
@@ -225,12 +225,12 @@ func TestReviewR2TransferAfterTerminalLockedPhase(t *testing.T) {
 			f := newStockFixture(t)
 			bindWorkspaceTestGate(t, f.mount)
 			u := f.unique.Add(2)
-			entry, st := f.mount.managed.beginWorkspaceEntry(u)
+			entry, st := f.mount.workspaceFS().beginWorkspaceEntry(u)
 			if st != fuse.OK {
 				t.Fatal(st)
 			}
 			done := entry.workspaceDone
-			cut := f.mount.managed.captureWorkspaceReplies()
+			cut := f.mount.workspaceFS().captureWorkspaceReplies()
 			release, entered := make(chan struct{}), make(chan struct{})
 			var terminal <-chan bool
 			if phase == "terminalizing" {
@@ -262,7 +262,7 @@ func TestReviewR2TransferAfterTerminalLockedPhase(t *testing.T) {
 					t.Fatal("terminal settlement failed")
 				}
 			}
-			f.mount.managed.finishWorkspaceEntry(u, entry)
+			f.mount.workspaceFS().finishWorkspaceEntry(u, entry)
 			if err := cut.wait(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -304,7 +304,7 @@ func TestReviewR2DrainLostWakeupAfterWrittenTail(t *testing.T) {
 					}
 				}
 				p := f.raw.replyPublications[u]
-				cut := f.mount.managed.captureWorkspaceReplies()
+				cut := f.mount.workspaceFS().captureWorkspaceReplies()
 				if !terminal {
 					f.raw.PrepareReplyPayload(u, entry.NodeId, opcode, nil, nil, 0)
 				}

@@ -132,7 +132,8 @@ type Config struct {
 	// workspace is private until the protected-path lifecycle driver exists.
 	// Tests may bind the real gate to the ordinary kernel frontend; the CLI
 	// cannot launch a managed mount through this field.
-	workspace *workspaceadmission.Reader
+	workspace          *workspaceadmission.Reader
+	workspaceLifecycle *workspaceLifecycle
 	// MountInstanceID is the random identity created before attach. MountVolume
 	// derives the kernel source from it, so every attempt is distinguishable even
 	// when several clients mount the same volume. Product supervisors persist it
@@ -221,7 +222,8 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	workspace *workspaceadmission.Reader
+	workspace          *workspaceadmission.Reader
+	workspaceLifecycle *workspaceLifecycle
 
 	posixMu       sync.Mutex
 	posixLocks    map[posixLockKey]uint64
@@ -263,7 +265,6 @@ type Mount struct {
 	nameCapacity      int
 	withdrawalTimeout time.Duration
 	raw               *rawFileSystem
-	managed           *workspaceFileSystem
 	kernelMount       kernelMount
 	// The withdrawal ladder must finish before its owned abort descriptor closes.
 	kernelWithdrawalMu     sync.Mutex
@@ -561,7 +562,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	// whose permits are each held for one RPC, so cleanup keeps its turn
 	// however long kernel requests wait for bulk slots.
 	mount := &Mount{
-		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel, workspace: cfg.workspace,
+		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel, workspace: cfg.workspace, workspaceLifecycle: cfg.workspaceLifecycle,
 		kernelConnectionDone: make(chan struct{}),
 		reclaim:              newReclaimQueue(cfg.ReclaimQueue),
 		reclaimWorkers:       workers,
@@ -574,7 +575,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		routesRevision:       cfg.Routes.Revision(),
 		onRevoked:            cfg.OnRevoked,
 
-		requireRemountOnEpochChange: cfg.RequireRemountOnEpochChange,
+		requireRemountOnEpochChange: cfg.RequireRemountOnEpochChange || cfg.workspace != nil,
 	}
 
 	var err error
@@ -784,10 +785,22 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 			return
 		case <-timer.C:
 			callCtx, cancel := context.WithTimeout(ctx, interval)
+			var finish func()
+			if m.workspace != nil && m.workspaceLifecycle != nil {
+				var started bool
+				callCtx, finish, started = m.workspaceLifecycle.keepalive.start(callCtx)
+				if !started {
+					cancel()
+					continue
+				}
+			}
 			// Renewal never passes through bulk admission: the transport
 			// carries it on its dedicated CONTROL liveness lane.
 			response, err := m.rpc.CallRead(callCtx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
 			cancel()
+			if finish != nil {
+				finish()
+			}
 			if ctx.Err() != nil {
 				// The mount is shutting down. A call that lost the race with
 				// cancellation says nothing about the authority.
@@ -1356,6 +1369,7 @@ type node struct {
 }
 
 type fileHandle struct {
+	afterFlushLoss   func() // deterministic reset boundary in tests; nil in production
 	node             *node
 	token            []byte
 	openFlags        uint32
@@ -1891,12 +1905,18 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	}
 	loss := handle.observeLoss()
 	closed := !n.mount.workspaceServing()
+	if closed && handle.afterFlushLoss != nil {
+		handle.afterFlushLoss()
+	}
 	if generation == 0 {
 		if loss != 0 {
 			return loss
 		}
 		if closed {
-			return handle.closedFlushResult()
+			if pending := handle.closedFlushResult(); pending != 0 {
+				return pending
+			}
+			return handle.observeLoss()
 		}
 		if local, errno := handle.flushLocally(); local {
 			return errno
@@ -1914,6 +1934,9 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	if closed {
 		if pending := handle.closedFlushResult(); pending != 0 {
 			return pending
+		}
+		if loss := handle.observeLoss(); loss != 0 {
+			return loss
 		}
 	}
 	return errno
@@ -1970,6 +1993,7 @@ func prepareHandleAcceptance(ctx context.Context, b *writeback.Buffer, epoch uin
 		h.acceptedCut.CompareAndSwap(nil, &handleAcceptedCut{})
 		cut = h.acceptedCut.Load()
 	}
+	h.node.mount.delegations.acceptedCuts.Store(cut, struct{}{})
 	cut.mu.Lock()
 	defer cut.mu.Unlock()
 	if cut.buffer == b && cut.epoch == epoch {

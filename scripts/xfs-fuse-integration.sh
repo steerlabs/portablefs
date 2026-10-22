@@ -52,6 +52,19 @@ REQUIRED_TESTS=()
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleDrainsAcceptedDirtyCut"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFailedReleaseRetainsDurabilityOutcome"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspacePersistenceCannotPublishStaleClock"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceOvertakenColdRetainsLoss"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRecoveryClassifiesTerminalEvidence"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleControlCutDrainsAck"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleJoinsInFlightRenewal"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleColdRecover"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleRetryBeyond45Seconds"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceColdFailureRetainsLossAndNotificationOwner"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleCancellationKeepsPhysicalOwner"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClosedFlushReobservesResetLoss"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelWorkspaceControlledPause"
   "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestClosedStartAndExactPreparedCAS"
   "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestReadOnlyHandoffAndDescriptorSeals"
   "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestHandoffRejectsWritableOrUnboundDescriptors"

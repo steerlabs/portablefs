@@ -596,3 +596,7 @@ func safeCutoff(authorizedAt, deadline time.Time, minimum time.Duration) time.Ti
 	}
 	return deadline.Add(-margin)
 }
+
+// Failure exposes the retained terminal disposition to the lifecycle owner.
+// Pending readiness by itself is never evidence that recovery should end.
+func (r *Renewer) Failure() error { r.mu.Lock(); defer r.mu.Unlock(); return r.terminal }

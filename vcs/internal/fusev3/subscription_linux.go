@@ -118,23 +118,34 @@ type subscriptionRegistry struct {
 	control subscriptionControlHandler
 	config  subscriptionConfig
 
-	mu              sync.RWMutex
-	workspaceProof  *workspaceadmission.RecoveryPermit
-	workspaceDrain  *workspaceDrainPermit
-	active          bool
-	paused          bool
-	incarnation     uint64
-	generation      uint64
-	watermark       uint64
-	horizon         time.Time
-	cacheUntil      time.Time
-	delegated       map[publicationIdentity]uint64
-	stale           map[publicationIdentity]struct{}
-	coordinates     map[publicationCoordinate]subscriptionCoordinateState
-	generationFloor uint64
-	versionFloor    uint64
-	lastChangeSeen  uint64
-	lastChangeAck   uint64
+	mu                     sync.RWMutex
+	workspaceProof         *workspaceadmission.RecoveryPermit
+	workspaceDrain         *workspaceDrainPermit
+	workspaceOwned         bool
+	subscribeCancel        context.CancelFunc
+	subscribeDone          chan struct{}
+	renewCancel            context.CancelFunc
+	renewDone              chan struct{}
+	controlCancel          context.CancelFunc
+	pollCancel             context.CancelFunc
+	pollDone               chan struct{}
+	controlQueue           *subscriptionChangeQueue
+	workspaceFailure       error
+	ordinaryWithdrawalDone chan struct{}
+	active                 bool
+	paused                 bool
+	incarnation            uint64
+	generation             uint64
+	watermark              uint64
+	horizon                time.Time
+	cacheUntil             time.Time
+	delegated              map[publicationIdentity]uint64
+	stale                  map[publicationIdentity]struct{}
+	coordinates            map[publicationCoordinate]subscriptionCoordinateState
+	generationFloor        uint64
+	versionFloor           uint64
+	lastChangeSeen         uint64
+	lastChangeAck          uint64
 
 	progressChanged chan struct{}
 	horizonChanged  chan struct{}
@@ -294,6 +305,11 @@ func (s *subscriptionRegistry) signalHorizonChangedLocked() {
 
 func (s *subscriptionRegistry) deactivate() {
 	s.mu.Lock()
+	if s.workspaceOwned {
+		s.workspaceFailure = errSubscriptionExpired
+		s.mu.Unlock()
+		return
+	}
 	if s.active {
 		s.active = false
 		s.generation++
@@ -394,7 +410,20 @@ func (s *subscriptionRegistry) retry(ctx context.Context, deadline time.Time, op
 }
 
 func (s *subscriptionRegistry) invalidateAll(ctx context.Context) error {
-	s.deactivate()
+	s.mu.Lock()
+	if s.workspaceOwned {
+		s.mu.Unlock()
+		return errSubscriptionPaused
+	}
+	if s.active {
+		s.active = false
+		s.generation++
+		s.signalHorizonChangedLocked()
+	}
+	done := make(chan struct{})
+	s.ordinaryWithdrawalDone = done
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.ordinaryWithdrawalDone = nil; close(done); s.mu.Unlock() }()
 	deadline := s.config.clock.Now().Add(s.config.withdrawalLead)
 	withdrawalCtx, cancel := context.WithTimeout(ctx, s.config.withdrawalLead)
 	defer cancel()
@@ -405,6 +434,23 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	if s == nil || s.rpc == nil {
 		return errors.New("fusev3: subscription transport is required")
 	}
+	s.mu.Lock()
+	_, recovery := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
+	if s.subscribeDone != nil || s.workspaceOwned && !recovery {
+		s.mu.Unlock()
+		return errSubscriptionPaused
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.subscribeCancel, s.subscribeDone = cancel, done
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		s.subscribeCancel, s.subscribeDone = nil, nil
+		close(done)
+		s.mu.Unlock()
+	}()
 	var proof *workspaceadmission.RecoveryPermit
 	if s.mount != nil && s.mount.workspace != nil {
 		p, ok := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
@@ -419,7 +465,11 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	if paused {
 		return errSubscriptionPaused
 	}
-	if err := s.invalidateAll(ctx); err != nil {
+	withdraw := s.invalidateAll
+	if proof != nil {
+		withdraw = s.config.invalidator.InvalidateAllCaches
+	}
+	if err := withdraw(ctx); err != nil {
 		return fmt.Errorf("fusev3: cold subscription cache withdrawal: %w", err)
 	}
 	// A cold Subscribe asserts that this client has abandoned the preceding
@@ -491,7 +541,11 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				set[identity] = 0
 			}
 			s.mu.Lock()
-			if s.paused || proof != nil && s.mount.workspace.Recover(*proof) != nil {
+			if err := ctx.Err(); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			if s.paused || s.workspaceOwned && proof == nil || proof != nil && s.mount.workspace.Recover(*proof) != nil {
 				s.mu.Unlock()
 				return errSubscriptionPaused
 			}
@@ -569,7 +623,7 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		s.mu.RLock()
-		paused, pauseChanged := s.paused, s.pauseChanged
+		paused, pauseChanged := s.paused || s.workspaceOwned, s.pauseChanged
 		s.mu.RUnlock()
 		if paused {
 			select {
@@ -603,11 +657,15 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 
 func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 	s.mu.Lock()
-	incarnation, active := s.incarnation, s.active && !s.paused
+	incarnation, active := s.incarnation, s.active && !s.paused && !s.workspaceOwned
 	if !active || incarnation == 0 {
 		s.mu.Unlock()
 		return errSubscriptionExpired
 	}
+	ctx, cancel := context.WithCancel(parent)
+	renewalCtx, renewalCancel := context.WithCancel(ctx)
+	renewalDone := make(chan struct{})
+	s.controlCancel, s.renewCancel, s.renewDone = cancel, renewalCancel, renewalDone
 	done := make(chan struct{})
 	s.serveDone = done
 	s.mu.Unlock()
@@ -618,10 +676,17 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 		}
 		s.mu.Unlock()
 	}()
-	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	defer renewalCancel()
 	failures := make(chan error, 4)
 	changeQueue := newSubscriptionChangeQueue()
+	changeQueue.controlContext = ctx
+	pollCtx, pollCancel := context.WithCancel(ctx)
+	defer pollCancel()
+	pollDone := make(chan struct{})
+	s.mu.Lock()
+	s.pollCancel, s.pollDone, s.controlQueue = pollCancel, pollDone, changeQueue
+	s.mu.Unlock()
 	var workers sync.WaitGroup
 	start := func(run func(context.Context) error) {
 		workers.Add(1)
@@ -635,20 +700,45 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 			}
 		}()
 	}
-	start(func(ctx context.Context) error { return s.pollLoop(ctx, incarnation, changeQueue) })
+	start(func(context.Context) error {
+		defer close(pollDone)
+		err := s.pollLoop(pollCtx, incarnation, changeQueue)
+		if pollCtx.Err() != nil {
+			return nil
+		}
+		return err
+	})
 	start(func(ctx context.Context) error { return s.changeLoop(ctx, incarnation, changeQueue) })
-	start(func(ctx context.Context) error { return s.renewLoop(ctx, incarnation) })
+	start(func(context.Context) error {
+		defer close(renewalDone)
+		err := s.renewLoop(renewalCtx, incarnation)
+		if renewalCtx.Err() != nil {
+			return nil
+		}
+		return err
+	})
 	start(func(ctx context.Context) error { return s.horizonLoop(ctx, incarnation) })
 
 	var result error
 	select {
 	case result = <-failures:
-	case <-parent.Done():
-		result = parent.Err()
+	case <-ctx.Done():
+		result = ctx.Err()
 	}
 	cancel()
 	changeQueue.close()
 	workers.Wait()
+	s.mu.RLock()
+	owned := s.workspaceOwned
+	s.mu.RUnlock()
+	if owned {
+		s.mu.Lock()
+		if !errors.Is(result, context.Canceled) {
+			s.workspaceFailure = result
+		}
+		s.mu.Unlock()
+		return result
+	}
 	if parent.Err() != nil {
 		return parent.Err()
 	}
@@ -659,13 +749,16 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 }
 
 type subscriptionChangeQueue struct {
-	mu        sync.Mutex
-	wake      chan struct{}
-	closed    bool
-	head      int
-	items     []subscriptionChangeWork
-	completed uint64
-	finished  map[uint64]struct{}
+	controlContext context.Context
+	accepted       uint64
+	progress       chan struct{}
+	mu             sync.Mutex
+	wake           chan struct{}
+	closed         bool
+	head           int
+	items          []subscriptionChangeWork
+	completed      uint64
+	finished       map[uint64]struct{}
 }
 
 type subscriptionChangeWork struct {
@@ -683,6 +776,10 @@ func (q *subscriptionChangeQueue) complete(sequence uint64) {
 		q.finished = make(map[uint64]struct{})
 	}
 	q.finished[sequence] = struct{}{}
+	if q.progress != nil {
+		close(q.progress)
+		q.progress = nil
+	}
 	for {
 		if _, ok := q.finished[q.completed+1]; !ok {
 			break
@@ -777,6 +874,9 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 		if event == nil || event.GetIncarnation() != incarnation || event.GetSequence() != after+1 || event.GetEvent() == nil {
 			return fmt.Errorf("%w: malformed CONTROL event after %d", errSubscriptionInvalid, after)
 		}
+		changes.mu.Lock()
+		changes.accepted = event.GetSequence()
+		changes.mu.Unlock()
 		if batch := event.GetChangeBatch(); batch != nil {
 			if batch.GetIncarnation() != incarnation || len(batch.GetEntries()) == 0 {
 				return fmt.Errorf("%w: malformed change batch at event %d", errSubscriptionInvalid, event.GetSequence())
@@ -790,12 +890,16 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 		} else if s.control == nil {
 			return fmt.Errorf("%w: delegation event has no handler", errSubscriptionInvalid)
 		} else {
-			done := s.control.HandleControlEvent(ctx, event)
+			handlerContext := changes.controlContext
+			if handlerContext == nil {
+				handlerContext = ctx
+			}
+			done := s.control.HandleControlEvent(handlerContext, event)
 			go func(sequence uint64) {
 				select {
 				case <-done:
 					changes.complete(sequence)
-				case <-ctx.Done():
+				case <-handlerContext.Done():
 				}
 			}(event.GetSequence())
 		}
@@ -990,6 +1094,9 @@ func (s *subscriptionRegistry) markChangeStale(coordinate publicationCoordinate)
 func (s *subscriptionRegistry) ackChanges(ctx context.Context, incarnation, position uint64) error {
 	s.mu.RLock()
 	deadline := s.cacheUntil
+	if s.workspaceDrain != nil {
+		deadline = s.workspaceDrain.deadline
+	}
 	s.mu.RUnlock()
 	// The horizon is the real bound. Renewal, polling and KeepAlive supply
 	// readiness after a failed CONTROL call; a 10 ms timer supplies none.
@@ -1398,5 +1505,5 @@ func (s *subscriptionRegistry) controlLiveLocked() bool {
 
 // A drain may finish the old CONTROL cut, but may not extend its exclusion.
 func (s *subscriptionRegistry) renewalLiveLocked() bool {
-	return s.workspaceDrain == nil && s.controlLiveLocked()
+	return !s.workspaceOwned && s.workspaceDrain == nil && s.controlLiveLocked()
 }

@@ -50,6 +50,7 @@ type transportNegotiation struct {
 }
 
 func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.TransportRole) (*transportNegotiation, error) {
+	backoff := 100 * time.Millisecond
 	var last error
 	for {
 		if err := ctx.Err(); err != nil {
@@ -74,7 +75,7 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 						resume.GetBindingGeneration() == 0 ||
 						(resume.GetState() != authoritypb.SessionState_SESSION_STATE_PROVISIONAL &&
 							resume.GetState() != authoritypb.SessionState_SESSION_STATE_ACTIVE) {
-						err = fmt.Errorf("authorityrpc: provisional %s resume refused with errno %d", role, response.GetErrno())
+						err = fmt.Errorf("%w: provisional %s resume refused with errno %d", ErrSessionEnded, role, response.GetErrno())
 					} else {
 						opened.resumedBindingGeneration = resume.GetBindingGeneration()
 						return opened, nil
@@ -83,11 +84,15 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 			}
 			closeNegotiations(opened)
 		}
-		if recoveryTerminal(err) {
+		if recoveryTerminal(err) || c.cfg.LifecycleRetry && !TransientTransport(err) {
 			return nil, err
 		}
 		last = err
-		if err := waitTransportRetry(ctx); err != nil {
+		waitRetry := waitTransportRetry
+		if c.cfg.LifecycleRetry {
+			waitRetry = func(ctx context.Context) error { return waitLifecycleRetry(ctx, &backoff) }
+		}
+		if err := waitRetry(ctx); err != nil {
 			return nil, fmt.Errorf("%v: %w", last, err)
 		}
 	}
@@ -97,7 +102,7 @@ func (c *Client) resumeRawForActivation(ctx context.Context, role authoritypb.Tr
 // pass: a changed authority, or a proven frame defect from any read of the
 // attempt (Hello or Resume). Everything else is transport loss, retried.
 func recoveryTerminal(err error) bool {
-	return errors.Is(err, ErrAuthorityChanged) || frameDefect(err)
+	return errors.Is(err, ErrAuthorityChanged) || errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrTransportBinding) || frameDefect(err)
 }
 
 // frameDefect reports a received frame that is a proven protocol defect:
@@ -132,6 +137,7 @@ func waitTransportRetry(ctx context.Context) error {
 }
 
 func (c *Client) resumeRawPairForActivation(ctx context.Context) (*transportNegotiation, *transportNegotiation, error) {
+	backoff := 100 * time.Millisecond
 	for {
 		data, err := c.resumeRawForActivation(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
 		if err != nil {
@@ -142,10 +148,14 @@ func (c *Client) resumeRawPairForActivation(ctx context.Context) (*transportNego
 			return data, control, nil
 		}
 		closeNegotiations(data)
-		if recoveryTerminal(err) {
+		if recoveryTerminal(err) || c.cfg.LifecycleRetry && !TransientTransport(err) {
 			return nil, nil, err
 		}
-		if waitErr := waitTransportRetry(ctx); waitErr != nil {
+		waitRetry := waitTransportRetry
+		if c.cfg.LifecycleRetry {
+			waitRetry = func(ctx context.Context) error { return waitLifecycleRetry(ctx, &backoff) }
+		}
+		if waitErr := waitRetry(ctx); waitErr != nil {
 			return nil, nil, fmt.Errorf("%v: %w", err, waitErr)
 		}
 	}
@@ -173,6 +183,8 @@ func (c *Client) tlsConfig() *tls.Config {
 }
 
 func (c *Client) dialTLS(ctx context.Context) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
+	defer cancel()
 	dialer := &net.Dialer{Timeout: c.cfg.DialTimeout, KeepAlive: 15 * time.Second}
 	raw, err := dialer.DialContext(ctx, "tcp", c.cfg.Address)
 	if err != nil {
@@ -327,6 +339,7 @@ func (c *Client) openInitialPair(ctx context.Context) (*transportNegotiation, *t
 // must replay the exact attempt to promote both newly authenticated bindings.
 func (c *Client) reopenInitialPair(ctx context.Context) (*transportNegotiation, *transportNegotiation, error) {
 	var last error
+	backoff := 100 * time.Millisecond
 	for {
 		if err := ctx.Err(); err != nil {
 			if last != nil {
@@ -343,11 +356,15 @@ func (c *Client) reopenInitialPair(ctx context.Context) (*transportNegotiation, 
 			}
 			closeNegotiations(data, control)
 		}
-		if recoveryTerminal(err) {
+		if recoveryTerminal(err) || c.cfg.LifecycleRetry && !TransientTransport(err) {
 			return nil, nil, err
 		}
 		last = err
-		if err := waitTransportRetry(ctx); err != nil {
+		waitRetry := waitTransportRetry
+		if c.cfg.LifecycleRetry {
+			waitRetry = func(ctx context.Context) error { return waitLifecycleRetry(ctx, &backoff) }
+		}
+		if err := waitRetry(ctx); err != nil {
 			return nil, nil, fmt.Errorf("%v: %w", last, err)
 		}
 	}
@@ -561,6 +578,13 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 }
 
 func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) (resultErr error) {
+	if c.cfg.DispatchFence != nil {
+		done, err := c.cfg.DispatchFence.begin(ctx, false)
+		if err != nil {
+			return err
+		}
+		defer done()
+	}
 	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
 		return err
