@@ -263,6 +263,7 @@ type Mount struct {
 	nameCapacity      int
 	withdrawalTimeout time.Duration
 	raw               *rawFileSystem
+	managed           *workspaceFileSystem
 	kernelMount       kernelMount
 	// The withdrawal ladder must finish before its owned abort descriptor closes.
 	kernelWithdrawalMu     sync.Mutex
@@ -382,7 +383,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 		m.delegations.Stop()
 		return failBeforeKernelMount(errors.Join(err, grafts.Close()))
 	}
-	server, err := fuse.NewServer(raw, mountpoint, options)
+	server, err := fuse.NewServer(raw.fileSystemForServer(), mountpoint, options)
 	if err != nil {
 		m.cancel()
 		cause := errors.Join(fmt.Errorf("mount PortableFS v3: %w", err), grafts.Close())
@@ -1359,7 +1360,7 @@ type fileHandle struct {
 	token            []byte
 	openFlags        uint32
 	buffered         bool
-	acceptedCut      atomic.Uint64
+	acceptedCut      atomic.Pointer[handleAcceptedCut]
 	stale            atomic.Bool
 	lossMu           sync.Mutex
 	lossObserved     uint64
@@ -1922,31 +1923,76 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 // reached durability must remain visible as a failure to the closing caller.
 func (h *fileHandle) closedFlushResult() syscall.Errno {
 	cut := h.acceptedCut.Load()
-	if cut == 0 {
+	if cut == nil {
 		return 0
 	}
-	m := h.node.mount.delegations
-	id, err := delegationIdentity(h.node.item.GetStableIdentity())
-	if err != nil {
-		return syscall.EIO
+	cut.mu.Lock()
+	defer cut.mu.Unlock()
+	if cut.buffer == nil || cut.sequence == 0 {
+		return 0
 	}
-	m.epoch.RLock()
-	defer m.epoch.RUnlock()
-	if m.buf.HasRetainedThrough(id, cut) {
+	id, err := delegationIdentity(h.node.item.GetStableIdentity())
+	if err != nil || cut.buffer.HasRetainedThrough(id, cut.sequence) {
 		return syscall.EIO
 	}
 	return 0
 }
 
-func (h *fileHandle) noteAcceptedCut(cut writeback.Cut) {
-	if h == nil || h.node.mount.workspace == nil || cut.Sequence == 0 {
+// Sequences are local to one buffer epoch. resetBuffer disposes of the old
+// prefix through durability or loss before installing its successor; the loss
+// observer remains responsible for reporting that disposition to this handle.
+type handleAcceptedCut struct {
+	mu       sync.Mutex
+	buffer   *writeback.Buffer
+	epoch    uint64
+	sequence uint64
+}
+
+type handleAcceptanceKey struct{}
+
+func withHandleAcceptance(ctx context.Context, h *fileHandle) context.Context {
+	if h == nil || h.node.mount.workspace == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, handleAcceptanceKey{}, h)
+}
+
+// The manager calls this with its epoch reader and identity operation lock
+// held, before buffer acceptance. It cannot mistake a successor's sequence for
+// old work or discard an old prefix which still requires disposition.
+func prepareHandleAcceptance(ctx context.Context, b *writeback.Buffer, epoch uint64) (*handleAcceptedCut, error) {
+	h, _ := ctx.Value(handleAcceptanceKey{}).(*fileHandle)
+	if h == nil {
+		return nil, nil
+	}
+	cut := h.acceptedCut.Load()
+	if cut == nil {
+		h.acceptedCut.CompareAndSwap(nil, &handleAcceptedCut{})
+		cut = h.acceptedCut.Load()
+	}
+	cut.mu.Lock()
+	defer cut.mu.Unlock()
+	if cut.buffer == b && cut.epoch == epoch {
+		return cut, nil
+	}
+	id, err := delegationIdentity(h.node.item.GetStableIdentity())
+	if err != nil {
+		return nil, err
+	}
+	if cut.buffer != nil && cut.buffer.HasRetainedThrough(id, cut.sequence) {
+		return nil, writeback.ErrLost
+	}
+	cut.buffer, cut.epoch, cut.sequence = b, epoch, 0
+	return cut, nil
+}
+
+func (accepted *handleAcceptedCut) noteAcceptedCut(cut writeback.Cut) {
+	if accepted == nil || cut.Sequence == 0 {
 		return
 	}
-	for previous := h.acceptedCut.Load(); previous < cut.Sequence; previous = h.acceptedCut.Load() {
-		if h.acceptedCut.CompareAndSwap(previous, cut.Sequence) {
-			return
-		}
-	}
+	accepted.mu.Lock()
+	defer accepted.mu.Unlock()
+	accepted.sequence = max(accepted.sequence, cut.Sequence)
 }
 
 func (h *fileHandle) observeLoss() syscall.Errno {
@@ -3015,8 +3061,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		var admissionErr error
 		var cut writeback.Cut
 		for {
-			cut, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
-			fh.noteAcceptedCut(cut)
+			cut, admissionErr = n.mount.delegations.SetAttr(withHandleAcceptance(ctx, fh), n.item.GetStableIdentity(), attrs)
 			if !errors.Is(admissionErr, errDelegationNotOwned) {
 				break
 			}

@@ -43,14 +43,14 @@ func TestReviewR2GatedStall(t *testing.T) {
 			func() fuse.Status {
 				u := unique.Add(2)
 				var out fuse.AttrOut
-				st := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: node}}, &out)
+				st := testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: node}}, &out)
 				reply(u, 3, 0)
 				return st
 			},
 			func() fuse.Status {
 				u := unique.Add(2)
 				var out fuse.EntryOut
-				st := f.raw.Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &out)
+				st := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &out)
 				if reply(u, 1, 0) && st == fuse.OK && out.NodeId != 0 {
 					f.raw.Forget(out.NodeId, 1)
 				}

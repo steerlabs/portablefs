@@ -133,11 +133,11 @@ func TestWorkspaceCohortJoinsTerminalSettlement(t *testing.T) {
 			f := newStockFixture(t)
 			bindWorkspaceTestGate(t, f.mount)
 			u := f.unique.Add(2)
-			entry, status := f.raw.beginWorkspaceEntry(u)
+			entry, status := f.mount.managed.beginWorkspaceEntry(u)
 			if status != fuse.OK {
 				t.Fatal(status)
 			}
-			cut := f.raw.captureWorkspaceReplies()
+			cut := f.mount.managed.captureWorkspaceReplies()
 			if boundary == "before-prepare" {
 				if !f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second)) {
 					t.Fatal("terminalization did not complete")
@@ -156,7 +156,7 @@ func TestWorkspaceCohortJoinsTerminalSettlement(t *testing.T) {
 					f.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
 				}
 			}
-			f.raw.finishWorkspaceEntry(u, entry)
+			f.mount.managed.finishWorkspaceEntry(u, entry)
 			f.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
@@ -179,7 +179,7 @@ func TestWorkspaceDrainKeepsWithdrawalLead(t *testing.T) {
 	cacheUntil, horizon := s.cacheUntil, s.horizon
 	s.mu.RUnlock()
 	renewed := s.acceptRenewal(inc, horizon.Add(time.Minute))
-	drain := f.mount.delegations.captureWorkspaceDrain(time.Now().Add(time.Hour))
+	drain := f.mount.managed.captureWorkspaceDrain(time.Now().Add(time.Hour))
 	_, deadline, _, liveDrain := s.currentIncarnation()
 	t.Logf("live=%v liveAfterClose=%v renewalAccepted=%v liveWithDrain=%v cacheUntil=%v horizon=%v drainDeadline=%v (drain-cacheUntil=%v)",
 		live, liveAfter, renewed, liveDrain, cacheUntil.Format(time.RFC3339Nano), horizon.Format(time.RFC3339Nano), deadline.Format(time.RFC3339Nano), drain.deadline.Sub(cacheUntil))
@@ -307,7 +307,7 @@ func TestWorkspaceCohortIncludesWrittenSettlement(t *testing.T) {
 			record := f.raw.nodesByID[entry.NodeId]
 			lookups := record.lookups
 			if boundary == "lookup-rollback" {
-				if st := f.raw.Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &fuse.EntryOut{}); st != fuse.OK {
+				if st := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &fuse.EntryOut{}); st != fuse.OK {
 					t.Fatal(st)
 				}
 				p = f.raw.replyPublications[u]
@@ -352,7 +352,7 @@ func TestWorkspaceCohortIncludesWrittenSettlement(t *testing.T) {
 			go func() { f.raw.ReplyWritten(u, fuse.OK); close(settled) }()
 			<-entered
 			g.Close(1)
-			cut := f.raw.captureWorkspaceReplies()
+			cut := f.mount.managed.captureWorkspaceReplies()
 			if len(cut.replies) != 1 {
 				t.Fatalf("cut has %d replies, want the settling publication", len(cut.replies))
 			}
@@ -444,7 +444,7 @@ func TestWorkspaceRenewLoopSkipsClosedControl(t *testing.T) {
 			timer := <-timers
 			g.Close(1)
 			if mode == "captured-drain" {
-				drain := f.mount.delegations.captureWorkspaceDrain(remoteHorizon)
+				drain := f.mount.managed.captureWorkspaceDrain(remoteHorizon)
 				if _, deadline, _, live := s.currentIncarnation(); !live || !deadline.Equal(drain.deadline) {
 					t.Fatal("drain lost old CONTROL permission")
 				}
@@ -540,23 +540,14 @@ func TestWorkspaceClosedCleanFlushSucceeds(t *testing.T) {
 
 func TestOrdinaryEntrySkipsWorkspaceAndPreservesRefusals(t *testing.T) {
 	f := newStockFixture(t)
-	f.raw.mu.Lock()
-	done := make(chan struct{})
-	go func() {
-		p, status := f.raw.beginWorkspaceEntry(0)
-		if p != nil || status != fuse.OK {
-			t.Error("ordinary entry acquired workspace ownership")
-		}
-		f.raw.finishWorkspaceEntry(0, p)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		f.raw.mu.Unlock()
-		t.Fatal("ordinary entry took registry lock")
+	if f.raw.fileSystemForServer() != f.raw || f.mount.managed != nil {
+		t.Fatal("ordinary mount selected managed dispatch")
 	}
-	f.raw.mu.Unlock()
+	if _, ok := any(f.raw).(interface {
+		captureWorkspaceDrain(time.Time) workspaceDrainPermit
+	}); ok {
+		t.Fatal("ordinary mount exposes managed drain")
+	}
 	for _, refusal := range []string{"zero", "duplicate", "terminal"} {
 		t.Run(refusal, func(t *testing.T) {
 			f := newStockFixture(t)
@@ -566,14 +557,14 @@ func TestOrdinaryEntrySkipsWorkspaceAndPreservesRefusals(t *testing.T) {
 				u = 0
 			}
 			if refusal == "duplicate" {
-				if st := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{}); st != fuse.OK {
+				if st := testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{}); st != fuse.OK {
 					t.Fatal(st)
 				}
 			}
 			if refusal == "terminal" {
 				f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
 			}
-			st := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+			st := testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{})
 			if st != fuse.Status(syscall.ENOTCONN) || !f.mount.isRevoked() {
 				t.Fatal("ordinary invariant refusal changed", st)
 			}

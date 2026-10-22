@@ -147,7 +147,7 @@ func (f *graftFixture) lookup(t *testing.T, parent uint64, name string) (*fuse.E
 	t.Helper()
 	out := &fuse.EntryOut{}
 	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
-		return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: parent}, name, out)
+		return testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: parent}, name, out)
 	})
 	return out, status
 }
@@ -405,7 +405,7 @@ func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 
 	routeUnique := nextTestRequestUnique()
 	routeOut := &fuse.EntryOut{}
-	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: routeUnique, NodeId: fuse.FUSE_ROOT_ID}, "node_modules", routeOut); !status.Ok() {
+	if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: routeUnique, NodeId: fuse.FUSE_ROOT_ID}, "node_modules", routeOut); !status.Ok() {
 		t.Fatalf("missing route root LOOKUP = %v, want structured success", status)
 	}
 	if routeOut.NodeId != 0 || routeOut.Attr.Flags != 0 {
@@ -418,7 +418,7 @@ func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
 	localUnique := nextTestRequestUnique()
 	localOut := &fuse.EntryOut{}
-	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", localOut); !status.Ok() {
+	if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", localOut); !status.Ok() {
 		t.Fatalf("missing local child LOOKUP = %v, want structured success", status)
 	}
 	if localOut.NodeId != 0 || localOut.Attr.Flags != 0 || f.raw.ReplyWriteTracked(localUnique) {

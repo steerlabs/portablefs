@@ -700,7 +700,17 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
+	var handle *handleAcceptedCut
+	if m.subscription != nil && m.subscription.mount.workspace != nil {
+		handle, err = prepareHandleAcceptance(ctx, b, m.epochSerial)
+		if err != nil {
+			return writeback.Cut{}, err
+		}
+	}
 	cut, err := b.WriteInGeneration(workspaceAdmissionContext(ctx), id, generation, off, data, opts)
+	if handle != nil {
+		handle.noteAcceptedCut(cut)
+	}
 	s.admission.RLock()
 	if err == nil {
 		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {
@@ -797,7 +807,17 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
+	var handle *handleAcceptedCut
+	if m.subscription != nil && m.subscription.mount.workspace != nil {
+		handle, err = prepareHandleAcceptance(ctx, b, m.epochSerial)
+		if err != nil {
+			return writeback.Cut{}, err
+		}
+	}
 	cut, err := admit(b, id, generation)
+	if handle != nil {
+		handle.noteAcceptedCut(cut)
+	}
 	s.admission.RLock()
 	if err == nil {
 		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {

@@ -12,6 +12,41 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
+// Construction selects admission dispatch once. Embedding promotes the exact
+// physical-reply interfaces discovered by go-fuse, without an ordinary entry
+// wrapper or a second implementation of the cache handlers.
+type workspaceFileSystem struct{ *rawFileSystem }
+
+var _ fuse.RawFileSystem = (*workspaceFileSystem)(nil)
+var _ fuse.ReplyWriteLifecycle = (*workspaceFileSystem)(nil)
+var _ fuse.ReplyPayloadPreparer = (*workspaceFileSystem)(nil)
+
+func (r *rawFileSystem) fileSystemForServer() fuse.RawFileSystem {
+	if r.mount.workspace == nil {
+		return r
+	}
+	r.mount.managed = &workspaceFileSystem{rawFileSystem: r}
+	return r.mount.managed
+}
+
+func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
+	entry, status := r.beginWorkspaceEntry(header.Unique)
+	if !status.Ok() {
+		return status
+	}
+	defer r.finishWorkspaceEntry(header.Unique, entry)
+	return r.rawFileSystem.Lookup(cancel, header, name, out)
+}
+
+func (r *workspaceFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
+	entry, status := r.beginWorkspaceEntry(input.Unique)
+	if !status.Ok() {
+		return status
+	}
+	defer r.finishWorkspaceEntry(input.Unique, entry)
+	return r.rawFileSystem.GetAttr(cancel, input, out)
+}
+
 func (r *rawFileSystem) recycleReplyLocked(p *replyPublication) {
 	if p.cachedArena {
 		*p = replyPublication{cachedNext: r.cachedReplyFree}
@@ -23,7 +58,7 @@ func (r *rawFileSystem) recycleReplyLocked(p *replyPublication) {
 // closure cannot replenish a join. A cancelled waiter retains every owner.
 type workspaceReplyCohort struct{ replies []<-chan struct{} }
 
-func (r *rawFileSystem) captureWorkspaceReplies() workspaceReplyCohort {
+func (r *workspaceFileSystem) captureWorkspaceReplies() workspaceReplyCohort {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var cut workspaceReplyCohort
@@ -101,10 +136,7 @@ type workspaceRecoveryKey struct{}
 
 // beginWorkspaceEntry reserves one existing physical-reply owner before the
 // first answer or effect. The slow callback transfers this owner explicitly.
-func (r *rawFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
-	if r.mount.workspace == nil {
-		return nil, fuse.OK
-	}
+func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil {
@@ -118,21 +150,19 @@ func (r *rawFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, f
 	} else {
 		p = &replyPublication{}
 	}
-	p.owner, p.requestUnique = r, unique
+	p.owner, p.requestUnique = r.rawFileSystem, unique
 	p.workspaceDone = make(chan struct{})
 	r.replyPublications[unique] = p
-	if r.mount.workspace != nil {
-		permit, err := r.mount.workspace.Check()
-		if err != nil {
-			delete(r.replyPublications, unique)
-			r.recycleReplyLocked(p)
-			return nil, fuse.EIO
-		}
-		p.workspace, p.workspaceBound = permit, true
+	permit, err := r.mount.workspace.Check()
+	if err != nil {
+		delete(r.replyPublications, unique)
+		r.recycleReplyLocked(p)
+		return nil, fuse.EIO
 	}
+	p.workspace, p.workspaceBound = permit, true
 	return p, fuse.OK
 }
-func (r *rawFileSystem) finishWorkspaceEntry(unique uint64, entry *replyPublication) {
+func (r *workspaceFileSystem) finishWorkspaceEntry(unique uint64, entry *replyPublication) {
 	if entry == nil {
 		return
 	}
@@ -207,7 +237,8 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, ne
 
 // The lifecycle owner captures this before retiring the old buffer. Control
 // and cleanup keep that exact identity/deadline, independently of serving.
-func (m *delegationManager) captureWorkspaceDrain(deadline time.Time) workspaceDrainPermit {
+func (r *workspaceFileSystem) captureWorkspaceDrain(deadline time.Time) workspaceDrainPermit {
+	m := r.mount.delegations
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	s := m.subscription
@@ -220,7 +251,8 @@ func (m *delegationManager) captureWorkspaceDrain(deadline time.Time) workspaceD
 	s.workspaceDrain = &p
 	return p
 }
-func (m *delegationManager) drainIncarnation(p workspaceDrainPermit) uint64 {
+func (r *workspaceFileSystem) drainIncarnation(p workspaceDrainPermit) uint64 {
+	m := r.mount.delegations
 	if p.manager != m || m.subscription == nil || !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
 		return 0
 	}

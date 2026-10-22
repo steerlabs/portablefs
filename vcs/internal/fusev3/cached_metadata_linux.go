@@ -56,7 +56,7 @@ func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoor
 // mount's source gate must join their physical reply before completing.
 func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
 	if r.mount.workspace != nil {
-		return r.registerWorkspaceCachedReplyLocked(unique, first, second, count)
+		return r.mount.managed.registerWorkspaceCachedReplyLocked(unique, first, second, count)
 	}
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil || r.mount.revoked.Load() || r.cachedReplyFree == nil {
 		return false
@@ -75,7 +75,7 @@ func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second p
 	return true
 }
 
-func (r *rawFileSystem) registerWorkspaceCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
+func (r *workspaceFileSystem) registerWorkspaceCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
 	p := r.replyPublications[unique]
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || p != nil && p.callbackOwned || r.mount.revoked.Load() || p == nil && r.cachedReplyFree == nil {
 		return false
@@ -84,13 +84,14 @@ func (r *rawFileSystem) registerWorkspaceCachedReplyLocked(unique uint64, first,
 	if stamp.incarnation == 0 {
 		return false
 	}
-	if p == nil {
+	fresh := p == nil
+	if fresh {
 		// Direct helper callers still reserve the existing cache arena. Raw entries
 		// transfer their reservation here rather than registering the Unique twice.
 		p = r.cachedReplyFree
 		r.cachedReplyFree = p.cachedNext
 		p.cachedNext = nil
-		p.owner, p.requestUnique, p.cachedArena = r, unique, true
+		p.owner, p.requestUnique, p.cachedArena = r.rawFileSystem, unique, true
 		if r.mount.workspace != nil {
 			permit, err := r.mount.workspace.Check()
 			if err != nil {
@@ -105,6 +106,9 @@ func (r *rawFileSystem) registerWorkspaceCachedReplyLocked(unique uint64, first,
 		return false
 	}
 	if p.workspaceBound && p.workspace.Check() != nil {
+		if fresh {
+			r.recycleReplyLocked(p)
+		}
 		return false
 	}
 	p.originalFinalized = true

@@ -58,7 +58,10 @@ A drain permit captures one old buffer, its incarnation and the earlier of the
 requested deadline and local cache-withdrawal deadline, preserving its lead
 before the authority horizon. It cannot select a successor buffer,
 extend the horizon or admit writes. This PR supplies that boundary; the lifecycle
-owner and complete cold transition are subsequent work.
+owner and complete cold transition are subsequent work. The lifecycle PR must
+also join or fence a renewal admitted before closure: the renew loop checks
+permission before dispatch and at acceptance, but drain capture does not join an
+RPC already in flight. That RPC can still extend the authority horizon.
 
 Buffer admission checks the captured serving word under the buffer mutex after
 every capacity wait for writes, truncation and metadata. The predicate acquires
@@ -86,11 +89,20 @@ READ includes short and EOF results because the kernel zero-fills folios.
 purge, and delivered metadata retains withdrawal bookkeeping without fresh daemon
 cache authority. It cannot reject a write that already reached the kernel.
 
-RELEASE and RELEASEDIR reserve cleanup before removing handles. FORGET retains
-its existing counted bookkeeping/RECLAIM ownership. FLUSH preserves its exact
-POSIX unlock obligation even when serving or durability fails. Closed, clean
-handles return success; dirty or lost work retains its failure. INIT and terminal
-connection notifications bootstrap or retire the connection without a serving
+RELEASE and RELEASEDIR first remove the handle with `takeHandle`; the callback
+then owns that handle and its inode pin. Authority handles next enter
+`cleanupContext` with the request Unique, and any deferred authority close moves
+to counted cleanup before the callback releases its ownership. Local handles
+close or release their snapshot directly under callback ownership. The lifecycle
+integration must reserve cleanup before handle removal if its drain relies on a
+count that spans that handoff; this substrate does not supply that reservation.
+FORGET retains its existing counted bookkeeping/RECLAIM ownership. FLUSH preserves
+its exact POSIX unlock obligation even when serving or durability fails. Closed, clean
+handles return success; dirty or lost work retains its failure. Each description's
+accepted prefix names its buffer and epoch. Sequences advance only within that
+identity; a successor replaces the old cut only after durability or loss has
+disposed of its retained work. Loss reporting keeps its existing handle observer.
+INIT and terminal connection notifications bootstrap or retire the connection without a serving
 permit. The maintained go-fuse `WaitMountReady` boundary joins the real mount
 helper after NewServer completes FUSE INIT, without WaitMount's path probe.
 Negotiated kernel validation remains mandatory before Open. The cold proof concerns authority-derived cache authority. Machine-local

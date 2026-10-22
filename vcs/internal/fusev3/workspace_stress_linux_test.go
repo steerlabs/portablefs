@@ -58,14 +58,14 @@ func TestReviewGateChurnStress(t *testing.T) {
 				func() fuse.Status {
 					u := unique.Add(2)
 					var out fuse.AttrOut
-					st := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: node}}, &out)
+					st := testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: node}}, &out)
 					reply(u, 3, 0)
 					return st
 				},
 				func() fuse.Status {
 					u := unique.Add(2)
 					var out fuse.EntryOut
-					st := f.raw.Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &out)
+					st := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &out)
 					delivered := reply(u, 1, 0)
 					// A refused physical LOOKUP owns its rollback; the kernel never
 					// acquires that reference and therefore cannot FORGET it again.
@@ -167,7 +167,7 @@ func TestReviewGateChurnStress(t *testing.T) {
 			t.Logf("first revocation observed after churn %d", firstRevoke)
 			if gated {
 				g.Close(1)
-				cut := f.raw.captureWorkspaceReplies()
+				cut := f.mount.managed.captureWorkspaceReplies()
 				close(stop)
 				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()

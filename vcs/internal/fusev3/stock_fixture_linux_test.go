@@ -150,7 +150,7 @@ func (f *stockFixture) lookup(t *testing.T, parentNode uint64, name string) *fus
 	t.Helper()
 	out := &fuse.EntryOut{}
 	status := f.rawCall(func(unique uint64) fuse.Status {
-		return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: parentNode}, name, out)
+		return testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: parentNode}, name, out)
 	})
 	if !status.Ok() {
 		t.Fatalf("LOOKUP %q = %v", name, status)
@@ -180,4 +180,13 @@ func (f *stockFixture) openForData(t *testing.T, node uint64) *fuse.OpenOut {
 		t.Fatalf("warm OPEN flags = %#x, want KEEP_CACHE", out.OpenFlags)
 	}
 	return out
+}
+
+// The same construction-time selection used by fuse.NewServer is retained by
+// bindWorkspaceTestGate. Warmup before binding remains an ordinary mount.
+func testEntryFileSystem(r *rawFileSystem) fuse.RawFileSystem {
+	if r.mount.managed != nil {
+		return r.mount.managed
+	}
+	return r
 }

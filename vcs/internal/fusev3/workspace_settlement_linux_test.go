@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
@@ -64,7 +65,7 @@ func TestReviewR2TerminalRacesWrittenTail(t *testing.T) {
 				opened := openDelegatedWriter(t, f, node)
 				writeDelegated(t, f, node, opened.Fh, 0, []byte("seed"))
 				if st := f.rawCall(func(u uint64) fuse.Status {
-					return r.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: node}}, &fuse.AttrOut{})
+					return testEntryFileSystem(r).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: node}}, &fuse.AttrOut{})
 				}); st != fuse.OK {
 					t.Fatal(st)
 				}
@@ -74,7 +75,7 @@ func TestReviewR2TerminalRacesWrittenTail(t *testing.T) {
 			}
 			if variant == "heap-estale" || variant == "heap-graft" {
 				for i := range r.cachedReplyArena {
-					if _, st := r.beginWorkspaceEntry(1<<50 + uint64(i)); st != fuse.OK {
+					if _, st := r.mount.managed.beginWorkspaceEntry(1<<50 + uint64(i)); st != fuse.OK {
 						t.Fatal(st)
 					}
 				}
@@ -83,14 +84,14 @@ func TestReviewR2TerminalRacesWrittenTail(t *testing.T) {
 			switch variant {
 			case "arena-lookup":
 				opcode = 1
-				if st := r.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); st != fuse.OK {
+				if st := testEntryFileSystem(r).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); st != fuse.OK {
 					t.Fatal(st)
 				}
 			default:
 				if variant == "heap-estale" {
 					node = 1 << 40
 				}
-				st := r.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: node}}, &fuse.AttrOut{})
+				st := testEntryFileSystem(r).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: node}}, &fuse.AttrOut{})
 				if variant == "heap-estale" && st != fuse.Status(syscall.ESTALE) || variant != "heap-estale" && st != fuse.OK {
 					t.Fatal(st)
 				}
@@ -110,7 +111,7 @@ func TestReviewR2TerminalRacesWrittenTail(t *testing.T) {
 			pin := p.holderAdmission
 			done := p.workspaceDone
 			r.mu.Unlock()
-			cut := r.captureWorkspaceReplies()
+			cut := r.mount.managed.captureWorkspaceReplies()
 			r.PrepareReplyPayload(unique, node, opcode, nil, nil, 0)
 			entered, release := make(chan struct{}), make(chan struct{})
 			r.beforeReplySettlement = func(q *replyPublication) {
@@ -189,7 +190,7 @@ func TestWorkspaceConsumedResponseThenTerminalWrite(t *testing.T) {
 	finish()
 	p.consumeAuthorityResponse()
 	f.raw.PrepareReplyPayload(u, entry.NodeId, 4, nil, nil, 0)
-	cut := f.raw.captureWorkspaceReplies()
+	cut := f.mount.managed.captureWorkspaceReplies()
 	if f.raw.terminalizeReplyCacheOwnership(time.Now()) {
 		t.Fatal("unwritten reply unexpectedly joined")
 	}
@@ -224,12 +225,12 @@ func TestReviewR2TransferAfterTerminalLockedPhase(t *testing.T) {
 			f := newStockFixture(t)
 			bindWorkspaceTestGate(t, f.mount)
 			u := f.unique.Add(2)
-			entry, st := f.raw.beginWorkspaceEntry(u)
+			entry, st := f.mount.managed.beginWorkspaceEntry(u)
 			if st != fuse.OK {
 				t.Fatal(st)
 			}
 			done := entry.workspaceDone
-			cut := f.raw.captureWorkspaceReplies()
+			cut := f.mount.managed.captureWorkspaceReplies()
 			release, entered := make(chan struct{}), make(chan struct{})
 			var terminal <-chan bool
 			if phase == "terminalizing" {
@@ -261,7 +262,7 @@ func TestReviewR2TransferAfterTerminalLockedPhase(t *testing.T) {
 					t.Fatal("terminal settlement failed")
 				}
 			}
-			f.raw.finishWorkspaceEntry(u, entry)
+			f.mount.managed.finishWorkspaceEntry(u, entry)
 			if err := cut.wait(t.Context()); err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +292,7 @@ func TestReviewR2DrainLostWakeupAfterWrittenTail(t *testing.T) {
 				opcode := uint32(3)
 				coordinate := publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
 				if kind == "source" {
-					if st := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{}); st != fuse.OK {
+					if st := testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{}); st != fuse.OK {
 						t.Fatal(st)
 					}
 				} else {
@@ -303,7 +304,7 @@ func TestReviewR2DrainLostWakeupAfterWrittenTail(t *testing.T) {
 					}
 				}
 				p := f.raw.replyPublications[u]
-				cut := f.raw.captureWorkspaceReplies()
+				cut := f.mount.managed.captureWorkspaceReplies()
 				if !terminal {
 					f.raw.PrepareReplyPayload(u, entry.NodeId, opcode, nil, nil, 0)
 				}
@@ -363,7 +364,7 @@ func TestWorkspaceSourceAcquisitionCancellationRemovesOnlyItsHolds(t *testing.T)
 			entry := f.lookup(t, 1, "cached")
 			g := bindWorkspaceTestGate(t, f.mount)
 			prior := f.unique.Add(2)
-			if st := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: prior, NodeId: entry.NodeId}}, &fuse.AttrOut{}); st != fuse.OK {
+			if st := testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: prior, NodeId: entry.NodeId}}, &fuse.AttrOut{}); st != fuse.OK {
 				t.Fatal(st)
 			}
 			f.raw.PrepareReplyPayload(prior, entry.NodeId, 3, nil, nil, 0)
@@ -460,25 +461,106 @@ func TestWorkspaceSourceAcquisitionCancellationRemovesOnlyItsHolds(t *testing.T)
 	}
 }
 
+// File FSYNC can retire an exact prefix while background volume durability
+// stays parked. This fixes the pending-data assertions independently of timers.
+type workspaceFlushCutRPC struct {
+	*fakeRPC
+	barrier <-chan struct{}
+}
+
+func (r *workspaceFlushCutRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetBarrier() != nil {
+		select {
+		case <-r.barrier:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return r.fakeRPC.CallMutation(ctx, request)
+}
+
 // Imported from zz_review_r2_flush_linux_test.go, with failing assertions for
 // the fixed result and for separate clean and dirty writer descriptions.
 func TestReviewR2ClosedReadOnlyFlushOnDirtyFile(t *testing.T) {
-	for _, mode := range []string{"pending", "durable-prefix"} {
+	for _, mode := range []string{"pending", "durable-prefix", "cold", "cold-reuse", "cold-loss"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newStockFixture(t)
+			barrier := make(chan struct{})
+			defer close(barrier)
+			f.mount.delegations.rpc = &workspaceFlushCutRPC{fakeRPC: f.rpc, barrier: barrier}
 			entry := f.lookup(t, 1, "cached")
 			g := bindWorkspaceTestGate(t, f.mount)
 			writer := openDelegatedWriter(t, f, entry.NodeId)
 			other := openDelegatedWriter(t, f, entry.NodeId)
 			writeDelegated(t, f, entry.NodeId, writer.Fh, 0, []byte("dirty"))
 			writerResult, otherResult := fuse.EIO, fuse.OK
-			if mode == "durable-prefix" {
+			if mode != "pending" && mode != "cold-loss" {
+				// Keep the old sequence above the successor sequences. A maximum
+				// across epochs would then charge A for B even after reusing A.
+				for i := 0; i < 4; i++ {
+					writeDelegated(t, f, entry.NodeId, writer.Fh, 0, []byte("dirty"))
+				}
 				if st := f.rawCall(func(u uint64) fuse.Status {
 					return f.raw.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: writer.Fh})
 				}); st != fuse.OK {
 					t.Fatal(st)
 				}
 				writeDelegated(t, f, entry.NodeId, other.Fh, 0, []byte("later"))
+				writerResult, otherResult = fuse.OK, fuse.EIO
+			}
+			if mode == "cold" || mode == "cold-reuse" || mode == "cold-loss" {
+				// Retain both frontend descriptions across the real same-session
+				// cold transition, including FenceSubscription/resetBuffer.
+				if mode != "cold-loss" {
+					if st := f.rawCall(func(u uint64) fuse.Status {
+						return f.raw.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: other.Fh})
+					}); st != fuse.OK {
+						t.Fatal(st)
+					}
+				}
+				old := f.mount.delegations.buf
+				g.Close(1)
+				proof, err := g.Recovery(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.mount.subscription.subscribe(context.WithValue(t.Context(), workspaceRecoveryKey{}, proof)); err != nil {
+					t.Fatal(err)
+				}
+				if f.mount.delegations.buf == old {
+					t.Fatal("cold subscribe did not replace buffer")
+				}
+				if err := g.Prepared(proof); err != nil {
+					t.Fatal(err)
+				}
+				if err := g.Open(1, proof.Serial()); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "cold-loss" {
+					// Loss remains an independent, once-per-description observation.
+					for _, fh := range []uint64{writer.Fh, other.Fh} {
+						if st := f.rawCall(func(u uint64) fuse.Status {
+							return f.raw.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: fh})
+						}); st != fuse.EIO {
+							t.Fatal("lost prefix escaped observer", st)
+						}
+					}
+				}
+				// A scratch OPEN is a distinct authority description; the fixture's
+				// default shared token would close the retained handle as well.
+				f.rpc.mu.Lock()
+				f.rpc.handle = testToken(901)
+				f.rpc.mu.Unlock()
+				writeDelegated(t, f, entry.NodeId, other.Fh, 0, []byte("later"))
+				if mode == "cold-reuse" {
+					writeDelegated(t, f, entry.NodeId, writer.Fh, 0, []byte("reuse"))
+					if st := f.rawCall(func(u uint64) fuse.Status {
+						return f.raw.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: writer.Fh})
+					}); st != fuse.OK {
+						t.Fatal(st)
+					}
+					writeDelegated(t, f, entry.NodeId, other.Fh, 0, []byte("newer"))
+				}
 				writerResult, otherResult = fuse.OK, fuse.EIO
 			}
 			ro := &fuse.OpenOut{}

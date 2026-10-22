@@ -42,6 +42,16 @@ func bindWorkspaceTestGate(t *testing.T, m *Mount) *workspaceadmission.Superviso
 		t.Fatal(err)
 	}
 	m.workspace = reader
+	selected := m.raw.fileSystemForServer()
+	if _, ok := selected.(*workspaceFileSystem); !ok {
+		t.Fatal("managed mount did not select admission adapter")
+	}
+	if _, ok := selected.(fuse.ReplyWriteLifecycle); !ok {
+		t.Fatal("adapter lost physical reply lifecycle")
+	}
+	if _, ok := selected.(fuse.ReplyPayloadPreparer); !ok {
+		t.Fatal("adapter lost payload preparation")
+	}
 	proof, err := g.Recovery(1)
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +80,7 @@ func TestWorkspaceFastAnswersCloseBeforeServing(t *testing.T) {
 				opened := openDelegatedWriter(t, f, entry.NodeId)
 				writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("held"))
 				if s := f.rawCall(func(unique uint64) fuse.Status {
-					return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+					return testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
 				}); s != fuse.OK {
 					t.Fatal(s)
 				}
@@ -89,7 +99,7 @@ func TestWorkspaceFastAnswersCloseBeforeServing(t *testing.T) {
 			var status fuse.Status
 			switch kind {
 			case "getattr", "holder-getattr":
-				status = f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+				status = testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
 			default:
 				name := "cached"
 				if kind == "negative" {
@@ -98,7 +108,7 @@ func TestWorkspaceFastAnswersCloseBeforeServing(t *testing.T) {
 				if kind == "complete-directory" {
 					name = "not-enumerated"
 				}
-				status = f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, name, &fuse.EntryOut{})
+				status = testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, name, &fuse.EntryOut{})
 			}
 			if status != fuse.EIO || f.rpcCalls() != calls || record.lookups != lookups || f.raw.ReplyWriteTracked(unique) {
 				t.Fatalf("closed %s changed answer/owner: %v calls=%d lookups=%d", kind, status, f.rpcCalls()-calls, record.lookups-lookups)
@@ -114,7 +124,7 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 	record := f.raw.nodesByID[entry.NodeId]
 	before := record.lookups
 	unique := f.unique.Add(2)
-	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
+	if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
 		t.Fatal(status)
 	}
 	p := f.raw.replyPublications[unique]
@@ -122,7 +132,7 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 		t.Fatal("fast answer lost arena/reference owner")
 	}
 	g.Close(1)
-	cut := f.raw.captureWorkspaceReplies()
+	cut := f.mount.managed.captureWorkspaceReplies()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	if err := cut.wait(ctx); !errors.Is(err, context.Canceled) {
@@ -133,7 +143,7 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 	}
 	for i := 0; i < 10; i++ {
 		u := f.unique.Add(2)
-		if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.EIO {
+		if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.EIO {
 			t.Fatal(status)
 		}
 	}
@@ -152,12 +162,12 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 		f := newStockFixture(t)
 		g := bindWorkspaceTestGate(t, f.mount)
 		unique := f.unique.Add(2)
-		reservation, status := f.raw.beginWorkspaceEntry(unique)
+		reservation, status := f.mount.managed.beginWorkspaceEntry(unique)
 		if status != fuse.OK {
 			t.Fatal(status)
 		}
 		g.Close(1)
-		cut := f.raw.captureWorkspaceReplies()
+		cut := f.mount.managed.captureWorkspaceReplies()
 		ctx, finish, status := f.raw.mutationContext(unique)
 		if status != fuse.OK {
 			t.Fatal(status)
@@ -167,7 +177,7 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 			t.Fatal(err)
 		}
 		finish()
-		f.raw.finishWorkspaceEntry(unique, reservation)
+		f.mount.managed.finishWorkspaceEntry(unique, reservation)
 		f.raw.PrepareReplyPayload(unique, 1, 20, nil, nil, 0)
 		settled := make(chan struct{})
 		go func() { f.raw.ReplyWritten(unique, fuse.OK); close(settled) }()
@@ -192,7 +202,7 @@ func TestWorkspaceEmptyPublicationsRetainOwner(t *testing.T) {
 			f := newStockFixture(t)
 			g := bindWorkspaceTestGate(t, f.mount)
 			unique := f.unique.Add(2)
-			entry, status := f.raw.beginWorkspaceEntry(unique)
+			entry, status := f.mount.managed.beginWorkspaceEntry(unique)
 			if status != fuse.OK {
 				t.Fatal(status)
 			}
@@ -201,12 +211,12 @@ func TestWorkspaceEmptyPublicationsRetainOwner(t *testing.T) {
 				t.Fatal(status)
 			}
 			finish()
-			f.raw.finishWorkspaceEntry(unique, entry)
+			f.mount.managed.finishWorkspaceEntry(unique, entry)
 			if p := f.raw.replyPublications[unique]; p == nil || !p.callbackOwned || !p.workspaceBound {
 				t.Fatal("empty admitted reply lost transferred owner")
 			}
 			g.Close(1)
-			cut := f.raw.captureWorkspaceReplies()
+			cut := f.mount.managed.captureWorkspaceReplies()
 			_, reply, prepare := f.raw.PrepareReplyPayload(unique, 1, opcode, nil, nil, 0)
 			if reply != fuse.OK || prepare != fuse.OK {
 				t.Fatal("empty accepted result fabricated no-change failure")
@@ -316,8 +326,8 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 		t.Fatal("closed recovery lost control liveness")
 	}
 	deadline := f.mount.subscription.config.clock.Now().Add(time.Hour)
-	drain := f.mount.delegations.captureWorkspaceDrain(deadline)
-	if f.mount.delegations.drainIncarnation(drain) == 0 {
+	drain := f.mount.managed.captureWorkspaceDrain(deadline)
+	if f.mount.managed.drainIncarnation(drain) == 0 {
 		t.Fatal("closed drain lost captured incarnation")
 	}
 	_, controlDeadline, _, controlLive := f.mount.subscription.currentIncarnation()
@@ -331,7 +341,7 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 	if _, _, _, live := f.mount.subscription.currentIncarnation(); live {
 		t.Fatal("expired drain fell back to recovery permission")
 	}
-	if f.mount.delegations.drainIncarnation(drain) != 0 {
+	if f.mount.managed.drainIncarnation(drain) != 0 {
 		t.Fatal("expired drain remained usable")
 	}
 
@@ -363,7 +373,7 @@ func TestWorkspaceCapacityWaitChecksActualAcceptance(t *testing.T) {
 			opened := openDelegatedWriter(t, f, entry.NodeId)
 			writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("old"))
 			unique := f.unique.Add(2)
-			reservation, status := f.raw.beginWorkspaceEntry(unique)
+			reservation, status := f.mount.managed.beginWorkspaceEntry(unique)
 			if status != fuse.OK {
 				t.Fatal(status)
 			}
@@ -398,7 +408,7 @@ func TestWorkspaceCapacityWaitChecksActualAcceptance(t *testing.T) {
 				t.Fatal("closed waiter assigned a sequence")
 			}
 			finish()
-			f.raw.finishWorkspaceEntry(unique, reservation)
+			f.mount.managed.finishWorkspaceEntry(unique, reservation)
 			f.raw.PrepareReplyPayload(unique, entry.NodeId, 16, nil, nil, 0)
 			f.raw.ReplyWritten(unique, fuse.OK)
 		})
@@ -468,7 +478,7 @@ func TestWorkspaceAcceptedCreateAndWriteKeepPhysicalOwner(t *testing.T) {
 			if p == nil || p.source == nil {
 				t.Fatal("accepted effect lost physical/source owner")
 			}
-			cut := f.raw.captureWorkspaceReplies()
+			cut := f.mount.managed.captureWorkspaceReplies()
 			_, reply, prepare := f.raw.PrepareReplyPayload(unique, entry.NodeId, opcode, nil, nil, 0)
 			if reply != fuse.OK || prepare != fuse.OK {
 				t.Fatal("accepted effect became no-change error", reply, prepare)
@@ -560,7 +570,7 @@ func TestWorkspaceCloseAfterLastInstallationCheckIsInert(t *testing.T) {
 					t.Fatal("new write used closed install", st)
 				}
 				if st := f.rawCall(func(u uint64) fuse.Status {
-					return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+					return testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}}, &fuse.AttrOut{})
 				}); st != fuse.EIO {
 					t.Fatal("new holder GETATTR used closed install", st)
 				}
