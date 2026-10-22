@@ -3,7 +3,8 @@
 package cli
 
 import (
-	"errors"
+	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,39 +24,69 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	if err := os.Mkdir(mount, 0700); err != nil {
 		t.Fatal(err)
 	}
-	run := func(args ...string) {
+
+	runTool := func(tool string, args ...string) []byte {
 		t.Helper()
-		if out, err := exec.Command("/usr/bin/hdiutil", args...).CombinedOutput(); err != nil {
-			t.Fatalf("hdiutil %v: %v: %s", args, err, out)
+		out, err := exec.Command(tool, args...).Output()
+		if err != nil {
+			var stderr []byte
+			if exit, ok := err.(*exec.ExitError); ok {
+				stderr = exit.Stderr
+			}
+			t.Fatalf("%s %v: %v: %s%s", tool, args, err, out, stderr)
 		}
+		return out
 	}
+	run := func(args ...string) []byte { t.Helper(); return runTool("/usr/bin/hdiutil", args...) }
 	run("create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest", image)
-	// Disk Arbitration and system scanners can keep a freshly attached image
-	// busy on hosted runners, refusing even a forced detach with EBUSY (exit
-	// 16) for a short time. This test proves EVFILT_FS delivery and inventory
-	// absence, not detach latency, so the fixture waits until Disk Arbitration
-	// releases its own private image. Any other failure is reported at once.
-	detach := func() {
-		t.Helper()
-		deadline := time.Now().Add(30 * time.Second)
-		for {
-			out, err := exec.Command("/usr/bin/hdiutil", "detach", "-quiet", "-force", mount).CombinedOutput()
-			var exit *exec.ExitError
-			if err == nil {
-				return
-			}
-			if !errors.As(err, &exit) || exit.ExitCode() != 16 || time.Now().After(deadline) {
-				t.Fatalf("hdiutil detach %s: %v: %s", mount, err, out)
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-	}
-	mounted := false
+	device := ""
 	t.Cleanup(func() {
-		if mounted {
-			detach()
+		if device != "" {
+			run("detach", "-force", device)
 		}
 	})
+	attach := func() {
+		t.Helper()
+		out := run("attach", "-plist", "-nobrowse", "-mountpoint", mount, image)
+		convert := exec.Command("/usr/bin/plutil", "-convert", "json", "-o", "-", "-")
+		convert.Stdin = bytes.NewReader(out)
+		converted, err := convert.CombinedOutput()
+		if err != nil {
+			t.Fatalf("decode attach plist: %v: %s", err, converted)
+		}
+		var result struct {
+			Entities []struct {
+				Device  string `json:"dev-entry"`
+				Content string `json:"content-hint"`
+				Mount   string `json:"mount-point"`
+			} `json:"system-entities"`
+		}
+		if err := json.Unmarshal(converted, &result); err != nil {
+			t.Fatal(err)
+		}
+		mounted := false
+		for _, entity := range result.Entities {
+			if entity.Content == "GUID_partition_scheme" {
+				device = entity.Device
+			}
+			if entity.Mount == mount {
+				mounted = true
+			}
+		}
+		if device == "" || !mounted {
+			t.Fatalf("attach did not identify its whole disk and mount: %s", out)
+		}
+	}
+	detach := func() {
+		t.Helper()
+		// APFS volumes live on a synthesized disk, distinct from the attached
+		// image's whole disk. Disk Arbitration must finish unmounting all of them
+		// before image ejection. A partial detach can already have removed the
+		// mount path, so retain the exact attach identity through both operations.
+		runTool("/usr/sbin/diskutil", "unmountDisk", "force", device)
+		run("detach", "-force", device)
+		device = ""
+	}
 	wait := func(w fsKitMountWatcher) {
 		t.Helper()
 		select {
@@ -68,8 +99,7 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 		}
 	}
 	// The first watcher is registered before these real mount/unmount events.
-	run("attach", "-quiet", "-nobrowse", "-mountpoint", mount, image)
-	mounted = true
+	attach()
 	wait(watcher)
 	if mounts, err := darwinMountTable(); err != nil {
 		t.Fatal(err)
@@ -92,7 +122,6 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	}
 	defer second.close()
 	detach()
-	mounted = false
 	wait(watcher)
 	wait(second)
 	st := validFSKitMountState(t, mount)
@@ -111,16 +140,13 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	}
 	// Queue unrelated mount-table changes without consuming either event. They
 	// may coalesce; the wake is never a receipt for this attach's absence.
-	run("attach", "-quiet", "-nobrowse", "-mountpoint", mount, image)
-	mounted = true
+	attach()
 	detach()
-	mounted = false
 	wait(late)
 	if present, err := recordedKernelMountPresent(&st); err != nil || present {
 		t.Fatalf("coalesced events changed absence evidence: %v %v", present, err)
 	}
-	run("attach", "-quiet", "-nobrowse", "-mountpoint", mount, image)
-	mounted = true
+	attach()
 	if _, err := recordedKernelMountPresent(&st); err == nil {
 		t.Fatal("reused mount coordinates did not produce identity refusal")
 	}

@@ -15,7 +15,6 @@ func (m *delegationManager) state(id writeback.Identity) *delegationState {
 	if s == nil {
 		s = &delegationState{manager: m, grantChanged: make(chan struct{}), identity: id, handles: make(map[string][]byte), writers: make(map[string][]byte), bindings: make(map[uint64]delegationBinding)}
 		m.byID[id] = s
-		m.stateIndex.Store(id, s)
 	}
 	return s
 }

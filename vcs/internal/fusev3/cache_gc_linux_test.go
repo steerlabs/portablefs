@@ -54,7 +54,7 @@ func TestSlowMetadataCacheWaitsForCollectionAndRechecksOwnership(t *testing.T) {
 				case <-time.After(20 * time.Millisecond):
 				}
 				if ownsAfter {
-					s.ref = &authoritypb.DelegationRef{Id: []byte("new"), Generation: 1}
+					s.setGrantLocked(&authoritypb.DelegationRef{Id: []byte("new"), Generation: 1})
 				}
 				s.admission.Unlock()
 				m.mu.Unlock()
