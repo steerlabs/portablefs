@@ -14,7 +14,36 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+// Refuse only the foreground FSYNC. Keep background durability parked until
+// the assertion observes the failed cut; an independent successful barrier may
+// legitimately retire it afterward.
+type workspaceFsyncRefusalRPC struct {
+	*fakeRPC
+	barrier <-chan struct{}
+}
+
+func (r *workspaceFsyncRefusalRPC) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if fsync := request.GetFsync(); fsync != nil {
+		r.mu.Lock()
+		r.fsyncs = append(r.fsyncs, fsync)
+		r.mu.Unlock()
+		return &authoritypb.Response{Errno: int32(syscall.EIO)}, nil
+	}
+	return r.fakeRPC.CallIdempotent(ctx, request)
+}
+func (r *workspaceFsyncRefusalRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetBarrier() != nil {
+		select {
+		case <-r.barrier:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return r.fakeRPC.CallMutation(ctx, request)
+}
 
 // Adapted from the Opus PR #122 review repros.
 func TestWorkspaceAdmittedFsyncKeepsDirtyCut(t *testing.T) {
@@ -32,15 +61,9 @@ func TestWorkspaceAdmittedFsyncKeepsDirtyCut(t *testing.T) {
 				t.Fatal("FULL write was not buffered")
 			}
 			if mode == "closed-fsync-refusal" {
-				f.rpc.hook = func(req *authoritypb.Request) {
-					if req.GetFsync() != nil {
-						f.rpc.mu.Lock()
-						f.rpc.replyOverride = func(*authoritypb.Request) (*authoritypb.Response, error) {
-							return &authoritypb.Response{Errno: int32(syscall.EIO)}, nil
-						}
-						f.rpc.mu.Unlock()
-					}
-				}
+				barrier := make(chan struct{})
+				defer close(barrier)
+				f.mount.delegations.rpc = &workspaceFsyncRefusalRPC{fakeRPC: f.rpc, barrier: barrier}
 			}
 			unique := f.unique.Add(2)
 			// Hold the epoch writer so the real raw FSYNC callback is admitted at
@@ -64,8 +87,8 @@ func TestWorkspaceAdmittedFsyncKeepsDirtyCut(t *testing.T) {
 			f.rpc.snapshot(func(rpc *fakeRPC) { writesAfter, fsyncsAfter = len(rpc.writes), len(rpc.fsyncs) })
 			t.Logf("closed=%v FSYNC status=%v authorityFSYNCs=%d flushedWrites=%d", closeIt, status, fsyncsAfter-fsyncsBefore, writesAfter-writesBefore)
 			if mode == "closed-fsync-refusal" {
-				if status != fuse.EIO || writesAfter-writesBefore != 1 || f.mount.delegations.buf.Stats().Entries == 0 {
-					t.Fatal("FSYNC refusal silently certified durability", status)
+				if status != fuse.EIO || writesAfter-writesBefore != 1 || fsyncsAfter-fsyncsBefore != 1 || f.mount.delegations.buf.Stats().Entries == 0 {
+					t.Fatalf("FSYNC refusal lost its retained failure: status=%v entries=%d revoked=%v fatal=%v", status, f.mount.delegations.buf.Stats().Entries, f.mount.isRevoked(), f.mount.fatalError())
 				}
 				return
 			}
@@ -330,6 +353,14 @@ func TestWorkspaceCohortIncludesWrittenSettlement(t *testing.T) {
 			<-entered
 			g.Close(1)
 			cut := f.raw.captureWorkspaceReplies()
+			if len(cut.replies) != 1 {
+				t.Fatalf("cut has %d replies, want the settling publication", len(cut.replies))
+			}
+			select {
+			case <-cut.replies[0]:
+				t.Fatal("settlement completion closed at the paused boundary")
+			default:
+			}
 			canceled, cancel := context.WithCancel(t.Context())
 			cancel()
 			if err := cut.wait(canceled); !errors.Is(err, context.Canceled) {
@@ -366,30 +397,105 @@ func TestWorkspaceCohortIncludesWrittenSettlement(t *testing.T) {
 	}
 }
 
-func TestWorkspaceRenewLoopSkipsClosedControl(t *testing.T) {
-	f := newStockFixture(t)
-	g := bindWorkspaceTestGate(t, f.mount)
-	timers := make(chan *subscriptionTestTimer, 2)
-	renewed := make(chan uint64, 2)
-	s := f.mount.subscription
-	s.config.clock = &subscriptionTestClock{now: s.config.clock.Now(), timers: timers}
-	s.rpc = &subscriptionTestRPC{renewed: renewed}
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- s.renewLoop(ctx, s.incarnation) }()
-	timer := <-timers
-	g.Close(1)
-	timer.fired <- s.config.clock.Now()
-	<-timers // The next iteration proves the prior RPC decision completed.
-	select {
-	case <-renewed:
-		t.Fatal("closed control renewed authority exclusion")
-	default:
+type workspaceRenewRPC struct {
+	*subscriptionTestRPC
+	calls atomic.Int32
+}
+
+func (r *workspaceRenewRPC) RenewSubscription(_ context.Context, _ uint64) (time.Time, error) {
+	r.calls.Add(1)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.horizon = r.horizon.Add(time.Hour)
+	return r.horizon, nil
+}
+
+type workspaceRecallRPC struct {
+	*fakeRPC
+	recalls atomic.Int32
+}
+
+func (r *workspaceRecallRPC) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetDelegationRecallAck() != nil {
+		r.recalls.Add(1)
+		return &authoritypb.Response{Body: &authoritypb.Response_DelegationRecallAck{DelegationRecallAck: &authoritypb.DelegationRecallAckReply{}}}, nil
 	}
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
+	return r.fakeRPC.CallIdempotent(ctx, request)
+}
+
+func TestWorkspaceRenewLoopSkipsClosedControl(t *testing.T) {
+	for _, mode := range []string{"closed", "captured-drain"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newStockFixture(t)
+			entry := f.lookup(t, 1, "cached")
+			g := bindWorkspaceTestGate(t, f.mount)
+			opened := openDelegatedWriter(t, f, entry.NodeId)
+			writeDelegated(t, f, entry.NodeId, opened.Fh, 0, []byte("dirty"))
+			timers := make(chan *subscriptionTestTimer, 2)
+			s := f.mount.subscription
+			remoteHorizon := s.horizon
+			rpc := &workspaceRenewRPC{subscriptionTestRPC: &subscriptionTestRPC{horizon: remoteHorizon}}
+			s.config.clock = &subscriptionTestClock{now: s.config.clock.Now(), timers: timers}
+			s.rpc = rpc
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- s.renewLoop(ctx, s.incarnation) }()
+			timer := <-timers
+			g.Close(1)
+			if mode == "captured-drain" {
+				drain := f.mount.delegations.captureWorkspaceDrain(remoteHorizon)
+				if _, deadline, _, live := s.currentIncarnation(); !live || !deadline.Equal(drain.deadline) {
+					t.Fatal("drain lost old CONTROL permission")
+				}
+			}
+			timer.fired <- s.config.clock.Now()
+			<-timers
+			rpc.mu.Lock()
+			horizon := rpc.horizon
+			rpc.mu.Unlock()
+			if rpc.calls.Load() != 0 || !horizon.Equal(remoteHorizon) || !s.horizon.Equal(remoteHorizon) {
+				t.Fatal("drain dispatched renewal or extended exclusion")
+			}
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if mode == "captured-drain" {
+				// The real recall path must still flush and acknowledge its old grant.
+				m := f.mount.delegations
+				controlRPC := &workspaceRecallRPC{fakeRPC: f.rpc}
+				m.rpc = controlRPC
+				identity := f.raw.nodesByID[entry.NodeId].identity
+				state := m.retainState(writeback.Identity(identity), false)
+				state.admission.RLock()
+				ref := cloneDelegationRef(state.ref)
+				state.admission.RUnlock()
+				m.releaseState(state)
+				event := &authoritypb.ControlEvent{Incarnation: s.incarnation, Sequence: 1, Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{Identity: identity[:], Delegation: ref, BudgetNanos: uint64(time.Second)}}}
+				<-m.HandleControlEvent(t.Context(), event)
+				if controlRPC.recalls.Load() != 1 {
+					t.Fatal("drain suppressed recall acknowledgement")
+				}
+				batch := &authoritypb.ChangeBatch{Incarnation: s.incarnation, Entries: []*authoritypb.ChangeEntry{{Position: s.lastChangeSeen + 1, VolumeVersion: 100, Kind: authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED, Identity: identity[:]}}}
+				if err := s.registerChangeBatch(s.incarnation, batch); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.applyChangeBatch(t.Context(), s.incarnation, batch); err != nil {
+					t.Fatal(err)
+				}
+				if err := s.ackChanges(t.Context(), s.incarnation, batch.Entries[0].Position); err != nil {
+					t.Fatal(err)
+				}
+				rpc.mu.Lock()
+				acks := len(rpc.acks)
+				horizon = rpc.horizon
+				rpc.mu.Unlock()
+				if acks != 1 || rpc.calls.Load() != 0 || !horizon.Equal(remoteHorizon) {
+					t.Fatal("old change/ack control lost or renewed its horizon")
+				}
+			}
+		})
 	}
 }
 

@@ -105,7 +105,11 @@ func TestOrdinaryMountBenchmarks(t *testing.T) {
 	}
 	ops["getattr-cached"]()
 	ops["lookup-cached"]()
-	for _, name := range []string{"getattr-cached", "lookup-cached", "write-delegated", "read-delegated", "getxattr-slow", "write-local", "read-local"} {
+	names := []string{"getattr-cached", "lookup-cached", "write-delegated", "read-delegated", "getxattr-slow", "write-local", "read-local"}
+	if os.Getenv("PFS_ORDINARY_BENCH_CACHED_ONLY") == "1" {
+		names = names[:2]
+	}
+	for _, name := range names {
 		op := ops[name]
 		calls := f.rpcCalls()
 		serial := testing.Benchmark(func(b *testing.B) {
@@ -115,6 +119,11 @@ func TestOrdinaryMountBenchmarks(t *testing.T) {
 			}
 		})
 		fastHit := f.rpcCalls() == calls
+		cached := name == "getattr-cached" || name == "lookup-cached"
+		if cached && !fastHit {
+			t.Fatalf("%s serial issued an authority RPC", name)
+		}
+		calls = f.rpcCalls()
 		par := testing.Benchmark(func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetParallelism(1)
@@ -124,7 +133,11 @@ func TestOrdinaryMountBenchmarks(t *testing.T) {
 				}
 			})
 		})
-		fmt.Fprintf(os.Stdout, "ORDINARY %-15s procs=%d serial=%6d ns/op %.2f allocs/op %d B/op  parallel=%6d ns/op %.2f allocs/op %d B/op  noRPC=%v\n",
-			name, runtime.GOMAXPROCS(0), serial.NsPerOp(), float64(serial.MemAllocs)/float64(serial.N), serial.AllocedBytesPerOp(), par.NsPerOp(), float64(par.MemAllocs)/float64(par.N), par.AllocedBytesPerOp(), fastHit)
+		parallelFastHit := f.rpcCalls() == calls
+		if cached && !parallelFastHit {
+			t.Fatalf("%s parallel issued an authority RPC", name)
+		}
+		fmt.Fprintf(os.Stdout, "ORDINARY %-15s procs=%d serial=%9.3f ns/op %.2f allocs/op %d B/op  parallel=%9.3f ns/op %.2f allocs/op %d B/op  noRPC=%v\n",
+			name, runtime.GOMAXPROCS(0), float64(serial.T.Nanoseconds())/float64(serial.N), float64(serial.MemAllocs)/float64(serial.N), serial.AllocedBytesPerOp(), float64(par.T.Nanoseconds())/float64(par.N), float64(par.MemAllocs)/float64(par.N), par.AllocedBytesPerOp(), fastHit && parallelFastHit)
 	}
 }

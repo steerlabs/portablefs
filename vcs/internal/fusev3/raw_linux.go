@@ -266,6 +266,10 @@ type replyPublication struct {
 	originalFinalized bool
 	originalWrote     bool
 	originalStatus    fuse.Status
+	// The registry lock grants physical settlement exactly once, independently
+	// of callback response consumption. The claimant retains storage through
+	// every unlocked cleanup step.
+	settlementClaimed bool
 }
 
 func (p *replyPublication) empty() bool {
@@ -964,6 +968,7 @@ type terminalReplyCompletion struct {
 	dirPlus             dirPlusLookupCompletion
 	responseConsumption responseConsumptionClaim
 	physical            bool
+	lookupReference     *inodeRecord
 }
 
 // terminalizeReplyCacheOwnership joins physical writer callbacks only until
@@ -1050,11 +1055,10 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 	}
 	completions := make([]terminalReplyCompletion, 0, len(seen))
 	for publication := range seen {
-		// ReplyWritten already transferred this operation to its settlement owner.
-		// Keep it discoverable until that owner releases source and responses.
-		if publication.originalWrote && publication.responseConsumptionOwner == responseConsumptionTransferred {
+		if publication.settlementClaimed {
 			continue
 		}
+		publication.settlementClaimed = true
 		if publication.workspaceDone == nil {
 			delete(r.replyPublications, publication.requestUnique)
 		}
@@ -1064,11 +1068,16 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 		}
 		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
 		responseConsumption := r.settleReplyPublicationLocked(publication, physical)
+		var lookupReference *inodeRecord
+		if !physical || publication.cacheRejected {
+			lookupReference, publication.lookupReference = publication.lookupReference, nil
+		}
 		completions = append(completions, terminalReplyCompletion{
 			publication:         publication,
 			dirPlus:             dirPlus,
 			responseConsumption: responseConsumption,
 			physical:            physical,
+			lookupReference:     lookupReference,
 		})
 	}
 	r.replyTerminal = true
@@ -1078,18 +1087,27 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 	r.mu.Unlock()
 
 	for _, completion := range completions {
+		if completion.publication.workspaceDone != nil && r.beforeReplySettlement != nil {
+			r.beforeReplySettlement(completion.publication)
+		}
 		r.finishDirPlusLookupCompletion(completion.dirPlus)
-		if (!completion.physical || completion.publication.cacheRejected) && completion.publication.lookupReference != nil {
-			r.Forget(completion.publication.lookupReference.id, 1)
+		if completion.lookupReference != nil {
+			r.Forget(completion.lookupReference.id, 1)
 		}
 		if completion.publication.source != nil {
 			completion.publication.source.revoke()
 		}
 		consumeClaimedAuthorityResponses(completion.responseConsumption)
-		if completion.publication.workspaceDone != nil {
+		if completion.publication.responseConsumptionDone != nil {
+			<-completion.publication.responseConsumptionDone
+		}
+		if completion.publication.workspaceDone != nil || completion.publication.cachedArena {
 			r.mu.Lock()
-			close(completion.publication.workspaceDone)
+			if completion.publication.workspaceDone != nil {
+				close(completion.publication.workspaceDone)
+			}
 			delete(r.replyPublications, completion.publication.requestUnique)
+			r.signalSourceChangedLocked()
 			r.recycleReplyLocked(completion.publication)
 			r.mu.Unlock()
 		}
@@ -1888,20 +1906,18 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 			publication.originalWrote = true
 			publication.originalStatus = status
 			publication.closeOriginalDoneLocked()
-			if status.Ok() {
-				r.releaseReplyCapacityLocked(publication)
-			}
 			r.signalSourceChangedLocked()
 		}
 		r.mu.Unlock()
 		return
 	}
 	publication := r.replyPublications[unique]
-	if publication == nil || publication.originalWrote {
+	if publication == nil || publication.settlementClaimed {
 		r.mu.Unlock()
 		r.mount.revoke(fmt.Errorf("fusev3: tracked FUSE reply %d lost its publication ownership", unique))
 		return
 	}
+	publication.settlementClaimed = true
 	if status.Ok() && publication.workspaceBound && publication.workspace.Check() != nil && publication.opcode == 15 {
 		for _, candidate := range publication.data {
 			r.settleDataPublicationLocked(candidate, false)
@@ -1933,8 +1949,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 				r.markIdentityStale(candidate.coordinate.item)
 			}
 		}
-		r.ReplyWritten(unique, status)
-		return
+		r.mu.Lock()
 	}
 	publication.originalWrote = true
 	publication.originalStatus = status
@@ -1960,6 +1975,10 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		delete(r.replyPublications, unique)
 	}
 	responseConsumption := r.settleReplyPublicationLocked(publication, successful)
+	var lookupReference *inodeRecord
+	if !successful {
+		lookupReference, publication.lookupReference = publication.lookupReference, nil
+	}
 	if successful && publication.workspaceBound && publication.workspace.Check() != nil {
 		// Physical delivery still creates withdrawal duties. These entries carry
 		// the obsolete stamp and no reusable attribute payload, so an observed Close
@@ -1981,8 +2000,8 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		r.beforeReplySettlement(publication)
 	}
 	r.finishDirPlusLookupCompletion(dirPlusCompletion)
-	if (publication.cacheRejected || !status.Ok()) && publication.lookupReference != nil {
-		r.Forget(publication.lookupReference.id, 1)
+	if lookupReference != nil {
+		r.Forget(lookupReference.id, 1)
 	}
 	if publication.source != nil {
 		if status.Ok() {
@@ -1996,11 +2015,15 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 
 	consumeClaimedAuthorityResponses(responseConsumption)
+	if publication.responseConsumptionDone != nil {
+		<-publication.responseConsumptionDone
+	}
 	if publication.workspaceDone != nil || publication.cachedArena {
 		r.mu.Lock()
 		if publication.workspaceDone != nil {
 			close(publication.workspaceDone)
 			delete(r.replyPublications, unique)
+			r.signalSourceChangedLocked()
 		}
 		r.recycleReplyLocked(publication)
 		r.mu.Unlock()
@@ -2440,6 +2463,10 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 			return nil, nil, false
 		}
 		r.mu.Lock()
+		if p.settlementClaimed {
+			r.mu.Unlock()
+			return nil, nil, false
+		}
 		if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
 			r.mu.Unlock()
 			return nil, nil, false
@@ -2481,7 +2508,7 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 				retry = true
 				return false
 			}
-			if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
+			if p.settlementClaimed || r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
 				r.mount.subscription.remaining(coordinate, stamp, stamp.version) <= 0 || r.withdrawingCoordinates[coordinate] {
 				return false
 			}
@@ -2675,6 +2702,7 @@ func (r *rawFileSystem) lookupAdmitted(header *fuse.InHeader, name string, out *
 		out.SetEntryTimeout(0)
 		return fuse.OK
 	}
+	lookupRegistered := record != nil
 	if record == nil {
 		item, errno := parent.node.Lookup(ctx, name)
 		if errno != 0 {
@@ -2701,7 +2729,16 @@ func (r *rawFileSystem) lookupAdmitted(header *fuse.InHeader, name string, out *
 	publication := replyPublicationFromContext(ctx)
 	// Both cached and authority lookups transfer their reference only with the
 	// physical reply. A holder overlay can lose permission after either sample.
+	r.mu.Lock()
+	if publication.settlementClaimed {
+		r.mu.Unlock()
+		if !lookupRegistered {
+			r.Forget(record.id, 1)
+		}
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	publication.lookupReference = record
+	r.mu.Unlock()
 	r.bindPath(record, parent, name)
 	if err := r.publishEntry(ctx, out, parent, name, record, attr); err != nil {
 		if errors.Is(err, errMetadataInterrupted) {
@@ -3153,9 +3190,6 @@ func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Statu
 }
 
 func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
-
-	ctx, finish := r.noReplyCleanupContext()
-	defer finish()
 	if r.grafts != nil {
 		if held, ok := r.takeHandle(input.Fh, handleLocalFile); ok {
 			// A failed close(2) has released the descriptor regardless, and
@@ -3173,6 +3207,11 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	}
 	defer r.unpin(handle.inode)
 	defer handle.file.endLossObservation()
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
+	defer finish()
 	// Epoch recovery retired this capability; closing it on the new session
 	// cannot release any old resource and must not revoke the recovered mount.
 	if handle.file.stale.Load() || handle.file.node.epochStale.Load() {
@@ -4157,9 +4196,6 @@ func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.St
 }
 
 func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
-
-	ctx, finish := r.noReplyCleanupContext()
-	defer finish()
 	if r.grafts != nil {
 		if held, ok := r.takeHandle(input.Fh, handleLocalDir); ok {
 			// The snapshot is memory this process owns; nothing outside it is
@@ -4173,6 +4209,11 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 		return
 	}
 	defer r.unpin(handle.inode)
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
+	defer finish()
 	// Epoch recovery retired this capability; closing it on the new session
 	// cannot release any old resource and must not revoke the recovered mount.
 	if handle.dir.stale.Load() || handle.dir.node.epochStale.Load() {

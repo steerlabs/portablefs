@@ -225,7 +225,7 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.servingLocked() {
+	if !s.liveLocked() || s.mount != nil && s.mount.workspace != nil && !s.workspaceServingLocked() {
 		return subscriptionStamp{}
 	}
 	// The publication owns the entry's serving permit. Cache facts need only
@@ -262,7 +262,7 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.servingLocked() || stamp.incarnation != s.incarnation {
+	if !s.liveLocked() || s.mount != nil && s.mount.workspace != nil && !s.workspaceServingLocked() || stamp.incarnation != s.incarnation {
 		return 0
 	}
 	if coordinate.kind == publicationNamespaceName {
@@ -1026,7 +1026,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			return ctx.Err()
 		}
 		s.mu.Lock()
-		live := s.incarnation == incarnation && s.controlLiveLocked()
+		live := s.incarnation == incarnation && s.renewalLiveLocked()
 		s.mu.Unlock()
 		if !live {
 			continue
@@ -1055,7 +1055,7 @@ func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.T
 	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.controlLiveLocked() || s.workspaceDrain != nil || s.paused || s.incarnation != incarnation {
+	if !s.renewalLiveLocked() || s.paused || s.incarnation != incarnation {
 		return false
 	}
 	now := s.config.clock.Now()
@@ -1376,19 +1376,12 @@ func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
 	return true
 }
 
-// liveLocked remains the old horizon predicate: closing serving cannot erase
-// the incarnation used by recalls, release or exact cleanup.
-func (s *subscriptionRegistry) servingLocked() bool {
-	if s.workspaceDrain != nil {
-		return false
-	}
-	if !s.liveLocked() {
-		return false
-	}
-	if s.mount == nil || s.mount.workspace == nil {
-		return true
-	}
-	return s.workspaceProof != nil && s.mount.workspace.Installed(*s.workspaceProof)
+// Only managed subscriptions need the cold proof. Keep its large Installed
+// check out of the ordinary horizon caller's stack frame.
+//
+//go:noinline
+func (s *subscriptionRegistry) workspaceServingLocked() bool {
+	return s.workspaceDrain == nil && s.workspaceProof != nil && s.mount.workspace.Installed(*s.workspaceProof)
 }
 func (s *subscriptionRegistry) controlLiveLocked() bool {
 	if s.workspaceDrain != nil {
@@ -1401,4 +1394,9 @@ func (s *subscriptionRegistry) controlLiveLocked() bool {
 		return true
 	}
 	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
+}
+
+// A drain may finish the old CONTROL cut, but may not extend its exclusion.
+func (s *subscriptionRegistry) renewalLiveLocked() bool {
+	return s.workspaceDrain == nil && s.controlLiveLocked()
 }

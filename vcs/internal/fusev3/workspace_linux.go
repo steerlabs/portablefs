@@ -138,16 +138,12 @@ func (r *rawFileSystem) finishWorkspaceEntry(unique uint64, entry *replyPublicat
 	}
 	r.mu.RLock()
 	p := r.replyPublications[unique]
+	callbackOwned := p != nil && p.callbackOwned
 	r.mu.RUnlock()
-	if p == nil || p.callbackOwned {
+	if p == nil || callbackOwned {
 		return
 	}
 	r.finishReplyPublicationRegistration(unique, p)
-	r.mu.Lock()
-	if r.replyPublications[unique] == nil {
-		r.recycleReplyLocked(p)
-	}
-	r.mu.Unlock()
 }
 
 func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, next *replyPublication) error {
@@ -156,6 +152,10 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, ne
 		return r.registerReplyPublication(unique, next)
 	}
 	r.mu.Lock()
+	if r.replyTerminal || r.replyTerminalizing {
+		r.mu.Unlock()
+		return fmt.Errorf("fusev3: reply publication transferred after terminal settlement")
+	}
 	p := r.replyPublications[unique]
 	if p != nil {
 		if p.callbackOwned {

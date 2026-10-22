@@ -320,6 +320,16 @@ func (b *Buffer) sizeLocked(f *file) {
 }
 func (b *Buffer) Snapshot() Cut { b.mu.Lock(); defer b.mu.Unlock(); return Cut{b.sequence, b.loss} }
 
+// HasRetainedThrough reports whether this description's accepted prefix still
+// contains non-durable work. Later writes on another description do not make a
+// completed prefix dirty again. Loss is reported through the caller's observer.
+func (b *Buffer) HasRetainedThrough(id Identity, sequence uint64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.files[id]
+	return f != nil && f.head != nil && f.head.seq <= sequence
+}
+
 // BeginBarrier captures a root completion cut. Callers hold their admission
 // fence only around this method, then pass the returned cut through flushing,
 // the remote barrier, and WaitBarrier. The registered state makes a later drop

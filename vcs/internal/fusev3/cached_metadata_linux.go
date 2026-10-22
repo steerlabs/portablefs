@@ -55,9 +55,29 @@ func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoor
 // Treat them as finalized immediately: both peer withdrawal and the initiating
 // mount's source gate must join their physical reply before completing.
 func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
+	if r.mount.workspace != nil {
+		return r.registerWorkspaceCachedReplyLocked(unique, first, second, count)
+	}
+	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil || r.mount.revoked.Load() || r.cachedReplyFree == nil {
+		return false
+	}
+	stamp := r.mount.subscription.stamp()
+	if stamp.incarnation == 0 {
+		return false
+	}
+	p := r.cachedReplyFree
+	r.cachedReplyFree = p.cachedNext
+	p.cachedNext = nil
+	p.owner, p.requestUnique, p.originalFinalized, p.cachedArena = r, unique, true, true
+	p.stamp, p.retainedAnswer = stamp, true
+	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
+	r.replyPublications[unique] = p
+	return true
+}
+
+func (r *rawFileSystem) registerWorkspaceCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
 	p := r.replyPublications[unique]
-	managed := r.mount.workspace != nil
-	if unique == 0 || r.replyTerminal || r.replyTerminalizing || p != nil && !managed || r.mount.revoked.Load() || p == nil && r.cachedReplyFree == nil {
+	if unique == 0 || r.replyTerminal || r.replyTerminalizing || p != nil && p.callbackOwned || r.mount.revoked.Load() || p == nil && r.cachedReplyFree == nil {
 		return false
 	}
 	stamp := r.mount.subscription.stamp()
@@ -81,10 +101,10 @@ func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second p
 			p.workspaceBound = true
 		}
 	}
-	if managed && !p.cachedArena {
+	if !p.cachedArena {
 		return false
 	}
-	if managed && p.workspaceBound && p.workspace.Check() != nil {
+	if p.workspaceBound && p.workspace.Check() != nil {
 		return false
 	}
 	p.originalFinalized = true

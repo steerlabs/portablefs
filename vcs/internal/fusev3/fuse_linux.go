@@ -1359,6 +1359,7 @@ type fileHandle struct {
 	token            []byte
 	openFlags        uint32
 	buffered         bool
+	acceptedCut      atomic.Uint64
 	stale            atomic.Bool
 	lossMu           sync.Mutex
 	lossObserved     uint64
@@ -1920,6 +1921,10 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 // Closed admission still permits a clean close. Accepted data which has not
 // reached durability must remain visible as a failure to the closing caller.
 func (h *fileHandle) closedFlushResult() syscall.Errno {
+	cut := h.acceptedCut.Load()
+	if cut == 0 {
+		return 0
+	}
 	m := h.node.mount.delegations
 	id, err := delegationIdentity(h.node.item.GetStableIdentity())
 	if err != nil {
@@ -1927,20 +1932,21 @@ func (h *fileHandle) closedFlushResult() syscall.Errno {
 	}
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
-	s := m.retainState(id, false)
-	defer m.releaseState(s)
-	if s == nil {
-		return 0
-	}
-	s.meta.Lock()
-	defer s.meta.Unlock()
-	m.durabilityMu.Lock()
-	durable := m.durableHigh
-	m.durabilityMu.Unlock()
-	if s.dirty && (s.appliedCut < s.acceptedCut || s.applied == 0 || s.applied > durable) {
+	if m.buf.HasRetainedThrough(id, cut) {
 		return syscall.EIO
 	}
 	return 0
+}
+
+func (h *fileHandle) noteAcceptedCut(cut writeback.Cut) {
+	if h == nil || h.node.mount.workspace == nil || cut.Sequence == 0 {
+		return
+	}
+	for previous := h.acceptedCut.Load(); previous < cut.Sequence; previous = h.acceptedCut.Load() {
+		if h.acceptedCut.CompareAndSwap(previous, cut.Sequence) {
+			return
+		}
+	}
 }
 
 func (h *fileHandle) observeLoss() syscall.Errno {
@@ -3010,6 +3016,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		var cut writeback.Cut
 		for {
 			cut, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
+			fh.noteAcceptedCut(cut)
 			if !errors.Is(admissionErr, errDelegationNotOwned) {
 				break
 			}

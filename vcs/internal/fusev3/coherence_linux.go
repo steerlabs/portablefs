@@ -242,20 +242,6 @@ func (r *rawFileSystem) cleanupContext(unique uint64) (context.Context, func(), 
 	return r.callbackContext(unique, false)
 }
 
-func (r *rawFileSystem) noReplyCleanupContext() (context.Context, func()) {
-	r.mount.epochMu.RLock()
-	ctx, cancel := context.WithTimeout(r.opContext(), r.requestTimeout)
-	callback := &mutationCallback{mount: r.mount}
-	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
-	return ctx, func() {
-		cancel()
-		r.mount.epochMu.RUnlock()
-		for _, dispatch := range callback.closeDispatch {
-			go dispatch()
-		}
-	}
-}
-
 // kernelMount records the installed filesystem as well as its owned abort inode.
 // Mount IDs and anonymous device numbers can both be recycled after unmount.
 type kernelMount struct {
