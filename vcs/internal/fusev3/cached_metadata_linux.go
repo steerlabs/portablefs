@@ -52,17 +52,41 @@ func (r *rawFileSystem) cachedCoordinateAllowedLocked(coordinate publicationCoor
 // Treat them as finalized immediately: both peer withdrawal and the initiating
 // mount's source gate must join their physical reply before completing.
 func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second publicationCoordinate, count int) bool {
-	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil || r.mount.revoked.Load() || r.cachedReplyFree == nil {
+	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.mount.revoked.Load() {
 		return false
 	}
 	stamp := r.mount.subscription.stamp()
 	if stamp.incarnation == 0 {
 		return false
 	}
-	p := r.cachedReplyFree
-	r.cachedReplyFree = p.cachedNext
-	p.cachedNext = nil
-	p.owner, p.requestUnique, p.originalFinalized, p.cachedArena = r, unique, true, true
+	p := r.replyPublications[unique]
+	if p == nil {
+		// Direct helper callers still reserve the existing cache arena. Raw entries
+		// transfer their reservation here rather than registering the Unique twice.
+		if r.cachedReplyFree == nil {
+			return false
+		}
+		p = r.cachedReplyFree
+		r.cachedReplyFree = p.cachedNext
+		*p = replyPublication{owner: r, requestUnique: unique, cachedArena: true}
+		if r.mount.workspace != nil {
+			permit, err := r.mount.workspace.Check()
+			if err != nil {
+				r.recycleReplyLocked(p)
+				return false
+			}
+			p.workspace = permit
+			p.workspaceBound = true
+		}
+		r.replyPublications[unique] = p
+	}
+	if !p.cachedArena {
+		return false
+	}
+	if p.workspaceBound && p.workspace.Check() != nil {
+		return false
+	}
+	p.originalFinalized, p.cachedAnswer = true, true
 	p.stamp, p.retainedAnswer = stamp, true
 	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
 	r.replyPublications[unique] = p

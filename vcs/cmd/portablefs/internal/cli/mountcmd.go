@@ -73,6 +73,8 @@ type mountOpts struct {
 	foreground          bool
 	readyFD             int
 	opLockFD            int
+	workspaceGateFD     int
+	workspaceOwnerFD    int
 }
 
 // A mount that is already absent cannot fail closed a second time. Keep a
@@ -114,6 +116,8 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
 	fs.BoolVar(&o.foreground, "foreground", false, "stay attached instead of daemonizing")
 	fs.IntVar(&o.readyFD, "ready-fd", 0, "internal: fd to write the readiness report to")
+	fs.IntVar(&o.workspaceGateFD, "workspace-gate-fd", 0, "internal: sealed read-only workspace admission descriptor")
+	fs.IntVar(&o.workspaceOwnerFD, "workspace-owner-fd", 0, "internal: workspace supervisor lifetime reader")
 	fs.IntVar(&o.opLockFD, "op-lock-fd", 0, "internal: inherited mount operation lock fd")
 }
 
@@ -192,6 +196,9 @@ func cmdMount(e *cmdEnv, args []string) int {
 	}
 	if len(positionals) != 2 {
 		return e.usageError("mount", fmt.Errorf("expected <volumeId> <mountPath>"))
+	}
+	if err := refuseManagedWorkspaceMount(&o); err != nil {
+		return e.fail("mount", err)
 	}
 	sessionStateDir, err := e.mountLifecycleStateDir()
 	if err != nil {
@@ -979,6 +986,9 @@ func canonicalOrigin(raw string) (string, error) {
 // runMountForeground performs the actual mount in this process: resolve the
 // session, pick a strategy, attach, record state, then serve until unmounted.
 func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir string, operation *mountOperation) int {
+	if err := refuseManagedWorkspaceMount(o); err != nil {
+		return e.fail("mount", err)
+	}
 	// Leave a full minute for exact rollback before the parent's three-minute
 	// startup limit. This bound starts before attach and enrollment work.
 	startupDeadline := time.Now().Add(2 * time.Minute)
@@ -2767,4 +2777,21 @@ func formatMs(ms int64) string {
 		return "-"
 	}
 	return time.UnixMilli(ms).Local().Format(time.RFC3339)
+}
+
+// Managed launch remains unavailable until the real kernel, clock and root
+// lifecycle owners are integrated. Ordinary launches carry neither descriptor.
+func refuseManagedWorkspaceMount(o *mountOpts) error {
+	if o.workspaceGateFD == 0 && o.workspaceOwnerFD == 0 {
+		return nil
+	}
+	for i, fd := range []int{o.workspaceGateFD, o.workspaceOwnerFD} {
+		if fd > 2 && (i == 0 || fd != o.workspaceGateFD) {
+			_ = os.NewFile(uintptr(fd), "workspace-launch").Close()
+		}
+	}
+	if runtime.GOOS != "linux" || !o.foreground || o.workspaceGateFD <= 2 || o.workspaceOwnerFD <= 2 || o.workspaceGateFD == o.workspaceOwnerFD {
+		return errors.New("managed workspace launch requires Linux foreground mode and two distinct inherited descriptors")
+	}
+	return errors.New("managed workspace mounts are unavailable until the kernel, clock and root lifecycle owners are integrated")
 }

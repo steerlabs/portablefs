@@ -15,6 +15,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"google.golang.org/protobuf/proto"
 )
@@ -95,6 +96,8 @@ func (m *delegationMutex) Unlock() {
 }
 
 type delegationState struct {
+	workspace        workspaceadmission.ServingPermit
+	workspaceBound   bool
 	manager          *delegationManager
 	ownershipVersion uint64       // admission; clocks grant installation and retirement
 	users            atomic.Int64 // index read lock joins; scoped operations and physical reply publications
@@ -155,10 +158,12 @@ type delegationFlushProgress struct {
 // Its methods return ordinary errors so the raw FUSE layer can make the errno
 // policy at the callback boundary.
 type delegationManager struct {
-	subscription *subscriptionRegistry
-	rpc          delegationRPC
-	timeout      time.Duration
-	maxWrite     int
+	// Nil in production; tests place Close after the final proof load.
+	beforeWorkspaceInstall func()
+	subscription           *subscriptionRegistry
+	rpc                    delegationRPC
+	timeout                time.Duration
+	maxWrite               int
 
 	epoch      sync.RWMutex
 	epochCtx   context.Context
@@ -363,7 +368,7 @@ func (m *delegationManager) Owns(identity []byte) bool {
 	}
 	s.admission.RLock()
 	defer s.admission.RUnlock()
-	return s.ref != nil
+	return s.ref != nil && s.workspaceLive()
 }
 
 // sharedCacheAllowed is called under the raw registry lock. A retirement may
@@ -482,6 +487,9 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 // An allocating mutation can carry an application cut of its returned grant.
 // Publish both under admission before CONTROL can observe that generation.
 func (m *delegationManager) install(identity, item, handle []byte, grant *authoritypb.Delegation, applied uint64) error {
+	return m.installContext(context.Background(), identity, item, handle, grant, applied)
+}
+func (m *delegationManager) installContext(ctx context.Context, identity, item, handle []byte, grant *authoritypb.Delegation, applied uint64) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
 		return err
@@ -509,6 +517,15 @@ func (m *delegationManager) install(identity, item, handle []byte, grant *author
 	defer s.operation.Unlock()
 	s.admission.Lock()
 	defer s.admission.Unlock()
+	var permit workspaceadmission.ServingPermit
+	bound := m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspace != nil
+	if bound {
+		p := replyPublicationFromContext(ctx)
+		if p == nil || !p.workspaceBound || p.workspace.Check() != nil {
+			return errDelegationRetired
+		}
+		permit = p.workspace
+	}
 	if ref.GetGeneration() <= s.retiredGeneration {
 		return errDelegationRetired
 	}
@@ -535,6 +552,10 @@ func (m *delegationManager) install(identity, item, handle []byte, grant *author
 	s.meta.Lock()
 	s.applied = max(s.applied, applied)
 	s.meta.Unlock()
+	if m.beforeWorkspaceInstall != nil {
+		m.beforeWorkspaceInstall()
+	}
+	s.workspace, s.workspaceBound = permit, bound
 	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
 	s.sessionCtx = m.sessionCtx
 	close(s.grantChanged)
@@ -597,6 +618,9 @@ func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bo
 type delegationPrepareContextKey struct{}
 
 func prepareDelegationAdmission(ctx context.Context) error {
+	if err := workspaceAcceptance(ctx); err != nil {
+		return err
+	}
 	if prepare, ok := ctx.Value(delegationPrepareContextKey{}).(func() error); ok {
 		return prepare()
 	}
@@ -625,7 +649,7 @@ func (m *delegationManager) modeAndBuffer(s *delegationState) (*delegationState,
 		return nil, nil, 0, errors.New("fusev3: delegated mutation while subscription is fenced")
 	}
 	s.admission.RLock()
-	if s.ref == nil {
+	if s.ref == nil || !s.workspaceLive() {
 		s.admission.RUnlock()
 		return nil, nil, 0, errDelegationNotOwned
 	}
@@ -682,7 +706,7 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
-	cut, err := b.WriteInGeneration(ctx, id, generation, off, data, opts)
+	cut, err := b.WriteInGeneration(writeback.WithAdmissionCheck(ctx, func() error { return workspaceAcceptance(ctx) }), id, generation, off, data, opts)
 	s.admission.RLock()
 	if err == nil {
 		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {
@@ -730,12 +754,14 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 }
 
 func (m *delegationManager) Truncate(ctx context.Context, identity []byte, size int64) (writeback.Cut, error) {
+	ctx = writeback.WithAdmissionCheck(ctx, func() error { return workspaceAcceptance(ctx) })
 	return m.admitMetadata(ctx, identity, func(b *writeback.Buffer, id writeback.Identity, generation uint64) (writeback.Cut, error) {
 		return b.TruncateInGeneration(ctx, id, generation, size)
 	})
 }
 
 func (m *delegationManager) SetAttr(ctx context.Context, identity []byte, attrs writeback.Attributes) (writeback.Cut, error) {
+	ctx = writeback.WithAdmissionCheck(ctx, func() error { return workspaceAcceptance(ctx) })
 	return m.admitMetadata(ctx, identity, func(b *writeback.Buffer, id writeback.Identity, generation uint64) (writeback.Cut, error) {
 		return b.SetAttrInGeneration(ctx, id, generation, attrs)
 	})
@@ -857,7 +883,7 @@ func (m *delegationManager) OverlayAttributes(identity []byte, base writeback.At
 func delegationStateOwned(s *delegationState) bool {
 	s.admission.RLock()
 	defer s.admission.RUnlock()
-	return s.ref != nil
+	return s.ref != nil && s.workspaceLive()
 }
 
 func (m *delegationManager) LossSequence() uint64 {
@@ -2599,4 +2625,10 @@ func (m *delegationManager) FlushCycleCompleted(ctx context.Context, id writebac
 	if err := invalidate(ctx, id[:]); err != nil && ref != nil {
 		m.loseDelegationIfCurrent(state, ref, "holder flush-cycle invalidation failed")
 	}
+}
+
+// Caller holds admission. The proof remains stored even after Close, so old
+// release/flush ownership can identify the exact grant without serving it.
+func (s *delegationState) workspaceLive() bool {
+	return !s.workspaceBound || s.workspace.Check() == nil
 }

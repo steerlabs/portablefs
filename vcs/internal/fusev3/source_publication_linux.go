@@ -70,6 +70,7 @@ type namespaceBounds struct {
 type sourcePublicationLease struct {
 	completeParent       publicationIdentity
 	completeProof        *directoryCompleteness
+	workspaceCheck       func() error
 	r                    *rawFileSystem
 	coordinates          map[publicationCoordinate]struct{}
 	names                map[publicationNamespace]namespaceBounds
@@ -363,7 +364,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 	if err != nil {
 		return nil, err
 	}
-	lease := &sourcePublicationLease{r: r, names: names, preBindings: make(map[publicationNamespace]publicationIdentity)}
+	lease := &sourcePublicationLease{workspaceCheck: func() error { return workspaceAcceptance(ctx) }, r: r, names: names, preBindings: make(map[publicationNamespace]publicationIdentity)}
 	for _, bounds := range names {
 		if bounds.attributes {
 			lease.unresolvedAttributes++
@@ -373,6 +374,9 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		}
 	}
 	for {
+		if err := workspaceAcceptance(ctx); err != nil {
+			return nil, err
+		}
 		coordinates := make(map[publicationCoordinate]struct{}, len(base)+len(names)*2)
 		for coordinate := range base {
 			coordinates[coordinate] = struct{}{}
@@ -425,6 +429,10 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 	// while the namespace coordinate was draining. Refresh under the closed
 	// gate so that unlink/rename also retain the exact child which became the
 	// locally bound pre-state during that drain.
+	if err := workspaceAcceptance(ctx); err != nil {
+		lease.release()
+		return nil, err
+	}
 	if err := lease.refreshPreBindings(ctx); err != nil {
 		lease.release()
 		return nil, err
@@ -500,6 +508,11 @@ func (l *sourcePublicationLease) markAssigned() error {
 	defer l.r.mu.Unlock()
 	if l.released || l.revoked || l.assigned {
 		return errors.New("fusev3: source publication lease has an invalid replay-assignment transition")
+	}
+	if l.workspaceCheck != nil {
+		if err := l.workspaceCheck(); err != nil {
+			return err
+		}
 	}
 	l.assigned = true
 	return nil

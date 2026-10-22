@@ -45,10 +45,36 @@ REQUIRED_TESTS=()
 #     provisioner;
 #   - the FUSE probe's missing-fusectl prerequisite: a child private mount
 #     namespace hides fusectl without changing the service suite's mounts.
+# The sealed-page and gated raw-entry tests also require a real root supervisor;
+# keep them in this required lane rather than letting the service-UID suite
+# silently stand in for those proofs.
 # Keeping an exact, nonempty required list prevents a renamed, skipped or
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestClosedStartAndExactPreparedCAS"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestReadOnlyHandoffAndDescriptorSeals"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestHandoffRejectsWritableOrUnboundDescriptors"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestOwnerEOFIsIndependentAndPermanent"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestStalledChildCloseAndSoleWriter"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestCloseSerialExhaustionAndGenerationFloor"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestRetireInterruptsOwnerReadWhileSupervisorLives"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFastAnswersCloseBeforeServing"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCachedReplyRollbackAndFixedCohort"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceEmptyPublicationsRetainOwner"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLatePhysicalReadPurgesAfterWrite"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClosedCleanupAndFlushUnlock"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRecoveryAndDrainAreNotServing"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCapacityWaitChecksActualAcceptance"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceScratchOpenLoopStopsOnClose"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceAcceptedCreateAndWriteKeepPhysicalOwner"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceInitialSubscribeLosesToPark"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCloseAfterLastInstallationCheckIsInert"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceSlowHelperCannotInventServingAdmission"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceEveryGraftBranchChecksEntry"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceStaticRefusalsDoNotAcquireServingOwner"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCloseHandoffReleasesEpochFenceBeforeQueueCapacity"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelWorkspaceGateAndOwnerLifetime"
   "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestSharedXFSWritebackDomain"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeRejectsHiddenFusectl"
@@ -124,8 +150,8 @@ validate_root_tests() {
   [[ ${#REQUIRED_ROOT_TESTS[@]} -gt 0 ]] ||
     fail "REQUIRED_ROOT_TESTS is empty; the root boundary must require at least one test" 70
   for entry in "${REQUIRED_ROOT_TESTS[@]}"; do
-    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore|fusev3):Test[A-Za-z0-9_]+$ ]] ||
-      fail "REQUIRED_ROOT_TESTS entry is not a cellhost, xfsstore or fusev3 top-level test: $entry" 70
+    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore|fusev3|workspaceadmission):Test[A-Za-z0-9_]+$ ]] ||
+      fail "REQUIRED_ROOT_TESTS entry is not a cellhost, xfsstore, fusev3 or workspaceadmission top-level test: $entry" 70
     [[ $seen != *" ${entry} "* ]] ||
       fail "REQUIRED_ROOT_TESTS names a test twice: $entry" 70
     seen="${seen}${entry} "
@@ -423,6 +449,8 @@ run_root_boundary_suite() {
     GOTOOLCHAIN=local \
     GOFLAGS=-mod=readonly \
     PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
+    PORTABLEFS_XFS_TEST_ROOT="/srv/portablefs/$PORTABLEFS_VOLUME_NAME" \
+    PORTABLEFS_XFS_TEST_PROJECT="$PORTABLEFS_PROJECT_ID" \
     PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
     PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
     PORTABLEFS_XFS_DOMAIN_TEST=1 \

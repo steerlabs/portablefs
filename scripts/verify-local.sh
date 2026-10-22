@@ -125,8 +125,8 @@ bash scripts/test-macos-cli-layouts.sh
 step "maintained go-fuse reply and unmount seams"
 go -C vcs/third_party/go-fuse build ./fuse
 go -C vcs/third_party/go-fuse vet ./fuse
-go -C vcs/third_party/go-fuse test ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
-go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
+go -C vcs/third_party/go-fuse test ./fuse -run 'Test(MountReadyBootstrapDoesNotServe|TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
+go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(MountReadyBootstrapDoesNotServe|TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites|NormalUnmountMakesOneAttemptAndPreservesTheError|NormalUnmountJoinsWorkersOnlyAfterSuccess)$'
 
 # 5. The native observer's evidence rules need no mount or platform privilege.
 step "native cache observer evidence"

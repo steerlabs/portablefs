@@ -40,7 +40,7 @@ func writeDelegated(t *testing.T, f *stockFixture, node, handle uint64, offset u
 		return status
 	})
 	if status != fuse.OK {
-		t.Fatalf("write: %v", status)
+		t.Fatalf("write: %v; terminal cause: %v", status, f.mount.fatalError())
 	}
 }
 

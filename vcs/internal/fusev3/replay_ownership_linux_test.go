@@ -163,7 +163,7 @@ func TestOldOpenResponseCannotRestoreCacheAuthority(t *testing.T) {
 	m := newDelegationTestManager(t, &delegationFakeRPC{})
 	mount := &Mount{delegations: m}
 	p := &replyPublication{stamp: subscriptionStamp{incarnation: 7}}
-	ctx := context.WithValue(t.Context(), mutationCallbackKey{}, &mutationCallback{publication: *p})
+	ctx := context.WithValue(t.Context(), mutationCallbackKey{}, &mutationCallback{publication: p})
 	if !mount.currentOpenResponse(ctx) {
 		t.Fatal("current grant refused")
 	}

@@ -2058,7 +2058,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		t.Fatal("the peer existing-create mutation did not complete")
 	}
 	if injectionErr != nil {
-		t.Fatalf("materialize existing-create race through the peer mount: %v", injectionErr)
+		t.Fatalf("materialize existing-create race through the peer mount: %v; mount causes: %v / %v", injectionErr, f.mounts[0].fatalError(), f.mounts[1].fatalError())
 	}
 	if elapsed := time.Since(existingStart); elapsed > 2*time.Second {
 		t.Fatalf("same-name CREATE waited %v for subscription expiry", elapsed)

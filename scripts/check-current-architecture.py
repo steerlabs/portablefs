@@ -182,14 +182,39 @@ REQUIRED_TEST_LISTS = (
 # The privileged suite's root invocation: the cell helper's root-owned volume
 # provisioning proved against real XFS project quota, and the shared-cell
 # writeback-domain fault proof, and the FUSE probe's private-mount-namespace
-# prerequisite proof. The invocation is provisioned for exactly these
+# prerequisite proof, plus the root-owned workspace gate and its complete
+# entry/publication inventory. The invocation is provisioned for exactly these
 # packages, so every root entry must name a top-level test in one of them.
 ROOT_TEST_PACKAGES = {
     "github.com/steerlabs/portablefs/vcs/internal/cellhost",
     "github.com/steerlabs/portablefs/vcs/internal/xfsstore",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission",
 }
 ROOT_REQUIRED = {
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestClosedStartAndExactPreparedCAS",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestReadOnlyHandoffAndDescriptorSeals",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestHandoffRejectsWritableOrUnboundDescriptors",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestOwnerEOFIsIndependentAndPermanent",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestStalledChildCloseAndSoleWriter",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestCloseSerialExhaustionAndGenerationFloor",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestRetireInterruptsOwnerReadWhileSupervisorLives",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFastAnswersCloseBeforeServing",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCachedReplyRollbackAndFixedCohort",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceEmptyPublicationsRetainOwner",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLatePhysicalReadPurgesAfterWrite",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClosedCleanupAndFlushUnlock",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRecoveryAndDrainAreNotServing",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCapacityWaitChecksActualAcceptance",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceScratchOpenLoopStopsOnClose",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceAcceptedCreateAndWriteKeepPhysicalOwner",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceInitialSubscribeLosesToPark",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCloseAfterLastInstallationCheckIsInert",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceSlowHelperCannotInventServingAdmission",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceEveryGraftBranchChecksEntry",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceStaticRefusalsDoNotAcquireServingOwner",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceCloseHandoffReleasesEpochFenceBeforeQueueCapacity",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelWorkspaceGateAndOwnerLifetime",
     "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestProvisionedVolumeEnforcesXFSProjectQuotaAndConfinement",
     "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestSharedXFSWritebackDomain",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeRejectsHiddenFusectl",

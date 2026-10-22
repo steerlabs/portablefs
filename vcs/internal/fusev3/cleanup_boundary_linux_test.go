@@ -117,6 +117,12 @@ func TestInterruptedClosePreparationRetainsSameSessionDebt(t *testing.T) {
 }
 
 func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
+	testCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t, false)
+}
+func TestWorkspaceCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
+	testCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t, true)
+}
+func testCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T, workspace bool) {
 	for _, directory := range []bool{false, true} {
 		t.Run(fmt.Sprintf("directory_%t", directory), func(t *testing.T) {
 			f := newStockFixture(t)
@@ -129,6 +135,11 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 			}
 			f.mount.delegations = m
 			f.mount.subscription.control = m
+			closeAdmission := func() {}
+			if workspace {
+				g := bindWorkspaceTestGate(t, f.mount)
+				closeAdmission = func() { g.Close(1) }
+			}
 			waiting, active := make(chan struct{}), make(chan struct{})
 			m.SetCleanupFailureReporter(func(error) {})
 			m.SetCleanupRetryWaiter(func(ctx context.Context) error {
@@ -173,6 +184,7 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 				}
 			}
 			handed, done := make(chan struct{}), make(chan struct{})
+			allowReturn := make(chan struct{})
 			go func() {
 				defer close(done)
 				f.rawCall(func(unique uint64) fuse.Status {
@@ -197,6 +209,7 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 						t.Errorf("handoff: %v", outcome.cause)
 					}
 					close(handed)
+					<-allowReturn
 					return fuse.OK
 				})
 			}()
@@ -205,6 +218,8 @@ func TestCloseHandoffReleasesEpochFenceBeforeQueueCapacity(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("full queue blocked ownership transfer under callback fence")
 			}
+			closeAdmission()
+			close(allowReturn)
 			select {
 			case <-done:
 			case <-time.After(time.Second):

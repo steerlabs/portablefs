@@ -34,3 +34,9 @@ circular wait without strengthening that proof.
 The retired private opcodes, capability bits, trailers, inode markers, and
 notification payloads are absent. Kernel communication is the stock FUSE 7.31+
 ABI; the fork does not implement a patched-kernel or compatibility profile.
+
+Closed-start bootstrap also exposes `Server.WaitMountReady`: it joins the
+platform mount-helper result after NewServer has completed FUSE INIT, without
+running WaitMount's path-based polling probe. PortableFS validates the negotiated
+kernel guarantees before opening admission. Ordinary mounts retain WaitMount
+and its existing probe; this adds no serving permission or synthetic readiness.

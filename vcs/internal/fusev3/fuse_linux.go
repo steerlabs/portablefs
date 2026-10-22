@@ -24,6 +24,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
@@ -128,6 +129,10 @@ type RPC interface {
 type WritebackDropReport = writeback.DropReport
 
 type Config struct {
+	// workspace is private until the protected-path lifecycle driver exists.
+	// Tests may bind the real gate to the ordinary kernel frontend; the CLI
+	// cannot launch a managed mount through this field.
+	workspace *workspaceadmission.Reader
 	// MountInstanceID is the random identity created before attach. MountVolume
 	// derives the kernel source from it, so every attempt is distinguishable even
 	// when several clients mount the same volume. Product supervisors persist it
@@ -216,6 +221,8 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
+	workspace *workspaceadmission.Reader
+
 	posixMu       sync.Mutex
 	posixLocks    map[posixLockKey]uint64
 	posixSequence uint64
@@ -312,7 +319,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
 	}
-	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) {
+	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) || cfg.workspace != nil && cfg.workspace.MountInstanceID() != cfg.MountInstanceID {
 		rpc.FinishLocalSessionEnforcement()
 		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
@@ -413,7 +420,11 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	// which must never observe a counter that is still being raised from zero.
 	m.start(lease)
 	m.startKernelConnection()
-	if err := server.WaitMount(); err != nil {
+	waitMount := server.WaitMount
+	if cfg.workspace != nil {
+		waitMount = server.WaitMountReady
+	}
+	if err := waitMount(); err != nil {
 		// NewServer has already installed the kernel mount. If INIT or the
 		// readiness probe fails, remove it before releasing the authority
 		// session so callers can never observe a mounted but unserved path.
@@ -549,7 +560,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	// whose permits are each held for one RPC, so cleanup keeps its turn
 	// however long kernel requests wait for bulk slots.
 	mount := &Mount{
-		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel,
+		rpc: newEpochRPC(rpc), ctx: ctx, cancel: cancel, workspace: cfg.workspace,
 		kernelConnectionDone: make(chan struct{}),
 		reclaim:              newReclaimQueue(cfg.ReclaimQueue),
 		reclaimWorkers:       workers,
@@ -1522,9 +1533,11 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	assignmentFailed := false
 	response, consumption, callErr := m.rpc.CallMutationWithIdentityRetained(ctx, request, func(authorityrpc.MutationIdentity) error {
 		if err := lease.markAssigned(); err != nil {
-			assignmentFailed = true
-			lease.revoke()
-			m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
+			if !errors.Is(err, workspaceadmission.ErrClosed) {
+				assignmentFailed = true
+				lease.revoke()
+				m.revoke(fmt.Errorf("fusev3: source mutation assignment callback violated its lifecycle: %w", err))
+			}
 			return err
 		}
 		return nil
@@ -1792,7 +1805,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	kernelFlags := portableOpenFlags(flags, current && response.GetOpen().GetCacheCapable())
 	handle := &fileHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := n.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
+	if err := n.registerDelegatedHandleContext(ctx, handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, 0, syscall.EIO
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response, current); err != nil {
@@ -1869,22 +1882,35 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	if handle == nil {
 		return syscall.EBADF
 	}
+	key := n.posixLockKey(lockOwner)
+	generation := n.mount.possiblePOSIXLock(key)
 	if handle.stale.Load() || n.stale.Load() {
 		return syscall.EIO
 	}
-	if errno := handle.observeLoss(); errno != 0 {
-		return errno
-	}
-	key := n.posixLockKey(lockOwner)
-	generation := n.mount.possiblePOSIXLock(key)
+	loss := handle.observeLoss()
+	closed := !n.mount.workspaceServing()
 	if generation == 0 {
+		if loss != 0 {
+			return loss
+		}
+		if closed {
+			return syscall.EIO
+		}
 		if local, errno := handle.flushLocally(); local {
 			return errno
 		}
 	}
+	// FLUSH's POSIX unlock is an exact cleanup obligation even when serving or
+	// durability has failed. Preserve that failure after discharging the lock.
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
 	if errno == 0 {
 		n.mount.dischargePOSIXLock(key, generation)
+	}
+	if loss != 0 {
+		return loss
+	}
+	if closed {
+		return syscall.EIO
 	}
 	return errno
 }
@@ -2489,7 +2515,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	}
 	kernelFlags := portableOpenFlags(flags, current && created.GetCacheCapable())
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags, buffered: kernelFlags&fuse.FOPEN_DIRECT_IO == 0}
-	if err := child.registerDelegatedHandle(handle, grant, response.GetAppliedSequence()); err != nil {
+	if err := child.registerDelegatedHandleContext(ctx, handle, grant, response.GetAppliedSequence()); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response, current); err != nil {
@@ -2574,7 +2600,7 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags}
-	if err := child.registerDelegatedHandle(handle, nil, 0); err != nil {
+	if err := child.registerDelegatedHandleContext(ctx, handle, nil, 0); err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	owner.transfer()

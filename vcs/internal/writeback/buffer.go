@@ -210,6 +210,16 @@ func (b *Buffer) setAttrInGeneration(ctx context.Context, id Identity, generatio
 	}
 	return b.admit(ctx, id, generation, SetAttr, 0, nil, a, WriteOptions{})
 }
+
+// WithAdmissionCheck binds the frontend's nonblocking acceptance predicate.
+// The function must not acquire any lock: admit calls it under the buffer mutex
+// after every capacity wait, before assigning an accepted sequence.
+type admissionCheckKey struct{}
+
+func WithAdmissionCheck(ctx context.Context, check func() error) context.Context {
+	return context.WithValue(ctx, admissionCheckKey{}, check)
+}
+
 func (b *Buffer) admit(ctx context.Context, id Identity, generation uint64, kind Kind, off int64, data []byte, a Attributes, opts WriteOptions) (Cut, error) {
 	// The caller's payload becomes immutable before admission, but the copy is
 	// deliberately outside the global buffer mutex so a large write does not
@@ -223,6 +233,11 @@ func (b *Buffer) admit(ctx context.Context, id Identity, generation uint64, kind
 		}
 		if b.stopped {
 			return Cut{}, ErrClosed
+		}
+		if check, ok := ctx.Value(admissionCheckKey{}).(func() error); ok {
+			if err := check(); err != nil {
+				return Cut{}, err
+			}
 		}
 		f := b.file(id)
 		if generation != 0 && f.generation != generation {

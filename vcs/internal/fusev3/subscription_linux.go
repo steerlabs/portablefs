@@ -17,6 +17,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 )
 
 const (
@@ -37,9 +38,11 @@ var (
 // Keeping it alongside the stamp lets daemon-resident cache entries be checked
 // without a second side table.
 type subscriptionStamp struct {
-	incarnation uint64
-	generation  uint64
-	version     uint64
+	incarnation    uint64
+	generation     uint64
+	version        uint64
+	workspace      workspaceadmission.ServingPermit
+	workspaceBound bool
 }
 
 func (s subscriptionStamp) withVersion(version uint64) subscriptionStamp {
@@ -94,11 +97,13 @@ func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
 func (t wallSubscriptionTimer) Stop() bool          { return t.timer.Stop() }
 
 type subscriptionConfig struct {
-	clock          subscriptionClock
-	retryDelay     time.Duration
-	withdrawalLead time.Duration
-	maxPages       int
-	invalidator    subscriptionInvalidator
+	// Deterministic test schedule at the last proof check/local-store boundary.
+	beforeWorkspaceInstall func()
+	clock                  subscriptionClock
+	retryDelay             time.Duration
+	withdrawalLead         time.Duration
+	maxPages               int
+	invalidator            subscriptionInvalidator
 }
 
 type subscriptionCoordinateState struct {
@@ -116,6 +121,8 @@ type subscriptionRegistry struct {
 	config  subscriptionConfig
 
 	mu              sync.RWMutex
+	workspaceProof  *workspaceadmission.RecoveryPermit
+	workspaceDrain  *workspaceDrainPermit
 	active          bool
 	paused          bool
 	incarnation     uint64
@@ -220,10 +227,18 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.liveLocked() {
+	if !s.servingLocked() {
 		return subscriptionStamp{}
 	}
-	return subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
+	stamp := subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
+	if s.mount != nil && s.mount.workspace != nil {
+		p, err := s.mount.workspace.Check()
+		if err != nil {
+			return subscriptionStamp{}
+		}
+		stamp.workspace, stamp.workspaceBound = p, true
+	}
+	return stamp
 }
 
 // remaining is the sole cache-admission predicate. A change advances only its
@@ -255,7 +270,7 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.liveLocked() || stamp.incarnation != s.incarnation {
+	if !s.servingLocked() || stamp.incarnation != s.incarnation || stamp.workspaceBound && stamp.workspace.Check() != nil {
 		return 0
 	}
 	if coordinate.kind == publicationNamespaceName {
@@ -398,6 +413,14 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	if s == nil || s.rpc == nil {
 		return errors.New("fusev3: subscription transport is required")
 	}
+	var proof *workspaceadmission.RecoveryPermit
+	if s.mount != nil && s.mount.workspace != nil {
+		p, ok := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
+		if !ok || s.mount.workspace.Recover(p) != nil {
+			return workspaceadmission.ErrClosed
+		}
+		proof = &p
+	}
 	s.mu.RLock()
 	paused := s.paused
 	s.mu.RUnlock()
@@ -476,10 +499,15 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				set[identity] = 0
 			}
 			s.mu.Lock()
-			if s.paused {
+			if s.paused || proof != nil && s.mount.workspace.Recover(*proof) != nil {
 				s.mu.Unlock()
 				return errSubscriptionPaused
 			}
+			if s.config.beforeWorkspaceInstall != nil {
+				s.config.beforeWorkspaceInstall()
+			}
+			s.workspaceDrain = nil
+			s.workspaceProof = proof
 			s.active = true
 			s.incarnation = incarnation
 			s.generation++
@@ -512,8 +540,12 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 func (s *subscriptionRegistry) currentIncarnation() (uint64, time.Time, <-chan struct{}, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	live := s.liveLocked()
-	return s.incarnation, s.cacheUntil, s.horizonChanged, live
+	live := s.controlLiveLocked()
+	deadline := s.cacheUntil
+	if s.workspaceDrain != nil {
+		deadline = s.workspaceDrain.deadline
+	}
+	return s.incarnation, deadline, s.horizonChanged, live
 }
 
 func (s *subscriptionRegistry) waitActive(ctx context.Context) error {
@@ -1025,7 +1057,7 @@ func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.T
 	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.liveLocked() || s.paused || s.incarnation != incarnation {
+	if !s.controlLiveLocked() || s.workspaceDrain != nil || s.paused || s.incarnation != incarnation {
 		return false
 	}
 	now := s.config.clock.Now()
@@ -1333,9 +1365,39 @@ func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
 	if incarnation == 0 || incarnation != s.incarnation {
 		return false
 	}
+	if s.workspaceDrain != nil && s.workspaceDrain.incarnation == incarnation && s.config.clock.Now().Before(s.workspaceDrain.deadline) {
+		return true
+	}
 	if !s.config.clock.Now().Before(s.cacheUntil) {
 		s.liveLocked()
 		return false
 	}
 	return true
+}
+
+// liveLocked remains the old horizon predicate: closing serving cannot erase
+// the incarnation used by recalls, release or exact cleanup.
+func (s *subscriptionRegistry) servingLocked() bool {
+	if s.workspaceDrain != nil {
+		return false
+	}
+	if !s.liveLocked() {
+		return false
+	}
+	if s.mount == nil || s.mount.workspace == nil {
+		return true
+	}
+	return s.workspaceProof != nil && s.mount.workspace.Installed(*s.workspaceProof)
+}
+func (s *subscriptionRegistry) controlLiveLocked() bool {
+	if s.workspaceDrain != nil {
+		return s.workspaceDrain.incarnation == s.incarnation && s.config.clock.Now().Before(s.workspaceDrain.deadline)
+	}
+	if !s.liveLocked() {
+		return false
+	}
+	if s.mount == nil || s.mount.workspace == nil {
+		return true
+	}
+	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
 }

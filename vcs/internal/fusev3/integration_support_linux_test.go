@@ -35,6 +35,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
@@ -151,7 +152,9 @@ func (a integrationAuthorizer) Authorize(_ context.Context, _ string, token []by
 }
 
 type integrationConfig struct {
-	latencies fuse.LatencyMap
+	workspace         *workspaceadmission.Reader
+	workspaceRecovery *workspaceadmission.RecoveryPermit
+	latencies         fuse.LatencyMap
 	// The shipping CLI lifecycle test owns its mounts and uses signed hosted
 	// grants, while sharing this fixture's actual XFS/authority assembly.
 	skipMounts    bool
@@ -617,7 +620,15 @@ func (f *integrationFixture) mountAll() {
 		if err != nil {
 			t.Fatalf("create mount %d identity: %v", i, err)
 		}
-		mount, err := MountVolume(context.Background(), context.Background(), f.paths[i], transport, Config{
+		if f.cfg.workspace != nil {
+			mountInstanceID = f.cfg.workspace.MountInstanceID()
+		}
+		startup := context.Background()
+		if f.cfg.workspaceRecovery != nil {
+			startup = context.WithValue(startup, workspaceRecoveryKey{}, *f.cfg.workspaceRecovery)
+		}
+		mount, err := MountVolume(context.Background(), startup, f.paths[i], transport, Config{
+			workspace:       f.cfg.workspace,
 			MountInstanceID: mountInstanceID, RequestTimeout: requestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend carves its cleanup workers out of this number, so it
