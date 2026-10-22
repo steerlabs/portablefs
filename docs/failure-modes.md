@@ -93,7 +93,15 @@ Cold reset first interrupts old admission, waking writers parked on buffer
 capacity, then drains callbacks and physical replies before replacing ownership.
 Reversing that order would wait for a callback whose capacity cannot be released
 until reset. Metadata interrupted at this boundary returns EIO without revoking
-the recoverable mount or retaining an unreturned lookup reference.
+the recoverable mount or retaining an unreturned lookup reference. An admitted
+READ continues using the retained dirty overlay and its EOF after interruption;
+reset records any discarded tail exactly once after the callback drain.
+
+Terminal reply settlement claims source and cache ownership under the raw
+registry lock. Late source acquisitions cancel their unassigned holds, and
+claimed replies refuse new name, attribute and data candidates. Finalized cached
+writers remain tracked during the terminal join, including writers that have
+not yet sampled tracking. Cache withdrawals follow that join before abort.
 
 Cache-installing replies drain by exact identity/name coordinates. Shared
 kernel name validity is zero; inode notifications withdraw data and attributes.

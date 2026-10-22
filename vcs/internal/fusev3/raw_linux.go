@@ -745,7 +745,7 @@ func cacheCandidateVersion(publication *replyPublication) (uint64, uint64) {
 
 func (r *rawFileSystem) reserveCacheCandidateLocked(publication *replyPublication, coordinate publicationCoordinate) (*cacheInstallReservation, bool) {
 	snapshot := cacheCandidateSnapshot(publication)
-	if snapshot == 0 || r.withdrawingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
+	if publication == nil || publication.settlementClaimed || snapshot == 0 || r.withdrawingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
 		return nil, false
 	}
 	reservation := &cacheInstallReservation{
@@ -1169,10 +1169,10 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 			})
 		}
 	}
-	r.mu.Unlock()
 	if cachedName {
 		publication.names = append(publication.names, namePublication)
 	}
+	r.mu.Unlock()
 	out.NodeId = record.id
 	out.Generation = 1
 	// Subscriptions cover the daemon's name cache. Stock rename can transplant
@@ -1443,13 +1443,15 @@ func (r *rawFileSystem) publishNegativeEntry(ctx context.Context, out *fuse.Entr
 	}
 	r.mu.Lock()
 	lifetime, namePublication, cached := r.admitNegativeNameLocked(ctx, parent, name)
+	if cached {
+		publication.names = append(publication.names, namePublication)
+	}
 	r.mu.Unlock()
 	if !cached {
 		*out = fuse.EntryOut{}
 		out.SetEntryTimeout(0)
 		return fuse.OK, nil
 	}
-	publication.names = append(publication.names, namePublication)
 	// A zero-NodeId reply carries no object, so every other field is written
 	// out fresh rather than left at whatever the pooled request buffer held.
 	*out = fuse.EntryOut{}
@@ -1469,10 +1471,10 @@ func (r *rawFileSystem) publishNegativePostState(ctx context.Context, parent *in
 	}
 	r.mu.Lock()
 	_, candidate, cached := r.admitNegativeNameLocked(ctx, parent, name)
-	r.mu.Unlock()
 	if cached {
 		publication.names = append(publication.names, candidate)
 	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -1485,23 +1487,20 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	if publication == nil || record == nil || attr == nil {
 		return errors.New("fusev3: anonymous entry escaped its post-VFS reply-publication lifecycle")
 	}
-	var coordinate publicationCoordinate
-	var reservation *cacheInstallReservation
-	cached := false
 	// Mutation post-state supplies the exact versioned payload at callback
 	// completion. A versionless candidate here would hide that later admission.
 	if publication.postState == nil {
 		r.mu.Lock()
-		_, coordinate, reservation, cached = r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
+		_, coordinate, reservation, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
+		if cached {
+			objectVersion, snapshot := cacheCandidateVersion(publication)
+			publication.attrs = append(publication.attrs, replyAttrPublication{
+				inode: attr.GetInode(), identity: record.identity, record: record, coordinate: coordinate, reservation: reservation,
+				stamp: publication.subscriptionCacheStamp(), attr: proto.Clone(attr).(*authoritypb.Attr),
+				objectVersion: objectVersion, snapshot: snapshot,
+			})
+		}
 		r.mu.Unlock()
-	}
-	if cached {
-		objectVersion, snapshot := cacheCandidateVersion(publication)
-		publication.attrs = append(publication.attrs, replyAttrPublication{
-			inode: attr.GetInode(), identity: record.identity, record: record, coordinate: coordinate, reservation: reservation,
-			stamp: publication.subscriptionCacheStamp(), attr: proto.Clone(attr).(*authoritypb.Attr),
-			objectVersion: objectVersion, snapshot: snapshot,
-		})
 	}
 	out.NodeId, out.Generation = record.id, 1
 	out.SetEntryTimeout(0)
@@ -1705,7 +1704,9 @@ func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRec
 func (r *rawFileSystem) ReplyWriteTracked(unique uint64) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.replyTerminal || r.replyTerminalizing {
+	// A finalized cached reply is already in the terminal writer join, even
+	// when go-fuse has not sampled tracking yet. It must still report.
+	if r.replyTerminal {
 		return false
 	}
 	return r.replyPublications[unique] != nil
@@ -2862,7 +2863,8 @@ func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *f
 // waits for, so a publication that still has to queue for transport capacity
 // would make that purge wait on the lane it is competing for.
 //
-// It never refuses and never waits. A read that arrives while this mount is
+// Before settlement is claimed, it never refuses or waits. A read that arrives
+// while this mount is
 // withdrawing the coordinate is admitted and ordered by the authority instead: it
 // is answered with the applied bytes, and the purge that follows the recall
 // waits for this reply before invalidating. Refusing here is not available --
@@ -2877,6 +2879,9 @@ func (r *rawFileSystem) beginBufferedRead(ctx context.Context, record *inodeReco
 	coordinate := publicationCoordinate{kind: publicationItemData, item: record.identity}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if publication.settlementClaimed {
+		return false
+	}
 	r.publishingInodes[record.key.inode]++
 	r.admitSourcePublicationLocked(coordinate)
 	publication.data = append(publication.data, replyDataPublication{inode: record.key.inode, record: record, coordinate: coordinate})
@@ -4393,9 +4398,6 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 	r.mu.Lock()
 	record := r.byIdentityLocked(identity)
 	_, coordinate, reservation, cached := r.admitAttrLocked(ctx, inode, identity)
-	r.mu.Unlock()
-	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
-	out.SetTimeout(0)
 	if cached {
 		objectVersion, snapshot := cacheCandidateVersion(publication)
 		publication.attrs = append(publication.attrs, replyAttrPublication{
@@ -4404,6 +4406,9 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 			objectVersion: objectVersion, snapshot: snapshot,
 		})
 	}
+	r.mu.Unlock()
+	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	out.SetTimeout(0)
 }
 
 // abortAsync is safe from FORGET: it only cancels local contexts and schedules

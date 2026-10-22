@@ -116,16 +116,8 @@ managed launch or protected-path driver. The native workspace inventory is
 unchanged. Ordinary mounts reserve no workspace reply owner, take no workspace
 registry locks and allocate no gate closures. Unfenced host sleep remains unqualified.
 
-The lifecycle PR must resolve the admitted-READ/InterruptSubscription crossing
-before qualifying cold recovery. This issue also exists on ordinary mounts: a
-READ can pass the live-subscription check, wait for the delegation epoch reader,
-then observe incarnation zero after InterruptSubscription. The delegation reader
-selects authority storage even while its old buffer still owns accepted dirty
-bytes. FenceSubscription records the loss only after callback readers finish;
-the READ can therefore return older bytes or a shorter EOF as success before that
-loss exists. Closing admission alone does not discharge this obligation. The
-lifecycle owner must order the captured cohort and its dirty-data obligations
-against interruption, or the coherence layer must refuse that READ with an
-accounted failure. The interrupt must still wake capacity-blocked admissions;
-moving it behind a callback join without that wakeup would deadlock recovery.
-This admission PR does not change that pre-existing read/reset behavior.
+An admitted READ selects its overlay from retained buffer ownership even after
+InterruptSubscription clears the incarnation. The callback fence retains that
+buffer until the READ returns; FenceSubscription then accounts for its dirty
+loss exactly once. Interruption still wakes capacity-blocked writers before
+joining callbacks. This ordering also applies to ordinary mounts.
