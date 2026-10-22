@@ -111,7 +111,16 @@ func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem
 	if err != nil {
 		return nil, err
 	}
+	raw.mu.Lock()
+	// Settlement owns a stable source pointer after claiming the publication.
+	// Acquisition has assigned no effect yet, so a losing lease is cancellable.
+	if c.publication.settlementClaimed || c.publication.source != nil {
+		raw.mu.Unlock()
+		lease.cancelAcquisition()
+		return nil, errors.New("fusev3: source acquisition lost its reply publication ownership")
+	}
 	c.publication.source = lease
+	raw.mu.Unlock()
 	return lease, nil
 }
 

@@ -855,7 +855,9 @@ func (m *delegationManager) Read(ctx context.Context, identity []byte, off int64
 	defer m.epoch.RUnlock()
 	s := m.retainState(id, false)
 	defer m.releaseState(s)
-	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+	// Interruption closes admission, not ownership of acknowledged bytes.
+	// The callback fence keeps this buffer until reset accounts for its loss.
+	if s == nil || !delegationStateOwned(s) {
 		if off < 0 || length < 0 || fetch == nil {
 			return nil, writeback.ErrInvalid
 		}

@@ -132,3 +132,10 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWriteAndSetattrReacquisi
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAllocatingDescriptorValidationKeepsCleanupOwner
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTemporaryDescriptorUnprovenCleanupRetainsDebt
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRejectedItemAllocationKeepsReclaimOwner
+# Ordinary frontend interruption and terminal publication ownership.
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryReadDuringInterruptKeepsOverlay
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSourceAcquisitionRefusesTerminalClaim
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCandidatesRefuseTerminalClaim
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedWriterTrackingDuringTerminalWithdrawal
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelReadDuringInterruptKeepsOverlay
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelCachedWriterJoinsTerminalWithdrawal

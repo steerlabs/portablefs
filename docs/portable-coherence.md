@@ -61,6 +61,13 @@ The maintained go-fuse reply lifecycle and inode notifications are part of this
 publication proof, not substitutes for a kernel acknowledgment that FUSE does
 not expose.
 
+The reply settlement claim closes resource attachment under the raw registry
+lock. A source acquisition that loses this claim cancels its unassigned lease;
+name, attribute and data candidates cannot join an already claimed reply.
+Candidate reservation and attachment share that lock. Terminal withdrawal joins
+finalized cached replies even when their physical writers sample tracking after
+terminalization begins, then withdraws caches before aborting the connection.
+
 Metadata sampling also retains its ownership interval. If a grant changes or
 retires before publication, the client resamples under the original request
 deadline; a clean release cannot make an older storage size current again.
@@ -201,6 +208,11 @@ DATA mutation's exact replay before current coherence admission, returning its
 retained outcome and mutation state without executing again. New operations
 still require current permission. Replay does not restore an expired grant,
 cache contents, or a discarded volatile tail.
+
+Interrupting a subscription closes new admission without discarding retained
+buffer ownership. A READ admitted before interruption still overlays acknowledged
+bytes and preserves their EOF while its callback fence holds the old buffer.
+Only the subsequent ownership reset discards that tail and records its loss.
 
 Cold reset cancels old cache and grant work, but preserves session-owned CLOSE,
 CLOSE_BATCH, RECLAIM, and Barrier resolution. Each unresolved mutation retains
