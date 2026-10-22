@@ -151,9 +151,9 @@ func TestManagedInstallerRefusesMissingAndStalePermit(t *testing.T) {
 
 type unavailableWorkspaceHandler struct{ calls atomic.Int32 }
 
-func (h *unavailableWorkspaceHandler) Run(context.Context, *mountcontrol.Job) error {
+func (h *unavailableWorkspaceHandler) Run(context.Context, *mountcontrol.Job) mountcontrol.LifecycleResult {
 	h.calls.Add(1)
-	return mountcontrol.ErrUnavailable
+	return mountcontrol.LifecycleResult{Disposition: mountcontrol.LifecycleFailed, Err: mountcontrol.ErrUnavailable}
 }
 func TestWorkspaceSocketBudgetIncludesPartialRequestRead(t *testing.T) {
 	if os.Geteuid() != 0 {

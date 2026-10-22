@@ -106,7 +106,7 @@ func TestR5FailedRecoveryCannotReviveThroughNewSuspend(t *testing.T) {
 		snap := do(t, o, q, &Rights{})
 		t.Fatalf("real failure revived the same incarnation: ack=%s final=%s install=%s", out.Workspace.State, snap.Workspace.State, snap.Workspace.Phases.Install.Progress)
 	}
-	if !errors.Is(err, ErrGrammar) {
+	if !errors.Is(err, ErrIncarnationTerminal) {
 		t.Fatalf("recovery refusal: %v", err)
 	}
 	cleanup := cleanupRequest(9, "terminal")
@@ -134,25 +134,31 @@ func observeGeneration(t *testing.T, o *Owner, id, operation uint64, generation 
 
 func TestR5ServingFailureDistinguishesGenerationCancellation(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		cancel   bool
-		cause    error
-		terminal bool
+		name        string
+		cancel      bool
+		cause       error
+		disposition LifecycleDisposition
+		terminal    bool
 	}{
-		{"real-failure", false, errors.New("prepare failed"), true},
-		{"cancellation-with-live-context", false, context.Canceled, true},
-		{"generation-canceled", true, context.Canceled, false},
-		{"real-failure-races-close", true, errors.New("prepare failed"), true},
+		{"real-failure", false, errors.New("prepare failed"), LifecycleFailed, true},
+		{"cancellation-with-live-context", false, context.Canceled, LifecycleOvertaken, true},
+		{"generation-canceled", true, context.Canceled, LifecycleOvertaken, false},
+		{"lost-cancellation-chain", true, errors.New("teardown after Park"), LifecycleOvertaken, false},
+		{"mixed-failure-races-close", true, errors.Join(context.Canceled, errors.New("prepare failed")), LifecycleFailed, true},
+		{"unrecorded-cancellation", false, nil, LifecycleOvertaken, true},
+		{"missing-disposition", true, nil, LifecycleFailed, true},
+		{"unknown-disposition", true, nil, LifecycleDisposition(255), true},
+		{"real-failure-races-close", true, errors.New("prepare failed"), LifecycleFailed, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			entered, release := make(chan *Job, 1), make(chan struct{})
-			o := testOwner(t, func(ctx context.Context, j *Job) error {
+			o := testOwnerResult(t, func(ctx context.Context, j *Job) LifecycleResult {
 				if j.start.Operation == "workspace-suspend" {
-					return j.Publish("cold", Facts{})
+					return lifecycleResult(j.Publish("cold", Facts{}))
 				}
 				entered <- j
 				<-release
-				return tc.cause
+				return LifecycleResult{Disposition: tc.disposition, Err: tc.cause}
 			})
 			j := start(t, o, request("workspace-prepare", 1, 1))
 			<-entered
@@ -182,27 +188,35 @@ func TestR5OvertakenPublicationDoesNotEndIncarnation(t *testing.T) {
 			offered, recovering, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			var permit atomic.Bool
 			permit.Store(true)
-			o := testOwner(t, func(ctx context.Context, j *Job) error {
+			o := testOwnerResult(t, func(ctx context.Context, j *Job) LifecycleResult {
 				switch j.start.Operation {
 				case "workspace-prepare":
 					if err := j.OfferInstall(*phase()); err != nil {
-						return err
+						return lifecycleResult(err)
 					}
 					close(offered)
 					if err := j.WaitInstall(ctx); err != nil {
-						return err
+						return lifecycleResult(err)
 					}
-					return j.Publish("prepared", readyFacts())
+					return lifecycleResult(j.Publish("prepared", readyFacts()))
 				case "workspace-suspend":
-					return j.Publish("cold", Facts{})
+					return lifecycleResult(j.Publish("cold", Facts{}))
 				case "workspace-recover":
 					if j.start.Workspace.Generation == "1" {
 						close(recovering)
 						<-release
 					}
-					return j.Publish("prepared", readyFacts())
+					err := j.Publish("prepared", readyFacts())
+					if err != nil {
+						if ctx.Err() == nil {
+							t.Error("lost publication did not cancel job before driver return")
+							return lifecycleResult(err)
+						}
+						return LifecycleResult{Disposition: LifecycleOvertaken, Err: err}
+					}
+					return lifecycleResult(nil)
 				}
-				return ErrGrammar
+				return lifecycleResult(ErrGrammar)
 			})
 			o.CheckPermit = func(Workspace) bool { return permit.Load() }
 			j := start(t, o, request("workspace-prepare", 1, 1))

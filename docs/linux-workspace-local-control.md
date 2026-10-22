@@ -58,6 +58,23 @@ network operation, INIT, join, descriptor close or response write holds that
 lock. Install follows offered to running to complete/failed. Failure retains
 resources and partial witness for cleanup; it cannot offer the action again.
 
+The Mount driver's `Run` returns an explicit `LifecycleResult`: Completed
+requires successful publication and no error; Failed includes every independent
+failure, including one joined with cancellation. Overtaken asserts that this
+job ended only because its generation lost admission, with no independent
+failure during work or teardown. Its error is diagnostic and may omit the
+cancellation chain. The owner exempts Overtaken from the incarnation terminal
+latch only when it recorded cancelling that exact job, through a legal Close,
+owner shutdown or rejected prepared publication. A context error alone grants
+no exemption. Missing/unknown dispositions fail closed. The owner cancels the
+context when prepared publication loses its permit, so the driver can join;
+it must return Overtaken only after establishing no independent failure.
+
+A failed Prepare/Recover ends serving preparation for this incarnation, even
+if a concurrent Close also cancels it. Later Suspend preserves the terminal
+fact and exact Cleanup remains available. A new serving start then refuses
+`incarnation-terminal`; malformed input still refuses `invalid`.
+
 The mount has one install slot and one removal lifecycle, represented by fixed
 voluntary and terminal slots. Each mode has at most one action identity, so an
 incarnation has at most three identities. Terminal escalation waits for the
@@ -134,8 +151,8 @@ Open, including after a delayed kernel-required observation.
 
 All refusals have `ok=false`, state refused, compact correlation and one code:
 unavailable, occupied, retired, invalid, handler-failed, deadline, stopped,
-peer-refused, action-consumed or not-accepted. They carry unresolved/unobserved
-outcome and no readiness, phase facts or unbounded diagnostic. A refusal never
+peer-refused, action-consumed, not-accepted or incarnation-terminal. They carry
+unresolved/unobserved outcome and no readiness, phase facts or unbounded diagnostic. A refusal never
 erases an earlier accepted job.
 
 ## Time, rights and death

@@ -150,20 +150,22 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 // authorityAttached stays true even when later startup fails. That distinction
 // keeps a Manager enrollment alive when cleanup is ambiguous, while a failure
 // before attach can close an enrollment that was never handed to a session.
-func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ error) {
+// startupClean is decided at the failed attach or kernel-startup boundary before
+// callers add diagnostics; later error-tree members cannot certify release.
+func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached, startupClean bool, _ error) {
 	tlsCfg, err := cfg.transport.tlsConfig()
 	if err != nil {
-		return nil, false, fmt.Errorf("data-plane transport: %w", err)
+		return nil, false, false, fmt.Errorf("data-plane transport: %w", err)
 	}
 	if tlsCfg == nil {
 		// Refused earlier by flag validation; kept as a structural guard so the
 		// dial below can never run without endpoint verification.
-		return nil, false, fmt.Errorf("v3 authority sessions require mutually authenticated TLS; %q cannot carry one", cfg.transport.Mode)
+		return nil, false, false, fmt.Errorf("v3 authority sessions require mutually authenticated TLS; %q cannot carry one", cfg.transport.Mode)
 	}
 	tlsCfg.Certificates = []tls.Certificate{cfg.identity.certificate}
 	preKernelAbsence, err := mountv3.PreKernelMountAbsenceObserver(cfg.mountPath, cfg.mountInstanceID)
 	if err != nil {
-		return nil, false, fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
+		return nil, false, false, fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
 	attach := authorityrpc.ClientConfig{
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
@@ -183,8 +185,12 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		// against a volume that is being reconfigured is not an answer.
 		var failure *authorityrpc.AttachError
 		// Missing classification is cleanup debt, never evidence of no ownership.
-		retained := !errors.As(err, &failure) || failure.Disposition == authorityrpc.AttachCleanupRequired
-		return nil, retained, err
+		retained, clean := true, false
+		if errors.As(err, &failure) {
+			retained = failure.Disposition != authorityrpc.AttachNotCommitted && failure.Disposition != authorityrpc.AttachReleased
+			clean = failure.Disposition == authorityrpc.AttachReleased
+		}
+		return nil, retained, clean, err
 	}
 	backing := ""
 	if !rules.Empty() {
@@ -214,7 +220,7 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		// failed-startup path supplies the same exact source-bound absence proof
 		// and closes the client, so a second release here would be a second
 		// lifecycle transition rather than cleanup.
-		return nil, true, fmt.Errorf("mount %s: %w", cfg.mountPath, err)
+		return nil, true, fusev3.FailedStartupClean(err), fmt.Errorf("mount %s: %w", cfg.mountPath, err)
 	}
 	return &fuseV3Mount{
 		mount:  mount,
@@ -225,10 +231,5 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 			declared: !rules.Empty(),
 		},
 		backing: backing,
-	}, true, nil
-}
-
-func failedFUSEStartupClean(err error) bool {
-	var failure *authorityrpc.AttachError
-	return fusev3.FailedStartupClean(err) || errors.As(err, &failure) && failure.Disposition == authorityrpc.AttachReleased
+	}, true, false, nil
 }

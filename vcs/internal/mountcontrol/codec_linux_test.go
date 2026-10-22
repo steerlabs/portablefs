@@ -294,7 +294,7 @@ func TestDrainAllowanceIsCanonicalAndOnlyOnSuspend(t *testing.T) {
 
 func TestFinitePhaseAndRefusalGrammar(t *testing.T) {
 	q := request("workspace-observe", 2, 1)
-	for _, err := range []error{ErrUnavailable, ErrOccupied, ErrRetired, ErrGrammar, ErrActionConsumed, ErrNotAccepted, ErrPeerRefused, context.Canceled, context.DeadlineExceeded, errors.New("private")} {
+	for _, err := range []error{ErrUnavailable, ErrOccupied, ErrRetired, ErrGrammar, ErrActionConsumed, ErrNotAccepted, ErrIncarnationTerminal, ErrPeerRefused, context.Canceled, context.DeadlineExceeded, errors.New("private")} {
 		if _, err := EncodeResponse(WorkspaceRefusal(q, err)); err != nil {
 			t.Fatal(err)
 		}

@@ -648,7 +648,7 @@ func TestO5OwnerLifecycleStress(t *testing.T) {
 				}
 				return witness(), nil
 			},
-			Run: func(ctx context.Context, j *Job) error {
+			Run: lifecycleDriver(func(ctx context.Context, j *Job) error {
 				heldJobs.Store(j, true)
 				q := j.Request()
 				switch q.Operation {
@@ -700,7 +700,7 @@ func TestO5OwnerLifecycleStress(t *testing.T) {
 				}
 				j.CloseKernel()
 				return j.Publish("cleanup-finalized", Facts{})
-			},
+			}),
 		}
 		var admits atomic.Int32
 		o.CloseAdmission = func() { admits.Add(1) }

@@ -1270,7 +1270,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 					"the authority's strict membership for this session must be discharged explicitly", mountPath)
 			}
 		}
-		m, authorityAttached, err := mountFUSEv3(attachCtx, fuseV3Config{
+		m, authorityAttached, startupClean, err := mountFUSEv3(attachCtx, fuseV3Config{
 			addr: authorityURL, token: mountToken, transport: transport,
 			identity: clientIdentity,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
@@ -1285,7 +1285,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			if attachInterrupted != nil {
 				err = errors.Join(errors.New("mount startup interrupted"), err)
 			}
-			if failedFUSEStartupClean(err) {
+			if startupClean {
 				return finalizeCleanedStartup(err)
 			}
 			return failReady(err)

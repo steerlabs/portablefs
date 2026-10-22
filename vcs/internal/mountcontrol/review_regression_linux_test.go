@@ -27,9 +27,27 @@ func awaitResult[T any](t *testing.T, ch <-chan T) T {
 func absentPhases() *PhaseFacts {
 	return &PhaseFacts{Install: ActionStatus{Progress: "absent"}, VoluntaryRemoval: ActionStatus{Progress: "absent"}, TerminalRemoval: ActionStatus{Progress: "absent"}}
 }
+
+// Legacy fixtures report ordinary errors as independent failures. Cancellation
+// fixtures use testOwnerResult and state their lifecycle disposition explicitly.
+func lifecycleResult(err error) LifecycleResult {
+	if err != nil {
+		return LifecycleResult{Disposition: LifecycleFailed, Err: err}
+	}
+	return LifecycleResult{Disposition: LifecycleCompleted}
+}
+func lifecycleDriver(run func(context.Context, *Job) error) func(context.Context, *Job) LifecycleResult {
+	return func(ctx context.Context, j *Job) LifecycleResult { return lifecycleResult(run(ctx, j)) }
+}
+func testOwnerResult(t *testing.T, run func(context.Context, *Job) LifecycleResult) *Owner {
+	t.Helper()
+	o := testOwner(t, nil)
+	o.Driver.Run = run
+	return o
+}
 func testOwner(t *testing.T, run func(context.Context, *Job) error) *Owner {
 	t.Helper()
-	o := &Owner{Driver: Driver{Run: run, ValidateInstall: func(*Rights, Phase) error { return nil }, Install: func(context.Context, *Job, *Rights) (Witness, error) { return witness(), nil }}, CheckPermit: func(Workspace) bool { return true }}
+	o := &Owner{Driver: Driver{Run: lifecycleDriver(run), ValidateInstall: func(*Rights, Phase) error { return nil }, Install: func(context.Context, *Job, *Rights) (Witness, error) { return witness(), nil }}, CheckPermit: func(Workspace) bool { return true }}
 	t.Cleanup(o.Close)
 	return o
 }
@@ -127,7 +145,7 @@ func TestJobAcceptanceSurvivesSocketLossAndExpiry(t *testing.T) {
 			if snap.Workspace.State != "failed" || snap.Workspace.Phases.Install.Progress != "failed" || snap.Workspace.Phases.Install.Failure != "stopped" || calls.Load() != 1 {
 				t.Fatal(snap, calls.Load())
 			}
-			if _, err := o.Do(context.Background(), request("workspace-prepare", 3, 3), &Rights{}); !errors.Is(err, ErrGrammar) {
+			if _, err := o.Do(context.Background(), request("workspace-prepare", 3, 3), &Rights{}); !errors.Is(err, ErrIncarnationTerminal) {
 				t.Fatal("Prepare rearmed", err)
 			}
 		})
@@ -230,15 +248,15 @@ func TestStaleActionsRetiredStartsAndChangedBodiesRefuse(t *testing.T) {
 
 func TestSuspendClosesCancelsAndRetainsOccupiedWorker(t *testing.T) {
 	entered, canceled, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}, 4)
-	o := testOwner(t, func(ctx context.Context, j *Job) error {
+	o := testOwnerResult(t, func(ctx context.Context, j *Job) LifecycleResult {
 		if j.start.Operation == "workspace-prepare" {
 			close(entered)
 			<-ctx.Done()
 			close(canceled)
 			<-release
-			return ctx.Err()
+			return LifecycleResult{Disposition: LifecycleOvertaken, Err: ctx.Err()}
 		}
-		return j.Publish("cold", Facts{})
+		return lifecycleResult(j.Publish("cold", Facts{}))
 	})
 	o.CloseAdmission = func() { closed <- struct{}{} }
 	old := start(t, o, request("workspace-prepare", 1, 1))

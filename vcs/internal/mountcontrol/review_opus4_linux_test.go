@@ -516,7 +516,7 @@ func TestR4ConcurrentOwnerStress(t *testing.T) {
 				time.Sleep(time.Duration(rand.Intn(200)) * time.Microsecond)
 				return witness(), nil
 			},
-			Run: func(ctx context.Context, j *Job) error {
+			Run: lifecycleDriver(func(ctx context.Context, j *Job) error {
 				runs.Add(1)
 				switch j.start.Operation {
 				case "workspace-prepare":
@@ -547,7 +547,7 @@ func TestR4ConcurrentOwnerStress(t *testing.T) {
 					return err
 				}
 				return j.Publish("cleanup-finalized", Facts{})
-			},
+			}),
 		}
 		var admits atomic.Int32
 		o.CloseAdmission = func() { admits.Add(1) }
@@ -650,13 +650,13 @@ func TestR4CloseDuringValidationDisposesRights(t *testing.T) {
 		offered := make(chan struct{})
 		o := &Owner{CheckPermit: func(Workspace) bool { return true }}
 		o.Driver = Driver{
-			Run: func(ctx context.Context, j *Job) error {
+			Run: lifecycleDriver(func(ctx context.Context, j *Job) error {
 				if err := j.OfferInstall(*phase()); err != nil {
 					return err
 				}
 				close(offered)
 				return j.WaitInstall(ctx)
-			},
+			}),
 			ValidateInstall: func(*Rights, Phase) error { runtime.Gosched(); return nil },
 			Install:         func(context.Context, *Job, *Rights) (Witness, error) { return witness(), nil },
 		}

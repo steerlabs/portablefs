@@ -173,8 +173,11 @@ under an independent bounded reconciliation lifetime. It rebinds the same
 session and replays the exact Activate; startup cancellation joins before an
 independently bounded exact Detach. Unresolved reconciliation returns explicit
 transport uncertainty. An explicit attach disposition survives the shared
-routing wrapper and ordinary mount startup: proven exact release permits intent
-finalization and enrollment closure; possible commitment or failed release
+routing wrapper. Ordinary startup decides its clean verdict at the attach or
+kernel-startup return boundary, before callers add diagnostic errors; a later
+AttachReleased member elsewhere in an error tree cannot certify cleanup. Proven
+exact release permits intent finalization and enrollment closure; possible
+commitment or failed release
 retains authority ownership, enrollment and cleanup debt. Cancellation, a nil
 client and the absence of transport uncertainty cannot prove cleanup.
 
@@ -235,13 +238,20 @@ with bounded attempts/backoff, and have no 45-second logical deadline. Only
 current session/authorization validation, a functioning renewal owner and fresh
 subscription evidence can authorize publication. A genuine failed Prepare or
 Recover permanently ends serving preparation for that mount incarnation. The
-terminal fact survives replacement of its job and cold transaction. Later Suspend may withdraw state, but reports the retained
-failure instead of a new cold recovery opportunity; exact Cleanup remains
-available. A worker canceled by its own overtaking generation does not create
-this terminal fact. An unrelated error still does, including one racing Close
-or a cancellation-looking error returned while the worker context is live.
-The supervisor does not renew sessions. These remain typed driver contracts
-until the real admission, clock and lifecycle owners exist.
+terminal fact survives replacement of its job and cold transaction. Later
+Suspend may withdraw state, but reports the retained failure instead of a new
+cold recovery opportunity; exact Cleanup remains available. The Mount driver returns an explicit lifecycle disposition:
+Completed requires successful publication and no error; Overtaken asserts only
+job-overtaking cancellation, with no independent work or teardown failure;
+Failed includes independent failures even when joined with cancellation.
+Overtaken avoids the terminal latch only when the owner recorded cancelling
+that exact job. Error-chain membership never determines the outcome. A
+cancellation-only teardown may omit the context error without ending the
+incarnation. Missing dispositions and unrecorded cancellation fail closed.
+Recover on a terminal incarnation refuses `incarnation-terminal` in the local
+mount-control grammar, separately from malformed-frame `invalid`. The supervisor
+does not renew sessions. These remain typed driver contracts until the real
+admission, clock and lifecycle owners exist.
 
 ## Controlled suspension transaction
 
@@ -640,6 +650,26 @@ multiple VMs, custom images, RAM snapshots/migration, Rosetta, root-system
 customization and Linux desktops remain deferred. No Finder mirror, native Mac
 re-export, synchronization engine or automatic remote-workspace substitution
 belongs to this product.
+
+### Later PR obligations from the Stage 1c control review
+
+- macOS enrollment closure (Opus r6 note 1): when portablefsd consumes the
+  attach disposition, `registry.go` must retain the Manager enrollment on
+  AttachCleanupRequired until exact cleanup proves release. Qualify both
+  successful Detach and failed/uncertain release through the daemon path.
+- Prepared-publication cancellation (note 3): this control owner now cancels
+  its job context when a permit rejects publication. The protected-path Mount
+  driver PR must join that cancellation, return Overtaken only without an
+  independent failure, and prove a retry cannot remain pending or publish under
+  the closed permit.
+- Managed renewal observation (note 6): the managed consumer PR must publish
+  the retained permit-closed remote install and its Resume republication to
+  observers, including RenewalSucceeded semantics. Prove readiness and Observe
+  agree on the exact session, sequence, deadline and current permit.
+- Bootstrap entry ordering (note 7): the protected-path root driver PR must
+  distinguish a never-begun Bootstrap from outstanding work at Finalize and
+  prove its callers never interpret occupied as an accepted Begin or as
+  evidence of absence. This boundary currently returns occupied in both cases.
 
 ### Stage 1c drain dispatch
 

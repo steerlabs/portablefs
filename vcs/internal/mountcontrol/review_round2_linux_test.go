@@ -340,10 +340,10 @@ func TestRecoverConsumesExactAuthorizationAndPreservesKernelSlot(t *testing.T) {
 	awaitResult(t, j.done)
 	recover.Workspace.RequestID = "3"
 	recover.Workspace.OperationID = "3"
-	if _, err := o.Do(context.Background(), recover, &Rights{}); !errors.Is(err, ErrGrammar) {
+	if _, err := o.Do(context.Background(), recover, &Rights{}); !errors.Is(err, ErrIncarnationTerminal) {
 		t.Fatal("token reused", err)
 	}
-	if _, err := o.Do(context.Background(), request("workspace-prepare", 4, 4), &Rights{}); !errors.Is(err, ErrGrammar) {
+	if _, err := o.Do(context.Background(), request("workspace-prepare", 4, 4), &Rights{}); !errors.Is(err, ErrIncarnationTerminal) {
 		t.Fatal("bootstrap resurrected", err)
 	}
 }

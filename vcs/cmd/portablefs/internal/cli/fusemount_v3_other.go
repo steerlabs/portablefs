@@ -44,8 +44,6 @@ func (m *fuseV3Mount) Reauthorize(context.Context, string, uint64, []byte) (time
 	return time.Time{}, fmt.Errorf("the v3 FUSE engine requires Linux")
 }
 
-func mountFUSEv3(context.Context, fuseV3Config) (*fuseV3Mount, bool, error) {
-	return nil, false, fmt.Errorf("the v3 FUSE engine requires Linux")
+func mountFUSEv3(context.Context, fuseV3Config) (*fuseV3Mount, bool, bool, error) {
+	return nil, false, false, fmt.Errorf("the v3 FUSE engine requires Linux")
 }
-
-func failedFUSEStartupClean(error) bool { return false }

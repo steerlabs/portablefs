@@ -15,11 +15,32 @@ import (
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
 
-// Driver runs lifecycle work, never socket requests. ValidateInstall verifies
-// first-delivery roles/bootstrap without taking ownership. All three callbacks
-// and CheckPermit must exist before this boundary can accept a real job.
+// LifecycleDisposition describes all retained causes, independently of Err's
+// diagnostic chain. The zero value fails closed.
+type LifecycleDisposition uint8
+
+const (
+	LifecycleFailed LifecycleDisposition = iota
+	LifecycleCompleted
+	LifecycleOvertaken
+)
+
+type LifecycleResult struct {
+	Disposition LifecycleDisposition
+	Err         error
+}
+
+// Driver runs lifecycle work, never socket requests. Run returns Completed only
+// after successful publication with no error. Overtaken means cancellation-only:
+// no independent failure occurred, including during teardown, even if Err loses
+// the cancellation chain. Any independent failure, including one joined with
+// cancellation, must return Failed. Only an owner-recorded cancellation of this
+// exact job makes Overtaken nonterminal; context/error inspection cannot do so.
+// ValidateInstall verifies first-delivery roles/bootstrap without taking
+// ownership. All three callbacks and CheckPermit must exist before this
+// boundary can accept a real job.
 type Driver struct {
-	Run             func(context.Context, *Job) error
+	Run             func(context.Context, *Job) LifecycleResult
 	ValidateInstall func(*Rights, Phase) error
 	Install         func(context.Context, *Job, *Rights) (Witness, error)
 }
@@ -68,6 +89,7 @@ type Job struct {
 	cancel            context.CancelFunc
 	done              chan struct{}
 	running, stopping bool
+	ownerCanceled     bool
 	state, reason     string
 	drainDeadline     time.Time
 }
@@ -111,6 +133,7 @@ func (o *Owner) cancelJob(q Request) {
 	var cancel context.CancelFunc
 	if o.job != nil && o.job.running && o.successorLocked(q) == nil && o.permitted(q) {
 		o.job.stopping = true
+		o.job.ownerCanceled = true
 		cancel = o.job.cancel
 	}
 	o.mu.Unlock()
@@ -340,7 +363,7 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 		return Response{}, nil, ErrGrammar
 	}
 	if o.servingFailure != "" && (q.Operation == "workspace-prepare" || q.Operation == "workspace-recover") {
-		return Response{}, nil, ErrGrammar
+		return Response{}, nil, ErrIncarnationTerminal
 	}
 	switch q.Operation {
 	case "workspace-prepare":
@@ -433,13 +456,10 @@ func (o *Owner) actionLocked(q Request, s *actionSlot) error {
 	return nil
 }
 func (o *Owner) run(j *Job) {
-	err := o.Driver.Run(j.ctx, j)
+	result := o.Driver.Run(j.ctx, j)
 	o.mu.Lock()
-	if err != nil || j.state != "prepared" && j.state != "cold" && j.state != "cleanup-finalized" && j.state != "failed" {
-		// Only cancellation actually caused by this generation's context is an
-		// overtaking disposition. An unrelated error remains terminal even if Close
-		// raced its return; cancellation-looking errors with a live context do too.
-		canceled := (j.stopping || j.ctx.Err() != nil) && (err == nil || errors.Is(err, context.Canceled) || errors.Is(err, j.ctx.Err()))
+	if result.Disposition != LifecycleCompleted || result.Err != nil || j.state != "prepared" && j.state != "cold" && j.state != "cleanup-finalized" {
+		canceled := j.ownerCanceled && result.Disposition == LifecycleOvertaken
 		if !canceled && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && o.servingFailure == "" {
 			o.servingFailure = "mount incarnation preparation/recovery failed"
 		}
@@ -544,6 +564,8 @@ func (j *Job) Publish(state string, f Facts) error {
 			// Losing the publication race to Close is generation cancellation, not
 			// a failed preparation. Preserve unrelated driver failures in run.
 			j.stopping = true
+			j.ownerCanceled = true
+			j.cancel()
 			return context.Canceled
 		}
 		if o.install.status.Progress != "complete" {
@@ -699,6 +721,7 @@ func (o *Owner) Close() {
 	}
 	if j != nil {
 		j.stopping = true
+		j.ownerCanceled = true
 	}
 	o.mu.Unlock()
 	if j != nil {

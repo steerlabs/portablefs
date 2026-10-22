@@ -32,7 +32,15 @@ func rootWorkspace(t *testing.T, run func(context.Context, *mountcontrol.Job) er
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Owner: mountcontrol.Owner{Driver: mountcontrol.Driver{Run: run}, CheckPermit: func(mountcontrol.Workspace) bool { return true }}}
+	cfg := &workspaceControlConfig{Supervisor: mountcontrol.Peer{UID: 0, PID: int32(os.Getpid()), Start: start}, Owner: mountcontrol.Owner{Driver: mountcontrol.Driver{Run: func(ctx context.Context, j *mountcontrol.Job) mountcontrol.LifecycleResult {
+		if err := run(ctx, j); err != nil {
+			return mountcontrol.LifecycleResult{Disposition: mountcontrol.LifecycleFailed, Err: err}
+		}
+		return mountcontrol.LifecycleResult{Disposition: mountcontrol.LifecycleCompleted}
+	}}, CheckPermit: func(mountcontrol.Workspace) bool { return true }}}
+	if run == nil {
+		cfg.Owner.Driver.Run = nil
+	}
 	for _, configure := range configure {
 		configure(cfg)
 	}

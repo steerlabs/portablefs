@@ -147,15 +147,16 @@ func TestR5OrdinaryMountPreservesActivationCleanupDisposition(t *testing.T) {
 			defer cancel()
 			type result struct {
 				attached bool
+				clean    bool
 				err      error
 			}
 			done := make(chan result, 1)
 			go func() {
-				m, attached, err := mountFUSEv3(ctx, fuseV3Config{addr: listener.Addr().String(), token: "test", transport: dataPlaneTransport{Mode: dataPlaneTransportTLSPrivateCA, ServerName: "localhost", CAPEM: ca, CASHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(ca)))}, identity: &clientTLSIdentity{certificate: clientTLS.Certificates[0]}, volumeID: "volume", mountPath: t.TempDir(), mountInstanceID: "mnt_0000000000000000000001"})
+				m, attached, clean, err := mountFUSEv3(ctx, fuseV3Config{addr: listener.Addr().String(), token: "test", transport: dataPlaneTransport{Mode: dataPlaneTransportTLSPrivateCA, ServerName: "localhost", CAPEM: ca, CASHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(ca)))}, identity: &clientTLSIdentity{certificate: clientTLS.Certificates[0]}, volumeID: "volume", mountPath: t.TempDir(), mountInstanceID: "mnt_0000000000000000000001"})
 				if m != nil {
 					panic("unexpected mount")
 				}
-				done <- result{attached, err}
+				done <- result{attached, clean, err}
 			}()
 			select {
 			case <-h.entered:
@@ -175,7 +176,7 @@ func TestR5OrdinaryMountPreservesActivationCleanupDisposition(t *testing.T) {
 				t.Fatalf("expected one exact Detach, got %d: %v", h.detaches.Load(), got.err)
 			}
 			uncertain := errors.Is(got.err, rpc.ErrTransportUncertain)
-			clean := failedFUSEStartupClean(got.err)
+			clean := got.clean
 			t.Logf("refused=%v attached=%v clean=%v uncertain=%v enrollmentMayClose=%v error=%v", refused, got.attached, clean, uncertain, automaticEnrollmentCanCloseAfterStartupFailure(got.attached, clean), got.err)
 			if refused {
 				if !uncertain {

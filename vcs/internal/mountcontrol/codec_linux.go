@@ -22,6 +22,7 @@ const MaxWorkspaceRequest = 64 << 10
 const MaxWorkspaceResponse = 64 << 10
 
 var ErrGrammar = errors.New("mount control: invalid exact grammar")
+var ErrIncarnationTerminal = errors.New("mount control: incarnation terminal")
 var ErrPeerRefused = errors.New("workspace peer refused")
 var ErrOccupied = errors.New("workspace lane occupied")
 var ErrRetired = errors.New("workspace request retired")

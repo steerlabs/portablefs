@@ -282,7 +282,7 @@ func (r Response) ValidateWorkspace() error {
 	}
 	if w.State == "refused" {
 		switch w.Refusal {
-		case "unavailable", "occupied", "retired", "invalid", "handler-failed", "deadline", "stopped", "peer-refused", "action-consumed", "not-accepted":
+		case "unavailable", "occupied", "retired", "invalid", "handler-failed", "deadline", "stopped", "peer-refused", "action-consumed", "not-accepted", "incarnation-terminal":
 		default:
 			return ErrGrammar
 		}
@@ -478,6 +478,8 @@ func WorkspaceRefusal(req Request, err error) Response {
 		code = "action-consumed"
 	case errors.Is(err, ErrNotAccepted):
 		code = "not-accepted"
+	case errors.Is(err, ErrIncarnationTerminal):
+		code = "incarnation-terminal"
 	case errors.Is(err, ErrGrammar):
 		code = "invalid"
 	case errors.Is(err, context.DeadlineExceeded):
