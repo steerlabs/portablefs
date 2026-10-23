@@ -73,9 +73,11 @@ elif KIND=='allocate':
         try:
             body=(TAG+':'+str(n)).encode()
             with (root/(TAG+'-'+str(n))).open('xb') as f:
-                f.write(body);f.flush();os.fsync(f.fileno())
-            allocated.append(n)
-            if len(allocated)==1: print('held-ready',flush=True)
+                f.write(body);f.flush()
+                if n%2==0: os.fsync(f.fileno())
+            if n%2==0:
+                allocated.append(n)
+                if len(allocated)==1: print('held-ready',flush=True)
         except OSError as e: errors.append(e.errno)
         n+=1;time.sleep(.01)
     counts['allocate']=len(allocated)

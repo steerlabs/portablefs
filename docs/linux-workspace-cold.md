@@ -125,7 +125,7 @@ requires the current shared clock. Cold acknowledgment joins applying replays;
 the power deadline does not grow while that join waits.
 
 Before descriptor CLOSE is submitted, its grant preparation can lose the old
-cache cut. An expired dispatch/horizon at that boundary requests cold recovery
+cache cut. Expiry or recorded buffered-data loss at that boundary requests cold recovery
 and retains the counted exact descriptor for retry. It does not establish an
 unknown CLOSE outcome or end the session. Independent sibling failures retain
 their terminal policy, and the old cleanup cannot acquire a successor grant.

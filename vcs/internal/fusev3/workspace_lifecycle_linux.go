@@ -1009,7 +1009,7 @@ func subscriptionResetAttempt(err error) bool {
 		}
 		return true
 	}
-	if err == authorityrpc.ErrSubscriptionReset || err == errSubscriptionExpired || err == authorityrpc.ErrDispatchExpired || authorityrpc.TransientTransport(err) {
+	if err == authorityrpc.ErrSubscriptionReset || err == errSubscriptionExpired || err == authorityrpc.ErrDispatchExpired || err == writeback.ErrLost || authorityrpc.TransientTransport(err) {
 		return true
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
