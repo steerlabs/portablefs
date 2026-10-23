@@ -30,6 +30,7 @@ type orderedFlushFake struct {
 	assigned     []uint64
 	fail         map[uint64]error
 	errno        map[uint64]syscall.Errno
+	replies      map[uint64]*authoritypb.Response
 }
 
 func (f *orderedFlushFake) CallMutation(ctx context.Context, r *authoritypb.Request) (*authoritypb.Response, error) {
@@ -76,6 +77,9 @@ func (f *orderedFlushFake) CallMutationSegments(ctx context.Context, r *authorit
 	}
 	if errno := f.errno[ordinal]; errno != 0 {
 		return &authoritypb.Response{Errno: int32(errno)}, nil
+	}
+	if reply := f.replies[ordinal]; reply != nil {
+		return reply, nil
 	}
 	size := 0
 	for _, piece := range pieces {
@@ -134,6 +138,40 @@ func TestDelegationPipelineAdmitsFourChunksBeforeJoining(t *testing.T) {
 		}
 	}
 }
+func TestDelegationPipelineAccountsExactCapacityPrefix(t *testing.T) {
+	for _, committed := range []uint64{0, 3} {
+		t.Run(fmt.Sprintf("committed-%d", committed), func(t *testing.T) {
+			release := make(chan struct{})
+			close(release)
+			f := pipelineFake(release)
+			assigned := uint64(0)
+			if committed != 0 {
+				assigned = 16
+			}
+			f.replies = map[uint64]*authoritypb.Response{1: {
+				AppliedSequence: 1, VolumeVersion: 101, PostState: &authoritypb.PostState{},
+				Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: committed, AssignedOffset: assigned, Error: -int32(syscall.EDQUOT), PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: 16 + int64(committed)}}},
+			}}
+			m := newDelegationTestManager(t, f)
+			id := installDelegationForTest(t, m, 109, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			if _, err := m.Write(t.Context(), id, 16, []byte("abcdefgh"), false); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := m.FlushIdentity(t.Context(), id); !errors.Is(err, syscall.EDQUOT) {
+				t.Fatalf("flush = %v", err)
+			}
+			parsed, _ := delegationIdentity(id)
+			s := m.state(parsed)
+			s.meta.Lock()
+			applied, accepted := s.applied, s.appliedCut
+			s.meta.Unlock()
+			if !delegationStateOwned(s) || applied != 1 || accepted != 0 || m.buf.Stats().Entries != 0 {
+				t.Fatalf("capacity accounting: owned=%t applied=%d accepted=%d stats=%+v", delegationStateOwned(s), applied, accepted, m.buf.Stats())
+			}
+		})
+	}
+}
+
 func TestDelegationPipelineReducesFailuresOnceAfterJoining(t *testing.T) {
 	for _, uncertain := range []bool{false, true} {
 		t.Run(map[bool]string{false: "capacity", true: "uncertainty dominates capacity"}[uncertain], func(t *testing.T) {

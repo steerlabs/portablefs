@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"syscall"
@@ -190,17 +191,20 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 			continue
 		}
 		reply := response.GetWrite()
-		// XFS may update timestamps even when quota refuses every byte. A
-		// recorded metadata ticket is still a definite capacity error, not
-		// unknown placement. Preserve its errno while accounting the lost tail.
-		if !response.GetUncertain() && response.GetFailure() == 0 && response.GetErrno() == 0 &&
-			reply != nil && reply.GetCommittedSize() == 0 && reply.GetAssignedOffset() == 0 &&
+		// A capacity failure can follow an exact prefix or only metadata
+		// changes. Neither makes placement uncertain. Account its ticket and
+		// preserve the errno without marking the unwritten suffix applied.
+		if !response.GetUncertain() && !response.GetSessionTerminal() && len(response.GetTerminalDeliveryToken()) == 0 && response.GetFailure() == 0 && response.GetErrno() == 0 && response.GetVolumeVersion() != 0 &&
+			reply != nil && reply.GetCommittedSize() <= uint64(result.size) &&
+			(reply.GetCommittedSize() == 0 && reply.GetAssignedOffset() == 0 ||
+				reply.GetCommittedSize() != 0 && reply.GetAssignedOffset() == uint64(e.Offset) && reply.GetPostAttr().GetSize() >= e.Offset+int64(reply.GetCommittedSize())) &&
 			reply.GetPostAttr().GetKind() == authoritypb.Attr_REGULAR &&
 			response.GetAppliedSequence() != 0 && response.GetPostState() != nil &&
 			(reply.GetError() == -int32(syscall.ENOSPC) || reply.GetError() == -int32(syscall.EDQUOT) || reply.GetError() == -int32(syscall.EFBIG)) {
 			if capacity == 0 {
 				capacity = syscall.Errno(-reply.GetError())
 			}
+			sequences[i] = response.GetAppliedSequence()
 			s.meta.Lock()
 			s.applied = max(s.applied, response.GetAppliedSequence())
 			s.meta.Unlock()
@@ -213,6 +217,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		}
 		if successfulDelegationResponse(response) != nil || reply == nil || response.GetVolumeVersion() == 0 || reply.GetPostAttr() == nil || reply.GetPostAttr().GetKind() != authoritypb.Attr_REGULAR || reply.GetPostAttr().GetSize() < e.Offset+int64(result.size) || reply.GetCommittedSize() != uint64(result.size) || reply.GetAssignedOffset() != uint64(e.Offset) || reply.GetError() != 0 || response.GetAppliedSequence() == 0 {
 			lost = true
+			lostReason = fmt.Sprintf("ordered delegated write outcome unprovable: requested=%d offset=%d committed=%d assigned=%d error=%d errno=%d uncertain=%t failure=%s applied=%d", result.size, e.Offset, reply.GetCommittedSize(), reply.GetAssignedOffset(), reply.GetError(), response.GetErrno(), response.GetUncertain(), response.GetFailure(), response.GetAppliedSequence())
 			continue
 		}
 		seq := response.GetAppliedSequence()

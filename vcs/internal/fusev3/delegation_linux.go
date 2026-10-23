@@ -1790,10 +1790,10 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 	return r, err
 }
 
-// Only a definite, unapplied capacity refusal preserves the grant. A reply
-// with a ticket or partial write is an uncertain application, even with ENOSPC.
+// This recognizes only unapplied capacity refusals. Applied WRITE prefixes
+// require exact placement and ticket accounting in FlushBatch instead.
 func definiteDelegationCapacityRefusal(response *authoritypb.Response, write bool) syscall.Errno {
-	if response == nil || response.GetUncertain() || response.GetFailure() != 0 || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
+	if response == nil || response.GetUncertain() || response.GetSessionTerminal() || len(response.GetTerminalDeliveryToken()) != 0 || response.GetFailure() != 0 || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
 		return 0
 	}
 	errno := syscall.Errno(response.GetErrno())

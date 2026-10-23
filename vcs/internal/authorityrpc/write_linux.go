@@ -184,6 +184,7 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 				RequestedSize: metadata.requestedSize, Position: metadata.position,
 				RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: metadata.mode,
 				DataSync: metadata.dataSync, Sync: metadata.sync,
+				Complete:       body.GetDelegation() != nil,
 				KillPrivileges: metadata.writeFlags&writeKillSUIDGID != 0,
 			})
 			return int(committed), int64(assigned), applyErr

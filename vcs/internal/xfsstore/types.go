@@ -191,6 +191,9 @@ type WriteCommit struct {
 	Mode        WriteMode
 	DataSync    bool
 	Sync        bool
+	// Complete finishes short writes before releasing the inode writer stripe.
+	// Delegated flushes need this: a successor may overlap the unwritten tail.
+	Complete bool
 	// KillPrivileges implements FUSE_WRITE_KILL_SUIDGID/HANDLE_KILLPRIV_V2
 	// inside the same stable-inode writer critical section as the data. It is a
 	// per-call kernel decision, never retained on the open description.

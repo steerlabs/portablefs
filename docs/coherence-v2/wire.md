@@ -493,7 +493,12 @@ The client admits each predecessor to its transport lane before launching the
 next chunk and joins the wave before changing local ownership. Transport
 retries keep the same mutation identity, ordinal, and immutable scatter spans;
 an unprovable wave result loses the delegation, while definite capacity errors
-keep the grant and report the errno. A partial acceptance record stays retained
+keep the grant and report the errno. A delegated WRITE finishes short syscall
+prefixes inside its inode writer stripe before admitting the next ordinal;
+a capacity error after an exact prefix carries its actual placement, post-state
+and ticket. The client accounts that ticket and reports the rejected suffix as
+lost with the capacity errno, without retiring it as applied or durable.
+A partial acceptance record stays retained
 and outside the applied acceptance cut until its final chunk succeeds. Scatter
 spans use the single bulk carrier and canonical frame bytes.
 
