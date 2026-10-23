@@ -1,5 +1,7 @@
 """Disposable direct-TLS XFS authority and independent ordinary Linux peer."""
+import contextlib
 import json
+import selectors
 import os
 import pathlib
 import re
@@ -240,6 +242,31 @@ print(pids[0])
         assert prior[0]['outcome']['observation'] == 'unobserved' and prior[0]['outcome']['durability'] == 'unresolved', prior
         self.protected(guest)
 
+    @contextlib.contextmanager
+    def held_handle(self, guest, worker):
+        # The accepted SSH session owns its process group. Retain that session
+        # while the old descriptor crosses expiry/replacement; nohup cannot
+        # transfer ownership out of the per-connection systemd service.
+        with (self.evidence/'held-fd-worker.stderr').open('w') as stderr:
+            process = subprocess.Popen(['/usr/bin/ssh', '-F', guest.ready['ssh_config'],
+                'portablefs-workspace', 'python3 -u -c '+shlex.quote(worker)],
+                text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr)
+            try:
+                with selectors.DefaultSelector() as ready:
+                    ready.register(process.stdout, selectors.EVENT_READ)
+                    assert ready.select(10), 'held descriptor worker did not start'
+                    assert process.stdout.readline().strip() == 'held-ready', process.poll()
+                yield process
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                process.stdout.close()
+
     def terminal_replacement(self, guest):
         old = self.mount(guest, short=True)
         worker = """import os,time,json,pathlib
@@ -248,6 +275,7 @@ stop=root/'pfs-native-held.stop'
 stop.unlink(missing_ok=True)
 fd=os.open('/workspaces/native-managed/data',os.O_RDONLY)
 with open(root/'pfs-native-held.jsonl','w',buffering=1) as out:
+    print('held-ready',flush=True)
     while not stop.exists():
         try:
             data=os.pread(fd,128,0); os.fsync(fd)
@@ -259,23 +287,24 @@ with open(root/'pfs-native-held.jsonl','w',buffering=1) as out:
 os.close(fd)
 (root/'pfs-native-held.done').touch()
 """
-        guest.ssh('printf %s '+shlex.quote(worker)+' > ~/pfs-native-held.py; nohup python3 ~/pfs-native-held.py >~/pfs-native-held.stdout 2>~/pfs-native-held.stderr </dev/null &')
-        deadline = time.monotonic() + 75
-        while True:
-            status = self.status(guest)
-            mounts = [m for m in status.get('mounts', []) if m['mount']['volumeId'] == self.volume]
-            if mounts and mounts[0]['state'] == 'terminal' and mounts[0]['cleanup'] == 'complete':
-                break
-            assert time.monotonic() < deadline, status
-            time.sleep(.1)
-        fresh = self.mount(guest)
-        assert fresh['mount'] != old['mount'] and fresh['public_key'] == old['public_key']
-        assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
-        time.sleep(.2)
-        observed = guest.ssh('tail -n 1 ~/pfs-native-held.jsonl')
-        assert json.loads(observed).get('error', 0) != 0, observed
-        guest.ssh('touch ~/pfs-native-held.stop; while test ! -f ~/pfs-native-held.done; do sleep .02; done')
-        self.unmount(guest, fresh)
+        with self.held_handle(guest, worker) as held:
+            deadline = time.monotonic() + 75
+            while True:
+                status = self.status(guest)
+                mounts = [m for m in status.get('mounts', []) if m['mount']['volumeId'] == self.volume]
+                if mounts and mounts[0]['state'] == 'terminal' and mounts[0]['cleanup'] == 'complete':
+                    break
+                assert time.monotonic() < deadline, status
+                time.sleep(.1)
+            fresh = self.mount(guest)
+            assert fresh['mount'] != old['mount'] and fresh['public_key'] == old['public_key']
+            assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
+            time.sleep(.2)
+            observed = guest.ssh('tail -n 1 ~/pfs-native-held.jsonl')
+            assert json.loads(observed).get('error', 0) != 0, observed
+            guest.ssh('touch ~/pfs-native-held.stop; while test ! -f ~/pfs-native-held.done; do sleep .02; done')
+            self.unmount(guest, fresh)
+            assert held.wait(timeout=10) == 0
         return old, fresh
 
     def close(self):
