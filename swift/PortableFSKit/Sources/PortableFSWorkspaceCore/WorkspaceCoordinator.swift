@@ -320,6 +320,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 }
                 guard self.retainsLoss(ack.mounts) else { self.reason = "guest recovery erased retained loss"; return }
                 self.mountStatus = ack.mounts; self.state = .running; self.reason = ""
+                // Suspend can interrupt page observation or its acknowledgement.
+                self.refreshStatus()
             }
         }
     }

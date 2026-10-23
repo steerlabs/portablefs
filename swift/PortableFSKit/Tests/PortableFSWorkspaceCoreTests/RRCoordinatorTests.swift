@@ -539,3 +539,84 @@ private func rrGolden(_ name: String) throws -> Data {
     ch.statuses.removeFirst()(.success(try WorkspaceControl.decode(rrGolden("status_reply")).statusReply))
     #expect(rejected)
 }
+
+// A cold suspension can overtake either a page observation or its ack.
+// Resume must restart the sole observer even when the host has no saved page.
+@Test @MainActor func workspaceResumeRestartsRetirementPages() throws {
+    try resumeRetirementPages(suspendAtStatus: true)
+}
+@Test @MainActor func workspaceResumeRestartsRetirementAfterInFlightAck() throws {
+    try resumeRetirementPages(suspendAtStatus: false)
+}
+@MainActor private func resumeRetirementPages(suspendAtStatus: Bool) throws {
+    let (c, vm, power, _, ch) = try rrRig()
+    var base = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    base.generation = c.generation; base.retired = []
+    var victim = base.jobs[0]; victim.generation = c.generation; victim.requestID = 1000; victim.phase = "running"; victim.failure = ""; victim.reason = ""
+    base.jobs = [victim]
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(base))
+    #expect(c.jobStatus == [victim])
+    var guest: [WorkspaceRetiredOutcome] = []
+    for i in 0..<128 {
+        var j = victim; j.phase = "failed"; j.failure = "unavailable"; j.reason = "unavailable"
+        if i < 127 { j.mount.volumeID = String(format: "other%03d", i); j.requestID = UInt64(i + 1) }
+        var o = WorkspaceRetiredOutcome(); o.retirementSequence = UInt64(i + 1); o.job = j
+        guest.append(o)
+    }
+    func page() -> WorkspaceStatusReply {
+        var s = base; s.generation = c.generation; s.jobs = []; s.retired = Array(guest.prefix(16)); return s
+    }
+    var statuses = 0, acks: [UInt64] = [], suspended = false
+    func sleep() {
+        suspended = true
+        power.handler?(.sleep(WorkspaceSleepNotification(id: 1, arrivedAt: 1_000)))
+        #expect(c.phase == .draining)
+    }
+    func resume() {
+        let (request, done) = ch.suspensions.removeFirst()
+        var ack = WorkspaceSuspendAck(); ack.suspension = request
+        done(.success(ack))
+        vm.pauses.removeFirst()(.success(()))
+        #expect(c.phase == .pausedCold)
+        power.handler?(.wake)
+        vm.resumes.removeFirst()(.success(()))
+        let (token, resumed) = ch.resumes.removeFirst()
+        var reply = WorkspaceResumeAck(); reply.token = token
+        resumed(.success(reply))
+    }
+    c.refreshStatus()
+    for _ in 0..<32 {
+        if !ch.statuses.isEmpty {
+            statuses += 1
+            let interrupt = suspendAtStatus && statuses == 4 && !suspended
+            if interrupt {
+                sleep()
+            }
+            ch.statuses.removeFirst()(.success(page()))
+            if interrupt {
+                #expect(c.retiredStatus.count == 16 && ch.retiredAcks.isEmpty)
+                resume()
+            }
+        } else if !ch.retiredAcks.isEmpty {
+            let (through, done) = ch.retiredAcks.removeFirst()
+            let interrupt = !suspendAtStatus && acks.count == 3 && !suspended
+            if interrupt {
+                sleep()
+            }
+            acks.append(through)
+            guest.removeAll { $0.retirementSequence <= through }
+            done(.success(()))
+            if interrupt {
+                #expect(c.retiredStatus.isEmpty && ch.statuses.isEmpty)
+                resume()
+            }
+        } else { break }
+    }
+    #expect(suspended && c.phase == .running && guest.isEmpty && c.jobStatus.isEmpty)
+    #expect(c.retiredStatus.isEmpty && ch.statuses.isEmpty && ch.retiredAcks.isEmpty)
+    #expect(acks == stride(from: UInt64(16), through: 128, by: 16).map { $0 })
+    var successor = victim; successor.requestID = 1001; successor.generation = c.generation
+    var s = base; s.generation = c.generation; s.jobs = [successor]
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(s))
+    #expect(c.phase == .running && c.jobStatus == [successor] && c.reason.isEmpty)
+}

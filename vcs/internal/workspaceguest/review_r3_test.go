@@ -290,6 +290,12 @@ func TestR3RandomWalkNoCapacityCycle(t *testing.T) {
 					s.mu.Lock()
 					existing = s.mounts[k] != nil || s.jobs[k] != nil
 					A, R = len(s.activeKeysLocked()), len(s.retired)
+					retiredJob := false
+					for _, outcome := range s.retired {
+						if outcome.Job != nil && control.MountKey(outcome.Job.Mount) == k {
+							retiredJob = true
+						}
+					}
 					s.mu.Unlock()
 					if err != nil && existing && r3Capacity(err) {
 						t.Fatalf("existing key refused for capacity A=%d R=%d: %v", A, R, err)
@@ -297,8 +303,11 @@ func TestR3RandomWalkNoCapacityCycle(t *testing.T) {
 					if err != nil && !existing && strings.Contains(err.Error(), "acknowledgement") {
 						ackWaits++
 					}
-					if err != nil && !existing && strings.Contains(err.Error(), "acknowledgement") && R == 0 {
-						t.Fatalf("new key waits with nothing acknowledgeable: %v", err)
+					// Only this walk acknowledges records, so the refusal's
+					// record survives this sample. Without an exact retired
+					// job, reservation capacity requires R >= 128 - 64.
+					if err != nil && !existing && strings.Contains(err.Error(), "acknowledgement") && !retiredJob && R < MaxReservations-control.MaxMounts {
+						t.Fatalf("new key waits below reservation capacity A=%d R=%d: %v", A, R, err)
 					}
 				case op < 7:
 					if cleaned {
