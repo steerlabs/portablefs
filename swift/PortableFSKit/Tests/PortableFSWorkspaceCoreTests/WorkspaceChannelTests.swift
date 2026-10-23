@@ -16,7 +16,13 @@ import PortableFSWorkspaceCore
     try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in stream.write(frame, deadline: deadline) { c.resume(with: $0) } }
 }
 
-@Test(arguments: [false, true]) @MainActor func astraR4AutoRetryMustPreserveDesiredFIFO(mountFirst: Bool) async throws {
+@Test @MainActor func astraR4AutoRetryMustPreserveDesiredFIFO() async throws {
+    try await desiredFIFO(mountFirst: false)
+}
+@Test @MainActor func workspaceAutoRetryPreservesMountThenUmountFIFO() async throws {
+    try await desiredFIFO(mountFirst: true)
+}
+@MainActor private func desiredFIFO(mountFirst: Bool) async throws {
     var fds: [Int32] = [-1, -1]
     try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
     defer { close(fds[0]); close(fds[1]) }

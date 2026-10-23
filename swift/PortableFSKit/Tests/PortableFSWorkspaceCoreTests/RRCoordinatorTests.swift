@@ -485,7 +485,13 @@ private func rrGolden(_ name: String) throws -> Data {
 
 // The old page-17 guest sequence is now forbidden. Keep strict host validation
 // and separately prove ordered auto-ack progress through the legal snapshots.
-@Test(arguments: [false, true]) @MainActor func r4OffPageJobRetirementWithAdmittedSuccessor(astraSequence: Bool) throws {
+@Test @MainActor func r4OffPageJobRetirementWithAdmittedSuccessor() throws {
+    try offPageJobRetirement(astraSequence: false)
+}
+@Test @MainActor func astraR4OffPageJobRetirementPreservesChannel() throws {
+    try offPageJobRetirement(astraSequence: true)
+}
+@MainActor private func offPageJobRetirement(astraSequence: Bool) throws {
     let (c, vm, _, _, ch) = try rrRig()
     var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
     status.generation = c.generation; status.retired = []
