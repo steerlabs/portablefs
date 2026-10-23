@@ -75,7 +75,8 @@ func (r *rawFileSystem) Fallocate(interrupted <-chan struct{}, input *fuse.Fallo
 			}
 			return candidate, nil
 		})
-		if err != nil {
+		var visibility *appliedVisibilityError
+		if err != nil && !errors.As(err, &visibility) {
 			return fuse.Status(delegationErrno(err))
 		}
 		reply := response.GetFallocate()
@@ -110,7 +111,7 @@ func (r *rawFileSystem) Fallocate(interrupted <-chan struct{}, input *fuse.Fallo
 			r.mount.revoke(errors.New("fusev3: stock fallocate applied result carried an invalid error"))
 			return fuse.Status(syscall.ENOTCONN)
 		}
-		return fuse.OK
+		return r.mount.appliedVisibilityStatus(visibility)
 	}
 	return fuse.EBADF
 }
@@ -225,7 +226,8 @@ func (r *rawFileSystem) CopyFileRange(interrupted <-chan struct{}, input *fuse.C
 		}
 		return candidate, nil
 	})
-	if err != nil {
+	var visibility *appliedVisibilityError
+	if err != nil && !errors.As(err, &visibility) {
 		return 0, fuse.Status(delegationErrno(err))
 	}
 	var errno syscall.Errno
@@ -276,5 +278,5 @@ func (r *rawFileSystem) CopyFileRange(interrupted <-chan struct{}, input *fuse.C
 		r.mount.revoke(errors.New("fusev3: stock copy_file_range applied result carried an invalid error"))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
-	return uint32(reply.GetResultSize()), fuse.OK
+	return uint32(reply.GetResultSize()), r.mount.appliedVisibilityStatus(visibility)
 }

@@ -116,7 +116,8 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		}
 		return candidate, nil
 	})
-	if err != nil {
+	var visibility *appliedVisibilityError
+	if err != nil && !errors.As(err, &visibility) {
 		return 0, fuse.Status(delegationErrno(err))
 	}
 	if response == nil || response.GetUncertain() || response.GetWrite() == nil {
@@ -170,7 +171,7 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		r.mount.revoke(fmt.Errorf("fusev3: complete stock write publication: %w", err))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
-	return uint32(reply.GetCommittedSize()), fuse.OK
+	return uint32(reply.GetCommittedSize()), r.mount.appliedVisibilityStatus(visibility)
 }
 
 func delegationErrno(err error) syscall.Errno {

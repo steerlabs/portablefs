@@ -1,0 +1,169 @@
+//go:build linux
+
+package fusev3
+
+import (
+	"context"
+	"errors"
+	"syscall"
+	"testing"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+)
+
+type refusedVisibilityRPC struct {
+	delegationRPC
+	failure error
+}
+
+func (r refusedVisibilityRPC) CallIdempotent(ctx context.Context, q *authoritypb.Request) (*authoritypb.Response, error) {
+	if q.GetWaitVisibility() != nil {
+		if r.failure != nil {
+			return nil, r.failure
+		}
+		return &authoritypb.Response{Errno: int32(syscall.EIO), Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}, nil
+	}
+	return r.delegationRPC.CallIdempotent(ctx, q)
+}
+
+func TestAppliedAppendVisibilityFailureSettlesSourceWithoutRevocation(t *testing.T) {
+	f := newStockFixture(t)
+	entry := f.lookup(t, 1, "appended")
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc}
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		_, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 4, Flags: uint32(syscall.O_RDWR | syscall.O_APPEND)}, []byte("data"))
+		return status
+	})
+	if status != fuse.EIO || f.mount.isRevoked() {
+		t.Fatalf("applied write: %v; terminal=%v", status, f.mount.fatalError())
+	}
+	f.rpc.mu.Lock()
+	writes := len(f.rpc.writes)
+	f.rpc.mu.Unlock()
+	if writes != 1 {
+		t.Fatal("applied mutation was lost or replayed", writes)
+	}
+	f.raw.mu.RLock()
+	holds := len(f.raw.sourceHolds)
+	f.raw.mu.RUnlock()
+	if holds != 0 {
+		t.Fatal("failed visibility retained uncompleted source", holds)
+	}
+}
+
+func TestAppliedCreateVisibilityFailureDischargesBindingAndDescriptor(t *testing.T) {
+	f := newStockFixture(t)
+	f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc}
+	f.rpc.mu.Lock()
+	f.rpc.replyOverride = func(q *authoritypb.Request) (*authoritypb.Response, error) {
+		if q.GetCreate() != nil {
+			item := f.rpc.namedItem(q.GetCreate().GetName())
+			f.rpc.applied = 2
+			return &authoritypb.Response{AppliedSequence: 2, VolumeVersion: 2,
+				PostState: exactTestPostState(2, struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{item, postStateRoleCreated}, struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{f.rpc.root, postStateRoleParent}),
+				Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: item, Handle: cloneBytes(f.rpc.handle), Delegation: testDelegation()}}}, nil
+		}
+		if q.GetBarrier() != nil {
+			return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: f.rpc.applied, DurableSequence: f.rpc.applied}}}, nil
+		}
+		if q.GetCloseBatch() != nil {
+			results := make([]*authoritypb.CloseBatchResult, len(q.GetCloseBatch().GetCloses()))
+			for i := range results {
+				results[i] = &authoritypb.CloseBatchResult{Retired: true}
+			}
+			return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	f.rpc.mu.Unlock()
+	before := f.raw.nextHandle
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{Unique: unique, NodeId: 1}, Flags: uint32(syscall.O_RDWR | syscall.O_CREAT), Mode: 0o600}, "created", &fuse.CreateOut{})
+	})
+	if status != fuse.EIO || f.mount.isRevoked() {
+		t.Fatalf("applied create: %v; terminal=%v", status, f.mount.fatalError())
+	}
+	f.raw.mu.RLock()
+	holds, handles := len(f.raw.sourceHolds), f.raw.nextHandle
+	f.raw.mu.RUnlock()
+	if holds != 0 || handles != before {
+		t.Fatal("error published a handle or retained an unresolved binding", holds, handles, before)
+	}
+}
+
+func TestAppliedVisibilityIndependentFailureRemainsTerminal(t *testing.T) {
+	f := newStockFixture(t)
+	entry := f.lookup(t, 1, "appended")
+	opened := openDelegatedWriter(t, f, entry.NodeId)
+	cause := errors.New("malformed visibility reply")
+	f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc, failure: cause}
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		_, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 4, Flags: uint32(syscall.O_RDWR | syscall.O_APPEND)}, []byte("data"))
+		return status
+	})
+	if status != fuse.EIO || !f.mount.isRevoked() || !errors.Is(f.mount.fatalError(), cause) {
+		t.Fatal("independent failure was hidden", status, f.mount.fatalError())
+	}
+}
+
+func TestAppliedRangeAndTruncatingOpenVisibilityFailuresSettleSource(t *testing.T) {
+	for _, operation := range []string{"fallocate", "truncate-open"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newStockFixture(t)
+			entry := f.lookup(t, 1, "target")
+			opened := openDelegatedWriter(t, f, entry.NodeId)
+			f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc}
+			f.rpc.mu.Lock()
+			f.rpc.replyOverride = func(q *authoritypb.Request) (*authoritypb.Response, error) {
+				if q.GetOpen() != nil || q.GetFallocate() != nil {
+					item := cloneItem(f.rpc.item)
+					f.rpc.applied = 2
+					item.Attr.Size = 4096
+					r := &authoritypb.Response{AppliedSequence: 2, VolumeVersion: 2, PostState: exactTestPostState(2, struct {
+						item  *authoritypb.Item
+						roles uint32
+					}{item, postStateRoleTarget})}
+					if q.GetOpen() != nil {
+						item.Attr.Size = 0
+						r.PostState = exactTestPostState(2, struct {
+							item  *authoritypb.Item
+							roles uint32
+						}{item, postStateRoleTarget})
+						r.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: testToken(901), Delegation: testDelegation()}}
+					} else {
+						r.Body = &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{Flags: rangeResultApplied, PostSize: 4096, VisibilitySequence: 2}}
+					}
+					return r, nil
+				}
+				if q.GetBarrier() != nil {
+					return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: 2, DurableSequence: 2}}}, nil
+				}
+				return &authoritypb.Response{}, nil
+			}
+			f.rpc.mu.Unlock()
+			status := f.rawCall(func(unique uint64) fuse.Status {
+				if operation == "truncate-open" {
+					return f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags: uint32(syscall.O_RDWR | syscall.O_TRUNC)}, &fuse.OpenOut{})
+				}
+				return f.raw.Fallocate(nil, &fuse.FallocateIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Length: 4096})
+			})
+			if status != fuse.EIO || f.mount.isRevoked() {
+				t.Fatal(status, f.mount.fatalError())
+			}
+			f.raw.mu.RLock()
+			holds := len(f.raw.sourceHolds)
+			f.raw.mu.RUnlock()
+			if holds != 0 {
+				t.Fatal("known commit retained source ownership", holds)
+			}
+		})
+	}
+}

@@ -1448,7 +1448,10 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 		// visibility: a peer's pending read may need that grant's CONTROL cut.
 		if response.GetOpen() == nil && response.GetCreate() == nil {
 			if err := m.waitVisibility(ctx, m.buf, id, cut, response.GetAppliedSequence()); err != nil {
-				return response, err
+				// The mutation has a definite applied result. Its caller must
+				// validate and finish local publication before reporting this
+				// later visibility failure; it cannot treat it as no result.
+				return response, &appliedVisibilityError{cause: err}
 			}
 		}
 	}

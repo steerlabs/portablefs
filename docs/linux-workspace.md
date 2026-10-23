@@ -944,3 +944,12 @@ qualification verdict false: source provenance, multi-day accuracy, host clock
 corrections and worst-case long-awake load require separate evidence. No NTP,
 host-message fallback, clock server or RTC admission is implemented. This TLS
 wall discipline grants no BOOTTIME continuity across unfenced host sleep.
+
+A definite applied mutation is distinct from its later peer visibility wait.
+If that wait loses the old subscription, append/range callbacks still validate
+the returned result and complete their source publication before reporting the
+visibility errno. OPEN/CREATE failure discharges the validated binding locally
+and retains its existing descriptor cleanup owner, without publishing a new
+kernel handle. Such a failure closes cache admission for the existing cold
+path; it neither invents a no-change result nor replays the committed mutation.
+Malformed results and independent failures remain terminal.

@@ -1944,7 +1944,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response, current); err != nil {
 		handle.endLossObservation()
-		return nil, 0, bufferErrno(err)
+		return nil, 0, n.failedOpenedVisibility(ctx, n.item, nil, err)
 	}
 	if current && openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
@@ -2759,7 +2759,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response, current); err != nil {
 		handle.endLossObservation()
-		return nil, nil, 0, bufferErrno(err)
+		return nil, nil, 0, n.failedOpenedVisibility(ctx, item, &name, err)
 	}
 	object := postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleTarget)
 	if object == nil {
