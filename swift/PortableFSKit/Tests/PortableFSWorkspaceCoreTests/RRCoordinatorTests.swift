@@ -217,6 +217,7 @@ private func rrGolden(_ name: String) throws -> Data {
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     let running = status.jobs[0]
     #expect(c.jobStatus == [running])
+    ch.retiredAcks.removeFirst().1(.success(()))
     // A missing retirement page must leave the last observed owner intact.
     status.jobs = []
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
@@ -236,4 +237,131 @@ private func rrGolden(_ name: String) throws -> Data {
     status.retired = []
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.reason.isEmpty)
+}
+
+@Test @MainActor func workspaceMixedRetirementPagesReconcileMountBeforeLaterJob() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("status_reply")).statusReply
+    status.generation = c.generation
+    status.retired = []
+    var old = status.mounts[0]
+    old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
+    status.mounts = [old]
+    var job = try WorkspaceControl.decode(rrGolden("job_running")).statusReply.jobs[0]
+    job.generation = c.generation; job.mount.volumeID = "pending"
+    status.jobs = [job]
+    #expect(WorkspaceControl.validStatus(status))
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.mountStatus == [old] && c.jobStatus == [job])
+
+    var replacement = old
+    replacement.mount.incarnation = Data(repeating: 99, count: 16)
+    replacement.state = "closed"; replacement.reason = ""; replacement.cleanup = "retained"
+    status.mounts = [replacement]; status.jobs = []
+    status.retired = [retiredTestOutcome(old, sequence: 1)]
+    for seq in 2...16 {
+        var filler = job; filler.mount.volumeID = "filler-" + String(seq); filler.requestID = UInt64(seq + 100); filler.phase = "complete"
+        var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = UInt64(seq); outcome.job = filler
+        status.retired.append(outcome)
+    }
+    #expect(WorkspaceControl.validStatus(status))
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.mountStatus == [replacement])
+    #expect(c.jobStatus == [job])
+    #expect(ch.retiredAcks.map(\.0) == [16])
+    try c.acknowledgeRetired(c.retiredStatus)
+    ch.retiredAcks.removeFirst().1(.success(()))
+
+    job.phase = "complete"
+    var last = WorkspaceRetiredOutcome(); last.retirementSequence = 17; last.job = job
+    status.retired = [last]
+    #expect(WorkspaceControl.validStatus(status))
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus.isEmpty)
+    #expect(ch.retiredAcks.map(\.0) == [17])
+    try c.acknowledgeRetired(c.retiredStatus)
+    ch.retiredAcks.removeFirst().1(.success(()))
+    status.retired = []
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.reason.isEmpty, "both pages were observed and acknowledged")
+    #expect(c.mountStatus == [replacement], "old mount stayed pinned after its evidence was acknowledged and deleted")
+}
+
+// R2 review: refreshStatus never acknowledges, and an acknowledgement sent on
+// the channel outside the coordinator (WorkspaceDev.observeUnavailableJob)
+// leaves a sequence gap that wedges coordinator observation permanently.
+@Test @MainActor func workspaceObservationOwnsAcknowledgementAndReconcilesStalePages() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    status.generation = c.generation; status.jobs[0].generation = c.generation
+    var joined = status.jobs[0]; joined.phase = "failed"; joined.failure = "unavailable"; joined.reason = "real mount driver unavailable"
+    status.jobs = []
+    var first = WorkspaceRetiredOutcome(); first.retirementSequence = 1; first.job = joined
+    status.retired = [first]
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.retiredStatus == [first])
+    #expect(ch.retiredAcks.map(\.0) == [1])
+    ch.retiredAcks.removeFirst().1(.success(()))
+    // A snapshot queued before the ack can arrive after its completion.
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.retiredStatus.isEmpty && c.reason.isEmpty)
+    var second = first; second.retirementSequence = 2; second.job.requestID += 1
+    status.retired = [second]
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.retiredStatus == [second])
+    #expect(ch.retiredAcks.map(\.0) == [2])
+    ch.retiredAcks.removeFirst().1(.success(()))
+    status.retired = []
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.retiredStatus.isEmpty && c.reason.isEmpty)
+}
+
+@Test @MainActor func workspaceMixedRetirementPagesReconcileJobBeforeLaterMount() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("status_reply")).statusReply
+    status.generation = c.generation
+    status.retired = []
+    var old = status.mounts[0]
+    old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
+    status.mounts = [old]
+    var job = try WorkspaceControl.decode(rrGolden("job_running")).statusReply.jobs[0]
+    job.generation = c.generation; job.mount.volumeID = "pending"
+    status.jobs = [job]
+    #expect(WorkspaceControl.validStatus(status))
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.mountStatus == [old] && c.jobStatus == [job])
+
+    var replacement = old
+    replacement.mount.incarnation = Data(repeating: 99, count: 16)
+    replacement.state = "closed"; replacement.reason = ""; replacement.cleanup = "retained"
+    status.mounts = [replacement]; status.jobs = []
+    var joined = job; joined.phase = "complete"
+    var first = WorkspaceRetiredOutcome(); first.retirementSequence = 1; first.job = joined
+    status.retired = [first]
+    for seq in 2...16 {
+        var filler = job; filler.mount.volumeID = "filler-" + String(seq); filler.requestID = UInt64(seq + 100); filler.phase = "complete"
+        var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = UInt64(seq); outcome.job = filler
+        status.retired.append(outcome)
+    }
+    #expect(WorkspaceControl.validStatus(status))
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.mountStatus == [old])
+    #expect(c.jobStatus.isEmpty)
+    #expect(ch.retiredAcks.map(\.0) == [16])
+    try c.acknowledgeRetired(c.retiredStatus)
+    ch.retiredAcks.removeFirst().1(.success(()))
+
+    job.phase = "complete"
+    let last = retiredTestOutcome(old, sequence: 17)
+    status.retired = [last]
+    #expect(WorkspaceControl.validStatus(status))
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus.isEmpty)
+    #expect(ch.retiredAcks.map(\.0) == [17])
+    try c.acknowledgeRetired(c.retiredStatus)
+    ch.retiredAcks.removeFirst().1(.success(()))
+    status.retired = []
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.reason.isEmpty, "both pages were observed and acknowledged")
+    #expect(c.mountStatus == [replacement], "old mount stayed pinned after its evidence was acknowledged and deleted")
 }

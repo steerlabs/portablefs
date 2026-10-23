@@ -90,6 +90,12 @@ func fixtures() map[string]*pb.Envelope {
 		status.Jobs = nil
 		bodies["retired_job_"+phase] = e
 	}
+	summary := proto.Clone(bodies["job_failed"]).(*pb.Envelope)
+	current := summary.GetStatusReply().Jobs[0]
+	first := proto.Clone(current).(*pb.MountJob)
+	current.RequestId = first.RequestId + 4
+	current.Prior = []*pb.JoinedJobSummary{{First: first, Count: 3, LastRequestId: first.RequestId + 2}}
+	bodies["job_with_joined_summary"] = summary
 	combined := proto.Clone(bodies["retired_job_failed"]).(*pb.Envelope)
 	cloneJob := proto.Clone(combined.GetStatusReply().Retired[1].Job).(*pb.MountJob)
 	cloneJob.Mount = proto.Clone(combined.GetStatusReply().Retired[0].MountStatus.Mount).(*pb.MountID)
@@ -211,8 +217,8 @@ func invalidFixtures() map[string][]byte {
 			r.RetirementSequence++
 			s.Retired = append(s.Retired, r)
 		}},
-		{"active_and_retired_excess_capacity", func(s *pb.StatusReply) {
-			for i := 0; i < 63; i++ {
+		{"active_excess_capacity", func(s *pb.StatusReply) {
+			for i := 0; i < 64; i++ {
 				m := proto.Clone(s.Mounts[0]).(*pb.MountStatus)
 				m.Mount.VolumeId = fmt.Sprintf("v%02d", i)
 				s.Mounts = append(s.Mounts, m)
@@ -221,6 +227,24 @@ func invalidFixtures() map[string][]byte {
 	} {
 		e := fixtures()["retired_job_complete"]
 		tc.mutate(e.GetStatusReply())
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		negative[tc.name] = framed(raw)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*pb.MountJob)
+	}{
+		{"summary_zero_count", func(j *pb.MountJob) { j.Prior[0].Count = 0 }},
+		{"summary_future_request", func(j *pb.MountJob) { j.Prior[0].LastRequestId = j.RequestId }},
+		{"summary_wrong_mount", func(j *pb.MountJob) { j.Prior[0].First.Mount.VolumeId = "other" }},
+		{"summary_unjoined", func(j *pb.MountJob) { j.Prior[0].First.Phase = "running" }},
+		{"summary_duplicate", func(j *pb.MountJob) { j.Prior = append(j.Prior, proto.Clone(j.Prior[0]).(*pb.JoinedJobSummary)) }},
+		{"summary_recursive", func(j *pb.MountJob) {
+			j.Prior[0].First.Prior = append(j.Prior[0].First.Prior, proto.Clone(j.Prior[0]).(*pb.JoinedJobSummary))
+		}},
+	} {
+		e := fixtures()["job_with_joined_summary"]
+		tc.mutate(e.GetStatusReply().Jobs[0])
 		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 		negative[tc.name] = framed(raw)
 	}
@@ -239,7 +263,7 @@ func invalidFixtures() map[string][]byte {
 		"invalid_utf8":       framed([]byte{8, 8, 16, 1, 0xaa, 1, 3, 0x0a, 1, 0xff}),
 		"excessive_nesting":  framed(protowire.AppendBytes(protowire.AppendTag([]byte{8, 8, 16, 1}, 10, protowire.BytesType), nested)),
 		"excessive_repeated": framed(repeated),
-		"oversized_length":   {0, 0x10, 0, 1}, "truncated": status[:len(status)-1], "trailing": append(status, 0),
+		"oversized_length":   {0, 0x20, 0, 1}, "truncated": status[:len(status)-1], "trailing": append(status, 0),
 	}
 	for name, raw := range negative {
 		base[name] = raw
@@ -441,14 +465,33 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 		cold = append(cold, &pb.MountCold{Mount: mid, Loss: loss, Outcome: UnknownOutcome()})
 		jobs = append(jobs, &pb.MountJob{Mount: mid, RequestId: math.MaxUint64, Generation: math.MaxUint64, Operation: "provision", Phase: "failed", Failure: "authorization-required", Reason: strings.Repeat("r", MaxReason)})
 	}
+	for _, job := range jobs {
+		for _, operation := range []string{"mount", "provision", "umount"} {
+			for _, failure := range []string{"", "authorization-required", "deadline", "handler-failed", "refused", "stopped", "unavailable"} {
+				first := proto.Clone(job).(*pb.MountJob)
+				first.Prior = nil
+				first.RequestId = uint64(len(job.Prior) + 1)
+				first.Operation, first.Failure = operation, failure
+				first.Phase = "failed"
+				if failure == "" {
+					first.Phase, first.Reason = "complete", ""
+				}
+				job.Prior = append(job.Prior, &pb.JoinedJobSummary{First: first, Count: (math.MaxUint64 - 1) / 21, LastRequestId: math.MaxUint64 - uint64(21-len(job.Prior))})
+			}
+		}
+	}
 	var retired []*pb.RetiredOutcome
 	for i := 0; i < MaxRetiredBatch; i++ {
 		r := proto.Clone(statuses[i]).(*pb.MountStatus)
 		r.Mount.Incarnation = fixtureID(30)
-		retired = append(retired, &pb.RetiredOutcome{RetirementSequence: uint64(i + 1), MountStatus: r})
+		retired = append(retired, &pb.RetiredOutcome{RetirementSequence: uint64(i + 1), MountStatus: r, Job: proto.Clone(jobs[i]).(*pb.MountJob)})
+		retired[i].Job.Mount = r.Mount
+		for _, summary := range retired[i].Job.Prior {
+			summary.First.Mount = r.Mount
+		}
 	}
 	for name, e := range map[string]*pb.Envelope{
-		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "running", Mounts: statuses[:MaxMounts-MaxRetiredBatch], Retired: retired, Jobs: jobs[:MaxMounts-MaxRetiredBatch]}}},
+		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "running", Mounts: statuses, Retired: retired, Jobs: jobs}}},
 		"suspend": {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: cold}}},
 		"resume":  {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}, Mounts: statuses}}},
 	} {
@@ -459,6 +502,7 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Logf("maximum %s frame: %d bytes (limit %d)", name, len(raw), MaxFrame+4)
 			if len(raw) > MaxFrame+4 {
 				t.Fatal("semantic maximum exceeds frame")
 			}

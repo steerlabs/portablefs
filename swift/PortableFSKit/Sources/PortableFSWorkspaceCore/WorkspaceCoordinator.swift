@@ -339,44 +339,68 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             self.retirementAckInFlight = nil
             guard case .success = result else { return }
             self.acknowledgedRetirement = max(self.acknowledgedRetirement, through)
-            let consumed = self.retiredStatus.filter { $0.retirementSequence <= through && $0.hasJob }.map(\.job)
-            self.jobStatus.removeAll { old in consumed.contains { $0.mount == old.mount && $0.requestID == old.requestID } }
             self.retiredStatus.removeAll { $0.retirementSequence <= through }
+            if !self.retiredStatus.isEmpty, self.phase == .running || self.phase == .recovering {
+                try? self.acknowledgeRetired(Array(self.retiredStatus.prefix(16)))
+            } else if observed.count == 16 { self.refreshStatus() }
         }
     }
-    // Called by the status UI/poller. Authority recovery has no VM-killing
-    // deadline; an invalid decoded ResumeAck can be reconciled by exact guest status.
+    // All observers, including the dev probe, hand snapshots to this owner.
+    // Retirement reconciliation precedes acknowledgement and is independent for
+    // each mount/job: a missing later page cannot pin an already retired owner.
+    public func observeStatus(_ status: WorkspaceStatusReply) throws {
+        guard phase == .running || phase == .recovering,
+              WorkspaceControl.validStatus(status), status.bootID == host.bootID,
+              status.hostServiceID == host.hostServiceID, status.guestServiceID == guestServiceID,
+              status.generation == generation, status.state == "running" else { throw WorkspaceControlError.transition }
+        let unacknowledged = status.retired.filter { $0.retirementSequence > acknowledgedRetirement }
+        let knownThrough = retiredStatus.last?.retirementSequence ?? acknowledgedRetirement
+        let added = unacknowledged.filter { $0.retirementSequence > knownThrough }
+        guard unacknowledged.allSatisfy({ $0.retirementSequence > knownThrough || retiredStatus.contains($0) }),
+              added.isEmpty || (knownThrough < UInt64.max && added[0].retirementSequence == knownThrough + 1) else {
+            reason = "retired outcome sequence mismatch"; throw WorkspaceControlError.transition
+        }
+        guard retiredStatus.count + added.count <= 128 else { throw WorkspaceControlError.transition }
+        // Validate against retained owners before consuming either kind of
+        // evidence. A contradictory retirement never earns an acknowledgement.
+        for outcome in added {
+            if outcome.hasMountStatus, let old = mountStatus.first(where: { $0.mount == outcome.mountStatus.mount }) {
+                guard WorkspaceControl.retainsLoss(outcome.mountStatus.loss, prior: old.loss) else { throw WorkspaceControlError.transition }
+            }
+            if outcome.hasJob, let old = jobStatus.first(where: { $0.mount == outcome.job.mount && $0.requestID <= outcome.job.requestID }) {
+                guard WorkspaceControl.retainsJob(outcome.job, prior: old) else { throw WorkspaceControlError.transition }
+            }
+        }
+        retiredStatus.append(contentsOf: added)
+        mountStatus.removeAll { old in retiredStatus.contains { $0.hasMountStatus && $0.mountStatus.mount == old.mount } }
+        jobStatus.removeAll { old in retiredStatus.contains { $0.hasJob && WorkspaceControl.retainsJob($0.job, prior: old) } }
+
+        // Preserve only owners still missing their own evidence, while advancing
+        // every other owner from this snapshot. Conflicting replacements wait
+        // in the guest snapshot until the old owner's retirement page arrives.
+        let pendingMounts = mountStatus.filter { old in
+            !status.mounts.contains { $0.mount == old.mount && WorkspaceControl.retainsLoss($0.loss, prior: old.loss) }
+        }
+        let pendingJobs = jobStatus.filter { old in !status.jobs.contains { WorkspaceControl.retainsJob($0, prior: old) } }
+        mountStatus = pendingMounts + status.mounts.filter { next in
+            !pendingMounts.contains { $0.mount.authorityID == next.mount.authorityID && $0.mount.volumeID == next.mount.volumeID }
+        }
+        jobStatus = pendingJobs + status.jobs.filter { next in !pendingJobs.contains { $0.mount == next.mount } }
+        reason = !pendingJobs.isEmpty ? "waiting for earlier retired jobs before replacing active status" :
+            (!pendingMounts.isEmpty ? "waiting for earlier retired outcomes before replacing active status" : "")
+        state = .running
+        if retirementAckInFlight == nil, !retiredStatus.isEmpty {
+            try acknowledgeRetired(Array(retiredStatus.prefix(16)))
+        }
+    }
+    // Authority recovery has no VM-killing deadline; exact status can reconcile
+    // a lost ResumeAck. Socket failure does not erase the retained observation.
     public func refreshStatus() {
         guard phase == .running || phase == .recovering else { return }
         let gen = generation
         channel.status(deadline: clock.now + totalBudget) { [weak self] reply in
-            guard let self, self.generation == gen, self.phase == .running || self.phase == .recovering,
-                  case .success(let status) = reply, WorkspaceControl.validStatus(status),
-                  status.bootID == self.host.bootID, status.hostServiceID == self.host.hostServiceID,
-                  status.guestServiceID == self.guestServiceID, status.generation == gen,
-                  status.state == "running" else { return }
-            let unacknowledged = status.retired.filter { $0.retirementSequence > self.acknowledgedRetirement }
-            let knownThrough = self.retiredStatus.last?.retirementSequence ?? self.acknowledgedRetirement
-            let added = unacknowledged.filter { $0.retirementSequence > knownThrough }
-            guard unacknowledged.allSatisfy({ next in
-                next.retirementSequence > knownThrough || self.retiredStatus.contains(next)
-            }), added.isEmpty || (knownThrough < UInt64.max && added[0].retirementSequence == knownThrough + 1) else {
-                self.reason = "retired outcome sequence mismatch"; return
-            }
-            guard self.retiredStatus.count + added.count <= 64 else { self.reason = "retired outcome acknowledgement required"; return }
-            self.retiredStatus.append(contentsOf: added)
-            let retired = status.retired + self.retiredStatus
-            let retainedJobs = status.jobs + retired.filter(\.hasJob).map(\.job)
-            guard self.jobStatus.allSatisfy({ old in
-                retainedJobs.contains { next in
-                    next.mount == old.mount && next.requestID == old.requestID && next.generation == old.generation &&
-                    next.operation == old.operation && (!["complete", "failed"].contains(old.phase) || next == old)
-                }
-            }) else { self.reason = "waiting for earlier retired jobs before replacing active status"; return }
-            guard self.retainsLoss(status.mounts, retired: retired) else {
-                self.reason = "waiting for earlier retired outcomes before replacing active status"; return
-            }
-            self.mountStatus = status.mounts; self.jobStatus = status.jobs; self.state = .running; self.reason = ""
+            guard let self, self.generation == gen, case .success(let status) = reply else { return }
+            do { try self.observeStatus(status) } catch { return }
         }
     }
     // A lost paired channel cannot restore eligibility. While awake, terminate

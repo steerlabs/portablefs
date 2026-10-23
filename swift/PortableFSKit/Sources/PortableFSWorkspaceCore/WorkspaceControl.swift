@@ -5,7 +5,7 @@ public enum WorkspaceControlError: Error { case grammar, pairing, transition }
 
 public enum WorkspaceControl {
     public static let version: UInt32 = 8
-    public static let maxFrame = 1 << 20
+    public static let maxFrame = 2 << 20
     public static let maxLosses = 32
     public static let maxReason = 256
     public static let maxDrainBudget: UInt64 = 15_000_000_000
@@ -137,7 +137,7 @@ public enum WorkspaceControl {
             if let old = volumes[volume], old != key { return false }
             volumes[volume] = key
         }
-        guard volumes.count + status.retired.count <= 64,
+        guard volumes.count <= 64,
               status.retired.allSatisfy({ !$0.hasJob || $0.job.generation <= status.generation }) else { return false }
         return status.jobs.allSatisfy { validJob($0, generation: status.generation) }
     }
@@ -145,10 +145,42 @@ public enum WorkspaceControl {
         guard validMount(job.mount), job.requestID > 0, job.generation <= generation,
               ["provision", "mount", "umount"].contains(job.operation) else { return false }
         switch job.phase {
-        case "offered", "running", "complete": return job.failure.isEmpty && job.reason.isEmpty
-        case "failed": return ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason
+        case "offered", "running", "complete": guard job.failure.isEmpty && job.reason.isEmpty else { return false }
+        case "failed": guard ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason else { return false }
         default: return false
         }
+        guard job.prior.count <= 21 else { return false }
+        var previous = "", count: UInt64 = 0
+        for summary in job.prior {
+            let first = summary.first, category = summary.first.operation + "/" + summary.first.failure
+            guard summary.hasFirst, first.prior.isEmpty, validJob(first, generation: job.generation),
+                  first.mount == job.mount, ["complete", "failed"].contains(first.phase), summary.count > 0,
+                  summary.lastRequestID >= first.requestID, summary.lastRequestID < job.requestID,
+                  summary.count <= summary.lastRequestID - first.requestID + 1,
+                  summary.count <= job.requestID - 1 - count, previous.isEmpty || category > previous else { return false }
+            previous = category; count += summary.count
+        }
+        return true
+    }
+    // A successor can only start after its predecessor joins. Its cumulative
+    // counters preserve every operation/failure category and the first exact
+    // diagnostic in each category, without a per-attempt history.
+    public static func retainsJob(_ current: WorkspaceMountJob, prior old: WorkspaceMountJob) -> Bool {
+        guard current.mount == old.mount, current.requestID >= old.requestID, current.generation >= old.generation else { return false }
+        if current.requestID == old.requestID {
+            return current.generation == old.generation && current.operation == old.operation && current.prior == old.prior &&
+                (!["complete", "failed"].contains(old.phase) || current == old)
+        }
+        guard old.prior.allSatisfy({ before in current.prior.contains { after in
+            after.first == before.first && after.count >= before.count && after.lastRequestID >= before.lastRequestID
+        } }) else { return false }
+        if ["complete", "failed"].contains(old.phase) {
+            let before = old.prior.first { $0.first.operation == old.operation && $0.first.failure == old.failure }
+            var exact = old; exact.prior = []
+            return current.prior.contains { $0.first.operation == old.operation && $0.first.failure == old.failure &&
+                (before != nil || $0.first == exact) && $0.lastRequestID >= old.requestID && $0.count > (before?.count ?? 0) }
+        }
+        return current.prior.contains { $0.lastRequestID >= old.requestID }
     }
     public static func validToken(_ token: WorkspaceResumeToken) -> Bool { validSuspension(token.suspension) && id(token.wakeNonce) }
     public static func validate(_ e: WorkspaceEnvelope) throws {

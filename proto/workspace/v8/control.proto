@@ -87,7 +87,8 @@ message ResumeAck {
 message StatusRequest {}
 // Desired work is distinct from registered kernel/session membership. One
 // fixed slot per desired mount retains acceptance until its final disposition
-// transfers to acknowledged retirement when no registered mount remains.
+// transfers to acknowledged retirement when no registered mount remains, or
+// when an Umount joins with terminal membership and exact cleanup proof.
 message MountJob {
   MountID mount = 1;
   uint64 request_id = 2;
@@ -99,6 +100,17 @@ message MountJob {
   // unavailable, refused, authorization-required, stopped, deadline, handler-failed.
   string failure = 6;
   string reason = 7;
+  // Cumulative joined predecessors, one bucket for complete and each failure
+  // code. The first exact result is retained; count and last_request_id merge
+  // subsequent results in the same operation/failure category without allocating
+  // another retirement reservation. At most 21 sorted categories; first has no prior.
+  repeated JoinedJobSummary prior = 8;
+}
+message JoinedJobSummary {
+  // A terminal MountJob without its own prior summaries.
+  MountJob first = 1;
+  uint64 count = 2;
+  uint64 last_request_id = 3;
 }
 // One acknowledged retirement stream for exact mount and joined job evidence.
 // A replaced mount and its last job share one record; job-only work never

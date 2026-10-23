@@ -20,13 +20,13 @@ import (
 )
 
 const Version = 8
-const MaxFrame = 1 << 20
+const MaxFrame = 2 << 20
 const MaxMounts = 64
 const MaxRetiredBatch = 16
 const MaxDrainBudget = 15 * time.Second
 
-// At most (64 + 16) * 32 * (256 + 40) bytes of loss plus <64 KiB of identities,
-// statuses and envelope overhead: every status/cold/resume reply fits MaxFrame.
+// At most 80 mount ledgers and 80 jobs with 21 fixed summary buckets each.
+// The paired maximum-payload tests prove every reply fits the 2 MiB frame.
 const MaxLosses = 32
 const MaxReason = 256
 const AggregateReason = "additional accepted-tail loss (aggregated)"
@@ -398,6 +398,29 @@ func Jobs(jobs []*pb.MountJob, mounts []*pb.MountStatus, generation uint64) erro
 		if j == nil || Mount(j.Mount) != nil || j.RequestId == 0 || j.Generation > generation {
 			return invalid("job identity")
 		}
+		if len(j.Prior) > 21 {
+			return invalid("joined job summary capacity")
+		}
+		var previous string
+		var count uint64
+		for _, summary := range j.Prior {
+			if summary == nil || summary.First == nil || len(summary.First.Prior) != 0 {
+				return invalid("joined job summary identity")
+			}
+			first := summary.First
+			category := first.Operation + "/" + first.Failure
+			if err := Jobs([]*pb.MountJob{first}, nil, j.Generation); err != nil {
+				return err
+			}
+			if !proto.Equal(first.Mount, j.Mount) || (first.Phase != "complete" && first.Phase != "failed") ||
+				summary.Count == 0 || summary.LastRequestId < first.RequestId || summary.LastRequestId >= j.RequestId ||
+				summary.Count > summary.LastRequestId-first.RequestId+1 || (previous != "" && category <= previous) ||
+				summary.Count > j.RequestId-1-count {
+				return invalid("joined job summary bounds or order")
+			}
+			previous = category
+			count += summary.Count
+		}
 		ids = append(ids, j.Mount)
 		volume := fmt.Sprintf("%x/%s", j.Mount.AuthorityId, j.Mount.VolumeId)
 		if old, ok := volumes[volume]; ok && old != MountKey(j.Mount) {
@@ -497,7 +520,7 @@ func Validate(e *pb.Envelope) error {
 				keys[MountKey(j.Mount)] = true
 			}
 		}
-		if len(keys)+len(s.Retired) > MaxMounts {
+		if len(keys) > MaxMounts {
 			return invalid("active and retired capacity")
 		}
 		for _, outcome := range s.Retired {

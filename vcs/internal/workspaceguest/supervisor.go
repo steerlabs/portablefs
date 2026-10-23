@@ -18,7 +18,9 @@ import (
 	"time"
 )
 
-const MaxRetired = 128
+// The 128 reservations permit a full 64-key rollover. Each active key owns
+// its final evidence slot until acknowledgement; active membership stays at 64.
+const MaxReservations = 2 * control.MaxMounts
 
 var ErrState = errors.New("workspace guest: transition refused")
 
@@ -231,6 +233,18 @@ func acquire(ctx context.Context, e *entry) error {
 }
 func release(e *entry) { <-e.serial }
 
+// Late driver evidence is merged before releasing the lane. Only then may an
+// exact joined removal publish its final immutable retirement.
+func (s *Supervisor) release(e *entry) {
+	release(e)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := control.MountKey(e.status.Mount)
+	if s.mounts[key] == e {
+		s.retireJoinedLocked(key)
+	}
+}
+
 // Initial activation can only use a driver proof for the registration generation.
 // It cannot be reused to bypass a failed token-bound post-wake recovery.
 func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation uint64) error {
@@ -257,7 +271,7 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 	if err := acquire(ctx, e); err != nil {
 		return fmt.Errorf("activate wait: %w", err)
 	}
-	defer release(e)
+	defer s.release(e)
 	s.mu.Lock()
 	if s.phase != "running" || generation != s.generation || e.status.State != "closed" || e.terminal {
 		s.mu.Unlock()
@@ -394,7 +408,7 @@ func (s *Supervisor) Drain(parent context.Context, x *pb.Suspension, id *pb.Moun
 	if err := acquire(ctx, e); err != nil {
 		return fmt.Errorf("drain wait: %w", err)
 	}
-	defer release(e)
+	defer s.release(e)
 	s.mu.Lock()
 	if s.phase != "suspending" || !proto.Equal(s.suspension, x) {
 		s.mu.Unlock()
@@ -527,6 +541,11 @@ func (s *Supervisor) Resume(parent context.Context, t *pb.ResumeToken) (*pb.Resu
 		}
 		a.Mounts = append(a.Mounts, clone(e.status))
 	}
+	// ResumeAck first consumes the exact fixed roster. Joined exact removals
+	// can now transfer membership into their already reserved retirement.
+	for key := range s.jobs {
+		s.retireJoinedLocked(key)
+	}
 	return a, nil
 }
 func (s *Supervisor) recoverMount(ctx context.Context, done func(), e *entry, t *pb.ResumeToken) {
@@ -534,7 +553,7 @@ func (s *Supervisor) recoverMount(ctx context.Context, done func(), e *entry, t 
 	if err := acquire(ctx, e); err != nil {
 		return
 	}
-	defer release(e)
+	defer s.release(e)
 	s.mu.Lock()
 	if s.phase != "running" || e.terminal || s.mounts[control.MountKey(e.status.Mount)] != e || ctx.Err() != nil || !proto.Equal(s.suspension, t.Suspension) {
 		s.mu.Unlock()
@@ -576,8 +595,8 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 			return err
 		}
 	}
-	if e == nil || s.phase != "running" || reason == "" {
-		return refused("terminal unknown mount, phase or missing reason")
+	if e == nil || reason == "" {
+		return refused("terminal unknown mount or missing reason")
 	}
 	e.gateSerial = e.driver.CloseAdmission(s.generation)
 	e.terminal = true
@@ -602,6 +621,7 @@ func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
 	}
 	e.setStatus(e.status.State, e.status.Reason, "complete")
 	e.cleaned = true
+	s.retireJoinedLocked(control.MountKey(id))
 	return nil
 }
 
@@ -622,10 +642,6 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		err = refused("replace requires running phase and exact cleanup")
 	} else if s.retainedIncarnationLocked(id) {
 		err = refused("replace previously retired incarnation")
-	} else if !s.retirementAvailableLocked(s.jobs[control.MountKey(old)]) {
-		err = refused("retired outcome sequence exhausted")
-	} else if s.slotsLocked() >= control.MaxMounts {
-		err = refused("replace waiting for retired outcome acknowledgement")
 	} else if !bytes.Equal(old.AuthorityId, id.AuthorityId) || old.VolumeId != id.VolumeId || bytes.Equal(old.Incarnation, id.Incarnation) {
 		err = refused("replace authority, volume or incarnation mismatch")
 	} else {
@@ -649,7 +665,11 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		s.retireLocked(e.status, s.jobs[control.MountKey(old)])
 		delete(s.mounts, control.MountKey(old))
 		delete(s.jobs, control.MountKey(old))
-		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
+		// The old owner has finished using its reservation. Only admission of
+		// the new incarnation may need an acknowledgement or sequence space.
+		if err = s.desiredCapacityLocked(id); err == nil {
+			s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
+		}
 	}
 	s.mu.Unlock()
 	if err != nil {

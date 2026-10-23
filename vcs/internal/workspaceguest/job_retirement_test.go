@@ -322,24 +322,25 @@ func TestTransportDrainBudgetBoundaryValidation(t *testing.T) {
 	}
 }
 
-func TestJobRetirementCountsUnacknowledgedEvidenceAtSharedBound(t *testing.T) {
+func TestJobRetirementCountsUnacknowledgedReservations(t *testing.T) {
 	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(s.ChannelLost)
-	for i := range control.MaxMounts {
+	for i := range MaxReservations {
 		if err := s.AcceptJob(jobRequest(uint64(i+1), retirementVolume(i, 4), "mount")); err != nil {
 			t.Fatal(err)
 		}
+		waitDesiredJobsJoined(t, s)
 	}
 	waitDesiredJobsJoined(t, s)
-	if len(s.Retired()) != control.MaxMounts || len(s.Status().Jobs) != 0 {
+	if len(s.Retired()) != MaxReservations || len(s.Status().Jobs) != 0 {
 		t.Fatal("joined owners did not transfer their slots")
 	}
 	before := s.Retired()
 	for _, mid := range []*pb.MountID{retirementVolume(99, 4), retirementVolume(0, 5)} {
-		if err := s.AcceptJob(jobRequest(100, mid, "provision")); err == nil {
+		if err := s.AcceptJob(jobRequest(200, mid, "provision")); err == nil {
 			t.Fatal("unacknowledged evidence bypassed capacity")
 		}
 		if err := s.Register(context.Background(), mid, Witness{}, &fakeMount{}); err == nil {
@@ -361,7 +362,7 @@ func TestJobRetirementCountsUnacknowledgedEvidenceAtSharedBound(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.AcceptJob(jobRequest(101, retirementVolume(0, 5), "mount")); err != nil {
+	if err := s.AcceptJob(jobRequest(201, retirementVolume(0, 5), "mount")); err != nil {
 		t.Fatal(err)
 	}
 	waitDesiredJobsJoined(t, s)
@@ -431,7 +432,7 @@ func TestReplaceRetiresRegisteredJobFailureWithExactMount(t *testing.T) {
 	}
 }
 
-func TestRegisteredJobRetryRetiresEarlierFailure(t *testing.T) {
+func TestRegisteredJobRetryMergesEarlierFailure(t *testing.T) {
 	s, _, mid := fixture(t)
 	for _, request := range []uint64{2, 3} {
 		if err := s.AcceptJob(jobRequest(request, mid, "mount")); err != nil {
@@ -439,7 +440,7 @@ func TestRegisteredJobRetryRetiresEarlierFailure(t *testing.T) {
 		}
 		waitDesiredJobsJoined(t, s)
 	}
-	if len(s.Retired()) != 1 || s.Retired()[0].Job.RequestId != 2 || s.Status().Jobs[0].RequestId != 3 {
+	if len(s.Retired()) != 0 || len(s.Status().Jobs[0].Prior) != 1 || s.Status().Jobs[0].Prior[0].First.RequestId != 2 || s.Status().Jobs[0].RequestId != 3 {
 		t.Fatal("retry erased unobserved failure")
 	}
 	encodable(t, s.Status())

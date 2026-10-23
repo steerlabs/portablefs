@@ -430,8 +430,8 @@ aggregates the remainder, retaining the highest sequence and saturating
 accepted-entry/byte counters. The driver retains exact barrier outcomes.
 Overflow terminalizes only that mount for exact cleanup/replacement; its cold
 withdrawal still counts toward suspension. Later reports cannot reduce a
-reported aggregate. Even 48 active and 16 retired maximum-size mount ledgers, statuses and identities
-fit a 1 MiB frame by construction. Cold completion never implies loss-free
+reported aggregate. Even 64 active and 16 retired maximum-size mount ledgers, statuses, identities
+and cumulative job summaries fit the paired 2 MiB frame by construction. Cold completion never implies loss-free
 durability.
 
 | Body | Required meaning |
@@ -698,24 +698,44 @@ lanes remain owned until they actually join. Cold proof covers the whole roster
 in canonical order; neither a failed participant nor a stuck notification earns
 a partial acknowledgement.
 
-Status has at most one desired-job slot per exact MountID, with originating
-request, generation, operation, phase and bounded retained failure. Registered
-mounts and desired intents share capacity with unacknowledged retirement records,
-with at most 64 slots in total; an intent never adds a
-ready mount to the roster. Acceptance reserves the slot under the supervisor
-lock, then dispatches `offered -> running -> complete|failed` on its generation
-context. A live slot cannot be replaced, including after cancellation. A later
-accepted command can replace a joined registered slot only after moving its prior
-job evidence into retirement. A joined job with no registered mount immediately
-transfers its slot into retirement, including completed Umount. It no longer
-blocks a new incarnation. Capacity is reusable after explicit RetireAck; a full
-unacknowledged ledger refuses admission rather than evicting evidence.
-`RetiredOutcome` carries a joined job, an exactly cleaned terminal mount, or both
-for replacement of that mount. Job-only retirement asserts no mount membership,
-cleanup proof or durability outcome. The existing retirement sequence, 16-record
-Status batch and RetireAck cover all three forms. Admission reserves sequence
-space for asynchronous job completion; exhaustion refuses before dispatch.
-Observation stores no responses or reply history.
+Status has at most one desired-job slot per active exact MountID. Membership
+and desired work share a 64-key active bound. Separately, at most 128 reservations
+cover active keys and final unacknowledged retirement records. Admission of a new
+active key reserves its eventual record and sequence under the supervisor lock,
+then dispatches `offered -> running -> complete|failed` on its generation context.
+A key's lifecycle never allocates another reservation. Only a new-key admission
+can wait for acknowledgement, and reservation saturation always has at least
+64 directly acknowledgeable records. Sequence exhaustion refuses a new admission;
+it never prevents an admitted owner's final retirement.
+
+A live job cannot be replaced, including after cancellation. Registered retries
+merge joined predecessors into the current job's cumulative `prior` summaries.
+There are exactly 21 possible operation/result categories (three operations,
+complete or one of six failure codes). Each present category retains the first
+exact result, an exact count and the highest joined request ID. Later diagnostic
+strings and individual request IDs are explicitly aggregated within that category;
+no failure category or count is erased. Summaries are canonical, nonrecursive and
+monotonic, and their counts cannot overflow because accepted request IDs increase.
+This is finite outcome evidence, not a request/response history.
+
+A joined job without membership transfers its reservation into retirement. A
+joined Umount with terminal membership and exact cleanup proof retires the mount
+and job, including all predecessor summaries, atomically as one record. Actual
+driver calls join before publishing that immutable evidence. During a fixed cold
+transaction, cleaned membership remains through Resume token consumption, then
+retires. It needs no further driver call or capacity. Exactly cleaned Replace
+first retires the old key using its reservation, then admits the new incarnation.
+At reservation saturation only that new admission waits; the old key is already
+retired and can be acknowledged. After acknowledgement the caller Registers the
+new incarnation, without an old membership tombstone.
+
+`RetiredOutcome` carries a joined job, an exactly cleaned terminal mount, or both.
+Job-only retirement asserts no membership, cleanup proof or durability outcome.
+The host coordinator owns observation and acknowledgement: it reconciles mount
+and job owners independently, retains each page before acknowledging, and advances
+full pages until the backlog is consumed. One missing owner's later page cannot
+block another owner's evidence. Duplicate acknowledgements and snapshots older
+than the acknowledged cursor are harmless. No unobserved retirement is evicted.
 Suspend closes admission and cancels jobs before waiting for their actual
 owners, including desired-only work. One reader watches EOF while the ordered
 dispatcher drains or writes a response; loss immediately closes admission and

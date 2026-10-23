@@ -82,6 +82,12 @@ enum WorkspaceWireSchema {
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "$", repeated: false, oneof: false),
             7: .init(kind: "$", repeated: false, oneof: false),
+            8: .init(kind: "JoinedJobSummary", repeated: true, oneof: false),
+        ],
+        "JoinedJobSummary": [
+            1: .init(kind: "MountJob", repeated: false, oneof: false),
+            2: .init(kind: "", repeated: false, oneof: false),
+            3: .init(kind: "", repeated: false, oneof: false),
         ],
         "RetiredOutcome": [
             1: .init(kind: "", repeated: false, oneof: false),
