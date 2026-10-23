@@ -39,7 +39,7 @@ type Host interface {
 	Terminal(*pb.MountID, string, []*pb.Loss) error
 	Cleanup(*pb.MountID, CleanupProof) error
 	Replace(context.Context, *pb.MountID, *pb.MountID, Witness, Mount) error
-	RecoveryRequired(*pb.MountID, string) error
+	RecoveryRequired(*pb.MountID, uint64, uint64, string) error
 	Registered(*pb.MountID) bool
 }
 type Manager struct {
@@ -57,7 +57,6 @@ type Manager struct {
 // cannot adopt it, and uncertain socket delivery cannot create another mount.
 type Driver struct {
 	registered         atomic.Bool
-	proofUnavailable   atomic.Bool
 	terminalCleanup    atomic.Bool
 	cleaned            atomic.Bool
 	removals           [2]*rootRemoval
@@ -418,7 +417,6 @@ func (d *Driver) OpenAdmission(g, serial uint64) error {
 		return err
 	}
 	d.serving.Store(true)
-	d.proofUnavailable.Store(false)
 	return nil
 }
 func (d *Driver) next() (uint64, error) {
@@ -917,8 +915,10 @@ func (d *Driver) watch() {
 					_ = d.manager.Host.Cleanup(d.id, proof)
 				}
 			}()
-		} else if r.State == "recovery-required" && d.proofUnavailable.CompareAndSwap(false, true) {
-			_ = d.manager.Host.RecoveryRequired(d.id, "workspace clock or subscription proof unavailable")
+		} else if r.State == "recovery-required" {
+			g, _ := strconv.ParseUint(b.Generation, 10, 64)
+			serial, _ := strconv.ParseUint(b.GateSerial, 10, 64)
+			_ = d.manager.Host.RecoveryRequired(d.id, g, serial, "workspace clock or subscription proof unavailable")
 		}
 	}
 }

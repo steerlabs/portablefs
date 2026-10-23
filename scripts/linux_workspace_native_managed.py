@@ -50,6 +50,71 @@ class NativeAuthority:
         return subprocess.check_output(['docker', 'exec', '--user', '200001:200001', self.name,
                                         'python3', '-c', script], text=True).strip()
 
+    def authority_sessions(self):
+        raw = subprocess.check_output(['docker', 'exec', self.name, 'python3', '-c',
+            "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:7444/metrics').read().decode())"], text=True)
+        active = re.search(r'^portablefs_authority_active_sessions\{[^\n]*\} (\d+)$', raw, re.M)
+        log = subprocess.check_output(['docker', 'exec', self.name, 'cat', '/var/tmp/pfs-native/authority.log'], text=True)
+        attached = re.findall(r'session=([0-9a-f]+) opcode=attach outcome=success', log)
+        assert active, raw
+        return {'active': int(active.group(1)), 'attached': attached}
+
+    def network(self, blocked):
+        subprocess.run(['docker', 'exec', self.name, 'iptables', '-I' if blocked else '-D', 'INPUT',
+                        '-i', 'eth0', '-p', 'tcp', '--dport', '17443', '-j', 'DROP'], check=True)
+
+    def arm_prepare_outage(self):
+        # Delayed egress gives the fixture observer time to block guest ingress
+        # after real Activate commits and before the initial Subscribe. The
+        # ordinary peer uses loopback and remains independently live.
+        subprocess.run(['docker', 'exec', self.name, 'tc', 'qdisc', 'add', 'dev', 'eth0', 'root', 'netem', 'delay', '500ms'], check=True)
+        script = """import pathlib,subprocess,time
+p=pathlib.Path('/var/tmp/pfs-native/authority.log')
+with p.open() as f:
+    f.seek(0,2)
+    pathlib.Path('/var/tmp/pfs-native/outage-armed').touch()
+    limit=time.monotonic()+60
+    while time.monotonic()<limit:
+        line=f.readline()
+        if 'opcode=activate outcome=success' in line:
+            subprocess.run(['iptables','-I','INPUT','-i','eth0','-p','tcp','--dport','17443','-j','DROP'],check=True)
+            subprocess.run(['tc','qdisc','del','dev','eth0','root'],check=True)
+            pathlib.Path('/var/tmp/pfs-native/outage-blocked').touch()
+            break
+        time.sleep(.001)
+    else:
+        raise RuntimeError('no managed Activate observed')
+"""
+        subprocess.run(['docker', 'exec', '-d', self.name, 'python3', '-c', script], check=True)
+        self.wait_fixture('outage-armed')
+
+    def wait_fixture(self, name):
+        deadline = time.monotonic()+65
+        while subprocess.run(['docker', 'exec', self.name, 'test', '-f', '/var/tmp/pfs-native/'+name], capture_output=True).returncode:
+            assert time.monotonic()<deadline, name
+            time.sleep(.02)
+
+    def outage(self, guest, phase):
+        before = self.authority_sessions()
+        assert before['active'] == 2, before
+        started = time.monotonic()
+        deadline = started+46
+        samples = []
+        while time.monotonic()<deadline:
+            status = self.status(guest)
+            mounts = [m for m in status.get('mounts', []) if m['mount']['volumeId'] == self.volume]
+            assert len(mounts) == 1 and mounts[0]['state'] == 'recovering', status
+            if phase == 'prepare':
+                jobs = [j for j in status.get('jobs', []) if j['mount']['volumeId'] == self.volume and j['operation'] == 'mount']
+                assert len(jobs) == 1 and jobs[0]['phase'] == 'running', status
+            samples.append({'elapsed': time.monotonic()-started, 'state': mounts[0]['state']})
+            time.sleep(.2)
+        after = self.authority_sessions()
+        assert before == after, (before, after)
+        (self.evidence/('managed-'+phase+'-outage.json')).write_text(json.dumps({'before': before, 'after': after, 'seconds': time.monotonic()-started, 'samples': samples}, indent=2))
+        self.network(False)
+        return before
+
     def status(self, guest):
         guest.command('mount-status')
         event = guest.wait('mount-status', 30)
@@ -80,7 +145,7 @@ class NativeAuthority:
             assert time.monotonic() < deadline, status
             time.sleep(.05)
 
-    def mount(self, guest, short=False):
+    def mount(self, guest, short=False, outage=False):
         guest.command('identity', body=self.fixture('identity-request', self.volume))
         identity = guest.wait('identity-result', 30)['body']
         public = json.loads(self.fixture('decode-identity', identity))
@@ -90,10 +155,17 @@ class NativeAuthority:
         guest.command('provision', body=material)
         assert guest.wait('provision-accepted', 30)['code'] == 'accepted'
         self.job(guest, 'provision')
+        if outage:
+            self.arm_prepare_outage()
         guest.command('mount', body=public['mount'])
         assert guest.wait('mount-accepted', 30)['code'] == 'accepted'
+        if outage:
+            self.wait_fixture('outage-blocked')
+            retained = self.outage(guest, 'prepare')
         self.job(guest, 'mount')
         mounted = self.ready(guest)
+        if outage:
+            assert self.authority_sessions() == retained
         public['incarnation'] = mounted['mount']['incarnation']
         assert mounted['renewal']['state'] == 'not-required', mounted
         return public

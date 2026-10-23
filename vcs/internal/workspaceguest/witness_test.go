@@ -22,6 +22,41 @@ func partialWitnessFixture(t *testing.T) (*Supervisor, *fakeMount, *pb.MountID) 
 	return s, m, mid
 }
 
+func TestRecoveryRequiredClosesOnlyItsExactServingInterval(t *testing.T) {
+	s, m, mid := partialWitnessFixture(t)
+	for interval := 0; interval < 3; interval++ {
+		if err := s.Activate(context.Background(), mid, 0); err != nil {
+			t.Fatal(err)
+		}
+		m.mu.Lock()
+		serial := m.gateSerial
+		m.mu.Unlock()
+		for _, obsolete := range [][2]uint64{{1, serial}, {0, serial - 1}} {
+			if err := s.RecoveryRequired(mid, obsolete[0], obsolete[1], "delayed old observation"); err == nil {
+				t.Fatal("obsolete observation closed a new interval")
+			}
+		}
+		m.mu.Lock()
+		open := m.open && m.gateSerial == serial
+		m.mu.Unlock()
+		if !open {
+			t.Fatal("stale observation changed serving admission")
+		}
+		if err := s.RecoveryRequired(mid, 0, serial, "clock proof unavailable"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RecoveryRequired(mid, 0, serial, "duplicate observation"); err == nil {
+			t.Fatal("old observation advanced the close serial again")
+		}
+		m.mu.Lock()
+		closed := !m.open && m.gateSerial == serial+1
+		m.mu.Unlock()
+		if !closed || s.Status().Mounts[0].State != "closed" {
+			t.Fatal("unavailable proof retained serving admission")
+		}
+	}
+}
+
 func TestWitnessPartialConflictRetainsNewAcquisitions(t *testing.T) {
 	s, _, mid := partialWitnessFixture(t)
 	if _, err := s.BindWitness(mid, Witness{Session: "first"}); err != nil {

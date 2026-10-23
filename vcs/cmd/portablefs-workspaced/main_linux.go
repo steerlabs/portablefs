@@ -241,6 +241,11 @@ func serve() error {
 		if err = os.MkdirAll(directory, 0711); err != nil {
 			return err
 		}
+		// The service's private umask must not remove traversal to separately
+		// owned client directories. Listing remains reserved to this root owner.
+		if err = os.Chmod(directory, 0711); err != nil {
+			return err
+		}
 	}
 	mounts = &workspacemount.Manager{Identity: identities, Inventory: inventory, Clock: clock, Boot: boot, HostService: host, GuestService: guest, Binary: "/usr/local/bin/portablefs", Targets: "/workspaces", Clients: "/data/workspace-clients", Backing: "/data/workspace-backing"}
 	if err = mounts.Reconcile(context.Background()); err != nil {

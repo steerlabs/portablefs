@@ -27,3 +27,6 @@ managed-channel-loss-vm-discard
 managed-reboot-durable-reconcile
 managed-terminal-replacement
 managed-old-handle-terminal
+managed-prepare-outage-over-45s
+managed-recover-outage-over-45s
+managed-root-owner-death-vm-discard

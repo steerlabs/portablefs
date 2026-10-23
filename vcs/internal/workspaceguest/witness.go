@@ -88,12 +88,15 @@ func (s *Supervisor) Registered(id *pb.MountID) bool {
 
 // RecoveryRequired closes a serving interval without inventing an authority
 // expiry. A host-owned cold transaction supplies fresh Resume authority.
-func (s *Supervisor) RecoveryRequired(id *pb.MountID, reason string) error {
+func (s *Supervisor) RecoveryRequired(id *pb.MountID, generation, serial uint64, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.mounts[control.MountKey(id)]
 	if e == nil {
 		return refused("recovery-required unknown mount")
+	}
+	if s.generation != generation || e.gateSerial != serial || e.cleaned {
+		return refused("recovery-required obsolete interval")
 	}
 	e.gateSerial = e.driver.CloseAdmission(s.generation)
 	if !e.terminal {

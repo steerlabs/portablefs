@@ -203,8 +203,9 @@ try:
     record('rtc-boot-correction')
     subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), '--seconds', '65'], check=True)
     record('rtc-awake-measurement')
-    managed = authority.mount(guest)
+    managed = authority.mount(guest, outage=True)
     record('managed-standalone-provision')
+    record('managed-prepare-outage-over-45s')
     authority.initial_io(guest)
     record('managed-write-read-fsync')
     record('managed-peer-coherence')
@@ -221,11 +222,15 @@ try:
     authority.write_while_paused()
     time.sleep(5)
     record('controlled-cold-pause')
+    authority.network(True)
     guest.command('resume')
     resumed = guest.wait('resumed', 25)
     assert resumed['operations'][-1] == 'resume-completed'
     assert len(resumed['mount_states']) == 1
+    retained = authority.outage(guest, 'recover')
     authority.ready(guest)
+    assert authority.authority_sessions() == retained
+    record('managed-recover-outage-over-45s')
     assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
     record('managed-suspend-resume-data')
     deadline = time.monotonic() + 10
@@ -271,6 +276,7 @@ try:
     record('guest-host-key-persistence')
     guest.stop(interrupt=True)
     guest = Guest()
+    root_death_mount = authority.mount(guest)
     guest.command('pause'); guest.wait('paused', 25)
     guest.command('resume'); guest.wait('resumed', 25)
     guest.command('replay-resume')
@@ -279,10 +285,13 @@ try:
     # This is a real replay on the paired stream; the guest closes it and the
     # coordinator discards the now-unpaired VM. No dev input guard refused it.
     guest.wait('failure', 25)
-    guest.wait('stopped', 25)
+    stopped = guest.wait('stopped', 25)
+    assert stopped['operations'][-1] == 'stop-completed', stopped
     assert guest.p.wait(timeout=10) == 1
     record('resume-single-use')
+    record('managed-root-owner-death-vm-discard')
     guest = Guest()
+    authority.reconciled(guest, root_death_mount)
     guest.p.stdin.close()
     stopped = guest.wait('stopped', 30)
     assert stopped['operations'][-1] == 'shutdown-completed'

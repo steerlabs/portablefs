@@ -6,7 +6,9 @@ root=/var/tmp/pfs-native
 volume=native-managed
 mkdir -p "$root/bin" "$root/home" "$root/xfs"
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends xfsprogs fuse3 util-linux python3 >/dev/null
+apt-get install -y -qq --no-install-recommends xfsprogs fuse3 util-linux python3 iproute2 iptables >/dev/null
+groupadd --gid 200001 pfs-native
+useradd --uid 200001 --gid 200001 --no-create-home --home-dir "$root/home" pfs-native
 mountpoint -q /sys/fs/fuse/connections || mount -t fusectl none /sys/fs/fuse/connections
 for program in portablefs-authority portablefs-mount-v3; do
   go -C /work/vcs build -o "$root/bin/$program" "./cmd/$program"
@@ -25,18 +27,21 @@ service "$root/bin/pfs-workspace-fixture" setup "$root/home/test-pki" "$volume"
 service mkdir "$root/home/peer"
 authority_pid= peer_pid=
 cleanup() {
+  result=$?
   trap - EXIT TERM INT
   if [[ -n "$peer_pid" ]]; then kill -TERM "$peer_pid" 2>/dev/null || true; wait "$peer_pid" || true; fi
   if [[ -n "$authority_pid" ]]; then kill -TERM "$authority_pid" 2>/dev/null || true; wait "$authority_pid" || true; fi
+  if mountpoint -q "$root/home/peer"; then umount "$root/home/peer"; fi
+  if (( result != 0 )); then cat "$root/authority.log" "$root/peer.log" >&2; fi
   umount "$root/xfs"
   [[ -z $(losetup -j "$root/xfs.img") ]]
 }
 trap cleanup EXIT TERM INT
-service "$root/bin/portablefs-authority" --listen 0.0.0.0:17443 --volume-id "$volume" \
+setpriv --reuid 200001 --regid 200001 --clear-groups "$root/bin/portablefs-authority" --listen 0.0.0.0:17443 --volume-id "$volume" \
   --root "$root/xfs/$volume" --project-id 42016 \
   --tls-cert "$root/home/test-pki/server.pem" --tls-key "$root/home/test-pki/server.key" \
   --client-ca "$root/home/test-pki/client-ca.pem" --capability-public-key "$root/home/test-pki/capability-public.pem" \
-  --capability-max-lifetime 1h --mount-membership-file "$root/xfs/.portablefs-control/$volume/mount.membership" \
+  --capability-max-lifetime 61m --mount-membership-file "$root/xfs/.portablefs-control/$volume/mount.membership" \
   >"$root/authority.log" 2>&1 &
 authority_pid=$!
 for attempt in $(seq 1 150); do
@@ -44,7 +49,7 @@ for attempt in $(seq 1 150); do
   kill -0 "$authority_pid"
   sleep 0.1
 done
-service "$root/bin/portablefs-mount-v3" --authority 127.0.0.1:17443 --volume-id "$volume" --mountpoint "$root/home/peer" \
+setpriv --reuid 200001 --regid 200001 --clear-groups "$root/bin/portablefs-mount-v3" --authority 127.0.0.1:17443 --volume-id "$volume" --mountpoint "$root/home/peer" \
   --access-token-file "$root/home/test-pki/peer.token" --tls-cert "$root/home/test-pki/peer.pem" \
   --tls-key "$root/home/test-pki/peer.key" --tls-server-ca "$root/home/test-pki/server-ca.pem" \
   --tls-server-name authority.portablefs.test >"$root/peer.log" 2>&1 &

@@ -183,6 +183,7 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 	case <-reader.Done():
 		// The root is gone. Keep the same offered action and evidence; the host
 		// must discard this VM. This child has no path-based unmount authority.
+		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace owner pipe ended")
 		<-c.finalized
 		return 1
 	case <-signals:
