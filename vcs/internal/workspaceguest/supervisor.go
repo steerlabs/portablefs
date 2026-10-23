@@ -135,10 +135,12 @@ type Supervisor struct {
 	retired              []*pb.MountStatus
 	retirementSequence   uint64
 	acknowledgedSequence uint64
+	jobs                 map[string]*mountJob
+	jobDriver            MountJobDriver
 }
 
 // A restarted service cannot infer safety while old mount processes may survive.
-func New(boot, host, guest []byte, freshBoot bool) (*Supervisor, error) {
+func New(boot, host, guest []byte, freshBoot bool, driver MountJobDriver) (*Supervisor, error) {
 	if !control.ID(boot) || !control.ID(host) || !control.ID(guest) {
 		return nil, fmt.Errorf("new supervisor identity: %w", control.ErrGrammar)
 	}
@@ -148,7 +150,7 @@ func New(boot, host, guest []byte, freshBoot bool) (*Supervisor, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Supervisor{boot: bytes.Clone(boot), host: bytes.Clone(host), guest: bytes.Clone(guest),
-		phase: phase, mounts: map[string]*entry{}, generationContext: ctx, cancel: cancel}, nil
+		phase: phase, mounts: map[string]*entry{}, jobs: map[string]*mountJob{}, jobDriver: driver, generationContext: ctx, cancel: cancel}, nil
 }
 func clone[T proto.Message](v T) T { return proto.Clone(v).(T) }
 func (s *Supervisor) rosterLocked() []*pb.MountID {
@@ -199,6 +201,9 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 		}
 	}
 	if err == nil {
+		err = s.desiredCapacityLocked(id)
+	}
+	if err == nil {
 		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
 	}
 	s.mu.Unlock()
@@ -208,9 +213,10 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 	return nil
 }
 func callContext(parent, generation context.Context) (context.Context, func()) {
-	ctx, cancel := context.WithCancel(generation)
-	stop := context.AfterFunc(parent, cancel)
-	if parent.Err() != nil {
+	// Preserve Deadline for adapters forwarding the shrinking local allowance.
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(generation, cancel)
+	if generation.Err() != nil {
 		cancel()
 	}
 	return ctx, func() { stop(); cancel() }
@@ -379,8 +385,12 @@ func (s *Supervisor) Drain(parent context.Context, x *pb.Suspension, id *pb.Moun
 	generation := s.generation
 	e.draining = generation
 	ctx, done := callContext(parent, s.generationContext)
+	job := s.jobs[control.MountKey(id)]
 	s.mu.Unlock()
 	defer done()
+	if err := waitJob(ctx, job); err != nil {
+		return fmt.Errorf("drain desired job join: %w", err)
+	}
 	if err := acquire(ctx, e); err != nil {
 		return fmt.Errorf("drain wait: %w", err)
 	}
@@ -426,6 +436,13 @@ func (s *Supervisor) SuspendAck(x *pb.Suspension) (*pb.SuspendAck, error) {
 	defer s.mu.Unlock()
 	if s.phase != "suspending" || !proto.Equal(s.suspension, x) {
 		return nil, refused("ack outside current suspension")
+	}
+	for _, j := range s.jobs {
+		select {
+		case <-j.done:
+		default:
+			return nil, refused("ack waiting for desired job owner")
+		}
 	}
 	a := &pb.SuspendAck{Suspension: clone(x)}
 	for _, id := range x.Roster {
@@ -544,6 +561,10 @@ func (s *Supervisor) Status() *pb.StatusReply {
 	for _, v := range s.retired[:min(len(s.retired), control.MaxRetiredBatch)] {
 		out.Retired = append(out.Retired, clone(v))
 	}
+	for _, job := range s.jobs {
+		out.Jobs = append(out.Jobs, clone(job.status))
+	}
+	sort.Slice(out.Jobs, func(i, j int) bool { return control.MountKey(out.Jobs[i].Mount) < control.MountKey(out.Jobs[j].Mount) })
 	return out
 }
 func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) error {
@@ -616,11 +637,21 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		}
 	}
 	if err == nil {
+		if j := s.jobs[control.MountKey(old)]; j != nil {
+			select {
+			case <-j.done:
+			default:
+				err = refused("replace waiting for desired job owner")
+			}
+		}
+	}
+	if err == nil {
 		s.retirementSequence++
 		outcome := clone(e.status)
 		outcome.RetirementSequence = s.retirementSequence
 		s.retired = append(s.retired, outcome)
 		delete(s.mounts, control.MountKey(old))
+		delete(s.jobs, control.MountKey(old))
 		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
 	}
 	s.mu.Unlock()
@@ -672,6 +703,9 @@ func (s *Supervisor) AcknowledgeRetired(through uint64) error {
 func (s *Supervisor) ChannelLost() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.discardLocked()
+}
+func (s *Supervisor) discardLocked() {
 	s.cancel()
 	s.phase = "discard-only"
 	s.suspension = nil

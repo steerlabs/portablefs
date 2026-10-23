@@ -75,6 +75,15 @@ enum WorkspaceWireSchema {
         "StatusRequest": [
             :
         ],
+        "MountJob": [
+            1: .init(kind: "MountID", repeated: false, oneof: false),
+            2: .init(kind: "", repeated: false, oneof: false),
+            3: .init(kind: "", repeated: false, oneof: false),
+            4: .init(kind: "$", repeated: false, oneof: false),
+            5: .init(kind: "$", repeated: false, oneof: false),
+            6: .init(kind: "$", repeated: false, oneof: false),
+            7: .init(kind: "$", repeated: false, oneof: false),
+        ],
         "StatusReply": [
             1: .init(kind: "$", repeated: false, oneof: false),
             2: .init(kind: "$", repeated: false, oneof: false),
@@ -83,6 +92,7 @@ enum WorkspaceWireSchema {
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "MountStatus", repeated: true, oneof: false),
             7: .init(kind: "MountStatus", repeated: true, oneof: false),
+            8: .init(kind: "MountJob", repeated: true, oneof: false),
         ],
         "RetireAck": [
             1: .init(kind: "", repeated: false, oneof: false),
@@ -109,6 +119,7 @@ enum WorkspaceWireSchema {
         "Envelope": [
             1: .init(kind: "", repeated: false, oneof: false),
             2: .init(kind: "", repeated: false, oneof: false),
+            3: .init(kind: "", repeated: false, oneof: false),
             10: .init(kind: "Hello", repeated: false, oneof: true),
             11: .init(kind: "Hello", repeated: false, oneof: true),
             12: .init(kind: "Suspension", repeated: false, oneof: true),

@@ -18,7 +18,7 @@ func TestTransportFailedPrepareRetainsTerminalOutcomeOnResume(t *testing.T) {
 	_ = s.Activate(context.Background(), mid, 0) // invalid closed proof terminalizes this incarnation
 	pairTransport(t, c)
 	x := suspension(s)
-	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Suspend{Suspend: x}})
+	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, DrainBudgetNanos: uint64(control.MaxDrainBudget), Body: &pb.Envelope_Suspend{Suspend: x}})
 	ack := r.GetSuspendAck()
 	if ack == nil {
 		t.Fatalf("no ack: %v", r)

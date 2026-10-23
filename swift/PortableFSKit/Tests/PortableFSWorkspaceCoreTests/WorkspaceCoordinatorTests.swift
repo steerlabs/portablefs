@@ -133,6 +133,26 @@ private enum InjectedFailure: Error { case failed }
     #expect(r.power.acknowledgements.count == 1)
     #expect(r.power.acknowledgements[0].1)
 }
+
+@Test @MainActor func workspaceQueuedControlRefusesPauseAndColdEligibility() throws {
+    for queueDuringPause in [false, true] {
+        let r = try Rig(); r.sleep()
+        if !queueDuringPause { r.channel.isIdle = false }
+        r.channel.acknowledge()
+        if queueDuringPause {
+            #expect(r.coordinator.phase == .pausing)
+            r.channel.isIdle = false
+            r.vm.pauses.removeFirst()(.success(()))
+        } else { #expect(r.vm.pauses.isEmpty) }
+        #expect(r.coordinator.phase == .stopping)
+        #expect(!r.coordinator.attachAllowed)
+        #expect(r.power.acknowledgements.isEmpty)
+        #expect(r.vm.stops.count == 1)
+        r.vm.stops.removeFirst()(.success(()))
+        #expect(r.coordinator.phase == .stopped)
+        #expect(r.power.acknowledgements.count == 1)
+    }
+}
 @Test @MainActor func workspaceMissingAckBecomesDiscardOnlyAndNeverResumes() throws {
     let r = try Rig(); r.sleep()
     r.clock.advance(15_000_000_000)

@@ -140,7 +140,7 @@ func mountID(n byte) *pb.MountID {
 }
 func fixture(t *testing.T) (*Supervisor, *fakeMount, *pb.MountID) {
 	t.Helper()
-	s, err := New(id(1), id(2), id(3), true)
+	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestGuestSecondSleepBeforeTokenConsumption(t *testing.T) {
 func TestGuestServiceRestartDefaultsToDiscard(t *testing.T) {
 	s, _, mid := fixture(t)
 	x := cold(t, s, mid)
-	restarted, err := New(id(1), id(2), id(30), false)
+	restarted, err := New(id(1), id(2), id(30), false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

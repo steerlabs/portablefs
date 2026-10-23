@@ -186,7 +186,7 @@ func serve() error {
 			unix.Close(client)
 			return fmt.Errorf("invalid vsock descriptor")
 		}
-		supervisor, err := workspaceguest.New(boot, host, guest, true)
+		supervisor, err := workspaceguest.New(boot, host, guest, true, nil)
 		if err != nil {
 			stream.Close()
 			return fmt.Errorf("guest workspace: %w", err)

@@ -86,6 +86,20 @@ message ResumeAck {
   repeated MountStatus mounts = 2;
 }
 message StatusRequest {}
+// Desired work is distinct from registered kernel/session membership. One
+// fixed slot per desired mount retains acceptance and its final disposition.
+message MountJob {
+  MountID mount = 1;
+  uint64 request_id = 2;
+  uint64 generation = 3;
+  // provision, mount, umount.
+  string operation = 4;
+  // offered, running, complete, failed.
+  string phase = 5;
+  // unavailable, refused, authorization-required, stopped, deadline, handler-failed.
+  string failure = 6;
+  string reason = 7;
+}
 message StatusReply {
   bytes boot_id = 1;
   bytes host_service_id = 2;
@@ -96,6 +110,7 @@ message StatusReply {
   repeated MountStatus mounts = 6;
   // First 16 unacknowledged retired outcomes, in retirement order.
   repeated MountStatus retired = 7;
+  repeated MountJob jobs = 8;
 }
 // Idempotently acknowledge all retired outcomes through this sequence.
 message RetireAck { uint64 through_sequence = 1; }
@@ -119,6 +134,9 @@ message Result {
 message Envelope {
   uint32 version = 1;
   uint64 request_id = 2;
+  // Remaining allowance, stamped after host FIFO delay. Suspend only; not
+  // part of Suspension or ResumeToken identity. Positive and at most 15 s.
+  uint64 drain_budget_nanos = 3;
   oneof body {
     Hello hello = 10;
     Hello hello_ack = 11;

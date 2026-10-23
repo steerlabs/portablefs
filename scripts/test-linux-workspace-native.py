@@ -154,6 +154,11 @@ try:
     assert guest.ssh('findmnt -n -o FSTYPE /workspaces') == 'tmpfs'
     assert guest.ssh('test -x /workspaces && test ! -w /workspaces && echo traversable') == 'traversable'
     record('workspace-root-layout')
+    guest.command('probe-unavailable-jobs')
+    jobs = guest.wait('jobs-refused', 10)
+    assert jobs['mounts'] == 0 and jobs['failure'] == 'unavailable', jobs
+    assert len(jobs['request_ids']) == 3 and all(a < b for a, b in zip(jobs['request_ids'], jobs['request_ids'][1:])), jobs
+    record('desired-jobs-retain-unavailable')
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()

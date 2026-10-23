@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
@@ -22,6 +23,7 @@ const Version = 8
 const MaxFrame = 1 << 20
 const MaxMounts = 64
 const MaxRetiredBatch = 16
+const MaxDrainBudget = 15 * time.Second
 
 // At most (64 + 16) * 32 * (256 + 40) bytes of loss plus <64 KiB of identities,
 // statuses and envelope overhead: every status/cold/resume reply fits MaxFrame.
@@ -367,9 +369,62 @@ func ResumeAck(a *pb.ResumeAck) error {
 	}
 	return nil
 }
+
+// Jobs and registered mounts share desired-volume capacity, but only registered
+// mounts belong to the cold roster. A start intent is never readiness evidence.
+func Jobs(jobs []*pb.MountJob, mounts []*pb.MountStatus, generation uint64) error {
+	ids := make([]*pb.MountID, 0, len(jobs))
+	volumes := map[string]string{}
+	for _, m := range mounts {
+		volumes[fmt.Sprintf("%x/%s", m.Mount.AuthorityId, m.Mount.VolumeId)] = MountKey(m.Mount)
+	}
+	for _, j := range jobs {
+		if j == nil || Mount(j.Mount) != nil || j.RequestId == 0 || j.Generation > generation {
+			return invalid("job identity")
+		}
+		ids = append(ids, j.Mount)
+		volume := fmt.Sprintf("%x/%s", j.Mount.AuthorityId, j.Mount.VolumeId)
+		if old, ok := volumes[volume]; ok && old != MountKey(j.Mount) {
+			return invalid("job incarnation conflicts with registered mount")
+		}
+		volumes[volume] = MountKey(j.Mount)
+		if j.Operation != "provision" && j.Operation != "mount" && j.Operation != "umount" {
+			return invalid("job operation")
+		}
+		switch j.Phase {
+		case "offered", "running", "complete":
+			if j.Failure != "" || j.Reason != "" {
+				return invalid("unfinished or complete job with failure")
+			}
+		case "failed":
+			switch j.Failure {
+			case "unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed":
+			default:
+				return invalid("job failure")
+			}
+			if j.Reason == "" || len(j.Reason) > MaxReason || !utf8.ValidString(j.Reason) {
+				return invalid("job failure reason")
+			}
+		default:
+			return invalid("job phase")
+		}
+	}
+	if len(volumes) > MaxMounts {
+		return invalid("desired mount capacity")
+	}
+	return Roster(ids)
+}
+
 func Validate(e *pb.Envelope) error {
 	if e == nil || e.Version != Version || e.RequestId == 0 {
 		return invalid("Validate: invalid field or state combination")
+	}
+	if _, suspend := e.Body.(*pb.Envelope_Suspend); suspend {
+		if e.DrainBudgetNanos == 0 || e.DrainBudgetNanos > uint64(MaxDrainBudget) {
+			return invalid("suspend remaining drain budget")
+		}
+	} else if e.DrainBudgetNanos != 0 {
+		return invalid("drain budget outside Suspend")
 	}
 	switch b := e.Body.(type) {
 	case *pb.Envelope_Hello:
@@ -413,6 +468,9 @@ func Validate(e *pb.Envelope) error {
 		}
 		if err := statuses(s.Mounts, false); err != nil {
 			return fmt.Errorf("status mounts: %w", err)
+		}
+		if err := Jobs(s.Jobs, s.Mounts, s.Generation); err != nil {
+			return fmt.Errorf("status jobs: %w", err)
 		}
 		if (s.State == "suspending" || s.State == "suspended-cold") && s.Generation == 0 {
 			return fmt.Errorf("status missing suspension generation: %w", ErrGrammar)
@@ -599,20 +657,33 @@ func Decode(frame []byte) (*pb.Envelope, error) {
 	return e, nil
 }
 func Read(r io.Reader) (*pb.Envelope, error) {
+	e, _, err := ReadReceived(r)
+	return e, err
+}
+
+// ReadReceived anchors the allowance at the first received frame byte. Time
+// spent framing, decoding or waiting for dispatch must not renew that budget.
+// Idle time before a peer starts a frame consumes no new request's allowance.
+func ReadReceived(r io.Reader) (*pb.Envelope, time.Time, error) {
 	var h [4]byte
-	if _, err := io.ReadFull(r, h[:]); err != nil {
-		return nil, fmt.Errorf("workspace header: %w", err)
+	if _, err := io.ReadFull(r, h[:1]); err != nil {
+		return nil, time.Time{}, fmt.Errorf("workspace header: %w", err)
+	}
+	receivedAt := time.Now()
+	if _, err := io.ReadFull(r, h[1:]); err != nil {
+		return nil, receivedAt, fmt.Errorf("workspace header: %w", err)
 	}
 	n := binary.BigEndian.Uint32(h[:])
 	if n == 0 || n > MaxFrame {
-		return nil, fmt.Errorf("invalid workspace frame: %w", ErrGrammar)
+		return nil, receivedAt, fmt.Errorf("invalid workspace frame: %w", ErrGrammar)
 	}
 	frame := make([]byte, 4+int(n))
 	copy(frame, h[:])
 	if _, err := io.ReadFull(r, frame[4:]); err != nil {
-		return nil, fmt.Errorf("workspace payload: %w", err)
+		return nil, receivedAt, fmt.Errorf("workspace payload: %w", err)
 	}
-	return Decode(frame)
+	e, err := Decode(frame)
+	return e, receivedAt, err
 }
 func Write(w io.Writer, e *pb.Envelope) error {
 	frame, err := Encode(e)

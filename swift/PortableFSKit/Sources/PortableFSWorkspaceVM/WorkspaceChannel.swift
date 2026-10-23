@@ -56,9 +56,11 @@ import PortableFSWorkspaceCore
         let request = queue.removeFirst()
         guard clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < request.deadline, requestID < UInt64.max else { request.completion(.failure(WorkspaceVMError("queued control deadline expired"))); advance(); return }
         requestID += 1; let expected = requestID; active = request
-        var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = expected; envelope.body = request.body
         do {
-            try stream.write(WorkspaceControl.encode(envelope), deadline: request.deadline) { result in
+            // Stamp after FIFO residence, immediately before encoding. The
+            // original host deadline still bounds transport and pause.
+            let frame = try Self.encodeRequest(request.body, requestID: expected, deadline: request.deadline, now: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW))
+            stream.write(frame, deadline: request.deadline) { result in
                 switch result {
                 case .failure(let error): self.finish(.failure(error))
                 case .success:
@@ -74,7 +76,7 @@ import PortableFSWorkspaceCore
                                         throw WorkspaceVMError("guest refused resume: " + refusal.reason)
                                     }
                                     switch (request.body, reply.body) {
-                                    case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result): break
+                                    case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result), (.provision, .result), (.mount, .result), (.umount, .result): break
                                     default: throw WorkspaceVMError("unexpected control reply")
                                     }
                                     self.finish(.success(reply))
@@ -85,6 +87,12 @@ import PortableFSWorkspaceCore
                 }
             }
         } catch { finish(.failure(error)) }
+    }
+    static func encodeRequest(_ body: WorkspaceEnvelope.OneOf_Body, requestID: UInt64, deadline: UInt64, now: UInt64) throws -> Data {
+        guard now < deadline else { throw WorkspaceVMError("queued control deadline expired") }
+        var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = requestID; envelope.body = body
+        if case .suspend = body { envelope.drainBudgetNanos = deadline - now }
+        return try WorkspaceControl.encode(envelope)
     }
     private func finish(_ result: Result<WorkspaceEnvelope, Error>) {
         guard let current = active else { return }; active = nil
@@ -101,6 +109,17 @@ import PortableFSWorkspaceCore
     }
     public func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
         exchange(.status(WorkspaceStatusRequest()), deadline: deadline) { completion($0.map { $0.statusReply }) }
+    }
+    public func provision(_ request: WorkspaceProvision, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        exchange(.provision(request), deadline: deadline) { completion($0.map { $0.result }) }
+    }
+    public func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        var request = WorkspaceMountRequest(); request.mount = mount
+        exchange(.mount(request), deadline: deadline) { completion($0.map { $0.result }) }
+    }
+    public func umount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        var request = WorkspaceUmountRequest(); request.mount = mount
+        exchange(.umount(request), deadline: deadline) { completion($0.map { $0.result }) }
     }
     public func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {
         exchange(.suspend(request), deadline: deadline) { completion($0.map { $0.suspendAck }) }

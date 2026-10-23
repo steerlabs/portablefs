@@ -6,6 +6,7 @@ ssh-workspace-user
 immutable-root
 vsock-only-ssh
 workspace-root-layout
+desired-jobs-retain-unavailable
 controlled-cold-pause
 resume-single-use
 data-disk-reboot-persistence

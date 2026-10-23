@@ -72,9 +72,11 @@ Preserve old barrier failures even if the new mount serves successfully.
 
 ## Stage 1c control boundary
 
-The first Stage 1c unit adds control contracts and renewal ownership. Real
-workspace Mount, Umount and Provision remain unavailable in the paired guest
-transport. It does not enable managed mounts or qualify host sleep.
+Stage 1c adds control contracts, renewal ownership and prompt desired-mount
+jobs. Mount, Umount and Provision acknowledge job acceptance; Status retains
+their progress separately from registered mounts. The guest has no real root
+driver, so these jobs fail with typed `unavailable` evidence. Acceptance never
+asserts mount, removal or provisioning success. Managed mounts remain disabled.
 
 The existing random abstract mount socket retains ordinary reauthorization and
 loss snapshots. Ordinary requests are bounded by `(32 << 10) + (256 << 10) +
@@ -296,7 +298,8 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    completion on its serial queue. Eligibility requires the complete roster's
    cold acknowledgement and confirmed pause for the same generation. Host
    continuous time measures every budget, including delayed callbacks. The
-   control queue must be empty before pause. Retirement acknowledgement is
+   control queue must be empty before pause and at successful pause
+   completion. Retirement acknowledgement is
    permitted only while running or recovering. The model defaults to absolute
    deadlines of 15 seconds for drain, 17.5 seconds
    for confirmed pause and 20 seconds total after native notification arrival,
@@ -340,8 +343,8 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    Other mounts and shells continue. Status polling reconciles an invalid but
    decodable recovery reply; paired-channel loss discards the VM. Initial activation and replacement
    obtain generation-tagged proofs from the driver, never from the caller.
-   Stage 1c must dispatch an initial Prepare outside Serve's serial request loop:
-   a long retry there would queue a sleep's Suspend behind authority recovery.
+   Desired-mount jobs dispatch initial Prepare outside Serve's ordered request
+   loop, allowing a later Suspend to cancel it during authority recovery.
    Discard-only/uncertain
    state stops without resuming old RAM; only exact termination permits a new
    coordinator with a new boot identity. A cancelled sleep reconciles the current
@@ -675,15 +678,43 @@ belongs to this product.
 
 ### Stage 1c drain dispatch
 
-The current guest transport drains its roster serially. Stage 1b registers no
-real mounts, so native suspension exercises an empty roster. Stage 1c must
-start mount drains in parallel under the coordinator's remaining drain budget,
-cancel unfinished work at expiry, and prove whole-roster completion before
-acknowledging cold state. The current suspension grammar carries no drain
-budget; the transport's service-lifetime context does not bound each request.
-Parallel dispatch alone would not establish this deadline contract. Real mount
-integration must supply both deadline propagation and cancellation before it
-can qualify the 15-second boundary.
+The paired, unreleased format 8 carries `Envelope.drain_budget_nanos=3` only on
+Suspend: positive and at most 15 seconds. It is outside Suspension and token
+identity. `WorkspaceVsockChannel.advance` stamps the remaining host-continuous
+allowance immediately before encoding, after FIFO residence, and refuses an
+expired request. The coordinator retains its original notification-relative
+15/17.5/20-second drain, confirmed-pause and total deadlines.
+
+The guest anchors one deadline at the first received frame byte, charging
+framing, decoding and dispatcher waits. Every fixed-roster drain starts in
+parallel, with at most 64 lanes and the same context deadline. The mount adapter
+must forward its shrinking remainder as local `drainBudgetNanos`; the local
+Suspend owner already captures that receipt-relative deadline once, including
+its framing/admission delay. Every lifecycle join, withdrawal and cut uses the
+same allowance. No adapter may create a fresh per-mount timeout. A failure
+cancels sibling waiters and closes this transaction; physical workers and their
+lanes remain owned until they actually join. Cold proof covers the whole roster
+in canonical order; neither a failed participant nor a stuck notification earns
+a partial acknowledgement.
+
+Status has at most one desired-job slot per exact MountID, with originating
+request, generation, operation, phase and bounded retained failure. Registered
+mounts and desired intents share the 64-volume capacity; an intent never adds a
+ready mount to the roster. Acceptance reserves the slot under the supervisor
+lock, then dispatches `offered -> running -> complete|failed` on its generation
+context. A live slot cannot be replaced, including after cancellation. A later
+accepted command can replace a joined slot; exact cleaned-incarnation
+replacement retires its joined slot. Observation stores no responses or history.
+Suspend closes admission and cancels jobs before waiting for their actual
+owners, including desired-only work. One reader watches EOF while the ordered
+dispatcher drains or writes a response; loss immediately closes admission and
+cancels generation work. Bounded read-ahead never blocks that loss path.
+
+The native inventory proves all three absent-driver jobs retain `unavailable`
+and leave the registered roster empty. Deterministic model/transport tests
+exercise interrupted initial Prepare, slow provisioning/removal, independent
+64-mount drains, spent framing/dispatch allowance, EOF and retained physical
+owners. Real managed multi-mount integration remains a later driver gate.
 
 Data formatting relies on mke2fs's device flush before successful exit. The
 initializer treats that completion as its format boundary; it does not use

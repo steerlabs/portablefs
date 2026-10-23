@@ -39,7 +39,7 @@ func TestGuestFailedRecoveryRetainsEncodableTerminalReason(t *testing.T) {
 
 // Same for a failed initial Prepare.
 func TestGuestFailedPrepareRetainsEncodableTerminalReason(t *testing.T) {
-	s, err := New(id(1), id(2), id(3), true)
+	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

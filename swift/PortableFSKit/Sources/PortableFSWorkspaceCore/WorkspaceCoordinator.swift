@@ -98,6 +98,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public private(set) var reason = ""
     public private(set) var retiredStatus: [WorkspaceMountStatus] = []
     public private(set) var mountStatus: [WorkspaceMountStatus] = []
+    public private(set) var jobStatus: [WorkspaceMountJob] = []
     public var attachAllowed: Bool { phase == .running }
     private let vm: any WorkspaceVirtualMachine
     private let power: any WorkspacePowerNotifications
@@ -121,7 +122,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 totalBudget: UInt64 = 20_000_000_000) throws {
         guard WorkspaceControl.validRelease(host.release), WorkspaceControl.id(host.bootID),
               WorkspaceControl.id(host.hostServiceID), host.guestServiceID.isEmpty,
-              drainBudget > 0, totalBudget > drainBudget, totalBudget < 30_000_000_000 else { throw WorkspaceControlError.grammar }
+              drainBudget > 0, drainBudget <= WorkspaceControl.maxDrainBudget, totalBudget > drainBudget, totalBudget < 30_000_000_000 else { throw WorkspaceControlError.grammar }
         self.startBudget = startBudget
         self.host = host; self.vm = vm; self.power = power; self.channel = channel
         self.clock = clock; self.nonces = nonces; self.drainBudget = drainBudget; self.totalBudget = totalBudget
@@ -273,6 +274,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             guard let self, case .pausing(let current, let proof, let intent) = self.state,
                   current.request == transaction.request else { return }
             guard case .success = result, self.clock.now < current.window.pause else { self.stopUnsafe("VM pause not confirmed within budget"); return }
+            guard self.channel.isIdle else { self.stopUnsafe("control queue changed during VM pause"); return }
             self.state = proof.map(State.pausedCold) ?? .pausedDiscard
             if proof != nil { self.reason = "" }
             self.acknowledgeAll(fenced: true)
@@ -364,7 +366,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             guard self.retainsLoss(status.mounts, retired: status.retired + self.retiredStatus) else {
                 self.reason = "waiting for earlier retired outcomes before replacing active status"; return
             }
-            self.mountStatus = status.mounts; self.state = .running; self.reason = ""
+            self.mountStatus = status.mounts; self.jobStatus = status.jobs; self.state = .running; self.reason = ""
         }
     }
     // A lost paired channel cannot restore eligibility. While awake, terminate
@@ -429,6 +431,6 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     }
     private func finishStop() {
         state = .stopped; acknowledgeAll(fenced: true); power.unregister()
-        guestServiceID = Data(); mountStatus = []
+        guestServiceID = Data(); mountStatus = []; jobStatus = []
     }
 }

@@ -334,6 +334,44 @@ public nonisolated struct WorkspaceStatusRequest: Sendable {
   public init() {}
 }
 
+/// Desired work is distinct from registered kernel/session membership. One
+/// fixed slot per desired mount retains acceptance and its final disposition.
+public nonisolated struct WorkspaceMountJob: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var mount: WorkspaceMountID {
+    get {_mount ?? WorkspaceMountID()}
+    set {_mount = newValue}
+  }
+  /// Returns true if `mount` has been explicitly set.
+  public var hasMount: Bool {self._mount != nil}
+  /// Clears the value of `mount`. Subsequent reads from it will return its default value.
+  public mutating func clearMount() {self._mount = nil}
+
+  public var requestID: UInt64 = 0
+
+  public var generation: UInt64 = 0
+
+  /// provision, mount, umount.
+  public var operation: String = String()
+
+  /// offered, running, complete, failed.
+  public var phase: String = String()
+
+  /// unavailable, refused, authorization-required, stopped, deadline, handler-failed.
+  public var failure: String = String()
+
+  public var reason: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _mount: WorkspaceMountID? = nil
+}
+
 public nonisolated struct WorkspaceStatusReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -354,6 +392,8 @@ public nonisolated struct WorkspaceStatusReply: Sendable {
 
   /// First 16 unacknowledged retired outcomes, in retirement order.
   public var retired: [WorkspaceMountStatus] = []
+
+  public var jobs: [WorkspaceMountJob] = []
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -472,6 +512,10 @@ public nonisolated struct WorkspaceEnvelope: Sendable {
   public var version: UInt32 = 0
 
   public var requestID: UInt64 = 0
+
+  /// Remaining allowance, stamped after host FIFO delay. Suspend only; not
+  /// part of Suspension or ResumeToken identity. Positive and at most 15 s.
+  public var drainBudgetNanos: UInt64 = 0
 
   public var body: WorkspaceEnvelope.OneOf_Body? = nil
 
@@ -1173,9 +1217,73 @@ nonisolated extension WorkspaceStatusRequest: SwiftProtobuf.Message, SwiftProtob
   }
 }
 
+nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".MountJob"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}request_id\0\u{1}generation\0\u{1}operation\0\u{1}phase\0\u{1}failure\0\u{1}reason\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularMessageField(value: &self._mount) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.requestID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.generation) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.operation) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.phase) }()
+      case 6: try { try decoder.decodeSingularStringField(value: &self.failure) }()
+      case 7: try { try decoder.decodeSingularStringField(value: &self.reason) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    try { if let v = self._mount {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+    } }()
+    if self.requestID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.requestID, fieldNumber: 2)
+    }
+    if self.generation != 0 {
+      try visitor.visitSingularUInt64Field(value: self.generation, fieldNumber: 3)
+    }
+    if !self.operation.isEmpty {
+      try visitor.visitSingularStringField(value: self.operation, fieldNumber: 4)
+    }
+    if !self.phase.isEmpty {
+      try visitor.visitSingularStringField(value: self.phase, fieldNumber: 5)
+    }
+    if !self.failure.isEmpty {
+      try visitor.visitSingularStringField(value: self.failure, fieldNumber: 6)
+    }
+    if !self.reason.isEmpty {
+      try visitor.visitSingularStringField(value: self.reason, fieldNumber: 7)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: WorkspaceMountJob, rhs: WorkspaceMountJob) -> Bool {
+    if lhs._mount != rhs._mount {return false}
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.generation != rhs.generation {return false}
+    if lhs.operation != rhs.operation {return false}
+    if lhs.phase != rhs.phase {return false}
+    if lhs.failure != rhs.failure {return false}
+    if lhs.reason != rhs.reason {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StatusReply"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}state\0\u{1}mounts\0\u{1}retired\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}state\0\u{1}mounts\0\u{1}retired\0\u{1}jobs\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1190,6 +1298,7 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
       case 5: try { try decoder.decodeSingularStringField(value: &self.state) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.mounts) }()
       case 7: try { try decoder.decodeRepeatedMessageField(value: &self.retired) }()
+      case 8: try { try decoder.decodeRepeatedMessageField(value: &self.jobs) }()
       default: break
       }
     }
@@ -1217,6 +1326,9 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
     if !self.retired.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.retired, fieldNumber: 7)
     }
+    if !self.jobs.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.jobs, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1228,6 +1340,7 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
     if lhs.state != rhs.state {return false}
     if lhs.mounts != rhs.mounts {return false}
     if lhs.retired != rhs.retired {return false}
+    if lhs.jobs != rhs.jobs {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1432,7 +1545,7 @@ nonisolated extension WorkspaceResult: SwiftProtobuf.Message, SwiftProtobuf._Mes
 
 nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}request_id\0\u{2}\u{8}hello\0\u{3}hello_ack\0\u{1}suspend\0\u{3}suspend_ack\0\u{1}resume\0\u{3}resume_ack\0\u{1}status\0\u{3}status_reply\0\u{1}provision\0\u{1}mount\0\u{1}umount\0\u{1}result\0\u{3}retire_ack\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}request_id\0\u{3}drain_budget_nanos\0\u{2}\u{7}hello\0\u{3}hello_ack\0\u{1}suspend\0\u{3}suspend_ack\0\u{1}resume\0\u{3}resume_ack\0\u{1}status\0\u{3}status_reply\0\u{1}provision\0\u{1}mount\0\u{1}umount\0\u{1}result\0\u{3}retire_ack\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1442,6 +1555,7 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self.version) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.requestID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.drainBudgetNanos) }()
       case 10: try {
         var v: WorkspaceHello?
         var hadOneofValue = false
@@ -1627,6 +1741,9 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
     if self.requestID != 0 {
       try visitor.visitSingularUInt64Field(value: self.requestID, fieldNumber: 2)
     }
+    if self.drainBudgetNanos != 0 {
+      try visitor.visitSingularUInt64Field(value: self.drainBudgetNanos, fieldNumber: 3)
+    }
     switch self.body {
     case .hello?: try {
       guard case .hello(let v)? = self.body else { preconditionFailure() }
@@ -1688,6 +1805,7 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
   public static func ==(lhs: WorkspaceEnvelope, rhs: WorkspaceEnvelope) -> Bool {
     if lhs.version != rhs.version {return false}
     if lhs.requestID != rhs.requestID {return false}
+    if lhs.drainBudgetNanos != rhs.drainBudgetNanos {return false}
     if lhs.body != rhs.body {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true

@@ -1,7 +1,7 @@
 // Code generated from proto/workspace/v8/control.proto. DO NOT EDIT.
 package workspacecontrol
 
-const SchemaSHA256 = "47d652c8c09e5b08cb06ffefdbfedcbf85607d1fdd534943abf94dbd686e117e"
-const GoBindingSHA256 = "60401871abfed3ffc40d8da5b8eb22bcaa1f90a1c31ae73441940ccf4e299271"
-const SwiftBindingSHA256 = "d029f95300d37bf80db6ca64748dd9b88506c0888364b74075b9ea894354a1c5"
-const SwiftWireSchemaSHA256 = "75e0aaad4f7b8b2387fa1a109347f8c97811de251a51f4b8cdf23cc1085efcae"
+const SchemaSHA256 = "49eb66ee7949ef47104990b5873365dba53eae8d315ecce32de0b3343a37addf"
+const GoBindingSHA256 = "2370b32562f484148d27a996f34cad65b58166255072df638e0c844b55ccbeaf"
+const SwiftBindingSHA256 = "18a73b85735d7cdd01465e3c064650e972c7c753ab4d08b326240dd179ad439d"
+const SwiftWireSchemaSHA256 = "bae4250c34eed9fa7da9f0f3520f45e3cf1ea49ce6b361ccccff3eecc7c4e0b4"

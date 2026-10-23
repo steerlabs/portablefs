@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
@@ -24,8 +25,13 @@ func PairingProof(expected *pb.Hello) []byte {
 	return h.Sum(nil)
 }
 
-func Serve(ctx context.Context, stream io.ReadWriter, expected *pb.Hello, supervisor *Supervisor, paired func()) error {
+func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, supervisor *Supervisor, paired func()) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer stream.Close()
 	defer supervisor.ChannelLost()
+	stop := context.AfterFunc(ctx, func() { supervisor.ChannelLost(); _ = stream.Close() })
+	defer stop()
 	if _, err := stream.Write(PairingProof(expected)); err != nil {
 		return fmt.Errorf("write guest pairing proof: %w", err)
 	}
@@ -46,31 +52,64 @@ func Serve(ctx context.Context, stream io.ReadWriter, expected *pb.Hello, superv
 	if err := control.Write(stream, &pb.Envelope{Version: 8, RequestId: request.RequestId, Body: &pb.Envelope_HelloAck{HelloAck: expected}}); err != nil {
 		return fmt.Errorf("workspace control stream: %w", err)
 	}
-	prior := request.RequestId
+	// One reader can observe EOF while the ordered dispatcher waits on a drain
+	// or response write. Bounded read-ahead is not concurrent RPC dispatch.
+	type frame struct {
+		request    *pb.Envelope
+		receivedAt time.Time
+	}
+	frames := make(chan frame, 1)
+	readDone := make(chan error, 1)
+	go func(prior uint64) {
+		for {
+			request, receivedAt, err := control.ReadReceived(stream)
+			if err == nil && request.RequestId <= prior {
+				err = fmt.Errorf("workspace request ID did not increase")
+			}
+			if err != nil {
+				supervisor.ChannelLost()
+				readDone <- err
+				cancel()
+				return
+			}
+			prior = request.RequestId
+			select {
+			case frames <- frame{request, receivedAt}:
+			case <-ctx.Done():
+				return
+			default:
+				// Never stop reading behind dispatch: this paired peer has one
+				// ordered exchange, not an arbitrary pipelined RPC window.
+				supervisor.ChannelLost()
+				readDone <- fmt.Errorf("workspace request read-ahead exceeded")
+				cancel()
+				return
+			}
+		}
+	}(request.RequestId)
 	for {
-		request, err = control.Read(stream)
-		if err != nil {
+		var incoming frame
+		select {
+		case incoming = <-frames:
+		case <-ctx.Done():
+			select {
+			case err := <-readDone:
+				return fmt.Errorf("workspace control stream: %w", err)
+			default:
+				return fmt.Errorf("workspace control stream: %w", ctx.Err())
+			}
+		}
+		request = incoming.request
+		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("workspace control stream: %w", err)
 		}
-		if request.RequestId <= prior {
-			return fmt.Errorf("workspace request ID did not increase")
-		}
-		prior = request.RequestId
+		prior := request.RequestId
 		reply := &pb.Envelope{Version: 8, RequestId: prior}
 		switch body := request.Body.(type) {
 		case *pb.Envelope_Status:
 			reply.Body = &pb.Envelope_StatusReply{StatusReply: supervisor.Status()}
 		case *pb.Envelope_Suspend:
-			transaction, err := supervisor.BeginSuspend(body.Suspend)
-			if err != nil {
-				return fmt.Errorf("workspace control stream: %w", err)
-			}
-			for _, id := range transaction.Roster {
-				if err := supervisor.Drain(ctx, transaction, id); err != nil {
-					return fmt.Errorf("workspace control stream: %w", err)
-				}
-			}
-			ack, err := supervisor.SuspendAck(transaction)
+			ack, err := supervisor.Suspend(ctx, body.Suspend, incoming.receivedAt.Add(time.Duration(request.DrainBudgetNanos)))
 			if err != nil {
 				return fmt.Errorf("workspace control stream: %w", err)
 			}
@@ -93,9 +132,17 @@ func Serve(ctx context.Context, stream io.ReadWriter, expected *pb.Hello, superv
 			}
 			reply.Body = &pb.Envelope_Result{Result: result}
 		case *pb.Envelope_Provision, *pb.Envelope_Mount, *pb.Envelope_Umount:
-			reply.Body = &pb.Envelope_Result{Result: &pb.Result{Code: "unavailable", Reason: "real mount integration pending"}}
+			result := &pb.Result{Code: "accepted"}
+			if err := supervisor.AcceptJob(request); err != nil {
+				result.Code = "refused"
+				result.Reason = control.BoundedReason(err.Error())
+			}
+			reply.Body = &pb.Envelope_Result{Result: result}
 		default:
 			return fmt.Errorf("workspace request body refused")
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("workspace control stream: %w", err)
 		}
 		if err := control.Write(stream, reply); err != nil {
 			return fmt.Errorf("workspace control stream: %w", err)
