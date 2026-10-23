@@ -42,6 +42,7 @@ var mutating = map[string]bool{
 	"rename": true, "chmod": true, "chown": true, "utimes": true, "truncate": true,
 	"symlink": true, "link": true, "burst_create": true, "burst_append": true,
 	"burst_overwrite": true, "atomic_replace": true, "burst_churn": true,
+	"burst_editor_save": true, "burst_truncate_overwrite": true,
 }
 
 func (a *staleActor) exec(req request) (response, error) {

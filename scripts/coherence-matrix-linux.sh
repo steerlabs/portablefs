@@ -71,6 +71,8 @@ FALSIFIABLE_CASES=(
   # The disjoint-namespace control still turns that case red. Replaying an
   # `open` response here would manufacture an invalid handle, not a stale view.
   atomic_replace_new_inode
+  same_mount_editor_save_with_reader
+  two_local_truncating_writers_and_peer
   rename_old_gone_new_present_same_inode
   remote_chmod_visible
   # remote_chown_visible is deliberately absent: the v3 volume model is

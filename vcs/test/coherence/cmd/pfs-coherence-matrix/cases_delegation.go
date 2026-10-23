@@ -22,6 +22,7 @@ func allCases() []coherenceCase {
 	cases := baselineCases()
 	loss := cases[len(cases)-1]
 	cases = append(cases[:len(cases)-1], delegationCases()...)
+	cases = append(cases, ordinaryContentionCases()...)
 	return append(cases, loss)
 }
 
