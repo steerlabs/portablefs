@@ -476,10 +476,10 @@ func (c *workspaceChild) monitor(ctx context.Context) {
 			}
 		}
 		if o.State == fusev3.WorkspaceRecoveryRequired {
+			// Admission and authorization have different owners. The existing
+			// renewer must ride out an awake outage until the cold worker joins
+			// it; stopping it here can consume an otherwise valid session lease.
 			c.control.Owner.InvalidatePrepared("workspace proof unavailable")
-			if c.renewer != nil {
-				_ = c.renewer.Park(ctx)
-			}
 		}
 		if o.State == fusev3.WorkspaceTerminal {
 			reason := "terminal workspace mount"

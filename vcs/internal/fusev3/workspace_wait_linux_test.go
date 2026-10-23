@@ -4,6 +4,7 @@ package fusev3
 
 import (
 	"context"
+	"syscall"
 	"testing"
 	"time"
 
@@ -106,5 +107,28 @@ func TestWorkspaceClosedWaitEndsWithTerminalCause(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("terminal waiter remained parked")
+	}
+}
+
+func TestWorkspaceClosedRequestRemainsInterruptible(t *testing.T) {
+	f, gate, _ := coldFixture(t)
+	gate.Close(1)
+	interrupted := make(chan struct{})
+	done := make(chan fuse.Status, 1)
+	unique := f.unique.Add(2)
+	go func() {
+		done <- f.mount.workspaceFS().Lookup(interrupted, &fuse.InHeader{Unique: unique, NodeId: 1}, "cancelled", &fuse.EntryOut{})
+	}()
+	close(interrupted)
+	select {
+	case status := <-done:
+		if status != fuse.Status(syscall.EINTR) {
+			t.Fatal(status)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupted request remained parked")
+	}
+	if f.raw.ReplyWriteTracked(unique) {
+		t.Fatal("interrupted waiter owned a physical reply")
 	}
 }

@@ -15,7 +15,7 @@ func workspaceGolden(_ name: String) throws -> Data {
     return bytes
 }
 @Test func workspaceGoldensCoverEveryMessageAndRejectMalformedFrames() throws {
-    let names = ["identity_request", "identity_reply", "hosted_provision", "hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required", "job_offered", "job_running", "job_complete", "job_failed", "retired_job_complete", "retired_job_failed", "retired_mount_with_job", "predecessor_unobserved"]
+    let names = ["awake_recover", "awake_recover_ack", "job_busy", "identity_request", "identity_reply", "hosted_provision", "hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required", "job_offered", "job_running", "job_complete", "job_failed", "retired_job_complete", "retired_job_failed", "retired_mount_with_job", "predecessor_unobserved"]
     for name in names {
         let raw = try workspaceGolden(name)
         let envelope = try WorkspaceControl.decode(raw)

@@ -272,6 +272,9 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 // The request has no roster: the guest fixes membership and returns it to its
 // dispatcher; SuspendAck binds that exact roster for the host's resume token.
 func (s *Supervisor) BeginSuspend(request *pb.Suspension) (*pb.Suspension, error) {
+	return s.beginCut(request, false)
+}
+func (s *Supervisor) beginCut(request *pb.Suspension, awake bool) (*pb.Suspension, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.matchesLocked(request) {
@@ -297,7 +300,7 @@ func (s *Supervisor) BeginSuspend(request *pb.Suspension) (*pb.Suspension, error
 	if previous == "discard-only" || s.generation == math.MaxUint64 || request.Generation != s.generation+1 {
 		return nil, refused("suspend generation or phase mismatch")
 	}
-	if len(request.Roster) != 0 {
+	if request.AwakeRecovery != awake || len(request.Roster) != 0 {
 		return nil, refused("suspend roster belongs to guest")
 	}
 	s.generation = request.Generation
@@ -536,6 +539,91 @@ func (s *Supervisor) Resume(parent context.Context, t *pb.ResumeToken) (*pb.Resu
 		s.retireJoinedLocked(key)
 	}
 	return a, nil
+}
+
+// RecoverAwake consumes a fresh generation and closes every gate synchronously.
+// The acknowledgement owns the fixed cohort, not a cold proof. Actual cold
+// withdrawal and recovery run on the existing per-mount lane. A later power
+// Suspend cancels and joins that lane under its original drain budget.
+func (s *Supervisor) RecoverAwake(parent context.Context, t *pb.ResumeToken) (*pb.ResumeAck, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	if err := control.Token(t); err != nil {
+		return nil, err
+	}
+	x, err := s.beginCut(t.Suspension, true)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != "suspending" || !proto.Equal(s.suspension, x) {
+		return nil, refused("awake cut overtaken")
+	}
+	if s.clock != nil {
+		if err := s.clock.Begin(s.generation); err != nil {
+			s.phase = "discard-only"
+			return nil, err
+		}
+	}
+	s.phase = "running"
+	bound := clone(t)
+	bound.Suspension = x
+	a := &pb.ResumeAck{Token: clone(bound)}
+	for _, id := range x.Roster {
+		e := s.mounts[control.MountKey(id)]
+		if !e.terminal {
+			e.setStatus("recovering", "", "")
+			ctx, done := context.WithCancel(s.generationContext)
+			go s.recoverAwakeMount(ctx, done, e, clone(bound), s.jobs[control.MountKey(id)])
+		}
+		a.Mounts = append(a.Mounts, clone(e.status))
+	}
+	return a, nil
+}
+func (s *Supervisor) recoverAwakeMount(ctx context.Context, done func(), e *entry, t *pb.ResumeToken, job *mountJob) {
+	defer done()
+	if err := waitJob(ctx, job); err != nil {
+		return
+	}
+	if err := acquire(ctx, e); err != nil {
+		return
+	}
+	defer s.release(e)
+	s.mu.Lock()
+	current := s.phase == "running" && proto.Equal(s.suspension, t.Suspension) && s.mounts[control.MountKey(e.status.Mount)] == e && !e.terminal && ctx.Err() == nil
+	s.mu.Unlock()
+	if !current {
+		return
+	}
+	cold, err := e.driver.Suspend(ctx, clone(t.Suspension))
+	s.mu.Lock()
+	if evidenceErr := s.mergeEvidenceLocked(e, cold.Loss, cold.Outcome); evidenceErr != nil {
+		err = errors.Join(err, evidenceErr)
+	}
+	if s.phase != "running" || !proto.Equal(s.suspension, t.Suspension) || ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+	if err == nil && (!cold.ColdComplete || cold.Generation != t.Suspension.Generation) {
+		err = refused("awake kernel cold withdrawal not proven")
+	}
+	if err != nil || e.terminal {
+		_ = s.publishRecoveryLocked(ctx, e, t.Suspension.Generation, Recovery{}, err)
+		s.mu.Unlock()
+		return
+	}
+	e.cold = true
+	s.mu.Unlock()
+	r, err := e.driver.Recover(ctx, t)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != "running" || !proto.Equal(s.suspension, t.Suspension) {
+		_ = s.mergeEvidenceLocked(e, r.Loss, r.Outcome)
+		return
+	}
+	_ = s.publishRecoveryLocked(ctx, e, t.Suspension.Generation, r, err)
 }
 func (s *Supervisor) recoverMount(ctx context.Context, done func(), e *entry, t *pb.ResumeToken) {
 	defer done()

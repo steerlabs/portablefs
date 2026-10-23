@@ -41,7 +41,10 @@ def run(i):
                 os.fsync(fd); n+=1
             except OSError as e:
                 with lock: errors.append(e.errno)
+                break
             time.sleep(.01)
+    except BaseException as e:
+        with lock: errors.append(repr(e))
     finally:
         try: os.close(fd)
         except OSError as e:
@@ -50,7 +53,8 @@ def run(i):
 if KIND=='cwd':
     os.chdir(root); print('held-ready',flush=True)
     while not stop.exists(): time.sleep(.01)
-    os.stat('.'); counts['cwd']=1
+    try: os.stat('.'); counts['cwd']=1
+    except OSError as e: errors.append(e.errno)
 else:
     workers=[threading.Thread(target=run,args=(i,)) for i in range(THREADS)]
     for w in workers: w.start()
@@ -85,6 +89,7 @@ result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
         self.g.ssh('touch '+stop)
         assert p.wait(timeout=10) == 0
         value = json.loads(self.g.ssh('cat '+result))
+        assert all(isinstance(e, int) for e in value['errors']), value
         assert allow_errors or not value['errors'], value
         assert value['counts'] and all(n > 0 for n in value['counts'].values()), value
         if 'cwd' not in value['counts']:
@@ -138,18 +143,27 @@ print('all-acknowledged-records-intact')
         for kind in ('cwd', 'fsync'):
             with self.holder(kind) as holder:
                 started = time.monotonic()
-                self.g.command('umount', body=public['mount'])
+                if kind == 'fsync':
+                    self.g.p.stdin.write(json.dumps({'command':'umount','body':public['mount']})+'\n'+json.dumps({'command':'pause'})+'\n')
+                    self.g.p.stdin.flush()
+                else:
+                    self.g.command('umount', body=public['mount'])
                 assert self.g.wait('umount-accepted', 10)['code'] == 'accepted'
+                if kind == 'fsync':
+                    paused = self.g.wait('paused', 20)
+                    assert paused['fenced'] and time.monotonic()-started < 15, paused
+                    self.g.command('resume'); self.g.wait('resumed', 20)
+                    self.a.ready(self.g, timeout=15)
                 self.a.job(self.g, 'umount', timeout=5, allow_fail=True)
                 job = self.a.last_job
-                assert job['phase'] == 'failed' and 'busy' in job['reason'].lower(), job
+                assert job['phase'] == 'failed' and job['failure'] == 'busy' and 'busy' in job['reason'].lower(), job
                 assert time.monotonic()-started < 5 and self.mount()['state'] == 'ready'
-                if kind == 'fsync':
-                    self.pause_resume()
                 value = self.finish_holder(holder)
             self.a.unmount(self.g, public)
             public = self.a.mount(self.g)
             self.save('managed-busy-'+kind+'-unmount-retry', {'job': job, 'application': value})
+            if kind == 'fsync':
+                self.save('managed-umount-suspend-independent-budget', {'seconds': time.monotonic()-started, 'job': job})
         return public
 
     def suspend(self):
@@ -199,7 +213,10 @@ print('all-acknowledged-records-intact')
             replacement = self.a.mount(self.g)
             assert replacement['incarnation'] != public['incarnation']
             self.g.ssh('touch '+holder[1])
-            holder[0].wait(timeout=10)
+            assert holder[0].wait(timeout=10) == 0
+            old_cwd = json.loads(self.g.ssh('cat '+holder[2]))
+            assert old_cwd['errors'] and all(e in (5, 107, 116) for e in old_cwd['errors']), old_cwd
+            self.g.ssh('rm -f '+holder[1]+' '+holder[2])
             assert self.g.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
         self.save('managed-long-pause-terminal-replacement', {'terminal': mounted, 'settle_seconds': time.monotonic()-started})
         self.save('managed-terminal-cause-and-cwd-removal', {'reason': mounted['reason']})

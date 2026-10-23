@@ -24,7 +24,7 @@ Other request IDs only correlate socket attempts.
 | --- | --- | --- |
 | `workspace-prepare` | None | `accepted` |
 | `workspace-recover` | `hostRequestId`, canonical unpadded base64url ResumeToken in `transaction` | `accepted` |
-| `workspace-suspend` | `hostRequestId`, canonical unpadded base64url Suspension in `transaction`, positive decimal `drainBudgetNanos` at most 15000000000 | `accepted` |
+| `workspace-suspend` | `hostRequestId`, canonical unpadded base64url Suspension in `transaction`, decimal `drainBudgetNanos`: positive and at most 15000000000 for power, zero only for awake recovery | `accepted` |
 | `workspace-cleanup` | `phase` with voluntary/terminal mode and exact witness | `accepted` |
 | `workspace-install-kernel` | Exact offered `phase`, including options, action ID and witness; two ordered rights | `accepted` |
 | `workspace-unmount-complete` | Exact removal `phase` plus `removal.kernelAbsent=true`; terminal also requires `abortCompleted=true` | `unmount-recorded` |
@@ -199,3 +199,11 @@ work; ambiguous inventory blocks replacement until exact cleanup or confirmed
 VM termination. Boundary tests cover these transitions with owned descriptions;
 the protected-path driver adds actual device/bootstrap tests. Host sleep remains
 unqualified.
+
+An awake recovery cold transaction sets the paired Suspension `awake_recovery`
+flag and carries `drainBudgetNanos: "0"`. It uses the existing Suspend and
+Recover jobs and exact token matching. Zero is refused for power Suspend;
+positive drain budgets are refused for awake mode. The awake worker has no
+power deadline. A changed shared permit cancels a running Suspend as well as
+Prepare and Recover, preserving the actual join before a successor starts.
+Socket budgets still bound each exchange and never cancel the retained worker.

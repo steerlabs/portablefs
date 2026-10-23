@@ -385,7 +385,7 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 		}
 	case "workspace-suspend":
 		drain, _ := decimal(q.Workspace.DrainBudgetNanos, true)
-		if !o.now().Before(receivedAt.Add(time.Duration(drain))) {
+		if !q.Workspace.AwakeRecoveryCut() && !o.now().Before(receivedAt.Add(time.Duration(drain))) {
 			return Response{}, nil, context.DeadlineExceeded
 		}
 	}
@@ -403,9 +403,11 @@ func (o *Owner) startLocked(q Request, receivedAt time.Time) (Response, *Job, er
 	}
 	if q.Operation == "workspace-suspend" {
 		drain, _ := decimal(q.Workspace.DrainBudgetNanos, true)
-		j.drainDeadline = receivedAt.Add(time.Duration(drain))
-		cancel()
-		j.ctx, j.cancel = context.WithDeadline(ownerCtx, j.drainDeadline)
+		if !q.Workspace.AwakeRecoveryCut() {
+			j.drainDeadline = receivedAt.Add(time.Duration(drain))
+			cancel()
+			j.ctx, j.cancel = context.WithDeadline(ownerCtx, j.drainDeadline)
+		}
 		j.state = "pending-suspend"
 	}
 	if o.facts.Outcome == (Outcome{}) {
@@ -762,7 +764,7 @@ func (o *Owner) InvalidatePrepared(reason string) {
 func (o *Owner) PollPermit() {
 	o.mu.Lock()
 	var cancel context.CancelFunc
-	if j := o.job; j != nil && j.running && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && !o.permitted(j.start) {
+	if j := o.job; j != nil && j.running && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover" || j.start.Operation == "workspace-suspend") && !o.permitted(j.start) {
 		j.stopping = true
 		j.lifecycleOwner.Overtake()
 		cancel = j.cancel

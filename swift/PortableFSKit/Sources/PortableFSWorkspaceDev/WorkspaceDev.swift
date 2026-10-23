@@ -22,6 +22,7 @@ import PortableFSWorkspaceCore
         }
     }
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { base.suspend(request, deadline: deadline, completion: completion) }
+    func recoverAwake(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { base.recoverAwake(token, deadline: deadline, completion: completion) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { lastResume = token; base.resume(token, deadline: deadline, completion: completion) }
     func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { base.acknowledgeRetired(through: sequence, deadline: deadline, completion: completion) }
     func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { base.status(deadline: deadline, completion: completion) }

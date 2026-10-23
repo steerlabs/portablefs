@@ -61,6 +61,7 @@ private enum InjectedFailure: Error { case failed }
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
     var resumes: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
+    var awakeRecoveries: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
     var mounts: [(WorkspaceMountID, (Result<WorkspaceResult, Error>) -> Void)] = []
     func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { mounts.append((mount, completion)) }
     func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
@@ -75,6 +76,7 @@ private enum InjectedFailure: Error { case failed }
         })
     } }
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
+    func recoverAwake(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { awakeRecoveries.append((token, completion)) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
     func acknowledge(_ index: Int = 0, cold: Bool = true, loss: Bool = false) {
         var ack = WorkspaceSuspendAck(); ack.suspension = suspensions[index].0; ack.suspension.roster = roster
@@ -584,8 +586,7 @@ private enum InjectedFailure: Error { case failed }
     #expect(r.power.unregisters == 1)
 }
 
-@Test @MainActor func workspaceAwakeProofLossOwnsColdRecoveryWithoutPowerEvent() throws {
-    let r = try Rig()
+@MainActor private func awakeStatus(_ r: Rig, loss: Bool = true) throws -> WorkspaceStatusReply {
     var status = WorkspaceStatusReply()
     let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
     status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
@@ -593,78 +594,71 @@ private enum InjectedFailure: Error { case failed }
     var mount = WorkspaceMountStatus(); mount.mount = r.channel.roster[0]
     mount.state = "closed"; mount.reason = "workspace clock or subscription proof unavailable"
     mount.cleanup = "retained"; mount.outcome = unknownTestOutcome()
-    var loss = WorkspaceLoss(); loss.sequence = 1; loss.acceptedBytes = 23; loss.reason = "accepted tail lost"
-    mount.loss = [loss]; status.mounts = [mount]
-    r.channel.roster = [mount.mount]
-    // The coordinator itself polls; neither a power event nor UI action drives it.
+    if loss {
+        var item = WorkspaceLoss(); item.sequence = 1; item.acceptedBytes = 23; item.reason = "accepted tail lost"
+        mount.loss = [item]
+    }
+    status.mounts = [mount]; r.channel.roster = [mount.mount]
+    return status
+}
+@Test @MainActor func workspaceAwakeProofLossOwnsColdRecoveryWithoutPowerEvent() throws {
+    let r = try Rig(); let status = try awakeStatus(r)
     r.clock.advance(250_000_000)
     #expect(r.channel.statuses.count == 1)
     r.channel.statuses.removeFirst()(.success(status))
-    #expect(r.coordinator.phase == .draining)
+    #expect(r.coordinator.phase == .recovering)
     #expect(r.coordinator.generation == 1)
     try r.coordinator.observeStatus(status)
-    #expect(r.channel.suspensions.count == 1)
-    var cold = WorkspaceSuspendAck(); cold.suspension = r.channel.suspensions[0].0
-    cold.suspension.roster = [mount.mount]
-    var proof = WorkspaceMountCold(); proof.mount = mount.mount; proof.loss = [loss]; proof.outcome = unknownTestOutcome()
-    cold.mounts = [proof]
-    // A user Status call may be queued behind the cold cut. Awake recovery
-    // keeps the VM running and must not treat that caller as a pause failure.
+    #expect(r.channel.awakeRecoveries.count == 1)
+    #expect(r.channel.suspensions.isEmpty)
+    var ack = WorkspaceResumeAck(); ack.token = r.channel.awakeRecoveries[0].0
+    ack.token.suspension.roster = r.channel.roster
+    var recovering = status.mounts[0]; recovering.state = "recovering"; recovering.reason = ""
+    ack.mounts = [recovering]
     r.channel.isIdle = false
-    r.channel.suspensions[0].1(.success(cold))
-    #expect(r.coordinator.phase == .recovering)
-    #expect(r.power.acknowledgements.isEmpty)
-    let token = r.channel.resumes[0].0
-    #expect(token.suspension.generation == 1)
-    #expect(token.wakeNonce != token.suspension.nonce)
-    var resumed = WorkspaceResumeAck(); resumed.token = token
-    mount.state = "ready"; mount.reason = ""; mount.renewal = installedTestRenewal()
-    resumed.mounts = [mount]
-    r.channel.resumes[0].1(.success(resumed))
+    r.channel.awakeRecoveries[0].1(.success(ack))
     #expect(r.coordinator.phase == .running)
-    #expect(r.coordinator.mountStatus[0].loss == [loss])
+    #expect(r.power.acknowledgements.isEmpty)
+    #expect(ack.token.suspension.awakeRecovery)
+    #expect(ack.token.wakeNonce != ack.token.suspension.nonce)
+    r.clock.advance(21_000_000_000)
     #expect(r.vm.calls == ["start"])
+    var ready = status; ready.generation = 1; ready.mounts[0].state = "ready"
+    ready.mounts[0].reason = ""; ready.mounts[0].renewal = installedTestRenewal()
+    try r.coordinator.observeStatus(ready)
+    #expect(r.coordinator.mountStatus[0].loss == status.mounts[0].loss)
+    #expect(r.channel.awakeRecoveries.count == 1)
 }
-
 @Test @MainActor func workspaceAwakeRecoveryDeduplicatesSleepAndLeavesTerminalExplicit() throws {
     for terminal in [false, true] {
-        let r = try Rig()
-        var status = WorkspaceStatusReply()
-        let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
-        status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
-        status.guestServiceID = Data(repeating: 6, count: 16); status.state = "running"
-        var mount = WorkspaceMountStatus(); mount.mount = r.channel.roster[0]
-        mount.state = terminal ? "terminal" : "closed"; mount.reason = "proof unavailable"
-        mount.cleanup = "retained"; mount.outcome = unknownTestOutcome(); status.mounts = [mount]
+        let r = try Rig(); var status = try awakeStatus(r, loss: false)
+        if terminal { status.mounts[0].state = "terminal" }
         try r.coordinator.observeStatus(status)
-        if terminal { #expect(r.channel.suspensions.isEmpty); continue }
+        if terminal { #expect(r.channel.awakeRecoveries.isEmpty); continue }
+        let stale = r.channel.awakeRecoveries[0]
         r.sleep()
         #expect(r.channel.suspensions.count == 1)
-        r.channel.acknowledge()
-        r.vm.pauses.removeFirst()(.success(()))
+        #expect(r.channel.suspensions[0].0.generation == 2)
+        #expect(!r.channel.suspensions[0].0.awakeRecovery)
+        var ack = WorkspaceResumeAck(); ack.token = stale.0; ack.token.suspension.roster = r.channel.roster
+        var mount = status.mounts[0]; mount.state = "recovering"; mount.reason = ""; ack.mounts = [mount]
+        stale.1(.success(ack))
+        #expect(r.coordinator.phase == .draining)
+        r.channel.acknowledge(); r.vm.pauses.removeFirst()(.success(()))
         #expect(r.coordinator.phase == .pausedCold)
         #expect(r.vm.resumes.isEmpty)
-        r.wake()
-        #expect(r.channel.resumes.count == 1)
+        r.wake(); #expect(r.channel.resumes.count == 1)
     }
 }
-
 @Test @MainActor func workspaceAwakeColdAckCannotEraseLoss() throws {
-    let r = try Rig()
-    var status = WorkspaceStatusReply()
-    let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
-    status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
-    status.guestServiceID = Data(repeating: 6, count: 16); status.state = "running"
-    var mount = WorkspaceMountStatus(); mount.mount = r.channel.roster[0]
-    mount.state = "closed"; mount.reason = "proof unavailable"; mount.cleanup = "retained"; mount.outcome = unknownTestOutcome()
-    var loss = WorkspaceLoss(); loss.sequence = 1; loss.acceptedBytes = 23; loss.reason = "accepted tail lost"
-    mount.loss = [loss]; status.mounts = [mount]
-    r.channel.roster = [mount.mount]
+    let r = try Rig(); let status = try awakeStatus(r)
     try r.coordinator.observeStatus(status)
-    r.channel.acknowledge() // Omits the already retained ticket.
-    r.vm.pauses.removeFirst()(.success(()))
-    #expect(r.vm.calls == ["start", "pause", "stop"])
-    #expect(r.coordinator.mountStatus[0].loss == [loss])
+    var ack = WorkspaceResumeAck(); ack.token = r.channel.awakeRecoveries[0].0
+    ack.token.suspension.roster = r.channel.roster
+    var mount = status.mounts[0]; mount.state = "recovering"; mount.reason = ""; mount.loss = []; ack.mounts = [mount]
+    r.channel.awakeRecoveries[0].1(.success(ack))
+    #expect(r.vm.calls == ["start", "stop"])
+    #expect(r.coordinator.mountStatus[0].loss == status.mounts[0].loss)
     #expect(r.channel.resumes.isEmpty)
 }
 

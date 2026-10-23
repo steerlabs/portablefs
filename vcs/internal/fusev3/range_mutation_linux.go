@@ -24,13 +24,13 @@ func validSignedRange(offset, length uint64) bool {
 	return length != 0 && offset <= math.MaxInt64 && length <= math.MaxInt64 && offset <= math.MaxInt64-length
 }
 
-func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fuse.Status {
+func (r *rawFileSystem) Fallocate(interrupted <-chan struct{}, input *fuse.FallocateIn) fuse.Status {
 	if input == nil || !validSignedRange(input.Offset, input.Length) {
 		return fuse.EINVAL
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -117,14 +117,14 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 
 // CopyFileRange never bridges local and authority domains. The kernel performs
 // generic write-limit checks before issuing the stock FUSE request.
-func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
+func (r *rawFileSystem) CopyFileRange(interrupted <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
 	if input == nil || input.Flags != 0 || input.Len == 0 || input.Len > math.MaxUint32 ||
 		!validSignedRange(input.OffIn, input.Len) || !validSignedRange(input.OffOut, input.Len) {
 		return 0, fuse.EINVAL
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}

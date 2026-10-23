@@ -54,11 +54,26 @@ func (m *Mount) workspaceFS() *workspaceFileSystem {
 // buffer admission. In particular, they cannot extend the fixed cold-drain
 // cohort or hold an epoch reader needed by its withdrawal. The shared page has
 // no child notification; resampling also observes terminal teardown.
-func (m *Mount) awaitWorkspaceServing(ctx context.Context) error {
+func (m *Mount) awaitWorkspaceServing(ctx context.Context, interrupted ...<-chan struct{}) error {
 	if m.workspace == nil {
 		return nil
 	}
+	// A gate alone promises refusal, not recovery. Waiting requires the
+	// lifecycle owner which can reopen or terminalize this mount.
+	if m.workspaceLifecycle == nil {
+		_, err := m.workspace.Check()
+		return err
+	}
+	var cancel <-chan struct{}
+	if len(interrupted) != 0 {
+		cancel = interrupted[0]
+	}
 	for {
+		select {
+		case <-cancel:
+			return syscall.EINTR
+		default:
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -79,6 +94,9 @@ func (m *Mount) awaitWorkspaceServing(ctx context.Context) error {
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
+		case <-cancel:
+			timer.Stop()
+			return syscall.EINTR
 		case <-ctx.Done():
 			timer.Stop()
 			return ctx.Err()
@@ -91,7 +109,7 @@ func (m *Mount) awaitWorkspaceServing(ctx context.Context) error {
 }
 
 func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
-	entry, status := r.beginWorkspaceEntry(header.Unique)
+	entry, status := r.beginWorkspaceEntry(header.Unique, cancel)
 	if !status.Ok() {
 		return status
 	}
@@ -100,7 +118,7 @@ func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHead
 }
 
 func (r *workspaceFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
-	entry, status := r.beginWorkspaceEntry(input.Unique)
+	entry, status := r.beginWorkspaceEntry(input.Unique, cancel)
 	if !status.Ok() {
 		return status
 	}
@@ -230,9 +248,9 @@ type workspaceRecoveryKey struct{}
 
 // beginWorkspaceEntry reserves one existing physical-reply owner before the
 // first answer or effect. The slow callback transfers this owner explicitly.
-func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
+func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64, interrupted ...<-chan struct{}) (*replyPublication, fuse.Status) {
 	for {
-		if err := r.mount.awaitWorkspaceServing(r.opContext()); err != nil {
+		if err := r.mount.awaitWorkspaceServing(r.opContext(), interrupted...); err != nil {
 			return nil, fuse.Status(errnoOfError(err))
 		}
 		p, status := r.tryWorkspaceEntry(unique)
@@ -359,7 +377,7 @@ func (r *workspaceFileSystem) captureWorkspaceDrain(deadline time.Time) workspac
 		return *s.workspaceDrain
 	}
 	s.workspaceOwned = true
-	if s.cacheUntil.Before(deadline) {
+	if deadline.IsZero() || s.cacheUntil.Before(deadline) {
 		deadline = s.cacheUntil
 	}
 	p := workspaceDrainPermit{manager: m, buffer: m.buf, incarnation: s.incarnation, deadline: deadline}

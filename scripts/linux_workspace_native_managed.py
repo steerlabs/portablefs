@@ -190,20 +190,16 @@ with p.open() as f:
         generation = int(initial.get('generation', '0'))
         self.network(True)
         try:
-            deadline = time.monotonic() + 90
+            deadline = time.monotonic() + 30
             while True:
-                phase = guest.wait('phase', max(.1, deadline-time.monotonic()))
-                if int(phase['generation']) > generation and phase['phase'] == 'draining':
+                phase = self.status(guest)
+                if int(phase.get('generation', '0')) > generation:
+                    assert phase['state'] == 'running', phase
                     break
                 assert time.monotonic() < deadline, phase
+                time.sleep(.1)
         finally:
             self.network(False)
-        # Observe the VM owner's transaction without enqueueing a control
-        # exchange into its confirmed-pause boundary.
-        while True:
-            completed = guest.wait('phase', 30)
-            if int(completed['generation']) == generation+1 and completed['phase'] == 'running':
-                break
         mounted = self.ready(guest)
         after = self.authority_sessions()
         assert before == after and before['active'] == 2, (before, after)

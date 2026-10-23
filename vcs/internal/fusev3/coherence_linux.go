@@ -224,6 +224,7 @@ func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Co
 		if serving && r.mount.workspace != nil && errors.Is(err, workspaceadmission.ErrClosed) {
 			r.mount.epochMu.RUnlock()
 			cancel()
+			callback = &mutationCallback{mount: r.mount, operationID: unique}
 			continue
 		}
 		break

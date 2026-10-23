@@ -119,7 +119,7 @@ admission. Install completion remains distinct from prepared readiness, and
 recorded removal remains distinct from final cleanup.
 
 Socket attempts have a maximum 45-second budget. Losing or expiring a socket
-cannot cancel accepted work or erase its resources and outcomes. Suspend alone
+cannot cancel accepted work or erase its resources and outcomes. Power Suspend
 also carries a positive `drainBudgetNanos` of at most 15 seconds. Acceptance
 captures its receipt-relative deadline after charging framing and admission
 delay; retry allowances cannot extend it. Observation gets its own socket
@@ -129,6 +129,18 @@ admission and cancels a legal predecessor before its drain budget is checked.
 If that budget is already spent, the start is refused after the predecessor
 joins; the predecessor may remain failed. The root must escalate to Cleanup,
 not retry recovery or treat refusal as withdrawal completion.
+
+Awake proof loss uses `AwakeRecover` (paired control tag 25). Its fresh token
+has `Suspension.awake_recovery` set and an empty request roster. The guest closes
+all gates, fixes membership, starts the new clock generation, and immediately
+returns a `ResumeAck` with recovering mount states. This is admission evidence,
+not cold evidence. Each existing mount lane owns its cold cut and subsequent
+same-session Recover, without a VM power deadline. The local cold transaction
+carries `drainBudgetNanos: "0"` only for this exact mode. Its drain permission
+still ends at the original subscription horizon. A later power Suspend advances
+the permit, cancels and joins these actual workers, and retains its original
+15-second budget. Normal Suspend and Resume reject the awake flag. Failed
+cold work ends that incarnation and retains its actual cause and loss.
 
 `AdmitFrame` owns the immediate admission invalidation for each authenticated,
 fully framed Suspend or Cleanup, before checking lanes, remaining budget or

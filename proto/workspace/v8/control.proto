@@ -30,6 +30,8 @@ message Suspension {
   // Empty in Suspend requests; guest-owned fixed membership in ack/token.
   repeated MountID roster = 5;
   bytes nonce = 6;
+  // Awake recovery closes the same fixed cohort without a VM power deadline.
+  bool awake_recovery = 7;
 }
 message Loss {
   uint64 sequence = 1;
@@ -97,7 +99,7 @@ message MountJob {
   string operation = 4;
   // offered, running, complete, failed.
   string phase = 5;
-  // unavailable, refused, authorization-required, stopped, deadline, handler-failed.
+  // unavailable, refused, authorization-required, stopped, deadline, handler-failed, busy.
   string failure = 6;
   string reason = 7;
   // Predecessors are consumed through Status before a successor is admitted.
@@ -189,5 +191,6 @@ message Envelope {
     RetireAck retire_ack = 22;
     IdentityRequest identity_request = 23;
     IdentityReply identity_reply = 24;
+    ResumeToken awake_recover = 25;
   }
 }

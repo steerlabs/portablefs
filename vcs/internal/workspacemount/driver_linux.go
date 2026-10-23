@@ -625,11 +625,15 @@ func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspa
 	}
 	b.BudgetNanos = strconv.FormatInt(time.Until(deadline).Nanoseconds(), 10)
 	if op == "workspace-suspend" {
-		end, ok := ctx.Deadline()
-		if !ok || !end.After(time.Now()) {
-			return nil, context.DeadlineExceeded
+		if b.AwakeRecoveryCut() {
+			b.DrainBudgetNanos = "0"
+		} else {
+			end, ok := ctx.Deadline()
+			if !ok || !end.After(time.Now()) {
+				return nil, context.DeadlineExceeded
+			}
+			b.DrainBudgetNanos = strconv.FormatInt(time.Until(end).Nanoseconds(), 10)
 		}
-		b.DrainBudgetNanos = strconv.FormatInt(time.Until(end).Nanoseconds(), 10)
 	}
 	q := mountcontrol.Request{Operation: op, MountInstanceID: d.bound().Intent, Workspace: &b}
 	err = q.ValidateWorkspace()

@@ -46,6 +46,7 @@ import Testing
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
     var resumes: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
+    var awakeRecoveries: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
     func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         var guest = host; guest.guestServiceID = Data(repeating: 6, count: 16); completion(.success(guest))
     }
@@ -60,6 +61,7 @@ import Testing
         })
     } }
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
+    func recoverAwake(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { awakeRecoveries.append((token, completion)) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
 }
 private func rrGolden(_ name: String) throws -> Data {

@@ -136,8 +136,14 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 				return fmt.Errorf("workspace control stream: %w", err)
 			}
 			reply.Body = &pb.Envelope_SuspendAck{SuspendAck: ack}
-		case *pb.Envelope_Resume:
-			ack, err := supervisor.Resume(ctx, body.Resume)
+		case *pb.Envelope_Resume, *pb.Envelope_AwakeRecover:
+			var ack *pb.ResumeAck
+			var err error
+			if awake, ok := body.(*pb.Envelope_AwakeRecover); ok {
+				ack, err = supervisor.RecoverAwake(ctx, awake.AwakeRecover)
+			} else {
+				ack, err = supervisor.Resume(ctx, request.GetResume())
+			}
 			if err != nil {
 				refusal := &pb.Envelope{Version: 8, RequestId: prior, Body: &pb.Envelope_Result{Result: &pb.Result{Code: "refused", Reason: control.BoundedReason(err.Error())}}}
 				if writeErr := control.Write(stream, refusal); writeErr != nil {

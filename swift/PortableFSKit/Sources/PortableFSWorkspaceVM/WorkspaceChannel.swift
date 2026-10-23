@@ -87,7 +87,7 @@ import PortableFSWorkspaceCore
                                     }
                                     switch (request.body, reply.body) {
                                     case (.identityRequest, .result): throw WorkspaceVMError("guest identity refused")
-                                    case (.identityRequest, .identityReply), (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result), (.provision, .result), (.mount, .result), (.umount, .result): break
+                                    case (.identityRequest, .identityReply), (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.awakeRecover, .resumeAck), (.retireAck, .result), (.provision, .result), (.mount, .result), (.umount, .result): break
                                     default: throw WorkspaceVMError("unexpected control reply")
                                     }
                                     self.finish(.success(reply))
@@ -159,6 +159,9 @@ import PortableFSWorkspaceCore
     }
     public func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {
         exchange(.suspend(request), deadline: deadline) { completion($0.map { $0.suspendAck }) }
+    }
+    public func recoverAwake(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) {
+        exchange(.awakeRecover(token), deadline: deadline) { completion($0.map { $0.resumeAck }) }
     }
     public func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) {
         exchange(.resume(token), deadline: deadline) { completion($0.map { $0.resumeAck }) }

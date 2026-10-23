@@ -43,3 +43,4 @@ managed-guest-cli-inventory
 managed-mount-intent-across-suspend
 managed-long-pause-terminal-replacement
 managed-terminal-cause-and-cwd-removal
+managed-umount-suspend-independent-budget

@@ -226,8 +226,10 @@ type Suspension struct {
 	GuestServiceId []byte                 `protobuf:"bytes,3,opt,name=guest_service_id,json=guestServiceId,proto3" json:"guest_service_id,omitempty"`
 	Generation     uint64                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
 	// Empty in Suspend requests; guest-owned fixed membership in ack/token.
-	Roster        []*MountID `protobuf:"bytes,5,rep,name=roster,proto3" json:"roster,omitempty"`
-	Nonce         []byte     `protobuf:"bytes,6,opt,name=nonce,proto3" json:"nonce,omitempty"`
+	Roster []*MountID `protobuf:"bytes,5,rep,name=roster,proto3" json:"roster,omitempty"`
+	Nonce  []byte     `protobuf:"bytes,6,opt,name=nonce,proto3" json:"nonce,omitempty"`
+	// Awake recovery closes the same fixed cohort without a VM power deadline.
+	AwakeRecovery bool `protobuf:"varint,7,opt,name=awake_recovery,json=awakeRecovery,proto3" json:"awake_recovery,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -302,6 +304,13 @@ func (x *Suspension) GetNonce() []byte {
 		return x.Nonce
 	}
 	return nil
+}
+
+func (x *Suspension) GetAwakeRecovery() bool {
+	if x != nil {
+		return x.AwakeRecovery
+	}
+	return false
 }
 
 type Loss struct {
@@ -864,7 +873,7 @@ type MountJob struct {
 	Operation string `protobuf:"bytes,4,opt,name=operation,proto3" json:"operation,omitempty"`
 	// offered, running, complete, failed.
 	Phase string `protobuf:"bytes,5,opt,name=phase,proto3" json:"phase,omitempty"`
-	// unavailable, refused, authorization-required, stopped, deadline, handler-failed.
+	// unavailable, refused, authorization-required, stopped, deadline, handler-failed, busy.
 	Failure       string `protobuf:"bytes,6,opt,name=failure,proto3" json:"failure,omitempty"`
 	Reason        string `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -1663,6 +1672,7 @@ type Envelope struct {
 	//	*Envelope_RetireAck
 	//	*Envelope_IdentityRequest
 	//	*Envelope_IdentityReply
+	//	*Envelope_AwakeRecover
 	Body          isEnvelope_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1861,6 +1871,15 @@ func (x *Envelope) GetIdentityReply() *IdentityReply {
 	return nil
 }
 
+func (x *Envelope) GetAwakeRecover() *ResumeToken {
+	if x != nil {
+		if x, ok := x.Body.(*Envelope_AwakeRecover); ok {
+			return x.AwakeRecover
+		}
+	}
+	return nil
+}
+
 type isEnvelope_Body interface {
 	isEnvelope_Body()
 }
@@ -1925,6 +1944,10 @@ type Envelope_IdentityReply struct {
 	IdentityReply *IdentityReply `protobuf:"bytes,24,opt,name=identity_reply,json=identityReply,proto3,oneof"`
 }
 
+type Envelope_AwakeRecover struct {
+	AwakeRecover *ResumeToken `protobuf:"bytes,25,opt,name=awake_recover,json=awakeRecover,proto3,oneof"`
+}
+
 func (*Envelope_Hello) isEnvelope_Body() {}
 
 func (*Envelope_HelloAck) isEnvelope_Body() {}
@@ -1955,6 +1978,8 @@ func (*Envelope_IdentityRequest) isEnvelope_Body() {}
 
 func (*Envelope_IdentityReply) isEnvelope_Body() {}
 
+func (*Envelope_AwakeRecover) isEnvelope_Body() {}
+
 var File_proto_workspace_v8_control_proto protoreflect.FileDescriptor
 
 const file_proto_workspace_v8_control_proto_rawDesc = "" +
@@ -1974,7 +1999,7 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\aMountID\x12!\n" +
 	"\fauthority_id\x18\x01 \x01(\fR\vauthorityId\x12\x1b\n" +
 	"\tvolume_id\x18\x02 \x01(\tR\bvolumeId\x12 \n" +
-	"\vincarnation\x18\x03 \x01(\fR\vincarnation\"\xe7\x01\n" +
+	"\vincarnation\x18\x03 \x01(\fR\vincarnation\"\x8e\x02\n" +
 	"\n" +
 	"Suspension\x12\x17\n" +
 	"\aboot_id\x18\x01 \x01(\fR\x06bootId\x12&\n" +
@@ -1984,7 +2009,8 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"generation\x18\x04 \x01(\x04R\n" +
 	"generation\x128\n" +
 	"\x06roster\x18\x05 \x03(\v2 .portablefs.workspace.v8.MountIDR\x06roster\x12\x14\n" +
-	"\x05nonce\x18\x06 \x01(\fR\x05nonce\"\xac\x01\n" +
+	"\x05nonce\x18\x06 \x01(\fR\x05nonce\x12%\n" +
+	"\x0eawake_recovery\x18\a \x01(\bR\rawakeRecovery\"\xac\x01\n" +
 	"\x04Loss\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12)\n" +
 	"\x10accepted_entries\x18\x02 \x01(\x04R\x0facceptedEntries\x12%\n" +
@@ -2101,7 +2127,7 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\"4\n" +
 	"\x06Result\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\"\xf8\b\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"\xc5\t\n" +
 	"\bEnvelope\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12\x1d\n" +
 	"\n" +
@@ -2125,7 +2151,8 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\n" +
 	"retire_ack\x18\x16 \x01(\v2\".portablefs.workspace.v8.RetireAckH\x00R\tretireAck\x12U\n" +
 	"\x10identity_request\x18\x17 \x01(\v2(.portablefs.workspace.v8.IdentityRequestH\x00R\x0fidentityRequest\x12O\n" +
-	"\x0eidentity_reply\x18\x18 \x01(\v2&.portablefs.workspace.v8.IdentityReplyH\x00R\ridentityReplyB\x06\n" +
+	"\x0eidentity_reply\x18\x18 \x01(\v2&.portablefs.workspace.v8.IdentityReplyH\x00R\ridentityReply\x12K\n" +
+	"\rawake_recover\x18\x19 \x01(\v2$.portablefs.workspace.v8.ResumeTokenH\x00R\fawakeRecoverB\x06\n" +
 	"\x04bodyBFZ8github.com/steerlabs/portablefs/vcs/internal/workspacepb\xba\x02\tWorkspaceb\x06proto3"
 
 var (
@@ -2209,11 +2236,12 @@ var file_proto_workspace_v8_control_proto_depIdxs = []int32{
 	16, // 37: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
 	17, // 38: portablefs.workspace.v8.Envelope.identity_request:type_name -> portablefs.workspace.v8.IdentityRequest
 	18, // 39: portablefs.workspace.v8.Envelope.identity_reply:type_name -> portablefs.workspace.v8.IdentityReply
-	40, // [40:40] is the sub-list for method output_type
-	40, // [40:40] is the sub-list for method input_type
-	40, // [40:40] is the sub-list for extension type_name
-	40, // [40:40] is the sub-list for extension extendee
-	0,  // [0:40] is the sub-list for field type_name
+	9,  // 40: portablefs.workspace.v8.Envelope.awake_recover:type_name -> portablefs.workspace.v8.ResumeToken
+	41, // [41:41] is the sub-list for method output_type
+	41, // [41:41] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_proto_workspace_v8_control_proto_init() }
@@ -2237,6 +2265,7 @@ func file_proto_workspace_v8_control_proto_init() {
 		(*Envelope_RetireAck)(nil),
 		(*Envelope_IdentityRequest)(nil),
 		(*Envelope_IdentityReply)(nil),
+		(*Envelope_AwakeRecover)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
