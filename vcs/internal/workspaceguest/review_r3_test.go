@@ -29,7 +29,7 @@ func r3AckAll(t *testing.T, s *Supervisor) {
 		if len(page) == 0 {
 			return
 		}
-		if err := s.AcknowledgeRetired(page[len(page)-1].RetirementSequence); err != nil {
+		if err := acknowledgeExposedRetired(s, page[len(page)-1].RetirementSequence); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -332,7 +332,7 @@ func TestR3RandomWalkNoCapacityCycle(t *testing.T) {
 				default:
 					if (step/600)%2 == 1 {
 						if page := s.Status().Retired; len(page) > 0 {
-							if err := s.AcknowledgeRetired(page[len(page)-1].RetirementSequence); err != nil {
+							if err := acknowledgeExposedRetired(s, page[len(page)-1].RetirementSequence); err != nil {
 								t.Fatal(err)
 							}
 						}

@@ -105,7 +105,7 @@ func TestReservationRealDriverMountUmountCyclesReleaseCapacity(t *testing.T) {
 			waitDesiredJobsJoined(t, s)
 			writtenStatus(t, s, s.Status())
 			if r := s.Status().Retired; len(r) != 0 {
-				if err := s.AcknowledgeRetired(r[len(r)-1].RetirementSequence); err != nil {
+				if err := acknowledgeExposedRetired(s, r[len(r)-1].RetirementSequence); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -144,7 +144,7 @@ func TestReservationSuspendResumeWithFullUnacknowledgedBound(t *testing.T) {
 		t.Fatalf("suspend at full bound: %v", err)
 	}
 	// Acknowledgement is accepted outside running (guest has no phase gate).
-	if err := s.AcknowledgeRetired(s.Status().Retired[15].RetirementSequence); err != nil {
+	if err := acknowledgeExposedRetired(s, s.Status().Retired[15].RetirementSequence); err != nil {
 		t.Fatalf("ack while suspended-cold: %v", err)
 	}
 	if _, err := resumeAndWait(t, s, context.Background(), token(ack.Suspension)); err != nil {
@@ -181,7 +181,7 @@ func TestReservationRetireAckEdgeCases(t *testing.T) {
 		{5, true, 35}, {5, true, 35}, {3, true, 35}, // duplicate and stale are no-ops
 		{21, true, 19}, {37, true, 3}, {40, true, 0}, {40, true, 0},
 	} {
-		err := s.AcknowledgeRetired(tc.through)
+		err := acknowledgeExposedRetired(s, tc.through)
 		if (err == nil) != tc.ok || len(s.Retired()) != tc.left {
 			t.Fatalf("ack %d: err=%v left=%d want ok=%v left=%d", tc.through, err, len(s.Retired()), tc.ok, tc.left)
 		}
@@ -243,7 +243,7 @@ func TestReservationStatusNeverShowsRetiredJobActive(t *testing.T) {
 			}
 			mu.Unlock()
 			if len(st.Retired) > 0 {
-				_ = s.AcknowledgeRetired(st.Retired[len(st.Retired)-1].RetirementSequence)
+				_ = acknowledgeExposedRetired(s, st.Retired[len(st.Retired)-1].RetirementSequence)
 			}
 		}
 	}()

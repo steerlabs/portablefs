@@ -141,7 +141,7 @@ func TestReservedLifecycleProgressAtEvidenceSaturation(t *testing.T) {
 	}
 	for len(s.Retired()) != 0 {
 		page := s.Status().Retired
-		if err := s.AcknowledgeRetired(page[len(page)-1].RetirementSequence); err != nil {
+		if err := acknowledgeExposedRetired(s, page[len(page)-1].RetirementSequence); err != nil {
 			t.Fatal(err)
 		}
 	}

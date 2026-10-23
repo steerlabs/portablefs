@@ -26,8 +26,8 @@ func Open(unavailable func()) (*Owner, error) {
 		f.Close()
 		return nil, errors.New("workspace RTC is not a character device")
 	}
-	owner := New(&RTC{file: f}, unavailable)
-	if err = owner.share(); err != nil {
+	owner, err := NewShared(&RTC{file: f}, unavailable)
+	if err != nil {
 		f.Close()
 		return nil, err
 	}

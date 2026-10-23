@@ -226,10 +226,16 @@ func (i *Inventory) BindWitness(id *pb.MountID, w Witness) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	d := i.runs[control.MountKey(id)]
-	if d == nil || d.Removed {
+	if d == nil {
 		return errors.New("bind unknown or removed workspace intent")
 	}
 	merged, err := MergeWitness(d.Witness, w)
+	if d.Removed {
+		if merged != d.Witness {
+			return errors.New("removed workspace witness changed")
+		}
+		return errors.Join(err, i.failed)
+	}
 	d.Witness = merged
 	// Keep late acquisitions in memory even after a failed commit. The owner
 	// cannot acknowledge readiness, but still needs those resources for cleanup.
