@@ -1249,40 +1249,38 @@ func (v *Volume) syncDescriptor(state *inodeFsyncState, fd int, full, dataOnly b
 type writeTargetApply func(limit, assigned uint64) (committed uint64, dispatched, invalidResult bool, err error)
 
 // CommitWriteData applies a complete one-frame write directly from the
-// retained authority frame. It never creates a staging file and dispatches
-// exactly one data syscall to XFS.
+// retained authority frame. Delegated flushes finish short writes inside the
+// same writer stripe; ordinary writes retain their one-syscall short result.
 func (t *writeTarget) CommitWriteData(data []byte, spec WriteCommit) (uint64, uint64, Attr, error) {
 	if uint64(len(data)) != spec.RequestedSize || len(data) == 0 {
 		return 0, 0, Attr{}, fs.ErrInvalid
 	}
 	return t.commitWrite(spec, func(limit, assigned uint64) (uint64, bool, bool, error) {
-		payload := data[:int(limit)]
-		var n int
-		var err error
-		if spec.Mode == WriteAppend {
-			n, err = t.volume.pwritev2(t.res.fd, [][]byte{payload}, 0, unix.RWF_APPEND)
-		} else {
-			n, err = t.volume.pwrite(t.res.fd, payload, int64(assigned))
-		}
-		invalid := false
-		if n < 0 {
+		var committed uint64
+		for committed < limit {
+			payload := data[int(committed):int(limit)]
+			var n int
+			var err error
+			if spec.Mode == WriteAppend {
+				n, err = t.volume.pwritev2(t.res.fd, [][]byte{payload}, 0, unix.RWF_APPEND)
+			} else {
+				n, err = t.volume.pwrite(t.res.fd, payload, int64(assigned+committed))
+			}
 			if n == -1 && err != nil {
 				n = 0
-			} else {
-				invalid = true
-				n = 0
+			}
+			if n < 0 || n > len(payload) {
+				return committed, true, true, syscall.EIO
+			}
+			committed += uint64(n)
+			if err != nil {
+				return committed, true, false, err
+			}
+			if n != len(payload) && (!spec.Complete || n == 0) {
+				return committed, true, false, io.ErrShortWrite
 			}
 		}
-		if uint64(n) > limit {
-			invalid = true
-		}
-		if invalid {
-			return uint64(n), true, true, syscall.EIO
-		}
-		if err == nil && n != len(payload) {
-			err = io.ErrShortWrite
-		}
-		return uint64(n), true, false, err
+		return committed, true, false, nil
 	})
 }
 
@@ -1343,7 +1341,7 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		applyErr = syscall.EIO
 	}
 	expectedPost := uint64(before.Size)
-	if end := assigned + committed; end > expectedPost {
+	if end := assigned + committed; committed != 0 && end > expectedPost {
 		expectedPost = end
 	}
 	if dispatched {
@@ -1385,6 +1383,12 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		return committed, assigned, post, fmt.Errorf("%w: %w", ErrWritePostApply, postApplyErr)
 	}
 	if committed < spec.RequestedSize {
+		if spec.Complete && committed != 0 {
+			if applyErr == nil {
+				applyErr = &WriteLimitError{RLimit: limitedByRLimit}
+			}
+			return committed, assigned, post, fmt.Errorf("%w: %w", ErrWritePostApply, applyErr)
+		}
 		if applyErr != nil {
 			return committed, assigned, post, applyErr
 		}

@@ -181,6 +181,12 @@ mutation carries a client-owned replay slot and sequence; exact replay
 returns the retained outcome without re-execution, and reuse with a different
 canonical body fences the session. Replay dies with the epoch. A reply lost
 across authority death is uncertain and is never resubmitted automatically.
+A recorded nonterminal Linux uncertainty withdraws cache permission for cold
+resubscription without ending the authenticated session. The application
+receives `EREMOTEIO`, inspects current state, and never automatically re-executes
+the effect. Lost replay ownership, epoch loss and storage-fatal uncertainty
+retain their terminal handling.
+
 Surviving field and enum numbers are never renumbered and a shipped tag is
 never reused within protocol 8.
 

@@ -581,6 +581,12 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			}
 			for index, candidate := range issued {
 				if err := h.trackItem(cred.ID, candidate.item, h.protectedChild(cred.ID, directory, candidate.dirent.GetName())); err != nil {
+					if errors.Is(err, errCapabilityTableFull) {
+						// The name and sampled metadata need no retained descriptor.
+						// Saturation refuses new item acquisition, not enumeration.
+						candidate.dirent.Item = nil
+						continue
+					}
 					for _, prior := range issued[:index] {
 						h.untrackItem(cred.ID, prior.item)
 						h.forgetItem(prior.item)

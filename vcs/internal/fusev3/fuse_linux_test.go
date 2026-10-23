@@ -2123,7 +2123,7 @@ func TestLockRequestPreservesFlockNamespace(t *testing.T) {
 }
 
 func TestUncertainResponseFailsClosed(t *testing.T) {
-	if got := responseErrno(&authoritypb.Response{Uncertain: true}); got != syscall.EIO {
+	if got := responseErrno(&authoritypb.Response{Uncertain: true}); got != syscall.EREMOTEIO {
 		t.Fatalf("uncertain errno = %v", got)
 	}
 }
@@ -2215,6 +2215,29 @@ func TestForgetCannotReclaimCapabilityUsedByInflightOperation(t *testing.T) {
 	frontend.Forget(newRecord.id, 1)
 	if got := popReclaim(t, mount); !bytes.Equal(got, testToken(2)) {
 		t.Fatalf("reclaimed token = %x, want replacement token", got)
+	}
+}
+
+func TestForgetReclaimsCapabilityWithCachedNames(t *testing.T) {
+	raw, mount, _ := testRawFileSystem(t, 8)
+	item := testItem(42, authoritypb.Attr_REGULAR, 1)
+	record, errno := raw.intern(context.Background(), item)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	raw.mu.Lock()
+	parent := raw.nodesByID[1]
+	key := nameKey{parent: parent.key.inode, name: "cached"}
+	raw.bindCachedNameLocked(key, publicationNamespace{parent: parent.identity, name: "cached"}, record, subscriptionStamp{})
+	raw.mu.Unlock()
+	raw.Forget(record.id, 1)
+	if got := popReclaim(t, mount); !bytes.Equal(got, item.GetToken()) {
+		t.Fatalf("reclaimed %x, want %x", got, item.GetToken())
+	}
+	raw.mu.RLock()
+	defer raw.mu.RUnlock()
+	if raw.nodesByID[record.id] != nil || raw.cachedNames[key] != nil || raw.nodesByIdentity[record.identity] != nil {
+		t.Fatal("forgotten cached item remains retained")
 	}
 }
 

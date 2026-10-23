@@ -27,6 +27,7 @@ var mutatingOps = map[string]bool{
 	"utimes": true, "truncate": true, "symlink": true, "link": true,
 	"burst_create": true, "burst_churn": true, "burst_append": true,
 	"burst_overwrite": true, "atomic_replace": true, "run": true,
+	"burst_editor_save": true, "burst_truncate_overwrite": true,
 }
 
 // mutates reports whether req changes the volume (or, for open, requests write

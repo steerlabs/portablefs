@@ -128,8 +128,8 @@ func removedPostStateIdentity(state *authoritypb.PostState, parent publicationId
 
 // renamePostStateOverwrittenIdentity binds the role-shaped rename post-state
 // to the exact parents and post-bindings returned by the ordered authority
-// reply. Cached pre-bindings remain useful disagreement witnesses, but they are
-// not required: either source name can be deliberately uncacheable.
+// reply. Cached pre-bindings only identify local withdrawal duties: a peer
+// may replace either binding before this mutation reaches storage ordering.
 func renamePostStateOverwrittenIdentity(state *authoritypb.PostState, oldParent, newParent, newPost publicationIdentity, oldPost *publicationIdentity, exchange bool) (*publicationIdentity, error) {
 	if err := validateMutationPostStateForOpcode(12, state); err != nil {
 		return nil, err

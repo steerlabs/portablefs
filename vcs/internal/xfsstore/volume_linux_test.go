@@ -504,6 +504,66 @@ func TestCommitWriteDataPositionedUsesExactlyOnePwriteWithoutStaging(t *testing.
 	}
 }
 
+func TestDelegatedWriteCompletesShortPrefixBeforeSuccessor(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		complete  bool
+		tailErr   error
+		wantBytes uint64
+		wantCalls int
+	}{
+		{"ordinary short", false, nil, 2, 1},
+		{"delegated short", true, nil, 4, 2},
+		{"delegated quota", true, syscall.EDQUOT, 2, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			v := openTestVolume(t)
+			root, _ := v.Root()
+			item, _, err := v.Create(root, "short", 0600, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = v.CloseOpen(handle) })
+			target, err := v.PinWriteTarget(handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer target.Close()
+			realPwrite, calls := v.pwrite, 0
+			v.pwrite = func(fd int, data []byte, offset int64) (int, error) {
+				calls++
+				if calls == 1 {
+					return realPwrite(fd, data[:2], offset)
+				}
+				if offset != 5 || string(data) != "cd" {
+					t.Fatalf("tail = %q at %d", data, offset)
+				}
+				if test.tailErr != nil {
+					return -1, test.tailErr
+				}
+				return realPwrite(fd, data, offset)
+			}
+			committed, assigned, post, err := target.CommitWriteData([]byte("abcd"), WriteCommit{
+				RequestedSize: 4, Position: 3, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned, Complete: test.complete,
+			})
+			if committed != test.wantBytes || calls != test.wantCalls || assigned != 3 || post.Size != 3+int64(committed) {
+				t.Fatalf("result = %d at %d size %d calls %d error %v", committed, assigned, post.Size, calls, err)
+			}
+			if test.tailErr != nil {
+				if !errors.Is(err, test.tailErr) || !errors.Is(err, ErrWritePostApply) || errors.Is(err, ErrOutcomeUncertain) {
+					t.Fatalf("lost exact capacity outcome: %v", err)
+				}
+			} else if test.complete && err != nil || !test.complete && !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("short result error = %v", err)
+			}
+		})
+	}
+}
+
 func TestCommitWriteDataAppendUsesOneRWFAppendCall(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
@@ -893,9 +953,9 @@ func TestCommitWriteZeroByteBackendErrorPublishesExactMetadataState(t *testing.T
 	}
 	t.Cleanup(func() { v.pwrite = realPwrite })
 	committed, assigned, post, err := target.CommitWriteData([]byte("x"), WriteCommit{
-		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+		RequestedSize: 1, Position: 1 << 20, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
 	})
-	if committed != 0 || assigned != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+	if committed != 0 || assigned != 1<<20 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("zero-byte CommitWrite = (%d, %d, %+v, %v), want exact postapply ENOSPC", committed, assigned, post, err)
 	}
 	if post.Kind != KindRegular || post.Size != 0 || post.Mode.Perm() != 0o640 {

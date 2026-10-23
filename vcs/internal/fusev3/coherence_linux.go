@@ -163,12 +163,25 @@ func completeSourcePublication(ctx context.Context) error {
 	if lease == nil {
 		return nil
 	}
-	if err := lease.markCallbackPublicationReady(); err != nil {
-		return err
-	}
 	publication := replyPublicationFromContext(ctx)
 	if publication == nil {
 		return errors.New("fusev3: source publication escaped its reply ownership")
+	}
+	lease.r.mu.Lock()
+	publication.stamp = lease.r.mount.subscription.advanceSource(publication.stamp, lease.coordinates, publication.servedVersion)
+	stamp := publication.subscriptionCacheStamp()
+	for index := range publication.names {
+		publication.names[index].stamp = stamp
+	}
+	for index := range publication.attrs {
+		publication.attrs[index].stamp = stamp
+	}
+	if lease.completeProof != nil && lease.r.completeDirectories[lease.completeParent] == lease.completeProof {
+		lease.completeProof.stamp = stamp
+	}
+	lease.r.mu.Unlock()
+	if err := lease.markCallbackPublicationReady(); err != nil {
+		return err
 	}
 	return nil
 }

@@ -319,8 +319,8 @@ the worker class and workload measurements.
 | `--max-replay-slots` | `256` |
 | `--max-sessions` | `1024` |
 | `--max-lock-records` | `65536` |
-| `--max-items` | `65536` |
-| `--max-items-per-session` | `65536` |
+| `--max-items` | `524288` |
+| `--max-items-per-session` | `262144` |
 | `--max-opens` | `32768` |
 | `--max-opens-per-session` | `4096` |
 | `--max-retained-reply-bytes` | `512 MiB` |
@@ -337,6 +337,17 @@ bytes, per-connection execution lanes, replay slots and retained reply bytes,
 and the session, connection, item, and open limits are the bounded owners of a
 write. An applied mutation keeps its resources through durability and replay
 settlement.
+
+Item limits count retained descriptor-backed capabilities and in-flight
+reservations, not filesystem objects. Kernel FORGET and completed Reclaim
+release that charge; ending a session releases its remaining capabilities.
+At saturation, new item acquisitions fail with ENFILE while directory names
+remain enumerable without allocating items. Existing handles, cleanup and
+quota recovery remain admitted. Defaults allow several repository working
+sets per worker; deployments still size file-descriptor and memory limits
+for their configured bounds. The authority service's descriptor limit is
+1,048,576, leaving headroom above the default item budget for open descriptions,
+transport connections and bounded directory-page probes.
 
 Startup cross-checks the bounds rather than accepting any combination:
 

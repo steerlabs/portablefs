@@ -57,7 +57,7 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		var lease *sourcePublicationLease
 		ctx = context.WithValue(ctx, delegationPrepareContextKey{}, func() error {
 			var acquireErr error
-			lease, acquireErr = callback.acquireSource(ctx, r.mount.raw, gate)
+			lease, acquireErr = callback.acquireSource(context.WithValue(ctx, sourcePublicationTryKey{}, true), r.mount.raw, gate)
 			if acquireErr != nil {
 				return acquireErr
 			}
@@ -76,6 +76,9 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 			if lease != nil {
 				lease.resolveAllNoBinding()
 				_ = lease.markDefiniteNoChange()
+			}
+			if errno := handle.observeLoss(); errno != 0 {
+				return 0, fuse.Status(errno)
 			}
 			return 0, fuse.Status(delegationErrno(err))
 		}

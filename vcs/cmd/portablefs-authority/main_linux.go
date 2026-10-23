@@ -93,7 +93,7 @@ func run() error {
 	flag.UintVar(&o.maxLockRecords, "max-lock-records", 65536, "maximum held and waiting POSIX lock records")
 	flag.UintVar(&o.maxItemsPerSession, "max-items-per-session", defaultMaxItemsPerSession, "maximum descriptor-backed item capabilities per session")
 	flag.UintVar(&o.maxOpensPerSession, "max-opens-per-session", 4096, "maximum open file descriptions per session")
-	flag.UintVar(&o.maxItems, "max-items", 65536, "maximum descriptor-backed item capabilities for the worker")
+	flag.UintVar(&o.maxItems, "max-items", defaultMaxItems, "maximum descriptor-backed item capabilities for the worker")
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
 	flag.Uint64Var(&o.maxRetainedReplyBytes, "max-retained-reply-bytes", 512<<20, "total bytes this worker may hold in replay slots")
 	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", defaultMaxFrameBytesInFlight, "total bytes this worker may have allocated for inbound frames")

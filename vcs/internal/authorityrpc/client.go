@@ -111,6 +111,21 @@ type MutationIdentity struct {
 // sends nothing and leaves the replay slot unadvanced.
 type MutationAssigned func(MutationIdentity) error
 
+// RecoverableUncertainty is a recorded operation failure whose envelope does
+// not end the storage epoch or session. Uncertainty alone says nothing about
+// scope: an ordinary post-apply errno can leave the session healthy.
+func RecoverableUncertainty(response *authoritypb.Response) bool {
+	if response == nil || !response.GetUncertain() || response.GetSessionTerminal() || len(response.GetTerminalDeliveryToken()) != 0 {
+		return false
+	}
+	switch response.GetFailure() {
+	case authoritypb.FailureClass_FAILURE_CLASS_STORAGE, authoritypb.FailureClass_FAILURE_CLASS_INTERNAL:
+		return false
+	default:
+		return true
+	}
+}
+
 type mutationSessionKey struct{}
 
 // RetainMutationForSession separates revocable cache work from an assigned
@@ -2219,7 +2234,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 		c.signalSessionEnd(err)
 		return response, consumption, err
 	}
-	if response.GetUncertain() {
+	if response.GetUncertain() && !RecoverableUncertainty(response) {
 		c.signalSessionEnd(ErrTransportUncertain)
 	}
 	return response, consumption, nil
@@ -2280,7 +2295,7 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 				c.signalSessionEnd(ErrSessionEnded)
 			}
 		}
-		if response.GetUncertain() {
+		if response.GetUncertain() && !RecoverableUncertainty(response) {
 			c.signalSessionEnd(ErrTransportUncertain)
 		}
 		if token := response.GetTerminalDeliveryToken(); len(token) != 0 {

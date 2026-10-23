@@ -63,7 +63,10 @@ without re-execution. Expired cache permission still refuses new execution.
 Reusing an operation identity with a different canonical body or skipping its
 sequence fences the session. A reply lost across Authority death may be
 UNCERTAIN; it is not resubmitted in the new epoch. The application inspects
-current state and restarts the affected run.
+current state and restarts the affected run. A retained nonterminal uncertainty
+on a live Linux session instead returns `EREMOTEIO` and withdraws cache
+permission for cold resubscription; it does not revoke the mount or reapply
+the mutation. Linux has no errno that proves whether the effect committed.
 
 ## Recall, partition, and cache withdrawal
 

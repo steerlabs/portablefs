@@ -1691,12 +1691,21 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 		callErr = lifecycleErr
 	}
 	if !assignmentFailed && assigned && (callErr != nil || response == nil || response.GetUncertain()) {
-		lease.revoke()
-		cause := callErr
-		if cause == nil {
-			cause = authorityrpc.ErrTransportUncertain
+		if callErr == nil && authorityrpc.RecoverableUncertainty(response) {
+			// Storage may have applied before the source subscription expired.
+			// The recorded outcome consumes this replay identity, but does not
+			// end the authenticated session. Cold withdrawal, never replay of
+			// the effect, resolves local cache permission.
+			m.subscription.deactivate()
+			lease.retireEpoch()
+		} else {
+			lease.revoke()
+			cause := callErr
+			if cause == nil {
+				cause = authorityrpc.ErrTransportUncertain
+			}
+			m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
 		}
-		m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
 	}
 	definiteNoChange := response != nil && responseErrno(response) != 0 && response.GetPostState() == nil
 	if !assignmentFailed && callErr == nil && response != nil && !response.GetUncertain() && definiteNoChange {
@@ -1997,7 +2006,7 @@ func (n *node) Fsync(ctx context.Context, handle *fileHandle, flags uint32) sysc
 		return errno
 	}
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
-		return bufferErrno(n.mount.delegations.Fsync(ctx, n.item.GetStableIdentity(), flags&fsyncDataOnly != 0))
+		return bufferErrno(n.mount.delegations.Fsync(withHandleAcceptance(ctx, handle), n.item.GetStableIdentity(), flags&fsyncDataOnly != 0))
 	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: cloneBytes(handle.token), DataOnly: flags&fsyncDataOnly != 0}}})
 	return errno
@@ -2100,7 +2109,7 @@ type handleAcceptedCut struct {
 type handleAcceptanceKey struct{}
 
 func withHandleAcceptance(ctx context.Context, h *fileHandle) context.Context {
-	if h == nil || h.node.mount.workspace == nil {
+	if h == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, handleAcceptanceKey{}, h)
@@ -2966,9 +2975,6 @@ func (n *node) completeRemoval(ctx context.Context, name string, response *autho
 	}
 	namespace := publicationNamespace{parent: parent, name: name}
 	lease := sourceLeaseFromContext(ctx)
-	if prior, known := lease.preBinding(namespace); known && prior != removed {
-		return errors.New("fusev3: removal post-state disagreed with the source mount's cached pre-binding")
-	}
 	if err := expectPostState(ctx,
 		expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
 		expectedPostStateObject{identity: parent, roles: postStateRoleParent},
@@ -3021,19 +3027,6 @@ func (n *node) Rename(ctx context.Context, name string, parent *node, newName st
 	overwritten, err := renamePostStateOverwrittenIdentity(response.GetPostState(), oldParentIdentity, newParentIdentity, newPost, oldPost, flags&renameExchange != 0)
 	if err != nil {
 		return false, syscall.EIO
-	}
-	if moved, known := lease.preBinding(oldNamespace); known && moved != newPost {
-		return false, syscall.EIO
-	}
-	if replaced, known := lease.preBinding(newNamespace); known {
-		switch {
-		case flags&renameExchange != 0 && (oldPost == nil || replaced != *oldPost):
-			return false, syscall.EIO
-		case flags&renameExchange == 0 && overwritten != nil && replaced != *overwritten:
-			return false, syscall.EIO
-		case flags&renameExchange == 0 && overwritten == nil && replaced != newPost:
-			return false, syscall.EIO
-		}
 	}
 	expected := []expectedPostStateObject{
 		{identity: newPost, roles: postStateRoleSource | postStateRoleDestination},
@@ -3185,7 +3178,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		var lease *sourcePublicationLease
 		ctx = context.WithValue(ctx, delegationPrepareContextKey{}, func() error {
 			var acquireErr error
-			lease, acquireErr = callback.acquireSource(ctx, n.mount.raw, gate)
+			lease, acquireErr = callback.acquireSource(context.WithValue(ctx, sourcePublicationTryKey{}, true), n.mount.raw, gate)
 			if acquireErr != nil {
 				return acquireErr
 			}
@@ -3535,8 +3528,14 @@ func contextErrno(err error) syscall.Errno {
 }
 
 func responseErrno(response *authoritypb.Response) syscall.Errno {
-	if response == nil || response.GetUncertain() {
+	if response == nil {
 		return syscall.EIO
+	}
+	if response.GetUncertain() {
+		// Linux has no committed-but-unknown errno. EREMOTEIO identifies the
+		// remote outcome failure without promising that the effect was absent
+		// or inviting an unconditional EINTR/EAGAIN retry.
+		return syscall.EREMOTEIO
 	}
 	if response.GetErrno() < 0 {
 		return syscall.EIO

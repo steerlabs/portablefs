@@ -142,3 +142,10 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelCachedWriterJoinsT
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryTearingDownReleaseClosesLocalFD
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelOrdinaryExpiredSessionIsTerminal
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOpusR2OrdinaryLeaseExpiryOverOutage
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryAtomicSaveWithLocalReader
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryThreeInPlaceWriters
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryItemPressurePreservesExistingAccess
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryQuotaExhaustionIsLocal
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryRecoverableUncertainRename
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryDelayedLookupCannotRestorePreRenameBinding
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryPeerReplacementBeforeSourceDispatch

@@ -3691,3 +3691,26 @@ func TestAssignedMutationOutlivesCacheCancellation(t *testing.T) {
 		t.Fatal(client.SessionEndCause())
 	}
 }
+
+func TestRecoverableUncertaintyUsesExplicitFailureScope(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response *authoritypb.Response
+		want     bool
+	}{
+		{"no result", nil, false},
+		{"definite", &authoritypb.Response{Errno: int32(syscall.ENOSPC)}, false},
+		{"post-apply errno", &authoritypb.Response{Errno: int32(syscall.EAGAIN), Uncertain: true}, true},
+		{"coherence", &authoritypb.Response{Errno: int32(syscall.EIO), Uncertain: true, Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}, true},
+		{"storage", &authoritypb.Response{Uncertain: true, Failure: authoritypb.FailureClass_FAILURE_CLASS_STORAGE}, false},
+		{"internal", &authoritypb.Response{Uncertain: true, Failure: authoritypb.FailureClass_FAILURE_CLASS_INTERNAL}, false},
+		{"session", &authoritypb.Response{Uncertain: true, SessionTerminal: true}, false},
+		{"terminal receipt", &authoritypb.Response{Uncertain: true, TerminalDeliveryToken: []byte{1}}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := RecoverableUncertainty(test.response); got != test.want {
+				t.Fatalf("recoverable=%t, want %t", got, test.want)
+			}
+		})
+	}
+}

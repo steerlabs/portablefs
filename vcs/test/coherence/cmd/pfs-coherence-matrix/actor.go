@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -410,6 +411,72 @@ func (a *localActor) execute(req request) (response, error) {
 			}
 		}
 		return response{N: req.Count}, file.Close()
+	case "burst_truncate_overwrite":
+		writers := max(1, req.Len)
+		completed := make(chan error, writers)
+		for writer := range writers {
+			go func() {
+				payload := bytes.Repeat([]byte{req.Fill + byte(writer)}, int(req.Size))
+				for range req.Count {
+					file, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+					if err != nil {
+						completed <- err
+						return
+					}
+					_, err = file.Write(payload)
+					if err == nil {
+						err = file.Sync()
+					}
+					err = errors.Join(err, file.Close())
+					if err != nil {
+						completed <- err
+						return
+					}
+				}
+				completed <- nil
+			}()
+		}
+		var result error
+		for range writers {
+			result = errors.Join(result, <-completed)
+		}
+		return response{N: req.Count * writers}, result
+	case "burst_editor_save":
+		stop, started := make(chan struct{}), make(chan struct{})
+		readerDone := make(chan error, 1)
+		go func() {
+			first := true
+			for {
+				select {
+				case <-stop:
+					readerDone <- nil
+					return
+				default:
+				}
+				data, err := os.ReadFile(path)
+				if err == nil && (len(data) != int(req.Size) || !bytes.Equal(data, bytes.Repeat(data[:1], len(data)))) {
+					err = errors.New("editor reader observed a torn replacement")
+				}
+				if first {
+					close(started)
+					first = false
+				}
+				if err != nil {
+					readerDone <- err
+					return
+				}
+			}
+		}()
+		<-started
+		var result error
+		for round := range req.Count {
+			_, result = a.execute(request{Op: "atomic_replace", Path: req.Path, Data: bytes.Repeat([]byte{byte('A' + round%2)}, int(req.Size)), Mode: 0o600})
+			if result != nil {
+				break
+			}
+		}
+		close(stop)
+		return response{N: req.Count}, errors.Join(result, <-readerDone)
 	case "atomic_replace":
 		// create temp -> write -> fsync -> rename over the target. This is the
 		// exact sequence editors, compilers and package managers use, and the

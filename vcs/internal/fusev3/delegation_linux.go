@@ -652,6 +652,37 @@ func (m *delegationManager) modeAndBuffer(s *delegationState) (*delegationState,
 	return s, m.buf, mode, nil
 }
 
+// Return with operation and admission held. A source owner may need operation
+// to register its returned grant, so contention waits hold neither lock and
+// recheck ownership before attempting local acceptance.
+func (m *delegationManager) lockPreparedAdmission(ctx context.Context, s *delegationState) (*writeback.Buffer, authoritypb.DelegationMode, error) {
+	for {
+		if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+			return nil, 0, err
+		}
+		_, buffer, mode, err := m.modeAndBuffer(s)
+		if err != nil {
+			s.operation.Unlock()
+			return nil, 0, err
+		}
+		err = prepareDelegationAdmission(ctx)
+		if err == nil {
+			return buffer, mode, nil
+		}
+		s.admission.RUnlock()
+		s.operation.Unlock()
+		var waiting *sourcePublicationWait
+		if !errors.As(err, &waiting) {
+			return nil, 0, err
+		}
+		select {
+		case <-waiting.changed:
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		}
+	}
+}
+
 func (m *delegationManager) markAccepted(s *delegationState, cut writeback.Cut) {
 	s.meta.Lock()
 	defer s.meta.Unlock()
@@ -681,7 +712,8 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	}()
 	s := m.retainState(id, true)
 	defer m.releaseState(s)
-	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+	b, mode, err := m.lockPreparedAdmission(ctx, s)
+	if err != nil {
 		return writeback.Cut{}, err
 	}
 	lockedState := s
@@ -691,14 +723,6 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 			lockedState.operation.Unlock()
 		}
 	}()
-	s, b, mode, err := m.modeAndBuffer(s)
-	if err != nil {
-		return writeback.Cut{}, err
-	}
-	if err := prepareDelegationAdmission(ctx); err != nil {
-		s.admission.RUnlock()
-		return writeback.Cut{}, err
-	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
 	var handle *handleAcceptedCut
@@ -725,7 +749,7 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	if err == nil && syncWrite {
 		// The operation lock fixes the accepted cut. Release admission before a
 		// flush can record a refusal and rebind the successor buffer generation.
-		applied, err = m.syncIdentityCut(ctx, s, b, cut, false)
+		applied, err = b.FlushIdentity(ctx, id, cut)
 	}
 	if err != nil {
 		return cut, err
@@ -746,6 +770,11 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 		operationLocked = false
 		m.frontend.RUnlock()
 		frontendLocked = false
+		if syncWrite {
+			if err := m.syncIdentity(ctx, s, false); err != nil {
+				return cut, err
+			}
+		}
 		if err := m.waitVisibility(ctx, b, id, cut, applied); err != nil {
 			return cut, err
 		}
@@ -788,7 +817,8 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	}()
 	s := m.retainState(id, true)
 	defer m.releaseState(s)
-	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+	b, mode, err := m.lockPreparedAdmission(ctx, s)
+	if err != nil {
 		return writeback.Cut{}, err
 	}
 	lockedState := s
@@ -798,14 +828,6 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 			lockedState.operation.Unlock()
 		}
 	}()
-	s, b, mode, err := m.modeAndBuffer(s)
-	if err != nil {
-		return writeback.Cut{}, err
-	}
-	if err := prepareDelegationAdmission(ctx); err != nil {
-		s.admission.RUnlock()
-		return writeback.Cut{}, err
-	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
 	var handle *handleAcceptedCut
@@ -1454,6 +1476,11 @@ func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState
 	s.admission.RLock()
 	handle := firstDelegatedHandle(s.handles)
 	s.admission.RUnlock()
+	if caller, _ := ctx.Value(handleAcceptanceKey{}).(*fileHandle); caller != nil {
+		// The raw callback pins this exact description through FSYNC. An
+		// arbitrary sibling may close while recall is making progress.
+		handle = caller.token
+	}
 	if len(handle) == 0 {
 		return errors.New("fusev3: delegated fsync has no live server handle")
 	}
@@ -1471,19 +1498,6 @@ func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState
 	return nil
 }
 
-// The operation lock fixes this identity's accepted cut. FSYNC proves only
-// that file durable; its common prefix may remain behind an unrelated writer.
-func (m *delegationManager) syncIdentityCut(ctx context.Context, s *delegationState, b *writeback.Buffer, cut writeback.Cut, dataOnly bool) (uint64, error) {
-	applied, err := b.FlushIdentity(ctx, s.identity, cut)
-	if err != nil {
-		return applied, err
-	}
-	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
-		return applied, err
-	}
-	return applied, nil
-}
-
 func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly bool) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
@@ -1497,10 +1511,16 @@ func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly
 		return err
 	}
 	cut := m.buf.Snapshot()
-	applied, err := m.syncIdentityCut(ctx, s, m.buf, cut, dataOnly)
+	applied, err := m.buf.FlushIdentity(ctx, s.identity, cut)
 	s.operation.Unlock()
 	s.transition.Unlock()
 	if err != nil {
+		return err
+	}
+	// A peer may already have replaced the grant by the time FSYNC reaches
+	// the authority. Its read admission can recall/break our local holder;
+	// never retain the operation or transition lock needed by that callback.
+	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
 		return err
 	}
 	if applied != 0 {
@@ -1770,10 +1790,10 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 	return r, err
 }
 
-// Only a definite, unapplied capacity refusal preserves the grant. A reply
-// with a ticket or partial write is an uncertain application, even with ENOSPC.
+// This recognizes only unapplied capacity refusals. Applied WRITE prefixes
+// require exact placement and ticket accounting in FlushBatch instead.
 func definiteDelegationCapacityRefusal(response *authoritypb.Response, write bool) syscall.Errno {
-	if response == nil || response.GetUncertain() || response.GetFailure() != 0 || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
+	if response == nil || response.GetUncertain() || response.GetSessionTerminal() || len(response.GetTerminalDeliveryToken()) != 0 || response.GetFailure() != 0 || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
 		return 0
 	}
 	errno := syscall.Errno(response.GetErrno())

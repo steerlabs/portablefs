@@ -128,9 +128,11 @@ sends an empty list.
 Every resolvable `Dirent` carries `stable_identity` at tag 7 together with its
 attributes, object version, and snapshot sequence. When `want_items` is true,
 the Authority returns a fresh `Item` unless that exact stable identity appears
-in `held_identities`; for a held identity it omits `Item`. The client may use
-the identity only to find its already-retained capability. It must fail closed
-if that binding is absent or mismatched. The Authority still resolves and
+in `held_identities` or the item table is full. It omits `Item` in those cases.
+The client may use the identity only to find its already-retained capability.
+Without a matching retained capability it lists the row without publishing a
+kernel inode (`NodeId` zero in READDIRPLUS); a later LOOKUP remains subject to
+item admission. Enumeration does not require allocating item capabilities. The Authority still resolves and
 revalidates every entry under the page's storage cut and never turns the hint
 into access authority.
 
@@ -491,7 +493,12 @@ The client admits each predecessor to its transport lane before launching the
 next chunk and joins the wave before changing local ownership. Transport
 retries keep the same mutation identity, ordinal, and immutable scatter spans;
 an unprovable wave result loses the delegation, while definite capacity errors
-keep the grant and report the errno. A partial acceptance record stays retained
+keep the grant and report the errno. A delegated WRITE finishes short syscall
+prefixes inside its inode writer stripe before admitting the next ordinal;
+a capacity error after an exact prefix carries its actual placement, post-state
+and ticket. The client accounts that ticket and reports the rejected suffix as
+lost with the capacity errno, without retiring it as applied or durable.
+A partial acceptance record stays retained
 and outside the applied acceptance cut until its final chunk succeeds. Scatter
 spans use the single bulk carrier and canonical frame bytes.
 
