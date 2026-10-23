@@ -319,7 +319,7 @@ the worker class and workload measurements.
 | `--max-replay-slots` | `256` |
 | `--max-sessions` | `1024` |
 | `--max-lock-records` | `65536` |
-| `--max-items` | `1048576` |
+| `--max-items` | `524288` |
 | `--max-items-per-session` | `262144` |
 | `--max-opens` | `32768` |
 | `--max-opens-per-session` | `4096` |
@@ -345,7 +345,9 @@ At saturation, new item acquisitions fail with ENFILE while directory names
 remain enumerable without allocating items. Existing handles, cleanup and
 quota recovery remain admitted. Defaults allow several repository working
 sets per worker; deployments still size file-descriptor and memory limits
-for their configured bounds.
+for their configured bounds. The authority service's descriptor limit is
+1,048,576, leaving headroom above the default item budget for open descriptions,
+transport connections and bounded directory-page probes.
 
 Startup cross-checks the bounds rather than accepting any combination:
 

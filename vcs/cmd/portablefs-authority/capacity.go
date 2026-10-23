@@ -17,7 +17,9 @@ const (
 	// The authority has no item-capacity negotiation. This must remain at least
 	// mountv3.NameCacheCapacity so a stock mount can retain its declared cache.
 	defaultMaxItemsPerSession = 1 << 18
-	defaultMaxItems           = 1 << 20
+	// Leave descriptor headroom under the service's 1,048,576-fd limit for
+	// opens, transport pairs and bounded directory-page probes.
+	defaultMaxItems = 1 << 19
 )
 
 // validateConnectionCapacity keeps physical transport admission ahead of the
