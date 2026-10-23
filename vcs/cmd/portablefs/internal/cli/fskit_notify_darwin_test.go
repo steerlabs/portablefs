@@ -23,17 +23,7 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	root := t.TempDir()
 	image := filepath.Join(root, "events.dmg")
 	mount := filepath.Join(root, "mounted")
-	seed := filepath.Join(root, "seed")
 	if err := os.Mkdir(mount, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(seed, 0700); err != nil {
-		t.Fatal(err)
-	}
-	// This fixture needs mount-table changes, not a writable filesystem.
-	// Exclude Spotlight before the test mounts the image; adding the marker
-	// after attach would race the very background opens we need to prevent.
-	if err := os.WriteFile(filepath.Join(seed, ".metadata_never_index"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	device := ""
@@ -69,8 +59,11 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 		return out
 	}
 	run := func(args ...string) []byte { t.Helper(); return runTool("/usr/bin/hdiutil", args...) }
-	run("create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest",
-		"-srcfolder", seed, "-format", "UDRO", image)
+	// A blank image needs no source copy; -srcfolder creation is itself
+	// intermittently busy on hosted runners. The fixture needs mount-table
+	// changes, not a writable filesystem: read-only, unbrowsed attaches give
+	// background services nothing to index or check.
+	run("create", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest", image)
 	detachAttempted := false
 	attach := func() {
 		t.Helper()
