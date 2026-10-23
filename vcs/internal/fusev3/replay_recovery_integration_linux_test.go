@@ -193,6 +193,12 @@ func TestKernelMutationReplayAcrossColdRecovery(t *testing.T) {
 					if got := readExactlyAt(t, cached, 0, 7, "prime kernel pages"); string(got) != "oldpage" {
 						t.Fatal(string(got))
 					}
+					// OPEN can withdraw its LOOKUP attributes. Prime them through
+					// this live description: a path-only stat may receive final
+					// FORGET before the fixture inspects its retained cache classes.
+					if _, err := cached.Stat(); err != nil {
+						t.Fatal(err)
+					}
 					if _, err := os.Stat(f.join(0, "gone")); err != nil {
 						t.Fatal(err)
 					}
@@ -207,12 +213,12 @@ func TestKernelMutationReplayAcrossColdRecovery(t *testing.T) {
 						defer m.delegations.closeMu.Unlock()
 						return m.delegations.closePending == 0
 					})
-					m.raw.mu.RLock()
-					primed := len(m.raw.cachedStableNames) > 0 && len(m.raw.cachedNegatives) > 0 && len(m.raw.cachedAttrs) > 0 && len(m.raw.cachedData) > 0
-					m.raw.mu.RUnlock()
-					if !primed {
-						t.Fatal("cache withdrawal fixture did not prime names, negatives, attributes and pages")
-					}
+					// Kernel receipt precedes the daemon's post-reply settlement.
+					waitUntil(t, 5*time.Second, "cache withdrawal fixture names, negatives, attributes and pages to settle", func() bool {
+						m.raw.mu.RLock()
+						defer m.raw.mu.RUnlock()
+						return len(m.raw.cachedStableNames) > 0 && len(m.raw.cachedNegatives) > 0 && len(m.raw.cachedAttrs) > 0 && len(m.raw.cachedData) > 0
+					})
 					// Retain an accepted volatile tail without assigning it a DATA replay
 					// identity. Reset may discard these bytes, but must still settle the
 					// independently assigned CLOSE_BATCH outcome below.
