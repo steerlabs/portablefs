@@ -282,6 +282,8 @@ try:
     root_death_mount = authority.mount(guest)
     guest.command('pause'); guest.wait('paused', 25)
     guest.command('resume'); guest.wait('resumed', 25)
+    authority.ready(guest)
+    assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
     guest.command('replay-resume')
     refusal = guest.wait('replay-refused', 25)
     assert refusal['generation'] == 1 and 'guest refused resume: resume token consumed' in refusal['reason'], refusal
