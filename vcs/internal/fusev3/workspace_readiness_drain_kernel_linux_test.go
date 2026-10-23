@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
@@ -56,10 +58,30 @@ func workspaceReadinessDrainChild(t *testing.T, mode string) {
 	}
 	loss0 := c.m.delegations.LossSequence()
 	beforeWrites := f.counter.count("write")
-	clock.unavailable.Store(true)
+	preAssignment, admit := workspaceHoldBeforeAssignment(t, f)
+	assigned, released := make(chan struct{}), make(chan struct{})
+	var assignedOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+	defer release()
+	if mode == "cancel" {
+		f.counter.setBeforeHandle(func(q *authoritypb.Request) {
+			if w := q.GetWrite(); w != nil && w.GetFlushSequence() != 0 {
+				assignedOnce.Do(func() { close(assigned) })
+				<-released
+			}
+		})
+		defer f.counter.setBeforeHandle(nil)
+	}
 	if _, err := file.WriteAt([]byte("w1"), 0); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case <-preAssignment:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accepted WRITE did not reach pre-assignment hold")
+	}
+	clock.unavailable.Store(true)
+	admit()
 	waitUntil(t, 5*time.Second, "pre-assignment wait", func() bool { return f.clients[0].DispatchSnapshot().WaitingApplying > 0 })
 	serial, _ := strconv.ParseUint(c.req("close"), 10, 64)
 	var o WorkspaceObservation
@@ -94,7 +116,13 @@ func workspaceReadinessDrainChild(t *testing.T, mode string) {
 		if o.ColdComplete || o.Result.Disposition != authorityrpc.LifecycleOvertaken || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatal("canceled cut did not retain incomplete work", o.Result, err)
 		}
+		select {
+		case <-assigned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("captured drain never assigned retained WRITE")
+		}
 		clock.unavailable.Store(false)
+		release()
 	}
 	fmt.Printf("%s: loss=%v writes=%d->%d\n", mode, o.Loss, beforeWrites, f.counter.count("write"))
 	c.recover(serial)

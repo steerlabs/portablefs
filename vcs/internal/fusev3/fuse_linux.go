@@ -1382,7 +1382,7 @@ func (m *Mount) closeLocked() error {
 		return m.closeErr
 	}
 	m.closed = true
-	barrierErr := m.flushDelegationsBeforeClose()
+	barrierErr := errors.Join(m.prepareWorkspaceClose(), m.flushDelegationsBeforeClose())
 	m.cancel()
 	var replyOwnershipErr error
 	if m.raw != nil {

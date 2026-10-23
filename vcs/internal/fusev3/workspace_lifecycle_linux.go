@@ -774,15 +774,7 @@ func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d works
 		return m.finishWorkspaceCold(w, d)
 	}
 	w.outcome = control.UnknownOutcome()
-	if err = d.DrainDispatch(func() error {
-		if err := m.ctx.Err(); err != nil {
-			return err
-		}
-		if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
-			return errSubscriptionExpired
-		}
-		return nil
-	}); err != nil {
+	if err = m.drainWorkspaceDispatch(d, p); err != nil {
 		return false, err
 	}
 	w.workers = nil
@@ -850,6 +842,33 @@ func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d works
 		return false, errors.New("fusev3: terminal worker prevents healthy cold proof")
 	}
 	return m.finishWorkspaceCold(w, d)
+}
+
+func (m *Mount) drainWorkspaceDispatch(d workspaceDispatch, p workspaceDrainPermit) error {
+	return d.DrainDispatch(func() error {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+		if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
+			return errSubscriptionExpired
+		}
+		return nil
+	})
+}
+
+func (m *Mount) prepareWorkspaceClose() error {
+	if m.workspaceLifecycle == nil || !m.delegations.hasRetainedEntries() || m.rpc.SessionEndCause() != nil {
+		return nil
+	}
+	_, d, err := m.workspaceDependencies()
+	if err != nil {
+		return err
+	}
+	// Exact kernel removal has closed frontend admission. Its accepted tail
+	// remains owned by the old grant, not the now-defeated serving predicate.
+	// Capture never refreshes the subscription's original conservative horizon.
+	p := m.workspaceFS().captureWorkspaceDrain(m.subscription.config.clock.Now().Add(m.subscription.shutdownBudget()))
+	return m.drainWorkspaceDispatch(d, p)
 }
 
 // Both a full cut and a re-acknowledgment retire cache ownership, then capture

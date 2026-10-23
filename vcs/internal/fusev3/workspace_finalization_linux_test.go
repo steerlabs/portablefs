@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
@@ -92,6 +95,78 @@ func TestWorkspaceFinalizationRetainsTerminalOutcomeAndRefusesCleanupDebt(t *tes
 			}
 			if ordinary := m.Close(); !errors.Is(ordinary, terminal) || tc.refusal && !errors.Is(ordinary, debt) {
 				t.Fatal("ordinary close lost its combined diagnostic", ordinary)
+			}
+		})
+	}
+}
+
+// An accepted cut remains owned after serving closure and exact
+// local kernel removal. The production transport also checks serving at send.
+type closeCutRPC struct {
+	*coldTestRPC
+	permission func() error
+	drains     int
+}
+
+func (r *closeCutRPC) DrainDispatch(check func() error) error {
+	r.permission = check
+	r.drains++
+	return nil
+}
+func (r *closeCutRPC) CallMutationSegments(ctx context.Context, q *authoritypb.Request, spans [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	if err := r.permission(); err != nil {
+		return nil, err
+	}
+	return r.coldTestRPC.RPC.CallMutationSegments(ctx, q, spans, assigned)
+}
+func (r *closeCutRPC) CallMutation(ctx context.Context, q *authoritypb.Request) (*authoritypb.Response, error) {
+	if err := r.permission(); err != nil {
+		return nil, err
+	}
+	return r.coldTestRPC.RPC.CallMutation(ctx, q)
+}
+func TestWorkspaceFinalizationDrainsAcceptedCutAfterServingClosure(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		name := "live-original-horizon"
+		if expired {
+			name = "expired-original-horizon"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, g, base := coldFixture(t)
+			r := &closeCutRPC{coldTestRPC: base, permission: func() error { _, err := f.mount.workspace.Check(); return err }}
+			f.mount.rpc.(*epochRPC).rpc = r
+			e := f.lookup(t, 1, "close-cut")
+			opened := openDelegatedWriter(t, f, e.NodeId)
+			payload := []byte("accepted before removal")
+			writeDelegated(t, f, e.NodeId, opened.Fh, 0, payload)
+			old := f.mount.delegations.buf
+			if old.Stats().Entries != 1 || old.Stats().Bytes != int64(len(payload)) {
+				t.Fatal("no exact retained accepted cut", old.Stats())
+			}
+			f.mount.plannedFSName = "portablefs:" + f.mount.workspace.MountInstanceID()
+			f.mount.plannedMountpoint = t.TempDir()
+			g.Close(1)
+			if r.permission() == nil {
+				t.Fatal("serving permission survived Close")
+			}
+			if expired {
+				f.mount.subscription.mu.Lock()
+				f.mount.subscription.cacheUntil = f.mount.subscription.config.clock.Now().Add(-time.Second)
+				f.mount.subscription.mu.Unlock()
+			}
+			o, err := f.mount.FinalizeWorkspace()
+			if err != nil {
+				t.Fatal("local finalization refused", err)
+			}
+			f.rpc.mu.Lock()
+			applied := f.rpc.applied
+			f.rpc.mu.Unlock()
+			if expired {
+				if applied != 0 || len(o.Loss) != 1 || o.Loss[0].AcceptedBytes != uint64(len(payload)) || o.Loss[0].AcceptedEntries != 1 {
+					t.Fatal("expired old cut was extended or not exactly accounted", applied, o.Loss)
+				}
+			} else if applied == 0 || len(o.Loss) != 0 {
+				t.Fatalf("accepted live cut discarded behind closed serving predicate; drains=%d applied=%d loss=%v", r.drains, applied, o.Loss)
 			}
 		})
 	}

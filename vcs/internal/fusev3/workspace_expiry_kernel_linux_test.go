@@ -34,6 +34,36 @@ func TestWorkspaceKernelAssignedWriteColdCut(t *testing.T) {
 	opusKernelParent(t, func(t *testing.T) { workspaceHeldCutChild(t, "assigned") })
 }
 
+// Hold accepted delegated data before the real transport can assign a request.
+// Clock readiness changes only after the kernel's Write has been acknowledged.
+func workspaceHoldBeforeAssignment(t *testing.T, f *integrationFixture) (<-chan struct{}, func()) {
+	t.Helper()
+	entered, released := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(released) }) }
+	transport := f.transports[0]
+	transport.hookMu.Lock()
+	transport.beforeDelegatedMutation = func(ctx context.Context, q *authoritypb.Request) error {
+		if w := q.GetWrite(); w != nil && w.GetDelegation() != nil {
+			enteredOnce.Do(func() { close(entered) })
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-released:
+			}
+		}
+		return nil
+	}
+	transport.hookMu.Unlock()
+	t.Cleanup(func() {
+		release()
+		transport.hookMu.Lock()
+		transport.beforeDelegatedMutation = nil
+		transport.hookMu.Unlock()
+	})
+	return entered, release
+}
+
 func workspaceHeldCutChild(t *testing.T, mode string) {
 	reader, proof, mounted := opusAdopt(t)
 	defer reader.Retire()
@@ -99,6 +129,8 @@ func workspaceHeldCutChild(t *testing.T, mode string) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once, releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
+	var unassigned <-chan struct{}
+	var admit func()
 	if mode == "assigned" {
 		f.counter.setBeforeHandle(func(q *authoritypb.Request) {
 			if q.GetWrite() != nil && q.GetWrite().GetFlushSequence() != 0 {
@@ -107,7 +139,7 @@ func workspaceHeldCutChild(t *testing.T, mode string) {
 		})
 		defer f.counter.setBeforeHandle(nil)
 	} else {
-		clock.unavailable.Store(true)
+		unassigned, admit = workspaceHoldBeforeAssignment(t, f)
 	}
 	for _, file := range files {
 		if _, err := file.WriteAt([]byte("w1"), 0); err != nil {
@@ -121,6 +153,13 @@ func workspaceHeldCutChild(t *testing.T, mode string) {
 			t.Fatal("assigned background WRITE did not reach authority")
 		}
 	} else {
+		select {
+		case <-unassigned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("accepted WRITE did not reach pre-assignment hold")
+		}
+		clock.unavailable.Store(true)
+		admit()
 		waitUntil(t, 5*time.Second, "background WRITE at pre-assignment readiness fence", func() bool { return f.clients[0].DispatchSnapshot().WaitingApplying > 0 })
 		if f.counter.count("write") != beforeWrites {
 			t.Fatal("unassigned WRITE crossed transport")

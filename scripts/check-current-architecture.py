@@ -195,6 +195,7 @@ ROOT_TEST_PACKAGES = {
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission",
 }
 ROOT_REQUIRED = {
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFinalizationDrainsAcceptedCutAfterServingClosure",
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootRegistrationObservationCannotBlockClockClosure",
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootLocalConnectChargesSaturatedBacklog",
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootRecreatesOnlyProtectedColdTarget",
