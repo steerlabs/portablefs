@@ -98,15 +98,15 @@ func TestDesiredJobAcceptanceOwnsLaneAndRetainsFailure(t *testing.T) {
 		}
 	}
 	close(release)
-	waitFor(t, func() bool { return s.Status().Jobs[0].Phase == "failed" })
-	j := s.Status().Jobs[0]
+	waitFor(t, func() bool { return len(s.Retired()) == 1 })
+	j := s.Retired()[0].Job
 	if j.Failure != "handler-failed" || j.Reason != "exact removal remains unproven" || j.Generation != 0 {
 		t.Fatalf("independent failure erased: %v", j)
 	}
 }
 
 func TestDesiredAndRegisteredMountsShareCapacity(t *testing.T) {
-	s, err := New(id(1), id(2), id(3), true, nil)
+	s, err := New(id(1), id(2), id(3), true, jobDriverFunc(func(ctx context.Context, _ *pb.MountJob, _ *pb.Provision) error { <-ctx.Done(); return ctx.Err() }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestDesiredAndRegisteredMountsShareCapacity(t *testing.T) {
 	}
 	waitFor(t, func() bool {
 		for _, j := range s.Status().Jobs {
-			if j.Phase != "failed" {
+			if j.Phase != "running" {
 				return false
 			}
 		}

@@ -45,7 +45,7 @@ func fixtures() map[string]*pb.Envelope {
 	retired := proto.Clone(status).(*pb.MountStatus)
 	retired.Mount.Incarnation = fixtureID(10)
 	retired.Cleanup = "complete"
-	retired.RetirementSequence = 1
+	outcome := &pb.RetiredOutcome{RetirementSequence: 1, MountStatus: retired}
 	bodies := map[string]*pb.Envelope{
 		"hello": {Body: &pb.Envelope_Hello{Hello: h}}, "hello_ack": {Body: &pb.Envelope_HelloAck{HelloAck: guest}},
 		"suspend":      {DrainBudgetNanos: uint64(MaxDrainBudget), Body: &pb.Envelope_Suspend{Suspend: request}},
@@ -53,7 +53,7 @@ func fixtures() map[string]*pb.Envelope {
 		"resume":       {Body: &pb.Envelope_Resume{Resume: token}},
 		"resume_ack":   {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{status}}}},
 		"status":       {Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}},
-		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}, Retired: []*pb.MountStatus{retired}}}},
+		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}, Retired: []*pb.RetiredOutcome{outcome}}}},
 		"provision":    {Body: &pb.Envelope_Provision{Provision: &pb.Provision{Mount: fixtureMount(), AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("public CA"), ClientCertificate: []byte("public certificate"), Capability: []byte("signed capability"), PublicKey: []byte("guest public key"), RoutesRevision: bytes.Repeat([]byte{9}, 32)}}},
 		"mount":        {Body: &pb.Envelope_Mount{Mount: &pb.MountRequest{Mount: fixtureMount()}}},
 		"umount":       {Body: &pb.Envelope_Umount{Umount: &pb.UmountRequest{Mount: fixtureMount()}}},
@@ -83,6 +83,18 @@ func fixtures() map[string]*pb.Envelope {
 		e.GetStatusReply().Jobs = []*pb.MountJob{j}
 		bodies["job_"+phase] = e
 	}
+	for _, phase := range []string{"complete", "failed"} {
+		e := proto.Clone(bodies["job_"+phase]).(*pb.Envelope)
+		status := e.GetStatusReply()
+		status.Retired = append(status.Retired, &pb.RetiredOutcome{RetirementSequence: 2, Job: status.Jobs[0]})
+		status.Jobs = nil
+		bodies["retired_job_"+phase] = e
+	}
+	combined := proto.Clone(bodies["retired_job_failed"]).(*pb.Envelope)
+	cloneJob := proto.Clone(combined.GetStatusReply().Retired[1].Job).(*pb.MountJob)
+	cloneJob.Mount = proto.Clone(combined.GetStatusReply().Retired[0].MountStatus.Mount).(*pb.MountID)
+	combined.GetStatusReply().Retired[0].Job = cloneJob
+	bodies["retired_mount_with_job"] = combined
 	for _, e := range bodies {
 		e.Version = 8
 		e.RequestId = 1
@@ -184,6 +196,33 @@ func invalidFixtures() map[string][]byte {
 			name = "job_excess_capacity"
 		}
 		negative[name] = framed(raw)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*pb.StatusReply)
+	}{
+		{"retired_empty", func(s *pb.StatusReply) { s.Retired[1].Job = nil }},
+		{"retired_running_job", func(s *pb.StatusReply) { s.Retired[1].Job.Phase = "running" }},
+		{"retired_future_job", func(s *pb.StatusReply) { s.Retired[1].Job.Generation++ }},
+		{"retired_sequence_gap", func(s *pb.StatusReply) { s.Retired[1].RetirementSequence++ }},
+		{"retired_mismatched_job", func(s *pb.StatusReply) { s.Retired[0].Job = proto.Clone(s.Retired[1].Job).(*pb.MountJob) }},
+		{"retired_duplicate_job", func(s *pb.StatusReply) {
+			r := proto.Clone(s.Retired[1]).(*pb.RetiredOutcome)
+			r.RetirementSequence++
+			s.Retired = append(s.Retired, r)
+		}},
+		{"active_and_retired_excess_capacity", func(s *pb.StatusReply) {
+			for i := 0; i < 63; i++ {
+				m := proto.Clone(s.Mounts[0]).(*pb.MountStatus)
+				m.Mount.VolumeId = fmt.Sprintf("v%02d", i)
+				s.Mounts = append(s.Mounts, m)
+			}
+		}},
+	} {
+		e := fixtures()["retired_job_complete"]
+		tc.mutate(e.GetStatusReply())
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		negative[tc.name] = framed(raw)
 	}
 	base := map[string][]byte{
 		"unequal_version":    framed([]byte{8, 9, 16, 1, 0x82, 1, 0}),
@@ -402,15 +441,14 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 		cold = append(cold, &pb.MountCold{Mount: mid, Loss: loss, Outcome: UnknownOutcome()})
 		jobs = append(jobs, &pb.MountJob{Mount: mid, RequestId: math.MaxUint64, Generation: math.MaxUint64, Operation: "provision", Phase: "failed", Failure: "authorization-required", Reason: strings.Repeat("r", MaxReason)})
 	}
-	var retired []*pb.MountStatus
+	var retired []*pb.RetiredOutcome
 	for i := 0; i < MaxRetiredBatch; i++ {
 		r := proto.Clone(statuses[i]).(*pb.MountStatus)
 		r.Mount.Incarnation = fixtureID(30)
-		r.RetirementSequence = uint64(i + 1)
-		retired = append(retired, r)
+		retired = append(retired, &pb.RetiredOutcome{RetirementSequence: uint64(i + 1), MountStatus: r})
 	}
 	for name, e := range map[string]*pb.Envelope{
-		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "running", Mounts: statuses, Retired: retired, Jobs: jobs}}},
+		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "running", Mounts: statuses[:MaxMounts-MaxRetiredBatch], Retired: retired, Jobs: jobs[:MaxMounts-MaxRetiredBatch]}}},
 		"suspend": {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: cold}}},
 		"resume":  {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}, Mounts: statuses}}},
 	} {

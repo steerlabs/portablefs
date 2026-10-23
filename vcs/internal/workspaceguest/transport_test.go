@@ -148,8 +148,8 @@ func TestTransportMountUnavailableAndStatusCorrelated(t *testing.T) {
 	if r.GetResult().GetCode() != "accepted" {
 		t.Fatal("job not accepted")
 	}
-	waitFor(t, func() bool { jobs := s.Status().Jobs; return len(jobs) == 1 && jobs[0].Phase == "failed" })
-	if len(s.Status().Mounts) != 0 || s.Status().Jobs[0].Failure != "unavailable" {
+	waitFor(t, func() bool { return len(s.Retired()) == 1 })
+	if len(s.Status().Mounts) != 0 || s.Retired()[0].Job.Failure != "unavailable" {
 		t.Fatal("absent real driver reported success")
 	}
 	c.Close()
@@ -181,7 +181,7 @@ func TestTransportRetiredOutcomeAcknowledgementUsesPairedGrammar(t *testing.T) {
 		t.Fatal(err)
 	}
 	status := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}).GetStatusReply()
-	if len(status.Retired) != 1 || !proto.Equal(status.Retired[0].Mount, old) {
+	if len(status.Retired) != 1 || !proto.Equal(status.Retired[0].MountStatus.Mount, old) {
 		t.Fatalf("missing retired outcome: %v", status)
 	}
 	result := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{ThroughSequence: status.Retired[len(status.Retired)-1].RetirementSequence}}})

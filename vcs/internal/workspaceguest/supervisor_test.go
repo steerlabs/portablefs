@@ -417,7 +417,7 @@ func TestGuestTerminalReplacementRequiresExactCleanupAndAuthorization(t *testing
 	if err := s.Activate(context.Background(), next, 0); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Retired()) != 2 || s.Retired()[0].Loss[0].Sequence != 1 {
+	if len(s.Retired()) != 2 || s.Retired()[0].MountStatus.Loss[0].Sequence != 1 {
 		t.Fatal("replacement erased old run")
 	}
 }
@@ -795,7 +795,7 @@ func TestGuestLossCapacityClosesOnlyMountAndStillAcknowledgesCold(t *testing.T) 
 }
 func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 	s, _, mid := fixture(t)
-	for i := 0; i < MaxRetired+2; i++ {
+	for i := 0; i < control.MaxMounts+1; i++ {
 		if err := s.Terminal(mid, "session ended", []*pb.Loss{{Sequence: 1, Reason: "retained failure"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -805,7 +805,7 @@ func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 		}
 		next := mountID(byte(i + 10))
 		m := &fakeMount{}
-		if i == MaxRetired {
+		if i == control.MaxMounts-1 {
 			if err := s.Replace(context.Background(), mid, next, Witness{}, m); err == nil || !m.cleaned {
 				t.Fatal("unobserved retired outcomes discarded")
 			}

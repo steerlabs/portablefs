@@ -106,7 +106,7 @@ func TestTransportSlowProvisionAndUmountCannotObstructSuspend(t *testing.T) {
 			if err != nil || reply.GetSuspendAck() == nil || len(reply.GetSuspendAck().Mounts) != 0 {
 				t.Fatalf("desired intent became a mount: %v %v", reply, err)
 			}
-			if s.Status().Jobs[0].Failure != "stopped" {
+			if s.Retired()[0].Job.Failure != "stopped" {
 				t.Fatal("late job success survived cancellation")
 			}
 			c.Close()

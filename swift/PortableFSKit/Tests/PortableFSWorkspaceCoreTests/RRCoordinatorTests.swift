@@ -66,17 +66,17 @@ private func rrGolden(_ name: String) throws -> Data {
     try c.start()
     return (c, vm, power, clock, channel)
 }
-@MainActor private func runningWithRetired(_ c: WorkspaceCoordinator, _ ch: RRChannel) throws -> WorkspaceMountStatus {
+@MainActor private func runningWithRetired(_ c: WorkspaceCoordinator, _ ch: RRChannel) throws -> WorkspaceRetiredOutcome {
     c.refreshStatus()
     var status = WorkspaceStatusReply()
     let h = try WorkspaceControl.decode(rrGolden("hello")).hello
     status.bootID = h.bootID; status.hostServiceID = h.hostServiceID; status.guestServiceID = Data(repeating: 6, count: 16)
     status.state = "running"; status.generation = c.generation
     var old = WorkspaceMountStatus(); old.outcome = unknownTestOutcome(); old.mount.authorityID = Data(repeating: 1, count: 32); old.mount.volumeID = "v"; old.mount.incarnation = Data(repeating: 3, count: 16)
-    old.retirementSequence = 1; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
-    status.retired = [old]
+    old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
+    status.retired = [retiredTestOutcome(old, sequence: 1)]
     ch.statuses.removeFirst()(.success(status))
-    return old
+    return status.retired[0]
 }
 
 @Test @MainActor func workspaceConcurrentRetirementAcknowledgementsCoalesce() throws {
@@ -106,7 +106,7 @@ private func rrGolden(_ name: String) throws -> Data {
     status.state = "running"; status.generation = c.generation
     var r = WorkspaceMountStatus(); r.outcome = unknownTestOutcome(); r.mount.authorityID = Data(repeating: 1, count: 32); r.mount.volumeID = "v"; r.mount.incarnation = Data(repeating: 3, count: 16)
     r.state = "terminal"; r.reason = "x"; r.cleanup = "complete"
-    r.retirementSequence = 1; status.retired = [r]
+    status.retired = [retiredTestOutcome(r, sequence: 1)]
     ch.statuses.removeFirst()(.success(status))
     // Now a real failure: start a sleep and let pause budget expire.
     c.powerEvent(.sleep(WorkspaceSleepNotification(id: 1, arrivedAt: clock.now)))
@@ -208,4 +208,32 @@ private func rrGolden(_ name: String) throws -> Data {
     #expect(c.phase == .stopping)
     #expect(vm.calls.last == "stop")
     #expect(c.reason == "unknown power transition")
+}
+
+@Test @MainActor func workspaceJoinedJobRetirementPreservesObservationAndAcknowledgement() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    status.generation = c.generation; status.jobs[0].generation = c.generation
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    let running = status.jobs[0]
+    #expect(c.jobStatus == [running])
+    // A missing retirement page must leave the last observed owner intact.
+    status.jobs = []
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus == [running])
+    #expect(c.reason.contains("retired jobs"))
+    var joined = running; joined.phase = "failed"; joined.failure = "unavailable"; joined.reason = "real mount driver unavailable"
+    var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = 2; outcome.job = joined
+    status.retired.append(outcome)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus.isEmpty)
+    #expect(c.retiredStatus.last == outcome)
+    #expect(c.reason.isEmpty)
+    let observed = c.retiredStatus
+    try c.acknowledgeRetired(observed)
+    ch.retiredAcks.removeFirst().1(.success(()))
+    #expect(c.retiredStatus.isEmpty)
+    status.retired = []
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.reason.isEmpty)
 }

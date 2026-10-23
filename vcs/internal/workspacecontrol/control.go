@@ -284,10 +284,10 @@ func ColdAck(a *pb.SuspendAck) error {
 	}
 	return nil
 }
-func statuses(ms []*pb.MountStatus, retired bool) error {
+func statuses(ms []*pb.MountStatus) error {
 	roster := make([]*pb.MountID, 0, len(ms))
 	for _, m := range ms {
-		if m == nil || (m.RetirementSequence != 0) != retired {
+		if m == nil {
 			return invalid("statuses: invalid field or state combination")
 		}
 		if m.Renewal != nil {
@@ -324,23 +324,39 @@ func statuses(ms []*pb.MountStatus, retired bool) error {
 	return Roster(roster)
 }
 
-// Retired outcomes can include repeated volumes, but never repeated incarnations.
-func RetiredStatuses(ms []*pb.MountStatus) error {
-	if len(ms) > MaxRetiredBatch {
+// One contiguous sequence carries mount cleanup and joined job evidence.
+func RetiredStatuses(outcomes []*pb.RetiredOutcome) error {
+	if len(outcomes) > MaxRetiredBatch {
 		return invalid("retired outcome batch exceeds limit")
 	}
-	seen := map[string]bool{}
 	var sequence uint64
-	for _, m := range ms {
-		if err := statuses([]*pb.MountStatus{m}, true); err != nil {
-			return fmt.Errorf("retired outcome: %w", err)
+	mounts := map[string]bool{}
+	jobs := map[string]bool{}
+	for _, outcome := range outcomes {
+		if outcome == nil || outcome.RetirementSequence == 0 || (sequence != 0 && (sequence == math.MaxUint64 || outcome.RetirementSequence != sequence+1)) || (outcome.MountStatus == nil && outcome.Job == nil) {
+			return invalid("retired outcome sequence or missing evidence")
 		}
-		key := MountKey(m.Mount)
-		if seen[key] || m.RetirementSequence <= sequence || (sequence != 0 && m.RetirementSequence != sequence+1) || m.Cleanup != "complete" || (m.State != "terminal" && m.State != "authorization-required") {
-			return invalid("retired outcome requires unique, exactly cleaned terminal incarnation")
+		if m := outcome.MountStatus; m != nil {
+			if err := statuses([]*pb.MountStatus{m}); err != nil {
+				return err
+			}
+			key := MountKey(m.Mount)
+			if mounts[key] || m.Cleanup != "complete" || (m.State != "terminal" && m.State != "authorization-required") {
+				return invalid("retired mount requires unique, exactly cleaned terminal incarnation")
+			}
+			mounts[key] = true
 		}
-		seen[key] = true
-		sequence = m.RetirementSequence
+		if j := outcome.Job; j != nil {
+			if err := Jobs([]*pb.MountJob{j}, nil, math.MaxUint64); err != nil {
+				return err
+			}
+			key := fmt.Sprintf("%s/%d", MountKey(j.Mount), j.RequestId)
+			if jobs[key] || (j.Phase != "complete" && j.Phase != "failed") || (outcome.MountStatus != nil && !proto.Equal(outcome.MountStatus.Mount, j.Mount)) {
+				return invalid("retired job requires unique joined matching owner")
+			}
+			jobs[key] = true
+		}
+		sequence = outcome.RetirementSequence
 	}
 	return nil
 }
@@ -359,7 +375,7 @@ func ResumeAck(a *pb.ResumeAck) error {
 			return fmt.Errorf("resume acknowledgement roster member %d: %w", i, ErrGrammar)
 		}
 	}
-	if err := statuses(a.Mounts, false); err != nil {
+	if err := statuses(a.Mounts); err != nil {
 		return fmt.Errorf("resume statuses: %w", err)
 	}
 	for _, m := range a.Mounts {
@@ -466,11 +482,28 @@ func Validate(e *pb.Envelope) error {
 		if err := RetiredStatuses(s.Retired); err != nil {
 			return fmt.Errorf("status retired: %w", err)
 		}
-		if err := statuses(s.Mounts, false); err != nil {
+		if err := statuses(s.Mounts); err != nil {
 			return fmt.Errorf("status mounts: %w", err)
 		}
 		if err := Jobs(s.Jobs, s.Mounts, s.Generation); err != nil {
 			return fmt.Errorf("status jobs: %w", err)
+		}
+		keys := map[string]bool{}
+		for _, m := range s.Mounts {
+			keys[MountKey(m.Mount)] = true
+		}
+		for _, j := range s.Jobs {
+			if j != nil {
+				keys[MountKey(j.Mount)] = true
+			}
+		}
+		if len(keys)+len(s.Retired) > MaxMounts {
+			return invalid("active and retired capacity")
+		}
+		for _, outcome := range s.Retired {
+			if outcome.Job != nil && outcome.Job.Generation > s.Generation {
+				return invalid("retired job generation")
+			}
 		}
 		if (s.State == "suspending" || s.State == "suspended-cold") && s.Generation == 0 {
 			return fmt.Errorf("status missing suspension generation: %w", ErrGrammar)

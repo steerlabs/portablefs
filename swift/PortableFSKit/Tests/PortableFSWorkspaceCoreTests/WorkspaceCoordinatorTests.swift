@@ -471,12 +471,12 @@ private enum InjectedFailure: Error { case failed }
     var old = r.coordinator.mountStatus[0]; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
-    old.retirementSequence = 1
-    status.mounts = [replacement]; status.retired = [old]
+    let retired = retiredTestOutcome(old, sequence: 1)
+    status.mounts = [replacement]; status.retired = [retired]
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
-    #expect(r.coordinator.retiredStatus == [old])
-    try r.coordinator.acknowledgeRetired([old])
+    #expect(r.coordinator.retiredStatus == [retired])
+    try r.coordinator.acknowledgeRetired([retired])
     r.channel.retiredAcks.removeFirst().1(.success(()))
     #expect(r.coordinator.retiredStatus.isEmpty)
 }
@@ -521,13 +521,13 @@ private enum InjectedFailure: Error { case failed }
     var earlier = old; earlier.mount.volumeID = "earlier"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
-    earlier.retirementSequence = 1; old.retirementSequence = 2
-    status.mounts = [replacement]; status.retired = [earlier]
+    let earlierRetired = retiredTestOutcome(earlier, sequence: 1); let retired = retiredTestOutcome(old, sequence: 2)
+    status.mounts = [replacement]; status.retired = [earlierRetired]
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
-    #expect(r.coordinator.retiredStatus == [earlier])
+    #expect(r.coordinator.retiredStatus == [earlierRetired])
     #expect(r.coordinator.mountStatus[0].mount == old.mount)
-    try r.coordinator.acknowledgeRetired([earlier]); r.channel.retiredAcks.removeFirst().1(.success(()))
-    status.retired = [old]
+    try r.coordinator.acknowledgeRetired([earlierRetired]); r.channel.retiredAcks.removeFirst().1(.success(()))
+    status.retired = [retired]
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
 }

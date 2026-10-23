@@ -56,8 +56,9 @@ mount incarnation, exact process-start and kernel-mount witnesses, session,
 enrollment, route revision, cleanup phase and the old run's loss outcome.
 A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
-Stage 1a models these identities and cleanup in memory. It retains up to 128
-retired outcomes with monotonic, guest-incarnation-scoped sequence numbers.
+The supervisor models these identities and cleanup in memory. Active slots and
+unacknowledged retired outcomes share a bound of 64. Retirements have monotonic,
+guest-incarnation-scoped sequence numbers.
 The observer retains exact outcomes, then acknowledges through a sequence;
 duplicate or older acknowledgements succeed without erasing newer outcomes. Full
 capacity applies temporary replacement backpressure; acknowledgement frees it.
@@ -429,7 +430,7 @@ aggregates the remainder, retaining the highest sequence and saturating
 accepted-entry/byte counters. The driver retains exact barrier outcomes.
 Overflow terminalizes only that mount for exact cleanup/replacement; its cold
 withdrawal still counts toward suspension. Later reports cannot reduce a
-reported aggregate. Even 64 active and 16 retired maximum-size mount ledgers, statuses and identities
+reported aggregate. Even 48 active and 16 retired maximum-size mount ledgers, statuses and identities
 fit a 1 MiB frame by construction. Cold completion never implies loss-free
 durability.
 
@@ -699,12 +700,22 @@ a partial acknowledgement.
 
 Status has at most one desired-job slot per exact MountID, with originating
 request, generation, operation, phase and bounded retained failure. Registered
-mounts and desired intents share the 64-volume capacity; an intent never adds a
+mounts and desired intents share capacity with unacknowledged retirement records,
+with at most 64 slots in total; an intent never adds a
 ready mount to the roster. Acceptance reserves the slot under the supervisor
 lock, then dispatches `offered -> running -> complete|failed` on its generation
 context. A live slot cannot be replaced, including after cancellation. A later
-accepted command can replace a joined slot; exact cleaned-incarnation
-replacement retires its joined slot. Observation stores no responses or history.
+accepted command can replace a joined registered slot only after moving its prior
+job evidence into retirement. A joined job with no registered mount immediately
+transfers its slot into retirement, including completed Umount. It no longer
+blocks a new incarnation. Capacity is reusable after explicit RetireAck; a full
+unacknowledged ledger refuses admission rather than evicting evidence.
+`RetiredOutcome` carries a joined job, an exactly cleaned terminal mount, or both
+for replacement of that mount. Job-only retirement asserts no mount membership,
+cleanup proof or durability outcome. The existing retirement sequence, 16-record
+Status batch and RetireAck cover all three forms. Admission reserves sequence
+space for asynchronous job completion; exhaustion refuses before dispatch.
+Observation stores no responses or reply history.
 Suspend closes admission and cancels jobs before waiting for their actual
 owners, including desired-only work. One reader watches EOF while the ordered
 dispatcher drains or writes a response; loss immediately closes admission and

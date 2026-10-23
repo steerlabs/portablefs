@@ -76,8 +76,7 @@ message MountStatus {
   repeated Loss loss = 4;
   // retained, process-exited, kernel-absent, complete; never inferred from errno.
   string cleanup = 5;
-  // Zero for active mounts; strictly increasing for retired outcomes per guest.
-  uint64 retirement_sequence = 6;
+  reserved 6;
   RenewalReadiness renewal = 7;
   MountOutcome outcome = 8;
 }
@@ -87,7 +86,8 @@ message ResumeAck {
 }
 message StatusRequest {}
 // Desired work is distinct from registered kernel/session membership. One
-// fixed slot per desired mount retains acceptance and its final disposition.
+// fixed slot per desired mount retains acceptance until its final disposition
+// transfers to acknowledged retirement when no registered mount remains.
 message MountJob {
   MountID mount = 1;
   uint64 request_id = 2;
@@ -100,6 +100,14 @@ message MountJob {
   string failure = 6;
   string reason = 7;
 }
+// One acknowledged retirement stream for exact mount and joined job evidence.
+// A replaced mount and its last job share one record; job-only work never
+// invents a registered mount, cleanup proof or durability outcome.
+message RetiredOutcome {
+  uint64 retirement_sequence = 1;
+  MountStatus mount_status = 2;
+  MountJob job = 3;
+}
 message StatusReply {
   bytes boot_id = 1;
   bytes host_service_id = 2;
@@ -109,7 +117,7 @@ message StatusReply {
   string state = 5;
   repeated MountStatus mounts = 6;
   // First 16 unacknowledged retired outcomes, in retirement order.
-  repeated MountStatus retired = 7;
+  repeated RetiredOutcome retired = 7;
   repeated MountJob jobs = 8;
 }
 // Idempotently acknowledge all retired outcomes through this sequence.

@@ -184,7 +184,8 @@ import PortableFSWorkspaceCore
             guard let self else { return }
             do {
                 let status = try result.get()
-                guard status.mounts.isEmpty, status.jobs.count == 1, let job = status.jobs.first, job.mount == mount,
+                guard status.mounts.isEmpty,
+                      let job = status.jobs.first ?? status.retired.last(where: { $0.hasJob })?.job, job.mount == mount,
                       job.operation == ["provision", "mount", "umount"][index], job.requestID > (requests.last ?? 0),
                       job.generation == self.coordinator.generation, self.clock.now < deadline else { throw WorkspaceVMError("desired job observation mismatch") }
                 if job.phase == "offered" || job.phase == "running" {
@@ -196,8 +197,14 @@ import PortableFSWorkspaceCore
                 }
                 guard job.phase == "failed", job.failure == "unavailable", !job.reason.isEmpty else { throw WorkspaceVMError("absent mount driver reported completion") }
                 let accepted = requests + [job.requestID]
-                if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
-                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": job.failure]) }
+                guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
+                self.channel.acknowledgeRetired(through: status.retired[0].retirementSequence, deadline: deadline) { result in
+                    do {
+                        try result.get()
+                        if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
+                        else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": job.failure]) }
+                    } catch { self.fail(error) }
+                }
             } catch { self.fail(error) }
         }
     }

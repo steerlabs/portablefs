@@ -64,7 +64,6 @@ enum WorkspaceWireSchema {
             3: .init(kind: "$", repeated: false, oneof: false),
             4: .init(kind: "Loss", repeated: true, oneof: false),
             5: .init(kind: "$", repeated: false, oneof: false),
-            6: .init(kind: "", repeated: false, oneof: false),
             7: .init(kind: "RenewalReadiness", repeated: false, oneof: false),
             8: .init(kind: "MountOutcome", repeated: false, oneof: false),
         ],
@@ -84,6 +83,11 @@ enum WorkspaceWireSchema {
             6: .init(kind: "$", repeated: false, oneof: false),
             7: .init(kind: "$", repeated: false, oneof: false),
         ],
+        "RetiredOutcome": [
+            1: .init(kind: "", repeated: false, oneof: false),
+            2: .init(kind: "MountStatus", repeated: false, oneof: false),
+            3: .init(kind: "MountJob", repeated: false, oneof: false),
+        ],
         "StatusReply": [
             1: .init(kind: "$", repeated: false, oneof: false),
             2: .init(kind: "$", repeated: false, oneof: false),
@@ -91,7 +95,7 @@ enum WorkspaceWireSchema {
             4: .init(kind: "", repeated: false, oneof: false),
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "MountStatus", repeated: true, oneof: false),
-            7: .init(kind: "MountStatus", repeated: true, oneof: false),
+            7: .init(kind: "RetiredOutcome", repeated: true, oneof: false),
             8: .init(kind: "MountJob", repeated: true, oneof: false),
         ],
         "RetireAck": [

@@ -62,9 +62,8 @@ public enum WorkspaceControl {
     public static func validColdAck(_ ack: WorkspaceSuspendAck) -> Bool {
         validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
     }
-    private static func validStatuses(_ mounts: [WorkspaceMountStatus], retired: Bool = false) -> Bool {
+    private static func validStatuses(_ mounts: [WorkspaceMountStatus]) -> Bool {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {
-            ($0.retirementSequence > 0) == retired &&
             $0.hasOutcome && validOutcome($0.outcome) &&
             (!$0.hasRenewal || validRenewal($0.renewal)) &&
             ($0.state != "ready" || ($0.hasRenewal && $0.renewal.state != "pending")) &&
@@ -76,10 +75,24 @@ public enum WorkspaceControl {
             ($0.cleanup == "retained" || ["terminal", "authorization-required"].contains($0.state))
         }
     }
-    public static func validRetired(_ mounts: [WorkspaceMountStatus]) -> Bool {
-        zip(mounts, mounts.dropFirst()).allSatisfy { $0.retirementSequence < UInt64.max && $1.retirementSequence == $0.retirementSequence + 1 } &&
-        mounts.count <= 16 && Set(mounts.map { mountKey($0.mount) }).count == mounts.count && mounts.allSatisfy {
-            validStatuses([$0], retired: true) && $0.cleanup == "complete" && ["terminal", "authorization-required"].contains($0.state)
+    public static func validRetired(_ outcomes: [WorkspaceRetiredOutcome]) -> Bool {
+        guard outcomes.count <= 16,
+              zip(outcomes, outcomes.dropFirst()).allSatisfy({ $0.retirementSequence < UInt64.max && $1.retirementSequence == $0.retirementSequence + 1 }) else { return false }
+        var mounts = Set<String>(), jobs = Set<String>()
+        return outcomes.allSatisfy { outcome in
+            guard outcome.retirementSequence > 0, outcome.hasMountStatus || outcome.hasJob else { return false }
+            if outcome.hasMountStatus {
+                let m = outcome.mountStatus
+                guard validStatuses([m]), m.cleanup == "complete", ["terminal", "authorization-required"].contains(m.state),
+                      mounts.insert(mountKey(m.mount)).inserted else { return false }
+            }
+            if outcome.hasJob {
+                let j = outcome.job
+                guard validJob(j, generation: UInt64.max), ["complete", "failed"].contains(j.phase),
+                      !outcome.hasMountStatus || outcome.mountStatus.mount == j.mount,
+                      jobs.insert(mountKey(j.mount) + "/" + String(j.requestID)).inserted else { return false }
+            }
+            return true
         }
     }
     public static func validResumeAck(_ ack: WorkspaceResumeAck) -> Bool {
@@ -124,15 +137,17 @@ public enum WorkspaceControl {
             if let old = volumes[volume], old != key { return false }
             volumes[volume] = key
         }
-        guard volumes.count <= 64 else { return false }
-        return status.jobs.allSatisfy {
-            guard $0.requestID > 0, $0.generation <= status.generation,
-                  ["provision", "mount", "umount"].contains($0.operation) else { return false }
-            switch $0.phase {
-            case "offered", "running", "complete": return $0.failure.isEmpty && $0.reason.isEmpty
-            case "failed": return ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed"].contains($0.failure) && !$0.reason.isEmpty && $0.reason.utf8.count <= maxReason
-            default: return false
-            }
+        guard volumes.count + status.retired.count <= 64,
+              status.retired.allSatisfy({ !$0.hasJob || $0.job.generation <= status.generation }) else { return false }
+        return status.jobs.allSatisfy { validJob($0, generation: status.generation) }
+    }
+    private static func validJob(_ job: WorkspaceMountJob, generation: UInt64) -> Bool {
+        guard validMount(job.mount), job.requestID > 0, job.generation <= generation,
+              ["provision", "mount", "umount"].contains(job.operation) else { return false }
+        switch job.phase {
+        case "offered", "running", "complete": return job.failure.isEmpty && job.reason.isEmpty
+        case "failed": return ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason
+        default: return false
         }
     }
     public static func validToken(_ token: WorkspaceResumeToken) -> Bool { validSuspension(token.suspension) && id(token.wakeNonce) }

@@ -132,7 +132,7 @@ type Supervisor struct {
 	generationContext    context.Context
 	cancel               context.CancelFunc
 	mounts               map[string]*entry
-	retired              []*pb.MountStatus
+	retired              []*pb.RetiredOutcome
 	retirementSequence   uint64
 	acknowledgedSequence uint64
 	jobs                 map[string]*mountJob
@@ -622,9 +622,9 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		err = refused("replace requires running phase and exact cleanup")
 	} else if s.retainedIncarnationLocked(id) {
 		err = refused("replace previously retired incarnation")
-	} else if s.retirementSequence == math.MaxUint64 {
+	} else if !s.retirementAvailableLocked(s.jobs[control.MountKey(old)]) {
 		err = refused("retired outcome sequence exhausted")
-	} else if len(s.retired) >= MaxRetired {
+	} else if s.slotsLocked() >= control.MaxMounts {
 		err = refused("replace waiting for retired outcome acknowledgement")
 	} else if !bytes.Equal(old.AuthorityId, id.AuthorityId) || old.VolumeId != id.VolumeId || bytes.Equal(old.Incarnation, id.Incarnation) {
 		err = refused("replace authority, volume or incarnation mismatch")
@@ -646,10 +646,7 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		}
 	}
 	if err == nil {
-		s.retirementSequence++
-		outcome := clone(e.status)
-		outcome.RetirementSequence = s.retirementSequence
-		s.retired = append(s.retired, outcome)
+		s.retireLocked(e.status, s.jobs[control.MountKey(old)])
 		delete(s.mounts, control.MountKey(old))
 		delete(s.jobs, control.MountKey(old))
 		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
@@ -660,10 +657,10 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 	}
 	return nil
 }
-func (s *Supervisor) Retired() []*pb.MountStatus {
+func (s *Supervisor) Retired() []*pb.RetiredOutcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*pb.MountStatus, 0, len(s.retired))
+	out := make([]*pb.RetiredOutcome, 0, len(s.retired))
 	for _, v := range s.retired {
 		out = append(out, clone(v))
 	}
@@ -671,7 +668,7 @@ func (s *Supervisor) Retired() []*pb.MountStatus {
 }
 func (s *Supervisor) retainedIncarnationLocked(id *pb.MountID) bool {
 	for _, outcome := range s.retired {
-		if proto.Equal(outcome.Mount, id) {
+		if outcome.MountStatus != nil && proto.Equal(outcome.MountStatus.Mount, id) {
 			return true
 		}
 	}
@@ -693,7 +690,7 @@ func (s *Supervisor) AcknowledgeRetired(through uint64) error {
 		return refused("retired acknowledgement exceeds exposed batch")
 	}
 	count := int(through - s.acknowledgedSequence)
-	s.retired = append([]*pb.MountStatus(nil), s.retired[count:]...)
+	s.retired = append([]*pb.RetiredOutcome(nil), s.retired[count:]...)
 	s.acknowledgedSequence = through
 	return nil
 }

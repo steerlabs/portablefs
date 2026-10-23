@@ -25,7 +25,7 @@ func PairingProof(expected *pb.Hello) []byte {
 	return h.Sum(nil)
 }
 
-func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, supervisor *Supervisor, paired func()) error {
+func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, supervisor *Supervisor, paired func()) (serveErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer stream.Close()
@@ -60,6 +60,15 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 	}
 	frames := make(chan frame, 1)
 	readDone := make(chan error, 1)
+	// The reader publishes its cause before cancellation closes a blocked
+	// response write. Preserve that cause at every dispatcher return boundary.
+	defer func() {
+		select {
+		case err := <-readDone:
+			serveErr = fmt.Errorf("workspace control stream: %w", err)
+		default:
+		}
+	}()
 	go func(prior uint64) {
 		for {
 			request, receivedAt, err := control.ReadReceived(stream)

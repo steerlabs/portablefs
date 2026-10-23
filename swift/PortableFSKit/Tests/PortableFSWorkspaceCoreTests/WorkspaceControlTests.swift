@@ -15,14 +15,14 @@ func workspaceGolden(_ name: String) throws -> Data {
     return bytes
 }
 @Test func workspaceGoldensCoverEveryMessageAndRejectMalformedFrames() throws {
-    let names = ["hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required", "job_offered", "job_running", "job_complete", "job_failed"]
+    let names = ["hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required", "job_offered", "job_running", "job_complete", "job_failed", "retired_job_complete", "retired_job_failed", "retired_mount_with_job"]
     for name in names {
         let raw = try workspaceGolden(name)
         let envelope = try WorkspaceControl.decode(raw)
         #expect(envelope.version == 8)
         #expect(try WorkspaceControl.encode(envelope) == raw)
     }
-    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated", "missing_outcome", "missing_renewal", "zero_installed_sequence", "pending_with_sequence", "not_required_with_sequence", "unobserved_durable", "invalid_release_outcome", "ready_with_pending_renewal", "cold_missing_outcome", "suspend_missing_budget", "suspend_excess_budget", "budget_outside_suspend", "job_zero_request", "job_future_generation", "job_unknown_operation", "job_unknown_phase", "job_missing_failure", "job_unknown_failure", "job_missing_reason", "job_running_failure", "job_incarnation_conflict", "job_duplicate", "job_excess_capacity"]
+    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated", "missing_outcome", "missing_renewal", "zero_installed_sequence", "pending_with_sequence", "not_required_with_sequence", "unobserved_durable", "invalid_release_outcome", "ready_with_pending_renewal", "cold_missing_outcome", "suspend_missing_budget", "suspend_excess_budget", "budget_outside_suspend", "job_zero_request", "job_future_generation", "job_unknown_operation", "job_unknown_phase", "job_missing_failure", "job_unknown_failure", "job_missing_reason", "job_running_failure", "job_incarnation_conflict", "job_duplicate", "job_excess_capacity", "retired_empty", "retired_running_job", "retired_future_job", "retired_sequence_gap", "retired_mismatched_job", "retired_duplicate_job", "active_and_retired_excess_capacity"]
     for name in invalid {
         let raw = try workspaceGolden(name + ".invalid")
         #expect(throws: (any Error).self) { try WorkspaceControl.decode(raw) }
@@ -75,8 +75,9 @@ func workspaceGolden(_ name: String) throws -> Data {
         return m
     }
     status.retired = Array(status.mounts.prefix(16)).enumerated().map { index, old in
-        var retired = old; retired.retirementSequence = UInt64(index + 1); retired.mount.incarnation = Data(repeating: 99, count: 16); return retired
+        var retired = old; retired.mount.incarnation = Data(repeating: 99, count: 16); return retiredTestOutcome(retired, sequence: UInt64(index + 1))
     }
+    status.mounts = Array(status.mounts.prefix(48))
     status.jobs = status.mounts.map { mount in
         var job = WorkspaceMountJob(); job.mount = mount.mount; job.requestID = UInt64.max; job.generation = status.generation
         job.operation = "provision"; job.phase = "failed"; job.failure = "authorization-required"; job.reason = String(repeating: "r", count: WorkspaceControl.maxReason); return job
@@ -116,4 +117,8 @@ func installedTestRenewal() -> WorkspaceRenewalReadiness {
     s.mounts[0].renewal = installedTestRenewal()
     #expect(WorkspaceControl.validStatus(s))
     e.body = .statusReply(s); _ = try WorkspaceControl.encode(e)
+}
+
+func retiredTestOutcome(_ mount: WorkspaceMountStatus, sequence: UInt64) -> WorkspaceRetiredOutcome {
+    var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = sequence; outcome.mountStatus = mount; return outcome
 }

@@ -96,7 +96,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     }
     public private(set) var generation: UInt64 = 0
     public private(set) var reason = ""
-    public private(set) var retiredStatus: [WorkspaceMountStatus] = []
+    public private(set) var retiredStatus: [WorkspaceRetiredOutcome] = []
     public private(set) var mountStatus: [WorkspaceMountStatus] = []
     public private(set) var jobStatus: [WorkspaceMountJob] = []
     public var attachAllowed: Bool { phase == .running }
@@ -317,15 +317,15 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             }
         }
     }
-    private func retainsLoss(_ mounts: [WorkspaceMountStatus], retired: [WorkspaceMountStatus] = []) -> Bool {
+    private func retainsLoss(_ mounts: [WorkspaceMountStatus], retired: [WorkspaceRetiredOutcome] = []) -> Bool {
         mountStatus.allSatisfy { old in
-            guard let current = (mounts + retired).first(where: { $0.mount == old.mount }) else { return false }
+            guard let current = (mounts + retired.filter(\.hasMountStatus).map(\.mountStatus)).first(where: { $0.mount == old.mount }) else { return false }
             return WorkspaceControl.retainsLoss(current.loss, prior: old.loss)
         }
     }
     // The observer retains exact outcomes before acknowledging their sequence.
     // One in-flight ack avoids duplicate UI actions and bounds the control queue.
-    public func acknowledgeRetired(_ observed: [WorkspaceMountStatus]) throws {
+    public func acknowledgeRetired(_ observed: [WorkspaceRetiredOutcome]) throws {
         guard phase == .running || phase == .recovering,
               !observed.isEmpty, observed.count <= 16,
               let through = observed.last?.retirementSequence, through > 0 else { throw WorkspaceControlError.transition }
@@ -339,6 +339,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             self.retirementAckInFlight = nil
             guard case .success = result else { return }
             self.acknowledgedRetirement = max(self.acknowledgedRetirement, through)
+            let consumed = self.retiredStatus.filter { $0.retirementSequence <= through && $0.hasJob }.map(\.job)
+            self.jobStatus.removeAll { old in consumed.contains { $0.mount == old.mount && $0.requestID == old.requestID } }
             self.retiredStatus.removeAll { $0.retirementSequence <= through }
         }
     }
@@ -361,9 +363,17 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             }), added.isEmpty || (knownThrough < UInt64.max && added[0].retirementSequence == knownThrough + 1) else {
                 self.reason = "retired outcome sequence mismatch"; return
             }
-            guard self.retiredStatus.count + added.count <= 128 else { self.reason = "retired outcome acknowledgement required"; return }
+            guard self.retiredStatus.count + added.count <= 64 else { self.reason = "retired outcome acknowledgement required"; return }
             self.retiredStatus.append(contentsOf: added)
-            guard self.retainsLoss(status.mounts, retired: status.retired + self.retiredStatus) else {
+            let retired = status.retired + self.retiredStatus
+            let retainedJobs = status.jobs + retired.filter(\.hasJob).map(\.job)
+            guard self.jobStatus.allSatisfy({ old in
+                retainedJobs.contains { next in
+                    next.mount == old.mount && next.requestID == old.requestID && next.generation == old.generation &&
+                    next.operation == old.operation && (!["complete", "failed"].contains(old.phase) || next == old)
+                }
+            }) else { self.reason = "waiting for earlier retired jobs before replacing active status"; return }
+            guard self.retainsLoss(status.mounts, retired: retired) else {
                 self.reason = "waiting for earlier retired outcomes before replacing active status"; return
             }
             self.mountStatus = status.mounts; self.jobStatus = status.jobs; self.state = .running; self.reason = ""

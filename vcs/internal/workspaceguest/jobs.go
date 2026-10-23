@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
@@ -29,6 +30,43 @@ func sameVolume(a, b *pb.MountID) bool {
 	return string(a.AuthorityId) == string(b.AuthorityId) && a.VolumeId == b.VolumeId
 }
 
+// A retired record occupies its former slot until explicit acknowledgement.
+// Registered membership and current jobs for one key share a slot.
+func (s *Supervisor) slotsLocked() int {
+	keys := make(map[string]bool, len(s.mounts)+len(s.jobs))
+	for key := range s.mounts {
+		keys[key] = true
+	}
+	for key := range s.jobs {
+		keys[key] = true
+	}
+	return len(keys) + len(s.retired)
+}
+
+// Each current job reserves a sequence so asynchronous completion cannot run
+// out of retirement space. Replacing a registered job consumes its reservation.
+func (s *Supervisor) retirementAvailableLocked(replaced *mountJob) bool {
+	reserved := len(s.jobs)
+	if replaced != nil {
+		reserved--
+	}
+	return math.MaxUint64-s.retirementSequence > uint64(reserved)
+}
+
+// Admission reserved capacity and a sequence before any work began. Callers
+// retire only joined owners under mu; no response waiter owns this evidence.
+func (s *Supervisor) retireLocked(mount *pb.MountStatus, job *mountJob) {
+	s.retirementSequence++
+	outcome := &pb.RetiredOutcome{RetirementSequence: s.retirementSequence}
+	if mount != nil {
+		outcome.MountStatus = clone(mount)
+	}
+	if job != nil {
+		outcome.Job = clone(job.status)
+	}
+	s.retired = append(s.retired, outcome)
+}
+
 // Registered membership and desired intents share the same 64 slots. A second
 // incarnation cannot hide behind a different job key for the same volume.
 func (s *Supervisor) desiredCapacityLocked(id *pb.MountID) error {
@@ -45,7 +83,7 @@ func (s *Supervisor) desiredCapacityLocked(id *pb.MountID) error {
 		}
 		keys[key] = true
 	}
-	if !keys[control.MountKey(id)] && len(keys) >= control.MaxMounts {
+	if !keys[control.MountKey(id)] && s.slotsLocked() >= control.MaxMounts {
 		return refused("desired mount capacity reached")
 	}
 	return nil
@@ -76,11 +114,23 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 	if s.phase != "running" {
 		return refused("desired job outside running phase")
 	}
+	if s.retainedIncarnationLocked(id) {
+		return refused("desired job previously retired incarnation")
+	}
 	if err := s.desiredCapacityLocked(id); err != nil {
 		return err
 	}
 	key := control.MountKey(id)
-	if previous := s.jobs[key]; previous != nil {
+	for _, outcome := range s.retired {
+		if j := outcome.Job; j != nil && proto.Equal(j.Mount, id) && request.RequestId <= j.RequestId {
+			return refused("desired job request retired or consumed")
+		}
+	}
+	previous := s.jobs[key]
+	if !s.retirementAvailableLocked(nil) {
+		return refused("retired outcome sequence exhausted")
+	}
+	if previous != nil {
 		if request.RequestId <= previous.status.RequestId {
 			return refused("desired job request retired or consumed")
 		}
@@ -89,6 +139,12 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 		default:
 			return refused("desired job lane occupied")
 		}
+	}
+	if previous != nil {
+		if s.slotsLocked() >= control.MaxMounts {
+			return refused("desired job waiting for retired outcome acknowledgement")
+		}
+		s.retireLocked(nil, previous)
 	}
 	j := &mountJob{status: &pb.MountJob{Mount: clone(id), RequestId: request.RequestId, Generation: s.generation, Operation: operation, Phase: "offered"}, done: make(chan struct{})}
 	s.jobs[key] = j
@@ -135,6 +191,10 @@ func (s *Supervisor) runJob(ctx context.Context, j *mountJob, provision *pb.Prov
 		}
 	}
 	close(j.done)
+	if s.mounts[control.MountKey(j.status.Mount)] == nil {
+		s.retireLocked(nil, j)
+		delete(s.jobs, control.MountKey(j.status.Mount))
+	}
 }
 
 func waitJob(ctx context.Context, j *mountJob) error {
