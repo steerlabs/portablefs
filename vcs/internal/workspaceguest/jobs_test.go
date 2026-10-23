@@ -51,7 +51,7 @@ func jobRequest(requestID uint64, id *pb.MountID, operation string) *pb.Envelope
 	case "umount":
 		e.Body = &pb.Envelope_Umount{Umount: &pb.UmountRequest{Mount: id}}
 	case "provision":
-		e.Body = &pb.Envelope_Provision{Provision: &pb.Provision{Mount: id, AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("ca"), ClientCertificate: []byte("cert"), Capability: []byte("cap"), PublicKey: []byte("public"), RoutesRevision: makeDigest(1)}}
+		e.Body = &pb.Envelope_Provision{Provision: &pb.Provision{Mount: id, ServerName: "authority.example", AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("ca"), ClientCertificate: []byte("cert"), Capability: []byte("cap"), PublicKey: []byte("public"), RoutesRevision: makeDigest(1)}}
 	}
 	return e
 }

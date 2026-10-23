@@ -34,6 +34,8 @@ const maxResponseBytes = 2 << 20
 var ErrDefinitiveDenial = errors.New("mount enrollment was definitively denied")
 
 type Config struct {
+	Managed                  bool
+	AwaitTLS                 func(context.Context) error
 	ManagerURL               string
 	ManagerServerName        string
 	ManagerCAPEM             []byte
@@ -48,6 +50,7 @@ type Config struct {
 const MaxClientIdentityBytes = 256 << 10
 
 type Client struct {
+	awaitTLS            func(context.Context) error
 	baseURL             *url.URL
 	http                *http.Client
 	enrollmentID        string
@@ -58,6 +61,9 @@ type Client struct {
 }
 
 func NewClient(cfg Config) (*Client, error) {
+	if cfg.Managed && cfg.AwaitTLS == nil {
+		return nil, errors.New("workspace enrollment requires the shared TLS clock")
+	}
 	baseURL, err := url.Parse(cfg.ManagerURL)
 	if err != nil || baseURL.Scheme != "https" || baseURL.Host == "" || baseURL.User != nil || baseURL.Opaque != "" ||
 		baseURL.RawQuery != "" || baseURL.ForceQuery || baseURL.Fragment != "" || baseURL.RawPath != "" ||
@@ -116,12 +122,35 @@ func NewClient(cfg Config) (*Client, error) {
 		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: cfg.Timeout,
 		IdleConnTimeout: 90 * time.Second, MaxIdleConns: 2, MaxIdleConnsPerHost: 2,
 	}
+	if cfg.AwaitTLS != nil {
+		transport.DialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if err := cfg.AwaitTLS(ctx); err != nil {
+				return nil, err
+			}
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			raw, err := transport.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			if err = cfg.AwaitTLS(ctx); err != nil {
+				raw.Close()
+				return nil, err
+			}
+			conn := tls.Client(raw, tlsConfig)
+			if err = conn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return conn, nil
+		}
+	}
 	httpClient := &http.Client{
 		Transport: transport, Timeout: cfg.Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return &Client{
-		baseURL: baseURL, http: httpClient, enrollmentID: cfg.EnrollmentID, volumeID: cfg.VolumeID,
+		awaitTLS: cfg.AwaitTLS, baseURL: baseURL, http: httpClient, enrollmentID: cfg.EnrollmentID, volumeID: cfg.VolumeID,
 		authorityGeneration: cfg.AuthorityGeneration,
 		csrPEM:              string(csrPEM), keySPKI: spki,
 	}, nil
@@ -184,6 +213,11 @@ func (client *Client) Close(ctx context.Context, reason string) error {
 }
 
 func (client *Client) do(ctx context.Context, method, operation, requestID string, body, response any) error {
+	if client.awaitTLS != nil {
+		if err := client.awaitTLS(ctx); err != nil {
+			return err
+		}
+	}
 	requestBody, err := json.Marshal(body)
 	if err != nil {
 		return err

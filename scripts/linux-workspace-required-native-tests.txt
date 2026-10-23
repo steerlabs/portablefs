@@ -12,3 +12,9 @@ resume-single-use
 data-disk-reboot-persistence
 guest-host-key-persistence
 clean-stop
+guest-identity-signed-csr
+guest-identity-reboot-persistence
+rtc-single-owner-duplicate-contention
+rtc-boot-correction
+rtc-cold-resume-generation
+rtc-awake-measurement

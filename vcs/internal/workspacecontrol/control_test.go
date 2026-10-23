@@ -54,12 +54,17 @@ func fixtures() map[string]*pb.Envelope {
 		"resume_ack":   {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{status}}}},
 		"status":       {Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}},
 		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}, Retired: []*pb.RetiredOutcome{outcome}}}},
-		"provision":    {Body: &pb.Envelope_Provision{Provision: &pb.Provision{Mount: fixtureMount(), AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("public CA"), ClientCertificate: []byte("public certificate"), Capability: []byte("signed capability"), PublicKey: []byte("guest public key"), RoutesRevision: bytes.Repeat([]byte{9}, 32)}}},
+		"provision":    {Body: &pb.Envelope_Provision{Provision: &pb.Provision{Mount: fixtureMount(), ServerName: "authority.example", AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("public CA"), ClientCertificate: []byte("public certificate"), Capability: []byte("signed capability"), PublicKey: []byte("guest public key"), RoutesRevision: bytes.Repeat([]byte{9}, 32)}}},
 		"mount":        {Body: &pb.Envelope_Mount{Mount: &pb.MountRequest{Mount: fixtureMount()}}},
 		"umount":       {Body: &pb.Envelope_Umount{Umount: &pb.UmountRequest{Mount: fixtureMount()}}},
 		"retire_ack":   {Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{ThroughSequence: 1}}},
 		"result":       {Body: &pb.Envelope_Result{Result: &pb.Result{Code: "unavailable", Reason: "mount integration pending"}}},
 	}
+	bodies["identity_request"] = &pb.Envelope{Body: &pb.Envelope_IdentityRequest{IdentityRequest: &pb.IdentityRequest{AuthorityId: fixtureMount().AuthorityId, VolumeId: "example"}}}
+	bodies["identity_reply"] = &pb.Envelope{Body: &pb.Envelope_IdentityReply{IdentityReply: &pb.IdentityReply{Mount: fixtureMount(), PublicKey: []byte("DER SPKI"), Csr: []byte("signed DER CSR"), GuestUuid: fixtureID(11), IdentityIncarnation: fixtureID(12), RenewalEpoch: 1}}}
+	hosted := proto.Clone(bodies["provision"]).(*pb.Envelope)
+	hosted.GetProvision().HostedEnrollment = &pb.HostedEnrollment{ManagerOrigin: "https://manager.example", ManagerServerName: "manager.example", ManagerCa: []byte("Manager CA"), EnrollmentId: "enrollment", EnrollmentCertificate: []byte("same-key enrollment cert"), AuthorityGeneration: 1, AuthorizationDeadlineUnix: 2000000000}
+	bodies["hosted_provision"] = hosted
 	for _, state := range []string{"pending", "installed", "not-required"} {
 		entry := proto.Clone(status).(*pb.MountStatus)
 		entry.State = "ready"

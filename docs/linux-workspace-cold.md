@@ -1,9 +1,9 @@
 # Linux workspace cold lifecycle
 
-Managed launch remains unavailable. The private lifecycle engine requires a real
-clock owner, an exact serving/recovery permit, the session's dispatch fence and
-an outcome persistence owner. Provisioning, protected-path bootstrap and the
-root driver are separate dependencies; no ready implementation substitutes for
+Managed launch remains unavailable. The private lifecycle engine requires the
+shared RTC clock owner, an exact serving/recovery permit, the session's dispatch fence and
+an outcome persistence owner. Identity/provisioning and the clock owner exist; protected-path bootstrap and
+the root driver remain separate dependencies; no ready implementation substitutes for
 them. Authority protocol 8 and ordinary mount dispatch remain unchanged.
 
 ## Suspension ownership
@@ -169,3 +169,12 @@ join. Cold acknowledgement requires every desired job to join and the entire
 registered roster to prove withdrawal, in canonical order. The host separately
 checks its original continuous deadline, an idle control FIFO and successful
 pause completion; late callbacks cannot recreate eligibility.
+
+The guest TLS clock owner invalidates its shared result at suspension and starts
+a new correction after accepted Resume. Each mount binds that generation to its
+exact close serial, including at low-level authority and Manager TLS dispatch.
+A delayed or failed measurement denies freshness synchronously; correction does
+not restore latched serving permission. The root driver's observation of
+WorkspaceRecoveryRequired, gate closure and remaining-deadline forwarding remain
+PR 6 obligations. RTC is not an admission clock, and its source UTC allocation
+remains conditional on exact-image qualification.

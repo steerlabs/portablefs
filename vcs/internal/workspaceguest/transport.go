@@ -116,6 +116,13 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 		prior := request.RequestId
 		reply := &pb.Envelope{Version: 8, RequestId: prior}
 		switch body := request.Body.(type) {
+		case *pb.Envelope_IdentityRequest:
+			identity, err := supervisor.Identity(body.IdentityRequest)
+			if err != nil {
+				reply.Body = &pb.Envelope_Result{Result: &pb.Result{Code: "refused", Reason: control.BoundedReason(err.Error())}}
+			} else {
+				reply.Body = &pb.Envelope_IdentityReply{IdentityReply: identity}
+			}
 		case *pb.Envelope_Status:
 			reply.Body = &pb.Envelope_StatusReply{StatusReply: supervisor.Status()}
 		case *pb.Envelope_Suspend:

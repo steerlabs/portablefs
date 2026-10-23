@@ -43,6 +43,9 @@ var (
 type PreKernelMountAbsenceObserver func(context.Context) (*authoritypb.MountAbsenceProof, error)
 
 type ClientConfig struct {
+	// AwaitTLS is mandatory for a workspace transport, including retained
+	// cleanup and activation reconciliation. Ordinary clients leave it nil.
+	AwaitTLS func(context.Context) error
 	// DispatchFence is installed only by a lifecycle-owned Linux client.
 	DispatchFence *DispatchFence
 	// LifecycleRetry keeps one initial Attach/Activate owner through transient
@@ -320,6 +323,9 @@ func dialClient(ctx context.Context, cfg ClientConfig) (_ *Client, resultErr err
 			resultErr = &AttachError{Disposition: c.attachDisposition, Cause: resultErr}
 		}
 	}()
+	if cfg.DispatchFence != nil && cfg.AwaitTLS == nil {
+		return nil, errors.New("authorityrpc: workspace transport requires the shared TLS clock")
+	}
 	if cfg.LifecycleRetry && (cfg.DispatchFence == nil || cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX) {
 		return nil, errors.New("authorityrpc: pending lifecycle requires a Linux dispatch owner")
 	}

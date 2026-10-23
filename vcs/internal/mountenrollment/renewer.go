@@ -127,6 +127,7 @@ type Renewer struct {
 	// Managed requires an explicit Resume permit before dispatch. No implicit
 	// ordinary permit is available on this branch.
 	Managed                      bool
+	WallChanges                  func() <-chan struct{}
 	CheckPermit                  func(Permit) bool
 	mu                           sync.Mutex
 	running, initialized, parked bool
@@ -213,6 +214,22 @@ func (r *Renewer) Resume(p Permit) error {
 // RefreshNow wakes the owner for an immediate scheduling decision. Ordinary
 // owners may refresh early. Managed owners preserve the normal Manager refresh
 // time for a recorded install; only an unknown pending grant retries immediately.
+// WallCorrected recomputes the wall-derived schedule without changing sequence,
+// pending grants, permission or terminal latches. A backward step grants no life.
+func (r *Renewer) WallCorrected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.initialized || r.terminal != nil {
+		return
+	}
+	r.authorizedAt = r.authorizedAt.Round(0)
+	r.deadline = r.deadline.Round(0)
+	r.status.NextAttempt = refreshTime(r.authorizedAt, r.deadline, r.session, r.sequence).Round(0)
+	if r.pending != nil {
+		r.status.NextAttempt = time.Time{}
+	}
+	r.signalLocked()
+}
 func (r *Renewer) RefreshNow() { r.mu.Lock(); r.force = true; r.signalLocked(); r.mu.Unlock() }
 func (r *Renewer) Readiness() RenewalReadiness {
 	r.mu.Lock()
@@ -226,7 +243,26 @@ func (r *Renewer) Readiness() RenewalReadiness {
 // A proof is publishable only outside the serving withdrawal margin.
 func (r *Renewer) installationSafeLocked() bool {
 	publishable := r.installedDisposition == installationCurrent || r.installedDisposition == installationPermitClosed && r.permit != r.installed.Permit
-	return publishable && r.installed.State == "installed" && r.installed.SessionID == r.session && r.installed.AuthorizationDeadline.Equal(r.deadline) && r.installed.InstalledSequence > 0 && r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin))
+	if !publishable || r.installed.State != "installed" || r.installed.SessionID != r.session || !r.installed.AuthorizationDeadline.Equal(r.deadline) || r.installed.InstalledSequence == 0 {
+		return false
+	}
+	if !r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin)) {
+		if !r.Managed || r.serving {
+			r.latchCutoffLocked()
+		}
+		return false
+	}
+	return r.terminal == nil
+}
+func (r *Renewer) latchCutoffLocked() {
+	if r.terminal == nil {
+		r.terminal = errors.New("automatic mount reauthorization reached its safe cutoff")
+	}
+	r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+	if r.attemptCancel != nil {
+		r.attemptCancel()
+	}
+	r.signalLocked()
 }
 func (r *Renewer) signalLocked() {
 	if r.wake == nil {
@@ -240,7 +276,7 @@ func (r *Renewer) signalLocked() {
 func (r *Renewer) allowedLocked() bool {
 	return !r.parked && (!r.Managed || (r.CheckPermit != nil && r.CheckPermit(r.permit)))
 }
-func (r *Renewer) wait(ctx context.Context, target time.Time) error {
+func (r *Renewer) wait(ctx context.Context, target time.Time, correction <-chan struct{}) error {
 	r.mu.Lock()
 	if r.wake == nil {
 		r.wake = make(chan struct{}, 1)
@@ -252,17 +288,42 @@ func (r *Renewer) wait(ctx context.Context, target time.Time) error {
 	}
 	var tick <-chan time.Time
 	if !target.IsZero() {
-		timer := time.NewTimer(max(time.Duration(0), target.Sub(r.now())))
+		timer := time.NewTimer(max(time.Duration(0), target.Round(0).Sub(r.now().Round(0))))
 		defer timer.Stop()
 		tick = timer.C
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-correction:
+		r.WallCorrected()
+		return nil
 	case <-wake:
 		return nil
 	case <-tick:
 		return nil
+	}
+}
+
+// The cutoff belongs to wall time even while Refresh or install owns the
+// attempt. Cancellation requests settlement; Run still joins its disposition.
+func (r *Renewer) watchCutoff(ctx context.Context, cutoff time.Time, correction <-chan struct{}) {
+	for {
+		r.mu.Lock()
+		if ctx.Err() != nil || r.terminal != nil || !r.allowedLocked() {
+			r.mu.Unlock()
+			return
+		}
+		if !r.now().Before(cutoff) {
+			r.latchCutoffLocked()
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
+		if r.wait(ctx, cutoff, correction) != nil {
+			return
+		}
+		correction = r.WallChanges()
 	}
 }
 
@@ -322,10 +383,22 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 			r.emit(RenewalStopped, time.Time{}, "", 0)
 			return nil
 		}
+		// Subscribe before reading any wall-derived scheduling state. A step in
+		// the snapshot-to-wait gap must still wake this iteration.
+		var correction <-chan struct{}
+		if r.WallChanges != nil {
+			correction = r.WallChanges()
+		}
 		r.mu.Lock()
+		if r.terminal != nil {
+			err := r.terminal
+			r.mu.Unlock()
+			r.emit(RenewalCutoff, time.Time{}, boundedError(err), r.statusFailures())
+			return err
+		}
 		if !r.allowedLocked() {
 			r.mu.Unlock()
-			if r.wait(ctx, time.Time{}) != nil {
+			if r.wait(ctx, time.Time{}, correction) != nil {
 				continue
 			}
 			continue
@@ -347,9 +420,8 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		}
 		bounded := !r.Managed || r.serving
 		if bounded && !r.now().Before(cutoff) {
-			err := errors.New("automatic mount reauthorization reached its safe cutoff")
-			r.terminal = err
-			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+			r.latchCutoffLocked()
+			err := r.terminal
 			r.mu.Unlock()
 			r.emit(RenewalCutoff, time.Time{}, boundedError(err), r.statusFailures())
 			return err
@@ -369,7 +441,7 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		}
 		if next.After(r.now()) {
 			r.mu.Unlock()
-			_ = r.wait(ctx, next)
+			_ = r.wait(ctx, next, correction)
 			continue
 		}
 		p, seq, session := r.permit, r.sequence, r.session
@@ -377,7 +449,11 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		// Managed preparation runs behind closed admission. Its attempts remain
 		// bounded, but the previous serving window cannot retire a live pending
 		// grant or end transient recovery. The generation owns cancellation.
-		if bounded {
+		if r.WallChanges != nil {
+			// Timeout is elapsed time; the workspace cutoff is watched separately
+			// so a backward correction cannot leave a stale context deadline.
+			deadline = time.Now().Add(timeout)
+		} else if bounded {
 			deadline = minTime(deadline, cutoff)
 		}
 		attemptCtx, cancel := context.WithDeadline(WithPermit(ctx, p), deadline)
@@ -386,6 +462,19 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		r.attemptDone = done
 		pending := r.pending
 		r.mu.Unlock()
+		var cutoffDone chan struct{}
+		var stopCutoff context.CancelFunc
+		if r.WallChanges != nil && bounded {
+			// An attempt timeout requests cancellation but does not prove the
+			// installer joined. Watch its serving window until actual settlement.
+			cutoffCtx, stop := context.WithCancel(ctx)
+			stopCutoff = stop
+			cutoffDone = make(chan struct{})
+			go func() {
+				defer close(cutoffDone)
+				r.watchCutoff(cutoffCtx, cutoff, correction)
+			}()
+		}
 		var err error
 		if pending == nil {
 			var grant controlplane.MountAuthorization
@@ -411,7 +500,16 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		if r.attemptDispositionHook != nil {
 			r.attemptDispositionHook(p)
 		}
+		if stopCutoff != nil {
+			stopCutoff()
+			<-cutoffDone
+		}
 		r.mu.Lock()
+		// Join the watcher before changing the installed window. Cover the
+		// final settlement-to-lock gap against the window this attempt owned.
+		if cutoffDone != nil && r.allowedLocked() && r.permit == p && !r.now().Before(cutoff) {
+			r.latchCutoffLocked()
+		}
 		// A successful installer is a known remote installation even if Park/Close
 		// raced it. Keep that sequence before considering readiness publication.
 		permitClosed := errors.Is(err, ErrPermitClosedInstallation)
@@ -443,7 +541,7 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 					r.installedDisposition = installationSessionChanged
 				}
 				r.installed = RenewalReadiness{State: "installed", InstalledSequence: seq, Permit: p, SessionID: session, AuthorizationDeadline: installed}
-				if r.allowedLocked() && r.permit == p && ctx.Err() == nil && !obsolete && r.installationSafeLocked() {
+				if r.terminal == nil && r.allowedLocked() && r.permit == p && ctx.Err() == nil && !obsolete && r.installationSafeLocked() {
 					r.readiness = r.installed
 					r.serving = true
 				}
@@ -461,7 +559,10 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		}
 		var terminal error
 		current := r.allowedLocked() && r.permit == p
-		if errors.Is(err, ErrDefinitiveDenial) {
+		if r.terminal != nil {
+			terminal = r.terminal
+			record(RenewalCutoff, time.Time{}, boundedError(terminal), r.status.ConsecutiveFailures)
+		} else if errors.Is(err, ErrDefinitiveDenial) {
 			r.terminal = err
 			terminal = err
 			record(RenewalDenied, time.Time{}, boundedError(err), r.status.ConsecutiveFailures+1)
@@ -473,7 +574,7 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 				record(RenewalScheduled, next, "", 0)
 			} else {
 				failures := r.status.ConsecutiveFailures + 1
-				next = r.now().Add(backoff)
+				next = r.now().Round(0).Add(backoff)
 				// Recompute the policy from this still-owned permission
 				// interval; Park/Resume cannot splice in closed recovery.
 				bounded = !r.Managed || r.serving
@@ -574,6 +675,7 @@ func (renewer *Renewer) observe(kind RenewalEventKind, status RenewalStatus) {
 }
 
 func refreshTime(now, deadline time.Time, sessionID string, sequence uint64) time.Time {
+	now, deadline = now.Round(0), deadline.Round(0)
 	remaining := deadline.Sub(now)
 	if remaining <= 0 {
 		return now
@@ -586,6 +688,7 @@ func refreshTime(now, deadline time.Time, sessionID string, sequence uint64) tim
 }
 
 func safeCutoff(authorizedAt, deadline time.Time, minimum time.Duration) time.Time {
+	authorizedAt, deadline = authorizedAt.Round(0), deadline.Round(0)
 	window := deadline.Sub(authorizedAt)
 	margin := window / 10
 	if minimum < 5*time.Second {

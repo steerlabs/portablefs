@@ -189,6 +189,8 @@ ROOT_TEST_PACKAGES = {
     "github.com/steerlabs/portablefs/vcs/internal/cellhost",
     "github.com/steerlabs/portablefs/vcs/internal/xfsstore",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceclock",
+    "github.com/steerlabs/portablefs/vcs/internal/workspacemount",
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission",
 }
 ROOT_REQUIRED = {
@@ -208,6 +210,11 @@ ROOT_REQUIRED = {
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceLifecycleCancellationKeepsPhysicalOwner",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClosedFlushReobservesResetLoss",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelWorkspaceControlledPause",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockReadOnlyGenerationAndFreshness",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockSeqlockCannotMixAuthorization",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockChildCannotForgePage",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockClosedOwnerAndIdempotentReaderClose",
+    "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestIdentityPrivateToWorkspaceUser",
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestClosedStartAndExactPreparedCAS",
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestReadOnlyHandoffAndDescriptorSeals",
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission:TestHandoffRejectsWritableOrUnboundDescriptors",

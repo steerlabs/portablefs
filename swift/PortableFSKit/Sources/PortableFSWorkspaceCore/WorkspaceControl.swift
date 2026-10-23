@@ -178,10 +178,21 @@ public enum WorkspaceControl {
         case .statusReply(let s):
             ok = validStatus(s)
         case .retireAck(let ack): ok = ack.throughSequence > 0
+        case .identityRequest(let r):
+            var m = WorkspaceMountID(); m.authorityID = r.authorityID; m.volumeID = r.volumeID; m.incarnation = Data(repeating: 1, count: 16)
+            ok = validMount(m)
+        case .identityReply(let r):
+            ok = validMount(r.mount) && id(r.guestUuid) && id(r.identityIncarnation) && r.renewalEpoch > 0 && r.renewalEpoch <= 9_007_199_254_740_991 &&
+                [r.publicKey, r.csr].allSatisfy { !$0.isEmpty && $0.count <= 65536 }
         case .provision(let p):
             let material = [p.caCertificate, p.clientCertificate, p.capability, p.publicKey]
             ok = validMount(p.mount) && !p.authorityEndpoint.isEmpty && p.authorityEndpoint.utf8.count <= 4096 &&
-                digest(p.routesRevision) && material.allSatisfy { !$0.isEmpty && $0.count <= 65536 }
+                !p.serverName.isEmpty && p.serverName.utf8.count <= 4096 && digest(p.routesRevision) && material.allSatisfy { !$0.isEmpty && $0.count <= 65536 }
+            if p.hasHostedEnrollment {
+                let h = p.hostedEnrollment
+                ok = ok && [h.managerOrigin, h.managerServerName, h.enrollmentID].allSatisfy { !$0.isEmpty && $0.utf8.count <= 4096 } &&
+                    [h.managerCa, h.enrollmentCertificate].allSatisfy { !$0.isEmpty && $0.count <= 65536 } && h.authorityGeneration > 0 && h.authorizationDeadlineUnix > 0 && h.authorizationDeadlineUnix <= UInt64(Int64.max)
+            }
         case .mount(let m): ok = validMount(m.mount)
         case .umount(let m): ok = validMount(m.mount)
         case .result(let r): ok = (["accepted", "unavailable", "authorization-required", "refused"].contains(r.code) ||

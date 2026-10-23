@@ -679,6 +679,7 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 		CancelDrainTimeout: 5 * time.Second, MaxInFlight: integrationMaxInFlight,
 	}
 	if f.cfg.workspaceDispatch && len(f.clients) == 0 {
+		cfg.AwaitTLS = func(context.Context) error { return nil } // Explicit test clock.
 		cfg.DispatchFence = authorityrpc.NewDispatchFence()
 		if err := cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
 			f.t.Fatal(err)

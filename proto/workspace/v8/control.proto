@@ -126,6 +126,27 @@ message StatusReply {
 }
 // Idempotently acknowledge all retired outcomes through this sequence.
 message RetireAck { uint64 through_sequence = 1; }
+message IdentityRequest {
+  bytes authority_id = 1;
+  string volume_id = 2;
+}
+message IdentityReply {
+  MountID mount = 1;
+  bytes public_key = 2; // DER SubjectPublicKeyInfo.
+  bytes csr = 3; // Signed DER PKCS#10 request, using the same key.
+  bytes guest_uuid = 4;
+  bytes identity_incarnation = 5;
+  uint64 renewal_epoch = 6;
+}
+message HostedEnrollment {
+  string manager_origin = 1;
+  string manager_server_name = 2;
+  bytes manager_ca = 3;
+  string enrollment_id = 4;
+  bytes enrollment_certificate = 5;
+  uint64 authority_generation = 6;
+  uint64 authorization_deadline_unix = 7;
+}
 message Provision {
   MountID mount = 1;
   string authority_endpoint = 2;
@@ -135,6 +156,8 @@ message Provision {
   bytes routes_revision = 6;
   // A guest-generated public identity, never a private-key import.
   bytes public_key = 7;
+  string server_name = 8;
+  HostedEnrollment hosted_enrollment = 9;
 }
 message MountRequest { MountID mount = 1; }
 message UmountRequest { MountID mount = 1; }
@@ -164,5 +187,7 @@ message Envelope {
     UmountRequest umount = 20;
     Result result = 21;
     RetireAck retire_ack = 22;
+    IdentityRequest identity_request = 23;
+    IdentityReply identity_reply = 24;
   }
 }

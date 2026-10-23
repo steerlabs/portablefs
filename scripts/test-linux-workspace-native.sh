@@ -23,4 +23,5 @@ trap 'rm -r "$comparison"' EXIT
 bash "$repo/scripts/build-linux-workspace-image.sh" "$comparison"
 cmp "$image/manifest.json" "$comparison/manifest.json"
 echo 'PASS: reproducible-image-build-twice'
+bash "$repo/scripts/test-linux-workspace-rtc.sh" "$image" "$evidence"
 python3 "$repo/scripts/test-linux-workspace-native.py" "$bin" "$image" "$evidence" "$repo/scripts/linux-workspace-required-native-tests.txt"

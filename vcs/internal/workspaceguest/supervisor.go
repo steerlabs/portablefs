@@ -13,6 +13,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacemount"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/proto"
 	"time"
@@ -126,6 +127,9 @@ func initialStatus(id *pb.MountID) *pb.MountStatus {
 }
 
 type Supervisor struct {
+	identities           *workspacemount.Store
+	clock                guestClock
+	waitClock            func(context.Context, uint64) error
 	mu                   sync.Mutex
 	boot, host, guest    []byte
 	generation           uint64
@@ -302,6 +306,9 @@ func (s *Supervisor) BeginSuspend(request *pb.Suspension) (*pb.Suspension, error
 		return nil, refused("suspend service identity mismatch")
 	}
 	s.cancel()
+	if s.clock != nil {
+		s.clock.Pause()
+	}
 	for _, e := range s.mounts {
 		e.gateSerial = e.driver.CloseAdmission(max(s.generation, request.Generation))
 		e.cold = false
@@ -529,6 +536,11 @@ func (s *Supervisor) Resume(parent context.Context, t *pb.ResumeToken) (*pb.Resu
 	defer s.mu.Unlock()
 	if s.phase != "suspended-cold" || !proto.Equal(s.suspension, t.Suspension) {
 		return nil, refused("resume token consumed or suspension mismatch")
+	}
+	if s.clock != nil {
+		if err := s.clock.Begin(s.generation); err != nil {
+			return nil, err
+		}
 	}
 	s.phase = "running"
 	a := &pb.ResumeAck{Token: clone(t)}
