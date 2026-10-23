@@ -158,6 +158,14 @@ supervisor before publication; RetireAck requires the exact published result.
 Death preserves uncertain inventory and blocks replacement. The control-boundary tests use owned descriptors; required root tests also
 exercise real protected bootstrap, failed INIT, uncertain handoff and exact removal.
 
+A voluntary root unmount tries the original kernel owner while serving remains
+available. A real `EBUSY` finishes that job promptly without changing admission
+or terminal state. A later request retries the same original removal slot.
+Successful unmount is retained before the child closes and finalizes; terminal
+removal instead closes admission, aborts the original connection and detaches.
+A finished lifecycle result and a later removal action are independent facts:
+offering removal cannot turn a joined failed Recover back into pending work.
+
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
 joins in-flight source/installation work and its synchronized policy
@@ -242,6 +250,13 @@ retains it. Cleanup debt and loss remain cumulative across intervals.
 Close advances an exact serial even within one generation. It immediately denies
 new admission and defeats delayed prepared publication; it does not retract an
 already admitted operation. Completed withdrawal requires Suspend's joins.
+New callbacks wait outside the admitted cohort while the gate is closed and
+enter only after a fresh serving interval opens. They hold no epoch reader,
+reply publication or buffer acceptance, so they cannot replenish or obstruct
+the cut. Terminal teardown releases them with the retained failure. A callback
+already admitted before Close still obeys its exact acceptance and publication
+checks; accepted loss and uncertain assigned effects cannot be retried as new
+work or reported as durable merely to make suspension transparent.
 Prepare/Recover belong to their generation, retry classified transient failures
 with bounded attempts/backoff, and have no 45-second logical deadline. Only
 current session/authorization validation, a functioning renewal owner and fresh
@@ -364,6 +379,14 @@ replacement. These rules are independent of the unresolved uncontrolled path.
 Voluntary updates require a clean drain and shutdown; defer an undrainable
 update. Forced sleep may report loss and discard. Neither policy converts
 accepted volatile data into durable data.
+
+Awake proof loss uses the same closed cold cut and single-use recovery token
+without pausing or resuming VZ. A power notification which overtakes the cut
+still requires the confirmed pause within its original budget. The coordinator
+holds queued Mount intent across that transition. An already dispatched initial
+Mount joins before Suspend within the original drain budget; it is never
+recreated by spending the same single-use grant again. Failure to join takes
+the existing discard path, without extending the sleep deadline.
 
 ## Unfenced host sleep: OPEN release gate
 

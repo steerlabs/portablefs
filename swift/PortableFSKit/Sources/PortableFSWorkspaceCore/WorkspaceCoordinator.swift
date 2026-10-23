@@ -40,6 +40,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void)
     func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void)
     func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void)
+    func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void)
 }
 // Continuous nanoseconds include host sleep. Deliver deadlines even if a
 // channel never replies; late callbacks must still compare now with the deadline.
@@ -80,7 +81,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         case stopping(StopTransaction), unknown(StopTransaction?)
     }
     public var onChange: (() -> Void)?
-    private var state: State { didSet { onChange?() } }
+    private var state: State { didSet { onChange?(); scheduleMounts() } }
     public var phase: WorkspacePhase {
         switch state {
         case .idle, .stopped: .stopped
@@ -101,7 +102,18 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public private(set) var retiredStatus: [WorkspaceRetiredOutcome] = []
     public private(set) var mountStatus: [WorkspaceMountStatus] = []
     public private(set) var jobStatus: [WorkspaceMountJob] = []
-    public var attachAllowed: Bool { phase == .running }
+    public var attachAllowed: Bool { phase == .running && pendingSleep == nil }
+    private final class MountRequest {
+        let mount: WorkspaceMountID
+        var sent = false
+        var completion: ((Result<WorkspaceResult, Error>) -> Void)?
+        init(_ mount: WorkspaceMountID, _ completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+            self.mount = mount; self.completion = completion
+        }
+    }
+    private var requestedMounts: [MountRequest] = []
+    private var mountsScheduled = false
+    private var pendingSleep: (Window, WakeIntent)?
     private let vm: any WorkspaceVirtualMachine
     private let power: any WorkspacePowerNotifications
     private let channel: any WorkspaceGuestChannel
@@ -167,6 +179,56 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     }
     public func discardUnknown() { if case .unknown = state { reconcileUnknown() } }
 
+    // Retain user intent outside the paired FIFO across power transitions.
+    // A Mount already dispatched joins its initial job before Suspend, within
+    // the notification's original budget. This avoids cancelling a consumed
+    // single-use Attach and then trying to recreate it with the same grant.
+    public func mount(_ mount: WorkspaceMountID, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        guard WorkspaceControl.validMount(mount), requestedMounts.count < 64,
+              !requestedMounts.contains(where: { $0.mount == mount }),
+              phase != .stopped, phase != .stopping, phase != .unknown else {
+            completion(.failure(WorkspaceControlError.transition)); return
+        }
+        requestedMounts.append(MountRequest(mount, completion))
+        scheduleMounts()
+    }
+    private func scheduleMounts() {
+        guard attachAllowed, !mountsScheduled, requestedMounts.contains(where: { !$0.sent }) else { return }
+        mountsScheduled = true
+        clock.schedule(at: clock.now) { [weak self] in
+            guard let self else { return }; self.mountsScheduled = false
+            guard self.attachAllowed, self.clock.now <= UInt64.max - self.totalBudget else { return }
+            for request in self.requestedMounts where !request.sent {
+                request.sent = true
+                self.channel.mount(request.mount, deadline: self.clock.now + self.totalBudget) { [weak self, weak request] result in
+                    guard let self, let request else { return }
+                    let complete = request.completion; request.completion = nil
+                    if case .success(let accepted) = result, accepted.code == "accepted" {
+                        self.refreshStatus()
+                    } else {
+                        self.requestedMounts.removeAll { $0 === request }
+                        self.finishPendingSleep()
+                    }
+                    complete?(result)
+                }
+            }
+        }
+    }
+    private func requestSuspend(_ window: Window, intent: WakeIntent = .asleep) {
+        guard requestedMounts.contains(where: { $0.sent }) else { beginSuspend(window, intent: intent); return }
+        pendingSleep = (window, intent)
+        clock.schedule(at: window.drain) { [weak self] in
+            guard let self, let pending = self.pendingSleep, pending.0.total == window.total else { return }
+            self.stopUnsafe("initial mount did not join within the sleep drain budget")
+        }
+        refreshStatus()
+    }
+    private func finishPendingSleep() {
+        guard let (window, intent) = pendingSleep, !requestedMounts.contains(where: { $0.sent }) else { return }
+        pendingSleep = nil
+        beginSuspend(window, intent: intent)
+    }
+
     public func powerEvent(_ event: WorkspacePowerEvent) {
         switch event {
         case .sleep(let notification):
@@ -187,7 +249,9 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             switch state {
             case .idle, .stopped: acknowledgeAll(fenced: true)
             case .pausedCold, .pausedDiscard: acknowledgeAll(fenced: true)
-            case .running, .recovering: beginSuspend(window)
+            case .running, .recovering:
+                if let pending = pendingSleep { pendingSleep = (pending.0, .asleep) }
+                else { requestSuspend(window) }
             case .resuming(let resume):
                 state = .resumingForSleep(resume, window, .asleep)
                 clock.schedule(at: window.drain) { [weak self] in
@@ -204,6 +268,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             }
             if clock.now >= window.total { expireNotification(notification.id) }
         case .wake, .cancelledSleep:
+            if let pending = pendingSleep { pendingSleep = (pending.0, .awake) }
             switch state {
             case .pausedCold(let suspension): resumeCold(suspension)
             case .pausedDiscard: stopUnsafe("cold drain incomplete; discard VM")
@@ -214,6 +279,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             default: break
             }
         case .darkWake:
+            if let pending = pendingSleep { pendingSleep = (pending.0, .asleep) }
             switch state {
             case .resumingForSleep(let transaction, let window, _): state = .resumingForSleep(transaction, window, .asleep)
             case .draining(let transaction, _): state = .draining(transaction, .asleep)
@@ -275,6 +341,15 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             let pending = self.mountStatus.filter { !ack.suspension.roster.contains($0.mount) }
             guard self.retainsLoss(coldMounts + pending) else { self.pause(cold: nil); return }
             self.mountStatus = pending + coldMounts
+            // Awake recovery needs a cold filesystem cut, not a VM power
+            // transition. Ordinary control callers may remain queued while the
+            // guest runs closed; only a real sleep requires an idle FIFO and
+            // confirmed VZ pause. A sleep which overtakes this cut still owns
+            // the original power budget and takes the pause path below.
+            if case .draining(_, .awake) = self.state, self.notifications.isEmpty {
+                self.recoverCold(ack.suspension)
+                return
+            }
             self.pause(cold: ack.suspension)
         }
     }
@@ -319,8 +394,21 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             }
             guard case .success = result, self.clock.now < transaction.deadline else { self.stopUnsafe("VM resume not confirmed within deadline"); return }
             if let (window, intent) = pending { self.beginSuspend(window, intent: intent); return }
-            self.state = .recovering(token)
-            self.channel.resume(token, deadline: transaction.deadline) { [weak self] reply in
+            self.recoverCold(suspension, transaction: transaction)
+        }
+    }
+    private func recoverCold(_ suspension: WorkspaceSuspension, transaction supplied: ResumeTransaction? = nil) {
+        let transaction: ResumeTransaction
+        if let current = supplied {
+            transaction = current
+        } else {
+            var token = WorkspaceResumeToken(); token.suspension = suspension; token.wakeNonce = nonces.next()
+            guard WorkspaceControl.validToken(token), let window = window(at: clock.now) else { stopUnsafe("invalid awake recovery identity"); return }
+            transaction = ResumeTransaction(token: token, deadline: window.total)
+        }
+        let token = transaction.token
+        state = .recovering(token)
+        channel.resume(token, deadline: transaction.deadline) { [weak self] reply in
                 guard let self, case .recovering(let current) = self.state, current == token else { return }
                 guard case .success(let ack) = reply, ack.token == token, WorkspaceControl.validResumeAck(ack) else {
                     self.reason = "guest recovery reply unavailable or invalid; mounts remain unavailable"; return
@@ -330,7 +418,6 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 self.mountStatus = pending + ack.mounts; self.state = .running; self.reason = ""
                 // Suspend can interrupt page observation or its acknowledgement.
                 self.refreshStatus()
-            }
         }
     }
     private func retainsLoss(_ mounts: [WorkspaceMountStatus], retired: [WorkspaceRetiredOutcome] = []) -> Bool {
@@ -413,7 +500,13 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             }
         }
         jobStatus = pendingJobs + status.jobs.filter { next in !pendingJobs.contains { $0.mount == next.mount } }
-        guard publishesReadiness else { return }
+        let observedJobs = status.jobs + status.retired.filter(\.hasJob).map(\.job)
+        requestedMounts.removeAll { request in
+            request.sent && request.completion == nil && observedJobs.contains {
+                $0.mount == request.mount && $0.operation == "mount" && ($0.phase == "complete" || $0.phase == "failed")
+            }
+        }
+        guard publishesReadiness else { finishPendingSleep(); return }
         reason = !pendingJobs.isEmpty ? "waiting for earlier retired jobs before replacing active status" :
             (!pendingMounts.isEmpty ? "waiting for earlier retired outcomes before replacing active status" : "")
         state = .running
@@ -423,11 +516,12 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         // A local proof refusal is latched closed. Only this coordinator may
         // obtain a fresh generation/token through the same cold transaction
         // used for power transitions. Terminal mounts require explicit replacement.
-        if case .running = state,
+        if case .running = state, pendingSleep == nil,
            status.mounts.contains(where: { $0.state == "closed" && !$0.reason.isEmpty && $0.cleanup == "retained" }),
            let window = window(at: clock.now) {
             beginSuspend(window, intent: .awake)
         }
+        finishPendingSleep()
     }
     private func scheduleStatus() {
         guard phase != .stopped, clock.now <= UInt64.max - 250_000_000 else { return }
@@ -470,6 +564,9 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         default: break
         }
         reason = why
+        pendingSleep = nil
+        let mounts = requestedMounts; requestedMounts = []
+        for request in mounts { request.completion?(.failure(WorkspaceControlError.transition)) }
         let transaction = StopTransaction()
         state = .stopping(transaction)
         if let window = window(at: clock.now) {

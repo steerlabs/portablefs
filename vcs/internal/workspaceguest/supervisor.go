@@ -587,6 +587,9 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 	if e == nil || reason == "" {
 		return refused("terminal unknown mount or missing reason")
 	}
+	if e.terminal {
+		return nil
+	}
 	e.gateSerial = e.driver.CloseAdmission(s.generation)
 	e.terminal = true
 	e.setStatus("terminal", reason, "")

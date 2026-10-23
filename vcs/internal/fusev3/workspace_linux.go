@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"fmt"
+	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -47,6 +48,46 @@ func (m *Mount) workspaceFS() *workspaceFileSystem {
 		return nil
 	}
 	return &workspaceFileSystem{rawFileSystem: m.raw}
+}
+
+// Requests waiting for a new serving interval own no callback, publication or
+// buffer admission. In particular, they cannot extend the fixed cold-drain
+// cohort or hold an epoch reader needed by its withdrawal. The shared page has
+// no child notification; resampling also observes terminal teardown.
+func (m *Mount) awaitWorkspaceServing(ctx context.Context) error {
+	if m.workspace == nil {
+		return nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.fatalError(); err != nil {
+			return err
+		}
+		if m.isRevoked() {
+			return syscall.EIO
+		}
+		if err := m.rpc.SessionEndCause(); err != nil {
+			return err
+		}
+		if m.workspaceServing() {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-m.workspace.Done():
+			timer.Stop()
+			return workspaceadmission.ErrClosed
+		case <-timer.C:
+		}
+	}
 }
 
 func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -190,6 +231,17 @@ type workspaceRecoveryKey struct{}
 // beginWorkspaceEntry reserves one existing physical-reply owner before the
 // first answer or effect. The slow callback transfers this owner explicitly.
 func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
+	for {
+		if err := r.mount.awaitWorkspaceServing(r.opContext()); err != nil {
+			return nil, fuse.ToStatus(err)
+		}
+		p, status := r.tryWorkspaceEntry(unique)
+		if status != fuse.Status(syscall.EAGAIN) { // Closure raced the wait; no entry was admitted.
+			return p, status
+		}
+	}
+}
+func (r *workspaceFileSystem) tryWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil {
@@ -210,7 +262,7 @@ func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublicat
 	if err != nil || !r.mount.workspaceClockReady() {
 		delete(r.replyPublications, unique)
 		r.recycleReplyLocked(p)
-		return nil, fuse.EIO
+		return nil, fuse.Status(syscall.EAGAIN)
 	}
 	if life := r.mount.workspaceLifecycle; life != nil {
 		life.servedSinceCold.Store(true)

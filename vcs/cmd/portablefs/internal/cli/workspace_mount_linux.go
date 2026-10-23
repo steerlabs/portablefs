@@ -482,7 +482,11 @@ func (c *workspaceChild) monitor(ctx context.Context) {
 			}
 		}
 		if o.State == fusev3.WorkspaceTerminal {
-			_ = c.control.Owner.RequireRemoval(ctx, "terminal", "terminal workspace mount")
+			reason := "terminal workspace mount"
+			if o.Result.Err != nil {
+				reason = o.Result.Err.Error()
+			}
+			_ = c.control.Owner.RequireRemoval(ctx, "terminal", reason)
 		}
 	}
 }

@@ -40,6 +40,7 @@ import Testing
 }
 @MainActor private final class RRChannel: WorkspaceGuestChannel {
     var isIdle = true
+    func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { completion(.failure(WorkspaceControlError.transition)) }
     var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     var retiredAcks: [(UInt64, (Result<Void, Error>) -> Void)] = []
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []

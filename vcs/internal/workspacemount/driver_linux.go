@@ -177,15 +177,23 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		if d == nil {
 			return errors.New("workspace mount not owned")
 		}
-		if err := m.Host.Terminal(j.Mount, "voluntary unmount requested", nil); err != nil {
+		mode := "terminal"
+		if d.serving.Load() {
+			// An unforced unmount must run while holders can still use and
+			// release the filesystem. EBUSY changes no serving or lifecycle
+			// state. Success is retained in the same original removal slot
+			// which the child subsequently observes and finalizes.
+			d.effectMu.Lock()
+			err := d.removeKernelLocked("voluntary", "2")
+			d.effectMu.Unlock()
+			if err != nil {
+				return fmt.Errorf("unmount workspace %s: %w", j.Mount.VolumeId, err)
+			}
+			mode = "voluntary"
+		}
+		if err := m.Host.Terminal(j.Mount, "workspace unmount requested", nil); err != nil {
 			return err
 		}
-		mode := "voluntary"
-		d.effectMu.Lock()
-		if d.removals[0] != nil {
-			mode = "terminal"
-		}
-		d.effectMu.Unlock()
 		p, err := d.remove(ctx, mode)
 		err = errors.Join(err, m.Host.Cleanup(j.Mount, p))
 		if err != nil {
@@ -806,22 +814,18 @@ func (d *Driver) removeKernelLocked(mode, id string) error {
 	if attempt == nil {
 		attempt = &rootRemoval{id: id}
 		d.removals[index] = attempt
-		if d.kernel != nil {
-			attempt.err = d.kernel.Remove(mode == "terminal")
-		} else {
-			w := d.bound()
-			_, attempt.err = fusev3.ObservePlannedKernelMountAbsent(w.Source, w.Target)
-		}
+		attempt.err = errors.New("workspace removal not attempted")
 	}
 	if attempt.id != id {
 		return errors.New("workspace removal action changed")
 	}
-	if mode == "terminal" && attempt.err != nil {
-		// Retry only this fixed terminal action with its original descriptions.
+	if attempt.err != nil {
+		// Retry only this fixed action with its original descriptions. EBUSY
+		// belongs to one syscall, not to the lifetime of a voluntary action.
 		// ManagedKernel retains successful abort independently from alias absence;
 		// disappearance of an alias cannot fabricate a successful abort.
 		if d.kernel != nil {
-			attempt.err = d.kernel.Remove(true)
+			attempt.err = d.kernel.Remove(mode == "terminal")
 		} else if _, err := fusev3.ObservePlannedKernelMountAbsent(d.bound().Source, d.bound().Target); err == nil {
 			attempt.err = nil
 		}
@@ -857,7 +861,7 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 	for {
 		select {
 		case <-d.exited:
-			return nil, errors.New("workspace child exited before lifecycle completion")
+			return nil, fmt.Errorf("workspace child exited before lifecycle completion: %v", d.exitErr)
 		default:
 		}
 		if !accepted && !uncertain {
@@ -1128,7 +1132,11 @@ func (d *Driver) watch() {
 		case <-d.exited:
 			if d.registered.Load() && !d.cleaned.Load() {
 				d.CloseAdmission(d.bindingGeneration())
-				_ = d.manager.Host.Terminal(d.id, "workspace child exited", nil)
+				reason := "workspace child exited"
+				if d.exitErr != nil {
+					reason += ": " + d.exitErr.Error()
+				}
+				_ = d.manager.Host.Terminal(d.id, reason, nil)
 				if d.terminalCleanup.CompareAndSwap(false, true) {
 					proof, _ := d.remove(context.Background(), "terminal")
 					_ = d.manager.Host.Cleanup(d.id, proof)
@@ -1152,7 +1160,7 @@ func (d *Driver) watch() {
 		}
 		terminal := r.Phases != nil && r.Phases.TerminalRemoval.Progress == "offered"
 		if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
-			_ = d.manager.Host.Terminal(d.id, "workspace terminal removal required", nil)
+			_ = d.manager.Host.Terminal(d.id, r.Phases.TerminalRemoval.Action.Reason, nil)
 			go func() {
 				proof, _ := d.remove(context.Background(), "terminal")
 				_ = d.manager.Host.Cleanup(d.id, proof)

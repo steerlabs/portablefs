@@ -25,6 +25,7 @@ import PortableFSWorkspaceCore
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { lastResume = token; base.resume(token, deadline: deadline, completion: completion) }
     func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { base.acknowledgeRetired(through: sequence, deadline: deadline, completion: completion) }
     func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { base.status(deadline: deadline, completion: completion) }
+    func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { base.mount(mount, deadline: deadline, completion: completion) }
 }
 
 @MainActor final class Driver {
@@ -179,7 +180,7 @@ import PortableFSWorkspaceCore
                             catch { self?.fail(error) }
                         }
                         if command == "provision" { channel.provision(try WorkspaceProvision(serializedBytes: body), deadline: deadline, completion: complete) }
-                        else if command == "mount" { channel.mount(try WorkspaceMountID(serializedBytes: body), deadline: deadline, completion: complete) }
+                        else if command == "mount" { coordinator.mount(try WorkspaceMountID(serializedBytes: body), completion: complete) }
                         else { channel.umount(try WorkspaceMountID(serializedBytes: body), deadline: deadline, completion: complete) }
                     }
                 } catch { fail(error) }

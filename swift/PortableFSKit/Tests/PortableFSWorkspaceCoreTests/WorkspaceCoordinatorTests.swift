@@ -61,6 +61,8 @@ private enum InjectedFailure: Error { case failed }
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
     var resumes: [(WorkspaceResumeToken, (Result<WorkspaceResumeAck, Error>) -> Void)] = []
+    var mounts: [(WorkspaceMountID, (Result<WorkspaceResult, Error>) -> Void)] = []
+    func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { mounts.append((mount, completion)) }
     func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         var guest = host; guest.guestServiceID = Data(repeating: 6, count: 16)
         if wrongRelease { guest.release.appVersion = "other" }
@@ -606,11 +608,12 @@ private enum InjectedFailure: Error { case failed }
     cold.suspension.roster = [mount.mount]
     var proof = WorkspaceMountCold(); proof.mount = mount.mount; proof.loss = [loss]; proof.outcome = unknownTestOutcome()
     cold.mounts = [proof]
+    // A user Status call may be queued behind the cold cut. Awake recovery
+    // keeps the VM running and must not treat that caller as a pause failure.
+    r.channel.isIdle = false
     r.channel.suspensions[0].1(.success(cold))
-    r.vm.pauses.removeFirst()(.success(()))
-    #expect(r.coordinator.phase == .resuming)
+    #expect(r.coordinator.phase == .recovering)
     #expect(r.power.acknowledgements.isEmpty)
-    r.vm.resumes.removeFirst()(.success(()))
     let token = r.channel.resumes[0].0
     #expect(token.suspension.generation == 1)
     #expect(token.wakeNonce != token.suspension.nonce)
@@ -620,7 +623,7 @@ private enum InjectedFailure: Error { case failed }
     r.channel.resumes[0].1(.success(resumed))
     #expect(r.coordinator.phase == .running)
     #expect(r.coordinator.mountStatus[0].loss == [loss])
-    #expect(r.vm.calls == ["start", "pause", "resume"])
+    #expect(r.vm.calls == ["start"])
 }
 
 @Test @MainActor func workspaceAwakeRecoveryDeduplicatesSleepAndLeavesTerminalExplicit() throws {
@@ -663,4 +666,55 @@ private enum InjectedFailure: Error { case failed }
     #expect(r.vm.calls == ["start", "pause", "stop"])
     #expect(r.coordinator.mountStatus[0].loss == [loss])
     #expect(r.channel.resumes.isEmpty)
+}
+
+@Test @MainActor func workspaceMountIntentWaitsAcrossSuspend() throws {
+    let r = try Rig()
+    let mount = r.channel.roster[0]
+    var accepted = false
+    r.coordinator.mount(mount) { result in accepted = (try? result.get().code) == "accepted" }
+    r.sleep()
+    r.clock.advance(0)
+    #expect(r.channel.mounts.isEmpty)
+    r.channel.acknowledge()
+    r.vm.pauses.removeFirst()(.success(()))
+    r.wake(); r.channel.recovered()
+    r.clock.advance(0)
+    #expect(r.channel.mounts.count == 1)
+    var reply = WorkspaceResult(); reply.code = "accepted"
+    r.channel.mounts[0].1(.success(reply))
+    #expect(accepted)
+    #expect(r.coordinator.phase == .running)
+}
+
+@Test @MainActor func workspaceDispatchedMountJoinsBeforeSuspendWithinOriginalBudget() throws {
+    for finish in [false, true] {
+        let r = try Rig()
+        let mount = r.channel.roster[0]
+        r.coordinator.mount(mount) { _ in }
+        r.clock.advance(0)
+        var reply = WorkspaceResult(); reply.code = "accepted"
+        r.channel.mounts[0].1(.success(reply))
+        r.sleep()
+        #expect(r.channel.suspensions.isEmpty)
+        #expect(!r.coordinator.attachAllowed)
+        if finish {
+            let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
+            var status = WorkspaceStatusReply(); status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
+            status.guestServiceID = Data(repeating: 6, count: 16); status.state = "running"
+            var job = WorkspaceMountJob(); job.mount = mount; job.requestID = 1; job.operation = "mount"; job.phase = "complete"
+            status.jobs = [job]
+            let observed = try #require(r.channel.statuses.first)
+            observed(.success(status))
+            #expect(r.channel.suspensions.count == 1)
+            r.channel.acknowledge()
+            let paused = try #require(r.vm.pauses.first)
+            paused(.success(()))
+            #expect(r.coordinator.phase == .pausedCold)
+        } else {
+            r.clock.advance(15_000_000_000)
+            #expect(r.coordinator.phase == .stopping)
+            #expect(r.channel.suspensions.isEmpty)
+        }
+    }
 }

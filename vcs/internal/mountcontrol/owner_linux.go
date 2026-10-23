@@ -463,10 +463,14 @@ func (o *Owner) run(j *Job) {
 		loss := result.PermitLoss
 		permitLost := loss != nil && strconv.FormatUint(loss.Generation, 10) == j.start.Workspace.Generation && strconv.FormatUint(loss.Serial, 10) == j.start.Workspace.GateSerial && loss.Successor > loss.Serial
 		canceled := (j.lifecycleOwner.Overtaken() || permitLost) && result.Disposition == LifecycleOvertaken
-		if !canceled && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && o.servingFailure == "" {
-			o.servingFailure = "mount incarnation preparation/recovery failed"
+		reason := "lifecycle work failed"
+		if result.Err != nil {
+			reason = control.BoundedReason(result.Err.Error())
 		}
-		j.state, j.reason = "failed", "lifecycle work failed"
+		if !canceled && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && o.servingFailure == "" {
+			o.servingFailure = reason
+		}
+		j.state, j.reason = "failed", reason
 		if o.servingFailure != "" {
 			j.reason = o.servingFailure
 		}
@@ -696,6 +700,12 @@ func (o *Owner) RequireRemoval(ctx context.Context, mode, reason string) error {
 	if mode == "terminal" {
 		s = &o.terminal
 		id = "3"
+		if o.servingFailure == "" {
+			o.servingFailure = control.BoundedReason(reason)
+			if o.servingFailure == "" {
+				o.servingFailure = "mount removal required"
+			}
+		}
 	}
 	if s.status.Progress == "" {
 		if o.removedLocked() {
@@ -710,7 +720,14 @@ func (o *Owner) RequireRemoval(ctx context.Context, mode, reason string) error {
 	}
 	done := s.done
 	o.facts.Readiness = nil
-	o.job.state = "unmount-required"
+	if o.job.running {
+		o.job.state = "unmount-required"
+	} else {
+		// A spontaneous removal can race the final failed Recover observation.
+		// The action is independent of job completion; never turn a joined job
+		// back into a pending lifecycle which no worker can finish.
+		o.job.state, o.job.reason = "failed", o.servingFailure
+	}
 	o.mu.Unlock()
 	select {
 	case <-ctx.Done():

@@ -314,6 +314,17 @@ func (m *Mount) WorkspaceObservation() WorkspaceObservation {
 	if terminal {
 		o.Prepared, o.ColdComplete = false, false
 		o.State = WorkspaceTerminal
+		cause := m.fatalError()
+		if cause == nil {
+			cause = m.rpc.SessionEndCause()
+		}
+		if cause == nil {
+			cause = m.ctx.Err()
+		}
+		if cause == nil {
+			cause = errors.New("workspace owner ended")
+		}
+		o.Result = authorityrpc.LifecycleResult{Disposition: authorityrpc.LifecycleFailed, Err: cause}
 		return o
 	}
 	if prior != nil {
