@@ -74,7 +74,10 @@ elif KIND=='cwd':
 else:
     workers=[threading.Thread(target=run,args=(i,)) for i in range(THREADS)]
     for w in workers: w.start()
-    deadline=time.monotonic()+8
+    # A replacement's first CREATE can wait out the authority's retained
+    # ten-second cache horizon. This setup bound is independent of the later
+    # EBUSY and power-drain assertions, which start only after real fsync.
+    deadline=time.monotonic()+20
     while True:
         with lock: active=len(ready); failures=list(errors)
         assert not failures,failures
@@ -96,7 +99,7 @@ result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
         try:
             with selectors.DefaultSelector() as ready:
                 ready.register(p.stdout, selectors.EVENT_READ)
-                assert ready.select(10), 'application holder did not start'
+                assert ready.select(22), 'application holder did not start'
                 assert p.stdout.readline().strip() == 'held-ready', p.poll()
             yield p, stop, result
         finally:
@@ -181,7 +184,8 @@ print('all-acknowledged-records-intact')
                 assert self.a.peer("import pathlib;print((pathlib.Path('/var/tmp/pfs-native/home/peer')/"+repr(probe)+").read_text())") == payload
                 value = self.finish_holder(holder, allow_errors=True)
             self.save('managed-network-outage-'+str(seconds)+'s',
-                      {'recovery_seconds': recovery, 'application': value, 'sessions': before})
+                      {'recovery_seconds': recovery, 'application': value,
+                       'recovery_probe': probe_result, 'sessions': before})
 
     def busy(self, public):
         for kind in ('cwd', 'fsync'):
