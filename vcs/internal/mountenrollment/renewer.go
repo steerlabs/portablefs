@@ -248,13 +248,21 @@ func (r *Renewer) installationSafeLocked() bool {
 	}
 	if !r.now().Before(safeCutoff(r.authorizedAt, r.installed.AuthorizationDeadline, r.MinimumSafetyMargin)) {
 		if !r.Managed || r.serving {
-			r.terminal = errors.New("automatic mount reauthorization reached its safe cutoff")
-			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
-			r.signalLocked()
+			r.latchCutoffLocked()
 		}
 		return false
 	}
 	return r.terminal == nil
+}
+func (r *Renewer) latchCutoffLocked() {
+	if r.terminal == nil {
+		r.terminal = errors.New("automatic mount reauthorization reached its safe cutoff")
+	}
+	r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+	if r.attemptCancel != nil {
+		r.attemptCancel()
+	}
+	r.signalLocked()
 }
 func (r *Renewer) signalLocked() {
 	if r.wake == nil {
@@ -294,6 +302,28 @@ func (r *Renewer) wait(ctx context.Context, target time.Time, correction <-chan 
 		return nil
 	case <-tick:
 		return nil
+	}
+}
+
+// The cutoff belongs to wall time even while Refresh or install owns the
+// attempt. Cancellation requests settlement; Run still joins its disposition.
+func (r *Renewer) watchCutoff(ctx context.Context, cutoff time.Time, correction <-chan struct{}) {
+	for {
+		r.mu.Lock()
+		if ctx.Err() != nil || r.terminal != nil || !r.allowedLocked() {
+			r.mu.Unlock()
+			return
+		}
+		if !r.now().Before(cutoff) {
+			r.latchCutoffLocked()
+			r.mu.Unlock()
+			return
+		}
+		r.mu.Unlock()
+		if r.wait(ctx, cutoff, correction) != nil {
+			return
+		}
+		correction = r.WallChanges()
 	}
 }
 
@@ -390,9 +420,8 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		}
 		bounded := !r.Managed || r.serving
 		if bounded && !r.now().Before(cutoff) {
-			err := errors.New("automatic mount reauthorization reached its safe cutoff")
-			r.terminal = err
-			r.readiness = RenewalReadiness{State: "pending", Permit: r.permit}
+			r.latchCutoffLocked()
+			err := r.terminal
 			r.mu.Unlock()
 			r.emit(RenewalCutoff, time.Time{}, boundedError(err), r.statusFailures())
 			return err
@@ -420,7 +449,11 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		// Managed preparation runs behind closed admission. Its attempts remain
 		// bounded, but the previous serving window cannot retire a live pending
 		// grant or end transient recovery. The generation owns cancellation.
-		if bounded {
+		if r.WallChanges != nil {
+			// Timeout is elapsed time; the workspace cutoff is watched separately
+			// so a backward correction cannot leave a stale context deadline.
+			deadline = time.Now().Add(timeout)
+		} else if bounded {
 			deadline = minTime(deadline, cutoff)
 		}
 		attemptCtx, cancel := context.WithDeadline(WithPermit(ctx, p), deadline)
@@ -429,6 +462,19 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		r.attemptDone = done
 		pending := r.pending
 		r.mu.Unlock()
+		var cutoffDone chan struct{}
+		var stopCutoff context.CancelFunc
+		if r.WallChanges != nil && bounded {
+			// An attempt timeout requests cancellation but does not prove the
+			// installer joined. Watch its serving window until actual settlement.
+			cutoffCtx, stop := context.WithCancel(ctx)
+			stopCutoff = stop
+			cutoffDone = make(chan struct{})
+			go func() {
+				defer close(cutoffDone)
+				r.watchCutoff(cutoffCtx, cutoff, correction)
+			}()
+		}
 		var err error
 		if pending == nil {
 			var grant controlplane.MountAuthorization
@@ -454,7 +500,16 @@ func (r *Renewer) Run(ctx context.Context, sessionID string, initialDeadline tim
 		if r.attemptDispositionHook != nil {
 			r.attemptDispositionHook(p)
 		}
+		if stopCutoff != nil {
+			stopCutoff()
+			<-cutoffDone
+		}
 		r.mu.Lock()
+		// Join the watcher before changing the installed window. Cover the
+		// final settlement-to-lock gap against the window this attempt owned.
+		if cutoffDone != nil && r.allowedLocked() && r.permit == p && !r.now().Before(cutoff) {
+			r.latchCutoffLocked()
+		}
 		// A successful installer is a known remote installation even if Park/Close
 		// raced it. Keep that sequence before considering readiness publication.
 		permitClosed := errors.Is(err, ErrPermitClosedInstallation)

@@ -8,6 +8,8 @@ import (
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
 
+var ErrIdentityUnavailable = errors.New("guest identity unavailable")
+
 type guestClock interface {
 	Begin(uint64) error
 	Pause()
@@ -28,16 +30,19 @@ func (s *Supervisor) Identity(request *pb.IdentityRequest) (*pb.IdentityReply, e
 		return nil, refused("identity outside running phase")
 	}
 	if s.identities == nil {
-		return nil, ErrUnavailable
+		return nil, ErrIdentityUnavailable
 	}
 	reply, err := s.identities.EnsureIdentity(request)
 	if err != nil {
-		return nil, errors.New("guest identity unavailable")
+		return nil, ErrIdentityUnavailable
 	}
 	return reply, nil
 }
 func (s *Supervisor) provision(ctx context.Context, generation uint64, p *pb.Provision) error {
-	if s.identities == nil || s.waitClock == nil {
+	if s.identities == nil {
+		return ErrIdentityUnavailable
+	}
+	if s.waitClock == nil {
 		return ErrUnavailable
 	}
 	return s.identities.AcceptProvision(ctx, p, func(ctx context.Context) error { return s.waitClock(ctx, generation) })

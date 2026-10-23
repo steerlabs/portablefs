@@ -181,7 +181,7 @@ func (s *Supervisor) runJob(ctx context.Context, j *mountJob, provision *pb.Prov
 	var err error
 	if ctx.Err() != nil {
 		err = ctx.Err()
-	} else if request.Operation == "provision" && s.identities != nil {
+	} else if request.Operation == "provision" && (s.identities != nil || s.jobDriver == nil) {
 		err = s.provision(ctx, request.Generation, provision)
 	} else if s.jobDriver == nil {
 		err = ErrUnavailable
@@ -199,7 +199,7 @@ func (s *Supervisor) runJob(ctx context.Context, j *mountJob, provision *pb.Prov
 	if err != nil {
 		j.status.Phase, j.status.Failure = "failed", "handler-failed"
 		switch {
-		case errors.Is(err, ErrUnavailable):
+		case errors.Is(err, ErrUnavailable), errors.Is(err, ErrIdentityUnavailable):
 			j.status.Failure = "unavailable"
 		case errors.Is(err, ErrState):
 			j.status.Failure = "refused"

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -145,12 +146,24 @@ func publishClockEvidence(name string, raw []byte) error {
 	}
 	return os.Rename(f.Name(), state+"/"+name)
 }
+
+// A refused persistent identity disables provisioning, while control and clock
+// service remain available to report the refusal without rewriting its scope.
+func openGuestIdentities(directory string) (*workspacemount.Store, error) {
+	identities, err := workspacemount.Open(directory)
+	if errors.Is(err, workspacemount.ErrIdentityUnavailable) {
+		return nil, nil
+	}
+	return identities, err
+}
 func serve() error {
-	identities, err := workspacemount.Open("/data/workspace-identities")
+	identities, err := openGuestIdentities("/data/workspace-identities")
 	if err != nil {
 		return err
 	}
-	defer identities.Close()
+	if identities != nil {
+		defer identities.Close()
+	}
 	clock, err := workspaceclock.Open(nil)
 	if err != nil {
 		return err

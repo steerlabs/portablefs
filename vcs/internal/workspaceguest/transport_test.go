@@ -3,6 +3,7 @@ package workspaceguest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -158,6 +159,37 @@ func TestTransportMountUnavailableAndStatusCorrelated(t *testing.T) {
 	}
 	if s.Status().State != "discard-only" {
 		t.Fatal("disconnect not discarded")
+	}
+}
+
+func TestTransportIdentityUnavailableKeepsStatusAndProvision(t *testing.T) {
+	c, s, done := transportRig(t)
+	s.ConfigureGuest(nil, nil, nil)
+	pairTransport(t, c)
+	request := &pb.IdentityRequest{AuthorityId: mountID(4).AuthorityId, VolumeId: "volume"}
+	if _, err := s.Identity(request); !errors.Is(err, ErrIdentityUnavailable) {
+		t.Fatal("missing typed identity refusal", err)
+	}
+	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_IdentityRequest{IdentityRequest: request}})
+	if r.GetResult().GetCode() != "refused" || !strings.Contains(r.GetResult().GetReason(), "guest identity unavailable") {
+		t.Fatal("identity refusal missing from control reply", r)
+	}
+	r = exchange(t, c, jobRequest(3, mountID(4), "provision"))
+	if r.GetResult().GetCode() != "accepted" {
+		t.Fatal("provision intent not retained", r)
+	}
+	waitFor(t, func() bool { return len(s.Retired()) == 1 })
+	status := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 4, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}).GetStatusReply()
+	if status.GetState() != "running" || len(status.Retired) != 1 {
+		t.Fatal("identity refusal stopped control service", status)
+	}
+	job := status.Retired[0].GetJob()
+	if job.GetOperation() != "provision" || job.GetPhase() != "failed" || job.GetFailure() != "unavailable" || !strings.Contains(job.GetReason(), "guest identity unavailable") {
+		t.Fatal("missing classified provisioning failure", job)
+	}
+	c.Close()
+	if err := <-done; err == nil {
+		t.Fatal("disconnect succeeded")
 	}
 }
 
