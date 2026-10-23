@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -828,5 +829,42 @@ func TestARootLeftBehindByAPreviousMountServesImmediately(t *testing.T) {
 	}
 	if _, errno := grafts.Lstat("packages/app/node_modules/lodash"); errno != 0 {
 		t.Fatalf("content under a restored root = %v, want it served", errno)
+	}
+}
+
+func TestOrdinaryTearingDownReleaseClosesLocalFD(t *testing.T) {
+	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), false)
+	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
+	out := &fuse.CreateOut{}
+	if status := f.raw.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: root.NodeId}, Flags: uint32(os.O_RDWR), Mode: 0600}, "local", out); !status.Ok() {
+		t.Fatal(status)
+	}
+	held, handle := f.raw.acquireGraftFileHandle(out.Fh)
+	if handle == nil {
+		t.Fatal("missing local handle")
+	}
+	fd := handle.fd
+	f.raw.releaseHandleOperation(held)
+	directory := &fuse.OpenOut{}
+	if status := f.raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: root.NodeId}}, directory); !status.Ok() {
+		t.Fatal(status)
+	}
+	f.mount.cancel()
+	f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: out.NodeId}, Fh: out.Fh})
+	f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: root.NodeId}, Fh: directory.Fh})
+	f.raw.mu.RLock()
+	_, retainedDir := f.raw.handles[directory.Fh]
+	f.raw.mu.RUnlock()
+	if retainedDir {
+		t.Fatal("teardown retained local directory snapshot")
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, syscall.EBADF) {
+		t.Fatal("teardown leaked local descriptor", err)
+	}
+	f.raw.mu.RLock()
+	_, retained := f.raw.handles[out.Fh]
+	f.raw.mu.RUnlock()
+	if retained {
+		t.Fatal("teardown retained released local handle")
 	}
 }

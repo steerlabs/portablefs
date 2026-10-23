@@ -43,13 +43,19 @@ var (
 type PreKernelMountAbsenceObserver func(context.Context) (*authoritypb.MountAbsenceProof, error)
 
 type ClientConfig struct {
-	Address     string
-	TLS         *tls.Config
-	VolumeID    string
-	AccessToken []byte
-	ReplaySlots uint32
-	MaxFrame    uint32
-	DialTimeout time.Duration
+	// DispatchFence is installed only by a lifecycle-owned Linux client.
+	DispatchFence *DispatchFence
+	// LifecycleRetry keeps one initial Attach/Activate owner through transient
+	// loss. Only its generation cancels it; the explicit AttachDisposition still
+	// governs cleanup after a possible commitment.
+	LifecycleRetry bool
+	Address        string
+	TLS            *tls.Config
+	VolumeID       string
+	AccessToken    []byte
+	ReplaySlots    uint32
+	MaxFrame       uint32
+	DialTimeout    time.Duration
 	// CancelDrainTimeout bounds how long an interrupted caller waits for the
 	// authority to return the exact canceled-or-completed outcome.
 	CancelDrainTimeout time.Duration
@@ -314,6 +320,9 @@ func dialClient(ctx context.Context, cfg ClientConfig) (_ *Client, resultErr err
 			resultErr = &AttachError{Disposition: c.attachDisposition, Cause: resultErr}
 		}
 	}()
+	if cfg.LifecycleRetry && (cfg.DispatchFence == nil || cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX) {
+		return nil, errors.New("authorityrpc: pending lifecycle requires a Linux dispatch owner")
+	}
 	if cfg.Address == "" || cfg.TLS == nil || cfg.VolumeID == "" || len(cfg.AccessToken) == 0 ||
 		cfg.ReplaySlots == 0 || cfg.MaxFrame == 0 || cfg.MaxInFlight <= 0 || cfg.DialTimeout <= 0 || cfg.CancelDrainTimeout <= 0 {
 		return nil, errors.New("authorityrpc: complete client configuration is required")
@@ -432,9 +441,33 @@ func recoveryFailure(phase string, err error) error {
 }
 
 func (c *Client) attachAndActivate(ctx context.Context) error {
+	// Bootstrap owns its raw handshakes as one applying interval. Waiting on
+	// the startup fence precedes every network timeout and possible Attach
+	// commitment; Park cannot acknowledge until this interval settles.
+	if c.cfg.DispatchFence != nil {
+		done, err := c.cfg.DispatchFence.begin(ctx, true)
+		if err != nil {
+			return err
+		}
+		defer done()
+	}
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
+	if c.cfg.LifecycleRetry {
+		handshakeCancel()
+		handshakeCtx = ctx
+		handshakeCancel = func() {}
+	}
 	defer handshakeCancel()
 	data, control, err := c.openInitialPair(handshakeCtx)
+	if c.cfg.LifecycleRetry {
+		backoff := 100 * time.Millisecond
+		for err != nil && TransientTransport(err) && handshakeCtx.Err() == nil {
+			if waitErr := waitLifecycleRetry(handshakeCtx, &backoff); waitErr != nil {
+				return waitErr
+			}
+			data, control, err = c.openInitialPair(handshakeCtx)
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -519,6 +552,11 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 			// cannot cancel reconciliation or turn it into AbortAttach.
 			recoveryCtx, recoveryCancel = context.WithTimeout(context.Background(), c.cfg.CancelDrainTimeout)
 			defer recoveryCancel()
+			if c.cfg.LifecycleRetry {
+				recoveryCancel()
+				recoveryCtx = ctx
+				recoveryCancel = func() {}
+			}
 		}
 		data, control, err = c.resumeRawPairForActivation(recoveryCtx)
 		if err != nil {
@@ -1634,6 +1672,23 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 			return nil, nil, false, err
 		}
 	}
+	var endIO func()
+	if c.cfg.DispatchFence != nil && request.GetCancel() == nil && request.GetDetach() == nil && request.GetTerminalDeliveryReceipt() == nil {
+		endIO, err = c.cfg.DispatchFence.begin(ctx, false)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		defer func() {
+			if endIO != nil {
+				endIO()
+			}
+		}()
+		if timeout, _ := ctx.Value(dispatchTimeoutKey{}).(time.Duration); timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+	}
 	// Request IDs are physical-connection envelopes, not replay identities. A
 	// same-session mutation retry keeps its Mutation slot/sequence and body but
 	// must take a fresh ID on the replacement socket; another caller may already
@@ -1659,6 +1714,11 @@ func (c *Client) dispatchFrame(ctx context.Context, request *authoritypb.Request
 
 	submitted = true
 	err = c.writeRequest(ctx, transport, conn, request)
+	if endIO != nil {
+		endIO()
+		endIO = nil
+	}
+
 	if err != nil {
 		c.failConnection(transport, conn, ErrTransportUncertain)
 	}
@@ -1862,23 +1922,45 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 			c.releaseInvalidIncarnation.Store(body.GetIncarnation())
 		}()
 	}
-	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
-	if !errors.Is(err, ErrTransportUncertain) {
-		return response, releaseFrame, err
+	if c.cfg.DispatchFence != nil {
+		releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
+		if ownerErr != nil {
+			return nil, nil, ownerErr
+		}
+		defer releaseOwner()
 	}
-	if releaseFrame != nil {
-		releaseFrame()
-		releaseFrame = nil
+	for {
+		response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
+		if !errors.Is(err, ErrTransportUncertain) {
+			return response, releaseFrame, err
+		}
+		if releaseFrame != nil {
+			releaseFrame()
+			releaseFrame = nil
+		}
+		role, roleErr := roleForRequest(request)
+		if roleErr != nil {
+			return nil, nil, syscall.EINVAL
+		}
+		for {
+			reconnectErr := c.reconnectTransport(ctx, role)
+			if reconnectErr == nil {
+				break
+			}
+			// Managed logical owners outlive individual establishment attempts,
+			// including a park longer than the network retry budget.
+			if c.cfg.DispatchFence == nil || !TransientTransport(reconnectErr) || ctx.Err() != nil {
+				return nil, nil, reconnectErr
+			}
+			if err := waitTransportRetry(ctx); err != nil {
+				return nil, nil, err
+			}
+		}
+		if c.cfg.DispatchFence == nil {
+			response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
+			return response, releaseFrame, err
+		}
 	}
-	role, roleErr := roleForRequest(request)
-	if roleErr != nil {
-		return nil, nil, syscall.EINVAL
-	}
-	if err := c.reconnectTransport(ctx, role); err != nil {
-		return nil, nil, err
-	}
-	response, releaseFrame, _, err = c.dispatchOwnedFrame(ctx, request)
-	return response, releaseFrame, err
 }
 
 // CallIdempotentRetained retains the response until the frontend physically
@@ -2040,6 +2122,16 @@ func (c *Client) CallMutationWithIdentityRetained(
 	}()
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
+	}
+	// Readiness waiting is still buffer/epoch-owned. Registration under the
+	// fence is the handoff: Park now joins this applying owner, and no caller
+	// cancellation check can discard its identity/body before session retention.
+	if c.cfg.DispatchFence != nil {
+		releaseOwner, ownerErr := c.cfg.DispatchFence.own(ctx, request)
+		if ownerErr != nil {
+			return nil, nil, ownerErr
+		}
+		defer releaseOwner()
 	}
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
 		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))

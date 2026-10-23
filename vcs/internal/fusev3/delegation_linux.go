@@ -182,7 +182,8 @@ type delegationManager struct {
 	byID              map[writeback.Identity]*delegationState
 	// cacheOwners mirrors live grants, independently of idle-state collection.
 	// Shared cache admission runs under raw.mu and cannot take state locks.
-	cacheOwners sync.Map // writeback.Identity -> *delegationState
+	cacheOwners  sync.Map // writeback.Identity -> *delegationState
+	acceptedCuts sync.Map // *handleAcceptedCut; retired epochs release description references
 	// identityLoss retains the latest loss ticket after an epoch-scoped Buffer
 	// is replaced. Existing handles compare against it once; newly registered
 	// handles start at the retained value.
@@ -875,7 +876,7 @@ func (m *delegationManager) Size(identity []byte, base int64) (int64, error) {
 	defer m.epoch.RUnlock()
 	s := m.retainState(id, false)
 	defer m.releaseState(s)
-	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+	if s == nil || !delegationStateOwned(s) {
 		return base, nil
 	}
 	return m.buf.Size(id, base), nil
@@ -890,7 +891,7 @@ func (m *delegationManager) OverlayAttributes(identity []byte, base writeback.At
 	defer m.epoch.RUnlock()
 	s := m.retainState(id, false)
 	defer m.releaseState(s)
-	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+	if s == nil || !delegationStateOwned(s) {
 		return base, nil
 	}
 	return m.buf.OverlayAttributes(id, base), nil
@@ -1701,6 +1702,7 @@ func (m *delegationManager) retireTimedOutControl(s *delegationState, ref *autho
 	matched := sameDelegation(s.ref, ref)
 	var report writeback.DropReport
 	if matched {
+		m.workspaceGrantAbandoned()
 		s.clearGrantLocked()
 		report = m.buf.Drop(s.identity, "delegation control expired before its transition")
 		s.meta.Lock()
@@ -1731,7 +1733,37 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 	if s.retire != nil {
 		return s.retire, nil
 	}
-	r, err := buf.BeginRetire(ctx, &s.identity)
+	begin := buf.BeginRetire
+	if registry := m.subscription; registry != nil && registry.mount != nil && registry.mount.workspace != nil {
+		registry.mu.RLock()
+		p := registry.workspaceDrain
+		now := registry.config.clock.Now()
+		registry.mu.RUnlock()
+		if p != nil && p.manager == m && p.buffer == buf && !now.Before(p.deadline) {
+			// No release request was submitted. The elapsed cut belongs to
+			// lifecycle fencing, not descriptor-unknown terminal policy.
+			return nil, delegationCleanupError{cause: authorityrpc.ErrSubscriptionReset, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+		}
+		if p != nil && p.manager == m && p.allows(buf, m.inc.Load(), now) {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, p.deadline.Sub(now))
+			defer cancel()
+			begin = buf.BeginDrainRetire
+		}
+	}
+	r, err := begin(ctx, &s.identity)
+	if err == writeback.ErrClosed && m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspace != nil {
+		m.subscription.mu.RLock()
+		p := m.subscription.workspaceDrain
+		closing := p != nil && p.manager == m && p.buffer == buf
+		m.subscription.mu.RUnlock()
+		if closing {
+			// Drain capture may overtake the initial capability sample before
+			// BeginRetire observes fenced admission. No release was submitted;
+			// the lifecycle owns this cut and descriptor cleanup stays retained.
+			return nil, delegationCleanupError{cause: authorityrpc.ErrSubscriptionReset, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+		}
+	}
 	if err == nil {
 		s.retire = r
 	}
@@ -1781,12 +1813,12 @@ func (m *delegationManager) SetDropReporter(reporter func(writeback.DropReport))
 
 func (m *delegationManager) reportDrop(report writeback.DropReport) {
 	log.Printf("portablefs: dropped delegated writeback identity=%x bytes=%d entries=%d loss_sequence=%d errno=%d reason=%q", report.Identity, report.Bytes, report.Entries, report.LossSequence, report.Errno, report.Reason)
-	// Drop also advances an identity ticket when an uncertain operation loses a
-	// clean delegation. That is observable by handles, but it is not a retained
-	// writeback loss and must not produce a zero-entry data-loss report.
+	// The buffer observer records every completion ticket in the lifecycle
+	// ledger. This data-loss callback counts only forfeited retained records.
 	if report.Entries == 0 {
 		return
 	}
+
 	m.hookMu.RLock()
 	reporter := m.dropReporter
 	m.hookMu.RUnlock()
@@ -1836,6 +1868,7 @@ func (m *delegationManager) loseDelegationIfCurrent(s *delegationState, ref *aut
 // Releasing admission between them would let a successor install and lose its
 // writes to this grant's drop. A flusher cannot BeginRetire: it would join itself.
 func (m *delegationManager) loseDelegationLocked(s *delegationState, reason string) writeback.DropReport {
+	m.workspaceGrantAbandoned()
 	s.clearGrantLocked()
 	report := m.buf.Drop(s.identity, reason)
 	s.meta.Lock()
@@ -1857,6 +1890,7 @@ func (m *delegationManager) failCleanupIdentity(identity []byte, reason string) 
 		return
 	}
 	s.admission.Lock()
+	m.workspaceGrantAbandoned()
 	s.clearGrantLocked()
 	var report writeback.DropReport
 	dropped := false
@@ -2405,7 +2439,13 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	// Grant retirement belongs to the cache incarnation; descriptor CLOSE and
 	// its replay identity belong to the session. Only the preparation is bounded
 	// by the cache-work deadline and interrupted by a cold reset.
-	prepareCtx, stopPrepare := context.WithTimeout(callCtx, m.timeout)
+	prepareCtx, stopPrepare := context.WithCancel(callCtx)
+	if m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspace != nil {
+		prepareCtx = authorityrpc.WithDispatchTimeout(prepareCtx, m.timeout)
+	} else {
+		stopPrepare()
+		prepareCtx, stopPrepare = context.WithTimeout(callCtx, m.timeout)
+	}
 	stopEpochCancel := context.AfterFunc(epochCtx, stopPrepare)
 	defer func() { stopEpochCancel(); stopPrepare() }()
 	groups := make([]*delegationReleaseGroup, 0, len(groupsByID))
@@ -2416,6 +2456,9 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	if err != nil {
 		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
 			return m.closeResetOutcome(sessionSerial)
+		}
+		if classified, ok := err.(cleanupClassified); ok && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return err
 		}
 		return m.unknownCloseOutcome(err)
 	}
@@ -2519,8 +2562,10 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	for {
 		m.epoch.RLock()
 		old = m.buf
-		old.FenceAdmissions()
+		// Cancellation records the old epoch's disposition before local
+		// admission can return ErrClosed to its retained cleanup owners.
 		m.epochEnd()
+		old.FenceAdmissions()
 		m.epoch.RUnlock()
 		m.epoch.Lock()
 		if m.buf == old {
@@ -2547,17 +2592,27 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	m.durabilityMu.Lock()
 	durable := m.durableHigh
 	m.durabilityMu.Unlock()
+	// A completing flush holds state admission while it retires receipts
+	// through the manager index. Never hold that index across state locks.
 	m.mu.Lock()
+	states := make([]*delegationState, 0, len(m.byID))
 	for _, s := range m.byID {
+		s.users.Add(1)
+		states = append(states, s)
+	}
+	m.mu.Unlock()
+	for _, s := range states {
 		s.meta.Lock()
 		atRisk := s.dirty && (s.appliedCut < s.acceptedCut || s.applied == 0 || s.applied > durable)
 		if atRisk {
 			m.reportDrop(old.Drop(s.identity, reason))
 		}
+		s.meta.Unlock()
+		m.mu.Lock()
 		if loss := max(m.identityLoss[s.identity], old.IdentityLoss(s.identity)); loss != 0 && m.observers[s.identity] != 0 {
 			m.identityLoss[s.identity] = loss
 		}
-		s.meta.Unlock()
+		m.mu.Unlock()
 		s.admission.Lock()
 		s.setGrantLocked(nil)
 		s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
@@ -2565,7 +2620,9 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 		s.meta.Lock()
 		s.dirty = false
 		s.meta.Unlock()
+		m.releaseState(s)
 	}
+	m.mu.Lock()
 	loss := old.LossSequence()
 	m.byID = make(map[writeback.Identity]*delegationState)
 	m.retiredGrantFloor = 0
@@ -2574,6 +2631,18 @@ func (m *delegationManager) resetBuffer(reason string, sessionChanged bool) {
 	m.retainedStates = make(map[*delegationState]struct{})
 	m.mu.Unlock()
 	old.Stop()
+	m.acceptedCuts.Range(func(key, value any) bool {
+		cut := key.(*handleAcceptedCut)
+		cut.mu.Lock()
+		if cut.buffer == old && old.Stats().Entries == 0 {
+			cut.buffer = nil
+			cut.sequence = 0
+			m.acceptedCuts.Delete(cut)
+		}
+		cut.mu.Unlock()
+		return true
+	})
+	_ = old.ReleaseStorage() // all retained records have a durable receipt or drop ticket
 	// An in-flight old-buffer callback may have looked up its state after the
 	// first reset while Stop was joining it. Discard that epoch-scoped residue
 	// only after every old callback is gone.
@@ -2640,5 +2709,19 @@ func (m *delegationManager) FlushCycleCompleted(ctx context.Context, id writebac
 	defer cancel()
 	if err := invalidate(ctx, id[:]); err != nil && ref != nil {
 		m.loseDelegationIfCurrent(state, ref, "holder flush-cycle invalidation failed")
+	}
+}
+
+// RecordWritebackDrop runs in authoritative buffer-ticket order. Its CAS-only
+// bounded ledger performs no filesystem operation, RPC or lock acquisition.
+func (m *delegationManager) RecordWritebackDrop(report writeback.DropReport) {
+	if m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspaceLifecycle != nil {
+		m.subscription.mount.workspaceLifecycle.recordDrop(report)
+	}
+}
+
+func (m *delegationManager) workspaceGrantAbandoned() {
+	if m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspaceLifecycle != nil {
+		m.subscription.mount.workspaceLifecycle.abandonGrant()
 	}
 }

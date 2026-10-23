@@ -95,6 +95,7 @@ func (t wallSubscriptionTimer) C() <-chan time.Time { return t.timer.C }
 func (t wallSubscriptionTimer) Stop() bool          { return t.timer.Stop() }
 
 type subscriptionConfig struct {
+	beforeRecoveryProof func(install bool)
 	// Deterministic test schedule at the last proof check/local-store boundary.
 	beforeWorkspaceInstall func()
 	clock                  subscriptionClock
@@ -118,23 +119,35 @@ type subscriptionRegistry struct {
 	control subscriptionControlHandler
 	config  subscriptionConfig
 
-	mu              sync.RWMutex
-	workspaceProof  *workspaceadmission.RecoveryPermit
-	workspaceDrain  *workspaceDrainPermit
-	active          bool
-	paused          bool
-	incarnation     uint64
-	generation      uint64
-	watermark       uint64
-	horizon         time.Time
-	cacheUntil      time.Time
-	delegated       map[publicationIdentity]uint64
-	stale           map[publicationIdentity]struct{}
-	coordinates     map[publicationCoordinate]subscriptionCoordinateState
-	generationFloor uint64
-	versionFloor    uint64
-	lastChangeSeen  uint64
-	lastChangeAck   uint64
+	mu                     sync.RWMutex
+	workspaceProof         *workspaceadmission.RecoveryPermit
+	workspaceDrain         *workspaceDrainPermit
+	workspaceOwned         bool
+	subscribeCancel        context.CancelFunc
+	subscribeDone          chan struct{}
+	renewCancel            context.CancelFunc
+	renewDone              chan struct{}
+	controlCancel          context.CancelFunc
+	pollCancel             context.CancelFunc
+	pollDone               chan struct{}
+	controlQueue           *subscriptionChangeQueue
+	workspaceFailure       error
+	workspaceReset         bool
+	ordinaryWithdrawalDone chan struct{}
+	active                 bool
+	paused                 bool
+	incarnation            uint64
+	generation             uint64
+	watermark              uint64
+	horizon                time.Time
+	cacheUntil             time.Time
+	delegated              map[publicationIdentity]uint64
+	stale                  map[publicationIdentity]struct{}
+	coordinates            map[publicationCoordinate]subscriptionCoordinateState
+	generationFloor        uint64
+	versionFloor           uint64
+	lastChangeSeen         uint64
+	lastChangeAck          uint64
 
 	progressChanged chan struct{}
 	horizonChanged  chan struct{}
@@ -294,6 +307,11 @@ func (s *subscriptionRegistry) signalHorizonChangedLocked() {
 
 func (s *subscriptionRegistry) deactivate() {
 	s.mu.Lock()
+	if s.workspaceOwned {
+		s.workspaceReset = true
+		s.mu.Unlock()
+		return
+	}
 	if s.active {
 		s.active = false
 		s.generation++
@@ -394,7 +412,20 @@ func (s *subscriptionRegistry) retry(ctx context.Context, deadline time.Time, op
 }
 
 func (s *subscriptionRegistry) invalidateAll(ctx context.Context) error {
-	s.deactivate()
+	s.mu.Lock()
+	if s.workspaceOwned {
+		s.mu.Unlock()
+		return errSubscriptionPaused
+	}
+	if s.active {
+		s.active = false
+		s.generation++
+		s.signalHorizonChangedLocked()
+	}
+	done := make(chan struct{})
+	s.ordinaryWithdrawalDone = done
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.ordinaryWithdrawalDone = nil; close(done); s.mu.Unlock() }()
 	deadline := s.config.clock.Now().Add(s.config.withdrawalLead)
 	withdrawalCtx, cancel := context.WithTimeout(ctx, s.config.withdrawalLead)
 	defer cancel()
@@ -405,11 +436,34 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	if s == nil || s.rpc == nil {
 		return errors.New("fusev3: subscription transport is required")
 	}
+	s.mu.Lock()
+	_, recovery := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
+	if s.subscribeDone != nil || s.workspaceOwned && !recovery {
+		s.mu.Unlock()
+		return errSubscriptionPaused
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.subscribeCancel, s.subscribeDone = cancel, done
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		s.subscribeCancel, s.subscribeDone = nil, nil
+		close(done)
+		s.mu.Unlock()
+	}()
 	var proof *workspaceadmission.RecoveryPermit
 	if s.mount != nil && s.mount.workspace != nil {
+		if s.config.beforeRecoveryProof != nil {
+			s.config.beforeRecoveryProof(false)
+		}
 		p, ok := ctx.Value(workspaceRecoveryKey{}).(workspaceadmission.RecoveryPermit)
-		if !ok || s.mount.workspace.Recover(p) != nil {
+		if !ok {
 			return workspaceadmission.ErrClosed
+		}
+		if err := s.mount.workspace.Recover(p); err != nil {
+			return err
 		}
 		proof = &p
 	}
@@ -419,7 +473,11 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	if paused {
 		return errSubscriptionPaused
 	}
-	if err := s.invalidateAll(ctx); err != nil {
+	withdraw := s.invalidateAll
+	if proof != nil {
+		withdraw = s.config.invalidator.InvalidateAllCaches
+	}
+	if err := withdraw(ctx); err != nil {
 		return fmt.Errorf("fusev3: cold subscription cache withdrawal: %w", err)
 	}
 	// A cold Subscribe asserts that this client has abandoned the preceding
@@ -461,8 +519,11 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			return fmt.Errorf("fusev3: subscribe page %d: %w", page, err)
 		}
 		if reply == nil || reply.GetIncarnation() == 0 || reply.GetHorizonNanos() == 0 ||
-			len(reply.GetSnapshotId()) == 0 || !pageHorizon.After(s.config.clock.Now()) {
+			len(reply.GetSnapshotId()) == 0 {
 			return fmt.Errorf("%w: malformed page %d", errSubscriptionInvalid, page)
+		}
+		if !pageHorizon.After(s.config.clock.Now()) {
+			return fmt.Errorf("%w: aged page %d", errSubscriptionExpired, page)
 		}
 		if page == 0 {
 			watermark, incarnation, horizonNanos = reply.GetWatermark(), reply.GetIncarnation(), reply.GetHorizonNanos()
@@ -491,7 +552,20 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				set[identity] = 0
 			}
 			s.mu.Lock()
-			if s.paused || proof != nil && s.mount.workspace.Recover(*proof) != nil {
+			if err := ctx.Err(); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			if proof != nil {
+				if s.config.beforeRecoveryProof != nil {
+					s.config.beforeRecoveryProof(true)
+				}
+				if err := s.mount.workspace.Recover(*proof); err != nil {
+					s.mu.Unlock()
+					return err
+				}
+			}
+			if s.paused || s.workspaceOwned && proof == nil {
 				s.mu.Unlock()
 				return errSubscriptionPaused
 			}
@@ -499,6 +573,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				s.config.beforeWorkspaceInstall()
 			}
 			s.workspaceDrain = nil
+			s.workspaceReset = false
 			s.workspaceProof = proof
 			s.active = true
 			s.incarnation = incarnation
@@ -569,7 +644,7 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 			return ctx.Err()
 		}
 		s.mu.RLock()
-		paused, pauseChanged := s.paused, s.pauseChanged
+		paused, pauseChanged := s.paused || s.workspaceOwned, s.pauseChanged
 		s.mu.RUnlock()
 		if paused {
 			select {
@@ -603,11 +678,15 @@ func (s *subscriptionRegistry) run(ctx context.Context) error {
 
 func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 	s.mu.Lock()
-	incarnation, active := s.incarnation, s.active && !s.paused
+	incarnation, active := s.incarnation, s.active && !s.paused && !s.workspaceOwned
 	if !active || incarnation == 0 {
 		s.mu.Unlock()
 		return errSubscriptionExpired
 	}
+	ctx, cancel := context.WithCancel(parent)
+	renewalCtx, renewalCancel := context.WithCancel(ctx)
+	renewalDone := make(chan struct{})
+	s.controlCancel, s.renewCancel, s.renewDone = cancel, renewalCancel, renewalDone
 	done := make(chan struct{})
 	s.serveDone = done
 	s.mu.Unlock()
@@ -618,16 +697,37 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 		}
 		s.mu.Unlock()
 	}()
-	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	defer renewalCancel()
 	failures := make(chan error, 4)
 	changeQueue := newSubscriptionChangeQueue()
+	changeQueue.controlContext = ctx
+	pollCtx, pollCancel := context.WithCancel(ctx)
+	defer pollCancel()
+	pollDone := make(chan struct{})
+	s.mu.Lock()
+	s.pollCancel, s.pollDone, s.controlQueue = pollCancel, pollDone, changeQueue
+	s.mu.Unlock()
 	var workers sync.WaitGroup
-	start := func(run func(context.Context) error) {
+	start := func(workerCtx context.Context, run func(context.Context) error) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			if err := run(ctx); err != nil && ctx.Err() == nil {
+			if err := run(workerCtx); err != nil {
+				disposition := authorityrpc.LifecycleCompletion(workerCtx, err)
+				reset := subscriptionResetAttempt(err)
+				independent := disposition.Disposition == authorityrpc.LifecycleFailed && !reset
+				s.mu.Lock()
+				if independent {
+					s.workspaceFailure = errors.Join(s.workspaceFailure, &authorityrpc.LifecycleIndependentFailure{Err: disposition.Err})
+				}
+				if reset {
+					s.workspaceReset = true
+				}
+				s.mu.Unlock()
+				if !independent && workerCtx.Err() != nil {
+					return
+				}
 				select {
 				case failures <- err:
 				default:
@@ -635,20 +735,29 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 			}
 		}()
 	}
-	start(func(ctx context.Context) error { return s.pollLoop(ctx, incarnation, changeQueue) })
-	start(func(ctx context.Context) error { return s.changeLoop(ctx, incarnation, changeQueue) })
-	start(func(ctx context.Context) error { return s.renewLoop(ctx, incarnation) })
-	start(func(ctx context.Context) error { return s.horizonLoop(ctx, incarnation) })
+	start(pollCtx, func(ctx context.Context) error {
+		defer close(pollDone)
+		return s.pollLoop(ctx, incarnation, changeQueue)
+	})
+	start(ctx, func(ctx context.Context) error { return s.changeLoop(ctx, incarnation, changeQueue) })
+	start(renewalCtx, func(ctx context.Context) error { defer close(renewalDone); return s.renewLoop(ctx, incarnation) })
+	start(ctx, func(ctx context.Context) error { return s.horizonLoop(ctx, incarnation) })
 
 	var result error
 	select {
 	case result = <-failures:
-	case <-parent.Done():
-		result = parent.Err()
+	case <-ctx.Done():
+		result = ctx.Err()
 	}
 	cancel()
 	changeQueue.close()
 	workers.Wait()
+	s.mu.RLock()
+	owned := s.workspaceOwned
+	s.mu.RUnlock()
+	if owned {
+		return result
+	}
 	if parent.Err() != nil {
 		return parent.Err()
 	}
@@ -659,13 +768,16 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 }
 
 type subscriptionChangeQueue struct {
-	mu        sync.Mutex
-	wake      chan struct{}
-	closed    bool
-	head      int
-	items     []subscriptionChangeWork
-	completed uint64
-	finished  map[uint64]struct{}
+	controlContext context.Context
+	accepted       uint64
+	progress       chan struct{}
+	mu             sync.Mutex
+	wake           chan struct{}
+	closed         bool
+	head           int
+	items          []subscriptionChangeWork
+	completed      uint64
+	finished       map[uint64]struct{}
 }
 
 type subscriptionChangeWork struct {
@@ -683,6 +795,10 @@ func (q *subscriptionChangeQueue) complete(sequence uint64) {
 		q.finished = make(map[uint64]struct{})
 	}
 	q.finished[sequence] = struct{}{}
+	if q.progress != nil {
+		close(q.progress)
+		q.progress = nil
+	}
 	for {
 		if _, ok := q.finished[q.completed+1]; !ok {
 			break
@@ -766,6 +882,11 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
 				return err
 			}
+			// Semantic, local and authority errors remain independent even
+			// when the lifecycle cancels this poll before it returns.
+			if !authorityrpc.TransientTransport(err) {
+				return err
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -777,6 +898,9 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 		if event == nil || event.GetIncarnation() != incarnation || event.GetSequence() != after+1 || event.GetEvent() == nil {
 			return fmt.Errorf("%w: malformed CONTROL event after %d", errSubscriptionInvalid, after)
 		}
+		changes.mu.Lock()
+		changes.accepted = event.GetSequence()
+		changes.mu.Unlock()
 		if batch := event.GetChangeBatch(); batch != nil {
 			if batch.GetIncarnation() != incarnation || len(batch.GetEntries()) == 0 {
 				return fmt.Errorf("%w: malformed change batch at event %d", errSubscriptionInvalid, event.GetSequence())
@@ -790,12 +914,16 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 		} else if s.control == nil {
 			return fmt.Errorf("%w: delegation event has no handler", errSubscriptionInvalid)
 		} else {
-			done := s.control.HandleControlEvent(ctx, event)
+			handlerContext := changes.controlContext
+			if handlerContext == nil {
+				handlerContext = ctx
+			}
+			done := s.control.HandleControlEvent(handlerContext, event)
 			go func(sequence uint64) {
 				select {
 				case <-done:
 					changes.complete(sequence)
-				case <-ctx.Done():
+				case <-handlerContext.Done():
 				}
 			}(event.GetSequence())
 		}
@@ -990,6 +1118,9 @@ func (s *subscriptionRegistry) markChangeStale(coordinate publicationCoordinate)
 func (s *subscriptionRegistry) ackChanges(ctx context.Context, incarnation, position uint64) error {
 	s.mu.RLock()
 	deadline := s.cacheUntil
+	if s.workspaceDrain != nil {
+		deadline = s.workspaceDrain.deadline
+	}
 	s.mu.RUnlock()
 	// The horizon is the real bound. Renewal, polling and KeepAlive supply
 	// readiness after a failed CONTROL call; a 10 ms timer supplies none.
@@ -1033,7 +1164,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 		}
 		deadline, err := s.rpc.RenewSubscription(ctx, incarnation)
 		if err != nil {
-			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+			if errors.Is(err, authorityrpc.ErrSubscriptionReset) || !authorityrpc.TransientTransport(err) {
 				return err
 			}
 			continue
@@ -1393,10 +1524,19 @@ func (s *subscriptionRegistry) controlLiveLocked() bool {
 	if s.mount == nil || s.mount.workspace == nil {
 		return true
 	}
-	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
+	// Installation bound this proof to this reader and incarnation. Closing
+	// serving never revokes the old CONTROL capability before its fixed
+	// conservative horizon; takeover may only shorten it with workspaceDrain.
+	return s.workspaceProof != nil
 }
 
 // A drain may finish the old CONTROL cut, but may not extend its exclusion.
 func (s *subscriptionRegistry) renewalLiveLocked() bool {
-	return s.workspaceDrain == nil && s.controlLiveLocked()
+	if s.workspaceOwned || s.workspaceDrain != nil || !s.controlLiveLocked() {
+		return false
+	}
+	if s.mount == nil || s.mount.workspace == nil {
+		return true
+	}
+	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
 }

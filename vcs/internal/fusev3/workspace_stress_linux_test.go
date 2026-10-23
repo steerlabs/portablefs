@@ -167,7 +167,7 @@ func TestReviewGateChurnStress(t *testing.T) {
 			t.Logf("first revocation observed after churn %d", firstRevoke)
 			if gated {
 				g.Close(1)
-				cut := f.mount.managed.captureWorkspaceReplies()
+				cut := f.mount.workspaceFS().captureWorkspaceReplies()
 				close(stop)
 				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()

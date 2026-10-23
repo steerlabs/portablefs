@@ -550,6 +550,11 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e := s.mounts[control.MountKey(id)]
+	if e != nil {
+		if err := s.mergeLossLocked(e, loss); err != nil {
+			return err
+		}
+	}
 	if e == nil || s.phase != "running" || reason == "" {
 		return refused("terminal unknown mount, phase or missing reason")
 	}

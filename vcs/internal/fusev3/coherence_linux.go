@@ -191,7 +191,7 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 }
 func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Context, func(), fuse.Status) {
 	r.mount.epochMu.RLock()
-	ctx, cancel := context.WithTimeout(r.opContext(), r.requestTimeout)
+	ctx, cancel := r.mount.operationContext(r.opContext(), r.requestTimeout)
 	callback := &mutationCallback{mount: r.mount, operationID: unique}
 	err := r.transferReplyPublication(unique, serving, &callback.publication)
 	if err != nil {

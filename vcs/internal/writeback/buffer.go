@@ -527,6 +527,8 @@ func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) Dro
 			barrier.errno = errno
 		}
 	}
+	// A forfeited grant retains its conservative completion ticket even when
+	// its accepted tail has drained. Every ticket must reach the loss observer.
 	b.loss++
 	f.lastLoss = b.loss
 	f.lastErrno, b.lastErrno = errno, errno
@@ -557,6 +559,9 @@ func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) Dro
 	delete(b.active, id)
 	f.generation++
 	b.signal()
+	if observer, ok := b.flusher.(DropObserver); ok {
+		observer.RecordWritebackDrop(report)
+	}
 	return report
 }
 func (b *Buffer) release(r *record) {
@@ -599,6 +604,50 @@ func (b *Buffer) Stop() {
 	b.cancel()
 	b.Start()
 	<-b.done
+}
+
+// StopContext bounds only the join. An assigned session-owned flush can outlive
+// cancellation; its scheduler and records remain owned until done closes.
+func (b *Buffer) StopContext(ctx context.Context) error {
+	b.FenceAdmissions()
+	b.cancel()
+	b.Start()
+	select {
+	case <-b.done:
+		return nil
+	default:
+	}
+	select {
+	case <-b.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ReleaseStorage retires the arenas after the epoch owner joined every flush
+// and resolved every record. Lightweight loss facts remain for old descriptions.
+func (b *Buffer) ReleaseStorage() error {
+	select {
+	case <-b.done:
+	default:
+		return ErrInvalid
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.count != 0 {
+		return ErrInvalid
+	}
+	for _, f := range b.files {
+		if f.flushing || f.flushUsers != 0 {
+			return ErrInvalid
+		}
+		f.extents.root = nil
+		f.scheduled = false
+	}
+	b.records, b.free, b.appliedHeap, b.visibleHeap = nil, nil, nil, nil
+	b.pool = extentPool{}
+	return nil
 }
 
 type backgroundFlush struct {
@@ -717,13 +766,23 @@ type Retirement struct {
 }
 
 func (b *Buffer) BeginRetire(ctx context.Context, id *Identity) (*Retirement, error) {
+	return b.beginRetire(ctx, id, false)
+}
+
+// BeginDrainRetire settles a captured ownership interval after admissions were
+// fenced. It cannot reopen writes, and a canceled scheduler refuses new cuts.
+func (b *Buffer) BeginDrainRetire(ctx context.Context, id *Identity) (*Retirement, error) {
+	b.FenceAdmissions()
+	return b.beginRetire(ctx, id, true)
+}
+func (b *Buffer) beginRetire(ctx context.Context, id *Identity, drain bool) (*Retirement, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if b.stopped {
+		if b.stopped && !drain || drain && b.ctx.Err() != nil {
 			return nil, ErrClosed
 		}
 		busy := b.retiringAll

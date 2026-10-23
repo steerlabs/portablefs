@@ -74,6 +74,9 @@ func TestFullDelegationFlushSamplesLossAndRetirementAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := mount.delegations.buf.Write(t.Context(), id, 0, []byte("accepted")); err != nil {
+		t.Fatal(err)
+	}
 	mount.delegations.buf.Drop(id, "recall failure after initial FLUSH sample")
 	if local, errno := handle.flushLocally(); !local || errno != syscall.EIO {
 		t.Fatalf("local flush after loss = (%v, %v), want (true, EIO)", local, errno)

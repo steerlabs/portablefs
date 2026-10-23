@@ -180,6 +180,9 @@ func (r *Renewer) Park(ctx context.Context) error {
 	}
 	return nil
 }
+
+var ErrPermitObsolete = errors.New("renewal resume requires a current permit")
+
 func (r *Renewer) Resume(p Permit) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -187,7 +190,7 @@ func (r *Renewer) Resume(p Permit) error {
 		return r.terminal
 	}
 	if r.Managed && (r.CheckPermit == nil || !r.CheckPermit(p)) {
-		return errors.New("renewal resume requires a current permit")
+		return ErrPermitObsolete
 	}
 	if r.parked && r.attemptDone != nil {
 		return errors.New("renewal resume waits for the parked installation owner")
@@ -596,3 +599,7 @@ func safeCutoff(authorizedAt, deadline time.Time, minimum time.Duration) time.Ti
 	}
 	return deadline.Add(-margin)
 }
+
+// Failure exposes the retained terminal disposition to the lifecycle owner.
+// Pending readiness by itself is never evidence that recovery should end.
+func (r *Renewer) Failure() error { r.mu.Lock(); defer r.mu.Unlock(); return r.terminal }

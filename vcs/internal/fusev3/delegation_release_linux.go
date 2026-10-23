@@ -258,6 +258,7 @@ func (b *delegationReleaseBatch) applyAndRelease(ctx context.Context) error {
 		if !m.epochCurrent(b.epochSerial, b.buffer) {
 			return writeback.ErrLost
 		}
+		m.workspaceGrantAbandoned()
 		m.SetIncarnation(0)
 		if err == nil {
 			err = errors.New("fusev3: delegation release has no valid ownership outcome")

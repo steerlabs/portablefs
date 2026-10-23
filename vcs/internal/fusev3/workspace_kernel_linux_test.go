@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -25,8 +26,14 @@ import (
 // and kernel frontend run under the provisioned unprivileged service identity.
 // This qualifies the gate on an ordinary mount, not the future workspace driver.
 func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
+	runWorkspaceKernelParent(t, workspaceKernelChild)
+}
+func TestKernelWorkspaceControlledPause(t *testing.T) {
+	runWorkspaceKernelParent(t, workspaceKernelPauseChild)
+}
+func runWorkspaceKernelParent(t *testing.T, child func(*testing.T)) {
 	if os.Getenv("PFS_WORKSPACE_KERNEL_CHILD") == "1" {
-		workspaceKernelChild(t)
+		child(t)
 		return
 	}
 	if os.Getenv(envFUSE) != "1" || os.Getenv("PORTABLEFS_SERVICE_UID") == "" {
@@ -83,15 +90,15 @@ func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(target, "-test.run=^TestKernelWorkspaceGateAndOwnerLifetime$", "-test.timeout=2m")
+	cmd := exec.Command(target, "-test.run=^"+t.Name()+"$", "-test.timeout=2m", "-test.v")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}}
 	cmd.Env = append(os.Environ(), "PFS_WORKSPACE_KERNEL_CHILD=1", fmt.Sprintf("PFS_WORKSPACE_KERNEL_PID=%d", binding.SupervisorPID), fmt.Sprintf("PFS_WORKSPACE_KERNEL_START=%d", binding.SupervisorStart), envRequired+"=1")
 	cmd.ExtraFiles = files[:]
-	cmd.Stderr = os.Stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	cmd.Stderr = cmd.Stdout
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -103,17 +110,65 @@ func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
 	for _, f := range files {
 		_ = f.Close()
 	}
-	lines := bufio.NewScanner(stdout)
+	// Drain independently of the protocol, including subtest failures before a
+	// marker and cleanup failures after the final marker. Wait must follow EOF.
+	var outputMu sync.Mutex
+	var output []string
+	var scanErr error
+	changed, outputDone := make(chan struct{}, 1), make(chan struct{})
+	go func() {
+		defer close(outputDone)
+		lines := bufio.NewScanner(stdout)
+		lines.Buffer(make([]byte, 4096), 1<<20)
+		for lines.Scan() {
+			outputMu.Lock()
+			output = append(output, lines.Text())
+			outputMu.Unlock()
+			select {
+			case changed <- struct{}{}:
+			default:
+			}
+		}
+		scanErr = lines.Err()
+		if scanErr != nil {
+			_, _ = io.Copy(io.Discard, stdout)
+		}
+	}()
+	diagnostics := func() string {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		return strings.Join(output, "\n")
+	}
+	cursor := 0
 	expect := func(want string) {
 		t.Helper()
-		var diagnostics []string
-		for lines.Scan() {
-			if lines.Text() == want {
+		for {
+			outputMu.Lock()
+			found := false
+			for cursor < len(output) {
+				line := output[cursor]
+				cursor++
+				if line == want {
+					found = true
+					break
+				}
+			}
+			outputMu.Unlock()
+			if found {
 				return
 			}
-			diagnostics = append(diagnostics, lines.Text())
+			select {
+			case <-changed:
+			case <-outputDone:
+				// Consume any lines appended after the previous snapshot.
+				outputMu.Lock()
+				more := cursor < len(output)
+				outputMu.Unlock()
+				if !more {
+					t.Fatalf("kernel child did not reach %s (scanner: %v):\n%s", want, scanErr, diagnostics())
+				}
+			}
 		}
-		t.Fatalf("kernel child did not reach %s: %s", want, strings.Join(diagnostics, "\n"))
 	}
 
 	expect("prepared")
@@ -132,15 +187,40 @@ func TestKernelWorkspaceGateAndOwnerLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect("closed")
+	if t.Name() == "TestKernelWorkspaceControlledPause" {
+		if _, err := stdin.Write([]byte{'R'}); err != nil {
+			t.Fatal(err)
+		}
+		expect("reprepared")
+		p, err := g.Recovery(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = g.Prepared(p); err != nil {
+			t.Fatal(err)
+		}
+		if err = g.Open(1, p.Serial()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stdin.Write([]byte{'O'}); err != nil {
+			t.Fatal(err)
+		}
+		expect("resumed")
+	}
 	// Closing the sole writer requires no socket/control handler. Child teardown
 	// must prove its real connection is gone before reporting completion.
 	if err := g.Dispose(); err != nil {
 		t.Fatal(err)
 	}
 	expect("owner-exit")
+	<-outputDone
 	if err := cmd.Wait(); err != nil {
-		t.Fatal(err)
+		t.Fatalf("kernel child Wait: %v (scanner: %v):\n%s", err, scanErr, diagnostics())
 	}
+	if scanErr != nil {
+		t.Fatalf("kernel child output: %v:\n%s", scanErr, diagnostics())
+	}
+	t.Logf("kernel child output:\n%s", diagnostics())
 }
 
 func workspaceKernelChild(t *testing.T) {
@@ -161,7 +241,8 @@ func workspaceKernelChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, workspace: reader, workspaceRecovery: &proof})
+	revoked := make(chan RevocationReport, 1)
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, workspace: reader, workspaceRecovery: &proof, onRevoked: func(r RevocationReport) { revoked <- r }})
 	mounted.Store(f.mounts[0])
 	// Closed INIT and cold Subscribe must finish without serving permission.
 	if _, err := os.Stat(f.join(0, "missing")); !errors.Is(err, syscall.EIO) {
@@ -176,6 +257,7 @@ func workspaceKernelChild(t *testing.T) {
 		}
 	}
 	command('O')
+	opusPollHack(t, f.mountPath(0))
 	path := f.join(0, "data")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -222,5 +304,18 @@ func workspaceKernelChild(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("owner EOF stranded kernel connection")
 	}
+	waitWorkspaceKernelWithdrawal(t, revoked)
 	fmt.Println("owner-exit")
+}
+
+func waitWorkspaceKernelWithdrawal(t *testing.T, reports <-chan RevocationReport) {
+	t.Helper()
+	select {
+	case report := <-reports:
+		if !report.KernelStateWithdrawn {
+			t.Fatal("owner EOF did not withdraw kernel state", report)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("owner EOF did not report kernel withdrawal")
+	}
 }

@@ -2809,11 +2809,11 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
@@ -2914,11 +2914,11 @@ func (r *rawFileSystem) cancelBufferedRead(ctx context.Context, record *inodeRec
 func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
@@ -3019,11 +3019,11 @@ func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) 
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return nil, entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
@@ -3092,11 +3092,11 @@ func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byt
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if local != nil {
 		count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
@@ -3135,11 +3135,11 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
@@ -3175,17 +3175,17 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 			return
 		}
 	}
+	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
+	defer finish()
 	handle, ok := r.takeHandle(input.Fh, handleAuthorityFile)
 	if !ok {
 		return
 	}
 	defer r.unpin(handle.inode)
 	defer handle.file.endLossObservation()
-	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
-	if !lifecycle.Ok() {
-		return
-	}
-	defer finish()
 	// Epoch recovery retired this capability; closing it on the new session
 	// cannot release any old resource and must not revoke the recovered mount.
 	if handle.file.stale.Load() || handle.file.node.epochStale.Load() {
@@ -3209,11 +3209,11 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
@@ -3307,11 +3307,11 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
@@ -3415,11 +3415,11 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
@@ -3470,11 +3470,11 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	parent := r.acquire(input.NodeId)
 	if parent == nil {
@@ -3534,11 +3534,11 @@ func (r *rawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, nam
 func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name string, directory bool) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
@@ -3594,11 +3594,11 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	oldParent := r.acquire(input.NodeId)
 	if oldParent == nil {
@@ -3671,11 +3671,11 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	newParent := r.acquire(input.NodeId)
 	if newParent == nil {
@@ -3726,11 +3726,11 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointedTo, linkName string, out *fuse.EntryOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	parent := r.acquire(header.NodeId)
 	if parent == nil {
@@ -3777,11 +3777,11 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 func (r *rawFileSystem) Readlink(_ <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return nil, entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	record := r.acquire(header.NodeId)
 	if record == nil {
@@ -3811,11 +3811,11 @@ func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name 
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
@@ -3837,11 +3837,11 @@ func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
@@ -3862,11 +3862,11 @@ func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
@@ -3888,11 +3888,11 @@ func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, na
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
@@ -3920,11 +3920,11 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if record.graft {
 		handle, errno := r.graftReaddir(record)
@@ -3982,11 +3982,11 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
@@ -4036,11 +4036,11 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	held, handle := r.acquireDirHandle(input.Fh)
 	if handle == nil {
@@ -4140,11 +4140,11 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if r.grafts != nil {
 		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
@@ -4178,16 +4178,16 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 			return
 		}
 	}
-	handle, ok := r.takeHandle(input.Fh, handleAuthorityDir)
-	if !ok {
-		return
-	}
-	defer r.unpin(handle.inode)
 	ctx, finish, lifecycle := r.cleanupContext(input.Unique)
 	if !lifecycle.Ok() {
 		return
 	}
 	defer finish()
+	handle, ok := r.takeHandle(input.Fh, handleAuthorityDir)
+	if !ok {
+		return
+	}
+	defer r.unpin(handle.inode)
 	// Epoch recovery retired this capability; closing it on the new session
 	// cannot release any old resource and must not revoke the recovered mount.
 	if handle.dir.stale.Load() || handle.dir.node.epochStale.Load() {
@@ -4201,11 +4201,11 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 func (r *rawFileSystem) StatFs(_ <-chan struct{}, header *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(header.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(header.Unique, entry)
 	}
 	record := r.acquire(header.NodeId)
 	if record == nil {
@@ -4234,11 +4234,11 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	root := r.acquire(fuse.FUSE_ROOT_ID)
 	if root == nil || root.graft {
@@ -4268,11 +4268,11 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 func (r *rawFileSystem) GetLk(_ <-chan struct{}, input *fuse.LkIn, out *fuse.LkOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	record := r.acquire(input.NodeId)
 	if record == nil {
@@ -4317,11 +4317,11 @@ func (r *rawFileSystem) SetLkw(cancel <-chan struct{}, input *fuse.LkIn) fuse.St
 func (r *rawFileSystem) setLock(_ <-chan struct{}, input *fuse.LkIn, wait bool) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	record := r.acquire(input.NodeId)
 	if record == nil {

@@ -9,8 +9,20 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+// Managed callbacks retain their logical owner while dispatch is locally
+// unavailable. Each submitted attempt gets its bounded network budget only
+// after fence admission; mount cancellation still releases the callback.
+func (m *Mount) operationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if m == nil || m.workspace == nil {
+		return context.WithTimeout(parent, timeout)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return authorityrpc.WithDispatchTimeout(ctx, timeout), cancel
+}
 
 // Construction selects admission dispatch once. Embedding promotes the exact
 // physical-reply interfaces discovered by go-fuse, without an ordinary entry
@@ -25,8 +37,14 @@ func (r *rawFileSystem) fileSystemForServer() fuse.RawFileSystem {
 	if r.mount.workspace == nil {
 		return r
 	}
-	r.mount.managed = &workspaceFileSystem{rawFileSystem: r}
-	return r.mount.managed
+	return &workspaceFileSystem{rawFileSystem: r}
+}
+
+func (m *Mount) workspaceFS() *workspaceFileSystem {
+	if m.workspace == nil {
+		return nil
+	}
+	return &workspaceFileSystem{rawFileSystem: m.raw}
 }
 
 func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -159,6 +177,9 @@ func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublicat
 		r.recycleReplyLocked(p)
 		return nil, fuse.EIO
 	}
+	if life := r.mount.workspaceLifecycle; life != nil {
+		life.servedSinceCold.Store(true)
+	}
 	p.workspace, p.workspaceBound = permit, true
 	return p, fuse.OK
 }
@@ -229,6 +250,9 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, ne
 			close(p.workspaceDone)
 			return err
 		}
+		if life := r.mount.workspaceLifecycle; life != nil {
+			life.servedSinceCold.Store(true)
+		}
 		p.workspace, p.workspaceBound = permit, true
 		r.mu.Unlock()
 	}
@@ -244,6 +268,10 @@ func (r *workspaceFileSystem) captureWorkspaceDrain(deadline time.Time) workspac
 	s := m.subscription
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.workspaceDrain != nil {
+		return *s.workspaceDrain
+	}
+	s.workspaceOwned = true
 	if s.cacheUntil.Before(deadline) {
 		deadline = s.cacheUntil
 	}

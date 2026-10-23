@@ -152,9 +152,14 @@ func (a integrationAuthorizer) Authorize(_ context.Context, _ string, token []by
 }
 
 type integrationConfig struct {
-	workspace         *workspaceadmission.Reader
-	workspaceRecovery *workspaceadmission.RecoveryPermit
-	latencies         fuse.LatencyMap
+	workspaceFirstOnly bool
+	workspaceLifecycle *workspaceLifecycle
+	workspaceClock     subscriptionClock
+	workspaceDispatch  bool
+	workspace          *workspaceadmission.Reader
+	workspaceRecovery  *workspaceadmission.RecoveryPermit
+	latencies          fuse.LatencyMap
+	onRevoked          func(RevocationReport) // first mount only
 	// The shipping CLI lifecycle test owns its mounts and uses signed hosted
 	// grants, while sharing this fixture's actual XFS/authority assembly.
 	skipMounts    bool
@@ -615,21 +620,34 @@ func (f *integrationFixture) mountAll() {
 		requestTimeout = integrationRequestTimeout
 	}
 	for i := range f.paths {
+		workspace, life, clock := f.cfg.workspace, f.cfg.workspaceLifecycle, replaySubscriptionClockFor(f.cfg.clockOffset)
+		if f.cfg.workspaceClock != nil {
+			clock = f.cfg.workspaceClock
+		}
+		if i > 0 && f.cfg.workspaceFirstOnly {
+			workspace, life, clock = nil, nil, nil
+		}
 		client, transport := f.dialClient()
 		mountInstanceID, err := mountid.NewMountInstance()
 		if err != nil {
 			t.Fatalf("create mount %d identity: %v", i, err)
 		}
-		if f.cfg.workspace != nil {
-			mountInstanceID = f.cfg.workspace.MountInstanceID()
+		if workspace != nil {
+			mountInstanceID = workspace.MountInstanceID()
 		}
 		startup := context.Background()
-		if f.cfg.workspaceRecovery != nil {
+		if workspace != nil && f.cfg.workspaceRecovery != nil {
 			startup = context.WithValue(startup, workspaceRecoveryKey{}, *f.cfg.workspaceRecovery)
 		}
+		onRevoked := f.cfg.onRevoked
+		if i != 0 {
+			onRevoked = nil
+		}
 		mount, err := MountVolume(context.Background(), startup, f.paths[i], transport, Config{
-			workspace:       f.cfg.workspace,
-			MountInstanceID: mountInstanceID, RequestTimeout: requestTimeout,
+			workspace:          workspace,
+			workspaceLifecycle: life,
+			OnRevoked:          onRevoked,
+			MountInstanceID:    mountInstanceID, RequestTimeout: requestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend carves its cleanup workers out of this number, so it
 			// must be exactly the transport's bound.
@@ -639,7 +657,7 @@ func (f *integrationFixture) mountAll() {
 			WithdrawalTimeout: integrationWithdrawalTimeout,
 			Routes:            f.cfg.rules, LocalBacking: f.backing[i],
 			Debug: os.Getenv(envFUSEDebug) == "1", latencies: f.cfg.latencies,
-			subscriptionClock: replaySubscriptionClockFor(f.cfg.clockOffset),
+			subscriptionClock: clock,
 		})
 		if err != nil {
 			t.Fatalf("mount %s: %v", f.paths[i], err)
@@ -659,6 +677,12 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 		AccessToken: []byte("test-capability"), ReplaySlots: integrationReplaySlots,
 		MaxFrame: integrationMaxFrame, DialTimeout: 5 * time.Second,
 		CancelDrainTimeout: 5 * time.Second, MaxInFlight: integrationMaxInFlight,
+	}
+	if f.cfg.workspaceDispatch && len(f.clients) == 0 {
+		cfg.DispatchFence = authorityrpc.NewDispatchFence()
+		if err := cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
+			f.t.Fatal(err)
+		}
 	}
 	// Every mount declares the routing it is about to serve. The authority
 	// refuses a mount whose revision is not the volume's active one.

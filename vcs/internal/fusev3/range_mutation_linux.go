@@ -30,11 +30,11 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	if held, handle := r.acquireGraftFileHandle(input.Fh); handle != nil {
 		defer r.releaseHandleOperation(held)
@@ -124,11 +124,11 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.managed.beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
-		defer r.mount.managed.finishWorkspaceEntry(input.Unique, entry)
+		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
 	sourceRecord, sourceLocal := r.acquireGraftFileHandle(input.FhIn)
 	if sourceRecord != nil {
