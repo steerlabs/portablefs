@@ -1691,7 +1691,7 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 		callErr = lifecycleErr
 	}
 	if !assignmentFailed && assigned && (callErr != nil || response == nil || response.GetUncertain()) {
-		if callErr == nil && response != nil && response.GetUncertain() && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && !response.GetSessionTerminal() {
+		if callErr == nil && authorityrpc.RecoverableUncertainty(response) {
 			// Storage may have applied before the source subscription expired.
 			// The recorded outcome consumes this replay identity, but does not
 			// end the authenticated session. Cold withdrawal, never replay of

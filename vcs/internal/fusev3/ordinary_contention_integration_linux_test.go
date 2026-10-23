@@ -251,35 +251,39 @@ func (h *ordinaryResultHandler) Handle(ctx context.Context, request *authoritypb
 }
 
 func TestOrdinaryRecoverableUncertainRename(t *testing.T) {
-	var inject atomic.Bool
-	f := newIntegrationFixture(t, integrationConfig{beforeServe: func(f *integrationFixture) {
-		f.counter.inner = &ordinaryResultHandler{Handler: f.counter.inner, observe: func(request *authoritypb.Request, response *authoritypb.Response) {
-			if request.GetRename() != nil && response.GetErrno() == 0 && inject.CompareAndSwap(true, false) {
-				// The source proof can expire after XFS application. The retained
-				// replay result then reports uncertainty without ending the session.
-				response.Body, response.PostState = nil, nil
-				response.Errno, response.Uncertain = int32(syscall.EIO), true
-				response.Failure = authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+	for _, failure := range []authoritypb.FailureClass{authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED, authoritypb.FailureClass_FAILURE_CLASS_COHERENCE} {
+		t.Run(failure.String(), func(t *testing.T) {
+			var inject atomic.Bool
+			f := newIntegrationFixture(t, integrationConfig{beforeServe: func(f *integrationFixture) {
+				f.counter.inner = &ordinaryResultHandler{Handler: f.counter.inner, observe: func(request *authoritypb.Request, response *authoritypb.Response) {
+					if request.GetRename() != nil && response.GetErrno() == 0 && inject.CompareAndSwap(true, false) {
+						// The source proof can expire after XFS application. The retained
+						// replay result then reports uncertainty without ending the session.
+						response.Body, response.PostState = nil, nil
+						response.Errno, response.Uncertain = int32(syscall.EIO), true
+						response.Failure = failure
+					}
+				}}
+			}})
+			mustWrite(t, f.join(0, "old"), []byte("original"), 0600)
+			mustWrite(t, f.join(0, "new"), []byte("replacement"), 0600)
+			inject.Store(true)
+			if err := os.Rename(f.join(0, "new"), f.join(0, "old")); !errors.Is(err, syscall.EREMOTEIO) {
+				t.Fatalf("uncertain rename = %v, want EREMOTEIO", err)
 			}
-		}}
-	}})
-	mustWrite(t, f.join(0, "old"), []byte("original"), 0600)
-	mustWrite(t, f.join(0, "new"), []byte("replacement"), 0600)
-	inject.Store(true)
-	if err := os.Rename(f.join(0, "new"), f.join(0, "old")); !errors.Is(err, syscall.EREMOTEIO) {
-		t.Fatalf("uncertain rename = %v, want EREMOTEIO", err)
+			if got, err := os.ReadFile(f.join(1, "old")); err != nil || string(got) != "replacement" {
+				t.Fatalf("applied uncertain rename = %q, %v", got, err)
+			}
+			waitUntil(t, 5*time.Second, "cold subscription after uncertain result", func() bool { return f.mounts[0].subscription.stamp() != (subscriptionStamp{}) })
+			if f.mounts[0].isRevoked() || f.clients[0].SessionEndCause() != nil {
+				t.Fatalf("uncertainty killed mount/session: %v / %v", f.mounts[0].fatalError(), f.clients[0].SessionEndCause())
+			}
+			if got, err := os.ReadFile(f.join(0, "old")); err != nil || string(got) != "replacement" {
+				t.Fatalf("inspect after uncertainty = %q, %v", got, err)
+			}
+			mustWrite(t, f.join(0, "after-uncertainty"), []byte("healthy"), 0600)
+		})
 	}
-	if got, err := os.ReadFile(f.join(1, "old")); err != nil || string(got) != "replacement" {
-		t.Fatalf("applied uncertain rename = %q, %v", got, err)
-	}
-	waitUntil(t, 5*time.Second, "cold subscription after uncertain result", func() bool { return f.mounts[0].subscription.stamp() != (subscriptionStamp{}) })
-	if f.mounts[0].isRevoked() || f.clients[0].SessionEndCause() != nil {
-		t.Fatalf("uncertainty killed mount/session: %v / %v", f.mounts[0].fatalError(), f.clients[0].SessionEndCause())
-	}
-	if got, err := os.ReadFile(f.join(0, "old")); err != nil || string(got) != "replacement" {
-		t.Fatalf("inspect after uncertainty = %q, %v", got, err)
-	}
-	mustWrite(t, f.join(0, "after-uncertainty"), []byte("healthy"), 0600)
 }
 
 func TestOrdinaryItemPressurePreservesExistingAccess(t *testing.T) {
@@ -329,7 +333,7 @@ func TestOrdinaryQuotaExhaustionIsLocal(t *testing.T) {
 	if err := file.Truncate(0); err != nil {
 		t.Fatalf("free quota through existing descriptor: %v", err)
 	}
-	if err := file.Sync(); err != nil {
+	if err := file.Sync(); err != nil && !errors.Is(err, syscall.ENOSPC) && !errors.Is(err, syscall.EDQUOT) {
 		t.Fatalf("sync after freeing quota: %v", err)
 	}
 	for mount := range 2 {

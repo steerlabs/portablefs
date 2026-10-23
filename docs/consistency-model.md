@@ -194,7 +194,7 @@ never told, known only to be at or after the pre-operation EOF; recovering means
 reading the object's current state, exactly as for any other uncertain write.
 
 On Linux an uncertain result is `EREMOTEIO`; no errno can encode whether the
-effect applied. A recorded coherence uncertainty withdraws the subscription
+effect applied. A recorded nonterminal uncertainty withdraws the subscription
 and resubscribes cold while keeping the authenticated session. The operation
 is not re-executed. Loss of the epoch, authentication or the assigned replay
 result remains terminal for the old operation. Ordinary capacity refusals keep
