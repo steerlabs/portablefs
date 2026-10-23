@@ -20,6 +20,7 @@ import PortableFSWorkspaceCore
     private var ready = false
     private var pendingHello: (() -> Void)?
     public var isIdle: Bool { active == nil && queue.isEmpty && pendingHello == nil }
+    public var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     public var onFailure: ((String) -> Void)?
     public init(vm: WorkspaceMachine) { self.vm = vm }
     public func controlReady() { ready = true; let start = pendingHello; pendingHello = nil; start?() }
@@ -95,9 +96,18 @@ import PortableFSWorkspaceCore
         return try WorkspaceControl.encode(envelope)
     }
     private func finish(_ result: Result<WorkspaceEnvelope, Error>) {
-        guard let current = active else { return }; active = nil
-        current.completion(result)
-        if case .failure(let error) = result { lost(String(describing: error)) } else { advance() }
+        guard let current = active else { return }
+        var consumed = result
+        if case .success(let envelope) = result, case .statusReply(let status) = envelope.body {
+            do {
+                guard let statusObserver else { throw WorkspaceVMError("Status observation owner missing") }
+                try statusObserver(status)
+            } catch { consumed = .failure(error) }
+        }
+        if case .failure(let error) = consumed { lost(String(describing: error)); return }
+        active = nil
+        current.completion(consumed)
+        advance()
     }
     private func lost(_ reason: String) {
         guard !failed else { return }; failed = true
@@ -110,16 +120,30 @@ import PortableFSWorkspaceCore
     public func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
         exchange(.status(WorkspaceStatusRequest()), deadline: deadline) { completion($0.map { $0.statusReply }) }
     }
+    // A refusal leaves the predecessor intact. Consume it through the common
+    // Status owner, then resubmit with a new FIFO request ID and the same deadline.
+    private func desired(_ body: WorkspaceEnvelope.OneOf_Body, deadline: UInt64, completion: @escaping (Result<WorkspaceEnvelope, Error>) -> Void) {
+        exchange(body, deadline: deadline) { [self] reply in
+            if case .success(let envelope) = reply, envelope.result.code == "predecessor-unobserved" {
+                status(deadline: deadline) { result in
+                    switch result {
+                    case .success: self.desired(body, deadline: deadline, completion: completion)
+                    case .failure(let error): completion(.failure(error))
+                    }
+                }
+            } else { completion(reply) }
+        }
+    }
     public func provision(_ request: WorkspaceProvision, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
-        exchange(.provision(request), deadline: deadline) { completion($0.map { $0.result }) }
+        desired(.provision(request), deadline: deadline) { completion($0.map { $0.result }) }
     }
     public func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
         var request = WorkspaceMountRequest(); request.mount = mount
-        exchange(.mount(request), deadline: deadline) { completion($0.map { $0.result }) }
+        desired(.mount(request), deadline: deadline) { completion($0.map { $0.result }) }
     }
     public func umount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
         var request = WorkspaceUmountRequest(); request.mount = mount
-        exchange(.umount(request), deadline: deadline) { completion($0.map { $0.result }) }
+        desired(.umount(request), deadline: deadline) { completion($0.map { $0.result }) }
     }
     public func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {
         exchange(.suspend(request), deadline: deadline) { completion($0.map { $0.suspendAck }) }

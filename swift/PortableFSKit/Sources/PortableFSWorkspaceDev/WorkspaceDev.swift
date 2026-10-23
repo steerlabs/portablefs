@@ -11,6 +11,10 @@ import PortableFSWorkspaceCore
     var onHelloFailure: ((String) -> Void)?
     init(_ base: WorkspaceVsockChannel) { self.base = base }
     var isIdle: Bool { base.isIdle }
+    var statusObserver: ((WorkspaceStatusReply) throws -> Void)? {
+        get { base.statusObserver }
+        set { base.statusObserver = newValue }
+    }
     func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         base.hello(host, deadline: deadline) { [weak self] result in
             if case .failure(let error) = result { self?.onHelloFailure?(String(describing: error)) }
@@ -198,7 +202,6 @@ import PortableFSWorkspaceCore
                 guard job.phase == "failed", job.failure == "unavailable", !job.reason.isEmpty else { throw WorkspaceVMError("absent mount driver reported completion") }
                 let accepted = requests + [job.requestID]
                 guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
-                try self.coordinator.observeStatus(status)
                 if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
                 else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": job.failure]) }
             } catch { self.fail(error) }

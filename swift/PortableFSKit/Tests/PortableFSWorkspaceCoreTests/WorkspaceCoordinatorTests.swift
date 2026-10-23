@@ -51,6 +51,7 @@ private enum InjectedFailure: Error { case failed }
 }
 @MainActor private final class FakeChannel: WorkspaceGuestChannel {
     var isIdle = true
+    var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     var wrongRelease = false
     var holdHello = false
     var hellos: [(Result<WorkspaceHello, Error>) -> Void] = []
@@ -65,7 +66,12 @@ private enum InjectedFailure: Error { case failed }
         if wrongRelease { guest.release.appVersion = "other" }
         if holdHello { hellos.append(completion) } else { completion(.success(guest)) }
     }
-    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append { [self] result in
+        completion(result.flatMap { status in
+            do { try statusObserver?(status); return .success(status) }
+            catch { return .failure(error) }
+        })
+    } }
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
     func acknowledge(_ index: Int = 0, cold: Bool = true, loss: Bool = false) {
@@ -454,6 +460,7 @@ private enum InjectedFailure: Error { case failed }
     status.guestServiceID = token.suspension.guestServiceID; status.generation = token.suspension.generation
     status.state = "running"
     status.mounts = token.suspension.roster.map { var m = WorkspaceMountStatus(); m.outcome = unknownTestOutcome(); m.mount = $0; m.state = "recovering"; m.cleanup = "retained"; return m }
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.phase == .running)
     #expect(r.coordinator.mountStatus[0].state == "recovering")
@@ -473,6 +480,7 @@ private enum InjectedFailure: Error { case failed }
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
     let retired = retiredTestOutcome(old, sequence: 1)
     status.mounts = [replacement]; status.retired = [retired]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
     #expect(r.coordinator.retiredStatus == [retired])
@@ -523,11 +531,13 @@ private enum InjectedFailure: Error { case failed }
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
     let earlierRetired = retiredTestOutcome(earlier, sequence: 1); let retired = retiredTestOutcome(old, sequence: 2)
     status.mounts = [replacement]; status.retired = [earlierRetired]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.retiredStatus == [earlierRetired])
     #expect(r.coordinator.mountStatus[0].mount == old.mount)
     try r.coordinator.acknowledgeRetired([earlierRetired]); r.channel.retiredAcks.removeFirst().1(.success(()))
     status.retired = [retired]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
 }

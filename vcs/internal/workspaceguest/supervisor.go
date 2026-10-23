@@ -573,7 +573,7 @@ func (s *Supervisor) Status() *pb.StatusReply {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := &pb.StatusReply{BootId: bytes.Clone(s.boot), HostServiceId: bytes.Clone(s.host),
-		GuestServiceId: bytes.Clone(s.guest), Generation: s.generation, State: s.phase}
+		GuestServiceId: bytes.Clone(s.guest), Generation: s.generation, State: s.phase, RetirementSequence: s.retirementSequence}
 	for _, id := range s.rosterLocked() {
 		out.Mounts = append(out.Mounts, clone(s.mounts[control.MountKey(id)].status))
 	}
@@ -638,7 +638,9 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 	var err error
 	if invalid := control.Mount(id); invalid != nil {
 		err = fmt.Errorf("replace identity: %w", invalid)
-	} else if s.phase != "running" || e == nil || !e.cleaned {
+	} else if s.phase == "running" && e == nil {
+		err = refused("replace old incarnation already absent; Register the new incarnation after retired outcome acknowledgement")
+	} else if s.phase != "running" || !e.cleaned {
 		err = refused("replace requires running phase and exact cleanup")
 	} else if s.retainedIncarnationLocked(id) {
 		err = refused("replace previously retired incarnation")
@@ -669,6 +671,8 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		// the new incarnation may need an acknowledgement or sequence space.
 		if err = s.desiredCapacityLocked(id); err == nil {
 			s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
+		} else {
+			err = fmt.Errorf("replace old incarnation retired; Register the new incarnation after retired outcome acknowledgement: %w", err)
 		}
 	}
 	s.mu.Unlock()

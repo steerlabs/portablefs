@@ -865,13 +865,8 @@ type MountJob struct {
 	// offered, running, complete, failed.
 	Phase string `protobuf:"bytes,5,opt,name=phase,proto3" json:"phase,omitempty"`
 	// unavailable, refused, authorization-required, stopped, deadline, handler-failed.
-	Failure string `protobuf:"bytes,6,opt,name=failure,proto3" json:"failure,omitempty"`
-	Reason  string `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
-	// Cumulative joined predecessors, one bucket for complete and each failure
-	// code. The first exact result is retained; count and last_request_id merge
-	// subsequent results in the same operation/failure category without allocating
-	// another retirement reservation. At most 21 sorted categories; first has no prior.
-	Prior         []*JoinedJobSummary `protobuf:"bytes,8,rep,name=prior,proto3" json:"prior,omitempty"`
+	Failure       string `protobuf:"bytes,6,opt,name=failure,proto3" json:"failure,omitempty"`
+	Reason        string `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -955,74 +950,6 @@ func (x *MountJob) GetReason() string {
 	return ""
 }
 
-func (x *MountJob) GetPrior() []*JoinedJobSummary {
-	if x != nil {
-		return x.Prior
-	}
-	return nil
-}
-
-type JoinedJobSummary struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// A terminal MountJob without its own prior summaries.
-	First         *MountJob `protobuf:"bytes,1,opt,name=first,proto3" json:"first,omitempty"`
-	Count         uint64    `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"`
-	LastRequestId uint64    `protobuf:"varint,3,opt,name=last_request_id,json=lastRequestId,proto3" json:"last_request_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *JoinedJobSummary) Reset() {
-	*x = JoinedJobSummary{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *JoinedJobSummary) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*JoinedJobSummary) ProtoMessage() {}
-
-func (x *JoinedJobSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use JoinedJobSummary.ProtoReflect.Descriptor instead.
-func (*JoinedJobSummary) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{14}
-}
-
-func (x *JoinedJobSummary) GetFirst() *MountJob {
-	if x != nil {
-		return x.First
-	}
-	return nil
-}
-
-func (x *JoinedJobSummary) GetCount() uint64 {
-	if x != nil {
-		return x.Count
-	}
-	return 0
-}
-
-func (x *JoinedJobSummary) GetLastRequestId() uint64 {
-	if x != nil {
-		return x.LastRequestId
-	}
-	return 0
-}
-
 // One acknowledged retirement stream for exact mount and joined job evidence.
 // A replaced mount and its last job share one record; job-only work never
 // invents a registered mount, cleanup proof or durability outcome.
@@ -1037,7 +964,7 @@ type RetiredOutcome struct {
 
 func (x *RetiredOutcome) Reset() {
 	*x = RetiredOutcome{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1049,7 +976,7 @@ func (x *RetiredOutcome) String() string {
 func (*RetiredOutcome) ProtoMessage() {}
 
 func (x *RetiredOutcome) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1062,7 +989,7 @@ func (x *RetiredOutcome) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetiredOutcome.ProtoReflect.Descriptor instead.
 func (*RetiredOutcome) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{15}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *RetiredOutcome) GetRetirementSequence() uint64 {
@@ -1096,15 +1023,17 @@ type StatusReply struct {
 	State  string         `protobuf:"bytes,5,opt,name=state,proto3" json:"state,omitempty"`
 	Mounts []*MountStatus `protobuf:"bytes,6,rep,name=mounts,proto3" json:"mounts,omitempty"`
 	// First 16 unacknowledged retired outcomes, in retirement order.
-	Retired       []*RetiredOutcome `protobuf:"bytes,7,rep,name=retired,proto3" json:"retired,omitempty"`
-	Jobs          []*MountJob       `protobuf:"bytes,8,rep,name=jobs,proto3" json:"jobs,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Retired []*RetiredOutcome `protobuf:"bytes,7,rep,name=retired,proto3" json:"retired,omitempty"`
+	Jobs    []*MountJob       `protobuf:"bytes,8,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	// High-water mark, including acknowledged retirements; rejects stale snapshots.
+	RetirementSequence uint64 `protobuf:"varint,9,opt,name=retirement_sequence,json=retirementSequence,proto3" json:"retirement_sequence,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *StatusReply) Reset() {
 	*x = StatusReply{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1116,7 +1045,7 @@ func (x *StatusReply) String() string {
 func (*StatusReply) ProtoMessage() {}
 
 func (x *StatusReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1129,7 +1058,7 @@ func (x *StatusReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusReply.ProtoReflect.Descriptor instead.
 func (*StatusReply) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{16}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *StatusReply) GetBootId() []byte {
@@ -1188,6 +1117,13 @@ func (x *StatusReply) GetJobs() []*MountJob {
 	return nil
 }
 
+func (x *StatusReply) GetRetirementSequence() uint64 {
+	if x != nil {
+		return x.RetirementSequence
+	}
+	return 0
+}
+
 // Idempotently acknowledge all retired outcomes through this sequence.
 type RetireAck struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
@@ -1198,7 +1134,7 @@ type RetireAck struct {
 
 func (x *RetireAck) Reset() {
 	*x = RetireAck{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1210,7 +1146,7 @@ func (x *RetireAck) String() string {
 func (*RetireAck) ProtoMessage() {}
 
 func (x *RetireAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1223,7 +1159,7 @@ func (x *RetireAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetireAck.ProtoReflect.Descriptor instead.
 func (*RetireAck) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{17}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *RetireAck) GetThroughSequence() uint64 {
@@ -1249,7 +1185,7 @@ type Provision struct {
 
 func (x *Provision) Reset() {
 	*x = Provision{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[18]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1261,7 +1197,7 @@ func (x *Provision) String() string {
 func (*Provision) ProtoMessage() {}
 
 func (x *Provision) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[18]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1274,7 +1210,7 @@ func (x *Provision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Provision.ProtoReflect.Descriptor instead.
 func (*Provision) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{18}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *Provision) GetMount() *MountID {
@@ -1335,7 +1271,7 @@ type MountRequest struct {
 
 func (x *MountRequest) Reset() {
 	*x = MountRequest{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[19]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1347,7 +1283,7 @@ func (x *MountRequest) String() string {
 func (*MountRequest) ProtoMessage() {}
 
 func (x *MountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[19]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1360,7 +1296,7 @@ func (x *MountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MountRequest.ProtoReflect.Descriptor instead.
 func (*MountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{19}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *MountRequest) GetMount() *MountID {
@@ -1379,7 +1315,7 @@ type UmountRequest struct {
 
 func (x *UmountRequest) Reset() {
 	*x = UmountRequest{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[20]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1391,7 +1327,7 @@ func (x *UmountRequest) String() string {
 func (*UmountRequest) ProtoMessage() {}
 
 func (x *UmountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[20]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1404,7 +1340,7 @@ func (x *UmountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UmountRequest.ProtoReflect.Descriptor instead.
 func (*UmountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{20}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *UmountRequest) GetMount() *MountID {
@@ -1416,7 +1352,8 @@ func (x *UmountRequest) GetMount() *MountID {
 
 type Result struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// accepted, unavailable, authorization-required, refused.
+	// accepted, unavailable, authorization-required, refused, predecessor-unobserved.
+	// predecessor-unobserved is admission-only; no work or slot changes.
 	Code          string `protobuf:"bytes,1,opt,name=code,proto3" json:"code,omitempty"`
 	Reason        string `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -1425,7 +1362,7 @@ type Result struct {
 
 func (x *Result) Reset() {
 	*x = Result{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[21]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1437,7 +1374,7 @@ func (x *Result) String() string {
 func (*Result) ProtoMessage() {}
 
 func (x *Result) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[21]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1450,7 +1387,7 @@ func (x *Result) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Result.ProtoReflect.Descriptor instead.
 func (*Result) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{21}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Result) GetCode() string {
@@ -1496,7 +1433,7 @@ type Envelope struct {
 
 func (x *Envelope) Reset() {
 	*x = Envelope{}
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[22]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1508,7 +1445,7 @@ func (x *Envelope) String() string {
 func (*Envelope) ProtoMessage() {}
 
 func (x *Envelope) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_workspace_v8_control_proto_msgTypes[22]
+	mi := &file_proto_workspace_v8_control_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1521,7 +1458,7 @@ func (x *Envelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Envelope.ProtoReflect.Descriptor instead.
 func (*Envelope) Descriptor() ([]byte, []int) {
-	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{22}
+	return file_proto_workspace_v8_control_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Envelope) GetVersion() uint32 {
@@ -1826,7 +1763,7 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\tResumeAck\x12:\n" +
 	"\x05token\x18\x01 \x01(\v2$.portablefs.workspace.v8.ResumeTokenR\x05token\x12<\n" +
 	"\x06mounts\x18\x02 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\"\x0f\n" +
-	"\rStatusRequest\"\xa8\x02\n" +
+	"\rStatusRequest\"\xed\x01\n" +
 	"\bMountJob\x126\n" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x12\x1d\n" +
 	"\n" +
@@ -1837,16 +1774,11 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\toperation\x18\x04 \x01(\tR\toperation\x12\x14\n" +
 	"\x05phase\x18\x05 \x01(\tR\x05phase\x12\x18\n" +
 	"\afailure\x18\x06 \x01(\tR\afailure\x12\x16\n" +
-	"\x06reason\x18\a \x01(\tR\x06reason\x12?\n" +
-	"\x05prior\x18\b \x03(\v2).portablefs.workspace.v8.JoinedJobSummaryR\x05prior\"\x89\x01\n" +
-	"\x10JoinedJobSummary\x127\n" +
-	"\x05first\x18\x01 \x01(\v2!.portablefs.workspace.v8.MountJobR\x05first\x12\x14\n" +
-	"\x05count\x18\x02 \x01(\x04R\x05count\x12&\n" +
-	"\x0flast_request_id\x18\x03 \x01(\x04R\rlastRequestId\"\xbf\x01\n" +
+	"\x06reason\x18\a \x01(\tR\x06reasonJ\x04\b\b\x10\t\"\xbf\x01\n" +
 	"\x0eRetiredOutcome\x12/\n" +
 	"\x13retirement_sequence\x18\x01 \x01(\x04R\x12retirementSequence\x12G\n" +
 	"\fmount_status\x18\x02 \x01(\v2$.portablefs.workspace.v8.MountStatusR\vmountStatus\x123\n" +
-	"\x03job\x18\x03 \x01(\v2!.portablefs.workspace.v8.MountJobR\x03job\"\xe6\x02\n" +
+	"\x03job\x18\x03 \x01(\v2!.portablefs.workspace.v8.MountJobR\x03job\"\x97\x03\n" +
 	"\vStatusReply\x12\x17\n" +
 	"\aboot_id\x18\x01 \x01(\fR\x06bootId\x12&\n" +
 	"\x0fhost_service_id\x18\x02 \x01(\fR\rhostServiceId\x12(\n" +
@@ -1857,7 +1789,8 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\x05state\x18\x05 \x01(\tR\x05state\x12<\n" +
 	"\x06mounts\x18\x06 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\x12A\n" +
 	"\aretired\x18\a \x03(\v2'.portablefs.workspace.v8.RetiredOutcomeR\aretired\x125\n" +
-	"\x04jobs\x18\b \x03(\v2!.portablefs.workspace.v8.MountJobR\x04jobs\"6\n" +
+	"\x04jobs\x18\b \x03(\v2!.portablefs.workspace.v8.MountJobR\x04jobs\x12/\n" +
+	"\x13retirement_sequence\x18\t \x01(\x04R\x12retirementSequence\"6\n" +
 	"\tRetireAck\x12)\n" +
 	"\x10through_sequence\x18\x01 \x01(\x04R\x0fthroughSequence\"\xb0\x02\n" +
 	"\tProvision\x126\n" +
@@ -1914,7 +1847,7 @@ func file_proto_workspace_v8_control_proto_rawDescGZIP() []byte {
 	return file_proto_workspace_v8_control_proto_rawDescData
 }
 
-var file_proto_workspace_v8_control_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_proto_workspace_v8_control_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_proto_workspace_v8_control_proto_goTypes = []any{
 	(*Release)(nil),          // 0: portablefs.workspace.v8.Release
 	(*Hello)(nil),            // 1: portablefs.workspace.v8.Hello
@@ -1930,15 +1863,14 @@ var file_proto_workspace_v8_control_proto_goTypes = []any{
 	(*ResumeAck)(nil),        // 11: portablefs.workspace.v8.ResumeAck
 	(*StatusRequest)(nil),    // 12: portablefs.workspace.v8.StatusRequest
 	(*MountJob)(nil),         // 13: portablefs.workspace.v8.MountJob
-	(*JoinedJobSummary)(nil), // 14: portablefs.workspace.v8.JoinedJobSummary
-	(*RetiredOutcome)(nil),   // 15: portablefs.workspace.v8.RetiredOutcome
-	(*StatusReply)(nil),      // 16: portablefs.workspace.v8.StatusReply
-	(*RetireAck)(nil),        // 17: portablefs.workspace.v8.RetireAck
-	(*Provision)(nil),        // 18: portablefs.workspace.v8.Provision
-	(*MountRequest)(nil),     // 19: portablefs.workspace.v8.MountRequest
-	(*UmountRequest)(nil),    // 20: portablefs.workspace.v8.UmountRequest
-	(*Result)(nil),           // 21: portablefs.workspace.v8.Result
-	(*Envelope)(nil),         // 22: portablefs.workspace.v8.Envelope
+	(*RetiredOutcome)(nil),   // 14: portablefs.workspace.v8.RetiredOutcome
+	(*StatusReply)(nil),      // 15: portablefs.workspace.v8.StatusReply
+	(*RetireAck)(nil),        // 16: portablefs.workspace.v8.RetireAck
+	(*Provision)(nil),        // 17: portablefs.workspace.v8.Provision
+	(*MountRequest)(nil),     // 18: portablefs.workspace.v8.MountRequest
+	(*UmountRequest)(nil),    // 19: portablefs.workspace.v8.UmountRequest
+	(*Result)(nil),           // 20: portablefs.workspace.v8.Result
+	(*Envelope)(nil),         // 21: portablefs.workspace.v8.Envelope
 }
 var file_proto_workspace_v8_control_proto_depIdxs = []int32{
 	0,  // 0: portablefs.workspace.v8.Hello.release:type_name -> portablefs.workspace.v8.Release
@@ -1956,34 +1888,32 @@ var file_proto_workspace_v8_control_proto_depIdxs = []int32{
 	9,  // 12: portablefs.workspace.v8.ResumeAck.token:type_name -> portablefs.workspace.v8.ResumeToken
 	10, // 13: portablefs.workspace.v8.ResumeAck.mounts:type_name -> portablefs.workspace.v8.MountStatus
 	2,  // 14: portablefs.workspace.v8.MountJob.mount:type_name -> portablefs.workspace.v8.MountID
-	14, // 15: portablefs.workspace.v8.MountJob.prior:type_name -> portablefs.workspace.v8.JoinedJobSummary
-	13, // 16: portablefs.workspace.v8.JoinedJobSummary.first:type_name -> portablefs.workspace.v8.MountJob
-	10, // 17: portablefs.workspace.v8.RetiredOutcome.mount_status:type_name -> portablefs.workspace.v8.MountStatus
-	13, // 18: portablefs.workspace.v8.RetiredOutcome.job:type_name -> portablefs.workspace.v8.MountJob
-	10, // 19: portablefs.workspace.v8.StatusReply.mounts:type_name -> portablefs.workspace.v8.MountStatus
-	15, // 20: portablefs.workspace.v8.StatusReply.retired:type_name -> portablefs.workspace.v8.RetiredOutcome
-	13, // 21: portablefs.workspace.v8.StatusReply.jobs:type_name -> portablefs.workspace.v8.MountJob
-	2,  // 22: portablefs.workspace.v8.Provision.mount:type_name -> portablefs.workspace.v8.MountID
-	2,  // 23: portablefs.workspace.v8.MountRequest.mount:type_name -> portablefs.workspace.v8.MountID
-	2,  // 24: portablefs.workspace.v8.UmountRequest.mount:type_name -> portablefs.workspace.v8.MountID
-	1,  // 25: portablefs.workspace.v8.Envelope.hello:type_name -> portablefs.workspace.v8.Hello
-	1,  // 26: portablefs.workspace.v8.Envelope.hello_ack:type_name -> portablefs.workspace.v8.Hello
-	3,  // 27: portablefs.workspace.v8.Envelope.suspend:type_name -> portablefs.workspace.v8.Suspension
-	8,  // 28: portablefs.workspace.v8.Envelope.suspend_ack:type_name -> portablefs.workspace.v8.SuspendAck
-	9,  // 29: portablefs.workspace.v8.Envelope.resume:type_name -> portablefs.workspace.v8.ResumeToken
-	11, // 30: portablefs.workspace.v8.Envelope.resume_ack:type_name -> portablefs.workspace.v8.ResumeAck
-	12, // 31: portablefs.workspace.v8.Envelope.status:type_name -> portablefs.workspace.v8.StatusRequest
-	16, // 32: portablefs.workspace.v8.Envelope.status_reply:type_name -> portablefs.workspace.v8.StatusReply
-	18, // 33: portablefs.workspace.v8.Envelope.provision:type_name -> portablefs.workspace.v8.Provision
-	19, // 34: portablefs.workspace.v8.Envelope.mount:type_name -> portablefs.workspace.v8.MountRequest
-	20, // 35: portablefs.workspace.v8.Envelope.umount:type_name -> portablefs.workspace.v8.UmountRequest
-	21, // 36: portablefs.workspace.v8.Envelope.result:type_name -> portablefs.workspace.v8.Result
-	17, // 37: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
-	38, // [38:38] is the sub-list for method output_type
-	38, // [38:38] is the sub-list for method input_type
-	38, // [38:38] is the sub-list for extension type_name
-	38, // [38:38] is the sub-list for extension extendee
-	0,  // [0:38] is the sub-list for field type_name
+	10, // 15: portablefs.workspace.v8.RetiredOutcome.mount_status:type_name -> portablefs.workspace.v8.MountStatus
+	13, // 16: portablefs.workspace.v8.RetiredOutcome.job:type_name -> portablefs.workspace.v8.MountJob
+	10, // 17: portablefs.workspace.v8.StatusReply.mounts:type_name -> portablefs.workspace.v8.MountStatus
+	14, // 18: portablefs.workspace.v8.StatusReply.retired:type_name -> portablefs.workspace.v8.RetiredOutcome
+	13, // 19: portablefs.workspace.v8.StatusReply.jobs:type_name -> portablefs.workspace.v8.MountJob
+	2,  // 20: portablefs.workspace.v8.Provision.mount:type_name -> portablefs.workspace.v8.MountID
+	2,  // 21: portablefs.workspace.v8.MountRequest.mount:type_name -> portablefs.workspace.v8.MountID
+	2,  // 22: portablefs.workspace.v8.UmountRequest.mount:type_name -> portablefs.workspace.v8.MountID
+	1,  // 23: portablefs.workspace.v8.Envelope.hello:type_name -> portablefs.workspace.v8.Hello
+	1,  // 24: portablefs.workspace.v8.Envelope.hello_ack:type_name -> portablefs.workspace.v8.Hello
+	3,  // 25: portablefs.workspace.v8.Envelope.suspend:type_name -> portablefs.workspace.v8.Suspension
+	8,  // 26: portablefs.workspace.v8.Envelope.suspend_ack:type_name -> portablefs.workspace.v8.SuspendAck
+	9,  // 27: portablefs.workspace.v8.Envelope.resume:type_name -> portablefs.workspace.v8.ResumeToken
+	11, // 28: portablefs.workspace.v8.Envelope.resume_ack:type_name -> portablefs.workspace.v8.ResumeAck
+	12, // 29: portablefs.workspace.v8.Envelope.status:type_name -> portablefs.workspace.v8.StatusRequest
+	15, // 30: portablefs.workspace.v8.Envelope.status_reply:type_name -> portablefs.workspace.v8.StatusReply
+	17, // 31: portablefs.workspace.v8.Envelope.provision:type_name -> portablefs.workspace.v8.Provision
+	18, // 32: portablefs.workspace.v8.Envelope.mount:type_name -> portablefs.workspace.v8.MountRequest
+	19, // 33: portablefs.workspace.v8.Envelope.umount:type_name -> portablefs.workspace.v8.UmountRequest
+	20, // 34: portablefs.workspace.v8.Envelope.result:type_name -> portablefs.workspace.v8.Result
+	16, // 35: portablefs.workspace.v8.Envelope.retire_ack:type_name -> portablefs.workspace.v8.RetireAck
+	36, // [36:36] is the sub-list for method output_type
+	36, // [36:36] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	36, // [36:36] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_proto_workspace_v8_control_proto_init() }
@@ -1991,7 +1921,7 @@ func file_proto_workspace_v8_control_proto_init() {
 	if File_proto_workspace_v8_control_proto != nil {
 		return
 	}
-	file_proto_workspace_v8_control_proto_msgTypes[22].OneofWrappers = []any{
+	file_proto_workspace_v8_control_proto_msgTypes[21].OneofWrappers = []any{
 		(*Envelope_Hello)(nil),
 		(*Envelope_HelloAck)(nil),
 		(*Envelope_Suspend)(nil),
@@ -2012,7 +1942,7 @@ func file_proto_workspace_v8_control_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_workspace_v8_control_proto_rawDesc), len(file_proto_workspace_v8_control_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   23,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

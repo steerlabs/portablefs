@@ -90,12 +90,7 @@ func fixtures() map[string]*pb.Envelope {
 		status.Jobs = nil
 		bodies["retired_job_"+phase] = e
 	}
-	summary := proto.Clone(bodies["job_failed"]).(*pb.Envelope)
-	current := summary.GetStatusReply().Jobs[0]
-	first := proto.Clone(current).(*pb.MountJob)
-	current.RequestId = first.RequestId + 4
-	current.Prior = []*pb.JoinedJobSummary{{First: first, Count: 3, LastRequestId: first.RequestId + 2}}
-	bodies["job_with_joined_summary"] = summary
+	bodies["predecessor_unobserved"] = &pb.Envelope{Body: &pb.Envelope_Result{Result: &pb.Result{Code: "predecessor-unobserved", Reason: "observe predecessor result with Status before retry"}}}
 	combined := proto.Clone(bodies["retired_job_failed"]).(*pb.Envelope)
 	cloneJob := proto.Clone(combined.GetStatusReply().Retired[1].Job).(*pb.MountJob)
 	cloneJob.Mount = proto.Clone(combined.GetStatusReply().Retired[0].MountStatus.Mount).(*pb.MountID)
@@ -104,6 +99,9 @@ func fixtures() map[string]*pb.Envelope {
 	for _, e := range bodies {
 		e.Version = 8
 		e.RequestId = 1
+		if status := e.GetStatusReply(); status != nil && len(status.Retired) > 0 {
+			status.RetirementSequence = status.Retired[len(status.Retired)-1].RetirementSequence
+		}
 	}
 	return bodies
 }
@@ -177,6 +175,8 @@ func invalidFixtures() map[string][]byte {
 		{"job_unknown_operation", func(j *pb.MountJob) { j.Operation = "activate" }},
 		{"job_unknown_phase", func(j *pb.MountJob) { j.Phase = "ready" }},
 		{"job_missing_failure", func(j *pb.MountJob) { j.Failure = "" }},
+		{"job_admission_only_failure", func(j *pb.MountJob) { j.Failure = "predecessor-unobserved" }},
+		{"job_reserved_summary", func(j *pb.MountJob) { j.ProtoReflect().SetUnknown([]byte{0x42, 0}) }},
 		{"job_unknown_failure", func(j *pb.MountJob) { j.Failure = "success" }},
 		{"job_missing_reason", func(j *pb.MountJob) { j.Reason = "" }},
 		{"job_running_failure", func(j *pb.MountJob) { j.Phase = "running" }},
@@ -207,6 +207,7 @@ func invalidFixtures() map[string][]byte {
 		name   string
 		mutate func(*pb.StatusReply)
 	}{
+		{"retired_highwater_below", func(s *pb.StatusReply) { s.RetirementSequence = 1 }},
 		{"retired_empty", func(s *pb.StatusReply) { s.Retired[1].Job = nil }},
 		{"retired_running_job", func(s *pb.StatusReply) { s.Retired[1].Job.Phase = "running" }},
 		{"retired_future_job", func(s *pb.StatusReply) { s.Retired[1].Job.Generation++ }},
@@ -230,24 +231,10 @@ func invalidFixtures() map[string][]byte {
 		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
 		negative[tc.name] = framed(raw)
 	}
-	for _, tc := range []struct {
-		name   string
-		mutate func(*pb.MountJob)
-	}{
-		{"summary_zero_count", func(j *pb.MountJob) { j.Prior[0].Count = 0 }},
-		{"summary_future_request", func(j *pb.MountJob) { j.Prior[0].LastRequestId = j.RequestId }},
-		{"summary_wrong_mount", func(j *pb.MountJob) { j.Prior[0].First.Mount.VolumeId = "other" }},
-		{"summary_unjoined", func(j *pb.MountJob) { j.Prior[0].First.Phase = "running" }},
-		{"summary_duplicate", func(j *pb.MountJob) { j.Prior = append(j.Prior, proto.Clone(j.Prior[0]).(*pb.JoinedJobSummary)) }},
-		{"summary_recursive", func(j *pb.MountJob) {
-			j.Prior[0].First.Prior = append(j.Prior[0].First.Prior, proto.Clone(j.Prior[0]).(*pb.JoinedJobSummary))
-		}},
-	} {
-		e := fixtures()["job_with_joined_summary"]
-		tc.mutate(e.GetStatusReply().Jobs[0])
-		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
-		negative[tc.name] = framed(raw)
-	}
+	wrongRefusal := fixtures()["predecessor_unobserved"]
+	wrongRefusal.GetResult().Reason = "wrong"
+	refusalRaw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(wrongRefusal)
+	negative["predecessor_wrong_reason"] = framed(refusalRaw)
 	base := map[string][]byte{
 		"unequal_version":    framed([]byte{8, 9, 16, 1, 0x82, 1, 0}),
 		"unknown_body":       framed([]byte{8, 8, 16, 1, 0xb2, 1, 0}),
@@ -450,6 +437,7 @@ func TestWorkspaceStreamFraming(t *testing.T) {
 func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 	s := fixtureSuspension()
 	s.Roster = nil
+	s.Generation = math.MaxUint64
 	var statuses []*pb.MountStatus
 	var cold []*pb.MountCold
 	var jobs []*pb.MountJob
@@ -459,39 +447,22 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 		s.Roster = append(s.Roster, mid)
 		var loss []*pb.Loss
 		for n := 1; n <= MaxLosses; n++ {
-			loss = append(loss, &pb.Loss{Sequence: uint64(n), AcceptedEntries: math.MaxUint64, AcceptedBytes: math.MaxUint64, Reason: strings.Repeat("r", MaxReason)})
+			loss = append(loss, &pb.Loss{Sequence: math.MaxUint64 - uint64(MaxLosses-n), AcceptedEntries: math.MaxUint64, AcceptedBytes: math.MaxUint64, Reason: strings.Repeat("r", MaxReason)})
 		}
-		statuses = append(statuses, &pb.MountStatus{Mount: mid, State: "terminal", Reason: strings.Repeat("r", MaxReason), Cleanup: "complete", Loss: loss, Outcome: UnknownOutcome()})
+		statuses = append(statuses, &pb.MountStatus{Mount: mid, State: "authorization-required", Reason: strings.Repeat("r", MaxReason), Cleanup: "process-exited", Loss: loss, Renewal: &pb.RenewalReadiness{State: "installed", InstalledSequence: math.MaxUint64}, Outcome: &pb.MountOutcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: math.MaxUint64}})
 		cold = append(cold, &pb.MountCold{Mount: mid, Loss: loss, Outcome: UnknownOutcome()})
 		jobs = append(jobs, &pb.MountJob{Mount: mid, RequestId: math.MaxUint64, Generation: math.MaxUint64, Operation: "provision", Phase: "failed", Failure: "authorization-required", Reason: strings.Repeat("r", MaxReason)})
-	}
-	for _, job := range jobs {
-		for _, operation := range []string{"mount", "provision", "umount"} {
-			for _, failure := range []string{"", "authorization-required", "deadline", "handler-failed", "refused", "stopped", "unavailable"} {
-				first := proto.Clone(job).(*pb.MountJob)
-				first.Prior = nil
-				first.RequestId = uint64(len(job.Prior) + 1)
-				first.Operation, first.Failure = operation, failure
-				first.Phase = "failed"
-				if failure == "" {
-					first.Phase, first.Reason = "complete", ""
-				}
-				job.Prior = append(job.Prior, &pb.JoinedJobSummary{First: first, Count: (math.MaxUint64 - 1) / 21, LastRequestId: math.MaxUint64 - uint64(21-len(job.Prior))})
-			}
-		}
 	}
 	var retired []*pb.RetiredOutcome
 	for i := 0; i < MaxRetiredBatch; i++ {
 		r := proto.Clone(statuses[i]).(*pb.MountStatus)
 		r.Mount.Incarnation = fixtureID(30)
-		retired = append(retired, &pb.RetiredOutcome{RetirementSequence: uint64(i + 1), MountStatus: r, Job: proto.Clone(jobs[i]).(*pb.MountJob)})
+		r.Cleanup = "complete"
+		retired = append(retired, &pb.RetiredOutcome{RetirementSequence: math.MaxUint64 - uint64(MaxRetiredBatch-i-1), MountStatus: r, Job: proto.Clone(jobs[i]).(*pb.MountJob)})
 		retired[i].Job.Mount = r.Mount
-		for _, summary := range retired[i].Job.Prior {
-			summary.First.Mount = r.Mount
-		}
 	}
 	for name, e := range map[string]*pb.Envelope{
-		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "running", Mounts: statuses, Retired: retired, Jobs: jobs}}},
+		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "suspended-cold", Mounts: statuses, Retired: retired, Jobs: jobs, RetirementSequence: math.MaxUint64}}},
 		"suspend": {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: cold}}},
 		"resume":  {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}, Mounts: statuses}}},
 	} {
@@ -572,5 +543,13 @@ func TestWorkspaceStateCombinationsAndPublicIdentity(t *testing.T) {
 func TestWorkspaceScannerDepthBound(t *testing.T) {
 	if err := grammar(nil, new(pb.Envelope).ProtoReflect().Descriptor(), 17); err == nil {
 		t.Fatal("depth guard omitted")
+	}
+}
+
+func TestWorkspaceStatusHighWaterRejectsNilRetirement(t *testing.T) {
+	e := fixtures()["status_reply"]
+	e.GetStatusReply().Retired = []*pb.RetiredOutcome{nil}
+	if Validate(e) == nil {
+		t.Fatal("nil retirement accepted")
 	}
 }

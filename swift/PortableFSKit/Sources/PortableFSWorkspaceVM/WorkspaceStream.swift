@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import PortableFSWorkspaceCore
 
 // Descriptor and bounded buffers belong to one dedicated serial queue. Dispatch
 // sources do no blocking I/O and cancellation owns the final descriptor close.
@@ -81,7 +82,7 @@ final class WorkspaceStream: @unchecked Sendable {
                 return
             }
             incoming.append(contentsOf: bytes.prefix(n))
-            guard incoming.count <= 1_048_580 else { fail("control input exceeds frame limit"); return }
+            guard incoming.count <= WorkspaceControl.maxFrame + 4 else { fail("control input exceeds frame limit"); return }
             deliverRead()
         }
     }

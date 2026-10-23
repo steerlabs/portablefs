@@ -40,6 +40,7 @@ import Testing
 }
 @MainActor private final class RRChannel: WorkspaceGuestChannel {
     var isIdle = true
+    var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     var retiredAcks: [(UInt64, (Result<Void, Error>) -> Void)] = []
     var statuses: [(Result<WorkspaceStatusReply, Error>) -> Void] = []
     var suspensions: [(WorkspaceSuspension, (Result<WorkspaceSuspendAck, Error>) -> Void)] = []
@@ -48,7 +49,12 @@ import Testing
         var guest = host; guest.guestServiceID = Data(repeating: 6, count: 16); completion(.success(guest))
     }
     func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { retiredAcks.append((sequence, completion)) }
-    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append { [self] result in
+        completion(result.flatMap { status in
+            do { try statusObserver?(status); return .success(status) }
+            catch { return .failure(error) }
+        })
+    } }
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
 }
@@ -75,6 +81,7 @@ private func rrGolden(_ name: String) throws -> Data {
     var old = WorkspaceMountStatus(); old.outcome = unknownTestOutcome(); old.mount.authorityID = Data(repeating: 1, count: 32); old.mount.volumeID = "v"; old.mount.incarnation = Data(repeating: 3, count: 16)
     old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     status.retired = [retiredTestOutcome(old, sequence: 1)]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     ch.statuses.removeFirst()(.success(status))
     return status.retired[0]
 }
@@ -107,6 +114,7 @@ private func rrGolden(_ name: String) throws -> Data {
     var r = WorkspaceMountStatus(); r.outcome = unknownTestOutcome(); r.mount.authorityID = Data(repeating: 1, count: 32); r.mount.volumeID = "v"; r.mount.incarnation = Data(repeating: 3, count: 16)
     r.state = "terminal"; r.reason = "x"; r.cleanup = "complete"
     status.retired = [retiredTestOutcome(r, sequence: 1)]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     ch.statuses.removeFirst()(.success(status))
     // Now a real failure: start a sleep and let pause budget expire.
     c.powerEvent(.sleep(WorkspaceSleepNotification(id: 1, arrivedAt: clock.now)))
@@ -214,18 +222,21 @@ private func rrGolden(_ name: String) throws -> Data {
     let (c, _, _, _, ch) = try rrRig()
     var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
     status.generation = c.generation; status.jobs[0].generation = c.generation
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     let running = status.jobs[0]
     #expect(c.jobStatus == [running])
     ch.retiredAcks.removeFirst().1(.success(()))
     // A missing retirement page must leave the last observed owner intact.
     status.jobs = []
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.jobStatus == [running])
     #expect(c.reason.contains("retired jobs"))
     var joined = running; joined.phase = "failed"; joined.failure = "unavailable"; joined.reason = "real mount driver unavailable"
     var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = 2; outcome.job = joined
     status.retired.append(outcome)
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.jobStatus.isEmpty)
     #expect(c.retiredStatus.last == outcome)
@@ -235,6 +246,7 @@ private func rrGolden(_ name: String) throws -> Data {
     ch.retiredAcks.removeFirst().1(.success(()))
     #expect(c.retiredStatus.isEmpty)
     status.retired = []
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.reason.isEmpty)
 }
@@ -250,7 +262,9 @@ private func rrGolden(_ name: String) throws -> Data {
     var job = try WorkspaceControl.decode(rrGolden("job_running")).statusReply.jobs[0]
     job.generation = c.generation; job.mount.volumeID = "pending"
     status.jobs = [job]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     #expect(WorkspaceControl.validStatus(status))
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.mountStatus == [old] && c.jobStatus == [job])
 
@@ -264,7 +278,9 @@ private func rrGolden(_ name: String) throws -> Data {
         var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = UInt64(seq); outcome.job = filler
         status.retired.append(outcome)
     }
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     #expect(WorkspaceControl.validStatus(status))
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.mountStatus == [replacement])
     #expect(c.jobStatus == [job])
@@ -275,13 +291,16 @@ private func rrGolden(_ name: String) throws -> Data {
     job.phase = "complete"
     var last = WorkspaceRetiredOutcome(); last.retirementSequence = 17; last.job = job
     status.retired = [last]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     #expect(WorkspaceControl.validStatus(status))
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.jobStatus.isEmpty)
     #expect(ch.retiredAcks.map(\.0) == [17])
     try c.acknowledgeRetired(c.retiredStatus)
     ch.retiredAcks.removeFirst().1(.success(()))
     status.retired = []
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.reason.isEmpty, "both pages were observed and acknowledged")
     #expect(c.mountStatus == [replacement], "old mount stayed pinned after its evidence was acknowledged and deleted")
@@ -298,20 +317,25 @@ private func rrGolden(_ name: String) throws -> Data {
     status.jobs = []
     var first = WorkspaceRetiredOutcome(); first.retirementSequence = 1; first.job = joined
     status.retired = [first]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.retiredStatus == [first])
     #expect(ch.retiredAcks.map(\.0) == [1])
     ch.retiredAcks.removeFirst().1(.success(()))
-    // A snapshot queued before the ack can arrive after its completion.
+    // Injecting an old page is defensive coverage; the FIFO cannot deliver
+    // a pre-ack exchange after the acknowledgement completes.
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.retiredStatus.isEmpty && c.reason.isEmpty)
     var second = first; second.retirementSequence = 2; second.job.requestID += 1
     status.retired = [second]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.retiredStatus == [second])
     #expect(ch.retiredAcks.map(\.0) == [2])
     ch.retiredAcks.removeFirst().1(.success(()))
     status.retired = []
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.retiredStatus.isEmpty && c.reason.isEmpty)
 }
@@ -327,7 +351,9 @@ private func rrGolden(_ name: String) throws -> Data {
     var job = try WorkspaceControl.decode(rrGolden("job_running")).statusReply.jobs[0]
     job.generation = c.generation; job.mount.volumeID = "pending"
     status.jobs = [job]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     #expect(WorkspaceControl.validStatus(status))
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.mountStatus == [old] && c.jobStatus == [job])
 
@@ -343,7 +369,9 @@ private func rrGolden(_ name: String) throws -> Data {
         var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = UInt64(seq); outcome.job = filler
         status.retired.append(outcome)
     }
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     #expect(WorkspaceControl.validStatus(status))
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.mountStatus == [old])
     #expect(c.jobStatus.isEmpty)
@@ -354,14 +382,128 @@ private func rrGolden(_ name: String) throws -> Data {
     job.phase = "complete"
     let last = retiredTestOutcome(old, sequence: 17)
     status.retired = [last]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     #expect(WorkspaceControl.validStatus(status))
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.jobStatus.isEmpty)
     #expect(ch.retiredAcks.map(\.0) == [17])
     try c.acknowledgeRetired(c.retiredStatus)
     ch.retiredAcks.removeFirst().1(.success(()))
     status.retired = []
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
     c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
     #expect(c.reason.isEmpty, "both pages were observed and acknowledged")
     #expect(c.mountStatus == [replacement], "old mount stayed pinned after its evidence was acknowledged and deleted")
+}
+// R3 review probes.
+@Test @MainActor func workspaceStaleSnapshotCannotResurrectAcknowledgedMount() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("status_reply")).statusReply
+    status.generation = c.generation; status.retired = []; status.jobs = []; status.retirementSequence = 0
+    let m = status.mounts[0]
+    status.mounts = [m]
+    let stale = status
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.mountStatus == [m])
+    var gone = m; gone.state = "terminal"; gone.reason = "removed"; gone.cleanup = "complete"
+    status.mounts = []; status.retired = [retiredTestOutcome(gone, sequence: 1)]; status.retirementSequence = 1
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(ch.retiredAcks.map(\.0) == [1])
+    ch.retiredAcks.removeFirst().1(.success(()))
+    #expect(c.mountStatus.isEmpty)
+    // Out-of-order delivery of a snapshot older than the retirement.
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(stale))
+    #expect(c.mountStatus.isEmpty)
+    status.retired = []; status.retirementSequence = 1
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.mountStatus.isEmpty && c.reason.isEmpty)
+}
+
+@Test @MainActor func workspaceLostAckIsResentOnNextObservation() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    status.generation = c.generation; status.jobs[0].generation = c.generation
+    var joined = status.jobs[0]; joined.phase = "failed"; joined.failure = "unavailable"; joined.reason = "x"
+    status.jobs = []
+    var first = WorkspaceRetiredOutcome(); first.retirementSequence = 1; first.job = joined
+    status.retired = [first]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    ch.retiredAcks.removeFirst().1(.failure(WorkspaceControlError.transition))
+    #expect(c.retiredStatus == [first] && ch.retiredAcks.isEmpty)
+    // Guest actually applied it; next snapshot is empty.
+    status.retired = []; status.retirementSequence = 1
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(ch.retiredAcks.map(\.0) == [1])
+    ch.retiredAcks.removeFirst().1(.success(()))
+    #expect(c.retiredStatus.isEmpty && c.reason.isEmpty)
+}
+
+
+@Test @MainActor func workspaceSameCategoryFailuresRequireExactTerminalConsumption() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    status.generation = c.generation; status.retired = []
+    var j1 = status.jobs[0]; j1.generation = c.generation; j1.requestID = 5; j1.phase = "failed"; j1.failure = "handler-failed"; j1.reason = "ENOSPC"
+    status.jobs = [j1]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus == [j1])
+    var j2 = j1; j2.requestID = 6; j2.phase = "running"; j2.failure = ""; j2.reason = ""
+    status.jobs = [j2]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus == [j2])
+    var j3 = j2; j3.requestID = 7
+    status.jobs = [j3]
+    #expect(throws: (any Error).self) { try c.observeStatus(status) }
+    #expect(c.jobStatus == [j2])
+    j2.phase = "failed"; j2.failure = "handler-failed"; j2.reason = "EPERM"
+    status.jobs = [j2]; try c.observeStatus(status)
+    #expect(c.jobStatus[0].reason == "EPERM")
+    var altered = j2; altered.reason = "EIO"; status.jobs = [altered]
+    #expect(throws: (any Error).self) { try c.observeStatus(status) }
+    status.jobs = [j3]; try c.observeStatus(status)
+    #expect(c.jobStatus == [j3])
+}
+
+@Test @MainActor func workspaceSuspendOvertakingStatusStillConsumesJobEvidence() throws {
+    let (c, _, power, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    status.generation = c.generation; status.jobs[0].generation = c.generation
+    let running = status.jobs[0]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus == [running])
+    c.refreshStatus()
+    power.handler?(.sleep(WorkspaceSleepNotification(id: 1, arrivedAt: 1_000)))
+    #expect(c.phase == .draining)
+    var failed = running; failed.phase = "failed"; failed.failure = "handler-failed"; failed.reason = "EPERM"
+    status.jobs = [failed]
+    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+    ch.statuses.removeFirst()(.success(status))
+    #expect(c.jobStatus == [failed])
+    #expect(c.phase == .draining)
+}
+
+@Test @MainActor func workspaceRetiredPredecessorIsConsumedBeforeSameSnapshotSuccessor() throws {
+    let (c, _, _, _, ch) = try rrRig()
+    var status = try WorkspaceControl.decode(rrGolden("job_running")).statusReply
+    status.generation = c.generation; status.jobs[0].generation = c.generation
+    let running = status.jobs[0]
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    ch.retiredAcks.removeFirst().1(.success(()))
+    var joined = running; joined.phase = "failed"; joined.failure = "handler-failed"; joined.reason = "EPERM"
+    var outcome = WorkspaceRetiredOutcome(); outcome.retirementSequence = 2; outcome.job = joined
+    var successor = running; successor.requestID += 1
+    status.retired = [outcome]; status.retirementSequence = 2; status.jobs = [successor]
+    c.refreshStatus(); ch.statuses.removeFirst()(.success(status))
+    #expect(c.retiredStatus == [outcome])
+    #expect(c.jobStatus == [successor] && c.phase == .running)
+    #expect(ch.retiredAcks.map(\.0) == [2])
 }

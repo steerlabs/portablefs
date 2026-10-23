@@ -431,7 +431,7 @@ accepted-entry/byte counters. The driver retains exact barrier outcomes.
 Overflow terminalizes only that mount for exact cleanup/replacement; its cold
 withdrawal still counts toward suspension. Later reports cannot reduce a
 reported aggregate. Even 64 active and 16 retired maximum-size mount ledgers, statuses, identities
-and cumulative job summaries fit the paired 2 MiB frame by construction. Cold completion never implies loss-free
+and current jobs fit the paired 1 MiB frame by construction. Cold completion never implies loss-free
 durability.
 
 | Body | Required meaning |
@@ -708,26 +708,31 @@ can wait for acknowledgement, and reservation saturation always has at least
 64 directly acknowledgeable records. Sequence exhaustion refuses a new admission;
 it never prevents an admitted owner's final retirement.
 
-A live job cannot be replaced, including after cancellation. Registered retries
-merge joined predecessors into the current job's cumulative `prior` summaries.
-There are exactly 21 possible operation/result categories (three operations,
-complete or one of six failure codes). Each present category retains the first
-exact result, an exact count and the highest joined request ID. Later diagnostic
-strings and individual request IDs are explicitly aggregated within that category;
-no failure category or count is erased. Summaries are canonical, nonrecursive and
-monotonic, and their counts cannot overflow because accepted request IDs increase.
-This is finite outcome evidence, not a request/response history.
+A successor, including Umount, requires its predecessor to join and its exact
+terminal result to be observed. Only a successful paired Status write marks a
+still-current, joined result observed; internal snapshots, running snapshots and
+failed writes do not. Observation leaves the result intact. An early retry gets
+admission-only `predecessor-unobserved`, with reason `observe predecessor result
+with Status before retry`; it dispatches no work and changes no slot. The host
+consumes Status synchronously through the coordinator before any next exchange,
+then resubmits with a fresh request ID within the original deadline. Consumption
+of terminal evidence survives a power transition overtaking the snapshot; only
+readiness publication depends on the current phase and generation. Terminal
+results are immutable, and a running attempt cannot advance to a newer request.
+MountJob field 8 is reserved; there is no predecessor history or observation RPC.
 
 A joined job without membership transfers its reservation into retirement. A
 joined Umount with terminal membership and exact cleanup proof retires the mount
-and job, including all predecessor summaries, atomically as one record. Actual
+and job atomically as one record, preserving an unobserved result intact. Actual
 driver calls join before publishing that immutable evidence. During a fixed cold
 transaction, cleaned membership remains through Resume token consumption, then
 retires. It needs no further driver call or capacity. Exactly cleaned Replace
 first retires the old key using its reservation, then admits the new incarnation.
 At reservation saturation only that new admission waits; the old key is already
 retired and can be acknowledged. After acknowledgement the caller Registers the
-new incarnation, without an old membership tombstone.
+new incarnation. A refused Replace and its retry name the already retired or
+absent old incarnation and this continuation. Retirement, cleanup and joining
+never wait for observation.
 
 `RetiredOutcome` carries a joined job, an exactly cleaned terminal mount, or both.
 Job-only retirement asserts no membership, cleanup proof or durability outcome.
@@ -735,11 +740,20 @@ The host coordinator owns observation and acknowledgement: it reconciles mount
 and job owners independently, retains each page before acknowledging, and advances
 full pages until the backlog is consumed. One missing owner's later page cannot
 block another owner's evidence. Duplicate acknowledgements and snapshots older
-than the acknowledged cursor are harmless. No unobserved retirement is evicted.
+than the observed retirement high-water mark are ignored. Status carries this
+mark even after acknowledgement. No unobserved retirement is evicted.
 Suspend closes admission and cancels jobs before waiting for their actual
 owners, including desired-only work. One reader watches EOF while the ordered
 dispatcher drains or writes a response; loss immediately closes admission and
 cancels generation work. Bounded read-ahead never blocks that loss path.
+A successful write alone does not prove receipt: safety also requires the single
+FIFO exchange and synchronous host consumption. A lost Status reply retains the
+predecessor; channel loss permanently discards this boot, and coordinator restart
+discards the VM. The dispatcher rejects non-increasing request IDs across the
+whole channel, including after RetireAck. Direct supervisor calls have no replay
+store once a retirement is acknowledged; that replay is unreachable on the paired
+channel. Suspend drains existing owners directly without successor jobs or
+observation waits.
 
 The native inventory proves all three absent-driver jobs retain `unavailable`
 and leave the registered roster empty. Deterministic model/transport tests

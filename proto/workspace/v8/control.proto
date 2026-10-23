@@ -100,17 +100,8 @@ message MountJob {
   // unavailable, refused, authorization-required, stopped, deadline, handler-failed.
   string failure = 6;
   string reason = 7;
-  // Cumulative joined predecessors, one bucket for complete and each failure
-  // code. The first exact result is retained; count and last_request_id merge
-  // subsequent results in the same operation/failure category without allocating
-  // another retirement reservation. At most 21 sorted categories; first has no prior.
-  repeated JoinedJobSummary prior = 8;
-}
-message JoinedJobSummary {
-  // A terminal MountJob without its own prior summaries.
-  MountJob first = 1;
-  uint64 count = 2;
-  uint64 last_request_id = 3;
+  // Predecessors are consumed through Status before a successor is admitted.
+  reserved 8;
 }
 // One acknowledged retirement stream for exact mount and joined job evidence.
 // A replaced mount and its last job share one record; job-only work never
@@ -131,6 +122,8 @@ message StatusReply {
   // First 16 unacknowledged retired outcomes, in retirement order.
   repeated RetiredOutcome retired = 7;
   repeated MountJob jobs = 8;
+  // High-water mark, including acknowledged retirements; rejects stale snapshots.
+  uint64 retirement_sequence = 9;
 }
 // Idempotently acknowledge all retired outcomes through this sequence.
 message RetireAck { uint64 through_sequence = 1; }
@@ -147,7 +140,8 @@ message Provision {
 message MountRequest { MountID mount = 1; }
 message UmountRequest { MountID mount = 1; }
 message Result {
-  // accepted, unavailable, authorization-required, refused.
+  // accepted, unavailable, authorization-required, refused, predecessor-unobserved.
+  // predecessor-unobserved is admission-only; no work or slot changes.
   string code = 1;
   string reason = 2;
 }

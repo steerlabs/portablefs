@@ -432,16 +432,21 @@ func TestReplaceRetiresRegisteredJobFailureWithExactMount(t *testing.T) {
 	}
 }
 
-func TestRegisteredJobRetryMergesEarlierFailure(t *testing.T) {
+func TestRegisteredJobRetryAfterObservation(t *testing.T) {
 	s, _, mid := fixture(t)
 	for _, request := range []uint64{2, 3} {
 		if err := s.AcceptJob(jobRequest(request, mid, "mount")); err != nil {
 			t.Fatal(err)
 		}
 		waitDesiredJobsJoined(t, s)
+		status := s.Status()
+		if status.Jobs[0].RequestId != request || status.Jobs[0].Failure != "unavailable" {
+			t.Fatal("exact failure missing")
+		}
+		s.observeWrittenStatus(status)
 	}
-	if len(s.Retired()) != 0 || len(s.Status().Jobs[0].Prior) != 1 || s.Status().Jobs[0].Prior[0].First.RequestId != 2 || s.Status().Jobs[0].RequestId != 3 {
-		t.Fatal("retry erased unobserved failure")
+	if len(s.Retired()) != 0 {
+		t.Fatal("retry allocated retirement")
 	}
 	encodable(t, s.Status())
 }

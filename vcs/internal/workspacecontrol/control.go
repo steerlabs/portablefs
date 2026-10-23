@@ -20,13 +20,13 @@ import (
 )
 
 const Version = 8
-const MaxFrame = 2 << 20
+const MaxFrame = 1 << 20
 const MaxMounts = 64
 const MaxRetiredBatch = 16
 const MaxDrainBudget = 15 * time.Second
 
-// At most 80 mount ledgers and 80 jobs with 21 fixed summary buckets each.
-// The paired maximum-payload tests prove every reply fits the 2 MiB frame.
+// At most 80 mount ledgers and 80 current or retired terminal jobs.
+// The paired maximum-payload tests prove every reply fits the 1 MiB frame.
 const MaxLosses = 32
 const MaxReason = 256
 const AggregateReason = "additional accepted-tail loss (aggregated)"
@@ -398,29 +398,6 @@ func Jobs(jobs []*pb.MountJob, mounts []*pb.MountStatus, generation uint64) erro
 		if j == nil || Mount(j.Mount) != nil || j.RequestId == 0 || j.Generation > generation {
 			return invalid("job identity")
 		}
-		if len(j.Prior) > 21 {
-			return invalid("joined job summary capacity")
-		}
-		var previous string
-		var count uint64
-		for _, summary := range j.Prior {
-			if summary == nil || summary.First == nil || len(summary.First.Prior) != 0 {
-				return invalid("joined job summary identity")
-			}
-			first := summary.First
-			category := first.Operation + "/" + first.Failure
-			if err := Jobs([]*pb.MountJob{first}, nil, j.Generation); err != nil {
-				return err
-			}
-			if !proto.Equal(first.Mount, j.Mount) || (first.Phase != "complete" && first.Phase != "failed") ||
-				summary.Count == 0 || summary.LastRequestId < first.RequestId || summary.LastRequestId >= j.RequestId ||
-				summary.Count > summary.LastRequestId-first.RequestId+1 || (previous != "" && category <= previous) ||
-				summary.Count > j.RequestId-1-count {
-				return invalid("joined job summary bounds or order")
-			}
-			previous = category
-			count += summary.Count
-		}
 		ids = append(ids, j.Mount)
 		volume := fmt.Sprintf("%x/%s", j.Mount.AuthorityId, j.Mount.VolumeId)
 		if old, ok := volumes[volume]; ok && old != MountKey(j.Mount) {
@@ -505,6 +482,9 @@ func Validate(e *pb.Envelope) error {
 		if err := RetiredStatuses(s.Retired); err != nil {
 			return fmt.Errorf("status retired: %w", err)
 		}
+		if len(s.Retired) > 0 && s.Retired[len(s.Retired)-1].RetirementSequence > s.RetirementSequence {
+			return invalid("retired outcome exceeds status high-water mark")
+		}
 		if err := statuses(s.Mounts); err != nil {
 			return fmt.Errorf("status mounts: %w", err)
 		}
@@ -574,6 +554,8 @@ func Validate(e *pb.Envelope) error {
 			return invalid("Validate: invalid field or state combination")
 		}
 		switch b.Result.Code {
+		case "predecessor-unobserved":
+			return valid(b.Result.Reason == "observe predecessor result with Status before retry")
 		case "accepted", "unavailable", "authorization-required", "refused":
 			return nil
 		}

@@ -2,6 +2,7 @@ package workspaceguest
 
 import (
 	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ func astraFullRegisteredRoster(t *testing.T) (*Supervisor, []*pb.MountID) {
 		}
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	status := s.Status()
 	if len(status.Mounts) != 64 || len(status.Jobs) != 64 || len(status.Retired) != 0 {
 		t.Fatalf("not the required reachable full state: mounts=%d jobs=%d retired=%d", len(status.Mounts), len(status.Jobs), len(status.Retired))
@@ -69,7 +71,8 @@ func TestFullRegisteredRosterReplacesCleanedMountWithoutAcknowledgements(t *test
 }
 
 // Saturate reservations with both active owners and acknowledgeable evidence.
-// Every existing owner must still be able to retry, join, remove and drain.
+// After terminal observation, existing owners can retry and remove. Joining
+// and draining never depend on observation or another reservation.
 func TestReservedLifecycleProgressAtEvidenceSaturation(t *testing.T) {
 	s := r2RegisteringSupervisor(t)
 	for i := range control.MaxMounts {
@@ -78,17 +81,23 @@ func TestReservedLifecycleProgressAtEvidenceSaturation(t *testing.T) {
 		}
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	for i := range control.MaxMounts {
 		if err := s.AcceptJob(jobRequest(uint64(100+i), retirementVolume(i, 4), "mount")); err != nil {
 			t.Fatal(err)
 		}
 	}
 	waitDesiredJobsJoined(t, s)
+	if err := s.AcceptJob(jobRequest(999, retirementVolume(0, 4), "umount")); !errors.Is(err, ErrPredecessorUnobserved) {
+		t.Fatalf("unobserved predecessor at full reservations: %v", err)
+	}
+	writtenStatus(t, s, s.Status())
 	for i := range 200 {
 		if err := s.AcceptJob(jobRequest(uint64(1000+i), retirementVolume(0, 4), "mount")); err != nil {
 			t.Fatal(err)
 		}
 		waitDesiredJobsJoined(t, s)
+		writtenStatus(t, s, s.Status())
 	}
 	s.mu.Lock()
 	if s.slotsLocked() != MaxReservations {
@@ -96,8 +105,8 @@ func TestReservedLifecycleProgressAtEvidenceSaturation(t *testing.T) {
 	}
 	history := clone(s.jobs[control.MountKey(retirementVolume(0, 4))].status)
 	s.mu.Unlock()
-	if len(history.Prior) != 2 || history.Prior[1].Count != 199 {
-		t.Fatalf("unbounded or missing aggregate: %v", history)
+	if history.RequestId != 1199 {
+		t.Fatalf("current observed result missing: %v", history)
 	}
 	encodable(t, s.Status())
 	if err := s.AcceptJob(jobRequest(2000, retirementVolume(250, 4), "mount")); err == nil {
@@ -109,6 +118,7 @@ func TestReservedLifecycleProgressAtEvidenceSaturation(t *testing.T) {
 		}
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	st := s.Status()
 	if len(st.Mounts) != 0 || len(st.Jobs) != 0 || len(s.Retired()) != MaxReservations {
 		t.Fatalf("exact removal did not transfer reservations: %v", st)
@@ -117,8 +127,8 @@ func TestReservedLifecycleProgressAtEvidenceSaturation(t *testing.T) {
 	for _, outcome := range s.Retired() {
 		if outcome.Job.RequestId == 2100 {
 			found = true
-			if outcome.MountStatus == nil || len(outcome.Job.Prior) != 2 || outcome.Job.Prior[1].Count != 200 {
-				t.Fatal("removal lost cumulative evidence")
+			if outcome.MountStatus == nil || outcome.Job.Operation != "umount" {
+				t.Fatal("removal lost exact final evidence")
 			}
 		}
 	}
@@ -154,6 +164,7 @@ func TestExactUmountJoiningDuringSuspendKeepsFixedRosterThroughResume(t *testing
 	await(t, entered)
 	x := begin(t, s, suspension(s))
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	if len(s.Status().Mounts) != 1 || len(s.Retired()) != 0 {
 		t.Fatal("fixed roster retired before token consumption")
 	}
@@ -186,6 +197,7 @@ func TestRegisteredRetryAndExactRemovalUseLastReservedSequence(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitDesiredJobsJoined(t, s)
+		writtenStatus(t, s, s.Status())
 	}
 	if err := s.Terminal(mid, "removed", nil); err != nil {
 		t.Fatal(err)
@@ -197,8 +209,9 @@ func TestRegisteredRetryAndExactRemovalUseLastReservedSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	r := s.Retired()
-	if len(r) != 1 || r[0].RetirementSequence != math.MaxUint64 || r[0].MountStatus == nil || r[0].Job.Prior[0].Count != 2 {
+	if len(r) != 1 || r[0].RetirementSequence != math.MaxUint64 || r[0].MountStatus == nil || r[0].Job.RequestId != 4 {
 		t.Fatal("reserved final sequence lost")
 	}
 	encodable(t, s.Status())
@@ -229,6 +242,7 @@ func TestExactRemovalRetiresOnlyAfterLateDriverEvidenceJoins(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	if len(s.Retired()) != 0 || len(s.Status().Mounts) != 1 {
 		t.Fatal("retired before actual driver call joined")
 	}

@@ -364,43 +364,11 @@ public nonisolated struct WorkspaceMountJob: Sendable {
 
   public var reason: String = String()
 
-  /// Cumulative joined predecessors, one bucket for complete and each failure
-  /// code. The first exact result is retained; count and last_request_id merge
-  /// subsequent results in the same operation/failure category without allocating
-  /// another retirement reservation. At most 21 sorted categories; first has no prior.
-  public var prior: [WorkspaceJoinedJobSummary] = []
-
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _mount: WorkspaceMountID? = nil
-}
-
-public nonisolated struct WorkspaceJoinedJobSummary: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  /// A terminal MountJob without its own prior summaries.
-  public var first: WorkspaceMountJob {
-    get {_first ?? WorkspaceMountJob()}
-    set {_first = newValue}
-  }
-  /// Returns true if `first` has been explicitly set.
-  public var hasFirst: Bool {self._first != nil}
-  /// Clears the value of `first`. Subsequent reads from it will return its default value.
-  public mutating func clearFirst() {self._first = nil}
-
-  public var count: UInt64 = 0
-
-  public var lastRequestID: UInt64 = 0
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-
-  fileprivate var _first: WorkspaceMountJob? = nil
 }
 
 /// One acknowledged retirement stream for exact mount and joined job evidence.
@@ -463,6 +431,9 @@ public nonisolated struct WorkspaceStatusReply: Sendable {
   public var retired: [WorkspaceRetiredOutcome] = []
 
   public var jobs: [WorkspaceMountJob] = []
+
+  /// High-water mark, including acknowledged retirements; rejects stale snapshots.
+  public var retirementSequence: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -563,7 +534,8 @@ public nonisolated struct WorkspaceResult: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  /// accepted, unavailable, authorization-required, refused.
+  /// accepted, unavailable, authorization-required, refused, predecessor-unobserved.
+  /// predecessor-unobserved is admission-only; no work or slot changes.
   public var code: String = String()
 
   public var reason: String = String()
@@ -1283,7 +1255,7 @@ nonisolated extension WorkspaceStatusRequest: SwiftProtobuf.Message, SwiftProtob
 
 nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MountJob"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}request_id\0\u{1}generation\0\u{1}operation\0\u{1}phase\0\u{1}failure\0\u{1}reason\0\u{1}prior\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}request_id\0\u{1}generation\0\u{1}operation\0\u{1}phase\0\u{1}failure\0\u{1}reason\0\u{c}\u{8}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1298,7 +1270,6 @@ nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._M
       case 5: try { try decoder.decodeSingularStringField(value: &self.phase) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.failure) }()
       case 7: try { try decoder.decodeSingularStringField(value: &self.reason) }()
-      case 8: try { try decoder.decodeRepeatedMessageField(value: &self.prior) }()
       default: break
       }
     }
@@ -1330,9 +1301,6 @@ nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._M
     if !self.reason.isEmpty {
       try visitor.visitSingularStringField(value: self.reason, fieldNumber: 7)
     }
-    if !self.prior.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.prior, fieldNumber: 8)
-    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1344,51 +1312,6 @@ nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._M
     if lhs.phase != rhs.phase {return false}
     if lhs.failure != rhs.failure {return false}
     if lhs.reason != rhs.reason {return false}
-    if lhs.prior != rhs.prior {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension WorkspaceJoinedJobSummary: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".JoinedJobSummary"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}first\0\u{1}count\0\u{3}last_request_id\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularMessageField(value: &self._first) }()
-      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.count) }()
-      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.lastRequestID) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    // The use of inline closures is to circumvent an issue where the compiler
-    // allocates stack space for every if/case branch local when no optimizations
-    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-    // https://github.com/apple/swift-protobuf/issues/1182
-    try { if let v = self._first {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
-    } }()
-    if self.count != 0 {
-      try visitor.visitSingularUInt64Field(value: self.count, fieldNumber: 2)
-    }
-    if self.lastRequestID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.lastRequestID, fieldNumber: 3)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: WorkspaceJoinedJobSummary, rhs: WorkspaceJoinedJobSummary) -> Bool {
-    if lhs._first != rhs._first {return false}
-    if lhs.count != rhs.count {return false}
-    if lhs.lastRequestID != rhs.lastRequestID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1480,7 +1403,7 @@ nonisolated extension WorkspaceRetiredOutcome: SwiftProtobuf.Message, SwiftProto
 
 nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StatusReply"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}state\0\u{1}mounts\0\u{1}retired\0\u{1}jobs\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}state\0\u{1}mounts\0\u{1}retired\0\u{1}jobs\0\u{3}retirement_sequence\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1496,6 +1419,7 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.mounts) }()
       case 7: try { try decoder.decodeRepeatedMessageField(value: &self.retired) }()
       case 8: try { try decoder.decodeRepeatedMessageField(value: &self.jobs) }()
+      case 9: try { try decoder.decodeSingularUInt64Field(value: &self.retirementSequence) }()
       default: break
       }
     }
@@ -1526,6 +1450,9 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
     if !self.jobs.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.jobs, fieldNumber: 8)
     }
+    if self.retirementSequence != 0 {
+      try visitor.visitSingularUInt64Field(value: self.retirementSequence, fieldNumber: 9)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1538,6 +1465,7 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
     if lhs.mounts != rhs.mounts {return false}
     if lhs.retired != rhs.retired {return false}
     if lhs.jobs != rhs.jobs {return false}
+    if lhs.retirementSequence != rhs.retirementSequence {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

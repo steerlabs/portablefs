@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -144,6 +145,9 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 			result := &pb.Result{Code: "accepted"}
 			if err := supervisor.AcceptJob(request); err != nil {
 				result.Code = "refused"
+				if errors.Is(err, ErrPredecessorUnobserved) {
+					result.Code = "predecessor-unobserved"
+				}
 				result.Reason = control.BoundedReason(err.Error())
 			}
 			reply.Body = &pb.Envelope_Result{Result: result}
@@ -153,8 +157,20 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("workspace control stream: %w", err)
 		}
-		if err := control.Write(stream, reply); err != nil {
+		if err := supervisor.writeReply(stream, reply); err != nil {
 			return fmt.Errorf("workspace control stream: %w", err)
 		}
 	}
+}
+
+// No supervisor lock spans I/O. Only the paired dispatcher commits observation,
+// after the complete frame has been written successfully.
+func (s *Supervisor) writeReply(w io.Writer, reply *pb.Envelope) error {
+	if err := control.Write(w, reply); err != nil {
+		return err
+	}
+	if status := reply.GetStatusReply(); status != nil {
+		s.observeWrittenStatus(status)
+	}
+	return nil
 }

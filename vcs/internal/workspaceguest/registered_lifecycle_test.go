@@ -53,6 +53,7 @@ func TestReservationUmountOfRegisteredMountAtFullBound(t *testing.T) {
 		}
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	st := s.Status()
 	if len(st.Mounts) != control.MaxMounts || len(st.Retired) != 0 {
 		t.Fatalf("setup: mounts=%d retired=%d", len(st.Mounts), len(st.Retired))
@@ -102,6 +103,7 @@ func TestReservationRealDriverMountUmountCyclesReleaseCapacity(t *testing.T) {
 				t.Fatal(i, op, err)
 			}
 			waitDesiredJobsJoined(t, s)
+			writtenStatus(t, s, s.Status())
 			if r := s.Status().Retired; len(r) != 0 {
 				if err := s.AcknowledgeRetired(r[len(r)-1].RetirementSequence); err != nil {
 					t.Fatal(err)
@@ -129,8 +131,10 @@ func TestReservationSuspendResumeWithFullUnacknowledgedBound(t *testing.T) {
 			t.Fatal(err)
 		}
 		waitDesiredJobsJoined(t, s)
+		writtenStatus(t, s, s.Status())
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	if len(s.Retired()) != MaxReservations {
 		t.Fatal("setup")
 	}
@@ -167,6 +171,7 @@ func TestReservationRetireAckEdgeCases(t *testing.T) {
 		}
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	for _, tc := range []struct {
 		through uint64
 		ok      bool
@@ -248,6 +253,7 @@ func TestReservationStatusNeverShowsRetiredJobActive(t *testing.T) {
 		_ = s.AcceptJob(jobRequest(rid, retirementVolume(n%80, byte(4+n%3)), []string{"mount", "umount", "provision"}[n%3]))
 	}
 	waitDesiredJobsJoined(t, s)
+	writtenStatus(t, s, s.Status())
 	close(stop)
 	<-done
 }

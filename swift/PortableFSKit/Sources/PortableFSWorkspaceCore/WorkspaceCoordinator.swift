@@ -28,11 +28,13 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     func acknowledgeSleep(notificationID: UInt64, fenced: Bool)
     func unregister()
 }
-@MainActor public protocol WorkspaceGuestChannel {
+@MainActor public protocol WorkspaceGuestChannel: AnyObject {
     // True when no queued or active control exchange remains. Hello connection
     // and proof reads may still have an armed deadline during startup; the
     // coordinator cannot reach pause before Hello completes.
     var isIdle: Bool { get }
+    // Called synchronously before completing Status or dispatching another exchange.
+    var statusObserver: ((WorkspaceStatusReply) throws -> Void)? { get set }
     func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void)
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void)
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void)
@@ -110,6 +112,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     private var lastNotificationID: UInt64 = 0
     private var retirementAckInFlight: UInt64?
     private var acknowledgedRetirement: UInt64 = 0
+    private var observedRetirement: UInt64 = 0
     private var notifications: [UInt64: UInt64] = [:]
     private let startBudget: UInt64
     private let drainBudget: UInt64
@@ -127,6 +130,10 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         self.host = host; self.vm = vm; self.power = power; self.channel = channel
         self.clock = clock; self.nonces = nonces; self.drainBudget = drainBudget; self.totalBudget = totalBudget
         state = oldInstanceAbsent ? .idle : .unknown(nil)
+        channel.statusObserver = { [weak self] status in
+            guard let self else { throw WorkspaceControlError.transition }
+            try self.observeStatus(status)
+        }
     }
     private func window(at arrival: UInt64) -> Window? {
         let (total, overflow) = arrival.addingReportingOverflow(totalBudget)
@@ -349,10 +356,13 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     // Retirement reconciliation precedes acknowledgement and is independent for
     // each mount/job: a missing later page cannot pin an already retired owner.
     public func observeStatus(_ status: WorkspaceStatusReply) throws {
-        guard phase == .running || phase == .recovering,
-              WorkspaceControl.validStatus(status), status.bootID == host.bootID,
-              status.hostServiceID == host.hostServiceID, status.guestServiceID == guestServiceID,
-              status.generation == generation, status.state == "running" else { throw WorkspaceControlError.transition }
+        guard WorkspaceControl.validStatus(status), status.bootID == host.bootID,
+              status.hostServiceID == host.hostServiceID, status.guestServiceID == guestServiceID else { throw WorkspaceControlError.transition }
+        // FIFO makes regressions unreachable; the high-water guard also rejects
+        // an injected pre-retirement snapshot after its evidence was consumed.
+        let through = status.retirementSequence
+        guard through >= observedRetirement else { return }
+        let publishesReadiness = (phase == .running || phase == .recovering) && status.generation == generation && status.state == "running"
         let unacknowledged = status.retired.filter { $0.retirementSequence > acknowledgedRetirement }
         let knownThrough = retiredStatus.last?.retirementSequence ?? acknowledgedRetirement
         let added = unacknowledged.filter { $0.retirementSequence > knownThrough }
@@ -371,9 +381,18 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 guard WorkspaceControl.retainsJob(outcome.job, prior: old) else { throw WorkspaceControlError.transition }
             }
         }
+        let remainingJobs = jobStatus.filter { old in
+            !(retiredStatus + added).contains { $0.hasJob && WorkspaceControl.retainsJob($0.job, prior: old) }
+        }
+        for next in status.jobs {
+            if let old = remainingJobs.first(where: { $0.mount == next.mount }) {
+                guard WorkspaceControl.retainsJob(next, prior: old) else { throw WorkspaceControlError.transition }
+            }
+        }
+        observedRetirement = through
         retiredStatus.append(contentsOf: added)
         mountStatus.removeAll { old in retiredStatus.contains { $0.hasMountStatus && $0.mountStatus.mount == old.mount } }
-        jobStatus.removeAll { old in retiredStatus.contains { $0.hasJob && WorkspaceControl.retainsJob($0.job, prior: old) } }
+        jobStatus = remainingJobs
 
         // Preserve only owners still missing their own evidence, while advancing
         // every other owner from this snapshot. Conflicting replacements wait
@@ -382,10 +401,13 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
             !status.mounts.contains { $0.mount == old.mount && WorkspaceControl.retainsLoss($0.loss, prior: old.loss) }
         }
         let pendingJobs = jobStatus.filter { old in !status.jobs.contains { WorkspaceControl.retainsJob($0, prior: old) } }
-        mountStatus = pendingMounts + status.mounts.filter { next in
-            !pendingMounts.contains { $0.mount.authorityID == next.mount.authorityID && $0.mount.volumeID == next.mount.volumeID }
+        if publishesReadiness {
+            mountStatus = pendingMounts + status.mounts.filter { next in
+                !pendingMounts.contains { $0.mount.authorityID == next.mount.authorityID && $0.mount.volumeID == next.mount.volumeID }
+            }
         }
         jobStatus = pendingJobs + status.jobs.filter { next in !pendingJobs.contains { $0.mount == next.mount } }
+        guard publishesReadiness else { return }
         reason = !pendingJobs.isEmpty ? "waiting for earlier retired jobs before replacing active status" :
             (!pendingMounts.isEmpty ? "waiting for earlier retired outcomes before replacing active status" : "")
         state = .running
@@ -397,10 +419,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     // a lost ResumeAck. Socket failure does not erase the retained observation.
     public func refreshStatus() {
         guard phase == .running || phase == .recovering else { return }
-        let gen = generation
         channel.status(deadline: clock.now + totalBudget) { [weak self] reply in
-            guard let self, self.generation == gen, case .success(let status) = reply else { return }
-            do { try self.observeStatus(status) } catch { return }
+            if case .failure(let error) = reply { self?.channelLost(String(describing: error)) }
         }
     }
     // A lost paired channel cannot restore eligibility. While awake, terminate

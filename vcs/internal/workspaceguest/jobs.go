@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
@@ -23,8 +22,9 @@ type MountJobDriver interface {
 }
 
 type mountJob struct {
-	status *pb.MountJob
-	done   chan struct{}
+	status   *pb.MountJob
+	done     chan struct{}
+	observed bool
 }
 
 func sameVolume(a, b *pb.MountID) bool {
@@ -62,29 +62,25 @@ func (s *Supervisor) retireLocked(mount *pb.MountStatus, job *mountJob) {
 	s.retired = append(s.retired, outcome)
 }
 
-// Retries merge joined predecessors within the same fixed reservation. Each
-// operation/failure bucket retains its first exact result and an exact count;
-// later diagnostic strings are represented by that explicit aggregate.
-func joinedPrior(previous *mountJob) []*pb.JoinedJobSummary {
-	if previous == nil {
-		return nil
-	}
-	old := clone(previous.status)
-	prior := old.Prior
-	old.Prior = nil
-	for _, summary := range prior {
-		if summary.First.Operation == old.Operation && summary.First.Failure == old.Failure {
-			summary.Count++
-			summary.LastRequestId = old.RequestId
-			return prior
+// Observation is committed only after the paired dispatcher writes the exact
+// snapshot. Internal inspection and a terminal result published during I/O do
+// not grant a successor permission to erase that result.
+var ErrPredecessorUnobserved = errors.New("observe predecessor result with Status before retry")
+
+func (s *Supervisor) observeWrittenStatus(snapshot *pb.StatusReply) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, result := range snapshot.Jobs {
+		j := s.jobs[control.MountKey(result.Mount)]
+		if j == nil || (result.Phase != "complete" && result.Phase != "failed") || !proto.Equal(j.status, result) {
+			continue
+		}
+		select {
+		case <-j.done:
+			j.observed = true
+		default:
 		}
 	}
-	prior = append(prior, &pb.JoinedJobSummary{First: old, Count: 1, LastRequestId: old.RequestId})
-	sort.Slice(prior, func(i, j int) bool {
-		a, b := prior[i].First, prior[j].First
-		return a.Operation+"/"+a.Failure < b.Operation+"/"+b.Failure
-	})
-	return prior
 }
 
 // Registered membership and desired intents share 64 active slots. A second
@@ -164,8 +160,11 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 		default:
 			return refused("desired job lane occupied")
 		}
+		if !previous.observed {
+			return ErrPredecessorUnobserved
+		}
 	}
-	j := &mountJob{status: &pb.MountJob{Mount: clone(id), RequestId: request.RequestId, Generation: s.generation, Operation: operation, Phase: "offered", Prior: joinedPrior(previous)}, done: make(chan struct{})}
+	j := &mountJob{status: &pb.MountJob{Mount: clone(id), RequestId: request.RequestId, Generation: s.generation, Operation: operation, Phase: "offered"}, done: make(chan struct{})}
 	s.jobs[key] = j
 	go s.runJob(s.generationContext, j, provision)
 	return nil
