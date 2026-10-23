@@ -75,8 +75,9 @@ Preserve old barrier failures even if the new mount serves successfully.
 
 Stage 1c adds control contracts, renewal ownership and prompt desired-mount
 jobs. Mount, Umount and Provision acknowledge job acceptance; Status retains
-their progress separately from registered mounts. The guest has no real root
-driver, so these jobs fail with typed `unavailable` evidence. Acceptance never
+their progress separately from registered mounts. Provision validates and persists the guest-selected identity material. The guest
+has no real root mount/removal driver, so Mount and Umount fail with typed
+`unavailable` evidence; rejected provisioning retains its actual failure. Acceptance never
 asserts mount, removal or provisioning success. Managed mounts remain disabled.
 
 The existing random abstract mount socket retains ordinary reauthorization and
@@ -453,7 +454,7 @@ eligibility; do not transparently reconnect and reuse a token. Stage 1b connects
 guest accepts only host CID 2 on reserved port 1023, requires its independently seeded
 boot/service identity and exact release, and consumes one paired stream per
 boot. Disconnect discards its model; supervisor restart within that boot is
-refused. Provision, Mount and Umount return `unavailable`. The dev process is
+refused. Mount and Umount return `unavailable`; Provision owns validation and durable storage only. The dev process is
 the sole host caller; the signed-process local service API is Stage 2 work.
 
 Host-side callers must pass the existing same-user signed-process/audit-token
@@ -611,9 +612,9 @@ and serial logs retain the transaction. The no-mount recovery is not authority
 validation or real FUSE withdrawal evidence. Unsupported virtualization is a
 named **UNAVAILABLE** gate with nonzero exit status, never a passing skip.
 
-Guest wall-clock correction after a host pause is Stage 1c work. No RTC, wall
-clock or NTP observation is used to assert sleep safety. The unfenced host-sleep
-gate remains OPEN; the separate PL031 experiment is not part of this change.
+The guest now corrects TLS wall time from its retained RTC at boot and each
+accepted cold-resume generation. This grants no elapsed lease time or
+sleep-safety proof. The unfenced host-sleep gate remains OPEN.
 The coordinator owns each native notification's arrival-relative deadline;
 IOKit has no second release timer. An expired notification is explicitly released
 unfenced and cannot later earn cold eligibility. Unexpected VZ stops unregister
@@ -759,8 +760,9 @@ store once a retirement is acknowledged; that replay is unreachable on the paire
 channel. Suspend drains existing owners directly without successor jobs or
 observation waits.
 
-The native inventory proves all three absent-driver jobs retain `unavailable`
-and leave the registered roster empty. Deterministic model/transport tests
+The native inventory proves absent mount/removal drivers retain `unavailable`,
+invalid provisioning retains its validation failure, and the registered roster
+stays empty. Deterministic model/transport tests
 exercise interrupted initial Prepare, slow provisioning/removal, independent
 64-mount drains, spent framing/dispatch allowance, EOF and retained physical
 owners. Real managed multi-mount integration remains a later driver gate.
@@ -783,4 +785,71 @@ claim. Grant expiry within a live authorized session
 forfeits its accepted non-durable cut exactly once; recovery preserves the
 cumulative loss tickets and old description/root barrier baselines. It neither
 replays forfeited bytes under a successor grant nor ends a valid session.
-The production driver and its awake clock maintenance remain integration work.
+The root driver and its gate closure/recovery integration remain PR 6 work.
+
+## Guest identity and TLS time
+
+`workspacemount.Store` exclusively owns `/data/workspace-identities` for the
+supervisor lifetime. Its exact format-8 records retain the guest UUID, one
+Ed25519 key and identity incarnation per authority/volume, the renewal epoch and
+accepted provisioning material. Files have mode 0600 inside a root-owned 0700
+directory. Transactions sync the temporary file, rename, then sync the directory;
+a persistence failure prevents further issuance by that owner. A new boot or
+ordinary replacement chooses a new MountID without changing the key, identity
+incarnation, scope or epoch.
+
+IdentityRequest (Envelope 23) names authority/volume; IdentityReply (24) returns
+the guest-selected MountID, DER SPKI, signed DER PKCS#10 CSR, guest UUID, identity
+incarnation and positive renewal epoch. No private-key field exists. Standalone
+operators sign that CSR. Hosted callers use the existing Manager v1 issuance
+request and product authorization with renewal scope
+`portablefs-linux-workspace/8/<guest-uuid>/<identity-incarnation>` and the returned
+epoch. UUID components use canonical lowercase hyphenated text. Each volume has
+its own identity incarnation, so reissuance supersedes only that volume.
+Exact prior cleanup is a required operation before reissuance; intentional
+revocation commits an increased epoch first. The root driver supplies that
+cleanup operation when it is implemented.
+
+Provision adds server_name (8) and hosted_enrollment (9). Absence of the hosted
+record means standalone. Hosted data contains only Manager HTTPS origin, server
+name, CA, enrollment ID/certificate, authority generation and the initial Unix
+seconds authorization deadline. Acceptance checks the guest-selected mount,
+endpoint, route digest and exact SPKI through ProvisionForKey, then verifies
+same-key client/enrollment certificate chains and validity. Manager enrollment
+URI identity remains the existing v1 contract. A future NotBefore leaves the
+same generation-owned job pending; NotAfter refuses. Authority Attach still
+checks the route revision and signed capability. Diagnostics contain no signed
+provisioning request or enrollment/capability bytes.
+
+`workspaceclock` opens pinned `/dev/rtc0` read-only once. Only this privileged
+owner sets CLOCK_REALTIME; it never writes RTC. Its sealed read-only shared page
+publishes one generation-bound result to child daemons. A mount combines that
+result with its exact close serial through Binding. Authority dialTLS and
+Manager do, including the Manager transport's TLS dial, require this prerequisite
+for workspace clients. Cancellation, cleanup and retained replay cannot bypass
+it. Ordinary clients retain normal verified TLS and their existing dispatch.
+PR 6 must hand the clock page to real children and bind their existing gate and
+renewal owner; no real managed mount is enabled here.
+
+A whole-second RTC read supplies a UTC interval. The conditional source error is
+at most one second; quantization is less than one second, sample/set age at most
+250 ms and awake drift at most 250 ms. Their sum must stay within three seconds.
+The owner samples every 30 awake seconds, corrects to the interval midpoint only
+when the current wall falls outside the admissible uncertainty band, and checks
+the result and total age. Every use synchronously checks freshness below 60
+seconds and the wall against the projected interval. Read/set/calendar/age/error
+failures clear readiness and park TLS. They do not establish authority expiry.
+Suspend invalidates readiness immediately, and accepted Resume requires a fresh
+correction for its generation. Material corrections notify the same renewal
+owner to recompute wall-derived scheduling while retaining exact pending grants,
+sequence and terminal latches. A backward step cannot revive permission.
+
+The exact-image native inventory measures retained-opening exclusivity, eight
+concurrent duplicate readers, boot/resume corrections, CSR verification and
+identity persistence. `scripts/qualify-linux-workspace-clock.py` records at least
+one full maintenance interval against an image-manifest digest and can record
+an explicitly supplied independent UTC reference. It always leaves the final UTC
+qualification verdict false: source provenance, multi-day accuracy, host clock
+corrections and worst-case long-awake load require separate evidence. No NTP,
+host-message fallback, clock server or RTC admission is implemented. This TLS
+wall discipline grants no BOOTTIME continuity across unfenced host sleep.

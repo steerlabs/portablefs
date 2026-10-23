@@ -101,6 +101,27 @@ enum WorkspaceWireSchema {
         "RetireAck": [
             1: .init(kind: "", repeated: false, oneof: false),
         ],
+        "IdentityRequest": [
+            1: .init(kind: "$", repeated: false, oneof: false),
+            2: .init(kind: "$", repeated: false, oneof: false),
+        ],
+        "IdentityReply": [
+            1: .init(kind: "MountID", repeated: false, oneof: false),
+            2: .init(kind: "$", repeated: false, oneof: false),
+            3: .init(kind: "$", repeated: false, oneof: false),
+            4: .init(kind: "$", repeated: false, oneof: false),
+            5: .init(kind: "$", repeated: false, oneof: false),
+            6: .init(kind: "", repeated: false, oneof: false),
+        ],
+        "HostedEnrollment": [
+            1: .init(kind: "$", repeated: false, oneof: false),
+            2: .init(kind: "$", repeated: false, oneof: false),
+            3: .init(kind: "$", repeated: false, oneof: false),
+            4: .init(kind: "$", repeated: false, oneof: false),
+            5: .init(kind: "$", repeated: false, oneof: false),
+            6: .init(kind: "", repeated: false, oneof: false),
+            7: .init(kind: "", repeated: false, oneof: false),
+        ],
         "Provision": [
             1: .init(kind: "MountID", repeated: false, oneof: false),
             2: .init(kind: "$", repeated: false, oneof: false),
@@ -109,6 +130,8 @@ enum WorkspaceWireSchema {
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "$", repeated: false, oneof: false),
             7: .init(kind: "$", repeated: false, oneof: false),
+            8: .init(kind: "$", repeated: false, oneof: false),
+            9: .init(kind: "HostedEnrollment", repeated: false, oneof: false),
         ],
         "MountRequest": [
             1: .init(kind: "MountID", repeated: false, oneof: false),
@@ -137,6 +160,8 @@ enum WorkspaceWireSchema {
             20: .init(kind: "UmountRequest", repeated: false, oneof: true),
             21: .init(kind: "Result", repeated: false, oneof: true),
             22: .init(kind: "RetireAck", repeated: false, oneof: true),
+            23: .init(kind: "IdentityRequest", repeated: false, oneof: true),
+            24: .init(kind: "IdentityReply", repeated: false, oneof: true),
         ],
     ]
 }

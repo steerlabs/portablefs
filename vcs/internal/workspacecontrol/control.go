@@ -109,7 +109,7 @@ func ProvisionForKey(p *pb.Provision, publicKey []byte) error {
 	return nil
 }
 func Provision(p *pb.Provision) error {
-	if p == nil || len(p.AuthorityEndpoint) == 0 || len(p.AuthorityEndpoint) > 4096 || !utf8.ValidString(p.AuthorityEndpoint) || !Digest(p.RoutesRevision) {
+	if p == nil || len(p.AuthorityEndpoint) == 0 || len(p.AuthorityEndpoint) > 4096 || !utf8.ValidString(p.AuthorityEndpoint) || !Digest(p.RoutesRevision) || len(p.ServerName) == 0 || len(p.ServerName) > 4096 || !utf8.ValidString(p.ServerName) {
 		return invalid("provision endpoint or route revision")
 	}
 	for name, raw := range map[string][]byte{"CA": p.CaCertificate, "certificate": p.ClientCertificate, "capability": p.Capability, "public key": p.PublicKey} {
@@ -117,7 +117,29 @@ func Provision(p *pb.Provision) error {
 			return invalid("provision " + name + " length")
 		}
 	}
+	if h := p.HostedEnrollment; h != nil {
+		for _, v := range []string{h.ManagerOrigin, h.ManagerServerName, h.EnrollmentId} {
+			if len(v) == 0 || len(v) > 4096 || !utf8.ValidString(v) {
+				return invalid("hosted identity")
+			}
+		}
+		if len(h.ManagerCa) == 0 || len(h.ManagerCa) > 65536 || len(h.EnrollmentCertificate) == 0 || len(h.EnrollmentCertificate) > 65536 || h.AuthorityGeneration == 0 || h.AuthorizationDeadlineUnix == 0 || h.AuthorizationDeadlineUnix > math.MaxInt64 {
+			return invalid("hosted material")
+		}
+	}
 	return Mount(p.Mount)
+}
+func IdentityRequest(r *pb.IdentityRequest) error {
+	if r == nil {
+		return invalid("missing identity request")
+	}
+	return Mount(&pb.MountID{AuthorityId: r.AuthorityId, VolumeId: r.VolumeId, Incarnation: append([]byte{1}, make([]byte, 15)...)})
+}
+func IdentityReply(r *pb.IdentityReply) error {
+	if r == nil || !ID(r.GuestUuid) || !ID(r.IdentityIncarnation) || r.RenewalEpoch == 0 || r.RenewalEpoch > 1<<53-1 || len(r.PublicKey) == 0 || len(r.PublicKey) > 65536 || len(r.Csr) == 0 || len(r.Csr) > 65536 {
+		return invalid("identity reply")
+	}
+	return Mount(r.Mount)
 }
 
 var ErrGrammar = errors.New("workspace control: invalid exact grammar")
@@ -534,6 +556,10 @@ func Validate(e *pb.Envelope) error {
 			return invalid("retire acknowledgement missing sequence")
 		}
 		return nil
+	case *pb.Envelope_IdentityRequest:
+		return IdentityRequest(b.IdentityRequest)
+	case *pb.Envelope_IdentityReply:
+		return IdentityReply(b.IdentityReply)
 	case *pb.Envelope_Provision:
 		return Provision(b.Provision)
 	case *pb.Envelope_Mount:

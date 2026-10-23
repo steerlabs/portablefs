@@ -93,7 +93,7 @@ func TransientTransport(err error) bool {
 		if _, joined := cause.(interface{ Unwrap() []error }); joined {
 			return false
 		}
-		if cause == ErrTransportUncertain || cause == io.EOF || cause == io.ErrUnexpectedEOF || cause == context.DeadlineExceeded {
+		if cause == ErrTLSNotYetValid || cause == ErrTransportUncertain || cause == io.EOF || cause == io.ErrUnexpectedEOF || cause == context.DeadlineExceeded {
 			return true
 		}
 		_, network := cause.(net.Error)

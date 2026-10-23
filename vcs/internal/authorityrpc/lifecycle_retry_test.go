@@ -167,6 +167,7 @@ func TestLifecycleParkedCleanupReplaysSameIdentityAtWake(t *testing.T) {
 			address, tls, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 			defer stop()
 			cfg := coherentTestClientConfig(address, tls, "workspace-replay", 9, 9)
+			cfg.AwaitTLS = func(context.Context) error { return nil } // Explicit test clock.
 			cfg.DispatchFence = NewDispatchFence()
 			if err = cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
 				t.Fatal(err)
@@ -266,6 +267,7 @@ func TestLifecycleParkedVisibilityRetainsImmutableCut(t *testing.T) {
 	address, tls, stop := startTestServer(t, h, testMaxInFlight, time.Minute)
 	defer stop()
 	cfg := coherentTestClientConfig(address, tls, "volume", 9, 9)
+	cfg.AwaitTLS = func(context.Context) error { return nil } // Explicit test clock.
 	cfg.DispatchFence = NewDispatchFence()
 	if err := cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
 		t.Fatal(err)
@@ -358,6 +360,7 @@ func TestLifecycleInitialActivationOutageRetainsAttachOwner(t *testing.T) {
 	cfg := coherentTestClientConfig(address, tls, "volume", 9, 9)
 	cfg.DialTimeout = 2 * time.Second
 	cfg.LifecycleRetry = true
+	cfg.AwaitTLS = func(context.Context) error { return nil } // Explicit test clock.
 	cfg.DispatchFence = NewDispatchFence()
 	if err := cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
 		t.Fatal(err)
@@ -397,6 +400,7 @@ func TestDispatchFenceInitiallyParked(t *testing.T) {
 	address, tls, stop := startTestServer(t, h, testMaxInFlight, time.Minute)
 	defer stop()
 	cfg := coherentTestClientConfig(address, tls, "volume", 9, 9)
+	cfg.AwaitTLS = func(context.Context) error { return nil } // Explicit test clock.
 	cfg.DispatchFence = NewDispatchFence()
 	result := make(chan *Client, 1)
 	failed := make(chan error, 1)

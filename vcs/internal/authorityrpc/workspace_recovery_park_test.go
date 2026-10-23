@@ -32,6 +32,7 @@ func TestOpusParkLatencyDuringFailingReconnect(t *testing.T) {
 	address, tls, stop := startTestServer(t, h, testMaxInFlight, time.Minute)
 	defer stop()
 	cfg := coherentTestClientConfig(address, tls, "volume", 9, 9)
+	cfg.AwaitTLS = func(context.Context) error { return nil } // Explicit test clock.
 	cfg.DispatchFence = NewDispatchFence()
 	if err := cfg.DispatchFence.Resume(func() error { return nil }); err != nil {
 		t.Fatal(err)

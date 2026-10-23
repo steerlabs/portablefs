@@ -86,7 +86,8 @@ import PortableFSWorkspaceCore
                                         throw WorkspaceVMError("guest refused resume: " + refusal.reason)
                                     }
                                     switch (request.body, reply.body) {
-                                    case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result), (.provision, .result), (.mount, .result), (.umount, .result): break
+                                    case (.identityRequest, .result): throw WorkspaceVMError("guest identity refused")
+                                    case (.identityRequest, .identityReply), (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result), (.provision, .result), (.mount, .result), (.umount, .result): break
                                     default: throw WorkspaceVMError("unexpected control reply")
                                     }
                                     self.finish(.success(reply))
@@ -141,6 +142,9 @@ import PortableFSWorkspaceCore
     }
     public func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
         exchange(.status(WorkspaceStatusRequest()), deadline: deadline) { completion($0.map { $0.statusReply }) }
+    }
+    public func identity(_ request: WorkspaceIdentityRequest, deadline: UInt64, completion: @escaping (Result<WorkspaceIdentityReply, Error>) -> Void) {
+        exchange(.identityRequest(request), desired: true, deadline: deadline) { completion($0.map { $0.identityReply }) }
     }
     public func provision(_ request: WorkspaceProvision, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
         exchange(.provision(request), desired: true, deadline: deadline) { completion($0.map { $0.result }) }

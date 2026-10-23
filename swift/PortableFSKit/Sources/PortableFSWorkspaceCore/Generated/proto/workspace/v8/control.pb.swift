@@ -450,7 +450,21 @@ public nonisolated struct WorkspaceRetireAck: Sendable {
   public init() {}
 }
 
-public nonisolated struct WorkspaceProvision: Sendable {
+public nonisolated struct WorkspaceIdentityRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var authorityID: Data = Data()
+
+  public var volumeID: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct WorkspaceIdentityReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -464,24 +478,113 @@ public nonisolated struct WorkspaceProvision: Sendable {
   /// Clears the value of `mount`. Subsequent reads from it will return its default value.
   public mutating func clearMount() {self._mount = nil}
 
-  public var authorityEndpoint: String = String()
-
-  public var caCertificate: Data = Data()
-
-  public var clientCertificate: Data = Data()
-
-  public var capability: Data = Data()
-
-  public var routesRevision: Data = Data()
-
-  /// A guest-generated public identity, never a private-key import.
+  /// DER SubjectPublicKeyInfo.
   public var publicKey: Data = Data()
+
+  /// Signed DER PKCS#10 request, using the same key.
+  public var csr: Data = Data()
+
+  public var guestUuid: Data = Data()
+
+  public var identityIncarnation: Data = Data()
+
+  public var renewalEpoch: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _mount: WorkspaceMountID? = nil
+}
+
+public nonisolated struct WorkspaceHostedEnrollment: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var managerOrigin: String = String()
+
+  public var managerServerName: String = String()
+
+  public var managerCa: Data = Data()
+
+  public var enrollmentID: String = String()
+
+  public var enrollmentCertificate: Data = Data()
+
+  public var authorityGeneration: UInt64 = 0
+
+  public var authorizationDeadlineUnix: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct WorkspaceProvision: @unchecked Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var mount: WorkspaceMountID {
+    get {_storage._mount ?? WorkspaceMountID()}
+    set {_uniqueStorage()._mount = newValue}
+  }
+  /// Returns true if `mount` has been explicitly set.
+  public var hasMount: Bool {_storage._mount != nil}
+  /// Clears the value of `mount`. Subsequent reads from it will return its default value.
+  public mutating func clearMount() {_uniqueStorage()._mount = nil}
+
+  public var authorityEndpoint: String {
+    get {_storage._authorityEndpoint}
+    set {_uniqueStorage()._authorityEndpoint = newValue}
+  }
+
+  public var caCertificate: Data {
+    get {_storage._caCertificate}
+    set {_uniqueStorage()._caCertificate = newValue}
+  }
+
+  public var clientCertificate: Data {
+    get {_storage._clientCertificate}
+    set {_uniqueStorage()._clientCertificate = newValue}
+  }
+
+  public var capability: Data {
+    get {_storage._capability}
+    set {_uniqueStorage()._capability = newValue}
+  }
+
+  public var routesRevision: Data {
+    get {_storage._routesRevision}
+    set {_uniqueStorage()._routesRevision = newValue}
+  }
+
+  /// A guest-generated public identity, never a private-key import.
+  public var publicKey: Data {
+    get {_storage._publicKey}
+    set {_uniqueStorage()._publicKey = newValue}
+  }
+
+  public var serverName: String {
+    get {_storage._serverName}
+    set {_uniqueStorage()._serverName = newValue}
+  }
+
+  public var hostedEnrollment: WorkspaceHostedEnrollment {
+    get {_storage._hostedEnrollment ?? WorkspaceHostedEnrollment()}
+    set {_uniqueStorage()._hostedEnrollment = newValue}
+  }
+  /// Returns true if `hostedEnrollment` has been explicitly set.
+  public var hasHostedEnrollment: Bool {_storage._hostedEnrollment != nil}
+  /// Clears the value of `hostedEnrollment`. Subsequent reads from it will return its default value.
+  public mutating func clearHostedEnrollment() {_uniqueStorage()._hostedEnrollment = nil}
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
 public nonisolated struct WorkspaceMountRequest: Sendable {
@@ -661,6 +764,22 @@ public nonisolated struct WorkspaceEnvelope: Sendable {
     set {body = .retireAck(newValue)}
   }
 
+  public var identityRequest: WorkspaceIdentityRequest {
+    get {
+      if case .identityRequest(let v)? = body {return v}
+      return WorkspaceIdentityRequest()
+    }
+    set {body = .identityRequest(newValue)}
+  }
+
+  public var identityReply: WorkspaceIdentityReply {
+    get {
+      if case .identityReply(let v)? = body {return v}
+      return WorkspaceIdentityReply()
+    }
+    set {body = .identityReply(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Body: Equatable, Sendable {
@@ -677,6 +796,8 @@ public nonisolated struct WorkspaceEnvelope: Sendable {
     case umount(WorkspaceUmountRequest)
     case result(WorkspaceResult)
     case retireAck(WorkspaceRetireAck)
+    case identityRequest(WorkspaceIdentityRequest)
+    case identityReply(WorkspaceIdentityReply)
 
   }
 
@@ -1493,9 +1614,44 @@ nonisolated extension WorkspaceRetireAck: SwiftProtobuf.Message, SwiftProtobuf._
   }
 }
 
-nonisolated extension WorkspaceProvision: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".Provision"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}authority_endpoint\0\u{3}ca_certificate\0\u{3}client_certificate\0\u{1}capability\0\u{3}routes_revision\0\u{3}public_key\0")
+nonisolated extension WorkspaceIdentityRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".IdentityRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}authority_id\0\u{3}volume_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.authorityID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.volumeID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.authorityID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.authorityID, fieldNumber: 1)
+    }
+    if !self.volumeID.isEmpty {
+      try visitor.visitSingularStringField(value: self.volumeID, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: WorkspaceIdentityRequest, rhs: WorkspaceIdentityRequest) -> Bool {
+    if lhs.authorityID != rhs.authorityID {return false}
+    if lhs.volumeID != rhs.volumeID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension WorkspaceIdentityReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".IdentityReply"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}public_key\0\u{1}csr\0\u{3}guest_uuid\0\u{3}identity_incarnation\0\u{3}renewal_epoch\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1504,12 +1660,11 @@ nonisolated extension WorkspaceProvision: SwiftProtobuf.Message, SwiftProtobuf._
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._mount) }()
-      case 2: try { try decoder.decodeSingularStringField(value: &self.authorityEndpoint) }()
-      case 3: try { try decoder.decodeSingularBytesField(value: &self.caCertificate) }()
-      case 4: try { try decoder.decodeSingularBytesField(value: &self.clientCertificate) }()
-      case 5: try { try decoder.decodeSingularBytesField(value: &self.capability) }()
-      case 6: try { try decoder.decodeSingularBytesField(value: &self.routesRevision) }()
-      case 7: try { try decoder.decodeSingularBytesField(value: &self.publicKey) }()
+      case 2: try { try decoder.decodeSingularBytesField(value: &self.publicKey) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.csr) }()
+      case 4: try { try decoder.decodeSingularBytesField(value: &self.guestUuid) }()
+      case 5: try { try decoder.decodeSingularBytesField(value: &self.identityIncarnation) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.renewalEpoch) }()
       default: break
       }
     }
@@ -1523,35 +1678,217 @@ nonisolated extension WorkspaceProvision: SwiftProtobuf.Message, SwiftProtobuf._
     try { if let v = self._mount {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
     } }()
-    if !self.authorityEndpoint.isEmpty {
-      try visitor.visitSingularStringField(value: self.authorityEndpoint, fieldNumber: 2)
-    }
-    if !self.caCertificate.isEmpty {
-      try visitor.visitSingularBytesField(value: self.caCertificate, fieldNumber: 3)
-    }
-    if !self.clientCertificate.isEmpty {
-      try visitor.visitSingularBytesField(value: self.clientCertificate, fieldNumber: 4)
-    }
-    if !self.capability.isEmpty {
-      try visitor.visitSingularBytesField(value: self.capability, fieldNumber: 5)
-    }
-    if !self.routesRevision.isEmpty {
-      try visitor.visitSingularBytesField(value: self.routesRevision, fieldNumber: 6)
-    }
     if !self.publicKey.isEmpty {
-      try visitor.visitSingularBytesField(value: self.publicKey, fieldNumber: 7)
+      try visitor.visitSingularBytesField(value: self.publicKey, fieldNumber: 2)
+    }
+    if !self.csr.isEmpty {
+      try visitor.visitSingularBytesField(value: self.csr, fieldNumber: 3)
+    }
+    if !self.guestUuid.isEmpty {
+      try visitor.visitSingularBytesField(value: self.guestUuid, fieldNumber: 4)
+    }
+    if !self.identityIncarnation.isEmpty {
+      try visitor.visitSingularBytesField(value: self.identityIncarnation, fieldNumber: 5)
+    }
+    if self.renewalEpoch != 0 {
+      try visitor.visitSingularUInt64Field(value: self.renewalEpoch, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: WorkspaceIdentityReply, rhs: WorkspaceIdentityReply) -> Bool {
+    if lhs._mount != rhs._mount {return false}
+    if lhs.publicKey != rhs.publicKey {return false}
+    if lhs.csr != rhs.csr {return false}
+    if lhs.guestUuid != rhs.guestUuid {return false}
+    if lhs.identityIncarnation != rhs.identityIncarnation {return false}
+    if lhs.renewalEpoch != rhs.renewalEpoch {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension WorkspaceHostedEnrollment: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".HostedEnrollment"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}manager_origin\0\u{3}manager_server_name\0\u{3}manager_ca\0\u{3}enrollment_id\0\u{3}enrollment_certificate\0\u{3}authority_generation\0\u{3}authorization_deadline_unix\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularStringField(value: &self.managerOrigin) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.managerServerName) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.managerCa) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.enrollmentID) }()
+      case 5: try { try decoder.decodeSingularBytesField(value: &self.enrollmentCertificate) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.authorityGeneration) }()
+      case 7: try { try decoder.decodeSingularUInt64Field(value: &self.authorizationDeadlineUnix) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.managerOrigin.isEmpty {
+      try visitor.visitSingularStringField(value: self.managerOrigin, fieldNumber: 1)
+    }
+    if !self.managerServerName.isEmpty {
+      try visitor.visitSingularStringField(value: self.managerServerName, fieldNumber: 2)
+    }
+    if !self.managerCa.isEmpty {
+      try visitor.visitSingularBytesField(value: self.managerCa, fieldNumber: 3)
+    }
+    if !self.enrollmentID.isEmpty {
+      try visitor.visitSingularStringField(value: self.enrollmentID, fieldNumber: 4)
+    }
+    if !self.enrollmentCertificate.isEmpty {
+      try visitor.visitSingularBytesField(value: self.enrollmentCertificate, fieldNumber: 5)
+    }
+    if self.authorityGeneration != 0 {
+      try visitor.visitSingularUInt64Field(value: self.authorityGeneration, fieldNumber: 6)
+    }
+    if self.authorizationDeadlineUnix != 0 {
+      try visitor.visitSingularUInt64Field(value: self.authorizationDeadlineUnix, fieldNumber: 7)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: WorkspaceHostedEnrollment, rhs: WorkspaceHostedEnrollment) -> Bool {
+    if lhs.managerOrigin != rhs.managerOrigin {return false}
+    if lhs.managerServerName != rhs.managerServerName {return false}
+    if lhs.managerCa != rhs.managerCa {return false}
+    if lhs.enrollmentID != rhs.enrollmentID {return false}
+    if lhs.enrollmentCertificate != rhs.enrollmentCertificate {return false}
+    if lhs.authorityGeneration != rhs.authorityGeneration {return false}
+    if lhs.authorizationDeadlineUnix != rhs.authorizationDeadlineUnix {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension WorkspaceProvision: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".Provision"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}authority_endpoint\0\u{3}ca_certificate\0\u{3}client_certificate\0\u{1}capability\0\u{3}routes_revision\0\u{3}public_key\0\u{3}server_name\0\u{3}hosted_enrollment\0")
+
+  fileprivate class _StorageClass {
+    var _mount: WorkspaceMountID? = nil
+    var _authorityEndpoint: String = String()
+    var _caCertificate: Data = Data()
+    var _clientCertificate: Data = Data()
+    var _capability: Data = Data()
+    var _routesRevision: Data = Data()
+    var _publicKey: Data = Data()
+    var _serverName: String = String()
+    var _hostedEnrollment: WorkspaceHostedEnrollment? = nil
+
+      // This property is used as the initial default value for new instances of the type.
+      // The type itself is protecting the reference to its storage via CoW semantics.
+      // This will force a copy to be made of this reference when the first mutation occurs;
+      // hence, it is safe to mark this as `nonisolated(unsafe)`.
+      static nonisolated(unsafe) let defaultInstance = _StorageClass()
+
+    private init() {}
+
+    init(copying source: _StorageClass) {
+      _mount = source._mount
+      _authorityEndpoint = source._authorityEndpoint
+      _caCertificate = source._caCertificate
+      _clientCertificate = source._clientCertificate
+      _capability = source._capability
+      _routesRevision = source._routesRevision
+      _publicKey = source._publicKey
+      _serverName = source._serverName
+      _hostedEnrollment = source._hostedEnrollment
+    }
+  }
+
+  fileprivate mutating func _uniqueStorage() -> _StorageClass {
+    if !isKnownUniquelyReferenced(&_storage) {
+      _storage = _StorageClass(copying: _storage)
+    }
+    return _storage
+  }
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    _ = _uniqueStorage()
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      while let fieldNumber = try decoder.nextFieldNumber() {
+        // The use of inline closures is to circumvent an issue where the compiler
+        // allocates stack space for every case branch when no optimizations are
+        // enabled. https://github.com/apple/swift-protobuf/issues/1034
+        switch fieldNumber {
+        case 1: try { try decoder.decodeSingularMessageField(value: &_storage._mount) }()
+        case 2: try { try decoder.decodeSingularStringField(value: &_storage._authorityEndpoint) }()
+        case 3: try { try decoder.decodeSingularBytesField(value: &_storage._caCertificate) }()
+        case 4: try { try decoder.decodeSingularBytesField(value: &_storage._clientCertificate) }()
+        case 5: try { try decoder.decodeSingularBytesField(value: &_storage._capability) }()
+        case 6: try { try decoder.decodeSingularBytesField(value: &_storage._routesRevision) }()
+        case 7: try { try decoder.decodeSingularBytesField(value: &_storage._publicKey) }()
+        case 8: try { try decoder.decodeSingularStringField(value: &_storage._serverName) }()
+        case 9: try { try decoder.decodeSingularMessageField(value: &_storage._hostedEnrollment) }()
+        default: break
+        }
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every if/case branch local when no optimizations
+      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+      // https://github.com/apple/swift-protobuf/issues/1182
+      try { if let v = _storage._mount {
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
+      } }()
+      if !_storage._authorityEndpoint.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._authorityEndpoint, fieldNumber: 2)
+      }
+      if !_storage._caCertificate.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._caCertificate, fieldNumber: 3)
+      }
+      if !_storage._clientCertificate.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._clientCertificate, fieldNumber: 4)
+      }
+      if !_storage._capability.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._capability, fieldNumber: 5)
+      }
+      if !_storage._routesRevision.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._routesRevision, fieldNumber: 6)
+      }
+      if !_storage._publicKey.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._publicKey, fieldNumber: 7)
+      }
+      if !_storage._serverName.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._serverName, fieldNumber: 8)
+      }
+      try { if let v = _storage._hostedEnrollment {
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 9)
+      } }()
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: WorkspaceProvision, rhs: WorkspaceProvision) -> Bool {
-    if lhs._mount != rhs._mount {return false}
-    if lhs.authorityEndpoint != rhs.authorityEndpoint {return false}
-    if lhs.caCertificate != rhs.caCertificate {return false}
-    if lhs.clientCertificate != rhs.clientCertificate {return false}
-    if lhs.capability != rhs.capability {return false}
-    if lhs.routesRevision != rhs.routesRevision {return false}
-    if lhs.publicKey != rhs.publicKey {return false}
+    if lhs._storage !== rhs._storage {
+      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
+        let _storage = _args.0
+        let rhs_storage = _args.1
+        if _storage._mount != rhs_storage._mount {return false}
+        if _storage._authorityEndpoint != rhs_storage._authorityEndpoint {return false}
+        if _storage._caCertificate != rhs_storage._caCertificate {return false}
+        if _storage._clientCertificate != rhs_storage._clientCertificate {return false}
+        if _storage._capability != rhs_storage._capability {return false}
+        if _storage._routesRevision != rhs_storage._routesRevision {return false}
+        if _storage._publicKey != rhs_storage._publicKey {return false}
+        if _storage._serverName != rhs_storage._serverName {return false}
+        if _storage._hostedEnrollment != rhs_storage._hostedEnrollment {return false}
+        return true
+      }
+      if !storagesAreEqual {return false}
+    }
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1662,7 +1999,7 @@ nonisolated extension WorkspaceResult: SwiftProtobuf.Message, SwiftProtobuf._Mes
 
 nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}request_id\0\u{3}drain_budget_nanos\0\u{2}\u{7}hello\0\u{3}hello_ack\0\u{1}suspend\0\u{3}suspend_ack\0\u{1}resume\0\u{3}resume_ack\0\u{1}status\0\u{3}status_reply\0\u{1}provision\0\u{1}mount\0\u{1}umount\0\u{1}result\0\u{3}retire_ack\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}request_id\0\u{3}drain_budget_nanos\0\u{2}\u{7}hello\0\u{3}hello_ack\0\u{1}suspend\0\u{3}suspend_ack\0\u{1}resume\0\u{3}resume_ack\0\u{1}status\0\u{3}status_reply\0\u{1}provision\0\u{1}mount\0\u{1}umount\0\u{1}result\0\u{3}retire_ack\0\u{3}identity_request\0\u{3}identity_reply\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1842,6 +2179,32 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
           self.body = .retireAck(v)
         }
       }()
+      case 23: try {
+        var v: WorkspaceIdentityRequest?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .identityRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .identityRequest(v)
+        }
+      }()
+      case 24: try {
+        var v: WorkspaceIdentityReply?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .identityReply(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .identityReply(v)
+        }
+      }()
       default: break
       }
     }
@@ -1913,6 +2276,14 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
     case .retireAck?: try {
       guard case .retireAck(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 22)
+    }()
+    case .identityRequest?: try {
+      guard case .identityRequest(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 23)
+    }()
+    case .identityReply?: try {
+      guard case .identityReply(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 24)
     }()
     case nil: break
     }

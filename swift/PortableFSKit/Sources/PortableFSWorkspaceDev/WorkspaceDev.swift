@@ -152,6 +152,15 @@ import PortableFSWorkspaceCore
                     else { self?.fail(WorkspaceVMError("guest accepted consumed token")) }
                 }
             case "status": coordinator.refreshStatus(); event("status", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
+            case "probe-identity":
+                var request = WorkspaceIdentityRequest(); request.authorityID = Data(repeating: 3, count: 32); request.volumeID = "identity-probe"
+                channel.identity(request, deadline: clock.now + 5_000_000_000) { [weak self] result in
+                    do {
+                        let identity = try result.get()
+                        guard WorkspaceControl.validMount(identity.mount), identity.mount.authorityID == request.authorityID, identity.mount.volumeID == request.volumeID else { throw WorkspaceVMError("guest identity response mismatch") }
+                        self?.event("identity", ["mount": WorkspaceControl.mountKey(identity.mount), "public_key": identity.publicKey.base64EncodedString(), "csr": identity.csr.base64EncodedString(), "guest_uuid": identity.guestUuid.base64EncodedString(), "identity_incarnation": identity.identityIncarnation.base64EncodedString(), "renewal_epoch": identity.renewalEpoch])
+                    } catch { self?.fail(error) }
+                }
             case "probe-unavailable-jobs":
                 guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
                 pendingCommand = command
@@ -175,7 +184,7 @@ import PortableFSWorkspaceCore
         }
         switch operation {
         case "provision":
-            var p = WorkspaceProvision(); p.mount = mount; p.authorityEndpoint = "authority.invalid:7443"
+            var p = WorkspaceProvision(); p.mount = mount; p.authorityEndpoint = "authority.invalid:7443"; p.serverName = "authority.invalid"
             p.caCertificate = Data("public CA probe".utf8); p.clientCertificate = Data("public certificate probe".utf8)
             p.capability = Data("unusable probe".utf8); p.publicKey = Data("public identity probe".utf8); p.routesRevision = Data(repeating: 1, count: 32)
             channel.provision(p, deadline: deadline, completion: completion)
@@ -199,7 +208,7 @@ import PortableFSWorkspaceCore
                     }
                     return
                 }
-                guard job.phase == "failed", job.failure == "unavailable", !job.reason.isEmpty else { throw WorkspaceVMError("absent mount driver reported completion") }
+                guard job.phase == "failed", job.failure == (index == 0 ? "handler-failed" : "unavailable"), !job.reason.isEmpty else { throw WorkspaceVMError("absent mount driver reported completion") }
                 let accepted = requests + [job.requestID]
                 guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
                 if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }

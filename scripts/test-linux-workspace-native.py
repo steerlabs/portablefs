@@ -160,6 +160,29 @@ try:
         assert jobs['mounts'] == 0 and jobs['failure'] == 'unavailable', jobs
         assert len(jobs['request_ids']) == 3 and all(a < b for a, b in zip(jobs['request_ids'], jobs['request_ids'][1:])), jobs
     record('desired-jobs-retain-unavailable')
+    guest.command('probe-identity')
+    identity = guest.wait('identity', 10)
+    guest.command('probe-identity')
+    assert guest.wait('identity', 10) == identity
+    import base64
+    csr = root / 'identity-probe.csr.der'
+    csr.write_bytes(base64.b64decode(identity['csr']))
+    checked = subprocess.run(['openssl', 'req', '-inform', 'DER', '-in', str(csr), '-verify', '-noout'], capture_output=True, text=True)
+    assert checked.returncode == 0, checked.stderr
+    pub = subprocess.check_output(['openssl', 'req', '-inform', 'DER', '-in', str(csr), '-pubkey', '-noout'])
+    public_der = subprocess.run(['openssl', 'pkey', '-pubin', '-outform', 'DER'], input=pub, capture_output=True, check=True).stdout
+    assert public_der == base64.b64decode(identity['public_key'])
+    record('guest-identity-signed-csr')
+    owner = json.loads(guest.ssh('cat /run/portablefs-workspace/clock-owner.json'))
+    assert owner['read_only'] and owner['second_open_busy'] and owner['readers'] == 8 and owner['samples'] == 8000
+    assert owner['maximum_ns'] <= 250_000_000 and 'pl031' in owner['source']
+    measurements[-1]['clock_owner'] = owner
+    record('rtc-single-owner-duplicate-contention')
+    before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
+    assert before['generation'] == 0 and before['sample_age_ns'] <= 250_000_000
+    record('rtc-boot-correction')
+    subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), '--seconds', '65'], check=True)
+    record('rtc-awake-measurement')
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
@@ -176,6 +199,16 @@ try:
     resumed = guest.wait('resumed', 25)
     assert resumed['operations'][-1] == 'resume-completed'
     assert resumed['mount_states'] == []
+    deadline = time.monotonic() + 10
+    while True:
+        after = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
+        if after['generation'] == 1:
+            break
+        assert time.monotonic() < deadline, after
+        time.sleep(.1)
+    assert after['generation'] == 1 and after['sample_age_ns'] <= 250_000_000
+    measurements[-1]['resume_clock'] = after
+    record('rtc-cold-resume-generation')
     assert guest.ssh('cat ~/persistence') == token
     memory = guest.ssh("awk '/MemTotal:|MemAvailable:/ {print}' /proc/meminfo")
     measurements[-1]['guest_memory'] = memory
@@ -184,6 +217,12 @@ try:
     guest = Guest()
     assert guest.ssh('cat ~/persistence') == token
     record('data-disk-reboot-persistence')
+    guest.command('probe-identity')
+    replacement = guest.wait('identity', 10)
+    for field in ('public_key', 'guest_uuid', 'identity_incarnation', 'renewal_epoch'):
+        assert replacement[field] == identity[field], field
+    assert replacement['mount'] != identity['mount']
+    record('guest-identity-reboot-persistence')
     assert guest.ready['host_key'].split()[:2] == old_key.split()[:2]
     debug = subprocess.run(['/usr/bin/ssh', '-vv', '-F', guest.ready['ssh_config'], 'portablefs-workspace', 'true'], text=True, capture_output=True, timeout=30)
     fingerprint = subprocess.check_output(['/usr/bin/ssh-keygen', '-lf', str(state/'guest_host_key.pub')], text=True).split()[1]

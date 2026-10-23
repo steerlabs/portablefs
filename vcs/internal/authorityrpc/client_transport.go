@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -182,7 +183,14 @@ func (c *Client) tlsConfig() *tls.Config {
 	return c.cfg.TLS.Clone()
 }
 
+var ErrTLSNotYetValid = errors.New("workspace TLS certificate is not yet valid")
+
 func (c *Client) dialTLS(ctx context.Context) (net.Conn, error) {
+	if c.cfg.AwaitTLS != nil {
+		if err := c.cfg.AwaitTLS(ctx); err != nil {
+			return nil, err
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
 	defer cancel()
 	dialer := &net.Dialer{Timeout: c.cfg.DialTimeout, KeepAlive: 15 * time.Second}
@@ -190,9 +198,19 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.cfg.AwaitTLS != nil {
+		if err := c.cfg.AwaitTLS(ctx); err != nil {
+			raw.Close()
+			return nil, err
+		}
+	}
 	conn := newAuthorityTLSClient(raw, c.tlsConfig())
 	if err := conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
+		var invalid x509.CertificateInvalidError
+		if c.cfg.AwaitTLS != nil && errors.As(err, &invalid) && invalid.Reason == x509.Expired && time.Now().Before(invalid.Cert.NotBefore) {
+			return nil, ErrTLSNotYetValid
+		}
 		return nil, err
 	}
 	if conn.ConnectionState().NegotiatedProtocol != protocolALPN {

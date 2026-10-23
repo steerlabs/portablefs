@@ -181,6 +181,8 @@ func (s *Supervisor) runJob(ctx context.Context, j *mountJob, provision *pb.Prov
 	var err error
 	if ctx.Err() != nil {
 		err = ctx.Err()
+	} else if request.Operation == "provision" && s.identities != nil {
+		err = s.provision(ctx, request.Generation, provision)
 	} else if s.jobDriver == nil {
 		err = ErrUnavailable
 	} else {

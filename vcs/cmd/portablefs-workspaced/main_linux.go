@@ -15,8 +15,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceclock"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/workspaceguest"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacemount"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"golang.org/x/sys/unix"
 )
@@ -123,6 +125,46 @@ func bootstrap() (result error) {
 	return json.NewEncoder(console).Encode(map[string]string{"event": "seeded", "host_key": strings.TrimSpace(string(key)), "boot_id": seed.BootID, "format_complete": "8"})
 }
 func serve() error {
+	identities, err := workspacemount.Open("/data/workspace-identities")
+	if err != nil {
+		return err
+	}
+	defer identities.Close()
+	clock, err := workspaceclock.Open(nil)
+	if err != nil {
+		return err
+	}
+	defer clock.Close()
+	qualification, err := clock.Qualify()
+	if err != nil {
+		return err
+	}
+	rawQualification, err := json.Marshal(qualification)
+	if err != nil {
+		return err
+	}
+	if err = os.WriteFile(state+"/clock-owner.json", rawQualification, 0644); err != nil {
+		return err
+	}
+	if err = clock.Begin(0); err != nil {
+		return err
+	}
+	ctx, stopClock := context.WithCancel(context.Background())
+	clockDone := make(chan struct{})
+	defer func() { stopClock(); <-clockDone }()
+	go func() {
+		defer close(clockDone)
+		clock.Maintain(ctx, func(m workspaceclock.Measurement, err error) {
+			// Public measurement evidence contains no enrollment or capability data.
+			if err == nil {
+				raw, e := json.Marshal(m)
+				if e == nil {
+					_ = os.WriteFile(state+"/clock.json", raw, 0644)
+				}
+			}
+		})
+	}()
+
 	var r release
 	if err := readJSON("/usr/lib/portablefs-workspace/release.json", &r); err != nil {
 		return fmt.Errorf("guest workspace: %w", err)
@@ -196,7 +238,11 @@ func serve() error {
 			stream.Close()
 			return fmt.Errorf("guest workspace: %w", err)
 		}
-		err = workspaceguest.Serve(context.Background(), stream, expected, supervisor, func() { paired = true; _ = stream.SetDeadline(time.Time{}) })
+		err = workspaceguest.Serve(context.Background(), stream, expected, supervisor, func() {
+			paired = true
+			supervisor.ConfigureGuest(identities, clock, clock.Wait)
+			_ = stream.SetDeadline(time.Time{})
+		})
 		stream.Close()
 		if paired {
 			return fmt.Errorf("paired control channel ended; cold boot required: %w", err)

@@ -127,6 +127,7 @@ type Renewer struct {
 	// Managed requires an explicit Resume permit before dispatch. No implicit
 	// ordinary permit is available on this branch.
 	Managed                      bool
+	WallChanges                  func() <-chan struct{}
 	CheckPermit                  func(Permit) bool
 	mu                           sync.Mutex
 	running, initialized, parked bool
@@ -213,6 +214,22 @@ func (r *Renewer) Resume(p Permit) error {
 // RefreshNow wakes the owner for an immediate scheduling decision. Ordinary
 // owners may refresh early. Managed owners preserve the normal Manager refresh
 // time for a recorded install; only an unknown pending grant retries immediately.
+// WallCorrected recomputes the wall-derived schedule without changing sequence,
+// pending grants, permission or terminal latches. A backward step grants no life.
+func (r *Renewer) WallCorrected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.initialized || r.terminal != nil {
+		return
+	}
+	r.authorizedAt = r.authorizedAt.Round(0)
+	r.deadline = r.deadline.Round(0)
+	r.status.NextAttempt = refreshTime(r.authorizedAt, r.deadline, r.session, r.sequence).Round(0)
+	if r.pending != nil {
+		r.status.NextAttempt = time.Time{}
+	}
+	r.signalLocked()
+}
 func (r *Renewer) RefreshNow() { r.mu.Lock(); r.force = true; r.signalLocked(); r.mu.Unlock() }
 func (r *Renewer) Readiness() RenewalReadiness {
 	r.mu.Lock()
@@ -241,6 +258,10 @@ func (r *Renewer) allowedLocked() bool {
 	return !r.parked && (!r.Managed || (r.CheckPermit != nil && r.CheckPermit(r.permit)))
 }
 func (r *Renewer) wait(ctx context.Context, target time.Time) error {
+	var correction <-chan struct{}
+	if r.WallChanges != nil {
+		correction = r.WallChanges()
+	}
 	r.mu.Lock()
 	if r.wake == nil {
 		r.wake = make(chan struct{}, 1)
@@ -259,6 +280,9 @@ func (r *Renewer) wait(ctx context.Context, target time.Time) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-correction:
+		r.WallCorrected()
+		return nil
 	case <-wake:
 		return nil
 	case <-tick:
