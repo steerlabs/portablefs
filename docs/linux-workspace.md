@@ -1,9 +1,9 @@
 # Linux workspace on macOS
 
-Status: **unreleased and unsupported**. Stage 1a specifies the product and adds
-paired control and suspension models. It does not run a VM or mount. Supported
-release requires every qualification gate below, including the OPEN unfenced
-host-sleep clock gate. Passing the controlled-pause model cannot close it.
+Status: **unreleased and unsupported**. The development guest runs managed
+protocol-8 Linux mounts through the protected-path root driver. Supported release
+requires every qualification gate below, including the OPEN unfenced host-sleep
+clock gate. Controlled-pause evidence cannot close it.
 
 ## Execution and ownership
 
@@ -56,13 +56,16 @@ mount incarnation, exact process-start and kernel-mount witnesses, session,
 enrollment, route revision, cleanup phase and the old run's loss outcome.
 A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
-The supervisor models these identities and cleanup in memory. Active slots and
+The supervisor binds these identities progressively and persists desired ownership
+under `/data/workspace`; existing CLI records own session/mount inventory. Active slots and
 unacknowledged retired outcomes share a bound of 64. Retirements have monotonic,
 guest-incarnation-scoped sequence numbers.
 The observer retains exact outcomes, then acknowledges through a sequence;
 duplicate or older acknowledgements succeed without erasing newer outcomes. Full
 capacity applies temporary replacement backpressure; acknowledgement frees it.
-Crash-safe inventory and real cleanup remain pending.
+Each inventory commits with file sync, rename and directory sync. Any disagreement
+retains ownership until exact reconciliation; neither store's absence proves the
+other owns no resource. A new supervisor never resumes an old child.
 
 A replacement at the same pathname cannot transfer old fd, cwd, mapping or lock
 references. Old operations fail under the terminal contract. A shell must leave
@@ -75,10 +78,10 @@ Preserve old barrier failures even if the new mount serves successfully.
 
 Stage 1c adds control contracts, renewal ownership and prompt desired-mount
 jobs. Mount, Umount and Provision acknowledge job acceptance; Status retains
-their progress separately from registered mounts. Provision validates and persists the guest-selected identity material. The guest
-has no real root mount/removal driver, so Mount and Umount fail with typed
-`unavailable` evidence; rejected provisioning retains its actual failure. Acceptance never
-asserts mount, removal or provisioning success. Managed mounts remain disabled.
+their progress separately from registered mounts. Provision validates and persists the guest-selected identity material. Mount and
+Umount use the real root driver and retain their actual lifecycle outcomes.
+Unprovisioned or refused work retains its failure. Acceptance never asserts
+mount, removal or provisioning success.
 
 The existing random abstract mount socket retains ordinary reauthorization and
 loss snapshots. Ordinary requests are bounded by `(32 << 10) + (256 << 10) +
@@ -149,9 +152,8 @@ survives through independent process-exit and kernel/source/alias-absence proof.
 owners settle. Its proof binds the exact process, kernel, source and target
 alias inventory to this bootstrap owner. Finalize rejects unbound, foreign or
 stale proofs, including observation overtaken by another removal action.
-Death preserves uncertain inventory and blocks replacement. The control-boundary
-tests use owned descriptors; actual device/bootstrap qualification still belongs
-to the later protected-path driver.
+Death preserves uncertain inventory and blocks replacement. The control-boundary tests use owned descriptors; required root tests also
+exercise real protected bootstrap, failed INIT, uncertain handoff and exact removal.
 
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
@@ -211,9 +213,9 @@ with bounded attempts and backoff until a definitive outcome or generation
 cancellation; it grants no serving extension. This no-cutoff policy ends when
 readiness is published in the current permission interval. Serving managed
 owners and ordinary owners enforce the same safety cutoff, bounded attempt
-deadline and retry cutoff. The future managed driver must Park its serving
-renewal owner before the cutoff, or accept terminal cleanup and replacement
-afterward. Park/Resume cannot revive a terminal owner, even when Manager
+deadline and retry cutoff. The managed driver begins parking its serving renewal owner one second before
+the existing cutoff. A cutoff already latched remains terminal and requires
+cleanup and replacement. Park/Resume cannot revive a terminal owner, even when Manager
 service returns. Readiness checks the cutoff synchronously, even before the
 scheduling loop wakes. Park withdraws readiness before joining work; Resume
 near expiry remains pending and recovers behind closed admission. All owners
@@ -454,8 +456,8 @@ eligibility; do not transparently reconnect and reuse a token. Stage 1b connects
 guest accepts only host CID 2 on reserved port 1023, requires its independently seeded
 boot/service identity and exact release, and consumes one paired stream per
 boot. Disconnect discards its model; supervisor restart within that boot is
-refused. Mount and Umount return `unavailable`; Provision owns validation and durable storage only. The dev process is
-the sole host caller; the signed-process local service API is Stage 2 work.
+refused. Mount and Umount dispatch real root-owned lifecycle work; Provision owns
+validation and durable storage. The dev process is the sole host caller; the signed-process local service API is Stage 2 work.
 
 Host-side callers must pass the existing same-user signed-process/audit-token
 check. The guest channel must bind to the app-owned VM and fresh boot nonce.
@@ -484,7 +486,8 @@ authenticated live inventories; key by authority identity and volume, never an
 endpoint alias or display name. Authority exclusion remains the final global
 arbiter. A remote Mac writer can make Linux mutations return EBUSY; expose it.
 Other volumes may use FSKit concurrently. The cross-service reservation layer
-is pending; these model targets cannot create a real mount.
+is pending and remains a supported-release requirement. Development mounts do
+not establish signed cross-service exclusion.
 
 Use VZ NAT only, with direct guest DATA and CONTROL TLS to the advertised
 authority. Guest localhost means the guest; reject copied host-loopback
@@ -760,32 +763,73 @@ store once a retirement is acknowledged; that replay is unreachable on the paire
 channel. Suspend drains existing owners directly without successor jobs or
 observation waits.
 
-The native inventory proves absent mount/removal drivers retain `unavailable`,
-invalid provisioning retains its validation failure, and the registered roster
-stays empty. Deterministic model/transport tests
-exercise interrupted initial Prepare, slow provisioning/removal, independent
-64-mount drains, spent framing/dispatch allowance, EOF and retained physical
-owners. Real managed multi-mount integration remains a later driver gate.
+The native inventory requires standalone provisioning, managed write/read/fsync,
+independent peer coherence, Suspend/Resume, exact cleanup, durable cold reconcile
+and terminal replacement. Prepare and Recover each cross a real transport outage
+beyond 45 seconds while authority evidence retains the same active sessions.
+Deterministic model/transport tests also exercise interrupted initial Prepare,
+slow provisioning/removal, independent 64-mount drains, spent framing/dispatch
+allowance, EOF and retained physical owners. Native multi-mount load remains
+separate qualification.
 
 Data formatting relies on mke2fs's device flush before successful exit. The
 initializer treats that completion as its format boundary; it does not use
 `sync -f /dev/vdb`, which would synchronize devtmpfs rather than the device.
 
 The Linux frontend admission substrate is described in
-[Linux workspace admission](linux-workspace-admission.md). Managed launch remains
-unavailable until the lifecycle, clock and protected-path driver are integrated.
+[Linux workspace admission](linux-workspace-admission.md). The root driver wires
+that substrate to the real lifecycle and shared TLS clock.
 
 The private lifecycle observation reports `WorkspaceRecoveryRequired` when a
-prepared mount loses its subscription or clock proof. The root driver must
-observe that state while awake, close the shared gate, and drive the authorized
-Close/Suspend/Recover/Open sequence. Restoring clock readiness alone cannot
+prepared mount loses its subscription or clock proof. The root driver observes that state while awake and closes only the exact
+serving generation/serial described by the observation. A host-owned cold
+transaction supplies fresh Resume authority for Suspend/Recover/Open. Restoring clock readiness alone cannot
 republish serving permission. Revocation, owner death, mount shutdown or session
 termination reports `WorkspaceTerminal`, without a prepared or cold recovery
 claim. Grant expiry within a live authorized session
 forfeits its accepted non-durable cut exactly once; recovery preserves the
 cumulative loss tickets and old description/root barrier baselines. It neither
 replays forfeited bytes under a successor grant nor ends a valid session.
-The root driver and its gate closure/recovery integration remain PR 6 work.
+Serving entry and buffer acceptance also check shared-clock readiness
+synchronously, so delayed observation cannot admit another write.
+
+## Protected mount ownership
+
+The root driver commits startup intent and reserves the authority/volume and
+stable target before spawning a child. The underlying root-owned target stays
+mode 000. It pins the exact device/inode, installs FUSE with UID/GID 1000,
+nodev/nosuid/default_permissions, and retains the original abort description.
+The child first reports its private control address while unattached and closed;
+registration precedes Attach and renewal. Progressive witness commits happen
+outside the supervisor mutex, and a newer Close defeats readiness without
+discarding acquired evidence.
+
+The root passes copies of its original FUSE/abort descriptions once. Lost
+responses reconcile the fixed action slot; they cannot trigger another mount.
+The supplied-fd frontend still performs real INIT, WaitMountReady and negotiated
+kernel checks. Root bootstrap grants no serving permission. Shared-clock proof
+loss denies serving and buffered acceptance immediately; only a fresh authorized
+cold transaction can restore permission.
+
+Every managed unmount uses the fixed removal lifecycle. Voluntary removal keeps
+real EBUSY. Terminal removal withdraws caches, uses the original abort description,
+then detaches the exact target and independently checks complete source/alias
+absence. A dead child cannot erase this root owner. Cleanup joins actual process
+exit and reconciles both inventories before finalizing; local acknowledgement,
+EOF and ENOTCONN alone prove nothing. An unstarted child can release its intent
+only after proving that neither CLI ownership nor a kernel mount was acquired.
+
+Root owner loss permanently closes the child and retains the same terminal
+action. The host confirms termination of that exact VM before cold boot. The new
+boot reconciles surviving inventories without resuming old RAM, signalling an
+old numeric PID, making old-session RPCs, or reopening a numeric abort path.
+CLI evidence commits into the root inventory before an acknowledgement permits
+CLI removal. Unknown old outcomes remain unresolved/unobserved.
+
+Fresh provisioning follows exact cleanup and chooses a new MountID/session while
+retaining guest key/scope/epoch. Existing fd/cwd/mapping/lock references stay on
+the terminal instance. Leave an old shell with `cd /`, then enter the stable path
+after readiness; reconnect and reopen the remote editor workspace explicitly.
 
 ## Guest identity and TLS time
 
@@ -809,8 +853,7 @@ request and product authorization with renewal scope
 epoch. UUID components use canonical lowercase hyphenated text. Each volume has
 its own identity incarnation, so reissuance supersedes only that volume.
 Exact prior cleanup is a required operation before reissuance; intentional
-revocation commits an increased epoch first. The root driver supplies that
-cleanup operation when it is implemented.
+revocation commits an increased epoch first. The root driver supplies that exact cleanup operation before changing MountID.
 
 Provision adds server_name (8) and hosted_enrollment (9). Absence of the hosted
 record means standalone. Hosted data contains only Manager HTTPS origin, server
@@ -833,8 +876,9 @@ Transport clock waits use the mount owner's current generation, independently of
 serving permission and context values. Authority dialTLS and the Manager TLS
 transport recheck after raw TCP connection and before the TLS handshake. Cancellation, cleanup and retained replay cannot bypass
 it. Ordinary clients retain normal verified TLS and their existing dispatch.
-PR 6 must hand the clock page to real children and bind their existing gate and
-renewal owner; no real managed mount is enabled here.
+The root hands the read-only page to each real child and binds its existing gate
+and renewal owner. Cleanup and background TLS retain the same AwaitTLS owner;
+closed serving permission does not bypass clock readiness.
 
 A whole-second RTC read supplies a UTC interval. The conditional source error is
 at most one second; quantization is less than one second, sample/set age at most

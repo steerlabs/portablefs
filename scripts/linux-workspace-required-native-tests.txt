@@ -30,3 +30,4 @@ managed-old-handle-terminal
 managed-prepare-outage-over-45s
 managed-recover-outage-over-45s
 managed-root-owner-death-vm-discard
+managed-child-death-exact-cleanup

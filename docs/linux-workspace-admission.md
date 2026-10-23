@@ -1,12 +1,10 @@
 # Linux workspace admission
 
-The admission substrate is implemented; managed mounts remain unavailable.
-`portablefs mount` recognizes the private `--workspace-gate-fd` and
-`--workspace-owner-fd` pair and refuses managed launch before credential,
-enrollment or mount preparation, without adopting the caller's descriptors. Ordinary mounts have neither
-descriptor. Kernel installation, lifecycle suspension/recovery, the guest clock
-and the protected-path root driver remain integration dependencies. No readiness
-placeholder enables a managed mount.
+The root driver launches the UID/GID 1000 stock client with five distinct private
+inherited descriptors: sealed admission page, owner pipe, private launch pipe,
+shared TLS clock page and control-ready pipe. The launch binds the guest-selected
+identity and exact boot/services/process/target. Ordinary mounts have none of
+these descriptors. A partial or inconsistent private launch refuses.
 
 ## Shared word and lifetime
 
@@ -62,7 +60,8 @@ capture; late renewal cannot extend the captured permission. See
 [the cold lifecycle contract](linux-workspace-cold.md) for the transaction and
 worker dispositions.
 
-Buffer admission checks the captured serving word under the buffer mutex after
+Buffer admission checks the captured serving word and shared TLS clock readiness
+under the buffer mutex after
 every capacity wait for writes, truncation and metadata. The predicate acquires
 no frontend lock. Source acquisition checks after waits and before replay
 assignment. Scratch-OPEN reacquisition checks before each attempt.
@@ -107,9 +106,9 @@ does not claim to purge every local ext4 kernel cache.
 
 The required privileged root inventory contains a root supervisor/unprivileged
 child test of the real sealed page and owner pipe against kernel FUSE and XFS.
-It qualifies the admission substrate on the ordinary frontend, not the future
-managed launch or protected-path driver. The native workspace inventory is
-unchanged. Ordinary mounts reserve no workspace reply owner, take no workspace
+Required root tests also exercise the protected target, real failed INIT,
+uncertain handoff and exact removal. The expanded native inventory requires
+real managed lifecycle and peer coherence. Ordinary mounts reserve no workspace reply owner, take no workspace
 registry locks and allocate no gate closures. Unfenced host sleep remains unqualified.
 
 An admitted READ selects its overlay from retained buffer ownership even after

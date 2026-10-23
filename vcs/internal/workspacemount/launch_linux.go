@@ -25,6 +25,7 @@ type ChildReady struct {
 }
 
 type Reconciliation struct {
+	NeverSpawned   bool
 	ExitedProcess  string
 	Desired        *Desired
 	StateDirectory string

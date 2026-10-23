@@ -44,7 +44,10 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 	if run.KernelBoot == "" {
 		return fail(errors.New("workspace kernel boot witness missing"))
 	}
-	if run.KernelBoot == strings.TrimSpace(string(boot)) {
+	if q.NeverSpawned && (run.Witness.Process != "" || q.ExitedProcess != "") {
+		return fail(errors.New("unstarted workspace has a process witness"))
+	}
+	if run.KernelBoot == strings.TrimSpace(string(boot)) && !q.NeverSpawned {
 		if q.ExitedProcess == "" || q.ExitedProcess != run.Witness.Process {
 			return fail(errors.New("workspace reconciliation requires joined process exit"))
 		}
@@ -83,6 +86,9 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 	if err != nil {
 		return fail(err)
 	}
+	if q.NeverSpawned && (state != nil || intent != nil) {
+		return fail(errors.New("unstarted workspace has CLI ownership records"))
+	}
 	w := run.Witness
 	if state != nil {
 		if state.MountInstanceID != w.Intent || state.MountPath != w.Target || state.VolumeID != volume {
@@ -95,7 +101,7 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 			return fail(errors.New("workspace CLI kernel witness changed"))
 		}
 		if intent != nil {
-			if err = verifyCleanupIntentMatchesState(intent, state); err != nil {
+			if err = verifyMountIntentMatchesState(intent, state); err != nil {
 				return fail(err)
 			}
 		}
@@ -119,7 +125,7 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 		if intent.MountInstanceID != "" && intent.MountInstanceID != w.Intent {
 			return fail(errors.New("workspace CLI intent incarnation changed"))
 		}
-		if err = e.reconcileMountIntent(intent, false); err != nil {
+		if err = e.reconcileMountIntentWithProcess(intent, false, false); err != nil {
 			return fail(err)
 		}
 	}

@@ -72,6 +72,7 @@ type Driver struct {
 	sequence           atomic.Uint64
 	serving            atomic.Bool
 	opMu, effectMu     sync.Mutex
+	cleanupMu          sync.Mutex
 	bootstrapAttempted bool
 	kernel             *fusev3.ManagedKernel
 	target             *os.File
@@ -201,6 +202,7 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 	}
 	instance := "mnt_" + base64.RawURLEncoding.EncodeToString(id.Incarnation)
 	d := &Driver{manager: m, id: proto.Clone(id).(*pb.MountID), target: target, generation: g, exited: make(chan struct{}), witness: Witness{Intent: instance, Source: "portablefs:" + instance, Target: path}}
+	desiredRecorded := false
 	defer func() {
 		if result == nil {
 			return
@@ -208,6 +210,28 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 		if d.child != nil && d.child.Process != nil {
 			_ = d.child.Process.Kill()
 			<-d.exited
+		} else {
+			close(d.exited)
+		}
+		// No Prepare can run before control availability and registration. Join
+		// the unattached child, reconcile both stores, and release only an exact
+		// absence proof. A failed persistence/identity proof retains the intent.
+		if desiredRecorded && (d.child == nil || d.child.Process == nil || d.bound().Process != "") {
+			for _, run := range m.Inventory.Snapshot() {
+				if !proto.Equal(run.Mount, id) {
+					continue
+				}
+				neverSpawned := d.child == nil || d.child.Process == nil
+				_, cleanupErr := m.reconcileCLI(context.Background(), run, d.bound().Process, neverSpawned)
+				if cleanupErr == nil {
+					cleanupErr = m.Inventory.Reconcile(id, func(*Desired) error { return d.proveExitedAbsent() })
+				}
+				if cleanupErr == nil {
+					cleanupErr = m.Identity.Reissue(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId}, false, d.proveExitedAbsent)
+				}
+				result = errors.Join(result, cleanupErr)
+				break
+			}
 		}
 		if d.gate != nil {
 			_ = d.gate.Dispose()
@@ -222,6 +246,7 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 		target.Close()
 		return nil, err
 	}
+	desiredRecorded = true
 	start, err := mountcontrol.ProcessStart(int32(os.Getpid()))
 	if err != nil {
 		return nil, err
@@ -328,7 +353,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		if _, err = fusev3.ObservePlannedKernelMountAbsent(run.Witness.Source, run.Witness.Target); err != nil {
 			return err
 		}
-		if _, err = m.reconcileCLI(ctx, run, ""); err != nil {
+		if _, err = m.reconcileCLI(ctx, run, "", false); err != nil {
 			return err
 		}
 		err = m.Inventory.Reconcile(run.Mount, func(current *Desired) error {
@@ -353,7 +378,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	}
 	return nil
 }
-func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess string) (Witness, error) {
+func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess string, neverSpawned bool) (Witness, error) {
 	input, writer, err := os.Pipe()
 	if err != nil {
 		return Witness{}, err
@@ -383,7 +408,7 @@ func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess 
 		return Witness{}, err
 	}
 	input.Close()
-	writeErr := json.NewEncoder(writer).Encode(Reconciliation{Desired: run, StateDirectory: filepath.Join(m.Clients, run.Witness.Intent), ExitedProcess: exitedProcess})
+	writeErr := json.NewEncoder(writer).Encode(Reconciliation{Desired: run, StateDirectory: filepath.Join(m.Clients, run.Witness.Intent), ExitedProcess: exitedProcess, NeverSpawned: neverSpawned})
 	writer.Close()
 	var witness Witness
 	err = json.NewDecoder(out).Decode(&witness)
@@ -625,25 +650,8 @@ func (d *Driver) actions(ctx context.Context, b mountcontrol.Workspace, r *mount
 	for _, s := range []mountcontrol.ActionStatus{r.Phases.VoluntaryRemoval, r.Phases.TerminalRemoval} {
 		if s.Progress == "offered" {
 			p := s.Action.WithWitness(r.Witness)
-			index := 0
-			if p.Mode == "terminal" {
-				index = 1
-			}
-			attempt := d.removals[index]
-			if attempt == nil {
-				attempt = &rootRemoval{id: p.ActionID}
-				d.removals[index] = attempt
-				if d.kernel != nil {
-					attempt.err = d.kernel.Remove(p.Mode == "terminal")
-				} else {
-					_, attempt.err = fusev3.ObservePlannedKernelMountAbsent(p.Witness.Source, p.Witness.Target)
-				}
-			}
-			if attempt.id != p.ActionID {
-				return errors.New("workspace removal action changed")
-			}
-			if attempt.err != nil {
-				return attempt.err
+			if err := d.removeKernelLocked(p.Mode, p.ActionID); err != nil {
+				return err
 			}
 			p.Removal = &mountcontrol.Removal{KernelAbsent: true, AbortCompleted: p.Mode == "terminal"}
 			_, err := d.exchange(ctx, "workspace-unmount-complete", b, p, nil)
@@ -653,6 +661,30 @@ func (d *Driver) actions(ctx context.Context, b mountcontrol.Workspace, r *mount
 		}
 	}
 	return nil
+}
+
+// All managed removal effects consume the same fixed root action slot. A
+// joined dead child cannot acknowledge it, but cannot erase the original owner.
+func (d *Driver) removeKernelLocked(mode, id string) error {
+	index := 0
+	if mode == "terminal" {
+		index = 1
+	}
+	attempt := d.removals[index]
+	if attempt == nil {
+		attempt = &rootRemoval{id: id}
+		d.removals[index] = attempt
+		if d.kernel != nil {
+			attempt.err = d.kernel.Remove(mode == "terminal")
+		} else {
+			w := d.bound()
+			_, attempt.err = fusev3.ObservePlannedKernelMountAbsent(w.Source, w.Target)
+		}
+	}
+	if attempt.id != id {
+		return errors.New("workspace removal action changed")
+	}
+	return attempt.err
 }
 func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, mode string) (*mountcontrol.WorkspaceResponse, error) {
 	d.opMu.Lock()
@@ -708,6 +740,7 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 					if authorityrpc.TransientTransport(err) {
 						// Delivery does not change action ownership. The next snapshot
 						// decides whether to hand off original copies or only observe.
+						time.Sleep(20 * time.Millisecond)
 						continue
 					}
 					if op == "workspace-cleanup" {
@@ -800,6 +833,11 @@ func (d *Driver) Cleanup(_ context.Context, _ Witness) (CleanupProof, error) {
 	return d.remove(context.Background(), "terminal")
 }
 func (d *Driver) remove(ctx context.Context, mode string) (CleanupProof, error) {
+	d.cleanupMu.Lock()
+	defer d.cleanupMu.Unlock()
+	if d.cleaned.Load() {
+		return CleanupProof{Witness: d.bound(), ProcessExited: true, KernelAbsent: true}, nil
+	}
 	d.CloseAdmission(d.bindingGeneration())
 	_, err := d.job(ctx, "workspace-cleanup", nil, mode)
 	if err != nil {
@@ -809,7 +847,15 @@ func (d *Driver) remove(ctx context.Context, mode string) (CleanupProof, error) 
 			return CleanupProof{Witness: d.bound()}, err
 		}
 		if absentErr := d.proveExitedAbsent(); absentErr != nil {
-			return CleanupProof{Witness: d.bound()}, errors.Join(err, absentErr)
+			d.effectMu.Lock()
+			removeErr := d.removeKernelLocked("terminal", "3")
+			d.effectMu.Unlock()
+			if removeErr != nil {
+				return CleanupProof{Witness: d.bound()}, errors.Join(err, absentErr, removeErr)
+			}
+			if absentErr = d.proveExitedAbsent(); absentErr != nil {
+				return CleanupProof{Witness: d.bound()}, absentErr
+			}
 		}
 	} else {
 		<-d.exited
@@ -824,7 +870,7 @@ func (d *Driver) remove(ctx context.Context, mode string) (CleanupProof, error) 
 	if run == nil {
 		return CleanupProof{Witness: d.bound()}, errors.New("workspace cleanup intent missing")
 	}
-	w, err := d.manager.reconcileCLI(context.Background(), run, d.bound().Process)
+	w, err := d.manager.reconcileCLI(context.Background(), run, d.bound().Process, false)
 	if err != nil {
 		return CleanupProof{Witness: d.bound()}, err
 	}
@@ -896,9 +942,15 @@ func (d *Driver) watch() {
 	for {
 		select {
 		case <-d.exited:
-			if d.serving.Load() {
+			if d.registered.Load() && !d.cleaned.Load() {
 				d.CloseAdmission(d.bindingGeneration())
 				_ = d.manager.Host.Terminal(d.id, "workspace child exited", nil)
+				if d.terminalCleanup.CompareAndSwap(false, true) {
+					proof, err := d.remove(context.Background(), "terminal")
+					if err == nil {
+						_ = d.manager.Host.Cleanup(d.id, proof)
+					}
+				}
 			}
 			return
 		case <-t.C:

@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,72 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestManagedKernelFailedINITRetainsExactRemovalOwner(t *testing.T) {
+	k, _, path := managedBootstrapFixture(t)
+	files, err := k.Handoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files[0].Close()
+	defer files[1].Close()
+	frame := make([]byte, 8192)
+	n, err := unix.Read(int(files[0].Fd()), frame)
+	if err != nil || n < 40 || binary.LittleEndian.Uint32(frame[4:]) != 26 {
+		t.Fatal("kernel did not request real FUSE INIT", n, err)
+	}
+	reply := make([]byte, 16)
+	binary.LittleEndian.PutUint32(reply, uint32(len(reply)))
+	errno := int32(-int32(syscall.EPROTO))
+	binary.LittleEndian.PutUint32(reply[4:], uint32(errno))
+	copy(reply[8:], frame[8:16])
+	if n, err = unix.Write(int(files[0].Fd()), reply); err != nil || n != len(reply) {
+		t.Fatal("failed INIT reply did not settle", n, err)
+	}
+	if err = k.ChildOwnsFUSE(); err != nil {
+		t.Fatal(err)
+	}
+	if err = k.Absent(); err == nil {
+		t.Fatal("failed INIT fabricated kernel absence")
+	}
+	if err = k.Remove(true); err != nil {
+		t.Fatal("root could not remove its failed INIT", err)
+	}
+	if err = k.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Lstat(path)
+	if err != nil || st.Mode().Perm() != 0 {
+		t.Fatal("failed INIT exposed writable backing", st, err)
+	}
+}
+
+func TestManagedKernelRejectsForeignBootstrapDescriptions(t *testing.T) {
+	k, _, path := managedBootstrapFixture(t)
+	files, err := k.Handoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files[0].Close()
+	defer files[1].Close()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	for _, pair := range [][2]int{{int(r.Fd()), int(w.Fd())}, {int(files[0].Fd()), int(w.Fd())}, {int(files[0].Fd()), int(files[0].Fd())}, {int(files[1].Fd()), int(files[0].Fd())}} {
+		if err = ValidateManagedDescriptors(pair[0], pair[1], "portablefs:mnt_AAAAAAAAAAAAAAAAAAAAAA", path); err == nil {
+			t.Fatal("foreign or duplicate descriptor roles accepted", pair)
+		}
+	}
+	if err = ValidateManagedDescriptors(int(files[0].Fd()), int(files[1].Fd()), "portablefs:mnt_AAAAAAAAAAAAAAAAAAAAAA", path); err != nil {
+		t.Fatal("rejected handoff damaged the original owner", err)
+	}
+	if err = k.Absent(); err == nil {
+		t.Fatal("rejected bootstrap erased the installed original")
+	}
+}
 
 func managedBootstrapFixture(t *testing.T) (*ManagedKernel, *os.File, string) {
 	t.Helper()

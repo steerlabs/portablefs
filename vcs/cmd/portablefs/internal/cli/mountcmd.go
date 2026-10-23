@@ -2165,6 +2165,13 @@ func verifyCleanupIntentMatchesState(intent *mountIntent, state *mountState) err
 	if intent == nil || state == nil || intent.Phase != "resources-cleaned" {
 		return fmt.Errorf("missing cleaned-resource intent or mount state")
 	}
+	return verifyMountIntentMatchesState(intent, state)
+}
+
+func verifyMountIntentMatchesState(intent *mountIntent, state *mountState) error {
+	if intent == nil || state == nil {
+		return fmt.Errorf("missing mount intent or state")
+	}
 	if intent.MountPath != state.MountPath || intent.VolumeID != state.VolumeID ||
 		intent.Strategy != state.Strategy ||
 		intent.Engine != state.Engine ||
@@ -2205,6 +2212,13 @@ func publishResourcesCleanedIntent(operation *mountOperation, stateDir, mountPat
 }
 
 func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
+	return e.reconcileMountIntentWithProcess(intent, force, true)
+}
+
+// The workspace helper has an independent joined-exit or discarded-kernel-boot
+// proof. It may inspect the old intent, but must never signal a process whose
+// numeric PID/start happens to recur in a new kernel boot.
+func (e *cmdEnv) reconcileMountIntentWithProcess(intent *mountIntent, force, ownProcess bool) error {
 	if intent == nil {
 		return fmt.Errorf("missing intent")
 	}
@@ -2301,6 +2315,9 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
 	}
 
 	if mounted {
+		if !ownProcess {
+			return fmt.Errorf("workspace intent still owns a kernel mount")
+		}
 		if st.Strategy == "fskit" {
 			if _, err := e.v3FSKitDaemonDetach(st, force); err != nil {
 				return err
@@ -2352,7 +2369,7 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
 		}
 	}
 
-	if mountProcessMatches(st) {
+	if ownProcess && mountProcessMatches(st) {
 		if err := stopMountDaemon(st); err != nil {
 			return err
 		}

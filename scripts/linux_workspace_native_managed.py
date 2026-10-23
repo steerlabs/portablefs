@@ -201,6 +201,33 @@ else:
 """
         assert guest.ssh('python3 -c '+shlex.quote(script)) == 'protected'
 
+    def kill_child(self, guest):
+        script = """import os,pathlib,signal
+pids=[]
+for p in pathlib.Path('/proc').glob('[0-9]*'):
+    try:
+        if p.stat().st_uid!=1000: continue
+        args=(p/'cmdline').read_bytes().split(b'\\0')
+        if args[:2]==[b'/usr/local/bin/portablefs',b'mount'] and b'native-managed' in args:
+            pids.append(int(p.name))
+    except FileNotFoundError:
+        pass
+assert len(pids)==1,pids
+os.kill(pids[0],signal.SIGKILL)
+print(pids[0])
+"""
+        pid = int(guest.ssh('python3 -c '+shlex.quote(script)))
+        deadline = time.monotonic()+30
+        while True:
+            status = self.status(guest)
+            mounts = [m for m in status.get('mounts', []) if m['mount']['volumeId']==self.volume]
+            if mounts and mounts[0]['state']=='terminal' and mounts[0]['cleanup']=='complete':
+                break
+            assert time.monotonic()<deadline,status
+            time.sleep(.05)
+        self.protected(guest)
+        (self.evidence/'managed-child-death.json').write_text(json.dumps({'pid':pid,'status':mounts[0]},indent=2))
+
     def reconciled(self, guest, old):
         self.status(guest)
         records = []

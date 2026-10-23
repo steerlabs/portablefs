@@ -20,7 +20,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// The real clock/protected-path driver is intentionally not wired by this PR.
 // A clock must both await correction and synchronously reject stale evidence at
 // dispatch. Neither a missing owner nor a goroutine start constitutes readiness.
 type workspaceClock interface {

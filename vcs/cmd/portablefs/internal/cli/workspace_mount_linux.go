@@ -419,7 +419,9 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 	}
 	c.mounted.Store(m)
 	c.mu.Lock()
-	c.state.AuthorizationDeadlineAtMs = m.AuthorizationDeadline().UnixMilli()
+	if c.renewer != nil {
+		c.state.AuthorizationDeadlineAtMs = m.AuthorizationDeadline().UnixMilli()
+	}
 	err = writeMountState(c.launch.StateDirectory, c.state)
 	c.mu.Unlock()
 	if err != nil {

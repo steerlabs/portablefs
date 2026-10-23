@@ -16,7 +16,7 @@ type guestClock interface {
 }
 
 // ConfigureGuest installs real identity and clock owners before pairing. It
-// enables provisioning only; mount and removal still require PR 6's root driver.
+// The root driver consumes only material selected and persisted by this store.
 func (s *Supervisor) ConfigureGuest(identity *workspacemount.Store, clock guestClock, wait func(context.Context, uint64) error) {
 	s.identities = identity
 	s.clock = clock

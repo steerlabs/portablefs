@@ -1,10 +1,9 @@
 # Linux workspace cold lifecycle
 
-Managed launch remains unavailable. The private lifecycle engine requires the
-shared RTC clock owner, an exact serving/recovery permit, the session's dispatch fence and
-an outcome persistence owner. Identity/provisioning and the clock owner exist; protected-path bootstrap and
-the root driver remain separate dependencies; no ready implementation substitutes for
-them. Authority protocol 8 and ordinary mount dispatch remain unchanged.
+The protected-path driver runs the stock Linux frontend under UID/GID 1000.
+It supplies the shared TLS clock reader, exact serving/recovery permit, session
+dispatch fence and outcome persistence owner. Authority protocol 8 and ordinary
+mount dispatch remain unchanged. Supported release remains unqualified.
 
 ## Suspension ownership
 
@@ -149,9 +148,9 @@ real kernel FUSE and XFS: a held frontend clock/CONTROL stream allows stale
 successful metadata after a causally completed peer write in the unfenced
 negative control; cold withdrawal plus closed-until-fresh-recovery prevents it.
 This controlled frontend schedule does not qualify VZ resume ordering or real
-host sleep. The native workspace inventory also checks prompt paired-job
-acceptance followed by retained unavailable failure for Provision, Mount and
-Umount, without registering a real mount.
+host sleep. The native workspace inventory requires real managed Mount/Umount outcomes,
+peer coherence and exact replacement. Its unprovisioned-job case retains the
+actual handler failure.
 
 ## One drain deadline
 
@@ -159,8 +158,9 @@ The paired dispatcher closes admission and cancels desired jobs before starting
 independent fixed-roster drains in parallel. The first guest frame byte anchors
 one deadline from the host's remaining allowance. Framing and dispatcher waits,
 old-job joins, mount lanes and local Suspend all consume it. The supervisor
-preserves the deadline in the context passed to Mount.Suspend; the future root
-adapter must forward only its remainder to the existing local job owner. There
+preserves the deadline in the context passed to Mount.Suspend. The root adapter
+forwards only its remainder at the local send boundary, then observes the local
+job through actual settlement even if the caller deadline expires. There
 is no new outer deadline for Prepare or Recover.
 
 Failed or elapsed drains cancel sibling waiters, retain physical owners and
@@ -174,7 +174,6 @@ The guest TLS clock owner invalidates its shared result at suspension and starts
 a new correction after accepted Resume. Each mount binds that generation to its
 exact close serial, including at low-level authority and Manager TLS dispatch.
 A delayed or failed measurement denies freshness synchronously; correction does
-not restore latched serving permission. The root driver's observation of
-WorkspaceRecoveryRequired, gate closure and remaining-deadline forwarding remain
-PR 6 obligations. RTC is not an admission clock, and its source UTC allocation
+not restore latched serving permission. The root driver observes WorkspaceRecoveryRequired with its exact generation
+and close serial; a delayed old observation cannot close a new serving interval. RTC is not an admission clock, and its source UTC allocation
 remains conditional on exact-image qualification.

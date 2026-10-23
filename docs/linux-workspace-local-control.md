@@ -2,8 +2,8 @@
 
 This exact paired format 8 is unreleased. It changes with its root supervisor
 and child daemon together; authority protocol 8 and host/guest protobuf control
-remain unchanged. Real managed handlers remain unavailable until the gate,
-protected-path kernel driver and clock owners exist.
+remain unchanged. The real root driver supplies the sealed gate, protected kernel
+bootstrap and shared clock owners to its UID/GID 1000 child.
 
 ## Requests and correlation
 
@@ -111,7 +111,8 @@ callbacks, precedes listener publication.
 ## Observation
 
 Commands acknowledge acceptance only. A snapshot uses one of `preparing`,
-`kernel-required`, `pending-recovery`, `pending-suspend`, `prepared`, `cold`,
+`kernel-required`, `pending-recovery`, `pending-suspend`, `prepared`,
+`recovery-required`, `cold`,
 `unmount-required`, `cleanup-finalized` or `failed`. Only prepared carries the
 exact validated session, subscription and renewal readiness proof.
 
@@ -196,4 +197,5 @@ terminal cleanup. Child death leaves root-owned abort and witness evidence.
 Neither a new supervisor nor a replacement child resumes vanished in-memory
 work; ambiguous inventory blocks replacement until exact cleanup or confirmed
 VM termination. Boundary tests cover these transitions with owned descriptions;
-this PR does not implement real managed mounts or qualify host sleep.
+the protected-path driver adds actual device/bootstrap tests. Host sleep remains
+unqualified.
