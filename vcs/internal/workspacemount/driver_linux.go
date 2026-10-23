@@ -89,18 +89,39 @@ type rootRemoval struct {
 	err error
 }
 
+func (m *Manager) snapshotMounts() map[string]*Driver {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]*Driver, len(m.mounts))
+	for key, d := range m.mounts {
+		out[key] = d
+	}
+	return out
+}
+
+func (m *Manager) pruneMounts() {
+	// Host registration takes the supervisor lock. Clock invalidation can call
+	// back into this manager while that lock is held, so no Host method may run
+	// under the map lock. Cleaned incarnations cannot register again.
+	for key, prior := range m.snapshotMounts() {
+		if prior.cleaned.Load() && !m.Host.Registered(prior.id) {
+			m.mu.Lock()
+			if m.mounts[key] == prior {
+				delete(m.mounts, key)
+			}
+			m.mu.Unlock()
+		}
+	}
+}
+
 func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) error {
 	key := control.MountKey(j.Mount)
 	switch j.Operation {
 	case "mount":
+		m.pruneMounts()
 		m.mu.Lock()
 		if m.mounts == nil {
 			m.mounts = map[string]*Driver{}
-		}
-		for key, prior := range m.mounts {
-			if prior.cleaned.Load() && !m.Host.Registered(prior.id) {
-				delete(m.mounts, key)
-			}
 		}
 		old := m.mounts[key]
 		m.mu.Unlock()
@@ -115,14 +136,12 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		m.mounts[key] = d
 		m.mu.Unlock()
 		var predecessor *Driver
-		m.mu.Lock()
-		for _, prior := range m.mounts {
+		for _, prior := range m.snapshotMounts() {
 			if prior != d && prior.cleaned.Load() && string(prior.id.AuthorityId) == string(j.Mount.AuthorityId) && prior.id.VolumeId == j.Mount.VolumeId && m.Host.Registered(prior.id) {
 				predecessor = prior
 				break
 			}
 		}
-		m.mu.Unlock()
 		if predecessor != nil {
 			err = m.Host.Replace(ctx, predecessor.id, j.Mount, d.bound(), d)
 		} else {

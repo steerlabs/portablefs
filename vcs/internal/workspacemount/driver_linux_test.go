@@ -477,3 +477,84 @@ func TestRootLocalConnectChargesSaturatedBacklog(t *testing.T) {
 		t.Fatal("unsent start could not finish at caller expiry", err)
 	}
 }
+
+type stalledRegistrationHost struct {
+	Host
+	entered, release chan struct{}
+}
+
+func (h *stalledRegistrationHost) Registered(*pb.MountID) bool {
+	close(h.entered)
+	<-h.release
+	return false
+}
+func TestRootRegistrationObservationCannotBlockClockClosure(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root manager and real admission boundary")
+	}
+	start, err := mountcontrol.ProcessStart(int32(os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := func(n byte) *workspaceadmission.Supervisor {
+		b := workspaceadmission.Binding{SupervisorPID: int32(os.Getpid()), SupervisorStart: start}
+		copy(b.Boot[:], bytesID(1))
+		copy(b.HostService[:], bytesID(2))
+		copy(b.GuestService[:], bytesID(3))
+		copy(b.Incarnation[:], bytesID(n))
+		g, err := workspaceadmission.New(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { g.Dispose() })
+		return g
+	}
+	h := &stalledRegistrationHost{entered: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-h.release:
+		default:
+			close(h.release)
+		}
+	}()
+	old := &Driver{id: desired(1).Mount, gate: gate(1)}
+	old.cleaned.Store(true)
+	active := &Driver{id: desired(2).Mount, gate: gate(2)}
+	p, err := active.gate.Recovery(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = active.gate.Prepared(p); err != nil {
+		t.Fatal(err)
+	}
+	if err = active.gate.Open(0, p.Serial()); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Host: h, mounts: map[string]*Driver{"old": old, "active": active}}
+	pruned := make(chan struct{})
+	go func() { m.pruneMounts(); close(pruned) }()
+	<-h.entered
+	closed := make(chan struct{})
+	go func() { m.ClockUnavailable(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("supervisor observation held the clock closure lock")
+	}
+	next, err := active.gate.Recovery(0)
+	if err != nil || next.Serial() <= p.Serial() {
+		t.Fatal("clock callback did not close the serving interval", next, err)
+	}
+	close(h.release)
+	select {
+	case <-pruned:
+	case <-time.After(time.Second):
+		t.Fatal("registration observer not joined")
+	}
+	if _, ok := m.snapshotMounts()["old"]; ok {
+		t.Fatal("exact cleaned incarnation not pruned")
+	}
+	if m.snapshotMounts()["active"] != active {
+		t.Fatal("active owner was pruned")
+	}
+}
