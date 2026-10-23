@@ -186,6 +186,7 @@ REQUIRED_TEST_LISTS = (
 # entry/publication inventory. The invocation is provisioned for exactly these
 # packages, so every root entry must name a top-level test in one of them.
 ROOT_TEST_PACKAGES = {
+    "github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli",
     "github.com/steerlabs/portablefs/vcs/internal/cellhost",
     "github.com/steerlabs/portablefs/vcs/internal/xfsstore",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3",
@@ -194,6 +195,21 @@ ROOT_TEST_PACKAGES = {
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission",
 }
 ROOT_REQUIRED = {
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFinalizationDrainsAcceptedCutAfterServingClosure",
+  "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootRegistrationObservationCannotBlockClockClosure",
+  "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootLocalConnectChargesSaturatedBacklog",
+  "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootRecreatesOnlyProtectedColdTarget",
+    "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootStableBackingAndAcknowledgedMetadata",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFinalizationRetainsTerminalOutcomeAndRefusesCleanupDebt",
+    "github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli:TestWorkspaceClockRefusalLatchesServingUntilFreshClosedPermit",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClockDeniesEntryBeforeRootObservation",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClockDeniesCapacityWaitBeforeRootObservation",
+    "github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli:TestWorkspaceReconcileIndependentCommitsAndLostAcknowledgment",
+    "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootLostInstallResponseKeepsOriginalFailedINITOwner",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestManagedKernelFailedINITRetainsExactRemovalOwner",
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestManagedKernelRejectsForeignBootstrapDescriptions",
+    "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockConcurrentCheckAndCloseJoinsReaders",
+    "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootSuspendForwardsRemainingBudgetAndJoinsLocalOwner",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspacePersistenceFailureSurvivesPermitLoss",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceZeroEntryLossTicketRecorded",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceManagedResumePermitLoss",

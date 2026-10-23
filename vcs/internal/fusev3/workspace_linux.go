@@ -10,6 +10,8 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
@@ -106,6 +108,12 @@ func (cut workspaceReplyCohort) wait(ctx context.Context) error {
 func workspaceAcceptance(ctx context.Context) error {
 	p := replyPublicationFromContext(ctx)
 	if p != nil && p.workspaceBound {
+		if err := p.workspace.Check(); err != nil {
+			return err
+		}
+		if !p.owner.mount.workspaceClockReady() {
+			return workspaceadmission.ErrClosed
+		}
 		return p.workspace.Check()
 	}
 	return nil
@@ -122,7 +130,16 @@ func workspaceAdmissionContext(ctx context.Context) context.Context {
 func workspaceAcceptanceCheck(ctx context.Context) func() error {
 	p := replyPublicationFromContext(ctx)
 	if p != nil && p.workspaceBound {
-		return p.workspace.Check
+		check, m := p.workspace.Check, p.owner.mount
+		return func() error {
+			if err := check(); err != nil {
+				return err
+			}
+			if !m.workspaceClockReady() {
+				return workspaceadmission.ErrClosed
+			}
+			return check()
+		}
 	}
 	return nil
 }
@@ -132,7 +149,25 @@ func (m *Mount) workspaceServing() bool {
 		return true
 	}
 	_, err := m.workspace.Check()
-	return err == nil
+	return err == nil && m.workspaceClockReady()
+}
+
+// TLS readiness can withdraw between observer ticks. Denial at use prevents a
+// delayed root observation from admitting another write. It supplies no RTC
+// lease time; authority/subscription horizons still use the ordinary clocks.
+func (m *Mount) workspaceClockReady() bool {
+	w := m.workspaceLifecycle
+	if w == nil {
+		return true
+	}
+	if w.clock == nil {
+		return false
+	}
+	p := w.initialPermit
+	if prior := w.observation.Load(); prior != nil {
+		p = mountenrollment.Permit{Generation: prior.Generation, GateSerial: prior.GateSerial}
+	}
+	return w.clock.Check(p) == nil
 }
 
 // A drain never asks the current manager for a successor buffer/incarnation or
@@ -172,7 +207,7 @@ func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublicat
 	p.workspaceDone = make(chan struct{})
 	r.replyPublications[unique] = p
 	permit, err := r.mount.workspace.Check()
-	if err != nil {
+	if err != nil || !r.mount.workspaceClockReady() {
 		delete(r.replyPublications, unique)
 		r.recycleReplyLocked(p)
 		return nil, fuse.EIO

@@ -20,16 +20,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// The real clock/protected-path driver is intentionally not wired by this PR.
 // A clock must both await correction and synchronously reject stale evidence at
 // dispatch. Neither a missing owner nor a goroutine start constitutes readiness.
 type workspaceClock interface {
 	Wait(context.Context, mountenrollment.Permit) error
+	// Check also runs under buffer admission: no I/O, joins or owner mutex.
 	Check(mountenrollment.Permit) error
 }
 type workspaceDispatch interface {
 	ParkDispatch(context.Context) error
 	ResumeDispatch(func() error) error
+	DrainDispatch(func() error) error
 	DispatchSnapshot() authorityrpc.DispatchSnapshot
 	AuthorizationDeadline() time.Time
 }
@@ -61,6 +62,7 @@ type workspaceEvidence struct {
 	abandoned bool
 }
 type workspaceLifecycle struct {
+	initialPermit       mountenrollment.Permit
 	beforeRecoveryProof func()
 	afterFlushLoss      func(*fileHandle) // deterministic reset boundary; nil in production
 	observation         atomic.Pointer[WorkspaceObservation]
@@ -81,6 +83,23 @@ type workspaceLifecycle struct {
 	keepalive       workspaceAttempt
 	servedSinceCold atomic.Bool
 	coldOutcome     *pb.MountOutcome
+	closeCleanupErr error // protected by Mount.mu; terminal/barrier verdicts stay separate
+}
+
+// FinalizeWorkspace preserves the run's terminal/loss evidence independently
+// of whether exact connection/session cleanup completed. Ordinary Close keeps
+// returning its combined terminal, barrier and cleanup diagnostic.
+func (m *Mount) FinalizeWorkspace() (WorkspaceObservation, error) {
+	w := m.workspaceLifecycle
+	if w == nil || w.persist == nil {
+		return WorkspaceObservation{}, errors.New("fusev3: managed finalization has no outcome owner")
+	}
+	m.mu.Lock()
+	_ = m.closeLocked()
+	cleanupErr := w.closeCleanupErr
+	m.mu.Unlock()
+	o := m.WorkspaceObservation()
+	return o, errors.Join(cleanupErr, w.persist(o))
 }
 
 var workspaceWorkerGroups = [][]string{
@@ -262,6 +281,10 @@ func (m *Mount) workspaceObservation(g, serial uint64) WorkspaceObservation {
 	if e := w.evidence.Load(); e != nil {
 		for _, l := range e.loss {
 			o.Loss = append(o.Loss, proto.Clone(l).(*pb.Loss))
+		}
+		if e.abandoned && o.Outcome.Release == "unresolved" {
+			o.Outcome.Observation = "observed"
+			o.Outcome.Release = "abandoned"
 		}
 	}
 
@@ -751,6 +774,9 @@ func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d works
 		return m.finishWorkspaceCold(w, d)
 	}
 	w.outcome = control.UnknownOutcome()
+	if err = m.drainWorkspaceDispatch(d, p); err != nil {
+		return false, err
+	}
 	w.workers = nil
 	for group := 0; group < 6; group++ {
 		w.workerDisposition(group, "unresolved")
@@ -816,6 +842,33 @@ func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d works
 		return false, errors.New("fusev3: terminal worker prevents healthy cold proof")
 	}
 	return m.finishWorkspaceCold(w, d)
+}
+
+func (m *Mount) drainWorkspaceDispatch(d workspaceDispatch, p workspaceDrainPermit) error {
+	return d.DrainDispatch(func() error {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+		if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
+			return errSubscriptionExpired
+		}
+		return nil
+	})
+}
+
+func (m *Mount) prepareWorkspaceClose() error {
+	if m.workspaceLifecycle == nil || !m.delegations.hasRetainedEntries() || m.rpc.SessionEndCause() != nil {
+		return nil
+	}
+	_, d, err := m.workspaceDependencies()
+	if err != nil {
+		return err
+	}
+	// Exact kernel removal has closed frontend admission. Its accepted tail
+	// remains owned by the old grant, not the now-defeated serving predicate.
+	// Capture never refreshes the subscription's original conservative horizon.
+	p := m.workspaceFS().captureWorkspaceDrain(m.subscription.config.clock.Now().Add(m.subscription.shutdownBudget()))
+	return m.drainWorkspaceDispatch(d, p)
 }
 
 // Both a full cut and a re-acknowledgment retire cache ownership, then capture

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,6 +94,8 @@ func (o *Owner) share() (err error) {
 }
 
 type Reader struct {
+	checking                        atomic.Int64
+	closed                          atomic.Bool
 	closeOnce                       sync.Once
 	closeErr                        error
 	mu                              sync.RWMutex
@@ -170,9 +173,15 @@ func (r *Reader) Check(generation uint64) error {
 	if r == nil {
 		return ErrUnavailable
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if r.page == nil {
+	if r.closed.Load() {
+		return ErrUnavailable
+	}
+	// Serving/buffer admission must not acquire another owner's mutex. Register
+	// the read before inspecting closure; Close withdraws first and joins these
+	// bounded seqlock reads before unmapping the immutable page description.
+	r.checking.Add(1)
+	defer r.checking.Add(-1)
+	if r.closed.Load() || r.page == nil {
 		return ErrUnavailable
 	}
 	for tries := 0; tries < 16; tries++ {
@@ -208,10 +217,14 @@ func (r *Reader) Check(generation uint64) error {
 }
 func (r *Reader) Close() error {
 	r.closeOnce.Do(func() {
+		r.closed.Store(true)
 		close(r.stop)
 		<-r.done
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		for r.checking.Load() != 0 {
+			runtime.Gosched()
+		}
 		r.closeErr = errors.Join(unix.Munmap(r.page), r.file.Close())
 		r.page = nil
 	})

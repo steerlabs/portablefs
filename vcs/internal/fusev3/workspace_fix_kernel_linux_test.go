@@ -509,24 +509,22 @@ func reviewKernelClockReadinessChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.unavailable.Store(true)
-	corrected := clock.restoreAfter(3 * time.Second)
-	closed := make(chan error, 1)
-	go func() { closed <- held.Close() }()
-	// The readiness refusal owns no network submission and cannot destroy the
-	// accepted buffer, cleanup obligation, or healthy session.
-	<-clock.refused
+	// New frontend Flush must refuse immediately; accepted bytes remain owned.
+	if err := held.Close(); !errors.Is(err, syscall.EIO) {
+		t.Fatal("close under invalid serving proof", err)
+	}
+	select {
+	case <-clock.refused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no synchronous clock refusal")
+	}
 	if c.m.isRevoked() || c.m.rpc.SessionEndCause() != nil || c.m.delegations.LossSequence() != 0 {
 		t.Fatal("readiness refusal became terminal or lost data")
 	}
-	<-corrected
-	select {
-	case err := <-closed:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("close did not settle after readiness")
-	}
+	// Root closes and drains the accepted cut through the existing TLS owner.
+	serial := c.suspend()
+	<-clock.restoreAfter(3 * time.Second)
+	c.recover(serial)
 	data, err := os.ReadFile(f.join(1, "e"))
 	if err != nil || string(data) != "w" || c.m.isRevoked() || c.m.rpc.SessionEndCause() != nil || c.m.delegations.LossSequence() != 0 {
 		t.Fatalf("readiness gap lost accepted data: %q %v revoked=%v cause=%v", data, err, c.m.isRevoked(), c.m.rpc.SessionEndCause())

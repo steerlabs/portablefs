@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
-	"github.com/steerlabs/portablefs/vcs/internal/continuous"
-	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"golang.org/x/sys/unix"
 )
 
@@ -106,31 +104,19 @@ func TestWorkspaceKernelReparkResnapshotsRealCleanup(t *testing.T) {
 	opusKernelParent(t, r2KernelReparkEvidenceChild)
 }
 
-type r2PausedAuthorityClock struct{ now time.Time }
-
-func (c r2PausedAuthorityClock) Now() time.Time { return c.now }
-func (c r2PausedAuthorityClock) NewTimer(time.Duration) volumeserver.CoherenceTimer {
-	return &subscriptionTestTimer{fired: make(chan time.Time)}
-}
-
-// Freeze coherence ownership on both sides to isolate request-budget spending
-// from the separate, definitive expiry of an authority write grant. The kernel,
-// TLS, XFS and request timers advance for longer than the actual request bound.
+// A Recover owner outlives the per-request timeout while clock readiness is
+// unavailable. Kernel, TLS, authority grants and request clocks all advance;
+// fresh frontend operations refuse until root republishes admission.
 func r2KernelReadinessBudgetChild(t *testing.T, budget time.Duration) {
 	reader, proof, mounted := opusAdopt(t)
 	defer reader.Retire()
 	var off atomic.Int64
 	ready := &workspaceTestClockOwner{refused: make(chan struct{})}
 	life := &workspaceLifecycle{lane: make(chan struct{}, 1), clock: ready, standalone: true, persist: func(WorkspaceObservation) error { return nil }}
-	clock := &workspacePausedClock{start: continuous.Time()}
 	f := newIntegrationFixture(t, integrationConfig{
 		Mounts: 1, RequestTimeout: budget, SessionLease: 2 * time.Minute,
 		workspace: reader, workspaceRecovery: proof, workspaceFirstOnly: true,
-		workspaceLifecycle: life, workspaceDispatch: true, workspaceClock: clock,
-		beforeServe: func(f *integrationFixture) {
-			f.coherence = volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{Clock: r2PausedAuthorityClock{continuous.Time()}})
-			f.counter.inner.(*authorityrpc.VolumeHandler).Coherence = f.coherence
-		},
+		workspaceLifecycle: life, workspaceDispatch: true,
 	})
 	c := &opusChild{t: t, in: bufio.NewReader(os.Stdin), f: f, m: f.mounts[0], off: &off}
 	mounted.Store(c.m)
@@ -148,34 +134,39 @@ func r2KernelReadinessBudgetChild(t *testing.T, budget time.Duration) {
 			t.Fatal(err)
 		}
 	}
+	serial := c.suspend()
+	session := string(c.m.rpc.SessionID())
 	ready.unavailable.Store(true)
-	closed, synced := make(chan error, 1), make(chan error, 1)
-	go func() { closed <- held.Close() }()
-	go func() { synced <- other.Sync() }()
+	completed := make(chan struct{})
+	go func() { defer close(completed); c.recover(serial) }()
 	select {
 	case <-ready.refused:
 	case <-time.After(5 * time.Second):
-		t.Fatal("no dispatch readiness refusal")
+		t.Fatal("no recovery readiness refusal")
 	}
 	time.Sleep(budget + time.Second)
 	select {
-	case err := <-synced:
-		t.Fatal("fsync spent its request budget before admission", err)
+	case <-completed:
+		t.Fatal("Recover spent a request timeout before clock admission")
 	default:
 	}
-	if c.m.isRevoked() || c.m.rpc.SessionEndCause() != nil || c.m.delegations.LossSequence() != 0 {
-		t.Fatal("unsubmitted readiness wait lost accepted data or ownership", c.m.fatalError())
+	if _, err := reader.Check(); err == nil {
+		t.Fatal("root admission opened during invalid clock proof")
+	}
+	if c.m.isRevoked() || c.m.rpc.SessionEndCause() != nil || c.m.delegations.LossSequence() != 0 || string(c.m.rpc.SessionID()) != session {
+		t.Fatal("readiness wait lost accepted data or session ownership", c.m.fatalError())
 	}
 	ready.unavailable.Store(false)
-	for name, done := range map[string]<-chan error{"close": closed, "fsync": synced} {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatal(name, err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal(name, "did not settle after readiness")
-		}
+	select {
+	case <-completed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Recover did not settle after clock readiness")
+	}
+	if err := other.Sync(); err != nil {
+		t.Fatal("old handle fsync after recovery", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal("old handle close after recovery", err)
 	}
 	if err := other.Close(); err != nil {
 		t.Fatal(err)

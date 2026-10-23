@@ -6,7 +6,7 @@ ssh-workspace-user
 immutable-root
 vsock-only-ssh
 workspace-root-layout
-desired-jobs-retain-unavailable
+unprovisioned-jobs-retain-failure
 controlled-cold-pause
 resume-single-use
 data-disk-reboot-persistence
@@ -18,3 +18,16 @@ rtc-single-owner-duplicate-contention
 rtc-boot-correction
 rtc-cold-resume-generation
 rtc-awake-measurement
+managed-standalone-provision
+managed-write-read-fsync
+managed-peer-coherence
+managed-suspend-resume-data
+managed-unmount-exact-cleanup
+managed-channel-loss-vm-discard
+managed-reboot-durable-reconcile
+managed-terminal-replacement
+managed-old-handle-terminal
+managed-prepare-outage-over-45s
+managed-recover-outage-over-45s
+managed-root-owner-death-vm-discard
+managed-child-death-exact-cleanup

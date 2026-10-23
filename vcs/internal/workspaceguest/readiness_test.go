@@ -39,14 +39,14 @@ func TestRecoveryTypedReadinessBindsSerialAndStandalone(t *testing.T) {
 			r.Renewal.State = tc.state
 			r.Renewal.InstalledSequence = tc.seq
 			r.Renewal.Permit = mountenrollment.Permit{Generation: 4, GateSerial: 7}
-			if r.ready(4, 7) != tc.want {
+			if r.Ready(4, 7) != tc.want {
 				t.Fatal(r)
 			}
-			if r.ready(4, 8) {
+			if r.Ready(4, 8) {
 				t.Fatal("stale prepared serial")
 			}
 			r.AuthorizationDeadline = r.AuthorizationDeadline.Add(time.Nanosecond)
-			if !tc.standalone && r.ready(4, 7) {
+			if !tc.standalone && r.Ready(4, 7) {
 				t.Fatal("unequal deadline")
 			}
 		})

@@ -154,6 +154,72 @@ func TestDispatchFenceJoinsIOAndRejectsStaleClock(t *testing.T) {
 	}
 }
 
+func TestDispatchDrainUsesCapturedHorizonAfterAdmissionCloses(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := NewDispatchFence()
+		serving := true
+		if err := f.Resume(func() error {
+			if !serving {
+				return errors.New("serving closed")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		serving = false
+		deadline := time.Now().Add(time.Second)
+		if err := f.Drain(func() error {
+			if !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// A write already accepted by the old buffer still needs an applying
+		// replay owner; closing frontend admission must not erase its effect.
+		request := &authoritypb.Request{Mutation: &authoritypb.Mutation{Slot: 2, Sequence: 9}, Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Data: []byte("accepted cut")}}}
+		release, err := f.own(t.Context(), request)
+		if err != nil || len(f.Snapshot().Owners) != 1 {
+			t.Fatal("old accepted cut lost its owner", err)
+		}
+		finish, err := f.begin(t.Context(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err = f.Park(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatal("Park hid the accepted owner", err)
+		}
+		if err = f.Drain(func() error { return nil }); err == nil {
+			t.Fatal("drain revived an unjoined Park")
+		}
+		finish()
+		release()
+		if err = f.Park(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Second)
+		// The same expired cut may be installed for final accounting, but it
+		// cannot dispatch, even when an unrelated clock correction arrives.
+		if err = f.Drain(func() error { return context.DeadlineExceeded }); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if _, err = f.own(ctx, request); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal("expired cut admitted another effect", err)
+		}
+		if s := f.Snapshot(); s.InFlightIO != 0 || len(s.Owners) != 0 {
+			t.Fatal("readiness wait acquired ownership", s)
+		}
+		if err = f.Park(t.Context()); err != nil || !f.Snapshot().Parked {
+			t.Fatal("expired cut did not join", err)
+		}
+	})
+}
+
 // Real TLS, runtime replay and an assigned non-applying request cross Park.
 // Losing its response cannot turn the parked owner into terminal cancellation.
 func TestLifecycleParkedCleanupReplaysSameIdentityAtWake(t *testing.T) {

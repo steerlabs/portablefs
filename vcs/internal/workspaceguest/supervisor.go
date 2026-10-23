@@ -11,12 +11,10 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacemount"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/proto"
-	"time"
 )
 
 // The 128 reservations permit a full 64-key rollover. Each active key owns
@@ -42,46 +40,14 @@ func refused(why string) error { return fmt.Errorf("%s: %w", why, ErrState) }
 // Suspend proves withdrawal, physical settlement and worker dispositions.
 // Cleanup uses the exact retained witness. No method may replay an uncertain
 // mutation into a replacement. No real driver is enabled by this interface.
-type Mount interface {
-	CloseAdmission(generation uint64) uint64
-	Prepare(context.Context, uint64) (Recovery, error)
-	Suspend(context.Context, *pb.Suspension) (ColdResult, error)
-	Recover(context.Context, *pb.ResumeToken) (Recovery, error)
-	OpenAdmission(generation, gateSerial uint64) error
-	Cleanup(context.Context, Witness) (CleanupProof, error)
-}
-type ColdResult struct {
-	Generation   uint64
-	ColdComplete bool
-	Loss         []*pb.Loss
-	Outcome      *pb.MountOutcome
-}
-type Recovery struct {
-	Generation, GateSerial                                              uint64
-	State, Reason                                                       string
-	SessionValidated, AuthorizationValidated, ColdSubscriptionInstalled bool
-	Standalone                                                          bool
-	Renewal                                                             mountenrollment.RenewalReadiness
-	SessionID                                                           string
-	AuthorizationDeadline                                               time.Time
-	Loss                                                                []*pb.Loss
-	Outcome                                                             *pb.MountOutcome
-}
-
-func (r Recovery) ready(g, serial uint64) bool {
-	return r.Generation == g && r.GateSerial == serial && r.State == "ready" && r.SessionValidated && r.AuthorizationValidated && r.ColdSubscriptionInstalled &&
-		r.Renewal.Ready(r.Standalone, mountenrollment.Permit{Generation: g, GateSerial: serial}, r.SessionID, r.AuthorizationDeadline)
-}
-
-type Witness struct {
-	Process, Kernel, Session, Enrollment string
-	RoutesRevision                       [32]byte
-}
-type CleanupProof struct {
-	Witness                     Witness
-	ProcessExited, KernelAbsent bool
-}
+type Mount = workspacemount.Mount
+type ColdResult = workspacemount.ColdResult
+type Recovery = workspacemount.Recovery
+type Witness = workspacemount.Witness
+type CleanupProof = workspacemount.CleanupProof
 type entry struct {
+	witnessLane             sync.Mutex
+	binding                 bool
 	status                  *pb.MountStatus
 	driver                  Mount
 	witness                 Witness
@@ -127,6 +93,10 @@ func initialStatus(id *pb.MountID) *pb.MountStatus {
 }
 
 type Supervisor struct {
+	ackLane              sync.Mutex
+	persistRetirement    func([]*pb.MountID) error
+	persistWitness       func(*pb.MountID, Witness) error
+	channelFailure       func(error)
 	identities           *workspacemount.Store
 	clock                guestClock
 	waitClock            func(context.Context, uint64) error
@@ -200,7 +170,7 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 		err = refused("register mount capacity reached")
 	} else {
 		for _, e := range s.mounts {
-			if bytes.Equal(e.status.Mount.AuthorityId, id.AuthorityId) && e.status.Mount.VolumeId == id.VolumeId {
+			if bytes.Equal(e.status.Mount.AuthorityId, id.AuthorityId) && e.status.Mount.VolumeId == id.VolumeId || w.Target != "" && e.witness.Target == w.Target && !e.cleaned {
 				err = refused("register duplicate volume")
 				break
 			}
@@ -489,7 +459,7 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	if err == nil {
 		err = ctx.Err()
 	}
-	if err == nil && r.ready(g, e.gateSerial) {
+	if err == nil && !e.binding && r.Ready(g, e.gateSerial) {
 		err = e.driver.OpenAdmission(g, e.gateSerial)
 		if err == nil {
 			// Only a published serving interval starts fresh disposition evidence.
@@ -625,7 +595,7 @@ func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
 	if e.cleaned {
 		return nil
 	}
-	if p.Witness != e.witness {
+	if e.binding || p.Witness != e.witness {
 		return refused("cleanup terminal identity mismatch")
 	}
 	if !p.ProcessExited || !p.KernelAbsent {
@@ -714,20 +684,61 @@ func (s *Supervisor) retainedIncarnationLocked(id *pb.MountID) bool {
 // Duplicate and older acknowledgements are harmless. A future sequence cannot
 // free anything, and one request cannot skip the bounded batch Status exposed.
 func (s *Supervisor) AcknowledgeRetired(through uint64) error {
+	s.ackLane.Lock()
+	defer s.ackLane.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if through == 0 || through > s.retirementSequence {
+		s.mu.Unlock()
 		return refused("retired acknowledgement exceeds exposed outcomes")
 	}
 	if through <= s.acknowledgedSequence {
+		s.mu.Unlock()
 		return nil
 	}
 	if through-s.acknowledgedSequence > control.MaxRetiredBatch {
+		s.mu.Unlock()
 		return refused("retired acknowledgement exceeds exposed batch")
 	}
 	count := int(through - s.acknowledgedSequence)
+	var ids []*pb.MountID
+	for _, r := range s.retired[:count] {
+		if r.MountStatus != nil {
+			ids = append(ids, clone(r.MountStatus.Mount))
+		}
+	}
+	persist := s.persistRetirement
+	s.mu.Unlock()
+	if persist != nil {
+		if err := persist(ids); err != nil {
+			return err
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.retired = append([]*pb.RetiredOutcome(nil), s.retired[count:]...)
 	s.acknowledgedSequence = through
+	return nil
+}
+
+func (s *Supervisor) ConfigureRetirementPersistence(persist func([]*pb.MountID) error) {
+	s.persistRetirement = persist
+}
+
+// RestoreCleaned exposes retained outcomes after the new boot's root owner has
+// independently reconciled both inventories and exact resource absence.
+func (s *Supervisor) RestoreCleaned(id *pb.MountID, loss []*pb.Loss, outcome *pb.MountOutcome) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.generation != 0 || len(s.mounts) != 0 || len(s.jobs) != 0 || s.phase != "running" || len(s.retired) >= MaxReservations || control.Mount(id) != nil || control.Outcome(outcome) != nil {
+		return refused("retained workspace outcome restore refused")
+	}
+	status := initialStatus(id)
+	status.State = "terminal"
+	status.Reason = "previous kernel boot ended; exact cleanup reconciled"
+	status.Cleanup = "complete"
+	status.Loss = cloneLoss(loss)
+	status.Outcome = clone(outcome)
+	s.retireLocked(status, nil)
 	return nil
 }
 

@@ -63,6 +63,48 @@ func pairTransport(t *testing.T, c net.Conn) {
 		t.Fatal(err)
 	}
 }
+
+func TestTransportFailureObservationFollowsClosureAndPrecedesEOF(t *testing.T) {
+	c, s, done := transportRig(t)
+	m := new(fakeMount)
+	mid := mountID(4)
+	if err := s.Register(t.Context(), mid, Witness{}, m); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Activate(t.Context(), mid, 0); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	s.ConfigureChannelFailure(func(err error) {
+		if err == nil || m.isOpen() || s.Status().State != "discard-only" {
+			t.Error("diagnostic ran before the serving cut")
+		}
+		close(entered)
+		<-release
+	})
+	pairTransport(t, c)
+	x := suspension(s)
+	x.Roster = []*pb.MountID{mid}
+	token := &pb.ResumeToken{Suspension: x, WakeNonce: id(8)}
+	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Resume{Resume: token}})
+	if r.GetResult().GetCode() != "refused" {
+		t.Fatal(r)
+	}
+	await(t, entered)
+	if err := c.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	_, err := c.Read(one[:])
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Fatal("stream closed before bounded failure observation", err)
+	}
+	close(release)
+	if err := <-done; err == nil {
+		t.Fatal("invalid Resume did not fail the channel")
+	}
+}
 func TestTransportExactReleaseAndBootPairing(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

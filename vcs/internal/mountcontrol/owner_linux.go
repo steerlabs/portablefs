@@ -532,11 +532,25 @@ func (o *Owner) observeLocked(q Request) (Response, error) {
 	w.Phases = &PhaseFacts{status(o.install), status(o.voluntary), status(o.terminal)}
 	w.Reason = j.reason
 	w.ColdComplete = j.state == "cold"
+	if j.running {
+		switch j.state {
+		case "prepared":
+			w.State = "preparing"
+			if j.start.Operation == "workspace-recover" {
+				w.State = "pending-recovery"
+			}
+		case "cold":
+			w.State = "pending-suspend"
+			w.ColdComplete = false
+		case "cleanup-finalized":
+			w.State = "preparing"
+		}
+	}
 	if o.servingFailure != "" && j.start.Operation == "workspace-suspend" {
 		// Job progress cannot hide the incarnation's terminal serving verdict.
 		w.State, w.Reason, w.ColdComplete = "failed", o.servingFailure, false
 	}
-	if j.state == "prepared" && o.facts.Readiness != nil {
+	if w.State == "prepared" && o.facts.Readiness != nil {
 		p := *o.facts.Readiness
 		w.Readiness = &p
 	}
@@ -661,7 +675,88 @@ func (j *Job) OfferRemoval(p Phase) error {
 	j.state = "unmount-required"
 	return nil
 }
-func (j *Job) WaitInstall(ctx context.Context) error              { return j.waitAction(ctx, "install") }
+func (j *Job) WaitInstall(ctx context.Context) error { return j.waitAction(ctx, "install") }
+
+// RequireRemoval is the single handoff for startup, revocation, external
+// unmount and owner-loss paths as well as explicit Cleanup. It may run while
+// INIT owns the install worker, and never waits holding the lifecycle lock.
+// Owner death leaves this same offered action retained; only the root can
+// record independent removal evidence.
+func (o *Owner) RequireRemoval(ctx context.Context, mode, reason string) error {
+	if o.CloseAdmission != nil {
+		o.CloseAdmission()
+	}
+	o.mu.Lock()
+	if o.job == nil || !boundWitness(o.facts.Witness) || !modeValid(mode) {
+		o.mu.Unlock()
+		return ErrGrammar
+	}
+	s := &o.voluntary
+	id := "2"
+	if mode == "terminal" {
+		s = &o.terminal
+		id = "3"
+	}
+	if s.status.Progress == "" {
+		if o.removedLocked() {
+			o.mu.Unlock()
+			return nil
+		}
+		p := Phase{ActionID: id, Mode: mode, Reason: control.BoundedReason(reason), Witness: o.facts.Witness}
+		if p.Reason == "" {
+			p.Reason = "mount removal required"
+		}
+		*s = actionSlot{status: ActionStatus{Progress: "offered", Action: kernelAction(p)}, phase: &p, done: make(chan struct{})}
+	}
+	done := s.done
+	o.facts.Readiness = nil
+	o.job.state = "unmount-required"
+	o.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if s.status.Progress != "complete" {
+		return ErrGrammar
+	}
+	return nil
+}
+func modeValid(s string) bool { return s == "voluntary" || s == "terminal" }
+
+// InvalidatePrepared exposes a live frontend refusal to the root observer.
+// It does not manufacture a cold proof or consume another recovery token.
+func (o *Owner) InvalidatePrepared(reason string) {
+	if o.CloseAdmission != nil {
+		o.CloseAdmission()
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.job != nil && o.job.state == "prepared" {
+		o.job.state = "recovery-required"
+		o.facts.Readiness = nil
+	}
+}
+
+// PollPermit joins the child cancellation path to the root's shared serial.
+// It is independent of socket lanes, including during initial Attach.
+func (o *Owner) PollPermit() {
+	o.mu.Lock()
+	var cancel context.CancelFunc
+	if j := o.job; j != nil && j.running && (j.start.Operation == "workspace-prepare" || j.start.Operation == "workspace-recover") && !o.permitted(j.start) {
+		j.stopping = true
+		j.lifecycleOwner.Overtake()
+		cancel = j.cancel
+	}
+	o.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (o *Owner) Record(f Facts) error                             { o.mu.Lock(); defer o.mu.Unlock(); return o.mergeFactsLocked(f) }
 func (j *Job) WaitRemoval(ctx context.Context, mode string) error { return j.waitAction(ctx, mode) }
 func (j *Job) waitAction(ctx context.Context, kind string) error {
 	o := j.owner

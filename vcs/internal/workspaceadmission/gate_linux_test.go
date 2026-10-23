@@ -63,6 +63,20 @@ func TestClosedStartAndExactPreparedCAS(t *testing.T) {
 	if _, err := r.Check(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed startup admitted: %v", err)
 	}
+	initial := prepared(t, g, 0)
+	if err := r.Recover(initial); err != nil {
+		t.Fatal("initial generation cannot prepare", err)
+	}
+	if err := g.Open(0, initial.Serial()); err != nil {
+		t.Fatal(err)
+	}
+	if !r.Installed(initial) {
+		t.Fatal("initial generation lost its installed proof")
+	}
+	g.Close(0)
+	if r.Installed(initial) {
+		t.Fatal("initial generation survived a newer Close")
+	}
 	p := prepared(t, g, 1)
 	if err := r.Recover(p); err != nil {
 		t.Fatal(err)

@@ -54,27 +54,29 @@ type mountReady struct {
 }
 
 type mountOpts struct {
-	common              commonOpts
-	strategy            string
-	addr                string
-	mountToken          string
-	dataPlaneTransport  string
-	dataPlaneServerName string
-	dataPlaneCAPath     string
-	clientCertPath      string
-	clientKeyPath       string
-	authExpiresAtMs     int64
-	managerURL          string
-	managerServerName   string
-	managerCAPath       string
-	enrollmentID        string
-	enrollmentCertPath  string
-	authorityGeneration uint64
-	foreground          bool
-	readyFD             int
-	opLockFD            int
-	workspaceGateFD     int
-	workspaceOwnerFD    int
+	common                                                   commonOpts
+	strategy                                                 string
+	addr                                                     string
+	mountToken                                               string
+	dataPlaneTransport                                       string
+	dataPlaneServerName                                      string
+	dataPlaneCAPath                                          string
+	clientCertPath                                           string
+	clientKeyPath                                            string
+	authExpiresAtMs                                          int64
+	managerURL                                               string
+	managerServerName                                        string
+	managerCAPath                                            string
+	enrollmentID                                             string
+	enrollmentCertPath                                       string
+	authorityGeneration                                      uint64
+	foreground                                               bool
+	readyFD                                                  int
+	opLockFD                                                 int
+	workspaceGateFD                                          int
+	workspaceOwnerFD                                         int
+	workspaceBootstrapFD, workspaceClockFD, workspaceReadyFD int
+	workspaceReconcileFD                                     int
 }
 
 // A mount that is already absent cannot fail closed a second time. Keep a
@@ -118,6 +120,10 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.IntVar(&o.readyFD, "ready-fd", 0, "internal: fd to write the readiness report to")
 	fs.IntVar(&o.workspaceGateFD, "workspace-gate-fd", 0, "internal: sealed read-only workspace admission descriptor")
 	fs.IntVar(&o.workspaceOwnerFD, "workspace-owner-fd", 0, "internal: workspace supervisor lifetime reader")
+	fs.IntVar(&o.workspaceBootstrapFD, "workspace-bootstrap-fd", 0, "internal: workspace private launch pipe")
+	fs.IntVar(&o.workspaceClockFD, "workspace-clock-fd", 0, "internal: shared TLS clock reader")
+	fs.IntVar(&o.workspaceReadyFD, "workspace-ready-fd", 0, "internal: workspace control readiness pipe")
+	fs.IntVar(&o.workspaceReconcileFD, "workspace-reconcile-fd", 0, "internal: workspace inventory reconciliation pipe")
 	fs.IntVar(&o.opLockFD, "op-lock-fd", 0, "internal: inherited mount operation lock fd")
 }
 
@@ -196,6 +202,12 @@ func cmdMount(e *cmdEnv, args []string) int {
 	}
 	if len(positionals) != 2 {
 		return e.usageError("mount", fmt.Errorf("expected <volumeId> <mountPath>"))
+	}
+	if o.workspaceReconcileFD != 0 {
+		return e.runWorkspaceReconcile(o.workspaceReconcileFD, positionals[0], positionals[1])
+	}
+	if o.workspaceGateFD != 0 || o.workspaceOwnerFD != 0 || o.workspaceBootstrapFD != 0 || o.workspaceClockFD != 0 || o.workspaceReadyFD != 0 {
+		return e.runWorkspaceMount(&o, positionals[0], positionals[1])
 	}
 	if err := refuseManagedWorkspaceMount(&o); err != nil {
 		return e.fail("mount", err)
@@ -2153,6 +2165,13 @@ func verifyCleanupIntentMatchesState(intent *mountIntent, state *mountState) err
 	if intent == nil || state == nil || intent.Phase != "resources-cleaned" {
 		return fmt.Errorf("missing cleaned-resource intent or mount state")
 	}
+	return verifyMountIntentMatchesState(intent, state)
+}
+
+func verifyMountIntentMatchesState(intent *mountIntent, state *mountState) error {
+	if intent == nil || state == nil {
+		return fmt.Errorf("missing mount intent or state")
+	}
 	if intent.MountPath != state.MountPath || intent.VolumeID != state.VolumeID ||
 		intent.Strategy != state.Strategy ||
 		intent.Engine != state.Engine ||
@@ -2193,6 +2212,13 @@ func publishResourcesCleanedIntent(operation *mountOperation, stateDir, mountPat
 }
 
 func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
+	return e.reconcileMountIntentWithProcess(intent, force, true)
+}
+
+// The workspace helper has an independent joined-exit or discarded-kernel-boot
+// proof. It may inspect the old intent, but must never signal a process whose
+// numeric PID/start happens to recur in a new kernel boot.
+func (e *cmdEnv) reconcileMountIntentWithProcess(intent *mountIntent, force, ownProcess bool) error {
 	if intent == nil {
 		return fmt.Errorf("missing intent")
 	}
@@ -2289,6 +2315,9 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
 	}
 
 	if mounted {
+		if !ownProcess {
+			return fmt.Errorf("workspace intent still owns a kernel mount")
+		}
 		if st.Strategy == "fskit" {
 			if _, err := e.v3FSKitDaemonDetach(st, force); err != nil {
 				return err
@@ -2340,7 +2369,7 @@ func (e *cmdEnv) reconcileMountIntent(intent *mountIntent, force bool) error {
 		}
 	}
 
-	if mountProcessMatches(st) {
+	if ownProcess && mountProcessMatches(st) {
 		if err := stopMountDaemon(st); err != nil {
 			return err
 		}

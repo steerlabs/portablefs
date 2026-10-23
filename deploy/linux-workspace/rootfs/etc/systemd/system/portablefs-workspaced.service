@@ -1,10 +1,11 @@
 [Unit]
-Description=PortableFS workspace control 8 (no mounts)
+Description=PortableFS workspace control 8 and managed mount owner
 Requires=portablefs-workspace-bootstrap.service portablefs-workspace-ssh.socket
 After=portablefs-workspace-bootstrap.service portablefs-workspace-ssh.socket
 [Service]
 ExecStart=/usr/local/bin/portablefs-workspaced serve
 Restart=no
 UMask=0077
+StandardError=journal+console
 [Install]
 WantedBy=multi-user.target

@@ -176,7 +176,7 @@ func (g *Supervisor) Recovery(generation uint64) (RecoveryPermit, error) {
 		return RecoveryPermit{}, ErrClosed
 	}
 	word := g.word.Load()
-	if g.exhausted || word>>1 == math.MaxUint64>>1 || word&1 != 0 || generation == 0 || generation < g.generation {
+	if g.exhausted || word>>1 == math.MaxUint64>>1 || word&1 != 0 || generation < g.generation {
 		return RecoveryPermit{}, ErrClosed
 	}
 	g.generation = generation
@@ -353,7 +353,7 @@ func (r *Reader) Check() (ServingPermit, error) {
 	return p, p.Check()
 }
 func (r *Reader) Recover(p RecoveryPermit) error {
-	if r.dead.Load() || p.Serial() == math.MaxUint64>>1 || p.binding != r.binding || p.generation == 0 || p.word&1 != 0 {
+	if r.dead.Load() || p.Serial() == math.MaxUint64>>1 || p.binding != r.binding || p.word&1 != 0 {
 		return ErrClosed
 	}
 	word := r.word.Load()
@@ -390,7 +390,7 @@ func (r *Reader) Recovery(generation, serial uint64) (RecoveryPermit, error) {
 // Installed requires the prepared serial in its serving state. Matching only
 // the serial would also license the closed state and is never sufficient.
 func (r *Reader) Installed(p RecoveryPermit) bool {
-	return !r.dead.Load() && p.Serial() != math.MaxUint64>>1 && p.binding == r.binding && p.generation != 0 && p.word&1 == 0 && r.word.Load() == p.word|1
+	return !r.dead.Load() && p.Serial() != math.MaxUint64>>1 && p.binding == r.binding && p.word&1 == 0 && r.word.Load() == p.word|1
 }
 
 // MountInstanceID is the exact CLI/kernel source identity encoded in the header.

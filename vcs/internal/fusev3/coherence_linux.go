@@ -720,6 +720,19 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 			out.record(1, "data-withdrawal", errors.New(failure))
 		}
 	}
+	if m.managedRemoval != nil {
+		out.record(1, "root-removal", m.managedRemoval("terminal"))
+		if _, err := installed.absent(); err != nil {
+			out.record(1, "absence", err)
+		} else {
+			out.withdrawn = true
+		}
+		if !writersJoined && m.kernelConnectionAbsentBy(deadline) {
+			m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+			m.raw.discardCachedOwnershipAfterConnectionGone()
+		}
+		return out
+	}
 	for round := 1; ; round++ {
 		// Aborting is unconditional and comes first in every round. It unblocks
 		// any request still parked on an authority operation and terminates the
@@ -839,6 +852,10 @@ func (m *Mount) setNotifier(notify kernelNotifier) {
 // FUSE serving connection is terminal. Linux lazy unmount makes either fact on
 // its own insufficient. A failed check is returned to the supervisor and the
 // RPC close leaves durable membership active.
+type sessionDetachError struct{ error }
+
+func (e *sessionDetachError) Unwrap() error { return e.error }
+
 func (m *Mount) detach() error {
 	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
 	defer cancel()
@@ -863,7 +880,7 @@ func (m *Mount) detach() error {
 			return fmt.Errorf("fusev3: clean detach cannot establish failed-startup mount absence: %w", err)
 		}
 		if err := m.rpc.DetachAfterUnmount(ctx, proof); err != nil {
-			return fmt.Errorf("fusev3: deliver authenticated failed-startup clean detach: %w", err)
+			return &sessionDetachError{fmt.Errorf("fusev3: deliver authenticated failed-startup clean detach: %w", err)}
 		}
 		return nil
 	}
@@ -890,7 +907,7 @@ func (m *Mount) detach() error {
 		return errors.New("fusev3: clean detach produced an incomplete mount-absence observation")
 	}
 	if err := m.rpc.DetachAfterUnmount(ctx, proof); err != nil {
-		return fmt.Errorf("fusev3: deliver authenticated clean detach: %w", err)
+		return &sessionDetachError{fmt.Errorf("fusev3: deliver authenticated clean detach: %w", err)}
 	}
 	return nil
 }

@@ -70,6 +70,11 @@ import PortableFSWorkspaceCore
         observed.onHelloFailure = { [weak self] in self?.event("hello-refused", ["reason": $0]) }
         channel.onFailure = { [weak self] in self?.coordinator.channelLost($0) }
         coordinator.onChange = { [weak self] in self?.scheduleUpdate() }
+        let consume = channel.statusObserver
+        channel.statusObserver = { [weak self] status in
+            try consume?(status)
+            if !status.retired.isEmpty { self?.event("retained-evidence", ["body": try status.serializedData().base64EncodedString()]) }
+        }
     }
     func event(_ name: String, _ fields: [String: Any] = [:]) {
         var value = fields; value["event"] = name; value["continuous_ns"] = clock.now
@@ -134,7 +139,7 @@ import PortableFSWorkspaceCore
     func input(_ data: Data) {
         if data.isEmpty { stop(exitCode: 0); return }
         inputBuffer.append(data)
-        guard inputBuffer.count <= 8192 else { fail(WorkspaceVMError("oversized dev command")); return }
+        guard inputBuffer.count <= 2 * 1024 * 1024 else { fail(WorkspaceVMError("oversized dev command")); return }
         while let newline = inputBuffer.firstIndex(of: 10) {
             let line = inputBuffer.prefix(upTo: newline); inputBuffer.removeSubrange(...newline)
             guard let value = try? JSONSerialization.jsonObject(with: line) as? [String: String], let command = value["command"] else { fail(WorkspaceVMError("invalid dev command")); return }
@@ -152,6 +157,35 @@ import PortableFSWorkspaceCore
                     else { self?.fail(WorkspaceVMError("guest accepted consumed token")) }
                 }
             case "status": coordinator.refreshStatus(); event("status", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
+            case "identity", "provision", "mount", "umount":
+                guard let encoded = value["body"], let body = Data(base64Encoded: encoded) else { event("refused", ["command": command]); continue }
+                do {
+                    let deadline = clock.now + 20_000_000_000
+                    if command == "identity" {
+                        let request = try WorkspaceIdentityRequest(serializedBytes: body)
+                        channel.identity(request, deadline: deadline) { [weak self] result in
+                            do { let identity = try result.get(); self?.event("identity-result", ["body": try identity.serializedData().base64EncodedString()]) }
+                            catch { self?.fail(error) }
+                        }
+                    } else {
+                        let complete: (Result<WorkspaceResult, Error>) -> Void = { [weak self] result in
+                            do { self?.event("\(command)-accepted", ["code": try result.get().code]) }
+                            catch { self?.fail(error) }
+                        }
+                        if command == "provision" { channel.provision(try WorkspaceProvision(serializedBytes: body), deadline: deadline, completion: complete) }
+                        else if command == "mount" { channel.mount(try WorkspaceMountID(serializedBytes: body), deadline: deadline, completion: complete) }
+                        else { channel.umount(try WorkspaceMountID(serializedBytes: body), deadline: deadline, completion: complete) }
+                    }
+                } catch { fail(error) }
+            case "mount-status":
+                channel.status(deadline: clock.now + 20_000_000_000) { [weak self] result in
+                    do { let status = try result.get(); self?.event("mount-status", ["body": try status.serializedData().base64EncodedString()]) }
+                    catch { self?.fail(error) }
+                }
+            case "discard":
+                stopping = true; exitCode = 0
+                FileHandle.standardInput.readabilityHandler = nil
+                bridge.close(); channel.close(); coordinator.channelLost("native deliberate channel loss"); scheduleUpdate()
             case "probe-identity":
                 var request = WorkspaceIdentityRequest(); request.authorityID = Data(repeating: 3, count: 32); request.volumeID = "identity-probe"
                 channel.identity(request, deadline: clock.now + 5_000_000_000) { [weak self] result in
@@ -208,7 +242,7 @@ import PortableFSWorkspaceCore
                     }
                     return
                 }
-                guard job.phase == "failed", job.failure == (index == 0 ? "handler-failed" : "unavailable"), !job.reason.isEmpty else { throw WorkspaceVMError("absent mount driver reported completion") }
+                guard job.phase == "failed", job.failure == "handler-failed", !job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned job reported completion") }
                 let accepted = requests + [job.requestID]
                 guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
                 if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }

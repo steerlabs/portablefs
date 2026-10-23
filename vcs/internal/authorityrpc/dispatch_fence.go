@@ -56,6 +56,20 @@ func (f *DispatchFence) Resume(check func() error) error {
 	if err := check(); err != nil {
 		return err
 	}
+	return f.installPermission(check)
+}
+
+// Drain retains the old cut's bounded permission after serving admission has
+// closed. It cannot revive an unjoined Park, renew the grant, or admit a new
+// TLS connection: those connections still await the configured clock owner.
+func (f *DispatchFence) Drain(check func() error) error {
+	if check == nil {
+		return errors.New("authorityrpc: drain requires the captured cut permission")
+	}
+	return f.installPermission(check)
+}
+
+func (f *DispatchFence) installPermission(check func() error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.draining && (!f.parked || f.io != 0) {
@@ -188,6 +202,12 @@ func (c *Client) ResumeDispatch(check func() error) error {
 		return errors.New("authorityrpc: client has no lifecycle dispatch owner")
 	}
 	return c.cfg.DispatchFence.Resume(check)
+}
+func (c *Client) DrainDispatch(check func() error) error {
+	if c.cfg.DispatchFence == nil {
+		return errors.New("authorityrpc: client has no lifecycle dispatch owner")
+	}
+	return c.cfg.DispatchFence.Drain(check)
 }
 func (c *Client) DispatchSnapshot() DispatchSnapshot {
 	if c.cfg.DispatchFence == nil {

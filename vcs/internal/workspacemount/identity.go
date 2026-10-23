@@ -491,3 +491,26 @@ func (s *Store) TLSIdentity(r *pb.IdentityRequest) (tls.Certificate, error) {
 	}
 	return out, nil
 }
+
+// Provisioned returns an in-process launch handoff for the exact selected
+// incarnation. The key is delivered only through the child's inherited pipe.
+func (s *Store) Provisioned(id *pb.MountID) (*pb.Provision, []byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, key, err := s.load(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId})
+	if err != nil {
+		return nil, nil, err
+	}
+	if !proto.Equal(s.mounts[key], id) {
+		return nil, nil, errors.New("workspace identity incarnation not selected")
+	}
+	p := new(pb.Provision)
+	if len(v.Provision) == 0 || proto.Unmarshal(v.Provision, p) != nil || !proto.Equal(p.Mount, id) {
+		return nil, nil, errors.New("workspace incarnation requires fresh provisioning")
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(v.Key)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
+}

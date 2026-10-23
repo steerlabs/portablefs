@@ -706,3 +706,14 @@ func safeCutoff(authorizedAt, deadline time.Time, minimum time.Duration) time.Ti
 // Failure exposes the retained terminal disposition to the lifecycle owner.
 // Pending readiness by itself is never evidence that recovery should end.
 func (r *Renewer) Failure() error { r.mu.Lock(); defer r.mu.Unlock(); return r.terminal }
+
+// ParkBefore is the latest scheduling boundary for the managed owner to begin
+// parking. It leaves the ordinary cutoff semantics and pending grant intact.
+func (r *Renewer) ParkBefore() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.initialized {
+		return time.Time{}
+	}
+	return safeCutoff(r.authorizedAt, r.deadline, r.MinimumSafetyMargin).Add(-time.Second)
+}

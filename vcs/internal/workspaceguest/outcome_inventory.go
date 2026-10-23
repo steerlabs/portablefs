@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,12 +33,25 @@ type outcomeInventoryFile struct {
 
 func OpenOutcomeInventory(path string) (*OutcomeInventory, error) {
 	i := &OutcomeInventory{path: path, runs: make(map[string]*pb.MountStatus), syncFile: func(f *os.File) error { return f.Sync() }}
-	raw, err := os.ReadFile(path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return i, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), "workspace retained outcomes")
+	defer file.Close()
+	st, err := file.Stat()
+	if err != nil || !st.Mode().IsRegular() || st.Mode().Perm() != 0600 || st.Size() > 16<<20 {
+		return nil, errors.New("workspace outcome inventory mode/size refused")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, (16<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 16<<20 {
+		return nil, errors.New("workspace outcome inventory overflow")
 	}
 	var f outcomeInventoryFile
 	d := json.NewDecoder(bytes.NewReader(raw))
@@ -52,7 +66,7 @@ func OpenOutcomeInventory(path string) (*OutcomeInventory, error) {
 		return nil, errors.New("workspace outcome inventory format/capacity refused")
 	}
 	for _, r := range f.Runs {
-		if r == nil || control.Mount(r.Mount) != nil || control.Outcome(r.Outcome) != nil {
+		if r == nil || control.Mount(r.Mount) != nil || control.Outcome(r.Outcome) != nil || control.Losses(r.Loss) != nil {
 			return nil, errors.New("invalid retained workspace outcome")
 		}
 		k := control.MountKey(r.Mount)
@@ -81,7 +95,7 @@ func (i *OutcomeInventory) snapshot() []*pb.MountStatus {
 // acknowledgment may remove them; an empty replacement ledger proves nothing
 // about a crashed predecessor.
 func (i *OutcomeInventory) Commit(r *pb.MountStatus) error {
-	if r == nil || control.Mount(r.Mount) != nil || control.Outcome(r.Outcome) != nil {
+	if r == nil || control.Mount(r.Mount) != nil || control.Outcome(r.Outcome) != nil || control.Losses(r.Loss) != nil {
 		return errors.New("invalid workspace inventory evidence")
 	}
 	i.mu.Lock()
