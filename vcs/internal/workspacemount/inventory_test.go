@@ -12,7 +12,7 @@ import (
 )
 
 func desired(n byte) *Desired {
-	return &Desired{Mount: &pb.MountID{AuthorityId: bytes.Repeat([]byte{1}, 32), VolumeId: "volume", Incarnation: bytes.Repeat([]byte{n}, 16)}, Boot: bytes.Repeat([]byte{2}, 16), Witness: Witness{Intent: "intent", Source: "source", Target: "/workspaces/volume"}, TargetDevice: 1, TargetInode: 2, Outcome: control.UnknownOutcome()}
+	return &Desired{Mount: &pb.MountID{AuthorityId: bytes.Repeat([]byte{1}, 32), VolumeId: "volume", Incarnation: bytes.Repeat([]byte{n}, 16)}, Boot: bytes.Repeat([]byte{2}, 16), Witness: Witness{Intent: "mnt_AAAAAAAAAAAAAAAAAAAAAA", Source: "portablefs:mnt_AAAAAAAAAAAAAAAAAAAAAA", Target: "/workspaces/volume"}, TargetDevice: 1, TargetInode: 2, Outcome: control.UnknownOutcome()}
 }
 func inventory(t *testing.T) *Inventory {
 	t.Helper()
@@ -180,5 +180,53 @@ func TestInventoryAckRequiresRemovalAndRetainsFailedCommit(t *testing.T) {
 	i.syncFile = func(*os.File) error { return errors.New("ENOSPC") }
 	if err := i.Acknowledge([]*pb.MountID{d.Mount}); err == nil || len(i.Snapshot()) != 1 {
 		t.Fatal("failed acknowledgement lost retained evidence", err)
+	}
+}
+
+func TestInventoryBoundedAggregateSurvivesDurableReopen(t *testing.T) {
+	i := inventory(t)
+	d := desired(1)
+	if err := i.CommitDesired(d); err != nil {
+		t.Fatal(err)
+	}
+	var raw []*pb.Loss
+	for n := uint64(1); n <= 40; n++ {
+		raw = append(raw, &pb.Loss{Sequence: n, AcceptedEntries: 1, AcceptedBytes: 2, Reason: "retained cut"})
+	}
+	loss, aggregated, err := control.BoundLoss(raw)
+	if err != nil || !aggregated {
+		t.Fatal(err)
+	}
+	if err = i.RetainOutcome(d.Mount, loss, control.UnknownOutcome()); err != nil {
+		t.Fatal(err)
+	}
+	dir := i.directory
+	i.Close()
+	next, err := OpenInventory(dir)
+	if err != nil {
+		t.Fatal("valid aggregate refused on restart", err)
+	}
+	defer next.Close()
+	got := next.Snapshot()[0].Loss
+	if !control.RetainsLoss(got, loss) || len(got) != control.MaxLosses || got[len(got)-1].AcceptedBytes != 18 {
+		t.Fatal(got)
+	}
+	if err = next.RetainOutcome(d.Mount, []*pb.Loss{nil}, control.UnknownOutcome()); err == nil {
+		t.Fatal("invalid persisted loss accepted")
+	}
+}
+
+func TestInventoryRefusesEscapingIntentBeforeCommit(t *testing.T) {
+	i := inventory(t)
+	for _, intent := range []string{"../foreign", "mnt_invalid", "/absolute"} {
+		d := desired(1)
+		d.Witness.Intent = intent
+		d.Witness.Source = "portablefs:" + intent
+		if err := i.CommitDesired(d); err == nil {
+			t.Fatal("escaping intent accepted", intent)
+		}
+	}
+	if len(i.Snapshot()) != 0 {
+		t.Fatal("invalid intent acquired durable ownership")
 	}
 }

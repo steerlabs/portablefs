@@ -17,6 +17,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceguest"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacemount"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 )
@@ -52,6 +53,13 @@ func TestWorkspaceReconcileHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err = writeMountState(directory, state); err != nil {
+			t.Fatal(err)
+		}
+		outcomes, err := workspaceguest.OpenOutcomeInventory(filepath.Join(directory, "outcomes.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = outcomes.Commit(&pb.MountStatus{Mount: &pb.MountID{AuthorityId: bytes.Repeat([]byte{1}, 32), VolumeId: "volume", Incarnation: bytes.Repeat([]byte{2}, 16)}, Outcome: control.UnknownOutcome(), Loss: []*pb.Loss{{Sequence: 1, AcceptedEntries: 2, AcceptedBytes: 9, Reason: "durable child loss record"}}}); err != nil {
 			t.Fatal(err)
 		}
 		if err = op.close(false); err != nil {
@@ -197,15 +205,22 @@ func TestWorkspaceReconcileIndependentCommitsAndLostAcknowledgment(t *testing.T)
 				if _, err = ack.Write([]byte{'g'}); err != nil {
 					t.Fatal(err)
 				}
-				var witness workspacemount.Witness
-				if err = decoder.Decode(&witness); err != nil {
+				var response workspacemount.Reconciled
+				if err = decoder.Decode(&response); err != nil {
 					t.Fatal("helper signalled the reused PID or lost independent evidence", err)
+				}
+				witness := response.Witness
+				if response.Evidence == nil || len(response.Evidence.Loss) != 1 || response.Evidence.Loss[0].AcceptedBytes != 9 {
+					t.Fatal("child-durable loss disappeared during reconciliation", response)
 				}
 				retained()
 				if witness.Session == "" || witness.Process != run.Witness.Process {
 					t.Fatal(witness)
 				}
 				if err = inventory.BindWitness(id, witness); err != nil {
+					t.Fatal(err)
+				}
+				if err = inventory.RetainOutcome(id, response.Evidence.Loss, response.Evidence.Outcome); err != nil {
 					t.Fatal(err)
 				}
 				if lost {
@@ -220,7 +235,7 @@ func TestWorkspaceReconcileIndependentCommitsAndLostAcknowledgment(t *testing.T)
 						t.Fatal(err)
 					}
 					current := inventory.Snapshot()[0]
-					if current.Removed || current.Witness.Session != witness.Session {
+					if current.Removed || current.Witness.Session != witness.Session || len(current.Loss) != 1 || current.Loss[0].AcceptedBytes != 9 {
 						t.Fatal("crash lost partial durable ownership", current)
 					}
 					cmd, ack, decoder, request = startHelper("reconcile")
@@ -228,10 +243,14 @@ func TestWorkspaceReconcileIndependentCommitsAndLostAcknowledgment(t *testing.T)
 						t.Fatal(err)
 					}
 					request.Close()
-					if err = decoder.Decode(&witness); err != nil {
+					if err = decoder.Decode(&response); err != nil {
 						t.Fatal(err)
 					}
+					witness = response.Witness
 					if err = inventory.BindWitness(id, witness); err != nil {
+						t.Fatal(err)
+					}
+					if err = inventory.RetainOutcome(id, response.Evidence.Loss, response.Evidence.Outcome); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -254,7 +273,7 @@ func TestWorkspaceReconcileIndependentCommitsAndLostAcknowledgment(t *testing.T)
 					t.Fatal(err)
 				}
 				final := inventory.Snapshot()[0]
-				if !final.Removed || final.Outcome.Observation != "unobserved" || final.Outcome.Durability != "unresolved" {
+				if !final.Removed || final.Outcome.Observation != "unobserved" || final.Outcome.Durability != "unresolved" || len(final.Loss) != 1 || final.Loss[0].AcceptedBytes != 9 {
 					t.Fatal("reconciliation invented a durability observation", final)
 				}
 			})

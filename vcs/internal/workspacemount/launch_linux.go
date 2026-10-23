@@ -31,6 +31,11 @@ type Reconciliation struct {
 	StateDirectory string
 }
 
+type Reconciled struct {
+	Witness  Witness
+	Evidence *pb.MountStatus
+}
+
 func ReadLaunch(r io.Reader) (Launch, error) {
 	var c Launch
 	d := json.NewDecoder(io.LimitReader(r, 2<<20))

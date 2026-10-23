@@ -410,10 +410,21 @@ func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess 
 	input.Close()
 	writeErr := json.NewEncoder(writer).Encode(Reconciliation{Desired: run, StateDirectory: filepath.Join(m.Clients, run.Witness.Intent), ExitedProcess: exitedProcess, NeverSpawned: neverSpawned})
 	writer.Close()
-	var witness Witness
-	err = json.NewDecoder(out).Decode(&witness)
+	var result Reconciled
+	err = json.NewDecoder(io.LimitReader(out, 2<<20)).Decode(&result)
+	witness := result.Witness
 	if err == nil && writeErr == nil {
 		err = m.Inventory.BindWitness(run.Mount, witness)
+	}
+	if err == nil && writeErr == nil && result.Evidence != nil {
+		e := result.Evidence
+		if !proto.Equal(e.Mount, run.Mount) || control.Outcome(e.Outcome) != nil || control.Losses(e.Loss) != nil {
+			err = errors.New("workspace CLI outcome binding invalid")
+		} else if control.RetainsLoss(e.Loss, run.Loss) {
+			err = m.Inventory.RetainOutcome(run.Mount, e.Loss, e.Outcome)
+		} else if !control.RetainsLoss(run.Loss, e.Loss) {
+			err = errors.New("workspace CLI outcome conflicts with retained loss")
+		}
 	}
 	if err == nil && writeErr == nil {
 		_, err = ack.Write([]byte{'c'})

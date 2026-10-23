@@ -229,6 +229,11 @@ func Release(r *pb.Release) error {
 	}
 	return nil
 }
+
+// Losses validates a persisted or wire-bounded cumulative ledger, including its
+// final aggregate. BoundLoss accepts the unbounded, unaggregated source ledger.
+func Losses(ls []*pb.Loss) error { return losses(ls) }
+
 func losses(ls []*pb.Loss) error {
 	if len(ls) > MaxLosses {
 		return invalid("losses: invalid field or state combination")

@@ -195,6 +195,7 @@ ROOT_TEST_PACKAGES = {
     "github.com/steerlabs/portablefs/vcs/internal/workspaceadmission",
 }
 ROOT_REQUIRED = {
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFinalizationRetainsTerminalOutcomeAndRefusesCleanupDebt",
     "github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli:TestWorkspaceClockRefusalLatchesServingUntilFreshClosedPermit",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClockDeniesEntryBeforeRootObservation",
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClockDeniesCapacityWaitBeforeRootObservation",

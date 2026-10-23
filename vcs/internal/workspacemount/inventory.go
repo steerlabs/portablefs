@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"io"
 	"os"
 	"path/filepath"
@@ -79,11 +80,10 @@ func cloneDesired(d *Desired) *Desired {
 	return &c
 }
 func validDesired(d *Desired) error {
-	if d == nil || control.Mount(d.Mount) != nil || !control.ID(d.Boot) || d.Witness.Intent == "" || d.Witness.Source == "" || !filepath.IsAbs(d.Witness.Target) || d.TargetDevice == 0 || d.TargetInode == 0 || control.Outcome(d.Outcome) != nil {
+	if d == nil || control.Mount(d.Mount) != nil || !control.ID(d.Boot) || !mountid.ValidMountInstance(d.Witness.Intent) || d.Witness.Source != "portablefs:"+d.Witness.Intent || !filepath.IsAbs(d.Witness.Target) || filepath.Clean(d.Witness.Target) != d.Witness.Target || d.TargetDevice == 0 || d.TargetInode == 0 || control.Outcome(d.Outcome) != nil {
 		return errors.New("invalid desired mount ownership")
 	}
-	loss, _, err := control.BoundLoss(d.Loss)
-	if err != nil || !control.RetainsLoss(loss, d.Loss) {
+	if control.Losses(d.Loss) != nil {
 		return errors.New("invalid desired mount loss")
 	}
 	return nil
@@ -225,7 +225,7 @@ func (i *Inventory) BindWitness(id *pb.MountID, w Witness) error {
 	return errors.Join(err, i.persist())
 }
 func (i *Inventory) RetainOutcome(id *pb.MountID, loss []*pb.Loss, outcome *pb.MountOutcome) error {
-	if control.Outcome(outcome) != nil {
+	if control.Outcome(outcome) != nil || control.Losses(loss) != nil {
 		return errors.New("invalid retained workspace outcome")
 	}
 	i.mu.Lock()

@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -261,8 +262,13 @@ func (c *workspaceChild) facts(o fusev3.WorkspaceObservation) mountcontrol.Facts
 func (c *workspaceChild) persist(o fusev3.WorkspaceObservation) error {
 	return c.outcomes.Commit(&pb.MountStatus{Mount: c.launch.Provision.Mount, Outcome: o.Outcome, Loss: o.Loss})
 }
-func (c *workspaceChild) run(ctx context.Context, j *mountcontrol.Job) mountcontrol.LifecycleResult {
+func (c *workspaceChild) run(ctx context.Context, j *mountcontrol.Job) (result mountcontrol.LifecycleResult) {
 	q := j.Request()
+	defer func() {
+		if result.Err != nil {
+			fmt.Fprintf(os.Stderr, "workspace %s: %s\n", q.Operation, control.BoundedReason(result.Err.Error()))
+		}
+	}()
 	g, _ := strconv.ParseUint(q.Workspace.Generation, 10, 64)
 	serial, _ := strconv.ParseUint(q.Workspace.GateSerial, 10, 64)
 	c.generation.Store(g)
@@ -302,7 +308,9 @@ func (c *workspaceChild) run(ctx context.Context, j *mountcontrol.Job) mountcont
 		if err == nil {
 			if m := c.mounted.Load(); m != nil {
 				m.Wait()
-				err = m.Close()
+				var final fusev3.WorkspaceObservation
+				final, err = m.mount.FinalizeWorkspace()
+				err = errors.Join(err, c.control.Owner.Record(c.facts(final)))
 			} else if c.client != nil {
 				var proof fusev3.MountAbsenceProof
 				proof, err = fusev3.ObservePlannedKernelMountAbsent("portablefs:"+c.state.MountInstanceID, c.state.MountPath)

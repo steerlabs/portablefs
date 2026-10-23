@@ -1414,7 +1414,11 @@ func (m *Mount) closeLocked() error {
 	m.kernelWithdrawalClosed = true
 	abortCloseErr := m.kernelMount.abortFile.close()
 	m.kernelWithdrawalMu.Unlock()
-	m.closeErr = errors.Join(m.fatalError(), barrierErr, replyOwnershipErr, detachErr, abortCloseErr, m.grafts.Close(), m.rpc.Close())
+	cleanupErr := errors.Join(replyOwnershipErr, detachErr, abortCloseErr, m.grafts.Close(), m.rpc.Close())
+	if m.workspaceLifecycle != nil {
+		m.workspaceLifecycle.closeCleanupErr = cleanupErr
+	}
+	m.closeErr = errors.Join(m.fatalError(), barrierErr, cleanupErr)
 	return m.closeErr
 }
 

@@ -82,6 +82,23 @@ type workspaceLifecycle struct {
 	keepalive       workspaceAttempt
 	servedSinceCold atomic.Bool
 	coldOutcome     *pb.MountOutcome
+	closeCleanupErr error // protected by Mount.mu; terminal/barrier verdicts stay separate
+}
+
+// FinalizeWorkspace preserves the run's terminal/loss evidence independently
+// of whether exact connection/session cleanup completed. Ordinary Close keeps
+// returning its combined terminal, barrier and cleanup diagnostic.
+func (m *Mount) FinalizeWorkspace() (WorkspaceObservation, error) {
+	w := m.workspaceLifecycle
+	if w == nil || w.persist == nil {
+		return WorkspaceObservation{}, errors.New("fusev3: managed finalization has no outcome owner")
+	}
+	m.mu.Lock()
+	_ = m.closeLocked()
+	cleanupErr := w.closeCleanupErr
+	m.mu.Unlock()
+	o := m.WorkspaceObservation()
+	return o, errors.Join(cleanupErr, w.persist(o))
 }
 
 var workspaceWorkerGroups = [][]string{

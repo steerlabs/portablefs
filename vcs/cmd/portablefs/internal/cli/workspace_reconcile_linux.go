@@ -14,7 +14,9 @@ import (
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceguest"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacemount"
+	"google.golang.org/protobuf/proto"
 )
 
 // This new process reconciles inventories after a cold boot. It never resumes,
@@ -66,7 +68,7 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 		return fail(err)
 	}
 	if _, err = os.Lstat(q.StateDirectory); errors.Is(err, os.ErrNotExist) {
-		if err = json.NewEncoder(e.stdout).Encode(run.Witness); err != nil {
+		if err = json.NewEncoder(e.stdout).Encode(workspacemount.Reconciled{Witness: run.Witness}); err != nil {
 			return fail(err)
 		}
 		var ack [1]byte
@@ -90,6 +92,17 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 		return fail(errors.New("unstarted workspace has CLI ownership records"))
 	}
 	w := run.Witness
+	outcomes, err := workspaceguest.OpenOutcomeInventory(filepath.Join(q.StateDirectory, "outcomes.json"))
+	if err != nil {
+		return fail(err)
+	}
+	result := workspacemount.Reconciled{}
+	for _, evidence := range outcomes.Snapshot() {
+		if q.NeverSpawned || !proto.Equal(evidence.Mount, run.Mount) {
+			return fail(errors.New("workspace CLI outcome belongs to another owner"))
+		}
+		result.Evidence = evidence
+	}
 	if state != nil {
 		if state.MountInstanceID != w.Intent || state.MountPath != w.Target || state.VolumeID != volume {
 			return fail(errors.New("workspace CLI inventory disagrees with startup intent"))
@@ -130,7 +143,8 @@ func (e *cmdEnv) runWorkspaceReconcile(fd int, volume, path string) int {
 		}
 	}
 	// The root commits partial CLI evidence before authorizing its removal.
-	if err = json.NewEncoder(e.stdout).Encode(w); err != nil {
+	result.Witness = w
+	if err = json.NewEncoder(e.stdout).Encode(result); err != nil {
 		return fail(err)
 	}
 	var ack [1]byte
