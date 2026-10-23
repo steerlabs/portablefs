@@ -93,6 +93,8 @@ func (o *Owner) share() (err error) {
 }
 
 type Reader struct {
+	closeOnce                       sync.Once
+	closeErr                        error
 	mu                              sync.RWMutex
 	stop, done, changed, correction chan struct{}
 	file                            *os.File
@@ -205,11 +207,13 @@ func (r *Reader) Check(generation uint64) error {
 	return ErrUnavailable
 }
 func (r *Reader) Close() error {
-	close(r.stop)
-	<-r.done
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	err := unix.Munmap(r.page)
-	r.page = nil
-	return errors.Join(err, r.file.Close())
+	r.closeOnce.Do(func() {
+		close(r.stop)
+		<-r.done
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.closeErr = errors.Join(unix.Munmap(r.page), r.file.Close())
+		r.page = nil
+	})
+	return r.closeErr
 }

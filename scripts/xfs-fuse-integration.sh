@@ -53,6 +53,9 @@ REQUIRED_TESTS=()
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockReadOnlyGenerationAndFreshness"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockSeqlockCannotMixAuthorization"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockChildCannotForgePage"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockClosedOwnerAndIdempotentReaderClose"
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestIdentityPrivateToWorkspaceUser"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceZeroEntryLossTicketRecorded"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspacePersistenceFailureSurvivesPermitLoss"

@@ -156,7 +156,7 @@ func serve() error {
 		return err
 	}
 	defer clock.Close()
-	qualification, err := clock.Qualify()
+	qualification, err := clock.InspectRTC()
 	if err != nil {
 		return err
 	}

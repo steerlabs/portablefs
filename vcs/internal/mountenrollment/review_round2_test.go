@@ -199,14 +199,8 @@ func TestManagedReadinessWithdrawsAtServingCutoff(t *testing.T) {
 	if r.Readiness().State != "pending" {
 		t.Fatal("published at serving cutoff")
 	}
-	if err := r.Resume(Permit{1, 1}); err != nil {
-		t.Fatal(err)
-	}
-	r.mu.Lock()
-	serving := r.serving
-	r.mu.Unlock()
-	if !serving {
-		t.Fatal("repeated Resume bypassed serving cutoff without Park")
+	if err := r.Resume(Permit{1, 1}); err == nil {
+		t.Fatal("Resume bypassed the observed serving cutoff latch")
 	}
 	elapsed.Store(int64(10*time.Minute + time.Second))
 	if r.Readiness().State != "pending" {

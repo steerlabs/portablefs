@@ -127,8 +127,22 @@ func NewClient(cfg Config) (*Client, error) {
 			if err := cfg.AwaitTLS(ctx); err != nil {
 				return nil, err
 			}
-			d := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 10 * time.Second}, Config: tlsConfig}
-			return d.DialContext(ctx, network, address)
+			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			raw, err := transport.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			if err = cfg.AwaitTLS(ctx); err != nil {
+				raw.Close()
+				return nil, err
+			}
+			conn := tls.Client(raw, tlsConfig)
+			if err = conn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return conn, nil
 		}
 	}
 	httpClient := &http.Client{

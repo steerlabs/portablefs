@@ -34,6 +34,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var ErrIdentityUnavailable = errors.New("invalid or unavailable persistent guest identity")
+
 const format = 8
 const maxEpoch = 1<<53 - 1 // Existing Manager/product authorization contract.
 
@@ -79,14 +81,47 @@ func Open(directory string) (*Store, error) {
 		return nil, fmt.Errorf("identity already owned: %w", err)
 	}
 	s := &Store{directory: directory, lock: lock, mounts: map[string]*pb.MountID{}}
+	// A crash can leave private-key bytes in an uncommitted transaction. Sweep
+	// only after taking lifetime ownership; never race a live writer.
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		lock.Close()
+		return nil, ErrIdentityUnavailable
+	}
+	retained := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".identity-") {
+			if err = os.Remove(filepath.Join(directory, entry.Name())); err != nil {
+				lock.Close()
+				return nil, ErrIdentityUnavailable
+			}
+		} else if entry.Name() != "owner.lock" && entry.Name() != "guest.json" {
+			retained = true
+		}
+	}
+	dir, err := os.Open(directory)
+	if err == nil {
+		err = dir.Sync()
+		dir.Close()
+	}
+	if err != nil {
+		lock.Close()
+		return nil, ErrIdentityUnavailable
+	}
 	var g guestRecord
 	if err = s.read("guest.json", &g); errors.Is(err, os.ErrNotExist) {
+		// Retained volume keys/epochs must never escape their original scope.
+		// Refusal survives restart because no replacement UUID is written.
+		if retained {
+			lock.Close()
+			return nil, ErrIdentityUnavailable
+		}
 		g = guestRecord{format, nonce()}
 		err = s.commit("guest.json", g)
 	}
 	if err != nil || g.Format != format || !control.ID(g.UUID) {
 		lock.Close()
-		return nil, errors.New("invalid or unavailable persistent guest identity")
+		return nil, ErrIdentityUnavailable
 	}
 	s.guest = bytes.Clone(g.UUID)
 	return s, nil
@@ -277,37 +312,41 @@ func certificates(raw []byte) ([]*x509.Certificate, error) {
 type certificatePending struct{ until time.Time }
 
 func (e *certificatePending) Error() string { return "provision certificate is not yet valid" }
-func verify(raw, ca, spki []byte, now time.Time) (*x509.Certificate, error) {
+
+// The peer owns client-chain verification. These roots authenticate servers,
+// and need not issue either of the guest's client identities.
+func verifyServerCA(raw []byte) error {
+	roots, err := certificates(raw)
+	if err != nil {
+		return err
+	}
+	for _, c := range roots {
+		if !c.IsCA || !c.BasicConstraintsValid {
+			return errors.New("invalid CA certificate")
+		}
+	}
+	return nil
+}
+func verifyClientIdentity(raw, spki []byte, now time.Time) (*x509.Certificate, error) {
 	chain, err := certificates(raw)
 	if err != nil {
 		return nil, err
 	}
-	roots, err := certificates(ca)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	for _, c := range roots {
-		if !c.IsCA || !c.BasicConstraintsValid {
-			return nil, errors.New("invalid CA certificate")
-		}
-		pool.AddCert(c)
-	}
-	intermediates := x509.NewCertPool()
-	for _, c := range chain[1:] {
-		intermediates.AddCert(c)
-	}
-	if !bytes.Equal(chain[0].RawSubjectPublicKeyInfo, spki) {
+	leaf := chain[0]
+	if !bytes.Equal(leaf.RawSubjectPublicKeyInfo, spki) {
 		return nil, errors.New("provision certificate changed the guest key")
 	}
-	if _, err = chain[0].Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediates, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-		var invalid x509.CertificateInvalidError
-		if errors.As(err, &invalid) && invalid.Reason == x509.Expired && now.Before(invalid.Cert.NotBefore) {
-			return nil, &certificatePending{invalid.Cert.NotBefore}
-		}
+	clientAuth := false
+	for _, usage := range leaf.ExtKeyUsage {
+		clientAuth = clientAuth || usage == x509.ExtKeyUsageClientAuth || usage == x509.ExtKeyUsageAny
+	}
+	if !clientAuth || !now.Before(leaf.NotAfter) || !leaf.NotAfter.After(leaf.NotBefore) {
 		return nil, errors.New("provision certificate is not currently valid for client authentication")
 	}
-	return chain[0], nil
+	if now.Before(leaf.NotBefore) {
+		return nil, &certificatePending{leaf.NotBefore}
+	}
+	return leaf, nil
 }
 
 // AcceptProvision validates before a single durable commit. Errors never include
@@ -363,7 +402,10 @@ func (s *Store) acceptProvision(ctx context.Context, p *pb.Provision) error {
 		return errors.New("invalid authority server name")
 	}
 	now := time.Now()
-	if _, err = verify(p.ClientCertificate, p.CaCertificate, spki, now); err != nil {
+	if err = verifyServerCA(p.CaCertificate); err != nil {
+		return err
+	}
+	if _, err = verifyClientIdentity(p.ClientCertificate, spki, now); err != nil {
 		return err
 	}
 	if h := p.HostedEnrollment; h != nil {
@@ -371,7 +413,10 @@ func (s *Store) acceptProvision(ctx context.Context, p *pb.Provision) error {
 		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.Path != "" && u.Path != "/" {
 			return errors.New("Manager must be an HTTPS origin")
 		}
-		c, e := verify(h.EnrollmentCertificate, h.ManagerCa, spki, now)
+		if e := verifyServerCA(h.ManagerCa); e != nil {
+			return e
+		}
+		c, e := verifyClientIdentity(h.EnrollmentCertificate, spki, now)
 		if e != nil {
 			return e
 		}

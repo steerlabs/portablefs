@@ -177,8 +177,12 @@ try:
     assert public_der == base64.b64decode(identity['public_key'])
     record('guest-identity-signed-csr')
     owner = json.loads(guest.ssh('cat /run/portablefs-workspace/clock-owner.json'))
-    assert owner['read_only'] and owner['second_open_busy'] and owner['readers'] == 8 and owner['samples'] == 8000
-    assert owner['maximum_ns'] <= 250_000_000 and 'pl031' in owner['source']
+    assert owner['read_only'] and owner['second_open_busy'] and 'pl031' in owner['source']
+    contention = json.loads((root/'rtc-contention.json').read_text())
+    assert contention['readers'] == 8 and contention['samples'] == 8000
+    assert contention['read_only'] and contention['second_open_busy'] and contention['maximum_ns'] <= 250_000_000
+    assert contention['source'] == owner['source']
+    measurements[-1]['rtc_contention'] = contention
     measurements[-1]['clock_owner'] = owner
     record('rtc-single-owner-duplicate-contention')
     before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))

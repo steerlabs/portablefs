@@ -166,6 +166,14 @@ func (o *Owner) Measure() (m Measurement, err error) {
 	queued := o.backend.Elapsed()
 	o.sampleMu.Lock()
 	defer o.sampleMu.Unlock()
+	defer func() {
+		if err != nil && !errors.Is(err, ErrObsolete) {
+			o.mu.Lock()
+			was := o.invalidateLocked()
+			o.mu.Unlock()
+			o.notify(was)
+		}
+	}()
 	start := o.backend.Elapsed()
 	m.Contention = start - queued
 	if start < 0 || queued < 0 {
@@ -178,14 +186,6 @@ func (o *Owner) Measure() (m Measurement, err error) {
 		return m, ErrObsolete
 	}
 	m.Generation = g
-	defer func() {
-		if err != nil && !errors.Is(err, ErrObsolete) {
-			o.mu.Lock()
-			was := o.invalidateLocked()
-			o.mu.Unlock()
-			o.notify(was)
-		}
-	}()
 	rtc, e := o.backend.ReadUTC()
 	if e != nil {
 		return m, fmt.Errorf("%w: RTC read", ErrUnavailable)
@@ -302,8 +302,10 @@ type Source interface {
 	Changed() <-chan struct{}
 }
 type Binding struct {
-	Owner   Source
-	Current func(mountenrollment.Permit) bool
+	Owner Source
+	// Generation belongs to the mount owner, including cleanup after Close.
+	Generation func() uint64
+	Current    func(mountenrollment.Permit) bool
 }
 
 func (b Binding) Check(p mountenrollment.Permit) error {
@@ -345,12 +347,28 @@ func (b Binding) Wait(ctx context.Context, p mountenrollment.Permit) error {
 		timer.Stop()
 	}
 }
+
+// AwaitTLS gates all transport work, including background receipts and cleanup.
+// Serving permission stays at admission; Close cannot make cleanup undialable.
 func (b Binding) AwaitTLS(ctx context.Context) error {
-	p, ok := mountenrollment.PermitFromContext(ctx)
-	if !ok {
+	if b.Owner == nil || b.Generation == nil {
 		return ErrObsolete
 	}
-	return b.Wait(ctx, p)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		changed := b.Owner.Changed()
+		generation := b.Generation()
+		if b.Owner.Check(generation) == nil && b.Generation() == generation {
+			return ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // ChildFile hands the future root driver a read-only view of the shared result.

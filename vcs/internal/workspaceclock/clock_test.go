@@ -118,7 +118,10 @@ func TestClockFailuresClearReadinessAndRecover(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if o.Check(0) == nil || closed.Load() != 1 {
+			o.mu.Lock()
+			stillReady := o.ready
+			o.mu.Unlock()
+			if stillReady || closed.Load() != 1 || o.Check(0) == nil {
 				t.Fatal("failure did not close readiness exactly once")
 			}
 			ctx, cancel := context.WithCancel(t.Context())
@@ -153,7 +156,7 @@ func TestClockGenerationSerialAndDelayedCorrection(t *testing.T) {
 	}
 	var serial atomic.Uint64
 	serial.Store(2)
-	bound := Binding{Owner: o, Current: func(p mountenrollment.Permit) bool { return p.Generation == 1 && p.GateSerial == serial.Load() }}
+	bound := Binding{Owner: o, Generation: func() uint64 { return 1 }, Current: func(p mountenrollment.Permit) bool { return p.Generation == 1 && p.GateSerial == serial.Load() }}
 	p := mountenrollment.Permit{Generation: 1, GateSerial: 2}
 	if err := bound.Wait(t.Context(), p); err != nil {
 		t.Fatal(err)
@@ -162,8 +165,8 @@ func TestClockGenerationSerialAndDelayedCorrection(t *testing.T) {
 	if !errors.Is(bound.Check(p), ErrObsolete) {
 		t.Fatal("repeated Close released obsolete work")
 	}
-	if bound.AwaitTLS(t.Context()) == nil {
-		t.Fatal("TLS without an exact permit")
+	if err := bound.AwaitTLS(t.Context()); err != nil {
+		t.Fatal("ready clock refused cleanup after Close", err)
 	}
 }
 func TestClockAllMountsShareCorrectionAndWaitCancellation(t *testing.T) {

@@ -796,7 +796,9 @@ accepted provisioning material. Files have mode 0600 inside a root-owned 0700
 directory. Transactions sync the temporary file, rename, then sync the directory;
 a persistence failure prevents further issuance by that owner. A new boot or
 ordinary replacement chooses a new MountID without changing the key, identity
-incarnation, scope or epoch.
+incarnation, scope or epoch. Open removes crash-leftover identity transactions
+under the lifetime lock. Missing guest UUID with retained volume state refuses
+repeatedly without minting a new scope.
 
 IdentityRequest (Envelope 23) names authority/volume; IdentityReply (24) returns
 the guest-selected MountID, DER SPKI, signed DER PKCS#10 CSR, guest UUID, identity
@@ -815,7 +817,9 @@ record means standalone. Hosted data contains only Manager HTTPS origin, server
 name, CA, enrollment ID/certificate, authority generation and the initial Unix
 seconds authorization deadline. Acceptance checks the guest-selected mount,
 endpoint, route digest and exact SPKI through ProvisionForKey, then verifies
-same-key client/enrollment certificate chains and validity. Manager enrollment
+same-key client/enrollment leaves, ClientAuth EKU and validity, and parseable
+server CA constraints. Authority and Manager verify the client chains against
+their own client/enrollment roots; server roots need not issue guest identities. Manager enrollment
 URI identity remains the existing v1 contract. A future NotBefore leaves the
 same generation-owned job pending; NotAfter refuses. Authority Attach still
 checks the route revision and signed capability. Diagnostics contain no signed
@@ -824,9 +828,10 @@ provisioning request or enrollment/capability bytes.
 `workspaceclock` opens pinned `/dev/rtc0` read-only once. Only this privileged
 owner sets CLOCK_REALTIME; it never writes RTC. Its sealed read-only shared page
 publishes one generation-bound result to child daemons. A mount combines that
-result with its exact close serial through Binding. Authority dialTLS and
-Manager do, including the Manager transport's TLS dial, require this prerequisite
-for workspace clients. Cancellation, cleanup and retained replay cannot bypass
+result with its exact close serial through Binding for serving admission.
+Transport clock waits use the mount owner's current generation, independently of
+serving permission and context values. Authority dialTLS and the Manager TLS
+transport recheck after raw TCP connection and before the TLS handshake. Cancellation, cleanup and retained replay cannot bypass
 it. Ordinary clients retain normal verified TLS and their existing dispatch.
 PR 6 must hand the clock page to real children and bind their existing gate and
 renewal owner; no real managed mount is enabled here.
@@ -845,8 +850,11 @@ owner to recompute wall-derived scheduling while retaining exact pending grants,
 sequence and terminal latches. A backward step cannot revive permission.
 
 The exact-image native inventory measures retained-opening exclusivity, eight
-concurrent duplicate readers, boot/resume corrections, CSR verification and
-identity persistence. `scripts/qualify-linux-workspace-clock.py` records at least
+concurrent duplicate readers in a separate test-only initramfs on the pinned
+kernel, boot/resume corrections, CSR verification and
+identity persistence. Production boot checks read-only/exclusive ownership;
+measurement failures withdraw readiness and retry without exiting the service.
+`scripts/qualify-linux-workspace-clock.py` records at least
 one full maintenance interval against an image-manifest digest and can record
 an explicitly supplied independent UTC reference. It always leaves the final UTC
 qualification verdict false: source provenance, multi-day accuracy, host clock

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/proto"
 )
@@ -37,40 +38,53 @@ func store(t *testing.T) (*Store, *pb.IdentityReply) {
 	}
 	return s, r
 }
+func signingCA(t *testing.T, name string) *controlplane.CertificateAuthority {
+	t.Helper()
+	pub, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	cert := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: name}, NotBefore: now.Add(-24 * time.Hour), NotAfter: now.Add(24 * time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, pub, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := controlplane.ParseCertificateAuthority(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: raw}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ca
+}
+
 func provision(t *testing.T, r *pb.IdentityReply, hosted bool, validity ...time.Time) *pb.Provision {
 	t.Helper()
 	now := time.Now()
-	public, private, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ca := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test CA"}, IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour)}
-	der, err := x509.CreateCertificate(rand.Reader, ca, ca, public, private)
-	if err != nil {
-		t.Fatal(err)
-	}
-	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	spki, err := x509.ParsePKIXPublicKey(r.PublicKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert := &x509.Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "test client"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
+	authorityCA, clientCA := signingCA(t, "authority-server"), signingCA(t, "mount-client")
+	csr := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: r.Csr})
+	signingTime, lifetime := now, time.Hour
 	if len(validity) == 2 {
-		cert.NotBefore = validity[0]
-		cert.NotAfter = validity[1]
+		signingTime = validity[0].Add(time.Minute)
+		lifetime = validity[1].Sub(signingTime)
 	}
-	sign := func() []byte {
-		der, err := x509.CreateCertificate(rand.Reader, cert, ca, spki, private)
+	client, _, err := clientCA.SignCSR(csr, "peer", nil, true, signingTime, lifetime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &pb.Provision{Mount: r.Mount, AuthorityEndpoint: "authority.example:7443", ServerName: "authority.example", CaCertificate: []byte(authorityCA.CertificatePEM), ClientCertificate: []byte(client), PublicKey: r.PublicKey, Capability: []byte("test signed grant"), RoutesRevision: bytes.Repeat([]byte{2}, 32)}
+	if hosted {
+		enrollmentCA, httpsCA := signingCA(t, "enrollment"), signingCA(t, "manager-https")
+		id := "0f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a"
+		uri, _ := url.Parse("spiffe://portablefs/mount-enrollment/" + id)
+		enrollment, _, err := enrollmentCA.SignClientCSR(csr, id, uri, signingTime, lifetime)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	}
-	p := &pb.Provision{Mount: r.Mount, AuthorityEndpoint: "authority.example:7443", ServerName: "authority.example", CaCertificate: caPEM, ClientCertificate: sign(), PublicKey: r.PublicKey, Capability: []byte("test signed grant"), RoutesRevision: bytes.Repeat([]byte{2}, 32)}
-	if hosted {
-		uri, _ := url.Parse("spiffe://portablefs/mount-enrollment/test-enrollment")
-		cert.URIs = []*url.URL{uri}
-		p.HostedEnrollment = &pb.HostedEnrollment{ManagerOrigin: "https://manager.example", ManagerServerName: "manager.example", ManagerCa: caPEM, EnrollmentId: "test-enrollment", EnrollmentCertificate: sign(), AuthorityGeneration: 1, AuthorizationDeadlineUnix: uint64(now.Add(time.Minute).Unix())}
+		p.HostedEnrollment = &pb.HostedEnrollment{ManagerOrigin: "https://manager.example", ManagerServerName: "manager.example", ManagerCa: []byte(httpsCA.CertificatePEM), EnrollmentId: id, EnrollmentCertificate: []byte(enrollment), AuthorityGeneration: 1, AuthorizationDeadlineUnix: uint64(now.Add(time.Minute).Unix())}
 	}
 	return p
 }
@@ -119,7 +133,7 @@ func TestIdentityPersistenceScopeEpochAndMountNonce(t *testing.T) {
 		t.Fatal("scope borrowed Mac identity")
 	}
 }
-func TestProvisionStandaloneAndHostedSameKey(t *testing.T) {
+func TestProvisionStandaloneAndHostedWithDistinctIssuerCAs(t *testing.T) {
 	for _, hosted := range []bool{false, true} {
 		t.Run(map[bool]string{false: "standalone", true: "hosted"}[hosted], func(t *testing.T) {
 			s, r := store(t)
@@ -142,7 +156,7 @@ func TestProvisionStandaloneAndHostedSameKey(t *testing.T) {
 	}
 }
 func TestProvisionRejectsClockKeyCertificateEndpointAndRoute(t *testing.T) {
-	for _, name := range []string{"clock", "key", "cert-key", "CA", "endpoint", "route", "mount", "server", "hosted-origin", "hosted-cert", "hosted-deadline"} {
+	for _, name := range []string{"clock", "key", "cert-key", "CA", "endpoint", "route", "mount", "server", "hosted-origin", "hosted-cert", "hosted-deadline", "server-CA-leaf", "manager-CA-leaf", "client-EKU", "enrollment-EKU", "malformed-chain"} {
 		t.Run(name, func(t *testing.T) {
 			s, r := store(t)
 			p := provision(t, r, true)
@@ -170,6 +184,32 @@ func TestProvisionRejectsClockKeyCertificateEndpointAndRoute(t *testing.T) {
 				p.HostedEnrollment.ManagerOrigin += "/path"
 			case "hosted-cert":
 				p.HostedEnrollment.EnrollmentCertificate = p.ClientCertificate
+			case "server-CA-leaf":
+				p.CaCertificate = p.ClientCertificate
+			case "manager-CA-leaf":
+				p.HostedEnrollment.ManagerCa = p.HostedEnrollment.EnrollmentCertificate
+			case "malformed-chain":
+				p.ClientCertificate = append(p.ClientCertificate, []byte("invalid trailing certificate")...)
+			case "client-EKU", "enrollment-EKU":
+				ca := signingCA(t, "wrong-EKU")
+				spki, err := x509.ParsePKIXPublicKey(r.PublicKey)
+				if err != nil {
+					t.Fatal(err)
+				}
+				leaf := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+				if name == "enrollment-EKU" {
+					leaf.URIs = []*url.URL{{Scheme: "spiffe", Host: "portablefs", Path: "/mount-enrollment/" + p.HostedEnrollment.EnrollmentId}}
+				}
+				der, err := x509.CreateCertificate(rand.Reader, leaf, ca.Certificate, spki, ca.Signer)
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+				if name == "client-EKU" {
+					p.ClientCertificate = raw
+				} else {
+					p.HostedEnrollment.EnrollmentCertificate = raw
+				}
 			case "hosted-deadline":
 				p.HostedEnrollment.AuthorizationDeadlineUnix = 1
 			}
