@@ -269,7 +269,7 @@ print(pids[0])
 
     def terminal_replacement(self, guest):
         old = self.mount(guest, short=True)
-        worker = """import os,time,json,pathlib
+        worker = """import errno,fcntl,os,time,json,pathlib
 root=pathlib.Path.home()
 stop=root/'pfs-native-held.stop'
 stop.unlink(missing_ok=True)
@@ -284,8 +284,18 @@ with open(root/'pfs-native-held.jsonl','w',buffering=1) as out:
             value={'error':e.errno}
         out.write(json.dumps(value)+'\\n')
         time.sleep(.05)
-os.close(fd)
-(root/'pfs-native-held.done').touch()
+close_error=0
+try:
+    os.close(fd)
+except OSError as e:
+    close_error=e.errno
+try:
+    fcntl.fcntl(fd,fcntl.F_GETFD)
+except OSError as e:
+    assert e.errno==errno.EBADF,e
+else:
+    raise AssertionError('old descriptor remains open')
+print(json.dumps({'closed':True,'close_error':close_error}),flush=True)
 """
         with self.held_handle(guest, worker) as held:
             deadline = time.monotonic() + 75
@@ -302,9 +312,14 @@ os.close(fd)
             time.sleep(.2)
             observed = guest.ssh('tail -n 1 ~/pfs-native-held.jsonl')
             assert json.loads(observed).get('error', 0) != 0, observed
-            guest.ssh('touch ~/pfs-native-held.stop; while test ! -f ~/pfs-native-held.done; do sleep .02; done')
-            self.unmount(guest, fresh)
+            guest.ssh('touch ~/pfs-native-held.stop')
             assert held.wait(timeout=10) == 0
+            closure = json.loads(held.stdout.readline())
+            assert closure['closed'] and closure['close_error'] in (0, 5, 107), closure
+            (self.evidence/'managed-held-fd.json').write_text(json.dumps({
+                'old': old['incarnation'], 'fresh': fresh['incarnation'],
+                'last_old_handle': json.loads(observed), 'closure': closure}, indent=2))
+            self.unmount(guest, fresh)
         return old, fresh
 
     def close(self):
