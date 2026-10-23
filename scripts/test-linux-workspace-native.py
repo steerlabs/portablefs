@@ -193,7 +193,7 @@ try:
     assert paused['operations'].index('pause-completed') < paused['operations'].index('sleep-fenced')
     guest.command('status')
     assert guest.wait('status')['phase'] == 'pausedCold'
-    time.sleep(1)
+    time.sleep(5)
     record('controlled-cold-pause')
     guest.command('resume')
     resumed = guest.wait('resumed', 25)
@@ -207,6 +207,7 @@ try:
         assert time.monotonic() < deadline, after
         time.sleep(.1)
     assert after['generation'] == 1 and after['sample_age_ns'] <= 250_000_000
+    assert abs(after['correction_ns']) >= 3_000_000_000, 'resume did not exercise real guest wall correction'
     measurements[-1]['resume_clock'] = after
     record('rtc-cold-resume-generation')
     assert guest.ssh('cat ~/persistence') == token
