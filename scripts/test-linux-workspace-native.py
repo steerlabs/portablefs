@@ -1,5 +1,6 @@
 """Real VZ execution, independent causal assertions, exact required inventory."""
 import json
+import os
 import datetime
 import pathlib
 import queue
@@ -16,7 +17,7 @@ from linux_workspace_native_managed import NativeAuthority
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
-state = pathlib.Path(tempfile.mkdtemp(prefix=__import__('os').environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-workspace-native-'), dir='/tmp'))
+state = pathlib.Path(tempfile.mkdtemp(prefix=os.environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-workspace-native-'), dir='/tmp'))
 (root / 'state-directory.json').write_text(json.dumps({'state': str(state)}))
 required = pathlib.Path(inventory).read_text().splitlines()
 assert required and len(required) == len(set(required))
@@ -124,7 +125,7 @@ try:
     # mismatched Hello with the real guest over its authenticated vsock stream.
     # No host-only model test can satisfy this case.
     for field in ('version', 'commit', 'digest'):
-        mismatch_state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-ws-mismatch-', dir='/tmp'))
+        mismatch_state = pathlib.Path(tempfile.mkdtemp(prefix=os.environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-ws-mismatch-'), dir='/tmp'))
         try:
             process = subprocess.Popen([binary, image, str(mismatch_state), '--pairing-mismatch', field],
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

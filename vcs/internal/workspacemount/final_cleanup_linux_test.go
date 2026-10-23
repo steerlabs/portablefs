@@ -51,15 +51,17 @@ func realCLI(t *testing.T) string {
 	if existing := os.Getenv("PFS_WORKSPACE_TEST_CLI"); existing != "" {
 		return existing
 	}
-	binary := filepath.Join(t.TempDir(), "portablefs")
+	directory, err := os.MkdirTemp("/tmp", "pfs-final-fix-sol-binary-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(directory) })
+	if err = os.Chmod(directory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(directory, "portablefs")
 	if out, err := exec.Command("go", "build", "-o", binary, "../../cmd/portablefs").CombinedOutput(); err != nil {
 		t.Fatalf("build real CLI: %v %s", err, out)
-	}
-	// UID 1000 must traverse the generated executable's private test parents.
-	for p := filepath.Dir(binary); p != "/tmp" && p != "/"; p = filepath.Dir(p) {
-		if err := os.Chmod(p, 0755); err != nil {
-			t.Fatal(err)
-		}
 	}
 	return binary
 }
