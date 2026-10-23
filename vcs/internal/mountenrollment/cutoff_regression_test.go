@@ -5,10 +5,8 @@ import (
 	"time"
 )
 
-// The safe cutoff is wall-derived (deadline from Unix seconds). After the
-// cutoff has been reached but before the Run loop latches terminal (e.g. while
-// an attempt is in flight), a backward wall correction re-publishes serving
-// readiness. The PR's clock owner is the source of such steps.
+// Observing the wall-derived serving cutoff must latch it even while Run is
+// elsewhere. A later backward correction cannot republish the old installation.
 func TestBackwardCorrectionCannotReadmitObservedCutoff(t *testing.T) {
 	base := time.Unix(1_900_000_000, 0)
 	now := base

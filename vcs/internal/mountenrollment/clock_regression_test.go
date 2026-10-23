@@ -51,6 +51,10 @@ func TestManagerRechecksClockAfterTCP(t *testing.T) {
 	if called.Load() || err == nil {
 		t.Fatalf("Manager TLS/HTTP dispatched after clock withdrawal: called=%v err=%v", called.Load(), err)
 	}
+	ready.Store(true)
+	if err := client.do(t.Context(), "POST", "close", "test", struct{}{}, &out); err != nil || !called.Load() {
+		t.Fatalf("fresh ready clock did not restore verified Manager TLS: called=%v err=%v", called.Load(), err)
+	}
 }
 
 // Fake a CLOCK_REALTIME step in a copied Go timestamp; never sets a real clock.
