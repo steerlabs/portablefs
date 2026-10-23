@@ -482,9 +482,6 @@ func Validate(e *pb.Envelope) error {
 		if err := RetiredStatuses(s.Retired); err != nil {
 			return fmt.Errorf("status retired: %w", err)
 		}
-		if len(s.Retired) > 0 && s.Retired[len(s.Retired)-1].RetirementSequence > s.RetirementSequence {
-			return invalid("retired outcome exceeds status high-water mark")
-		}
 		if err := statuses(s.Mounts); err != nil {
 			return fmt.Errorf("status mounts: %w", err)
 		}

@@ -112,7 +112,6 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     private var lastNotificationID: UInt64 = 0
     private var retirementAckInFlight: UInt64?
     private var acknowledgedRetirement: UInt64 = 0
-    private var observedRetirement: UInt64 = 0
     private var notifications: [UInt64: UInt64] = [:]
     private let startBudget: UInt64
     private let drainBudget: UInt64
@@ -358,10 +357,8 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     public func observeStatus(_ status: WorkspaceStatusReply) throws {
         guard WorkspaceControl.validStatus(status), status.bootID == host.bootID,
               status.hostServiceID == host.hostServiceID, status.guestServiceID == guestServiceID else { throw WorkspaceControlError.transition }
-        // FIFO makes regressions unreachable; the high-water guard also rejects
-        // an injected pre-retirement snapshot after its evidence was consumed.
-        let through = status.retirementSequence
-        guard through >= observedRetirement else { return }
+        // The sole correlated FIFO consumes each snapshot before dispatching
+        // another exchange. A pre-ack snapshot cannot arrive after its ack.
         let publishesReadiness = (phase == .running || phase == .recovering) && status.generation == generation && status.state == "running"
         let unacknowledged = status.retired.filter { $0.retirementSequence > acknowledgedRetirement }
         let knownThrough = retiredStatus.last?.retirementSequence ?? acknowledgedRetirement
@@ -389,7 +386,6 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 guard WorkspaceControl.retainsJob(next, prior: old) else { throw WorkspaceControlError.transition }
             }
         }
-        observedRetirement = through
         retiredStatus.append(contentsOf: added)
         mountStatus.removeAll { old in retiredStatus.contains { $0.hasMountStatus && $0.mountStatus.mount == old.mount } }
         jobStatus = remainingJobs

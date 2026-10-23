@@ -432,9 +432,6 @@ public nonisolated struct WorkspaceStatusReply: Sendable {
 
   public var jobs: [WorkspaceMountJob] = []
 
-  /// High-water mark, including acknowledged retirements; rejects stale snapshots.
-  public var retirementSequence: UInt64 = 0
-
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -1403,7 +1400,7 @@ nonisolated extension WorkspaceRetiredOutcome: SwiftProtobuf.Message, SwiftProto
 
 nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StatusReply"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}state\0\u{1}mounts\0\u{1}retired\0\u{1}jobs\0\u{3}retirement_sequence\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}state\0\u{1}mounts\0\u{1}retired\0\u{1}jobs\0\u{c}\u{9}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1419,7 +1416,6 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.mounts) }()
       case 7: try { try decoder.decodeRepeatedMessageField(value: &self.retired) }()
       case 8: try { try decoder.decodeRepeatedMessageField(value: &self.jobs) }()
-      case 9: try { try decoder.decodeSingularUInt64Field(value: &self.retirementSequence) }()
       default: break
       }
     }
@@ -1450,9 +1446,6 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
     if !self.jobs.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.jobs, fieldNumber: 8)
     }
-    if self.retirementSequence != 0 {
-      try visitor.visitSingularUInt64Field(value: self.retirementSequence, fieldNumber: 9)
-    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1465,7 +1458,6 @@ nonisolated extension WorkspaceStatusReply: SwiftProtobuf.Message, SwiftProtobuf
     if lhs.mounts != rhs.mounts {return false}
     if lhs.retired != rhs.retired {return false}
     if lhs.jobs != rhs.jobs {return false}
-    if lhs.retirementSequence != rhs.retirementSequence {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

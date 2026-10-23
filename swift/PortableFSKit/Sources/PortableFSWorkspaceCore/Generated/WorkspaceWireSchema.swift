@@ -97,7 +97,6 @@ enum WorkspaceWireSchema {
             6: .init(kind: "MountStatus", repeated: true, oneof: false),
             7: .init(kind: "RetiredOutcome", repeated: true, oneof: false),
             8: .init(kind: "MountJob", repeated: true, oneof: false),
-            9: .init(kind: "", repeated: false, oneof: false),
         ],
         "RetireAck": [
             1: .init(kind: "", repeated: false, oneof: false),

@@ -122,8 +122,7 @@ message StatusReply {
   // First 16 unacknowledged retired outcomes, in retirement order.
   repeated RetiredOutcome retired = 7;
   repeated MountJob jobs = 8;
-  // High-water mark, including acknowledged retirements; rejects stale snapshots.
-  uint64 retirement_sequence = 9;
+  reserved 9;
 }
 // Idempotently acknowledge all retired outcomes through this sequence.
 message RetireAck { uint64 through_sequence = 1; }

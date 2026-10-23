@@ -22,7 +22,7 @@ func workspaceGolden(_ name: String) throws -> Data {
         #expect(envelope.version == 8)
         #expect(try WorkspaceControl.encode(envelope) == raw)
     }
-    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated", "missing_outcome", "missing_renewal", "zero_installed_sequence", "pending_with_sequence", "not_required_with_sequence", "unobserved_durable", "invalid_release_outcome", "ready_with_pending_renewal", "cold_missing_outcome", "suspend_missing_budget", "suspend_excess_budget", "budget_outside_suspend", "job_zero_request", "job_future_generation", "job_unknown_operation", "job_unknown_phase", "job_missing_failure", "job_unknown_failure", "job_admission_only_failure", "job_reserved_summary", "predecessor_wrong_reason", "job_missing_reason", "job_running_failure", "job_incarnation_conflict", "job_duplicate", "job_excess_capacity", "retired_highwater_below", "retired_empty", "retired_running_job", "retired_future_job", "retired_sequence_gap", "retired_mismatched_job", "retired_duplicate_job", "active_excess_capacity"]
+    let invalid = ["unequal_version", "unknown_body", "duplicate_version", "multiple_body", "nonminimal_varint", "explicit_default", "unknown_nested", "oversized_length", "truncated", "trailing", "out_of_order", "wrong_wire_type", "zero_length", "zero_request_id", "invalid_utf8", "excessive_nesting", "excessive_repeated", "missing_outcome", "missing_renewal", "zero_installed_sequence", "pending_with_sequence", "not_required_with_sequence", "unobserved_durable", "invalid_release_outcome", "ready_with_pending_renewal", "cold_missing_outcome", "suspend_missing_budget", "suspend_excess_budget", "budget_outside_suspend", "job_zero_request", "job_future_generation", "job_unknown_operation", "job_unknown_phase", "job_missing_failure", "job_unknown_failure", "job_admission_only_failure", "job_reserved_summary", "predecessor_wrong_reason", "job_missing_reason", "job_running_failure", "job_incarnation_conflict", "job_duplicate", "job_excess_capacity", "status_reserved_field9", "retired_empty", "retired_running_job", "retired_future_job", "retired_sequence_gap", "retired_mismatched_job", "retired_duplicate_job", "active_excess_capacity"]
     for name in invalid {
         let raw = try workspaceGolden(name + ".invalid")
         #expect(throws: (any Error).self) { try WorkspaceControl.decode(raw) }
@@ -62,7 +62,7 @@ func workspaceGolden(_ name: String) throws -> Data {
 func maximumWorkspaceStatus() throws -> WorkspaceEnvelope {
     let template = try WorkspaceControl.decode(workspaceGolden("status_reply")).statusReply
     var status = template
-    status.generation = UInt64.max; status.retirementSequence = UInt64.max; status.state = "suspended-cold"
+    status.generation = UInt64.max; status.state = "suspended-cold"
     status.mounts = (0..<64).map { index in
         var m = template.mounts[0]
         m.mount.volumeID = String(format: "%03d", index) + String(repeating: "v", count: 125)

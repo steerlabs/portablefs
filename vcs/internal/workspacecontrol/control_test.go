@@ -99,9 +99,6 @@ func fixtures() map[string]*pb.Envelope {
 	for _, e := range bodies {
 		e.Version = 8
 		e.RequestId = 1
-		if status := e.GetStatusReply(); status != nil && len(status.Retired) > 0 {
-			status.RetirementSequence = status.Retired[len(status.Retired)-1].RetirementSequence
-		}
 	}
 	return bodies
 }
@@ -128,6 +125,10 @@ func invalidFixtures() map[string][]byte {
 	repeated = protowire.AppendBytes(protowire.AppendTag(repeated, 12, protowire.BytesType), body)
 
 	negative := map[string][]byte{}
+	reserved, _ := proto.MarshalOptions{Deterministic: true}.Marshal(fixtures()["status_reply"].GetStatusReply())
+	reserved = protowire.AppendVarint(protowire.AppendTag(reserved, 9, protowire.VarintType), 1)
+	payload := protowire.AppendBytes(protowire.AppendTag([]byte{8, 8, 16, 1}, 12, protowire.BytesType), reserved)
+	negative["status_reserved_field9"] = framed(payload)
 	for _, tc := range []struct {
 		name   string
 		mutate func(*pb.MountStatus)
@@ -207,7 +208,6 @@ func invalidFixtures() map[string][]byte {
 		name   string
 		mutate func(*pb.StatusReply)
 	}{
-		{"retired_highwater_below", func(s *pb.StatusReply) { s.RetirementSequence = 1 }},
 		{"retired_empty", func(s *pb.StatusReply) { s.Retired[1].Job = nil }},
 		{"retired_running_job", func(s *pb.StatusReply) { s.Retired[1].Job.Phase = "running" }},
 		{"retired_future_job", func(s *pb.StatusReply) { s.Retired[1].Job.Generation++ }},
@@ -462,7 +462,7 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 		retired[i].Job.Mount = r.Mount
 	}
 	for name, e := range map[string]*pb.Envelope{
-		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "suspended-cold", Mounts: statuses, Retired: retired, Jobs: jobs, RetirementSequence: math.MaxUint64}}},
+		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "suspended-cold", Mounts: statuses, Retired: retired, Jobs: jobs}}},
 		"suspend": {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: cold}}},
 		"resume":  {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}, Mounts: statuses}}},
 	} {
@@ -546,7 +546,7 @@ func TestWorkspaceScannerDepthBound(t *testing.T) {
 	}
 }
 
-func TestWorkspaceStatusHighWaterRejectsNilRetirement(t *testing.T) {
+func TestWorkspaceStatusRejectsNilRetirement(t *testing.T) {
 	e := fixtures()["status_reply"]
 	e.GetStatusReply().Retired = []*pb.RetiredOutcome{nil}
 	if Validate(e) == nil {

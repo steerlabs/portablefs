@@ -117,7 +117,6 @@ public enum WorkspaceControl {
         guard id(status.bootID), id(status.hostServiceID), id(status.guestServiceID),
               ["running", "suspending", "suspended-cold", "discard-only"].contains(status.state), validStatuses(status.mounts), validRetired(status.retired), validJobs(status),
               !["suspending", "suspended-cold"].contains(status.state) || status.generation > 0 else { return false }
-        guard (status.retired.last?.retirementSequence ?? 0) <= status.retirementSequence else { return false }
         return status.mounts.allSatisfy { mount in
             if ["terminal", "authorization-required"].contains(mount.state) { return true }
             switch status.state {

@@ -1023,12 +1023,10 @@ type StatusReply struct {
 	State  string         `protobuf:"bytes,5,opt,name=state,proto3" json:"state,omitempty"`
 	Mounts []*MountStatus `protobuf:"bytes,6,rep,name=mounts,proto3" json:"mounts,omitempty"`
 	// First 16 unacknowledged retired outcomes, in retirement order.
-	Retired []*RetiredOutcome `protobuf:"bytes,7,rep,name=retired,proto3" json:"retired,omitempty"`
-	Jobs    []*MountJob       `protobuf:"bytes,8,rep,name=jobs,proto3" json:"jobs,omitempty"`
-	// High-water mark, including acknowledged retirements; rejects stale snapshots.
-	RetirementSequence uint64 `protobuf:"varint,9,opt,name=retirement_sequence,json=retirementSequence,proto3" json:"retirement_sequence,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	Retired       []*RetiredOutcome `protobuf:"bytes,7,rep,name=retired,proto3" json:"retired,omitempty"`
+	Jobs          []*MountJob       `protobuf:"bytes,8,rep,name=jobs,proto3" json:"jobs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *StatusReply) Reset() {
@@ -1115,13 +1113,6 @@ func (x *StatusReply) GetJobs() []*MountJob {
 		return x.Jobs
 	}
 	return nil
-}
-
-func (x *StatusReply) GetRetirementSequence() uint64 {
-	if x != nil {
-		return x.RetirementSequence
-	}
-	return 0
 }
 
 // Idempotently acknowledge all retired outcomes through this sequence.
@@ -1778,7 +1769,7 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\x0eRetiredOutcome\x12/\n" +
 	"\x13retirement_sequence\x18\x01 \x01(\x04R\x12retirementSequence\x12G\n" +
 	"\fmount_status\x18\x02 \x01(\v2$.portablefs.workspace.v8.MountStatusR\vmountStatus\x123\n" +
-	"\x03job\x18\x03 \x01(\v2!.portablefs.workspace.v8.MountJobR\x03job\"\x97\x03\n" +
+	"\x03job\x18\x03 \x01(\v2!.portablefs.workspace.v8.MountJobR\x03job\"\xec\x02\n" +
 	"\vStatusReply\x12\x17\n" +
 	"\aboot_id\x18\x01 \x01(\fR\x06bootId\x12&\n" +
 	"\x0fhost_service_id\x18\x02 \x01(\fR\rhostServiceId\x12(\n" +
@@ -1789,8 +1780,8 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\x05state\x18\x05 \x01(\tR\x05state\x12<\n" +
 	"\x06mounts\x18\x06 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\x12A\n" +
 	"\aretired\x18\a \x03(\v2'.portablefs.workspace.v8.RetiredOutcomeR\aretired\x125\n" +
-	"\x04jobs\x18\b \x03(\v2!.portablefs.workspace.v8.MountJobR\x04jobs\x12/\n" +
-	"\x13retirement_sequence\x18\t \x01(\x04R\x12retirementSequence\"6\n" +
+	"\x04jobs\x18\b \x03(\v2!.portablefs.workspace.v8.MountJobR\x04jobsJ\x04\b\t\x10\n" +
+	"\"6\n" +
 	"\tRetireAck\x12)\n" +
 	"\x10through_sequence\x18\x01 \x01(\x04R\x0fthroughSequence\"\xb0\x02\n" +
 	"\tProvision\x126\n" +

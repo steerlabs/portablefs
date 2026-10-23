@@ -99,6 +99,14 @@ func (s *Supervisor) desiredCapacityLocked(id *pb.MountID) error {
 		}
 		keys[key] = true
 	}
+	// Retirement moves observation ownership to RetireAck, including records
+	// beyond the current Status page. No admission path may reuse that key
+	// before the host consumes and acknowledges its exact predecessor.
+	for _, outcome := range s.retired {
+		if j := outcome.Job; j != nil && proto.Equal(j.Mount, id) {
+			return refused("new key waiting for retired outcome acknowledgement")
+		}
+	}
 	if !keys[control.MountKey(id)] {
 		if len(keys) >= control.MaxMounts {
 			return refused("desired mount capacity reached")
@@ -145,11 +153,6 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 		return err
 	}
 	key := control.MountKey(id)
-	for _, outcome := range s.retired {
-		if j := outcome.Job; j != nil && proto.Equal(j.Mount, id) && request.RequestId <= j.RequestId {
-			return refused("desired job request retired or consumed")
-		}
-	}
 	previous := s.jobs[key]
 	if previous != nil {
 		if request.RequestId <= previous.status.RequestId {

@@ -460,7 +460,7 @@ private enum InjectedFailure: Error { case failed }
     status.guestServiceID = token.suspension.guestServiceID; status.generation = token.suspension.generation
     status.state = "running"
     status.mounts = token.suspension.roster.map { var m = WorkspaceMountStatus(); m.outcome = unknownTestOutcome(); m.mount = $0; m.state = "recovering"; m.cleanup = "retained"; return m }
-    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.phase == .running)
     #expect(r.coordinator.mountStatus[0].state == "recovering")
@@ -480,7 +480,7 @@ private enum InjectedFailure: Error { case failed }
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
     let retired = retiredTestOutcome(old, sequence: 1)
     status.mounts = [replacement]; status.retired = [retired]
-    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
     #expect(r.coordinator.retiredStatus == [retired])
@@ -531,13 +531,13 @@ private enum InjectedFailure: Error { case failed }
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
     let earlierRetired = retiredTestOutcome(earlier, sequence: 1); let retired = retiredTestOutcome(old, sequence: 2)
     status.mounts = [replacement]; status.retired = [earlierRetired]
-    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.retiredStatus == [earlierRetired])
     #expect(r.coordinator.mountStatus[0].mount == old.mount)
     try r.coordinator.acknowledgeRetired([earlierRetired]); r.channel.retiredAcks.removeFirst().1(.success(()))
     status.retired = [retired]
-    status.retirementSequence = max(status.retirementSequence, status.retired.last?.retirementSequence ?? 0)
+
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
 }

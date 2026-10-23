@@ -715,8 +715,9 @@ failed writes do not. Observation leaves the result intact. An early retry gets
 admission-only `predecessor-unobserved`, with reason `observe predecessor result
 with Status before retry`; it dispatches no work and changes no slot. The host
 consumes Status synchronously through the coordinator before any next exchange,
-then resubmits with a fresh request ID within the original deadline. Consumption
-of terminal evidence survives a power transition overtaking the snapshot; only
+then resubmits with a fresh request ID within the original deadline. The logical
+operation keeps its FIFO position throughout observation and resubmission.
+Consumption of terminal evidence survives a power transition overtaking the snapshot; only
 readiness publication depends on the current phase and generation. Terminal
 results are immutable, and a running attempt cannot advance to a newer request.
 MountJob field 8 is reserved; there is no predecessor history or observation RPC.
@@ -729,19 +730,22 @@ transaction, cleaned membership remains through Resume token consumption, then
 retires. It needs no further driver call or capacity. Exactly cleaned Replace
 first retires the old key using its reservation, then admits the new incarnation.
 At reservation saturation only that new admission waits; the old key is already
-retired and can be acknowledged. After acknowledgement the caller Registers the
-new incarnation. A refused Replace and its retry name the already retired or
-absent old incarnation and this continuation. Retirement, cleanup and joining
-never wait for observation.
+retired and can be acknowledged. Replace reports the committed retirement and
+the actual new-admission cause. Acknowledgement releases reservations but cannot
+restore exhausted sequence space. An absent-old retry directs a separate Register
+without promising it can succeed. Retirement, cleanup and joining never wait for
+observation.
 
 `RetiredOutcome` carries a joined job, an exactly cleaned terminal mount, or both.
 Job-only retirement asserts no membership, cleanup proof or durability outcome.
 The host coordinator owns observation and acknowledgement: it reconciles mount
 and job owners independently, retains each page before acknowledging, and advances
 full pages until the backlog is consumed. One missing owner's later page cannot
-block another owner's evidence. Duplicate acknowledgements and snapshots older
-than the observed retirement high-water mark are ignored. Status carries this
-mark even after acknowledgement. No unobserved retirement is evicted.
+block another owner's evidence. Duplicate acknowledgements are harmless.
+A same-MountID job successor waits for acknowledgement while any retired record
+carries its predecessor, including an off-page record. StatusReply field 9 is
+reserved; the correlated FIFO prevents a pre-ack snapshot arriving after its
+acknowledgement. No unobserved retirement is evicted.
 Suspend closes admission and cancels jobs before waiting for their actual
 owners, including desired-only work. One reader watches EOF while the ordered
 dispatcher drains or writes a response; loss immediately closes admission and

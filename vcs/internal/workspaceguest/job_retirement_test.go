@@ -50,19 +50,18 @@ func TestFinishedUnregisteredJobAllowsNewIncarnation(t *testing.T) {
 		t.Fatalf("expected failed job: %v", j)
 	}
 	// The host has not acknowledged the failure when it requests removal.
-	if err := s.AcceptJob(jobRequest(3, first, "umount")); err != nil {
-		t.Fatal(err)
+	if err := s.AcceptJob(jobRequest(3, first, "umount")); err == nil || !strings.Contains(err.Error(), "acknowledgement") {
+		t.Fatalf("same key reused before retirement acknowledgement: %v", err)
 	}
-	waitDesiredJobsJoined(t, s)
 	next := retirementVolume(0, 5)
-	errAccept := s.AcceptJob(jobRequest(4, next, "provision"))
 	errRegister := s.Register(context.Background(), next, Witness{}, &fakeMount{})
+	errAccept := s.AcceptJob(jobRequest(4, next, "provision"))
 	if errAccept != nil || errRegister != nil {
 		t.Fatalf("joined failed desired-only incarnation blocks replacement forever: accept=%v register=%v", errAccept, errRegister)
 	}
 	waitDesiredJobsJoined(t, s)
 	retired := s.Retired()
-	if len(retired) < 2 || retired[0].Job.Failure != "unavailable" || retired[0].Job.RequestId != 2 || retired[1].Job.RequestId != 3 {
+	if len(retired) < 1 || retired[0].Job.Failure != "unavailable" || retired[0].Job.RequestId != 2 {
 		t.Fatalf("unobserved failure lost: %v", retired)
 	}
 	encodable(t, s.Status())

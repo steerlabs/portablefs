@@ -272,9 +272,25 @@ func TestR3RandomWalkNoCapacityCycle(t *testing.T) {
 				}
 				switch op := rng.Intn(10); {
 				case op < 6:
+					// Join this key between sampling and admission to exercise a
+					// job-only retirement in the old classifier's race window.
+					s.mu.Lock()
+					inflight := s.jobs[k]
+					s.mu.Unlock()
+					if inflight != nil {
+						<-inflight.done
+					}
 					rids[k]++
 					operation := []string{"mount", "umount", "provision"}[rng.Intn(3)]
 					err := s.AcceptJob(jobRequest(rids[k]+uint64(step)*1000, m, operation))
+					// A capacity refusal dispatches nothing. Re-read under the
+					// lock: an existing key with a running job skips capacity
+					// and is lane-occupied, so it cannot disappear after such
+					// a refusal and conceal an existing-key capacity bug.
+					s.mu.Lock()
+					existing = s.mounts[k] != nil || s.jobs[k] != nil
+					A, R = len(s.activeKeysLocked()), len(s.retired)
+					s.mu.Unlock()
 					if err != nil && existing && r3Capacity(err) {
 						t.Fatalf("existing key refused for capacity A=%d R=%d: %v", A, R, err)
 					}
