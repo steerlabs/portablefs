@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -46,7 +48,10 @@ func TestSharedClockSeqlockCannotMixAuthorization(t *testing.T) {
 	defer f.Close()
 	readers := make([]*Reader, 8)
 	for i := range readers {
-		dup, _ := unix.Dup(int(f.Fd()))
+		dup, err := unix.Dup(int(f.Fd()))
+		if err != nil {
+			t.Fatal(err)
+		}
 		if readers[i], err = OpenReader(os.NewFile(uintptr(dup), "r"), binding); err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +112,7 @@ func TestSharedClockChildCannotForgePage(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Root child: DAC override lets it reopen read-write; seals must still hold.
-	rw, err := unix.Open("/proc/self/fd/"+clockTestInt(int(f.Fd())), unix.O_RDWR, 0)
+	rw, err := unix.Open("/proc/self/fd/"+strconv.Itoa(int(f.Fd())), unix.O_RDWR, 0)
 	if err == nil {
 		defer unix.Close(rw)
 		if _, e := unix.Pwrite(rw, []byte{1}, 128+8*5); e == nil {
@@ -135,7 +140,25 @@ func TestSharedClockChildCannotForgePage(t *testing.T) {
 	}
 	unix.Munmap(m)
 	// Unprivileged child (UID 1000) with the inherited descriptor.
-	cmd := exec.Command(os.Args[0], "-test.run=TestSharedClockUnprivilegedHelper")
+	// Go's build directory is private. Give the child a traversable copy so
+	// the descriptor seals, rather than an unrelated directory mode, decide.
+	dir, err := os.MkdirTemp("", "workspace-clock-child-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(dir, "clock.test")
+	if err := os.WriteFile(child, binary, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(child, "-test.run=^TestSharedClockUnprivilegedHelper$")
 	cmd.Env = append(os.Environ(), "PFS_CLOCK_TEST_HELPER=1")
 	cmd.ExtraFiles = []*os.File{f}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1000, Gid: 1000}}
@@ -204,15 +227,4 @@ func TestSharedClockClosedOwnerAndIdempotentReaderClose(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func clockTestInt(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	s := ""
-	for ; n > 0; n /= 10 {
-		s = string(rune('0'+n%10)) + s
-	}
-	return s
 }
