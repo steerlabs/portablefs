@@ -665,12 +665,6 @@ func (f *integrationFixture) mountAll() {
 		f.clients = append(f.clients, client)
 		f.transports = append(f.transports, transport)
 		f.mounts = append(f.mounts, mount)
-		if workspace != nil {
-			// Closed-start mounts skip WaitMount's polling bootstrap. Prime the
-			// protocol-only inode before a Go file open can hold a runtime P in
-			// epoll_ctl while this in-process server needs stop-the-world GC.
-			opusPollHack(t, f.paths[i])
-		}
 	}
 }
 

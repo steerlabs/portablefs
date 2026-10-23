@@ -107,6 +107,7 @@ func workspaceKernelPauseChild(t *testing.T) {
 	}
 	fmt.Println("prepared")
 	command('O')
+	opusPollHack(t, f.mountPath(0))
 	if err := os.WriteFile(f.join(1, "pause"), []byte("old"), 0600); err != nil {
 		t.Fatal(err)
 	}

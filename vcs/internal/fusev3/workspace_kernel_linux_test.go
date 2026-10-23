@@ -257,6 +257,7 @@ func workspaceKernelChild(t *testing.T) {
 		}
 	}
 	command('O')
+	opusPollHack(t, f.mountPath(0))
 	path := f.join(0, "data")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {

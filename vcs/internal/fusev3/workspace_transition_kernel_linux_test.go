@@ -694,7 +694,10 @@ func (c *opusBlockingClock) Check(mountenrollment.Permit) error { return nil }
 // holding a P. A concurrent stop-the-world then deadlocks the in-process
 // server. Teach the kernel that POLL is unsupported once, via go-fuse's
 // protocol-level hack inode, using a syscall that releases its P.
+// Call after supervisor Open, before the first Go file open on the mount;
+// closed physical-reply publication also refuses the protocol-only inode.
 func opusPollHack(t *testing.T, mount string) {
+	t.Helper()
 	fd, err := unix.Open(filepath.Join(mount, ".go-fuse-epoll-hack"), unix.O_RDONLY, 0)
 	if err != nil {
 		t.Fatal("poll hack open:", err)
