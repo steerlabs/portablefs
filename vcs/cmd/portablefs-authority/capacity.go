@@ -16,7 +16,8 @@ const (
 	defaultMaxFrameBytesInFlight       = 512 << 20
 	// The authority has no item-capacity negotiation. This must remain at least
 	// mountv3.NameCacheCapacity so a stock mount can retain its declared cache.
-	defaultMaxItemsPerSession = 1 << 16
+	defaultMaxItemsPerSession = 1 << 18
+	defaultMaxItems           = 1 << 20
 )
 
 // validateConnectionCapacity keeps physical transport admission ahead of the

@@ -190,6 +190,27 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 			continue
 		}
 		reply := response.GetWrite()
+		// XFS may update timestamps even when quota refuses every byte. A
+		// recorded metadata ticket is still a definite capacity error, not
+		// unknown placement. Preserve its errno while accounting the lost tail.
+		if !response.GetUncertain() && response.GetFailure() == 0 && response.GetErrno() == 0 &&
+			reply != nil && reply.GetCommittedSize() == 0 && reply.GetAssignedOffset() == 0 &&
+			reply.GetPostAttr().GetKind() == authoritypb.Attr_REGULAR &&
+			response.GetAppliedSequence() != 0 && response.GetPostState() != nil &&
+			(reply.GetError() == -int32(syscall.ENOSPC) || reply.GetError() == -int32(syscall.EDQUOT) || reply.GetError() == -int32(syscall.EFBIG)) {
+			if capacity == 0 {
+				capacity = syscall.Errno(-reply.GetError())
+			}
+			s.meta.Lock()
+			s.applied = max(s.applied, response.GetAppliedSequence())
+			s.meta.Unlock()
+			m.durabilityMu.Lock()
+			m.appliedHigh = max(m.appliedHigh, response.GetAppliedSequence())
+			m.durabilityMu.Unlock()
+			completion.durable = max(completion.durable, reply.GetDurableSequence())
+			m.updateBaseFromResponse(s, response)
+			continue
+		}
 		if successfulDelegationResponse(response) != nil || reply == nil || response.GetVolumeVersion() == 0 || reply.GetPostAttr() == nil || reply.GetPostAttr().GetKind() != authoritypb.Attr_REGULAR || reply.GetPostAttr().GetSize() < e.Offset+int64(result.size) || reply.GetCommittedSize() != uint64(result.size) || reply.GetAssignedOffset() != uint64(e.Offset) || reply.GetError() != 0 || response.GetAppliedSequence() == 0 {
 			lost = true
 			continue

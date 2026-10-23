@@ -105,6 +105,15 @@ type sourcePublicationGate struct {
 	names []sourceNamespaceSpec
 }
 
+type sourcePublicationTryKey struct{}
+
+// Buffered admission must yield its operation turn while an allocating
+// callback owns the source gate: that callback needs the turn to install its
+// grant before it can release the gate.
+type sourcePublicationWait struct{ changed <-chan struct{} }
+
+func (*sourcePublicationWait) Error() string { return "fusev3: source publication is busy" }
+
 func sourceItem(item *authoritypb.Item, attributes, data bool) (sourceItemSpec, error) {
 	identity, ok := publicationIdentityFromItem(item)
 	if !ok || !attributes || data && !attributes {
@@ -399,6 +408,9 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		if r.leaseRecallHeldLocked(coordinates) {
 			changed := r.sourceChangedWaitLocked()
 			r.mu.Unlock()
+			if ctx.Value(sourcePublicationTryKey{}) != nil {
+				return nil, &sourcePublicationWait{changed: changed}
+			}
 			select {
 			case <-changed:
 				continue
@@ -409,6 +421,9 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		if r.sourceLeaseOverlapLocked(coordinates, nil) {
 			changed := r.sourceChangedWaitLocked()
 			r.mu.Unlock()
+			if ctx.Value(sourcePublicationTryKey{}) != nil {
+				return nil, &sourcePublicationWait{changed: changed}
+			}
 			select {
 			case <-changed:
 				continue

@@ -163,12 +163,15 @@ func completeSourcePublication(ctx context.Context) error {
 	if lease == nil {
 		return nil
 	}
-	if err := lease.markCallbackPublicationReady(); err != nil {
-		return err
-	}
 	publication := replyPublicationFromContext(ctx)
 	if publication == nil {
 		return errors.New("fusev3: source publication escaped its reply ownership")
+	}
+	lease.r.mu.Lock()
+	publication.stamp = lease.r.mount.subscription.advanceSource(publication.stamp, lease.coordinates, publication.servedVersion)
+	lease.r.mu.Unlock()
+	if err := lease.markCallbackPublicationReady(); err != nil {
+		return err
 	}
 	return nil
 }

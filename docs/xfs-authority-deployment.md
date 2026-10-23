@@ -319,8 +319,8 @@ the worker class and workload measurements.
 | `--max-replay-slots` | `256` |
 | `--max-sessions` | `1024` |
 | `--max-lock-records` | `65536` |
-| `--max-items` | `65536` |
-| `--max-items-per-session` | `65536` |
+| `--max-items` | `1048576` |
+| `--max-items-per-session` | `262144` |
 | `--max-opens` | `32768` |
 | `--max-opens-per-session` | `4096` |
 | `--max-retained-reply-bytes` | `512 MiB` |

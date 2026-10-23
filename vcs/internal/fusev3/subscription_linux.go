@@ -246,6 +246,34 @@ func (s *subscriptionRegistry) stamp() subscriptionStamp {
 	return subscriptionStamp{incarnation: s.incarnation, generation: s.generation}
 }
 
+// The source is omitted from the authority's change stream. Its own commit
+// must nevertheless reject older in-flight samples after its local gate opens.
+// Refresh only the committing reply; unrelated coordinates retain their stamps.
+func (s *subscriptionRegistry) advanceSource(stamp subscriptionStamp, coordinates map[publicationCoordinate]struct{}, version uint64) subscriptionStamp {
+	if s == nil {
+		return stamp
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active || stamp.incarnation != s.incarnation {
+		return stamp
+	}
+	s.generation++
+	if len(s.coordinates)+len(coordinates) > maxSubscriptionCoordinates {
+		clear(s.coordinates)
+		s.generationFloor = s.generation
+		s.versionFloor = max(s.versionFloor, version)
+	}
+	for coordinate := range coordinates {
+		state := s.coordinates[coordinate]
+		state.generation = s.generation
+		state.minVersion = max(state.minVersion, version)
+		s.coordinates[coordinate] = state
+	}
+	stamp.generation = s.generation
+	return stamp
+}
+
 // remaining is the sole cache-admission predicate. A change advances only its
 // exact coordinates, so an unrelated event does not invalidate a reply already
 // in flight. The global generation remains in the stamp to distinguish a reply

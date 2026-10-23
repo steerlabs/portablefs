@@ -1343,7 +1343,7 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		applyErr = syscall.EIO
 	}
 	expectedPost := uint64(before.Size)
-	if end := assigned + committed; end > expectedPost {
+	if end := assigned + committed; committed != 0 && end > expectedPost {
 		expectedPost = end
 	}
 	if dispatched {

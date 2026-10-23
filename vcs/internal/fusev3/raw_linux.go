@@ -2260,7 +2260,7 @@ func (r *rawFileSystem) Forget(nodeID, nlookup uint64) {
 }
 
 func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
-	if record == nil || record.root || record.reclaimed || record.lookups != 0 || record.inFlight != 0 || record.pins != 0 || len(record.names) != 0 {
+	if record == nil || record.root || record.reclaimed || record.lookups != 0 || record.inFlight != 0 || record.pins != 0 {
 		return nil
 	}
 	record.reclaimed = true
@@ -4101,7 +4101,10 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 				var ok bool
 				record, item, ok = r.addLookupHeldDirent(dirent)
 				if !ok {
-					return fuse.EIO
+					// Enumeration needs no retained item. A saturated authority or
+					// a concurrent FORGET can leave this row without one; NodeId 0
+					// lists the name without installing an inode in the kernel.
+					continue
 				}
 			} else {
 				record, errno = r.intern(ctx, item)

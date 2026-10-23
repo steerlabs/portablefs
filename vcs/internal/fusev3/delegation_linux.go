@@ -652,6 +652,37 @@ func (m *delegationManager) modeAndBuffer(s *delegationState) (*delegationState,
 	return s, m.buf, mode, nil
 }
 
+// Return with operation and admission held. A source owner may need operation
+// to register its returned grant, so contention waits hold neither lock and
+// recheck ownership before attempting local acceptance.
+func (m *delegationManager) lockPreparedAdmission(ctx context.Context, s *delegationState) (*writeback.Buffer, authoritypb.DelegationMode, error) {
+	for {
+		if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+			return nil, 0, err
+		}
+		_, buffer, mode, err := m.modeAndBuffer(s)
+		if err != nil {
+			s.operation.Unlock()
+			return nil, 0, err
+		}
+		err = prepareDelegationAdmission(ctx)
+		if err == nil {
+			return buffer, mode, nil
+		}
+		s.admission.RUnlock()
+		s.operation.Unlock()
+		var waiting *sourcePublicationWait
+		if !errors.As(err, &waiting) {
+			return nil, 0, err
+		}
+		select {
+		case <-waiting.changed:
+		case <-ctx.Done():
+			return nil, 0, ctx.Err()
+		}
+	}
+}
+
 func (m *delegationManager) markAccepted(s *delegationState, cut writeback.Cut) {
 	s.meta.Lock()
 	defer s.meta.Unlock()
@@ -681,7 +712,8 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	}()
 	s := m.retainState(id, true)
 	defer m.releaseState(s)
-	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+	b, mode, err := m.lockPreparedAdmission(ctx, s)
+	if err != nil {
 		return writeback.Cut{}, err
 	}
 	lockedState := s
@@ -691,14 +723,6 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 			lockedState.operation.Unlock()
 		}
 	}()
-	s, b, mode, err := m.modeAndBuffer(s)
-	if err != nil {
-		return writeback.Cut{}, err
-	}
-	if err := prepareDelegationAdmission(ctx); err != nil {
-		s.admission.RUnlock()
-		return writeback.Cut{}, err
-	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
 	var handle *handleAcceptedCut
@@ -788,7 +812,8 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	}()
 	s := m.retainState(id, true)
 	defer m.releaseState(s)
-	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+	b, mode, err := m.lockPreparedAdmission(ctx, s)
+	if err != nil {
 		return writeback.Cut{}, err
 	}
 	lockedState := s
@@ -798,14 +823,6 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 			lockedState.operation.Unlock()
 		}
 	}()
-	s, b, mode, err := m.modeAndBuffer(s)
-	if err != nil {
-		return writeback.Cut{}, err
-	}
-	if err := prepareDelegationAdmission(ctx); err != nil {
-		s.admission.RUnlock()
-		return writeback.Cut{}, err
-	}
 	ref, generation := s.ref, b.Generation(id)
 	s.admission.RUnlock()
 	var handle *handleAcceptedCut

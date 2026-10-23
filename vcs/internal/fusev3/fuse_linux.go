@@ -3185,7 +3185,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		var lease *sourcePublicationLease
 		ctx = context.WithValue(ctx, delegationPrepareContextKey{}, func() error {
 			var acquireErr error
-			lease, acquireErr = callback.acquireSource(ctx, n.mount.raw, gate)
+			lease, acquireErr = callback.acquireSource(context.WithValue(ctx, sourcePublicationTryKey{}, true), n.mount.raw, gate)
 			if acquireErr != nil {
 				return acquireErr
 			}
