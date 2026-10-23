@@ -73,15 +73,14 @@ func (r Recovery) ready(g, serial uint64) bool {
 		r.Renewal.Ready(r.Standalone, mountenrollment.Permit{Generation: g, GateSerial: serial}, r.SessionID, r.AuthorizationDeadline)
 }
 
-type Witness struct {
-	Process, Kernel, Session, Enrollment string
-	RoutesRevision                       [32]byte
-}
+type Witness = workspacemount.Witness
 type CleanupProof struct {
 	Witness                     Witness
 	ProcessExited, KernelAbsent bool
 }
 type entry struct {
+	witnessLane             sync.Mutex
+	binding                 bool
 	status                  *pb.MountStatus
 	driver                  Mount
 	witness                 Witness
@@ -127,6 +126,7 @@ func initialStatus(id *pb.MountID) *pb.MountStatus {
 }
 
 type Supervisor struct {
+	persistWitness       func(*pb.MountID, Witness) error
 	identities           *workspacemount.Store
 	clock                guestClock
 	waitClock            func(context.Context, uint64) error
@@ -200,7 +200,7 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 		err = refused("register mount capacity reached")
 	} else {
 		for _, e := range s.mounts {
-			if bytes.Equal(e.status.Mount.AuthorityId, id.AuthorityId) && e.status.Mount.VolumeId == id.VolumeId {
+			if bytes.Equal(e.status.Mount.AuthorityId, id.AuthorityId) && e.status.Mount.VolumeId == id.VolumeId || w.Target != "" && e.witness.Target == w.Target && !e.cleaned {
 				err = refused("register duplicate volume")
 				break
 			}
@@ -489,7 +489,7 @@ func (s *Supervisor) publishRecoveryLocked(ctx context.Context, e *entry, g uint
 	if err == nil {
 		err = ctx.Err()
 	}
-	if err == nil && r.ready(g, e.gateSerial) {
+	if err == nil && !e.binding && r.ready(g, e.gateSerial) {
 		err = e.driver.OpenAdmission(g, e.gateSerial)
 		if err == nil {
 			// Only a published serving interval starts fresh disposition evidence.
@@ -625,7 +625,7 @@ func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
 	if e.cleaned {
 		return nil
 	}
-	if p.Witness != e.witness {
+	if e.binding || p.Witness != e.witness {
 		return refused("cleanup terminal identity mismatch")
 	}
 	if !p.ProcessExited || !p.KernelAbsent {
