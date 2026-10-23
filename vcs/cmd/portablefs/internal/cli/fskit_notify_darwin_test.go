@@ -4,10 +4,12 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,8 +23,36 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	root := t.TempDir()
 	image := filepath.Join(root, "events.dmg")
 	mount := filepath.Join(root, "mounted")
+	seed := filepath.Join(root, "seed")
 	if err := os.Mkdir(mount, 0700); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Mkdir(seed, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// This fixture needs mount-table changes, not a writable filesystem.
+	// Exclude Spotlight before the test mounts the image; adding the marker
+	// after attach would race the very background opens we need to prevent.
+	if err := os.WriteFile(filepath.Join(seed, ".metadata_never_index"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	device := ""
+	var devices []string
+	diagnose := func() {
+		t.Helper()
+		commands := [][]string{
+			{"/usr/sbin/lsof", "-nP", "+f", "--", mount},
+			append([]string{"/usr/sbin/lsof", "-nP", "--", image}, devices...),
+		}
+		if device != "" {
+			commands = append(commands, []string{"/usr/sbin/diskutil", "info", device})
+		}
+		for _, args := range commands {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
+			cancel()
+			t.Logf("fixture diagnostic %v: %v: %s", args, err, out)
+		}
 	}
 
 	runTool := func(tool string, args ...string) []byte {
@@ -33,21 +63,18 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 			if exit, ok := err.(*exec.ExitError); ok {
 				stderr = exit.Stderr
 			}
+			diagnose()
 			t.Fatalf("%s %v: %v: %s%s", tool, args, err, out, stderr)
 		}
 		return out
 	}
 	run := func(args ...string) []byte { t.Helper(); return runTool("/usr/bin/hdiutil", args...) }
-	run("create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest", image)
-	device := ""
-	t.Cleanup(func() {
-		if device != "" {
-			run("detach", "-force", device)
-		}
-	})
+	run("create", "-quiet", "-size", "64m", "-fs", "APFS", "-volname", "PFSNotificationTest",
+		"-srcfolder", seed, "-format", "UDRO", image)
+	detachAttempted := false
 	attach := func() {
 		t.Helper()
-		out := run("attach", "-plist", "-nobrowse", "-mountpoint", mount, image)
+		out := run("attach", "-plist", "-readonly", "-nobrowse", "-noautofsck", "-mountpoint", mount, image)
 		convert := exec.Command("/usr/bin/plutil", "-convert", "json", "-o", "-", "-")
 		convert.Stdin = bytes.NewReader(out)
 		converted, err := convert.CombinedOutput()
@@ -65,7 +92,12 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 			t.Fatal(err)
 		}
 		mounted := false
+		devices = nil
+		detachAttempted = false
 		for _, entity := range result.Entities {
+			if entity.Device != "" {
+				devices = append(devices, entity.Device, "/dev/r"+strings.TrimPrefix(entity.Device, "/dev/"))
+			}
 			if entity.Content == "GUID_partition_scheme" {
 				device = entity.Device
 			}
@@ -79,6 +111,7 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 	}
 	detach := func() {
 		t.Helper()
+		detachAttempted = true
 		// APFS volumes live on a synthesized disk, distinct from the attached
 		// image's whole disk. Disk Arbitration must finish unmounting all of them
 		// before image ejection. A partial detach can already have removed the
@@ -86,7 +119,13 @@ func TestFSKitNativeGlobalMountNotification(t *testing.T) {
 		runTool("/usr/sbin/diskutil", "unmountDisk", "force", device)
 		run("detach", "-force", device)
 		device = ""
+		devices = nil
 	}
+	t.Cleanup(func() {
+		if device != "" && !detachAttempted {
+			detach()
+		}
+	})
 	wait := func(w fsKitMountWatcher) {
 		t.Helper()
 		select {
