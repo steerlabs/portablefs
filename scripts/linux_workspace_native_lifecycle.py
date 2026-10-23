@@ -146,7 +146,7 @@ print('all-acknowledged-records-intact')
         return drain
 
     def network(self):
-        for seconds in (8, 20):
+        for seconds in (8, 20, 90):
             before = self.a.authority_sessions()
             generation = int(self.a.status(self.g)['generation'])
             incarnation = self.mount()['mount']['incarnation']

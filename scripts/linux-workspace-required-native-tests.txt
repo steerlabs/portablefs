@@ -36,6 +36,7 @@ managed-provision-only-reboot-reissue
 managed-terminal-final-evidence-retired
 managed-network-outage-8s
 managed-network-outage-20s
+managed-network-outage-90s
 managed-busy-cwd-unmount-retry
 managed-busy-fsync-unmount-retry
 managed-suspend-application-transparency

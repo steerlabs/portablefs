@@ -116,6 +116,14 @@ keeping the tracked unlock obligation for session-owned RELEASE cleanup; a
 closed serving gate whose dispatch still runs keeps its existing cleanup path.
 Known loss still wins the FLUSH result.
 
+An assigned mutation keeps its exact replay identity beyond an individual
+network-attempt deadline. An expired cache drain may still reconcile that
+registered replay, including assigned barrier/cleanup results; it cannot assign
+another mutation. The authority returns the retained outcome or refuses the old
+subscription rather than authorizing fresh cache work. TLS establishment still
+requires the current shared clock. Cold acknowledgment joins applying replays;
+the power deadline does not grow while that join waits.
+
 A serving managed driver must close admission before its safe cutoff. The cold
 owner Parks and joins the renewer with the other captured workers; a proof-loss
 observation does not independently Park it while recovery is still being

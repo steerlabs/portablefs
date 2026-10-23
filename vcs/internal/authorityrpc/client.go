@@ -2153,6 +2153,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 			return nil, nil, ownerErr
 		}
 		defer releaseOwner()
+		ctx = context.WithValue(ctx, dispatchReplayKey{}, request)
 	}
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
 		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
@@ -2177,6 +2178,12 @@ func (c *Client) CallMutationWithIdentityRetained(
 		var attemptSubmitted bool
 		response, releaseFrame, attemptSubmitted, err = c.dispatchOwnedFrame(ctx, request)
 		submitted = submitted || attemptSubmitted
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil && c.cfg.DispatchFence != nil {
+			// A managed network-attempt budget is not the lifetime of its
+			// assigned replay. Keep the original body/slot until the session
+			// verdict resolves it, including beyond cache withdrawal.
+			err = ErrTransportUncertain
+		}
 		if !errors.Is(err, ErrTransportUncertain) {
 			break
 		}
