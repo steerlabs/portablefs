@@ -19,7 +19,7 @@ type ManagedConfig struct {
 	Standalone  bool
 	Persist     func(WorkspaceObservation) error
 	FUSE, Abort int
-	Remove      func(mode string) error
+	Remove      func(mode string, cause error) error
 }
 
 func (c *ManagedConfig) validate() error {

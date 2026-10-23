@@ -756,7 +756,7 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		}
 	}
 	if m.managedRemoval != nil {
-		out.record(1, "root-removal", m.managedRemoval("terminal"))
+		out.record(1, "root-removal", m.managedRemoval("terminal", m.fatalError()))
 		if _, err := installed.absent(); err != nil {
 			out.record(1, "absence", err)
 		} else {

@@ -224,7 +224,7 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	managedRemoval func(string) error
+	managedRemoval func(string, error) error
 	workspace      *workspaceadmission.Reader
 
 	posixMu       sync.Mutex
@@ -341,7 +341,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	fsName := "portablefs:" + cfg.MountInstanceID
 	failBeforeKernelMount := func(cause error) (*Mount, error) {
 		if cfg.Managed != nil {
-			if err := cfg.Managed.Remove("terminal"); err != nil {
+			if err := cfg.Managed.Remove("terminal", cause); err != nil {
 				rpc.FinishLocalSessionEnforcement()
 				return nil, errors.Join(cause, err, rpc.Close())
 			}
@@ -684,7 +684,7 @@ func (m *Mount) start(lease time.Duration) {
 // close upgrades the original error to a clean-startup verdict.
 func (m *Mount) abortMount(cause error) error {
 	if m.managedRemoval != nil {
-		if err := m.managedRemoval("terminal"); err != nil {
+		if err := m.managedRemoval("terminal", cause); err != nil {
 			return errors.Join(cause, err)
 		}
 	} else {

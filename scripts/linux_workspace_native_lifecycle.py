@@ -180,12 +180,15 @@ print('all-acknowledged-records-intact')
     def mount_race(self, public):
         self.a.unmount(self.g, public)
         public = self.a.mount(self.g, provision_only=True)
+        observed = len(self.g.history)
         self.g.p.stdin.write(json.dumps({'command':'mount','body':public['mount']})+'\n'+json.dumps({'command':'pause'})+'\n')
         self.g.p.stdin.flush()
         paused = self.g.wait('paused', 20)
         assert paused['fenced']
         self.g.command('resume'); self.g.wait('resumed', 20)
-        assert self.g.wait('mount-accepted', 10)['code'] == 'accepted'
+        accepted = next((e for e in self.g.history[observed:] if e['event'] == 'mount-accepted'), None)
+        if accepted is None: accepted = self.g.wait('mount-accepted', 10)
+        assert accepted['code'] == 'accepted', accepted
         self.a.job(self.g, 'mount', timeout=15)
         mounted = self.a.ready(self.g, timeout=15)
         public['incarnation'] = mounted['mount']['incarnation']
@@ -193,6 +196,23 @@ print('all-acknowledged-records-intact')
         assert self.a.peer("import pathlib;print(pathlib.Path('/var/tmp/pfs-native/home/peer/mount-race').read_text())") == 'resumed-intent'
         self.save('managed-mount-intent-across-suspend', {'mount': mounted})
         return public
+
+    def terminal_io(self, public):
+        with self.holder('fsync', threads=4) as holder:
+            started = time.monotonic()
+            self.a.kill_child(self.g)
+            elapsed = time.monotonic()-started
+            assert elapsed < 10, elapsed
+            mounted = self.mount()
+            assert 'killed' in mounted['reason'] and mounted['cleanup'] == 'complete', mounted
+            value = self.finish_holder(holder, allow_errors=True)
+            assert value['errors'], value
+        self.a.unmount(self.g, public)
+        replacement = self.a.mount(self.g)
+        assert replacement['incarnation'] != public['incarnation']
+        self.save('managed-terminal-removal-wakes-inflight-io',
+                  {'seconds': elapsed, 'terminal': mounted, 'application': value})
+        return replacement
 
     def long_pause(self, public):
         with self.holder('cwd') as holder:
@@ -230,4 +250,5 @@ def lifecycle_checks(authority, guest, public, record):
     public = checks.busy(public)
     checks.suspend()
     public = checks.mount_race(public)
+    public = checks.terminal_io(public)
     return checks.long_pause(public)

@@ -418,8 +418,12 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 		if err = c.control.Owner.Record(mountcontrol.Facts{Witness: w}); err != nil {
 			return nil, err
 		}
-		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string) error {
-			return c.control.Owner.RequireRemoval(context.Background(), mode, "kernel removal required")
+		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string, cause error) error {
+			reason := "workspace unmount requested"
+			if cause != nil {
+				reason = control.BoundedReason(cause.Error())
+			}
+			return c.control.Owner.RequireRemoval(context.Background(), mode, reason)
 		}}, nil
 	}})
 	c.authorityAttached, c.startupClean = attached, clean
