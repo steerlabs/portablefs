@@ -1014,9 +1014,9 @@ func (d *Driver) cleanupProof() CleanupProof {
 	return p
 }
 func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, result error) {
-	defer func() { evidence := d.cleanupProof(); proof.Loss, proof.Outcome = evidence.Loss, evidence.Outcome }()
 	d.cleanupMu.Lock()
 	defer d.cleanupMu.Unlock()
+	defer func() { evidence := d.cleanupProof(); proof.Loss, proof.Outcome = evidence.Loss, evidence.Outcome }()
 	if d.cleaned.Load() {
 		return CleanupProof{Witness: d.bound(), ProcessExited: true, KernelAbsent: true}, nil
 	}
