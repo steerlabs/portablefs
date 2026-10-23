@@ -35,8 +35,3 @@ func (m *Mount) RevokeWorkspace(cause error) {
 		m.revoke(cause)
 	}
 }
-func (m *Mount) CloseWorkspaceAdmission() {
-	if m.workspace != nil && m.subscription != nil {
-		m.subscription.deactivate()
-	}
-}

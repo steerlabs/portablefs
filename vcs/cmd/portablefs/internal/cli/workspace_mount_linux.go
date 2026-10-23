@@ -151,9 +151,9 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 		return err == nil
 	}, CloseAdmission: func() {
 		c.localOpen.Store(false)
-		if m := c.mounted.Load(); m != nil {
-			m.mount.CloseWorkspaceAdmission()
-		}
+		// The local predicate denies new entry/acceptance immediately. Only the
+		// lifecycle owner may deactivate the subscription after capturing its
+		// old CONTROL/drain horizon and joining its installation owner.
 	}, Driver: mountcontrol.Driver{Run: c.run, ValidateInstall: func(rights *mountcontrol.Rights, p mountcontrol.Phase) error {
 		return fusev3.ValidateManagedDescriptors(rights.FDs[0], rights.FDs[1], p.Witness.Source, p.Witness.Target)
 	}, Install: c.adoptKernel}}

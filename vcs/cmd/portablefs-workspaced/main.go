@@ -1,5 +1,4 @@
-// portablefs-workspaced owns the VM-bound guest control stream. Mount creation
-// remains unavailable until the real daemon suspension boundary is integrated.
+// portablefs-workspaced owns the VM-bound control stream and protected mounts.
 package main
 
 import (

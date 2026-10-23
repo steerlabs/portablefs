@@ -30,6 +30,11 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer stream.Close()
+	defer func() {
+		if serveErr != nil && supervisor.channelFailure != nil {
+			supervisor.channelFailure(serveErr)
+		}
+	}()
 	defer supervisor.ChannelLost()
 	stop := context.AfterFunc(ctx, func() { supervisor.ChannelLost(); _ = stream.Close() })
 	defer stop()
@@ -169,6 +174,11 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, expected *pb.Hello, s
 		}
 	}
 }
+
+// ConfigureChannelFailure is installed before pairing. Observation runs after
+// admission closure and before the owned stream closes; host discard may stop
+// the VM immediately at EOF, before main could report a returned error.
+func (s *Supervisor) ConfigureChannelFailure(observe func(error)) { s.channelFailure = observe }
 
 // No supervisor lock spans I/O. Only the paired dispatcher commits observation,
 // after the complete frame has been written successfully.

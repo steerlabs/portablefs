@@ -96,6 +96,7 @@ type Supervisor struct {
 	ackLane              sync.Mutex
 	persistRetirement    func([]*pb.MountID) error
 	persistWitness       func(*pb.MountID, Witness) error
+	channelFailure       func(error)
 	identities           *workspacemount.Store
 	clock                guestClock
 	waitClock            func(context.Context, uint64) error

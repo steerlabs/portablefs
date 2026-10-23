@@ -292,6 +292,9 @@ func serve() error {
 			return fmt.Errorf("guest workspace: %w", err)
 		}
 		mounts.Host = supervisor
+		supervisor.ConfigureChannelFailure(func(err error) {
+			fmt.Fprintln(os.Stderr, "workspace control failure:", control.BoundedReason(err.Error()))
+		})
 		supervisor.ConfigureWitnessPersistence(inventory.BindWitness)
 		supervisor.ConfigureRetirementPersistence(inventory.Acknowledge)
 		for _, run := range inventory.Snapshot() {
