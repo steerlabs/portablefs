@@ -30,6 +30,7 @@ type workspaceClock interface {
 type workspaceDispatch interface {
 	ParkDispatch(context.Context) error
 	ResumeDispatch(func() error) error
+	DrainDispatch(func() error) error
 	DispatchSnapshot() authorityrpc.DispatchSnapshot
 	AuthorizationDeadline() time.Time
 }
@@ -769,6 +770,17 @@ func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d works
 		return m.finishWorkspaceCold(w, d)
 	}
 	w.outcome = control.UnknownOutcome()
+	if err = d.DrainDispatch(func() error {
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+		if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
+			return errSubscriptionExpired
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
 	w.workers = nil
 	for group := 0; group < 6; group++ {
 		w.workerDisposition(group, "unresolved")

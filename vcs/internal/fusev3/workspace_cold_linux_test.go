@@ -71,6 +71,10 @@ func (r *coldTestRPC) ResumeDispatch(check func() error) error {
 	r.parked.Store(false)
 	return nil
 }
+func (r *coldTestRPC) DrainDispatch(check func() error) error {
+	r.parked.Store(false)
+	return nil
+}
 func (r *coldTestRPC) DispatchSnapshot() authorityrpc.DispatchSnapshot {
 	return authorityrpc.DispatchSnapshot{Parked: r.parked.Load()}
 }
