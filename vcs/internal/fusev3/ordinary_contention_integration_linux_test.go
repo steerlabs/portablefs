@@ -4,12 +4,18 @@ package fusev3
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
 func TestOrdinaryAtomicSaveWithLocalReader(t *testing.T) {
@@ -39,7 +45,19 @@ func TestOrdinaryAtomicSaveWithLocalReader(t *testing.T) {
 			}
 		}()
 	}
-	defer close(stop)
+	defer func() {
+		close(stop)
+		for range 2 {
+			select {
+			case err := <-readers:
+				if err != nil {
+					t.Error(err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("atomic-save reader did not stop")
+			}
+		}
+	}()
 	for round := range 500 {
 		file, err := os.OpenFile(f.join(0, "temporary"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
@@ -56,11 +74,6 @@ func TestOrdinaryAtomicSaveWithLocalReader(t *testing.T) {
 		if err := os.Rename(f.join(0, "temporary"), name); err != nil {
 			t.Fatalf("save %d: %v", round, err)
 		}
-		select {
-		case err := <-readers:
-			t.Fatalf("reader stopped: %v", err)
-		default:
-		}
 	}
 	for mount := range 2 {
 		if _, err := os.ReadDir(f.mountPath(mount)); err != nil {
@@ -69,8 +82,59 @@ func TestOrdinaryAtomicSaveWithLocalReader(t *testing.T) {
 	}
 }
 
-func TestOrdinaryThreeInPlaceWriters(t *testing.T) {
+func TestOrdinaryDelayedLookupCannotRestorePreRenameBinding(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{})
+	mustWrite(t, f.join(0, "document"), []byte("original"), 0600)
+	raw := f.mounts[0].raw
+	raw.mu.Lock()
+	raw.dropCachedNameLocked(nameKey{parent: raw.nodesByID[1].key.inode, name: "document"})
+	raw.mu.Unlock()
+	var armed atomic.Bool
+	armed.Store(true)
+	sampled, release := make(chan struct{}), make(chan struct{})
+	f.transports[0].setAfterMutation(func(request *authoritypb.Request, response *authoritypb.Response, err error) {
+		if request.GetLookup() != nil && string(request.GetLookup().GetName()) == "document" && response.GetLookup().GetItem() != nil && armed.CompareAndSwap(true, false) {
+			close(sampled)
+			<-release
+		}
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	done := make(chan error, 1)
+	go func() { _, err := os.Stat(f.join(0, "document")); done <- err }()
+	select {
+	case <-sampled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("LOOKUP did not sample pre-rename binding")
+	}
+	mustWrite(t, f.join(0, "temporary"), []byte("replacement"), 0600)
+	if err := os.Rename(f.join(0, "temporary"), f.join(0, "document")); err != nil {
+		t.Fatal(err)
+	}
+	unblock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for mount := range 2 {
+		if got, err := os.ReadFile(f.join(mount, "document")); err != nil || string(got) != "replacement" {
+			t.Fatalf("mount %d retained old binding: %q, %v", mount, got, err)
+		}
+	}
+	mustWrite(t, f.join(0, "temporary"), []byte("third"), 0600)
+	if err := os.Rename(f.join(0, "temporary"), f.join(0, "document")); err != nil {
+		t.Fatalf("next save: %v", err)
+	}
+}
+
+func TestOrdinaryThreeInPlaceWriters(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{beforeServe: func(f *integrationFixture) {
+		f.counter.inner = &ordinaryResultHandler{Handler: f.counter.inner, observe: func(request *authoritypb.Request, response *authoritypb.Response) {
+			if response.GetErrno() == int32(syscall.EIO) || response.GetUncertain() {
+				t.Logf("authority %s errno=%d uncertain=%t failure=%s health=%v", requestKind(request), response.GetErrno(), response.GetUncertain(), response.GetFailure(), f.store.Health())
+			}
+		}}
+	}})
 	mustWrite(t, f.join(0, "overwrite"), []byte("initial"), 0600)
 	start := make(chan struct{})
 	done := make(chan error, 3)
@@ -101,7 +165,7 @@ func TestOrdinaryThreeInPlaceWriters(t *testing.T) {
 		select {
 		case err := <-done:
 			if err != nil {
-				t.Fatal(err)
+				t.Errorf("%v; mount errors: %v / %v", err, f.mounts[0].fatalError(), f.mounts[1].fatalError())
 			}
 		case <-time.After(30 * time.Second):
 			t.Fatalf("in-place writers stalled: %s", f.sessionDiagnostics())
@@ -112,6 +176,49 @@ func TestOrdinaryThreeInPlaceWriters(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+type ordinaryResultHandler struct {
+	authorityrpc.Handler
+	observe func(*authoritypb.Request, *authoritypb.Response)
+}
+
+func (h *ordinaryResultHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	response := h.Handler.Handle(ctx, request)
+	h.observe(request, response)
+	return response
+}
+
+func TestOrdinaryRecoverableUncertainRename(t *testing.T) {
+	var inject atomic.Bool
+	f := newIntegrationFixture(t, integrationConfig{beforeServe: func(f *integrationFixture) {
+		f.counter.inner = &ordinaryResultHandler{Handler: f.counter.inner, observe: func(request *authoritypb.Request, response *authoritypb.Response) {
+			if request.GetRename() != nil && response.GetErrno() == 0 && inject.CompareAndSwap(true, false) {
+				// The source proof can expire after XFS application. The retained
+				// replay result then reports uncertainty without ending the session.
+				response.Body, response.PostState = nil, nil
+				response.Errno, response.Uncertain = int32(syscall.EIO), true
+				response.Failure = authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+			}
+		}}
+	}})
+	mustWrite(t, f.join(0, "old"), []byte("original"), 0600)
+	mustWrite(t, f.join(0, "new"), []byte("replacement"), 0600)
+	inject.Store(true)
+	if err := os.Rename(f.join(0, "new"), f.join(0, "old")); !errors.Is(err, syscall.EREMOTEIO) {
+		t.Fatalf("uncertain rename = %v, want EREMOTEIO", err)
+	}
+	if got, err := os.ReadFile(f.join(1, "old")); err != nil || string(got) != "replacement" {
+		t.Fatalf("applied uncertain rename = %q, %v", got, err)
+	}
+	waitUntil(t, 5*time.Second, "cold subscription after uncertain result", func() bool { return f.mounts[0].subscription.stamp() != (subscriptionStamp{}) })
+	if f.mounts[0].isRevoked() || f.clients[0].SessionEndCause() != nil {
+		t.Fatalf("uncertainty killed mount/session: %v / %v", f.mounts[0].fatalError(), f.clients[0].SessionEndCause())
+	}
+	if got, err := os.ReadFile(f.join(0, "old")); err != nil || string(got) != "replacement" {
+		t.Fatalf("inspect after uncertainty = %q, %v", got, err)
+	}
+	mustWrite(t, f.join(0, "after-uncertainty"), []byte("healthy"), 0600)
 }
 
 func TestOrdinaryItemPressurePreservesExistingAccess(t *testing.T) {

@@ -749,7 +749,7 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	if err == nil && syncWrite {
 		// The operation lock fixes the accepted cut. Release admission before a
 		// flush can record a refusal and rebind the successor buffer generation.
-		applied, err = m.syncIdentityCut(ctx, s, b, cut, false)
+		applied, err = b.FlushIdentity(ctx, id, cut)
 	}
 	if err != nil {
 		return cut, err
@@ -770,6 +770,11 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 		operationLocked = false
 		m.frontend.RUnlock()
 		frontendLocked = false
+		if syncWrite {
+			if err := m.syncIdentity(ctx, s, false); err != nil {
+				return cut, err
+			}
+		}
 		if err := m.waitVisibility(ctx, b, id, cut, applied); err != nil {
 			return cut, err
 		}
@@ -1471,6 +1476,11 @@ func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState
 	s.admission.RLock()
 	handle := firstDelegatedHandle(s.handles)
 	s.admission.RUnlock()
+	if caller, _ := ctx.Value(handleAcceptanceKey{}).(*fileHandle); caller != nil {
+		// The raw callback pins this exact description through FSYNC. An
+		// arbitrary sibling may close while recall is making progress.
+		handle = caller.token
+	}
 	if len(handle) == 0 {
 		return errors.New("fusev3: delegated fsync has no live server handle")
 	}
@@ -1488,19 +1498,6 @@ func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState
 	return nil
 }
 
-// The operation lock fixes this identity's accepted cut. FSYNC proves only
-// that file durable; its common prefix may remain behind an unrelated writer.
-func (m *delegationManager) syncIdentityCut(ctx context.Context, s *delegationState, b *writeback.Buffer, cut writeback.Cut, dataOnly bool) (uint64, error) {
-	applied, err := b.FlushIdentity(ctx, s.identity, cut)
-	if err != nil {
-		return applied, err
-	}
-	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
-		return applied, err
-	}
-	return applied, nil
-}
-
 func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly bool) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
@@ -1514,10 +1511,16 @@ func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly
 		return err
 	}
 	cut := m.buf.Snapshot()
-	applied, err := m.syncIdentityCut(ctx, s, m.buf, cut, dataOnly)
+	applied, err := m.buf.FlushIdentity(ctx, s.identity, cut)
 	s.operation.Unlock()
 	s.transition.Unlock()
 	if err != nil {
+		return err
+	}
+	// A peer may already have replaced the grant by the time FSYNC reaches
+	// the authority. Its read admission can recall/break our local holder;
+	// never retain the operation or transition lock needed by that callback.
+	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
 		return err
 	}
 	if applied != 0 {

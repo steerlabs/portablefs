@@ -338,6 +338,15 @@ and the session, connection, item, and open limits are the bounded owners of a
 write. An applied mutation keeps its resources through durability and replay
 settlement.
 
+Item limits count retained descriptor-backed capabilities and in-flight
+reservations, not filesystem objects. Kernel FORGET and completed Reclaim
+release that charge; ending a session releases its remaining capabilities.
+At saturation, new item acquisitions fail with ENFILE while directory names
+remain enumerable without allocating items. Existing handles, cleanup and
+quota recovery remain admitted. Defaults allow several repository working
+sets per worker; deployments still size file-descriptor and memory limits
+for their configured bounds.
+
 Startup cross-checks the bounds rather than accepting any combination:
 
 - `--max-in-flight` must be at least 9. The authority serves Linux mounts, and

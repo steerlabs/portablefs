@@ -4090,6 +4090,8 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 			break
 		}
 		emitted++
+		p := replyPublicationFromContext(ctx)
+		p.stamp, p.servedVersion = stamp, stamp.version
 		if (item != nil || len(dirent.GetStableIdentity()) != 0) && entry.Name != "." && entry.Name != ".." {
 			freshItem := item != nil
 			if freshItem && (item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) || !bytes.Equal(item.GetStableIdentity(), dirent.GetStableIdentity())) {
@@ -4121,8 +4123,6 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		} else if item != nil {
 			r.mount.deferReclaim(item.GetToken())
 		}
-		p := replyPublicationFromContext(ctx)
-		p.stamp, p.servedVersion = stamp, stamp.version
 		if page.finished {
 			break
 		}

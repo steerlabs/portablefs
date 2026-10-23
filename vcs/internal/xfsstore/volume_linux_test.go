@@ -893,9 +893,9 @@ func TestCommitWriteZeroByteBackendErrorPublishesExactMetadataState(t *testing.T
 	}
 	t.Cleanup(func() { v.pwrite = realPwrite })
 	committed, assigned, post, err := target.CommitWriteData([]byte("x"), WriteCommit{
-		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+		RequestedSize: 1, Position: 1 << 20, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
 	})
-	if committed != 0 || assigned != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
+	if committed != 0 || assigned != 1<<20 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("zero-byte CommitWrite = (%d, %d, %+v, %v), want exact postapply ENOSPC", committed, assigned, post, err)
 	}
 	if post.Kind != KindRegular || post.Size != 0 || post.Mode.Perm() != 0o640 {

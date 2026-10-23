@@ -128,9 +128,11 @@ sends an empty list.
 Every resolvable `Dirent` carries `stable_identity` at tag 7 together with its
 attributes, object version, and snapshot sequence. When `want_items` is true,
 the Authority returns a fresh `Item` unless that exact stable identity appears
-in `held_identities`; for a held identity it omits `Item`. The client may use
-the identity only to find its already-retained capability. It must fail closed
-if that binding is absent or mismatched. The Authority still resolves and
+in `held_identities` or the item table is full. It omits `Item` in those cases.
+The client may use the identity only to find its already-retained capability.
+Without a matching retained capability it lists the row without publishing a
+kernel inode (`NodeId` zero in READDIRPLUS); a later LOOKUP remains subject to
+item admission. Enumeration does not require allocating item capabilities. The Authority still resolves and
 revalidates every entry under the page's storage cut and never turns the hint
 into access authority.
 

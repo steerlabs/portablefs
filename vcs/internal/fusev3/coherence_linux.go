@@ -169,6 +169,9 @@ func completeSourcePublication(ctx context.Context) error {
 	}
 	lease.r.mu.Lock()
 	publication.stamp = lease.r.mount.subscription.advanceSource(publication.stamp, lease.coordinates, publication.servedVersion)
+	if lease.completeProof != nil && lease.r.completeDirectories[lease.completeParent] == lease.completeProof {
+		lease.completeProof.stamp = publication.subscriptionCacheStamp()
+	}
 	lease.r.mu.Unlock()
 	if err := lease.markCallbackPublicationReady(); err != nil {
 		return err

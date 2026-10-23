@@ -108,14 +108,10 @@ func TestWarmReadDirPlusReusesRetainedPageCapabilities(t *testing.T) {
 	if child == nil || directory == nil {
 		t.Fatal("cold READDIRPLUS did not intern its directory and child")
 	}
-	raw.Forget(child.id, 1)
-	if mount.reclaim.pending() != 0 {
-		t.Fatal("kernel FORGET reclaimed a binding retained by the live subscription")
-	}
 	raw.mu.RLock()
 	if raw.nodesByIdentity[child.identity] != child || raw.nodesByKey[child.key] != child {
 		raw.mu.RUnlock()
-		t.Fatal("FORGET removed a retained daemon binding from an identity index")
+		t.Fatal("live lookup lost its retained daemon binding")
 	}
 	raw.mu.RUnlock()
 	heldIdentities := raw.heldDirectoryPageIdentities(directory.identity, nil)
@@ -146,7 +142,7 @@ func TestWarmReadDirPlusReusesRetainedPageCapabilities(t *testing.T) {
 	}
 	raw.PrepareReplyPayload(secondUnique, 42, 44, nil, nil, 0)
 	completeTestReply(t, raw, secondUnique, fuse.OK)
-	if child.lookups != 1 || mount.reclaim.pending() != 0 {
+	if child.lookups != 2 || mount.reclaim.pending() != 0 {
 		t.Fatalf("warm lookup refs=%d reclaim debt=%d, want retained lookup and no fresh capability", child.lookups, mount.reclaim.pending())
 	}
 }

@@ -2219,7 +2219,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 		c.signalSessionEnd(err)
 		return response, consumption, err
 	}
-	if response.GetUncertain() {
+	if response.GetUncertain() && response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 		c.signalSessionEnd(ErrTransportUncertain)
 	}
 	return response, consumption, nil
@@ -2280,7 +2280,7 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 				c.signalSessionEnd(ErrSessionEnded)
 			}
 		}
-		if response.GetUncertain() {
+		if response.GetUncertain() && response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 			c.signalSessionEnd(ErrTransportUncertain)
 		}
 		if token := response.GetTerminalDeliveryToken(); len(token) != 0 {

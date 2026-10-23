@@ -1691,12 +1691,21 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 		callErr = lifecycleErr
 	}
 	if !assignmentFailed && assigned && (callErr != nil || response == nil || response.GetUncertain()) {
-		lease.revoke()
-		cause := callErr
-		if cause == nil {
-			cause = authorityrpc.ErrTransportUncertain
+		if callErr == nil && response != nil && response.GetUncertain() && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && !response.GetSessionTerminal() {
+			// Storage may have applied before the source subscription expired.
+			// The recorded outcome consumes this replay identity, but does not
+			// end the authenticated session. Cold withdrawal, never replay of
+			// the effect, resolves local cache permission.
+			m.subscription.deactivate()
+			lease.retireEpoch()
+		} else {
+			lease.revoke()
+			cause := callErr
+			if cause == nil {
+				cause = authorityrpc.ErrTransportUncertain
+			}
+			m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
 		}
-		m.revoke(fmt.Errorf("fusev3: assigned source mutation outcome is uncertain: %w", cause))
 	}
 	definiteNoChange := response != nil && responseErrno(response) != 0 && response.GetPostState() == nil
 	if !assignmentFailed && callErr == nil && response != nil && !response.GetUncertain() && definiteNoChange {
@@ -1997,7 +2006,7 @@ func (n *node) Fsync(ctx context.Context, handle *fileHandle, flags uint32) sysc
 		return errno
 	}
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
-		return bufferErrno(n.mount.delegations.Fsync(ctx, n.item.GetStableIdentity(), flags&fsyncDataOnly != 0))
+		return bufferErrno(n.mount.delegations.Fsync(withHandleAcceptance(ctx, handle), n.item.GetStableIdentity(), flags&fsyncDataOnly != 0))
 	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: cloneBytes(handle.token), DataOnly: flags&fsyncDataOnly != 0}}})
 	return errno
@@ -2100,7 +2109,7 @@ type handleAcceptedCut struct {
 type handleAcceptanceKey struct{}
 
 func withHandleAcceptance(ctx context.Context, h *fileHandle) context.Context {
-	if h == nil || h.node.mount.workspace == nil {
+	if h == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, handleAcceptanceKey{}, h)
@@ -3535,8 +3544,14 @@ func contextErrno(err error) syscall.Errno {
 }
 
 func responseErrno(response *authoritypb.Response) syscall.Errno {
-	if response == nil || response.GetUncertain() {
+	if response == nil {
 		return syscall.EIO
+	}
+	if response.GetUncertain() {
+		// Linux has no committed-but-unknown errno. EREMOTEIO identifies the
+		// remote outcome failure without promising that the effect was absent
+		// or inviting an unconditional EINTR/EAGAIN retry.
+		return syscall.EREMOTEIO
 	}
 	if response.GetErrno() < 0 {
 		return syscall.EIO

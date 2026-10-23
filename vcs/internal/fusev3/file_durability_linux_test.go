@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"testing"
@@ -60,6 +61,55 @@ func TestFileFsyncDoesNotWaitForUnrelatedDurablePrefix(t *testing.T) {
 			m.durabilityMu.Unlock()
 			if durable != 0 {
 				t.Fatal("file fsync invented a common durable prefix")
+			}
+		})
+	}
+}
+
+type fsyncRecallRPC struct {
+	delegationFakeRPC
+	manager  *delegationManager
+	identity []byte
+	grant    *authoritypb.Delegation
+}
+
+func (f *fsyncRecallRPC) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetFsync() == nil {
+		return f.delegationFakeRPC.CallIdempotent(ctx, request)
+	}
+	done := f.manager.HandleControlEvent(ctx, &authoritypb.ControlEvent{Incarnation: 7, Sequence: 1,
+		Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{
+			Identity: f.identity, Delegation: &authoritypb.DelegationRef{Id: f.grant.Id, Generation: f.grant.Generation}, BudgetNanos: uint64(time.Second),
+		}},
+	})
+	select {
+	case <-done:
+		if fakeControlCount(&f.delegationFakeRPC, func(r *authoritypb.Request) bool { return r.GetDelegationBreakAck() != nil }) != 1 {
+			return nil, errors.New("FSYNC blocked its required delegation callback")
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_Fsync{Fsync: &authoritypb.FsyncReply{}}}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestFileFsyncAllowsRequiredDelegationCallback(t *testing.T) {
+	for _, synchronousWrite := range []bool{false, true} {
+		t.Run(fmt.Sprint(synchronousWrite), func(t *testing.T) {
+			fake := &fsyncRecallRPC{}
+			m := newDelegationTestManager(t, fake)
+			fake.manager = m
+			fake.identity = installDelegationForTest(t, m, 111, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			fake.grant = delegationTestGrant(143, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			if _, err := m.Write(ctx, fake.identity, 0, []byte("accepted"), synchronousWrite); err != nil {
+				t.Fatal(err)
+			}
+			if !synchronousWrite {
+				if err := m.Fsync(ctx, fake.identity, false); err != nil {
+					t.Fatal(err)
+				}
 			}
 		})
 	}
