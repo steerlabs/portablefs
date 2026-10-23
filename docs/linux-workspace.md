@@ -175,6 +175,10 @@ available. A real `EBUSY` finishes that job promptly without changing admission
 or terminal state. A later request retries the same original removal slot.
 Successful unmount is retained before the child closes and finalizes; terminal
 removal instead closes admission, aborts the original connection and detaches.
+It then kills and joins the exact retained process owner without acquiring the
+child control lane. A stopped child or a notification blocked in the kernel
+cannot prevent root removal. Original source/target absence and process exit
+remain separate prerequisites for replacement; killing cannot prove durability.
 A finished lifecycle result and a later removal action are independent facts:
 offering removal cannot turn a joined failed Recover back into pending work.
 
@@ -262,10 +266,14 @@ retains it. Cleanup debt and loss remain cumulative across intervals.
 Close advances an exact serial even within one generation. It immediately denies
 new admission and defeats delayed prepared publication; it does not retract an
 already admitted operation. Completed withdrawal requires Suspend's joins.
-New callbacks wait outside the admitted cohort while the gate is closed and
-enter only after a fresh serving interval opens. They hold no epoch reader,
-reply publication or buffer acceptance, so they cannot replenish or obstruct
-the cut. Terminal teardown releases them with the retained failure. A callback
+Direct WRITE and regular-file FSYNC callbacks wait outside the admitted cohort
+while the gate is closed and enter only after a fresh serving interval opens.
+Other callbacks can wait after complete kernel withdrawal. Before that proof,
+they must refuse promptly: namespace requests can hold the parent inode lock
+needed by entry invalidation, and buffered READ can hold the folio needed by
+inode invalidation. Waiting with those locks would deadlock the cold cut.
+Waiters hold no epoch reader, reply publication or buffer acceptance, so they
+cannot replenish the cut. Terminal teardown releases them with the retained failure. A callback
 already admitted before Close still obeys its exact acceptance and publication
 checks; accepted loss and uncertain assigned effects cannot be retried as new
 work or reported as durable merely to make suspension transparent.

@@ -55,6 +55,10 @@ func (m *Mount) workspaceFS() *workspaceFileSystem {
 // cohort or hold an epoch reader needed by its withdrawal. The shared page has
 // no child notification; resampling also observes terminal teardown.
 func (m *Mount) awaitWorkspaceServing(ctx context.Context, interrupted ...<-chan struct{}) error {
+	return m.awaitWorkspaceEntry(ctx, true, interrupted...)
+}
+
+func (m *Mount) awaitWorkspaceEntry(ctx context.Context, safeForWithdrawal bool, interrupted ...<-chan struct{}) error {
 	if m.workspace == nil {
 		return nil
 	}
@@ -91,6 +95,13 @@ func (m *Mount) awaitWorkspaceServing(ctx context.Context, interrupted ...<-chan
 		}
 		if m.workspaceServing() {
 			return nil
+		}
+		if !safeForWithdrawal && !m.workspaceLifecycle.kernelColdReady.Load() {
+			// Namespace callbacks can hold the parent inode lock needed by
+			// EntryNotify; buffered READ can hold a folio needed by InodeNotify.
+			// They must release those kernel locks before the cold proof. Once
+			// the kernel is cold, no retained notification can need their locks.
+			return workspaceadmission.ErrClosed
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
@@ -208,7 +219,14 @@ func (m *Mount) workspaceServing() bool {
 		return true
 	}
 	_, err := m.workspace.Check()
-	return err == nil && m.workspaceClockReady()
+	if err != nil || !m.workspaceClockReady() {
+		return false
+	}
+	if m.workspaceLifecycle != nil {
+		_, _, _, live := m.subscription.currentIncarnation()
+		return live
+	}
+	return true
 }
 
 // TLS readiness can withdraw between observer ticks. Denial at use prevents a
@@ -249,8 +267,18 @@ type workspaceRecoveryKey struct{}
 // beginWorkspaceEntry reserves one existing physical-reply owner before the
 // first answer or effect. The slow callback transfers this owner explicitly.
 func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64, interrupted ...<-chan struct{}) (*replyPublication, fuse.Status) {
+	return r.beginWorkspaceEntryPolicy(unique, false, interrupted...)
+}
+
+// Regular-file direct writes and fsync hold no parent inode lock or page-cache
+// folio needed by cold invalidation. Other kernel operations wait only after
+// the complete cold proof, so none can deadlock its reverse notifications.
+func (r *workspaceFileSystem) beginWorkspaceFileEntry(unique uint64, interrupted <-chan struct{}) (*replyPublication, fuse.Status) {
+	return r.beginWorkspaceEntryPolicy(unique, true, interrupted)
+}
+func (r *workspaceFileSystem) beginWorkspaceEntryPolicy(unique uint64, safeForWithdrawal bool, interrupted ...<-chan struct{}) (*replyPublication, fuse.Status) {
 	for {
-		if err := r.mount.awaitWorkspaceServing(r.opContext(), interrupted...); err != nil {
+		if err := r.mount.awaitWorkspaceEntry(r.opContext(), safeForWithdrawal, interrupted...); err != nil {
 			return nil, fuse.Status(errnoOfError(err))
 		}
 		p, status := r.tryWorkspaceEntry(unique)
@@ -277,12 +305,13 @@ func (r *workspaceFileSystem) tryWorkspaceEntry(unique uint64) (*replyPublicatio
 	p.workspaceDone = make(chan struct{})
 	r.replyPublications[unique] = p
 	permit, err := r.mount.workspace.Check()
-	if err != nil || !r.mount.workspaceClockReady() {
+	if err != nil || !r.mount.workspaceServing() {
 		delete(r.replyPublications, unique)
 		r.recycleReplyLocked(p)
 		return nil, fuse.Status(syscall.EAGAIN)
 	}
 	if life := r.mount.workspaceLifecycle; life != nil {
+		life.kernelColdReady.Store(false)
 		life.servedSinceCold.Store(true)
 	}
 	p.workspace, p.workspaceBound = permit, true

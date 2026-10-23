@@ -1040,7 +1040,19 @@ func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, r
 		return CleanupProof{Witness: d.bound(), ProcessExited: true, KernelAbsent: true}, nil
 	}
 	d.CloseAdmission(d.bindingGeneration())
-	_, err := d.job(ctx, "workspace-cleanup", nil, mode)
+	var err error
+	if mode == "terminal" {
+		// The privileged owner must be able to remove a closed mount even
+		// when its child cannot answer control or is stuck in notification
+		// writev. Abort the exact original connection before joining that
+		// process; joining first can wait on the kernel's pending requests.
+		err = d.forceKernelOwner()
+		if err != nil {
+			return CleanupProof{Witness: d.bound()}, err
+		}
+	} else {
+		_, err = d.job(ctx, "workspace-cleanup", nil, mode)
+	}
 	if err != nil {
 		select {
 		case <-d.exited:
@@ -1110,6 +1122,28 @@ func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, r
 	}
 	return CleanupProof{Witness: w, ProcessExited: true, KernelAbsent: true}, nil
 }
+func (d *Driver) forceKernelOwner() error {
+	d.effectMu.Lock()
+	err := d.removeKernelLocked("terminal", "3")
+	d.effectMu.Unlock()
+	if err != nil {
+		return err
+	}
+	select {
+	case <-d.exited:
+		return nil
+	default:
+	}
+	if d.child == nil || d.child.Process == nil {
+		return errors.New("terminal workspace process owner missing")
+	}
+	if err := d.child.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	<-d.exited
+	return nil
+}
+
 func (d *Driver) bindingGeneration() uint64 { d.mu.Lock(); defer d.mu.Unlock(); return d.generation }
 
 func (d *Driver) proveExitedAbsent() error {

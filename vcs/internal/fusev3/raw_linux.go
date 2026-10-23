@@ -3092,7 +3092,7 @@ func (r *rawFileSystem) Write(interrupted <-chan struct{}, input *fuse.WriteIn, 
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceFileEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
@@ -3135,7 +3135,7 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 func (r *rawFileSystem) Fsync(interrupted <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceFileEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}

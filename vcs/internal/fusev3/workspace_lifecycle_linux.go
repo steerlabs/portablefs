@@ -82,6 +82,7 @@ type workspaceLifecycle struct {
 	parkedRequests  []authorityrpc.DispatchOwner
 	keepalive       workspaceAttempt
 	servedSinceCold atomic.Bool
+	kernelColdReady atomic.Bool
 	coldOutcome     *pb.MountOutcome
 	closeCleanupErr error // protected by Mount.mu; terminal/barrier verdicts stay separate
 }
@@ -954,6 +955,7 @@ func (m *Mount) finishWorkspaceCold(w *workspaceLifecycle, d workspaceDispatch) 
 	w.cold = true
 	w.coldOutcome = proto.Clone(w.outcome).(*pb.MountOutcome)
 	w.servedSinceCold.Store(false)
+	w.kernelColdReady.Store(true)
 	w.callbacks, w.withdrawal = nil, nil
 	return true, nil
 }

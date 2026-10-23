@@ -12,33 +12,20 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 )
 
-// A closed operation must stay outside the cohort until recovery or terminal
-// teardown. Use cancellation only after proving that it has not answered.
-func closedWorkspaceCall(t *testing.T, m *Mount, call func() fuse.Status) fuse.Status {
-	t.Helper()
-	done := make(chan fuse.Status, 1)
-	go func() { done <- call() }()
-	select {
-	case status := <-done:
-		t.Fatalf("closed request answered before recovery or terminal teardown: %v", status)
-	case <-time.After(20 * time.Millisecond):
-	}
-	m.cancel()
-	select {
-	case status := <-done:
-		return status
-	case <-time.After(time.Second):
-		t.Fatal("terminal teardown did not release admission waiter")
-		return fuse.EIO
-	}
-}
-
 func TestWorkspaceClosedRequestsWaitOutsideColdCut(t *testing.T) {
 	for _, fast := range []bool{false, true} {
 		t.Run(map[bool]string{true: "cached-entry", false: "callback"}[fast], func(t *testing.T) {
 			f, gate, _ := coldFixture(t)
 			f.lookup(t, 1, "warm")
 			serial := gate.Close(1)
+			if fast {
+				// Kernel namespace locks can wait only after their old reverse
+				// notifications have completed, never during that withdrawal.
+				o, err := f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(time.Second))
+				if err != nil || !o.ColdComplete {
+					t.Fatal(o, err)
+				}
+			}
 			unique := f.unique.Add(2)
 			done := make(chan fuse.Status, 1)
 			go func() {
@@ -117,7 +104,8 @@ func TestWorkspaceClosedRequestRemainsInterruptible(t *testing.T) {
 	done := make(chan fuse.Status, 1)
 	unique := f.unique.Add(2)
 	go func() {
-		done <- f.mount.workspaceFS().Lookup(interrupted, &fuse.InHeader{Unique: unique, NodeId: 1}, "cancelled", &fuse.EntryOut{})
+		_, status := f.mount.workspaceFS().beginWorkspaceFileEntry(unique, interrupted)
+		done <- status
 	}()
 	close(interrupted)
 	select {
@@ -130,5 +118,20 @@ func TestWorkspaceClosedRequestRemainsInterruptible(t *testing.T) {
 	}
 	if f.raw.ReplyWriteTracked(unique) {
 		t.Fatal("interrupted waiter owned a physical reply")
+	}
+}
+
+func TestWorkspaceNamespaceRefusalReleasesKernelLocksBeforeColdProof(t *testing.T) {
+	f, gate, _ := coldFixture(t)
+	f.lookup(t, 1, "warm")
+	serial := gate.Close(1)
+	unique := f.unique.Add(2)
+	status := f.mount.workspaceFS().Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "warm", &fuse.EntryOut{})
+	if status != fuse.EIO || f.raw.ReplyWriteTracked(unique) {
+		t.Fatal("unsafe waiter obstructed kernel withdrawal", status)
+	}
+	o, err := f.mount.SuspendWorkspace(t.Context(), 1, serial, continuous.Time().Add(time.Second))
+	if err != nil || !o.ColdComplete {
+		t.Fatal(o, err)
 	}
 }

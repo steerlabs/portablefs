@@ -5,8 +5,10 @@ package workspacemount
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	"golang.org/x/sys/unix"
@@ -58,7 +60,25 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 				}
 			}
 			if terminal {
-				err = d.removeKernelLocked("terminal", "3")
+				d.child = exec.Command("/bin/sleep", "30")
+				if err := d.child.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer d.child.Process.Kill()
+				d.exited = make(chan struct{})
+				go func() { _ = d.child.Wait(); close(d.exited) }()
+				// A stopped/unresponsive old lifecycle lane cannot prevent the
+				// root's original abort and exact process join.
+				d.opMu.Lock()
+				done := make(chan error, 1)
+				go func() { done <- d.forceKernelOwner() }()
+				select {
+				case err = <-done:
+				case <-time.After(time.Second):
+					d.opMu.Unlock()
+					t.Fatal("terminal owner waited for child control")
+				}
+				d.opMu.Unlock()
 			} else {
 				if err = unix.Close(holder); err != nil {
 					t.Fatal(err)

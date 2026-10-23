@@ -32,9 +32,7 @@ func TestWorkspaceClockDeniesEntryBeforeRootObservation(t *testing.T) {
 	}
 	calls := f.rpcCalls()
 	unique := f.unique.Add(2)
-	status := closedWorkspaceCall(t, f.mount, func() fuse.Status {
-		return testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{})
-	})
+	status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{})
 	if status != fuse.EIO || f.rpcCalls() != calls || f.raw.ReplyWriteTracked(unique) || f.mount.workspaceServing() {
 		t.Fatal("unavailable shared clock admitted an answer before root observation", status)
 	}

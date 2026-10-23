@@ -30,15 +30,18 @@ class LifecycleChecks:
         stop, result = '~/'+tag+'.stop', '~/'+tag+'.json'
         worker = r'''import json,os,pathlib,threading,time
 home=pathlib.Path.home(); stop=home/STOP; result=home/RESULT
-root=pathlib.Path(ROOT); errors=[]; counts={}; lock=threading.Lock()
+root=pathlib.Path(ROOT); errors=[]; counts={}; ready=set(); lock=threading.Lock()
 def run(i):
-    n=0; fd=os.open(root/(TAG+'-'+str(i)),os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600)
+    n=0; fd=None
     try:
+        fd=os.open(root/(TAG+'-'+str(i)),os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600)
         while not stop.exists():
             try:
                 data=('%08d\n'%n).encode()
                 assert os.write(fd,data)==len(data)
                 os.fsync(fd); n+=1
+                if n==1:
+                    with lock: ready.add(i)
             except OSError as e:
                 with lock: errors.append(e.errno)
                 break
@@ -46,11 +49,24 @@ def run(i):
     except BaseException as e:
         with lock: errors.append(repr(e))
     finally:
-        try: os.close(fd)
+        try:
+            if fd is not None: os.close(fd)
         except OSError as e:
             with lock: errors.append(e.errno)
         counts[str(i)]=n
-if KIND=='cwd':
+if KIND=='probe':
+    fd=os.open(root/TAG,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+    print('held-ready',flush=True)
+    while not stop.exists(): time.sleep(.005)
+    counts['probe']=0
+    try:
+        assert os.write(fd,b'recovered-durable')==17
+        os.fsync(fd);counts['probe']=1
+    except OSError as e: errors.append(e.errno)
+    finally:
+        try: os.close(fd)
+        except OSError as e: errors.append(e.errno)
+elif KIND=='cwd':
     os.chdir(root); print('held-ready',flush=True)
     while not stop.exists(): time.sleep(.01)
     try: os.stat('.'); counts['cwd']=1
@@ -58,7 +74,14 @@ if KIND=='cwd':
 else:
     workers=[threading.Thread(target=run,args=(i,)) for i in range(THREADS)]
     for w in workers: w.start()
-    time.sleep(.2); print('held-ready',flush=True)
+    deadline=time.monotonic()+8
+    while True:
+        with lock: active=len(ready); failures=list(errors)
+        assert not failures,failures
+        if active==THREADS: break
+        assert time.monotonic()<deadline,('initial fsync did not complete',active,THREADS)
+        time.sleep(.005)
+    print('held-ready',flush=True)
     for w in workers: w.join()
 result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
 '''
@@ -88,12 +111,15 @@ result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
     def finish_holder(self, holder, allow_errors=False):
         p, stop, result = holder
         self.g.ssh('touch '+stop)
-        assert p.wait(timeout=10) == 0
+        assert p.wait(timeout=20) == 0
         value = json.loads(self.g.ssh('cat '+result))
         assert all(isinstance(e, int) for e in value['errors']), value
         assert allow_errors or not value['errors'], value
-        assert value['counts'] and all(n > 0 for n in value['counts'].values()), value
-        if 'cwd' not in value['counts']:
+        assert value['counts'] and all(n > 0 or allow_errors and n == 0 for n in value['counts'].values()), value
+        if 'probe' in value['counts']:
+            if value['counts']['probe']:
+                assert self.a.peer("import pathlib;print((pathlib.Path('/var/tmp/pfs-native/home/peer')/"+repr(value['tag'])+").read_text())") == 'recovered-durable'
+        elif 'cwd' not in value['counts']:
             # Every fsync-acknowledged record is checked through the independent
             # ordinary peer, including a failure tail beyond the ack watermark.
             check = """import pathlib,json
@@ -123,7 +149,7 @@ print('all-acknowledged-records-intact')
         for seconds in (8, 20):
             before = self.a.authority_sessions()
             incarnation = self.mount()['mount']['incarnation']
-            with self.holder('fsync') as holder:
+            with self.holder('fsync') as holder, self.holder('probe') as probe_holder:
                 self.a.network(True)
                 started = time.monotonic()
                 try:
@@ -136,6 +162,7 @@ print('all-acknowledged-records-intact')
                 recovery = time.monotonic()-started-seconds
                 assert recovered['mount']['incarnation'] == incarnation, recovered
                 assert self.a.authority_sessions() == before, 'outage replaced the authority session'
+                probe_result = self.finish_holder(probe_holder)
                 probe = 'pfs-native-recovered-'+uuid.uuid4().hex
                 payload = 'durable-after-outage-'+str(seconds)
                 script = "import os,pathlib;p=pathlib.Path("+repr(self.a.target)+")/"+repr(probe)+";f=p.open('xb');f.write("+repr(payload.encode())+");f.flush();os.fsync(f.fileno());f.close();assert p.read_text()=="+repr(payload)
@@ -210,6 +237,45 @@ print('all-acknowledged-records-intact')
         self.save('managed-mount-intent-across-suspend', {'mount': mounted})
         return public
 
+    def unresponsive_child(self, public):
+        with self.holder('probe') as holder:
+            self.a.network(True)
+            try:
+                deadline = time.monotonic()+30
+                while self.mount()['state'] != 'recovering':
+                    assert time.monotonic()<deadline
+                    time.sleep(.05)
+                signal_child = """import os,pathlib,signal
+pids=[]
+for p in pathlib.Path('/proc').glob('[0-9]*'):
+    try:
+        args=(p/'cmdline').read_bytes().split(b'\\0')
+        if p.stat().st_uid==1000 and args[:2]==[b'/usr/local/bin/portablefs',b'mount'] and b'native-managed' in args: pids.append(int(p.name))
+    except FileNotFoundError: pass
+assert len(pids)==1,pids
+fd=os.pidfd_open(pids[0])
+signal.pidfd_send_signal(fd,signal.SIGSTOP)
+os.close(fd)
+print(pids[0])
+"""
+                pid = int(self.g.ssh('python3 -c '+shlex.quote(signal_child)))
+                started = time.monotonic()
+                self.g.command('umount', body=public['mount'])
+                assert self.g.wait('umount-accepted', 10)['code'] == 'accepted'
+                self.a.job(self.g, 'umount', timeout=10)
+                self.a.protected(self.g)
+                elapsed = time.monotonic()-started
+                assert elapsed < 10, elapsed
+                value = self.finish_holder(holder, allow_errors=True)
+                assert value['errors'], value
+            finally:
+                self.a.network(False)
+        replacement = self.a.mount(self.g)
+        assert replacement['incarnation'] != public['incarnation']
+        self.save('managed-terminal-removal-unresponsive-child',
+                  {'pid': pid, 'seconds': elapsed, 'application': value})
+        return replacement
+
     def terminal_io(self, public):
         with self.holder('fsync', threads=4) as holder:
             started = time.monotonic()
@@ -264,5 +330,6 @@ def lifecycle_checks(authority, guest, public, record):
     checks.umount_suspend(public)
     checks.suspend()
     public = checks.mount_race(public)
+    public = checks.unresponsive_child(public)
     public = checks.terminal_io(public)
     return checks.long_pause(public)
