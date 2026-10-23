@@ -372,6 +372,13 @@ func (m *delegationManager) SetCleanupRetryWaiter(wait func(context.Context) err
 	m.hookMu.Unlock()
 }
 
+// An elapsed cache-preparation cut says nothing about the descriptor table.
+// CLOSE has not been submitted yet. Keep the same session-owned close queued
+// for cold recovery; an independent sibling error must remain terminal.
+func expiredClosePreparation(err error) bool {
+	return (errors.Is(err, authorityrpc.ErrDispatchExpired) || errors.Is(err, errSubscriptionExpired)) && subscriptionResetAttempt(err)
+}
+
 func (m *delegationManager) closeResetOutcome(session uint64) error {
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()

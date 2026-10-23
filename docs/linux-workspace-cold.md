@@ -124,6 +124,12 @@ subscription rather than authorizing fresh cache work. TLS establishment still
 requires the current shared clock. Cold acknowledgment joins applying replays;
 the power deadline does not grow while that join waits.
 
+Before descriptor CLOSE is submitted, its grant preparation can lose the old
+cache cut. An expired dispatch/horizon at that boundary requests cold recovery
+and retains the counted exact descriptor for retry. It does not establish an
+unknown CLOSE outcome or end the session. Independent sibling failures retain
+their terminal policy, and the old cleanup cannot acquire a successor grant.
+
 A serving managed driver must close admission before its safe cutoff. The cold
 owner Parks and joins the renewer with the other captured workers; a proof-loss
 observation does not independently Park it while recovery is still being

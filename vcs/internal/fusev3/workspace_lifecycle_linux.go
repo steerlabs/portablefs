@@ -994,6 +994,9 @@ func subscriptionResetAttempt(err error) bool {
 	if err == nil {
 		return false
 	}
+	if _, independent := err.(*authorityrpc.LifecycleIndependentFailure); independent {
+		return false
+	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		causes := joined.Unwrap()
 		if len(causes) == 0 {
@@ -1006,7 +1009,7 @@ func subscriptionResetAttempt(err error) bool {
 		}
 		return true
 	}
-	if err == authorityrpc.ErrSubscriptionReset || err == errSubscriptionExpired || authorityrpc.TransientTransport(err) {
+	if err == authorityrpc.ErrSubscriptionReset || err == errSubscriptionExpired || err == authorityrpc.ErrDispatchExpired || authorityrpc.TransientTransport(err) {
 		return true
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {

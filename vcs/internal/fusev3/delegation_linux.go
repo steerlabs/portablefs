@@ -2477,7 +2477,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	batch, err := m.prepareReleaseBatch(prepareCtx, buf, epochSerial, incarnation, groups)
 	if err != nil {
-		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) || expiredClosePreparation(err) {
 			return m.closeResetOutcome(sessionSerial)
 		}
 		if classified, ok := err.(cleanupClassified); ok && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
@@ -2494,7 +2494,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	defer batch.finish()
 	if err := batch.applyAndRelease(prepareCtx); err != nil {
-		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) || expiredClosePreparation(err) {
 			return m.closeResetOutcome(sessionSerial)
 		}
 		var classified cleanupClassified

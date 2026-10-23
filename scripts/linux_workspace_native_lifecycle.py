@@ -31,6 +31,7 @@ class LifecycleChecks:
         worker = r'''import json,os,pathlib,threading,time
 home=pathlib.Path.home(); stop=home/STOP; result=home/RESULT
 root=pathlib.Path(ROOT); errors=[]; counts={}; ready=set(); lock=threading.Lock()
+allocated=[]
 def run(i):
     n=0; fd=None
     try:
@@ -66,6 +67,18 @@ if KIND=='probe':
     finally:
         try: os.close(fd)
         except OSError as e: errors.append(e.errno)
+elif KIND=='allocate':
+    n=0
+    while not stop.exists():
+        try:
+            body=(TAG+':'+str(n)).encode()
+            with (root/(TAG+'-'+str(n))).open('xb') as f:
+                f.write(body);f.flush();os.fsync(f.fileno())
+            allocated.append(n)
+            if len(allocated)==1: print('held-ready',flush=True)
+        except OSError as e: errors.append(e.errno)
+        n+=1;time.sleep(.01)
+    counts['allocate']=len(allocated)
 elif KIND=='cwd':
     os.chdir(root); print('held-ready',flush=True)
     while not stop.exists(): time.sleep(.01)
@@ -86,7 +99,9 @@ else:
         time.sleep(.005)
     print('held-ready',flush=True)
     for w in workers: w.join()
-result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
+value={'counts':counts,'errors':errors,'tag':TAG}
+if KIND=='allocate': value['allocated']=allocated
+result.write_text(json.dumps(value))
 '''
         variables = {'STOP': tag+'.stop', 'RESULT': tag+'.json', 'ROOT': self.a.target,
                      'TAG': tag, 'KIND': kind, 'THREADS': threads}
@@ -119,7 +134,15 @@ result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
         assert all(isinstance(e, int) for e in value['errors']), value
         assert allow_errors or not value['errors'], value
         assert value['counts'] and all(n > 0 or allow_errors and n == 0 for n in value['counts'].values()), value
-        if 'probe' in value['counts']:
+        if 'allocated' in value:
+            check = """import pathlib,json
+r=pathlib.Path('/var/tmp/pfs-native/home/peer');v=json.loads(VALUE)
+for n in v['allocated']:
+    assert (r/(v['tag']+'-'+str(n))).read_bytes()==(v['tag']+':'+str(n)).encode(),n
+print('all-allocated-acknowledgements-intact')
+""".replace('VALUE', repr(json.dumps(value)))
+            assert self.a.peer(check) == 'all-allocated-acknowledgements-intact'
+        elif 'probe' in value['counts']:
             if value['counts']['probe']:
                 assert self.a.peer("import pathlib;print((pathlib.Path('/var/tmp/pfs-native/home/peer')/"+repr(value['tag'])+").read_text())") == 'recovered-durable'
         elif 'cwd' not in value['counts']:
@@ -153,7 +176,7 @@ print('all-acknowledged-records-intact')
             before = self.a.authority_sessions()
             generation = int(self.a.status(self.g)['generation'])
             incarnation = self.mount()['mount']['incarnation']
-            with self.holder('fsync') as holder, self.holder('probe') as probe_holder:
+            with self.holder('fsync') as holder, self.holder('probe') as probe_holder, self.holder('allocate') as allocate_holder:
                 self.a.network(True)
                 started = time.monotonic()
                 try:
@@ -182,10 +205,11 @@ print('all-acknowledged-records-intact')
                 script = "import os,pathlib;p=pathlib.Path("+repr(self.a.target)+")/"+repr(probe)+";f=p.open('xb');f.write("+repr(payload.encode())+");f.flush();os.fsync(f.fileno());f.close();assert p.read_text()=="+repr(payload)
                 self.g.ssh('python3 -c '+shlex.quote(script))
                 assert self.a.peer("import pathlib;print((pathlib.Path('/var/tmp/pfs-native/home/peer')/"+repr(probe)+").read_text())") == payload
+                allocation = self.finish_holder(allocate_holder, allow_errors=True)
                 value = self.finish_holder(holder, allow_errors=True)
             self.save('managed-network-outage-'+str(seconds)+'s',
                       {'recovery_seconds': recovery, 'application': value,
-                       'recovery_probe': probe_result, 'sessions': before})
+                       'recovery_probe': probe_result, 'allocation': allocation, 'sessions': before})
 
     def busy(self, public):
         for kind in ('cwd', 'fsync'):
