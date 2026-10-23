@@ -171,6 +171,9 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		}
 		return nil
 	case "umount":
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		m.mu.Lock()
 		d := m.mounts[key]
 		m.mu.Unlock()
@@ -184,12 +187,20 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 			// state. Success is retained in the same original removal slot
 			// which the child subsequently observes and finalizes.
 			d.effectMu.Lock()
+			if err := ctx.Err(); err != nil {
+				d.effectMu.Unlock()
+				return err
+			}
 			err := d.removeKernelLocked("voluntary", "2")
 			d.effectMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("unmount workspace %s: %w", j.Mount.VolumeId, err)
 			}
 			mode = "voluntary"
+		} else if err := ctx.Err(); err != nil {
+			// A power cut closes serving after cancelling this generation.
+			// It cannot turn an overtaken voluntary intent into forced removal.
+			return err
 		}
 		if err := m.Host.Terminal(j.Mount, "workspace unmount requested", nil); err != nil {
 			return err

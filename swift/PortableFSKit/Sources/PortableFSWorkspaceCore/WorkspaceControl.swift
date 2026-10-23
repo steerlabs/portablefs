@@ -60,7 +60,7 @@ public enum WorkspaceControl {
         (o.observation != "unobserved" || (o.durability == "unresolved" && o.release == "unresolved"))
     }
     public static func validColdAck(_ ack: WorkspaceSuspendAck) -> Bool {
-        validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
+        validSuspension(ack.suspension) && !ack.suspension.awakeRecovery && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
     }
     private static func validStatuses(_ mounts: [WorkspaceMountStatus]) -> Bool {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {

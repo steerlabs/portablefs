@@ -155,3 +155,14 @@ func retiredTestOutcome(_ mount: WorkspaceMountStatus, sequence: UInt64) -> Work
     p = try WorkspaceControl.decode(workspaceGolden("provision")).provision
     #expect(!p.hasHostedEnrollment)
 }
+
+@Test func workspaceAwakeAdmissionCannotStandForColdProof() throws {
+    let awake = try WorkspaceControl.decode(workspaceGolden("awake_recover")).awakeRecover
+    var cold = WorkspaceSuspendAck(); cold.suspension = awake.suspension
+    #expect(!WorkspaceControl.validColdAck(cold))
+    var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = 1
+    envelope.body = .resume(awake)
+    #expect(throws: (any Error).self) { try WorkspaceControl.encode(envelope) }
+    envelope.body = .awakeRecover(awake); envelope.drainBudgetNanos = 1
+    #expect(throws: (any Error).self) { try WorkspaceControl.encode(envelope) }
+}

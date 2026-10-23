@@ -297,7 +297,7 @@ func (s *Supervisor) beginCut(request *pb.Suspension, awake bool) (*pb.Suspensio
 	if err := control.Suspension(request); err != nil {
 		return nil, fmt.Errorf("suspend identity: %w", err)
 	}
-	if previous == "discard-only" || s.generation == math.MaxUint64 || request.Generation != s.generation+1 {
+	if previous == "discard-only" || awake && previous != "running" || s.generation == math.MaxUint64 || request.Generation != s.generation+1 {
 		return nil, refused("suspend generation or phase mismatch")
 	}
 	if request.AwakeRecovery != awake || len(request.Roster) != 0 {
@@ -579,6 +579,9 @@ func (s *Supervisor) RecoverAwake(parent context.Context, t *pb.ResumeToken) (*p
 			go s.recoverAwakeMount(ctx, done, e, clone(bound), s.jobs[control.MountKey(id)])
 		}
 		a.Mounts = append(a.Mounts, clone(e.status))
+	}
+	for key := range s.jobs {
+		s.retireJoinedLocked(key)
 	}
 	return a, nil
 }

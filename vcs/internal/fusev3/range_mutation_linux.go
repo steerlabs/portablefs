@@ -104,6 +104,7 @@ func (r *rawFileSystem) Fallocate(interrupted <-chan struct{}, input *fuse.Fallo
 			r.mount.revoke(fmt.Errorf("fusev3: complete fallocate publication: %w", err))
 			return fuse.Status(syscall.ENOTCONN)
 		}
+		visibilityStatus := r.mount.appliedVisibilityStatus(visibility)
 		if reply.GetFlags()&rangeResultPostApply != 0 && reply.GetError() < 0 {
 			return fuse.Status(-reply.GetError())
 		}
@@ -111,7 +112,7 @@ func (r *rawFileSystem) Fallocate(interrupted <-chan struct{}, input *fuse.Fallo
 			r.mount.revoke(errors.New("fusev3: stock fallocate applied result carried an invalid error"))
 			return fuse.Status(syscall.ENOTCONN)
 		}
-		return r.mount.appliedVisibilityStatus(visibility)
+		return visibilityStatus
 	}
 	return fuse.EBADF
 }
@@ -271,6 +272,7 @@ func (r *rawFileSystem) CopyFileRange(interrupted <-chan struct{}, input *fuse.C
 		r.mount.revoke(fmt.Errorf("fusev3: complete copy_file_range publication: %w", err))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
+	visibilityStatus := r.mount.appliedVisibilityStatus(visibility)
 	if reply.GetFlags()&rangeResultPostApply != 0 && reply.GetError() < 0 {
 		return 0, fuse.Status(-reply.GetError())
 	}
@@ -278,5 +280,5 @@ func (r *rawFileSystem) CopyFileRange(interrupted <-chan struct{}, input *fuse.C
 		r.mount.revoke(errors.New("fusev3: stock copy_file_range applied result carried an invalid error"))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
-	return uint32(reply.GetResultSize()), r.mount.appliedVisibilityStatus(visibility)
+	return uint32(reply.GetResultSize()), visibilityStatus
 }

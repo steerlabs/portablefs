@@ -78,7 +78,8 @@ result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
             yield p, stop, result
         finally:
             if p.poll() is None:
-                self.g.ssh('touch '+stop)
+                with contextlib.suppress(Exception):
+                    self.g.ssh('touch '+stop)
                 try: p.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     p.terminate(); p.wait(timeout=5)
@@ -135,6 +136,11 @@ print('all-acknowledged-records-intact')
                 recovery = time.monotonic()-started-seconds
                 assert recovered['mount']['incarnation'] == incarnation, recovered
                 assert self.a.authority_sessions() == before, 'outage replaced the authority session'
+                probe = 'pfs-native-recovered-'+uuid.uuid4().hex
+                payload = 'durable-after-outage-'+str(seconds)
+                script = "import os,pathlib;p=pathlib.Path("+repr(self.a.target)+")/"+repr(probe)+";f=p.open('xb');f.write("+repr(payload.encode())+");f.flush();os.fsync(f.fileno());f.close();assert p.read_text()=="+repr(payload)
+                self.g.ssh('python3 -c '+shlex.quote(script))
+                assert self.a.peer("import pathlib;print((pathlib.Path('/var/tmp/pfs-native/home/peer')/"+repr(probe)+").read_text())") == payload
                 value = self.finish_holder(holder, allow_errors=True)
             self.save('managed-network-outage-'+str(seconds)+'s',
                       {'recovery_seconds': recovery, 'application': value, 'sessions': before})
@@ -143,17 +149,8 @@ print('all-acknowledged-records-intact')
         for kind in ('cwd', 'fsync'):
             with self.holder(kind) as holder:
                 started = time.monotonic()
-                if kind == 'fsync':
-                    self.g.p.stdin.write(json.dumps({'command':'umount','body':public['mount']})+'\n'+json.dumps({'command':'pause'})+'\n')
-                    self.g.p.stdin.flush()
-                else:
-                    self.g.command('umount', body=public['mount'])
+                self.g.command('umount', body=public['mount'])
                 assert self.g.wait('umount-accepted', 10)['code'] == 'accepted'
-                if kind == 'fsync':
-                    paused = self.g.wait('paused', 20)
-                    assert paused['fenced'] and time.monotonic()-started < 15, paused
-                    self.g.command('resume'); self.g.wait('resumed', 20)
-                    self.a.ready(self.g, timeout=15)
                 self.a.job(self.g, 'umount', timeout=5, allow_fail=True)
                 job = self.a.last_job
                 assert job['phase'] == 'failed' and job['failure'] == 'busy' and 'busy' in job['reason'].lower(), job
@@ -162,9 +159,25 @@ print('all-acknowledged-records-intact')
             self.a.unmount(self.g, public)
             public = self.a.mount(self.g)
             self.save('managed-busy-'+kind+'-unmount-retry', {'job': job, 'application': value})
-            if kind == 'fsync':
-                self.save('managed-umount-suspend-independent-budget', {'seconds': time.monotonic()-started, 'job': job})
         return public
+
+    def umount_suspend(self, public):
+        with self.holder('fsync') as holder:
+            started = time.monotonic()
+            self.g.p.stdin.write(json.dumps({'command':'umount','body':public['mount']})+'\n'+json.dumps({'command':'pause'})+'\n')
+            self.g.p.stdin.flush()
+            assert self.g.wait('umount-accepted', 10)['code'] == 'accepted'
+            paused = self.g.wait('paused', 20)
+            elapsed = time.monotonic()-started
+            assert paused['fenced'] and elapsed < 15, paused
+            self.g.command('resume'); self.g.wait('resumed', 20)
+            self.a.ready(self.g, timeout=15)
+            self.a.job(self.g, 'umount', timeout=5, allow_fail=True)
+            job = self.a.last_job
+            assert job['phase'] == 'failed' and job['failure'] in ('busy', 'stopped'), job
+            value = self.finish_holder(holder)
+        self.save('managed-umount-suspend-independent-budget',
+                  {'drain_seconds': elapsed, 'job': job, 'application': value})
 
     def suspend(self):
         with self.holder('fsync', threads=4) as holder:
@@ -248,6 +261,7 @@ def lifecycle_checks(authority, guest, public, record):
     checks.listing()
     checks.network()
     public = checks.busy(public)
+    checks.umount_suspend(public)
     checks.suspend()
     public = checks.mount_race(public)
     public = checks.terminal_io(public)

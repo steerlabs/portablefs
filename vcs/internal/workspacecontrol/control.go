@@ -289,6 +289,9 @@ func UnknownOutcome() *pb.MountOutcome {
 	return &pb.MountOutcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved"}
 }
 func ColdAck(a *pb.SuspendAck) error {
+	if a != nil && a.Suspension != nil && a.Suspension.AwakeRecovery {
+		return invalid("awake admission is not cold proof")
+	}
 	if a == nil {
 		return invalid("ColdAck: invalid field or state combination")
 	}

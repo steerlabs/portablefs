@@ -8,7 +8,7 @@ import (
 )
 
 func TestAwakeRecoveryExactModeRosterAndBudget(t *testing.T) {
-	for _, mode := range []string{"missing-mode", "host-roster", "power-budget", "normal-resume", "normal-suspend"} {
+	for _, mode := range []string{"missing-mode", "host-roster", "power-budget", "normal-resume", "normal-suspend", "cold-ack"} {
 		t.Run(mode, func(t *testing.T) {
 			e := proto.Clone(fixtures()["awake_recover"]).(*pb.Envelope)
 			tok := e.GetAwakeRecover()
@@ -21,6 +21,8 @@ func TestAwakeRecoveryExactModeRosterAndBudget(t *testing.T) {
 				e.DrainBudgetNanos = 1
 			case "normal-resume":
 				e.Body = &pb.Envelope_Resume{Resume: tok}
+			case "cold-ack":
+				e.Body = &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: tok.Suspension}}
 			case "normal-suspend":
 				e.Body = &pb.Envelope_Suspend{Suspend: tok.Suspension}
 				e.DrainBudgetNanos = 1
