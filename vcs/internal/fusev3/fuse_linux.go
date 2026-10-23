@@ -1405,6 +1405,7 @@ func (m *Mount) closeLocked() error {
 	// Any capability still queued for reclaim is released by Detach: ending the
 	// session drops every item and open this session holds.
 	detachErr := m.detach()
+	sessionEnded := m.rpc.SessionEndCause() != nil
 	// Normal unmount and externally observed detach have no revocation ladder,
 	// so their exact absence/connection checks above are the local enforcement
 	// boundary. A terminal revocation already finished this idempotently from
@@ -1414,9 +1415,19 @@ func (m *Mount) closeLocked() error {
 	m.kernelWithdrawalClosed = true
 	abortCloseErr := m.kernelMount.abortFile.close()
 	m.kernelWithdrawalMu.Unlock()
-	cleanupErr := errors.Join(replyOwnershipErr, detachErr, abortCloseErr, m.grafts.Close(), m.rpc.Close())
+	graftCloseErr, transportCloseErr := m.grafts.Close(), m.rpc.Close()
+	cleanupErr := errors.Join(replyOwnershipErr, detachErr, abortCloseErr, graftCloseErr, transportCloseErr)
 	if m.workspaceLifecycle != nil {
 		m.workspaceLifecycle.closeCleanupErr = cleanupErr
+		var remote *sessionDetachError
+		if errors.As(detachErr, &remote) && sessionEnded {
+			// Exact local absence and connection termination were established
+			// before this RPC. An ended session may refuse remote release; it
+			// stays fenced, with abandonment retained as outcome, not a live
+			// local cleanup owner or a claim of successful authenticated detach.
+			m.workspaceLifecycle.abandonGrant()
+			m.workspaceLifecycle.closeCleanupErr = errors.Join(replyOwnershipErr, abortCloseErr, graftCloseErr, transportCloseErr)
+		}
 	}
 	m.closeErr = errors.Join(m.fatalError(), barrierErr, cleanupErr)
 	return m.closeErr

@@ -73,6 +73,13 @@ a worker's completion; retained notification and callback joins use their own
 mount context. Kernel machine-local caches keep their ordinary local
 semantics; this proof withdraws authority-derived cache authority.
 
+Managed finalization proves exact local mount absence and serving-connection
+termination before attempting authenticated session detach. An ended session
+may refuse remote release: retain an observed abandonment without claiming
+durability, while completing actual local cleanup. Live-session detach refusal,
+missing local proof, failed descriptor close and failed transport close still
+refuse finalization. Ordinary Close retains its combined diagnostic.
+
 ## Preparation and recovery
 
 Both operations keep one logical owner through classified transport/DNS failures,

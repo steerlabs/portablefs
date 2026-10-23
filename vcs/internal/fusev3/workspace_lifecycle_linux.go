@@ -282,6 +282,10 @@ func (m *Mount) workspaceObservation(g, serial uint64) WorkspaceObservation {
 		for _, l := range e.loss {
 			o.Loss = append(o.Loss, proto.Clone(l).(*pb.Loss))
 		}
+		if e.abandoned && o.Outcome.Release == "unresolved" {
+			o.Outcome.Observation = "observed"
+			o.Outcome.Release = "abandoned"
+		}
 	}
 
 	m.subscription.mu.RLock()
