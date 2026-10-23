@@ -230,7 +230,9 @@ print('all-acknowledged-records-intact')
     def listing(self):
         rows = json.loads(self.g.ssh('portablefs mounts --json'))['mounts']
         assert len([r for r in rows if r['mountPath'] == self.a.target]) == 1, rows
-        self.save('managed-guest-cli-inventory', rows)
+        plain = self.g.ssh('portablefs mounts')
+        assert self.a.target in plain and 'no active mounts' not in plain, plain
+        self.save('managed-guest-cli-inventory', {'json': rows, 'text': plain})
 
     def mount_race(self, public):
         self.a.unmount(self.g, public)
