@@ -238,12 +238,12 @@ func serve() error {
 	}
 	defer inventory.Close()
 	for _, directory := range []string{"/data/workspace-clients", "/data/workspace-backing"} {
-		if err = os.MkdirAll(directory, 0711); err != nil {
+		if err = os.MkdirAll(directory, 0755); err != nil {
 			return err
 		}
-		// The service's private umask must not remove traversal to separately
-		// owned client directories. Listing remains reserved to this root owner.
-		if err = os.Chmod(directory, 0711); err != nil {
+		// CLI privatepath pins each ancestor with a directory read description.
+		// Only public incarnation names live here; each client directory is 0700.
+		if err = os.Chmod(directory, 0755); err != nil {
 			return err
 		}
 	}

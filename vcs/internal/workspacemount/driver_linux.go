@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
@@ -496,6 +498,9 @@ func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspa
 	if err != nil {
 		return nil, err
 	}
+	if len(body) == 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
 	r, err := mountcontrol.DecodeResponse(body, true)
 	if err != nil {
 		return nil, err
@@ -700,6 +705,11 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 					return r, err
 				}
 				if err = d.actions(context.Background(), b, r); err != nil {
+					if authorityrpc.TransientTransport(err) {
+						// Delivery does not change action ownership. The next snapshot
+						// decides whether to hand off original copies or only observe.
+						continue
+					}
 					if op == "workspace-cleanup" {
 						return r, err
 					}
