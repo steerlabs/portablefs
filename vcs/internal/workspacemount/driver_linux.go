@@ -299,13 +299,11 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 	defer ready.Close()
 	defer readyWriter.Close()
 	stateDir := filepath.Join(m.Clients, instance)
-	for _, dir := range []string{stateDir} {
-		if err = os.Mkdir(dir, 0700); err != nil {
-			return nil, err
-		}
-		if err = os.Chown(dir, 1000, 1000); err != nil {
-			return nil, err
-		}
+	if err = os.Mkdir(stateDir, 0700); err != nil {
+		return nil, err
+	}
+	if err = os.Chown(stateDir, 1000, 1000); err != nil {
+		return nil, err
 	}
 	backing, err := m.backingRoot(id)
 	if err != nil {
@@ -725,12 +723,11 @@ func (d *Driver) removeKernelLocked(mode, id string) error {
 		return errors.New("workspace removal action changed")
 	}
 	if mode == "terminal" && attempt.err != nil {
-		// A previously retained alias may have disappeared. Reobserve exact
-		// absence under the same action; never reconstruct abort authority.
+		// Retry only this fixed terminal action with its original descriptions.
+		// ManagedKernel retains successful abort independently from alias absence;
+		// disappearance of an alias cannot fabricate a successful abort.
 		if d.kernel != nil {
-			if d.kernel.Absent() == nil {
-				attempt.err = nil
-			}
+			attempt.err = d.kernel.Remove(true)
 		} else if _, err := fusev3.ObservePlannedKernelMountAbsent(d.bound().Source, d.bound().Target); err == nil {
 			attempt.err = nil
 		}

@@ -21,6 +21,7 @@ type ManagedKernel struct {
 	mu        sync.Mutex
 	fuse      *os.File
 	installed kernelMount
+	aborted   bool
 }
 
 func ObserveManagedKernelIdentity(source, target string) (string, error) {
@@ -138,10 +139,11 @@ func (k *ManagedKernel) Remove(terminal bool) error {
 		}
 		return errors.New("fusev3: installed mount lacks original abort witness; VM discard required")
 	}
-	if terminal {
+	if terminal && !k.aborted {
 		if err := installed.abortFile.abort(); err != nil {
 			return err
 		}
+		k.aborted = true
 	}
 	present, err := installed.detachTargetInstalled()
 	if err != nil {

@@ -189,10 +189,16 @@ func TestManagedKernelExternalUnmountNeedsIndependentAbsence(t *testing.T) {
 	if err := k.Remove(true); err == nil {
 		t.Fatal("terminal removal hid foreign alias")
 	}
+	if !k.aborted {
+		t.Fatal("alias ambiguity erased successful original abort")
+	}
 	if err := unix.Unmount(alias, unix.MNT_DETACH); err != nil {
 		t.Fatal(err)
 	}
 	if err := k.Absent(); err != nil {
 		t.Fatal(err)
+	}
+	if err := k.Remove(true); err != nil {
+		t.Fatal("original terminal owner could not finish after alias removal", err)
 	}
 }
