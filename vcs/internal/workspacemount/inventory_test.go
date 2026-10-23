@@ -31,6 +31,9 @@ func TestInventoryReservesPathAcrossAuthorities(t *testing.T) {
 	}
 	other := desired(2)
 	other.Mount.AuthorityId[0]++
+	if err := i.CanReserve(other.Mount, other.Witness.Target); err == nil {
+		t.Fatal("preflight entered a different authority target")
+	}
 	if err := i.CommitDesired(other); err == nil {
 		t.Fatal("different authority stacked same stable target")
 	}

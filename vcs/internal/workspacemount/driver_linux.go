@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,7 @@ type Manager struct {
 	Boot, HostService, GuestService   []byte
 	Binary, Targets, Clients, Backing string
 	mu                                sync.Mutex
+	allocationMu                      sync.Mutex
 	mounts                            map[string]*Driver
 }
 
@@ -74,6 +76,7 @@ type Driver struct {
 	opMu, effectMu     sync.Mutex
 	cleanupMu          sync.Mutex
 	bootstrapAttempted bool
+	bootstrapAction    *mountcontrol.KernelAction
 	kernel             *fusev3.ManagedKernel
 	target             *os.File
 	socket             string
@@ -187,6 +190,16 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 		return nil, err
 	}
 	path := filepath.Join(m.Targets, id.VolumeId)
+	m.allocationMu.Lock()
+	allocating := true
+	defer func() {
+		if allocating {
+			m.allocationMu.Unlock()
+		}
+	}()
+	if err = m.Inventory.CanReserve(id, path); err != nil {
+		return nil, err
+	}
 	if err = os.Mkdir(path, 0); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, err
 	}
@@ -247,6 +260,8 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 		return nil, err
 	}
 	desiredRecorded = true
+	allocating = false
+	m.allocationMu.Unlock()
 	start, err := mountcontrol.ProcessStart(int32(os.Getpid()))
 	if err != nil {
 		return nil, err
@@ -284,14 +299,17 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 	defer ready.Close()
 	defer readyWriter.Close()
 	stateDir := filepath.Join(m.Clients, instance)
-	backing := filepath.Join(m.Backing, instance)
-	for _, dir := range []string{stateDir, backing} {
+	for _, dir := range []string{stateDir} {
 		if err = os.Mkdir(dir, 0700); err != nil {
 			return nil, err
 		}
 		if err = os.Chown(dir, 1000, 1000); err != nil {
 			return nil, err
 		}
+	}
+	backing, err := m.backingRoot(id)
+	if err != nil {
+		return nil, err
 	}
 	d.child = exec.Command(m.Binary, "mount", "--foreground", "--workspace-gate-fd=3", "--workspace-owner-fd=4", "--workspace-bootstrap-fd=5", "--workspace-clock-fd=6", "--workspace-ready-fd=7", id.VolumeId, path)
 	d.child.Env = []string{"HOME=/home/workspace", "PATH=/usr/local/bin:/usr/bin:/bin"}
@@ -469,6 +487,11 @@ func (d *Driver) next() (uint64, error) {
 	}
 }
 func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspace, phase *mountcontrol.Phase, rights *mountcontrol.Rights) (*mountcontrol.WorkspaceResponse, error) {
+	// Transactions belong only to their start. Observations and action replies
+	// name that operation through its binding, without resubmitting its body.
+	if op != "workspace-suspend" && op != "workspace-recover" {
+		b.Transaction, b.HostRequestID = "", ""
+	}
 	id, err := d.next()
 	if err != nil {
 		return nil, err
@@ -621,8 +644,14 @@ func (d *Driver) actions(ctx context.Context, b mountcontrol.Workspace, r *mount
 	install := r.Phases.Install
 	if install.Progress == "offered" {
 		p := install.Action.WithWitness(r.Witness)
+		if d.bootstrapAction != nil && !reflect.DeepEqual(d.bootstrapAction, install.Action) {
+			return errors.New("workspace bootstrap action changed")
+		}
 		if !d.bootstrapAttempted {
 			d.bootstrapAttempted = true
+			action := *install.Action
+			action.Options = append([]string(nil), install.Action.Options...)
+			d.bootstrapAction = &action
 			var st unix.Stat_t
 			if err := unix.Fstat(int(d.target.Fd()), &st); err != nil {
 				return err
@@ -695,6 +724,17 @@ func (d *Driver) removeKernelLocked(mode, id string) error {
 	if attempt.id != id {
 		return errors.New("workspace removal action changed")
 	}
+	if mode == "terminal" && attempt.err != nil {
+		// A previously retained alias may have disappeared. Reobserve exact
+		// absence under the same action; never reconstruct abort authority.
+		if d.kernel != nil {
+			if d.kernel.Absent() == nil {
+				attempt.err = nil
+			}
+		} else if _, err := fusev3.ObservePlannedKernelMountAbsent(d.bound().Source, d.bound().Target); err == nil {
+			attempt.err = nil
+		}
+	}
 	return attempt.err
 }
 func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, mode string) (*mountcontrol.WorkspaceResponse, error) {
@@ -721,31 +761,44 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 	d.mu.Lock()
 	d.operation = &b
 	d.mu.Unlock()
-	accepted := false
+	accepted, uncertain := false, false
+	var persistenceErr error
 	for {
 		select {
 		case <-d.exited:
 			return nil, errors.New("workspace child exited before lifecycle completion")
 		default:
 		}
-		if !accepted {
+		if !accepted && !uncertain {
 			r, e := d.exchange(ctx, op, b, p, nil)
 			if e == nil && r.State == "accepted" {
 				accepted = true
 			} else if e == nil && r.Refusal != "occupied" {
 				return r, fmt.Errorf("workspace start refused: %s", r.Refusal)
 			}
-			if !accepted && ctx.Err() != nil {
-				return nil, ctx.Err()
+			if e != nil {
+				// Once delivery is uncertain, only observation can prove that
+				// there is no local owner. Caller expiry is not that proof.
+				uncertain = true
 			}
 		}
-		if accepted {
+		if accepted || uncertain {
 			// Socket and caller deadlines cannot discharge the local lifecycle
 			// owner. Observation continues until the actual worker settles.
 			r, e := d.exchange(context.Background(), "workspace-observe", b, nil, nil)
+			if e == nil && r.State == "refused" && r.Refusal == "not-accepted" {
+				uncertain = false
+				if ctx.Err() != nil {
+					return r, ctx.Err()
+				}
+			}
 			if e == nil && r.State != "refused" {
+				accepted, uncertain = true, false
 				if err = d.acceptEvidence(r); err != nil {
-					return r, err
+					if op != "workspace-cleanup" {
+						return r, err
+					}
+					persistenceErr = err
 				}
 				if err = d.actions(context.Background(), b, r); err != nil {
 					if authorityrpc.TransientTransport(err) {
@@ -774,7 +827,7 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 				}
 				switch r.State {
 				case "prepared", "cold", "cleanup-finalized":
-					return r, ctx.Err()
+					return r, errors.Join(ctx.Err(), persistenceErr)
 				case "failed":
 					return r, errors.New(r.Reason)
 				}

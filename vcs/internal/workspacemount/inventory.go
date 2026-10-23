@@ -190,10 +190,25 @@ func (i *Inventory) CommitDesired(d *Desired) error {
 	}
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	if err := i.reservation(d.Mount, d.Witness.Target); err != nil {
+		return err
+	}
+	i.runs[control.MountKey(d.Mount)] = cloneDesired(d)
+	return i.persist()
+}
+
+// CanReserve is checked before touching a potentially mounted target. The
+// root allocator serializes this preflight through CommitDesired.
+func (i *Inventory) CanReserve(id *pb.MountID, target string) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.reservation(id, target)
+}
+func (i *Inventory) reservation(id *pb.MountID, target string) error {
 	if i.failed != nil {
 		return i.failed
 	}
-	key := control.MountKey(d.Mount)
+	key := control.MountKey(id)
 	if i.runs[key] != nil {
 		return errors.New("workspace incarnation already retained")
 	}
@@ -201,12 +216,11 @@ func (i *Inventory) CommitDesired(d *Desired) error {
 		return errors.New("workspace retained inventory full")
 	}
 	for _, old := range i.runs {
-		if !old.Removed && (old.Witness.Target == d.Witness.Target || volumeKey(old.Mount.AuthorityId, old.Mount.VolumeId) == volumeKey(d.Mount.AuthorityId, d.Mount.VolumeId)) {
+		if !old.Removed && (old.Witness.Target == target || volumeKey(old.Mount.AuthorityId, old.Mount.VolumeId) == volumeKey(id.AuthorityId, id.VolumeId)) {
 			return errors.New("workspace volume or target reserved")
 		}
 	}
-	i.runs[key] = cloneDesired(d)
-	return i.persist()
+	return nil
 }
 func (i *Inventory) BindWitness(id *pb.MountID, w Witness) error {
 	i.mu.Lock()

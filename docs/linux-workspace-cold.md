@@ -29,7 +29,11 @@ using its fresh token to subscribe. The old CONTROL runner can still process
 recalls and changes and acknowledge them; stopping its poller captures a finite
 sequence, which must finish before its remaining workers stop.
 
-The dispatch fence refuses cold proof until applying mutation owners settle.
+The dispatch fence replaces serving readiness with the captured cut permission
+while draining. That permission names only the original buffer, incarnation and
+deadline; it cannot extend the horizon or admit new frontend work. New TLS
+connections still await the shared clock owner. The dispatch fence refuses cold
+proof until applying mutation owners settle.
 Transport cancellation does not discharge a session-owned submitted write.
 Parked non-applying requests retain their exact body, replay slot and sequence;
 response readers may observe a result while dispatch and reconnect are parked.

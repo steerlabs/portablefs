@@ -31,7 +31,9 @@ guest identity and machine-local route backing on the data disk. Never share
 the Mac home through virtiofs. Each volume mounts at `/workspaces/<volume-id>`;
 an unmounted path must deny workspace-user access so a build cannot write into
 an empty backing directory. One non-root guest user, UID/GID 1000, runs clients.
-Every volume has its own daemon, session, key and route backing.
+Every volume has its own daemon, session, key and route backing. Route backing
+is keyed by authority/volume on the persistent disk, across mount incarnations.
+Host acknowledgement removes only exactly cleaned incarnation metadata.
 
 The pending defaults are 4 vCPUs/4 GiB for hosts with at least 16 GiB, otherwise
 2 vCPUs/2 GiB, constrained by VZ limits, and a 64 GiB sparse data disk with
@@ -630,8 +632,9 @@ bootstrap console, exact vsock control, pinned SSH bridge and native gate. It
 creates no PortableFS mount and registers no synthetic participant. Cold proof
 and recovery use the empty guest-owned roster. The FUSE probe is invoked only
 by the native gate as the ordinary workspace user, never by a boot service.
-The real daemon suspension boundary, durable mount inventory and provisioning
-remain Stage 1c work. Production service registration, app UI, workspace CLI,
+Stage 1c implements real daemon suspension, protected root bootstrap, independent
+durable inventories and provisioning. Their native and fault qualification is
+required separately from Stage 1b evidence. Production service registration, app UI, workspace CLI,
 release packaging, update coordination and editor qualification remain pending.
 
 All new workspace surfaces are pending and unreleased: the control grammar,

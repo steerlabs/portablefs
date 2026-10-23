@@ -128,6 +128,11 @@ func TestRootSuspendAdapterChild(t *testing.T) {
 					// response while its failed INIT waits for the root removal.
 					return
 				}
+				if !initLoss && q.Operation == "workspace-suspend" {
+					// Acceptance is real, but the root must learn it by observation
+					// and keep ownership beyond the original caller deadline.
+					return
+				}
 				body, err := mountcontrol.EncodeResponse(r)
 				if err == nil {
 					_, _ = conn.Write(body)
@@ -142,6 +147,9 @@ func TestRootSuspendAdapterChild(t *testing.T) {
 		return
 	}
 	<-joined
+	// Death cannot stand in for a final observation. Keep this actual owner
+	// alive until the parent has observed the joined failed lifecycle.
+	_, _ = io.Copy(io.Discard, os.Stdin)
 	o.Close()
 }
 
@@ -394,12 +402,13 @@ func TestRootSuspendForwardsRemainingBudgetAndJoinsLocalOwner(t *testing.T) {
 	_, _ = stdin.Write([]byte{'j'})
 	select {
 	case r := <-done:
-		if r.err == nil || r.cold.ColdComplete {
+		if r.err == nil || r.cold.ColdComplete || r.err.Error() == "workspace child exited before lifecycle completion" {
 			t.Fatal("expired local owner certified coldness", r)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("local join did not settle")
 	}
+	stdin.Close()
 	<-d.exited
 }
 

@@ -296,7 +296,7 @@ func serve() error {
 			fmt.Fprintln(os.Stderr, "workspace control failure:", control.BoundedReason(err.Error()))
 		})
 		supervisor.ConfigureWitnessPersistence(inventory.BindWitness)
-		supervisor.ConfigureRetirementPersistence(inventory.Acknowledge)
+		supervisor.ConfigureRetirementPersistence(mounts.Acknowledge)
 		for _, run := range inventory.Snapshot() {
 			if run.Removed {
 				if err = supervisor.RestoreCleaned(run.Mount, run.Loss, run.Outcome); err != nil {
