@@ -12,6 +12,7 @@ import tempfile
 import re
 import shutil
 import signal
+from linux_workspace_native_managed import NativeAuthority
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
@@ -33,6 +34,7 @@ def record(name):
 class Guest:
     def __init__(self):
         self.lines = queue.Queue()
+        self.history = []
         self.stderr = (root / ('owner-' + str(len(measurements)) + '.stderr')).open('w')
         self.p = subprocess.Popen([binary, image, str(state)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=self.stderr, text=True, bufsize=1)
@@ -57,13 +59,21 @@ class Guest:
         deadline = time.monotonic() + timeout
         while True:
             value = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
+            self.history.append(value)
             if value['event'] == expected:
                 return value
             if value['event'] in ('failure', 'eof'):
                 raise RuntimeError(value)
 
-    def command(self, name):
-        self.p.stdin.write(json.dumps({'command': name}) + '\n'); self.p.stdin.flush()
+    def command(self, name, **fields):
+        self.p.stdin.write(json.dumps({'command': name, **fields}) + '\n'); self.p.stdin.flush()
+
+    def discard(self):
+        self.command('discard')
+        value = self.wait('stopped', 30)
+        assert value['operations'][-1] == 'stop-completed', value
+        assert self.p.wait(timeout=10) == 0
+        self.stderr.close()
 
     def ssh(self, command):
         result = subprocess.run(['/usr/bin/ssh', '-F', self.ready['ssh_config'], 'portablefs-workspace', command],
@@ -90,7 +100,9 @@ class Guest:
 
 
 guest = None
+authority = None
 try:
+    authority = NativeAuthority(root)
     guest = Guest()
     corrupt = pathlib.Path(tempfile.mkdtemp(prefix='pfs-corrupt-', dir='/tmp')) / 'image'
     try:
@@ -158,9 +170,9 @@ try:
     for _ in range(2):
         guest.command('probe-unavailable-jobs')
         jobs = guest.wait('jobs-refused', 10)
-        assert jobs['mounts'] == 0 and jobs['failure'] == 'unavailable', jobs
+        assert jobs['mounts'] == 0 and jobs['failure'] == 'handler-failed', jobs
         assert len(jobs['request_ids']) == 3 and all(a < b for a, b in zip(jobs['request_ids'], jobs['request_ids'][1:])), jobs
-    record('desired-jobs-retain-unavailable')
+    record('unprovisioned-jobs-retain-failure')
     guest.command('probe-identity')
     identity = guest.wait('identity', 10)
     guest.command('probe-identity')
@@ -190,6 +202,11 @@ try:
     record('rtc-boot-correction')
     subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), '--seconds', '65'], check=True)
     record('rtc-awake-measurement')
+    managed = authority.mount(guest)
+    record('managed-standalone-provision')
+    authority.initial_io(guest)
+    record('managed-write-read-fsync')
+    record('managed-peer-coherence')
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
@@ -200,12 +217,16 @@ try:
     assert paused['operations'].index('pause-completed') < paused['operations'].index('sleep-fenced')
     guest.command('status')
     assert guest.wait('status')['phase'] == 'pausedCold'
+    authority.write_while_paused()
     time.sleep(5)
     record('controlled-cold-pause')
     guest.command('resume')
     resumed = guest.wait('resumed', 25)
     assert resumed['operations'][-1] == 'resume-completed'
-    assert resumed['mount_states'] == []
+    assert len(resumed['mount_states']) == 1
+    authority.ready(guest)
+    assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
+    record('managed-suspend-resume-data')
     deadline = time.monotonic() + 10
     while True:
         after = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
@@ -223,8 +244,17 @@ try:
     memory = guest.ssh("awk '/MemTotal:|MemAvailable:/ {print}' /proc/meminfo")
     measurements[-1]['guest_memory'] = memory
     measurements[-1]['owner_rss_kib'] = int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(guest.p.pid)], text=True).strip())
-    guest.stop()
+    authority.unmount(guest, managed)
+    record('managed-unmount-exact-cleanup')
+    previous = authority.mount(guest)
+    guest.discard()
+    record('managed-channel-loss-vm-discard')
     guest = Guest()
+    authority.reconciled(guest, previous)
+    record('managed-reboot-durable-reconcile')
+    authority.terminal_replacement(guest)
+    record('managed-terminal-replacement')
+    record('managed-old-handle-terminal')
     assert guest.ssh('cat ~/persistence') == token
     record('data-disk-reboot-persistence')
     guest.command('probe-identity')
@@ -263,4 +293,6 @@ try:
 finally:
     if guest:
         guest.cleanup()
+    if authority:
+        authority.close()
     events.close()

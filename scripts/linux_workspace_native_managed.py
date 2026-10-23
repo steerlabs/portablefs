@@ -1,0 +1,189 @@
+"""Disposable direct-TLS XFS authority and independent ordinary Linux peer."""
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import time
+import uuid
+
+
+class NativeAuthority:
+    volume = 'native-managed'
+    target = '/workspaces/native-managed'
+
+    def __init__(self, evidence):
+        self.evidence = pathlib.Path(evidence)
+        self.repo = pathlib.Path(__file__).resolve().parent.parent
+        self.name = os.environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-workspace-native-') + uuid.uuid4().hex[:10]
+        self.helper = self.evidence / 'pfs-workspace-fixture'
+        subprocess.run(['go', '-C', str(self.repo/'vcs'), 'build', '-o', str(self.helper),
+                        './test/workspace/cmd/pfs-workspace-fixture'], check=True)
+        image = os.environ.get('PORTABLEFS_CI_IMAGE', 'golang@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51')
+        subprocess.run(['docker', 'run', '-d', '--name', self.name, '--privileged',
+                        '-e', 'PFS_NATIVE_FIXTURE_CONTAINER=1', '-v', str(self.repo)+':/work:ro', '-w', '/work',
+                        '-p', '0.0.0.0::17443', image, 'bash', '/work/scripts/linux-workspace-native-authority.sh'],
+                       check=True, capture_output=True, text=True)
+        try:
+            deadline = time.monotonic() + 240
+            while subprocess.run(['docker', 'exec', self.name, 'test', '-f', '/var/tmp/pfs-native/ready'],
+                                 capture_output=True).returncode != 0:
+                running = subprocess.check_output(['docker', 'inspect', '--format', '{{.State.Running}}', self.name], text=True).strip()
+                assert running == 'true' and time.monotonic() < deadline, 'native authority/peer startup failed'
+                time.sleep(.25)
+            route = subprocess.check_output(['/sbin/route', '-n', 'get', 'default'], text=True)
+            interface = re.search(r'interface:\s*(\S+)', route).group(1)
+            address = subprocess.check_output(['/usr/sbin/ipconfig', 'getifaddr', interface], text=True).strip()
+            published = subprocess.check_output(['docker', 'port', self.name, '17443/tcp'], text=True).splitlines()[0]
+            self.endpoint = address + ':' + published.rsplit(':', 1)[1]
+            (self.evidence/'native-authority.json').write_text(json.dumps({'container': self.name, 'endpoint': self.endpoint,
+                'topology': 'guest VZ NAT -> Mac routed address -> Docker port NAT -> authority TLS; ordinary peer in authority container'}, indent=2))
+        except BaseException:
+            self.close()
+            raise
+
+    def fixture(self, *args):
+        return subprocess.check_output([str(self.helper), *args], text=True).strip()
+
+    def peer(self, script):
+        return subprocess.check_output(['docker', 'exec', '--user', '200001:200001', self.name,
+                                        'python3', '-c', script], text=True).strip()
+
+    def status(self, guest):
+        guest.command('mount-status')
+        event = guest.wait('mount-status', 30)
+        return json.loads(self.fixture('decode-status', event['body']))
+
+    def job(self, guest, operation, timeout=90):
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.status(guest)
+            jobs = status.get('jobs', []) + [r['job'] for r in status.get('retired', []) if 'job' in r]
+            selected = [j for j in jobs if j['mount']['volumeId'] == self.volume and j['operation'] == operation]
+            for job in selected:
+                if job['phase'] in ('complete', 'failed'):
+                    assert job['phase'] == 'complete', job
+                    return status
+            assert time.monotonic() < deadline, (operation, status)
+            time.sleep(.05)
+
+    def ready(self, guest, timeout=90):
+        deadline = time.monotonic() + timeout
+        while True:
+            status = self.status(guest)
+            mounts = [m for m in status.get('mounts', []) if m['mount']['volumeId'] == self.volume]
+            if mounts and mounts[0]['state'] == 'ready':
+                return mounts[0]
+            if mounts:
+                assert mounts[0]['state'] not in ('terminal', 'authorization-required'), mounts[0]
+            assert time.monotonic() < deadline, status
+            time.sleep(.05)
+
+    def mount(self, guest, short=False):
+        guest.command('identity', body=self.fixture('identity-request', self.volume))
+        identity = guest.wait('identity-result', 30)['body']
+        public = json.loads(self.fixture('decode-identity', identity))
+        material = subprocess.check_output(['docker', 'exec', '--user', '200001:200001', self.name,
+            '/var/tmp/pfs-native/bin/pfs-workspace-fixture', 'provision-short' if short else 'provision',
+            '/var/tmp/pfs-native/home/test-pki', self.endpoint, identity], text=True).strip()
+        guest.command('provision', body=material)
+        assert guest.wait('provision-accepted', 30)['code'] == 'accepted'
+        self.job(guest, 'provision')
+        guest.command('mount', body=public['mount'])
+        assert guest.wait('mount-accepted', 30)['code'] == 'accepted'
+        self.job(guest, 'mount')
+        mounted = self.ready(guest)
+        public['incarnation'] = mounted['mount']['incarnation']
+        assert mounted['renewal']['state'] == 'not-required', mounted
+        return public
+
+    def initial_io(self, guest):
+        result = guest.ssh("python3 -c " + shlex.quote(
+            "import os; p='/workspaces/native-managed/data'; f=open(p,'wb'); f.write(b'guest-one'); f.flush(); os.fsync(f.fileno()); f.close(); assert open(p,'rb').read()==b'guest-one'; print('durable')"))
+        assert result == 'durable'
+        result = self.peer("import os; p='/var/tmp/pfs-native/home/peer/data'; assert open(p,'rb').read()==b'guest-one'; f=open(p,'wb'); f.write(b'peer-two'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-complete')")
+        assert result == 'peer-complete'
+        assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-two'
+
+    def write_while_paused(self):
+        assert self.peer("import os; p='/var/tmp/pfs-native/home/peer/data'; f=open(p,'wb'); f.write(b'peer-during-pause'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-durable-before-resume')") == 'peer-durable-before-resume'
+
+    def unmount(self, guest, public):
+        guest.command('umount', body=public['mount'])
+        assert guest.wait('umount-accepted', 30)['code'] == 'accepted'
+        self.job(guest, 'umount')
+        self.protected(guest)
+
+    def protected(self, guest):
+        script = """import os,stat
+p='/workspaces/native-managed'
+s=os.stat(p)
+assert stat.S_IMODE(s.st_mode)==0 and s.st_uid==0 and s.st_gid==0
+try:
+    open(p+'/forbidden','wb')
+except PermissionError:
+    print('protected')
+else:
+    raise AssertionError('wrote exposed backing')
+"""
+        assert guest.ssh('python3 -c '+shlex.quote(script)) == 'protected'
+
+    def reconciled(self, guest, old):
+        self.status(guest)
+        records = []
+        for event in guest.history:
+            if event['event'] == 'retained-evidence':
+                status = json.loads(self.fixture('decode-status', event['body']))
+                records.extend(r['mountStatus'] for r in status.get('retired', []) if 'mountStatus' in r)
+        prior = [m for m in records if m['mount']['volumeId'] == self.volume and m['mount']['incarnation'] == old['incarnation']]
+        assert prior and prior[0]['cleanup'] == 'complete', records
+        assert prior[0]['outcome']['observation'] == 'unobserved' and prior[0]['outcome']['durability'] == 'unresolved', prior
+        self.protected(guest)
+
+    def terminal_replacement(self, guest):
+        old = self.mount(guest, short=True)
+        worker = """import os,time,json,pathlib
+root=pathlib.Path.home()
+stop=root/'pfs-native-held.stop'
+stop.unlink(missing_ok=True)
+fd=os.open('/workspaces/native-managed/data',os.O_RDONLY)
+with open(root/'pfs-native-held.jsonl','w',buffering=1) as out:
+    while not stop.exists():
+        try:
+            data=os.pread(fd,128,0); os.fsync(fd)
+            value={'data':data.decode()}
+        except OSError as e:
+            value={'error':e.errno}
+        out.write(json.dumps(value)+'\\n')
+        time.sleep(.05)
+os.close(fd)
+(root/'pfs-native-held.done').touch()
+"""
+        guest.ssh('printf %s '+shlex.quote(worker)+' > ~/pfs-native-held.py; nohup python3 ~/pfs-native-held.py >~/pfs-native-held.stdout 2>~/pfs-native-held.stderr </dev/null &')
+        deadline = time.monotonic() + 75
+        while True:
+            status = self.status(guest)
+            mounts = [m for m in status.get('mounts', []) if m['mount']['volumeId'] == self.volume]
+            if mounts and mounts[0]['state'] == 'terminal' and mounts[0]['cleanup'] == 'complete':
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(.1)
+        fresh = self.mount(guest)
+        assert fresh['mount'] != old['mount'] and fresh['public_key'] == old['public_key']
+        assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
+        time.sleep(.2)
+        observed = guest.ssh('tail -n 1 ~/pfs-native-held.jsonl')
+        assert json.loads(observed).get('error', 0) != 0, observed
+        guest.ssh('touch ~/pfs-native-held.stop; while test ! -f ~/pfs-native-held.done; do sleep .02; done')
+        self.unmount(guest, fresh)
+        return old, fresh
+
+    def close(self):
+        if not getattr(self, 'name', None):
+            return
+        logs = subprocess.run(['docker', 'logs', self.name], capture_output=True, text=True)
+        (self.evidence/'native-authority.log').write_text(logs.stdout+logs.stderr)
+        subprocess.run(['docker', 'stop', '-t', '25', self.name], capture_output=True, timeout=40)
+        subprocess.run(['docker', 'rm', self.name], check=True, capture_output=True)
+        self.name = None

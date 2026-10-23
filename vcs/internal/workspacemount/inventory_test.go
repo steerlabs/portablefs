@@ -164,3 +164,21 @@ func TestInventoryUnknownCrashOutcomeSurvivesReplacement(t *testing.T) {
 		t.Fatal(old)
 	}
 }
+
+func TestInventoryAckRequiresRemovalAndRetainsFailedCommit(t *testing.T) {
+	i := inventory(t)
+	d := desired(1)
+	if err := i.CommitDesired(d); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.Acknowledge([]*pb.MountID{d.Mount}); err == nil {
+		t.Fatal("acknowledgement erased live intent")
+	}
+	if err := i.Reconcile(d.Mount, func(*Desired) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	i.syncFile = func(*os.File) error { return errors.New("ENOSPC") }
+	if err := i.Acknowledge([]*pb.MountID{d.Mount}); err == nil || len(i.Snapshot()) != 1 {
+		t.Fatal("failed acknowledgement lost retained evidence", err)
+	}
+}

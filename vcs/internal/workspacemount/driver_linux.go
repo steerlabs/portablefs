@@ -40,6 +40,7 @@ type Host interface {
 	Cleanup(*pb.MountID, CleanupProof) error
 	Replace(context.Context, *pb.MountID, *pb.MountID, Witness, Mount) error
 	RecoveryRequired(*pb.MountID, string) error
+	Registered(*pb.MountID) bool
 }
 type Manager struct {
 	Host                              Host
@@ -91,6 +92,11 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		if m.mounts == nil {
 			m.mounts = map[string]*Driver{}
 		}
+		for key, prior := range m.mounts {
+			if prior.cleaned.Load() && !m.Host.Registered(prior.id) {
+				delete(m.mounts, key)
+			}
+		}
 		old := m.mounts[key]
 		m.mu.Unlock()
 		if old != nil {
@@ -106,7 +112,7 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		var predecessor *Driver
 		m.mu.Lock()
 		for _, prior := range m.mounts {
-			if prior != d && prior.cleaned.Load() && string(prior.id.AuthorityId) == string(j.Mount.AuthorityId) && prior.id.VolumeId == j.Mount.VolumeId {
+			if prior != d && prior.cleaned.Load() && string(prior.id.AuthorityId) == string(j.Mount.AuthorityId) && prior.id.VolumeId == j.Mount.VolumeId && m.Host.Registered(prior.id) {
 				predecessor = prior
 				break
 			}

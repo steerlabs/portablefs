@@ -80,6 +80,12 @@ func (s *Supervisor) BoundWitness(id *pb.MountID) (Witness, error) {
 	return e.witness, nil
 }
 
+func (s *Supervisor) Registered(id *pb.MountID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mounts[control.MountKey(id)] != nil
+}
+
 // RecoveryRequired closes a serving interval without inventing an authority
 // expiry. A host-owned cold transaction supplies fresh Resume authority.
 func (s *Supervisor) RecoveryRequired(id *pb.MountID, reason string) error {

@@ -355,6 +355,9 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 		c.state.AuthorizationSessionID = sessionString(client)
 		c.state.LocalRouteRevision = routes.revision
 		c.state.LocalRoutes = routes.rules.Patterns()
+		if !routes.rules.Empty() {
+			c.state.LocalBackingRoot = c.launch.BackingRoot
+		}
 		if p.HostedEnrollment != nil {
 			c.state.MountEnrollmentID = p.HostedEnrollment.EnrollmentId
 		}
