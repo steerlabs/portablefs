@@ -385,6 +385,7 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, ne
 			return err
 		}
 		if life := r.mount.workspaceLifecycle; life != nil {
+			life.kernelColdReady.Store(false)
 			life.servedSinceCold.Store(true)
 		}
 		p.workspace, p.workspaceBound = permit, true
