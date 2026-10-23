@@ -197,6 +197,12 @@ with p.open() as f:
                 assert time.monotonic() < deadline, phase
         finally:
             self.network(False)
+        # Observe the VM owner's transaction without enqueueing a control
+        # exchange into its confirmed-pause boundary.
+        while True:
+            completed = guest.wait('phase', 30)
+            if int(completed['generation']) == generation+1 and completed['phase'] == 'running':
+                break
         mounted = self.ready(guest)
         after = self.authority_sessions()
         assert before == after and before['active'] == 2, (before, after)
