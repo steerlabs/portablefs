@@ -124,6 +124,27 @@ func bootstrap() (result error) {
 	}
 	return json.NewEncoder(console).Encode(map[string]string{"event": "seeded", "host_key": strings.TrimSpace(string(key)), "boot_id": seed.BootID, "format_complete": "8"})
 }
+
+// Publish public measurement evidence atomically. The service's private umask
+// still protects credentials; these records intentionally permit UID 1000 read.
+func publishClockEvidence(name string, raw []byte) error {
+	f, err := os.CreateTemp(state, ".clock-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err = f.Chmod(0644); err != nil {
+		return err
+	}
+	if _, err = f.Write(raw); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), state+"/"+name)
+}
 func serve() error {
 	identities, err := workspacemount.Open("/data/workspace-identities")
 	if err != nil {
@@ -143,7 +164,7 @@ func serve() error {
 	if err != nil {
 		return err
 	}
-	if err = os.WriteFile(state+"/clock-owner.json", rawQualification, 0644); err != nil {
+	if err = publishClockEvidence("clock-owner.json", rawQualification); err != nil {
 		return err
 	}
 	if err = clock.Begin(0); err != nil {
@@ -159,7 +180,7 @@ func serve() error {
 			if err == nil {
 				raw, e := json.Marshal(m)
 				if e == nil {
-					_ = os.WriteFile(state+"/clock.json", raw, 0644)
+					_ = publishClockEvidence("clock.json", raw)
 				}
 			}
 		})

@@ -247,8 +247,8 @@ validate_root_tests() {
   [[ ${#REQUIRED_ROOT_TESTS[@]} -gt 0 ]] ||
     fail "REQUIRED_ROOT_TESTS is empty; the root boundary must require at least one test" 70
   for entry in "${REQUIRED_ROOT_TESTS[@]}"; do
-    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore|fusev3|workspaceadmission):Test[A-Za-z0-9_]+$ ]] ||
-      fail "REQUIRED_ROOT_TESTS entry is not a cellhost, xfsstore, fusev3 or workspaceadmission top-level test: $entry" 70
+    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore|fusev3|workspaceadmission|workspaceclock|workspacemount):Test[A-Za-z0-9_]+$ ]] ||
+      fail "REQUIRED_ROOT_TESTS entry is not a provisioned root-package top-level test: $entry" 70
     [[ $seen != *" ${entry} "* ]] ||
       fail "REQUIRED_ROOT_TESTS names a test twice: $entry" 70
     seen="${seen}${entry} "
