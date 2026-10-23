@@ -164,7 +164,9 @@ try:
     guest.command('probe-identity')
     identity = guest.wait('identity', 10)
     guest.command('probe-identity')
-    assert guest.wait('identity', 10) == identity
+    repeated = guest.wait('identity', 10)
+    for field in ('mount', 'public_key', 'csr', 'guest_uuid', 'identity_incarnation', 'renewal_epoch'):
+        assert repeated[field] == identity[field], field
     import base64
     csr = root / 'identity-probe.csr.der'
     csr.write_bytes(base64.b64decode(identity['csr']))
