@@ -16,7 +16,7 @@ from linux_workspace_native_managed import NativeAuthority
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
-state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-workspace-native-', dir='/tmp'))
+state = pathlib.Path(tempfile.mkdtemp(prefix=__import__('os').environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-workspace-native-'), dir='/tmp'))
 (root / 'state-directory.json').write_text(json.dumps({'state': str(state)}))
 required = pathlib.Path(inventory).read_text().splitlines()
 assert required and len(required) == len(set(required))
@@ -250,9 +250,17 @@ try:
     memory = guest.ssh("awk '/MemTotal:|MemAvailable:/ {print}' /proc/meminfo")
     measurements[-1]['guest_memory'] = memory
     measurements[-1]['owner_rss_kib'] = int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(guest.p.pid)], text=True).strip())
+    authority.awake_recovery(guest)
+    record('managed-awake-proof-loss-cold-recovery')
     authority.unmount(guest, managed)
     record('managed-unmount-exact-cleanup')
-    authority.mount(guest)
+    provisioned = authority.mount(guest, provision_only=True)
+    guest.discard()
+    guest = Guest()
+    reprovisioned = authority.mount(guest)
+    assert reprovisioned['mount'] != provisioned['mount'] and reprovisioned['public_key'] == provisioned['public_key']
+    assert reprovisioned['identity_incarnation'] == provisioned['identity_incarnation']
+    record('managed-provision-only-reboot-reissue')
     authority.kill_child(guest)
     record('managed-child-death-exact-cleanup')
     previous = authority.mount(guest)
@@ -263,6 +271,7 @@ try:
     record('managed-reboot-durable-reconcile')
     authority.terminal_replacement(guest)
     record('managed-terminal-replacement')
+    record('managed-terminal-final-evidence-retired')
     record('managed-old-handle-terminal')
     assert guest.ssh('cat ~/persistence') == token
     record('data-disk-reboot-persistence')

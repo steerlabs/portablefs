@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -200,5 +201,41 @@ func TestManagedKernelExternalUnmountNeedsIndependentAbsence(t *testing.T) {
 	}
 	if err := k.Remove(true); err != nil {
 		t.Fatal("original terminal owner could not finish after alias removal", err)
+	}
+}
+
+// The actual kernel owner serializes handoff and finalization. A failed absence
+// probe cannot close original descriptions; successful removal cannot rearm INIT.
+func TestManagedKernelConcurrentHandoffRemovalAndFinalize(t *testing.T) {
+	k, _, _ := managedBootstrapFixture(t)
+	if err := k.Finalize(); err == nil {
+		t.Fatal("finalized a live kernel mount")
+	}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 16 {
+				files, err := k.Handoff()
+				if err == nil {
+					files[0].Close()
+					files[1].Close()
+				}
+			}
+		}()
+	}
+	if err := k.Remove(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if _, err := k.Handoff(); err == nil {
+		t.Fatal("finalized owner handed off new descriptions")
+	}
+	if err := k.Absent(); err != nil {
+		t.Fatal(err)
 	}
 }

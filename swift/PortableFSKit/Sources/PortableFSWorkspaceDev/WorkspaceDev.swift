@@ -48,6 +48,8 @@ import PortableFSWorkspaceCore
     var pendingCommand: String?
     var signals: [DispatchSourceSignal] = []
     var updateQueued = false
+    var reportedPhase: WorkspacePhase?
+    var reportedGeneration: UInt64?
     init(image: URL, stateDirectory: URL, pairingMismatch: String? = nil) throws {
         let artifact = try WorkspaceArtifact(directory: image)
         guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit, artifact.release.appVersion == "dev" else { throw WorkspaceVMError("host executable and guest release differ; rebuild the paired dev executable") }
@@ -115,6 +117,10 @@ import PortableFSWorkspaceCore
         DispatchQueue.main.async { self.updateQueued = false; self.update() }
     }
     func update() {
+        if reportedPhase != coordinator.phase || reportedGeneration != coordinator.generation {
+            reportedPhase = coordinator.phase; reportedGeneration = coordinator.generation
+            event("phase", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "operations": vm.operations])
+        }
         if stopping, coordinator.phase == .stopped {
             channel.close(); event("stopped", ["operations": vm.operations]); exit(exitCode)
         }
