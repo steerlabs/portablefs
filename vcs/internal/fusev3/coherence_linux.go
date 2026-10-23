@@ -214,7 +214,7 @@ func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Co
 			r.mu.RUnlock()
 			if !admitted {
 				if err = r.mount.awaitWorkspaceServing(r.opContext()); err != nil {
-					return r.opContext(), func() {}, fuse.ToStatus(err)
+					return r.opContext(), func() {}, fuse.Status(errnoOfError(err))
 				}
 			}
 		}

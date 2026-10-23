@@ -97,20 +97,23 @@ func TestWorkspaceFastAnswersCloseBeforeServing(t *testing.T) {
 			record := f.raw.nodesByID[entry.NodeId]
 			lookups := record.lookups
 			unique := f.unique.Add(2)
-			var status fuse.Status
-			switch kind {
-			case "getattr", "holder-getattr":
-				status = testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
-			default:
-				name := "cached"
-				if kind == "negative" {
-					name = "missing"
+			status := closedWorkspaceCall(t, f.mount, func() fuse.Status {
+				var status fuse.Status
+				switch kind {
+				case "getattr", "holder-getattr":
+					status = testEntryFileSystem(f.raw).GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+				default:
+					name := "cached"
+					if kind == "negative" {
+						name = "missing"
+					}
+					if kind == "complete-directory" {
+						name = "not-enumerated"
+					}
+					status = testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, name, &fuse.EntryOut{})
 				}
-				if kind == "complete-directory" {
-					name = "not-enumerated"
-				}
-				status = testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, name, &fuse.EntryOut{})
-			}
+				return status
+			})
 			if status != fuse.EIO || f.rpcCalls() != calls || record.lookups != lookups || f.raw.ReplyWriteTracked(unique) {
 				t.Fatalf("closed %s changed answer/owner: %v calls=%d lookups=%d", kind, status, f.rpcCalls()-calls, record.lookups-lookups)
 			}
@@ -142,9 +145,11 @@ func TestWorkspaceCachedReplyRollbackAndFixedCohort(t *testing.T) {
 	if f.raw.replyPublications[unique] != p {
 		t.Fatal("cancelled waiter released physical owner")
 	}
-	for i := 0; i < 10; i++ {
+	{
 		u := f.unique.Add(2)
-		if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.EIO {
+		if status := closedWorkspaceCall(t, f.mount, func() fuse.Status {
+			return testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: u, NodeId: 1}, "cached", &fuse.EntryOut{})
+		}); status != fuse.EIO {
 			t.Fatal(status)
 		}
 	}
@@ -577,9 +582,11 @@ func TestWorkspaceCloseAfterLastInstallationCheckIsInert(t *testing.T) {
 				if !f.mount.delegations.Owns(identity[:]) {
 					t.Fatal("post-check grant lost retained cleanup ownership")
 				}
-				if st := f.rawCall(func(u uint64) fuse.Status {
-					_, st := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 1}, []byte("x"))
-					return st
+				if st := closedWorkspaceCall(t, f.mount, func() fuse.Status {
+					return f.rawCall(func(u uint64) fuse.Status {
+						_, st := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: u, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 1}, []byte("x"))
+						return st
+					})
 				}); st != fuse.EIO {
 					t.Fatal("new write used closed install", st)
 				}
@@ -610,8 +617,11 @@ func TestWorkspaceSlowHelperCannotInventServingAdmission(t *testing.T) {
 	g := bindWorkspaceTestGate(t, f.mount)
 	g.Close(1)
 	unique := f.unique.Add(2)
-	_, finish, status := f.raw.mutationContext(unique)
-	finish()
+	status := closedWorkspaceCall(t, f.mount, func() fuse.Status {
+		_, finish, status := f.raw.mutationContext(unique)
+		finish()
+		return status
+	})
 	if status != fuse.EIO || f.raw.ReplyWriteTracked(unique) || f.mount.isRevoked() {
 		t.Fatal("slow helper bypassed or terminalized closed admission", status)
 	}

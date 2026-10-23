@@ -53,6 +53,7 @@ REQUIRED_TESTS=()
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootFailedControlStartupTransfersExactOwner"
+  "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootBusyRemovalRetriesAndEscalatesOriginalOwner"
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootProvisionOnlyAndRemovedReconciliation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestManagedKernelConcurrentHandoffRemovalAndFinalize"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceFinalizationDrainsAcceptedCutAfterServingClosure"

@@ -233,7 +233,7 @@ type workspaceRecoveryKey struct{}
 func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
 	for {
 		if err := r.mount.awaitWorkspaceServing(r.opContext()); err != nil {
-			return nil, fuse.ToStatus(err)
+			return nil, fuse.Status(errnoOfError(err))
 		}
 		p, status := r.tryWorkspaceEntry(unique)
 		if status != fuse.Status(syscall.EAGAIN) { // Closure raced the wait; no entry was admitted.

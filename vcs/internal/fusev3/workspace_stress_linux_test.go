@@ -177,6 +177,9 @@ func TestReviewGateChurnStress(t *testing.T) {
 			} else {
 				close(stop)
 			}
+			// Closed requests are outside the joined cohort. Terminal teardown
+			// releases those remaining application waiters before joining them.
+			f.mount.cancel()
 			finished := make(chan struct{})
 			go func() { wg.Wait(); close(finished) }()
 			select {

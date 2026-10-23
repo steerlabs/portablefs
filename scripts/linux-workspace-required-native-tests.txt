@@ -34,3 +34,12 @@ managed-child-death-exact-cleanup
 managed-awake-proof-loss-cold-recovery
 managed-provision-only-reboot-reissue
 managed-terminal-final-evidence-retired
+managed-network-outage-8s
+managed-network-outage-20s
+managed-busy-cwd-unmount-retry
+managed-busy-fsync-unmount-retry
+managed-suspend-application-transparency
+managed-guest-cli-inventory
+managed-mount-intent-across-suspend
+managed-long-pause-terminal-replacement
+managed-terminal-cause-and-cwd-removal

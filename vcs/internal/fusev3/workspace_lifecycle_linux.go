@@ -861,7 +861,7 @@ func (m *Mount) drainWorkspaceDispatch(d workspaceDispatch, p workspaceDrainPerm
 			return err
 		}
 		if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
-			return errSubscriptionExpired
+			return errors.Join(authorityrpc.ErrDispatchExpired, errSubscriptionExpired)
 		}
 		return nil
 	})

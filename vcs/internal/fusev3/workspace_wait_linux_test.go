@@ -11,6 +11,27 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
 )
 
+// A closed operation must stay outside the cohort until recovery or terminal
+// teardown. Use cancellation only after proving that it has not answered.
+func closedWorkspaceCall(t *testing.T, m *Mount, call func() fuse.Status) fuse.Status {
+	t.Helper()
+	done := make(chan fuse.Status, 1)
+	go func() { done <- call() }()
+	select {
+	case status := <-done:
+		t.Fatalf("closed request answered before recovery or terminal teardown: %v", status)
+	case <-time.After(20 * time.Millisecond):
+	}
+	m.cancel()
+	select {
+	case status := <-done:
+		return status
+	case <-time.After(time.Second):
+		t.Fatal("terminal teardown did not release admission waiter")
+		return fuse.EIO
+	}
+}
+
 func TestWorkspaceClosedRequestsWaitOutsideColdCut(t *testing.T) {
 	for _, fast := range []bool{false, true} {
 		t.Run(map[bool]string{true: "cached-entry", false: "callback"}[fast], func(t *testing.T) {

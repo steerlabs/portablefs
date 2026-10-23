@@ -39,6 +39,11 @@ type DispatchSnapshot struct {
 
 type dispatchTimeoutKey struct{}
 
+// ErrDispatchExpired ends an unsubmitted foreground attempt whose captured
+// drain permission cannot become valid again. Cleanup owners without a
+// foreground budget remain parked for the next lifecycle permission.
+var ErrDispatchExpired = errors.New("authorityrpc: captured dispatch permission expired")
+
 // WithDispatchTimeout bounds submitted I/O without spending its budget behind
 // a local readiness fence. The parent still owns cancellation of the job.
 func WithDispatchTimeout(ctx context.Context, timeout time.Duration) context.Context {
@@ -136,8 +141,12 @@ func (f *DispatchFence) waitReadyLocked(ctx context.Context, assigning bool) err
 			f.mu.Lock()
 			continue
 		}
-		if f.check() == nil {
+		err := f.check()
+		if err == nil {
 			return nil
+		}
+		if timeout, _ := ctx.Value(dispatchTimeoutKey{}).(time.Duration); timeout > 0 && errors.Is(err, ErrDispatchExpired) {
+			return err
 		}
 		changed := f.changed
 		f.mu.Unlock()

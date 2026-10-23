@@ -122,7 +122,7 @@ with p.open() as f:
         event = guest.wait('mount-status', 30)
         return json.loads(self.fixture('decode-status', event['body']))
 
-    def job(self, guest, operation, timeout=90):
+    def job(self, guest, operation, timeout=90, allow_fail=False):
         deadline = time.monotonic() + timeout
         seen = getattr(self, 'seen_jobs', {})
         key = (guest.p.pid, operation)
@@ -138,7 +138,8 @@ with p.open() as f:
                             and int(j['requestId']) > seen.get(key, 0)]
                 for job in selected:
                     if job['phase'] in ('complete', 'failed'):
-                        assert job['phase'] == 'complete', job
+                        assert allow_fail or job['phase'] == 'complete', job
+                        self.last_job = job
                         seen[key] = int(job['requestId']); self.seen_jobs = seen
                         return status
             assert time.monotonic() < deadline, (operation, current)

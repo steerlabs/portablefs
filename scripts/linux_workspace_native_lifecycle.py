@@ -1,0 +1,216 @@
+"""Application effects across real managed-mount lifecycle transitions."""
+import contextlib
+import json
+import pathlib
+import selectors
+import shlex
+import subprocess
+import time
+import uuid
+
+
+class LifecycleChecks:
+    def __init__(self, authority, guest, record):
+        self.a, self.g, self.record = authority, guest, record
+        self.results = {}
+
+    def save(self, name, value):
+        self.results[name] = value
+        (self.a.evidence / 'managed-lifecycle.json').write_text(json.dumps(self.results, indent=2))
+        self.record(name)
+
+    def mount(self):
+        mounts = [m for m in self.a.status(self.g).get('mounts', [])
+                  if m['mount']['volumeId'] == self.a.volume]
+        return mounts[0] if mounts else None
+
+    @contextlib.contextmanager
+    def holder(self, kind, threads=2):
+        tag = 'pfs-native-lifecycle-' + uuid.uuid4().hex
+        stop, result = '~/'+tag+'.stop', '~/'+tag+'.json'
+        worker = r'''import json,os,pathlib,threading,time
+home=pathlib.Path.home(); stop=home/STOP; result=home/RESULT
+root=pathlib.Path(ROOT); errors=[]; counts={}; lock=threading.Lock()
+def run(i):
+    n=0; fd=os.open(root/(TAG+'-'+str(i)),os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600)
+    try:
+        while not stop.exists():
+            try:
+                data=('%08d\n'%n).encode()
+                assert os.write(fd,data)==len(data)
+                os.fsync(fd); n+=1
+            except OSError as e:
+                with lock: errors.append(e.errno)
+            time.sleep(.01)
+    finally:
+        try: os.close(fd)
+        except OSError as e:
+            with lock: errors.append(e.errno)
+        counts[str(i)]=n
+if KIND=='cwd':
+    os.chdir(root); print('held-ready',flush=True)
+    while not stop.exists(): time.sleep(.01)
+    os.stat('.'); counts['cwd']=1
+else:
+    workers=[threading.Thread(target=run,args=(i,)) for i in range(THREADS)]
+    for w in workers: w.start()
+    time.sleep(.2); print('held-ready',flush=True)
+    for w in workers: w.join()
+result.write_text(json.dumps({'counts':counts,'errors':errors,'tag':TAG}))
+'''
+        variables = {'STOP': tag+'.stop', 'RESULT': tag+'.json', 'ROOT': self.a.target,
+                     'TAG': tag, 'KIND': kind, 'THREADS': threads}
+        # Assign constants rather than substitute into Python string literals.
+        source = '\n'.join(k+'='+repr(v) for k, v in variables.items())+'\n'+worker
+        stderr = (self.a.evidence / (tag+'.stderr')).open('w')
+        p = subprocess.Popen(['/usr/bin/ssh', '-F', self.g.ready['ssh_config'],
+            'portablefs-workspace', 'python3 -u -c '+shlex.quote(source)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr, text=True)
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(p.stdout, selectors.EVENT_READ)
+                assert ready.select(10), 'application holder did not start'
+                assert p.stdout.readline().strip() == 'held-ready', p.poll()
+            yield p, stop, result
+        finally:
+            if p.poll() is None:
+                self.g.ssh('touch '+stop)
+                try: p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.terminate(); p.wait(timeout=5)
+            p.stdout.close(); stderr.close()
+
+    def finish_holder(self, holder, allow_errors=False):
+        p, stop, result = holder
+        self.g.ssh('touch '+stop)
+        assert p.wait(timeout=10) == 0
+        value = json.loads(self.g.ssh('cat '+result))
+        assert allow_errors or not value['errors'], value
+        assert value['counts'] and all(n > 0 for n in value['counts'].values()), value
+        if 'cwd' not in value['counts']:
+            # Every fsync-acknowledged record is checked through the independent
+            # ordinary peer, including a failure tail beyond the ack watermark.
+            check = """import pathlib,json
+r=pathlib.Path('/var/tmp/pfs-native/home/peer'); v=json.loads(VALUE)
+for i,n in v['counts'].items():
+    data=(r/(v['tag']+'-'+i)).read_bytes()
+    expected=b''.join(('%08d\\n'%j).encode() for j in range(n))
+    assert data[:len(expected)]==expected,(i,n,len(data))
+print('all-acknowledged-records-intact')
+""".replace('VALUE', repr(json.dumps(value)))
+            assert self.a.peer(check) == 'all-acknowledged-records-intact'
+        self.g.ssh('rm -f '+stop+' '+result)
+        return value
+
+    def pause_resume(self, seconds=1):
+        started = time.monotonic()
+        self.g.command('pause')
+        paused = self.g.wait('paused', 20)
+        drain = time.monotonic()-started
+        assert paused['fenced'] and drain < 15, (paused, drain)
+        time.sleep(seconds)
+        self.g.command('resume'); self.g.wait('resumed', 20)
+        self.a.ready(self.g, timeout=15)
+        return drain
+
+    def network(self):
+        for seconds in (8, 20):
+            before = self.a.authority_sessions()
+            incarnation = self.mount()['mount']['incarnation']
+            with self.holder('fsync') as holder:
+                self.a.network(True)
+                started = time.monotonic()
+                try:
+                    while time.monotonic()-started < seconds:
+                        self.a.status(self.g)  # A real caller during awake recovery.
+                        time.sleep(.2)
+                finally:
+                    self.a.network(False)
+                recovered = self.a.ready(self.g, timeout=20)
+                recovery = time.monotonic()-started-seconds
+                assert recovered['mount']['incarnation'] == incarnation, recovered
+                assert self.a.authority_sessions() == before, 'outage replaced the authority session'
+                value = self.finish_holder(holder, allow_errors=True)
+            self.save('managed-network-outage-'+str(seconds)+'s',
+                      {'recovery_seconds': recovery, 'application': value, 'sessions': before})
+
+    def busy(self, public):
+        for kind in ('cwd', 'fsync'):
+            with self.holder(kind) as holder:
+                started = time.monotonic()
+                self.g.command('umount', body=public['mount'])
+                assert self.g.wait('umount-accepted', 10)['code'] == 'accepted'
+                self.a.job(self.g, 'umount', timeout=5, allow_fail=True)
+                job = self.a.last_job
+                assert job['phase'] == 'failed' and 'busy' in job['reason'].lower(), job
+                assert time.monotonic()-started < 5 and self.mount()['state'] == 'ready'
+                if kind == 'fsync':
+                    self.pause_resume()
+                value = self.finish_holder(holder)
+            self.a.unmount(self.g, public)
+            public = self.a.mount(self.g)
+            self.save('managed-busy-'+kind+'-unmount-retry', {'job': job, 'application': value})
+        return public
+
+    def suspend(self):
+        with self.holder('fsync', threads=4) as holder:
+            drains = [self.pause_resume(seconds=1) for _ in range(3)]
+            value = self.finish_holder(holder)
+        self.save('managed-suspend-application-transparency', {'drain_seconds': drains, 'application': value})
+
+    def listing(self):
+        rows = json.loads(self.g.ssh('portablefs mounts --json'))['mounts']
+        assert len([r for r in rows if r['mountPath'] == self.a.target]) == 1, rows
+        self.save('managed-guest-cli-inventory', rows)
+
+    def mount_race(self, public):
+        self.a.unmount(self.g, public)
+        public = self.a.mount(self.g, provision_only=True)
+        self.g.p.stdin.write(json.dumps({'command':'mount','body':public['mount']})+'\n'+json.dumps({'command':'pause'})+'\n')
+        self.g.p.stdin.flush()
+        paused = self.g.wait('paused', 20)
+        assert paused['fenced']
+        self.g.command('resume'); self.g.wait('resumed', 20)
+        assert self.g.wait('mount-accepted', 10)['code'] == 'accepted'
+        self.a.job(self.g, 'mount', timeout=15)
+        mounted = self.a.ready(self.g, timeout=15)
+        public['incarnation'] = mounted['mount']['incarnation']
+        assert self.g.ssh("printf resumed-intent > /workspaces/native-managed/mount-race; sync /workspaces/native-managed/mount-race; cat /workspaces/native-managed/mount-race") == 'resumed-intent'
+        assert self.a.peer("import pathlib;print(pathlib.Path('/var/tmp/pfs-native/home/peer/mount-race').read_text())") == 'resumed-intent'
+        self.save('managed-mount-intent-across-suspend', {'mount': mounted})
+        return public
+
+    def long_pause(self, public):
+        with self.holder('cwd') as holder:
+            self.g.command('pause'); assert self.g.wait('paused', 20)['fenced']
+            time.sleep(150)
+            started = time.monotonic()
+            self.g.command('resume'); self.g.wait('resumed', 20)
+            while True:
+                mounted = self.mount()
+                if mounted and mounted['state'] == 'terminal' and mounted.get('cleanup') == 'complete': break
+                assert time.monotonic()-started < 15, mounted
+                time.sleep(.05)
+            assert 'session ended' in mounted['reason'], mounted
+            # The original cwd is terminal. It must not prevent exact removal,
+            # fresh provisioning, or an independent fresh-open application.
+            self.a.protected(self.g)
+            self.a.unmount(self.g, public)
+            replacement = self.a.mount(self.g)
+            assert replacement['incarnation'] != public['incarnation']
+            self.g.ssh('touch '+holder[1])
+            holder[0].wait(timeout=10)
+            assert self.g.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
+        self.save('managed-long-pause-terminal-replacement', {'terminal': mounted, 'settle_seconds': time.monotonic()-started})
+        self.save('managed-terminal-cause-and-cwd-removal', {'reason': mounted['reason']})
+        return replacement
+
+
+def lifecycle_checks(authority, guest, public, record):
+    checks = LifecycleChecks(authority, guest, record)
+    checks.listing()
+    checks.network()
+    public = checks.busy(public)
+    checks.suspend()
+    public = checks.mount_race(public)
+    return checks.long_pause(public)
