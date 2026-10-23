@@ -697,7 +697,9 @@ The private lifecycle observation reports `WorkspaceRecoveryRequired` when a
 prepared mount loses its subscription or clock proof. The root driver must
 observe that state while awake, close the shared gate, and drive the authorized
 Close/Suspend/Recover/Open sequence. Restoring clock readiness alone cannot
-republish serving permission. Grant expiry within a live authorized session
+republish serving permission. Revocation, owner death, mount shutdown or session
+termination reports `WorkspaceTerminal`, without a prepared or cold recovery
+claim. Grant expiry within a live authorized session
 forfeits its accepted non-durable cut exactly once; recovery preserves the
 cumulative loss tickets and old description/root barrier baselines. It neither
 replays forfeited bytes under a successor grant nor ends a valid session.

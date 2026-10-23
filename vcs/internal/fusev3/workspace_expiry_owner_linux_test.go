@@ -4,10 +4,12 @@ package fusev3
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
+	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 	"github.com/steerlabs/portablefs/vcs/internal/mountcontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
@@ -30,13 +33,20 @@ func TestWorkspaceOwnerCloseAtPermitBoundaries(t *testing.T) {
 		t.Run(boundary, func(t *testing.T) { testWorkspacePermitClose(t, boundary) })
 	}
 }
+
+func TestWorkspaceOwnerRenewalCutoffSurvivesClose(t *testing.T) {
+	testWorkspacePermitClose(t, "renewal-cutoff")
+}
+
 func testWorkspacePermitClose(t *testing.T, boundary string) {
 	for _, independent := range []bool{false, true} {
 		t.Run(strconv.FormatBool(independent), func(t *testing.T) {
-			f, gate, _ := coldFixture(t)
+			f, gate, rpc := coldFixture(t)
 			serial := gate.Close(1)
 			var hold atomic.Bool
 			entered, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			resume := func() { releaseOnce.Do(func() { close(release) }) }
 			pause := func() {
 				if hold.CompareAndSwap(true, false) {
 					close(entered)
@@ -47,7 +57,7 @@ func testWorkspacePermitClose(t *testing.T, boundary string) {
 				f.mount.workspaceLifecycle.beforeRecoveryProof = pause
 			}
 			f.mount.subscription.config.beforeRecoveryProof = func(install bool) {
-				if boundary == "subscribe-entry" && !install || boundary == "subscribe-install" && install {
+				if boundary == "subscribe-entry" && !install || (boundary == "subscribe-install" || boundary == "renewal-cutoff") && install {
 					pause()
 				}
 			}
@@ -99,6 +109,12 @@ func testWorkspacePermitClose(t *testing.T, boundary string) {
 						state = "prepared"
 						facts.AuthorizationDeadlineUnixNanos = "2000000000000000000"
 						facts.Readiness = &mountcontrol.Prepared{SessionValidated: true, AuthorizationValidated: true, Standalone: true, Renewal: mountcontrol.Renewal{State: "not-required", InstalledSequence: "0"}, SubscriptionIncarnation: strconv.FormatUint(o.SubscriptionIncarnation, 10)}
+						if renewer := f.mount.workspaceLifecycle.renewer; renewer != nil {
+							r := renewer.Readiness()
+							facts.Readiness.Standalone = false
+							facts.Readiness.Renewal = mountcontrol.Renewal{State: r.State, InstalledSequence: strconv.FormatUint(r.InstalledSequence, 10)}
+							facts.AuthorizationDeadlineUnixNanos = strconv.FormatInt(r.AuthorizationDeadline.UnixNano(), 10)
+						}
 					}
 					if err := j.Publish(state, facts); err != nil {
 						o.Result = authorityrpc.LifecycleCompletion(ctx, err)
@@ -108,7 +124,7 @@ func testWorkspacePermitClose(t *testing.T, boundary string) {
 				results <- o
 				return o.Result
 			}
-			defer owner.Close()
+			defer func() { resume(); owner.Close() }()
 			var requestID uint64
 			req := func(op string, id, g, s uint64, transaction string) mountcontrol.Request {
 				requestID++
@@ -217,17 +233,30 @@ func testWorkspacePermitClose(t *testing.T, boundary string) {
 				t.Fatal(o)
 			}
 			observe(q, "cold")
+			var renewalBoundary func()
+			if boundary == "renewal-cutoff" {
+				renewalBoundary = startWorkspaceCutoffRenewer(t, f.mount, rpc, independent)
+			}
 			hold.Store(true)
 			q = req("workspace-recover", requestID+1, 2, serial, transaction(2, true))
 			do(q, &mountcontrol.Rights{})
-			<-entered
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("recovery boundary not reached")
+			}
+			if renewalBoundary != nil {
+				// Subscribe owns its response but has not performed the final
+				// permit validation. Renewal reaches its own disposition first.
+				renewalBoundary()
+			}
 			// Production order: the supervisor closes the gate, then frames the
 			// newer Suspend. The running job may observe the closed gate first.
 			newerSerial := gate.Close(3)
-			if independent && boundary != "publication" {
+			if independent && boundary != "publication" && boundary != "renewal-cutoff" {
 				f.mount.workspaceLifecycle.evidence.Store(&workspaceEvidence{failure: syscall.ENOSPC})
 			}
-			close(release)
+			resume()
 			o := await()
 			t.Logf("job observed gate Close before the frame: result=%v err=%v", o.Result.Disposition, o.Result.Err)
 			newer := req("workspace-suspend", requestID+1, 3, newerSerial, transaction(3, false))
@@ -241,6 +270,12 @@ func testWorkspacePermitClose(t *testing.T, boundary string) {
 			}
 			if o.Result.Disposition != want || o.Prepared {
 				t.Error("a pure newer Close observed through the gate became", o.Result)
+			}
+			if !independent && (o.Result.PermitLoss == nil || *o.Result.PermitLoss != (authorityrpc.LifecyclePermitLoss{Generation: 2, Serial: serial, Successor: newerSerial})) {
+				t.Error("pure Close lost the exact job attribution", o.Result)
+			}
+			if boundary == "renewal-cutoff" && independent && !errors.Is(o.Result.Err, context.DeadlineExceeded) {
+				t.Error("completion lost the terminal renewal cutoff", o.Result)
 			}
 			// Do starts the exact previously framed successor once the old job joins.
 			do(newer, &mountcontrol.Rights{})
@@ -279,6 +314,99 @@ func testWorkspacePermitClose(t *testing.T, boundary string) {
 				observe(recover, "prepared")
 			}
 		})
+	}
+}
+
+type workspaceRenewalSourceFunc func(context.Context, string, uint64) (controlplane.MountAuthorization, error)
+
+func (f workspaceRenewalSourceFunc) Refresh(ctx context.Context, session string, sequence uint64) (controlplane.MountAuthorization, error) {
+	return f(ctx, session, sequence)
+}
+
+// The real renewal owner installs a grant, then fails a Manager refresh just
+// before its serving cutoff. Only the renewal clock advances; the lifecycle
+// job and its permit remain live until the test explicitly closes the gate.
+func startWorkspaceCutoffRenewer(t *testing.T, m *Mount, rpc *coldTestRPC, cutoff bool) func() {
+	t.Helper()
+	start := time.Now().Truncate(time.Second)
+	rpc.deadline = start.Add(2 * time.Minute)
+	var now atomic.Int64
+	now.Store(start.UnixNano())
+	installed, refreshing, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var runErr error
+	renewer := &mountenrollment.Renewer{
+		Managed: true,
+		Now:     func() time.Time { return time.Unix(0, now.Load()) },
+		CheckPermit: func(p mountenrollment.Permit) bool {
+			_, err := m.workspace.Recovery(p.Generation, p.GateSerial)
+			return err == nil
+		},
+		Observe: func(e mountenrollment.RenewalEvent) {
+			if e.Kind == mountenrollment.RenewalSucceeded && e.Status.Sequence == 1 {
+				close(installed)
+			}
+		},
+	}
+	refreshes := 0
+	renewer.Source = workspaceRenewalSourceFunc(func(ctx context.Context, session string, sequence uint64) (controlplane.MountAuthorization, error) {
+		if sequence == 2 {
+			refreshes++
+			if refreshes == 1 {
+				close(refreshing)
+				if cutoff {
+					return controlplane.MountAuthorization{}, context.DeadlineExceeded
+				}
+				<-ctx.Done()
+				return controlplane.MountAuthorization{}, ctx.Err()
+			}
+		}
+		return controlplane.MountAuthorization{SessionID: session, Sequence: sequence, Capability: "grant", ExpiresUnix: rpc.deadline.Unix()}, nil
+	})
+	if err := renewer.Park(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m.workspaceLifecycle.standalone, m.workspaceLifecycle.renewer = false, renewer
+	ctx, cancel := context.WithCancel(t.Context())
+	go func() {
+		defer close(done)
+		runErr = renewer.Run(ctx, base64.RawURLEncoding.EncodeToString(m.rpc.SessionID()), rpc.deadline, func(context.Context, string, uint64, []byte) (time.Time, error) {
+			return rpc.deadline, nil
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("renewal owner did not stop")
+		}
+	})
+	return func() {
+		t.Helper()
+		select {
+		case <-installed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("renewal did not install the serving grant")
+		}
+		// A two-minute window has a twelve-second safety margin. A failed
+		// refresh's 500 ms retry is outside that cutoff and becomes terminal.
+		now.Store(rpc.deadline.Add(-12*time.Second - 250*time.Millisecond).UnixNano())
+		renewer.RefreshNow()
+		select {
+		case <-refreshing:
+		case <-time.After(5 * time.Second):
+			t.Fatal("renewal did not reach the Manager refresh")
+		}
+		if cutoff {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("renewal did not latch its independent cutoff")
+			}
+			if ctx.Err() != nil || !errors.Is(runErr, context.DeadlineExceeded) || renewer.Failure() == nil {
+				t.Fatal("renewal cutoff was not independent", runErr, renewer.Failure(), ctx.Err())
+			}
+		}
 	}
 }
 

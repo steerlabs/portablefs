@@ -1734,7 +1734,7 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 		return s.retire, nil
 	}
 	begin := buf.BeginRetire
-	if registry := m.subscription; registry != nil {
+	if registry := m.subscription; registry != nil && registry.mount != nil && registry.mount.workspace != nil {
 		registry.mu.RLock()
 		p := registry.workspaceDrain
 		now := registry.config.clock.Now()
@@ -1752,7 +1752,7 @@ func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writebac
 		}
 	}
 	r, err := begin(ctx, &s.identity)
-	if err == writeback.ErrClosed && m.subscription != nil {
+	if err == writeback.ErrClosed && m.subscription != nil && m.subscription.mount != nil && m.subscription.mount.workspace != nil {
 		m.subscription.mu.RLock()
 		p := m.subscription.workspaceDrain
 		closing := p != nil && p.manager == m && p.buffer == buf

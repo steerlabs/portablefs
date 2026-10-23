@@ -159,6 +159,7 @@ type integrationConfig struct {
 	workspace          *workspaceadmission.Reader
 	workspaceRecovery  *workspaceadmission.RecoveryPermit
 	latencies          fuse.LatencyMap
+	onRevoked          func(RevocationReport) // first mount only
 	// The shipping CLI lifecycle test owns its mounts and uses signed hosted
 	// grants, while sharing this fixture's actual XFS/authority assembly.
 	skipMounts    bool
@@ -638,9 +639,14 @@ func (f *integrationFixture) mountAll() {
 		if workspace != nil && f.cfg.workspaceRecovery != nil {
 			startup = context.WithValue(startup, workspaceRecoveryKey{}, *f.cfg.workspaceRecovery)
 		}
+		onRevoked := f.cfg.onRevoked
+		if i != 0 {
+			onRevoked = nil
+		}
 		mount, err := MountVolume(context.Background(), startup, f.paths[i], transport, Config{
 			workspace:          workspace,
 			workspaceLifecycle: life,
+			OnRevoked:          onRevoked,
 			MountInstanceID:    mountInstanceID, RequestTimeout: requestTimeout,
 			MaxBackground: 64, ReclaimQueue: 1024,
 			// The frontend carves its cleanup workers out of this number, so it

@@ -41,6 +41,7 @@ const (
 	WorkspacePrepared
 	WorkspaceRecoveryRequired
 	WorkspaceCold
+	WorkspaceTerminal
 )
 
 type WorkspaceObservation struct {
@@ -274,11 +275,27 @@ func (m *Mount) WorkspaceObservation() WorkspaceObservation {
 		return WorkspaceObservation{Outcome: control.UnknownOutcome()}
 	}
 	prior := m.workspaceLifecycle.observation.Load()
-	if prior == nil {
-		return m.workspaceObservation(0, 0)
+	var g, serial uint64
+	if prior != nil {
+		g, serial = prior.Generation, prior.GateSerial
 	}
-	o := m.workspaceObservation(prior.Generation, prior.GateSerial)
-	o.Prepared, o.ColdComplete = prior.Prepared, prior.ColdComplete
+	o := m.workspaceObservation(g, serial)
+	terminal := m.isRevoked() || m.ctx.Err() != nil || m.rpc.SessionEndCause() != nil
+	if m.workspace != nil {
+		select {
+		case <-m.workspace.Done():
+			terminal = true
+		default:
+		}
+	}
+	if terminal {
+		o.Prepared, o.ColdComplete = false, false
+		o.State = WorkspaceTerminal
+		return o
+	}
+	if prior != nil {
+		o.Prepared, o.ColdComplete = prior.Prepared, prior.ColdComplete
+	}
 	o.State = WorkspaceIdle
 	if o.ColdComplete {
 		o.State = WorkspaceCold
@@ -290,12 +307,23 @@ func (m *Mount) WorkspaceObservation() WorkspaceObservation {
 		proof, err := m.workspace.Recovery(o.Generation, o.GateSerial)
 		permit := mountenrollment.Permit{Generation: o.Generation, GateSerial: o.GateSerial}
 		_, _, _, live := m.subscription.currentIncarnation()
-		if err != nil && !m.workspace.Installed(proof) || !live || m.workspaceLifecycle.clock.Check(permit) != nil || m.isRevoked() {
+		if err != nil && !m.workspace.Installed(proof) || !live || m.workspaceLifecycle.clock.Check(permit) != nil {
 			o.Prepared = false
 			o.State = WorkspaceRecoveryRequired
 		}
 	}
 	return o
+}
+
+// A retained terminal renewal verdict is independent of the lifecycle waiter,
+// even when its diagnostic wraps cancellation or an attempt deadline.
+func (w *workspaceLifecycle) renewalFailure() error {
+	if w.renewer != nil {
+		if err := w.renewer.Failure(); err != nil {
+			return &authorityrpc.LifecycleIndependentFailure{Err: err}
+		}
+	}
+	return nil
 }
 
 func (m *Mount) workspaceDependencies() (*workspaceLifecycle, workspaceDispatch, error) {
@@ -343,8 +371,8 @@ func (m *Mount) workspacePublication(ctx context.Context, g, serial uint64, prep
 	if e := w.evidence.Load(); e != nil && e.failure != nil {
 		return failed(e.failure)
 	}
-	if w.renewer != nil && w.renewer.Failure() != nil {
-		return failed(w.renewer.Failure())
+	if err := w.renewalFailure(); err != nil {
+		return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: err}
 	}
 	proof, err := m.workspace.Recovery(g, serial)
 	if err != nil {
@@ -598,6 +626,9 @@ func (m *Mount) prepareWorkspace(ctx context.Context, g, serial uint64, recover 
 	recoveryCtx := context.WithValue(ctx, workspaceRecoveryKey{}, proof)
 	if w.renewer != nil {
 		if err = w.renewer.Resume(p); err != nil {
+			if failure := w.renewalFailure(); failure != nil {
+				return o, fail(failure)
+			}
 			if errors.Is(err, mountenrollment.ErrPermitObsolete) {
 				if _, lost := m.workspace.Recovery(g, serial); lost != nil {
 					phase = authorityrpc.ClassifyLifecycleAttempt(lost)
@@ -623,8 +654,8 @@ func (m *Mount) prepareWorkspace(ctx context.Context, g, serial uint64, recover 
 				if result := check(); result.Disposition != authorityrpc.AttemptComplete {
 					return result
 				}
-				if err := w.renewer.Failure(); err != nil {
-					return authorityrpc.ClassifyLifecycleAttempt(err)
+				if err := w.renewalFailure(); err != nil {
+					return authorityrpc.LifecycleAttempt{Disposition: authorityrpc.AttemptFailed, Err: err}
 				}
 				_, _, _, live := m.subscription.currentIncarnation()
 				if !live {
@@ -729,10 +760,7 @@ func (m *Mount) cutWorkspace(ctx context.Context, w *workspaceLifecycle, d works
 	}
 	w.workerDisposition(0, "parked")
 	if w.renewer != nil {
-		if err = w.renewer.Park(ctx); err != nil {
-			return false, err
-		}
-		if err = w.renewer.Failure(); err != nil {
+		if err = errors.Join(w.renewer.Park(ctx), w.renewalFailure()); err != nil {
 			return false, err
 		}
 	}
@@ -871,7 +899,7 @@ func (m *Mount) parkWorkspace(ctx context.Context, w *workspaceLifecycle, d work
 	var err error
 	err = errors.Join(err, m.subscription.takeWorkspaceOwnership(ctx))
 	if w.renewer != nil {
-		err = errors.Join(err, w.renewer.Park(ctx), w.renewer.Failure())
+		err = errors.Join(err, w.renewer.Park(ctx), w.renewalFailure())
 	}
 	err = errors.Join(err, w.keepalive.park(ctx), m.subscription.parkWorkspaceControl(ctx), d.ParkDispatch(ctx))
 	if cause := m.rpc.SessionEndCause(); cause != nil {

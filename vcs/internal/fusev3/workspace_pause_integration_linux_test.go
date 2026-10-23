@@ -95,7 +95,8 @@ func workspaceKernelPauseChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	life := &workspaceLifecycle{lane: make(chan struct{}, 1), clock: &workspaceTestClockOwner{}, standalone: true, persist: func(WorkspaceObservation) error { return nil }}
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, SessionLease: 2 * time.Minute, workspace: reader, workspaceRecovery: &proof, workspaceFirstOnly: true, workspaceLifecycle: life, workspaceDispatch: true})
+	revoked := make(chan RevocationReport, 2)
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, SessionLease: 2 * time.Minute, workspace: reader, workspaceRecovery: &proof, workspaceFirstOnly: true, workspaceLifecycle: life, workspaceDispatch: true, onRevoked: func(r RevocationReport) { revoked <- r }})
 	mounted.Store(f.mounts[0])
 	m := f.mounts[0]
 	command := func(want byte) {
@@ -169,5 +170,6 @@ func workspaceKernelPauseChild(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("owner EOF stranded connection")
 	}
+	waitWorkspaceKernelWithdrawal(t, revoked)
 	fmt.Println("owner-exit")
 }

@@ -4,7 +4,9 @@ package fusev3
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -21,16 +23,13 @@ func opusRawWrite(path, data string) error {
 	if err != nil {
 		return err
 	}
-	_, werr := unix.Pwrite(fd, []byte(data), 0)
+	n, werr := unix.Pwrite(fd, []byte(data), 0)
+	if werr == nil && n != len(data) {
+		werr = io.ErrShortWrite
+	}
 	serr := unix.Fsync(fd)
 	cerr := unix.Close(fd)
-	if werr != nil {
-		return werr
-	}
-	if serr != nil {
-		return serr
-	}
-	return cerr
+	return errors.Join(werr, serr, cerr)
 }
 
 // R3 coherence: after the authority retires the lapsed subscriber (grant
@@ -92,6 +91,9 @@ func opusR3LateApplyChild(t *testing.T) {
 	perrE := opusRawWrite(f.join(1, "e"), "Q1")
 	perrG := opusRawWrite(f.join(1, "g"), "P1")
 	fmt.Printf("LA peer writes took %v: e=%v g=%v\n", time.Since(peerStart).Round(10*time.Millisecond), perrE, perrG)
+	if err := errors.Join(perrE, perrG); err != nil {
+		t.Fatal("peer write/fsync/close must succeed before readiness returns", err)
+	}
 	sample("after peer")
 	for time.Since(begin) < 45*time.Second {
 		time.Sleep(500 * time.Millisecond)
@@ -107,10 +109,10 @@ func opusR3LateApplyChild(t *testing.T) {
 	time.Sleep(time.Second)
 	sample("after Suspend/Recover")
 	e, g := authority("e"), authority("g")
-	if perrE == nil && e != "Q1" {
+	if e != "Q1" {
 		c.fail("LATE APPLY: peer's newer e=Q1 overwritten; authority e=%q", e)
 	}
-	if perrG == nil && g != "P1" {
+	if g != "P1" {
 		c.fail("LATE APPLY: peer's newer g=P1 overwritten; authority g=%q", g)
 	}
 	if c.m.isRevoked() || c.m.rpc.SessionEndCause() != nil {
