@@ -85,3 +85,40 @@ func TestRootStableBackingAndAcknowledgedMetadata(t *testing.T) {
 		t.Fatal("followed foreign local backing symlink")
 	}
 }
+
+func TestRootRecreatesOnlyProtectedColdTarget(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root target pin boundary")
+	}
+	m := &Manager{Targets: t.TempDir()}
+	id := desired(1).Mount
+	target, old, err := m.protectedTarget(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Close()
+	path := filepath.Join(m.Targets, id.VolumeId)
+	if err = os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	target, next, err := m.protectedTarget(id)
+	if err != nil || next.Mode&0777 != 0 || next.Uid != 0 || next.Gid != 0 {
+		t.Fatal("cold target was not protected", old, next, err)
+	}
+	target.Close()
+	if err = os.Chmod(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = m.protectedTarget(id); err == nil {
+		t.Fatal("adopted writable target")
+	}
+	if err = os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(m.Targets, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = m.protectedTarget(id); err == nil {
+		t.Fatal("followed replaced target")
+	}
+}

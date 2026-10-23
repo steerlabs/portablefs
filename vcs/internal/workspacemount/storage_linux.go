@@ -11,6 +11,24 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func (m *Manager) protectedTarget(id *pb.MountID) (*os.File, unix.Stat_t, error) {
+	var st unix.Stat_t
+	path := filepath.Join(m.Targets, id.VolumeId)
+	if err := os.Mkdir(path, 0); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, st, err
+	}
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, st, err
+	}
+	target := os.NewFile(uintptr(fd), "protected workspace target")
+	if err = unix.Fstat(fd, &st); err != nil || st.Uid != 0 || st.Gid != 0 || st.Mode&0777 != 0 {
+		target.Close()
+		return nil, st, errors.New("workspace target must be root-owned mode 000")
+	}
+	return target, st, nil
+}
+
 // Machine-local routes belong to this machine and authority/volume, across
 // terminal replacement and cold boots. Incarnation metadata is separate.
 func (m *Manager) backingRoot(id *pb.MountID) (string, error) {

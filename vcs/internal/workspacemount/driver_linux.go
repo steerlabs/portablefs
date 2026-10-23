@@ -200,18 +200,9 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 	if err = m.Inventory.CanReserve(id, path); err != nil {
 		return nil, err
 	}
-	if err = os.Mkdir(path, 0); err != nil && !errors.Is(err, os.ErrExist) {
-		return nil, err
-	}
-	fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	target, st, err := m.protectedTarget(id)
 	if err != nil {
 		return nil, err
-	}
-	target := os.NewFile(uintptr(fd), "protected workspace target")
-	var st unix.Stat_t
-	if err = unix.Fstat(fd, &st); err != nil || st.Uid != 0 || st.Mode&0777 != 0 {
-		target.Close()
-		return nil, errors.New("workspace target must be root-owned mode 000")
 	}
 	instance := "mnt_" + base64.RawURLEncoding.EncodeToString(id.Incarnation)
 	d := &Driver{manager: m, id: proto.Clone(id).(*pb.MountID), target: target, generation: g, exited: make(chan struct{}), witness: Witness{Intent: instance, Source: "portablefs:" + instance, Target: path}}
@@ -369,6 +360,18 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		if _, err = fusev3.ObservePlannedKernelMountAbsent(run.Witness.Source, run.Witness.Target); err != nil {
 			return err
 		}
+		if run.Witness.Target != filepath.Join(m.Targets, run.Mount.VolumeId) {
+			return errors.New("workspace reconciliation target differs from protected namespace")
+		}
+		// /workspaces is volatile. Recreate only the closed directory after
+		// proving old kernel absence; this never adopts the old inode or child.
+		target, _, err := m.protectedTarget(run.Mount)
+		if err != nil {
+			return err
+		}
+		if err = target.Close(); err != nil {
+			return err
+		}
 		if _, err = m.reconcileCLI(ctx, run, "", false); err != nil {
 			return err
 		}
@@ -484,7 +487,18 @@ func (d *Driver) next() (uint64, error) {
 		}
 	}
 }
-func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspace, phase *mountcontrol.Phase, rights *mountcontrol.Rights) (*mountcontrol.WorkspaceResponse, error) {
+
+type localRequestUnsent struct{ error }
+
+func (e *localRequestUnsent) Unwrap() error { return e.error }
+
+func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspace, phase *mountcontrol.Phase, rights *mountcontrol.Rights) (_ *mountcontrol.WorkspaceResponse, result error) {
+	sent := false
+	defer func() {
+		if result != nil && !sent {
+			result = &localRequestUnsent{result}
+		}
+	}()
 	// Transactions belong only to their start. Observations and action replies
 	// name that operation through its binding, without resubmitting its body.
 	if op != "workspace-suspend" && op != "workspace-recover" {
@@ -506,10 +520,11 @@ func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspa
 	if !deadline.After(time.Now()) {
 		return nil, context.DeadlineExceeded
 	}
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: d.socket, Net: "unix"})
+	stream, err := (&net.Dialer{Deadline: deadline}).DialContext(ctx, "unix", d.socket)
 	if err != nil {
 		return nil, err
 	}
+	conn := stream.(*net.UnixConn)
 	defer conn.Close()
 	if err = conn.SetDeadline(deadline); err != nil {
 		return nil, err
@@ -539,6 +554,7 @@ func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspa
 	if err != nil {
 		return nil, err
 	}
+	sent = true
 	if rights != nil {
 		_, _, err = conn.WriteMsgUnix(raw, unix.UnixRights(rights.FDs...), nil)
 	} else {
@@ -774,9 +790,19 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 				return r, fmt.Errorf("workspace start refused: %s", r.Refusal)
 			}
 			if e != nil {
-				// Once delivery is uncertain, only observation can prove that
-				// there is no local owner. Caller expiry is not that proof.
-				uncertain = true
+				var unsent *localRequestUnsent
+				if errors.As(e, &unsent) {
+					if ctx.Err() != nil || !authorityrpc.TransientTransport(e) {
+						return nil, errors.Join(ctx.Err(), e)
+					}
+				} else {
+					// Once delivery is uncertain, only observation can prove that
+					// there is no local owner. Caller expiry is not that proof.
+					uncertain = true
+				}
+			}
+			if !accepted && !uncertain && ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
 		}
 		if accepted || uncertain {

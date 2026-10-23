@@ -432,3 +432,48 @@ func TestRootOperationSequenceCannotWrap(t *testing.T) {
 		}
 	}
 }
+
+func TestRootLocalConnectChargesSaturatedBacklog(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root local adapter boundary")
+	}
+	name := "@pfs-pr6-backlog-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 16)
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if err = unix.Bind(fd, &unix.SockaddrUnix{Name: name}); err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.Listen(fd, 0); err != nil {
+		t.Fatal(err)
+	}
+	filler, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: name, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer filler.Close()
+	d := &Driver{manager: &Manager{Boot: bytesID(1), HostService: bytesID(2), GuestService: bytesID(3)}, socket: name}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := d.exchange(ctx, "workspace-observe", d.binding(), nil, nil); done <- err }()
+	select {
+	case err := <-done:
+		var unsent *localRequestUnsent
+		if !errors.As(err, &unsent) || !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, syscall.EAGAIN) {
+			t.Fatal("local connect lost definite non-delivery", err)
+		}
+	case <-time.After(time.Second):
+		unix.Close(fd)
+		t.Fatal("local connect escaped its lifecycle deadline")
+	}
+	// Linux can refuse a full UNIX backlog synchronously with EAGAIN. That
+	// proves no bytes were sent; unlike a lost reply it needs no remote join.
+	d.exited = make(chan struct{})
+	_, err = d.job(ctx, "workspace-prepare", nil, "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("unsent start could not finish at caller expiry", err)
+	}
+}
