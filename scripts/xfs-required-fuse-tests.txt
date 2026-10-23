@@ -148,3 +148,4 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryItemPressurePres
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryQuotaExhaustionIsLocal
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryRecoverableUncertainRename
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryDelayedLookupCannotRestorePreRenameBinding
+github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryPeerReplacementBeforeSourceDispatch

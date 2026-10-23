@@ -2975,9 +2975,6 @@ func (n *node) completeRemoval(ctx context.Context, name string, response *autho
 	}
 	namespace := publicationNamespace{parent: parent, name: name}
 	lease := sourceLeaseFromContext(ctx)
-	if prior, known := lease.preBinding(namespace); known && prior != removed {
-		return errors.New("fusev3: removal post-state disagreed with the source mount's cached pre-binding")
-	}
 	if err := expectPostState(ctx,
 		expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
 		expectedPostStateObject{identity: parent, roles: postStateRoleParent},
@@ -3030,19 +3027,6 @@ func (n *node) Rename(ctx context.Context, name string, parent *node, newName st
 	overwritten, err := renamePostStateOverwrittenIdentity(response.GetPostState(), oldParentIdentity, newParentIdentity, newPost, oldPost, flags&renameExchange != 0)
 	if err != nil {
 		return false, syscall.EIO
-	}
-	if moved, known := lease.preBinding(oldNamespace); known && moved != newPost {
-		return false, syscall.EIO
-	}
-	if replaced, known := lease.preBinding(newNamespace); known {
-		switch {
-		case flags&renameExchange != 0 && (oldPost == nil || replaced != *oldPost):
-			return false, syscall.EIO
-		case flags&renameExchange == 0 && overwritten != nil && replaced != *overwritten:
-			return false, syscall.EIO
-		case flags&renameExchange == 0 && overwritten == nil && replaced != newPost:
-			return false, syscall.EIO
-		}
 	}
 	expected := []expectedPostStateObject{
 		{identity: newPost, roles: postStateRoleSource | postStateRoleDestination},

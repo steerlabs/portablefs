@@ -183,6 +183,67 @@ type ordinaryResultHandler struct {
 	observe func(*authoritypb.Request, *authoritypb.Response)
 }
 
+func TestOrdinaryPeerReplacementBeforeSourceDispatch(t *testing.T) {
+	for _, operation := range []string{"rename", "unlink"} {
+		t.Run(operation, func(t *testing.T) {
+			f := newIntegrationFixture(t, integrationConfig{})
+			mustWrite(t, f.join(0, "document"), []byte("old"), 0600)
+			mustWrite(t, f.join(0, "local"), []byte("local"), 0600)
+			mustWrite(t, f.join(1, "peer"), []byte("peer"), 0600)
+			if _, err := os.Stat(f.join(0, "document")); err != nil {
+				t.Fatal(err)
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			var armed atomic.Bool
+			armed.Store(true)
+			f.transports[0].setBeforeMutation(func(r *authoritypb.Request) {
+				if (r.GetRename() != nil || r.GetUnlink() != nil) && armed.CompareAndSwap(true, false) {
+					close(entered)
+					<-release
+				}
+			})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+			done := make(chan error, 1)
+			go func() {
+				if operation == "rename" {
+					done <- os.Rename(f.join(0, "local"), f.join(0, "document"))
+				} else {
+					done <- os.Remove(f.join(0, "document"))
+				}
+			}()
+			select {
+			case <-entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("source did not acquire its pre-binding")
+			}
+			if err := os.Rename(f.join(1, "peer"), f.join(1, "document")); err != nil {
+				t.Fatal(err)
+			}
+			unblock()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("source %s after legitimate peer replacement: %v", operation, err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("source did not finish")
+			}
+			for mount := range 2 {
+				data, err := os.ReadFile(f.join(mount, "document"))
+				if operation == "unlink" {
+					if !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("mount %d removed binding: %q %v", mount, data, err)
+					}
+				} else if err != nil || string(data) != "local" {
+					t.Fatalf("mount %d renamed binding: %q %v", mount, data, err)
+				}
+			}
+		})
+	}
+}
+
 func (h *ordinaryResultHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	response := h.Handler.Handle(ctx, request)
 	h.observe(request, response)
@@ -245,6 +306,8 @@ func TestOrdinaryItemPressurePreservesExistingAccess(t *testing.T) {
 
 func TestOrdinaryQuotaExhaustionIsLocal(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{})
+	// An occupied block keeps exhaustion off the flush wave's MiB boundary.
+	mustWrite(t, f.join(1, "occupied"), bytes.Repeat([]byte{0x33}, 4096), 0600)
 	file := mustOpenFile(t, f.join(0, "fill"), os.O_CREATE|os.O_WRONLY, 0600)
 	defer file.Close()
 	block := bytes.Repeat([]byte{0x5a}, 1<<20)
