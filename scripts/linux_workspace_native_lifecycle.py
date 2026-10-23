@@ -148,6 +148,7 @@ print('all-acknowledged-records-intact')
     def network(self):
         for seconds in (8, 20):
             before = self.a.authority_sessions()
+            generation = int(self.a.status(self.g)['generation'])
             incarnation = self.mount()['mount']['incarnation']
             with self.holder('fsync') as holder, self.holder('probe') as probe_holder:
                 self.a.network(True)
@@ -158,7 +159,17 @@ print('all-acknowledged-records-intact')
                         time.sleep(.2)
                 finally:
                     self.a.network(False)
-                recovered = self.a.ready(self.g, timeout=20)
+                # A still-ready snapshot can describe the old interval while
+                # its last assigned RPC is settling after restoration. Require
+                # the new recovery publication before testing fresh durable I/O.
+                deadline = time.monotonic()+20
+                while True:
+                    status = self.a.status(self.g)
+                    recovered = next(m for m in status['mounts'] if m['mount']['volumeId'] == self.a.volume)
+                    if int(status['generation']) > generation and recovered['state'] == 'ready': break
+                    assert recovered['state'] not in ('terminal', 'authorization-required'), recovered
+                    assert time.monotonic() < deadline, status
+                    time.sleep(.05)
                 recovery = time.monotonic()-started-seconds
                 assert recovered['mount']['incarnation'] == incarnation, recovered
                 assert self.a.authority_sessions() == before, 'outage replaced the authority session'
