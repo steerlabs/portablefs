@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"syscall"
@@ -42,10 +43,13 @@ func (c *workspacePausedClock) NewTimer(d time.Duration) subscriptionTimer {
 func workspaceKernelPauseChild(t *testing.T) {
 	t.Run("unfenced", func(t *testing.T) {
 		clock := &workspacePausedClock{start: continuous.Time()}
-		f := newIntegrationFixture(t, integrationConfig{Mounts: 2, SessionLease: 2 * time.Minute, workspaceFirstOnly: true, workspaceClock: clock})
-		if err := os.WriteFile(f.join(1, "pause"), []byte("old"), 0600); err != nil {
-			t.Fatal(err)
-		}
+		f := newIntegrationFixture(t, integrationConfig{Mounts: 2, SessionLease: 2 * time.Minute, workspaceFirstOnly: true, workspaceClock: clock, beforeServe: func(f *integrationFixture) {
+			// Seed before subscription snapshots. A delayed setup CHANGE must
+			// not evict the stale answer this negative control needs to retain.
+			if err := os.WriteFile(filepath.Join(f.volumeRoot, "pause"), []byte("old"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}})
 		file := mustOpenFile(t, f.join(0, "pause"), os.O_RDONLY, 0)
 		defer file.Close()
 		if info, err := file.Stat(); err != nil || info.Size() != 3 {
@@ -72,9 +76,13 @@ func workspaceKernelPauseChild(t *testing.T) {
 		if err := peer.Close(); err != nil {
 			t.Fatal(err)
 		}
+		attrs := f.counter.count("getattr")
 		info, err := file.Stat()
 		if err != nil || info.Size() != 3 {
 			t.Fatal("negative control did not expose stale frontend success after peer completion", info, err)
+		}
+		if got := f.counter.count("getattr") - attrs; got != 0 {
+			t.Fatalf("negative control did not retain its cached answer: %d authority GETATTR calls", got)
 		}
 	})
 	pid, _ := strconv.ParseInt(os.Getenv("PFS_WORKSPACE_KERNEL_PID"), 10, 32)
