@@ -56,8 +56,9 @@ mount incarnation, exact process-start and kernel-mount witnesses, session,
 enrollment, route revision, cleanup phase and the old run's loss outcome.
 A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
-Stage 1a models these identities and cleanup in memory. It retains up to 128
-retired outcomes with monotonic, guest-incarnation-scoped sequence numbers.
+The supervisor models these identities and cleanup in memory. Active slots and
+unacknowledged retired outcomes share a bound of 64. Retirements have monotonic,
+guest-incarnation-scoped sequence numbers.
 The observer retains exact outcomes, then acknowledges through a sequence;
 duplicate or older acknowledgements succeed without erasing newer outcomes. Full
 capacity applies temporary replacement backpressure; acknowledgement frees it.
@@ -72,9 +73,11 @@ Preserve old barrier failures even if the new mount serves successfully.
 
 ## Stage 1c control boundary
 
-The first Stage 1c unit adds control contracts and renewal ownership. Real
-workspace Mount, Umount and Provision remain unavailable in the paired guest
-transport. It does not enable managed mounts or qualify host sleep.
+Stage 1c adds control contracts, renewal ownership and prompt desired-mount
+jobs. Mount, Umount and Provision acknowledge job acceptance; Status retains
+their progress separately from registered mounts. The guest has no real root
+driver, so these jobs fail with typed `unavailable` evidence. Acceptance never
+asserts mount, removal or provisioning success. Managed mounts remain disabled.
 
 The existing random abstract mount socket retains ordinary reauthorization and
 loss snapshots. Ordinary requests are bounded by `(32 << 10) + (256 << 10) +
@@ -296,7 +299,8 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    completion on its serial queue. Eligibility requires the complete roster's
    cold acknowledgement and confirmed pause for the same generation. Host
    continuous time measures every budget, including delayed callbacks. The
-   control queue must be empty before pause. Retirement acknowledgement is
+   control queue must be empty before pause and at successful pause
+   completion. Retirement acknowledgement is
    permitted only while running or recovering. The model defaults to absolute
    deadlines of 15 seconds for drain, 17.5 seconds
    for confirmed pause and 20 seconds total after native notification arrival,
@@ -340,8 +344,8 @@ replacement. These rules are independent of the unresolved uncontrolled path.
    Other mounts and shells continue. Status polling reconciles an invalid but
    decodable recovery reply; paired-channel loss discards the VM. Initial activation and replacement
    obtain generation-tagged proofs from the driver, never from the caller.
-   Stage 1c must dispatch an initial Prepare outside Serve's serial request loop:
-   a long retry there would queue a sleep's Suspend behind authority recovery.
+   Desired-mount jobs dispatch initial Prepare outside Serve's ordered request
+   loop, allowing a later Suspend to cancel it during authority recovery.
    Discard-only/uncertain
    state stops without resuming old RAM; only exact termination permits a new
    coordinator with a new boot identity. A cancelled sleep reconciles the current
@@ -426,8 +430,8 @@ aggregates the remainder, retaining the highest sequence and saturating
 accepted-entry/byte counters. The driver retains exact barrier outcomes.
 Overflow terminalizes only that mount for exact cleanup/replacement; its cold
 withdrawal still counts toward suspension. Later reports cannot reduce a
-reported aggregate. Even 64 active and 16 retired maximum-size mount ledgers, statuses and identities
-fit a 1 MiB frame by construction. Cold completion never implies loss-free
+reported aggregate. Even 64 active and 16 retired maximum-size mount ledgers, statuses, identities
+and current jobs fit the paired 1 MiB frame by construction. Cold completion never implies loss-free
 durability.
 
 | Body | Required meaning |
@@ -675,15 +679,91 @@ belongs to this product.
 
 ### Stage 1c drain dispatch
 
-The current guest transport drains its roster serially. Stage 1b registers no
-real mounts, so native suspension exercises an empty roster. Stage 1c must
-start mount drains in parallel under the coordinator's remaining drain budget,
-cancel unfinished work at expiry, and prove whole-roster completion before
-acknowledging cold state. The current suspension grammar carries no drain
-budget; the transport's service-lifetime context does not bound each request.
-Parallel dispatch alone would not establish this deadline contract. Real mount
-integration must supply both deadline propagation and cancellation before it
-can qualify the 15-second boundary.
+The paired, unreleased format 8 carries `Envelope.drain_budget_nanos=3` only on
+Suspend: positive and at most 15 seconds. It is outside Suspension and token
+identity. `WorkspaceVsockChannel.advance` stamps the remaining host-continuous
+allowance immediately before encoding, after FIFO residence, and refuses an
+expired request. The coordinator retains its original notification-relative
+15/17.5/20-second drain, confirmed-pause and total deadlines.
+
+The guest anchors one deadline at the first received frame byte, charging
+framing, decoding and dispatcher waits. Every fixed-roster drain starts in
+parallel, with at most 64 lanes and the same context deadline. The mount adapter
+must forward its shrinking remainder as local `drainBudgetNanos`; the local
+Suspend owner already captures that receipt-relative deadline once, including
+its framing/admission delay. Every lifecycle join, withdrawal and cut uses the
+same allowance. No adapter may create a fresh per-mount timeout. A failure
+cancels sibling waiters and closes this transaction; physical workers and their
+lanes remain owned until they actually join. Cold proof covers the whole roster
+in canonical order; neither a failed participant nor a stuck notification earns
+a partial acknowledgement.
+
+Status has at most one desired-job slot per active exact MountID. Membership
+and desired work share a 64-key active bound. Separately, at most 128 reservations
+cover active keys and final unacknowledged retirement records. Admission of a new
+active key reserves its eventual record and sequence under the supervisor lock,
+then dispatches `offered -> running -> complete|failed` on its generation context.
+A key's lifecycle never allocates another reservation. Only a new-key admission
+can wait for acknowledgement, and reservation saturation always has at least
+64 directly acknowledgeable records. Sequence exhaustion refuses a new admission;
+it never prevents an admitted owner's final retirement.
+
+A successor, including Umount, requires its predecessor to join and its exact
+terminal result to be observed. Only a successful paired Status write marks a
+still-current, joined result observed; internal snapshots, running snapshots and
+failed writes do not. Observation leaves the result intact. An early retry gets
+admission-only `predecessor-unobserved`, with reason `observe predecessor result
+with Status before retry`; it dispatches no work and changes no slot. The host
+consumes Status synchronously through the coordinator before any next exchange,
+then resubmits with a fresh request ID within the original deadline. The logical
+operation keeps its FIFO position throughout observation and resubmission.
+Consumption of terminal evidence survives a power transition overtaking the snapshot; only
+readiness publication depends on the current phase and generation. Terminal
+results are immutable, and a running attempt cannot advance to a newer request.
+MountJob field 8 is reserved; there is no predecessor history or observation RPC.
+
+A joined job without membership transfers its reservation into retirement. A
+joined Umount with terminal membership and exact cleanup proof retires the mount
+and job atomically as one record, preserving an unobserved result intact. Actual
+driver calls join before publishing that immutable evidence. During a fixed cold
+transaction, cleaned membership remains through Resume token consumption, then
+retires. It needs no further driver call or capacity. Exactly cleaned Replace
+first retires the old key using its reservation, then admits the new incarnation.
+At reservation saturation only that new admission waits; the old key is already
+retired and can be acknowledged. Replace reports the committed retirement and
+the actual new-admission cause. Acknowledgement releases reservations but cannot
+restore exhausted sequence space. An absent-old retry directs a separate Register
+without promising it can succeed. Retirement, cleanup and joining never wait for
+observation.
+
+`RetiredOutcome` carries a joined job, an exactly cleaned terminal mount, or both.
+Job-only retirement asserts no membership, cleanup proof or durability outcome.
+The host coordinator owns observation and acknowledgement: it reconciles mount
+and job owners independently, retains each page before acknowledging, and advances
+full pages until the backlog is consumed. One missing owner's later page cannot
+block another owner's evidence. Duplicate acknowledgements are harmless.
+A same-MountID job successor waits for acknowledgement while any retired record
+carries its predecessor, including an off-page record. StatusReply field 9 is
+reserved; the correlated FIFO prevents a pre-ack snapshot arriving after its
+acknowledgement. No unobserved retirement is evicted.
+Suspend closes admission and cancels jobs before waiting for their actual
+owners, including desired-only work. One reader watches EOF while the ordered
+dispatcher drains or writes a response; loss immediately closes admission and
+cancels generation work. Bounded read-ahead never blocks that loss path.
+A successful write alone does not prove receipt: safety also requires the single
+FIFO exchange and synchronous host consumption. A lost Status reply retains the
+predecessor; channel loss permanently discards this boot, and coordinator restart
+discards the VM. The dispatcher rejects non-increasing request IDs across the
+whole channel, including after RetireAck. Direct supervisor calls have no replay
+store once a retirement is acknowledged; that replay is unreachable on the paired
+channel. Suspend drains existing owners directly without successor jobs or
+observation waits.
+
+The native inventory proves all three absent-driver jobs retain `unavailable`
+and leave the registered roster empty. Deterministic model/transport tests
+exercise interrupted initial Prepare, slow provisioning/removal, independent
+64-mount drains, spent framing/dispatch allowance, EOF and retained physical
+owners. Real managed multi-mount integration remains a later driver gate.
 
 Data formatting relies on mke2fs's device flush before successful exit. The
 initializer treats that completion as its format boundary; it does not use

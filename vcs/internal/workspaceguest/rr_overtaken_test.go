@@ -38,7 +38,7 @@ func (m *rrRecordingMount) Recover(ctx context.Context, t *pb.ResumeToken) (Reco
 
 // Original reviewer schedule (finding 1), adapted to the corrected API.
 func TestRROriginalOvertakenRecoverSchedule(t *testing.T) {
-	s, err := New(id(1), id(2), id(3), true)
+	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestRROriginalOvertakenRecoverSchedule(t *testing.T) {
 // Drain parent context expires while waiting for an overtaken call: drain
 // cannot be retried in that generation (draining marker stays set).
 func TestRRDrainWaitTimeoutBlocksRetry(t *testing.T) {
-	s, err := New(id(1), id(2), id(3), true)
+	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

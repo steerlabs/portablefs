@@ -149,4 +149,23 @@ real kernel FUSE and XFS: a held frontend clock/CONTROL stream allows stale
 successful metadata after a causally completed peer write in the unfenced
 negative control; cold withdrawal plus closed-until-fresh-recovery prevents it.
 This controlled frontend schedule does not qualify VZ resume ordering or real
-host sleep. The native workspace inventory remains unchanged.
+host sleep. The native workspace inventory also checks prompt paired-job
+acceptance followed by retained unavailable failure for Provision, Mount and
+Umount, without registering a real mount.
+
+## One drain deadline
+
+The paired dispatcher closes admission and cancels desired jobs before starting
+independent fixed-roster drains in parallel. The first guest frame byte anchors
+one deadline from the host's remaining allowance. Framing and dispatcher waits,
+old-job joins, mount lanes and local Suspend all consume it. The supervisor
+preserves the deadline in the context passed to Mount.Suspend; the future root
+adapter must forward only its remainder to the existing local job owner. There
+is no new outer deadline for Prepare or Recover.
+
+Failed or elapsed drains cancel sibling waiters, retain physical owners and
+discard the suspension. A cancellation request cannot certify a notification
+join. Cold acknowledgement requires every desired job to join and the entire
+registered roster to prove withdrawal, in canonical order. The host separately
+checks its original continuous deadline, an idle control FIFO and successful
+pause completion; late callbacks cannot recreate eligibility.

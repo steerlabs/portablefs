@@ -11,6 +11,10 @@ import PortableFSWorkspaceCore
     var onHelloFailure: ((String) -> Void)?
     init(_ base: WorkspaceVsockChannel) { self.base = base }
     var isIdle: Bool { base.isIdle }
+    var statusObserver: ((WorkspaceStatusReply) throws -> Void)? {
+        get { base.statusObserver }
+        set { base.statusObserver = newValue }
+    }
     func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         base.hello(host, deadline: deadline) { [weak self] result in
             if case .failure(let error) = result { self?.onHelloFailure?(String(describing: error)) }
@@ -148,9 +152,59 @@ import PortableFSWorkspaceCore
                     else { self?.fail(WorkspaceVMError("guest accepted consumed token")) }
                 }
             case "status": coordinator.refreshStatus(); event("status", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
+            case "probe-unavailable-jobs":
+                guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
+                pendingCommand = command
+                var mount = WorkspaceMountID(); mount.authorityID = Data(repeating: 1, count: 32); mount.volumeID = "unavailable-probe"; mount.incarnation = random.next()
+                probeUnavailableJobs(mount, index: 0, requests: [], deadline: clock.now + 5_000_000_000)
             case "stop": stop(exitCode: 0)
             default: event("refused", ["command": command])
             }
+        }
+    }
+    // Exercise acceptance and observation on the real paired stream without
+    // supplying a real-mount driver or treating a command ack as completion.
+    func probeUnavailableJobs(_ mount: WorkspaceMountID, index: Int, requests: [UInt64], deadline: UInt64) {
+        let operation = ["provision", "mount", "umount"][index]
+        let completion: (Result<WorkspaceResult, Error>) -> Void = { [weak self] result in
+            guard let self else { return }
+            do {
+                guard try result.get().code == "accepted" else { throw WorkspaceVMError("desired job acceptance refused") }
+                self.observeUnavailableJob(mount, index: index, requests: requests, deadline: deadline)
+            } catch { self.fail(error) }
+        }
+        switch operation {
+        case "provision":
+            var p = WorkspaceProvision(); p.mount = mount; p.authorityEndpoint = "authority.invalid:7443"
+            p.caCertificate = Data("public CA probe".utf8); p.clientCertificate = Data("public certificate probe".utf8)
+            p.capability = Data("unusable probe".utf8); p.publicKey = Data("public identity probe".utf8); p.routesRevision = Data(repeating: 1, count: 32)
+            channel.provision(p, deadline: deadline, completion: completion)
+        case "mount": channel.mount(mount, deadline: deadline, completion: completion)
+        default: channel.umount(mount, deadline: deadline, completion: completion)
+        }
+    }
+    func observeUnavailableJob(_ mount: WorkspaceMountID, index: Int, requests: [UInt64], deadline: UInt64) {
+        channel.status(deadline: deadline) { [weak self] result in
+            guard let self else { return }
+            do {
+                let status = try result.get()
+                guard status.mounts.isEmpty,
+                      let job = status.jobs.first ?? status.retired.last(where: { $0.hasJob })?.job, job.mount == mount,
+                      job.operation == ["provision", "mount", "umount"][index], job.requestID > (requests.last ?? 0),
+                      job.generation == self.coordinator.generation, self.clock.now < deadline else { throw WorkspaceVMError("desired job observation mismatch") }
+                if job.phase == "offered" || job.phase == "running" {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(10))
+                        self.observeUnavailableJob(mount, index: index, requests: requests, deadline: deadline)
+                    }
+                    return
+                }
+                guard job.phase == "failed", job.failure == "unavailable", !job.reason.isEmpty else { throw WorkspaceVMError("absent mount driver reported completion") }
+                let accepted = requests + [job.requestID]
+                guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
+                if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
+                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": job.failure]) }
+            } catch { self.fail(error) }
         }
     }
     func fail(_ error: Error) { event("failure", ["error": String(describing: error)]); stop(exitCode: 1) }

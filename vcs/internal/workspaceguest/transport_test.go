@@ -24,7 +24,7 @@ func transportRig(t *testing.T) (net.Conn, *Supervisor, <-chan error) {
 	if err := host.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(id(1), id(2), id(3), true)
+	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestTransportColdResumeSingleUseAndDisconnect(t *testing.T) {
 	pairTransport(t, c)
 	x := suspension(s)
 	x.Roster = nil
-	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Suspend{Suspend: x}})
+	r := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, DrainBudgetNanos: uint64(control.MaxDrainBudget), Body: &pb.Envelope_Suspend{Suspend: x}})
 	if r.GetSuspendAck() == nil || len(r.GetSuspendAck().Mounts) != 0 {
 		t.Fatal("no cold proof")
 	}
@@ -145,8 +145,12 @@ func TestTransportMountUnavailableAndStatusCorrelated(t *testing.T) {
 		t.Fatal("wrong status")
 	}
 	r = exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_Mount{Mount: &pb.MountRequest{Mount: mountID(4)}}})
-	if r.GetResult().GetCode() != "unavailable" {
-		t.Fatal("created a mount")
+	if r.GetResult().GetCode() != "accepted" {
+		t.Fatal("job not accepted")
+	}
+	waitFor(t, func() bool { return len(s.Retired()) == 1 })
+	if len(s.Status().Mounts) != 0 || s.Retired()[0].Job.Failure != "unavailable" {
+		t.Fatal("absent real driver reported success")
 	}
 	c.Close()
 	if err := <-done; err == nil {
@@ -177,7 +181,7 @@ func TestTransportRetiredOutcomeAcknowledgementUsesPairedGrammar(t *testing.T) {
 		t.Fatal(err)
 	}
 	status := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 2, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}).GetStatusReply()
-	if len(status.Retired) != 1 || !proto.Equal(status.Retired[0].Mount, old) {
+	if len(status.Retired) != 1 || !proto.Equal(status.Retired[0].MountStatus.Mount, old) {
 		t.Fatalf("missing retired outcome: %v", status)
 	}
 	result := exchange(t, c, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_RetireAck{RetireAck: &pb.RetireAck{ThroughSequence: status.Retired[len(status.Retired)-1].RetirementSequence}}})

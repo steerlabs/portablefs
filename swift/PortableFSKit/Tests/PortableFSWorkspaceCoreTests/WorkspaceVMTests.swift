@@ -2,12 +2,31 @@ import Foundation
 import CryptoKit
 import Darwin
 import Testing
+import PortableFSWorkspaceCore
 @testable import PortableFSWorkspaceVM
 
 private func temporaryDirectory() throws -> URL {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("workspace-vm-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     return directory
+}
+
+@Test @MainActor func workspaceRequestEncodingChargesFIFOResidenceAndRefusesExpiry() throws {
+    let request = try WorkspaceControl.decode(workspaceGolden("suspend")).suspend
+    let deadline: UInt64 = 15_000_001_000
+    for now: UInt64 in [1_000, 7_000_001_000, deadline - 1] {
+        let raw = try WorkspaceVsockChannel.encodeRequest(.suspend(request), requestID: 9, deadline: deadline, now: now)
+        let envelope = try WorkspaceControl.decode(raw)
+        #expect(envelope.drainBudgetNanos == deadline - now)
+        #expect(envelope.suspend == request)
+        #expect(envelope.requestID == 9)
+    }
+    for now in [deadline, deadline + 1, UInt64.max] {
+        #expect(throws: (any Error).self) { try WorkspaceVsockChannel.encodeRequest(.suspend(request), requestID: 9, deadline: deadline, now: now) }
+    }
+    let status = try WorkspaceVsockChannel.encodeRequest(.status(WorkspaceStatusRequest()), requestID: 10, deadline: UInt64.max, now: UInt64.max - 1)
+    #expect(try WorkspaceControl.decode(status).drainBudgetNanos == 0)
+    #expect(throws: (any Error).self) { try WorkspaceVsockChannel.encodeRequest(.suspend(request), requestID: 9, deadline: deadline + 1, now: 1_000) }
 }
 
 @Suite struct WorkspaceArtifactTests {

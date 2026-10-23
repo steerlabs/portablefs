@@ -18,7 +18,9 @@ import (
 	"time"
 )
 
-const MaxRetired = 128
+// The 128 reservations permit a full 64-key rollover. Each active key owns
+// its final evidence slot until acknowledgement; active membership stays at 64.
+const MaxReservations = 2 * control.MaxMounts
 
 var ErrState = errors.New("workspace guest: transition refused")
 
@@ -132,13 +134,15 @@ type Supervisor struct {
 	generationContext    context.Context
 	cancel               context.CancelFunc
 	mounts               map[string]*entry
-	retired              []*pb.MountStatus
+	retired              []*pb.RetiredOutcome
 	retirementSequence   uint64
 	acknowledgedSequence uint64
+	jobs                 map[string]*mountJob
+	jobDriver            MountJobDriver
 }
 
 // A restarted service cannot infer safety while old mount processes may survive.
-func New(boot, host, guest []byte, freshBoot bool) (*Supervisor, error) {
+func New(boot, host, guest []byte, freshBoot bool, driver MountJobDriver) (*Supervisor, error) {
 	if !control.ID(boot) || !control.ID(host) || !control.ID(guest) {
 		return nil, fmt.Errorf("new supervisor identity: %w", control.ErrGrammar)
 	}
@@ -148,7 +152,7 @@ func New(boot, host, guest []byte, freshBoot bool) (*Supervisor, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Supervisor{boot: bytes.Clone(boot), host: bytes.Clone(host), guest: bytes.Clone(guest),
-		phase: phase, mounts: map[string]*entry{}, generationContext: ctx, cancel: cancel}, nil
+		phase: phase, mounts: map[string]*entry{}, jobs: map[string]*mountJob{}, jobDriver: driver, generationContext: ctx, cancel: cancel}, nil
 }
 func clone[T proto.Message](v T) T { return proto.Clone(v).(T) }
 func (s *Supervisor) rosterLocked() []*pb.MountID {
@@ -199,6 +203,9 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 		}
 	}
 	if err == nil {
+		err = s.desiredCapacityLocked(id)
+	}
+	if err == nil {
 		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
 	}
 	s.mu.Unlock()
@@ -208,9 +215,10 @@ func (s *Supervisor) Register(ctx context.Context, id *pb.MountID, w Witness, m 
 	return nil
 }
 func callContext(parent, generation context.Context) (context.Context, func()) {
-	ctx, cancel := context.WithCancel(generation)
-	stop := context.AfterFunc(parent, cancel)
-	if parent.Err() != nil {
+	// Preserve Deadline for adapters forwarding the shrinking local allowance.
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(generation, cancel)
+	if generation.Err() != nil {
 		cancel()
 	}
 	return ctx, func() { stop(); cancel() }
@@ -224,6 +232,18 @@ func acquire(ctx context.Context, e *entry) error {
 	}
 }
 func release(e *entry) { <-e.serial }
+
+// Late driver evidence is merged before releasing the lane. Only then may an
+// exact joined removal publish its final immutable retirement.
+func (s *Supervisor) release(e *entry) {
+	release(e)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := control.MountKey(e.status.Mount)
+	if s.mounts[key] == e {
+		s.retireJoinedLocked(key)
+	}
+}
 
 // Initial activation can only use a driver proof for the registration generation.
 // It cannot be reused to bypass a failed token-bound post-wake recovery.
@@ -251,7 +271,7 @@ func (s *Supervisor) Activate(ctx context.Context, id *pb.MountID, generation ui
 	if err := acquire(ctx, e); err != nil {
 		return fmt.Errorf("activate wait: %w", err)
 	}
-	defer release(e)
+	defer s.release(e)
 	s.mu.Lock()
 	if s.phase != "running" || generation != s.generation || e.status.State != "closed" || e.terminal {
 		s.mu.Unlock()
@@ -379,12 +399,16 @@ func (s *Supervisor) Drain(parent context.Context, x *pb.Suspension, id *pb.Moun
 	generation := s.generation
 	e.draining = generation
 	ctx, done := callContext(parent, s.generationContext)
+	job := s.jobs[control.MountKey(id)]
 	s.mu.Unlock()
 	defer done()
+	if err := waitJob(ctx, job); err != nil {
+		return fmt.Errorf("drain desired job join: %w", err)
+	}
 	if err := acquire(ctx, e); err != nil {
 		return fmt.Errorf("drain wait: %w", err)
 	}
-	defer release(e)
+	defer s.release(e)
 	s.mu.Lock()
 	if s.phase != "suspending" || !proto.Equal(s.suspension, x) {
 		s.mu.Unlock()
@@ -426,6 +450,13 @@ func (s *Supervisor) SuspendAck(x *pb.Suspension) (*pb.SuspendAck, error) {
 	defer s.mu.Unlock()
 	if s.phase != "suspending" || !proto.Equal(s.suspension, x) {
 		return nil, refused("ack outside current suspension")
+	}
+	for _, j := range s.jobs {
+		select {
+		case <-j.done:
+		default:
+			return nil, refused("ack waiting for desired job owner")
+		}
 	}
 	a := &pb.SuspendAck{Suspension: clone(x)}
 	for _, id := range x.Roster {
@@ -510,6 +541,11 @@ func (s *Supervisor) Resume(parent context.Context, t *pb.ResumeToken) (*pb.Resu
 		}
 		a.Mounts = append(a.Mounts, clone(e.status))
 	}
+	// ResumeAck first consumes the exact fixed roster. Joined exact removals
+	// can now transfer membership into their already reserved retirement.
+	for key := range s.jobs {
+		s.retireJoinedLocked(key)
+	}
 	return a, nil
 }
 func (s *Supervisor) recoverMount(ctx context.Context, done func(), e *entry, t *pb.ResumeToken) {
@@ -517,7 +553,7 @@ func (s *Supervisor) recoverMount(ctx context.Context, done func(), e *entry, t 
 	if err := acquire(ctx, e); err != nil {
 		return
 	}
-	defer release(e)
+	defer s.release(e)
 	s.mu.Lock()
 	if s.phase != "running" || e.terminal || s.mounts[control.MountKey(e.status.Mount)] != e || ctx.Err() != nil || !proto.Equal(s.suspension, t.Suspension) {
 		s.mu.Unlock()
@@ -544,6 +580,10 @@ func (s *Supervisor) Status() *pb.StatusReply {
 	for _, v := range s.retired[:min(len(s.retired), control.MaxRetiredBatch)] {
 		out.Retired = append(out.Retired, clone(v))
 	}
+	for _, job := range s.jobs {
+		out.Jobs = append(out.Jobs, clone(job.status))
+	}
+	sort.Slice(out.Jobs, func(i, j int) bool { return control.MountKey(out.Jobs[i].Mount) < control.MountKey(out.Jobs[j].Mount) })
 	return out
 }
 func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) error {
@@ -555,8 +595,8 @@ func (s *Supervisor) Terminal(id *pb.MountID, reason string, loss []*pb.Loss) er
 			return err
 		}
 	}
-	if e == nil || s.phase != "running" || reason == "" {
-		return refused("terminal unknown mount, phase or missing reason")
+	if e == nil || reason == "" {
+		return refused("terminal unknown mount or missing reason")
 	}
 	e.gateSerial = e.driver.CloseAdmission(s.generation)
 	e.terminal = true
@@ -581,6 +621,7 @@ func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
 	}
 	e.setStatus(e.status.State, e.status.Reason, "complete")
 	e.cleaned = true
+	s.retireJoinedLocked(control.MountKey(id))
 	return nil
 }
 
@@ -597,14 +638,12 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 	var err error
 	if invalid := control.Mount(id); invalid != nil {
 		err = fmt.Errorf("replace identity: %w", invalid)
-	} else if s.phase != "running" || e == nil || !e.cleaned {
+	} else if s.phase == "running" && e == nil {
+		err = refused("replace old incarnation already absent; Register the new incarnation separately")
+	} else if s.phase != "running" || !e.cleaned {
 		err = refused("replace requires running phase and exact cleanup")
 	} else if s.retainedIncarnationLocked(id) {
 		err = refused("replace previously retired incarnation")
-	} else if s.retirementSequence == math.MaxUint64 {
-		err = refused("retired outcome sequence exhausted")
-	} else if len(s.retired) >= MaxRetired {
-		err = refused("replace waiting for retired outcome acknowledgement")
 	} else if !bytes.Equal(old.AuthorityId, id.AuthorityId) || old.VolumeId != id.VolumeId || bytes.Equal(old.Incarnation, id.Incarnation) {
 		err = refused("replace authority, volume or incarnation mismatch")
 	} else {
@@ -616,12 +655,25 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 		}
 	}
 	if err == nil {
-		s.retirementSequence++
-		outcome := clone(e.status)
-		outcome.RetirementSequence = s.retirementSequence
-		s.retired = append(s.retired, outcome)
+		if j := s.jobs[control.MountKey(old)]; j != nil {
+			select {
+			case <-j.done:
+			default:
+				err = refused("replace waiting for desired job owner")
+			}
+		}
+	}
+	if err == nil {
+		s.retireLocked(e.status, s.jobs[control.MountKey(old)])
 		delete(s.mounts, control.MountKey(old))
-		s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
+		delete(s.jobs, control.MountKey(old))
+		// The old owner has finished using its reservation. Only admission of
+		// the new incarnation may need an acknowledgement or sequence space.
+		if err = s.desiredCapacityLocked(id); err == nil {
+			s.mounts[control.MountKey(id)] = newEntry(id, w, m, s.generation, serial)
+		} else {
+			err = fmt.Errorf("replace old incarnation retired; new admission failed: %w", err)
+		}
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -629,10 +681,10 @@ func (s *Supervisor) Replace(ctx context.Context, old, id *pb.MountID, w Witness
 	}
 	return nil
 }
-func (s *Supervisor) Retired() []*pb.MountStatus {
+func (s *Supervisor) Retired() []*pb.RetiredOutcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*pb.MountStatus, 0, len(s.retired))
+	out := make([]*pb.RetiredOutcome, 0, len(s.retired))
 	for _, v := range s.retired {
 		out = append(out, clone(v))
 	}
@@ -640,7 +692,7 @@ func (s *Supervisor) Retired() []*pb.MountStatus {
 }
 func (s *Supervisor) retainedIncarnationLocked(id *pb.MountID) bool {
 	for _, outcome := range s.retired {
-		if proto.Equal(outcome.Mount, id) {
+		if outcome.MountStatus != nil && proto.Equal(outcome.MountStatus.Mount, id) {
 			return true
 		}
 	}
@@ -662,7 +714,7 @@ func (s *Supervisor) AcknowledgeRetired(through uint64) error {
 		return refused("retired acknowledgement exceeds exposed batch")
 	}
 	count := int(through - s.acknowledgedSequence)
-	s.retired = append([]*pb.MountStatus(nil), s.retired[count:]...)
+	s.retired = append([]*pb.RetiredOutcome(nil), s.retired[count:]...)
 	s.acknowledgedSequence = through
 	return nil
 }
@@ -672,6 +724,9 @@ func (s *Supervisor) AcknowledgeRetired(through uint64) error {
 func (s *Supervisor) ChannelLost() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.discardLocked()
+}
+func (s *Supervisor) discardLocked() {
 	s.cancel()
 	s.phase = "discard-only"
 	s.suspension = nil

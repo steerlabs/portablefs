@@ -48,7 +48,7 @@ func OpenOutcomeInventory(path string) (*OutcomeInventory, error) {
 	if err = d.Decode(new(any)); err != io.EOF {
 		return nil, errors.New("workspace inventory has trailing data")
 	}
-	if f.Format != 1 || len(f.Runs) > control.MaxMounts+MaxRetired {
+	if f.Format != 1 || len(f.Runs) > control.MaxMounts+MaxReservations {
 		return nil, errors.New("workspace outcome inventory format/capacity refused")
 	}
 	for _, r := range f.Runs {
@@ -91,7 +91,7 @@ func (i *OutcomeInventory) Commit(r *pb.MountStatus) error {
 	if old != nil && !control.RetainsLoss(r.Loss, old.Loss) {
 		return errors.New("workspace inventory would erase known loss")
 	}
-	if old == nil && len(i.runs) >= control.MaxMounts+MaxRetired {
+	if old == nil && len(i.runs) >= control.MaxMounts+MaxReservations {
 		return errors.New("workspace outcome inventory full")
 	}
 	i.runs[k] = clone(r)

@@ -45,15 +45,15 @@ func fixtures() map[string]*pb.Envelope {
 	retired := proto.Clone(status).(*pb.MountStatus)
 	retired.Mount.Incarnation = fixtureID(10)
 	retired.Cleanup = "complete"
-	retired.RetirementSequence = 1
+	outcome := &pb.RetiredOutcome{RetirementSequence: 1, MountStatus: retired}
 	bodies := map[string]*pb.Envelope{
 		"hello": {Body: &pb.Envelope_Hello{Hello: h}}, "hello_ack": {Body: &pb.Envelope_HelloAck{HelloAck: guest}},
-		"suspend":      {Body: &pb.Envelope_Suspend{Suspend: request}},
+		"suspend":      {DrainBudgetNanos: uint64(MaxDrainBudget), Body: &pb.Envelope_Suspend{Suspend: request}},
 		"suspend_ack":  {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: []*pb.MountCold{{Mount: fixtureMount(), Loss: loss, Outcome: UnknownOutcome()}}}}},
 		"resume":       {Body: &pb.Envelope_Resume{Resume: token}},
 		"resume_ack":   {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{status}}}},
 		"status":       {Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}},
-		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}, Retired: []*pb.MountStatus{retired}}}},
+		"status_reply": {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: 1, State: "running", Mounts: []*pb.MountStatus{status}, Retired: []*pb.RetiredOutcome{outcome}}}},
 		"provision":    {Body: &pb.Envelope_Provision{Provision: &pb.Provision{Mount: fixtureMount(), AuthorityEndpoint: "authority.example:7443", CaCertificate: []byte("public CA"), ClientCertificate: []byte("public certificate"), Capability: []byte("signed capability"), PublicKey: []byte("guest public key"), RoutesRevision: bytes.Repeat([]byte{9}, 32)}}},
 		"mount":        {Body: &pb.Envelope_Mount{Mount: &pb.MountRequest{Mount: fixtureMount()}}},
 		"umount":       {Body: &pb.Envelope_Umount{Umount: &pb.UmountRequest{Mount: fixtureMount()}}},
@@ -73,6 +73,29 @@ func fixtures() map[string]*pb.Envelope {
 		}
 		bodies["renewal_"+strings.ReplaceAll(state, "-", "_")] = &pb.Envelope{Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: token, Mounts: []*pb.MountStatus{entry}}}}
 	}
+	for _, phase := range []string{"offered", "running", "complete", "failed"} {
+		e := proto.Clone(bodies["status_reply"]).(*pb.Envelope)
+		j := &pb.MountJob{Mount: fixtureMount(), RequestId: 2, Generation: 1, Operation: "provision", Phase: phase}
+		if phase == "failed" {
+			j.Failure = "unavailable"
+			j.Reason = "real mount driver unavailable"
+		}
+		e.GetStatusReply().Jobs = []*pb.MountJob{j}
+		bodies["job_"+phase] = e
+	}
+	for _, phase := range []string{"complete", "failed"} {
+		e := proto.Clone(bodies["job_"+phase]).(*pb.Envelope)
+		status := e.GetStatusReply()
+		status.Retired = append(status.Retired, &pb.RetiredOutcome{RetirementSequence: 2, Job: status.Jobs[0]})
+		status.Jobs = nil
+		bodies["retired_job_"+phase] = e
+	}
+	bodies["predecessor_unobserved"] = &pb.Envelope{Body: &pb.Envelope_Result{Result: &pb.Result{Code: "predecessor-unobserved", Reason: "observe predecessor result with Status before retry"}}}
+	combined := proto.Clone(bodies["retired_job_failed"]).(*pb.Envelope)
+	cloneJob := proto.Clone(combined.GetStatusReply().Retired[1].Job).(*pb.MountJob)
+	cloneJob.Mount = proto.Clone(combined.GetStatusReply().Retired[0].MountStatus.Mount).(*pb.MountID)
+	combined.GetStatusReply().Retired[0].Job = cloneJob
+	bodies["retired_mount_with_job"] = combined
 	for _, e := range bodies {
 		e.Version = 8
 		e.RequestId = 1
@@ -102,6 +125,10 @@ func invalidFixtures() map[string][]byte {
 	repeated = protowire.AppendBytes(protowire.AppendTag(repeated, 12, protowire.BytesType), body)
 
 	negative := map[string][]byte{}
+	reserved, _ := proto.MarshalOptions{Deterministic: true}.Marshal(fixtures()["status_reply"].GetStatusReply())
+	reserved = protowire.AppendVarint(protowire.AppendTag(reserved, 9, protowire.VarintType), 1)
+	payload := protowire.AppendBytes(protowire.AppendTag([]byte{8, 8, 16, 1}, 12, protowire.BytesType), reserved)
+	negative["status_reserved_field9"] = framed(payload)
 	for _, tc := range []struct {
 		name   string
 		mutate func(*pb.MountStatus)
@@ -127,6 +154,87 @@ func invalidFixtures() map[string][]byte {
 	coldMissing.GetSuspendAck().Mounts[0].Outcome = nil
 	raw, _ = proto.MarshalOptions{Deterministic: true}.Marshal(coldMissing)
 	negative["cold_missing_outcome"] = framed(raw)
+	for _, tc := range []struct {
+		name   string
+		change func(*pb.Envelope)
+	}{
+		{"suspend_missing_budget", func(e *pb.Envelope) { e.DrainBudgetNanos = 0 }},
+		{"suspend_excess_budget", func(e *pb.Envelope) { e.DrainBudgetNanos++ }},
+		{"budget_outside_suspend", func(e *pb.Envelope) { e.Body = &pb.Envelope_Status{Status: &pb.StatusRequest{}} }},
+	} {
+		e := fixtures()["suspend"]
+		tc.change(e)
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		negative[tc.name] = framed(raw)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*pb.MountJob)
+	}{
+		{"job_zero_request", func(j *pb.MountJob) { j.RequestId = 0 }},
+		{"job_future_generation", func(j *pb.MountJob) { j.Generation++ }},
+		{"job_unknown_operation", func(j *pb.MountJob) { j.Operation = "activate" }},
+		{"job_unknown_phase", func(j *pb.MountJob) { j.Phase = "ready" }},
+		{"job_missing_failure", func(j *pb.MountJob) { j.Failure = "" }},
+		{"job_admission_only_failure", func(j *pb.MountJob) { j.Failure = "predecessor-unobserved" }},
+		{"job_reserved_summary", func(j *pb.MountJob) { j.ProtoReflect().SetUnknown([]byte{0x42, 0}) }},
+		{"job_unknown_failure", func(j *pb.MountJob) { j.Failure = "success" }},
+		{"job_missing_reason", func(j *pb.MountJob) { j.Reason = "" }},
+		{"job_running_failure", func(j *pb.MountJob) { j.Phase = "running" }},
+		{"job_incarnation_conflict", func(j *pb.MountJob) { j.Mount.Incarnation = fixtureID(99) }},
+	} {
+		e := fixtures()["job_failed"]
+		tc.change(e.GetStatusReply().Jobs[0])
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		negative[tc.name] = framed(raw)
+	}
+	for _, count := range []int{2, 65} {
+		e := fixtures()["job_failed"]
+		for i := 1; i < count; i++ {
+			j := proto.Clone(e.GetStatusReply().Jobs[0]).(*pb.MountJob)
+			if count == 65 {
+				j.Mount.VolumeId = fmt.Sprintf("v%02d", i)
+			}
+			e.GetStatusReply().Jobs = append(e.GetStatusReply().Jobs, j)
+		}
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		name := "job_duplicate"
+		if count == 65 {
+			name = "job_excess_capacity"
+		}
+		negative[name] = framed(raw)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*pb.StatusReply)
+	}{
+		{"retired_empty", func(s *pb.StatusReply) { s.Retired[1].Job = nil }},
+		{"retired_running_job", func(s *pb.StatusReply) { s.Retired[1].Job.Phase = "running" }},
+		{"retired_future_job", func(s *pb.StatusReply) { s.Retired[1].Job.Generation++ }},
+		{"retired_sequence_gap", func(s *pb.StatusReply) { s.Retired[1].RetirementSequence++ }},
+		{"retired_mismatched_job", func(s *pb.StatusReply) { s.Retired[0].Job = proto.Clone(s.Retired[1].Job).(*pb.MountJob) }},
+		{"retired_duplicate_job", func(s *pb.StatusReply) {
+			r := proto.Clone(s.Retired[1]).(*pb.RetiredOutcome)
+			r.RetirementSequence++
+			s.Retired = append(s.Retired, r)
+		}},
+		{"active_excess_capacity", func(s *pb.StatusReply) {
+			for i := 0; i < 64; i++ {
+				m := proto.Clone(s.Mounts[0]).(*pb.MountStatus)
+				m.Mount.VolumeId = fmt.Sprintf("v%02d", i)
+				s.Mounts = append(s.Mounts, m)
+			}
+		}},
+	} {
+		e := fixtures()["retired_job_complete"]
+		tc.mutate(e.GetStatusReply())
+		raw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(e)
+		negative[tc.name] = framed(raw)
+	}
+	wrongRefusal := fixtures()["predecessor_unobserved"]
+	wrongRefusal.GetResult().Reason = "wrong"
+	refusalRaw, _ := proto.MarshalOptions{Deterministic: true}.Marshal(wrongRefusal)
+	negative["predecessor_wrong_reason"] = framed(refusalRaw)
 	base := map[string][]byte{
 		"unequal_version":    framed([]byte{8, 9, 16, 1, 0x82, 1, 0}),
 		"unknown_body":       framed([]byte{8, 8, 16, 1, 0xb2, 1, 0}),
@@ -142,7 +250,7 @@ func invalidFixtures() map[string][]byte {
 		"invalid_utf8":       framed([]byte{8, 8, 16, 1, 0xaa, 1, 3, 0x0a, 1, 0xff}),
 		"excessive_nesting":  framed(protowire.AppendBytes(protowire.AppendTag([]byte{8, 8, 16, 1}, 10, protowire.BytesType), nested)),
 		"excessive_repeated": framed(repeated),
-		"oversized_length":   {0, 0x10, 0, 1}, "truncated": status[:len(status)-1], "trailing": append(status, 0),
+		"oversized_length":   {0, 0x20, 0, 1}, "truncated": status[:len(status)-1], "trailing": append(status, 0),
 	}
 	for name, raw := range negative {
 		base[name] = raw
@@ -329,28 +437,32 @@ func TestWorkspaceStreamFraming(t *testing.T) {
 func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 	s := fixtureSuspension()
 	s.Roster = nil
+	s.Generation = math.MaxUint64
 	var statuses []*pb.MountStatus
 	var cold []*pb.MountCold
+	var jobs []*pb.MountJob
 	for i := 0; i < MaxMounts; i++ {
 		mid := fixtureMount()
 		mid.VolumeId = fmt.Sprintf("%03d%s", i, strings.Repeat("v", 125))
 		s.Roster = append(s.Roster, mid)
 		var loss []*pb.Loss
 		for n := 1; n <= MaxLosses; n++ {
-			loss = append(loss, &pb.Loss{Sequence: uint64(n), AcceptedEntries: math.MaxUint64, AcceptedBytes: math.MaxUint64, Reason: strings.Repeat("r", MaxReason)})
+			loss = append(loss, &pb.Loss{Sequence: math.MaxUint64 - uint64(MaxLosses-n), AcceptedEntries: math.MaxUint64, AcceptedBytes: math.MaxUint64, Reason: strings.Repeat("r", MaxReason)})
 		}
-		statuses = append(statuses, &pb.MountStatus{Mount: mid, State: "terminal", Reason: strings.Repeat("r", MaxReason), Cleanup: "complete", Loss: loss, Outcome: UnknownOutcome()})
+		statuses = append(statuses, &pb.MountStatus{Mount: mid, State: "authorization-required", Reason: strings.Repeat("r", MaxReason), Cleanup: "process-exited", Loss: loss, Renewal: &pb.RenewalReadiness{State: "installed", InstalledSequence: math.MaxUint64}, Outcome: &pb.MountOutcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved", CleanupDebt: math.MaxUint64}})
 		cold = append(cold, &pb.MountCold{Mount: mid, Loss: loss, Outcome: UnknownOutcome()})
+		jobs = append(jobs, &pb.MountJob{Mount: mid, RequestId: math.MaxUint64, Generation: math.MaxUint64, Operation: "provision", Phase: "failed", Failure: "authorization-required", Reason: strings.Repeat("r", MaxReason)})
 	}
-	var retired []*pb.MountStatus
+	var retired []*pb.RetiredOutcome
 	for i := 0; i < MaxRetiredBatch; i++ {
 		r := proto.Clone(statuses[i]).(*pb.MountStatus)
 		r.Mount.Incarnation = fixtureID(30)
-		r.RetirementSequence = uint64(i + 1)
-		retired = append(retired, r)
+		r.Cleanup = "complete"
+		retired = append(retired, &pb.RetiredOutcome{RetirementSequence: math.MaxUint64 - uint64(MaxRetiredBatch-i-1), MountStatus: r, Job: proto.Clone(jobs[i]).(*pb.MountJob)})
+		retired[i].Job.Mount = r.Mount
 	}
 	for name, e := range map[string]*pb.Envelope{
-		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "running", Mounts: statuses, Retired: retired}}},
+		"status":  {Body: &pb.Envelope_StatusReply{StatusReply: &pb.StatusReply{BootId: s.BootId, HostServiceId: s.HostServiceId, GuestServiceId: s.GuestServiceId, Generation: math.MaxUint64, State: "suspended-cold", Mounts: statuses, Retired: retired, Jobs: jobs}}},
 		"suspend": {Body: &pb.Envelope_SuspendAck{SuspendAck: &pb.SuspendAck{Suspension: s, Mounts: cold}}},
 		"resume":  {Body: &pb.Envelope_ResumeAck{ResumeAck: &pb.ResumeAck{Token: &pb.ResumeToken{Suspension: s, WakeNonce: fixtureID(8)}, Mounts: statuses}}},
 	} {
@@ -361,6 +473,7 @@ func TestReviewWorstCaseRepliesFitMaxFrame(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Logf("maximum %s frame: %d bytes (limit %d)", name, len(raw), MaxFrame+4)
 			if len(raw) > MaxFrame+4 {
 				t.Fatal("semantic maximum exceeds frame")
 			}
@@ -430,5 +543,13 @@ func TestWorkspaceStateCombinationsAndPublicIdentity(t *testing.T) {
 func TestWorkspaceScannerDepthBound(t *testing.T) {
 	if err := grammar(nil, new(pb.Envelope).ProtoReflect().Descriptor(), 17); err == nil {
 		t.Fatal("depth guard omitted")
+	}
+}
+
+func TestWorkspaceStatusRejectsNilRetirement(t *testing.T) {
+	e := fixtures()["status_reply"]
+	e.GetStatusReply().Retired = []*pb.RetiredOutcome{nil}
+	if Validate(e) == nil {
+		t.Fatal("nil retirement accepted")
 	}
 }

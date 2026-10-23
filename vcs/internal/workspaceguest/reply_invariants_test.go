@@ -95,7 +95,7 @@ func TestGuestEveryTransitionReplyEncodes(t *testing.T) {
 	for _, initial := range []bool{true, false} {
 		for _, tc := range cases {
 			t.Run(fmt.Sprintf("initial=%t/%s", initial, tc.name), func(t *testing.T) {
-				s, err := New(id(1), id(2), id(3), true)
+				s, err := New(id(1), id(2), id(3), true, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -309,7 +309,7 @@ func TestGuestFailedDrainsRemainEncodableAndCannotAcknowledgeCold(t *testing.T) 
 func TestGuestOvertakenProofTransitionsRemainEncodable(t *testing.T) {
 	for _, mode := range []string{"prepare-suspend", "recover-suspend", "recover-terminal", "prepare-channel-loss", "recover-channel-loss"} {
 		t.Run(mode, func(t *testing.T) {
-			s, err := New(id(1), id(2), id(3), true)
+			s, err := New(id(1), id(2), id(3), true, nil)
 			if err != nil {
 				t.Fatal(err)
 			}

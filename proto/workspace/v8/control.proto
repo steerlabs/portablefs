@@ -76,8 +76,7 @@ message MountStatus {
   repeated Loss loss = 4;
   // retained, process-exited, kernel-absent, complete; never inferred from errno.
   string cleanup = 5;
-  // Zero for active mounts; strictly increasing for retired outcomes per guest.
-  uint64 retirement_sequence = 6;
+  reserved 6;
   RenewalReadiness renewal = 7;
   MountOutcome outcome = 8;
 }
@@ -86,6 +85,32 @@ message ResumeAck {
   repeated MountStatus mounts = 2;
 }
 message StatusRequest {}
+// Desired work is distinct from registered kernel/session membership. One
+// fixed slot per desired mount retains acceptance until its final disposition
+// transfers to acknowledged retirement when no registered mount remains, or
+// when an Umount joins with terminal membership and exact cleanup proof.
+message MountJob {
+  MountID mount = 1;
+  uint64 request_id = 2;
+  uint64 generation = 3;
+  // provision, mount, umount.
+  string operation = 4;
+  // offered, running, complete, failed.
+  string phase = 5;
+  // unavailable, refused, authorization-required, stopped, deadline, handler-failed.
+  string failure = 6;
+  string reason = 7;
+  // Predecessors are consumed through Status before a successor is admitted.
+  reserved 8;
+}
+// One acknowledged retirement stream for exact mount and joined job evidence.
+// A replaced mount and its last job share one record; job-only work never
+// invents a registered mount, cleanup proof or durability outcome.
+message RetiredOutcome {
+  uint64 retirement_sequence = 1;
+  MountStatus mount_status = 2;
+  MountJob job = 3;
+}
 message StatusReply {
   bytes boot_id = 1;
   bytes host_service_id = 2;
@@ -95,7 +120,9 @@ message StatusReply {
   string state = 5;
   repeated MountStatus mounts = 6;
   // First 16 unacknowledged retired outcomes, in retirement order.
-  repeated MountStatus retired = 7;
+  repeated RetiredOutcome retired = 7;
+  repeated MountJob jobs = 8;
+  reserved 9;
 }
 // Idempotently acknowledge all retired outcomes through this sequence.
 message RetireAck { uint64 through_sequence = 1; }
@@ -112,13 +139,17 @@ message Provision {
 message MountRequest { MountID mount = 1; }
 message UmountRequest { MountID mount = 1; }
 message Result {
-  // accepted, unavailable, authorization-required, refused.
+  // accepted, unavailable, authorization-required, refused, predecessor-unobserved.
+  // predecessor-unobserved is admission-only; no work or slot changes.
   string code = 1;
   string reason = 2;
 }
 message Envelope {
   uint32 version = 1;
   uint64 request_id = 2;
+  // Remaining allowance, stamped after host FIFO delay. Suspend only; not
+  // part of Suspension or ResumeToken identity. Positive and at most 15 s.
+  uint64 drain_budget_nanos = 3;
   oneof body {
     Hello hello = 10;
     Hello hello_ack = 11;

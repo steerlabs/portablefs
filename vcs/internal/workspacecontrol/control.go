@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
@@ -22,9 +23,10 @@ const Version = 8
 const MaxFrame = 1 << 20
 const MaxMounts = 64
 const MaxRetiredBatch = 16
+const MaxDrainBudget = 15 * time.Second
 
-// At most (64 + 16) * 32 * (256 + 40) bytes of loss plus <64 KiB of identities,
-// statuses and envelope overhead: every status/cold/resume reply fits MaxFrame.
+// At most 80 mount ledgers and 80 current or retired terminal jobs.
+// The paired maximum-payload tests prove every reply fits the 1 MiB frame.
 const MaxLosses = 32
 const MaxReason = 256
 const AggregateReason = "additional accepted-tail loss (aggregated)"
@@ -282,10 +284,10 @@ func ColdAck(a *pb.SuspendAck) error {
 	}
 	return nil
 }
-func statuses(ms []*pb.MountStatus, retired bool) error {
+func statuses(ms []*pb.MountStatus) error {
 	roster := make([]*pb.MountID, 0, len(ms))
 	for _, m := range ms {
-		if m == nil || (m.RetirementSequence != 0) != retired {
+		if m == nil {
 			return invalid("statuses: invalid field or state combination")
 		}
 		if m.Renewal != nil {
@@ -322,23 +324,39 @@ func statuses(ms []*pb.MountStatus, retired bool) error {
 	return Roster(roster)
 }
 
-// Retired outcomes can include repeated volumes, but never repeated incarnations.
-func RetiredStatuses(ms []*pb.MountStatus) error {
-	if len(ms) > MaxRetiredBatch {
+// One contiguous sequence carries mount cleanup and joined job evidence.
+func RetiredStatuses(outcomes []*pb.RetiredOutcome) error {
+	if len(outcomes) > MaxRetiredBatch {
 		return invalid("retired outcome batch exceeds limit")
 	}
-	seen := map[string]bool{}
 	var sequence uint64
-	for _, m := range ms {
-		if err := statuses([]*pb.MountStatus{m}, true); err != nil {
-			return fmt.Errorf("retired outcome: %w", err)
+	mounts := map[string]bool{}
+	jobs := map[string]bool{}
+	for _, outcome := range outcomes {
+		if outcome == nil || outcome.RetirementSequence == 0 || (sequence != 0 && (sequence == math.MaxUint64 || outcome.RetirementSequence != sequence+1)) || (outcome.MountStatus == nil && outcome.Job == nil) {
+			return invalid("retired outcome sequence or missing evidence")
 		}
-		key := MountKey(m.Mount)
-		if seen[key] || m.RetirementSequence <= sequence || (sequence != 0 && m.RetirementSequence != sequence+1) || m.Cleanup != "complete" || (m.State != "terminal" && m.State != "authorization-required") {
-			return invalid("retired outcome requires unique, exactly cleaned terminal incarnation")
+		if m := outcome.MountStatus; m != nil {
+			if err := statuses([]*pb.MountStatus{m}); err != nil {
+				return err
+			}
+			key := MountKey(m.Mount)
+			if mounts[key] || m.Cleanup != "complete" || (m.State != "terminal" && m.State != "authorization-required") {
+				return invalid("retired mount requires unique, exactly cleaned terminal incarnation")
+			}
+			mounts[key] = true
 		}
-		seen[key] = true
-		sequence = m.RetirementSequence
+		if j := outcome.Job; j != nil {
+			if err := Jobs([]*pb.MountJob{j}, nil, math.MaxUint64); err != nil {
+				return err
+			}
+			key := fmt.Sprintf("%s/%d", MountKey(j.Mount), j.RequestId)
+			if jobs[key] || (j.Phase != "complete" && j.Phase != "failed") || (outcome.MountStatus != nil && !proto.Equal(outcome.MountStatus.Mount, j.Mount)) {
+				return invalid("retired job requires unique joined matching owner")
+			}
+			jobs[key] = true
+		}
+		sequence = outcome.RetirementSequence
 	}
 	return nil
 }
@@ -357,7 +375,7 @@ func ResumeAck(a *pb.ResumeAck) error {
 			return fmt.Errorf("resume acknowledgement roster member %d: %w", i, ErrGrammar)
 		}
 	}
-	if err := statuses(a.Mounts, false); err != nil {
+	if err := statuses(a.Mounts); err != nil {
 		return fmt.Errorf("resume statuses: %w", err)
 	}
 	for _, m := range a.Mounts {
@@ -367,9 +385,62 @@ func ResumeAck(a *pb.ResumeAck) error {
 	}
 	return nil
 }
+
+// Jobs and registered mounts share desired-volume capacity, but only registered
+// mounts belong to the cold roster. A start intent is never readiness evidence.
+func Jobs(jobs []*pb.MountJob, mounts []*pb.MountStatus, generation uint64) error {
+	ids := make([]*pb.MountID, 0, len(jobs))
+	volumes := map[string]string{}
+	for _, m := range mounts {
+		volumes[fmt.Sprintf("%x/%s", m.Mount.AuthorityId, m.Mount.VolumeId)] = MountKey(m.Mount)
+	}
+	for _, j := range jobs {
+		if j == nil || Mount(j.Mount) != nil || j.RequestId == 0 || j.Generation > generation {
+			return invalid("job identity")
+		}
+		ids = append(ids, j.Mount)
+		volume := fmt.Sprintf("%x/%s", j.Mount.AuthorityId, j.Mount.VolumeId)
+		if old, ok := volumes[volume]; ok && old != MountKey(j.Mount) {
+			return invalid("job incarnation conflicts with registered mount")
+		}
+		volumes[volume] = MountKey(j.Mount)
+		if j.Operation != "provision" && j.Operation != "mount" && j.Operation != "umount" {
+			return invalid("job operation")
+		}
+		switch j.Phase {
+		case "offered", "running", "complete":
+			if j.Failure != "" || j.Reason != "" {
+				return invalid("unfinished or complete job with failure")
+			}
+		case "failed":
+			switch j.Failure {
+			case "unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed":
+			default:
+				return invalid("job failure")
+			}
+			if j.Reason == "" || len(j.Reason) > MaxReason || !utf8.ValidString(j.Reason) {
+				return invalid("job failure reason")
+			}
+		default:
+			return invalid("job phase")
+		}
+	}
+	if len(volumes) > MaxMounts {
+		return invalid("desired mount capacity")
+	}
+	return Roster(ids)
+}
+
 func Validate(e *pb.Envelope) error {
 	if e == nil || e.Version != Version || e.RequestId == 0 {
 		return invalid("Validate: invalid field or state combination")
+	}
+	if _, suspend := e.Body.(*pb.Envelope_Suspend); suspend {
+		if e.DrainBudgetNanos == 0 || e.DrainBudgetNanos > uint64(MaxDrainBudget) {
+			return invalid("suspend remaining drain budget")
+		}
+	} else if e.DrainBudgetNanos != 0 {
+		return invalid("drain budget outside Suspend")
 	}
 	switch b := e.Body.(type) {
 	case *pb.Envelope_Hello:
@@ -411,8 +482,28 @@ func Validate(e *pb.Envelope) error {
 		if err := RetiredStatuses(s.Retired); err != nil {
 			return fmt.Errorf("status retired: %w", err)
 		}
-		if err := statuses(s.Mounts, false); err != nil {
+		if err := statuses(s.Mounts); err != nil {
 			return fmt.Errorf("status mounts: %w", err)
+		}
+		if err := Jobs(s.Jobs, s.Mounts, s.Generation); err != nil {
+			return fmt.Errorf("status jobs: %w", err)
+		}
+		keys := map[string]bool{}
+		for _, m := range s.Mounts {
+			keys[MountKey(m.Mount)] = true
+		}
+		for _, j := range s.Jobs {
+			if j != nil {
+				keys[MountKey(j.Mount)] = true
+			}
+		}
+		if len(keys) > MaxMounts {
+			return invalid("active and retired capacity")
+		}
+		for _, outcome := range s.Retired {
+			if outcome.Job != nil && outcome.Job.Generation > s.Generation {
+				return invalid("retired job generation")
+			}
 		}
 		if (s.State == "suspending" || s.State == "suspended-cold") && s.Generation == 0 {
 			return fmt.Errorf("status missing suspension generation: %w", ErrGrammar)
@@ -460,6 +551,8 @@ func Validate(e *pb.Envelope) error {
 			return invalid("Validate: invalid field or state combination")
 		}
 		switch b.Result.Code {
+		case "predecessor-unobserved":
+			return valid(b.Result.Reason == "observe predecessor result with Status before retry")
 		case "accepted", "unavailable", "authorization-required", "refused":
 			return nil
 		}
@@ -599,20 +692,33 @@ func Decode(frame []byte) (*pb.Envelope, error) {
 	return e, nil
 }
 func Read(r io.Reader) (*pb.Envelope, error) {
+	e, _, err := ReadReceived(r)
+	return e, err
+}
+
+// ReadReceived anchors the allowance at the first received frame byte. Time
+// spent framing, decoding or waiting for dispatch must not renew that budget.
+// Idle time before a peer starts a frame consumes no new request's allowance.
+func ReadReceived(r io.Reader) (*pb.Envelope, time.Time, error) {
 	var h [4]byte
-	if _, err := io.ReadFull(r, h[:]); err != nil {
-		return nil, fmt.Errorf("workspace header: %w", err)
+	if _, err := io.ReadFull(r, h[:1]); err != nil {
+		return nil, time.Time{}, fmt.Errorf("workspace header: %w", err)
+	}
+	receivedAt := time.Now()
+	if _, err := io.ReadFull(r, h[1:]); err != nil {
+		return nil, receivedAt, fmt.Errorf("workspace header: %w", err)
 	}
 	n := binary.BigEndian.Uint32(h[:])
 	if n == 0 || n > MaxFrame {
-		return nil, fmt.Errorf("invalid workspace frame: %w", ErrGrammar)
+		return nil, receivedAt, fmt.Errorf("invalid workspace frame: %w", ErrGrammar)
 	}
 	frame := make([]byte, 4+int(n))
 	copy(frame, h[:])
 	if _, err := io.ReadFull(r, frame[4:]); err != nil {
-		return nil, fmt.Errorf("workspace payload: %w", err)
+		return nil, receivedAt, fmt.Errorf("workspace payload: %w", err)
 	}
-	return Decode(frame)
+	e, err := Decode(frame)
+	return e, receivedAt, err
 }
 func Write(w io.Writer, e *pb.Envelope) error {
 	frame, err := Encode(e)

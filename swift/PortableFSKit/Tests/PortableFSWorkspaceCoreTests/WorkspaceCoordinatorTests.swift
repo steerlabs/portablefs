@@ -51,6 +51,7 @@ private enum InjectedFailure: Error { case failed }
 }
 @MainActor private final class FakeChannel: WorkspaceGuestChannel {
     var isIdle = true
+    var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     var wrongRelease = false
     var holdHello = false
     var hellos: [(Result<WorkspaceHello, Error>) -> Void] = []
@@ -65,7 +66,12 @@ private enum InjectedFailure: Error { case failed }
         if wrongRelease { guest.release.appVersion = "other" }
         if holdHello { hellos.append(completion) } else { completion(.success(guest)) }
     }
-    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append(completion) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { statuses.append { [self] result in
+        completion(result.flatMap { status in
+            do { try statusObserver?(status); return .success(status) }
+            catch { return .failure(error) }
+        })
+    } }
     func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) { suspensions.append((request, completion)) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { resumes.append((token, completion)) }
     func acknowledge(_ index: Int = 0, cold: Bool = true, loss: Bool = false) {
@@ -132,6 +138,26 @@ private enum InjectedFailure: Error { case failed }
     #expect(r.coordinator.phase == .pausedCold)
     #expect(r.power.acknowledgements.count == 1)
     #expect(r.power.acknowledgements[0].1)
+}
+
+@Test @MainActor func workspaceQueuedControlRefusesPauseAndColdEligibility() throws {
+    for queueDuringPause in [false, true] {
+        let r = try Rig(); r.sleep()
+        if !queueDuringPause { r.channel.isIdle = false }
+        r.channel.acknowledge()
+        if queueDuringPause {
+            #expect(r.coordinator.phase == .pausing)
+            r.channel.isIdle = false
+            r.vm.pauses.removeFirst()(.success(()))
+        } else { #expect(r.vm.pauses.isEmpty) }
+        #expect(r.coordinator.phase == .stopping)
+        #expect(!r.coordinator.attachAllowed)
+        #expect(r.power.acknowledgements.isEmpty)
+        #expect(r.vm.stops.count == 1)
+        r.vm.stops.removeFirst()(.success(()))
+        #expect(r.coordinator.phase == .stopped)
+        #expect(r.power.acknowledgements.count == 1)
+    }
 }
 @Test @MainActor func workspaceMissingAckBecomesDiscardOnlyAndNeverResumes() throws {
     let r = try Rig(); r.sleep()
@@ -434,6 +460,7 @@ private enum InjectedFailure: Error { case failed }
     status.guestServiceID = token.suspension.guestServiceID; status.generation = token.suspension.generation
     status.state = "running"
     status.mounts = token.suspension.roster.map { var m = WorkspaceMountStatus(); m.outcome = unknownTestOutcome(); m.mount = $0; m.state = "recovering"; m.cleanup = "retained"; return m }
+
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.phase == .running)
     #expect(r.coordinator.mountStatus[0].state == "recovering")
@@ -451,12 +478,13 @@ private enum InjectedFailure: Error { case failed }
     var old = r.coordinator.mountStatus[0]; old.state = "terminal"; old.reason = "session ended"; old.cleanup = "complete"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
-    old.retirementSequence = 1
-    status.mounts = [replacement]; status.retired = [old]
+    let retired = retiredTestOutcome(old, sequence: 1)
+    status.mounts = [replacement]; status.retired = [retired]
+
     r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
-    #expect(r.coordinator.retiredStatus == [old])
-    try r.coordinator.acknowledgeRetired([old])
+    #expect(r.coordinator.retiredStatus == [retired])
+    try r.coordinator.acknowledgeRetired([retired])
     r.channel.retiredAcks.removeFirst().1(.success(()))
     #expect(r.coordinator.retiredStatus.isEmpty)
 }
@@ -501,13 +529,15 @@ private enum InjectedFailure: Error { case failed }
     var earlier = old; earlier.mount.volumeID = "earlier"
     var replacement = old; replacement.mount.incarnation = Data(repeating: 99, count: 16)
     replacement.state = "ready"; replacement.renewal = installedTestRenewal(); replacement.reason = ""; replacement.cleanup = "retained"
-    earlier.retirementSequence = 1; old.retirementSequence = 2
-    status.mounts = [replacement]; status.retired = [earlier]
+    let earlierRetired = retiredTestOutcome(earlier, sequence: 1); let retired = retiredTestOutcome(old, sequence: 2)
+    status.mounts = [replacement]; status.retired = [earlierRetired]
+
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
-    #expect(r.coordinator.retiredStatus == [earlier])
+    #expect(r.coordinator.retiredStatus == [earlierRetired])
     #expect(r.coordinator.mountStatus[0].mount == old.mount)
-    try r.coordinator.acknowledgeRetired([earlier]); r.channel.retiredAcks.removeFirst().1(.success(()))
-    status.retired = [old]
+    try r.coordinator.acknowledgeRetired([earlierRetired]); r.channel.retiredAcks.removeFirst().1(.success(()))
+    status.retired = [retired]
+
     r.coordinator.refreshStatus(); r.channel.statuses.removeFirst()(.success(status))
     #expect(r.coordinator.mountStatus == [replacement])
 }

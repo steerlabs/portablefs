@@ -8,6 +8,7 @@ public enum WorkspaceControl {
     public static let maxFrame = 1 << 20
     public static let maxLosses = 32
     public static let maxReason = 256
+    public static let maxDrainBudget: UInt64 = 15_000_000_000
     public static let aggregateReason = "additional accepted-tail loss (aggregated)"
     public static func id(_ value: Data) -> Bool { value.count == 16 && value.contains { $0 != 0 } }
     public static func digest(_ value: Data) -> Bool { value.count == 32 && value.contains { $0 != 0 } }
@@ -61,9 +62,8 @@ public enum WorkspaceControl {
     public static func validColdAck(_ ack: WorkspaceSuspendAck) -> Bool {
         validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
     }
-    private static func validStatuses(_ mounts: [WorkspaceMountStatus], retired: Bool = false) -> Bool {
+    private static func validStatuses(_ mounts: [WorkspaceMountStatus]) -> Bool {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {
-            ($0.retirementSequence > 0) == retired &&
             $0.hasOutcome && validOutcome($0.outcome) &&
             (!$0.hasRenewal || validRenewal($0.renewal)) &&
             ($0.state != "ready" || ($0.hasRenewal && $0.renewal.state != "pending")) &&
@@ -75,10 +75,24 @@ public enum WorkspaceControl {
             ($0.cleanup == "retained" || ["terminal", "authorization-required"].contains($0.state))
         }
     }
-    public static func validRetired(_ mounts: [WorkspaceMountStatus]) -> Bool {
-        zip(mounts, mounts.dropFirst()).allSatisfy { $0.retirementSequence < UInt64.max && $1.retirementSequence == $0.retirementSequence + 1 } &&
-        mounts.count <= 16 && Set(mounts.map { mountKey($0.mount) }).count == mounts.count && mounts.allSatisfy {
-            validStatuses([$0], retired: true) && $0.cleanup == "complete" && ["terminal", "authorization-required"].contains($0.state)
+    public static func validRetired(_ outcomes: [WorkspaceRetiredOutcome]) -> Bool {
+        guard outcomes.count <= 16,
+              zip(outcomes, outcomes.dropFirst()).allSatisfy({ $0.retirementSequence < UInt64.max && $1.retirementSequence == $0.retirementSequence + 1 }) else { return false }
+        var mounts = Set<String>(), jobs = Set<String>()
+        return outcomes.allSatisfy { outcome in
+            guard outcome.retirementSequence > 0, outcome.hasMountStatus || outcome.hasJob else { return false }
+            if outcome.hasMountStatus {
+                let m = outcome.mountStatus
+                guard validStatuses([m]), m.cleanup == "complete", ["terminal", "authorization-required"].contains(m.state),
+                      mounts.insert(mountKey(m.mount)).inserted else { return false }
+            }
+            if outcome.hasJob {
+                let j = outcome.job
+                guard validJob(j, generation: UInt64.max), ["complete", "failed"].contains(j.phase),
+                      !outcome.hasMountStatus || outcome.mountStatus.mount == j.mount,
+                      jobs.insert(mountKey(j.mount) + "/" + String(j.requestID)).inserted else { return false }
+            }
+            return true
         }
     }
     public static func validResumeAck(_ ack: WorkspaceResumeAck) -> Bool {
@@ -101,7 +115,7 @@ public enum WorkspaceControl {
     }
     public static func validStatus(_ status: WorkspaceStatusReply) -> Bool {
         guard id(status.bootID), id(status.hostServiceID), id(status.guestServiceID),
-              ["running", "suspending", "suspended-cold", "discard-only"].contains(status.state), validStatuses(status.mounts), validRetired(status.retired),
+              ["running", "suspending", "suspended-cold", "discard-only"].contains(status.state), validStatuses(status.mounts), validRetired(status.retired), validJobs(status),
               !["suspending", "suspended-cold"].contains(status.state) || status.generation > 0 else { return false }
         return status.mounts.allSatisfy { mount in
             if ["terminal", "authorization-required"].contains(mount.state) { return true }
@@ -114,8 +128,44 @@ public enum WorkspaceControl {
             }
         }
     }
+    private static func validJobs(_ status: WorkspaceStatusReply) -> Bool {
+        guard validRoster(status.jobs.map(\.mount)) else { return false }
+        var volumes: [String: String] = [:]
+        for mount in status.mounts.map(\.mount) + status.jobs.map(\.mount) {
+            let volume = mount.authorityID.base64EncodedString() + "/" + mount.volumeID
+            let key = mountKey(mount)
+            if let old = volumes[volume], old != key { return false }
+            volumes[volume] = key
+        }
+        guard volumes.count <= 64,
+              status.retired.allSatisfy({ !$0.hasJob || $0.job.generation <= status.generation }) else { return false }
+        return status.jobs.allSatisfy { validJob($0, generation: status.generation) }
+    }
+    private static func validJob(_ job: WorkspaceMountJob, generation: UInt64) -> Bool {
+        guard validMount(job.mount), job.requestID > 0, job.generation <= generation,
+              ["provision", "mount", "umount"].contains(job.operation) else { return false }
+        switch job.phase {
+        case "offered", "running", "complete": guard job.failure.isEmpty && job.reason.isEmpty else { return false }
+        case "failed": guard ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason else { return false }
+        default: return false
+        }
+        return true
+    }
+    // A terminal result is immutable. A successor is valid only after this
+    // observer consumed the predecessor's terminal result, never from running.
+    public static func retainsJob(_ current: WorkspaceMountJob, prior old: WorkspaceMountJob) -> Bool {
+        guard current.mount == old.mount, current.requestID >= old.requestID, current.generation >= old.generation else { return false }
+        if current.requestID == old.requestID {
+            return current.generation == old.generation && current.operation == old.operation &&
+                (!["complete", "failed"].contains(old.phase) || current == old)
+        }
+        return ["complete", "failed"].contains(old.phase)
+    }
     public static func validToken(_ token: WorkspaceResumeToken) -> Bool { validSuspension(token.suspension) && id(token.wakeNonce) }
     public static func validate(_ e: WorkspaceEnvelope) throws {
+        if case .suspend = e.body {
+            guard e.drainBudgetNanos > 0, e.drainBudgetNanos <= maxDrainBudget else { throw WorkspaceControlError.grammar }
+        } else if e.drainBudgetNanos != 0 { throw WorkspaceControlError.grammar }
         var ok = false
         switch e.body {
         case .hello(let h): ok = validRelease(h.release) && id(h.bootID) && id(h.hostServiceID) && h.guestServiceID.isEmpty
@@ -134,7 +184,8 @@ public enum WorkspaceControl {
                 digest(p.routesRevision) && material.allSatisfy { !$0.isEmpty && $0.count <= 65536 }
         case .mount(let m): ok = validMount(m.mount)
         case .umount(let m): ok = validMount(m.mount)
-        case .result(let r): ok = ["accepted", "unavailable", "authorization-required", "refused"].contains(r.code) && r.reason.utf8.count <= maxReason
+        case .result(let r): ok = (["accepted", "unavailable", "authorization-required", "refused"].contains(r.code) ||
+            (r.code == "predecessor-unobserved" && r.reason == "observe predecessor result with Status before retry")) && r.reason.utf8.count <= maxReason
         case nil: break
         }
         guard e.version == version, e.requestID > 0, ok else { throw WorkspaceControlError.grammar }

@@ -7,10 +7,11 @@ import PortableFSWorkspaceCore
 @MainActor public final class WorkspaceVsockChannel: WorkspaceGuestChannel {
     private struct Request {
         let body: WorkspaceEnvelope.OneOf_Body
+        let desiredBody: WorkspaceEnvelope.OneOf_Body?
         let deadline: UInt64
         let completion: (Result<WorkspaceEnvelope, Error>) -> Void
     }
-    private let vm: WorkspaceMachine
+    private let vm: WorkspaceMachine?
     private var connection: VZVirtioSocketConnection?
     private var stream: WorkspaceStream?
     private var requestID: UInt64 = 0
@@ -20,13 +21,18 @@ import PortableFSWorkspaceCore
     private var ready = false
     private var pendingHello: (() -> Void)?
     public var isIdle: Bool { active == nil && queue.isEmpty && pendingHello == nil }
+    public var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     public var onFailure: ((String) -> Void)?
     public init(vm: WorkspaceMachine) { self.vm = vm }
+    init(fd: Int32) throws {
+        self.vm = nil
+        self.stream = try WorkspaceStream(fd: fd, label: "portablefs.workspace.control", onLost: { [weak self] in self?.lost($0) })
+    }
     public func controlReady() { ready = true; let start = pendingHello; pendingHello = nil; start?() }
     public func hello(_ host: WorkspaceHello, deadline: UInt64, completion: @escaping (Result<WorkspaceHello, Error>) -> Void) {
         let start = { [weak self] in
-            guard let self, !self.failed else { completion(.failure(WorkspaceVMError("control startup unavailable"))); return }
-            self.vm.connect(port: 1023) { [self] result in
+            guard let self, !self.failed, let vm = self.vm else { completion(.failure(WorkspaceVMError("control startup unavailable"))); return }
+            vm.connect(port: 1023) { [self] result in
                 do {
                     let connection = try result.get(); self.connection = connection
                     let stream = try WorkspaceStream(fd: connection.fileDescriptor, label: "portablefs.workspace.control", onLost: { [weak self] in self?.lost($0) })
@@ -47,18 +53,24 @@ import PortableFSWorkspaceCore
         }
         if ready { start() } else { pendingHello = start }
     }
-    private func exchange(_ body: WorkspaceEnvelope.OneOf_Body, deadline: UInt64, completion: @escaping (Result<WorkspaceEnvelope, Error>) -> Void) {
+    private func exchange(_ body: WorkspaceEnvelope.OneOf_Body, desired: Bool = false, deadline: UInt64, completion: @escaping (Result<WorkspaceEnvelope, Error>) -> Void) {
         guard !failed, queue.count < 128 else { completion(.failure(WorkspaceVMError("control queue unavailable"))); return }
-        queue.append(Request(body: body, deadline: deadline, completion: completion)); advance()
+        queue.append(Request(body: body, desiredBody: desired ? body : nil, deadline: deadline, completion: completion)); advance()
     }
     private func advance() {
-        guard active == nil, !failed, !queue.isEmpty, let stream else { return }
-        let request = queue.removeFirst()
-        guard clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < request.deadline, requestID < UInt64.max else { request.completion(.failure(WorkspaceVMError("queued control deadline expired"))); advance(); return }
-        requestID += 1; let expected = requestID; active = request
-        var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = expected; envelope.body = request.body
+        guard active == nil, !failed, !queue.isEmpty, stream != nil else { return }
+        dispatch(queue.removeFirst())
+    }
+    private func dispatch(_ request: Request) {
+        guard let stream else { return }
+        active = request
+        guard clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < request.deadline, requestID < UInt64.max else { active = nil; request.completion(.failure(WorkspaceVMError("queued control deadline expired"))); advance(); return }
+        requestID += 1; let expected = requestID
         do {
-            try stream.write(WorkspaceControl.encode(envelope), deadline: request.deadline) { result in
+            // Stamp after FIFO residence, immediately before encoding. The
+            // original host deadline still bounds transport and pause.
+            let frame = try Self.encodeRequest(request.body, requestID: expected, deadline: request.deadline, now: clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW))
+            stream.write(frame, deadline: request.deadline) { result in
                 switch result {
                 case .failure(let error): self.finish(.failure(error))
                 case .success:
@@ -74,7 +86,7 @@ import PortableFSWorkspaceCore
                                         throw WorkspaceVMError("guest refused resume: " + refusal.reason)
                                     }
                                     switch (request.body, reply.body) {
-                                    case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result): break
+                                    case (.hello, .helloAck), (.status, .statusReply), (.suspend, .suspendAck), (.resume, .resumeAck), (.retireAck, .result), (.provision, .result), (.mount, .result), (.umount, .result): break
                                     default: throw WorkspaceVMError("unexpected control reply")
                                     }
                                     self.finish(.success(reply))
@@ -86,10 +98,38 @@ import PortableFSWorkspaceCore
             }
         } catch { finish(.failure(error)) }
     }
+    static func encodeRequest(_ body: WorkspaceEnvelope.OneOf_Body, requestID: UInt64, deadline: UInt64, now: UInt64) throws -> Data {
+        guard now < deadline else { throw WorkspaceVMError("queued control deadline expired") }
+        var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = requestID; envelope.body = body
+        if case .suspend = body { envelope.drainBudgetNanos = deadline - now }
+        return try WorkspaceControl.encode(envelope)
+    }
     private func finish(_ result: Result<WorkspaceEnvelope, Error>) {
-        guard let current = active else { return }; active = nil
-        current.completion(result)
-        if case .failure(let error) = result { lost(String(describing: error)) } else { advance() }
+        guard let current = active else { return }
+        var consumed = result
+        if case .success(let envelope) = result, case .statusReply(let status) = envelope.body {
+            do {
+                guard let statusObserver else { throw WorkspaceVMError("Status observation owner missing") }
+                try statusObserver(status)
+            } catch { consumed = .failure(error) }
+        }
+        guard !failed else { return }
+        if case .failure(let error) = consumed { lost(String(describing: error)); return }
+        // Observation and retry are steps of the active logical operation.
+        // Keep later callers queued, with fresh wire IDs and one absolute deadline.
+        if let desiredBody = current.desiredBody, case .success(let envelope) = consumed {
+            if case .statusReply = envelope.body {
+                dispatch(Request(body: desiredBody, desiredBody: desiredBody, deadline: current.deadline, completion: current.completion))
+                return
+            }
+            if envelope.result.code == "predecessor-unobserved" {
+                dispatch(Request(body: .status(WorkspaceStatusRequest()), desiredBody: desiredBody, deadline: current.deadline, completion: current.completion))
+                return
+            }
+        }
+        active = nil
+        current.completion(consumed)
+        advance()
     }
     private func lost(_ reason: String) {
         guard !failed else { return }; failed = true
@@ -101,6 +141,17 @@ import PortableFSWorkspaceCore
     }
     public func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
         exchange(.status(WorkspaceStatusRequest()), deadline: deadline) { completion($0.map { $0.statusReply }) }
+    }
+    public func provision(_ request: WorkspaceProvision, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        exchange(.provision(request), desired: true, deadline: deadline) { completion($0.map { $0.result }) }
+    }
+    public func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        var request = WorkspaceMountRequest(); request.mount = mount
+        exchange(.mount(request), desired: true, deadline: deadline) { completion($0.map { $0.result }) }
+    }
+    public func umount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        var request = WorkspaceUmountRequest(); request.mount = mount
+        exchange(.umount(request), desired: true, deadline: deadline) { completion($0.map { $0.result }) }
     }
     public func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {
         exchange(.suspend(request), deadline: deadline) { completion($0.map { $0.suspendAck }) }

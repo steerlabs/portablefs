@@ -154,7 +154,7 @@ func TestGuestConcurrentRandomWalkRepliesEncode(t *testing.T) {
 			rng := rand.New(rand.NewSource(int64(seed)))
 			var rmu sync.Mutex
 			R := func(n int) int { rmu.Lock(); defer rmu.Unlock(); return rng.Intn(n) }
-			s, _ := New(id(1), id(2), id(3), true)
+			s, _ := New(id(1), id(2), id(3), true, nil)
 			var inc atomic.Uint32
 			inc.Store(20)
 			fresh := func(vol int) *pb.MountID {

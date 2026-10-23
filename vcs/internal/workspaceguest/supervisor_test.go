@@ -140,7 +140,7 @@ func mountID(n byte) *pb.MountID {
 }
 func fixture(t *testing.T) (*Supervisor, *fakeMount, *pb.MountID) {
 	t.Helper()
-	s, err := New(id(1), id(2), id(3), true)
+	s, err := New(id(1), id(2), id(3), true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestGuestSecondSleepBeforeTokenConsumption(t *testing.T) {
 func TestGuestServiceRestartDefaultsToDiscard(t *testing.T) {
 	s, _, mid := fixture(t)
 	x := cold(t, s, mid)
-	restarted, err := New(id(1), id(2), id(30), false)
+	restarted, err := New(id(1), id(2), id(30), false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestGuestTerminalReplacementRequiresExactCleanupAndAuthorization(t *testing
 	if err := s.Activate(context.Background(), next, 0); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Retired()) != 2 || s.Retired()[0].Loss[0].Sequence != 1 {
+	if len(s.Retired()) != 2 || s.Retired()[0].MountStatus.Loss[0].Sequence != 1 {
 		t.Fatal("replacement erased old run")
 	}
 }
@@ -795,7 +795,7 @@ func TestGuestLossCapacityClosesOnlyMountAndStillAcknowledgesCold(t *testing.T) 
 }
 func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 	s, _, mid := fixture(t)
-	for i := 0; i < MaxRetired+2; i++ {
+	for i := 0; i < MaxReservations+1; i++ {
 		if err := s.Terminal(mid, "session ended", []*pb.Loss{{Sequence: 1, Reason: "retained failure"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -805,7 +805,7 @@ func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 		}
 		next := mountID(byte(i + 10))
 		m := &fakeMount{}
-		if i == MaxRetired {
+		if i == MaxReservations-1 {
 			if err := s.Replace(context.Background(), mid, next, Witness{}, m); err == nil || !m.cleaned {
 				t.Fatal("unobserved retired outcomes discarded")
 			}
@@ -822,7 +822,15 @@ func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 			}
 			m = &fakeMount{}
 		}
-		if err := s.Replace(context.Background(), mid, next, Witness{}, m); err != nil {
+		var err error
+		if i == MaxReservations-1 {
+			// Replace retired the old key before new-key backpressure. The
+			// acknowledged exact cleanup needs no retained membership tombstone.
+			err = s.Register(context.Background(), next, Witness{}, m)
+		} else {
+			err = s.Replace(context.Background(), mid, next, Witness{}, m)
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 		if m.isOpen() {
