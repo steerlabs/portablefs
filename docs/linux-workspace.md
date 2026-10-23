@@ -150,10 +150,11 @@ retains original descriptions and partial witness, and retransmits only copies
 of those descriptions while child ownership remains unknown. Observing accepted
 child ownership closes the redundant root FUSE copy; the original abort owner
 survives through independent process-exit and kernel/source/alias-absence proof.
-`ObserveAbsence` starts that observation only after the bootstrap and removal
-owners settle. Its proof binds the exact process, kernel, source and target
-alias inventory to this bootstrap owner. Finalize rejects unbound, foreign or
-stale proofs, including observation overtaken by another removal action.
+The driver's serialized cleanup joins the child and reconciles the CLI and
+root inventories. `ManagedKernel.Absent` independently verifies the original
+kernel/source/target alias inventory before `Finalize` closes the retained
+abort description. Cleanup carries final cumulative loss and outcome to the
+supervisor before publication; RetireAck requires the exact published result.
 Death preserves uncertain inventory and blocks replacement. The control-boundary tests use owned descriptors; required root tests also
 exercise real protected bootstrap, failed INIT, uncertain handoff and exact removal.
 

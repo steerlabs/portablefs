@@ -191,7 +191,7 @@ func TestGuestEveryTransitionReplyEncodes(t *testing.T) {
 					t.Fatal(err)
 				}
 				encodable(t, s.Status())
-				if err := s.AcknowledgeRetired(s.Retired()[0].RetirementSequence); err != nil {
+				if err := acknowledgeExposedRetired(s, s.Retired()[0].RetirementSequence); err != nil {
 					t.Fatal(err)
 				}
 				encodable(t, s.Status())
@@ -222,7 +222,7 @@ func TestGuestRetirementAcknowledgementIsMonotonicAndIdempotent(t *testing.T) {
 		mid = next
 	}
 	for _, n := range []uint64{1, 1, 2, 1, 3, 3} {
-		if err := s.AcknowledgeRetired(n); err != nil {
+		if err := acknowledgeExposedRetired(s, n); err != nil {
 			t.Fatal(err)
 		}
 		encodable(t, s.Status())
@@ -230,7 +230,7 @@ func TestGuestRetirementAcknowledgementIsMonotonicAndIdempotent(t *testing.T) {
 	if len(s.Retired()) != 0 {
 		t.Fatal("acknowledged outcomes retained")
 	}
-	if err := s.AcknowledgeRetired(4); err == nil {
+	if err := acknowledgeExposedRetired(s, 4); err == nil {
 		t.Fatal("future ack accepted")
 	}
 	if s.acknowledgedSequence != 3 {

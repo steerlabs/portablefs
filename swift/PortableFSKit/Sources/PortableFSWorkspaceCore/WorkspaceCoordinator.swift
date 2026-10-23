@@ -113,6 +113,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     private var retirementAckInFlight: UInt64?
     private var acknowledgedRetirement: UInt64 = 0
     private var notifications: [UInt64: UInt64] = [:]
+    private var statusInFlight = false
     private let startBudget: UInt64
     private let drainBudget: UInt64
     private let totalBudget: UInt64
@@ -159,6 +160,7 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                     try WorkspaceControl.pair(host: self.host, guest: guest)
                     self.guestServiceID = guest.guestServiceID
                     self.state = .running; self.reason = ""
+                    self.scheduleStatus()
                 } catch { self.stopUnsafe("exact guest release pairing not proven within deadline") }
             }
         }
@@ -264,10 +266,15 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                   WorkspaceControl.validColdAck(ack), WorkspaceControl.acknowledges(ack.suspension, request: request) else {
                 self.pause(cold: nil); return
             }
-            self.mountStatus = ack.mounts.map {
+            let coldMounts = ack.mounts.map {
                 var status = WorkspaceMountStatus(); status.mount = $0.mount
                 status.state = "suspended-cold"; status.cleanup = "retained"; status.loss = $0.loss; status.outcome = $0.outcome; return status
             }
+            // Owners absent from the fixed roster may still await a later
+            // retirement page. Keep their evidence until that page arrives.
+            let pending = self.mountStatus.filter { !ack.suspension.roster.contains($0.mount) }
+            guard self.retainsLoss(coldMounts + pending) else { self.pause(cold: nil); return }
+            self.mountStatus = pending + coldMounts
             self.pause(cold: ack.suspension)
         }
     }
@@ -318,8 +325,9 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
                 guard case .success(let ack) = reply, ack.token == token, WorkspaceControl.validResumeAck(ack) else {
                     self.reason = "guest recovery reply unavailable or invalid; mounts remain unavailable"; return
                 }
-                guard self.retainsLoss(ack.mounts) else { self.reason = "guest recovery erased retained loss"; return }
-                self.mountStatus = ack.mounts; self.state = .running; self.reason = ""
+                let pending = self.mountStatus.filter { !token.suspension.roster.contains($0.mount) }
+                guard self.retainsLoss(ack.mounts + pending) else { self.reason = "guest recovery erased retained loss"; return }
+                self.mountStatus = pending + ack.mounts; self.state = .running; self.reason = ""
                 // Suspend can interrupt page observation or its acknowledgement.
                 self.refreshStatus()
             }
@@ -412,12 +420,31 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         if retirementAckInFlight == nil, !retiredStatus.isEmpty {
             try acknowledgeRetired(Array(retiredStatus.prefix(16)))
         }
+        // A local proof refusal is latched closed. Only this coordinator may
+        // obtain a fresh generation/token through the same cold transaction
+        // used for power transitions. Terminal mounts require explicit replacement.
+        if case .running = state,
+           status.mounts.contains(where: { $0.state == "closed" && !$0.reason.isEmpty && $0.cleanup == "retained" }),
+           let window = window(at: clock.now) {
+            beginSuspend(window, intent: .awake)
+        }
+    }
+    private func scheduleStatus() {
+        guard phase != .stopped, clock.now <= UInt64.max - 250_000_000 else { return }
+        clock.schedule(at: clock.now + 250_000_000) { [weak self] in
+            guard let self, self.phase != .stopped else { return }
+            if self.channel.isIdle { self.refreshStatus() }
+            self.scheduleStatus()
+        }
     }
     // Authority recovery has no VM-killing deadline; exact status can reconcile
     // a lost ResumeAck. Socket failure does not erase the retained observation.
     public func refreshStatus() {
-        guard phase == .running || phase == .recovering else { return }
+        guard (phase == .running || phase == .recovering), !statusInFlight,
+              clock.now <= UInt64.max - totalBudget else { return }
+        statusInFlight = true
         channel.status(deadline: clock.now + totalBudget) { [weak self] reply in
+            self?.statusInFlight = false
             if case .failure(let error) = reply { self?.channelLost(String(describing: error)) }
         }
     }

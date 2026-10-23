@@ -192,7 +192,7 @@ func TestObservationRetirementAndSuspendDoNotWait(t *testing.T) {
 	if err := s.writeReply(&frame, &pb.Envelope{Version: 8, RequestId: 3, Body: &pb.Envelope_StatusReply{StatusReply: s.Status()}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.AcknowledgeRetired(1); err != nil {
+	if err := acknowledgeExposedRetired(s, 1); err != nil {
 		t.Fatal(err)
 	}
 }

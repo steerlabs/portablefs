@@ -810,12 +810,12 @@ func TestGuestRetiredCapacityCanBeAcknowledgedAndReused(t *testing.T) {
 				t.Fatal("unobserved retired outcomes discarded")
 			}
 			observed := s.Retired()
-			if err := s.AcknowledgeRetired(s.retirementSequence + 1); err == nil {
+			if err := acknowledgeExposedRetired(s, s.retirementSequence+1); err == nil {
 				t.Fatal("unchecked acknowledgement erased loss")
 			}
 			for len(observed) > 0 {
 				batch := min(len(observed), control.MaxRetiredBatch)
-				if err := s.AcknowledgeRetired(observed[batch-1].RetirementSequence); err != nil {
+				if err := acknowledgeExposedRetired(s, observed[batch-1].RetirementSequence); err != nil {
 					t.Fatal(err)
 				}
 				observed = observed[batch:]

@@ -40,4 +40,18 @@ func (r Recovery) Ready(g, serial uint64) bool {
 type CleanupProof struct {
 	Witness                     Witness
 	ProcessExited, KernelAbsent bool
+	Loss                        []*pb.Loss
+	Outcome                     *pb.MountOutcome
 }
+
+// StartupFailure transfers the exact resource owner to the admitted job, even
+// when no child reached registration. Cleanup evidence is cumulative; an
+// unresolved owner must remain reserved rather than becoming a job-only result.
+type StartupFailure struct {
+	Cause error
+	Owner Mount
+	Proof CleanupProof
+}
+
+func (e *StartupFailure) Error() string { return e.Cause.Error() }
+func (e *StartupFailure) Unwrap() error { return e.Cause }

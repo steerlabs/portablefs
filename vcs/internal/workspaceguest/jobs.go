@@ -8,6 +8,7 @@ import (
 	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacemount"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/proto"
 )
@@ -70,6 +71,16 @@ var ErrPredecessorUnobserved = errors.New("observe predecessor result with Statu
 func (s *Supervisor) observeWrittenStatus(snapshot *pb.StatusReply) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for _, result := range snapshot.Retired {
+		if result.RetirementSequence <= s.exposedSequence {
+			continue
+		}
+		index := result.RetirementSequence - s.acknowledgedSequence - 1
+		if result.RetirementSequence != s.exposedSequence+1 || index >= uint64(len(s.retired)) || !proto.Equal(result, s.retired[index]) {
+			break
+		}
+		s.exposedSequence = result.RetirementSequence
+	}
 	for _, result := range snapshot.Jobs {
 		j := s.jobs[control.MountKey(result.Mount)]
 		if j == nil || (result.Phase != "complete" && result.Phase != "failed") || !proto.Equal(j.status, result) {
@@ -143,6 +154,7 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.phase != "running" {
 		return refused("desired job outside running phase")
 	}
@@ -190,6 +202,20 @@ func (s *Supervisor) runJob(ctx context.Context, j *mountJob, provision *pb.Prov
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var startup *workspacemount.StartupFailure
+	if errors.As(err, &startup) && s.mounts[control.MountKey(request.Mount)] == nil {
+		p := startup.Proof
+		e := newEntry(request.Mount, p.Witness, startup.Owner, request.Generation, startup.Owner.CloseAdmission(s.generation))
+		e.terminal, e.startup = true, true
+		e.setStatus("terminal", "workspace startup failed; exact cleanup required", "retained")
+		s.mounts[control.MountKey(request.Mount)] = e
+		evidenceErr := s.mergeEvidenceLocked(e, p.Loss, p.Outcome)
+		if evidenceErr == nil && p.ProcessExited && p.KernelAbsent {
+			e.cleaned = true
+			e.status.Cleanup = "complete"
+		}
+		err = errors.Join(err, evidenceErr)
+	}
 	// Cancellation defeats late success, but never erases an independent failure
 	// or releases the slot while the old driver still owns resources.
 	if err == nil {
@@ -229,7 +255,7 @@ func (s *Supervisor) retireJoinedLocked(key string) {
 	}
 	e := s.mounts[key]
 	if e != nil {
-		if j.status.Operation != "umount" || !e.terminal || !e.cleaned {
+		if (j.status.Operation != "umount" && !(e.startup && j.status.Operation == "mount" && j.status.Phase == "failed")) || !e.terminal || !e.cleaned {
 			return
 		}
 		select {

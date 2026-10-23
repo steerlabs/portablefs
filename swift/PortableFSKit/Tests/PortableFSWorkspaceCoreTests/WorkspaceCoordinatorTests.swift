@@ -581,3 +581,86 @@ private enum InjectedFailure: Error { case failed }
     #expect(r.coordinator.phase == .stopped)
     #expect(r.power.unregisters == 1)
 }
+
+@Test @MainActor func workspaceAwakeProofLossOwnsColdRecoveryWithoutPowerEvent() throws {
+    let r = try Rig()
+    var status = WorkspaceStatusReply()
+    let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
+    status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
+    status.guestServiceID = Data(repeating: 6, count: 16); status.state = "running"
+    var mount = WorkspaceMountStatus(); mount.mount = r.channel.roster[0]
+    mount.state = "closed"; mount.reason = "workspace clock or subscription proof unavailable"
+    mount.cleanup = "retained"; mount.outcome = unknownTestOutcome()
+    var loss = WorkspaceLoss(); loss.sequence = 1; loss.acceptedBytes = 23; loss.reason = "accepted tail lost"
+    mount.loss = [loss]; status.mounts = [mount]
+    r.channel.roster = [mount.mount]
+    // The coordinator itself polls; neither a power event nor UI action drives it.
+    r.clock.advance(250_000_000)
+    #expect(r.channel.statuses.count == 1)
+    r.channel.statuses.removeFirst()(.success(status))
+    #expect(r.coordinator.phase == .draining)
+    #expect(r.coordinator.generation == 1)
+    try r.coordinator.observeStatus(status)
+    #expect(r.channel.suspensions.count == 1)
+    var cold = WorkspaceSuspendAck(); cold.suspension = r.channel.suspensions[0].0
+    cold.suspension.roster = [mount.mount]
+    var proof = WorkspaceMountCold(); proof.mount = mount.mount; proof.loss = [loss]; proof.outcome = unknownTestOutcome()
+    cold.mounts = [proof]
+    r.channel.suspensions[0].1(.success(cold))
+    r.vm.pauses.removeFirst()(.success(()))
+    #expect(r.coordinator.phase == .resuming)
+    #expect(r.power.acknowledgements.isEmpty)
+    r.vm.resumes.removeFirst()(.success(()))
+    let token = r.channel.resumes[0].0
+    #expect(token.suspension.generation == 1)
+    #expect(token.wakeNonce != token.suspension.nonce)
+    var resumed = WorkspaceResumeAck(); resumed.token = token
+    mount.state = "ready"; mount.reason = ""; mount.renewal = installedTestRenewal()
+    resumed.mounts = [mount]
+    r.channel.resumes[0].1(.success(resumed))
+    #expect(r.coordinator.phase == .running)
+    #expect(r.coordinator.mountStatus[0].loss == [loss])
+    #expect(r.vm.calls == ["start", "pause", "resume"])
+}
+
+@Test @MainActor func workspaceAwakeRecoveryDeduplicatesSleepAndLeavesTerminalExplicit() throws {
+    for terminal in [false, true] {
+        let r = try Rig()
+        var status = WorkspaceStatusReply()
+        let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
+        status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
+        status.guestServiceID = Data(repeating: 6, count: 16); status.state = "running"
+        var mount = WorkspaceMountStatus(); mount.mount = r.channel.roster[0]
+        mount.state = terminal ? "terminal" : "closed"; mount.reason = "proof unavailable"
+        mount.cleanup = "retained"; mount.outcome = unknownTestOutcome(); status.mounts = [mount]
+        try r.coordinator.observeStatus(status)
+        if terminal { #expect(r.channel.suspensions.isEmpty); continue }
+        r.sleep()
+        #expect(r.channel.suspensions.count == 1)
+        r.channel.acknowledge()
+        r.vm.pauses.removeFirst()(.success(()))
+        #expect(r.coordinator.phase == .pausedCold)
+        #expect(r.vm.resumes.isEmpty)
+        r.wake()
+        #expect(r.channel.resumes.count == 1)
+    }
+}
+
+@Test @MainActor func workspaceAwakeColdAckCannotEraseLoss() throws {
+    let r = try Rig()
+    var status = WorkspaceStatusReply()
+    let host = try WorkspaceControl.decode(workspaceGolden("hello")).hello
+    status.bootID = host.bootID; status.hostServiceID = host.hostServiceID
+    status.guestServiceID = Data(repeating: 6, count: 16); status.state = "running"
+    var mount = WorkspaceMountStatus(); mount.mount = r.channel.roster[0]
+    mount.state = "closed"; mount.reason = "proof unavailable"; mount.cleanup = "retained"; mount.outcome = unknownTestOutcome()
+    var loss = WorkspaceLoss(); loss.sequence = 1; loss.acceptedBytes = 23; loss.reason = "accepted tail lost"
+    mount.loss = [loss]; status.mounts = [mount]
+    r.channel.roster = [mount.mount]
+    try r.coordinator.observeStatus(status)
+    r.channel.acknowledge() // Omits the already retained ticket.
+    r.vm.pauses.removeFirst()(.success(()))
+    #expect(r.vm.calls == ["start", "pause", "stop"])
+    #expect(r.coordinator.mountStatus[0].loss == [loss])
+    #expect(r.channel.resumes.isEmpty)
+}

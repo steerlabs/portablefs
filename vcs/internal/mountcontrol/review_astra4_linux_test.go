@@ -6,51 +6,9 @@ import (
 	"context"
 	"errors"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
-	"golang.org/x/sys/unix"
 	"testing"
 )
 
-func TestR4FinalizationJoinsBootstrap(t *testing.T) {
-	var b Bootstrap
-	p := *phase()
-	p.Witness.Kernel = ""
-	if err := b.Begin(p); err != nil {
-		t.Fatal(err)
-	}
-	// The child can have exited while the reserved root mount has not returned.
-	b.ChildLost()
-	if err := b.Finalize(absentBootstrap(&b)); !errors.Is(err, ErrOccupied) {
-		t.Errorf("finalized before mount owner joined: %v", err)
-	}
-	rights, fds := descriptors(t)
-	if err := b.Finish(rights, witness()); err != nil {
-		t.Error(err)
-	}
-	defer func() { _ = b.Finalize(absentBootstrap(&b)) }()
-	if b.finalized && b.rights != nil {
-		t.Errorf("late mount published descriptors after finalization: fds=%v kernel=%q", fds, b.action.Witness.Kernel)
-	}
-}
-func TestR4BootstrapRetainsPartialWitness(t *testing.T) {
-	var b Bootstrap
-	p := *phase()
-	p.Witness.Kernel = ""
-	if err := b.Begin(p); err != nil {
-		t.Fatal(err)
-	}
-	rights, _ := descriptors(t)
-	unix.Close(rights.FDs[1])
-	rights.FDs = rights.FDs[:1]
-	// Mount acquired its kernel identity; opening the abort description failed.
-	err := b.Finish(rights, witness())
-	defer func() { _ = b.Finalize(absentBootstrap(&b)) }()
-	if err == nil {
-		t.Fatal("expected incomplete handoff failure")
-	}
-	if b.action.Witness.Kernel != witness().Kernel {
-		t.Errorf("partial failure lost acquired kernel witness: %q", b.action.Witness.Kernel)
-	}
-}
 func TestR4RecoverRequiresExactColdSuspension(t *testing.T) {
 	o := testOwner(t, func(ctx context.Context, j *Job) error {
 		if j.start.Operation == "workspace-suspend" {

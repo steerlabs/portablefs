@@ -31,3 +31,6 @@ managed-prepare-outage-over-45s
 managed-recover-outage-over-45s
 managed-root-owner-death-vm-discard
 managed-child-death-exact-cleanup
+managed-awake-proof-loss-cold-recovery
+managed-provision-only-reboot-reissue
+managed-terminal-final-evidence-retired

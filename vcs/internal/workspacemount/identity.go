@@ -468,6 +468,54 @@ func (s *Store) Reissue(r *pb.IdentityRequest, revoke bool, cleanup func() error
 	return nil
 }
 
+// ReconcileProvisioning visits durable mount-specific grants, including ones
+// committed before any child intent. The root must join both mount inventories
+// and actual absence before forgetting a grant; keys, scope and epoch survive.
+// It runs before pairing, so no new provisioning can race this reconciliation.
+func (s *Store) ReconcileProvisioning(absent func(*pb.MountID) error) error {
+	if absent == nil {
+		return errors.New("provision reconciliation requires exact absence")
+	}
+	s.mu.Lock()
+	entries, err := os.ReadDir(s.directory)
+	var mounts []*pb.MountID
+	if err == nil {
+		for _, entry := range entries {
+			if entry.Name() == "guest.json" || entry.Name() == "owner.lock" {
+				continue
+			}
+			var v record
+			if err = s.read(entry.Name(), &v); err != nil {
+				break
+			}
+			_, key, loadErr := s.load(&pb.IdentityRequest{AuthorityId: v.Authority, VolumeId: v.Volume})
+			if loadErr != nil || entry.Name() != key+".json" {
+				err = ErrIdentityUnavailable
+				break
+			}
+			if len(v.Provision) == 0 {
+				continue
+			}
+			p := new(pb.Provision)
+			if proto.Unmarshal(v.Provision, p) != nil || control.Provision(p) != nil || !bytes.Equal(p.Mount.AuthorityId, v.Authority) || p.Mount.VolumeId != v.Volume {
+				err = ErrIdentityUnavailable
+				break
+			}
+			mounts = append(mounts, p.Mount)
+		}
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, id := range mounts {
+		if err = s.Reissue(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId}, false, func() error { return absent(id) }); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // TLSIdentity is an in-process handoff to the future root driver. Keys never
 // appear in IdentityReply/Provision, logs or the Mac control stream.
 func (s *Store) TLSIdentity(r *pb.IdentityRequest) (tls.Certificate, error) {

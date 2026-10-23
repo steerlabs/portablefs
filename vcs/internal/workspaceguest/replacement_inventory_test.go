@@ -73,7 +73,7 @@ func TestRetirementPersistenceFailureCannotAcknowledgeOrBlockClose(t *testing.T)
 		return errors.New("directory fsync failed")
 	})
 	done := make(chan error, 1)
-	go func() { done <- s.AcknowledgeRetired(1) }()
+	go func() { done <- acknowledgeExposedRetired(s, 1) }()
 	<-entered
 	if _, err = s.BeginSuspend(suspension(s)); err != nil {
 		t.Fatal("retirement fsync blocked Close", err)

@@ -54,6 +54,7 @@ type entry struct {
 	registration            uint64
 	gateSerial              uint64
 	cleaned, terminal, cold bool
+	startup                 bool
 	draining                uint64
 	serial                  chan struct{}
 }
@@ -111,6 +112,7 @@ type Supervisor struct {
 	retired              []*pb.RetiredOutcome
 	retirementSequence   uint64
 	acknowledgedSequence uint64
+	exposedSequence      uint64
 	jobs                 map[string]*mountJob
 	jobDriver            MountJobDriver
 }
@@ -435,6 +437,11 @@ func (s *Supervisor) SuspendAck(x *pb.Suspension) (*pb.SuspendAck, error) {
 			return nil, refused("ack waiting for desired job owner")
 		}
 	}
+	for _, e := range s.mounts {
+		if e.startup && !e.cleaned {
+			return nil, refused("ack waiting for failed startup resource cleanup")
+		}
+	}
 	a := &pb.SuspendAck{Suspension: clone(x)}
 	for _, id := range x.Roster {
 		e := s.mounts[control.MountKey(id)]
@@ -592,6 +599,11 @@ func (s *Supervisor) Cleanup(id *pb.MountID, p CleanupProof) error {
 	if e == nil || !e.terminal {
 		return refused("cleanup terminal identity mismatch")
 	}
+	// Even a failed or overtaken removal can discover final loss. Import it
+	// before testing completion, so refusal never discards truthful evidence.
+	if err := s.mergeEvidenceLocked(e, p.Loss, p.Outcome); err != nil {
+		return err
+	}
 	if e.cleaned {
 		return nil
 	}
@@ -687,7 +699,7 @@ func (s *Supervisor) AcknowledgeRetired(through uint64) error {
 	s.ackLane.Lock()
 	defer s.ackLane.Unlock()
 	s.mu.Lock()
-	if through == 0 || through > s.retirementSequence {
+	if through == 0 || through > s.exposedSequence {
 		s.mu.Unlock()
 		return refused("retired acknowledgement exceeds exposed outcomes")
 	}

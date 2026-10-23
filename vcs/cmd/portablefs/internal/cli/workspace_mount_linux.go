@@ -36,28 +36,29 @@ import (
 )
 
 type workspaceChild struct {
-	client        *authorityrpc.Client
-	renewCancel   context.CancelFunc
-	renewDone     chan struct{}
-	launch        workspacemount.Launch
-	reader        *workspaceadmission.Reader
-	clock         *workspaceclock.Reader
-	clockBinding  workspaceclock.Binding
-	control       *workspaceControlConfig
-	fence         *authorityrpc.DispatchFence
-	renewer       *mountenrollment.Renewer
-	manager       *mountenrollment.Client
-	generation    atomic.Uint64
-	localOpen     atomic.Bool
-	mounted       atomic.Pointer[fuseV3Mount]
-	install       chan *mountcontrol.Rights
-	installed     chan error
-	finalized     chan struct{}
-	mu            sync.Mutex
-	state         mountState
-	kernelWitness string
-	operation     *mountOperation
-	outcomes      *workspaceguest.OutcomeInventory
+	client                          *authorityrpc.Client
+	authorityAttached, startupClean bool
+	renewCancel                     context.CancelFunc
+	renewDone                       chan struct{}
+	launch                          workspacemount.Launch
+	reader                          *workspaceadmission.Reader
+	clock                           *workspaceclock.Reader
+	clockBinding                    workspaceclock.Binding
+	control                         *workspaceControlConfig
+	fence                           *authorityrpc.DispatchFence
+	renewer                         *mountenrollment.Renewer
+	manager                         *mountenrollment.Client
+	generation                      atomic.Uint64
+	localOpen                       atomic.Bool
+	mounted                         atomic.Pointer[fuseV3Mount]
+	install                         chan *mountcontrol.Rights
+	installed                       chan error
+	finalized                       chan struct{}
+	mu                              sync.Mutex
+	state                           mountState
+	kernelWitness                   string
+	operation                       *mountOperation
+	outcomes                        *workspaceguest.OutcomeInventory
 }
 
 func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
@@ -311,7 +312,7 @@ func (c *workspaceChild) run(ctx context.Context, j *mountcontrol.Job) (result m
 				var final fusev3.WorkspaceObservation
 				final, err = m.mount.FinalizeWorkspace()
 				err = errors.Join(err, c.control.Owner.Record(c.facts(final)))
-			} else if c.client != nil {
+			} else if c.client != nil && !c.startupClean {
 				var proof fusev3.MountAbsenceProof
 				proof, err = fusev3.ObservePlannedKernelMountAbsent("portablefs:"+c.state.MountInstanceID, c.state.MountPath)
 				if err == nil {
@@ -319,6 +320,8 @@ func (c *workspaceChild) run(ctx context.Context, j *mountcontrol.Job) (result m
 				}
 				c.client.FinishLocalSessionEnforcement()
 				err = errors.Join(err, c.client.Close())
+			} else if c.authorityAttached && !c.startupClean {
+				err = errors.New("workspace startup attachment cleanup unresolved")
 			}
 		}
 		if err == nil && c.manager != nil {
@@ -367,7 +370,7 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 	identity := &clientTLSIdentity{certificate: cert, keyPEM: c.launch.PrivateKey}
 	transport := dataPlaneTransport{Mode: dataPlaneTransportTLSPrivateCA, ServerName: p.ServerName, CAPEM: string(p.CaCertificate), CASHA256: c.state.DataPlaneCASHA256}
 	accepted := false
-	m, _, _, err := mountFUSEv3(ctx, fuseV3Config{addr: p.AuthorityEndpoint, token: string(p.Capability), transport: transport, identity: identity, volumeID: p.Mount.VolumeId, mountPath: c.state.MountPath, mountInstanceID: c.state.MountInstanceID, backingRoot: c.launch.BackingRoot, requireMountEnrollment: c.renewer != nil, awaitTLS: c.clockBinding.AwaitTLS, dispatchFence: c.fence, beforeKernel: func(client *authorityrpc.Client, routes mountRoutes) (*fusev3.ManagedConfig, error) {
+	m, attached, clean, err := mountFUSEv3(ctx, fuseV3Config{addr: p.AuthorityEndpoint, token: string(p.Capability), transport: transport, identity: identity, volumeID: p.Mount.VolumeId, mountPath: c.state.MountPath, mountInstanceID: c.state.MountInstanceID, backingRoot: c.launch.BackingRoot, requireMountEnrollment: c.renewer != nil, awaitTLS: c.clockBinding.AwaitTLS, dispatchFence: c.fence, beforeKernel: func(client *authorityrpc.Client, routes mountRoutes) (*fusev3.ManagedConfig, error) {
 		c.client = client
 		revision := routes.rules.Revision()
 		if !bytes.Equal(revision[:], p.RoutesRevision) {
@@ -419,6 +422,10 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 			return c.control.Owner.RequireRemoval(context.Background(), mode, "kernel removal required")
 		}}, nil
 	}})
+	c.authorityAttached, c.startupClean = attached, clean
+	if clean {
+		c.client = nil
+	}
 	if accepted {
 		c.installed <- err
 	}

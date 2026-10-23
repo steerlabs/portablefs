@@ -124,15 +124,24 @@ with p.open() as f:
 
     def job(self, guest, operation, timeout=90):
         deadline = time.monotonic() + timeout
+        seen = getattr(self, 'seen_jobs', {})
+        key = (guest.p.pid, operation)
         while True:
-            status = self.status(guest)
-            jobs = status.get('jobs', []) + [r['job'] for r in status.get('retired', []) if 'job' in r]
-            selected = [j for j in jobs if j['mount']['volumeId'] == self.volume and j['operation'] == operation]
-            for job in selected:
-                if job['phase'] in ('complete', 'failed'):
-                    assert job['phase'] == 'complete', job
-                    return status
-            assert time.monotonic() < deadline, (operation, status)
+            current = self.status(guest)
+            # The host's autonomous observer may already have acknowledged this
+            # result. Its exact retained-evidence event is still the observation.
+            snapshots = [current] + [json.loads(self.fixture('decode-status', e['body']))
+                for e in guest.history if e['event'] == 'retained-evidence']
+            for status in snapshots:
+                jobs = status.get('jobs', []) + [r['job'] for r in status.get('retired', []) if 'job' in r]
+                selected = [j for j in jobs if j['mount']['volumeId'] == self.volume and j['operation'] == operation
+                            and int(j['requestId']) > seen.get(key, 0)]
+                for job in selected:
+                    if job['phase'] in ('complete', 'failed'):
+                        assert job['phase'] == 'complete', job
+                        seen[key] = int(job['requestId']); self.seen_jobs = seen
+                        return status
+            assert time.monotonic() < deadline, (operation, current)
             time.sleep(.05)
 
     def ready(self, guest, timeout=90):
@@ -147,7 +156,7 @@ with p.open() as f:
             assert time.monotonic() < deadline, status
             time.sleep(.05)
 
-    def mount(self, guest, short=False, outage=False):
+    def mount(self, guest, short=False, outage=False, provision_only=False):
         guest.command('identity', body=self.fixture('identity-request', self.volume))
         identity = guest.wait('identity-result', 30)['body']
         public = json.loads(self.fixture('decode-identity', identity))
@@ -157,6 +166,8 @@ with p.open() as f:
         guest.command('provision', body=material)
         assert guest.wait('provision-accepted', 30)['code'] == 'accepted'
         self.job(guest, 'provision')
+        if provision_only:
+            return public
         if outage:
             self.arm_prepare_outage()
         guest.command('mount', body=public['mount'])
@@ -171,6 +182,37 @@ with p.open() as f:
         public['incarnation'] = mounted['mount']['incarnation']
         assert mounted['renewal']['state'] == 'not-required', mounted
         return public
+
+    def awake_recovery(self, guest):
+        before = self.authority_sessions()
+        initial = self.status(guest)
+        generation = int(initial.get('generation', '0'))
+        self.network(True)
+        try:
+            deadline = time.monotonic() + 90
+            while True:
+                phase = guest.wait('phase', max(.1, deadline-time.monotonic()))
+                if int(phase['generation']) > generation and phase['phase'] == 'draining':
+                    break
+                assert time.monotonic() < deadline, phase
+        finally:
+            self.network(False)
+        # Observe the VM owner's transaction without enqueueing a control
+        # exchange into its confirmed-pause boundary.
+        while True:
+            completed = guest.wait('phase', 30)
+            if int(completed['generation']) == generation+1 and completed['phase'] == 'running':
+                break
+        mounted = self.ready(guest)
+        after = self.authority_sessions()
+        assert before == after and before['active'] == 2, (before, after)
+        assert mounted['state'] == 'ready'
+        guest.command('status')
+        host = guest.wait('status')
+        assert host['phase'] == 'running' and int(host['generation']) == generation+1, host
+        # No command or synthetic power notification initiated this recovery.
+        (self.evidence/'managed-awake-recovery.json').write_text(json.dumps({
+            'before': before, 'after': after, 'host': host, 'trigger': phase}, indent=2))
 
     def initial_io(self, guest):
         result = guest.ssh("python3 -c " + shlex.quote(
@@ -306,7 +348,17 @@ print(json.dumps({'closed':True,'close_error':close_error}),flush=True)
                     break
                 assert time.monotonic() < deadline, status
                 time.sleep(.1)
+            final = mounts[0]
+            assert final['outcome']['observation'] == 'observed' and final['outcome']['release'] == 'abandoned', final
             fresh = self.mount(guest)
+            retired = []
+            for event in guest.history:
+                if event['event'] == 'retained-evidence':
+                    observed_status = json.loads(self.fixture('decode-status', event['body']))
+                    retired += [r['mountStatus'] for r in observed_status.get('retired', []) if 'mountStatus' in r
+                                and r['mountStatus']['mount'] == final['mount']]
+            assert retired and retired[0]['outcome'] == final['outcome'] and retired[0].get('loss', []) == final.get('loss', []), retired
+            (self.evidence/'managed-terminal-final-evidence.json').write_text(json.dumps({'final': final, 'retired': retired[0]}, indent=2))
             assert fresh['mount'] != old['mount'] and fresh['public_key'] == old['public_key']
             assert guest.ssh('cat /workspaces/native-managed/data') == 'peer-during-pause'
             time.sleep(.2)

@@ -94,7 +94,7 @@ func r4JobRetirementGate(t *testing.T, total int, operation string, victimFirst 
 		if !proto.Equal(s.Retired()[len(s.Retired())-1], predecessor) {
 			t.Fatal("terminal evidence changed")
 		}
-		if err := s.AcknowledgeRetired(page.Retired[len(page.Retired)-1].RetirementSequence); err != nil {
+		if err := acknowledgeExposedRetired(s, page.Retired[len(page.Retired)-1].RetirementSequence); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -132,7 +132,7 @@ func TestAstraR4ReplaceAcknowledgementCannotRestoreSequence(t *testing.T) {
 		t.Fatal(s.Retired())
 	}
 	writtenStatus(t, s, s.Status())
-	if err = s.AcknowledgeRetired(math.MaxUint64); err != nil {
+	if err = acknowledgeExposedRetired(s, math.MaxUint64); err != nil {
 		t.Fatal(err)
 	}
 	err = s.Register(context.Background(), next, r3W(next), &fakeMount{})

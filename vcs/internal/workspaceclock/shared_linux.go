@@ -20,6 +20,16 @@ import (
 
 const clockSeals = unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_FUTURE_WRITE | unix.F_SEAL_SEAL | unix.F_SEAL_EXEC
 
+// NewShared publishes this owner's measurements to inherited read-only child
+// views. The backend remains the single measurement and correction owner.
+func NewShared(backend Backend, unavailable func()) (*Owner, error) {
+	owner := New(backend, unavailable)
+	if err := owner.share(); err != nil {
+		return nil, err
+	}
+	return owner, nil
+}
+
 // A seqlock publishes one multiword measurement. Every payload access is atomic;
 // readers never combine readiness from one generation with another's interval.
 func clockWord(page []byte, n int) *atomic.Uint64 {

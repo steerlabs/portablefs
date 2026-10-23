@@ -87,7 +87,7 @@ func TestCompletedUmountsReleaseAcknowledgedCapacity(t *testing.T) {
 			if len(observed) != 1 || observed[0].Job.Operation != op || observed[0].Job.Phase != "complete" {
 				t.Fatalf("missing exact completion: %v", observed)
 			}
-			if err := s.AcknowledgeRetired(observed[0].RetirementSequence); err != nil {
+			if err := acknowledgeExposedRetired(s, observed[0].RetirementSequence); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -357,7 +357,7 @@ func TestJobRetirementCountsUnacknowledgedReservations(t *testing.T) {
 		if len(batch) == 0 || len(batch) > control.MaxRetiredBatch {
 			t.Fatal("unbounded observation")
 		}
-		if err := s.AcknowledgeRetired(batch[len(batch)-1].RetirementSequence); err != nil {
+		if err := acknowledgeExposedRetired(s, batch[len(batch)-1].RetirementSequence); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -423,7 +423,7 @@ func TestReplaceRetiresRegisteredJobFailureWithExactMount(t *testing.T) {
 		t.Fatalf("replacement lost job evidence: %v", outcomes)
 	}
 	encodable(t, s.Status())
-	if err := s.AcknowledgeRetired(outcomes[0].RetirementSequence); err != nil {
+	if err := acknowledgeExposedRetired(s, outcomes[0].RetirementSequence); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.Retired()) != 0 {
@@ -470,7 +470,7 @@ func TestJobRetirementReservesFinalSequenceBeforeDispatch(t *testing.T) {
 	if s.Retired()[0].RetirementSequence != math.MaxUint64 {
 		t.Fatal("reserved final sequence lost")
 	}
-	if err := s.AcknowledgeRetired(math.MaxUint64); err != nil {
+	if err := acknowledgeExposedRetired(s, math.MaxUint64); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AcceptJob(jobRequest(4, mountID(5), "mount")); err == nil {

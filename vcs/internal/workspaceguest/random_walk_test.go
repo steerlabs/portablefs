@@ -263,7 +263,7 @@ func TestGuestConcurrentRandomWalkRepliesEncode(t *testing.T) {
 					s.mu.Lock()
 					top := s.retirementSequence
 					s.mu.Unlock()
-					_ = s.AcknowledgeRetired(uint64(R(int(top) + 3)))
+					_ = acknowledgeExposedRetired(s, uint64(R(int(top)+3)))
 				}
 				check(fmt.Sprintf("step %d", step), s.Status())
 				if R(3) == 0 {

@@ -130,6 +130,12 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		}
 		d, err := m.start(ctx, j.Mount, j.Generation)
 		if err != nil {
+			if d != nil {
+				m.mu.Lock()
+				m.mounts[key] = d
+				m.mu.Unlock()
+				return &StartupFailure{Cause: err, Owner: d, Proof: d.cleanupProof()}
+			}
 			return err
 		}
 		m.mu.Lock()
@@ -148,7 +154,7 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 			err = m.Host.Register(ctx, j.Mount, d.bound(), d)
 		}
 		if err != nil {
-			return err
+			return &StartupFailure{Cause: err, Owner: d, Proof: d.cleanupProof()}
 		}
 		d.registered.Store(true)
 		if predecessor != nil {
@@ -160,9 +166,7 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		if err != nil {
 			terminalErr := m.Host.Terminal(j.Mount, "initial workspace preparation did not complete", nil)
 			proof, cleanupErr := d.Cleanup(context.Background(), d.bound())
-			if cleanupErr == nil {
-				cleanupErr = m.Host.Cleanup(j.Mount, proof)
-			}
+			cleanupErr = errors.Join(cleanupErr, m.Host.Cleanup(j.Mount, proof))
 			return errors.Join(err, terminalErr, cleanupErr)
 		}
 		return nil
@@ -183,10 +187,8 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		}
 		d.effectMu.Unlock()
 		p, err := d.remove(ctx, mode)
+		err = errors.Join(err, m.Host.Cleanup(j.Mount, p))
 		if err != nil {
-			return err
-		}
-		if err = m.Host.Cleanup(j.Mount, p); err != nil {
 			return err
 		}
 		m.mu.Lock()
@@ -197,7 +199,7 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		return errors.New("unsupported workspace driver job")
 	}
 }
-func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Driver, result error) {
+func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (owner *Driver, result error) {
 	if m.Host == nil || m.Identity == nil || m.Inventory == nil || m.Clock == nil || os.Geteuid() != 0 {
 		return nil, errors.New("workspace root owners unavailable")
 	}
@@ -239,6 +241,14 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 		// No Prepare can run before control availability and registration. Join
 		// the unattached child, reconcile both stores, and release only an exact
 		// absence proof. A failed persistence/identity proof retains the intent.
+		if !desiredRecorded {
+			for _, run := range m.Inventory.Snapshot() {
+				if proto.Equal(run.Mount, id) {
+					desiredRecorded = true
+					break
+				}
+			}
+		}
 		if desiredRecorded && (d.child == nil || d.child.Process == nil || d.bound().Process != "") {
 			for _, run := range m.Inventory.Snapshot() {
 				if !proto.Equal(run.Mount, id) {
@@ -253,13 +263,21 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (_ *Drive
 					cleanupErr = m.Identity.Reissue(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId}, false, d.proveExitedAbsent)
 				}
 				result = errors.Join(result, cleanupErr)
+				if cleanupErr == nil {
+					d.cleaned.Store(true)
+				}
 				break
 			}
 		}
-		if d.gate != nil {
-			_ = d.gate.Dispose()
+		if desiredRecorded {
+			owner = d
 		}
-		_ = target.Close()
+		if !desiredRecorded || d.cleaned.Load() {
+			if d.gate != nil {
+				_ = d.gate.Dispose()
+			}
+			_ = target.Close()
+		}
 	}()
 	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil {
@@ -371,6 +389,17 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	}
 	for _, run := range m.Inventory.Snapshot() {
 		if run.Removed {
+			if m.Identity != nil {
+				if _, err = m.reconcileCLI(ctx, run, run.Witness.Process, run.Witness.Process == ""); err != nil {
+					return err
+				}
+				if err = m.Identity.Reissue(&pb.IdentityRequest{AuthorityId: run.Mount.AuthorityId, VolumeId: run.Mount.VolumeId}, false, func() error {
+					_, e := fusev3.ObservePlannedKernelMountAbsent(run.Witness.Source, run.Witness.Target)
+					return e
+				}); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if run.KernelBoot == "" || run.KernelBoot == strings.TrimSpace(string(boot)) {
@@ -414,9 +443,32 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			}
 		}
 	}
+	if m.Identity != nil {
+		return m.Identity.ReconcileProvisioning(func(id *pb.MountID) error {
+			// Any recorded owner was reconciled above. An unrecorded grant must prove
+			// absence independently in the CLI inventory as well as the kernel.
+			instance := "mnt_" + base64.RawURLEncoding.EncodeToString(id.Incarnation)
+			run := &Desired{Mount: id, KernelBoot: strings.TrimSpace(string(boot)), Witness: Witness{Intent: instance, Source: "portablefs:" + instance, Target: filepath.Join(m.Targets, id.VolumeId)}, Outcome: control.UnknownOutcome()}
+			if _, e := fusev3.ObservePlannedKernelMountAbsent(run.Witness.Source, run.Witness.Target); e != nil {
+				return e
+			}
+			_, e := m.reconcileCLI(ctx, run, "", true)
+			return e
+		})
+	}
 	return nil
 }
 func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess string, neverSpawned bool) (Witness, error) {
+	recorded := false
+	for _, current := range m.Inventory.Snapshot() {
+		if proto.Equal(current.Mount, run.Mount) {
+			recorded = true
+			break
+		}
+	}
+	if !recorded && !neverSpawned {
+		return Witness{}, errors.New("workspace reconciliation has no root owner")
+	}
 	input, writer, err := os.Pipe()
 	if err != nil {
 		return Witness{}, err
@@ -452,7 +504,11 @@ func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess 
 	err = json.NewDecoder(io.LimitReader(out, 2<<20)).Decode(&result)
 	witness := result.Witness
 	if err == nil && writeErr == nil {
-		err = m.Inventory.BindWitness(run.Mount, witness)
+		if recorded {
+			err = m.Inventory.BindWitness(run.Mount, witness)
+		} else if witness != run.Witness || result.Evidence != nil {
+			err = errors.New("provision-only reconciliation discovered owned resources")
+		}
 	}
 	if err == nil && writeErr == nil && result.Evidence != nil {
 		e := result.Evidence
@@ -477,7 +533,10 @@ func (m *Manager) reconcileCLI(ctx context.Context, run *Desired, exitedProcess 
 
 func (d *Driver) bound() Witness { d.mu.Lock(); defer d.mu.Unlock(); return d.witness }
 func (d *Driver) CloseAdmission(g uint64) uint64 {
-	serial := d.gate.Close(g)
+	var serial uint64
+	if d.gate != nil {
+		serial = d.gate.Close(g)
+	}
 	d.serving.Store(false)
 	d.mu.Lock()
 	d.generation = max(d.generation, g)
@@ -938,9 +997,26 @@ func (d *Driver) Suspend(ctx context.Context, s *pb.Suspension) (ColdResult, err
 func (d *Driver) Cleanup(_ context.Context, _ Witness) (CleanupProof, error) {
 	return d.remove(context.Background(), "terminal")
 }
-func (d *Driver) remove(ctx context.Context, mode string) (CleanupProof, error) {
+
+// cleanupProof reads the existing inventory, including evidence acquired by a
+// failed finalization. It does not infer removal from an outcome observation.
+func (d *Driver) cleanupProof() CleanupProof {
+	p := CleanupProof{Witness: d.bound()}
+	for _, run := range d.manager.Inventory.Snapshot() {
+		if proto.Equal(run.Mount, d.id) {
+			p.Loss, p.Outcome = run.Loss, run.Outcome
+			break
+		}
+	}
+	if d.cleaned.Load() {
+		p.ProcessExited, p.KernelAbsent = true, true
+	}
+	return p
+}
+func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, result error) {
 	d.cleanupMu.Lock()
 	defer d.cleanupMu.Unlock()
+	defer func() { evidence := d.cleanupProof(); proof.Loss, proof.Outcome = evidence.Loss, evidence.Outcome }()
 	if d.cleaned.Load() {
 		return CleanupProof{Witness: d.bound(), ProcessExited: true, KernelAbsent: true}, nil
 	}
@@ -976,7 +1052,7 @@ func (d *Driver) remove(ctx context.Context, mode string) (CleanupProof, error) 
 	if run == nil {
 		return CleanupProof{Witness: d.bound()}, errors.New("workspace cleanup intent missing")
 	}
-	w, err := d.manager.reconcileCLI(context.Background(), run, d.bound().Process, false)
+	w, err := d.manager.reconcileCLI(context.Background(), run, d.bound().Process, d.bound().Process == "")
 	if err != nil {
 		return CleanupProof{Witness: d.bound()}, err
 	}
@@ -1005,12 +1081,14 @@ func (d *Driver) remove(ctx context.Context, mode string) (CleanupProof, error) 
 			return CleanupProof{Witness: w}, err
 		}
 	}
-	d.cleaned.Store(true)
 	if err = d.manager.Identity.Reissue(&pb.IdentityRequest{AuthorityId: d.id.AuthorityId, VolumeId: d.id.VolumeId}, false, d.proveExitedAbsent); err != nil {
-		return CleanupProof{Witness: w, ProcessExited: true, KernelAbsent: true}, err
+		return CleanupProof{Witness: w}, err
 	}
+	d.cleaned.Store(true)
 	d.target.Close()
-	d.gate.Dispose()
+	if d.gate != nil {
+		d.gate.Dispose()
+	}
 	return CleanupProof{Witness: w, ProcessExited: true, KernelAbsent: true}, nil
 }
 func (d *Driver) bindingGeneration() uint64 { d.mu.Lock(); defer d.mu.Unlock(); return d.generation }
@@ -1052,10 +1130,8 @@ func (d *Driver) watch() {
 				d.CloseAdmission(d.bindingGeneration())
 				_ = d.manager.Host.Terminal(d.id, "workspace child exited", nil)
 				if d.terminalCleanup.CompareAndSwap(false, true) {
-					proof, err := d.remove(context.Background(), "terminal")
-					if err == nil {
-						_ = d.manager.Host.Cleanup(d.id, proof)
-					}
+					proof, _ := d.remove(context.Background(), "terminal")
+					_ = d.manager.Host.Cleanup(d.id, proof)
 				}
 			}
 			return
@@ -1078,10 +1154,8 @@ func (d *Driver) watch() {
 		if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
 			_ = d.manager.Host.Terminal(d.id, "workspace terminal removal required", nil)
 			go func() {
-				proof, err := d.remove(context.Background(), "terminal")
-				if err == nil {
-					_ = d.manager.Host.Cleanup(d.id, proof)
-				}
+				proof, _ := d.remove(context.Background(), "terminal")
+				_ = d.manager.Host.Cleanup(d.id, proof)
 			}()
 		} else if r.State == "recovery-required" {
 			g, _ := strconv.ParseUint(b.Generation, 10, 64)

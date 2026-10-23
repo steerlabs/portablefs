@@ -8,51 +8,7 @@ import (
 	"testing"
 
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
-	"golang.org/x/sys/unix"
 )
-
-func TestBootstrapSettlesCanceledAndPartialAcquisitions(t *testing.T) {
-	for _, mode := range []string{"canceled-before-syscall", "partial-conflicting-witness"} {
-		t.Run(mode, func(t *testing.T) {
-			var b Bootstrap
-			p := *phase()
-			p.Witness.Kernel = ""
-			if err := b.Begin(p); err != nil {
-				t.Fatal(err)
-			}
-			b.OwnerLost()
-			if err := b.Finalize(absentBootstrap(&b)); !errors.Is(err, ErrOccupied) {
-				t.Fatal(err)
-			}
-			r := &Rights{}
-			w := Witness{}
-			var fds []int
-			if mode == "partial-conflicting-witness" {
-				r, fds = descriptors(t)
-				unix.Close(r.FDs[1])
-				r.FDs = r.FDs[:1]
-				w = witness()
-				w.Source = "foreign"
-				w.Session = "new-session"
-			}
-			if err := b.Finish(r, w); !errors.Is(err, ErrGrammar) {
-				t.Fatal(err)
-			}
-			if mode == "partial-conflicting-witness" && (b.action.Witness.Kernel != w.Kernel || b.action.Witness.Session != w.Session || b.action.Witness.Source != p.Witness.Source) {
-				t.Fatal("partial acquisition erased", b.action.Witness)
-			}
-			if err := b.Finalize(Absence{ProcessExited: true}); !errors.Is(err, ErrGrammar) {
-				t.Fatal("stale absence replaced observation", err)
-			}
-			if err := b.Finalize(absentBootstrap(&b)); err != nil {
-				t.Fatal(err)
-			}
-			if len(fds) > 0 {
-				assertClosed(t, fds[:1])
-			}
-		})
-	}
-}
 
 func TestLossMergesIndependentlyOfConflictingPublication(t *testing.T) {
 	for _, invalid := range []string{"disposition", "witness", "deadline", "outcome"} {
@@ -240,48 +196,6 @@ func TestCloseCancellationRequiresLegalSuccessor(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestStoppedInstallOfferRetainsRootOwnershipAndEndsHandoff(t *testing.T) {
-	var b Bootstrap
-	if err := b.Begin(*phase()); err != nil {
-		t.Fatal(err)
-	}
-	rights, fds := descriptors(t)
-	if err := b.Finish(rights, witness()); err != nil {
-		t.Fatal(err)
-	}
-	o := testOwner(t, func(ctx context.Context, j *Job) error {
-		if err := j.OfferInstall(*phase()); err != nil {
-			return err
-		}
-		return errors.New("prepare ended before handoff")
-	})
-	j := start(t, o, request("workspace-prepare", 1, 1))
-	<-j.done
-	snap := observe(t, o, 2, 1)
-	slot := snap.Workspace.Phases.Install
-	if slot.Progress != "failed" || slot.Failure != "stopped" {
-		t.Fatal(slot)
-	}
-	if err := b.ObserveInstall(slot, snap.Workspace.Witness); err != nil {
-		t.Fatal(err)
-	}
-	if b.childOwns {
-		t.Fatal("unaccepted offer transferred ownership")
-	}
-	if _, err := b.Handoff(); !errors.Is(err, ErrRetired) {
-		t.Fatal("stopped offer invited retransmission", err)
-	}
-	for _, fd := range fds {
-		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
-			t.Fatal("stopped offer dropped original root owner", err)
-		}
-	}
-	if err := b.Finalize(absentBootstrap(&b)); err != nil {
-		t.Fatal(err)
-	}
-	assertClosed(t, fds)
 }
 
 func TestRemovalDuringWorkerCancellationKeepsSnapshotEncodable(t *testing.T) {
