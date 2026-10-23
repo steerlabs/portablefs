@@ -330,7 +330,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 			return nil, errors.Join(err, rpc.Close())
 		}
 		cfg.workspace = cfg.Managed.Admission
-		cfg.workspaceLifecycle = &workspaceLifecycle{lane: make(chan struct{}, 1), clock: cfg.Managed.Clock, renewer: cfg.Managed.Renewer, standalone: cfg.Managed.Standalone, persist: cfg.Managed.Persist}
+		cfg.workspaceLifecycle = &workspaceLifecycle{initialPermit: cfg.Managed.Permit, lane: make(chan struct{}, 1), clock: cfg.Managed.Clock, renewer: cfg.Managed.Renewer, standalone: cfg.Managed.Standalone, persist: cfg.Managed.Persist}
 		proof, _ := cfg.workspace.Recovery(cfg.Managed.Permit.Generation, cfg.Managed.Permit.GateSerial)
 		startup = context.WithValue(startup, workspaceRecoveryKey{}, proof)
 	}
@@ -393,10 +393,19 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	m.grafts, m.backing = grafts, cfg.LocalBacking
 	root := &node{mount: m, item: cloneItem(rootItem), requestTimeout: cfg.RequestTimeout, maxRead: maxRead, maxWrite: maxWrite}
 	raw := newRawFileSystem(m, root)
-	if err := m.subscription.subscribe(startup); err != nil {
+	var subscribeErr error
+	if cfg.Managed != nil {
+		// The closed owner retains the initial session across bounded transport
+		// attempts, just as it does during recovery. A network outage cannot
+		// consume another Attach or manufacture a terminal incarnation.
+		subscribeErr = m.retryWorkspaceSubscribe(startup).Err
+	} else {
+		subscribeErr = m.subscription.subscribe(startup)
+	}
+	if subscribeErr != nil {
 		m.cancel()
 		m.delegations.Stop()
-		return failBeforeKernelMount(errors.Join(err, grafts.Close()))
+		return failBeforeKernelMount(errors.Join(subscribeErr, grafts.Close()))
 	}
 	if err := startup.Err(); err != nil {
 		m.cancel()

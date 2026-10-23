@@ -52,6 +52,10 @@ REQUIRED_TESTS=()
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/cmd/portablefs/internal/cli:TestWorkspaceClockRefusalLatchesServingUntilFreshClosedPermit"
+  "github.com/steerlabs/portablefs/vcs/internal/workspaceclock:TestSharedClockConcurrentCheckAndCloseJoinsReaders"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClockDeniesEntryBeforeRootObservation"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceClockDeniesCapacityWaitBeforeRootObservation"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootSuspendForwardsRemainingBudgetAndJoinsLocalOwner"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestManagedKernelProtectedBootstrapAndExactRemoval"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestManagedKernelVoluntaryEBUSYRetainsOriginalOwner"
@@ -254,7 +258,7 @@ validate_root_tests() {
   [[ ${#REQUIRED_ROOT_TESTS[@]} -gt 0 ]] ||
     fail "REQUIRED_ROOT_TESTS is empty; the root boundary must require at least one test" 70
   for entry in "${REQUIRED_ROOT_TESTS[@]}"; do
-    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/internal/(cellhost|xfsstore|fusev3|workspaceadmission|workspaceclock|workspacemount):Test[A-Za-z0-9_]+$ ]] ||
+    [[ $entry =~ ^github\.com/steerlabs/portablefs/vcs/(internal/(cellhost|xfsstore|fusev3|workspaceadmission|workspaceclock|workspacemount)|cmd/portablefs/internal/cli):Test[A-Za-z0-9_]+$ ]] ||
       fail "REQUIRED_ROOT_TESTS entry is not a provisioned root-package top-level test: $entry" 70
     [[ $seen != *" ${entry} "* ]] ||
       fail "REQUIRED_ROOT_TESTS names a test twice: $entry" 70

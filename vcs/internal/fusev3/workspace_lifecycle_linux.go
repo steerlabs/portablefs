@@ -25,6 +25,7 @@ import (
 // dispatch. Neither a missing owner nor a goroutine start constitutes readiness.
 type workspaceClock interface {
 	Wait(context.Context, mountenrollment.Permit) error
+	// Check also runs under buffer admission: no I/O, joins or owner mutex.
 	Check(mountenrollment.Permit) error
 }
 type workspaceDispatch interface {
@@ -61,6 +62,7 @@ type workspaceEvidence struct {
 	abandoned bool
 }
 type workspaceLifecycle struct {
+	initialPermit       mountenrollment.Permit
 	beforeRecoveryProof func()
 	afterFlushLoss      func(*fileHandle) // deterministic reset boundary; nil in production
 	observation         atomic.Pointer[WorkspaceObservation]

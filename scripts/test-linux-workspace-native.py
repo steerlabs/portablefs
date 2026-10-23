@@ -16,7 +16,8 @@ from linux_workspace_native_managed import NativeAuthority
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
-state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-ws-%h-%d-', dir='/tmp'))
+state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-workspace-native-', dir='/tmp'))
+(root / 'state-directory.json').write_text(json.dumps({'state': str(state)}))
 required = pathlib.Path(inventory).read_text().splitlines()
 assert required and len(required) == len(set(required))
 passed = []
@@ -296,3 +297,6 @@ finally:
     if authority:
         authority.close()
     events.close()
+    if (state / "serial.log").exists():
+        shutil.copyfile(state / "serial.log", root / "guest-final-serial.log")
+    shutil.rmtree(state)

@@ -198,6 +198,19 @@ func (c *workspaceChild) current(p mountenrollment.Permit) bool {
 	proof, err := c.reader.Recovery(p.Generation, p.GateSerial)
 	return err == nil || c.reader.Installed(proof)
 }
+
+func (c *workspaceChild) Wait(ctx context.Context, p mountenrollment.Permit) error {
+	return c.clockBinding.Wait(ctx, p)
+}
+func (c *workspaceChild) Check(p mountenrollment.Permit) error {
+	err := c.clockBinding.Check(p)
+	if errors.Is(err, workspaceclock.ErrUnavailable) {
+		if _, servingErr := c.reader.Check(); servingErr == nil {
+			c.localOpen.Store(false)
+		}
+	}
+	return err
+}
 func (c *workspaceChild) adoptKernel(ctx context.Context, j *mountcontrol.Job, r *mountcontrol.Rights) (mountcontrol.Witness, error) {
 	q := j.Request()
 	w := q.Workspace.Phase
@@ -393,7 +406,7 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 		if err = c.control.Owner.Record(mountcontrol.Facts{Witness: w}); err != nil {
 			return nil, err
 		}
-		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c.clockBinding, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string) error {
+		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string) error {
 			return c.control.Owner.RequireRemoval(context.Background(), mode, "kernel removal required")
 		}}, nil
 	}})

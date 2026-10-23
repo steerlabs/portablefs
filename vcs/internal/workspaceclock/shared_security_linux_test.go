@@ -228,3 +228,54 @@ func TestSharedClockClosedOwnerAndIdempotentReaderClose(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSharedClockConcurrentCheckAndCloseJoinsReaders(t *testing.T) {
+	o := sharedOwner(t)
+	if err := o.Begin(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.Measure(); err != nil {
+		t.Fatal(err)
+	}
+	f, binding, err := o.ChildFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := OpenReader(f, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stop atomic.Bool
+	var started atomic.Int32
+	var readers sync.WaitGroup
+	for range 32 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			started.Add(1)
+			for !stop.Load() {
+				_ = r.Check(0)
+			}
+		}()
+	}
+	for started.Load() != 32 {
+		time.Sleep(time.Millisecond)
+	}
+	done := make(chan error, 1)
+	go func() { done <- r.Close() }()
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		stop.Store(true)
+		readers.Wait()
+		t.Fatal("clock mapping retirement did not join registered readers")
+	}
+	stop.Store(true)
+	readers.Wait()
+	if r.checking.Load() != 0 || !errors.Is(r.Check(0), ErrUnavailable) {
+		t.Fatal("retired clock mapping remains readable")
+	}
+}

@@ -16,7 +16,7 @@ truncate -s 1G "$root/xfs.img"
 mkfs.xfs -q -f "$root/xfs.img"
 # util-linux sets LO_FLAGS_AUTOCLEAR. Namespace teardown cannot leave an owned
 # persistent loop attachment, including if the container is killed mid-test.
-mount -o loop,prjquota,nodev,nosuid "$root/xfs.img" "$root/xfs"
+mount -o loop,prjquota,nodev,nosuid,noexec,noatime "$root/xfs.img" "$root/xfs"
 bash /work/scripts/provision-xfs-volume.sh "$root/xfs" "$volume" 42016 200001 200001 512m 100000
 chown 200001:200001 "$root/home"
 chmod 0700 "$root/home"
