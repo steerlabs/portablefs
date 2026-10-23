@@ -1,5 +1,6 @@
 """Real VZ execution, independent causal assertions, exact required inventory."""
 import json
+import datetime
 import pathlib
 import queue
 import subprocess
@@ -207,7 +208,9 @@ try:
         assert time.monotonic() < deadline, after
         time.sleep(.1)
     assert after['generation'] == 1 and after['sample_age_ns'] <= 250_000_000
-    assert abs(after['correction_ns']) >= 3_000_000_000, 'resume did not exercise real guest wall correction'
+    wall_delta = (datetime.datetime.fromisoformat(after['wall_after'].replace('Z', '+00:00')) - datetime.datetime.fromisoformat(before['wall_after'].replace('Z', '+00:00'))).total_seconds()
+    elapsed_delta = (after['elapsed_end_ns'] - before['elapsed_end_ns']) / 1e9
+    assert wall_delta - elapsed_delta >= 3, 'resume did not exercise real guest wall correction'
     measurements[-1]['resume_clock'] = after
     record('rtc-cold-resume-generation')
     assert guest.ssh('cat ~/persistence') == token
