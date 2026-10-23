@@ -1,5 +1,5 @@
 [Unit]
-Description=PortableFS workspace control 8 (no mounts)
+Description=PortableFS workspace control 8 and managed mount owner
 Requires=portablefs-workspace-bootstrap.service portablefs-workspace-ssh.socket
 After=portablefs-workspace-bootstrap.service portablefs-workspace-ssh.socket
 [Service]

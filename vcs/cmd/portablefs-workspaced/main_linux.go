@@ -157,6 +157,7 @@ func openGuestIdentities(directory string) (*workspacemount.Store, error) {
 	return identities, err
 }
 func serve() error {
+	var mounts *workspacemount.Manager
 	identities, err := openGuestIdentities("/data/workspace-identities")
 	if err != nil {
 		return err
@@ -164,7 +165,11 @@ func serve() error {
 	if identities != nil {
 		defer identities.Close()
 	}
-	clock, err := workspaceclock.Open(nil)
+	clock, err := workspaceclock.Open(func() {
+		if mounts != nil {
+			mounts.ClockUnavailable()
+		}
+	})
 	if err != nil {
 		return err
 	}
@@ -227,6 +232,20 @@ func serve() error {
 	}
 	witness.Close()
 	expected := &pb.Hello{Release: version, BootId: boot, HostServiceId: host, GuestServiceId: guest}
+	inventory, err := workspacemount.OpenInventory("/data/workspace")
+	if err != nil {
+		return err
+	}
+	defer inventory.Close()
+	for _, directory := range []string{"/data/workspace-clients", "/data/workspace-backing"} {
+		if err = os.MkdirAll(directory, 0711); err != nil {
+			return err
+		}
+	}
+	mounts = &workspacemount.Manager{Identity: identities, Inventory: inventory, Clock: clock, Boot: boot, HostService: host, GuestService: guest, Binary: "/usr/local/bin/portablefs", Targets: "/workspaces", Clients: "/data/workspace-clients", Backing: "/data/workspace-backing"}
+	if err = mounts.Reconcile(context.Background()); err != nil {
+		return err
+	}
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("guest workspace: %w", err)
@@ -262,10 +281,21 @@ func serve() error {
 			unix.Close(client)
 			return fmt.Errorf("invalid vsock descriptor")
 		}
-		supervisor, err := workspaceguest.New(boot, host, guest, true, nil)
+		supervisor, err := workspaceguest.New(boot, host, guest, true, mounts)
 		if err != nil {
 			stream.Close()
 			return fmt.Errorf("guest workspace: %w", err)
+		}
+		mounts.Host = supervisor
+		supervisor.ConfigureWitnessPersistence(inventory.BindWitness)
+		supervisor.ConfigureRetirementPersistence(inventory.Acknowledge)
+		for _, run := range inventory.Snapshot() {
+			if run.Removed {
+				if err = supervisor.RestoreCleaned(run.Mount, run.Loss, run.Outcome); err != nil {
+					stream.Close()
+					return err
+				}
+			}
 		}
 		paired := false
 		if err = stream.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {

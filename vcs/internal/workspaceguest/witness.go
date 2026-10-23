@@ -43,6 +43,10 @@ func (s *Supervisor) BindWitness(id *pb.MountID, next Witness) (Witness, error) 
 		return Witness{}, refused("bind retired mount")
 	}
 	w, mergeErr := MergeWitness(e.witness, next)
+	if w == e.witness && mergeErr == nil {
+		s.mu.Unlock()
+		return w, nil
+	}
 	e.witness, e.binding = w, true
 	g, serial := s.generation, e.gateSerial
 	persist := s.persistWitness
@@ -74,4 +78,20 @@ func (s *Supervisor) BoundWitness(id *pb.MountID) (Witness, error) {
 		return Witness{}, refused("witness unknown mount")
 	}
 	return e.witness, nil
+}
+
+// RecoveryRequired closes a serving interval without inventing an authority
+// expiry. A host-owned cold transaction supplies fresh Resume authority.
+func (s *Supervisor) RecoveryRequired(id *pb.MountID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.mounts[control.MountKey(id)]
+	if e == nil {
+		return refused("recovery-required unknown mount")
+	}
+	e.gateSerial = e.driver.CloseAdmission(s.generation)
+	if !e.terminal {
+		e.setStatus("closed", reason, "")
+	}
+	return nil
 }

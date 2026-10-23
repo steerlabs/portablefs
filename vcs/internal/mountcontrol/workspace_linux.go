@@ -312,7 +312,7 @@ func (r Response) ValidateWorkspace() error {
 	}
 
 	switch w.State {
-	case "accepted", "preparing", "pending-recovery", "pending-suspend":
+	case "accepted", "preparing", "pending-recovery", "pending-suspend", "recovery-required":
 	case "unmount-recorded", "cleanup-finalized":
 		if !boundWitness(w.Witness) {
 			return ErrGrammar

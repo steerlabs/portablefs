@@ -39,7 +39,10 @@ type fuseV3Config struct {
 	// engine at construction because a strict mount can revoke before
 	// MountVolume returns, and the supervisor's whole job here is to persist a
 	// verdict it might otherwise never hear.
-	onRevoked func(mountRevocation)
+	onRevoked     func(mountRevocation)
+	awaitTLS      func(context.Context) error
+	dispatchFence *authorityrpc.DispatchFence
+	beforeKernel  func(*authorityrpc.Client, mountRoutes) (*fusev3.ManagedConfig, error)
 }
 
 // fuseRevocation translates the engine's report into the platform-neutral
@@ -168,6 +171,7 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		return nil, false, false, fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
 	attach := authorityrpc.ClientConfig{
+		AwaitTLS: cfg.awaitTLS, DispatchFence: cfg.dispatchFence, LifecycleRetry: cfg.beforeKernel != nil,
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         cfg.addr, TLS: tlsCfg, VolumeID: cfg.volumeID,
@@ -197,7 +201,15 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		backing = cfg.backingRoot
 	}
 	transport := mountv3.NewTransport(client)
+	var managed *fusev3.ManagedConfig
+	if cfg.beforeKernel != nil {
+		managed, err = cfg.beforeKernel(client, mountRoutes{rules: rules, revision: rules.RevisionHex(), declared: !rules.Empty()})
+		if err != nil {
+			return nil, true, false, err
+		}
+	}
 	mount, err := fusev3.MountVolume(context.Background(), ctx, cfg.mountPath, transport, fusev3.Config{
+		Managed: managed,
 		// The mount core derives "portablefs:<mountInstanceID>", the same
 		// instance-bound kernel source mount_identity_linux.go verifies.
 		MountInstanceID: cfg.mountInstanceID, RequestTimeout: mountv3.RequestTimeout,
@@ -222,7 +234,7 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		// lifecycle transition rather than cleanup.
 		return nil, true, fusev3.FailedStartupClean(err), fmt.Errorf("mount %s: %w", cfg.mountPath, err)
 	}
-	return &fuseV3Mount{
+	result := &fuseV3Mount{
 		mount:  mount,
 		client: client,
 		routes: mountRoutes{
@@ -231,5 +243,10 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 			declared: !rules.Empty(),
 		},
 		backing: backing,
-	}, true, false, nil
+	}
+	if managed != nil {
+		result.managed = true
+		result.checkPermit = func(p mountenrollment.Permit) bool { return managed.Clock.Check(p) == nil }
+	}
+	return result, true, false, nil
 }

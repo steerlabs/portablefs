@@ -176,7 +176,7 @@ func (g *Supervisor) Recovery(generation uint64) (RecoveryPermit, error) {
 		return RecoveryPermit{}, ErrClosed
 	}
 	word := g.word.Load()
-	if g.exhausted || word>>1 == math.MaxUint64>>1 || word&1 != 0 || generation == 0 || generation < g.generation {
+	if g.exhausted || word>>1 == math.MaxUint64>>1 || word&1 != 0 || generation < g.generation {
 		return RecoveryPermit{}, ErrClosed
 	}
 	g.generation = generation
@@ -353,7 +353,7 @@ func (r *Reader) Check() (ServingPermit, error) {
 	return p, p.Check()
 }
 func (r *Reader) Recover(p RecoveryPermit) error {
-	if r.dead.Load() || p.Serial() == math.MaxUint64>>1 || p.binding != r.binding || p.generation == 0 || p.word&1 != 0 {
+	if r.dead.Load() || p.Serial() == math.MaxUint64>>1 || p.binding != r.binding || p.word&1 != 0 {
 		return ErrClosed
 	}
 	word := r.word.Load()

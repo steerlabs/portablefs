@@ -720,6 +720,19 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 			out.record(1, "data-withdrawal", errors.New(failure))
 		}
 	}
+	if m.managedRemoval != nil {
+		out.record(1, "root-removal", m.managedRemoval("terminal"))
+		if _, err := installed.absent(); err != nil {
+			out.record(1, "absence", err)
+		} else {
+			out.withdrawn = true
+		}
+		if !writersJoined && m.kernelConnectionAbsentBy(deadline) {
+			m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+			m.raw.discardCachedOwnershipAfterConnectionGone()
+		}
+		return out
+	}
 	for round := 1; ; round++ {
 		// Aborting is unconditional and comes first in every round. It unblocks
 		// any request still parked on an authority operation and terminates the

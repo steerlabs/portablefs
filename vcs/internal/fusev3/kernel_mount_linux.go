@@ -19,6 +19,7 @@ import (
 // an old open file then do nothing, even when the numeric path names a successor.
 type kernelAbortFile struct {
 	file     *os.File
+	path     string
 	identity os.FileInfo
 	once     sync.Once
 	closeErr error
@@ -33,7 +34,7 @@ func openKernelAbortFile(path string) (*kernelAbortFile, error) {
 	if err != nil {
 		return nil, errors.Join(err, file.Close())
 	}
-	return &kernelAbortFile{file: file, identity: identity}, nil
+	return &kernelAbortFile{file: file, path: path, identity: identity}, nil
 }
 
 func (a *kernelAbortFile) abort() error {
@@ -52,7 +53,11 @@ func (a *kernelAbortFile) close() error {
 // current is read-only. It disambiguates even a caller reusing a source name
 // together with a recycled mount ID, device number, and mountpoint.
 func (a *kernelAbortFile) current() (bool, error) {
-	info, err := os.Stat(a.file.Name())
+	path := a.path
+	if path == "" {
+		path = a.file.Name()
+	}
+	info, err := os.Stat(path)
 	if err != nil {
 		return false, fmt.Errorf("fusev3: inspect original FUSE abort inode: %w", err)
 	}
@@ -142,6 +147,10 @@ func (k kernelMount) detachTargetInstalled() (bool, error) {
 // temporary root reference is released before serving, so it cannot keep an
 // ordinary or external unmount busy.
 func captureKernelMount(fsName, mountpoint string) (kernelMount, error) {
+	return captureKernelMountWithAbort(fsName, mountpoint, nil)
+}
+
+func captureKernelMountWithAbort(fsName, mountpoint string, supplied *os.File) (kernelMount, error) {
 	root, err := os.OpenFile(mountpoint, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return kernelMount{}, fmt.Errorf("fusev3: pin mounted root during identity capture: %w", err)
@@ -169,7 +178,22 @@ func captureKernelMount(fsName, mountpoint string) (kernelMount, error) {
 	if _, err := strconv.ParseUint(minor, 10, 32); !ok || err != nil || major != "0" {
 		return kernelMount{}, fmt.Errorf("fusev3: unexpected FUSE mount device %q", installed.device)
 	}
-	abort, err := openKernelAbortFile("/sys/fs/fuse/connections/" + minor + "/abort")
+	path := "/sys/fs/fuse/connections/" + minor + "/abort"
+	var abort *kernelAbortFile
+	if supplied == nil {
+		abort, err = openKernelAbortFile(path)
+	} else {
+		var identity os.FileInfo
+		identity, err = supplied.Stat()
+		if err == nil {
+			abort = &kernelAbortFile{file: supplied, path: path, identity: identity}
+			var current bool
+			current, err = abort.current()
+			if err == nil && !current {
+				err = errors.New("fusev3: supplied abort description is not the original connection")
+			}
+		}
+	}
 	if err != nil {
 		return kernelMount{}, err
 	}
@@ -182,6 +206,9 @@ func captureKernelMount(fsName, mountpoint string) (kernelMount, error) {
 }
 
 func (m *Mount) unmountOwnedKernelMount() error {
+	if m.managedRemoval != nil {
+		return m.managedRemoval("voluntary")
+	}
 	installed := m.kernelMount
 	if installed.point == "" {
 		if _, err := observePlannedKernelMountAbsent(m.plannedFSName, m.plannedMountpoint); err == nil {

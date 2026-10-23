@@ -20,6 +20,7 @@ import (
 // Desired is ownership and retained evidence, not another write journal. The
 // CLI inventory remains authoritative for the session and its kernel mount.
 type Desired struct {
+	KernelBoot                string      `json:"kernel_boot"`
 	Mount                     *pb.MountID `json:"mount"`
 	Boot                      []byte      `json:"boot"`
 	Witness                   Witness     `json:"witness"`
@@ -236,6 +237,18 @@ func (i *Inventory) RetainOutcome(id *pb.MountID, loss []*pb.Loss, outcome *pb.M
 	if !control.RetainsLoss(loss, d.Loss) {
 		return errors.New("workspace outcome would erase loss")
 	}
+	same := proto.Equal(outcome, d.Outcome) && len(loss) == len(d.Loss)
+	if same {
+		for n, l := range loss {
+			if !proto.Equal(l, d.Loss[n]) {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		return i.failed
+	}
 	d.Loss = nil
 	for _, l := range loss {
 		d.Loss = append(d.Loss, proto.Clone(l).(*pb.Loss))
@@ -276,4 +289,34 @@ func (i *Inventory) Reconcile(id *pb.MountID, observe func(*Desired) error) erro
 	}
 	current.Removed = true
 	return i.persist()
+}
+
+// Acknowledge releases only exactly removed runs after the paired host has
+// retained their outcomes. Job-only retirement cannot erase an owned intent.
+func (i *Inventory) Acknowledge(ids []*pb.MountID) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.failed != nil {
+		return i.failed
+	}
+	for _, id := range ids {
+		if r := i.runs[control.MountKey(id)]; r != nil && !r.Removed {
+			return errors.New("workspace outcome acknowledged before exact removal")
+		}
+	}
+	old := map[string]*Desired{}
+	for _, id := range ids {
+		key := control.MountKey(id)
+		old[key] = i.runs[key]
+		delete(i.runs, control.MountKey(id))
+	}
+	if err := i.persist(); err != nil {
+		for key, r := range old {
+			if r != nil {
+				i.runs[key] = r
+			}
+		}
+		return err
+	}
+	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -129,6 +130,7 @@ type RPC interface {
 type WritebackDropReport = writeback.DropReport
 
 type Config struct {
+	Managed *ManagedConfig
 	// workspace is private until the protected-path lifecycle driver exists.
 	// Tests may bind the real gate to the ordinary kernel frontend; the CLI
 	// cannot launch a managed mount through this field.
@@ -222,7 +224,8 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	workspace *workspaceadmission.Reader
+	managedRemoval func(string) error
+	workspace      *workspaceadmission.Reader
 
 	posixMu       sync.Mutex
 	posixLocks    map[posixLockKey]uint64
@@ -321,12 +324,28 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
 	}
+	if cfg.Managed != nil {
+		if err := cfg.Managed.validate(); err != nil {
+			rpc.FinishLocalSessionEnforcement()
+			return nil, errors.Join(err, rpc.Close())
+		}
+		cfg.workspace = cfg.Managed.Admission
+		cfg.workspaceLifecycle = &workspaceLifecycle{lane: make(chan struct{}, 1), clock: cfg.Managed.Clock, renewer: cfg.Managed.Renewer, standalone: cfg.Managed.Standalone, persist: cfg.Managed.Persist}
+		proof, _ := cfg.workspace.Recovery(cfg.Managed.Permit.Generation, cfg.Managed.Permit.GateSerial)
+		startup = context.WithValue(startup, workspaceRecoveryKey{}, proof)
+	}
 	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) || cfg.workspace != nil && cfg.workspace.MountInstanceID() != cfg.MountInstanceID {
 		rpc.FinishLocalSessionEnforcement()
 		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
 	fsName := "portablefs:" + cfg.MountInstanceID
 	failBeforeKernelMount := func(cause error) (*Mount, error) {
+		if cfg.Managed != nil {
+			if err := cfg.Managed.Remove("terminal"); err != nil {
+				rpc.FinishLocalSessionEnforcement()
+				return nil, errors.Join(cause, err, rpc.Close())
+			}
+		}
 		if err := releaseUninstalledSession(rpc, fsName, mountpoint); err != nil {
 			return nil, errors.Join(cause, err)
 		}
@@ -384,10 +403,25 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 		m.delegations.Stop()
 		return failBeforeKernelMount(errors.Join(err, grafts.Close()))
 	}
-	server, err := fuse.NewServer(raw.fileSystemForServer(), mountpoint, options)
+	serverTarget := mountpoint
+	if cfg.Managed != nil {
+		if err := ValidateManagedDescriptors(cfg.Managed.FUSE, cfg.Managed.Abort, fsName, mountpoint); err != nil {
+			return failBeforeKernelMount(err)
+		}
+		fd, err := unix.FcntlInt(uintptr(cfg.Managed.FUSE), unix.F_DUPFD_CLOEXEC, 3)
+		if err != nil {
+			return failBeforeKernelMount(err)
+		}
+		serverTarget = fmt.Sprintf("/dev/fd/%d", fd)
+	}
+	server, err := fuse.NewServer(raw.fileSystemForServer(), serverTarget, options)
 	if err != nil {
 		m.cancel()
 		cause := errors.Join(fmt.Errorf("mount PortableFS v3: %w", err), grafts.Close())
+		if cfg.Managed != nil {
+			_, cleanupErr := failBeforeKernelMount(cause)
+			return nil, cleanupErr
+		}
 		if cleanupErr := releaseMountInstalledByFailedHelper(rpc, fsName, mountpoint); cleanupErr != nil {
 			return nil, errors.Join(cause, cleanupErr)
 		}
@@ -407,7 +441,20 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	// identity is recorded before anything can use the mount: its later absence
 	// is the only thing that authorises a clean detach, and
 	// self-revocation needs its device to abort the connection.
-	installed, err := captureKernelMount(fsName, mountpoint)
+	var installed kernelMount
+	if cfg.Managed != nil {
+		var fd int
+		fd, err = unix.FcntlInt(uintptr(cfg.Managed.Abort), unix.F_DUPFD_CLOEXEC, 3)
+		if err == nil {
+			abort := os.NewFile(uintptr(fd), "managed child abort")
+			installed, err = captureKernelMountWithAbort(fsName, mountpoint, abort)
+			if err != nil {
+				abort.Close()
+			}
+		}
+	} else {
+		installed, err = captureKernelMount(fsName, mountpoint)
+	}
 	if err != nil {
 		// go-fuse prepares one request-loop reference in NewServer, so even an
 		// unserved mount needs Serve to consume it before Unmount can finish. The
@@ -577,6 +624,9 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 
 		requireRemountOnEpochChange: cfg.RequireRemountOnEpochChange || cfg.workspace != nil,
 	}
+	if cfg.Managed != nil {
+		mount.managedRemoval = cfg.Managed.Remove
+	}
 
 	var err error
 	mount.delegations, err = newDelegationManager(mount.rpc, cfg.RequestTimeout, 0, writeback.Options{})
@@ -624,7 +674,13 @@ func (m *Mount) start(lease time.Duration) {
 // then releases the authority session. Only exact absence plus a clean session
 // close upgrades the original error to a clean-startup verdict.
 func (m *Mount) abortMount(cause error) error {
-	_ = m.unmountOwnedKernelMount()
+	if m.managedRemoval != nil {
+		if err := m.managedRemoval("terminal"); err != nil {
+			return errors.Join(cause, err)
+		}
+	} else {
+		_ = m.unmountOwnedKernelMount()
+	}
 	m.Wait()
 	absenceErr := m.failedStartupKernelAbsent()
 	closeErr := m.Close()
