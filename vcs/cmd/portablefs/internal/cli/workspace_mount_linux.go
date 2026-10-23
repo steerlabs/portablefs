@@ -119,7 +119,7 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 		return e.fail("mount", err)
 	}
 	instance := reader.MountInstanceID()
-	c.state = mountState{MountPath: path, VolumeID: volume, PID: os.Getpid(), ProcessStartIdentity: start, Strategy: "fuse", Engine: mountEngineFuseV3, MountInstanceID: instance, MountTargetDevice: launch.TargetDevice, MountTargetInode: launch.TargetInode, MountMechanism: "direct", AuthorityURL: launch.Provision.AuthorityEndpoint, DataPlaneTransport: dataPlaneTransportTLSPrivateCA, DataPlaneServerName: launch.Provision.ServerName, StartedAtMs: time.Now().UnixMilli()}
+	c.state = mountState{SchemaVersion: mountStateSchemaVersion, MountPath: path, VolumeID: volume, PID: os.Getpid(), ProcessStartIdentity: start, Strategy: "fuse", Engine: mountEngineFuseV3, MountInstanceID: instance, MountTargetDevice: launch.TargetDevice, MountTargetInode: launch.TargetInode, MountMechanism: "direct", AuthorityURL: launch.Provision.AuthorityEndpoint, DataPlaneTransport: dataPlaneTransportTLSPrivateCA, DataPlaneServerName: launch.Provision.ServerName, StartedAtMs: time.Now().UnixMilli()}
 	caHash := sha256.Sum256(launch.Provision.CaCertificate)
 	c.state.DataPlaneCASHA256 = hex.EncodeToString(caHash[:])
 	c.state.DataPlaneCAPath = filepath.Join(launch.StateDirectory, "authority-ca.pem")

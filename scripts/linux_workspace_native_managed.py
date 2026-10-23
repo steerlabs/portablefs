@@ -284,5 +284,10 @@ os.close(fd)
         logs = subprocess.run(['docker', 'logs', self.name], capture_output=True, text=True)
         (self.evidence/'native-authority.log').write_text(logs.stdout+logs.stderr)
         subprocess.run(['docker', 'stop', '-t', '25', self.name], capture_output=True, timeout=40)
+        for name in ('authority', 'peer'):
+            captured = subprocess.run(['docker', 'cp', self.name+':/var/tmp/pfs-native/'+name+'.log',
+                                      str(self.evidence/('native-'+name+'-rpc.log'))], capture_output=True, text=True)
+            if captured.returncode:
+                (self.evidence/('native-'+name+'-unavailable.log')).write_text(captured.stderr)
         subprocess.run(['docker', 'rm', self.name], check=True, capture_output=True)
         self.name = None
