@@ -1039,7 +1039,35 @@ func (d *Driver) cleanupProof() CleanupProof {
 	return p
 }
 func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, result error) {
-	return d.removeOwned(ctx, mode, true)
+	if mode != "voluntary" || ctx.Done() == nil {
+		return d.removeOwned(ctx, mode, true)
+	}
+	// Voluntary mode follows a committed kernel unmount. Generation cancellation
+	// cannot undo that intent or leave its child finalizer ahead of Suspend's
+	// desired-job join. The same original terminal owner preempts it, and this
+	// call joins that cancellation worker before publishing any cleanup result.
+	d.CloseAdmission(d.bindingGeneration())
+	forced := make(chan struct{})
+	var forceErr error
+	stop := context.AfterFunc(ctx, func() {
+		if !d.cleaned.Load() {
+			forceErr = d.forceKernelOwner()
+		}
+		close(forced)
+	})
+	proof, result = d.removeOwned(ctx, mode, true)
+	if stop() {
+		return proof, result
+	}
+	<-forced
+	if proof.ProcessExited && proof.KernelAbsent {
+		return proof, errors.Join(result, ctx.Err(), forceErr)
+	}
+	if forceErr != nil && d.proveExitedAbsent() != nil {
+		return proof, errors.Join(result, ctx.Err(), forceErr)
+	}
+	final, err := d.removeOwned(context.WithoutCancel(ctx), "terminal", false)
+	return final, errors.Join(result, ctx.Err(), forceErr, err)
 }
 
 func (d *Driver) removeOwned(ctx context.Context, mode string, force bool) (proof CleanupProof, result error) {
@@ -1060,7 +1088,15 @@ func (d *Driver) removeOwned(ctx context.Context, mode string, force bool) (proo
 	}
 	var err error
 	if mode != "terminal" || !force {
-		_, err = d.job(ctx, "workspace-cleanup", nil, mode)
+		select {
+		case <-d.exited:
+			// A finalizer preempted by the original root owner has no control
+			// lane left to join. Its resource absence still needs independent
+			// proof and both inventory reconciliations below.
+			err = errors.New("workspace child exited before cleanup completion")
+		default:
+			_, err = d.job(ctx, "workspace-cleanup", nil, mode)
+		}
 	}
 	if err != nil {
 		select {

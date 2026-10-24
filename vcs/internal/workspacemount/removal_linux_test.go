@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root protected FUSE owner")
 	}
-	for _, mode := range []string{"retry", "terminal", "power"} {
+	for _, mode := range []string{"retry", "terminal", "power", "cancelled-voluntary"} {
 		t.Run(mode, func(t *testing.T) {
 			terminal := mode != "retry"
 			path := filepath.Join(t.TempDir(), "protected")
@@ -75,6 +76,17 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 				d.opMu.Lock()
 				d.cleanupMu.Lock()
 				done := make(chan error, 1)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if mode == "cancelled-voluntary" {
+					if err := unix.Close(holder); err != nil {
+						t.Fatal(err)
+					}
+					holder = -1
+					if err := d.removeKernelLocked("voluntary", "2"); err != nil {
+						t.Fatal(err)
+					}
+				}
 				if mode == "power" {
 					d.terminalCleanup.Store(true)
 				}
@@ -82,16 +94,24 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 					if mode == "power" {
 						_, err := d.Suspend(context.Background(), &pb.Suspension{Generation: 1})
 						done <- err
+					} else if mode == "cancelled-voluntary" {
+						_, err := d.remove(ctx, "voluntary")
+						done <- err
 					} else {
 						_, err := d.remove(context.Background(), "terminal")
 						done <- err
 					}
 				}()
+				if mode == "cancelled-voluntary" {
+					cancel()
+				}
 				select {
 				case <-d.exited:
 				case <-time.After(time.Second):
+					_ = d.forceKernelOwner()
 					d.cleanupMu.Unlock()
 					d.opMu.Unlock()
+					<-done
 					t.Fatal("terminal owner queued behind child control or finalization")
 				}
 				d.cleanupMu.Unlock()
@@ -99,7 +119,7 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 				case err = <-done:
 					// This fixture owns kernel/process resources only. Missing the
 					// inventory intent must still prevent claiming full cleanup.
-					if err == nil || err.Error() != "workspace cleanup intent missing" {
+					if err == nil || !strings.Contains(err.Error(), "workspace cleanup intent missing") || mode == "cancelled-voluntary" && !errors.Is(err, context.Canceled) {
 						t.Fatal("incomplete inventory fabricated final cleanup", err)
 					}
 					err = nil

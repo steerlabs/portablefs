@@ -181,6 +181,9 @@ retained process before acquiring cleanup or child-control lanes. They can
 preempt a stopped child or automatic finalizer. Original source/target absence,
 process exit and both inventory reconciliations remain prerequisites for
 replacement; killing cannot prove durability or invent a final outcome.
+After a voluntary kernel unmount commits, generation cancellation also drives
+that original terminal owner and joins it before the desired job completes.
+Suspend therefore cannot queue behind the removed mount's child finalizer.
 A finished lifecycle result and a later removal action are independent facts:
 offering removal cannot turn a joined failed Recover back into pending work.
 
