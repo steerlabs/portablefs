@@ -32,6 +32,7 @@ class LifecycleChecks:
 home=pathlib.Path.home(); stop=home/STOP; result=home/RESULT
 root=pathlib.Path(ROOT); errors=[]; counts={}; ready=set(); lock=threading.Lock()
 allocated=[]
+if KIND=='killable': (home/(TAG+'.pid')).write_text(str(os.getpid()))
 def run(i):
     n=0; fd=None
     try:
@@ -44,6 +45,9 @@ def run(i):
                 written=os.pwrite(fd,data,n*len(data)) if KIND=='positioned' else os.write(fd,data)
                 assert written==len(data)
                 os.fsync(fd); n+=1
+                if KIND=='killable':
+                    marker=home/(TAG+'.ack-'+str(i)); temp=marker.with_name(marker.name+'.tmp')
+                    temp.write_text(str(n));temp.replace(marker)
                 if n==1:
                     with lock: ready.add(i)
             except OSError as e:
@@ -249,6 +253,49 @@ print('all-acknowledged-records-intact')
         self.save('managed-umount-suspend-independent-budget',
                   {'drain_seconds': elapsed, 'job': job, 'application': value})
 
+    def busy_killed_application(self, public):
+        with self.holder('killable') as holder:
+            self.g.command('umount', body=public['mount'])
+            assert self.g.wait('umount-accepted', 10)['code'] == 'accepted'
+            self.a.job(self.g, 'umount', timeout=5, allow_fail=True)
+            job = self.a.last_job
+            assert job['phase'] == 'failed' and job['failure'] == 'busy', job
+            tag = pathlib.Path(holder[2]).stem
+            kill = """import os,pathlib,signal
+p=int((pathlib.Path.home()/(tag+'.pid')).read_text())
+fd=os.pidfd_open(p)
+assert pathlib.Path('/proc',str(p)).stat().st_uid==1000
+assert tag.encode() in pathlib.Path('/proc',str(p),'cmdline').read_bytes()
+signal.pidfd_send_signal(fd,signal.SIGKILL);os.close(fd)
+"""
+            started = time.monotonic()
+            self.g.ssh('python3 -c '+shlex.quote('tag='+repr(tag)+'\n'+kill))
+            assert holder[0].wait(timeout=5) != 0
+            elapsed = time.monotonic()-started
+            assert elapsed < 5 and self.mount()['state'] == 'ready'
+            watermarks = json.loads(self.g.ssh('python3 -c '+shlex.quote(
+                "import json,pathlib;h=pathlib.Path.home();print(json.dumps([int((h/("+repr(tag)+"+'.ack-'+str(i))).read_text()) for i in range(2)]))")))
+            assert all(n > 0 for n in watermarks), watermarks
+            verify = """import pathlib
+r=pathlib.Path('/var/tmp/pfs-native/home/peer')
+for i,n in enumerate(counts):
+    body=(r/(tag+'-'+str(i))).read_bytes()
+    expected=b''.join(('%08d\\n'%j).encode() for j in range(n))
+    assert body[:len(expected)]==expected
+print('acknowledged-prefix-intact')
+"""
+            assert self.a.peer('tag='+repr(tag)+'\ncounts='+repr(watermarks)+'\n'+verify) == 'acknowledged-prefix-intact'
+            name = tag+'-survivor'
+            fresh = "import os,pathlib;p=pathlib.Path("+repr(self.a.target)+")/"+repr(name)+";f=p.open('xb');f.write(b'after-application-kill');f.flush();os.fsync(f.fileno());f.close();assert p.read_bytes()==b'after-application-kill'"
+            self.g.ssh('python3 -c '+shlex.quote(fresh))
+            assert self.a.peer("import pathlib;print((pathlib.Path('/var/tmp/pfs-native/home/peer')/"+repr(name)+").read_text())") == 'after-application-kill'
+            self.g.ssh('rm -f ~/'+tag+'.pid ~/'+tag+'.ack-* ~/'+tag+'.tmp')
+        self.a.unmount(self.g, public)
+        replacement = self.a.mount(self.g)
+        self.save('managed-busy-unmount-application-sigkill',
+                  {'job': job, 'application_exit_seconds': elapsed, 'acknowledged_watermarks': watermarks})
+        return replacement
+
     def suspend(self):
         with self.holder('allocate') as namespace, self.holder('positioned', threads=4) as holder:
             drains = [self.pause_resume(seconds=.1) for _ in range(30)]
@@ -388,6 +435,7 @@ def lifecycle_checks(authority, guest, public, record):
     checks.listing()
     checks.network()
     public = checks.busy(public)
+    public = checks.busy_killed_application(public)
     checks.umount_suspend(public)
     checks.suspend()
     public = checks.mount_race(public)
