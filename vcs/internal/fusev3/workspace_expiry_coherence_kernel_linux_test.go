@@ -99,7 +99,29 @@ func opusR3LateApplyChild(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	clock.unavailable.Store(false)
-	cerr, serr := <-closed, <-synced
+	select {
+	case err := <-synced:
+		t.Fatalf("closed fsync completed before fresh recovery permission: %v", err)
+	default:
+	}
+	// Production's host executor supplies this cold recovery after proof loss.
+	// A closed fsync now waits outside the cut, so joining it before installing
+	// fresh serving permission would leave this host-less fixture waiting on
+	// itself. Recovery must still dispose of the old cut before either call can
+	// report its outcome, without applying it over the peer's newer bytes.
+	c.recover(c.suspend())
+	var cerr, serr error
+	for _, result := range []struct {
+		name string
+		done <-chan error
+		out  *error
+	}{{"close", closed, &cerr}, {"fsync", synced, &serr}} {
+		select {
+		case *result.out = <-result.done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s did not finish after cold recovery", result.name)
+		}
+	}
 	fmt.Printf("LA readiness restored; close(e)=%v fsync(g)=%v\n", cerr, serr)
 	time.Sleep(3 * time.Second)
 	sample("after readiness")
