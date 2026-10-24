@@ -343,13 +343,12 @@ func reviewKernelPauseChild(t *testing.T) {
 			f.advanceClock(phase.aged)
 		}
 		c.peerMutate(phase.tag)
-		if _, err := os.Stat(w.pa); !errors.Is(err, syscall.EIO) {
-			c.fail("%s: closed mount answered %v", phase.tag, err)
-		}
-		if phase.lag {
-			off.Add(-int64(continuous.Time().Sub(frozenAt)))
-		}
-		c.recover(serial)
+		kernelStatAcrossColdRecovery(t, w.pa, int64(len("peer-a-longer-"+phase.tag)), func() {
+			if phase.lag {
+				off.Add(-int64(continuous.Time().Sub(frozenAt)))
+			}
+			c.recover(serial)
+		})
 		c.verify(phase.tag, w)
 	}
 

@@ -312,6 +312,30 @@ func countOpusFDs() int {
 	return len(entries)
 }
 
+func kernelStatAcrossColdRecovery(t *testing.T, path string, wantSize int64, recover func()) {
+	t.Helper()
+	type result struct {
+		info os.FileInfo
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() { info, err := os.Stat(path); done <- result{info, err} }()
+	select {
+	case got := <-done:
+		t.Fatalf("cold stat completed before fresh permission: %v", got.err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	recover()
+	select {
+	case got := <-done:
+		if got.err != nil || got.info.Size() != wantSize || got.info.Mode().Perm() != 0640 {
+			t.Fatalf("waiting stat did not observe recovered peer state: %v %v", got.info, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cold stat did not finish after fresh permission")
+	}
+}
+
 func opusKernelPauseChild(t *testing.T) {
 	reader, proof, mounted := opusAdopt(t)
 	defer reader.Retire()
@@ -343,13 +367,12 @@ func opusKernelPauseChild(t *testing.T) {
 			f.advanceClock(phase.aged)
 		}
 		c.peerMutate(phase.tag)
-		if _, err := os.Stat(w.pa); !errors.Is(err, syscall.EIO) {
-			c.fail("%s: closed mount answered %v", phase.tag, err)
-		}
-		if phase.lag {
-			off.Add(-int64(continuous.Time().Sub(frozenAt)))
-		}
-		c.recover(serial)
+		kernelStatAcrossColdRecovery(t, w.pa, int64(len("peer-a-longer-"+phase.tag)), func() {
+			if phase.lag {
+				off.Add(-int64(continuous.Time().Sub(frozenAt)))
+			}
+			c.recover(serial)
+		})
 		c.verify(phase.tag, w)
 	}
 
