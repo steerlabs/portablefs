@@ -1005,6 +1005,12 @@ func (d *Driver) Recover(ctx context.Context, t *pb.ResumeToken) (Recovery, erro
 	return d.recovery(ctx, t.Suspension.Generation, "workspace-recover", t)
 }
 func (d *Driver) Suspend(ctx context.Context, s *pb.Suspension) (ColdResult, error) {
+	if d.terminalCleanup.Load() {
+		// A power cut owns a bounded terminal join. It cannot queue behind an
+		// automatic finalizer whose child is no longer responsive.
+		proof, err := d.remove(ctx, "terminal")
+		return ColdResult{Generation: s.Generation, ColdComplete: err == nil && proof.ProcessExited && proof.KernelAbsent, Loss: proof.Loss, Outcome: proof.Outcome}, err
+	}
 	r, err := d.job(ctx, "workspace-suspend", s, "")
 	out := ColdResult{Generation: s.Generation}
 	if r != nil {
@@ -1033,24 +1039,27 @@ func (d *Driver) cleanupProof() CleanupProof {
 	return p
 }
 func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, result error) {
+	return d.removeOwned(ctx, mode, true)
+}
+
+func (d *Driver) removeOwned(ctx context.Context, mode string, force bool) (proof CleanupProof, result error) {
+	d.CloseAdmission(d.bindingGeneration())
+	if mode == "terminal" && force && !d.cleaned.Load() {
+		// Explicit terminal removal and power drain preempt even a finalizer
+		// holding cleanupMu/opMu. Abort only the original connection and join
+		// its exact process before waiting for inventory reconciliation.
+		if err := d.forceKernelOwner(); err != nil {
+			return d.cleanupProof(), err
+		}
+	}
 	d.cleanupMu.Lock()
 	defer d.cleanupMu.Unlock()
 	defer func() { evidence := d.cleanupProof(); proof.Loss, proof.Outcome = evidence.Loss, evidence.Outcome }()
 	if d.cleaned.Load() {
 		return CleanupProof{Witness: d.bound(), ProcessExited: true, KernelAbsent: true}, nil
 	}
-	d.CloseAdmission(d.bindingGeneration())
 	var err error
-	if mode == "terminal" {
-		// The privileged owner must be able to remove a closed mount even
-		// when its child cannot answer control or is stuck in notification
-		// writev. Abort the exact original connection before joining that
-		// process; joining first can wait on the kernel's pending requests.
-		err = d.forceKernelOwner()
-		if err != nil {
-			return CleanupProof{Witness: d.bound()}, err
-		}
-	} else {
+	if mode != "terminal" || !force {
 		_, err = d.job(ctx, "workspace-cleanup", nil, mode)
 	}
 	if err != nil {
@@ -1219,7 +1228,10 @@ func (d *Driver) observeState(b mountcontrol.Workspace, r *mountcontrol.Workspac
 	if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
 		_ = d.manager.Host.Terminal(d.id, r.Phases.TerminalRemoval.Action.Reason, nil)
 		go func() {
-			proof, _ := d.remove(context.Background(), "terminal")
+			// The child remains the final outcome owner after its kernel action.
+			// Automatic removal joins that finalization; an explicit removal or
+			// power drain can still preempt it through the original root owner.
+			proof, _ := d.removeOwned(context.Background(), "terminal", false)
 			_ = d.manager.Host.Cleanup(d.id, proof)
 		}()
 	} else if r.State == "recovery-required" {

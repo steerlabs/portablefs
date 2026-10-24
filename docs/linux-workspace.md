@@ -173,12 +173,14 @@ exercise real protected bootstrap, failed INIT, uncertain handoff and exact remo
 A voluntary root unmount tries the original kernel owner while serving remains
 available. A real `EBUSY` finishes that job promptly without changing admission
 or terminal state. A later request retries the same original removal slot.
-Successful unmount is retained before the child closes and finalizes; terminal
-removal instead closes admission, aborts the original connection and detaches.
-It then kills and joins the exact retained process owner without acquiring the
-child control lane. A stopped child or a notification blocked in the kernel
-cannot prevent root removal. Original source/target absence and process exit
-remain separate prerequisites for replacement; killing cannot prove durability.
+Successful unmount is retained before the child closes and finalizes. Automatic
+terminal cleanup joins the child's final outcome publication even when its
+kernel-removal action already completed. Explicit terminal removal and power
+drain instead abort the original connection, detach and kill/join the exact
+retained process before acquiring cleanup or child-control lanes. They can
+preempt a stopped child or automatic finalizer. Original source/target absence,
+process exit and both inventory reconciliations remain prerequisites for
+replacement; killing cannot prove durability or invent a final outcome.
 A finished lifecycle result and a later removal action are independent facts:
 offering removal cannot turn a joined failed Recover back into pending work.
 

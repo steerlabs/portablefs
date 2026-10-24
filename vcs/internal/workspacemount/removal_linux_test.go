@@ -3,6 +3,7 @@
 package workspacemount
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
+	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,8 +20,9 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("root protected FUSE owner")
 	}
-	for _, terminal := range []bool{false, true} {
-		t.Run(map[bool]string{false: "retry", true: "terminal"}[terminal], func(t *testing.T) {
+	for _, mode := range []string{"retry", "terminal", "power"} {
+		t.Run(mode, func(t *testing.T) {
+			terminal := mode != "retry"
 			path := filepath.Join(t.TempDir(), "protected")
 			if err := os.Mkdir(path, 0); err != nil {
 				t.Fatal(err)
@@ -41,7 +44,7 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			d := &Driver{kernel: k}
+			d := &Driver{kernel: k, manager: &Manager{Inventory: inventory(t)}}
 			holder, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -67,16 +70,42 @@ func TestRootBusyRemovalRetriesAndEscalatesOriginalOwner(t *testing.T) {
 				defer d.child.Process.Kill()
 				d.exited = make(chan struct{})
 				go func() { _ = d.child.Wait(); close(d.exited) }()
-				// A stopped/unresponsive old lifecycle lane cannot prevent the
-				// root's original abort and exact process join.
+				// Neither an old lifecycle nor an automatic finalizer can prevent
+				// explicit terminal abort and the exact process join.
 				d.opMu.Lock()
+				d.cleanupMu.Lock()
 				done := make(chan error, 1)
-				go func() { done <- d.forceKernelOwner() }()
+				if mode == "power" {
+					d.terminalCleanup.Store(true)
+				}
+				go func() {
+					if mode == "power" {
+						_, err := d.Suspend(context.Background(), &pb.Suspension{Generation: 1})
+						done <- err
+					} else {
+						_, err := d.remove(context.Background(), "terminal")
+						done <- err
+					}
+				}()
+				select {
+				case <-d.exited:
+				case <-time.After(time.Second):
+					d.cleanupMu.Unlock()
+					d.opMu.Unlock()
+					t.Fatal("terminal owner queued behind child control or finalization")
+				}
+				d.cleanupMu.Unlock()
 				select {
 				case err = <-done:
+					// This fixture owns kernel/process resources only. Missing the
+					// inventory intent must still prevent claiming full cleanup.
+					if err == nil || err.Error() != "workspace cleanup intent missing" {
+						t.Fatal("incomplete inventory fabricated final cleanup", err)
+					}
+					err = nil
 				case <-time.After(time.Second):
 					d.opMu.Unlock()
-					t.Fatal("terminal owner waited for child control")
+					t.Fatal("forced removal waited for the old lifecycle")
 				}
 				d.opMu.Unlock()
 			} else {
