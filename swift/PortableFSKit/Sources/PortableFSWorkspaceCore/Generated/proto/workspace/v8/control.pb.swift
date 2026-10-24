@@ -106,6 +106,9 @@ public nonisolated struct WorkspaceSuspension: Sendable {
 
   public var nonce: Data = Data()
 
+  /// Awake recovery closes the same fixed cohort without a VM power deadline.
+  public var awakeRecovery: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -359,7 +362,7 @@ public nonisolated struct WorkspaceMountJob: Sendable {
   /// offered, running, complete, failed.
   public var phase: String = String()
 
-  /// unavailable, refused, authorization-required, stopped, deadline, handler-failed.
+  /// unavailable, refused, authorization-required, stopped, deadline, handler-failed, busy.
   public var failure: String = String()
 
   public var reason: String = String()
@@ -780,6 +783,14 @@ public nonisolated struct WorkspaceEnvelope: Sendable {
     set {body = .identityReply(newValue)}
   }
 
+  public var awakeRecover: WorkspaceResumeToken {
+    get {
+      if case .awakeRecover(let v)? = body {return v}
+      return WorkspaceResumeToken()
+    }
+    set {body = .awakeRecover(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Body: Equatable, Sendable {
@@ -798,6 +809,7 @@ public nonisolated struct WorkspaceEnvelope: Sendable {
     case retireAck(WorkspaceRetireAck)
     case identityRequest(WorkspaceIdentityRequest)
     case identityReply(WorkspaceIdentityReply)
+    case awakeRecover(WorkspaceResumeToken)
 
   }
 
@@ -944,7 +956,7 @@ nonisolated extension WorkspaceMountID: SwiftProtobuf.Message, SwiftProtobuf._Me
 
 nonisolated extension WorkspaceSuspension: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Suspension"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}roster\0\u{1}nonce\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}boot_id\0\u{3}host_service_id\0\u{3}guest_service_id\0\u{1}generation\0\u{1}roster\0\u{1}nonce\0\u{3}awake_recovery\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -958,6 +970,7 @@ nonisolated extension WorkspaceSuspension: SwiftProtobuf.Message, SwiftProtobuf.
       case 4: try { try decoder.decodeSingularUInt64Field(value: &self.generation) }()
       case 5: try { try decoder.decodeRepeatedMessageField(value: &self.roster) }()
       case 6: try { try decoder.decodeSingularBytesField(value: &self.nonce) }()
+      case 7: try { try decoder.decodeSingularBoolField(value: &self.awakeRecovery) }()
       default: break
       }
     }
@@ -982,6 +995,9 @@ nonisolated extension WorkspaceSuspension: SwiftProtobuf.Message, SwiftProtobuf.
     if !self.nonce.isEmpty {
       try visitor.visitSingularBytesField(value: self.nonce, fieldNumber: 6)
     }
+    if self.awakeRecovery != false {
+      try visitor.visitSingularBoolField(value: self.awakeRecovery, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -992,6 +1008,7 @@ nonisolated extension WorkspaceSuspension: SwiftProtobuf.Message, SwiftProtobuf.
     if lhs.generation != rhs.generation {return false}
     if lhs.roster != rhs.roster {return false}
     if lhs.nonce != rhs.nonce {return false}
+    if lhs.awakeRecovery != rhs.awakeRecovery {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1999,7 +2016,7 @@ nonisolated extension WorkspaceResult: SwiftProtobuf.Message, SwiftProtobuf._Mes
 
 nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}request_id\0\u{3}drain_budget_nanos\0\u{2}\u{7}hello\0\u{3}hello_ack\0\u{1}suspend\0\u{3}suspend_ack\0\u{1}resume\0\u{3}resume_ack\0\u{1}status\0\u{3}status_reply\0\u{1}provision\0\u{1}mount\0\u{1}umount\0\u{1}result\0\u{3}retire_ack\0\u{3}identity_request\0\u{3}identity_reply\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}version\0\u{3}request_id\0\u{3}drain_budget_nanos\0\u{2}\u{7}hello\0\u{3}hello_ack\0\u{1}suspend\0\u{3}suspend_ack\0\u{1}resume\0\u{3}resume_ack\0\u{1}status\0\u{3}status_reply\0\u{1}provision\0\u{1}mount\0\u{1}umount\0\u{1}result\0\u{3}retire_ack\0\u{3}identity_request\0\u{3}identity_reply\0\u{3}awake_recover\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -2205,6 +2222,19 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
           self.body = .identityReply(v)
         }
       }()
+      case 25: try {
+        var v: WorkspaceResumeToken?
+        var hadOneofValue = false
+        if let current = self.body {
+          hadOneofValue = true
+          if case .awakeRecover(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.body = .awakeRecover(v)
+        }
+      }()
       default: break
       }
     }
@@ -2284,6 +2314,10 @@ nonisolated extension WorkspaceEnvelope: SwiftProtobuf.Message, SwiftProtobuf._M
     case .identityReply?: try {
       guard case .identityReply(let v)? = self.body else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 24)
+    }()
+    case .awakeRecover?: try {
+      guard case .awakeRecover(let v)? = self.body else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 25)
     }()
     case nil: break
     }

@@ -2806,10 +2806,10 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 	return fuse.Status(record.node.Getattr(ctx, handle, out))
 }
 
-func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
+func (r *rawFileSystem) SetAttr(interrupted <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -2911,10 +2911,10 @@ func (r *rawFileSystem) cancelBufferedRead(ctx context.Context, record *inodeRec
 	r.mu.Unlock()
 }
 
-func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
+func (r *rawFileSystem) Open(interrupted <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3013,13 +3013,13 @@ func (r *rawFileSystem) closeOrphanedFile(ctx context.Context, handle *fileHandl
 	}
 }
 
-func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+func (r *rawFileSystem) Read(interrupted <-chan struct{}, input *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
 	if input.Offset > math.MaxInt64 {
 		return nil, fuse.EINVAL
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return nil, entryStatus
 		}
@@ -3074,7 +3074,7 @@ func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) 
 	return result, fuse.Status(errno)
 }
 
-func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
+func (r *rawFileSystem) Write(interrupted <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
 	if input == nil || input.Offset > math.MaxInt64 || uint64(len(data)) != uint64(input.Size) || input.Size == 0 || input.Size > r.maxWrite {
 		return 0, fuse.EINVAL
 	}
@@ -3091,21 +3091,21 @@ func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byt
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
 
+	if local == nil {
+		return r.writeStockInterruptible(input, data, interrupted)
+	}
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceFileEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
 		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
-	if local != nil {
-		count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
-		if err != nil {
-			return 0, fuse.Status(errnoOfError(err))
-		}
-		return uint32(count), fuse.OK
+	count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
+	if err != nil {
+		return 0, fuse.Status(errnoOfError(err))
 	}
-	return r.writeStock(input, data)
+	return uint32(count), fuse.OK
 }
 
 func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Status {
@@ -3132,10 +3132,10 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 	return fuse.Status(handle.node.Flush(ctx, handle, input.LockOwner))
 }
 
-func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+func (r *rawFileSystem) Fsync(interrupted <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceFileEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3206,10 +3206,10 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	}
 }
 
-func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
+func (r *rawFileSystem) Create(interrupted <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3300,14 +3300,14 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 	return fuse.OK
 }
 
-func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
+func (r *rawFileSystem) Tmpfile(interrupted <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 	if name != "/" {
 		r.mount.revoke(fmt.Errorf("fusev3: TMPFILE carried noncanonical slash name %q", name))
 		return fuse.Status(syscall.ENOTCONN)
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3402,7 +3402,7 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 // Mknod is implemented rather than left to the embedded default, which answers
 // ENOSYS. mkfifo(3) and bind(2) on a unix domain socket both arrive here, and
 // build systems, container runtimes, and agent sockets all do one or the other.
-func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name string, out *fuse.EntryOut) fuse.Status {
+func (r *rawFileSystem) Mknod(interrupted <-chan struct{}, input *fuse.MknodIn, name string, out *fuse.EntryOut) fuse.Status {
 	switch input.Mode & syscall.S_IFMT {
 	case 0, syscall.S_IFREG:
 	case syscall.S_IFIFO, syscall.S_IFSOCK:
@@ -3415,7 +3415,7 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3467,10 +3467,10 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 	return fuse.OK
 }
 
-func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
+func (r *rawFileSystem) Mkdir(interrupted <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3531,10 +3531,10 @@ func (r *rawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, nam
 	return r.unlink(cancel, header, name, true)
 }
 
-func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name string, directory bool) fuse.Status {
+func (r *rawFileSystem) unlink(interrupted <-chan struct{}, header *fuse.InHeader, name string, directory bool) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3591,10 +3591,10 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 	return fuse.Status(errno)
 }
 
-func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
+func (r *rawFileSystem) Rename(interrupted <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3668,10 +3668,10 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 	return fuse.Status(errno)
 }
 
-func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
+func (r *rawFileSystem) Link(interrupted <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3723,10 +3723,10 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 	return fuse.OK
 }
 
-func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointedTo, linkName string, out *fuse.EntryOut) fuse.Status {
+func (r *rawFileSystem) Symlink(interrupted <-chan struct{}, header *fuse.InHeader, pointedTo, linkName string, out *fuse.EntryOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3774,10 +3774,10 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 	return fuse.OK
 }
 
-func (r *rawFileSystem) Readlink(_ <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
+func (r *rawFileSystem) Readlink(interrupted <-chan struct{}, header *fuse.InHeader) ([]byte, fuse.Status) {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return nil, entryStatus
 		}
@@ -3800,7 +3800,7 @@ func (r *rawFileSystem) Readlink(_ <-chan struct{}, header *fuse.InHeader) ([]by
 	return value, fuse.Status(errno)
 }
 
-func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name string, dest []byte) (uint32, fuse.Status) {
+func (r *rawFileSystem) GetXAttr(interrupted <-chan struct{}, header *fuse.InHeader, name string, dest []byte) (uint32, fuse.Status) {
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return 0, fuse.Status(syscall.ESTALE)
@@ -3811,7 +3811,7 @@ func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name 
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
@@ -3826,7 +3826,7 @@ func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name 
 	return size, fuse.Status(errno)
 }
 
-func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name string, data []byte) fuse.Status {
+func (r *rawFileSystem) SetXAttr(interrupted <-chan struct{}, input *fuse.SetXAttrIn, name string, data []byte) fuse.Status {
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3837,7 +3837,7 @@ func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3851,7 +3851,7 @@ func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name
 	return fuse.Status(record.node.Setxattr(ctx, name, data, input.Flags))
 }
 
-func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
+func (r *rawFileSystem) ListXAttr(interrupted <-chan struct{}, header *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return 0, fuse.Status(syscall.ESTALE)
@@ -3862,7 +3862,7 @@ func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
@@ -3877,7 +3877,7 @@ func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest
 	return size, fuse.Status(errno)
 }
 
-func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
+func (r *rawFileSystem) RemoveXAttr(interrupted <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
 	record := r.acquire(header.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3888,7 +3888,7 @@ func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, na
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3909,7 +3909,7 @@ func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, na
 	return fuse.OK
 }
 
-func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
+func (r *rawFileSystem) OpenDir(interrupted <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3920,7 +3920,7 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -3979,10 +3979,10 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 	return fuse.OK
 }
 
-func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+func (r *rawFileSystem) ReadDir(interrupted <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -4030,13 +4030,13 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 	}
 }
 
-func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+func (r *rawFileSystem) ReadDirPlus(interrupted <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 	if r.grafts != nil {
 		return fuse.ENOSYS
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -4140,10 +4140,10 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	return fuse.OK
 }
 
-func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+func (r *rawFileSystem) FsyncDir(interrupted <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -4201,10 +4201,10 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 	}
 }
 
-func (r *rawFileSystem) StatFs(_ <-chan struct{}, header *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
+func (r *rawFileSystem) StatFs(interrupted <-chan struct{}, header *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(header.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -4230,14 +4230,14 @@ func (r *rawFileSystem) StatFs(_ <-chan struct{}, header *fuse.InHeader, out *fu
 // earlier accepted mutation and durably flushes the volume. It deliberately
 // carries no source-publication gate and requests no post-VFS PUBLISH receipt:
 // syncfs changes no local inode, dentry, or attribute state.
-func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Status {
+func (r *rawFileSystem) SyncFS(interrupted <-chan struct{}, input *fuse.SyncFSIn) fuse.Status {
 	if input == nil || input.Padding != 0 || input.NodeId != fuse.FUSE_ROOT_ID {
 		r.mount.revoke(errors.New("fusev3: malformed FUSE_SYNCFS request"))
 		return fuse.Status(syscall.ENOTCONN)
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -4268,10 +4268,10 @@ func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Sta
 	return fuse.OK
 }
 
-func (r *rawFileSystem) GetLk(_ <-chan struct{}, input *fuse.LkIn, out *fuse.LkOut) fuse.Status {
+func (r *rawFileSystem) GetLk(interrupted <-chan struct{}, input *fuse.LkIn, out *fuse.LkOut) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -4317,10 +4317,10 @@ func (r *rawFileSystem) SetLkw(cancel <-chan struct{}, input *fuse.LkIn) fuse.St
 	return r.setLock(cancel, input, true)
 }
 
-func (r *rawFileSystem) setLock(_ <-chan struct{}, input *fuse.LkIn, wait bool) fuse.Status {
+func (r *rawFileSystem) setLock(interrupted <-chan struct{}, input *fuse.LkIn, wait bool) fuse.Status {
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}

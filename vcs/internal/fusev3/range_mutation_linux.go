@@ -24,13 +24,13 @@ func validSignedRange(offset, length uint64) bool {
 	return length != 0 && offset <= math.MaxInt64 && length <= math.MaxInt64 && offset <= math.MaxInt64-length
 }
 
-func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fuse.Status {
+func (r *rawFileSystem) Fallocate(interrupted <-chan struct{}, input *fuse.FallocateIn) fuse.Status {
 	if input == nil || !validSignedRange(input.Offset, input.Length) {
 		return fuse.EINVAL
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return entryStatus
 		}
@@ -75,7 +75,8 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 			}
 			return candidate, nil
 		})
-		if err != nil {
+		var visibility *appliedVisibilityError
+		if err != nil && !errors.As(err, &visibility) {
 			return fuse.Status(delegationErrno(err))
 		}
 		reply := response.GetFallocate()
@@ -103,6 +104,7 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 			r.mount.revoke(fmt.Errorf("fusev3: complete fallocate publication: %w", err))
 			return fuse.Status(syscall.ENOTCONN)
 		}
+		visibilityStatus := r.mount.appliedVisibilityStatus(visibility)
 		if reply.GetFlags()&rangeResultPostApply != 0 && reply.GetError() < 0 {
 			return fuse.Status(-reply.GetError())
 		}
@@ -110,21 +112,21 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 			r.mount.revoke(errors.New("fusev3: stock fallocate applied result carried an invalid error"))
 			return fuse.Status(syscall.ENOTCONN)
 		}
-		return fuse.OK
+		return visibilityStatus
 	}
 	return fuse.EBADF
 }
 
 // CopyFileRange never bridges local and authority domains. The kernel performs
 // generic write-limit checks before issuing the stock FUSE request.
-func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
+func (r *rawFileSystem) CopyFileRange(interrupted <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
 	if input == nil || input.Flags != 0 || input.Len == 0 || input.Len > math.MaxUint32 ||
 		!validSignedRange(input.OffIn, input.Len) || !validSignedRange(input.OffOut, input.Len) {
 		return 0, fuse.EINVAL
 	}
 
 	if r.mount.workspace != nil {
-		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique)
+		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
 			return 0, entryStatus
 		}
@@ -225,7 +227,8 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 		}
 		return candidate, nil
 	})
-	if err != nil {
+	var visibility *appliedVisibilityError
+	if err != nil && !errors.As(err, &visibility) {
 		return 0, fuse.Status(delegationErrno(err))
 	}
 	var errno syscall.Errno
@@ -269,6 +272,7 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 		r.mount.revoke(fmt.Errorf("fusev3: complete copy_file_range publication: %w", err))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
+	visibilityStatus := r.mount.appliedVisibilityStatus(visibility)
 	if reply.GetFlags()&rangeResultPostApply != 0 && reply.GetError() < 0 {
 		return 0, fuse.Status(-reply.GetError())
 	}
@@ -276,5 +280,5 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 		r.mount.revoke(errors.New("fusev3: stock copy_file_range applied result carried an invalid error"))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
-	return uint32(reply.GetResultSize()), fuse.OK
+	return uint32(reply.GetResultSize()), visibilityStatus
 }

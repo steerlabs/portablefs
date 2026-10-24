@@ -203,10 +203,32 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 	return r.callbackContext(unique, true)
 }
 func (r *rawFileSystem) callbackContext(unique uint64, serving bool) (context.Context, func(), fuse.Status) {
-	r.mount.epochMu.RLock()
-	ctx, cancel := r.mount.operationContext(r.opContext(), r.requestTimeout)
 	callback := &mutationCallback{mount: r.mount, operationID: unique}
-	err := r.transferReplyPublication(unique, serving, &callback.publication)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var err error
+	for {
+		if serving && r.mount.workspace != nil {
+			r.mu.RLock()
+			admitted := r.replyPublications[unique] != nil
+			r.mu.RUnlock()
+			if !admitted {
+				if err = r.mount.awaitWorkspaceServing(r.opContext()); err != nil {
+					return r.opContext(), func() {}, fuse.Status(errnoOfError(err))
+				}
+			}
+		}
+		r.mount.epochMu.RLock()
+		ctx, cancel = r.mount.operationContext(r.opContext(), r.requestTimeout)
+		err = r.transferReplyPublication(unique, serving, &callback.publication)
+		if serving && r.mount.workspace != nil && errors.Is(err, workspaceadmission.ErrClosed) {
+			r.mount.epochMu.RUnlock()
+			cancel()
+			callback = &mutationCallback{mount: r.mount, operationID: unique}
+			continue
+		}
+		break
+	}
 	if err != nil {
 		// Registration is the ownership reservation for every fact this callback
 		// could make cacheable. It happens before any lookup/mutation RPC, so an
@@ -734,7 +756,7 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		}
 	}
 	if m.managedRemoval != nil {
-		out.record(1, "root-removal", m.managedRemoval("terminal"))
+		out.record(1, "root-removal", m.managedRemoval("terminal", m.fatalError()))
 		if _, err := installed.absent(); err != nil {
 			out.record(1, "absence", err)
 		} else {

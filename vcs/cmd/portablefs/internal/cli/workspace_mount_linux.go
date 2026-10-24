@@ -188,8 +188,8 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace owner pipe ended")
 		<-c.finalized
 		return 1
-	case <-signals:
-		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace child signal")
+	case received := <-signals:
+		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace child received signal: "+received.String())
 		<-c.finalized
 		return 0
 	}
@@ -418,8 +418,12 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 		if err = c.control.Owner.Record(mountcontrol.Facts{Witness: w}); err != nil {
 			return nil, err
 		}
-		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string) error {
-			return c.control.Owner.RequireRemoval(context.Background(), mode, "kernel removal required")
+		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string, cause error) error {
+			reason := "workspace unmount requested"
+			if cause != nil {
+				reason = control.BoundedReason(cause.Error())
+			}
+			return c.control.Owner.RequireRemoval(context.Background(), mode, reason)
 		}}, nil
 	}})
 	c.authorityAttached, c.startupClean = attached, clean
@@ -476,13 +480,17 @@ func (c *workspaceChild) monitor(ctx context.Context) {
 			}
 		}
 		if o.State == fusev3.WorkspaceRecoveryRequired {
+			// Admission and authorization have different owners. The existing
+			// renewer must ride out an awake outage until the cold worker joins
+			// it; stopping it here can consume an otherwise valid session lease.
 			c.control.Owner.InvalidatePrepared("workspace proof unavailable")
-			if c.renewer != nil {
-				_ = c.renewer.Park(ctx)
-			}
 		}
 		if o.State == fusev3.WorkspaceTerminal {
-			_ = c.control.Owner.RequireRemoval(ctx, "terminal", "terminal workspace mount")
+			reason := "terminal workspace mount"
+			if o.Result.Err != nil {
+				reason = o.Result.Err.Error()
+			}
+			_ = c.control.Owner.RequireRemoval(ctx, "terminal", reason)
 		}
 	}
 }

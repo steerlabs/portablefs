@@ -169,7 +169,7 @@ func (r Request) ValidateWorkspace() error {
 		return err
 	}
 	if r.Operation == "workspace-suspend" {
-		n, err := decimal(w.DrainBudgetNanos, true)
+		n, err := decimal(w.DrainBudgetNanos, false)
 		if err != nil || n > uint64(15*time.Second) {
 			return ErrGrammar
 		}
@@ -213,6 +213,9 @@ func (r Request) ValidateWorkspace() error {
 			if err := control.Suspension(&x); err != nil {
 				return err
 			}
+			if x.AwakeRecovery != (w.DrainBudgetNanos == "0") {
+				return ErrGrammar
+			}
 			s = &x
 		} else {
 			var t pb.ResumeToken
@@ -250,6 +253,17 @@ func (r Request) ValidateWorkspace() error {
 		return ErrGrammar
 	}
 	return nil
+}
+
+// AwakeRecoveryCut is carried by the exact transaction, never inferred from
+// an absent deadline or a socket retry budget.
+func (w *Workspace) AwakeRecoveryCut() bool {
+	if w == nil {
+		return false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(w.Transaction)
+	var x pb.Suspension
+	return err == nil && control.DecodeBody(raw, &x) == nil && x.AwakeRecovery
 }
 func mode(s string) bool { return s == "voluntary" || s == "terminal" }
 func boundedWitness(w Witness) bool {

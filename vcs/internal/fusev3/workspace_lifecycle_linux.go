@@ -82,6 +82,7 @@ type workspaceLifecycle struct {
 	parkedRequests  []authorityrpc.DispatchOwner
 	keepalive       workspaceAttempt
 	servedSinceCold atomic.Bool
+	kernelColdReady atomic.Bool
 	coldOutcome     *pb.MountOutcome
 	closeCleanupErr error // protected by Mount.mu; terminal/barrier verdicts stay separate
 }
@@ -314,6 +315,17 @@ func (m *Mount) WorkspaceObservation() WorkspaceObservation {
 	if terminal {
 		o.Prepared, o.ColdComplete = false, false
 		o.State = WorkspaceTerminal
+		cause := m.fatalError()
+		if cause == nil {
+			cause = m.rpc.SessionEndCause()
+		}
+		if cause == nil {
+			cause = m.ctx.Err()
+		}
+		if cause == nil {
+			cause = errors.New("workspace owner ended")
+		}
+		o.Result = authorityrpc.LifecycleResult{Disposition: authorityrpc.LifecycleFailed, Err: cause}
 		return o
 	}
 	if prior != nil {
@@ -850,7 +862,7 @@ func (m *Mount) drainWorkspaceDispatch(d workspaceDispatch, p workspaceDrainPerm
 			return err
 		}
 		if !p.allows(p.buffer, p.incarnation, m.subscription.config.clock.Now()) {
-			return errSubscriptionExpired
+			return errors.Join(authorityrpc.ErrDispatchExpired, errSubscriptionExpired)
 		}
 		return nil
 	})
@@ -943,6 +955,7 @@ func (m *Mount) finishWorkspaceCold(w *workspaceLifecycle, d workspaceDispatch) 
 	w.cold = true
 	w.coldOutcome = proto.Clone(w.outcome).(*pb.MountOutcome)
 	w.servedSinceCold.Store(false)
+	w.kernelColdReady.Store(true)
 	w.callbacks, w.withdrawal = nil, nil
 	return true, nil
 }
@@ -981,6 +994,9 @@ func subscriptionResetAttempt(err error) bool {
 	if err == nil {
 		return false
 	}
+	if _, independent := err.(*authorityrpc.LifecycleIndependentFailure); independent {
+		return false
+	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		causes := joined.Unwrap()
 		if len(causes) == 0 {
@@ -993,7 +1009,7 @@ func subscriptionResetAttempt(err error) bool {
 		}
 		return true
 	}
-	if err == authorityrpc.ErrSubscriptionReset || err == errSubscriptionExpired || authorityrpc.TransientTransport(err) {
+	if err == authorityrpc.ErrSubscriptionReset || err == errSubscriptionExpired || err == authorityrpc.ErrDispatchExpired || err == writeback.ErrLost || authorityrpc.TransientTransport(err) {
 		return true
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {

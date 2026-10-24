@@ -15,7 +15,7 @@ func workspaceGolden(_ name: String) throws -> Data {
     return bytes
 }
 @Test func workspaceGoldensCoverEveryMessageAndRejectMalformedFrames() throws {
-    let names = ["identity_request", "identity_reply", "hosted_provision", "hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required", "job_offered", "job_running", "job_complete", "job_failed", "retired_job_complete", "retired_job_failed", "retired_mount_with_job", "predecessor_unobserved"]
+    let names = ["awake_recover", "awake_recover_ack", "job_busy", "identity_request", "identity_reply", "hosted_provision", "hello", "hello_ack", "suspend", "suspend_ack", "resume", "resume_ack", "status", "status_reply", "provision", "mount", "umount", "result", "retire_ack", "renewal_pending", "renewal_installed", "renewal_not_required", "job_offered", "job_running", "job_complete", "job_failed", "retired_job_complete", "retired_job_failed", "retired_mount_with_job", "predecessor_unobserved"]
     for name in names {
         let raw = try workspaceGolden(name)
         let envelope = try WorkspaceControl.decode(raw)
@@ -154,4 +154,15 @@ func retiredTestOutcome(_ mount: WorkspaceMountStatus, sequence: UInt64) -> Work
     #expect(throws: WorkspaceControlError.self) { try WorkspaceControl.validate(e) }
     p = try WorkspaceControl.decode(workspaceGolden("provision")).provision
     #expect(!p.hasHostedEnrollment)
+}
+
+@Test func workspaceAwakeAdmissionCannotStandForColdProof() throws {
+    let awake = try WorkspaceControl.decode(workspaceGolden("awake_recover")).awakeRecover
+    var cold = WorkspaceSuspendAck(); cold.suspension = awake.suspension
+    #expect(!WorkspaceControl.validColdAck(cold))
+    var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = 1
+    envelope.body = .resume(awake)
+    #expect(throws: (any Error).self) { try WorkspaceControl.encode(envelope) }
+    envelope.body = .awakeRecover(awake); envelope.drainBudgetNanos = 1
+    #expect(throws: (any Error).self) { try WorkspaceControl.encode(envelope) }
 }

@@ -224,7 +224,7 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	managedRemoval func(string) error
+	managedRemoval func(string, error) error
 	workspace      *workspaceadmission.Reader
 
 	posixMu       sync.Mutex
@@ -341,7 +341,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 	fsName := "portablefs:" + cfg.MountInstanceID
 	failBeforeKernelMount := func(cause error) (*Mount, error) {
 		if cfg.Managed != nil {
-			if err := cfg.Managed.Remove("terminal"); err != nil {
+			if err := cfg.Managed.Remove("terminal", cause); err != nil {
 				rpc.FinishLocalSessionEnforcement()
 				return nil, errors.Join(cause, err, rpc.Close())
 			}
@@ -684,7 +684,7 @@ func (m *Mount) start(lease time.Duration) {
 // close upgrades the original error to a clean-startup verdict.
 func (m *Mount) abortMount(cause error) error {
 	if m.managedRemoval != nil {
-		if err := m.managedRemoval("terminal"); err != nil {
+		if err := m.managedRemoval("terminal", cause); err != nil {
 			return errors.Join(cause, err)
 		}
 	} else {
@@ -1944,7 +1944,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, n.item.GetStableIdentity(), response, current); err != nil {
 		handle.endLossObservation()
-		return nil, 0, bufferErrno(err)
+		return nil, 0, n.failedOpenedVisibility(ctx, n.item, nil, err)
 	}
 	if current && openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
@@ -2759,7 +2759,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	}
 	if err := n.mount.delegations.openedVisibility(ctx, item.GetStableIdentity(), response, current); err != nil {
 		handle.endLossObservation()
-		return nil, nil, 0, bufferErrno(err)
+		return nil, nil, 0, n.failedOpenedVisibility(ctx, item, &name, err)
 	}
 	object := postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleTarget)
 	if object == nil {

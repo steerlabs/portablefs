@@ -27,6 +27,7 @@ enum WorkspaceWireSchema {
             4: .init(kind: "", repeated: false, oneof: false),
             5: .init(kind: "MountID", repeated: true, oneof: false),
             6: .init(kind: "$", repeated: false, oneof: false),
+            7: .init(kind: "", repeated: false, oneof: false),
         ],
         "Loss": [
             1: .init(kind: "", repeated: false, oneof: false),
@@ -162,6 +163,7 @@ enum WorkspaceWireSchema {
             22: .init(kind: "RetireAck", repeated: false, oneof: true),
             23: .init(kind: "IdentityRequest", repeated: false, oneof: true),
             24: .init(kind: "IdentityReply", repeated: false, oneof: true),
+            25: .init(kind: "ResumeToken", repeated: false, oneof: true),
         ],
     ]
 }

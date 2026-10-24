@@ -1448,7 +1448,10 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 		// visibility: a peer's pending read may need that grant's CONTROL cut.
 		if response.GetOpen() == nil && response.GetCreate() == nil {
 			if err := m.waitVisibility(ctx, m.buf, id, cut, response.GetAppliedSequence()); err != nil {
-				return response, err
+				// The mutation has a definite applied result. Its caller must
+				// validate and finish local publication before reporting this
+				// later visibility failure; it cannot treat it as no result.
+				return response, &appliedVisibilityError{cause: err}
 			}
 		}
 	}
@@ -2474,7 +2477,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	batch, err := m.prepareReleaseBatch(prepareCtx, buf, epochSerial, incarnation, groups)
 	if err != nil {
-		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) || m.closePreparationLostCache(err, buf) {
 			return m.closeResetOutcome(sessionSerial)
 		}
 		if classified, ok := err.(cleanupClassified); ok && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
@@ -2491,7 +2494,7 @@ func (m *delegationManager) closeHandles(ctx context.Context, closes []delegatio
 	}
 	defer batch.finish()
 	if err := batch.applyAndRelease(prepareCtx); err != nil {
-		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) {
+		if epochCtx.Err() != nil || !m.epochCurrent(epochSerial, buf) || m.closePreparationLostCache(err, buf) {
 			return m.closeResetOutcome(sessionSerial)
 		}
 		var classified cleanupClassified

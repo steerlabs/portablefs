@@ -104,18 +104,9 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 	// shared write channel and POSIX does not promise that later external file
 	// changes become visible through it, so allowing it cannot violate the
 	// cross-mount coherence contract.
-	mapping, err := unix.Mmap(int(mappedFile.Fd()), 0, 4096, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE)
-	if err != nil {
-		t.Fatalf("private mmap = %v", err)
-	}
-	if mapping[0] != 0x5a {
-		_ = unix.Munmap(mapping)
-		t.Fatalf("private mmap initial byte = %#x, want 0x5a", mapping[0])
-	}
-	mapping[0] = 0x33
-	if err := unix.Munmap(mapping); err != nil {
-		t.Fatal(err)
-	}
+	mapping := startKernelMmapClient(t, int(mappedFile.Fd()), unix.PROT_READ|unix.PROT_WRITE, len(mappedPayload))
+	mapping.check(mappedPayload)
+	mapping.store(0x33)
 	underlying := []byte{0}
 	if _, err := mappedFile.ReadAt(underlying, 0); err != nil {
 		t.Fatal(err)
@@ -2404,23 +2395,15 @@ func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
 
 	mapped := mustOpenFile(t, nameB, os.O_RDONLY, 0)
 	defer mapped.Close()
-	view, err := unix.Mmap(int(mapped.Fd()), 0, page, unix.PROT_READ, unix.MAP_PRIVATE)
-	if err != nil {
-		t.Fatalf("MAP_PRIVATE of a shared file: %v", err)
-	}
-	defer unix.Munmap(view)
-	if view[0] != 'o' {
-		t.Fatalf("initial mapped byte = %q", view[0])
-	}
+	view := startKernelMmapClient(t, int(mapped.Fd()), unix.PROT_READ, page)
+	view.check(before)
 
 	// Same length again. The mapping is faulted in and its page table entries
 	// are live; only unmap_mapping_folio() inside the withdrawal can take them
 	// back, and if it does the next touch refaults through the authority.
 	after := bytes.Repeat([]byte{'n'}, page)
 	mustWrite(t, nameA, after, 0o600)
-	if view[0] != 'n' {
-		t.Fatalf("mapped byte after a same-length remote rewrite = %q; the DATA withdrawal did not unmap the stale page", view[0])
-	}
+	view.check(after)
 }
 
 // TestRevokedMountCannotServeRetainedPages is the retained-page proof under the

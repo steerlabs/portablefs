@@ -372,6 +372,27 @@ func (m *delegationManager) SetCleanupRetryWaiter(wait func(context.Context) err
 	m.hookMu.Unlock()
 }
 
+// Cache expiry or recorded data loss says nothing about the descriptor table.
+// CLOSE has not been submitted yet. Keep the same session-owned close queued
+// for cold recovery; an independent sibling error must remain terminal.
+func (m *delegationManager) closePreparationLostCache(err error, buffer *writeback.Buffer) bool {
+	if !subscriptionResetAttempt(err) {
+		return false
+	}
+	if errors.Is(err, authorityrpc.ErrDispatchExpired) || errors.Is(err, errSubscriptionExpired) || errors.Is(err, writeback.ErrLost) {
+		return true
+	}
+	if s := m.subscription; s != nil {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		p := s.workspaceDrain
+		// A bounded network attempt can outlive its captured grant permission.
+		// Only that exact expired cut permits abandoning cache preparation.
+		return p != nil && p.manager == m && p.buffer == buffer && !s.config.clock.Now().Before(p.deadline)
+	}
+	return false
+}
+
 func (m *delegationManager) closeResetOutcome(session uint64) error {
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()

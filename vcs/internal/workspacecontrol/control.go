@@ -289,6 +289,9 @@ func UnknownOutcome() *pb.MountOutcome {
 	return &pb.MountOutcome{Durability: "unresolved", Observation: "unobserved", Release: "unresolved"}
 }
 func ColdAck(a *pb.SuspendAck) error {
+	if a != nil && a.Suspension != nil && a.Suspension.AwakeRecovery {
+		return invalid("awake admission is not cold proof")
+	}
 	if a == nil {
 		return invalid("ColdAck: invalid field or state combination")
 	}
@@ -441,7 +444,7 @@ func Jobs(jobs []*pb.MountJob, mounts []*pb.MountStatus, generation uint64) erro
 			}
 		case "failed":
 			switch j.Failure {
-			case "unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed":
+			case "unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed", "busy":
 			default:
 				return invalid("job failure")
 			}
@@ -484,14 +487,25 @@ func Validate(e *pb.Envelope) error {
 		if err := Suspension(b.Suspend); err != nil {
 			return fmt.Errorf("suspend request: %w", err)
 		}
-		if len(b.Suspend.Roster) != 0 {
+		if b.Suspend.AwakeRecovery || len(b.Suspend.Roster) != 0 {
 			return invalid("suspend request roster is guest-owned")
 		}
 		return nil
 	case *pb.Envelope_SuspendAck:
 		return ColdAck(b.SuspendAck)
 	case *pb.Envelope_Resume:
+		if b.Resume == nil || b.Resume.Suspension == nil || b.Resume.Suspension.AwakeRecovery {
+			return invalid("awake recovery outside AwakeRecover")
+		}
 		return Token(b.Resume)
+	case *pb.Envelope_AwakeRecover:
+		if err := Token(b.AwakeRecover); err != nil {
+			return err
+		}
+		if !b.AwakeRecover.Suspension.AwakeRecovery || len(b.AwakeRecover.Suspension.Roster) != 0 {
+			return invalid("awake recovery request mode or roster")
+		}
+		return nil
 	case *pb.Envelope_ResumeAck:
 		return ResumeAck(b.ResumeAck)
 	case *pb.Envelope_Status:

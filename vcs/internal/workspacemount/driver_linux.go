@@ -171,21 +171,40 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		}
 		return nil
 	case "umount":
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		m.mu.Lock()
 		d := m.mounts[key]
 		m.mu.Unlock()
 		if d == nil {
 			return errors.New("workspace mount not owned")
 		}
-		if err := m.Host.Terminal(j.Mount, "voluntary unmount requested", nil); err != nil {
+		mode := "terminal"
+		if d.serving.Load() {
+			// An unforced unmount must run while holders can still use and
+			// release the filesystem. EBUSY changes no serving or lifecycle
+			// state. Success is retained in the same original removal slot
+			// which the child subsequently observes and finalizes.
+			d.effectMu.Lock()
+			if err := ctx.Err(); err != nil {
+				d.effectMu.Unlock()
+				return err
+			}
+			err := d.removeKernelLocked("voluntary", "2")
+			d.effectMu.Unlock()
+			if err != nil {
+				return fmt.Errorf("unmount workspace %s: %w", j.Mount.VolumeId, err)
+			}
+			mode = "voluntary"
+		} else if err := ctx.Err(); err != nil {
+			// A power cut closes serving after cancelling this generation.
+			// It cannot turn an overtaken voluntary intent into forced removal.
 			return err
 		}
-		mode := "voluntary"
-		d.effectMu.Lock()
-		if d.removals[0] != nil {
-			mode = "terminal"
+		if err := m.Host.Terminal(j.Mount, "workspace unmount requested", nil); err != nil {
+			return err
 		}
-		d.effectMu.Unlock()
 		p, err := d.remove(ctx, mode)
 		err = errors.Join(err, m.Host.Cleanup(j.Mount, p))
 		if err != nil {
@@ -617,11 +636,15 @@ func (d *Driver) exchange(ctx context.Context, op string, b mountcontrol.Workspa
 	}
 	b.BudgetNanos = strconv.FormatInt(time.Until(deadline).Nanoseconds(), 10)
 	if op == "workspace-suspend" {
-		end, ok := ctx.Deadline()
-		if !ok || !end.After(time.Now()) {
-			return nil, context.DeadlineExceeded
+		if b.AwakeRecoveryCut() {
+			b.DrainBudgetNanos = "0"
+		} else {
+			end, ok := ctx.Deadline()
+			if !ok || !end.After(time.Now()) {
+				return nil, context.DeadlineExceeded
+			}
+			b.DrainBudgetNanos = strconv.FormatInt(time.Until(end).Nanoseconds(), 10)
 		}
-		b.DrainBudgetNanos = strconv.FormatInt(time.Until(end).Nanoseconds(), 10)
 	}
 	q := mountcontrol.Request{Operation: op, MountInstanceID: d.bound().Intent, Workspace: &b}
 	err = q.ValidateWorkspace()
@@ -806,22 +829,18 @@ func (d *Driver) removeKernelLocked(mode, id string) error {
 	if attempt == nil {
 		attempt = &rootRemoval{id: id}
 		d.removals[index] = attempt
-		if d.kernel != nil {
-			attempt.err = d.kernel.Remove(mode == "terminal")
-		} else {
-			w := d.bound()
-			_, attempt.err = fusev3.ObservePlannedKernelMountAbsent(w.Source, w.Target)
-		}
+		attempt.err = errors.New("workspace removal not attempted")
 	}
 	if attempt.id != id {
 		return errors.New("workspace removal action changed")
 	}
-	if mode == "terminal" && attempt.err != nil {
-		// Retry only this fixed terminal action with its original descriptions.
+	if attempt.err != nil {
+		// Retry only this fixed action with its original descriptions. EBUSY
+		// belongs to one syscall, not to the lifetime of a voluntary action.
 		// ManagedKernel retains successful abort independently from alias absence;
 		// disappearance of an alias cannot fabricate a successful abort.
 		if d.kernel != nil {
-			attempt.err = d.kernel.Remove(true)
+			attempt.err = d.kernel.Remove(mode == "terminal")
 		} else if _, err := fusev3.ObservePlannedKernelMountAbsent(d.bound().Source, d.bound().Target); err == nil {
 			attempt.err = nil
 		}
@@ -857,7 +876,7 @@ func (d *Driver) job(ctx context.Context, op string, transaction proto.Message, 
 	for {
 		select {
 		case <-d.exited:
-			return nil, errors.New("workspace child exited before lifecycle completion")
+			return nil, fmt.Errorf("workspace child exited before lifecycle completion: %v", d.exitErr)
 		default:
 		}
 		if !accepted && !uncertain {
@@ -986,6 +1005,12 @@ func (d *Driver) Recover(ctx context.Context, t *pb.ResumeToken) (Recovery, erro
 	return d.recovery(ctx, t.Suspension.Generation, "workspace-recover", t)
 }
 func (d *Driver) Suspend(ctx context.Context, s *pb.Suspension) (ColdResult, error) {
+	if d.terminalCleanup.Load() {
+		// A power cut owns a bounded terminal join. It cannot queue behind an
+		// automatic finalizer whose child is no longer responsive.
+		proof, err := d.remove(ctx, "terminal")
+		return ColdResult{Generation: s.Generation, ColdComplete: err == nil && proof.ProcessExited && proof.KernelAbsent, Loss: proof.Loss, Outcome: proof.Outcome}, err
+	}
 	r, err := d.job(ctx, "workspace-suspend", s, "")
 	out := ColdResult{Generation: s.Generation}
 	if r != nil {
@@ -1014,14 +1039,65 @@ func (d *Driver) cleanupProof() CleanupProof {
 	return p
 }
 func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, result error) {
+	if mode != "voluntary" || ctx.Done() == nil {
+		return d.removeOwned(ctx, mode, true)
+	}
+	// Voluntary mode follows a committed kernel unmount. Generation cancellation
+	// cannot undo that intent or leave its child finalizer ahead of Suspend's
+	// desired-job join. The same original terminal owner preempts it, and this
+	// call joins that cancellation worker before publishing any cleanup result.
+	d.CloseAdmission(d.bindingGeneration())
+	forced := make(chan struct{})
+	var forceErr error
+	stop := context.AfterFunc(ctx, func() {
+		if !d.cleaned.Load() {
+			forceErr = d.forceKernelOwner()
+		}
+		close(forced)
+	})
+	proof, result = d.removeOwned(ctx, mode, true)
+	if stop() {
+		return proof, result
+	}
+	<-forced
+	if proof.ProcessExited && proof.KernelAbsent {
+		return proof, errors.Join(result, ctx.Err(), forceErr)
+	}
+	if forceErr != nil && d.proveExitedAbsent() != nil {
+		return proof, errors.Join(result, ctx.Err(), forceErr)
+	}
+	final, err := d.removeOwned(context.WithoutCancel(ctx), "terminal", false)
+	return final, errors.Join(result, ctx.Err(), forceErr, err)
+}
+
+func (d *Driver) removeOwned(ctx context.Context, mode string, force bool) (proof CleanupProof, result error) {
+	d.CloseAdmission(d.bindingGeneration())
+	if mode == "terminal" && force && !d.cleaned.Load() {
+		// Explicit terminal removal and power drain preempt even a finalizer
+		// holding cleanupMu/opMu. Abort only the original connection and join
+		// its exact process before waiting for inventory reconciliation.
+		if err := d.forceKernelOwner(); err != nil {
+			return d.cleanupProof(), err
+		}
+	}
 	d.cleanupMu.Lock()
 	defer d.cleanupMu.Unlock()
 	defer func() { evidence := d.cleanupProof(); proof.Loss, proof.Outcome = evidence.Loss, evidence.Outcome }()
 	if d.cleaned.Load() {
 		return CleanupProof{Witness: d.bound(), ProcessExited: true, KernelAbsent: true}, nil
 	}
-	d.CloseAdmission(d.bindingGeneration())
-	_, err := d.job(ctx, "workspace-cleanup", nil, mode)
+	var err error
+	if mode != "terminal" || !force {
+		select {
+		case <-d.exited:
+			// A finalizer preempted by the original root owner has no control
+			// lane left to join. Its resource absence still needs independent
+			// proof and both inventory reconciliations below.
+			err = errors.New("workspace child exited before cleanup completion")
+		default:
+			_, err = d.job(ctx, "workspace-cleanup", nil, mode)
+		}
+	}
 	if err != nil {
 		select {
 		case <-d.exited:
@@ -1091,6 +1167,28 @@ func (d *Driver) remove(ctx context.Context, mode string) (proof CleanupProof, r
 	}
 	return CleanupProof{Witness: w, ProcessExited: true, KernelAbsent: true}, nil
 }
+func (d *Driver) forceKernelOwner() error {
+	d.effectMu.Lock()
+	err := d.removeKernelLocked("terminal", "3")
+	d.effectMu.Unlock()
+	if err != nil {
+		return err
+	}
+	select {
+	case <-d.exited:
+		return nil
+	default:
+	}
+	if d.child == nil || d.child.Process == nil {
+		return errors.New("terminal workspace process owner missing")
+	}
+	if err := d.child.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	<-d.exited
+	return nil
+}
+
 func (d *Driver) bindingGeneration() uint64 { d.mu.Lock(); defer d.mu.Unlock(); return d.generation }
 
 func (d *Driver) proveExitedAbsent() error {
@@ -1128,7 +1226,11 @@ func (d *Driver) watch() {
 		case <-d.exited:
 			if d.registered.Load() && !d.cleaned.Load() {
 				d.CloseAdmission(d.bindingGeneration())
-				_ = d.manager.Host.Terminal(d.id, "workspace child exited", nil)
+				reason := "workspace child exited"
+				if d.exitErr != nil {
+					reason += ": " + d.exitErr.Error()
+				}
+				_ = d.manager.Host.Terminal(d.id, reason, nil)
 				if d.terminalCleanup.CompareAndSwap(false, true) {
 					proof, _ := d.remove(context.Background(), "terminal")
 					_ = d.manager.Host.Cleanup(d.id, proof)
@@ -1150,17 +1252,27 @@ func (d *Driver) watch() {
 		if err != nil {
 			continue
 		}
-		terminal := r.Phases != nil && r.Phases.TerminalRemoval.Progress == "offered"
-		if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
-			_ = d.manager.Host.Terminal(d.id, "workspace terminal removal required", nil)
-			go func() {
-				proof, _ := d.remove(context.Background(), "terminal")
-				_ = d.manager.Host.Cleanup(d.id, proof)
-			}()
-		} else if r.State == "recovery-required" {
-			g, _ := strconv.ParseUint(b.Generation, 10, 64)
-			serial, _ := strconv.ParseUint(b.GateSerial, 10, 64)
-			_ = d.manager.Host.RecoveryRequired(d.id, g, serial, "workspace clock or subscription proof unavailable")
-		}
+		d.observeState(b, r)
+	}
+}
+
+func (d *Driver) observeState(b mountcontrol.Workspace, r *mountcontrol.WorkspaceResponse) {
+	// The lifecycle caller can finish the kernel action before this observer
+	// samples it. Every retained terminal action still requires the root's
+	// process join, inventory reconciliation and host cleanup publication.
+	terminal := r.Phases != nil && r.Phases.TerminalRemoval.Action != nil
+	if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
+		_ = d.manager.Host.Terminal(d.id, r.Phases.TerminalRemoval.Action.Reason, nil)
+		go func() {
+			// The child remains the final outcome owner after its kernel action.
+			// Automatic removal joins that finalization; an explicit removal or
+			// power drain can still preempt it through the original root owner.
+			proof, _ := d.removeOwned(context.Background(), "terminal", false)
+			_ = d.manager.Host.Cleanup(d.id, proof)
+		}()
+	} else if r.State == "recovery-required" {
+		g, _ := strconv.ParseUint(b.Generation, 10, 64)
+		serial, _ := strconv.ParseUint(b.GateSerial, 10, 64)
+		_ = d.manager.Host.RecoveryRequired(d.id, g, serial, "workspace clock or subscription proof unavailable")
 	}
 }

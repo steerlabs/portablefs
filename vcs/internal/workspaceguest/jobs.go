@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"syscall"
 	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
@@ -225,6 +226,8 @@ func (s *Supervisor) runJob(ctx context.Context, j *mountJob, provision *pb.Prov
 	if err != nil {
 		j.status.Phase, j.status.Failure = "failed", "handler-failed"
 		switch {
+		case errors.Is(err, syscall.EBUSY):
+			j.status.Failure = "busy"
 		case errors.Is(err, ErrUnavailable), errors.Is(err, ErrIdentityUnavailable):
 			j.status.Failure = "unavailable"
 		case errors.Is(err, ErrState):

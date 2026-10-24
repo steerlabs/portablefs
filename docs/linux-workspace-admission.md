@@ -52,6 +52,21 @@ Closing admission
 still retains the old grant, dirty overlay and accepted cut for admitted READ,
 FSYNC and exact cleanup. New WRITE and holder GETATTR must pass entry admission.
 
+Closed direct WRITE and regular-file FSYNC can wait outside the callback cohort
+without obstructing kernel invalidation. Namespace requests can hold an inode
+lock required by entry invalidation; buffered READ can hold a folio required by
+inode invalidation. Those requests refuse until the complete kernel cold proof,
+then can wait for recovery. No wait admits data or suppresses a required kernel
+notification. The first admitted callback resets that proof under the same raw
+filesystem lock as entry reservation.
+
+A direct WRITE can lose admission after reserving its callback but before buffer
+acceptance. A zero accepted cut and a definite no-effect source result permit
+retiring that callback attempt, including its old cohort, source and response
+owners. The original FUSE request remains unanswered outside the epoch reader
+until fresh admission. No physical reply is invented. A nonzero accepted cut,
+filesystem post-state or independent failure cannot take this transition.
+
 A drain permit captures one old buffer, its incarnation and the earlier of the
 requested deadline and local cache-withdrawal deadline, preserving its lead
 before the authority horizon. It cannot select a successor buffer,

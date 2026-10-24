@@ -207,7 +207,7 @@ func captureKernelMountWithAbort(fsName, mountpoint string, supplied *os.File) (
 
 func (m *Mount) unmountOwnedKernelMount() error {
 	if m.managedRemoval != nil {
-		return m.managedRemoval("voluntary")
+		return m.managedRemoval("voluntary", nil)
 	}
 	installed := m.kernelMount
 	if installed.point == "" {

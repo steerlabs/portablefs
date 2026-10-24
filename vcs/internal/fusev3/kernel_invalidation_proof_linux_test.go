@@ -170,14 +170,8 @@ func TestKernelInvalidationProof(t *testing.T) {
 			checkRead('A', 1)
 			checkRead('A', 0)
 			if kind == "private-mapping" {
-				mapping, err := unix.Mmap(fd, 0, os.Getpagesize(), unix.PROT_READ, unix.MAP_PRIVATE)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer unix.Munmap(mapping)
-				if !bytes.Equal(mapping, bytes.Repeat([]byte{'A'}, len(mapping))) {
-					t.Fatal("initial mapping bytes")
-				}
+				mapping := startKernelMmapClient(t, fd, unix.PROT_READ, os.Getpagesize())
+				mapping.check(bytes.Repeat([]byte{'A'}, os.Getpagesize()))
 				if got := fs.reads.Load(); got != 1 {
 					t.Fatalf("resident mapping READ count=%d want=1", got)
 				}
@@ -185,9 +179,9 @@ func TestKernelInvalidationProof(t *testing.T) {
 				if status := server.InodeNotify(proofInode, 0, 0); status != fuse.OK {
 					t.Fatal(status)
 				}
-				good := bytes.Equal(mapping, bytes.Repeat([]byte{'B'}, len(mapping)))
-				t.Logf("post-notify private fault: daemon READ delta=%d total=%d content-B=%t", fs.reads.Load()-1, fs.reads.Load(), good)
-				if !good || fs.reads.Load() != 2 {
+				mapping.check(bytes.Repeat([]byte{'B'}, os.Getpagesize()))
+				t.Logf("post-notify private fault: daemon READ delta=%d total=%d content-B=true", fs.reads.Load()-1, fs.reads.Load())
+				if fs.reads.Load() != 2 {
 					t.Fatal("mapped page was not withdrawn")
 				}
 				checkRead('B', 0)

@@ -119,7 +119,7 @@ admission. Install completion remains distinct from prepared readiness, and
 recorded removal remains distinct from final cleanup.
 
 Socket attempts have a maximum 45-second budget. Losing or expiring a socket
-cannot cancel accepted work or erase its resources and outcomes. Suspend alone
+cannot cancel accepted work or erase its resources and outcomes. Power Suspend
 also carries a positive `drainBudgetNanos` of at most 15 seconds. Acceptance
 captures its receipt-relative deadline after charging framing and admission
 delay; retry allowances cannot extend it. Observation gets its own socket
@@ -129,6 +129,18 @@ admission and cancels a legal predecessor before its drain budget is checked.
 If that budget is already spent, the start is refused after the predecessor
 joins; the predecessor may remain failed. The root must escalate to Cleanup,
 not retry recovery or treat refusal as withdrawal completion.
+
+Awake proof loss uses `AwakeRecover` (paired control tag 25). Its fresh token
+has `Suspension.awake_recovery` set and an empty request roster. The guest closes
+all gates, fixes membership, starts the new clock generation, and immediately
+returns a `ResumeAck` with recovering mount states. This is admission evidence,
+not cold evidence. Each existing mount lane owns its cold cut and subsequent
+same-session Recover, without a VM power deadline. The local cold transaction
+carries `drainBudgetNanos: "0"` only for this exact mode. Its drain permission
+still ends at the original subscription horizon. A later power Suspend advances
+the permit, cancels and joins these actual workers, and retains its original
+15-second budget. Normal Suspend and Resume reject the awake flag. Failed
+cold work ends that incarnation and retains its actual cause and loss.
 
 `AdmitFrame` owns the immediate admission invalidation for each authenticated,
 fully framed Suspend or Cleanup, before checking lanes, remaining budget or
@@ -157,6 +169,23 @@ abort description. Cleanup carries final cumulative loss and outcome to the
 supervisor before publication; RetireAck requires the exact published result.
 Death preserves uncertain inventory and blocks replacement. The control-boundary tests use owned descriptors; required root tests also
 exercise real protected bootstrap, failed INIT, uncertain handoff and exact removal.
+
+A voluntary root unmount tries the original kernel owner while serving remains
+available. A real `EBUSY` finishes that job promptly without changing admission
+or terminal state. A later request retries the same original removal slot.
+Successful unmount is retained before the child closes and finalizes. Automatic
+terminal cleanup joins the child's final outcome publication even when its
+kernel-removal action already completed. Explicit terminal removal and power
+drain instead abort the original connection, detach and kill/join the exact
+retained process before acquiring cleanup or child-control lanes. They can
+preempt a stopped child or automatic finalizer. Original source/target absence,
+process exit and both inventory reconciliations remain prerequisites for
+replacement; killing cannot prove durability or invent a final outcome.
+After a voluntary kernel unmount commits, generation cancellation also drives
+that original terminal owner and joins it before the desired job completes.
+Suspend therefore cannot queue behind the removed mount's child finalizer.
+A finished lifecycle result and a later removal action are independent facts:
+offering removal cannot turn a joined failed Recover back into pending work.
 
 One persistent renewer retains session, next sequence, installed deadline and
 exact pending grant across Park/Resume/RefreshNow. Park prevents dispatch and
@@ -242,6 +271,17 @@ retains it. Cleanup debt and loss remain cumulative across intervals.
 Close advances an exact serial even within one generation. It immediately denies
 new admission and defeats delayed prepared publication; it does not retract an
 already admitted operation. Completed withdrawal requires Suspend's joins.
+Direct WRITE and regular-file FSYNC callbacks wait outside the admitted cohort
+while the gate is closed and enter only after a fresh serving interval opens.
+Other callbacks can wait after complete kernel withdrawal. Before that proof,
+they must refuse promptly: namespace requests can hold the parent inode lock
+needed by entry invalidation, and buffered READ can hold the folio needed by
+inode invalidation. Waiting with those locks would deadlock the cold cut.
+Waiters hold no epoch reader, reply publication or buffer acceptance, so they
+cannot replenish the cut. Terminal teardown releases them with the retained failure. A callback
+already admitted before Close still obeys its exact acceptance and publication
+checks; accepted loss and uncertain assigned effects cannot be retried as new
+work or reported as durable merely to make suspension transparent.
 Prepare/Recover belong to their generation, retry classified transient failures
 with bounded attempts/backoff, and have no 45-second logical deadline. Only
 current session/authorization validation, a functioning renewal owner and fresh
@@ -364,6 +404,14 @@ replacement. These rules are independent of the unresolved uncontrolled path.
 Voluntary updates require a clean drain and shutdown; defer an undrainable
 update. Forced sleep may report loss and discard. Neither policy converts
 accepted volatile data into durable data.
+
+Awake proof loss uses the same closed cold cut and single-use recovery token
+without pausing or resuming VZ. A power notification which overtakes the cut
+still requires the confirmed pause within its original budget. The coordinator
+holds queued Mount intent across that transition. An already dispatched initial
+Mount joins before Suspend within the original drain budget; it is never
+recreated by spending the same single-use grant again. Failure to join takes
+the existing discard path, without extending the sleep deadline.
 
 ## Unfenced host sleep: OPEN release gate
 
@@ -909,3 +957,12 @@ qualification verdict false: source provenance, multi-day accuracy, host clock
 corrections and worst-case long-awake load require separate evidence. No NTP,
 host-message fallback, clock server or RTC admission is implemented. This TLS
 wall discipline grants no BOOTTIME continuity across unfenced host sleep.
+
+A definite applied mutation is distinct from its later peer visibility wait.
+If that wait loses the old subscription, append/range callbacks still validate
+the returned result and complete their source publication before reporting the
+visibility errno. OPEN/CREATE failure discharges the validated binding locally
+and retains its existing descriptor cleanup owner, without publishing a new
+kernel handle. Such a failure closes cache admission for the existing cold
+path; it neither invents a no-change result nor replays the committed mutation.
+Malformed results and independent failures remain terminal.

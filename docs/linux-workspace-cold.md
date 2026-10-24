@@ -116,8 +116,24 @@ keeping the tracked unlock obligation for session-owned RELEASE cleanup; a
 closed serving gate whose dispatch still runs keeps its existing cleanup path.
 Known loss still wins the FLUSH result.
 
-A serving managed driver must close admission and Park the renewer before its
-safe cutoff. Resume is not a way to clear a latched terminal cutoff. Park joins
+An assigned mutation keeps its exact replay identity beyond an individual
+network-attempt deadline. An expired cache drain may still reconcile that
+registered replay, including assigned barrier/cleanup results; it cannot assign
+another mutation. The authority returns the retained outcome or refuses the old
+subscription rather than authorizing fresh cache work. TLS establishment still
+requires the current shared clock. Cold acknowledgment joins applying replays;
+the power deadline does not grow while that join waits.
+
+Before descriptor CLOSE is submitted, its grant preparation can lose the old
+cache cut. Expiry or recorded buffered-data loss at that boundary requests cold recovery
+and retains the counted exact descriptor for retry. It does not establish an
+unknown CLOSE outcome or end the session. Independent sibling failures retain
+their terminal policy, and the old cleanup cannot acquire a successor grant.
+
+A serving managed driver must close admission before its safe cutoff. The cold
+owner Parks and joins the renewer with the other captured workers; a proof-loss
+observation does not independently Park it while recovery is still being
+scheduled. Resume cannot clear a latched terminal cutoff. Park joins
 installation and its policy disposition; an unknown installer result keeps the
 same sequence and exact grant for reconciliation. The driver must provide
 current clock/permit checks to dispatch and the installer itself. The supervisor

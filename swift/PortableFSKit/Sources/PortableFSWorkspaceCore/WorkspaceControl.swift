@@ -60,7 +60,7 @@ public enum WorkspaceControl {
         (o.observation != "unobserved" || (o.durability == "unresolved" && o.release == "unresolved"))
     }
     public static func validColdAck(_ ack: WorkspaceSuspendAck) -> Bool {
-        validSuspension(ack.suspension) && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
+        validSuspension(ack.suspension) && !ack.suspension.awakeRecovery && ack.mounts.map(\.mount) == ack.suspension.roster && ack.mounts.allSatisfy { validLoss($0.loss) && $0.hasOutcome && validOutcome($0.outcome) }
     }
     private static func validStatuses(_ mounts: [WorkspaceMountStatus]) -> Bool {
         validRoster(mounts.map(\.mount)) && mounts.allSatisfy {
@@ -146,7 +146,7 @@ public enum WorkspaceControl {
               ["provision", "mount", "umount"].contains(job.operation) else { return false }
         switch job.phase {
         case "offered", "running", "complete": guard job.failure.isEmpty && job.reason.isEmpty else { return false }
-        case "failed": guard ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason else { return false }
+        case "failed": guard ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed", "busy"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason else { return false }
         default: return false
         }
         return true
@@ -170,9 +170,10 @@ public enum WorkspaceControl {
         switch e.body {
         case .hello(let h): ok = validRelease(h.release) && id(h.bootID) && id(h.hostServiceID) && h.guestServiceID.isEmpty
         case .helloAck(let h): ok = validRelease(h.release) && id(h.bootID) && id(h.hostServiceID) && id(h.guestServiceID)
-        case .suspend(let s): ok = validSuspension(s) && s.roster.isEmpty
+        case .suspend(let s): ok = validSuspension(s) && !s.awakeRecovery && s.roster.isEmpty
         case .suspendAck(let a): ok = validColdAck(a)
-        case .resume(let t): ok = validToken(t)
+        case .resume(let t): ok = validToken(t) && !t.suspension.awakeRecovery
+        case .awakeRecover(let t): ok = validToken(t) && t.suspension.awakeRecovery && t.suspension.roster.isEmpty
         case .resumeAck(let a): ok = validResumeAck(a)
         case .status: ok = true
         case .statusReply(let s):

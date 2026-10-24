@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 from linux_workspace_native_managed import NativeAuthority
+from linux_workspace_native_lifecycle import lifecycle_checks
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
@@ -253,6 +254,7 @@ try:
     measurements[-1]['owner_rss_kib'] = int(subprocess.check_output(['ps', '-o', 'rss=', '-p', str(guest.p.pid)], text=True).strip())
     authority.awake_recovery(guest)
     record('managed-awake-proof-loss-cold-recovery')
+    managed = lifecycle_checks(authority, guest, managed, record)
     authority.unmount(guest, managed)
     record('managed-unmount-exact-cleanup')
     provisioned = authority.mount(guest, provision_only=True)

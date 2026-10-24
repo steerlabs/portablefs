@@ -2577,6 +2577,13 @@ func cmdMounts(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mounts", err)
 	}
+	if e.stateDir == "" {
+		managed, err := platformManagedMountStates()
+		if err != nil {
+			return e.fail("mounts", err)
+		}
+		states = append(states, managed...)
+	}
 	intents, err := listMountIntents(stateDir)
 	if err != nil {
 		return e.fail("mounts", err)

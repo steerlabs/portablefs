@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -295,5 +296,23 @@ func TestParallelDrainNewGenerationDefeatsLateCompletion(t *testing.T) {
 	}
 	if m.isOpen() {
 		t.Fatal("new cold generation reopened admission")
+	}
+}
+
+func TestVoluntaryBusyJobPreservesRealErrno(t *testing.T) {
+	s, err := New(id(1), id(2), id(3), true, jobDriverFunc(func(context.Context, *pb.MountJob, *pb.Provision) error {
+		return fmt.Errorf("unmount original kernel: %w", syscall.EBUSY)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.ChannelLost)
+	if err := s.AcceptJob(jobRequest(2, mountID(4), "umount")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(s.Retired()) == 1 })
+	job := s.Retired()[0].Job
+	if job.Phase != "failed" || job.Failure != "busy" {
+		t.Fatal(job)
 	}
 }

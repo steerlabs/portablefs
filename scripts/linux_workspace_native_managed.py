@@ -122,7 +122,7 @@ with p.open() as f:
         event = guest.wait('mount-status', 30)
         return json.loads(self.fixture('decode-status', event['body']))
 
-    def job(self, guest, operation, timeout=90):
+    def job(self, guest, operation, timeout=90, allow_fail=False):
         deadline = time.monotonic() + timeout
         seen = getattr(self, 'seen_jobs', {})
         key = (guest.p.pid, operation)
@@ -138,7 +138,8 @@ with p.open() as f:
                             and int(j['requestId']) > seen.get(key, 0)]
                 for job in selected:
                     if job['phase'] in ('complete', 'failed'):
-                        assert job['phase'] == 'complete', job
+                        assert allow_fail or job['phase'] == 'complete', job
+                        self.last_job = job
                         seen[key] = int(job['requestId']); self.seen_jobs = seen
                         return status
             assert time.monotonic() < deadline, (operation, current)
@@ -189,20 +190,16 @@ with p.open() as f:
         generation = int(initial.get('generation', '0'))
         self.network(True)
         try:
-            deadline = time.monotonic() + 90
+            deadline = time.monotonic() + 30
             while True:
-                phase = guest.wait('phase', max(.1, deadline-time.monotonic()))
-                if int(phase['generation']) > generation and phase['phase'] == 'draining':
+                phase = self.status(guest)
+                if int(phase.get('generation', '0')) > generation:
+                    assert phase['state'] == 'running', phase
                     break
                 assert time.monotonic() < deadline, phase
+                time.sleep(.1)
         finally:
             self.network(False)
-        # Observe the VM owner's transaction without enqueueing a control
-        # exchange into its confirmed-pause boundary.
-        while True:
-            completed = guest.wait('phase', 30)
-            if int(completed['generation']) == generation+1 and completed['phase'] == 'running':
-                break
         mounted = self.ready(guest)
         after = self.authority_sessions()
         assert before == after and before['active'] == 2, (before, after)
@@ -245,7 +242,8 @@ else:
 """
         assert guest.ssh('python3 -c '+shlex.quote(script)) == 'protected'
 
-    def kill_child(self, guest):
+    def kill_child(self, guest, signame='SIGKILL'):
+        assert signame in ('SIGKILL', 'SIGTERM')
         script = """import os,pathlib,signal
 pids=[]
 for p in pathlib.Path('/proc').glob('[0-9]*'):
@@ -257,9 +255,11 @@ for p in pathlib.Path('/proc').glob('[0-9]*'):
     except FileNotFoundError:
         pass
 assert len(pids)==1,pids
-os.kill(pids[0],signal.SIGKILL)
+fd=os.pidfd_open(pids[0])
+signal.pidfd_send_signal(fd,getattr(signal,'__SIGNAL__'))
+os.close(fd)
 print(pids[0])
-"""
+""".replace('__SIGNAL__', signame)
         pid = int(guest.ssh('python3 -c '+shlex.quote(script)))
         deadline = time.monotonic()+30
         while True:
@@ -270,7 +270,8 @@ print(pids[0])
             assert time.monotonic()<deadline,status
             time.sleep(.05)
         self.protected(guest)
-        (self.evidence/'managed-child-death.json').write_text(json.dumps({'pid':pid,'status':mounts[0]},indent=2))
+        name = 'managed-child-death.json' if signame == 'SIGKILL' else 'managed-child-'+signame+'.json'
+        (self.evidence/name).write_text(json.dumps({'pid':pid,'status':mounts[0]},indent=2))
 
     def reconciled(self, guest, old):
         self.status(guest)

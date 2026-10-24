@@ -52,11 +52,37 @@ func opusKernelIncompleteSuspendChild(t *testing.T) {
 	o2, err2 := c.m.RecoverWorkspace(ctx, 1, serial2)
 	cancel()
 	fmt.Printf("Recover: prepared=%v result=%v err=%v\n", o2.Prepared, o2.Result.Disposition, err2)
-	_, perr := unix.Pread(int(held.Fd()), make([]byte, 4), 0)
+	if err != nil || !o.ColdComplete || err2 != nil || !o2.Prepared {
+		t.Fatalf("incomplete Suspend stranded the incarnation: suspend=%v recover=%v", err, err2)
+	}
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	read := make(chan readResult, 1)
+	go func() {
+		data := make([]byte, 4)
+		n, err := unix.Pread(int(held.Fd()), data, 0)
+		read <- readResult{data[:max(n, 0)], err}
+	}()
+	select {
+	case result := <-read:
+		t.Fatal("prepared read completed before serving permission", result)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if r := c.req("open"); r != "<nil>" {
+		t.Fatal("open recovered cut", r)
+	}
+	var result readResult
+	select {
+	case result = <-read:
+	case <-time.After(5 * time.Second):
+		t.Fatal("held read did not finish after fresh permission")
+	}
 	data, rerr := os.ReadFile(f.join(1, "e"))
-	fmt.Printf("held fd pread=%v; peer sees %q %v; revoked=%v sessionEnd=%v\n", perr, data, rerr, c.m.isRevoked(), c.m.rpc.SessionEndCause())
-	if !o.ColdComplete || !o2.Prepared {
-		c.fail("incomplete Suspend stranded the incarnation: suspend=%v recover=%v (result %v)", err, err2, o2.Result.Disposition)
+	fmt.Printf("held fd pread=%v; peer sees %q %v; revoked=%v sessionEnd=%v\n", result.err, data, rerr, c.m.isRevoked(), c.m.rpc.SessionEndCause())
+	if result.err != nil || rerr != nil || string(result.data) != string(data) {
+		t.Fatal("recovered held read disagrees with independent peer", result, string(data), rerr)
 	}
 	_ = held.Close()
 	for _, b := range c.bad {
@@ -168,11 +194,12 @@ func opusKernelCancelledSleepChild(t *testing.T) {
 	o3, err3 := c.m.SuspendWorkspace(ctx, 1, serial, c.now().Add(8*time.Second))
 	cancel()
 	fmt.Printf("immediate retry Suspend with a fresh deadline: cold=%v err=%v\n", o3.ColdComplete, err3)
+	if err2 != nil || !o2.Prepared || err3 != nil || !o3.ColdComplete {
+		t.Fatalf("cancelled sleep stranded the incarnation: recover=%v retry=%v", err2, err3)
+	}
+	kernelStatAcrossColdRecovery(t, func() (os.FileInfo, error) { return os.Stat(f.join(0, "e")) }, 1, 0644, func() { c.recover(serial) })
 	_, serr := os.Stat(f.join(0, "e"))
 	fmt.Printf("mount0 stat=%v revoked=%v sessionEnd=%v fatal=%v\n", serr, c.m.isRevoked(), c.m.rpc.SessionEndCause(), c.m.fatalError())
-	if err2 != nil || !o2.Prepared || err3 != nil || !o3.ColdComplete {
-		c.fail("cancelled sleep stranded the incarnation: recover=%v retry=%v", err2, err3)
-	}
 	for _, b := range c.bad {
 		t.Error(b)
 	}

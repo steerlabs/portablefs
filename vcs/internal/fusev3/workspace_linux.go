@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"fmt"
+	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -49,8 +50,77 @@ func (m *Mount) workspaceFS() *workspaceFileSystem {
 	return &workspaceFileSystem{rawFileSystem: m.raw}
 }
 
+// Requests waiting for a new serving interval own no callback, publication or
+// buffer admission. In particular, they cannot extend the fixed cold-drain
+// cohort or hold an epoch reader needed by its withdrawal. The shared page has
+// no child notification; resampling also observes terminal teardown.
+func (m *Mount) awaitWorkspaceServing(ctx context.Context, interrupted ...<-chan struct{}) error {
+	return m.awaitWorkspaceEntry(ctx, true, interrupted...)
+}
+
+func (m *Mount) awaitWorkspaceEntry(ctx context.Context, safeForWithdrawal bool, interrupted ...<-chan struct{}) error {
+	if m.workspace == nil {
+		return nil
+	}
+	// A gate alone promises refusal, not recovery. Waiting requires the
+	// lifecycle owner which can reopen or terminalize this mount.
+	if m.workspaceLifecycle == nil {
+		_, err := m.workspace.Check()
+		return err
+	}
+	var cancel <-chan struct{}
+	if len(interrupted) != 0 {
+		cancel = interrupted[0]
+	}
+	for {
+		select {
+		case <-cancel:
+			return syscall.EINTR
+		default:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.fatalError(); err != nil {
+			return err
+		}
+		if m.isRevoked() {
+			return syscall.EIO
+		}
+		if err := m.rpc.SessionEndCause(); err != nil {
+			return err
+		}
+		if m.workspaceServing() {
+			return nil
+		}
+		if !safeForWithdrawal && !m.workspaceLifecycle.kernelColdReady.Load() {
+			// Namespace callbacks can hold the parent inode lock needed by
+			// EntryNotify; buffered READ can hold a folio needed by InodeNotify.
+			// They must release those kernel locks before the cold proof. Once
+			// the kernel is cold, no retained notification can need their locks.
+			return workspaceadmission.ErrClosed
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-cancel:
+			timer.Stop()
+			return syscall.EINTR
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-m.workspace.Done():
+			timer.Stop()
+			return workspaceadmission.ErrClosed
+		case <-timer.C:
+		}
+	}
+}
+
 func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
-	entry, status := r.beginWorkspaceEntry(header.Unique)
+	entry, status := r.beginWorkspaceEntry(header.Unique, cancel)
 	if !status.Ok() {
 		return status
 	}
@@ -59,7 +129,7 @@ func (r *workspaceFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHead
 }
 
 func (r *workspaceFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
-	entry, status := r.beginWorkspaceEntry(input.Unique)
+	entry, status := r.beginWorkspaceEntry(input.Unique, cancel)
 	if !status.Ok() {
 		return status
 	}
@@ -149,7 +219,14 @@ func (m *Mount) workspaceServing() bool {
 		return true
 	}
 	_, err := m.workspace.Check()
-	return err == nil && m.workspaceClockReady()
+	if err != nil || !m.workspaceClockReady() {
+		return false
+	}
+	if m.workspaceLifecycle != nil {
+		_, _, _, live := m.subscription.currentIncarnation()
+		return live
+	}
+	return true
 }
 
 // TLS readiness can withdraw between observer ticks. Denial at use prevents a
@@ -189,7 +266,28 @@ type workspaceRecoveryKey struct{}
 
 // beginWorkspaceEntry reserves one existing physical-reply owner before the
 // first answer or effect. The slow callback transfers this owner explicitly.
-func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
+func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64, interrupted ...<-chan struct{}) (*replyPublication, fuse.Status) {
+	return r.beginWorkspaceEntryPolicy(unique, false, interrupted...)
+}
+
+// Regular-file direct writes and fsync hold no parent inode lock or page-cache
+// folio needed by cold invalidation. Other kernel operations wait only after
+// the complete cold proof, so none can deadlock its reverse notifications.
+func (r *workspaceFileSystem) beginWorkspaceFileEntry(unique uint64, interrupted <-chan struct{}) (*replyPublication, fuse.Status) {
+	return r.beginWorkspaceEntryPolicy(unique, true, interrupted)
+}
+func (r *workspaceFileSystem) beginWorkspaceEntryPolicy(unique uint64, safeForWithdrawal bool, interrupted ...<-chan struct{}) (*replyPublication, fuse.Status) {
+	for {
+		if err := r.mount.awaitWorkspaceEntry(r.opContext(), safeForWithdrawal, interrupted...); err != nil {
+			return nil, fuse.Status(errnoOfError(err))
+		}
+		p, status := r.tryWorkspaceEntry(unique)
+		if status != fuse.Status(syscall.EAGAIN) { // Closure raced the wait; no entry was admitted.
+			return p, status
+		}
+	}
+}
+func (r *workspaceFileSystem) tryWorkspaceEntry(unique uint64) (*replyPublication, fuse.Status) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if unique == 0 || r.replyTerminal || r.replyTerminalizing || r.replyPublications[unique] != nil {
@@ -207,12 +305,13 @@ func (r *workspaceFileSystem) beginWorkspaceEntry(unique uint64) (*replyPublicat
 	p.workspaceDone = make(chan struct{})
 	r.replyPublications[unique] = p
 	permit, err := r.mount.workspace.Check()
-	if err != nil || !r.mount.workspaceClockReady() {
+	if err != nil || !r.mount.workspaceServing() {
 		delete(r.replyPublications, unique)
 		r.recycleReplyLocked(p)
-		return nil, fuse.EIO
+		return nil, fuse.Status(syscall.EAGAIN)
 	}
 	if life := r.mount.workspaceLifecycle; life != nil {
+		life.kernelColdReady.Store(false)
 		life.servedSinceCold.Store(true)
 	}
 	p.workspace, p.workspaceBound = permit, true
@@ -230,6 +329,39 @@ func (r *workspaceFileSystem) finishWorkspaceEntry(unique uint64, entry *replyPu
 		return
 	}
 	r.finishReplyPublicationRegistration(unique, p)
+}
+
+// Only a WRITE refused before delegation acquisition or with a zero accepted cut may use this
+// transition. No filesystem effect or kernel candidate belongs to that attempt;
+// the original FUSE request remains unanswered and can await fresh admission.
+// This is callback retirement, never a fabricated physical reply completion.
+func (r *rawFileSystem) retireUnacceptedWorkspaceWrite(unique uint64) error {
+	r.mu.Lock()
+	p := r.replyPublications[unique]
+	if p == nil || !p.callbackOwned || !p.workspaceBound || p.originalFinalized || p.settlementClaimed ||
+		len(p.names) != 0 || len(p.attrs) != 0 || len(p.data) != 0 || len(p.unlicensed) != 0 ||
+		p.postState != nil || len(p.expectedPostState) != 0 || p.retainedAnswer || p.lookupReference != nil ||
+		p.dirPlusLookups != nil || p.completeDirectoryCount != 0 || p.cachedCount != 0 || p.payloadError != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("fusev3: unaccepted workspace write retained publication effects")
+	}
+	if source := p.source; source != nil && (!source.ready || source.revoked || source.released) {
+		r.mu.Unlock()
+		return fmt.Errorf("fusev3: unaccepted workspace write retained an unresolved source")
+	}
+	delete(r.replyPublications, unique)
+	claim := r.settleReplyPublicationLocked(p, false)
+	p.closeOriginalDoneLocked()
+	r.mu.Unlock()
+	if p.source != nil {
+		p.source.release()
+	}
+	consumeClaimedAuthorityResponses(claim)
+	r.mu.Lock()
+	close(p.workspaceDone)
+	r.signalSourceChangedLocked()
+	r.mu.Unlock()
+	return nil
 }
 
 func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, next *replyPublication) error {
@@ -286,6 +418,7 @@ func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, ne
 			return err
 		}
 		if life := r.mount.workspaceLifecycle; life != nil {
+			life.kernelColdReady.Store(false)
 			life.servedSinceCold.Store(true)
 		}
 		p.workspace, p.workspaceBound = permit, true
@@ -307,7 +440,7 @@ func (r *workspaceFileSystem) captureWorkspaceDrain(deadline time.Time) workspac
 		return *s.workspaceDrain
 	}
 	s.workspaceOwned = true
-	if s.cacheUntil.Before(deadline) {
+	if deadline.IsZero() || s.cacheUntil.Before(deadline) {
 		deadline = s.cacheUntil
 	}
 	p := workspaceDrainPermit{manager: m, buffer: m.buf, incarnation: s.incarnation, deadline: deadline}
