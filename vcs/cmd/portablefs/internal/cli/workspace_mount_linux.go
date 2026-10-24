@@ -188,8 +188,8 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace owner pipe ended")
 		<-c.finalized
 		return 1
-	case <-signals:
-		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace child signal")
+	case received := <-signals:
+		_ = c.control.Owner.RequireRemoval(context.Background(), "terminal", "workspace child received signal: "+received.String())
 		<-c.finalized
 		return 0
 	}

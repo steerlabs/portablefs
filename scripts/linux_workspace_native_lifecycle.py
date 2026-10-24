@@ -368,6 +368,20 @@ print(pids[0])
         self.save('managed-terminal-cause-and-cwd-removal', {'reason': mounted['reason']})
         return replacement
 
+    def caught_signal(self, public):
+        with self.holder('probe') as holder:
+            started = time.monotonic()
+            self.a.kill_child(self.g, 'SIGTERM')
+            mounted = self.mount()
+            assert time.monotonic()-started < 10 and mounted['cleanup'] == 'complete', mounted
+            assert mounted['reason'] == 'workspace child received signal: terminated', mounted
+            value = self.finish_holder(holder, allow_errors=True)
+            assert value['errors'], value
+        self.a.unmount(self.g, public)
+        replacement = self.a.mount(self.g)
+        self.save('managed-caught-signal-terminal-cause', {'terminal': mounted, 'application': value})
+        return replacement
+
 
 def lifecycle_checks(authority, guest, public, record):
     checks = LifecycleChecks(authority, guest, record)
@@ -379,4 +393,5 @@ def lifecycle_checks(authority, guest, public, record):
     public = checks.mount_race(public)
     public = checks.unresponsive_child(public)
     public = checks.terminal_io(public)
+    public = checks.caught_signal(public)
     return checks.long_pause(public)

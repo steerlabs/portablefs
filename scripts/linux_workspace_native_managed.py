@@ -242,7 +242,8 @@ else:
 """
         assert guest.ssh('python3 -c '+shlex.quote(script)) == 'protected'
 
-    def kill_child(self, guest):
+    def kill_child(self, guest, signame='SIGKILL'):
+        assert signame in ('SIGKILL', 'SIGTERM')
         script = """import os,pathlib,signal
 pids=[]
 for p in pathlib.Path('/proc').glob('[0-9]*'):
@@ -254,9 +255,11 @@ for p in pathlib.Path('/proc').glob('[0-9]*'):
     except FileNotFoundError:
         pass
 assert len(pids)==1,pids
-os.kill(pids[0],signal.SIGKILL)
+fd=os.pidfd_open(pids[0])
+signal.pidfd_send_signal(fd,getattr(signal,'__SIGNAL__'))
+os.close(fd)
 print(pids[0])
-"""
+""".replace('__SIGNAL__', signame)
         pid = int(guest.ssh('python3 -c '+shlex.quote(script)))
         deadline = time.monotonic()+30
         while True:
@@ -267,7 +270,8 @@ print(pids[0])
             assert time.monotonic()<deadline,status
             time.sleep(.05)
         self.protected(guest)
-        (self.evidence/'managed-child-death.json').write_text(json.dumps({'pid':pid,'status':mounts[0]},indent=2))
+        name = 'managed-child-death.json' if signame == 'SIGKILL' else 'managed-child-'+signame+'.json'
+        (self.evidence/name).write_text(json.dumps({'pid':pid,'status':mounts[0]},indent=2))
 
     def reconciled(self, guest, old):
         self.status(guest)

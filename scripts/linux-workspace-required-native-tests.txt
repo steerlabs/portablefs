@@ -47,3 +47,4 @@ managed-terminal-cause-and-cwd-removal
 managed-umount-suspend-independent-budget
 managed-terminal-removal-wakes-inflight-io
 managed-terminal-removal-unresponsive-child
+managed-caught-signal-terminal-cause
