@@ -1207,17 +1207,24 @@ func (d *Driver) watch() {
 		if err != nil {
 			continue
 		}
-		terminal := r.Phases != nil && r.Phases.TerminalRemoval.Progress == "offered"
-		if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
-			_ = d.manager.Host.Terminal(d.id, r.Phases.TerminalRemoval.Action.Reason, nil)
-			go func() {
-				proof, _ := d.remove(context.Background(), "terminal")
-				_ = d.manager.Host.Cleanup(d.id, proof)
-			}()
-		} else if r.State == "recovery-required" {
-			g, _ := strconv.ParseUint(b.Generation, 10, 64)
-			serial, _ := strconv.ParseUint(b.GateSerial, 10, 64)
-			_ = d.manager.Host.RecoveryRequired(d.id, g, serial, "workspace clock or subscription proof unavailable")
-		}
+		d.observeState(b, r)
+	}
+}
+
+func (d *Driver) observeState(b mountcontrol.Workspace, r *mountcontrol.WorkspaceResponse) {
+	// The lifecycle caller can finish the kernel action before this observer
+	// samples it. Every retained terminal action still requires the root's
+	// process join, inventory reconciliation and host cleanup publication.
+	terminal := r.Phases != nil && r.Phases.TerminalRemoval.Action != nil
+	if terminal && d.terminalCleanup.CompareAndSwap(false, true) {
+		_ = d.manager.Host.Terminal(d.id, r.Phases.TerminalRemoval.Action.Reason, nil)
+		go func() {
+			proof, _ := d.remove(context.Background(), "terminal")
+			_ = d.manager.Host.Cleanup(d.id, proof)
+		}()
+	} else if r.State == "recovery-required" {
+		g, _ := strconv.ParseUint(b.Generation, 10, 64)
+		serial, _ := strconv.ParseUint(b.GateSerial, 10, 64)
+		_ = d.manager.Host.RecoveryRequired(d.id, g, serial, "workspace clock or subscription proof unavailable")
 	}
 }
