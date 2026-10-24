@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -150,17 +149,16 @@ func workspaceKernelPauseChild(t *testing.T) {
 	if err := peer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.Stat(); !errors.Is(err, syscall.EIO) {
-		t.Fatal("closed frontend served after completed peer write", err)
-	}
-	fmt.Println("closed")
-	command('R')
-	o, err = m.RecoverWorkspace(t.Context(), 1, 1)
-	if err != nil || !o.Prepared {
-		t.Fatal("cold recovery", o, err)
-	}
-	fmt.Println("reprepared")
-	command('O')
+	kernelStatAcrossColdRecovery(t, file.Stat, int64(len("peer-completed")), 0600, func() {
+		fmt.Println("closed")
+		command('R')
+		o, err = m.RecoverWorkspace(t.Context(), 1, 1)
+		if err != nil || !o.Prepared {
+			t.Fatal("cold recovery", o, err)
+		}
+		fmt.Println("reprepared")
+		command('O')
+	})
 	info, err := file.Stat()
 	if err != nil || info.Size() != int64(len("peer-completed")) {
 		t.Fatal("recovery exposed stale metadata", info, err)

@@ -343,7 +343,7 @@ func reviewKernelPauseChild(t *testing.T) {
 			f.advanceClock(phase.aged)
 		}
 		c.peerMutate(phase.tag)
-		kernelStatAcrossColdRecovery(t, w.pa, int64(len("peer-a-longer-"+phase.tag)), func() {
+		kernelStatAcrossColdRecovery(t, func() (os.FileInfo, error) { return os.Stat(w.pa) }, int64(len("peer-a-longer-"+phase.tag)), 0640, func() {
 			if phase.lag {
 				off.Add(-int64(continuous.Time().Sub(frozenAt)))
 			}

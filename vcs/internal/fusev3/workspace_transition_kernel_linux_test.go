@@ -312,14 +312,14 @@ func countOpusFDs() int {
 	return len(entries)
 }
 
-func kernelStatAcrossColdRecovery(t *testing.T, path string, wantSize int64, recover func()) {
+func kernelStatAcrossColdRecovery(t *testing.T, stat func() (os.FileInfo, error), wantSize int64, wantMode os.FileMode, recover func()) {
 	t.Helper()
 	type result struct {
 		info os.FileInfo
 		err  error
 	}
 	done := make(chan result, 1)
-	go func() { info, err := os.Stat(path); done <- result{info, err} }()
+	go func() { info, err := stat(); done <- result{info, err} }()
 	select {
 	case got := <-done:
 		t.Fatalf("cold stat completed before fresh permission: %v", got.err)
@@ -328,7 +328,7 @@ func kernelStatAcrossColdRecovery(t *testing.T, path string, wantSize int64, rec
 	recover()
 	select {
 	case got := <-done:
-		if got.err != nil || got.info.Size() != wantSize || got.info.Mode().Perm() != 0640 {
+		if got.err != nil || got.info.Size() != wantSize || got.info.Mode().Perm() != wantMode {
 			t.Fatalf("waiting stat did not observe recovered peer state: %v %v", got.info, got.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -367,7 +367,7 @@ func opusKernelPauseChild(t *testing.T) {
 			f.advanceClock(phase.aged)
 		}
 		c.peerMutate(phase.tag)
-		kernelStatAcrossColdRecovery(t, w.pa, int64(len("peer-a-longer-"+phase.tag)), func() {
+		kernelStatAcrossColdRecovery(t, func() (os.FileInfo, error) { return os.Stat(w.pa) }, int64(len("peer-a-longer-"+phase.tag)), 0640, func() {
 			if phase.lag {
 				off.Add(-int64(continuous.Time().Sub(frozenAt)))
 			}
