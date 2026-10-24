@@ -11,11 +11,47 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"golang.org/x/sys/unix"
 )
 
 func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
+	return r.writeStockInterruptible(input, data, nil)
+}
+
+func (r *rawFileSystem) writeStockInterruptible(input *fuse.WriteIn, data []byte, interrupted <-chan struct{}) (uint32, fuse.Status) {
+	if input == nil {
+		return 0, fuse.EINVAL
+	}
+	for {
+		var entry *replyPublication
+		if r.mount.workspace != nil {
+			var status fuse.Status
+			entry, status = r.mount.workspaceFS().beginWorkspaceFileEntry(input.Unique, interrupted)
+			if !status.Ok() {
+				return 0, status
+			}
+		}
+		var unaccepted bool
+		count, status := r.writeStockAttempt(input, data, &unaccepted)
+		if !unaccepted {
+			if entry != nil {
+				r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
+			}
+			return count, status
+		}
+		// The old callback has ended without accepting any bytes. Retire its
+		// publication before waiting, so neither an epoch reader nor a physical
+		// reply waiter can prevent the cut which will admit this request again.
+		if err := r.retireUnacceptedWorkspaceWrite(input.Unique); err != nil {
+			r.mount.revoke(err)
+			return 0, fuse.Status(syscall.ENOTCONN)
+		}
+	}
+}
+
+func (r *rawFileSystem) writeStockAttempt(input *fuse.WriteIn, data []byte, unaccepted *bool) (uint32, fuse.Status) {
 	if input == nil {
 		return 0, fuse.EINVAL
 	}
@@ -42,6 +78,7 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		return 0, fuse.Status(errno)
 	}
 	if err := handle.node.ensureWriteDelegation(ctx, handle); err != nil {
+		*unaccepted = r.mount.workspace != nil && err == workspaceadmission.ErrClosed
 		return 0, fuse.Status(delegationErrno(err))
 	}
 	syncWrite := input.Flags&uint32(syscall.O_SYNC) == uint32(syscall.O_SYNC) || input.Flags&uint32(unix.O_DSYNC) != 0
@@ -63,8 +100,9 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 			}
 			return lease.markAssigned()
 		})
+		var cut writeback.Cut
 		for {
-			_, err = r.mount.delegations.WriteWithOptions(withHandleAcceptance(ctx, handle), identity, int64(placement.position), data, syncWrite, writeback.WriteOptions{Flags: input.WriteFlags, LockOwner: input.LockOwner, KillPrivileges: input.WriteFlags&fuse.WRITE_KILL_SUIDGID != 0})
+			cut, err = r.mount.delegations.WriteWithOptions(withHandleAcceptance(ctx, handle), identity, int64(placement.position), data, syncWrite, writeback.WriteOptions{Flags: input.WriteFlags, LockOwner: input.LockOwner, KillPrivileges: input.WriteFlags&fuse.WRITE_KILL_SUIDGID != 0})
 			if !errors.Is(err, errDelegationNotOwned) {
 				break
 			}
@@ -75,11 +113,21 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		if err != nil {
 			if lease != nil {
 				lease.resolveAllNoBinding()
-				_ = lease.markDefiniteNoChange()
+				var completionErr error
+				if cut.Sequence == 0 {
+					completionErr = lease.markDefiniteNoChange()
+				} else {
+					completionErr = lease.markCallbackPublicationReady()
+				}
+				if completionErr != nil {
+					r.mount.revoke(completionErr)
+					return 0, fuse.Status(syscall.ENOTCONN)
+				}
 			}
 			if errno := handle.observeLoss(); errno != 0 {
 				return 0, fuse.Status(errno)
 			}
+			*unaccepted = r.mount.workspace != nil && cut.Sequence == 0 && err == workspaceadmission.ErrClosed
 			return 0, fuse.Status(delegationErrno(err))
 		}
 		if err := handleRecord.inode.acceptOwnWrite(ctx, int64(placement.position), int64(len(data))); err != nil {

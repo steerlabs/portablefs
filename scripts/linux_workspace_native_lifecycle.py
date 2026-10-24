@@ -35,11 +35,14 @@ allocated=[]
 def run(i):
     n=0; fd=None
     try:
-        fd=os.open(root/(TAG+'-'+str(i)),os.O_CREAT|os.O_WRONLY|os.O_APPEND,0o600)
+        flags=os.O_CREAT|os.O_WRONLY
+        if KIND!='positioned': flags|=os.O_APPEND
+        fd=os.open(root/(TAG+'-'+str(i)),flags,0o600)
         while not stop.exists():
             try:
                 data=('%08d\n'%n).encode()
-                assert os.write(fd,data)==len(data)
+                written=os.pwrite(fd,data,n*len(data)) if KIND=='positioned' else os.write(fd,data)
+                assert written==len(data)
                 os.fsync(fd); n+=1
                 if n==1:
                     with lock: ready.add(i)
@@ -74,10 +77,9 @@ elif KIND=='allocate':
             body=(TAG+':'+str(n)).encode()
             with (root/(TAG+'-'+str(n))).open('xb') as f:
                 f.write(body);f.flush()
-                if n%2==0: os.fsync(f.fileno())
-            if n%2==0:
-                allocated.append(n)
-                if len(allocated)==1: print('held-ready',flush=True)
+                if n%2==0:
+                    os.fsync(f.fileno());allocated.append(n)
+                    if len(allocated)==1: print('held-ready',flush=True)
         except OSError as e: errors.append(e.errno)
         n+=1;time.sleep(.01)
     counts['allocate']=len(allocated)
@@ -248,10 +250,12 @@ print('all-acknowledged-records-intact')
                   {'drain_seconds': elapsed, 'job': job, 'application': value})
 
     def suspend(self):
-        with self.holder('fsync', threads=4) as holder:
-            drains = [self.pause_resume(seconds=1) for _ in range(3)]
+        with self.holder('allocate') as namespace, self.holder('positioned', threads=4) as holder:
+            drains = [self.pause_resume(seconds=.1) for _ in range(30)]
             value = self.finish_holder(holder)
-        self.save('managed-suspend-application-transparency', {'drain_seconds': drains, 'application': value})
+            allocating = self.finish_holder(namespace, allow_errors=True)
+        self.save('managed-suspend-application-transparency',
+                  {'drain_seconds': drains, 'application': value, 'namespace': allocating})
 
     def listing(self):
         rows = json.loads(self.g.ssh('portablefs mounts --json'))['mounts']

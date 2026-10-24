@@ -269,7 +269,9 @@ func TestWorkspaceLatePhysicalReadPurgesAfterWrite(t *testing.T) {
 }
 
 func TestWorkspaceClosedCleanupAndFlushUnlock(t *testing.T) {
-	f := newStockFixture(t)
+	// The successful cleanup fixture must return the paired delegation-release
+	// reply before its asynchronous final CLOSE can preserve the incarnation.
+	f, g, _ := coldFixture(t)
 	entry := f.lookup(t, 1, "cached")
 	opened := openDelegatedWriter(t, f, entry.NodeId)
 	var directory fuse.OpenOut
@@ -281,7 +283,6 @@ func TestWorkspaceClosedCleanupAndFlushUnlock(t *testing.T) {
 	record := f.raw.nodesByID[entry.NodeId]
 	key := record.node.posixLockKey(7)
 	f.mount.notePOSIXLock(key)
-	g := bindWorkspaceTestGate(t, f.mount)
 	g.Close(1)
 	status := f.rawCall(func(unique uint64) fuse.Status {
 		return f.raw.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, LockOwner: 7})
@@ -310,7 +311,7 @@ func TestWorkspaceClosedCleanupAndFlushUnlock(t *testing.T) {
 		t.Fatal("closed FORGET stranded lookup")
 	}
 	if f.mount.delegations.incarnation() == 0 {
-		t.Fatal("Close erased cleanup incarnation")
+		t.Fatal("Close erased cleanup incarnation", f.mount.fatalError())
 	}
 }
 

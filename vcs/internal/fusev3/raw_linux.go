@@ -3091,6 +3091,9 @@ func (r *rawFileSystem) Write(interrupted <-chan struct{}, input *fuse.WriteIn, 
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
 
+	if local == nil {
+		return r.writeStockInterruptible(input, data, interrupted)
+	}
 	if r.mount.workspace != nil {
 		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceFileEntry(input.Unique, interrupted)
 		if !entryStatus.Ok() {
@@ -3098,14 +3101,11 @@ func (r *rawFileSystem) Write(interrupted <-chan struct{}, input *fuse.WriteIn, 
 		}
 		defer r.mount.workspaceFS().finishWorkspaceEntry(input.Unique, entry)
 	}
-	if local != nil {
-		count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
-		if err != nil {
-			return 0, fuse.Status(errnoOfError(err))
-		}
-		return uint32(count), fuse.OK
+	count, err := unix.Pwrite(local.fd, data, int64(input.Offset))
+	if err != nil {
+		return 0, fuse.Status(errnoOfError(err))
 	}
-	return r.writeStock(input, data)
+	return uint32(count), fuse.OK
 }
 
 func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Status {

@@ -331,6 +331,39 @@ func (r *workspaceFileSystem) finishWorkspaceEntry(unique uint64, entry *replyPu
 	r.finishReplyPublicationRegistration(unique, p)
 }
 
+// Only a WRITE refused before delegation acquisition or with a zero accepted cut may use this
+// transition. No filesystem effect or kernel candidate belongs to that attempt;
+// the original FUSE request remains unanswered and can await fresh admission.
+// This is callback retirement, never a fabricated physical reply completion.
+func (r *rawFileSystem) retireUnacceptedWorkspaceWrite(unique uint64) error {
+	r.mu.Lock()
+	p := r.replyPublications[unique]
+	if p == nil || !p.callbackOwned || !p.workspaceBound || p.originalFinalized || p.settlementClaimed ||
+		len(p.names) != 0 || len(p.attrs) != 0 || len(p.data) != 0 || len(p.unlicensed) != 0 ||
+		p.postState != nil || len(p.expectedPostState) != 0 || p.retainedAnswer || p.lookupReference != nil ||
+		p.dirPlusLookups != nil || p.completeDirectoryCount != 0 || p.cachedCount != 0 || p.payloadError != nil {
+		r.mu.Unlock()
+		return fmt.Errorf("fusev3: unaccepted workspace write retained publication effects")
+	}
+	if source := p.source; source != nil && (!source.ready || source.revoked || source.released) {
+		r.mu.Unlock()
+		return fmt.Errorf("fusev3: unaccepted workspace write retained an unresolved source")
+	}
+	delete(r.replyPublications, unique)
+	claim := r.settleReplyPublicationLocked(p, false)
+	p.closeOriginalDoneLocked()
+	r.mu.Unlock()
+	if p.source != nil {
+		p.source.release()
+	}
+	consumeClaimedAuthorityResponses(claim)
+	r.mu.Lock()
+	close(p.workspaceDone)
+	r.signalSourceChangedLocked()
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *rawFileSystem) transferReplyPublication(unique uint64, serving bool, next *replyPublication) error {
 	if r.mount.workspace == nil {
 		next.callbackOwned = true
