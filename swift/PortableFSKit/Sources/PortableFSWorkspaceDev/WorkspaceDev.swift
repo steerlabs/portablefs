@@ -250,11 +250,17 @@ import PortableFSWorkspaceCore
                     }
                     return
                 }
-                guard job.phase == "failed", job.failure == "handler-failed", !job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned job reported completion") }
+                if index < 2 {
+                    guard job.phase == "failed", job.failure == "handler-failed", !job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned job reported completion") }
+                } else {
+                    // No mount was admitted. Removal still joins the exact
+                    // inventories and kernel absence before retiring the intent.
+                    guard job.phase == "complete", job.failure.isEmpty, job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned intent cleanup failed") }
+                }
                 let accepted = requests + [job.requestID]
                 guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
                 if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
-                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": job.failure]) }
+                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": "handler-failed", "cleanup": job.phase]) }
             } catch { self.fail(error) }
         }
     }

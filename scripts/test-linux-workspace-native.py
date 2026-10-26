@@ -182,7 +182,7 @@ try:
     for _ in range(2):
         guest.command('probe-unavailable-jobs')
         jobs = guest.wait('jobs-refused', 10)
-        assert jobs['mounts'] == 0 and jobs['failure'] == 'handler-failed', jobs
+        assert jobs['mounts'] == 0 and jobs['failure'] == 'handler-failed' and jobs['cleanup'] == 'complete', jobs
         assert len(jobs['request_ids']) == 3 and all(a < b for a, b in zip(jobs['request_ids'], jobs['request_ids'][1:])), jobs
     record('unprovisioned-jobs-retain-failure')
     guest.command('probe-identity')
