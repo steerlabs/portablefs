@@ -111,6 +111,10 @@ with tempfile.TemporaryDirectory(prefix='pfs-clock-load-') as root:
 PROBE = "python3 -c " + shlex.quote("import json,time; m=json.load(open('/run/portablefs-workspace/clock.json')); print(json.dumps(dict(measurement=m,elapsed_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME),wall_ns=time.time_ns())))")
 
 
+class BoundViolation(ValueError):
+    """Observed bound failure, distinct from missing qualification coverage."""
+
+
 class PauseCampaign:
     """The exact candidate's test owner supplies VZ controls; never sleep macOS.
 
@@ -160,15 +164,19 @@ class PauseCampaign:
                     rtc = utc_ns(first['rtc'])
                     offset = (rtc-interval[1],rtc+SECOND+first['sample_age_ns']-interval[0])
                     if not 0 <= first['sample_age_ns'] <= SECOND//4:
-                        raise ValueError('first resumed sample exceeded age allocation')
+                        raise BoundViolation('first resumed sample exceeded age allocation')
                     result['first_read_source_offset_ns'] = offset
                     result['first_read_source'] = ('pass' if max(abs(v) for v in offset)<=SECOND else 'inconclusive')
+                    if offset[0] > SECOND or offset[1] < -SECOND:
+                        raise BoundViolation(f'first resumed RTC source exceeds one second: {offset}')
                     duplicate = result['duplicate_readers']
-                    if duplicate['readers']<8 or duplicate['samples']<8000 or not 0<=duplicate['maximum_ns']<=SECOND//4:
+                    if not 0<=duplicate['maximum_ns']<=SECOND//4:
+                        raise BoundViolation('duplicate RTC read exceeded age allocation')
+                    if duplicate['readers']<8 or duplicate['samples']<8000:
                         raise ValueError('concurrent duplicate-reader coverage incomplete')
                     self.records.append(result)
                 except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError) as error:
-                    self.errors.append(dict(case=case,error=str(error)))
+                    self.errors.append(dict(case=case,error=str(error),bound_violation=isinstance(error,BoundViolation)))
                 finally:
                     self.active.clear()
                     (self.evidence/'pause-campaign.json').write_text(json.dumps(dict(cases=self.records,errors=self.errors),indent=2)+'\n')
@@ -274,6 +282,7 @@ def main():
             load.wait(timeout=20)
     (a.evidence / 'samples.json').write_text(json.dumps(records, indent=2)+'\n')
     coverage = sum(v.get('checks', {}).get('source') == 'pass' for v in records)
+    failures.extend(v['error'] for v in campaign.errors if v.get('bound_violation'))
     available = len(records)-sum(v.get('intentional_pause_unavailability') is True for v in records)
     reference_coverage = sum(v.get('reference_valid') is True for v in records)
     full = time.monotonic()-start >= FULL_SECONDS and not a.dry_run

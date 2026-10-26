@@ -25,8 +25,7 @@ def pause_checks(authority, guest, managed, record):
             trace = dict(case=case, requested_pause_seconds=duration, fencing=fencing,
                          first_operation_prestarted=True, host_sleep=False, request_token=token, request_path=authority.target+'/'+token)
             try:
-                if fencing != 'normal':
-                    code = '''import errno,json,os,sys,time
+                code = '''import errno,json,os,sys,time
 print('armed',flush=True)
 assert sys.stdin.readline().strip()=='probe'
 b=time.clock_gettime_ns(time.CLOCK_BOOTTIME);start=time.monotonic_ns()
@@ -37,13 +36,15 @@ except OSError as e:
 result.update(boottime_ns=b,operation_ns=time.monotonic_ns()-start)
 print(json.dumps(result),flush=True)
 '''.replace('PATH', repr(authority.target+'/'+token))
-                    worker = subprocess.Popen(['/usr/bin/ssh', '-F', guest.ready['ssh_config'],
-                        '-o','ServerAliveInterval=0','-o','TCPKeepAlive=no','portablefs-workspace', 'python3 -u -c '+shlex.quote(code)],
-                        text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    with selectors.DefaultSelector() as ready:
-                        ready.register(worker.stdout, selectors.EVENT_READ)
-                        assert ready.select(10), 'prestarted first operation not armed'
-                        assert worker.stdout.readline().strip() == 'armed'
+                worker = subprocess.Popen(['/usr/bin/ssh', '-F', guest.ready['ssh_config'],
+                    '-o','ServerAliveInterval=0','-o','TCPKeepAlive=no','portablefs-workspace', 'python3 -u -c '+shlex.quote(code)],
+                    text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                with selectors.DefaultSelector() as ready:
+                    ready.register(worker.stdout, selectors.EVENT_READ)
+                    assert ready.select(10), 'prestarted first operation not armed'
+                    assert worker.stdout.readline().strip() == 'armed'
+                trace['worker_armed_host_ns'] = time.monotonic_ns()
+                if fencing != 'normal':
                     limit = time.monotonic()+10
                     while True:
                         guest.command('test-hold-host')
@@ -64,13 +65,13 @@ print(json.dumps(result),flush=True)
                         if paused['event'] == 'test-paused-unfenced': break
                         assert time.monotonic()<limit, paused
                         time.sleep(.02)
-                    # Queue the already-started request while the guest cannot
-                    # execute. It needs no host recovery/status/SSH round trip
-                    # after VZ resume to make its first filesystem operation.
-                    worker.stdin.write('probe\n'); worker.stdin.flush()
                 else:
                     guest.command('pause'); paused = guest.wait('paused',25)
                     assert paused['fenced'] and not paused['attach_allowed'], paused
+                # Queue every case's prestarted operation while VZ is paused.
+                # Normal fencing may hold it outside the cold cohort until
+                # fresh admission; unfenced cases must deny without recovery.
+                worker.stdin.write('probe\n'); worker.stdin.flush()
                 trace['pause_confirmed_host_ns'] = time.monotonic_ns()
                 # The ordinary peer is outside the guest and remains live.
                 # It waits for the actual authority obligation, then persists.
@@ -130,6 +131,12 @@ print(json.dumps(result),flush=True)
                         trace['recovery_disposition']='terminal-cleanup-fresh-authorization'; break
                     assert time.monotonic()<deadline, snapshot
                     time.sleep(.05)
+                if fencing == 'normal':
+                    with selectors.DefaultSelector() as ready:
+                        ready.register(worker.stdout, selectors.EVENT_READ)
+                        assert ready.select(5), 'fenced first operation stranded after recovery'
+                        trace['first_operation'] = json.loads(worker.stdout.readline())
+                assert worker.wait(timeout=5) == 0, worker.stderr.read()
                 assert guest.ssh('cat '+shlex.quote(authority.target+'/'+token)) == 'peer-after-old-permission'
                 trace['fresh_permission_observed_host_ns'] = time.monotonic_ns()
                 traces.append(trace)

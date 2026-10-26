@@ -50,6 +50,15 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(len(campaign.records),3)
             self.assertFalse(campaign.errors)
             self.assertTrue(all(v['first_read_source']=='pass' for v in campaign.records))
+            def failed_bound(args, **kwargs):
+                value=json.loads(result(args,**kwargs))
+                value['first_read']['rtc']='2026-10-26T00:00:05Z'
+                return json.dumps(value)
+            campaign.records=[];campaign.errors=[]
+            with mock.patch.object(clock.subprocess,'check_output',side_effect=failed_bound): campaign.run()
+            self.assertFalse(campaign.records)
+            self.assertEqual(len(campaign.errors),3)
+            self.assertTrue(all(v['bound_violation'] for v in campaign.errors))
 
     def test_fractional_nanoseconds_are_not_rounded(self):
         self.assertEqual(clock.utc_ns('2026-10-26T00:00:00.123456789Z')-
