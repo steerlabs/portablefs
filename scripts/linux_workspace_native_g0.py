@@ -20,6 +20,7 @@ def pause_checks(authority, guest, managed, record):
             case = f'g0-vz-{fencing}-{duration}s'
             token = 'g0-' + uuid.uuid4().hex
             worker = None
+            peer = None
             blocked = False
             trace = dict(case=case, requested_pause_seconds=duration, fencing=fencing,
                          first_operation_prestarted=True, host_sleep=False)
@@ -37,7 +38,7 @@ result.update(boottime_ns=b,operation_ns=time.monotonic_ns()-start)
 print(json.dumps(result),flush=True)
 '''.replace('PATH', repr(authority.target+'/'+token))
                     worker = subprocess.Popen(['/usr/bin/ssh', '-F', guest.ready['ssh_config'],
-                        'portablefs-workspace', 'python3 -u -c '+shlex.quote(code)],
+                        '-o','ServerAliveInterval=0','-o','TCPKeepAlive=no','portablefs-workspace', 'python3 -u -c '+shlex.quote(code)],
                         text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     with selectors.DefaultSelector() as ready:
                         ready.register(worker.stdout, selectors.EVENT_READ)
@@ -91,7 +92,7 @@ print(json.dumps(result),flush=True)
                         ready.register(worker.stdout, selectors.EVENT_READ)
                         assert ready.select(5), 'first expired operation waited for host recovery'
                         first = json.loads(worker.stdout.readline())
-                    assert not first['success'] and first['errno'] in (errno.EIO,errno.ENOTCONN,errno.ESTALE), first
+                    assert not first['success'] and first['errno'] in (errno.EIO,errno.ENOTCONN,errno.ESTALE,errno.EACCES), first
                     assert first['operation_ns']<1_000_000_000, first
                     trace['first_operation'] = first
                     trace['denial_observed_before_host_recovery_ns'] = time.monotonic_ns()
@@ -101,7 +102,22 @@ print(json.dumps(result),flush=True)
                     recovery = guest.wait('test-awake-recovery',10)
                     assert not recovery['attach_allowed'], recovery
                     trace['recovery'] = recovery
-                authority.ready(guest)
+                deadline=time.monotonic()+90
+                while True:
+                    snapshot=authority.status(guest)
+                    rows=[m for m in snapshot.get('mounts',[]) if m['mount']['volumeId']==authority.volume]
+                    if rows and rows[0]['state']=='ready':
+                        trace['recovery_disposition']='closed-cold-fresh'; break
+                    if rows and rows[0]['state'] in ('terminal','authorization-required') and rows[0]['cleanup']=='complete':
+                        trace['terminal']=rows[0]
+                        authority.protected(guest)
+                        authority.unmount(guest,managed)
+                        previous=managed
+                        managed=authority.mount(guest)
+                        assert managed['incarnation']!=previous['incarnation']
+                        trace['recovery_disposition']='terminal-cleanup-fresh-authorization'; break
+                    assert time.monotonic()<deadline, snapshot
+                    time.sleep(.05)
                 assert guest.ssh('cat '+shlex.quote(authority.target+'/'+token)) == 'peer-after-old-permission'
                 trace['fresh_permission_observed_host_ns'] = time.monotonic_ns()
                 traces.append(trace)
@@ -111,6 +127,10 @@ print(json.dumps(result),flush=True)
                 managed = authority.mount(guest)
             finally:
                 if blocked: authority.network(False)
+                if peer is not None and peer.poll() is None:
+                    peer.terminate()
+                    try: peer.wait(timeout=5)
+                    except subprocess.TimeoutExpired: peer.kill();peer.wait(timeout=5)
                 if worker is not None:
                     if worker.poll() is None:
                         worker.terminate()

@@ -17,6 +17,8 @@ import pathlib
 import shlex
 import subprocess
 import time
+import threading
+import re
 
 SECOND = 1_000_000_000
 FULL_SECONDS = 72 * 3600
@@ -25,10 +27,12 @@ INTERVAL = 30
 
 
 def utc_ns(value):
+    fraction = re.search(r'\.(\d+)(?:Z|[+-]\d\d:\d\d)$', value)
+    extra = int((fraction.group(1)+'000000000')[6:9]) if fraction else 0
     value = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
     epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
     delta = value - epoch
-    return (delta.days * 86400 + delta.seconds) * SECOND + delta.microseconds * 1000
+    return (delta.days * 86400 + delta.seconds) * SECOND + delta.microseconds * 1000 + extra
 
 
 def reference_interval(references, began, ended, guest_began, guest_ended):
@@ -107,6 +111,76 @@ with tempfile.TemporaryDirectory(prefix='pfs-clock-load-') as root:
 PROBE = "python3 -c " + shlex.quote("import json,time; m=json.load(open('/run/portablefs-workspace/clock.json')); print(json.dumps(dict(measurement=m,elapsed_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME),wall_ns=time.time_ns())))")
 
 
+class PauseCampaign:
+    """The exact candidate's test owner supplies VZ controls; never sleep macOS.
+
+    The command receives one case JSON argument and returns causal evidence.
+    It owns only its VM, runs prestarted operations and fresh duplicate reads,
+    and collects NTS observations around the first register read after resume.
+    Missing command/coverage never produces a qualification pass.
+    """
+    def __init__(self, command, image_hash, evidence, duration, dry_run):
+        self.command, self.image_hash, self.evidence = command, image_hash, evidence
+        self.duration, self.dry_run = duration, dry_run
+        self.started = time.monotonic()
+        self.stop = threading.Event()
+        self.active = threading.Event()
+        self.records, self.errors = [], []
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        if command:
+            self.thread.start()
+
+    def run(self):
+        blocks = 1 if self.dry_run else int(self.duration // (6*3600))
+        for block in range(blocks):
+            if self.stop.wait(max(0,self.started+(60 if self.dry_run else 900+block*6*3600)-time.monotonic())):
+                return
+            cases = [(mode,pause) for mode in ('normal','delayed','suppressed')
+                     for pause in ((.1,) if self.dry_run else (.1,.5,2,5,15,45,150,600))]
+            for mode,pause in cases:
+                if self.stop.is_set(): return
+                case = dict(block=block, fencing=mode, pause_seconds=pause,
+                            image_manifest_sha256=self.image_hash, host_sleep=False)
+                self.active.set()
+                try:
+                    raw = subprocess.check_output(shlex.split(self.command)+[json.dumps(case)], text=True,
+                                                  timeout=pause+120)
+                    result = json.loads(raw)
+                    if result.get('image_manifest_sha256') != self.image_hash:
+                        raise ValueError('pause driver used a different image')
+                    if result.get('case') != case or result.get('first_operation_prestarted') is not True:
+                        raise ValueError('pause driver did not bind the requested prestarted operation')
+                    if mode != 'normal' and result.get('denied_before_host_round_trip') is not True:
+                        raise ValueError('expired admission succeeded or waited for host recovery')
+                    if not (result.get('closed_cold_fresh') is True or result.get('terminal_cleanup_complete') is True):
+                        raise ValueError('pause did not prove cold recovery or exact terminal cleanup')
+                    first = result['first_read']
+                    interval = reference_interval(first['references'], first['reference_began_ns'],
+                        first['reference_ended_ns'], first['sample_began_ns'], first['sample_ended_ns'])
+                    rtc = utc_ns(first['rtc'])
+                    offset = (rtc-interval[1],rtc+SECOND+first['sample_age_ns']-interval[0])
+                    if not 0 <= first['sample_age_ns'] <= SECOND//4:
+                        raise ValueError('first resumed sample exceeded age allocation')
+                    result['first_read_source_offset_ns'] = offset
+                    result['first_read_source'] = ('pass' if max(abs(v) for v in offset)<=SECOND else 'inconclusive')
+                    duplicate = result['duplicate_readers']
+                    if duplicate['readers']<8 or duplicate['samples']<8000 or not 0<=duplicate['maximum_ns']<=SECOND//4:
+                        raise ValueError('concurrent duplicate-reader coverage incomplete')
+                    self.records.append(result)
+                except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError) as error:
+                    self.errors.append(dict(case=case,error=str(error)))
+                finally:
+                    self.active.clear()
+                    (self.evidence/'pause-campaign.json').write_text(json.dumps(dict(cases=self.records,errors=self.errors),indent=2)+'\n')
+
+    def finish(self):
+        self.stop.set()
+        if self.command:
+            self.thread.join(timeout=725)
+            if self.thread.is_alive():
+                self.errors.append(dict(error="pause driver failed to join; qualification incomplete"))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('image', type=pathlib.Path)
@@ -117,6 +191,7 @@ def main():
     p.add_argument('--dry-run', action='store_true', help='exercise idle/load in 15-minute blocks')
     p.add_argument('--utc-reference-command')
     p.add_argument('--admission-evidence', type=pathlib.Path)
+    p.add_argument('--pause-command', help='read-only-clock native VZ qualification driver; receives one JSON case argument')
     a = p.parse_args()
     seconds = FULL_SECONDS if a.soak else a.seconds
     if seconds < 60 or (a.soak and a.dry_run):
@@ -129,6 +204,7 @@ def main():
     records, failures, drift_bounds = [], [], []
     start, next_sample, block, load = time.monotonic(), 0., -1, None
     deadline = start + seconds
+    campaign = PauseCampaign(a.pause_command, image_hash, a.evidence, seconds, a.dry_run)
     sample_file = (a.evidence / 'samples.jsonl').open('w')
     try:
         while True:
@@ -155,7 +231,13 @@ def main():
             ref_ended = time.monotonic_ns()
             began = time.monotonic_ns()
             record = dict(index=len(records), block=block, load='load' if block % 2 else 'idle',
-                          host_elapsed_ns=began-int(start*SECOND))
+                          host_elapsed_ns=began-int(start*SECOND), independent_reference=reference, reference_error=reference_error, reference_valid=False)
+            if reference:
+                try:
+                    reference_interval(reference['references'],ref_began,ref_ended,ref_ended,ref_ended)
+                    record['reference_valid']=True
+                except (KeyError,TypeError,ValueError) as error:
+                    record['reference_error']=str(error)
             try:
                 sample = json.loads(subprocess.check_output(ssh + [PROBE], text=True, timeout=10))
                 ended = time.monotonic_ns()
@@ -174,7 +256,10 @@ def main():
                     failures.append('independent source error exceeds one second')
             except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
                 record['error'] = str(error)
-                failures.append(str(error))
+                if campaign.active.is_set():
+                    record['intentional_pause_unavailability'] = True
+                else:
+                    failures.append(str(error))
             records.append(record)
             sample_file.write(json.dumps(record, sort_keys=True)+'\n'); sample_file.flush()
             if time.monotonic() >= deadline:
@@ -183,13 +268,16 @@ def main():
             time.sleep(max(0, min(start+next_sample, deadline)-time.monotonic()))
     finally:
         sample_file.close()
+        campaign.finish()
         if load is not None:
             # Only our SSH process, whose bounded remote workload owns a temp tree.
             load.wait(timeout=20)
     (a.evidence / 'samples.json').write_text(json.dumps(records, indent=2)+'\n')
     coverage = sum(v.get('checks', {}).get('source') == 'pass' for v in records)
+    available = len(records)-sum(v.get('intentional_pause_unavailability') is True for v in records)
+    reference_coverage = sum(v.get('reference_valid') is True for v in records)
     full = time.monotonic()-start >= FULL_SECONDS and not a.dry_run
-    utc = ('fail' if failures else 'pass' if full and coverage == len(records) and
+    utc = ('fail' if failures else 'pass' if full and available > 0 and coverage == available and reference_coverage == len(records) and
            drift_bounds and all(v <= SECOND//4 for v in drift_bounds) else 'inconclusive')
     admission, resume_covered, duplicates_covered = 'inconclusive', False, False
     if a.admission_evidence:
@@ -198,18 +286,25 @@ def main():
             admission = evidence.get('rtc_admission', 'inconclusive')
             resume_covered = evidence.get('first_read_after_resume') is True
             duplicates_covered = evidence.get('concurrent_duplicate_readers') is True
+    campaign_complete = (bool(a.pause_command) and not campaign.errors and full and
+                         len(campaign.records)==12*3*8 and
+                         all(v['first_read_source']=='pass' for v in campaign.records))
+    if not campaign_complete:
+        resume_covered = False
+        duplicates_covered = False
     if not resume_covered or not duplicates_covered:
         utc = 'inconclusive' if utc != 'fail' else utc
     result = dict(format=8, image_manifest_sha256=image_hash, seconds=time.monotonic()-start,
-                  dry_run=a.dry_run, full_soak=full, samples=len(records), reference_coverage=coverage,
+                  dry_run=a.dry_run, full_soak=full, samples=len(records), source_coverage=coverage, source_measurements=available, reference_coverage=reference_coverage,
                   blocks=sorted({(v['block'], v['load']) for v in records}), failures=failures,
                   awake_discipline_passed=not failures, utc=utc, rtc_admission=admission,
                   g0='pass' if utc == admission == 'pass' else 'fail' if 'fail' in (utc,admission) else 'inconclusive',
                   first_read_after_resume=resume_covered, concurrent_duplicate_readers=duplicates_covered,
+                  pause_campaign_cases=len(campaign.records), pause_campaign_errors=campaign.errors,
                   utc_accuracy_qualified=utc == 'pass',
-                  unproven=[name for name,ok in [('72-hour coverage',full),('independent NTS UTC coverage',coverage==len(records)),
+                  unproven=[name for name,ok in [('72-hour coverage',full),('independent NTS UTC coverage',reference_coverage==len(records) and coverage==available),
                             ('first read after VZ resume',resume_covered),('concurrent duplicated readers',duplicates_covered),
-                            ('awake drift bound',bool(drift_bounds) and all(v<=SECOND//4 for v in drift_bounds))] if not ok])
+                            ('six-hour VZ pause campaigns',campaign_complete),('awake drift bound',bool(drift_bounds) and all(v<=SECOND//4 for v in drift_bounds))] if not ok])
     (a.evidence / 'result.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, sort_keys=True), flush=True)
     return 1 if failures else 0

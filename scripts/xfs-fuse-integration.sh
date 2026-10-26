@@ -52,6 +52,18 @@ REQUIRED_TESTS=()
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCRenewalSampleCannotInstallAcrossNewClose"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCCutoffPauseMatrix"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCScheduleOneDeniesBeforeRoundTrip"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCFailureLatchesUntilColdPermission"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCRenewalChecksOldIntervalAndIdentity"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCFinalPreparationChecksCachedArenaAndCapsTTL"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCCapacityWaitResamplesBeforeAcceptance"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCCadenceLeavesNativeThreeSeconds"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCOnlyColdWithdrawalAndFreshPermissionClearLatch"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCFreezePublicationCutsDenyDifferentRequest"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCReadFrozenAfterPreparationStillPurges"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCRepeatedPausesAndBackwardCorrectionAboveAnchor"
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootFailedControlStartupTransfersExactOwner"
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootBusyRemovalRetriesAndEscalatesOriginalOwner"
   "github.com/steerlabs/portablefs/vcs/internal/workspacemount:TestRootTerminalObservationRetainsHostCleanupAfterKernelCompletion"

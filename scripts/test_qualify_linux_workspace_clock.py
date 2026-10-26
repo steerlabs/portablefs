@@ -3,6 +3,10 @@
 import importlib.util
 import pathlib
 import unittest
+import json
+import tempfile
+import threading
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('clock', pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py'))
 clock = importlib.util.module_from_spec(spec)
@@ -22,6 +26,34 @@ class QualificationTests(unittest.TestCase):
         for refs in ([],[ref],[ref,ref]):
             with self.assertRaises(ValueError):
                 clock.reference_interval(refs,100,120,130,150)
+
+    def test_pause_campaign_binds_image_and_independent_first_read(self):
+        class NoWait:
+            def wait(self, seconds): return False
+            def is_set(self): return False
+        with tempfile.TemporaryDirectory(prefix='pfs-g0-campaign-test-') as directory:
+            campaign=clock.PauseCampaign.__new__(clock.PauseCampaign)
+            campaign.command='test-driver'; campaign.image_hash='candidate'
+            campaign.evidence=pathlib.Path(directory); campaign.duration=1800
+            campaign.dry_run=True; campaign.started=0; campaign.stop=NoWait()
+            campaign.active=threading.Event(); campaign.records=[];campaign.errors=[]
+            utc=clock.utc_ns('2026-10-26T00:00:00Z')
+            def result(args, **kwargs):
+                case=json.loads(args[-1])
+                return json.dumps(dict(case=case,image_manifest_sha256='candidate',
+                    first_operation_prestarted=True,denied_before_host_round_trip=True,closed_cold_fresh=True,
+                    first_read=dict(rtc='2026-10-26T00:00:00Z',sample_age_ns=1000,
+                        reference_began_ns=100,reference_ended_ns=120,sample_began_ns=130,sample_ended_ns=140,
+                        references=[dict(server=n,protocol='NTS',authenticated=True,unix_ns=utc+500_000_000,uncertainty_ns=1000) for n in ('a','b')]),
+                    duplicate_readers=dict(readers=8,samples=8000,maximum_ns=1000)))
+            with mock.patch.object(clock.subprocess,'check_output',side_effect=result): campaign.run()
+            self.assertEqual(len(campaign.records),3)
+            self.assertFalse(campaign.errors)
+            self.assertTrue(all(v['first_read_source']=='pass' for v in campaign.records))
+
+    def test_fractional_nanoseconds_are_not_rounded(self):
+        self.assertEqual(clock.utc_ns('2026-10-26T00:00:00.123456789Z')-
+                         clock.utc_ns('2026-10-26T00:00:00Z'),123456789)
 
     def test_integer_nanoseconds_and_separate_source_bound(self):
         rtc = clock.utc_ns('2026-10-26T00:00:00Z')

@@ -1263,6 +1263,10 @@ func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, candidate permi
 		s.closeRTCIntervalLocked()
 		return false
 	}
+	if s.mount != nil && s.mount.workspaceRTC != nil && (s.workspaceProof == nil ||
+		s.mount.workspace.Recover(*s.workspaceProof) != nil && !s.mount.workspace.Installed(*s.workspaceProof)) {
+		return false
+	}
 	if deadline.After(s.horizon) {
 		s.permission = candidate
 		s.horizon = deadline

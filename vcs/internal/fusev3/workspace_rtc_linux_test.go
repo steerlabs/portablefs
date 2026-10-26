@@ -360,3 +360,54 @@ func TestWorkspaceRTCRepeatedPausesAndBackwardCorrectionAboveAnchor(t *testing.T
 		t.Fatal("backward correction resurrected closure")
 	}
 }
+
+func TestWorkspaceRTCRenewalSampleCannotInstallAcrossNewClose(t *testing.T) {
+	f, clock, rtc := workspaceRTCFixture(t)
+	s := f.mount.subscription
+	// Recover the gate owner from this fixture's installed proof through a new
+	// real binding, so Close changes its seqlock independently of the use lock.
+	gate := bindWorkspaceTestGate(t, f.mount)
+	clock.advance(time.Second)
+	rtc.second.Store(1)
+	old := s.permission
+	reader := &cutRTC{reader: rtc, inside: func(n int) {
+		if n == 2 {
+			gate.Close(2)
+		}
+	}}
+	f.mount.workspaceRTC = reader
+	candidate := permissionclock.Permission{Time: clock.Now().Add(10 * time.Second), Started: clock.Now(), RTC: rtc.anchor.Add(time.Second), Horizon: 10 * time.Second}
+	if s.acceptRenewal(s.incarnation, candidate) || s.permission != old {
+		t.Fatal("obsolete candidate installed across host Close", reader.calls, s.permission)
+	}
+}
+
+func TestWorkspaceRTCCutoffPauseMatrix(t *testing.T) {
+	for _, pause := range []time.Duration{100 * time.Millisecond, 500 * time.Millisecond, 2 * time.Second} {
+		for _, cutoff := range []time.Duration{6 * time.Second, 10 * time.Second} {
+			for _, offset := range []time.Duration{-time.Millisecond, 0, time.Millisecond} {
+				for _, phase := range []time.Duration{0, 500 * time.Millisecond, 999 * time.Millisecond} {
+					f, clock, rtc := workspaceRTCFixture(t)
+					elapsed := cutoff + offset
+					clock.advance(elapsed - pause)
+					rtc.second.Store(int64((phase + elapsed) / time.Second))
+					remaining := f.mount.subscription.workspaceRemaining()
+					if elapsed >= 9*time.Second && remaining != 0 {
+						t.Fatal("authority/lead cutoff admitted", pause, cutoff, offset, phase)
+					}
+					if phase == 0 && cutoff == 6*time.Second && offset < 0 && remaining <= 0 {
+						t.Fatal("below reduced cutoff refused without source variation")
+					}
+					if phase == 0 && cutoff == 6*time.Second && offset >= 0 && remaining > 0 {
+						t.Fatal("RTC equality or later admitted")
+					}
+					if remaining > 0 && remaining+elapsed > 9*time.Second {
+						t.Fatal("unsafe remaining after pause")
+					}
+					f.mount.cancel()
+					f.mount.delegations.Stop()
+				}
+			}
+		}
+	}
+}

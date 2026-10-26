@@ -411,6 +411,7 @@ func TestWorkspaceSubscriptionAnchorsSurviveQueuePaginationAndRenewal(t *testing
 		t.Fatal(p, callErr)
 	}
 	initial := p
+	handler.beforeSubscriptionReply.Store(nil)
 	elapsed.Store(int64(3 * time.Second))
 	_, p, err := c.Subscribe(t.Context(), first.GetSnapshotId(), first.GetNextAfterIdentity())
 	if err != nil || p != initial {

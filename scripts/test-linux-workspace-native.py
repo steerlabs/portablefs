@@ -1,5 +1,6 @@
 """Real VZ execution, independent causal assertions, exact required inventory."""
 import json
+import hashlib
 import os
 import datetime
 import pathlib
@@ -120,6 +121,11 @@ try:
     finally:
         shutil.rmtree(corrupt.parent)
     record('artifact-verification')
+    g0_native=json.loads((root/'g0-native.json').read_text())
+    assert g0_native['image_manifest_sha256']==hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest()
+    for case in g0_native['cases']:
+        assert case['pass'] and case['no_host_round_trip_after_resume'] and case['rpc_delta']==0
+        record(case['case'])
     operations = guest.starting['operations']
     assert operations.index('power-registered') < operations.index('start-request')
     record('power-before-start')
@@ -331,7 +337,7 @@ try:
     record('clean-stop')
     product_checks(image, root / "product", record, authority=authority)
     assert sorted(passed) == sorted(required), (passed, required)
-    (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state)}, indent=2) + '\n')
+    (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)
 finally:
     if guest:
