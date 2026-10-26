@@ -42,6 +42,7 @@ public final class WorkspaceReservations {
     }
     public var inventory: [WorkspaceReservation] { state.reservations }
     public func reserve(_ reservation: WorkspaceReservation) throws {
+        try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: directory.url)
         try reservation.validate()
         for old in state.reservations where old.authority == reservation.authority && old.volume == reservation.volume || (old.frontend == "workspace" || reservation.frontend == "workspace") && old.volume == reservation.volume {
             if old == reservation { return }

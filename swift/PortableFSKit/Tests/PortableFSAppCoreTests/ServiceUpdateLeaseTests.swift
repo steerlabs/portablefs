@@ -424,7 +424,11 @@ private func withUpdateStore(
             let host = account.appendingPathComponent("host", isDirectory: true)
             try FileManager.default.createDirectory(at: host, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
             let store = try PortableFSDUpdateLeaseStore(directoryURL: host)
-            try store.create(updateTestLease(phase: phase))
+            let template = updateTestLease(phase: phase)
+            let now = Int64(Date().timeIntervalSince1970 * 1_000)
+            try store.create(PortableFSDUpdateLease(schemaVersion: template.schemaVersion, phase: phase,
+                tokenSHA256: template.tokenSHA256, oldRelease: template.oldRelease, targetRelease: template.targetRelease,
+                createdAtUnixMs: now, deadlineUnixMs: now + PortableFSDUpdateLease.lifetimeMilliseconds))
             if phase == .targetComplete || phase == .rollbackComplete {
                 try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: account)
             } else {

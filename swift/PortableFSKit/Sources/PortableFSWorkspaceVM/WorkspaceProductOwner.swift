@@ -12,7 +12,6 @@ import PortableFSAppCore
     private let factory: Factory
     private var runtimeStarted = false
     private var cleanStopConfirmed = false
-    private var runtimeAdmission: WorkspaceFileLock?
     private var runtime: (any WorkspaceProductRuntime)?
     private var latest: WorkspaceStatusReply?
     private var inFlight = Set<String>()
@@ -116,6 +115,8 @@ import PortableFSAppCore
         let admission = try acquireAdmission()
         try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
+        defer { withExtendedLifetime((transition, admission)) {} }
+        try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: reservationDirectory)
         for volume in store.value.volumes { try transition.reserve(volume.reservation) }
         let instance: any WorkspaceProductRuntime
         do { instance = try factory() } catch { failure = String(describing: error); throw error }
@@ -130,11 +131,9 @@ import PortableFSAppCore
             for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity" }
         }
         runtimeStarted = false; cleanStopConfirmed = false
-        runtimeAdmission = admission
         runtime = instance
         do { try instance.start(); runtimeStarted = true }
         catch { failure=String(describing:error);scheduleUpdate();throw error }
-        withExtendedLifetime(transition) {}
     }
     private func remove(_ volume: String, force: Bool) throws {
         guard let index = store.value.volumes.firstIndex(where: { $0.connection.volumeId == volume }) else { throw WorkspaceVMError("unknown workspace volume") }
@@ -178,7 +177,7 @@ import PortableFSAppCore
                     state.current=nil; state.execution=nil
                     if stopRequested { state.running=false }
                 }
-                self.runtime = nil; runtimeAdmission = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
+                self.runtime = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
                 try releaseAbsentReservations()
                 if stopRequested { try store.commit { $0.running = false }; stopRequested = false }
                 else if failure.isEmpty { failure = "Cleanup required" }

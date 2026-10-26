@@ -12,8 +12,11 @@ public enum PortableFSProductUpdate {
             return
         }
         let store = try PortableFSDUpdateLeaseStore(directoryURL: host)
-        if let lease = try store.load(), !lease.phase.permitsNormalAdmission {
-            throw PortableFSSignedServiceError.codeValidation("PortableFS update is pending")
+        if let lease = try store.load() {
+            let now = Int64(Date().timeIntervalSince1970 * 1_000)
+            guard lease.createdAtUnixMs <= now + 60_000, lease.phase.permitsNormalAdmission else {
+                throw PortableFSSignedServiceError.codeValidation("PortableFS update is pending")
+            }
         }
     }
 }

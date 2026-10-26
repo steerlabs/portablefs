@@ -120,7 +120,8 @@ continues to govern other users and machines.
 
 The existing per-account `mount-lifecycle.lock` is the one update exclusion for
 both frontends. Workspace Start/Mount acquire a shared guard; cleanup remains
-available behind closed admission. A live VM retains the guard through confirmed
+available behind closed admission. Starts retain the shared guard through durable
+execution publication. The VM's durable presence marker remains through confirmed
 termination. The installer acquires the exclusive guard, proves exact FSKit absence and requires the workspace's
 `resources.present` name absent. It never decodes an outgoing desired-state
 registry. The service publishes this marker durably before VM execution and

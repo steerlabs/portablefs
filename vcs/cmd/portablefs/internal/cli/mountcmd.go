@@ -27,6 +27,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
@@ -221,6 +222,9 @@ func cmdMount(e *cmdEnv, args []string) int {
 		return e.fail("mount", fmt.Errorf("acquire account session guard: %w; credentials or profiles may be changing", err))
 	}
 	defer sessionGuard.Close()
+	if err := hostctl.RequireNormalAdmission(sessionStateDir); err != nil {
+		return e.fail("mount", err)
+	}
 	volumeID := positionals[0]
 	if !validVolumeName(volumeID) {
 		return e.usageError("mount", fmt.Errorf("invalid volume id %q: must match [A-Za-z0-9_-]{1,220}", volumeID))

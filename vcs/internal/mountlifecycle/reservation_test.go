@@ -1,15 +1,61 @@
 package mountlifecycle
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
+
+func TestPendingUpdateRefusesReservationAndAllowsCleanup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	transition, err := BeginTransition(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transition.Close()
+	old := reservation("fskit", "old")
+	if err := transition.Reserve(old); err != nil {
+		t.Fatal(err)
+	}
+	host := filepath.Join(dir, "host")
+	if err := os.Mkdir(host, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := hostctl.TokenSHA256(strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := hostctl.ReleaseIdentity{CodeDirectoryHash: strings.Repeat("b", 40), ExecutableSHA256: strings.Repeat("b", 64), DaemonVersion: "1"}
+	now := time.Now()
+	body, err := json.Marshal(hostctl.ActivationLease{SchemaVersion: 1, Phase: hostctl.PhasePreparingOld, TokenSHA256: hash,
+		OldRelease: release, TargetRelease: release, CreatedAtUnixMS: now.UnixMilli(), DeadlineUnixMS: now.Add(hostctl.LeaseLifetime).UnixMilli()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, hostctl.LeaseName), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next := old
+	next.Volume = "vol-2"
+	next.Owner = "new"
+	if err := transition.Reserve(next); err == nil {
+		t.Fatal("new reservation entered pending update")
+	}
+	if err := transition.Release(old); err != nil {
+		t.Fatalf("cleanup blocked by pending update: %v", err)
+	}
+	if len(transition.Inventory()) != 0 {
+		t.Fatal("cleanup did not retire old reservation")
+	}
+}
 
 func reservation(frontend, owner string) Reservation {
 	return Reservation{Authority: strings.Repeat("ab", 32), Volume: "vol-1", Frontend: frontend, Owner: owner}

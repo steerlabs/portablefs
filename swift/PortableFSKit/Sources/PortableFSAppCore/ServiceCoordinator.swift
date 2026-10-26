@@ -472,7 +472,8 @@ public enum PortableFSDServiceCoordinator {
         }
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
-            outgoing: try ExpectedDaemon(bundle: bundle, releaseIdentity: releaseIdentity)
+            outgoing: try ExpectedDaemon(bundle: bundle, releaseIdentity: releaseIdentity),
+            workspaceDrain: true
         )
         do {
             try quiesceWorkspaceForInstaller(bundle: bundle)
@@ -628,13 +629,21 @@ public enum PortableFSDServiceCoordinator {
                 "the cancelled installer release is not this sealed release"
             )
         }
+        let service = SMAppService.agent(plistName: configuration.plistName)
+        if service.status == .enabled {
+            // A busy preflight may leave the original services serving. No
+            // replacement crossed this pre-commit boundary: prove that exact
+            // old daemon live, then let the token owner reopen admission.
+            // Requiring an empty VM here would strand a harmless deferral.
+            try requireLiveDaemon(expectedRelease, bundle: bundle)
+            return
+        }
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
             outgoing: try ExpectedDaemon(bundle: bundle, releaseIdentity: expectedRelease)
         )
         defer { updateGuard.release() }
 
-        let service = SMAppService.agent(plistName: configuration.plistName)
         switch service.status {
         case .notRegistered, .notFound:
             try activateForInstaller(
@@ -1330,9 +1339,11 @@ public enum PortableFSDServiceCoordinator {
     /// the helper then proves the inventory empty without adopting a daemon,
     /// and this app decides registry absence under the state singleton.
     static func inventoryGuardArguments(
-        outgoing: ExpectedDaemon?
+        outgoing: ExpectedDaemon?,
+        workspaceDrain: Bool = false
     ) -> [String] {
         var arguments = ["lifecycle", "hold-install-exclusive", "--json"]
+        if workspaceDrain { arguments.append("--workspace-drain") }
         if let outgoing {
             arguments += [
                 "--expected-daemon-version", outgoing.releaseIdentity.daemonVersion,
@@ -1346,7 +1357,8 @@ public enum PortableFSDServiceCoordinator {
 
     private static func acquireEmptyInventoryGuard(
         bundle: Bundle,
-        outgoing: ExpectedDaemon?
+        outgoing: ExpectedDaemon?,
+        workspaceDrain: Bool = false
     ) throws -> EmptyInventoryGuard {
         let cliURL = bundle.bundleURL
             .appendingPathComponent("Contents/Helpers", isDirectory: true)
@@ -1360,7 +1372,7 @@ public enum PortableFSDServiceCoordinator {
         let output = Pipe()
         let errors = Pipe()
         process.executableURL = cliURL
-        process.arguments = inventoryGuardArguments(outgoing: outgoing)
+        process.arguments = inventoryGuardArguments(outgoing: outgoing, workspaceDrain: workspaceDrain)
         process.standardInput = input
         process.standardOutput = output
         process.standardError = errors
@@ -1396,7 +1408,7 @@ public enum PortableFSDServiceCoordinator {
         ),
               payload.schemaVersion == 1,
               payload.held,
-              payload.purpose == "service-update",
+              payload.purpose == (workspaceDrain ? "workspace-drain" : "service-update"),
               payload.kernelMounts == 0,
               payload.mountRecords == 0,
               payload.mountIntents == 0,

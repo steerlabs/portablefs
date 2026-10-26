@@ -103,6 +103,9 @@ func (t *Transition) Inventory() []Reservation {
 	return append([]Reservation(nil), t.state.Reservations...)
 }
 func (t *Transition) Reserve(r Reservation) error {
+	if err := hostctl.RequireNormalAdmission(t.stateDir); err != nil {
+		return err
+	}
 	if !validReservation(r) {
 		return errors.New("invalid volume reservation")
 	}
