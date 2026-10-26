@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	control "github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
@@ -180,54 +181,59 @@ func TestTransportUncooperativeJobDiscardsAtSharedBudget(t *testing.T) {
 // 64 registered mounts, one stuck ignoring ctx: one deadline total, siblings
 // cancelled, no partial ack, stuck lane still owned.
 func TestParallelDrain64RetainsStuckOwnerAndCancelsSiblings(t *testing.T) {
-	s, err := New(id(1), id(2), id(3), true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(s.ChannelLost)
-	var cancelled atomic.Int32
-	release := make(chan struct{})
-	defer close(release)
-	var stuck *entry
-	for i := range control.MaxMounts {
-		mid := retirementVolume(i, 4)
-		isStuck := i == 37
-		m := &fakeMount{suspend: func(ctx context.Context, _ *pb.Suspension) (ColdResult, error) {
-			if isStuck {
-				<-release
-				return ColdResult{ColdComplete: true}, nil
-			}
-			<-ctx.Done()
-			cancelled.Add(1)
-			return ColdResult{}, ctx.Err()
-		}}
-		if err := s.Register(context.Background(), mid, Witness{}, m); err != nil {
+	synctest.Test(t, func(t *testing.T) {
+		s, err := New(id(1), id(2), id(3), true, nil)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if isStuck {
-			stuck = s.mounts[control.MountKey(mid)]
+		t.Cleanup(s.ChannelLost)
+		var cancelled atomic.Int32
+		release := make(chan struct{})
+		defer close(release)
+		var stuck *entry
+		for i := range control.MaxMounts {
+			mid := retirementVolume(i, 4)
+			isStuck := i == 37
+			m := &fakeMount{suspend: func(ctx context.Context, _ *pb.Suspension) (ColdResult, error) {
+				if isStuck {
+					<-release
+					return ColdResult{ColdComplete: true}, nil
+				}
+				<-ctx.Done()
+				cancelled.Add(1)
+				return ColdResult{}, ctx.Err()
+			}}
+			if err := s.Register(context.Background(), mid, Witness{}, m); err != nil {
+				t.Fatal(err)
+			}
+			if isStuck {
+				stuck = s.mounts[control.MountKey(mid)]
+			}
 		}
-	}
-	budget := 300 * time.Millisecond
-	start := time.Now()
-	ack, err := s.Suspend(context.Background(), suspension(s), start.Add(budget))
-	elapsed := time.Since(start)
-	if err == nil || ack != nil {
-		t.Fatal("partial ack")
-	}
-	if elapsed < budget || elapsed > budget+150*time.Millisecond {
-		t.Fatalf("budget spent per mount or not at all: %v", elapsed)
-	}
-	waitFor(t, func() bool { return cancelled.Load() == control.MaxMounts-1 })
-	select {
-	case stuck.serial <- struct{}{}:
-		<-stuck.serial
-		t.Fatal("stuck lane released")
-	default:
-	}
-	if s.Status().State != "discard-only" {
-		t.Fatal("failed drain did not discard")
-	}
+		budget := 300 * time.Millisecond
+		start := time.Now()
+		ack, err := s.Suspend(context.Background(), suspension(s), start.Add(budget))
+		elapsed := time.Since(start)
+		if err == nil || ack != nil {
+			t.Fatal("partial ack")
+		}
+		if elapsed != budget {
+			t.Fatalf("budget spent per mount or not at all: %v", elapsed)
+		}
+		synctest.Wait()
+		if cancelled.Load() != control.MaxMounts-1 {
+			t.Fatalf("cancelled drains = %d, want %d", cancelled.Load(), control.MaxMounts-1)
+		}
+		select {
+		case stuck.serial <- struct{}{}:
+			<-stuck.serial
+			t.Fatal("stuck lane released")
+		default:
+		}
+		if s.Status().State != "discard-only" {
+			t.Fatal("failed drain did not discard")
+		}
+	})
 }
 
 func TestParallelDrainExpiredBudgetRefusesIncludingEmptyRoster(t *testing.T) {
