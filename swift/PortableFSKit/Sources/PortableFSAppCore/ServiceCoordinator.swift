@@ -2520,19 +2520,7 @@ extension PortableFSDServiceCoordinator {
         let deadline = Date().addingTimeInterval(10)
         repeat {
             if service.status == .notRegistered || service.status == .notFound {
-                switch try lockStateSingleton(at: directory, creating: false, lockName: "service.lock") {
-                case .absent:
-                    try requireWorkspaceResourceWitnessAbsent(directory)
-                    return
-                case .owned(let exclusion):
-                    defer { exclusion.release() }
-                    try exclusion.requireResourceAbsent("resources.present")
-                    var socket = stat()
-                    let path = directory.appendingPathComponent("control.sock").path
-                    guard lstat(path, &socket) != 0, errno == ENOENT else { throw PortableFSSignedServiceError.invalidIdentity }
-                    return
-                case .held: break
-                }
+                if try workspaceRuntimeAbsent(directory) { return }
             }
             Thread.sleep(forTimeInterval: 0.05)
         } while Date() < deadline
@@ -2541,6 +2529,23 @@ extension PortableFSDServiceCoordinator {
 }
 
 extension PortableFSDServiceCoordinator {
+    private static func workspaceRuntimeAbsent(_ directory: URL) throws -> Bool {
+        var exclusions: [StateSingletonExclusion] = []
+        defer { exclusions.forEach { $0.release() } }
+        for name in ["service.lock", "owner.lock"] {
+            switch try lockStateSingleton(at: directory, creating: false, lockName: name) {
+            case .absent: break
+            case .held: return false
+            case .owned(let exclusion): exclusions.append(exclusion)
+            }
+        }
+        try requireWorkspaceResourceWitnessAbsent(directory)
+        for name in ["control.sock", "ssh.sock"] {
+            var entry = stat()
+            guard lstat(directory.appendingPathComponent(name).path, &entry) != 0, errno == ENOENT else { throw PortableFSSignedServiceError.invalidIdentity }
+        }
+        return true
+    }
     private static func requireWorkspaceResourceWitnessAbsent(_ url: URL) throws {
         guard let directory = try openStateDirectory(at: url, creating: false) else { return }
         defer { Darwin.close(directory) }

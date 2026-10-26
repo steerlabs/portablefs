@@ -879,7 +879,7 @@ for (const ciGate of [
 // same image and SDK as the Swift tests, packaging and signing lanes.
 for (const [filename, source, jobs] of [
   ["ci.yml", ciWorkflow, ["swift-xcode-native", "go-darwin", "macos-app-unsigned"]],
-  ["release.yml", workflow, ["macos-app"]],
+  ["release.yml", workflow, ["macos-app", "verify-signed-release"]],
 ]) {
   for (const job of jobs) {
     const body = new RegExp(`\n  ${job}:\n([\\s\\S]*?)(?=\n  [\\w-]+:\n|$)`).exec(source)?.[1] ?? "";

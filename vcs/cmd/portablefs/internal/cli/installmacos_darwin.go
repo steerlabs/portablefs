@@ -332,11 +332,18 @@ func runInstallMacOSAppWithLayout(
 			return macOSInstallResult{}, fmt.Errorf("workspace singleton release unconfirmed: %w", err)
 		}
 		defer workspaceExclusion.Close()
+		ownerExclusion, err := mountlifecycle.AcquireNamedExclusive(filepath.Join(stateDir, "workspace"), "owner.lock")
+		if err != nil {
+			return macOSInstallResult{}, fmt.Errorf("workspace VM owner singleton release unconfirmed: %w", err)
+		}
+		defer ownerExclusion.Close()
 		if err := requireWorkspaceResourcesAbsent(stateDir); err != nil {
 			return macOSInstallResult{}, err
 		}
-		if _, err := os.Lstat(filepath.Join(stateDir, "workspace/control.sock")); !os.IsNotExist(err) {
-			return macOSInstallResult{}, fmt.Errorf("workspace endpoint absence unconfirmed: %v", err)
+		for _, name := range []string{"control.sock", "ssh.sock"} {
+			if _, err := os.Lstat(filepath.Join(stateDir, "workspace", name)); !os.IsNotExist(err) {
+				return macOSInstallResult{}, fmt.Errorf("workspace endpoint absence unconfirmed: %s: %v", name, err)
+			}
 		}
 	}
 

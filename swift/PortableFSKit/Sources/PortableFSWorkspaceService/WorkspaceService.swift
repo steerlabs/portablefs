@@ -39,7 +39,6 @@ import PortableFSWorkspaceVM
                     #endif
                 } catch { throw WorkspaceVMError("Workspace image failed verification") }
                 guard artifact.release.appVersion == bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String else { throw WorkspaceVMError("Workspace image failed verification") }
-                try WorkspaceDiskSpace.preflight(at: directory, requiredBytes: WorkspaceDiskSpace.initialDataReserveBytes)
                 return try WorkspaceVMRuntime(artifact: artifact, directory: directory)
             }
             let listener = try PortableFSSignedLocalListener(directory: directory, socketName: "control.sock", release: release, frameLimit: WorkspaceHostControl.maxFrame)
