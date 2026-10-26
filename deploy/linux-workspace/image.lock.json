@@ -28,7 +28,8 @@
     "nodejs",
     "npm",
     "python3-venv",
-    "python3-pip"
+    "python3-pip",
+    "wireless-regdb"
   ],
   "packages": [
     {
@@ -1656,28 +1657,28 @@
       "version": "4.12.1"
     },
     {
-      "built_using": "linux (= 6.12.111-1)",
-      "package": "linux-image-6.12.111+deb13-arm64",
+      "built_using": "linux (= 6.12.113-1)",
+      "package": "linux-image-6.12.113+deb13-arm64",
       "source": "linux-signed-arm64",
-      "source_version": "6.12.111+1",
+      "source_version": "6.12.113+1",
       "static_built_using": "",
-      "version": "6.12.111-1"
+      "version": "6.12.113-1"
     },
     {
       "built_using": "",
       "package": "linux-image-arm64",
       "source": "linux-signed-arm64",
-      "source_version": "6.12.111+1",
+      "source_version": "6.12.113+1",
       "static_built_using": "",
-      "version": "6.12.111-1"
+      "version": "6.12.113-1"
     },
     {
       "built_using": "",
       "package": "linux-libc-dev",
       "source": "linux",
-      "source_version": "6.12.111-1",
+      "source_version": "6.12.113-1",
       "static_built_using": "",
-      "version": "6.12.111-1"
+      "version": "6.12.113-1"
     },
     {
       "built_using": "",
@@ -4833,6 +4834,14 @@
     },
     {
       "built_using": "",
+      "package": "wireless-regdb",
+      "source": "wireless-regdb",
+      "source_version": "2026.05.30-1~deb13u1",
+      "static_built_using": "",
+      "version": "2026.05.30-1~deb13u1"
+    },
+    {
+      "built_using": "",
       "package": "xz-utils",
       "source": "xz-utils",
       "source_version": "5.8.1-1+deb13u1",
@@ -4853,7 +4862,7 @@
     "filename": "go1.26.10.src.tar.gz",
     "sha256": "fd63e883ba2f2bfca93c1646b31ebef63e2b1e4d2b317c9789d976a68d81f36f"
   },
-  "kernel_release": "6.12.111+deb13-arm64",
+  "kernel_release": "6.12.113+deb13-arm64",
   "sources": [
     {
       "files": {
@@ -6538,22 +6547,22 @@
       "version": "1.5.7+dfsg-1"
     },
     {
+      "package": "linux",
+      "version": "6.12.113-1",
       "files": {
-        "debian/linux/6.12.111-1/linux_6.12.111-1.debian.tar.xz": {
-          "sha256": "e0146c63a70014f23141fe3e4e830e8a5b2627427d449f3e5415d930016be297",
-          "size": 1933512
-        },
-        "debian/linux/6.12.111-1/linux_6.12.111-1.dsc": {
-          "sha256": "6935287a25ed12865714b53cb936959db5875ee025abdaadea8df6335fe74d55",
+        "debian/linux/6.12.113-1/linux_6.12.113-1.dsc": {
+          "sha256": "7785e2db803dc74912f2dd4861eb454404cf3b9a2c2120f0cc3efda1f2337fa6",
           "size": 290418
         },
-        "debian/linux/6.12.111-1/linux_6.12.111.orig.tar.xz": {
-          "sha256": "716516cd85c3ff9e5c197203730b698ad7c0fb4c6c2d1d1e44ab3ced2faba178",
-          "size": 151518968
+        "debian/linux/6.12.113-1/linux_6.12.113-1.debian.tar.xz": {
+          "sha256": "e2d62aaf6d3771dce7116feea9c419b47d6bbf8cb957153896fbbc276f2a54f9",
+          "size": 1954984
+        },
+        "debian/linux/6.12.113-1/linux_6.12.113.orig.tar.xz": {
+          "sha256": "2efc477744741f5d580a199ee79c251abb01f899759c621d1af0c3d361380821",
+          "size": 151589656
         }
-      },
-      "package": "linux",
-      "version": "6.12.111-1"
+      }
     },
     {
       "files": {
@@ -6570,18 +6579,18 @@
       "version": "4.12.1"
     },
     {
+      "package": "linux-signed-arm64",
+      "version": "6.12.113+1",
       "files": {
-        "debian/linux-signed-arm64/6.12.111+1/linux-signed-arm64_6.12.111+1.dsc": {
-          "sha256": "1de201bb8396be10efc2a45ca1b247cef8aff33516877d37799fba356205af08",
+        "debian/linux-signed-arm64/6.12.113+1/linux-signed-arm64_6.12.113+1.dsc": {
+          "sha256": "b54cb23cbc73171aa2a365d2c536a6eb9f2009417d868a65994fb8786ad91172",
           "size": 9683
         },
-        "debian/linux-signed-arm64/6.12.111+1/linux-signed-arm64_6.12.111+1.tar.xz": {
-          "sha256": "fc91cbc6f7bc8c083aaed4f030a2109dc0a3099135be7c748a66f7b94edaa530",
-          "size": 1054824
+        "debian/linux-signed-arm64/6.12.113+1/linux-signed-arm64_6.12.113+1.tar.xz": {
+          "sha256": "85e501f17ac11f96636de752e2e3c2e66f5c8958c00c0ffe106d2e6e30526928",
+          "size": 1077012
         }
-      },
-      "package": "linux-signed-arm64",
-      "version": "6.12.111+1"
+      }
     },
     {
       "files": {
@@ -17330,6 +17339,24 @@
       "version": "0.46.1-2"
     },
     {
+      "package": "wireless-regdb",
+      "version": "2026.05.30-1~deb13u1",
+      "files": {
+        "debian/wireless-regdb/2026.05.30-1~deb13u1/wireless-regdb_2026.05.30-1~deb13u1.dsc": {
+          "sha256": "942d249ebe62d66eb91a78b9d4c9d58147a006099532ea15065fb3f9fe6d078c",
+          "size": 2303
+        },
+        "debian/wireless-regdb/2026.05.30-1~deb13u1/wireless-regdb_2026.05.30-1~deb13u1.debian.tar.xz": {
+          "sha256": "b92130f84e7fe9dbacdf1a2ffd5d5212b117ce072abd041c4aba87b7d03d7e3f",
+          "size": 21188
+        },
+        "debian/wireless-regdb/2026.05.30-1~deb13u1/wireless-regdb_2026.05.30.orig.tar.xz": {
+          "sha256": "8a27bfc081bafed8c24dd70fab0d96f098e5a0bfcd08d3da672595f225ab8993",
+          "size": 32044
+        }
+      }
+    },
+    {
       "files": {
         "debian/wtmpdb/0.73.0-3+deb13u1/wtmpdb_0.73.0-3+deb13u1.debian.tar.xz": {
           "sha256": "becebb935a760c8cd5cc24113e6a8133fbac685ecbdc649f34470cb98d86a728",
@@ -17405,5 +17432,6 @@
       "package": "zlib",
       "version": "1:1.3.dfsg+really1.3.1-1"
     }
-  ]
+  ],
+  "security_snapshot": "20261026T000000Z"
 }

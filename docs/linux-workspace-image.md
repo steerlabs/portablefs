@@ -2,7 +2,7 @@
 
 The guest is Debian 13 arm64 at the snapshot in
 `deploy/linux-workspace/image.lock.json`, with exact binary/source inventories,
-the 6.12.111 kernel and Go 1.26.10. The 3 GiB ext4 system disk is read-only.
+the 6.12.113 kernel and Go 1.26.10. The 3 GiB ext4 system disk is read-only.
 The owner creates the 64 GiB sparse persistent data disk locally; it is never
 part of an image or source download. Node.js, npm, Python pip/venv, Git and the
 C/C++ toolchain are installed before sealing the system disk.
@@ -25,9 +25,36 @@ The binaries carry VERSION; the guest handshake binds the exact source commit
 and image-input digest. No older authority protocol or image decoder is used.
 The reproduction gate hashes every output, including both compressed archives.
 
-To change package inputs, edit the include list and run the builder with
+The base snapshot and build epoch remain fixed. A separately pinned security
+snapshot supplies Debian's 6.12.113-1 kernel and matching userspace headers;
+APT preferences retain every other locked package version before bootstrap.
+The pinned `wireless-regdb` package supplies the regulatory firmware requested
+by Debian's kernel, avoiding missing-firmware errors during boot.
+This kernel includes the 6.12.112 anon-vma publication ordering fix, upstream
+`b6ac0b3f6013c168f22cad97e79967accacb08e1`, listed in
+[Debian's changelog](https://tracker.debian.org/news/1811640/accepted-linux-612113-1-source-into-stable-security/).
+
+To change package inputs, edit the include list or exact package versions and run the builder with
 `--update-lock` from a clean commit. Commit its generated lock, then build
 normally twice. The refresh is input maintenance, not release evidence.
+
+For kernel stability, build the paired native development executable and run
+50 serial boot/workload/orderly-stop cycles on Apple silicon:
+
+```sh
+bash scripts/build-linux-workspace-dev.sh
+bin="$(swift build --package-path swift/PortableFSKit --show-bin-path)/portablefs-workspace-dev"
+python3 scripts/test-linux-workspace-kernel-stability.py \
+  "$bin" /absolute/image /absolute/stability-evidence --cycles 50
+```
+
+Each cycle runs offline Git operations, npm and pip installs, a parallel C
+build and 512 fork/exec churn iterations before requesting ordinary shutdown.
+The loop retains every serial transcript, rejects kernel diagnostics and
+requires `shutdown-completed`; it never retries a failed cycle. Its result
+file binds the kernel, image release and workload hash. Coordinate native VZ
+runs with other sessions on the same Mac. This soak supplements the exact
+native workspace inventory; it does not replace it.
 
 ## Retained source and notices
 
