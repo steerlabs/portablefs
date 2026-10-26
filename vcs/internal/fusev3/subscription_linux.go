@@ -329,7 +329,10 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 		servedVersion < s.watermark || servedVersion < s.versionFloor || servedVersion < state.minVersion {
 		return 0
 	}
-	return max(time.Duration(0), s.permissionRemainingLocked(s.config.withdrawalLead))
+	if s.mount == nil || s.mount.workspaceRTC == nil {
+		return max(time.Duration(0), s.cacheUntil.Sub(s.config.clock.Now()))
+	}
+	return s.permissionRemainingLocked(s.config.withdrawalLead)
 }
 
 func (s *subscriptionRegistry) signalHorizonChangedLocked() {
@@ -1553,8 +1556,16 @@ func (r *rawFileSystem) markIdentityStale(identity publicationIdentity) {
 // Denial is not withdrawal completion: serveDone joins the workers and their
 // subsequent kernel invalidation attempt.
 func (s *subscriptionRegistry) liveLocked() bool {
-	if s.active && s.permissionRemainingLocked(s.config.withdrawalLead) <= 0 {
-		s.closeRTCIntervalLocked()
+	if s.mount != nil && s.mount.workspaceRTC != nil {
+		if s.active && s.permissionRemainingLocked(s.config.withdrawalLead) <= 0 {
+			s.closeRTCIntervalLocked()
+		}
+		return s.active
+	}
+	if s.active && !s.config.clock.Now().Before(s.cacheUntil) {
+		s.active = false
+		s.generation++
+		s.signalHorizonChangedLocked()
 	}
 	return s.active
 }
@@ -1570,6 +1581,13 @@ func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
 	}
 	if s.workspaceDrain != nil {
 		return s.workspaceDrain.incarnation == incarnation && s.drainLiveLocked()
+	}
+	if s.mount == nil || s.mount.workspaceRTC == nil {
+		if !s.config.clock.Now().Before(s.cacheUntil) {
+			s.liveLocked()
+			return false
+		}
+		return true
 	}
 	if s.permissionRemainingLocked(s.config.withdrawalLead) <= 0 {
 		s.closeRTCIntervalLocked()

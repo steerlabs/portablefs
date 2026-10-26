@@ -27,7 +27,27 @@ import (
 
 // Wall and elapsed clocks advance normally; this fixture never changes the
 // machine clock. It exercises the real shared measurement and child reader.
-type advancingClock struct{}
+type advancingClock struct{ rtc *os.File }
+
+func (c advancingClock) RTCFile() *os.File { return c.rtc }
+
+func startupClock(t *testing.T) *workspaceclock.Owner {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "startup-rtc-description")
+	if err := os.WriteFile(path, nil, 0400); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	clock, err := workspaceclock.NewShared(advancingClock{rtc: file}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return clock
+}
 
 func (advancingClock) ReadUTC() (time.Time, error) { return time.Now().Truncate(time.Second), nil }
 func (advancingClock) CorrectWall(time.Time) error { return nil }
@@ -178,7 +198,7 @@ func TestRootRealCLIFailedINITFinalizesBothInventories(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	clock, err := workspaceclock.NewShared(advancingClock{}, nil)
+	clock, err := workspaceclock.Open(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,10 +369,7 @@ func TestRootFailedControlStartupTransfersExactOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	clock, err := workspaceclock.NewShared(advancingClock{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	clock := startupClock(t)
 	defer clock.Close()
 	if err = clock.Begin(0); err != nil {
 		t.Fatal(err)

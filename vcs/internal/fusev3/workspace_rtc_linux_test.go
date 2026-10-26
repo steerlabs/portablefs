@@ -411,3 +411,48 @@ func TestWorkspaceRTCCutoffPauseMatrix(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkspaceRTCAcceptedMutationKeepsAssignedOutcome(t *testing.T) {
+	for _, delegated := range []bool{false, true} {
+		t.Run(map[bool]string{false: "authority", true: "delegated"}[delegated], func(t *testing.T) {
+			var f *stockFixture
+			var item *fuse.EntryOut
+			if delegated {
+				f, item = dirtyHolderMetadataFixture(t)
+			} else {
+				f = newStockFixture(t)
+				item = f.lookup(t, 1, "cached")
+			}
+			bindWorkspaceTestGate(t, f.mount)
+			s := f.mount.subscription
+			clock := &subscriptionTestClock{now: s.config.clock.Now()}
+			rtc := &injectedRTC{anchor: time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)}
+			s.config.clock = clock
+			s.horizon = clock.Now().Add(10 * time.Second)
+			s.cacheUntil = clock.Now().Add(9 * time.Second)
+			s.permission = permissionclock.Permission{Time: s.horizon, Started: clock.Now(), RTC: rtc.anchor, Horizon: 10 * time.Second}
+			f.mount.workspaceRTC = rtc
+			unique := f.unique.Add(2)
+			in := &fuse.SetAttrIn{}
+			in.Unique = unique
+			in.NodeId = item.NodeId
+			in.Valid = fuse.FATTR_MODE
+			in.Mode = 0640
+			if status := f.raw.SetAttr(nil, in, &fuse.AttrOut{}); status != fuse.OK {
+				t.Fatal(status)
+			}
+			p := f.raw.replyPublications[unique]
+			if p == nil || !p.workspaceBound || p.source == nil {
+				t.Fatal("assigned effect not owned by physical reply")
+			}
+			pin := p.holderAdmission
+			rtc.second.Store(31)
+			_, reply, prepare := f.raw.PrepareReplyPayload(unique, item.NodeId, 4, nil, nil, 0)
+			f.raw.ReplyWritten(unique, fuse.OK)
+			if reply != fuse.OK || prepare != fuse.OK || f.mount.isRevoked() {
+				t.Fatal("expiry fabricated a definite no-change result", reply, prepare)
+			}
+			assertMetadataPinReleased(t, pin)
+		})
+	}
+}

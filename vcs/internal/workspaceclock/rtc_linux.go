@@ -59,6 +59,11 @@ func (r *RTC) Elapsed() time.Duration {
 }
 func (r *RTC) Close() error { return r.file.Close() }
 
+// RTCFile exposes the retained description to the owner's duplication boundary.
+// Injected backends may supply a test description; a real child independently
+// validates the character device before it can use it for admission.
+func (r *RTC) RTCFile() *os.File { return r.file }
+
 // DuplicateRTC shares the sole read-only device opening with one managed
 // daemon. Duplication never calls rtc_dev_open and cannot acquire set rights.
 func (o *Owner) DuplicateRTC() (*os.File, error) {
@@ -66,11 +71,16 @@ func (o *Owner) DuplicateRTC() (*os.File, error) {
 	defer o.sampleMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	r, ok := o.backend.(*RTC)
-	if o.closed || !ok {
+	r, ok := o.backend.(interface{ RTCFile() *os.File })
+	if o.closed || !ok || r.RTCFile() == nil {
 		return nil, ErrUnavailable
 	}
-	fd, err := unix.FcntlInt(r.file.Fd(), unix.F_DUPFD_CLOEXEC, 3)
+	file := r.RTCFile()
+	flags, err := unix.FcntlInt(file.Fd(), unix.F_GETFL, 0)
+	if err != nil || flags&unix.O_ACCMODE != unix.O_RDONLY {
+		return nil, ErrUnavailable
+	}
+	fd, err := unix.FcntlInt(file.Fd(), unix.F_DUPFD_CLOEXEC, 3)
 	if err != nil {
 		return nil, fmt.Errorf("duplicate workspace RTC: %w", err)
 	}
