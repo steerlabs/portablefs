@@ -45,7 +45,7 @@ exports.activate = async () => {
 '''
 
 
-def editor_checks(host, env, config, home, evidence, authority, ssh, record):
+def editor_checks(host, env, config, home, evidence, authority, ssh, record, defer_ui=False, defer_case=None):
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
     applications = {
@@ -75,6 +75,9 @@ def editor_checks(host, env, config, home, evidence, authority, ssh, record):
         assert not any(extensions.iterdir()), 'production action installed an extension'
         (root/'missing-extension.txt').write_text(missing.stderr)
         record('service-' + name + '-missing-extension')
+        if defer_ui:
+            defer_case('service-' + name + '-remote-save-peer')
+            continue
         extension_id = 'anysphere.remote-ssh' if name == 'cursor' else 'ms-vscode-remote.remote-ssh'
         with (root/'extension-install.log').open('w') as log:
             subprocess.run([str(cli), *profile, '--install-extension', extension_id], env=isolated,

@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from linux_workspace_native_editors import editor_checks
 
 
-def product_checks(image, evidence, record, authority=None, api_only=False):
+def product_checks(image, evidence, record, authority=None, api_only=False, defer_ui=False, defer_case=None):
     repo = pathlib.Path(__file__).resolve().parent.parent
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -135,23 +135,26 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         # The controlling agent uses computer use to toggle only this generated
         # Background Item. No global background-item reset or installed service
         # identifier participates. Files coordinate the two UI observations.
-        (evidence/'consent-fixture.json').write_text(json.dumps({**fixture, 'displayName': info['CFBundleName']},indent=2))
-        print('AWAITING: disable throwaway Background Item; write '+str(evidence/'consent-denied'),flush=True)
-        deadline=time.monotonic()+300
-        while not (evidence/'consent-denied').exists():
-            assert time.monotonic()<deadline,'denied-consent UI observation unavailable'
-            time.sleep(.2)
-        denied=app_command('--workspace-service-register',success=False)
-        assert denied.returncode==3 and 'Allow PortableFS in Background Items' in denied.stderr,denied
-        (evidence/'denied-consent.txt').write_text(denied.stdout+denied.stderr)
-        print('AWAITING: re-enable same throwaway Background Item; write '+str(evidence/'consent-restored'),flush=True)
-        deadline=time.monotonic()+300
-        while not (evidence/'consent-restored').exists():
-            assert time.monotonic()<deadline,'restored-consent UI observation unavailable'
-            time.sleep(.2)
-        app_command('--workspace-service-register')
-        until(lambda s:s['state']=='stopped',30)
-        record('service-background-consent-denied')
+        if defer_ui:
+            defer_case('service-background-consent-denied')
+        else:
+            (evidence/'consent-fixture.json').write_text(json.dumps({**fixture, 'displayName': info['CFBundleName']},indent=2))
+            print('AWAITING: disable throwaway Background Item; write '+str(evidence/'consent-denied'),flush=True)
+            deadline=time.monotonic()+300
+            while not (evidence/'consent-denied').exists():
+                assert time.monotonic()<deadline,'denied-consent UI observation unavailable'
+                time.sleep(.2)
+            denied=app_command('--workspace-service-register',success=False)
+            assert denied.returncode==3 and 'Allow PortableFS in Background Items' in denied.stderr,denied
+            (evidence/'denied-consent.txt').write_text(denied.stdout+denied.stderr)
+            print('AWAITING: re-enable same throwaway Background Item; write '+str(evidence/'consent-restored'),flush=True)
+            deadline=time.monotonic()+300
+            while not (evidence/'consent-restored').exists():
+                assert time.monotonic()<deadline,'restored-consent UI observation unavailable'
+                time.sleep(.2)
+            app_command('--workspace-service-register')
+            until(lambda s:s['state']=='stopped',30)
+            record('service-background-consent-denied')
         command('start');command('start')
         until(lambda s:s['state']=='running')
         snapshot('running')
@@ -193,7 +196,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
             snapshot('volume-ready')
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
             record('service-document-standalone')
-            editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record)
+            editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record,defer_ui,defer_case)
             holder=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace',
                 'cd /workspaces/native-managed && echo holding && read -r release'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:

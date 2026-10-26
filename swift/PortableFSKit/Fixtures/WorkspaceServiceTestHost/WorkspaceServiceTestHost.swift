@@ -9,7 +9,19 @@ import SwiftUI
 /// Native tests never register a shipping or developer-app identity. This
 /// executable is fixture-only and is not embedded in the product.
 @main struct WorkspaceServiceTestHost {
-    @MainActor static func main() async {
+    @MainActor static func main() {
+        let args = Array(CommandLine.arguments.dropFirst())
+        if args.count == 3, args[0] == "--workspace-menu-fixture" {
+            do {
+                guard Bundle.main.bundleIdentifier?.hasPrefix("dev.portablefs.workspace-tests.") == true else { exit(64) }
+                showMenu(status: try PortableFSWorkspaceStatus.decode(Data(contentsOf: URL(fileURLWithPath: args[1]))), consent: args[2] == "denied")
+            } catch { fputs("workspace menu fixture: \(error)\n", stderr); exit(1) }
+            return
+        }
+        Task { @MainActor in await handle() }
+        RunLoop.main.run()
+    }
+    @MainActor private static func handle() async {
         guard let id = Bundle.main.bundleIdentifier, id.hasPrefix("dev.portablefs.workspace-tests.") else { exit(64) }
         do {
             switch Array(CommandLine.arguments.dropFirst()) {
@@ -44,8 +56,6 @@ import SwiftUI
             case let args where args.count == 6 && args[0] == "--workspace-editor":
                 guard let editor = PortableFSWorkspaceEditor(rawValue: args[1]) else { exit(64) }
                 try await editor.open(volume: args[2], application: URL(fileURLWithPath: args[3]), userData: URL(fileURLWithPath: args[4]), extensions: URL(fileURLWithPath: args[5])); exit(0)
-            case let args where args.count == 3 && args[0] == "--workspace-menu-fixture":
-                showMenu(status: try PortableFSWorkspaceStatus.decode(Data(contentsOf: URL(fileURLWithPath: args[1]))), consent: args[2] == "denied")
             default: exit(64)
             }
         } catch { fputs("workspace test service: \(error)\n",stderr); exit(1) }
@@ -58,6 +68,7 @@ import SwiftUI
     @MainActor private static func showMenu(status: PortableFSWorkspaceStatus, consent: Bool) {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
+        app.finishLaunching()
         let model = PortableFSWorkspaceModel(status: status, consentMissing: consent)
         let window = NSWindow(contentRect: NSRect(x: 200, y: 400, width: 330, height: 110), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "PortableFS Workspace Menu Test"
@@ -65,7 +76,7 @@ import SwiftUI
             Text("PortableFS").font(.headline)
             PortableFSWorkspaceMenu(model: model)
         }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading))
-        window.makeKeyAndOrderFront(nil); app.activate()
+        window.center(); window.makeKeyAndOrderFront(nil); app.activate()
         app.run()
         withExtendedLifetime((model, window)) {}
     }

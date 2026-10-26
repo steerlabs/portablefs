@@ -76,9 +76,24 @@ public struct PortableFSWorkspaceClient: Sendable {
             if force { guard operation == .stop || operation == .umount else { throw PortableFSWorkspaceError("Invalid workspace action") }; request["force"] = true }
             let path = home.appendingPathComponent(".local/state/portablefs/workspace/control.sock").path
             var info = stat()
-            if operation == .status, lstat(path, &info) != 0, errno == ENOENT { return PortableFSWorkspaceStatus() }
+            if operation == .status, lstat(path, &info) != 0, errno == ENOENT {
+                let desired = home.appendingPathComponent(".local/state/portablefs/workspace/desired.json").path
+                guard lstat(desired, &info) != 0, errno == ENOENT else { throw PortableFSWorkspaceError("Cleanup required: Linux Workspace service is unavailable") }
+                return PortableFSWorkspaceStatus()
+            }
             let data = try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys, .withoutEscapingSlashes])
-            return try PortableFSWorkspaceStatus.decode(exchange(data, path: path))
+            let deadline = ContinuousClock.now.advanced(by: .seconds(20))
+            while true {
+                do { return try PortableFSWorkspaceStatus.decode(exchange(data, path: path)) }
+                catch {
+                    // As in the CLI, only endpoint absence after registration
+                    // permits a new dial. Identity/framing failures never retry.
+                    guard operation == .start || operation == .mount,
+                          lstat(path, &info) != 0, errno == ENOENT,
+                          ContinuousClock.now < deadline else { throw error }
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+            }
         }.value
     }
     private func exchange(_ request: Data, path: String) throws -> Data {

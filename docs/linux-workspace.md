@@ -775,6 +775,11 @@ computer-use toggles of only that throwaway Background Item. The controlling
 test agent writes `product/consent-denied` and `product/consent-restored` after
 the corresponding observations. A password or Touch ID request stops the case;
 an absent UI observation fails rather than skipping it.
+When the desktop is locked, `--defer-ui` runs the complete non-UI inventory,
+including real missing-extension checks, and records the exact unrun consent and
+editor-save names. It exits 3 with an INCOMPLETE verdict, never an all-passing
+native qualification. Rerun without that flag after an authorized operator
+unlocks the session.
 
 It builds or verifies/reuses the pinned image, builds and signs the owner, then
 requires exact equality with `scripts/linux-workspace-required-native-tests.txt`.
