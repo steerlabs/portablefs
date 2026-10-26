@@ -282,7 +282,10 @@ func setup(dir, volume string) error {
 	if err != nil {
 		return err
 	}
-	token, err := grant(k, volume, peer.RawSubjectPublicKeyInfo, time.Hour)
+	// Fixed VZ pauses plus lifecycle checks can outlast an hour. Keep the
+	// independent peer authorized throughout the full inventory; guest expiry
+	// cases retain their separate short grants.
+	token, err := grant(k, volume, peer.RawSubjectPublicKeyInfo, 3*time.Hour)
 	if err != nil {
 		return err
 	}

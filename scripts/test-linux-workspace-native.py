@@ -108,7 +108,6 @@ class Guest:
 guest = None
 authority = None
 try:
-    authority = NativeAuthority(root)
     guest = Guest()
     corrupt = pathlib.Path(tempfile.mkdtemp(prefix='pfs-corrupt-', dir='/tmp')) / 'image'
     try:
@@ -226,6 +225,7 @@ try:
     clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '65']
     subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), *clock_arguments], check=True)
     record('rtc-awake-measurement')
+    authority = NativeAuthority(root)
     managed = authority.mount(guest, outage=True)
     record('managed-standalone-provision')
     record('managed-prepare-outage-over-45s')
