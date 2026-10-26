@@ -132,6 +132,26 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         for args in [('shell',),('pause',),('identity',),('exec','true'),('vm-list',),('start','--json')]: assert command(*args,success=False).returncode==2
         record('service-api-cli-five-verbs')
         if api_only: return
+        # The controlling agent uses computer use to toggle only this generated
+        # Background Item. No global background-item reset or installed service
+        # identifier participates. Files coordinate the two UI observations.
+        (evidence/'consent-fixture.json').write_text(json.dumps({**fixture, 'displayName': info['CFBundleName']},indent=2))
+        print('AWAITING: disable throwaway Background Item; write '+str(evidence/'consent-denied'),flush=True)
+        deadline=time.monotonic()+300
+        while not (evidence/'consent-denied').exists():
+            assert time.monotonic()<deadline,'denied-consent UI observation unavailable'
+            time.sleep(.2)
+        denied=app_command('--workspace-service-register',success=False)
+        assert denied.returncode==3 and 'Allow PortableFS in Background Items' in denied.stderr,denied
+        (evidence/'denied-consent.txt').write_text(denied.stdout+denied.stderr)
+        print('AWAITING: re-enable same throwaway Background Item; write '+str(evidence/'consent-restored'),flush=True)
+        deadline=time.monotonic()+300
+        while not (evidence/'consent-restored').exists():
+            assert time.monotonic()<deadline,'restored-consent UI observation unavailable'
+            time.sleep(.2)
+        app_command('--workspace-service-register')
+        until(lambda s:s['state']=='stopped',30)
+        record('service-background-consent-denied')
         command('start');command('start')
         until(lambda s:s['state']=='running')
         snapshot('running')
