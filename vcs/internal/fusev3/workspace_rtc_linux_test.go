@@ -144,6 +144,29 @@ func TestWorkspaceRTCFinalPreparationChecksCachedArenaAndCapsTTL(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRTCFinalSampleRecapsLiveCachedTTL(t *testing.T) {
+	f, _, rtc := workspaceRTCFixture(t)
+	unique := f.unique.Add(2)
+	if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
+		t.Fatal(status)
+	}
+	defer f.raw.ReplyWritten(unique, fuse.EIO)
+	reader := &cutRTC{reader: rtc, before: func(n int) {
+		if n == 5 {
+			rtc.second.Store(5)
+		}
+	}}
+	f.mount.workspaceRTC = reader
+	encoded := make([]byte, 128)
+	binary.LittleEndian.PutUint64(encoded[16:24], 9)
+	binary.LittleEndian.PutUint64(encoded[24:32], 9)
+	_, reply, prepare := f.raw.PrepareReplyPayload(unique, 1, 1, encoded, nil, 0)
+	if reader.calls != 5 || reply != fuse.OK || prepare != fuse.OK ||
+		binary.LittleEndian.Uint64(encoded[16:24]) != 1 || binary.LittleEndian.Uint64(encoded[24:32]) != 1 {
+		t.Fatal("final live sample did not shorten encoded TTL", reader.calls, reply, prepare, encoded[:40])
+	}
+}
+
 func TestWorkspaceRTCCapacityWaitResamplesBeforeAcceptance(t *testing.T) {
 	for _, kind := range []string{"write", "truncate", "metadata"} {
 		t.Run(kind, func(t *testing.T) {
@@ -278,7 +301,7 @@ func TestWorkspaceRTCFreezePublicationCutsDenyDifferentRequest(t *testing.T) {
 			}
 			sampled := &cutRTC{reader: rtc}
 			f.mount.workspaceRTC = sampled
-			// Four entry/TTL samples precede the retained-answer stamp's final sample.
+			// Four earlier permission samples precede the final lifetime sample.
 			const final = 5
 			freeze := func(n int) {
 				if n == final {

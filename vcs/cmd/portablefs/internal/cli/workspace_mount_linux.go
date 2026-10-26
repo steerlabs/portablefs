@@ -66,7 +66,7 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 	seen := map[int]bool{}
 	for _, fd := range []int{o.workspaceGateFD, o.workspaceOwnerFD, o.workspaceBootstrapFD, o.workspaceClockFD, o.workspaceReadyFD, o.workspaceRTCFD} {
 		if fd < 3 || seen[fd] {
-			return e.fail("mount", errors.New("workspace requires five distinct inherited descriptors"))
+			return e.fail("mount", errors.New("workspace requires six distinct inherited descriptors"))
 		}
 		seen[fd] = true
 		syscall.CloseOnExec(fd)

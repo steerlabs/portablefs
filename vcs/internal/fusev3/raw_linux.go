@@ -1740,21 +1740,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	// This precedes both the arena shortcut and empty candidate sets. An
 	// assigned effect is still its original operation; denial cannot fabricate a
 	// definite no-change CREATE/WRITE result. READ still owes physical purge.
-	workspaceClosed := publication.workspaceBound && (publication.workspace.Check() != nil || !r.mount.workspacePermissionLive())
-	var workspaceRemaining time.Duration
-	if publication.workspaceBound && !workspaceClosed && r.mount.workspaceRTC != nil {
-		workspaceRemaining = r.mount.subscription.workspaceRemaining()
-		workspaceClosed = workspaceRemaining <= 0
-	}
-	if publication.workspaceBound && r.mount.workspaceRTC != nil {
-		capReplyLifetime(opcode, outData, workspaceRemaining)
-		for _, candidate := range publication.dirPlus {
-			if candidate.entry != nil {
-				candidate.entry.SetEntryTimeout(min(candidate.entry.EntryTimeout(), workspaceRemaining))
-				candidate.entry.SetAttrTimeout(min(candidate.entry.AttrTimeout(), workspaceRemaining))
-			}
-		}
-	}
+	workspaceClosed := r.workspaceReplyPermissionLocked(publication, opcode, outData)
 	if workspaceClosed && publication.retainedAnswer && publication.source == nil && opcode != 15 {
 		publication.cacheRejected = true
 	}
@@ -1771,6 +1757,11 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		return 0, fuse.EIO, fuse.OK
 	}
 	if publication.cachedArena && publication.originalFinalized {
+		if r.workspaceReplyPermissionLocked(publication, opcode, outData) && publication.retainedAnswer && publication.source == nil && opcode != 15 {
+			publication.cacheRejected = true
+			r.mu.Unlock()
+			return 0, fuse.EIO, fuse.OK
+		}
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
@@ -1848,6 +1839,14 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		publication.data = retained
 	}
 	zeroAttributes := len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity]
+	// Reservation validation can itself straddle a pause. The last permission
+	// sample must also bound the encoded lifetime, including a still-live but
+	// shortened interval. Assigned outcomes and READ's purge remain owned.
+	if r.workspaceReplyPermissionLocked(publication, opcode, outData) && publication.retainedAnswer && publication.source == nil && opcode != 15 {
+		publication.cacheRejected = true
+		r.mu.Unlock()
+		return 0, fuse.EIO, fuse.OK
+	}
 	r.mu.Unlock()
 
 	if nameDropped {
@@ -1863,6 +1862,32 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	// not carry PortableFS trailers; returning the original payload length is
 	// what preserves the upstream wire shape.
 	return payloadSize, fuse.OK, fuse.OK
+}
+
+func (r *rawFileSystem) workspaceReplyPermissionLocked(publication *replyPublication, opcode uint32, out []byte) bool {
+	if !publication.workspaceBound {
+		return false
+	}
+	closed := publication.workspace.Check() != nil
+	if r.mount.workspaceRTC == nil {
+		return closed
+	}
+	var remaining time.Duration
+	if !closed {
+		remaining = r.mount.subscription.workspaceRemaining()
+		closed = remaining <= 0 || publication.workspace.Check() != nil
+	}
+	if closed {
+		remaining = 0
+	}
+	capReplyLifetime(opcode, out, remaining)
+	for _, candidate := range publication.dirPlus {
+		if candidate.entry != nil {
+			candidate.entry.SetEntryTimeout(min(candidate.entry.EntryTimeout(), remaining))
+			candidate.entry.SetAttrTimeout(min(candidate.entry.AttrTimeout(), remaining))
+		}
+	}
+	return closed
 }
 
 func disableKeepCache(opcode uint32, out []byte) {
