@@ -1740,7 +1740,21 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	// This precedes both the arena shortcut and empty candidate sets. An
 	// assigned effect is still its original operation; denial cannot fabricate a
 	// definite no-change CREATE/WRITE result. READ still owes physical purge.
-	workspaceClosed := publication.workspaceBound && publication.workspace.Check() != nil
+	workspaceClosed := publication.workspaceBound && (publication.workspace.Check() != nil || !r.mount.workspacePermissionLive())
+	var workspaceRemaining time.Duration
+	if publication.workspaceBound && !workspaceClosed && r.mount.workspaceRTC != nil {
+		workspaceRemaining = r.mount.subscription.workspaceRemaining()
+		workspaceClosed = workspaceRemaining <= 0
+	}
+	if publication.workspaceBound && r.mount.workspaceRTC != nil {
+		capReplyLifetime(opcode, outData, workspaceRemaining)
+		for _, candidate := range publication.dirPlus {
+			if candidate.entry != nil {
+				candidate.entry.SetEntryTimeout(min(candidate.entry.EntryTimeout(), workspaceRemaining))
+				candidate.entry.SetAttrTimeout(min(candidate.entry.AttrTimeout(), workspaceRemaining))
+			}
+		}
+	}
 	if workspaceClosed && publication.retainedAnswer && publication.source == nil && opcode != 15 {
 		publication.cacheRejected = true
 	}
@@ -4502,4 +4516,27 @@ func (m *Mount) recordFatalCause(err error) {
 	m.fatalMu.Lock()
 	m.fatalErr = errors.Join(m.fatalErr, err)
 	m.fatalMu.Unlock()
+}
+
+// Cap the encoded lifetime again at physical preparation, including cached
+// arena replies whose payload was encoded before a capacity wait or pause.
+func capReplyLifetime(opcode uint32, out []byte, remaining time.Duration) {
+	capAt := func(sec, nano int) {
+		if sec+8 > len(out) || nano+4 > len(out) {
+			return
+		}
+		seconds, nanos := binary.LittleEndian.Uint64(out[sec:sec+8]), binary.LittleEndian.Uint32(out[nano:nano+4])
+		remaining = max(time.Duration(0), remaining)
+		if seconds > uint64(remaining/time.Second) || seconds == uint64(remaining/time.Second) && uint64(nanos) > uint64(remaining%time.Second) {
+			binary.LittleEndian.PutUint64(out[sec:sec+8], uint64(remaining/time.Second))
+			binary.LittleEndian.PutUint32(out[nano:nano+4], uint32(remaining%time.Second))
+		}
+	}
+	switch opcode {
+	case 1, 6, 8, 9, 13, 35, 51:
+		capAt(16, 32)
+		capAt(24, 36)
+	case 3, 4:
+		capAt(0, 8)
+	}
 }

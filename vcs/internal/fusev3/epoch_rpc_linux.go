@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"sync"
 	"syscall"
 	"time"
@@ -127,11 +128,11 @@ func (e *epochRPC) CallMutationWithIdentityRetained(ctx context.Context, request
 	return e.current().CallMutationWithIdentityRetained(ctx, request, assigned, force)
 }
 
-func (e *epochRPC) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (e *epochRPC) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	return e.current().Subscribe(ctx, snapshotID, afterIdentity)
 }
 
-func (e *epochRPC) RenewSubscription(ctx context.Context, incarnation uint64) (time.Time, error) {
+func (e *epochRPC) RenewSubscription(ctx context.Context, incarnation uint64) (permissionclock.Permission, error) {
 	return e.current().RenewSubscription(ctx, incarnation)
 }
 

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"slices"
 	"sync"
 	"testing"
@@ -75,36 +76,36 @@ type subscriptionTestRPC struct {
 	log         *[]string
 }
 
-func (r *subscriptionTestRPC) Subscribe(_ context.Context, snapshotID, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r *subscriptionTestRPC) Subscribe(_ context.Context, snapshotID, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.log != nil {
 		*r.log = append(*r.log, "subscribe")
 	}
 	if r.page >= len(r.pages) {
-		return nil, time.Time{}, errors.New("unexpected subscribe")
+		return nil, permissionclock.Permission{}, errors.New("unexpected subscribe")
 	}
 	reply := r.pages[r.page]
 	if r.page == 0 && (len(snapshotID) != 0 || len(after) != 0) {
-		return nil, time.Time{}, errors.New("initial subscribe carried a cursor")
+		return nil, permissionclock.Permission{}, errors.New("initial subscribe carried a cursor")
 	}
 	if r.page > 0 {
 		if !bytes.Equal(snapshotID, r.pages[0].GetSnapshotId()) ||
 			!bytes.Equal(after, r.pages[r.page-1].GetNextAfterIdentity()) {
-			return nil, time.Time{}, errors.New("continuation subscribe carried the wrong snapshot cursor")
+			return nil, permissionclock.Permission{}, errors.New("continuation subscribe carried the wrong snapshot cursor")
 		}
 	}
 	r.page++
-	return reply, r.horizon, nil
+	return reply, permissionclock.Permission{Time: r.horizon}, nil
 }
 
-func (r *subscriptionTestRPC) RenewSubscription(_ context.Context, incarnation uint64) (time.Time, error) {
+func (r *subscriptionTestRPC) RenewSubscription(_ context.Context, incarnation uint64) (permissionclock.Permission, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.renewed != nil {
 		r.renewed <- incarnation
 	}
-	return r.horizon, nil
+	return permissionclock.Permission{Time: r.horizon}, nil
 }
 
 func (r *subscriptionTestRPC) NextControlEvent(ctx context.Context, _ uint64, _ uint64, _ uint64) (*authoritypb.ControlEvent, error) {

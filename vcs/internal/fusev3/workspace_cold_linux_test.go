@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -91,9 +92,9 @@ func (r *coldTestRPC) CallRead(ctx context.Context, q *authoritypb.Request) (*au
 	}
 	return r.RPC.CallRead(ctx, q)
 }
-func (r *coldTestRPC) Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r *coldTestRPC) Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	n := r.subscriptions.Add(1)
-	return &authoritypb.SubscribeReply{Incarnation: 100 + n, Watermark: 1, SnapshotId: []byte{byte(n)}, HorizonNanos: uint64(time.Minute)}, continuous.Time().Add(time.Minute), nil
+	return &authoritypb.SubscribeReply{Incarnation: 100 + n, Watermark: 1, SnapshotId: []byte{byte(n)}, HorizonNanos: uint64(time.Minute)}, permissionclock.Permission{Time: continuous.Time().Add(time.Minute)}, nil
 }
 func coldFixture(t *testing.T) (*stockFixture, *workspaceadmission.Supervisor, *coldTestRPC) {
 	t.Helper()

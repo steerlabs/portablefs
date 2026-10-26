@@ -25,6 +25,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"golang.org/x/sys/unix"
@@ -112,8 +113,8 @@ type RPC interface {
 	// SessionID is this mount's authority session identity. Subscription CONTROL must
 	// never direct a peer recall back to the initiating source session.
 	SessionID() []byte
-	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error)
-	RenewSubscription(context.Context, uint64) (time.Time, error)
+	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error)
+	RenewSubscription(context.Context, uint64) (permissionclock.Permission, error)
 	NextControlEvent(context.Context, uint64, uint64, uint64) (*authoritypb.ControlEvent, error)
 	AcknowledgeChanges(context.Context, uint64, uint64) error
 	AcknowledgeDelegationRecall(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error
@@ -225,6 +226,7 @@ func markCleanStartupFailure(cause error) error {
 
 type Mount struct {
 	managedRemoval func(string, error) error
+	workspaceRTC   permissionclock.UTCReader
 	workspace      *workspaceadmission.Reader
 
 	posixMu       sync.Mutex
@@ -635,6 +637,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	}
 	if cfg.Managed != nil {
 		mount.managedRemoval = cfg.Managed.Remove
+		mount.workspaceRTC = cfg.Managed.RTC
 	}
 
 	var err error

@@ -19,6 +19,12 @@ is not yet qualified.
 
 ### Changed
 
+- Managed Linux workspaces use a conservative synchronous RTC permission
+  deadline and one-second renewal cadence. Ordinary native mounts retain
+  BOOTTIME admission and their three-second renewal cadence.
+
+If host sleep overtakes cold-before-pause, the workspace retains the native protocol-8 Linux suspend limit: under the qualified RTC source bound, permission sampled after resume cannot authorize expired cache or write admission, but an operation frozen after its final permission sample, including inside an RTC read before it returns, may complete with stale state after resume, and resident kernel pages, mappings, names and attributes may remain observable until withdrawal or cache timeout; host sleep is not an atomic cache-revocation boundary.
+
 - Authority ALPN `portablefs-authority-v8`, exact major 8. Authority feature
   strings and negotiation are gone; the major and the frontend profile fix the
   grammar and semantics, and the schema holds only current declarations.

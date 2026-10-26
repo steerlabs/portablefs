@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"sync"
 	"syscall"
 	"testing"
@@ -27,7 +28,7 @@ func (r *workspacePermitHookRPC) CallRead(ctx context.Context, q *authoritypb.Re
 	}
 	return r.coldTestRPC.CallRead(ctx, q)
 }
-func (r *workspacePermitHookRPC) Subscribe(ctx context.Context, a, b []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r *workspacePermitHookRPC) Subscribe(ctx context.Context, a, b []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	if r.onSubscribe != nil {
 		r.onSubscribe()
 	}

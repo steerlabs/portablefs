@@ -66,6 +66,9 @@ func (m *Mount) awaitWorkspaceEntry(ctx context.Context, safeForWithdrawal bool,
 	// lifecycle owner which can reopen or terminalize this mount.
 	if m.workspaceLifecycle == nil {
 		_, err := m.workspace.Check()
+		if err == nil && !m.workspacePermissionLive() {
+			return workspaceadmission.ErrClosed
+		}
 		return err
 	}
 	var cancel <-chan struct{}
@@ -181,7 +184,7 @@ func workspaceAcceptance(ctx context.Context) error {
 		if err := p.workspace.Check(); err != nil {
 			return err
 		}
-		if !p.owner.mount.workspaceClockReady() {
+		if !p.owner.mount.workspaceClockReady() || !p.owner.mount.workspacePermissionLive() {
 			return workspaceadmission.ErrClosed
 		}
 		return p.workspace.Check()
@@ -205,7 +208,7 @@ func workspaceAcceptanceCheck(ctx context.Context) func() error {
 			if err := check(); err != nil {
 				return err
 			}
-			if !m.workspaceClockReady() {
+			if !m.workspaceClockReady() || !m.workspacePermissionLive() {
 				return workspaceadmission.ErrClosed
 			}
 			return check()
@@ -219,7 +222,7 @@ func (m *Mount) workspaceServing() bool {
 		return true
 	}
 	_, err := m.workspace.Check()
-	if err != nil || !m.workspaceClockReady() {
+	if err != nil || !m.workspaceClockReady() || !m.workspacePermissionLive() {
 		return false
 	}
 	if m.workspaceLifecycle != nil {
@@ -227,6 +230,13 @@ func (m *Mount) workspaceServing() bool {
 		return live
 	}
 	return true
+}
+
+func (m *Mount) workspacePermissionLive() bool {
+	if m == nil || m.workspaceRTC == nil {
+		return true
+	}
+	return m.subscription != nil && m.subscription.workspaceRemaining() > 0
 }
 
 // TLS readiness can withdraw between observer ticks. Denial at use prevents a
@@ -250,6 +260,7 @@ func (m *Mount) workspaceClockReady() bool {
 // A drain never asks the current manager for a successor buffer/incarnation or
 // a refreshed horizon. It names the captured cut and its actual old deadline.
 type workspaceDrainPermit struct {
+	registry    *subscriptionRegistry
 	manager     *delegationManager
 	buffer      *writeback.Buffer
 	incarnation uint64
@@ -257,7 +268,7 @@ type workspaceDrainPermit struct {
 }
 
 func (p workspaceDrainPermit) allows(buffer *writeback.Buffer, incarnation uint64, now time.Time) bool {
-	return p.buffer != nil && p.buffer == buffer && p.incarnation != 0 && p.incarnation == incarnation && now.Before(p.deadline)
+	return p.buffer != nil && p.buffer == buffer && p.incarnation != 0 && p.incarnation == incarnation && now.Before(p.deadline) && (p.registry == nil || p.registry.delegationHorizonLive(incarnation))
 }
 
 // Recovery is kept on the subscription owner. Closing serving does not erase
@@ -443,7 +454,7 @@ func (r *workspaceFileSystem) captureWorkspaceDrain(deadline time.Time) workspac
 	if deadline.IsZero() || s.cacheUntil.Before(deadline) {
 		deadline = s.cacheUntil
 	}
-	p := workspaceDrainPermit{manager: m, buffer: m.buf, incarnation: s.incarnation, deadline: deadline}
+	p := workspaceDrainPermit{registry: s, manager: m, buffer: m.buf, incarnation: s.incarnation, deadline: deadline}
 	s.workspaceDrain = &p
 	return p
 }

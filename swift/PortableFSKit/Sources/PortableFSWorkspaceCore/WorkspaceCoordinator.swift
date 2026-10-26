@@ -272,6 +272,10 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         case .wake, .cancelledSleep:
             if let pending = pendingSleep { pendingSleep = (pending.0, .awake) }
             switch state {
+            case .running:
+                // A missed cold fence must not wait for status polling. The
+                // guest RTC predicate covers entry before this callback runs.
+                beginAwakeRecovery()
             case .pausedCold(let suspension): resumeCold(suspension)
             case .pausedDiscard: stopUnsafe("cold drain incomplete; discard VM")
             case .unknown: reconcileUnknown()

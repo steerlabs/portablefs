@@ -2,8 +2,9 @@
 
 Status: **unreleased and unsupported**. The development guest runs managed
 protocol-8 Linux mounts through the protected-path root driver. Supported release
-requires every qualification gate below, including the OPEN unfenced host-sleep
-clock gate. Controlled-pause evidence cannot close it.
+requires every qualification gate below, including independent exact-image RTC
+source qualification. Controlled pauses test conditional native equivalence; they
+do not establish physical host-sleep behavior.
 
 ## Execution and ownership
 
@@ -488,40 +489,38 @@ Mount joins before Suspend within the original drain budget; it is never
 recreated by spending the same single-use grant again. Failure to join takes
 the existing discard path, without extending the sleep deadline.
 
-## Unfenced host sleep: OPEN release gate
+## Host sleep and conservative RTC permission
 
-A power notification can be posted without the host service completing its
-handler before the system's acknowledgement timeout. Delaying that service
-while the VM worker remains live supplies the counterexample: after sleep,
-guest work can execute before the service handles wake. This does not require
-assuming thermal or low-battery sleep omits notification.
+Cold-before-pause remains the normal host transaction. If a wake arrives while
+an owned guest is running without a completed cold fence, the coordinator
+immediately starts awake cold recovery and closes host attach admission.
 
-The experiment measured frozen guest BOOTTIME during public VZ pause and
-successful stale held-fd, size and name observations after peer completion.
-Later REALTIME correction did not repair BOOTTIME. Awake-host SIGSTOP advanced
-guest clocks; neither method establishes actual host-sleep ordering. The
-controlled fence removes deliberate pause from the continuity requirement by
-withdrawing permission beforehand.
+Managed daemons synchronously read a read-only duplicate of the supervisor's
+sole `/dev/rtc0` opening. Subscribe and renewal capture BOOTTIME `b0` and RTC
+`r0` before request queueing; pagination retains the first anchors. For returned
+horizon `H`, withdrawal lead `L` and fresh samples `b,r`, admission requires the
+existing BOOTTIME permission, `r >= r0` and `(r-r0)+3s < H-L`. Equality denies.
+The remaining permission is the smaller of BOOTTIME remaining and
+`H-L-((r-r0)+3s)`. The three seconds charge two endpoint source errors bounded
+by one second each plus integer quantization of less than one second.
 
-Supported release still needs a guest-visible elapsed clock that includes
-unfenced host sleep before the first resumed admission, within the authority's
-clock-error budget, or platform enforcement that prevents affected execution
-until complete withdrawal/replacement. No such mechanism has been established
-for the proposed macOS 26/27 configurations. The separate PL031 measurement
-remains research, not an implemented clock mechanism.
+Entry, delegated acceptance after capacity waits, CONTROL/drain and physical
+reply preparation use that original interval. Encoded cache lifetimes cannot
+exceed its remaining permission, including finalized cached-arena replies.
+Invalid evidence, ioctl failure, backward RTC below the anchor and expiry close
+it synchronously. Successful reads and delayed renewal cannot reopen it; complete
+cold withdrawal and fresh permission in the accepted recovery generation must
+precede serving. Renewal checks the installed old interval before replacing it.
+Managed workspaces renew every second. Ordinary native mounts retain their
+BOOTTIME checks and three-second renewal cadence.
 
-Wake callbacks, watchdogs, periodic timestamps, a shared heartbeat, NTP/REALTIME
-updates and guest timers provide eventual detection. A pre-sleep vsock clock
-response can arrive after wake; a second acknowledgement moves that gap.
-None supplies the missing ordering proof. Do not add a clock workaround or
-claim that later remount repairs earlier stale success. If the platform cannot
-supply the required mechanism, it cannot support this release architecture.
+If host sleep overtakes cold-before-pause, the workspace retains the native protocol-8 Linux suspend limit: under the qualified RTC source bound, permission sampled after resume cannot authorize expired cache or write admission, but an operation frozen after its final permission sample, including inside an RTC read before it returns, may complete with stale state after resume, and resident kernel pages, mappings, names and attributes may remain observable until withdrawal or cache timeout; host sleep is not an atomic cache-revocation boundary.
 
-The workspace also inherits the stock Linux stalled-daemon resident-page
-residual in [portable-coherence.md](./portable-coherence.md): a daemon that
-cannot run cannot withdraw kernel pages before a consumer observes them.
-Successful stale daemon metadata/name admissions due to a frozen clock are a
-separate defect. Stage 1a makes no stronger kernel claim.
+This contract is conditional on the RTC source bound at both samples, including
+the first sample after VZ resume. The 72-hour host-awake G3 run qualifies the
+supported candidate/image under the trusted-host-time assumption. It does not
+prove safety against arbitrary future host-clock edits. Physical host sleep and
+host clock changes are not qualification procedures.
 
 ## Paired workspace control 8
 
@@ -685,7 +684,7 @@ relay is configured. IOKit power notification registration must succeed before
 start. A controlled pause enters the existing coordinator; only confirmed cold
 pause creates single-use resume eligibility. The real adapter uses host
 sleep-inclusive continuous time for deadlines and releases sleep participation
-within its bounded budget. This does not establish the unfenced-sleep invariant.
+within its bounded budget. The guest RTC predicate covers admission before a delayed host callback.
 
 The state directory has an exclusive owner lock, a 64 GiB sparse `data.ext4`,
 a separate persisted host SSH client key, pinned guest host public key,
@@ -746,8 +745,8 @@ validation or real FUSE withdrawal evidence. Unsupported virtualization is a
 named **UNAVAILABLE** gate with nonzero exit status, never a passing skip.
 
 The guest now corrects TLS wall time from its retained RTC at boot and each
-accepted cold-resume generation. This grants no elapsed lease time or
-sleep-safety proof. The unfenced host-sleep gate remains OPEN.
+accepted cold-resume generation. The separate per-daemon RTC permission check
+bounds admission; shared TLS readiness does not supply elapsed permission.
 The coordinator owns each native notification's arrival-relative deadline;
 IOKit has no second release timer. An expired notification is explicitly released
 unfenced and cannot later earn cold eligibility. Unexpected VZ stops unregister
@@ -776,7 +775,7 @@ sources/licenses, PortableFS commit and sealed app resources.
 | Gate | Status and evidence required |
 | --- | --- |
 | Controlled fence | Stage 1a model tests and Stage 1b native VZ transaction with an empty roster. Real managed-daemon withdrawal and the full duration/fault matrix remain pending. Typed initial-renewal readiness is covered at the control boundary. Test 5/15/45/150/600-second pauses, lost channels, blocked invalidation, stale replies/tokens, mount races and crashes. |
-| Unfenced host sleep | OPEN. Identify the clock/execution mechanism and ordering, then qualify actual lid/menu/idle sleep on exact supported OS/hardware/image digests with independently advancing remote authority and peer. Delay the service past the notification timeout. A finite successful sample cannot replace the mechanism. |
+| Host sleep | Conservative RTC deadline with the native sampling/use residual above. Require exact-image controlled VZ pauses, publication cuts, injected ordering tests and independent 72-hour G3 source evidence. No host sleep test or host-clock edit. |
 | Short-sleep availability | Root cause identified: authority replay-before-coherence admission ordering. Fix and regression work are in progress in a separate PR. This stage does not change the authority or Linux data plane. |
 | Image, lifecycle and persistence | Pin Debian artifact; prove boot/FUSE INIT and kernel notification/durability behavior. Prove exact teardown/remount with cwd, fd, mapping and editor holders, no empty-directory writes, ENOSPC/image-corruption handling, signed updates and same-volume exclusion. |
 | Protocol-8 correctness | Full privileged Linux integration and coherence matrix, root barriers, dirty-tail loss, authority restart and power-loss qualification. The experiment's 22 passes, 7 skips and relay topology do not qualify the product. |
@@ -1029,13 +1028,18 @@ concurrent duplicate readers in a separate test-only initramfs on the pinned
 kernel, boot/resume corrections, CSR verification and
 identity persistence. Production boot checks read-only/exclusive ownership;
 measurement failures withdraw readiness and retry without exiting the service.
-`scripts/qualify-linux-workspace-clock.py` records at least
-one full maintenance interval against an image-manifest digest and can record
-an explicitly supplied independent UTC reference. It always leaves the final UTC
-qualification verdict false: source provenance, multi-day accuracy, host clock
-corrections and worst-case long-awake load require separate evidence. No NTP,
-host-message fallback, clock server or RTC admission is implemented. This TLS
-wall discipline grants no BOOTTIME continuity across unfenced host sleep.
+`scripts/qualify-linux-workspace-clock.py --soak` runs 72 host-awake hours on
+an already-running exact-image guest, alternating three-hour idle/load blocks
+and sampling every 30 seconds. An explicit read-only NTS adapter supplies at
+least two independent authenticated UTC references, including server uncertainty;
+the harness charges the full reference collection and guest sampling/transit
+interval. Missing reference coverage is inconclusive. Source error must stay
+within one second, quantization below one second, sample/set age and awake drift
+within 250 ms each, and conditional total error within three seconds. Separate
+UTC, RTC admission and G0 verdicts require matching first-read-after-resume and
+concurrent duplicate-reader evidence. `--dry-run --seconds 1800` exercises the
+harness in fifteen-minute idle/load blocks without claiming the 72-hour gate.
+No NTP setter, host-message fallback or clock server supplies admission.
 
 A definite applied mutation is distinct from its later peer visibility wait.
 If that wait loses the old subscription, append/range callbacks still validate

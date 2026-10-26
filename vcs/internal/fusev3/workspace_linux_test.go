@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -342,7 +343,7 @@ func TestWorkspaceRecoveryAndDrainAreNotServing(t *testing.T) {
 	if !controlLive || !controlDeadline.Equal(drain.deadline) || !drain.deadline.Equal(f.mount.subscription.cacheUntil) {
 		t.Fatal("CONTROL replaced the captured drain deadline", controlDeadline, drain.deadline)
 	}
-	if f.mount.subscription.acceptRenewal(drain.incarnation, deadline.Add(time.Minute)) {
+	if f.mount.subscription.acceptRenewal(drain.incarnation, permissionclock.Permission{Time: deadline.Add(time.Minute)}) {
 		t.Fatal("drain renewed the old horizon")
 	}
 	f.mount.subscription.config.clock = &subscriptionTestClock{now: drain.deadline.Add(time.Nanosecond)}
@@ -507,12 +508,12 @@ type workspaceSubscribeBarrier struct {
 	entered, release chan struct{}
 }
 
-func (b workspaceSubscribeBarrier) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (b workspaceSubscribeBarrier) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	close(b.entered)
 	select {
 	case <-b.release:
 	case <-ctx.Done():
-		return nil, time.Time{}, ctx.Err()
+		return nil, permissionclock.Permission{}, ctx.Err()
 	}
 	return b.subscriptionRPC.Subscribe(ctx, snapshot, after)
 }

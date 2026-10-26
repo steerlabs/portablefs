@@ -19,6 +19,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 )
 
 // fuseV3Config is everything the v3 engine needs to attach and mount. The
@@ -40,6 +41,7 @@ type fuseV3Config struct {
 	// MountVolume returns, and the supervisor's whole job here is to persist a
 	// verdict it might otherwise never hear.
 	onRevoked     func(mountRevocation)
+	rtc           permissionclock.UTCReader
 	awaitTLS      func(context.Context) error
 	dispatchFence *authorityrpc.DispatchFence
 	beforeKernel  func(*authorityrpc.Client, mountRoutes) (*fusev3.ManagedConfig, error)
@@ -171,7 +173,7 @@ func mountFUSEv3(ctx context.Context, cfg fuseV3Config) (_ *fuseV3Mount, authori
 		return nil, false, false, fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
 	attach := authorityrpc.ClientConfig{
-		AwaitTLS: cfg.awaitTLS, DispatchFence: cfg.dispatchFence, LifecycleRetry: cfg.beforeKernel != nil,
+		WorkspaceRTC: cfg.rtc, AwaitTLS: cfg.awaitTLS, DispatchFence: cfg.dispatchFence, LifecycleRetry: cfg.beforeKernel != nil,
 		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX,
 		Address:         cfg.addr, TLS: tlsCfg, VolumeID: cfg.volumeID,

@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -178,7 +179,7 @@ func TestWorkspaceDrainKeepsWithdrawalLead(t *testing.T) {
 	s.mu.RLock()
 	cacheUntil, horizon := s.cacheUntil, s.horizon
 	s.mu.RUnlock()
-	renewed := s.acceptRenewal(inc, horizon.Add(time.Minute))
+	renewed := s.acceptRenewal(inc, permissionclock.Permission{Time: horizon.Add(time.Minute)})
 	drain := f.mount.workspaceFS().captureWorkspaceDrain(time.Now().Add(time.Hour))
 	_, deadline, _, liveDrain := s.currentIncarnation()
 	t.Logf("live=%v liveAfterClose=%v renewalAccepted=%v liveWithDrain=%v cacheUntil=%v horizon=%v drainDeadline=%v (drain-cacheUntil=%v)",
@@ -402,12 +403,12 @@ type workspaceRenewRPC struct {
 	calls atomic.Int32
 }
 
-func (r *workspaceRenewRPC) RenewSubscription(_ context.Context, _ uint64) (time.Time, error) {
+func (r *workspaceRenewRPC) RenewSubscription(_ context.Context, _ uint64) (permissionclock.Permission, error) {
 	r.calls.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.horizon = r.horizon.Add(time.Hour)
-	return r.horizon, nil
+	return permissionclock.Permission{Time: r.horizon}, nil
 }
 
 type workspaceRecallRPC struct {
