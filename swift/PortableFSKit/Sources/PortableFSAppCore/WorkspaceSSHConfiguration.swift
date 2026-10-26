@@ -134,6 +134,7 @@ public enum PortableFSWorkspaceSSH {
         }
         func requireWritable() throws {
             guard metadata.map({ $0.st_mode & 0o200 != 0 }) ?? true,
+                  metadata == nil || access(url.path, W_OK) == 0,
                   access(url.deletingLastPathComponent().path, W_OK) == 0 else { throw PortableFSWorkspaceError("SSH configuration is read-only") }
         }
         func recheck() throws {
