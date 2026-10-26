@@ -35,6 +35,11 @@ var (
 	// mount: continuing would hide a subtree from every peer, so the mount must
 	// reconcile its declaration and remount rather than retry.
 	ErrRoutesMismatch = errors.New("authorityrpc: mount routing revision is not the volume's active one")
+	// Abandoning an unresolved replay ends this client's usable session even
+	// without an authority expiry verdict. Keep both the terminal scope and the
+	// unknown operation outcome; transport uncertainty alone also names retryable
+	// connection failures and must not imply session termination.
+	errUnresolvedMutation = fmt.Errorf("%w: unresolved mutation: %w", ErrSessionEnded, ErrTransportUncertain)
 )
 
 // PreKernelMountAbsenceObserver produces the supervisor's exact local evidence
@@ -2156,7 +2161,16 @@ func (c *Client) CallMutationWithIdentityRetained(
 		ctx = context.WithValue(ctx, dispatchReplayKey{}, request)
 	}
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
-		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		// Cache withdrawal must not cancel an assigned replay. Ordinary
+		// operations still owe their caller the original request deadline;
+		// only lifecycle-owned workspace requests outlive network budgets.
+		var owned context.Context
+		var cancel context.CancelFunc
+		if deadline, bounded := ctx.Deadline(); bounded && c.cfg.DispatchFence == nil {
+			owned, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		} else {
+			owned, cancel = context.WithCancel(context.WithoutCancel(ctx))
+		}
 		stop := context.AfterFunc(session, cancel)
 		defer func() { stop(); cancel() }()
 		if session.Err() != nil {
@@ -2197,10 +2211,11 @@ func (c *Client) CallMutationWithIdentityRetained(
 			if terminalErr := c.checkCallEntry(); terminalErr != nil {
 				return nil, nil, terminalErr
 			}
-			// Each establishment attempt stays bounded. Its subscription-sized
-			// budget says nothing about a live session's retained replay outcome:
-			// keep this exact body, slot, and lane permit until it resolves.
-			if errors.Is(reconnectErr, ErrTransportUncertain) && ctx.Err() == nil {
+			// Only a workspace lifecycle owns replay across exhausted network
+			// attempts. An ordinary mount must settle uncertainty when its
+			// bounded reconnect fails, including background calls without a
+			// foreground deadline.
+			if c.cfg.DispatchFence != nil && errors.Is(reconnectErr, ErrTransportUncertain) && ctx.Err() == nil {
 				retryErr := waitTransportRetry(ctx)
 				if retryErr == nil {
 					continue
@@ -2211,7 +2226,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 				return nil, nil, reconnectErr
 			}
 			if !errors.Is(reconnectErr, ErrAuthorityChanged) && !errors.Is(reconnectErr, ErrSessionEnded) && !errors.Is(reconnectErr, ErrTransportBinding) {
-				reconnectErr = ErrTransportUncertain
+				reconnectErr = errUnresolvedMutation
 			}
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
@@ -2222,8 +2237,8 @@ func (c *Client) CallMutationWithIdentityRetained(
 	// may have reached the authority, cancellation cannot settle that identity,
 	// even when the exact replay was refused before its own socket write.
 	if submitted && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		c.signalSessionEnd(ErrTransportUncertain)
-		return nil, nil, ErrTransportUncertain
+		c.signalSessionEnd(errUnresolvedMutation)
+		return nil, nil, errUnresolvedMutation
 	}
 	if err != nil {
 		return nil, nil, err
@@ -2242,7 +2257,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 		return response, consumption, err
 	}
 	if response.GetUncertain() && !RecoverableUncertainty(response) {
-		c.signalSessionEnd(ErrTransportUncertain)
+		c.signalSessionEnd(errUnresolvedMutation)
 	}
 	return response, consumption, nil
 }
@@ -2303,7 +2318,7 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 			}
 		}
 		if response.GetUncertain() && !RecoverableUncertainty(response) {
-			c.signalSessionEnd(ErrTransportUncertain)
+			c.signalSessionEnd(errUnresolvedMutation)
 		}
 		if token := response.GetTerminalDeliveryToken(); len(token) != 0 {
 			if validTerminalDeliveryToken(token) {

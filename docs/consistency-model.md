@@ -200,6 +200,18 @@ is not re-executed. Loss of the epoch, authentication or the assigned replay
 result remains terminal for the old operation. Ordinary capacity refusals keep
 their precise `ENOSPC`/`EDQUOT` errno.
 
+An ordinary mount bounds recovery of an unresolved mutation by its request
+deadline or, without one, a bounded reconnect attempt. Exhausting that bound
+ends the client's usable session: abandoning its assigned replay prevents safe
+reuse of the session. The terminal cause retains both session termination and
+the uncertain operation outcome; it does not claim authenticated lease expiry.
+An operation that still has a reply path reports uncertainty as `EREMOTEIO`.
+After terminal enforcement aborts the FUSE connection, retained descriptors
+fail with `ENOTCONN`. An authenticated expiry verdict remains terminal and
+cannot be replaced by a later transport failure. Explicit workspace lifecycle
+owners retain assigned replay across individual reconnect budgets until their
+session or lifecycle ends.
+
 ## Locks and open handles
 
 The authority implements independent POSIX record-lock and BSD `flock`

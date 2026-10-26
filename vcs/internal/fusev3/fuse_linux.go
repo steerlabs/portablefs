@@ -3502,6 +3502,9 @@ func rpcErrno(response *authoritypb.Response, err error) syscall.Errno {
 		if errno := contextErrno(err); errno != 0 {
 			return errno
 		}
+		if errors.Is(err, authorityrpc.ErrTransportUncertain) {
+			return syscall.EREMOTEIO
+		}
 		if errors.Is(err, authorityrpc.ErrAuthorityChanged) {
 			return syscall.EIO
 		}

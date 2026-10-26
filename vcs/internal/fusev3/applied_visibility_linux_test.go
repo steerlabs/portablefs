@@ -7,6 +7,7 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -56,6 +57,7 @@ func TestAppliedAppendVisibilityFailureSettlesSourceWithoutRevocation(t *testing
 func TestAppliedCreateVisibilityFailureDischargesBindingAndDescriptor(t *testing.T) {
 	f := newStockFixture(t)
 	f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc}
+	closed := 0
 	f.rpc.mu.Lock()
 	f.rpc.replyOverride = func(q *authoritypb.Request) (*authoritypb.Response, error) {
 		if q.GetCreate() != nil {
@@ -77,9 +79,13 @@ func TestAppliedCreateVisibilityFailureDischargesBindingAndDescriptor(t *testing
 		if q.GetCloseBatch() != nil {
 			results := make([]*authoritypb.CloseBatchResult, len(q.GetCloseBatch().GetCloses()))
 			for i := range results {
+				closed++
 				results[i] = &authoritypb.CloseBatchResult{Retired: true}
 			}
 			return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
+		}
+		if q.GetDelegationRelease() != nil {
+			return releaseSuccess(), nil
 		}
 		return &authoritypb.Response{}, nil
 	}
@@ -88,6 +94,20 @@ func TestAppliedCreateVisibilityFailureDischargesBindingAndDescriptor(t *testing
 	status := f.rawCall(func(unique uint64) fuse.Status {
 		return f.raw.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{Unique: unique, NodeId: 1}, Flags: uint32(syscall.O_RDWR | syscall.O_CREAT), Mode: 0o600}, "created", &fuse.CreateOut{})
 	})
+	// Visibility failure still owns the applied CREATE's grant and descriptor.
+	// Join their retirement so a malformed cleanup cannot race this assertion.
+	waitUntil(t, time.Second, "created descriptor retirement", func() bool {
+		f.rpc.mu.Lock()
+		retired := closed
+		f.rpc.mu.Unlock()
+		return retired != 0 && pendingCloses(f.mount.delegations) == 0
+	})
+	f.rpc.mu.Lock()
+	closes := closed
+	f.rpc.mu.Unlock()
+	if closes != 1 {
+		t.Fatalf("applied CREATE retired %d descriptors, want 1", closes)
+	}
 	if status != fuse.EIO || f.mount.isRevoked() {
 		t.Fatalf("applied create: %v; terminal=%v", status, f.mount.fatalError())
 	}
@@ -154,6 +174,9 @@ func TestAppliedRangeAndTruncatingOpenVisibilityFailuresSettleSource(t *testing.
 						results[i] = &authoritypb.CloseBatchResult{Retired: true}
 					}
 					return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
+				}
+				if q.GetDelegationRelease() != nil {
+					return releaseSuccess(), nil
 				}
 				return &authoritypb.Response{}, nil
 			}

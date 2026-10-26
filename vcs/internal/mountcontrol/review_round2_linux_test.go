@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -377,30 +378,34 @@ func TestObservationRefusalsAndExpiredAcceptanceHaveNoLifecycleEffect(t *testing
 }
 
 func TestObservationAfterDrainExpiry(t *testing.T) {
-	expired, release := make(chan struct{}), make(chan struct{})
-	o := testOwner(t, func(ctx context.Context, j *Job) error {
-		<-ctx.Done()
-		close(expired)
-		<-release
-		if err := j.Publish("cold", Facts{}); err == nil {
-			t.Error("expired drain certified cold")
+	// Admission must precede expiry even when race instrumentation or host
+	// scheduling takes longer than this pure fixture's ten-millisecond budget.
+	synctest.Test(t, func(t *testing.T) {
+		expired, release := make(chan struct{}), make(chan struct{})
+		o := testOwner(t, func(ctx context.Context, j *Job) error {
+			<-ctx.Done()
+			close(expired)
+			<-release
+			if err := j.Publish("cold", Facts{}); err == nil {
+				t.Error("expired drain certified cold")
+			}
+			return ctx.Err()
+		})
+		q := request("workspace-suspend", 1, 1)
+		transaction(t, &q)
+		q.Workspace.DrainBudgetNanos = "10000000"
+		j := start(t, o, q)
+		awaitResult(t, expired)
+		if snap := observe(t, o, 2, 1); snap.Workspace.State != "pending-suspend" {
+			t.Fatal(snap)
 		}
-		return ctx.Err()
+		do(t, o, q, &Rights{}) // A live waiter neither extends nor cancels the fixed job.
+		close(release)
+		awaitResult(t, j.done)
+		if snap := observe(t, o, 2, 1); snap.Workspace.State != "failed" {
+			t.Fatal(snap)
+		}
 	})
-	q := request("workspace-suspend", 1, 1)
-	transaction(t, &q)
-	q.Workspace.DrainBudgetNanos = "10000000"
-	j := start(t, o, q)
-	awaitResult(t, expired)
-	if snap := observe(t, o, 2, 1); snap.Workspace.State != "pending-suspend" {
-		t.Fatal(snap)
-	}
-	do(t, o, q, &Rights{}) // A live waiter neither extends nor cancels the fixed job.
-	close(release)
-	awaitResult(t, j.done)
-	if snap := observe(t, o, 2, 1); snap.Workspace.State != "failed" {
-		t.Fatal(snap)
-	}
 }
 
 func TestFirstDeliveryValidationNeverOwnsRejectedRights(t *testing.T) {
