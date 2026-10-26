@@ -43,9 +43,9 @@ For kernel stability, build the paired native development executable and run
 
 ```sh
 bash scripts/build-linux-workspace-dev.sh
+bin="$(swift build --package-path swift/PortableFSKit --show-bin-path)/portablefs-workspace-dev"
 python3 scripts/test-linux-workspace-kernel-stability.py \
-  swift/PortableFSKit/.build/arm64-apple-macosx/debug/portablefs-workspace-dev \
-  /absolute/image /absolute/stability-evidence --cycles 50
+  "$bin" /absolute/image /absolute/stability-evidence --cycles 50
 ```
 
 Each cycle runs offline Git operations, npm and pip installs, a parallel C
