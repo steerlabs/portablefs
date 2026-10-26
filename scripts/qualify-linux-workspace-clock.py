@@ -37,6 +37,8 @@ def utc_ns(value):
 
 def reference_interval(references, began, ended, guest_began, guest_ended):
     """Charge server uncertainty and the complete command/SSH transit window."""
+    if began > ended or guest_began > guest_ended:
+        raise ValueError('reversed reference or sample interval')
     if not isinstance(references, list) or len(references) < 2:
         raise ValueError('two independent NTS servers required')
     servers, intervals = set(), []
@@ -52,7 +54,7 @@ def reference_interval(references, began, ended, guest_began, guest_ended):
         instant = ref['unix_ns']
         if type(instant) is not int:
             raise ValueError('reference timestamp must be integer nanoseconds')
-        intervals.append((instant - uncertainty + max(0, guest_began - ended),
+        intervals.append((instant - uncertainty + guest_began - ended,
                           instant + uncertainty + guest_ended - began))
     low, high = max(v[0] for v in intervals), min(v[1] for v in intervals)
     if low > high:
@@ -95,14 +97,22 @@ def evaluate(sample, reference=None):
     return result
 
 
+def measurement_coverage(records, seconds):
+    # Catch-up bursts cannot replace an unobserved thirty-second interval.
+    return set(range(int(seconds // INTERVAL) + 1)).issubset({v['interval_slot'] for v in records})
+
+
 # Bounded CPU, fsync, directory traversal and source indexing in one owned tree.
 LOAD = r'''
-import hashlib,os,pathlib,tempfile,time
-end=time.monotonic()+float(__import__('sys').argv[1])
+import hashlib,os,pathlib,sys,tempfile,threading
+stop=threading.Event()
+def until_closed():
+ sys.stdin.buffer.read(1);stop.set()
+threading.Thread(target=until_closed,daemon=True).start()
 with tempfile.TemporaryDirectory(prefix='pfs-clock-load-') as root:
  p=pathlib.Path(root); data=b'x'*1048576
  for n in range(256): (p/('source-%04d.py'%n)).write_text('def value(): return 42\n'*128)
- while time.monotonic()<end:
+ while not stop.is_set():
   for n in range(16):
    with (p/('io-%d'%n)).open('wb') as f: f.write(data);f.flush();os.fsync(f.fileno())
    hashlib.sha256(data).digest()
@@ -113,6 +123,21 @@ PROBE = "python3 -c " + shlex.quote("import json,time; m=json.load(open('/run/po
 
 class BoundViolation(ValueError):
     """Observed bound failure, distinct from missing qualification coverage."""
+
+
+def stop_load(load):
+    # EOF names only this SSH command's owned workload and remains meaningful
+    # when guest MONOTONIC stopped during a VZ pause in the load block.
+    load.stdin.close()
+    try:
+        return load.wait(timeout=20) == 0
+    except subprocess.TimeoutExpired:
+        load.terminate()
+        try:
+            load.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            load.kill(); load.wait(timeout=5)
+        return False
 
 
 class PauseCampaign:
@@ -137,14 +162,18 @@ class PauseCampaign:
     def run(self):
         blocks = 1 if self.dry_run else int(self.duration // (6*3600))
         for block in range(blocks):
-            if self.stop.wait(max(0,self.started+(60 if self.dry_run else 900+block*6*3600)-time.monotonic())):
-                return
             cases = [(mode,pause) for mode in ('normal','delayed','suppressed')
                      for pause in ((.1,) if self.dry_run else (.1,.5,2,5,15,45,150,600))]
-            for mode,pause in cases:
+            if block % 2: cases.reverse()
+            for index,(mode,pause) in enumerate(cases):
+                phase = 0 if self.dry_run or index < len(cases)//2 else 1
+                when = 60 if self.dry_run else 900+block*6*3600+phase*3*3600
+                if self.stop.wait(max(0,self.started+when-time.monotonic())):
+                    return
                 if self.stop.is_set(): return
                 case = dict(block=block, fencing=mode, pause_seconds=pause,
-                            image_manifest_sha256=self.image_hash, host_sleep=False)
+                            image_manifest_sha256=self.image_hash, host_sleep=False,
+                            load='load' if phase else 'idle')
                 self.active.set()
                 try:
                     raw = subprocess.check_output(shlex.split(self.command)+[json.dumps(case)], text=True,
@@ -188,6 +217,12 @@ class PauseCampaign:
             if self.thread.is_alive():
                 self.errors.append(dict(error="pause driver failed to join; qualification incomplete"))
 
+    def sample_token(self):
+        return self.active.is_set(), len(self.records) + len(self.errors)
+
+    def overlaps_sample(self, token):
+        return token[0] or self.active.is_set() or token[1] != len(self.records) + len(self.errors)
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -220,16 +255,15 @@ def main():
             current = int((now - start) // block_seconds)
             if current != block:
                 if load is not None:
-                    load.wait(timeout=15)
-                    if load.returncode != 0:
+                    if not stop_load(load):
                         failures.append('owned guest load failed')
                     load = None
                 block = current
                 if block % 2:
-                    duration = max(0, min(deadline, start + (block + 1) * block_seconds) - now)
-                    load = subprocess.Popen(ssh + ['python3 -c ' + shlex.quote(LOAD) + ' ' + str(duration)],
+                    load = subprocess.Popen(ssh + ['python3 -c ' + shlex.quote(LOAD)], stdin=subprocess.PIPE,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             reference, reference_error = None, None
+            pause_token = campaign.sample_token()
             ref_began = time.monotonic_ns()
             try:
                 if a.utc_reference_command:
@@ -239,6 +273,7 @@ def main():
             ref_ended = time.monotonic_ns()
             began = time.monotonic_ns()
             record = dict(index=len(records), block=block, load='load' if block % 2 else 'idle',
+                          interval_slot=int((ref_began-int(start*SECOND))//(INTERVAL*SECOND)),
                           host_elapsed_ns=began-int(start*SECOND), independent_reference=reference, reference_error=reference_error, reference_valid=False)
             if reference:
                 try:
@@ -249,22 +284,28 @@ def main():
             try:
                 sample = json.loads(subprocess.check_output(ssh + [PROBE], text=True, timeout=10))
                 ended = time.monotonic_ns()
-                interval = None
-                if reference:
-                    try:
-                        interval = reference_interval(reference['references'], ref_began, ref_ended, began, ended)
-                    except (KeyError, TypeError, ValueError) as error:
-                        reference_error = str(error)
-                checks = evaluate(sample, interval)
-                record.update(sample=sample, checks=checks, independent_reference=reference,
-                              reference_error=reference_error, host_measurement_ns=ended-began,
+                record.update(sample=sample, host_measurement_ns=ended-began,
                               full_reference_sampling_transit_ns=ended-ref_began)
-                drift_bounds.append(checks['awake_drift_bound_ns'])
-                if checks['source'] == 'fail':
-                    failures.append('independent source error exceeds one second')
+                if campaign.overlaps_sample(pause_token):
+                    # Old maintenance projection is deliberately invalid across
+                    # VZ pause. The campaign separately qualifies the first
+                    # fresh register read and waits for completed recovery.
+                    record['intentional_pause_unavailability'] = True
+                else:
+                    interval = None
+                    if reference:
+                        try:
+                            interval = reference_interval(reference['references'], ref_began, ref_ended, began, ended)
+                        except (KeyError, TypeError, ValueError) as error:
+                            reference_error = str(error)
+                    checks = evaluate(sample, interval)
+                    record.update(checks=checks, reference_error=reference_error)
+                    drift_bounds.append(checks['awake_drift_bound_ns'])
+                    if checks['source'] == 'fail':
+                        failures.append('independent source error exceeds one second')
             except (OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
                 record['error'] = str(error)
-                if campaign.active.is_set():
+                if campaign.overlaps_sample(pause_token):
                     record['intentional_pause_unavailability'] = True
                 else:
                     failures.append(str(error))
@@ -278,15 +319,16 @@ def main():
         sample_file.close()
         campaign.finish()
         if load is not None:
-            # Only our SSH process, whose bounded remote workload owns a temp tree.
-            load.wait(timeout=20)
+            if not stop_load(load):
+                failures.append('owned guest load failed')
     (a.evidence / 'samples.json').write_text(json.dumps(records, indent=2)+'\n')
     coverage = sum(v.get('checks', {}).get('source') == 'pass' for v in records)
     failures.extend(v['error'] for v in campaign.errors if v.get('bound_violation'))
     available = len(records)-sum(v.get('intentional_pause_unavailability') is True for v in records)
     reference_coverage = sum(v.get('reference_valid') is True for v in records)
     full = time.monotonic()-start >= FULL_SECONDS and not a.dry_run
-    utc = ('fail' if failures else 'pass' if full and available > 0 and coverage == available and reference_coverage == len(records) and
+    cadence_complete = measurement_coverage(records, seconds)
+    utc = ('fail' if failures else 'pass' if full and cadence_complete and available > 0 and coverage == available and reference_coverage == len(records) and
            drift_bounds and all(v <= SECOND//4 for v in drift_bounds) else 'inconclusive')
     admission, resume_covered, duplicates_covered = 'inconclusive', False, False
     if a.admission_evidence:
@@ -306,12 +348,14 @@ def main():
     result = dict(format=8, image_manifest_sha256=image_hash, seconds=time.monotonic()-start,
                   dry_run=a.dry_run, full_soak=full, samples=len(records), source_coverage=coverage, source_measurements=available, reference_coverage=reference_coverage,
                   blocks=sorted({(v['block'], v['load']) for v in records}), failures=failures,
+                  measurement_coverage_complete=cadence_complete,
                   awake_discipline_passed=not failures, utc=utc, rtc_admission=admission,
                   g0='pass' if utc == admission == 'pass' else 'fail' if 'fail' in (utc,admission) else 'inconclusive',
                   first_read_after_resume=resume_covered, concurrent_duplicate_readers=duplicates_covered,
                   pause_campaign_cases=len(campaign.records), pause_campaign_errors=campaign.errors,
                   utc_accuracy_qualified=utc == 'pass',
                   unproven=[name for name,ok in [('72-hour coverage',full),('independent NTS UTC coverage',reference_coverage==len(records) and coverage==available),
+                            ('30-second measurement coverage',cadence_complete),
                             ('first read after VZ resume',resume_covered),('concurrent duplicated readers',duplicates_covered),
                             ('six-hour VZ pause campaigns',campaign_complete),('awake drift bound',bool(drift_bounds) and all(v<=SECOND//4 for v in drift_bounds))] if not ok])
     (a.evidence / 'result.json').write_text(json.dumps(result, indent=2)+'\n')

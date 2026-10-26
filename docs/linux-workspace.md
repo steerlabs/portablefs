@@ -1039,6 +1039,11 @@ within 250 ms each, and conditional total error within three seconds. Separate
 UTC, RTC admission and G0 verdicts require matching first-read-after-resume and
 concurrent duplicate-reader evidence. `--dry-run --seconds 1800` exercises the
 harness in fifteen-minute idle/load blocks without claiming the 72-hour gate.
+Set `PFS_NATIVE_CLOCK_DRY_RUN=1` when running the native workspace gate to
+include this thirty-minute dry run on that gate's exact image. Missing
+thirty-second measurement slots remain inconclusive; catch-up samples cannot
+replace them. Each six-hour pause campaign spans both its idle and load halves,
+with case order reversed in alternating campaigns.
 For a full run, `--pause-command` invokes the exact candidate's disposable VZ
 test owner every six hours. Each case binds the image digest and prestarted
 operation, reports denial before host recovery, cold/fresh or exact terminal
