@@ -12,14 +12,27 @@ printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-sec
 rm -f /etc/apt/sources.list.d/*
 apt-get update
 apt-get install -y --no-install-recommends mmdebstrap ca-certificates python3 e2fsprogs
+security_snapshot="$(python3 -c 'import json;print(json.load(open("/source/image.lock.json"))["security_snapshot"])')"
 mkdir -p /build
 rm -rf /build/rootfs
+# Retain the base snapshot and its security packages while selecting the kernel
+# from a newer security snapshot. Pin every locked version before bootstrap so
+# an unrelated security update cannot silently change the image inventory.
+python3 - <<'PYPINS'
+import json,pathlib
+lock=json.load(open('/source/image.lock.json'))
+pathlib.Path('/build/preferences').write_text(''.join(
+    'Package: '+p['package']+'\nPin: version '+p['version']+'\nPin-Priority: 1001\n\n'
+    for p in lock['packages']))
+PYPINS
 includes="$(python3 -c 'import json;print(",".join(json.load(open("/source/image.lock.json"))["include"]))')"
 mmdebstrap --mode=root --architectures=arm64 --variant=minbase --include="$includes" \
+  --setup-hook='cp /build/preferences "$1/etc/apt/preferences.d/portablefs-workspace"' \
   --aptopt='Acquire::Check-Valid-Until "false"' \
   trixie /build/rootfs "deb https://snapshot.debian.org/archive/debian/$snapshot/ trixie main" \
   "deb https://snapshot.debian.org/archive/debian/$snapshot/ trixie-updates main" \
-  "deb https://snapshot.debian.org/archive/debian-security/$snapshot/ trixie-security main"
+  "deb https://snapshot.debian.org/archive/debian-security/$snapshot/ trixie-security main" \
+  "deb https://snapshot.debian.org/archive/debian-security/$security_snapshot/ trixie-security main"
 root=/build/rootfs
 # Debian's machine-id, Python bytecode headers, initramfs and ext4 metadata must
 # describe the inputs, never the build container's hostname or wall time.

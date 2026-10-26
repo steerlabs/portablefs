@@ -569,8 +569,9 @@ swift/PortableFSKit/.build/out/Products/Debug/portablefs-workspace-dev /absolute
 
 The builder uses mmdebstrap in its own bounded container with SYS_ADMIN for mmdebstrap mounts from the digest in
 `image.lock.json`, with Debian trixie at one snapshot timestamp and
-`SOURCE_DATE_EPOCH` and a fixed ext4 creation clock. Security and updates use the
-same snapshot timestamp; hostname and hosts are explicit. The native gate builds
+`SOURCE_DATE_EPOCH` and a fixed ext4 creation clock. A second pinned security
+snapshot supplies the kernel update; APT preferences retain all other locked
+package versions. Hostname and hosts are explicit. The native gate builds
 twice and compares every manifest hash. It checks the complete installed binary/source version
 inventory against that lock. `--update-lock` explicitly refreshes the binary and
 source inventories; commit the changed lock before building a release candidate.
