@@ -210,7 +210,8 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             try PortableFSWorkspaceSSH.install(home: home, stanza: uxStanza)
             var calls: [String] = []
             var running = PortableFSWorkspaceStatus(); running.state = "running"; running.desiredRunning = true
-            let actions = WorkspaceRemoval.Actions(stop: { calls.append("stop"); return .init() }, status: { running }, quiesce: { calls.append("quiesce") }, unregister: { calls.append("unregister") }, removeSSH: { calls.append("ssh"); try PortableFSWorkspaceSSH.remove(home: home) })
+            let initialStatus = running
+            let actions = WorkspaceRemoval.Actions(stop: { calls.append("stop"); return .init() }, status: { initialStatus }, quiesce: { calls.append("quiesce") }, unregister: { calls.append("unregister") }, removeSSH: { calls.append("ssh"); try PortableFSWorkspaceSSH.remove(home: home) })
             _ = try await WorkspaceRemoval.run(data: data, home: home, actions: actions)
             #expect(calls == ["stop", "quiesce", "unregister", "ssh"])
             _ = try await WorkspaceRemoval.run(data: data, home: home, actions: actions)
@@ -229,7 +230,8 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             if reason == "cleanup-required" { status.state = reason; status.message = "Cleanup required" }
             status.someChangesWereNotSaved = reason == "lost"; status.previousWriteOutcomeUnknown = reason == "unknown"
             var touched = false
-            let actions = WorkspaceRemoval.Actions(stop: { status }, status: { status }, quiesce: { touched = true }, unregister: { touched = true }, removeSSH: { touched = true })
+            let refusal = status
+            let actions = WorkspaceRemoval.Actions(stop: { refusal }, status: { refusal }, quiesce: { touched = true }, unregister: { touched = true }, removeSSH: { touched = true })
             await #expect(throws: (any Error).self) { try await WorkspaceRemoval.run(data: .delete, home: home, actions: actions) }
             #expect(!touched)
         }
