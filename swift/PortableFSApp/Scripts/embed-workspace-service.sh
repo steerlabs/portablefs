@@ -1,6 +1,6 @@
 #!/bin/sh
-# The VM executable is nested code with its own entitlement. Guest images and
-# installer/update integration are owned by the subsequent packaging change.
+# The VM executable alone receives the virtualization entitlement. The image
+# is inserted before either nested or enclosing code is signed.
 set -eu
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
@@ -25,6 +25,16 @@ for arch in ${ARCHS:-$(uname -m)}; do
 done
 if [ "$#" -gt 1 ]; then /usr/bin/lipo -create "$@" -output "$service_macos/portablefs-workspace-service"
 else /bin/cp "$1" "$service_macos/portablefs-workspace-service"; fi
+image_digest=
+if [ -n "${PORTABLEFS_WORKSPACE_ARTIFACT_DIR:-}" ]; then
+  image="$contents_dir/Resources/LinuxWorkspace"
+  # Xcode clean/archive owns this output, never a user data directory.
+  rm -rf "$image"
+  mkdir -p "$contents_dir/Resources"
+  image_digest=$(python3 "$repo_root/scripts/prepare-workspace-bundle.py" \
+    "$PORTABLEFS_WORKSPACE_ARTIFACT_DIR" "$image" \
+    --commit "$PFS_WORKSPACE_BUILD_COMMIT" --version "$MARKETING_VERSION" | tail -n 1)
+fi
 info="$service_contents/Info.plist"
 /usr/bin/plutil -create xml1 "$info"
 /usr/bin/plutil -insert CFBundleExecutable -string portablefs-workspace-service "$info"
@@ -32,6 +42,10 @@ info="$service_contents/Info.plist"
 /usr/bin/plutil -insert CFBundleName -string PortableFSWorkspaceService "$info"
 /usr/bin/plutil -insert CFBundlePackageType -string APPL "$info"
 /usr/bin/plutil -insert CFBundleShortVersionString -string "$MARKETING_VERSION" "$info"
+/usr/bin/plutil -insert PFSWorkspaceBuildCommit -string "$PFS_WORKSPACE_BUILD_COMMIT" "$info"
+if [ -n "$image_digest" ]; then
+  /usr/bin/plutil -insert PFSWorkspaceImageManifestSHA256 -string "$image_digest" "$info"
+fi
 /usr/bin/plutil -insert CFBundleVersion -string "$CURRENT_PROJECT_VERSION" "$info"
 /usr/bin/plutil -insert LSBackgroundOnly -bool YES "$info"
 /usr/bin/plutil -insert LSMinimumSystemVersion -string 26.0 "$info"
@@ -43,6 +57,6 @@ plist="$contents_dir/Library/LaunchAgents/$PRODUCT_BUNDLE_IDENTIFIER.workspace.p
 /usr/bin/plutil -insert RunAtLoad -bool YES "$plist"
 /usr/bin/plutil -insert KeepAlive -bool YES "$plist"
 if [ "${CODE_SIGNING_ALLOWED:-NO}" != NO ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "$EXPANDED_CODE_SIGN_IDENTITY" != - ]; then
-  /usr/bin/codesign --force --options runtime --sign "${PORTABLEFS_SERVICE_SIGN_IDENTITY:-$EXPANDED_CODE_SIGN_IDENTITY}" \
+  /usr/bin/codesign --force --options runtime --sign "${PORTABLEFS_SERVICE_SIGN_IDENTITY:?explicit Developer ID service identity required}" \
     --entitlements "$script_dir/../Config/PortableFSWorkspaceService.entitlements" "$service_app"
 fi

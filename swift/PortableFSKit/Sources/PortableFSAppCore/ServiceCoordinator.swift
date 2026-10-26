@@ -230,19 +230,22 @@ public enum PortableFSDServiceCoordinator {
         private let pinnedLock: stat
         private let directoryURL: URL
         private let pinnedDirectory: stat
+        private let lockName: String
 
         init(
             directory: Int32,
             lock: Int32,
             pinnedLock: stat,
             directoryURL: URL,
-            pinnedDirectory: stat
+            pinnedDirectory: stat,
+            lockName: String = ".portablefsd-state.lock"
         ) {
             self.directory = directory
             self.lock = lock
             self.pinnedLock = pinnedLock
             self.directoryURL = directoryURL
             self.pinnedDirectory = pinnedDirectory
+            self.lockName = lockName
         }
 
         deinit { release() }
@@ -253,7 +256,7 @@ public enum PortableFSDServiceCoordinator {
             guard lock >= 0,
                   Darwin.fstatat(
                     directory,
-                    PortableFSDServiceCoordinator.stateSingletonName,
+                    lockName,
                     &current,
                     AT_SYMLINK_NOFOLLOW
                   ) == 0,
@@ -274,6 +277,9 @@ public enum PortableFSDServiceCoordinator {
         /// is neither opened, parsed nor changed. Nothing is decoded: the
         /// registry's format is private to the release that wrote it.
         func requireDaemonRegistryAbsent() throws {
+            try requireResourceAbsent(PortableFSDServiceCoordinator.daemonRegistryName)
+        }
+        func requireResourceAbsent(_ name: String) throws {
             try confirmHeld()
             try PortableFSDServiceCoordinator.recheckPinnedDirectory(
                 directoryURL,
@@ -282,7 +288,7 @@ public enum PortableFSDServiceCoordinator {
             var entry = stat()
             if Darwin.fstatat(
                 directory,
-                PortableFSDServiceCoordinator.daemonRegistryName,
+                name,
                 &entry,
                 AT_SYMLINK_NOFOLLOW
             ) == 0 {
@@ -469,6 +475,7 @@ public enum PortableFSDServiceCoordinator {
             outgoing: try ExpectedDaemon(bundle: bundle, releaseIdentity: releaseIdentity)
         )
         do {
+            try quiesceWorkspaceForInstaller(bundle: bundle)
             // Capture the exact current listener only after the mount/attach
             // inventory guard is held, closing the daemon-restart gap between
             // admission proof and ServiceManagement unregistration.
@@ -576,6 +583,7 @@ public enum PortableFSDServiceCoordinator {
                 "the installer fence target is not this sealed release"
             )
         }
+        try quiesceWorkspaceForInstaller(bundle: bundle)
         let service = SMAppService.agent(plistName: configuration.plistName)
         if service.status == .notRegistered {
             let paths = try runtimePaths(bundle: bundle)
@@ -1536,7 +1544,8 @@ public enum PortableFSDServiceCoordinator {
     static func lockStateSingleton(
         at stateDirectory: URL,
         creating: Bool,
-        beforeFinalRecheck: (() throws -> Void)? = nil
+        beforeFinalRecheck: (() throws -> Void)? = nil,
+        lockName: String = ".portablefsd-state.lock"
     ) throws -> StateSingletonLock {
         guard let directory = try openStateDirectory(at: stateDirectory, creating: creating) else {
             return .absent
@@ -1548,7 +1557,7 @@ public enum PortableFSDServiceCoordinator {
             throw RegistrationError.inspectDaemonStateSingleton(errno)
         }
 
-        let name = stateSingletonName
+        let name = lockName
         let lock: Int32
         var namedLock = stat()
         let lockExisted = Darwin.fstatat(directory, name, &namedLock, AT_SYMLINK_NOFOLLOW) == 0
@@ -1611,7 +1620,8 @@ public enum PortableFSDServiceCoordinator {
             lock: lock,
             pinnedLock: pinnedLock,
             directoryURL: stateDirectory,
-            pinnedDirectory: pinnedDirectory
+            pinnedDirectory: pinnedDirectory,
+            lockName: lockName
         )
         directoryOwned = true
         lockOwned = true
@@ -2489,5 +2499,57 @@ extension PortableFSDServiceCoordinator {
         defer { witness.close() }
         let peer = DaemonPeer(auditToken:token,executableURL:URL(fileURLWithPath:expectedPath),processWitness:witness)
         try requireRunningImage(peer,expectedPath:expectedPath,expectedCDHash:expectedCDHash)
+    }
+}
+
+// The installer already holds the shared product's exclusive lifecycle guard.
+// The workspace's durable marker is independent of any private registry format.
+extension PortableFSDServiceCoordinator {
+    static func quiesceWorkspaceForInstaller(bundle: Bundle) throws {
+        guard let identifier = bundle.bundleIdentifier else { throw PortableFSSignedServiceError.invalidBundle }
+        // The manual-registration development host has no workspace component.
+        guard FileManager.default.fileExists(atPath: bundle.bundleURL.appendingPathComponent("Contents/Library/LaunchAgents/PortableFSWorkspaceService.app").path) else { return }
+        let directory = URL(fileURLWithPath: try PortableFSAccountHome.resolve(), isDirectory: true).appendingPathComponent(".local/state/portablefs/workspace", isDirectory: true)
+        try requireWorkspaceResourceWitnessAbsent(directory)
+        let service = SMAppService.agent(plistName: identifier + ".workspace.plist")
+        switch service.status {
+        case .enabled, .requiresApproval: try service.unregister()
+        case .notRegistered, .notFound: break
+        @unknown default: throw PortableFSSignedServiceError.invalidIdentity
+        }
+        let deadline = Date().addingTimeInterval(10)
+        repeat {
+            if service.status == .notRegistered || service.status == .notFound {
+                switch try lockStateSingleton(at: directory, creating: false, lockName: "service.lock") {
+                case .absent:
+                    try requireWorkspaceResourceWitnessAbsent(directory)
+                    return
+                case .owned(let exclusion):
+                    defer { exclusion.release() }
+                    try exclusion.requireResourceAbsent("resources.present")
+                    var socket = stat()
+                    let path = directory.appendingPathComponent("control.sock").path
+                    guard lstat(path, &socket) != 0, errno == ENOENT else { throw PortableFSSignedServiceError.invalidIdentity }
+                    return
+                case .held: break
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        throw PortableFSSignedServiceError.codeValidation("workspace singleton release unconfirmed")
+    }
+}
+
+extension PortableFSDServiceCoordinator {
+    private static func requireWorkspaceResourceWitnessAbsent(_ url: URL) throws {
+        guard let directory = try openStateDirectory(at: url, creating: false) else { return }
+        defer { Darwin.close(directory) }
+        var pinned = stat(), entry = stat()
+        guard fstat(directory, &pinned) == 0 else { throw PortableFSSignedServiceError.invalidIdentity }
+        guard fstatat(directory, "resources.present", &entry, AT_SYMLINK_NOFOLLOW) != 0, errno == ENOENT else {
+            throw PortableFSSignedServiceError.codeValidation("workspace resources remain; cleanly stop Linux Workspace before updating")
+        }
+        guard fsync(directory) == 0 else { throw PortableFSSignedServiceError.invalidIdentity }
+        try recheckPinnedDirectory(url, expected: pinned)
     }
 }

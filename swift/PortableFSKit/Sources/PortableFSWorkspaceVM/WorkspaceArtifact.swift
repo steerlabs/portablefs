@@ -19,8 +19,11 @@ public struct WorkspaceArtifact: Sendable {
     public let release: WorkspaceRelease
     public let byteCount: UInt64
 
-    public init(directory: URL) throws {
+    public init(directory: URL, manifestSHA256: String? = nil) throws {
         let manifestData = try Data(contentsOf: directory.appendingPathComponent("manifest.json"))
+        if let manifestSHA256 {
+            guard hex(Data(SHA256.hash(data: manifestData))) == manifestSHA256 else { throw WorkspaceVMError("Workspace image failed verification") }
+        }
         let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
         var byteCount = UInt64(manifestData.count)
         let required: Set<String> = ["kernel", "initramfs", "system.ext4", "kernel.config", "packages.json", "packages.tsv", "source-manifest.json", "licenses.tar.gz", "initramfs.inventory", "image-inputs.json", "release.json", "bin/portablefs", "bin/portablefsd", "bin/portablefs-workspaced"]

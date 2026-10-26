@@ -33,13 +33,24 @@ cat >"$work/shims/ditto" <<'SH'
 touch "$PFS_TEST_EXTRACT_MARKER"
 exit 77
 SH
-chmod +x "$work/shims/curl" "$work/shims/ditto"
+cat >"$work/shims/df" <<'SH'
+#!/bin/sh
+if [ "${PFS_TEST_NO_SPACE:-0}" = 1 ]; then
+  printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'test 100 100 0 100% /'
+else
+  exec /bin/df "$@"
+fi
+SH
+chmod +x "$work/shims/curl" "$work/shims/ditto" "$work/shims/df"
 mkdir "$work/preinstall-shims"
 cp "$work/shims/curl" "$work/preinstall-shims/curl"
 cat >"$work/preinstall-shims/plutil" <<'SH'
 #!/bin/sh
-touch "$PFS_TEST_PREINSTALL_MARKER"
-exit 79
+if [ "$1" = -extract ] && [ "$2" = appGroup ]; then
+  touch "$PFS_TEST_PREINSTALL_MARKER"
+  exit 79
+fi
+exec /usr/bin/plutil "$@"
 SH
 chmod +x "$work/preinstall-shims/plutil"
 
@@ -80,6 +91,7 @@ PY
 }
 
 run_case normal_directories 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' reach
+PFS_TEST_NO_SPACE=1 run_case peak_space_failure 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' 'Not enough disk space'
 run_case repeated_root_slash 'PortableFS.app//' 'unsafe member name'
 run_case repeated_nested_slash 'PortableFS.app/Contents//' 'unsafe member name'
 run_case dot_component 'PortableFS.app/./Contents' 'unsafe member name'

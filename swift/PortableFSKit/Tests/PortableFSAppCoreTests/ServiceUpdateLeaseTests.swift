@@ -417,3 +417,19 @@ private func withUpdateStore(
         #expect(Date().timeIntervalSince(started) < 0.5)
     }
 }
+
+@Test func productAdmissionRefusesEveryInterruptedUpdatePhase() throws {
+    for phase in PortableFSDUpdatePhase.allCases {
+        try withUpdateStore { _, account in
+            let host = account.appendingPathComponent("host", isDirectory: true)
+            try FileManager.default.createDirectory(at: host, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let store = try PortableFSDUpdateLeaseStore(directoryURL: host)
+            try store.create(updateTestLease(phase: phase))
+            if phase == .targetComplete || phase == .rollbackComplete {
+                try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: account)
+            } else {
+                #expect(throws: (any Error).self) { try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: account) }
+            }
+        }
+    }
+}

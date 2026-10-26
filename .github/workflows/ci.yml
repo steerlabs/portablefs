@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  guest-arm64:
+    uses: ./.github/workflows/workspace-image.yml
+
   # Supply-chain, workflow-semantics, and release-trust policy. The repository
   # checks its offline policy first, then actionlint validates GitHub's complete
   # workflow schema/context contract before any product gate can merge.
@@ -174,6 +177,7 @@ jobs:
   # integration branches, not in the pull-request gate. swift-xcode-native is
   # the macOS correctness lane and stays in the gate.
   macos-app-unsigned:
+    needs: [guest-arm64]
     if: github.event_name != 'pull_request'
     runs-on: xcode-27
     timeout-minutes: 20
@@ -193,12 +197,22 @@ jobs:
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-workspace-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/guest-artifact
       - name: Build and verify the exact unsigned universal shipping app
         env:
           PORTABLEFS_APP_GROUP: B47U2LLKHW.pfsoss
           PORTABLEFS_PACKAGE_DIR: ${{ runner.temp }}/portablefs-macos-package
           PORTABLEFS_UNSIGNED: "1"
+          PORTABLEFS_WORKSPACE_ARTIFACT_DIR: ${{ runner.temp }}/guest-artifact/first
         run: scripts/package-macos-app.sh
+      - name: Falsify unsigned bundled guest and service identity checks
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          bash scripts/test-workspace-bundle-trust.sh "$RUNNER_TEMP/portablefs-macos-package/PortableFS-$version.xcarchive/Products/Applications/PortableFS.app"
       - name: Build and verify the macOS 26 development host identity
         run: |
           set -euo pipefail

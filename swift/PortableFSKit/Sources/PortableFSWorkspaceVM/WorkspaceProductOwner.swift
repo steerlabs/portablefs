@@ -1,5 +1,6 @@
 import Foundation
 import PortableFSWorkspaceCore
+import PortableFSAppCore
 
 /// One durable desired-state owner above the existing VM and guest jobs. API
 /// connections are waiters only; closing an app/CLI never cancels accepted work.
@@ -9,6 +10,7 @@ import PortableFSWorkspaceCore
     private let reservationDirectory: URL
     private let hostBoot: String
     private let factory: Factory
+    private var runtimeAdmission: WorkspaceFileLock?
     private var runtime: (any WorkspaceProductRuntime)?
     private var latest: WorkspaceStatusReply?
     private var inFlight = Set<String>()
@@ -36,6 +38,8 @@ import PortableFSWorkspaceCore
         do {
             defer { scheduleUpdate() }
             try request.validate()
+            let admission = request.operation == "status" ? nil : try acquireAdmission()
+            defer { withExtendedLifetime(admission) {} }
             guard !quiescing || request.operation == "status" else { throw WorkspaceVMError("workspace service is quiescing") }
             switch request.operation {
             case "status": break
@@ -59,6 +63,12 @@ import PortableFSWorkspaceCore
         } catch {
             var reply = snapshot(); reply.state = "refused"; reply.message = String(describing: error); return reply
         }
+    }
+    private func acquireAdmission() throws -> WorkspaceFileLock {
+        let account = try WorkspacePrivateDirectory(reservationDirectory)
+        let admission = try account.lock("mount-lifecycle.lock", shared: true)
+        try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: reservationDirectory)
+        return admission
     }
     private func accept(_ document: WorkspaceConnectionDocument) throws {
         try document.validate()
@@ -98,6 +108,7 @@ import PortableFSWorkspaceCore
             guard runtime.phase != .stopped else { throw WorkspaceVMError(failure.isEmpty ? "Cleanup required" : failure) }
             return
         }
+        let admission = try acquireAdmission()
         try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         for volume in store.value.volumes { try transition.reserve(volume.reservation) }
@@ -113,6 +124,7 @@ import PortableFSWorkspaceCore
             // Desired availability, key/scope (in guest) and old evidence survive.
             for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity" }
         }
+        runtimeAdmission = admission
         runtime = instance
         do { try instance.start() }
         catch { failure=String(describing:error);scheduleUpdate();throw error }
@@ -156,7 +168,7 @@ import PortableFSWorkspaceCore
                     state.current=nil; state.execution=nil
                     if stopRequested { state.running=false }
                 }
-                self.runtime = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
+                self.runtime = nil; runtimeAdmission = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
                 try releaseAbsentReservations()
                 if stopRequested { try store.commit { $0.running = false }; stopRequested = false }
                 else if failure.isEmpty { failure = "Cleanup required" }
@@ -298,6 +310,7 @@ import PortableFSWorkspaceCore
         guard store.value.execution == nil else { throw WorkspaceVMError("VM termination unconfirmed") }
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         for entry in transition.inventory where entry.frontend == "workspace" { try transition.release(entry) }
+        try store.publishEmptyResources()
     }
     // Lifecycle v1 is independent of the paired operational version. Quiesce
     // closes this serving execution's admission only after exact VM absence;
@@ -308,7 +321,7 @@ import PortableFSWorkspaceCore
         reply.executionPresent=runtime != nil || store.value.execution != nil
         reply.desiredRunning=store.value.running
         if request.operation == "quiesce" {
-            guard !reply.executionPresent, !store.value.running, inFlight.isEmpty else { reply.state="busy";return reply }
+            guard !reply.executionPresent, !store.value.running, inFlight.isEmpty, !WorkspaceHostState.hasUnresolvedOutcome(store.value) else { reply.state="busy";return reply }
             try releaseAbsentReservations();quiescing=true;reply.state="quiesced"
         } else { reply.state=request.operation }
         return reply

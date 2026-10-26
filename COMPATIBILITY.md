@@ -114,6 +114,7 @@ another, and none is bumped to match another.
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |
 | Mac release identity | daemon CodeDirectory hash, executable SHA-256, release version | Static release authentication; protocol numbers are not part of it. |
+| Workspace resource witness | `workspace/resources.present` under account state | Present through execution or unresolved outcome; absent only after confirmed VM termination, reservation release and clean observed outcomes. Cross-release readers check existence only, under product lifecycle exclusion. |
 | Lifecycle registry witness | `attaches.json` in the daemon state directory | Present only while the daemon has registered attachments; absent means none. |
 | Mount membership file | `mount.membership`, header `PFS-MEMBERSHIP-1` | Exact; one shared codec for authority and cell host. |
 | Signed cell plan | version `3` | Exact version, token prefix, and signing domain. |
@@ -468,7 +469,7 @@ Status never defeats explicit Stop. API/CLI acceptance reports pending work,
 never completed mount readiness. JSON separates desired running state, per-volume
 pending/authorization/ready/busy/terminal states and retained known/unknown loss.
 Only explicit force authorizes discarded RAM or terminal forced removal. The
-workspace is unqualified; signed image packaging and installer/update integration
+workspace is unqualified; installed signed-product and editor qualification
 remain required before it is a supported product.
 
 `portablefs version --json` advertises exactly these capability strings, each

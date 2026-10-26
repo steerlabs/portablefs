@@ -55,7 +55,25 @@ public final class WorkspaceHostState {
         var next = value; try update(&next)
         let raw = try WorkspaceHostControl.encode(next)
         guard raw.count <= 2 << 20 else { throw WorkspaceVMError("workspace evidence capacity reached") }
+        // The absence of this name is the cross-release empty-resource proof.
+        // Publish it before an execution can exist; retire it only after both
+        // durable desired state and clean termination/loss evidence settle.
+        let hasResources = next.execution != nil || Self.hasUnresolvedOutcome(next)
+        if hasResources { try directory.write("resources.present", data: Data("8\n".utf8)) }
         try directory.write("desired.json", data: raw); value = next
+
+    }
+    public func publishEmptyResources() throws {
+        guard value.execution == nil, !Self.hasUnresolvedOutcome(value) else { throw WorkspaceVMError("workspace outcome is unresolved") }
+        try directory.remove("resources.present")
+    }
+    public static func hasUnresolvedOutcome(_ state: WorkspaceDesiredState) -> Bool {
+        for raw in state.retained + (state.current.map { [$0] } ?? []) {
+            guard let frame = try? WorkspaceControl.decode(raw) else { return true }
+            let statuses = frame.statusReply.mounts + frame.statusReply.retired.filter(\.hasMountStatus).map(\.mountStatus)
+            if statuses.contains(where: { !$0.loss.isEmpty || $0.outcome.durability == "lost" || $0.outcome.observation == "unobserved" }) { return true }
+        }
+        return false
     }
     public func saveRequest(_ document: WorkspaceConnectionDocument) throws -> URL {
         let name = "authorization-" + document.connection.volumeId + ".pfsworkspace"

@@ -20,6 +20,7 @@ public struct PortableFSSignedRelease: Sendable {
             throw PortableFSSignedServiceError.invalidBundle
         }
         _ = try Self.codeHash(root)
+        try Self.validateWorkspaceService(root: root, identifier: identifier, bundle: bundle)
         bundleURL = root; bundleIdentifier = identifier
         let cli = root.appendingPathComponent("Contents/Helpers/portablefs")
         let executable = try Self.canonicalURL(executableURL)
@@ -36,6 +37,23 @@ public struct PortableFSSignedRelease: Sendable {
         guard own == executable || own == cli || own.path == service.path,
               try Self.team(own) == cliTeam else { throw PortableFSSignedServiceError.invalidIdentity }
         try PortableFSDServiceCoordinator.requireCurrentRunningImage(expectedPath:own.path,expectedCDHash:Self.codeHash(own))
+    }
+    private static func validateWorkspaceService(root: URL, identifier: String, bundle: Bundle) throws {
+        let service = root.appendingPathComponent("Contents/Library/LaunchAgents/PortableFSWorkspaceService.app")
+        guard let nested = Bundle(url: service), nested.bundleIdentifier == identifier + ".WorkspaceService",
+              nested.object(forInfoDictionaryKey: "CFBundleExecutable") as? String == "portablefs-workspace-service",
+              nested.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
+            throw PortableFSSignedServiceError.invalidBundle
+        }
+        _ = try codeHash(service)
+        guard try team(service) == team(root) else { throw PortableFSSignedServiceError.invalidIdentity }
+        var code: SecStaticCode?, raw: CFDictionary?
+        guard SecStaticCodeCreateWithPath(service as CFURL, [], &code) == errSecSuccess, let code,
+              SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &raw) == errSecSuccess,
+              let info = raw as? [CFString: Any],
+              info[kSecCodeInfoIdentifier] as? String == identifier + ".WorkspaceService",
+              let entitlements = info[kSecCodeInfoEntitlementsDict] as? [String: Any], entitlements.count == 1,
+              entitlements["com.apple.security.virtualization"] as? Bool == true else { throw PortableFSSignedServiceError.invalidIdentity }
     }
     public static func canonicalURL(_ url: URL) throws -> URL {
         guard let path = realpath(url.path, nil) else { throw PortableFSSignedServiceError.invalidIdentity }
@@ -111,6 +129,12 @@ public enum PortableFSWorkspaceServiceRegistration {
     public static func register(bundle: Bundle = .main) throws -> Bool {
         _ = try PortableFSSignedRelease(bundle: bundle)
         guard let id = bundle.bundleIdentifier else { throw PortableFSSignedServiceError.invalidBundle }
+        var home = try PortableFSAccountHome.resolve()
+        #if WORKSPACE_SERVICE_TESTING
+        guard id.hasPrefix("dev.portablefs.workspace-tests."), let testHome = bundle.object(forInfoDictionaryKey: "PFSWorkspaceTestHome") as? String else { throw PortableFSSignedServiceError.invalidBundle }
+        home = testHome
+        #endif
+        try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".local/state/portablefs", isDirectory: true))
         let service = SMAppService.agent(plistName: id + ".workspace.plist")
         if service.status == .notRegistered || service.status == .notFound { try service.register() }
         switch service.status {

@@ -29,6 +29,22 @@ func cmdLifecycle(e *cmdEnv, args []string) int {
 	if len(args) == 0 {
 		return e.usageError("lifecycle", fmt.Errorf("expected `hold-shared`, `hold-account-exclusive`, `hold-install-exclusive`, or `identity`"))
 	}
+	if args[0] == "verify-workspace-bundle" || args[0] == "verify-macos-bundle" {
+		fs := newFlagSet("lifecycle verify-workspace-bundle")
+		var app string
+		fs.StringVar(&app, "app", "", "staged app path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return e.usageError("lifecycle", err)
+		}
+		if app == "" || fs.NArg() != 0 {
+			return e.usageError("lifecycle", fmt.Errorf("expected --app"))
+		}
+		if args[0] == "verify-macos-bundle" {
+			return e.verifyMacOSReleaseBundle(app)
+		}
+		return e.verifyWorkspaceBundle(app)
+	}
+
 	if args[0] == "identity" {
 		fs := newFlagSet("lifecycle identity")
 		var jsonOut bool
@@ -262,6 +278,13 @@ func (e *cmdEnv) strictAccountInventory(
 	expectedIdentity *daemonRelease,
 ) (lifecycleInventory, error) {
 	var inventory lifecycleInventory
+	stateDir, err := e.mountLifecycleStateDir()
+	if err != nil {
+		return inventory, err
+	}
+	if err := requireWorkspaceResourcesAbsent(stateDir); err != nil {
+		return inventory, err
+	}
 	kernelMounts, err := e.kernelMountInventory()
 	if err != nil {
 		return inventory, fmt.Errorf("strict kernel mount inventory: %w", err)
@@ -320,6 +343,9 @@ func (e *cmdEnv) strictAccountInventory(
 // replacement preflight refuses all CLI anchors and any daemon registry entry.
 // The app still owns the final absence check under singleton exclusion.
 func rejectDurableMountAnchors(stateDir string) error {
+	if err := requireWorkspaceResourcesAbsent(stateDir); err != nil {
+		return err
+	}
 	mountStateDir := filepath.Join(stateDir, "mounts")
 	states, err := listMountStates(mountStateDir)
 	if err != nil {

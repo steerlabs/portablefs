@@ -90,8 +90,11 @@ runs the omission controls and uploads the guest/source archives, manifests,
 space measurements and reproduction proof together for 90 days. A release
 packaging job must retain and publish the matching corresponding-source archive
 beside the release assets for the entire distribution period. CI's temporary
-artifact retention does not satisfy that release retention obligation. This
-workflow does not publish a release or change `release.yml`.
+artifact retention does not satisfy that release retention obligation. The reusable `guest-arm64` job also runs at the exact tagged commit in
+`release.yml`. The macOS job consumes that workflow artifact, never an older
+build or a freshly downloaded upstream image. The release retains the matching
+source archive, manifests and reproduction proof beside its other assets, with
+Sigstore provenance.
 
 ## Space accounting
 
@@ -115,3 +118,30 @@ writes and working headroom. PR 2's owner can call
 before extraction/update, adding any compressed installer or app bytes it still
 needs. Before first boot it can preflight `initialDataReserveBytes`. This checks
 present capacity; subsequent project data growth still needs available disk.
+
+## Signed app membership
+
+`scripts/package-macos-app.sh` requires `PORTABLEFS_WORKSPACE_ARTIFACT_DIR`
+pointing at the artifact's `first/` directory. `prepare-workspace-bundle.py`
+checks exact commit/version, archive membership, distribution hashes and full
+matching source/notice coverage before inserting `Contents/Resources/LinuxWorkspace`.
+Only the image, inventories, notices and digest-bound source manifest enter the
+app; corresponding source remains a release asset.
+
+The nested `PortableFSWorkspaceService.app` retains its existing
+`.WorkspaceService` identity and exactly `com.apple.security.virtualization`.
+Its signed plist binds `PFSWorkspaceImageManifestSHA256` and the build commit.
+The service checks that manifest pin, every image file and paired release before
+creating a VM. Failure reports `Workspace image failed verification`. First
+boot uses `WorkspaceDiskSpace.preflight` with the 2 GiB initial-data reserve.
+The installer checks extraction capacity before writing ZIP members, then the
+CLI checks destination capacity before staging replacement. Failure reports
+`Not enough disk space`. These are conservative logical bounds; concurrent
+unrelated writes can still exhaust space later.
+
+Each final ZIP has a `.space.json` with measured compressed and expanded bytes,
+peak extraction, same-size update and additional required free bytes. The update
+bound retains both app copies and the archive without assuming sparse copying
+or APFS clones. Existing user data is excluded from incremental space and is
+retained. A signed release's final sizes come from the actual notarized and
+stapled ZIP, not the guest archive's estimated contribution.

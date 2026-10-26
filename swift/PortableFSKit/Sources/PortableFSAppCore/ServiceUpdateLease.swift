@@ -11,6 +11,8 @@ enum PortableFSDUpdatePhase: String, Codable, CaseIterable, Sendable {
     case rollbackActive = "rollback-active"
     case targetComplete = "target-complete"
     case rollbackComplete = "rollback-complete"
+
+    var permitsNormalAdmission: Bool { self == .targetComplete || self == .rollbackComplete }
 }
 
 struct PortableFSDUpdateLease: Codable, Equatable, Sendable {
