@@ -117,6 +117,14 @@ func (b *v3CoherenceBridge) beginDetach() error {
 	return nil
 }
 
+// Exact kernel absence admits only teardown, including a retry after an
+// earlier absence observation failed and fenced the session.
+func (b *v3CoherenceBridge) confirmMountAbsence() {
+	b.mu.Lock()
+	b.detaching = true
+	b.mu.Unlock()
+}
+
 func (b *v3CoherenceBridge) acceptPlannedDetachCancellation(cause error) bool {
 	if cause == nil {
 		return false
