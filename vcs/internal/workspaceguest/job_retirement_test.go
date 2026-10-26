@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"sync/atomic"
@@ -271,7 +272,9 @@ func TestTransportPipelinedReadAheadReportsReaderCause(t *testing.T) {
 	c, s, done := transportRig(t)
 	pairTransport(t, c)
 	for rid := uint64(2); rid <= 4; rid++ {
-		if err := control.Write(c, &pb.Envelope{Version: 8, RequestId: rid, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}); err != nil {
+		// Reader refusal may close the pipe before the rejected frame's write
+		// returns. The exact reader cause below, not write completion, proves it.
+		if err := control.Write(c, &pb.Envelope{Version: 8, RequestId: rid, Body: &pb.Envelope_Status{Status: &pb.StatusRequest{}}}); err != nil && !(rid == 4 && errors.Is(err, io.ErrClosedPipe)) {
 			t.Fatal(err)
 		}
 	}
