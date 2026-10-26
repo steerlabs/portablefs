@@ -51,6 +51,17 @@ private func temporaryDirectory() throws -> URL {
         do { _ = try WorkspaceArtifact(directory: directory); Issue.record("corrupt artifact accepted") }
         catch let error as WorkspaceVMError { #expect(error.description == "artifact hash mismatch: kernel") }
     }
+    @Test func imageSpaceCountsLogicalBytesAndRefusesInsufficientCapacity() throws {
+        let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        try artifact(directory)
+        let verified = try WorkspaceArtifact(directory: directory)
+        let space = try WorkspaceDiskSpace(artifact: verified)
+        #expect(space.extractionRequiredBytes == verified.byteCount + (2 << 30))
+        try WorkspaceDiskSpace.preflight(at: directory, requiredBytes: 0)
+        #expect(throws: (any Error).self) {
+            try WorkspaceDiskSpace.preflight(at: directory, requiredBytes: UInt64.max)
+        }
+    }
     @Test func manifestCannotNameExtraPaths() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         try artifact(directory)

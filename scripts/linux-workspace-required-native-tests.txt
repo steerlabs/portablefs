@@ -3,6 +3,7 @@ power-before-start
 exact-handshake
 fuse-init-7.31
 ssh-workspace-user
+guest-development-toolchain
 immutable-root
 vsock-only-ssh
 workspace-root-layout

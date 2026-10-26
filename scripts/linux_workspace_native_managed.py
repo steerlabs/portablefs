@@ -23,7 +23,7 @@ class NativeAuthority:
         subprocess.run(['go', '-C', str(self.repo/'vcs'), 'build', '-o', str(self.helper),
                         './test/workspace/cmd/pfs-workspace-fixture'], check=True)
         image = os.environ.get('PORTABLEFS_CI_IMAGE', 'golang@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51')
-        subprocess.run(['docker', 'run', '-d', '--name', self.name, '--privileged',
+        subprocess.run(['docker', 'run', '-d', '--name', self.name, '--memory', '4g', '--cpus', '4', '--privileged',
                         '-e', 'PFS_NATIVE_FIXTURE_CONTAINER=1', '-v', str(self.repo)+':/work:ro', '-w', '/work',
                         '-p', '0.0.0.0::17443', image, 'bash', '/work/scripts/linux-workspace-native-authority.sh'],
                        check=True, capture_output=True, text=True)

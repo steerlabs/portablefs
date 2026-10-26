@@ -22,10 +22,11 @@ the menu app leaves that service running. Only this service receives the virtual
 Workspace setup does not require the FSKit extension.
 
 The selected guest is Debian 13 arm64 with a pinned 6.12 kernel, glibc, systemd,
-OpenSSH and a development toolchain. The development image is pinned by
+OpenSSH, Git, a C/C++ compiler, Node.js/npm and Python with pip/venv. The image is pinned by
 `deploy/linux-workspace/image.lock.json`; the builder records its actual kernel
-configuration, package/source inventory and output hashes. Release attestation
-and sealed-app insertion remain Stage 2 work. Use an immutable system
+configuration, package/source inventory and output hashes, and retains the matching
+corresponding source. Release attestation and sealed-app insertion remain separate
+packaging work. Use an immutable system
 disk and sparse persistent ext4 data disk; keep home, editor installations,
 guest identity and machine-local route backing on the data disk. Never share
 the Mac home through virtiofs. Each volume mounts at `/workspaces/<volume-id>`;
@@ -556,7 +557,7 @@ unrelated SSH configuration. Qualify VS Code/Cursor, Zed and JetBrains Linux
 arm64 backends independently; local UI or AI networking does not establish that
 file tools execute in Linux.
 
-## Development artifact and boot path
+## Guest artifact and boot path
 
 Run from an Apple-silicon Mac with macOS 26+, Xcode and Docker:
 
@@ -566,13 +567,14 @@ bash scripts/build-linux-workspace-dev.sh
 swift/PortableFSKit/.build/out/Products/Debug/portablefs-workspace-dev /absolute/image /absolute/state
 ```
 
-The builder uses mmdebstrap in its own container with SYS_ADMIN for mmdebstrap mounts from the digest in
+The builder uses mmdebstrap in its own bounded container with SYS_ADMIN for mmdebstrap mounts from the digest in
 `image.lock.json`, with Debian trixie at one snapshot timestamp and
 `SOURCE_DATE_EPOCH` and a fixed ext4 creation clock. Security and updates use the
 same snapshot timestamp; hostname and hosts are explicit. The native gate builds
 twice and compares every manifest hash. It checks the complete installed binary/source version
-inventory against that lock. `--update-lock` explicitly refreshes that inventory;
-`--reuse` reuses only matching input identity and package inventory. There is no
+inventory against that lock. `--update-lock` explicitly refreshes the binary and
+source inventories; commit the changed lock before building a release candidate.
+`--reuse` checks the exact commit, artifact hashes and source/notice coverage. There is no
 boot-time package installation, upgrade or fetch. Debian's archive signatures
 check the snapshot indexes, including the builder bootstrap over HTTP.
 
@@ -583,10 +585,12 @@ The artifact directory contains `kernel` (an uncompressed Debian arm64 Image),
 `manifest.json`. The kernel is on Debian's maintained 6.12 line. Required block,
 network, console, vsock, entropy, FUSE and ext4 drivers must be built in or
 present in the initramfs; source configuration alone is insufficient for modules.
-Package copyright/source notices remain in the system image under
-`/usr/share/doc`. `packages.json` records binary and corresponding source names
-and versions at the pinned snapshot. Release source redistribution and the
-attested client archive insertion are not implemented by this development build.
+Package notices remain in the system image under `/usr/share/doc`, including
+common license texts and notices for every linked Go module and the Go runtime.
+`packages.json` records binary/source versions and both Built-Using fields.
+[Guest redistribution](./linux-workspace-image.md) specifies the retained source
+archive, coverage gate, CI assets and disk-space accounting. Insertion into the
+signed release app is a separate packaging step.
 
 `image-inputs.json` canonically hashes the pinned snapshot/builder recipe,
 image overlay and exact static Linux/arm64 client/supervisor binaries. Its SHA-256
