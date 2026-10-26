@@ -309,6 +309,10 @@ def check(out):
                 assert hashlib.sha256(data).hexdigest() == sha, 'recipe mismatch: ' + name
     assert sources['files']['kernel.config'] == digest(out / 'kernel.config')
     go = sources['go']
+    expected_sources = {'repository.tar', 'kernel.config', go['runtime']['filename']}
+    expected_sources.update(name for p in debian.values() for name in p['files'])
+    expected_sources.update(module['source'] for module in go['modules'])
+    assert set(sources['files']) == expected_sources, 'incorrect retained source membership'
     assert sources['files'][go['runtime']['filename']]['sha256'] == go['runtime']['sha256']
     linked = {}
     sums = {}
