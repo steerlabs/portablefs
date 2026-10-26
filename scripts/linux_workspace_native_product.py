@@ -96,6 +96,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         last=command('status','--json',success=False)
         raise AssertionError('product status deadline: '+last.stdout+' '+last.stderr)
     crashed=False
+    confirmed_absent=False
     def app_command(*args, success=True):
         result=subprocess.run([str(host),*args],env=env,capture_output=True,text=True,timeout=200)
         if success: assert result.returncode==0,(args,result.stdout,result.stderr)
@@ -266,10 +267,15 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         # installed or dev-host identity, and retain unconfirmed execution data.
         assert label.startswith('dev.portablefs.workspace-tests.')
         if not crashed:
-            with contextlib.suppress(Exception): command('stop','--force','--json');until(lambda s:s['state']=='stopped',30)
+            try:
+                command('stop','--force','--json')
+                until(lambda s:s['state']=='stopped' and not s['desiredRunning'],30)
+                confirmed_absent=True
+            except Exception as error:
+                (evidence/'cleanup-unconfirmed.txt').write_text(str(error)+'\n')
         subprocess.run([str(host),'--unregister-workspace-test'],env=env,check=True,capture_output=True,text=True)
         subprocess.run([lsregister,'-u',str(app)],check=True)
-        if not crashed: shutil.rmtree(root)
+        if confirmed_absent: shutil.rmtree(root)
         else: (evidence/'unconfirmed-test-vm-state.txt').write_text(str(root)+'\nretained until host reboot proves absence\n')
 
 if __name__=='__main__':
