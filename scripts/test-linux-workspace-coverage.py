@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 repo = pathlib.Path(__file__).resolve().parents[1]
@@ -12,7 +13,7 @@ sys.path.insert(0, str(repo / 'deploy/linux-workspace'))
 from redistribute import digest, write
 
 original = pathlib.Path(sys.argv[1]).resolve()
-for field, expected in [('debian', 'incomplete Debian source coverage'), ('notices', 'incomplete Debian notice coverage')]:
+for field, expected in [('debian', 'incomplete Debian source coverage'), ('notice', 'missing notice:')]:
     with tempfile.TemporaryDirectory(prefix='coverage-', dir=original.parent) as temp:
         out = pathlib.Path(temp)
         manifest = json.loads((original / 'manifest.json').read_text())
@@ -25,7 +26,15 @@ for field, expected in [('debian', 'incomplete Debian source coverage'), ('notic
         if field == 'debian':
             sources[field].pop()
         else:
-            del sources[field][next(iter(sources[field]))]
+            notice = next(iter(sources['notices'].values()))
+            del sources['notice_files'][notice]
+            target = out / 'licenses.tar.gz'
+            target.unlink()
+            with tarfile.open(original / 'licenses.tar.gz', 'r:gz') as source, tarfile.open(target, 'w:gz') as tar:
+                for member in source:
+                    if member.name != notice:
+                        tar.addfile(member, source.extractfile(member))
+            manifest['files']['licenses.tar.gz'] = digest(target)
         write(out / 'source-manifest.json', sources)
         manifest['files']['source-manifest.json'] = digest(out / 'source-manifest.json')
         write(out / 'manifest.json', manifest)

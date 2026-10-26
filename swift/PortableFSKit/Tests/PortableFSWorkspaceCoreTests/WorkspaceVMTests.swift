@@ -56,7 +56,7 @@ private func temporaryDirectory() throws -> URL {
         try artifact(directory)
         let verified = try WorkspaceArtifact(directory: directory)
         let space = try WorkspaceDiskSpace(artifact: verified)
-        #expect(space.extractionRequiredBytes == verified.byteCount + (1 << 30))
+        #expect(space.extractionRequiredBytes == verified.byteCount + (2 << 30))
         try WorkspaceDiskSpace.preflight(at: directory, requiredBytes: 0)
         #expect(throws: (any Error).self) {
             try WorkspaceDiskSpace.preflight(at: directory, requiredBytes: UInt64.max)

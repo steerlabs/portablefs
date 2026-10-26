@@ -2,7 +2,7 @@ import Foundation
 
 /// Logical sizes are conservative even when APFS clones or sparse files save blocks.
 public struct WorkspaceDiskSpace: Sendable {
-    public static let initialDataReserveBytes: UInt64 = 1 << 30
+    public static let initialDataReserveBytes: UInt64 = 2 << 30
     public let imageBytes: UInt64
 
     public init(artifact: WorkspaceArtifact) throws {

@@ -164,7 +164,7 @@ try:
                           'portablefs version')
     node_version = next(p['version'] for p in json.loads((pathlib.Path(image) / 'packages.json').read_text()) if p['package'] == 'nodejs')
     assert toolchain.splitlines()[0].startswith('v' + node_version.split(':')[-1].split('.')[0] + '.'), toolchain
-    assert toolchain.splitlines()[-1].startswith('portablefs '), toolchain
+    assert toolchain.splitlines()[-1] == 'portablefs ' + json.loads((pathlib.Path(image) / 'release.json').read_text())['app_version'], toolchain
     record('guest-development-toolchain')
     record('ssh-workspace-user')
     assert guest.ssh('cat /sys/block/vda/ro') == '1'

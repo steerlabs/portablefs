@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+trap 'chown -R "$PFS_OUTPUT_UID:$PFS_OUTPUT_GID" /output' EXIT
 export DEBIAN_FRONTEND=noninteractive
 snapshot=20261001T000000Z
 export SOURCE_DATE_EPOCH=1790812800
@@ -24,7 +25,7 @@ root=/build/rootfs
 # describe the inputs, never the build container's hostname or wall time.
 export SOURCE_DATE_EPOCH E2FSPROGS_FAKE_TIME
 
-cp -a /source/rootfs/. "$root/"
+cp -a --no-preserve=ownership /source/rootfs/. "$root/"
 install -m755 /output/bin/* "$root/usr/local/bin/"
 install -Dm644 /output/release.json "$root/usr/lib/portablefs-workspace/release.json"
 chroot "$root" groupadd -g 1000 workspace
@@ -41,7 +42,7 @@ printf '127.0.0.1 localhost\n127.0.1.1 portablefs-workspace\n::1 localhost ip6-l
 mkdir -p "$root/etc/systemd/resolved.conf.d"
 printf '[Resolve]\nLLMNR=no\nMulticastDNS=no\n' >"$root/etc/systemd/resolved.conf.d/workspace.conf"
 mkdir -p "$root/usr/share/doc/portablefs-go"
-cp -a /output/go-notices/. "$root/usr/share/doc/portablefs-go/"
+cp -R /output/go-notices/. "$root/usr/share/doc/portablefs-go/"
 cat >"$root/etc/fstab" <<'EOF'
 /dev/vda / ext4 ro 0 0
 tmpfs /tmp tmpfs mode=1777,nosuid,nodev 0 0
@@ -76,6 +77,7 @@ if os.environ.get('PFS_UPDATE_LOCK') != '--update-lock':
     assert packages == lock['packages'], 'exact binary package inventory differs from lock'
 PYINVENTORY
 python3 /source/redistribute.py collect "$root" /output /source/image.lock.json
+if [[ "$PFS_UPDATE_LOCK" == --update-lock ]]; then exit 0; fi
 chroot "$root" lsinitramfs "/boot/initrd.img-$kernel" >/output/initramfs.inventory
 python3 - <<'PYMODULES'
 import re
@@ -87,7 +89,18 @@ for module, symbol in {'virtio_blk':'VIRTIO_BLK', 'virtio_net':'VIRTIO_NET', 'vi
     assert 'CONFIG_' + symbol + '=m\n' in config, symbol
     assert re.search('/' + module.replace('_', '[-_]') + r'\.ko(?:\.xz)?$', inventory, re.M), module
 PYMODULES
-rm -f "$root/var/lib/systemd/random-seed" "$root/etc/.pwd.lock"
+rm -f "$root/var/lib/systemd/random-seed" "$root/etc/.pwd.lock" "$root/var/cache/ldconfig/aux-cache"
+python3 - "$root" <<'PYACCOUNTS'
+import os,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+path=root/'etc/shadow'
+rows=[line.split(':') for line in path.read_text().splitlines()]
+for row in rows:
+    row[2]=str(int(os.environ['SOURCE_DATE_EPOCH'])//86400)
+path.write_text(''.join(':'.join(row)+'\n' for row in rows))
+for name in ('passwd-', 'shadow-', 'group-', 'gshadow-'):
+    (root/'etc'/name).unlink(missing_ok=True)
+PYACCOUNTS
 rm -rf "$root/var/lib/apt/lists/"* "$root/var/cache/apt/archives/"* "$root/var/log/"*
 find "$root" -xdev -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 rm -f /output/system.ext4

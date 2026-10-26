@@ -37,9 +37,12 @@ for binary in portablefs portablefsd portablefs-workspaced; do
 done
 python3 "$repo/deploy/linux-workspace/identity.py" "$repo" "$staging" "$commit"
 python3 "$repo/deploy/linux-workspace/redistribute.py" prepare "$repo" "$staging"
+mkdir "$staging/build-inputs"
+tar -xf "$staging/sources/repository.tar" -C "$staging/build-inputs" deploy/linux-workspace
 docker run --name "$name" --platform linux/arm64 --memory 4g --cpus 4 \
   --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -e "PFS_UPDATE_LOCK=$mode" -v "$repo/deploy/linux-workspace:/source:ro" -v "$staging:/output" \
+  -e "PFS_UPDATE_LOCK=$mode" -e "PFS_OUTPUT_UID=$(id -u)" -e "PFS_OUTPUT_GID=$(id -g)" \
+  -v "$staging/build-inputs/deploy/linux-workspace:/source:ro" -v "$staging:/output" \
   "$builder" bash /source/build-guest.sh
 python3 - "$lock" "$staging" "$mode" <<'PY'
 import json,pathlib,sys
@@ -59,6 +62,6 @@ if [[ "$mode" == --update-lock ]]; then
   exit 0
 fi
 python3 "$repo/deploy/linux-workspace/redistribute.py" check "$staging"
-rm -rf "$staging/sources" "$staging/notices" "$staging/go-sources.json" "$staging/go-notices"
+rm -rf "$staging/sources" "$staging/notices" "$staging/go-sources.json" "$staging/go-notices" "$staging/build-inputs"
 for path in "$staging"/*; do mv "$path" "$out/"; done
 echo "PASS: release guest and retained source: $out"

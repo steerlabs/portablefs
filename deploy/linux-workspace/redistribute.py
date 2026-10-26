@@ -1,9 +1,11 @@
 """Retain and check the corresponding source for one exact protocol-8 guest."""
 import concurrent.futures
+import base64
 import gzip
 import hashlib
 import io
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -103,6 +105,16 @@ def prepare(repo, out):
                 modules[current]['replacement'] = 'vcs/third_party/go-fuse'
     notices = out / 'go-notices'
     notices.mkdir()
+    env = dict(os.environ, CGO_ENABLED='0', GOOS='linux', GOARCH='arm64')
+    raw = subprocess.check_output(['go', '-C', str(repo / 'vcs'), 'list', '-deps', '-json',
+                                   *['./cmd/' + p.name for p in sorted((out / 'bin').iterdir())]], env=env, text=True)
+    package_dirs = {}
+    decoder = json.JSONDecoder()
+    while raw.strip():
+        package, end = decoder.raw_decode(raw.lstrip())
+        raw = raw.lstrip()[end:]
+        if 'Module' in package:
+            package_dirs.setdefault(package['Module']['Path'], set()).add(pathlib.Path(package['Dir']))
     for name, module in sorted(modules.items()):
         if name == 'github.com/steerlabs/portablefs/vcs':
             source = repo
@@ -121,10 +133,19 @@ def prepare(repo, out):
         dest = notices / name
         dest.mkdir(parents=True)
         module['notices'] = []
-        for filename in ('LICENSE', 'LICENSE.txt', 'LICENSE.md', 'COPYING', 'NOTICE', 'PATENTS'):
-            if (source / filename).is_file():
-                shutil.copyfile(source / filename, dest / filename)
-                module['notices'].append(name + '/' + filename)
+        directories = {source}
+        for package in package_dirs[name]:
+            assert package.is_relative_to(source)
+            directories.add(package)
+            directories.update(parent for parent in package.parents if parent.is_relative_to(source))
+        for directory in sorted(directories):
+            for filename in ('LICENSE', 'LICENSE.txt', 'LICENSE.md', 'COPYING', 'COPYRIGHT', 'NOTICE', 'PATENTS'):
+                path = directory / filename
+                if path.is_file():
+                    relative = path.relative_to(source)
+                    (dest / relative).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, dest / relative)
+                    module['notices'].append(name + '/' + str(relative))
         assert module['notices'], 'missing Go module notice: ' + name
     goroot = pathlib.Path(subprocess.check_output(['go', '-C', str(repo / 'vcs'), 'env', 'GOROOT'], text=True).strip())
     (notices / 'go-runtime').mkdir()
@@ -261,7 +282,7 @@ def check(out):
     assert set(sources['notices']) == {p['package'] for p in packages}, 'incomplete Debian notice coverage'
     for name, notice in sources['notices'].items():
         assert notice == 'debian/' + name + '/copyright', 'incorrect Debian notice mapping'
-        assert sources['notice_files'][notice]['size'] > 0, 'missing notice: ' + name
+        assert notice in sources['notice_files'] and sources['notice_files'][notice]['size'] > 0, 'missing notice: ' + name
     with tarfile.open(out / 'corresponding-source.tar.gz', 'r:gz') as tar:
         for p in debian.values():
             assert p['files'] and all(sources['files'][n] == r for n, r in p['files'].items())
@@ -279,8 +300,9 @@ def check(out):
                 assert p['files'][path] == {'sha256': digest_hex, 'size': int(size)}, 'Debian source checksum mismatch'
                 expected.add(path)
             assert expected == set(p['files']), 'incomplete Debian source control coverage'
-        repo = tarfile.open(fileobj=tar.extractfile('repository.tar'), mode='r:')
+        repo = tarfile.open(fileobj=io.BytesIO(tar.extractfile('repository.tar').read()), mode='r:')
         assert repo.pax_headers['comment'] == sources['commit'], 'recipe commit mismatch'
+        assert json.loads(repo.extractfile('deploy/linux-workspace/image.lock.json').read()) == inputs['lock'], 'recipe lock mismatch'
         for name, sha in inputs['files'].items():
             if not name.startswith('bin/'):
                 data = repo.extractfile('deploy/linux-workspace/' + name).read()
@@ -309,6 +331,28 @@ def check(out):
             assert sources['notice_files']['go/' + notice]['size'] > 0
     for name in ('LICENSE', 'PATENTS'):
         assert sources['notice_files']['go/go-runtime/' + name]['size'] > 0
+    with tarfile.open(out / 'corresponding-source.tar.gz', 'r:gz') as tar, tarfile.open(out / 'licenses.tar.gz', 'r:gz') as notices:
+        for module in go['modules']:
+            if module['source'] == 'repository.tar':
+                prefix = module.get('replacement', '')
+                for notice in module['notices']:
+                    original = str(pathlib.PurePosixPath(prefix) / notice.removeprefix(module['path'] + '/'))
+                    assert repo.extractfile(original).read() == notices.extractfile('go/' + notice).read(), 'local Go notice mismatch'
+                continue
+            with zipfile.ZipFile(io.BytesIO(tar.extractfile(module['source']).read())) as z:
+                names = sorted(z.namelist())
+                assert len(names) == len(set(names)), 'duplicate Go source member'
+                h = hashlib.sha256()
+                for name in names:
+                    assert name.startswith(module['path'] + '@' + module['version'] + '/'), 'Go source version mismatch'
+                    h.update((hashlib.sha256(z.read(name)).hexdigest() + '  ' + name + '\n').encode())
+                assert 'h1:' + base64.b64encode(h.digest()).decode() == module['sum'], 'Go module source checksum mismatch'
+                for notice in module['notices']:
+                    original = module['path'] + '@' + module['version'] + '/' + notice.removeprefix(module['path'] + '/')
+                    assert z.read(original) == notices.extractfile('go/' + notice).read(), 'Go notice mismatch'
+        with tarfile.open(fileobj=io.BytesIO(tar.extractfile(go['runtime']['filename']).read()), mode='r:gz') as runtime:
+            for name in ('LICENSE', 'PATENTS'):
+                assert runtime.extractfile('go/' + name).read() == notices.extractfile('go/go-runtime/' + name).read(), 'Go runtime notice mismatch'
     print('PASS: exact binary, notice, incorporated-source, Go and recipe coverage')
 
 

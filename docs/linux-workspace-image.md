@@ -82,7 +82,7 @@ compression settings and app contents can change the exact increase. Source
 archive bytes are a separate release asset, not an installer cost.
 
 `WorkspaceDiskSpace(artifact:)` counts verified logical artifact bytes.
-`extractionRequiredBytes` adds a 1 GiB reserve for initial sparse-data filesystem
+`extractionRequiredBytes` adds a 2 GiB reserve for initial sparse-data filesystem
 writes and working headroom. PR 2's owner can call
 `WorkspaceDiskSpace.preflight(at:requiredBytes:)` on the destination filesystem
 before extraction/update, adding any compressed installer or app bytes it still

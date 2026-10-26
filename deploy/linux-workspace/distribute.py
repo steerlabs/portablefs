@@ -33,8 +33,8 @@ write(out / 'distribution.json', {
         'expanded_image_bytes': expanded,
         'peak_extraction_bytes': compressed + expanded,
         'peak_same_size_update_bytes': compressed + 2 * expanded,
-        'additional_free_bytes': compressed + expanded + (1 << 30),
-        'initial_data_reserve_bytes': 1 << 30,
+        'additional_free_bytes': compressed + expanded + (2 << 30),
+        'initial_data_reserve_bytes': 2 << 30,
         'data_disk_logical_bytes': 64 << 30,
     },
 })
