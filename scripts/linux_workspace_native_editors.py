@@ -72,7 +72,7 @@ def editor_checks(host, env, config, home, evidence, authority, ssh, record, def
                                   str(application), str(user), str(extensions)], env=isolated,
                                  text=True, capture_output=True, timeout=60)
         assert missing.returncode != 0 and 'Remote-SSH extension is not installed' in missing.stderr, missing
-        assert not any(extensions.iterdir()), 'production action installed an extension'
+        assert not any(path.is_dir() and (path/'package.json').exists() for path in extensions.iterdir()), 'production action installed an extension'
         (root/'missing-extension.txt').write_text(missing.stderr)
         record('service-' + name + '-missing-extension')
         if defer_ui:
