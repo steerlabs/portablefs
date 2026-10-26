@@ -611,9 +611,10 @@ exact markers; their external outputs are listed above.
 
 ## Qualification status
 
-None of the following has passed on the integrated protocol-8 tree. Until each
-has, this contract is a specification, and earlier protocol results are not
-evidence for it.
+Qualification requires the following gates on the integrated protocol-8 tree.
+Until each has passed, this contract remains a specification; passing the local
+verification and authority power-cut instruments does not qualify the native
+macOS boundaries, and earlier protocol results are not evidence for it.
 
 - `bash scripts/verify-local.sh --full`: Darwin Foundation/cgo and static Linux
   builds, uncached `pfslocal` schema freshness, native and race Go suites, the

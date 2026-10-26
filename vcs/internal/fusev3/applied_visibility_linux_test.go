@@ -146,6 +146,15 @@ func TestAppliedRangeAndTruncatingOpenVisibilityFailuresSettleSource(t *testing.
 				if q.GetBarrier() != nil {
 					return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: 2, DurableSequence: 2}}}, nil
 				}
+				// A failed visibility wait still owns the truncating OPEN's
+				// descriptor cleanup, which may race the callback's return.
+				if q.GetCloseBatch() != nil {
+					results := make([]*authoritypb.CloseBatchResult, len(q.GetCloseBatch().GetCloses()))
+					for i := range results {
+						results[i] = &authoritypb.CloseBatchResult{Retired: true}
+					}
+					return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
+				}
 				return &authoritypb.Response{}, nil
 			}
 			f.rpc.mu.Unlock()

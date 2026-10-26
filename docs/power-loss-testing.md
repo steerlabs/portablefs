@@ -268,7 +268,7 @@ requirement (`ExpectationsAfterRestart`).
 | `vcs/test/powerloss/cmd/pfs-powerloss-driver` | the Linux fsync workload, run as the volume identity |
 | `vcs/test/powerloss/cmd/pfs-powerloss-fskit-driver` | the FSKit acknowledged-mutation workload, run as the volume identity |
 | `scripts/run-powerloss.sh` | the entrypoint CI calls |
-| `.github/workflows/powerloss.yml` | weekly and on demand, on the self-hosted dm-log-writes runner |
+| `.github/workflows/powerloss.yml` | PRs, weekly and on demand; required again before release publication |
 
 ## Gates
 
@@ -303,7 +303,7 @@ any `--- SKIP` at all, since `REQUIRED=1` should have made one impossible.
 
 ## What runs where
 
-| | Any machine | Privileged Docker with `dm-log-writes` | Self-hosted `portablefs-dm-log-writes` runner |
+| | Any machine | Privileged Docker with `dm-log-writes` | GitHub-hosted `ubuntu-24.04` runner |
 | --- | --- | --- | --- |
 | Log parsing, replay, point selection, both ledgers and verifiers, both drivers' protocol and workload model | yes | yes | yes |
 | `TestReplayReproducesTheDeviceTheKernelWrote` | no | yes | yes |
@@ -312,25 +312,31 @@ any `--- SKIP` at all, since `REQUIRED=1` should have made one impossible.
 | `TestFSKitAcknowledgedMutationsSurvivePowerLoss` | no | yes; no FUSE in the path | yes |
 | `TestAuthorityKillDuringWritesKeepsFsyncedData` | no | needs host stock FUSE 7.31+ | yes |
 
-The CI job runs on a self-hosted runner labelled `self-hosted, linux, x64,
-portablefs-dm-log-writes`, because `dm-log-writes` is not exposed on
-GitHub-hosted runners. The label names that capability only; the filesystem
-under test uses the same stock FUSE interface as every other lane. A mount
-refuses a kernel below the stock FUSE floor at FUSE INIT; the harness reports
-that refusal through the ordinary gate, so it is a named skip on a developer
-machine and a hard failure in CI - never a quiet pass.
+The CI job uses `ubuntu-24.04`. It checks the running kernel's
+`CONFIG_DM_LOG_WRITES`, loads `dm-log-writes`, and requires the `log-writes`
+target before starting. A missing module or target fails the job. Each hosted
+job has its own VM and device-mapper namespace; runs never cancel an active
+harness during teardown.
+
+The workflow runs on every pull request, weekly, and on demand. The release
+workflow calls the same job on the exact tagged commit, and publication depends
+on its success. PR results do not substitute for that tag's run.
 
 `dm-log-writes` is available in privileged Docker provided the host kernel has
 `CONFIG_DM_LOG_WRITES` and `/lib/modules` is bind-mounted so `modprobe` can
 load it. The entrypoint does both.
 
-### Status for protocol 8
+### Protocol-8 qualification
 
-None of the privileged tests above has run against the protocol-8 tree. The
-FSKit instrument has never run anywhere: its driver and the authority it drives
-must first build on Linux from the integrated tree. Until a run of
-`scripts/run-powerloss.sh` passes every required test, the FSKit durability
-contract is a stated design property, not power-loss evidence.
+The complete five-test instrument exercises the integrated protocol-8 authority
+and both workload drivers. A successful run qualifies the Linux fsync and
+FSKit authority-handler durability claims at the replayed cuts, together with
+the separate process-kill recovery contract. The exact required-test gate makes
+a skipped instrument a failure.
+
+This does not qualify the daemon, extension, or macOS kernel's buffered-I/O
+boundaries. Native fsync, F_FULLFSYNC, dirty-page drain and unmount acceptance
+remain separate gates even after this instrument passes.
 
 ## Notes from bringing this up
 

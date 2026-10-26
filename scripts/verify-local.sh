@@ -225,7 +225,7 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
   echo "                                         needs a user-enabled extension"
   echo "    - scripts/run-powerloss.sh            dm-log-writes power-cut harness"
   echo "                                         (Linux and FSKit-handler cuts);"
-  echo "                                         privileged runner, weekly in CI"
+  echo "                                         privileged runner, PR/weekly/release in CI"
   echo "    - native macOS 26/27 acceptance and the LAN workload"
   echo "    - deploy/opensteer/staging-qualification.sh against a live cell"
   exit 0
