@@ -230,7 +230,7 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 	// The driver is now writing into a mount with no authority. It will fail,
 	// which is correct and expected; its ledger is durable up to its last
 	// completed checkpoint either way.
-	_ = driver.wait(t, 2*time.Minute)
+	_ = driver.wait(t, 2*time.Minute, mount)
 	driver.kill(t)
 	fence, err := forceFenceStrictMount(gate.runner, mount, mountpoint)
 	if err != nil {

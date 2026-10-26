@@ -4,6 +4,7 @@ package powerloss
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -657,13 +658,29 @@ func serviceMarks(requests io.Reader, acks io.WriteCloser, mark func(string) err
 // bound. It is separated from kill because a driver that finishes its
 // checkpoints on its own and one that is cut short are both legitimate, and
 // only the caller knows which it asked for.
-func (p *process) wait(t *testing.T, bound time.Duration) error {
+func (p *process) wait(t *testing.T, bound time.Duration, peers ...*process) error {
 	t.Helper()
 	select {
 	case <-p.exit:
 		return p.err
 	case <-time.After(bound):
-		p.dump(t)
+		// Preserve both sides of a blocked FUSE operation before cleanup kills
+		// the processes. Logs alone show completed work, not the wait cycle.
+		processes := append([]*process{p}, peers...)
+		for _, process := range processes {
+			if !process.exited() {
+				_ = process.command.Process.Signal(syscall.SIGQUIT)
+			}
+		}
+		diagnostics, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, process := range processes {
+			select {
+			case <-process.exit:
+			case <-diagnostics.Done():
+			}
+			process.dump(t)
+		}
 		t.Fatalf("%s did not finish within %s", p.name, bound)
 		return nil
 	}

@@ -2156,7 +2156,16 @@ func (c *Client) CallMutationWithIdentityRetained(
 		ctx = context.WithValue(ctx, dispatchReplayKey{}, request)
 	}
 	if session, ok := ctx.Value(mutationSessionKey{}).(context.Context); ok {
-		owned, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		// Cache withdrawal must not cancel an assigned replay. Ordinary
+		// operations still owe their caller the original request deadline;
+		// only lifecycle-owned workspace requests outlive network budgets.
+		var owned context.Context
+		var cancel context.CancelFunc
+		if deadline, bounded := ctx.Deadline(); bounded && c.cfg.DispatchFence == nil {
+			owned, cancel = context.WithDeadline(context.WithoutCancel(ctx), deadline)
+		} else {
+			owned, cancel = context.WithCancel(context.WithoutCancel(ctx))
+		}
 		stop := context.AfterFunc(session, cancel)
 		defer func() { stop(); cancel() }()
 		if session.Err() != nil {
@@ -2197,10 +2206,11 @@ func (c *Client) CallMutationWithIdentityRetained(
 			if terminalErr := c.checkCallEntry(); terminalErr != nil {
 				return nil, nil, terminalErr
 			}
-			// Each establishment attempt stays bounded. Its subscription-sized
-			// budget says nothing about a live session's retained replay outcome:
-			// keep this exact body, slot, and lane permit until it resolves.
-			if errors.Is(reconnectErr, ErrTransportUncertain) && ctx.Err() == nil {
+			// Only a workspace lifecycle owns replay across exhausted network
+			// attempts. An ordinary mount must settle uncertainty when its
+			// bounded reconnect fails, including background calls without a
+			// foreground deadline.
+			if c.cfg.DispatchFence != nil && errors.Is(reconnectErr, ErrTransportUncertain) && ctx.Err() == nil {
 				retryErr := waitTransportRetry(ctx)
 				if retryErr == nil {
 					continue
