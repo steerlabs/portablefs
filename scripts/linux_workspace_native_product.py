@@ -175,7 +175,6 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             first=agents.submit(ssh,"printf agent-one > /home/workspace/agent-one; sleep 1; cat /home/workspace/agent-two")
             second=agents.submit(ssh,"printf agent-two > /home/workspace/agent-two; sleep 1; cat /home/workspace/agent-one")
             assert first.result()=='agent-two' and second.result()=='agent-one'
-        record('service-two-ssh-agents')
         assert ssh('id -u')=='1000'
         ssh('printf service-persistence > /home/workspace/service-product-proof')
         record('service-app-exit-vm-alive')
@@ -196,6 +195,12 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             snapshot('volume-ready')
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
             record('service-document-standalone')
+            with ThreadPoolExecutor(max_workers=2) as agents:
+                first=agents.submit(ssh,"printf volume-agent-one > /workspaces/native-managed/agent-one; sync; sleep 1; cat /workspaces/native-managed/agent-two")
+                second=agents.submit(ssh,"printf volume-agent-two > /workspaces/native-managed/agent-two; sync; sleep 1; cat /workspaces/native-managed/agent-one")
+                assert first.result()=='volume-agent-two' and second.result()=='volume-agent-one'
+            assert authority.peer("import pathlib; p=pathlib.Path('/var/tmp/pfs-native/home/peer'); print((p/'agent-one').read_text()+','+(p/'agent-two').read_text())")=='volume-agent-one,volume-agent-two'
+            record('service-two-ssh-agents')
             editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record,defer_ui,defer_case)
             holder=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace',
                 'cd /workspaces/native-managed && echo holding && read -r release'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
