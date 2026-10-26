@@ -68,6 +68,11 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
     registered = subprocess.run([str(host),'--workspace-service-register'],env=env,capture_output=True,text=True)
     if registered.returncode:
         (evidence/'product-registration.txt').write_text(registered.stdout+registered.stderr)
+        # Approval can fail before the main fixture finally block is entered.
+        # Retire only this invocation's generated identity even on that cut.
+        cleanup=subprocess.run([str(host),'--unregister-workspace-test'],env=env,capture_output=True,text=True)
+        (evidence/'product-registration-cleanup.txt').write_text(cleanup.stdout+cleanup.stderr)
+        if cleanup.returncode==0:subprocess.run([lsregister,'-u',str(app)],check=True)
         raise RuntimeError('throwaway SMAppService registration requires consent or failed: '+registered.stderr.strip()+'; fixture '+str(evidence/'product-fixture.json'))
     endpoint = home/'.local/state/portablefs/workspace/control.sock'
     def command(*args, success=True):
