@@ -24,11 +24,17 @@ import PortableFSWorkspaceCore
         self.store = store; self.reservationDirectory = reservationDirectory; self.hostBoot = hostBoot; self.factory = factory
     }
     public func launch() {
-        guard store.value.running else { return }
-        do { try startIfNeeded() } catch { failure = String(describing: error) }
+        do {
+            if store.value.running { try startIfNeeded() }
+            else {
+                try store.requirePriorExecutionAbsent(hostBoot:hostBoot)
+                try releaseAbsentReservations()
+            }
+        } catch { failure = String(describing:error) }
     }
     public func handle(_ request: WorkspaceHostRequest) -> WorkspaceHostReply {
         do {
+            defer { scheduleUpdate() }
             try request.validate()
             guard !quiescing || request.operation == "status" else { throw WorkspaceVMError("workspace service is quiescing") }
             switch request.operation {
@@ -59,7 +65,7 @@ import PortableFSWorkspaceCore
         let connection = document.connection
         if let index = store.value.volumes.firstIndex(where: { $0.connection.volumeId == connection.volumeId }) {
             let old = store.value.volumes[index]
-            guard old.connection == connection, old.wanted else { throw WorkspaceVMError("Cleanup required") }
+            guard old.connection == connection else { throw WorkspaceVMError("Cleanup required") }
             if document.kind == "authorization" {
                 guard let saved = old.request, document.matchesRequest(saved) else { throw WorkspaceVMError("authorization does not bind the saved request") }
                 if old.authorizationConsumed { return }
@@ -94,7 +100,7 @@ import PortableFSWorkspaceCore
         }
         try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
-        for volume in store.value.volumes where volume.wanted { try transition.reserve(volume.reservation) }
+        for volume in store.value.volumes { try transition.reserve(volume.reservation) }
         let instance: any WorkspaceProductRuntime
         do { instance = try factory() } catch { failure = String(describing: error); throw error }
         instance.onStatus = { [weak self] in guard let self else { throw WorkspaceControlError.transition }; try self.observe($0) }
@@ -148,6 +154,7 @@ import PortableFSWorkspaceCore
                         state.retained.append(raw)
                     }
                     state.current=nil; state.execution=nil
+                    if stopRequested { state.running=false }
                 }
                 self.runtime = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
                 try releaseAbsentReservations()
@@ -181,7 +188,7 @@ import PortableFSWorkspaceCore
                 }; return
             }
             guard let runtime, runtime.ready else { return }
-            for volume in store.value.volumes where volume.wanted && !inFlight.contains(volume.connection.volumeId) {
+            for volume in store.value.volumes where !inFlight.contains(volume.connection.volumeId) {
                 let name = volume.connection.volumeId
                 switch volume.operation {
                 case "identity":
@@ -282,8 +289,10 @@ import PortableFSWorkspaceCore
     }
     private func forget(_ volume: WorkspaceDesiredVolume) throws {
         let transition = try WorkspaceReservations(directory: reservationDirectory)
+        let owned=transition.inventory.filter { $0.frontend == "workspace" && $0.authority == volume.connection.authority && $0.volume == volume.connection.volumeId }
+        guard owned.isEmpty || owned == [volume.reservation] else { throw WorkspaceVMError("Cleanup required") }
         try store.commit { $0.volumes.removeAll { $0.intent == volume.intent } }
-        try transition.release(volume.reservation)
+        if !owned.isEmpty { try transition.release(volume.reservation) }
     }
     private func releaseAbsentReservations() throws {
         guard store.value.execution == nil else { throw WorkspaceVMError("VM termination unconfirmed") }
@@ -307,6 +316,7 @@ import PortableFSWorkspaceCore
     public func snapshot() -> WorkspaceHostReply {
         var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.value.retained
         if !failure.isEmpty { result.state = "cleanup-required"; result.message = failure }
+        else if runtime == nil, store.value.execution != nil { result.state="cleanup-required";result.message="Cleanup required" }
         else if let runtime {
             if [.unknown,.pausedDiscard].contains(runtime.phase) { result.state = "cleanup-required"; result.message = "Cleanup required" }
             else if stopRequested || runtime.phase == .stopping { result.state = "pending"; result.message = "Stop Linux Workspace" }
@@ -335,6 +345,7 @@ import PortableFSWorkspaceCore
                 if current.state == "authorization-required" { volume.state = "authorization-required"; volume.message = WorkspaceHostControl.authorizationRequired }
             }
             if volume.state == "ready", desired.reopenRequired { volume.message = "Reconnect your editor and reopen this folder." }
+            if runtime == nil, store.value.execution == nil { volume.state="stopped";volume.message="Linux Workspace: Stopped" }
             if desired.request != nil { volume.authorizationRequest = store.directory.url.appendingPathComponent("authorization-" + desired.connection.volumeId + ".pfsworkspace").path }
             if let latest {
                 var page = latest; page.mounts = page.mounts.filter { $0.mount.volumeID == volume.volumeId }; page.jobs = page.jobs.filter { $0.mount.volumeID == volume.volumeId }

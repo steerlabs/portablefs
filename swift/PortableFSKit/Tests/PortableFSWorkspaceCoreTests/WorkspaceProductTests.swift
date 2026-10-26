@@ -271,3 +271,44 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     #expect(creations==2);#expect(first.starts==1);#expect(second.starts==1)
     #expect(store.value.execution?.boot==second.bootID)
 }
+
+@Test @MainActor func productStopIntentPersistsBeforeContendedReservationCleanup() async throws {
+    let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
+    let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    _=owner.handle(try productMount(productConnection()));runtime.running();try await productTurn()
+    do {
+        let transition=try WorkspaceReservations(directory:directory)
+        _=owner.handle(try productRequest("stop",force:true));try await productTurn()
+        #expect(!store.value.running);#expect(store.value.execution==nil)
+        #expect(owner.snapshot().volumes[0].state=="stopped")
+        withExtendedLifetime(transition){}
+    }
+    _=owner.handle(try productRequest("status"));try await productTurn()
+    let transition=try WorkspaceReservations(directory:directory)
+    #expect(transition.inventory.isEmpty);#expect(runtime.starts==1)
+}
+@Test @MainActor func productStoppedIntentCannotHideUnconfirmedOldExecution() throws {
+    let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
+    let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
+    try store.commit{$0.running=false;$0.execution=WorkspaceExecution(hostBoot:"host-boot",boot:Data(repeating:1,count:16))}
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    owner.launch()
+    #expect(owner.snapshot().state=="cleanup-required");#expect(runtime.starts==0)
+    #expect(store.value.execution != nil)
+}
+
+@Test @MainActor func productStoppedDescriptorRemovalDoesNotReleaseAFollowingMacReservation() async throws {
+    let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
+    let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    let connection=try productConnection()
+    _=owner.handle(try productMount(connection));runtime.running();try await productTurn()
+    _=owner.handle(try productRequest("stop",force:true));try await productTurn()
+    let mac=WorkspaceReservation(authority:connection.connection.authority,volume:"vol-1",frontend:"fskit",owner:"mac-ref")
+    do{let transition=try WorkspaceReservations(directory:directory);try transition.reserve(mac)}
+    #expect(owner.handle(try productRequest("umount",volume:"vol-1")).state != "refused")
+    #expect(store.value.volumes.isEmpty)
+    let transition=try WorkspaceReservations(directory:directory)
+    #expect(transition.inventory == [mac]);#expect(runtime.starts==1)
+}

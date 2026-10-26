@@ -6,7 +6,6 @@ import PortableFSWorkspaceCore
 public struct WorkspaceDesiredVolume: Codable, Sendable {
     public var connection: WorkspaceConnection
     public var intent: String
-    public var wanted = true
     public var reopenRequired = false
     public var request: WorkspaceConnectionDocument?
     // A single-use initial grant is committed as consumed BEFORE dispatch.
