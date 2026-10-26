@@ -10,8 +10,8 @@ enum PortableFSDStrictJSONError: Error, Equatable {
 /// including keys whose escaped spellings decode to the same string.
 /// Foundation's decoders intentionally accept the last duplicate key, which
 /// is not suitable for the security-sensitive host update protocol.
-enum PortableFSDStrictJSON {
-    static func validate(_ data: Data, maximumDepth: Int = 32) throws {
+public enum PortableFSDStrictJSON {
+    public static func validate(_ data: Data, maximumDepth: Int = 32) throws {
         var scanner = Scanner(bytes: Array(data), maximumDepth: maximumDepth)
         try scanner.parseDocument()
     }

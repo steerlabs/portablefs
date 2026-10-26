@@ -671,3 +671,18 @@ func AuthenticateSocketPeer(conn *net.UnixConn, expectedPath, expectedCDHash str
 	}
 	return witness.requireRunningImage(expectedPath, expectedCDHash)
 }
+
+// ConnectAuthenticated shares the host's pinned-socket and audit-token running
+// image boundary with other paired local services. Callers choose their own
+// bounded operational codec only after this proof succeeds.
+func ConnectAuthenticated(ctx context.Context, path, executable, cdhash string) (*net.UnixConn, error) {
+	conn, _, err := connectExactHost(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if err := AuthenticateSocketPeer(conn, executable, cdhash); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}

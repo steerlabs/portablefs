@@ -207,3 +207,9 @@ positive drain budgets are refused for awake mode. The awake worker has no
 power deadline. A changed shared permit cancels a running Suspend as well as
 Prepare and Recover, preserving the actual join before a successor starts.
 Socket budgets still bound each exchange and never cancel the retained worker.
+
+The paired host/guest UmountRequest carries an explicit `force` boolean. The
+supervisor retains it in MountJob field 9. The root driver uses terminal removal
+only for explicit force or an already terminal mount; a serving ordinary Umount
+still performs the original unforced kernel attempt and preserves EBUSY. This
+paired, unreleased addition leaves authority protocol 8 unchanged.

@@ -4,6 +4,8 @@
 #include <bsm/libbsm.h>
 #include <errno.h>
 #include <libproc.h>
+#include <mach/mach.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,4 +142,11 @@ int portablefs_running_image(
         return errno != 0 ? errno : EIO;
     }
     return (flags & (CS_VALID | CS_RUNTIME)) == (CS_VALID | CS_RUNTIME) ? 0 : EAUTH;
+}
+
+int portablefs_current_running_image(unsigned char cdhash_out[20]) {
+    audit_token_t token;
+    mach_msg_type_number_t count=TASK_AUDIT_TOKEN_COUNT;
+    if(task_info(mach_task_self(),TASK_AUDIT_TOKEN,(task_info_t)&token,&count)!=KERN_SUCCESS || count!=TASK_AUDIT_TOKEN_COUNT) return EACCES;
+    return portablefs_running_image(token.val,getpid(),audit_token_to_pidversion(token),cdhash_out);
 }

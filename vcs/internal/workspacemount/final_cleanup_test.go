@@ -69,3 +69,42 @@ func TestProvisionReconciliationRequiresAbsenceAndPreservesIdentity(t *testing.T
 		t.Fatal(err)
 	}
 }
+
+func TestProvisionRemovalCannotRetireReplacementIncarnation(t *testing.T) {
+	s, first := store(t)
+	initial := provision(t, first, false)
+	if err := s.AcceptProvision(t.Context(), initial, ready); err != nil {
+		t.Fatal(err)
+	}
+	absent := func() error { return nil }
+	if err := s.RetireProvision(first.Mount, absent); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetireProvision(first.Mount, absent); err != nil {
+		t.Fatal("lost cleanup acknowledgement was not retryable", err)
+	}
+	replacement, err := s.EnsureIdentity(request())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RetireProvision(first.Mount, absent); err == nil {
+		t.Fatal("old cleanup retired a selected replacement awaiting issuance")
+	}
+	grant := provision(t, replacement, false)
+	if err = s.AcceptProvision(t.Context(), grant, ready); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.RetireProvision(first.Mount, absent); err == nil {
+		t.Fatal("old cleanup retired a replacement grant")
+	}
+	retained, _, err := s.Provisioned(replacement.Mount)
+	if err != nil || !proto.Equal(retained, grant) {
+		t.Fatal("replacement ownership changed", err)
+	}
+	if err = s.RetireProvision(replacement.Mount, func() error { return errors.New("kernel absence unknown") }); err == nil {
+		t.Fatal("grant retired before absence")
+	}
+	if err = s.RetireProvision(replacement.Mount, absent); err != nil {
+		t.Fatal("replacement cleanup failed", err)
+	}
+}

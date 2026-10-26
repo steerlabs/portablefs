@@ -409,6 +409,9 @@ func (s *Store) acceptProvision(ctx context.Context, p *pb.Provision) error {
 		return err
 	}
 	if h := p.HostedEnrollment; h != nil {
+		if err := validateHostedScope(p, s.guest, v.Incarnation, spki, v.Epoch); err != nil {
+			return err
+		}
 		u, e := url.Parse(h.ManagerOrigin)
 		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.Path != "" && u.Path != "/" {
 			return errors.New("Manager must be an HTTPS origin")
@@ -442,6 +445,19 @@ func (s *Store) acceptProvision(ctx context.Context, p *pb.Provision) error {
 // join. Keeping that proof as a required operation avoids a caller-supplied bit.
 // Revocation commits the larger epoch before any new issuance can be requested.
 func (s *Store) Reissue(r *pb.IdentityRequest, revoke bool, cleanup func() error) error {
+	return s.reissue(r, nil, revoke, cleanup)
+}
+
+// RetireProvision refuses an old removal once a replacement incarnation has
+// been selected. The selection check and grant retirement share the store lock.
+func (s *Store) RetireProvision(id *pb.MountID, cleanup func() error) error {
+	if err := control.Mount(id); err != nil {
+		return err
+	}
+	return s.reissue(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId}, id, false, cleanup)
+}
+
+func (s *Store) reissue(r *pb.IdentityRequest, expected *pb.MountID, revoke bool, cleanup func() error) error {
 	if cleanup == nil {
 		return errors.New("reissuance requires exact cleanup")
 	}
@@ -453,6 +469,12 @@ func (s *Store) Reissue(r *pb.IdentityRequest, revoke bool, cleanup func() error
 	v, key, err := s.load(r)
 	if err != nil {
 		return err
+	}
+	if expected != nil && !proto.Equal(s.mounts[key], expected) {
+		if s.mounts[key] == nil && len(v.Provision) == 0 {
+			return nil
+		}
+		return errors.New("workspace cleanup does not own the selected incarnation")
 	}
 	if revoke {
 		if v.Epoch == maxEpoch {

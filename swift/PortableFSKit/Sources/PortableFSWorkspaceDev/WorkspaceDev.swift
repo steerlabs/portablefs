@@ -30,7 +30,7 @@ import PortableFSWorkspaceCore
 }
 
 @MainActor final class Driver {
-    let state: WorkspaceDevState
+    let state: WorkspaceState
     let vm: WorkspaceMachine
     let power = WorkspaceSystemPower()
     let clock = WorkspaceSystemClock()
@@ -55,7 +55,7 @@ import PortableFSWorkspaceCore
     init(image: URL, stateDirectory: URL, pairingMismatch: String? = nil) throws {
         let artifact = try WorkspaceArtifact(directory: image)
         guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit else { throw WorkspaceVMError("host executable and guest release differ; rebuild the paired dev executable") }
-        state = try WorkspaceDevState(directory: stateDirectory)
+        state = try WorkspaceState(directory: stateDirectory)
         vm = try WorkspaceMachine(artifact: artifact, dataDisk: stateDirectory.appendingPathComponent("data.ext4"), serialLog: stateDirectory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress)
         channel = WorkspaceVsockChannel(vm: vm); observed = ObservedChannel(channel); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)
         var hello = WorkspaceHello(); hello.release = artifact.release; hello.bootID = random.next(); hello.hostServiceID = random.next()
@@ -206,8 +206,13 @@ import PortableFSWorkspaceCore
             case "probe-unavailable-jobs":
                 guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
                 pendingCommand = command
-                var mount = WorkspaceMountID(); mount.authorityID = Data(repeating: 1, count: 32); mount.volumeID = "unavailable-probe"; mount.incarnation = random.next()
-                probeUnavailableJobs(mount, index: 0, requests: [], deadline: clock.now + 5_000_000_000)
+                var request = WorkspaceIdentityRequest(); request.authorityID = Data(repeating: 1, count: 32); request.volumeID = "unavailable-probe"
+                let deadline = clock.now + 5_000_000_000
+                channel.identity(request, deadline: deadline) { [weak self] result in
+                    guard let self else { return }
+                    do { self.probeUnavailableJobs(try result.get().mount, index: 0, requests: [], deadline: deadline) }
+                    catch { self.fail(error) }
+                }
             case "stop": stop(exitCode: 0)
             default: event("refused", ["command": command])
             }
@@ -250,11 +255,17 @@ import PortableFSWorkspaceCore
                     }
                     return
                 }
-                guard job.phase == "failed", job.failure == "handler-failed", !job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned job reported completion") }
+                if index < 2 {
+                    guard job.phase == "failed", job.failure == "handler-failed", !job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned job reported completion") }
+                } else {
+                    // No mount was admitted. Removal still joins the exact
+                    // inventories and kernel absence before retiring the intent.
+                    guard job.phase == "complete", job.failure.isEmpty, job.reason.isEmpty else { throw WorkspaceVMError("unprovisioned intent cleanup failed") }
+                }
                 let accepted = requests + [job.requestID]
                 guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
                 if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
-                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": job.failure]) }
+                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": "handler-failed", "cleanup": job.phase]) }
             } catch { self.fail(error) }
         }
     }

@@ -67,8 +67,19 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("validate per-mount log directory: %w", err)
 	}
 	s.registry = newRegistryWithMountLogDir(s.cfg.StateDir, s.cfg.MountLogDir)
+	s.registry.reservationStateDir = filepath.Dir(s.cfg.StateDir)
 	if s.registry.loadErr != nil {
 		return fmt.Errorf("strict persisted attach inventory: %w", s.registry.loadErr)
+	}
+	if err := s.registry.reconcileVolumeReservations(func(path, ref string) error {
+		observe, err := hostPreKernelFSKitMountAbsenceObserver(path, ref)
+		if err != nil {
+			return err
+		}
+		_, err = observe(context.Background())
+		return err
+	}); err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)

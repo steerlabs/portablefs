@@ -15,6 +15,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -107,16 +108,17 @@ type registry struct {
 	// unmountMu guards unmounting, the at-most-one-transaction-per-attach map
 	// that lets a second unmount request JOIN a running transaction instead of
 	// queueing another one behind it on mutationMu.
-	unmountMu     sync.Mutex
-	unmounting    map[string]*unmountTransaction
-	persistMu     sync.Mutex
-	writeAttaches func(string, []persistedAttachEntry) error
-	stateDir      string
-	mountLogDir   string
-	byRef         map[string]*attach
-	byKey         map[string]*attach
-	quiescing     bool
-	loadErr       error
+	unmountMu           sync.Mutex
+	unmounting          map[string]*unmountTransaction
+	persistMu           sync.Mutex
+	writeAttaches       func(string, []persistedAttachEntry) error
+	reservationStateDir string
+	stateDir            string
+	mountLogDir         string
+	byRef               map[string]*attach
+	byKey               map[string]*attach
+	quiescing           bool
+	loadErr             error
 }
 
 func newRegistry(stateDir string) *registry {
@@ -282,9 +284,42 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 	a.mountLogDir = r.mountLogDir
 	a.v3Config = v3Config
 	a.persist = r.persist
+	// Commit cross-service intent before any authority attach. A crashed or
+	// uncertain attach retains the exact ref until ordinary exact unmount.
+	if r.reservationStateDir != "" {
+		if req.AuthSequence != 0 {
+			r.mu.Unlock()
+			return nil, false, errors.New("an initial v3 attach credential must use authSequence zero")
+		}
+		reservation, err := reservationForAttach(a)
+		if err != nil {
+			r.mu.Unlock()
+			return nil, false, err
+		}
+		transition, err := mountlifecycle.BeginTransition(r.reservationStateDir)
+		if err != nil {
+			r.mu.Unlock()
+			return nil, false, err
+		}
+		err = transition.Reserve(reservation)
+		_ = transition.Close()
+		if err != nil {
+			r.mu.Unlock()
+			return nil, false, err
+		}
+	}
 	r.byRef[ref] = a
 	r.byKey[key] = a
 	r.mu.Unlock()
+	if r.reservationStateDir != "" {
+		if err := r.persist(); err != nil {
+			return a, true, err
+		}
+		if err := a.activate(ctx, req.AuthToken, req.AuthTokenExpiresAtMs, 0, ""); err != nil {
+			return a, true, err
+		}
+		return a, true, r.persist()
+	}
 	if req.AuthSequence != 0 {
 		r.mu.Lock()
 		delete(r.byRef, ref)
@@ -575,6 +610,20 @@ func (r *registry) runUnmountTransaction(
 			return true, detachErr
 		}
 	}
+	var transition *mountlifecycle.Transition
+	var reservation mountlifecycle.Reservation
+	if r.reservationStateDir != "" {
+		var err error
+		reservation, err = reservationForAttach(a)
+		if err != nil {
+			return true, errors.Join(detachErr, err)
+		}
+		transition, err = mountlifecycle.BeginTransition(r.reservationStateDir)
+		if err != nil {
+			return true, errors.Join(detachErr, err)
+		}
+		defer transition.Close()
+	}
 	r.mu.Lock()
 	delete(r.byRef, ref)
 	delete(r.byKey, a.key)
@@ -587,7 +636,21 @@ func (r *registry) runUnmountTransaction(
 		r.mu.Unlock()
 		return true, errors.Join(detachErr, err)
 	}
+	if transition != nil {
+		if err := transition.Release(reservation); err != nil {
+			r.mu.Lock()
+			r.byRef[ref] = a
+			r.byKey[a.key] = a
+			r.mu.Unlock()
+			return true, errors.Join(detachErr, err, r.persist())
+		}
+	}
 	return true, detachErr
+}
+
+func reservationForAttach(a *attach) (mountlifecycle.Reservation, error) {
+	identity, err := mountlifecycle.AuthorityIdentity(a.dataPlaneServerName)
+	return mountlifecycle.Reservation{Authority: identity, Volume: a.volumeID, Frontend: "fskit", Owner: a.ref, Target: a.mountPath}, err
 }
 
 // closeAll is the cooperative daemon-termination path. Every attach must pass

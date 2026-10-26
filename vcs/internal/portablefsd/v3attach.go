@@ -978,6 +978,12 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 			return cause
 		}
 	}
+	// Accepted absence terminates DATA before the CONTROL proof reply. Even
+	// when the kernel mount was already absent, its planned teardown must own
+	// that session edge so the bridge watcher cannot close CONTROL first.
+	if bridge := a.v3CoherenceBridge(); bridge != nil {
+		bridge.confirmMountAbsence()
+	}
 	observed := time.Now()
 	proof := &authoritypb.MountAbsenceProof{
 		ObservedUnixNanos: observed.UnixNano(),

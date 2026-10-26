@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -1112,6 +1113,46 @@ func TestV3DetachSeparatesReleaseDiagnosticsFromAcceptedAbsence(t *testing.T) {
 			reloaded := newRegistry(r.stateDir)
 			if reloaded.loadErr != nil || reloaded.get(a.ref) != nil {
 				t.Fatalf("registry removal was not durable: load=%v attach=%v", reloaded.loadErr, reloaded.get(a.ref))
+			}
+		})
+	}
+}
+
+type v3DetachSessionFunc func(context.Context, *authoritypb.MountAbsenceProof) error
+
+func (f v3DetachSessionFunc) DetachAfterUnmount(ctx context.Context, proof *authoritypb.MountAbsenceProof) error {
+	return f(ctx, proof)
+}
+
+func TestV3ExactAbsenceStartsPlannedDetachBeforeControl(t *testing.T) {
+	for _, initiallyPresent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("initially-present-%t", initiallyPresent), func(t *testing.T) {
+			pki := newV3TestPKI(t)
+			handler := newV3TestAuthority()
+			address := startV3TestAuthority(t, handler, pki.serverTLS)
+			r := newRegistry(privateTestDir(t))
+			a := ensureV3TestAttach(t, r, v3TestEnsureRequest(address, pki, "/Volumes/PortableFSPlannedDetach"))
+			d := a.v3Backend()
+			original := a.v3Session
+			a.v3Session = v3DetachSessionFunc(func(ctx context.Context, proof *authoritypb.MountAbsenceProof) error {
+				d.bridge.mu.Lock()
+				planned := d.bridge.detaching
+				d.bridge.mu.Unlock()
+				if !planned {
+					return errors.New("CONTROL proof has no planned session-teardown owner")
+				}
+				return original.DetachAfterUnmount(ctx, proof)
+			})
+			present := initiallyPresent
+			found, err := r.unmountFSKitWith(a.ref, false, fskitKernelOps{
+				present: func(string, string) (bool, error) { return present, nil },
+				unmountExact: func(string, string, bool) error {
+					present = false
+					return nil
+				},
+			})
+			if !found || err != nil || handler.recordedDetach().GetMountAbsence() == nil || r.get(a.ref) != nil {
+				t.Fatalf("planned exact detach = (%t, %v), proof=%v", found, err, handler.recordedDetach())
 			}
 		})
 	}

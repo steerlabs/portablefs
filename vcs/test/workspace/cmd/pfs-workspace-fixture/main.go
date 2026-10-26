@@ -16,11 +16,15 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
 	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacehost"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -37,6 +41,53 @@ func run(args []string) error {
 		return errors.New("fixture operation required")
 	}
 	switch args[0] {
+	case "document-connection":
+		if len(args) != 4 {
+			return errors.New("document-connection GENERATED_TEST_PKI ENDPOINT VOLUME")
+		}
+		ca, err := os.ReadFile(filepath.Join(args[1], "server-ca.pem"))
+		if err != nil {
+			return err
+		}
+		authority, err := mountlifecycle.AuthorityIdentity("authority.portablefs.test")
+		if err != nil {
+			return err
+		}
+		revision := localroutes.RuleSet{}.Revision()
+		return json.NewEncoder(os.Stdout).Encode(workspacehost.Document{Version: 1, Kind: "connection", Connection: workspacehost.Connection{Authority: authority, VolumeID: args[3], Endpoint: args[2], ServerName: "authority.portablefs.test", CACertificate: ca, RoutesRevision: revision[:]}})
+	case "document-authorize":
+		if len(args) != 3 {
+			return errors.New("document-authorize GENERATED_TEST_PKI PUBLIC_REQUEST_BASE64")
+		}
+		raw, err := base64.StdEncoding.DecodeString(args[2])
+		if err != nil {
+			return err
+		}
+		document, err := workspacehost.DecodeDocument(raw)
+		if err != nil {
+			return err
+		}
+		identity, err := document.GuestIdentity()
+		if err != nil {
+			return err
+		}
+		body, err := proto.Marshal(identity)
+		if err != nil {
+			return err
+		}
+		encoded, err := exec.Command(os.Args[0], "provision", args[1], document.Connection.Endpoint, base64.StdEncoding.EncodeToString(body)).Output()
+		if err != nil {
+			return errors.New("generated test issuer failed")
+		}
+		material := new(pb.Provision)
+		if err = decode(strings.TrimSpace(string(encoded)), material); err != nil {
+			return err
+		}
+		response, err := document.Authorize(material)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(response)
 	case "setup":
 		if len(args) != 3 {
 			return errors.New("setup DIRECTORY VOLUME")

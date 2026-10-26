@@ -25,3 +25,7 @@ func (ProcessWitness) RequireCurrentExecutable(string) error {
 func (ProcessWitness) requireRunningImage(string, string) error {
 	return fmt.Errorf("Darwin running-image authentication requires cgo")
 }
+
+func CurrentRunningCDHash() (string, error) {
+	return "", fmt.Errorf("Darwin running-image authentication requires cgo")
+}

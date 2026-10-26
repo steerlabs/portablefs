@@ -712,3 +712,15 @@ private enum InjectedFailure: Error { case failed }
         }
     }
 }
+
+@Test @MainActor func productOrderlyStopRefusalKeepsVMAndPowerOwnerRunning() throws {
+    let rig = try Rig()
+    var refused = false
+    rig.coordinator.stopOrderly { if case .failure = $0 { refused = true } }
+    #expect(rig.vm.calls.last == "shutdown")
+    rig.vm.stops[0](.failure(InjectedFailure.failed))
+    #expect(refused)
+    #expect(rig.coordinator.phase == .running)
+    #expect(rig.power.registered)
+    #expect(!rig.vm.calls.contains("stop"))
+}

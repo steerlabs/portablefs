@@ -61,6 +61,20 @@ Run ` + "`portablefs help <command>`" + ` for details and examples.
 // commandHelp returns detailed, example-driven help for one command.
 func commandHelp(name string) (string, bool) {
 	texts := map[string]string{
+		"workspace": `USAGE
+  portablefs workspace start
+  portablefs workspace status [--json]
+  portablefs workspace mount <connection-file> [--json]
+  portablefs workspace umount <volume-id> [--force] [--json]
+  portablefs workspace stop [--force] [--json]
+
+The per-user background service owns Linux independently of the menu app.
+Mount accepts a .pfsworkspace connection or guest-bound authorization document.
+Pending acceptance does not report a completed mount. A saved authorization
+request contains the public guest CSR and exact mount intent; keys stay in Linux.
+Only explicit --force discards open operations and potentially unflushed changes.
+Stop retains volume descriptors and Linux data. SSH supplies shell and exec.
+`,
 		"reauthorize": `USAGE
   PORTABLEFS_MOUNT_TOKEN=<manager-issued capability> portablefs reauthorize <mountPath>
     --client-cert renewed-client.pem --auth-expires-at-ms <unix-ms>

@@ -104,6 +104,8 @@ message MountJob {
   string reason = 7;
   // Predecessors are consumed through Status before a successor is admitted.
   reserved 8;
+  // Explicit user force; valid only for Umount. Never inferred from failure.
+  bool force = 9;
 }
 // One acknowledged retirement stream for exact mount and joined job evidence.
 // A replaced mount and its last job share one record; job-only work never
@@ -162,7 +164,7 @@ message Provision {
   HostedEnrollment hosted_enrollment = 9;
 }
 message MountRequest { MountID mount = 1; }
-message UmountRequest { MountID mount = 1; }
+message UmountRequest { MountID mount = 1; bool force = 2; }
 message Result {
   // accepted, unavailable, authorization-required, refused, predecessor-unobserved.
   // predecessor-unobserved is admission-only; no work or slot changes.

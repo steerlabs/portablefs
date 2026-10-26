@@ -220,9 +220,13 @@ func validLowerHex(value string, exactLength int) bool {
 }
 
 func DecodeExact[T any](frame []byte) (T, error) {
+	return DecodeBounded[T](frame, MaxFrameBytes)
+}
+
+func DecodeBounded[T any](frame []byte, limit int) (T, error) {
 	var value T
-	if len(frame) == 0 || len(frame) > MaxFrameBytes {
-		return value, fmt.Errorf("host update frame size is outside 1..%d bytes", MaxFrameBytes)
+	if len(frame) == 0 || len(frame) > limit {
+		return value, fmt.Errorf("host frame size is outside 1..%d bytes", limit)
 	}
 	if err := validateUniqueJSON(frame); err != nil {
 		return value, err

@@ -27,6 +27,7 @@ final class PortableFSDUpdateListener: @unchecked Sendable {
 
     init(
         store: PortableFSDUpdateLeaseStore,
+        socketName: String = PortableFSDUpdateLeaseStore.socketFilename,
         acceptSystemCall: @escaping AcceptSystemCall = {
             Darwin.accept($0, nil, nil)
         }
@@ -34,7 +35,7 @@ final class PortableFSDUpdateListener: @unchecked Sendable {
         self.store = store
         self.acceptSystemCall = acceptSystemCall
         socketURL = store.directoryURL.appendingPathComponent(
-            PortableFSDUpdateLeaseStore.socketFilename,
+            socketName,
             isDirectory: false
         )
         guard socketURL.path.utf8.count < MemoryLayout.size(
@@ -418,12 +419,14 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
     static let maximumFrameBytes = 4_096
     static let timeoutSeconds: TimeInterval = 20
 
-    private let descriptor: Int32
+    let descriptor: Int32
+    private var frameLimit: Int
     let peerPID: pid_t
     private var closed = false
     private let stateLock = NSLock()
 
-    init(descriptor: Int32, peerPID: pid_t) {
+    init(descriptor: Int32, peerPID: pid_t, frameLimit: Int = maximumFrameBytes) {
+        self.frameLimit = frameLimit
         self.descriptor = descriptor
         self.peerPID = peerPID
     }
@@ -432,10 +435,18 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
         close()
     }
 
+    func setFrameLimit(_ limit: Int) { frameLimit = limit }
+    func prepareBoundedIO() throws {
+        var one: Int32 = 1
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        guard flags >= 0, Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0,
+              Darwin.setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0 else { throw PortableFSDUpdateSocketError.closed }
+    }
+
     func readFrame() throws -> Data {
         let deadline = Date().addingTimeInterval(Self.timeoutSeconds)
         var frame = Data()
-        while frame.count < Self.maximumFrameBytes {
+        while frame.count < frameLimit {
             let milliseconds = max(1, Int32(deadline.timeIntervalSinceNow * 1_000))
             guard deadline.timeIntervalSinceNow > 0 else {
                 throw PortableFSDUpdateSocketError.timeout
@@ -452,7 +463,7 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
             }
             var byte: UInt8 = 0
             let count = Darwin.read(descriptor, &byte, 1)
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
             guard count == 1 else {
                 throw PortableFSDUpdateSocketError.closed
             }
@@ -469,7 +480,7 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
 
     func writeFrame(_ data: Data) throws {
         guard !data.isEmpty,
-              data.count <= Self.maximumFrameBytes,
+              data.count <= frameLimit,
               data.last == 0x0a,
               !data.dropLast().contains(0x0a) else {
             throw PortableFSDUpdateSocketError.invalidFrame
@@ -502,7 +513,7 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
                     remaining
                 )
             }
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
             guard count > 0 else {
                 throw PortableFSDUpdateSocketError.closed
             }

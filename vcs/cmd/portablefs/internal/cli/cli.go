@@ -6,10 +6,12 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacehost"
 	"io"
 	"os"
 	"runtime"
@@ -23,13 +25,14 @@ const linuxMountLossObservationFeature = "linux-mount-loss-observation-v1"
 // cmdEnv carries the process environment a command runs in; tests substitute
 // writers, env lookups, the config path, and the poll sleeper.
 type cmdEnv struct {
-	stdout     io.Writer
-	stderr     io.Writer
-	stdin      io.Reader   // nil = os.Stdin (tests script confirmations)
-	stdinIsTTY func() bool // nil = real character-device check on os.Stdin
-	getenv     func(string) string
-	version    string
-	sleepFn    func(time.Duration) // nil = time.Sleep (tests poll instantly)
+	workspaceRequestFn func(context.Context, workspacehost.Request) (workspacehost.Reply, error)
+	stdout             io.Writer
+	stderr             io.Writer
+	stdin              io.Reader   // nil = os.Stdin (tests script confirmations)
+	stdinIsTTY         func() bool // nil = real character-device check on os.Stdin
+	getenv             func(string) string
+	version            string
+	sleepFn            func(time.Duration) // nil = time.Sleep (tests poll instantly)
 	// Test-only override. Production lifecycle locking deliberately ignores
 	// XDG_STATE_HOME so environment variants cannot split the lock inode.
 	lifecycleStateDir string
@@ -128,6 +131,7 @@ type command struct {
 func commands() []command {
 	commands := []command{
 		{"mount", "mount a live volume on this machine", cmdMount},
+		{"workspace", "manage the per-user Linux workspace", cmdWorkspace},
 		{"reauthorize", "rotate a hosted live mount authorization", cmdReauthorize},
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},

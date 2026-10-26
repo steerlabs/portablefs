@@ -1,22 +1,18 @@
 import Foundation
 import Darwin
 
-public final class WorkspaceDevState {
+public final class WorkspaceState {
     public let directory: URL
-    private let lock: FileHandle
+    private let lock: WorkspaceFileLock
+    private let privateDirectory: WorkspacePrivateDirectory
     public var socket: URL { directory.appendingPathComponent("ssh.sock") }
     public var formatAuthorized: String { FileManager.default.fileExists(atPath: directory.appendingPathComponent("format-authorized").path) ? "8" : "" }
     public let machineID: String
     public let macAddress: String
     public init(directory: URL) throws {
         self.directory = directory
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        var info = stat()
-        guard lstat(directory.path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR, info.st_uid == getuid(), info.st_mode & 0o777 == 0o700 else { throw WorkspaceVMError("workspace state must be an owned, mode 0700 directory") }
-        let owner = open(directory.appendingPathComponent("owner.lock").path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        guard owner >= 0 else { throw WorkspaceVMError("workspace state lock: \(errno)") }
-        guard flock(owner, LOCK_EX | LOCK_NB) == 0 else { Darwin.close(owner); throw WorkspaceVMError("workspace state already owned") }
-        lock = FileHandle(fileDescriptor: owner, closeOnDealloc: true)
+        privateDirectory = try WorkspacePrivateDirectory(directory)
+        lock = try privateDirectory.lock("owner.lock")
         let identity = directory.appendingPathComponent("network-identity")
         if !FileManager.default.fileExists(atPath: identity.path) {
             let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
@@ -29,7 +25,7 @@ public final class WorkspaceDevState {
         let disk = directory.appendingPathComponent("data.ext4")
         if !FileManager.default.fileExists(atPath: disk.path) {
             let attributes = try FileManager.default.attributesOfFileSystem(forPath: directory.path)
-            guard let free = attributes[.systemFreeSize] as? NSNumber, free.uint64Value >= 8 * 1024 * 1024 * 1024 else { throw WorkspaceVMError("data disk requires at least 8 GiB free host storage") }
+            guard let free = attributes[.systemFreeSize] as? NSNumber, free.uint64Value >= 8 * 1024 * 1024 * 1024 else { throw WorkspaceVMError("Not enough disk space") }
             try Self.atomic(Data("8\n".utf8), to: directory.appendingPathComponent("format-authorized"))
             let temporary = directory.appendingPathComponent("data.initializing")
             let fd = open(temporary.path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
@@ -56,7 +52,6 @@ public final class WorkspaceDevState {
         let publicKey = try Self.keygen(["-y", "-f", key.path])
         try Self.atomic(Data(publicKey.utf8), to: directory.appendingPathComponent("client_ed25519.pub"))
     }
-    deinit { flock(lock.fileDescriptor, LOCK_UN) }
     private static func keygen(_ arguments: [String]) throws -> String {
         let process = Process(); let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen"); process.arguments = arguments; process.standardOutput = output
@@ -90,7 +85,7 @@ public final class WorkspaceDevState {
         let canonical = parts.prefix(2).joined(separator: " ") + "\n"
         let pin = directory.appendingPathComponent("guest_host_key.pub")
         if FileManager.default.fileExists(atPath: pin.path) {
-            guard try String(contentsOf: pin, encoding: .utf8) == canonical else { throw WorkspaceVMError("persistent guest host key changed") }
+            guard try String(contentsOf: pin, encoding: .utf8) == canonical else { throw WorkspaceVMError("SSH identity changed") }
         } else { try Self.atomic(Data(canonical.utf8), to: pin) }
         let known = directory.appendingPathComponent("known_hosts")
         try Self.atomic(Data(("portablefs-workspace " + canonical).utf8), to: known)

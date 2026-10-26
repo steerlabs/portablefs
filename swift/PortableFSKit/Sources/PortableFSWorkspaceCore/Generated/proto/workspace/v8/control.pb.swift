@@ -367,6 +367,9 @@ public nonisolated struct WorkspaceMountJob: Sendable {
 
   public var reason: String = String()
 
+  /// Explicit user force; valid only for Umount. Never inferred from failure.
+  public var force: Bool = false
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -624,6 +627,8 @@ public nonisolated struct WorkspaceUmountRequest: Sendable {
   public var hasMount: Bool {self._mount != nil}
   /// Clears the value of `mount`. Subsequent reads from it will return its default value.
   public mutating func clearMount() {self._mount = nil}
+
+  public var force: Bool = false
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -1390,7 +1395,7 @@ nonisolated extension WorkspaceStatusRequest: SwiftProtobuf.Message, SwiftProtob
 
 nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MountJob"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}request_id\0\u{1}generation\0\u{1}operation\0\u{1}phase\0\u{1}failure\0\u{1}reason\0\u{c}\u{8}\u{1}")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{3}request_id\0\u{1}generation\0\u{1}operation\0\u{1}phase\0\u{1}failure\0\u{1}reason\0\u{2}\u{2}force\0\u{c}\u{8}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1405,6 +1410,7 @@ nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._M
       case 5: try { try decoder.decodeSingularStringField(value: &self.phase) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.failure) }()
       case 7: try { try decoder.decodeSingularStringField(value: &self.reason) }()
+      case 9: try { try decoder.decodeSingularBoolField(value: &self.force) }()
       default: break
       }
     }
@@ -1436,6 +1442,9 @@ nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._M
     if !self.reason.isEmpty {
       try visitor.visitSingularStringField(value: self.reason, fieldNumber: 7)
     }
+    if self.force != false {
+      try visitor.visitSingularBoolField(value: self.force, fieldNumber: 9)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -1447,6 +1456,7 @@ nonisolated extension WorkspaceMountJob: SwiftProtobuf.Message, SwiftProtobuf._M
     if lhs.phase != rhs.phase {return false}
     if lhs.failure != rhs.failure {return false}
     if lhs.reason != rhs.reason {return false}
+    if lhs.force != rhs.force {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -1947,7 +1957,7 @@ nonisolated extension WorkspaceMountRequest: SwiftProtobuf.Message, SwiftProtobu
 
 nonisolated extension WorkspaceUmountRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".UmountRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}mount\0\u{1}force\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -1956,6 +1966,7 @@ nonisolated extension WorkspaceUmountRequest: SwiftProtobuf.Message, SwiftProtob
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularMessageField(value: &self._mount) }()
+      case 2: try { try decoder.decodeSingularBoolField(value: &self.force) }()
       default: break
       }
     }
@@ -1969,11 +1980,15 @@ nonisolated extension WorkspaceUmountRequest: SwiftProtobuf.Message, SwiftProtob
     try { if let v = self._mount {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 1)
     } }()
+    if self.force != false {
+      try visitor.visitSingularBoolField(value: self.force, fieldNumber: 2)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: WorkspaceUmountRequest, rhs: WorkspaceUmountRequest) -> Bool {
     if lhs._mount != rhs._mount {return false}
+    if lhs.force != rhs.force {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

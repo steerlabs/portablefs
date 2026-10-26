@@ -2471,3 +2471,23 @@ public enum PortableFSDServiceCoordinator {
         }
     }
 }
+
+extension PortableFSDServiceCoordinator {
+    /// Binds the caller's live text to the statically verified enclosing release
+    /// before it trusts that release's nested service pins. This uses the same
+    /// audit-token rule as socket peers, including after an app is replaced.
+    public static func requireCurrentRunningImage(expectedPath: String, expectedCDHash: String) throws {
+        var token = audit_token_t()
+        var count = mach_msg_type_number_t(MemoryLayout<audit_token_t>.size / MemoryLayout<integer_t>.size)
+        let status = withUnsafeMutablePointer(to:&token) { pointer in
+            pointer.withMemoryRebound(to:integer_t.self,capacity:Int(count)) {
+                task_info(mach_task_self_,task_flavor_t(TASK_AUDIT_TOKEN),$0,&count)
+            }
+        }
+        guard status == KERN_SUCCESS else { throw PortableFSSignedServiceError.invalidIdentity }
+        let witness = try DaemonProcessWitness(pid:getpid(),pidVersion:audit_token_to_pidversion(token))
+        defer { witness.close() }
+        let peer = DaemonPeer(auditToken:token,executableURL:URL(fileURLWithPath:expectedPath),processWitness:witness)
+        try requireRunningImage(peer,expectedPath:expectedPath,expectedCDHash:expectedCDHash)
+    }
+}

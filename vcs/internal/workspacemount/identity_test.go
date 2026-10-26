@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"math/big"
@@ -18,6 +20,8 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
+	"github.com/steerlabs/portablefs/vcs/internal/productauth"
+	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/proto"
 )
@@ -85,6 +89,15 @@ func provision(t *testing.T, r *pb.IdentityReply, hosted bool, validity ...time.
 			t.Fatal(err)
 		}
 		p.HostedEnrollment = &pb.HostedEnrollment{ManagerOrigin: "https://manager.example", ManagerServerName: "manager.example", ManagerCa: []byte(httpsCA.CertificatePEM), EnrollmentId: id, EnrollmentCertificate: []byte(enrollment), AuthorityGeneration: 1, AuthorizationDeadlineUnix: uint64(now.Add(time.Minute).Unix())}
+		peer := sha256.Sum256(r.PublicKey)
+		product, err := productauth.Sign(clientCA.Signer.(ed25519.PrivateKey), productauth.Claims{Issuer: "test", Audience: "portablefs-manager", AuthorizationDomain: "test", Owner: "test", Subject: "test", VolumeID: r.Mount.VolumeId, Access: []string{"read", "write"}, PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: "test-product", NotBefore: now.Add(-time.Second).Unix(), Expires: now.Add(time.Minute).Unix(), RenewalScope: RenewalScope(r), RenewalEpoch: r.RenewalEpoch})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Capability, err = volumecap.Sign(clientCA.Signer.(ed25519.PrivateKey), volumecap.Claims{VolumeID: r.Mount.VolumeId, Subject: "test", Access: []string{"read", "write"}, NotBefore: now.Add(-time.Second).Unix(), Expires: int64(p.HostedEnrollment.AuthorizationDeadlineUnix), PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: "test-capability", CellID: "11111111-1111-4111-8111-111111111111", AuthorityID: p.ServerName, AuthorityGeneration: 1, MountEnrollmentID: id, ProductAuthorization: string(product)})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	return p
 }
