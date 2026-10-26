@@ -151,6 +151,16 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
 }
 
 @Suite struct WorkspacePresentationTests {
+    @Test func statusDoesNotStartServiceOrHideRetainedStateWhenSocketIsMissing() async throws {
+        let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let client = PortableFSWorkspaceClient(home: home)
+        #expect(try await client.perform(.status).state == "stopped")
+        #expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent(".local").path))
+        let directory = home.appendingPathComponent(".local/state/portablefs/workspace")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("retained state".utf8).write(to: directory.appendingPathComponent("desired.json"))
+        await #expect(throws: PortableFSWorkspaceError("Cleanup required: Linux Workspace service is unavailable")) { try await client.perform(.status) }
+    }
     @Test func editorURLsAndMissingExtensionAreExplicit() throws {
         for editor in PortableFSWorkspaceEditor.allCases {
             let expected = editor == .vscode ? "vscode-remote://ssh-remote+portablefs-workspace/workspaces/vol-1" : "cursor://vscode-remote/ssh-remote+portablefs-workspace/workspaces/vol-1"
@@ -221,5 +231,29 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
         fail = false
         _ = try await WorkspaceRemoval.run(data: .keep, home: home, actions: actions)
         #expect(stops == 1); #expect(unregistrations == 1)
+    }
+    @Test func interruptedQuiescenceCanRetryAlreadyStoppedServiceWithoutAnotherStop() async throws {
+        let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }
+        var interrupt = true
+        let actions = WorkspaceRemoval.Actions(stop: { throw PortableFSWorkspaceError("quiesced service refuses new Stop") }, status: { .init() }, quiesce: { if interrupt { throw PortableFSWorkspaceError("interrupted before checkpoint") } }, unregister: {}, removeSSH: {})
+        await #expect(throws: (any Error).self) { try await WorkspaceRemoval.run(data: .keep, home: home, actions: actions) }
+        interrupt = false
+        _ = try await WorkspaceRemoval.run(data: .keep, home: home, actions: actions)
+    }
+    @Test func interruptedDeletionResumesWhenTheOldLockFileWasAlreadyDeleted() async throws {
+        let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let directory = home.appendingPathComponent(".local/state/portablefs/workspace")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try Data().write(to: directory.appendingPathComponent("service.lock"))
+        try Data("remaining local data".utf8).write(to: directory.appendingPathComponent("data.ext4"))
+        let actions = WorkspaceRemoval.Actions(stop: { .init() }, status: { .init() }, quiesce: {}, unregister: {}, removeSSH: {})
+        _ = try await WorkspaceRemoval.run(data: .keep, home: home, actions: actions)
+        // Simulate interruption during deletion, after the earlier invocation
+        // durably proved idle, unregistered and removed its SSH configuration.
+        let journal = home.appendingPathComponent(".local/state/portablefs/workspace-removal.json")
+        try Data("{\"version\":1,\"data\":\"delete\",\"phase\":\"ssh-removed\"}".utf8).write(to: journal)
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("service.lock"))
+        _ = try await WorkspaceRemoval.run(data: .delete, home: home, actions: actions)
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
     }
 }
