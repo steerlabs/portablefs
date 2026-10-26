@@ -236,11 +236,18 @@ try:
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
+    guest.command('status')
+    prior_generation = guest.wait('status')['generation']
+    before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
+    assert before['generation'] == prior_generation and before['sample_age_ns'] <= 250_000_000, before
+    expected_generation = prior_generation + 1
+    measurements[-1]['pre_pause_clock'] = before
     # One input batch makes Status in flight when Suspend is enqueued.
     guest.p.stdin.write(json.dumps({'command':'status'})+'\n'+json.dumps({'command':'pause'})+'\n'); guest.p.stdin.flush()
     paused = guest.wait('paused', 25)
-    assert paused['fenced'] and not paused['attach_allowed'] and paused['generation'] == 1
-    assert paused['operations'].index('pause-completed') < paused['operations'].index('sleep-fenced')
+    assert paused['fenced'] and not paused['attach_allowed'] and paused['generation'] == expected_generation
+    operations = paused['operations']
+    assert max(i for i, op in enumerate(operations) if op == 'pause-completed') < max(i for i, op in enumerate(operations) if op == 'sleep-fenced')
     guest.command('status')
     assert guest.wait('status')['phase'] == 'pausedCold'
     authority.write_while_paused()
@@ -260,11 +267,11 @@ try:
     deadline = time.monotonic() + 10
     while True:
         after = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
-        if after['generation'] == 1:
+        if after['generation'] == expected_generation:
             break
         assert time.monotonic() < deadline, after
         time.sleep(.1)
-    assert after['generation'] == 1 and after['sample_age_ns'] <= 250_000_000
+    assert after['generation'] == expected_generation and after['sample_age_ns'] <= 250_000_000
     wall_delta = (datetime.datetime.fromisoformat(after['wall_after'].replace('Z', '+00:00')) - datetime.datetime.fromisoformat(before['wall_after'].replace('Z', '+00:00'))).total_seconds()
     elapsed_delta = (after['elapsed_end_ns'] - before['elapsed_end_ns']) / 1e9
     assert wall_delta - elapsed_delta >= 3, 'resume did not exercise real guest wall correction'
