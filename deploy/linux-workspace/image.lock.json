@@ -642,7 +642,7 @@
     },
     {
       "built_using": "",
-      "package": "libc6-dev:arm64",
+      "package": "libc6:arm64",
       "source": "glibc",
       "source_version": "2.41-12+deb13u4",
       "static_built_using": "",
@@ -650,7 +650,7 @@
     },
     {
       "built_using": "",
-      "package": "libc6:arm64",
+      "package": "libc6-dev:arm64",
       "source": "glibc",
       "source_version": "2.41-12+deb13u4",
       "static_built_using": "",
@@ -666,7 +666,7 @@
     },
     {
       "built_using": "",
-      "package": "libcap2-bin",
+      "package": "libcap2:arm64",
       "source": "libcap2",
       "source_version": "1:2.75-10+deb13u1",
       "static_built_using": "",
@@ -674,7 +674,7 @@
     },
     {
       "built_using": "",
-      "package": "libcap2:arm64",
+      "package": "libcap2-bin",
       "source": "libcap2",
       "source_version": "1:2.75-10+deb13u1",
       "static_built_using": "",
@@ -1258,7 +1258,7 @@
     },
     {
       "built_using": "",
-      "package": "libpam-modules-bin",
+      "package": "libpam-modules:arm64",
       "source": "pam",
       "source_version": "1.7.0-5",
       "static_built_using": "",
@@ -1266,7 +1266,7 @@
     },
     {
       "built_using": "",
-      "package": "libpam-modules:arm64",
+      "package": "libpam-modules-bin",
       "source": "pam",
       "source_version": "1.7.0-5",
       "static_built_using": "",

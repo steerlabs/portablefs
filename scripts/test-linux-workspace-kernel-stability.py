@@ -98,6 +98,9 @@ for number in range(1, args.cycles + 1):
         serial = state / 'serial.log'
         if serial.exists():
             shutil.copyfile(serial, out / 'serial.log')
+            if not 0 < serial.stat().st_size < 8 * 1024 * 1024:
+                record['passed'] = False
+                record['failure'] = 'missing or truncated serial evidence'
             for line in ansi.sub('', serial.read_text(errors='replace')).splitlines():
                 match = kernel_line.match(line)
                 # systemd emits userspace service names inside timestamped lines.
@@ -105,6 +108,9 @@ for number in range(1, args.cycles + 1):
                     record['kernel_diagnostics'].append(line)
             if record['kernel_diagnostics']:
                 record['passed'] = False
+        else:
+            record['passed'] = False
+            record['failure'] = 'missing serial evidence'
         record['seconds'] = round(time.monotonic() - started, 3)
         results['cycles'].append(record)
         save()
