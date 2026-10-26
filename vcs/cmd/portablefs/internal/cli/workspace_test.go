@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacehost"
 	"strings"
 	"testing"
@@ -50,5 +51,22 @@ func TestWorkspaceReportsPendingAuthorizationAndBusyWithoutMountCompletion(t *te
 	}
 	if !strings.Contains(out.String(), `"state": "authorization-required"`) || strings.Contains(out.String(), `"state": "ready"`) {
 		t.Fatal(out.String())
+	}
+}
+
+func TestWorkspaceCleanupRequiredStatusKeepsMachineReadableEvidence(t *testing.T) {
+	e, out, errs := testEnv(t)
+	e.workspaceRequestFn = func(context.Context, workspacehost.Request) (workspacehost.Reply, error) {
+		return workspacehost.Reply{Version: 1, State: "cleanup-required", Message: "Cleanup required", DesiredRunning: true, PreviousWriteOutcomeUnknown: true, Volumes: []workspacehost.Volume{}}, nil
+	}
+	if code := cmdWorkspace(e, []string{"status", "--json"}); code != 1 {
+		t.Fatalf("cleanup status exit=%d, want 1", code)
+	}
+	var reply workspacehost.Reply
+	if err := json.Unmarshal(out.Bytes(), &reply); err != nil {
+		t.Fatal("nonzero status lost JSON evidence", err)
+	}
+	if reply.State != "cleanup-required" || !reply.PreviousWriteOutcomeUnknown || !reply.DesiredRunning || errs.Len() != 0 {
+		t.Fatalf("cleanup status changed: %+v, stderr=%s", reply, errs)
 	}
 }

@@ -72,7 +72,12 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         result = subprocess.run([str(cli),'workspace',*args],env=env,capture_output=True,text=True,timeout=40)
         if success: assert result.returncode == 0, (args,result.stdout,result.stderr)
         return result
-    def status(): return json.loads(command('status','--json').stdout)
+    def status():
+        result=command('status','--json',success=False)
+        value=json.loads(result.stdout)
+        expected=1 if value['state'] in ('refused','busy','cleanup-required') else 0
+        assert result.returncode==expected and value['version']==1, (result.returncode,value,result.stderr)
+        return value
     def until(predicate, limit=180):
         deadline=time.monotonic()+limit
         while time.monotonic()<deadline:
