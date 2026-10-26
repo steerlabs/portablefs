@@ -106,6 +106,7 @@ const daemonControl = await readFile(
 );
 const workflow = await readFile(path.join(root, ".github/workflows/release.yml"), "utf8");
 const ciWorkflow = await readFile(path.join(root, ".github/workflows/ci.yml"), "utf8");
+const powerlossWorkflow = await readFile(path.join(root, ".github/workflows/powerloss.yml"), "utf8");
 const xcodeSwiftGate = await readFile(path.join(root, "scripts/test-swift-xcode.sh"), "utf8");
 const xcodeEvidenceVerifier = await readFile(
   path.join(root, "scripts/verify_xcode_tests.py"),
@@ -671,7 +672,7 @@ for (const permission of ["id-token: write", "attestations: write"]) {
 }
 requireText(
   workflow,
-  "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
+  "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
   "pinned attestation action"
 );
 requireText(
@@ -754,12 +755,28 @@ for (const releaseGate of [
   "node scripts/check-install-release-trust.mjs",
   "govulncheck@v1.6.0",
   "args: check",
-  "needs: validate",
+  "needs: [validate, powerloss]",
+  "uses: ./.github/workflows/powerloss.yml",
   "needs: [validate, goreleaser]",
   "needs: [validate, goreleaser, macos-app]",
   "run: bash scripts/test-swift-xcode.sh",
 ]) {
   requireText(workflow, releaseGate, `release validation gate ${releaseGate}`);
+}
+// Release publication depends on this reusable job, so it must run the
+// complete fail-closed instrument on an available hosted runner.
+for (const powerlossContract of [
+  "  pull_request:",
+  "  workflow_call:",
+  "  workflow_dispatch:",
+  "  schedule:",
+  "    runs-on: ubuntu-24.04",
+  "  cancel-in-progress: false",
+  "sudo modprobe dm-log-writes",
+  'PORTABLEFS_POWERLOSS_REQUIRED: "1"',
+  "run: bash scripts/run-powerloss.sh",
+]) {
+  requireText(powerlossWorkflow, powerlossContract, `power-loss gate ${powerlossContract.trim()}`);
 }
 for (const signingRoleContract of [
   "Import exact archive and distribution identities",

@@ -15,11 +15,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Re-run on the exact tag; PR evidence cannot qualify a different commit.
+  powerloss:
+    uses: ./.github/workflows/powerloss.yml
+
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -36,7 +40,7 @@ jobs:
           version="$(cat VERSION)"
           printf '%s\n' "$version" | cmp -s - VERSION
           test "$GITHUB_REF_NAME" = "v$version"
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -64,14 +68,14 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           govulncheck ./...
         working-directory: vcs
-      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
           version: "2.17.1"
           args: check
 
   goreleaser:
-    needs: validate
+    needs: [validate, powerloss]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # Gates publishing behind the `release` GitHub environment. Required
@@ -83,11 +87,11 @@ jobs:
       id-token: write # mint the short-lived OIDC identity used by Sigstore
       attestations: write # publish build provenance for the Linux archives
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # goreleaser needs full history for the changelog
           persist-credentials: false # release auth flows via GITHUB_TOKEN env below
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -116,7 +120,7 @@ jobs:
               exit 1
               ;;
           esac
-      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
           # Exact pin (not a "~> v2" moving band) so a tagged release builds with
@@ -163,7 +167,7 @@ jobs:
           done
       - name: Attest Linux amd64 release archive
         id: attest-linux-amd64
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           # macOS has its independent Developer ID + notarization trust chain.
           # This attestation is deliberately scoped to the executable Linux
@@ -171,17 +175,17 @@ jobs:
           subject-path: "${{ github.workspace }}/dist/portablefs_*_linux_amd64.tar.gz"
       - name: Attest Linux arm64 release archive
         id: attest-linux-arm64
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: "${{ github.workspace }}/dist/portablefs_*_linux_arm64.tar.gz"
       - name: Attest Linux server amd64 release archive
         id: attest-linux-server-amd64
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: "${{ github.workspace }}/dist/portablefs-server_*_linux_amd64.tar.gz"
       - name: Attest Linux server arm64 release archive
         id: attest-linux-server-arm64
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: "${{ github.workspace }}/dist/portablefs-server_*_linux_arm64.tar.gz"
       - name: Upload offline Linux attestation bundles
@@ -221,7 +225,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -231,7 +235,7 @@ jobs:
           xcodebuild -version
           test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
           test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum

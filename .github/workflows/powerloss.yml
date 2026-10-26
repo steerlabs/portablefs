@@ -1,41 +1,32 @@
 name: powerloss
 
-# The power-cut harness is deliberately not on the pull-request path. It needs
-# the privileged self-hosted runner, it replays a multi-gigabyte device image
-# once per cut, and it competes with the other jobs for that machine's
-# device-mapper namespace. It runs weekly and on demand instead, and its result
-# is evidence for docs/power-loss-testing.md rather than a merge gate.
+# Every PR and release commit must exercise the actual power-cut instrument.
+# Weekly and manual runs also detect runner-image or kernel changes.
 on:
+  pull_request:
+  workflow_call:
   workflow_dispatch:
   schedule:
-    # 04:00 UTC on Mondays, after the weekend and before the working week.
     - cron: "0 4 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  # The device-mapper namespace is kernel-global on the runner, so two of these
-  # must never overlap. In-progress runs are NOT cancelled: a cancelled run
-  # leaves a device-mapper target and loop devices behind, which would break the
-  # next run rather than this one.
-  group: powerloss-${{ github.workflow }}
+  # Hosted jobs each own a VM and device-mapper namespace. Never cancel an
+  # active harness while it is releasing its targets and loop devices.
+  group: powerloss-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # dm-log-writes is not exposed on GitHub-hosted runners, so this instrument
-  # uses a capability-labeled self-host. The label says nothing about a custom
-  # FUSE dialect or an exact kernel patch release. The authority requires
-  # upstream Linux 5.17 final or newer plus the real filesystem/capability
-  # probes; the filesystem under test uses the same stock interface as CI.
   linux-power-loss:
-    runs-on: [self-hosted, linux, x64, portablefs-dm-log-writes]
+    runs-on: ubuntu-24.04
     # Linux checkpoints, FSKit acknowledged mutations, and process-crash cuts
     # share one suite. Leave room beyond its own timeout for provisioning and
     # evidence upload so a native test timeout retains its diagnostics.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Every prerequisite is checked before the harness starts, so a runner
@@ -44,6 +35,9 @@ jobs:
       - name: Verify the runner can provide loop devices, /dev/fuse and dm-log-writes
         run: |
           set -euo pipefail
+          uname -r
+          grep -E '^CONFIG_DM_LOG_WRITES=(y|m)$' "/boot/config-$(uname -r)"
+          df -h "$RUNNER_TEMP"
           sudo modprobe loop
           sudo modprobe fuse
           sudo modprobe dm-log-writes
@@ -53,6 +47,7 @@ jobs:
       - name: Power-cut and crash-consistency harness
         env:
           PORTABLEFS_POWERLOSS_TIMEOUT: 90m
+          PORTABLEFS_POWERLOSS_REQUIRED: "1"
         run: bash scripts/run-powerloss.sh
       # The suite output and the data-plane process logs are what a failed run
       # is read from. The harness writes them into this directory from inside
@@ -61,7 +56,7 @@ jobs:
       - name: Make the run's evidence readable
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" powerloss-evidence || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: powerloss-evidence

@@ -24,10 +24,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -71,7 +71,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify pinned Xcode and macOS SDK
@@ -85,7 +85,7 @@ jobs:
         run: bash scripts/test-swift-xcode.sh
       - name: Retain Swift failure evidence
         if: failure() && steps.swift-tests.outputs.failure-evidence != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: swift-xcode-failure-evidence
           path: ${{ steps.swift-tests.outputs.failure-evidence }}
@@ -98,10 +98,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -141,7 +141,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify pinned Xcode and macOS SDK
@@ -150,7 +150,7 @@ jobs:
           xcodebuild -version
           test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
           test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -180,7 +180,7 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify pinned Xcode and macOS SDK
@@ -189,7 +189,7 @@ jobs:
           xcodebuild -version
           test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
           test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -259,7 +259,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify the stock runner can provide loop devices and /dev/fuse
@@ -301,7 +301,7 @@ jobs:
     # second inner timeout fire and report rather than be hard-killed at 15m.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Verify the stock runner can provide loop devices and /dev/fuse
