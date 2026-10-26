@@ -109,3 +109,5 @@ for name in names:
 manifest={'format':8,'release':json.loads((p/'release.json').read_text()),'files':files}
 (p/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
 PY
+
+python3 /source/distribute.py /output

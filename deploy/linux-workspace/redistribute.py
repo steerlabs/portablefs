@@ -10,8 +10,11 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.parse
+import urllib.error
 import urllib.request
+import zipfile
 
 
 def digest(path):
@@ -26,8 +29,18 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
+def request(url):
+    for attempt in range(4):
+        try:
+            return urllib.request.urlopen(url, timeout=180)
+        except urllib.error.HTTPError as error:
+            if error.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                raise
+            time.sleep(2 ** attempt)
+
+
 def download(url, path):
-    with urllib.request.urlopen(url, timeout=180) as response, path.open('wb') as out:
+    with request(url) as response, path.open('wb') as out:
         shutil.copyfileobj(response, out)
 
 
@@ -125,21 +138,40 @@ def fetch_source(pair, sources):
     name, version = pair
     base = 'https://snapshot.debian.org'
     url = base + '/mr/package/' + urllib.parse.quote(name, safe='') + '/' + urllib.parse.quote(version, safe='') + '/srcfiles'
-    with urllib.request.urlopen(url, timeout=180) as response:
+    with request(url) as response:
         hashes = json.load(response)['result']
     directory = pathlib.Path('debian') / name / version
     dest = sources / directory
     dest.mkdir(parents=True)
-    files = {}
+    indexed = {}
     for item in hashes:
-        with urllib.request.urlopen(base + '/mr/file/' + item['hash'] + '/info', timeout=180) as response:
+        with request(base + '/mr/file/' + item['hash'] + '/info') as response:
             names = {x['name'] for x in json.load(response)['result']}
-        assert len(names) == 1, (pair, names)
-        filename = names.pop()
+        for filename in names:
+            assert filename not in indexed or indexed[filename] == item['hash']
+            indexed[filename] = item['hash']
+    dsc_name = name + '_' + version.split(':')[-1] + '.dsc'
+    download(base + '/file/' + indexed[dsc_name], dest / dsc_name)
+    text = (dest / dsc_name).read_text()
+    checksums = re.search(r'^Checksums-Sha256:\n((?: .+\n)+)', text, re.M)
+    assert checksums, 'missing source checksums: ' + dsc_name
+    components = {line.split()[2]: {'sha256': line.split()[0], 'size': int(line.split()[1])}
+                  for line in checksums[1].splitlines()}
+    files = {}
+    # A snapshot hash may have names in several versions. The .dsc selects the
+    # original component names for this version, including multi-orig sources.
+    for filename in [dsc_name, *sorted(components)]:
         assert pathlib.Path(filename).name == filename
         path = dest / filename
-        download(base + '/file/' + item['hash'], path)
-        assert hashlib.sha1(path.read_bytes()).hexdigest() == item['hash'], path
+        if filename != dsc_name:
+            download(base + '/file/' + indexed[filename], path)
+        h = hashlib.sha1()
+        with path.open('rb') as f:
+            for block in iter(lambda: f.read(4 << 20), b''):
+                h.update(block)
+        assert h.hexdigest() == indexed[filename], path
+        if filename in components:
+            assert digest(path) == components[filename], 'source component digest mismatch'
         files[str(directory / filename)] = digest(path)
     print('retained source:', name, version, flush=True)
     return {'package': name, 'version': version, 'files': files}
@@ -200,6 +232,10 @@ def members(path):
 
 def check(out):
     manifest = json.loads((out / 'manifest.json').read_text())
+    required = {'kernel', 'initramfs', 'system.ext4', 'kernel.config', 'packages.json', 'packages.tsv',
+                'source-manifest.json', 'licenses.tar.gz', 'initramfs.inventory', 'image-inputs.json',
+                'release.json', 'bin/portablefs', 'bin/portablefsd', 'bin/portablefs-workspaced'}
+    assert set(manifest['files']) == required, 'invalid exact image manifest'
     for name, record in manifest['files'].items():
         path = out / name
         assert not path.is_symlink() and path.is_file() and digest(path) == record, 'artifact mismatch: ' + name
@@ -208,14 +244,23 @@ def check(out):
     assert sources['commit'] == manifest['release']['commit']
     assert sources['packages_sha256'] == digest(out / 'packages.json')['sha256']
     packages = json.loads((out / 'packages.json').read_text())
+    inputs = json.loads((out / 'image-inputs.json').read_text())
+    assert digest(out / 'image-inputs.json')['sha256'] == manifest['release']['image_digest']
+    assert json.loads((out / 'release.json').read_text()) == manifest['release']
+    assert inputs['commit'] == sources['commit'] and inputs['app_version'] == manifest['release']['app_version']
+    assert manifest['release']['authority_major'] == 8
     debian = {(p['package'], p['version']): p for p in sources['debian']}
     assert len(debian) == len(sources['debian']) and set(debian) == required_sources(packages), 'incomplete Debian source coverage'
     assert set(sources['notices']) == {p['package'] for p in packages}, 'incomplete Debian notice coverage'
+    assert inputs['lock']['packages'] == packages, 'binary inventory differs from recipe lock'
+    assert inputs['lock']['sources'] == sources['debian'], 'source inventory differs from recipe lock'
+    assert inputs['lock']['go'] == sources['go']['runtime'], 'Go source differs from recipe lock'
     assert digest(out / 'corresponding-source.tar.gz') == sources['archive'], 'source archive mismatch'
     assert members(out / 'corresponding-source.tar.gz') == sources['files'], 'retained source file mismatch'
     assert members(out / 'licenses.tar.gz') == sources['notice_files'], 'notice archive mismatch'
     assert set(sources['notices']) == {p['package'] for p in packages}, 'incomplete Debian notice coverage'
     for name, notice in sources['notices'].items():
+        assert notice == 'debian/' + name + '/copyright', 'incorrect Debian notice mapping'
         assert sources['notice_files'][notice]['size'] > 0, 'missing notice: ' + name
     with tarfile.open(out / 'corresponding-source.tar.gz', 'r:gz') as tar:
         for p in debian.values():
@@ -236,7 +281,6 @@ def check(out):
             assert expected == set(p['files']), 'incomplete Debian source control coverage'
         repo = tarfile.open(fileobj=tar.extractfile('repository.tar'), mode='r:')
         assert repo.pax_headers['comment'] == sources['commit'], 'recipe commit mismatch'
-        inputs = json.loads((out / 'image-inputs.json').read_text())
         for name, sha in inputs['files'].items():
             if not name.startswith('bin/'):
                 data = repo.extractfile('deploy/linux-workspace/' + name).read()
@@ -245,6 +289,7 @@ def check(out):
     go = sources['go']
     assert sources['files'][go['runtime']['filename']]['sha256'] == go['runtime']['sha256']
     linked = {}
+    sums = {}
     for binary in sorted((out / 'bin').iterdir()):
         text = subprocess.check_output(['go', 'version', '-m', str(binary)], text=True)
         assert text.splitlines()[0].endswith(go['runtime']['version']), 'Go runtime mismatch'
@@ -252,10 +297,15 @@ def check(out):
             fields = line.split()
             if fields and fields[0] in ('mod', 'dep'):
                 linked[fields[1]] = fields[2]
+                if len(fields) == 4:
+                    sums[fields[1]] = fields[3]
     assert linked == {m['path']: m['version'] for m in go['modules']}, 'incomplete Go module coverage'
     for module in go['modules']:
         assert module['source'] in sources['files'] and module['notices'], 'missing Go source/notice'
+        if module['source'] != 'repository.tar':
+            assert module['sum'] == sums[module['path']], 'linked Go module checksum mismatch'
         for notice in module['notices']:
+            assert notice.startswith(module['path'] + '/'), 'incorrect Go notice mapping'
             assert sources['notice_files']['go/' + notice]['size'] > 0
     for name in ('LICENSE', 'PATENTS'):
         assert sources['notice_files']['go/go-runtime/' + name]['size'] > 0

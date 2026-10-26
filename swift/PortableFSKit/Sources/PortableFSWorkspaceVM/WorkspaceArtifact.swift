@@ -17,12 +17,18 @@ public struct WorkspaceArtifact: Sendable {
     struct Manifest: Decodable { let format: Int; let release: Release; let files: [String: FileRecord] }
     public let directory: URL
     public let release: WorkspaceRelease
+    public let byteCount: UInt64
 
     public init(directory: URL) throws {
-        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
+        let manifestData = try Data(contentsOf: directory.appendingPathComponent("manifest.json"))
+        let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
+        var byteCount = UInt64(manifestData.count)
         let required: Set<String> = ["kernel", "initramfs", "system.ext4", "kernel.config", "packages.json", "packages.tsv", "source-manifest.json", "licenses.tar.gz", "initramfs.inventory", "image-inputs.json", "release.json", "bin/portablefs", "bin/portablefsd", "bin/portablefs-workspaced"]
         guard manifest.format == 8, Set(manifest.files.keys) == required else { throw WorkspaceVMError("invalid exact image manifest") }
         for (name, record) in manifest.files {
+            let (sum, overflow) = byteCount.addingReportingOverflow(record.size)
+            guard !overflow else { throw WorkspaceVMError("image size overflow") }
+            byteCount = sum
             let path = directory.appendingPathComponent(name)
             let values = try path.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
             guard values.isRegularFile == true, values.isSymbolicLink == false, let size = values.fileSize, size >= 0, UInt64(size) == record.size else { throw WorkspaceVMError("invalid artifact: \(name)") }
@@ -45,7 +51,7 @@ public struct WorkspaceArtifact: Sendable {
         r.appVersion = manifest.release.app_version; r.commit = manifest.release.commit
         r.imageDigest = try unhex(manifest.release.image_digest); r.authorityMajor = manifest.release.authority_major
         guard WorkspaceControl.validRelease(r) else { throw WorkspaceVMError("invalid image release") }
-        self.directory = directory; self.release = r
+        self.directory = directory; self.release = r; self.byteCount = byteCount
     }
 }
 

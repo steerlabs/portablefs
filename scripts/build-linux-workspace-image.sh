@@ -54,8 +54,11 @@ else:
     assert value['packages'] == packages, 'exact package inventory differs from image.lock.json'
     assert value['sources'] == sources, 'exact source inventory differs from image.lock.json'
 PY
+if [[ "$mode" == --update-lock ]]; then
+  echo 'Updated exact package/source lock; commit it and rebuild normally for release evidence'
+  exit 0
+fi
 python3 "$repo/deploy/linux-workspace/redistribute.py" check "$staging"
 rm -rf "$staging/sources" "$staging/notices" "$staging/go-sources.json" "$staging/go-notices"
-python3 "$repo/deploy/linux-workspace/distribute.py" "$staging"
 for path in "$staging"/*; do mv "$path" "$out/"; done
 echo "PASS: release guest and retained source: $out"

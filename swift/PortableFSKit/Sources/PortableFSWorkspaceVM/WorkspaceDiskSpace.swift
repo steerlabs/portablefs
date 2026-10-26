@@ -6,16 +6,8 @@ public struct WorkspaceDiskSpace: Sendable {
     public let imageBytes: UInt64
 
     public init(artifact: WorkspaceArtifact) throws {
-        let manifest = try JSONDecoder().decode(WorkspaceArtifact.Manifest.self,
-            from: Data(contentsOf: artifact.directory.appendingPathComponent("manifest.json")))
-        var bytes = UInt64(try Data(contentsOf: artifact.directory.appendingPathComponent("manifest.json")).count)
-        for record in manifest.files.values {
-            let (sum, overflow) = bytes.addingReportingOverflow(record.size)
-            guard !overflow else { throw WorkspaceVMError("image size overflow") }
-            bytes = sum
-        }
-        guard bytes <= UInt64.max - Self.initialDataReserveBytes else { throw WorkspaceVMError("image size overflow") }
-        imageBytes = bytes
+        guard artifact.byteCount <= UInt64.max - Self.initialDataReserveBytes else { throw WorkspaceVMError("image size overflow") }
+        imageBytes = artifact.byteCount
     }
 
     /// Additional free space while retaining the installed image and user data.

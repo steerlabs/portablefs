@@ -158,6 +158,14 @@ try:
     record('fuse-init-7.31')
     assert guest.ssh('id -u; id -g; whoami').splitlines() == ['1000', '1000', 'workspace']
     assert guest.ssh("set -e; command -v python3 git cc; python3 -c 'print(6*7)'; git --version; cc --version").splitlines()[3] == '42'
+    toolchain = guest.ssh('set -e; node --version; npm --version; python3 -m pip --version; '
+                          'work=$(mktemp -d); trap \'rm -rf "$work"\' EXIT; '
+                          'python3 -m venv "$work/venv"; "$work/venv/bin/python" -m pip --version; '
+                          'portablefs version')
+    node_version = next(p['version'] for p in json.loads((pathlib.Path(image) / 'packages.json').read_text()) if p['package'] == 'nodejs')
+    assert toolchain.splitlines()[0].startswith('v' + node_version.split(':')[-1].split('.')[0] + '.'), toolchain
+    assert toolchain.splitlines()[-1].startswith('portablefs '), toolchain
+    record('guest-development-toolchain')
     record('ssh-workspace-user')
     assert guest.ssh('cat /sys/block/vda/ro') == '1'
     assert 'ro' in guest.ssh('findmnt -n -o OPTIONS /').split(',')
