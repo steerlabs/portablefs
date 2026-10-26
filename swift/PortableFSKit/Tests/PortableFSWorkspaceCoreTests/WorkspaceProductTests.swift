@@ -11,6 +11,7 @@ private enum ProductFailure: Error { case refused }
     var onChange: (() -> Void)?
     var onStatus: ((WorkspaceStatusReply) throws -> Void)?
     var starts = 0
+    var startFails = false
     var identityCalls = 0
     var mounts = 0
     var umounts: [Bool] = []
@@ -19,7 +20,7 @@ private enum ProductFailure: Error { case refused }
     var identityReply: WorkspaceIdentityReply
     var provisions: [WorkspaceProvision] = []
     init() throws { identityReply = try WorkspaceControl.decode(workspaceGolden("identity_reply")).identityReply }
-    func start() throws { starts += 1 }
+    func start() throws { starts += 1; if startFails { phase = .stopped; throw ProductFailure.refused } }
     func running() { ready = true; phase = .running; onChange?() }
     func identity(_ request: WorkspaceIdentityRequest, completion: @escaping (Result<WorkspaceIdentityReply, Error>) -> Void) {
         identityCalls += 1; identityReply.mount.authorityID = request.authorityID; identityReply.mount.volumeID = request.volumeID
@@ -254,4 +255,19 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     #expect(idle.handle(try productRequest("start")).state=="refused")
     #expect(!idleStore.value.running)
     #expect(throws:(any Error).self) { try WorkspaceHostLifecycleRequest.decode(Data("{\"lifecycleVersion\":2,\"operation\":\"identity\"}".utf8)) }
+}
+
+@Test @MainActor func productPowerRegistrationFailureRetiresOnlyTheNeverStartedInstance() async throws {
+    let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
+    let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace"))
+    let first=try ProductRuntime(),second=try ProductRuntime();first.startFails=true;second.bootID=Data(repeating:9,count:16)
+    var creations=0
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){creations+=1;return creations==1 ? first:second}
+    #expect(owner.handle(try productRequest("start")).state=="refused")
+    #expect(owner.handle(try productRequest("start")).state=="refused")
+    try await productTurn()
+    #expect(store.value.execution==nil)
+    #expect(owner.handle(try productRequest("start")).state=="starting")
+    #expect(creations==2);#expect(first.starts==1);#expect(second.starts==1)
+    #expect(store.value.execution?.boot==second.bootID)
 }

@@ -87,7 +87,11 @@ import PortableFSWorkspaceCore
         withExtendedLifetime(transition) {}
     }
     private func startIfNeeded() throws {
-        guard store.value.running, runtime == nil else { return }
+        guard store.value.running else { return }
+        if let runtime {
+            guard runtime.phase != .stopped else { throw WorkspaceVMError(failure.isEmpty ? "Cleanup required" : failure) }
+            return
+        }
         try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         for volume in store.value.volumes where volume.wanted { try transition.reserve(volume.reservation) }
@@ -104,7 +108,8 @@ import PortableFSWorkspaceCore
             for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity" }
         }
         runtime = instance
-        try instance.start()
+        do { try instance.start() }
+        catch { failure=String(describing:error);scheduleUpdate();throw error }
         withExtendedLifetime(transition) {}
     }
     private func remove(_ volume: String, force: Bool) throws {
@@ -147,7 +152,7 @@ import PortableFSWorkspaceCore
                 self.runtime = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
                 try releaseAbsentReservations()
                 if stopRequested { try store.commit { $0.running = false }; stopRequested = false }
-                else { failure = "Cleanup required" }
+                else if failure.isEmpty { failure = "Cleanup required" }
                 return
             }
             if stopRequested {
