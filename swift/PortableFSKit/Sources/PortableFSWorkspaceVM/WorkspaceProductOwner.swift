@@ -159,7 +159,7 @@ import PortableFSWorkspaceCore
                 self.runtime = nil; latest = nil; inFlight.removeAll(); authorizations.removeAll()
                 try releaseAbsentReservations()
                 if stopRequested { try store.commit { $0.running = false }; stopRequested = false }
-                else if failure.isEmpty { failure = "Cleanup required" }
+                else if failure.isEmpty { failure = runtime.failureMessage.isEmpty ? "Cleanup required" : runtime.failureMessage }
                 return
             }
             if stopRequested {
@@ -318,7 +318,7 @@ import PortableFSWorkspaceCore
         if !failure.isEmpty { result.state = "cleanup-required"; result.message = failure }
         else if runtime == nil, store.value.execution != nil { result.state="cleanup-required";result.message="Cleanup required" }
         else if let runtime {
-            if [.unknown,.pausedDiscard].contains(runtime.phase) { result.state = "cleanup-required"; result.message = "Cleanup required" }
+            if [.unknown,.pausedDiscard].contains(runtime.phase) { result.state = "cleanup-required"; result.message = runtime.failureMessage.isEmpty ? "Cleanup required" : runtime.failureMessage }
             else if stopRequested || runtime.phase == .stopping { result.state = "pending"; result.message = "Stop Linux Workspace" }
             else if runtime.ready, runtime.phase == .running { result.state = "running"; result.message = WorkspaceHostControl.running }
             else if [.draining, .pausing, .pausedCold, .resuming, .recovering].contains(runtime.phase) { result.state = "reconnecting"; result.message = "Reconnecting…" }

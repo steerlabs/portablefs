@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>PortableFS connects to filesystem authorities on your local network to mount and access your files.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>PortableFS opens an SSH session in Terminal when you choose Open Terminal.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>PortableFS accesses the volumes you mount to keep their files consistent with the filesystem authority.</string>
 	<key>NSSystemExtensionUsageDescriptionKey</key>

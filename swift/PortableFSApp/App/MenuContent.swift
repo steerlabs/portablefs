@@ -17,6 +17,8 @@ struct MenuContent: View {
             } else {
                 mountsSection
                 Divider()
+                PortableFSWorkspaceMenu(model: model.workspace)
+                Divider()
 
                 alertsSection
 

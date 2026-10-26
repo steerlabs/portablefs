@@ -60,3 +60,16 @@ service-document-standalone
 service-stop-persists
 service-ssh-identity-persistence
 service-crash-no-ram-adoption
+service-app-api-client
+service-managed-ssh-config
+service-two-ssh-agents
+service-cursor-missing-extension
+service-cursor-remote-save-peer
+service-vscode-missing-extension
+service-vscode-remote-save-peer
+service-busy-removal-refusal
+service-stop-busy-preserves-running
+service-unmounted-path-denial
+service-removal-keep-data
+service-removal-delete-data
+service-removal-unknown-refusal

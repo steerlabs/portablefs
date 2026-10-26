@@ -26,6 +26,7 @@ struct AppAlert: Identifiable, Equatable {
 @MainActor
 @Observable
 final class AppModel {
+    let workspace = PortableFSWorkspaceModel()
     // MARK: Account identity
 
     private var startupPathError: String?
@@ -147,11 +148,13 @@ final class AppModel {
         Task {
             await refreshMounts()
             await refreshVersion()
+            await workspace.refresh()
         }
         mountPollTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 await refreshMounts()
+                await workspace.refresh()
             }
         }
     }
@@ -246,6 +249,7 @@ final class AppModel {
         }
         await refreshMounts()
         await refreshVersion()
+        await workspace.refresh()
     }
 
     func refreshMounts() async {

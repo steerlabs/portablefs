@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from linux_workspace_native_editors import editor_checks
 
 
 def product_checks(image, evidence, record, authority=None, api_only=False):
@@ -89,12 +91,23 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         last=command('status','--json',success=False)
         raise AssertionError('product status deadline: '+last.stdout+' '+last.stderr)
     crashed=False
+    def app_command(*args, success=True):
+        result=subprocess.run([str(host),*args],env=env,capture_output=True,text=True,timeout=200)
+        if success: assert result.returncode==0,(args,result.stdout,result.stderr)
+        return result
+    def snapshot(name):
+        value=status()
+        (evidence/('menu-'+name+'.json')).write_text(json.dumps(value,indent=2))
+        return value
     try:
         deadline=time.monotonic()+30
         while not endpoint.exists():
             assert time.monotonic()<deadline, 'test service did not publish its socket; see service.stderr'
             time.sleep(.1)
         until(lambda s:s['state']=='stopped',30)
+        snapshot('stopped')
+        assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
+        record('service-app-api-client')
         subprocess.run([str(host),'--abandon-workspace-test-request'],env=env,check=True)
         assert status()['state']=='stopped'
         record('service-authenticated-status')
@@ -121,10 +134,25 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         if api_only: return
         command('start');command('start')
         until(lambda s:s['state']=='running')
+        snapshot('running')
         record('service-start-idempotent')
         # The registration-only host has exited. SSH still executes in the VM.
         config=home/'.local/state/portablefs/workspace/ssh_config'
         def ssh(script): return subprocess.check_output(['ssh','-F',str(config),'portablefs-workspace',script],env=env,text=True,timeout=30).strip()
+        managed=home/'.ssh/portablefs-workspace.conf'
+        assert managed.read_bytes()==config.read_bytes()
+        assert (home/'.ssh/config').read_text().startswith('# PortableFS Linux Workspace\nInclude ~/.ssh/portablefs-workspace.conf\n')
+        effective=subprocess.check_output(['ssh','-G','-F',str(managed),'portablefs-workspace'],env=env,text=True)
+        for option in ['user workspace\n','identitiesonly yes\n','forwardagent no\n','identityagent none\n','stricthostkeychecking true\n','clearallforwardings yes\n']:
+            assert option in effective,(option,effective)
+        assert subprocess.check_output(['ssh','-F',str(managed),'portablefs-workspace','id -u'],env=env,text=True).strip()=='1000'
+        (evidence/'ssh-effective.txt').write_text(effective)
+        record('service-managed-ssh-config')
+        with ThreadPoolExecutor(max_workers=2) as agents:
+            first=agents.submit(ssh,"printf agent-one > /home/workspace/agent-one; sleep 1; cat /home/workspace/agent-two")
+            second=agents.submit(ssh,"printf agent-two > /home/workspace/agent-two; sleep 1; cat /home/workspace/agent-one")
+            assert first.result()=='agent-two' and second.result()=='agent-one'
+        record('service-two-ssh-agents')
         assert ssh('id -u')=='1000'
         ssh('printf service-persistence > /home/workspace/service-product-proof')
         record('service-app-exit-vm-alive')
@@ -133,17 +161,44 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
             descriptor=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
                 '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-connection','/var/tmp/pfs-native/home/test-pki',authority.endpoint,authority.volume],text=True)
             connection=root/'connection.pfsworkspace';connection.write_text(descriptor)
-            command('mount',str(connection),'--json')
+            app_command('--workspace-api','mount',str(connection))
             waiting=until(lambda s:s['volumes'] and s['volumes'][0]['state']=='authorization-required' and s['volumes'][0].get('authorizationRequest'))
+            snapshot('authorization')
             public=pathlib.Path(waiting['volumes'][0]['authorizationRequest']).read_bytes()
             response=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
                 '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-authorize','/var/tmp/pfs-native/home/test-pki',base64.b64encode(public).decode()],text=True)
             authorized=root/'authorized.pfsworkspace';authorized.write_text(response)
-            command('mount',str(authorized),'--json')
+            app_command('--workspace-api','mount',str(authorized))
             until(lambda s:s['volumes'] and s['volumes'][0]['state']=='ready')
+            snapshot('volume-ready')
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
             record('service-document-standalone')
-            command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
+            editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record)
+            holder=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace',
+                'cd /workspaces/native-managed && echo holding && read -r release'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            try:
+                assert holder.stdout.readline().strip()=='holding'
+                app_command('--workspace-api','umount',authority.volume)
+                busy=until(lambda s:s['volumes'] and s['volumes'][0]['state']=='busy')
+                assert busy['volumes'][0]['message']=='Volume is in use. Close its terminals and editor windows, then try again.'
+                snapshot('busy')
+                assert ssh('cat /workspaces/native-managed/product-proof')=='product-volume'
+                refused=app_command('--workspace-remove','delete',success=False)
+                assert refused.returncode!=0 and 'Volume is in use.' in refused.stderr
+                assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
+                record('service-busy-removal-refusal')
+                command('stop','--json');until(lambda s:s['state']=='running' and s['volumes'][0]['state']=='busy')
+                assert status()['desiredRunning'] and ssh('cat /workspaces/native-managed/product-proof')=='product-volume'
+                record('service-stop-busy-preserves-running')
+            finally:
+                holder.stdin.write('release\n');holder.stdin.flush();holder.wait(timeout=15)
+                holder.stdin.close();holder.stdout.close();holder.stderr.close()
+            app_command('--workspace-api','umount',authority.volume);until(lambda s:not s['volumes'])
+            denied=subprocess.run(['ssh','-F',str(config),'portablefs-workspace',
+                'printf forbidden > /workspaces/native-managed/unmounted-proof'],env=env,capture_output=True,text=True,timeout=30)
+            assert denied.returncode!=0 and ('Permission denied' in denied.stderr or 'does not exist' in denied.stderr),denied
+            assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'unmounted-proof').exists())")=='False'
+            record('service-unmounted-path-denial')
         command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
         record('service-stop-persists')
         # Registration and status cannot defeat the explicit stopped intent.
@@ -153,11 +208,26 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         assert ssh('cat /home/workspace/service-product-proof')=='service-persistence'
         assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
         record('service-ssh-identity-persistence')
+        command('stop','--json');until(lambda s:s['state']=='stopped')
+        app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
+        assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
+        assert not managed.exists() and not (home/'.ssh/config').exists()
+        record('service-removal-keep-data')
+        app_command('--workspace-remove','delete');app_command('--workspace-remove','delete')
+        assert not (home/'.local/state/portablefs/workspace').exists()
+        if authority is not None:
+            assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'product-proof').read_text())")=='product-volume'
+        record('service-removal-delete-data')
+        app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
         subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
         crashed=True
         until(lambda s:s['state']=='cleanup-required')
         assert command('start',success=False).returncode!=0
         record('service-crash-no-ram-adoption')
+        refused=app_command('--workspace-remove','delete',success=False)
+        assert refused.returncode!=0 and (home/'.local/state/portablefs/workspace/data.ext4').exists()
+        snapshot('cleanup')
+        record('service-removal-unknown-refusal')
     finally:
         # This identity was generated by this invocation. Never unregister any
         # installed or dev-host identity, and retain unconfirmed execution data.

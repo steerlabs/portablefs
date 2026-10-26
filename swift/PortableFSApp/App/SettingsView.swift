@@ -6,6 +6,11 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Linux Workspace") {
+                Text(model.workspace.statusText)
+                Button("Remove Linux Workspace…") { model.workspace.removeWorkspace() }
+                    .disabled(model.workspace.working)
+            }
             Section("Mount Runtime") {
                 Text("launchd supervises the signed per-user PortableFS daemon. The bundled portablefs CLI owns mount lifecycle state; this app presents that state and drives unmount and reconciliation.")
                     .font(.callout)

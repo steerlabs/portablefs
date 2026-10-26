@@ -47,9 +47,39 @@ The product owner is `PortableFSWorkspaceService.app`, a per-user SMAppService
 LaunchAgent nested in the shipping app. It reuses the VZ machine, power adapter,
 coordinator, paired guest channel and persistent SSH identity owner. The menu app
 has a registration-only entrypoint; its exit does not own VM termination. The
-workspace service requires no FSKit registration. Image bundling, managed SSH
-include, menu/editor actions and installer/update integration remain separate,
-unqualified packaging work.
+workspace service requires no FSKit registration. The shipping menu's Linux
+Workspace submenu presents the same operational API as the CLI. Add Volume
+opens a connection document; pending authorization offers Save Authorization
+Request and Open Authorization. Connect opens Terminal, VS Code or Cursor,
+or copies `ssh portablefs-workspace`. Missing editors or Remote-SSH extensions
+produce an error; the app installs neither. Image bundling and installer/update
+integration remain separate, unqualified packaging work.
+
+Start installs `Include ~/.ssh/portablefs-workspace.conf` at the beginning of
+the account's SSH config. OpenSSH takes the first obtained value: placing this
+before user `Host *` defaults prevents those defaults from changing the workspace
+identity or transport. The managed file contains only the workspace Host stanza
+and a final `Host *` scope reset. Other hosts retain their effective options.
+Original bytes, CRLF and a missing final newline survive; a symlinked config is
+edited atomically at its owned target. Read-only or unsafe files refuse setup.
+Existing alias definitions, including matching specific patterns and Includes,
+refuse with **SSH name already in use**. The dedicated key, pinned guest host
+key and Unix socket are retained under workspace state. SSH disables agent
+forwarding, agent identities and configured forwarding. There is no TCP listener.
+An owned checkpoint makes include setup/removal retryable without adopting or
+deleting another config. Test homes never redirect OpenSSH's passwd-based `~`
+expansion; native tests use `ssh -F` with the generated managed stanza.
+
+Settings offers Remove Linux Workspace with Keep Linux data selected by default.
+Delete Linux data requires a second destructive confirmation. The public AppCore
+`WorkspaceRemoval.remove(data:bundle:home:)` uses ordinary Stop and lifecycle-v1
+quiescence, refuses busy/unknown/lost outcomes, unregisters only the workspace
+service, removes the owned SSH include, and optionally deletes local workspace
+state/data. It never removes remote files. A synced checkpoint outside that data
+directory retains progress through interruption; new registration refuses an
+unfinished removal. Retrying completes it. A completed keep-data removal can
+later delete retained data without starting a VM. Explicit Start clears completed
+removal intent and begins ordinary setup again.
 
 `portablefs workspace` exposes only Start, Status, Mount, Umount and Stop, with
 the exact flags in `portablefs help workspace`. The service's operational-v1
@@ -731,6 +761,15 @@ Run the native gate with explicit artifact and evidence directories:
 ```sh
 bash scripts/test-linux-workspace-native.sh /absolute/image /absolute/evidence
 ```
+
+The product/editor portion also requires `PFS_WORKSPACE_TEST_VSCODE_APP` to name
+a disposable downloaded VS Code app. It uses the installed `/Applications/Cursor.app`
+with separate temporary `--user-data-dir` and `--extensions-dir` directories for
+both editors. The fixture installs Remote-SSH only into those test directories;
+the shipping action never installs an extension. Real editor document saves and
+reads handshake with an independent ordinary Linux peer. The exact inventory
+also requires the AppCore client, managed SSH, two SSH agents, busy refusal,
+unmounted-path denial and data-preserving/destructive removal.
 
 It builds or verifies/reuses the pinned image, builds and signs the owner, then
 requires exact equality with `scripts/linux-workspace-required-native-tests.txt`.

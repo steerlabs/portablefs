@@ -110,6 +110,13 @@ public enum PortableFSWorkspaceServiceRegistration {
     public static let serviceName = "PortableFSWorkspaceService.app"
     public static func register(bundle: Bundle = .main) throws -> Bool {
         _ = try PortableFSSignedRelease(bundle: bundle)
+        var home = URL(fileURLWithPath: try PortableFSAccountHome.resolve(), isDirectory: true)
+        #if WORKSPACE_SERVICE_TESTING
+        guard bundle.bundleIdentifier?.hasPrefix("dev.portablefs.workspace-tests.") == true,
+              let testHome = bundle.object(forInfoDictionaryKey: "PFSWorkspaceTestHome") as? String else { throw PortableFSSignedServiceError.invalidBundle }
+        home = URL(fileURLWithPath: testHome, isDirectory: true)
+        #endif
+        try WorkspaceRemoval.prepareToStart(home: home)
         guard let id = bundle.bundleIdentifier else { throw PortableFSSignedServiceError.invalidBundle }
         let service = SMAppService.agent(plistName: id + ".workspace.plist")
         if service.status == .notRegistered || service.status == .notFound { try service.register() }

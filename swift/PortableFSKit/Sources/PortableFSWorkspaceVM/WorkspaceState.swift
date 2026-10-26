@@ -97,15 +97,32 @@ public final class WorkspaceState {
         let config = """
         Host portablefs-workspace
           HostName portablefs-workspace
+          Port 22
+          CanonicalizeHostname no
           ProxyCommand /usr/bin/nc -U \(shellPath)
           User workspace
           IdentityFile \(try quote(directory.appendingPathComponent("client_ed25519").path))
           IdentitiesOnly yes
+          IdentityAgent none
+          ForwardAgent no
+          ForwardX11 no
+          ClearAllForwardings yes
+          PreferredAuthentications publickey
+          PubkeyAuthentication yes
           HostKeyAlias portablefs-workspace
           StrictHostKeyChecking yes
           UserKnownHostsFile \(try quote(known.path))
+          GlobalKnownHostsFile /dev/null
+          UpdateHostKeys no
+          VerifyHostKeyDNS no
+          PermitLocalCommand no
+          RemoteCommand none
+          SessionType default
+          ControlMaster no
+          ControlPath none
           BatchMode yes
           ConnectTimeout 10
+        Host *
 
         """
         let path = directory.appendingPathComponent("ssh_config")

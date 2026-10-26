@@ -1,9 +1,11 @@
 import Foundation
+import PortableFSAppCore
 import PortableFSWorkspaceCore
 
 @MainActor public protocol WorkspaceProductRuntime: AnyObject {
     var phase: WorkspacePhase { get }
     var ready: Bool { get }
+    var failureMessage: String { get }
     var onChange: (() -> Void)? { get set }
     var onStatus: ((WorkspaceStatusReply) throws -> Void)? { get set }
     var bootID: Data { get }
@@ -14,6 +16,7 @@ import PortableFSWorkspaceCore
     func umount(_ mount: WorkspaceMountID, force: Bool, completion: @escaping (Result<WorkspaceResult, Error>) -> Void)
     func stop(force: Bool, completion: @escaping (Result<Void, Error>) -> Void)
 }
+public extension WorkspaceProductRuntime { var failureMessage: String { "" } }
 
 /// The SMAppService executable retains this owner. No menu-app or CLI lifetime
 /// owns it. All power/VZ transitions remain in the existing coordinator.
@@ -30,13 +33,16 @@ import PortableFSWorkspaceCore
     public var phase: WorkspacePhase { coordinator.phase }
     public var bootID: Data { hello.bootID }
     public private(set) var ready = false
+    public private(set) var failureMessage = ""
     public var onChange: (() -> Void)?
     public var onStatus: ((WorkspaceStatusReply) throws -> Void)?
     private var seeded = false
     private var hostKey = ""
     private var updateQueued = false
     private var sshProbe: Process?
-    public init(artifact: WorkspaceArtifact, directory: URL) throws {
+    private let sshHome: URL
+    public init(artifact: WorkspaceArtifact, directory: URL, sshHome: URL) throws {
+        self.sshHome = sshHome
         guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit else { throw WorkspaceVMError("Workspace image failed verification") }
         state = try WorkspaceState(directory: directory)
         vm = try WorkspaceMachine(artifact: artifact, dataDisk: directory.appendingPathComponent("data.ext4"), serialLog: directory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress)
@@ -77,6 +83,7 @@ import PortableFSWorkspaceCore
         if phase == .running, seeded, !ready, sshProbe == nil {
             do {
                 let config = try state.pin(hostKey: hostKey)
+                try PortableFSWorkspaceSSH.install(home: sshHome, stanza: Data(contentsOf: config))
                 try bridge.start()
                 let probe = Process(); probe.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
                 probe.arguments = ["-F", config.path, "portablefs-workspace", "true"]
@@ -90,7 +97,7 @@ import PortableFSWorkspaceCore
                     }
                 }
                 sshProbe = probe; try probe.run()
-            } catch { coordinator.channelLost(String(describing: error)) }
+            } catch { failureMessage = error.localizedDescription; coordinator.channelLost(String(describing: error)) }
         }
         if phase == .stopped || phase == .unknown || phase == .stopping { ready = false; bridge.close() }
         onChange?()

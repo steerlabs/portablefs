@@ -3,11 +3,13 @@ import Foundation
 import PortableFSAppCore
 import PortableFSKit
 import ServiceManagement
+import AppKit
+import SwiftUI
 
 /// Native tests never register a shipping or developer-app identity. This
 /// executable is fixture-only and is not embedded in the product.
 @main struct WorkspaceServiceTestHost {
-    static func main() async {
+    @MainActor static func main() async {
         guard let id = Bundle.main.bundleIdentifier, id.hasPrefix("dev.portablefs.workspace-tests.") else { exit(64) }
         do {
             switch Array(CommandLine.arguments.dropFirst()) {
@@ -25,8 +27,46 @@ import ServiceManagement
                 exit(0)
             case ["--unregister-workspace-test"]:
                 try await SMAppService.agent(plistName:id + ".workspace.plist").unregister(); exit(0)
+            case let args where args.count == 2 && args[0] == "--workspace-api":
+                let client = try client()
+                guard let action = PortableFSWorkspaceClient.Operation(rawValue: args[1]) else { exit(64) }
+                let status = try await client.perform(action)
+                print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
+            case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "mount":
+                let status = try await client().perform(.mount, document: Data(contentsOf: URL(fileURLWithPath: args[2])))
+                print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
+            case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "umount":
+                let status = try await client().perform(.umount, volume: args[2])
+                print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
+            case let args where args.count == 2 && args[0] == "--workspace-remove":
+                guard let disposition = WorkspaceRemoval.DataDisposition(rawValue: args[1]) else { exit(64) }
+                _ = try await WorkspaceRemoval.remove(data: disposition, home: testHome()); exit(0)
+            case let args where args.count == 6 && args[0] == "--workspace-editor":
+                guard let editor = PortableFSWorkspaceEditor(rawValue: args[1]) else { exit(64) }
+                try await editor.open(volume: args[2], application: URL(fileURLWithPath: args[3]), userData: URL(fileURLWithPath: args[4]), extensions: URL(fileURLWithPath: args[5])); exit(0)
+            case let args where args.count == 3 && args[0] == "--workspace-menu-fixture":
+                showMenu(status: try PortableFSWorkspaceStatus.decode(Data(contentsOf: URL(fileURLWithPath: args[1]))), consent: args[2] == "denied")
             default: exit(64)
             }
         } catch { fputs("workspace test service: \(error)\n",stderr); exit(1) }
+    }
+    private static func testHome() throws -> URL {
+        guard let home = Bundle.main.object(forInfoDictionaryKey: "PFSWorkspaceTestHome") as? String else { throw PortableFSWorkspaceError("Test home missing") }
+        return URL(fileURLWithPath: home, isDirectory: true)
+    }
+    private static func client() throws -> PortableFSWorkspaceClient { PortableFSWorkspaceClient(home: try testHome()) }
+    @MainActor private static func showMenu(status: PortableFSWorkspaceStatus, consent: Bool) {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        let model = PortableFSWorkspaceModel(status: status, consentMissing: consent)
+        let window = NSWindow(contentRect: NSRect(x: 200, y: 400, width: 330, height: 110), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "PortableFS Workspace Menu Test"
+        window.contentView = NSHostingView(rootView: VStack(alignment: .leading, spacing: 16) {
+            Text("PortableFS").font(.headline)
+            PortableFSWorkspaceMenu(model: model)
+        }.padding(20).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading))
+        window.makeKeyAndOrderFront(nil); app.activate()
+        app.run()
+        withExtendedLifetime((model, window)) {}
     }
 }
