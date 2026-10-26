@@ -90,6 +90,8 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
             assert time.monotonic()<deadline, 'test service did not publish its socket; see service.stderr'
             time.sleep(.1)
         until(lambda s:s['state']=='stopped',30)
+        subprocess.run([str(host),'--abandon-workspace-test-request'],env=env,check=True)
+        assert status()['state']=='stopped'
         record('service-authenticated-status')
         # Same UID alone has no authority. Python is not a sealed app/CLI peer.
         with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as client:

@@ -24,6 +24,18 @@ public struct PortableFSSignedRelease: Sendable {
         let cli = root.appendingPathComponent("Contents/Helpers/portablefs")
         let executable = try Self.canonicalURL(executableURL)
         clients = [executable.path: try Self.codeHash(executable), cli.path: try Self.codeHash(cli)]
+        let team = try Self.team(root), cliTeam = try Self.team(cli)
+        #if WORKSPACE_SERVICE_TESTING
+        guard team == cliTeam else { throw PortableFSSignedServiceError.invalidIdentity }
+        #else
+        guard let team, !team.isEmpty, team == cliTeam else { throw PortableFSSignedServiceError.invalidIdentity }
+        #endif
+        guard let ownURL = Bundle.main.executableURL else { throw PortableFSSignedServiceError.invalidIdentity }
+        let own = try Self.canonicalURL(ownURL)
+        let service = root.appendingPathComponent("Contents/Library/LaunchAgents/PortableFSWorkspaceService.app/Contents/MacOS/portablefs-workspace-service")
+        guard own == executable || own == cli || own.path == service.path,
+              try Self.team(own) == cliTeam else { throw PortableFSSignedServiceError.invalidIdentity }
+        try PortableFSDServiceCoordinator.requireCurrentRunningImage(expectedPath:own.path,expectedCDHash:Self.codeHash(own))
     }
     public static func canonicalURL(_ url: URL) throws -> URL {
         guard let path = realpath(url.path, nil) else { throw PortableFSSignedServiceError.invalidIdentity }
@@ -43,6 +55,14 @@ public struct PortableFSSignedRelease: Sendable {
               hash.count == 20, let flags = info[kSecCodeInfoFlags] as? NSNumber,
               flags.uint32Value & 0x0001_0000 != 0 else { throw PortableFSSignedServiceError.codeValidation("hardened code/hash: " + url.path) }
         return hash.map { String(format: "%02x", $0) }.joined()
+    }
+    private static func team(_ named: URL) throws -> String? {
+        var code: SecStaticCode?, raw: CFDictionary?
+        let url=try canonicalURL(named)
+        guard SecStaticCodeCreateWithPath(url as CFURL,[],&code)==errSecSuccess,let code,
+              SecCodeCopySigningInformation(code,SecCSFlags(rawValue:kSecCSSigningInformation),&raw)==errSecSuccess,
+              let info=raw as? [CFString:Any] else { throw PortableFSSignedServiceError.invalidIdentity }
+        return info[kSecCodeInfoTeamIdentifier] as? String
     }
     func authenticate(_ descriptor: Int32) throws {
         let peer = try PortableFSDServiceCoordinator.captureDaemonPeer(descriptor)
@@ -66,19 +86,22 @@ public final class PortableFSSignedLocalListener: @unchecked Sendable {
     private let frameLimit: Int
     /// The caller holds its singleton before reclaiming this owned endpoint.
     public init(directory: URL, socketName: String, release: PortableFSSignedRelease, frameLimit: Int) throws {
-        guard !socketName.isEmpty, !socketName.contains("/"), frameLimit > 0, frameLimit <= 2 << 20 else { throw PortableFSSignedServiceError.invalidFrame }
+        guard !socketName.isEmpty, !socketName.contains("/"), frameLimit > 0, frameLimit <= 4 << 20 else { throw PortableFSSignedServiceError.invalidFrame }
         listener = try PortableFSDUpdateListener(store: PortableFSDUpdateLeaseStore(directoryURL: directory), socketName: socketName)
         self.release = release; self.frameLimit = frameLimit
     }
     public func accept() throws -> PortableFSSignedLocalConnection {
-        let accepted = try listener.accept()
+        let accepted: PortableFSDUpdateConnection
+        do { accepted = try listener.accept() }
+        catch PortableFSDUpdateSocketError.peerIdentity { throw PortableFSSignedServiceError.invalidIdentity }
         do {
             try release.authenticate(accepted.descriptor)
             // The accepted connection already owns its descriptor. Configure
             // the paired bound without handing it to a second closing owner.
+            try accepted.prepareBoundedIO()
             accepted.setFrameLimit(frameLimit)
             return PortableFSSignedLocalConnection(accepted)
-        } catch { accepted.close(); throw error }
+        } catch { accepted.close(); throw PortableFSSignedServiceError.invalidIdentity }
     }
     public func close() { listener.stop() }
 }

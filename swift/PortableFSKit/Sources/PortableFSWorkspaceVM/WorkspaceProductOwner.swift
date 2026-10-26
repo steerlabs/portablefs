@@ -18,6 +18,7 @@ import PortableFSWorkspaceCore
     private var shutdownIssued = false
     private var failure = ""
     private var updateQueued = false
+    private var quiescing = false
 
     public init(store: WorkspaceHostState, reservationDirectory: URL, hostBoot: String, factory: @escaping Factory) {
         self.store = store; self.reservationDirectory = reservationDirectory; self.hostBoot = hostBoot; self.factory = factory
@@ -29,6 +30,7 @@ import PortableFSWorkspaceCore
     public func handle(_ request: WorkspaceHostRequest) -> WorkspaceHostReply {
         do {
             try request.validate()
+            guard !quiescing || request.operation == "status" else { throw WorkspaceVMError("workspace service is quiescing") }
             switch request.operation {
             case "status": break
             case "start":
@@ -283,11 +285,27 @@ import PortableFSWorkspaceCore
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         for entry in transition.inventory where entry.frontend == "workspace" { try transition.release(entry) }
     }
+    // Lifecycle v1 is independent of the paired operational version. Quiesce
+    // closes this serving execution's admission only after exact VM absence;
+    // the installer must still unregister and prove singleton release.
+    public func lifecycle(_ request: WorkspaceHostLifecycleRequest) throws -> WorkspaceHostLifecycleReply {
+        try request.validate()
+        var reply=WorkspaceHostLifecycleReply()
+        reply.executionPresent=runtime != nil || store.value.execution != nil
+        reply.desiredRunning=store.value.running
+        if request.operation == "quiesce" {
+            guard !reply.executionPresent, !store.value.running, inFlight.isEmpty else { reply.state="busy";return reply }
+            try releaseAbsentReservations();quiescing=true;reply.state="quiesced"
+        } else { reply.state=request.operation }
+        return reply
+    }
     public func snapshot() -> WorkspaceHostReply {
-        var result = WorkspaceHostReply(); result.desiredRunning = store.value.running
+        var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.value.retained
         if !failure.isEmpty { result.state = "cleanup-required"; result.message = failure }
         else if let runtime {
-            if runtime.ready, runtime.phase == .running { result.state = "running"; result.message = WorkspaceHostControl.running }
+            if [.unknown,.pausedDiscard].contains(runtime.phase) { result.state = "cleanup-required"; result.message = "Cleanup required" }
+            else if stopRequested || runtime.phase == .stopping { result.state = "pending"; result.message = "Stop Linux Workspace" }
+            else if runtime.ready, runtime.phase == .running { result.state = "running"; result.message = WorkspaceHostControl.running }
             else if [.draining, .pausing, .pausedCold, .resuming, .recovering].contains(runtime.phase) { result.state = "reconnecting"; result.message = "Reconnecting…" }
             else { result.state = "starting"; result.message = WorkspaceHostControl.starting }
         }
@@ -315,10 +333,7 @@ import PortableFSWorkspaceCore
             if desired.request != nil { volume.authorizationRequest = store.directory.url.appendingPathComponent("authorization-" + desired.connection.volumeId + ".pfsworkspace").path }
             if let latest {
                 var page = latest; page.mounts = page.mounts.filter { $0.mount.volumeID == volume.volumeId }; page.jobs = page.jobs.filter { $0.mount.volumeID == volume.volumeId }
-                page.retired = store.value.retained.compactMap { try? WorkspaceControl.decode($0).statusReply.retired.first }.filter { $0.mountStatus.mount.volumeID == volume.volumeId || $0.job.mount.volumeID == volume.volumeId }
-                // Host-retained history is independent of the guest's 16-record
-                // retirement page. Expose the newest exact page on this response.
-                page.retired = Array(page.retired.suffix(16))
+                page.retired = page.retired.filter { $0.mountStatus.mount.volumeID == volume.volumeId || $0.job.mount.volumeID == volume.volumeId }
                 var envelope = WorkspaceEnvelope(); envelope.version = 8; envelope.requestID = 1; envelope.statusReply = page
                 volume.evidence = try? WorkspaceControl.encode(envelope)
             }

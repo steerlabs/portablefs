@@ -436,6 +436,12 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
     }
 
     func setFrameLimit(_ limit: Int) { frameLimit = limit }
+    func prepareBoundedIO() throws {
+        var one: Int32 = 1
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        guard flags >= 0, Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0,
+              Darwin.setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0 else { throw PortableFSDUpdateSocketError.closed }
+    }
 
     func readFrame() throws -> Data {
         let deadline = Date().addingTimeInterval(Self.timeoutSeconds)
@@ -457,7 +463,7 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
             }
             var byte: UInt8 = 0
             let count = Darwin.read(descriptor, &byte, 1)
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
             guard count == 1 else {
                 throw PortableFSDUpdateSocketError.closed
             }
@@ -507,7 +513,7 @@ final class PortableFSDUpdateConnection: @unchecked Sendable {
                     remaining
                 )
             }
-            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
             guard count > 0 else {
                 throw PortableFSDUpdateSocketError.closed
             }

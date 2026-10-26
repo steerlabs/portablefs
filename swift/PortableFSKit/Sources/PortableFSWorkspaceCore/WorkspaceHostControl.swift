@@ -1,10 +1,11 @@
 import CryptoKit
+import Darwin
 import Foundation
 import PortableFSAppCore
 
 public enum WorkspaceHostControl {
     public static let version = 1
-    public static let maxFrame = 2 << 20
+    public static let maxFrame = 4 << 20
     public static let maxDocument = 512 << 10
     public static let starting = "Starting Linux Workspace…"
     public static let running = "Linux Workspace: Running"
@@ -22,6 +23,16 @@ public enum WorkspaceHostControl {
         if canonical.hasSuffix(".") { canonical.removeLast() }
         guard !canonical.isEmpty, canonical.utf8.count <= 253,
               canonical.utf8.allSatisfy({ (33...126).contains($0) && ![47, 92].contains($0) }) else { throw WorkspaceControlError.grammar }
+        var v6 = in6_addr(), v4 = in_addr()
+        var rendered = [CChar](repeating:0,count:Int(INET6_ADDRSTRLEN))
+        if canonical.withCString({ inet_pton(AF_INET6,$0,&v6) }) == 1 {
+            guard inet_ntop(AF_INET6,&v6,&rendered,socklen_t(rendered.count)) != nil else { throw WorkspaceControlError.grammar }
+            canonical = String(decoding:rendered.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) },as:UTF8.self)
+            if canonical.hasPrefix("::ffff:") { canonical = String(canonical.dropFirst(7)) }
+        } else if canonical.withCString({ inet_pton(AF_INET,$0,&v4) }) == 1 {
+            guard inet_ntop(AF_INET,&v4,&rendered,socklen_t(rendered.count)) != nil else { throw WorkspaceControlError.grammar }
+            canonical = String(decoding:rendered.prefix { $0 != 0 }.map { UInt8(bitPattern:$0) },as:UTF8.self)
+        }
         return SHA256.hash(data: Data(("portablefs-authority-identity/8\0" + canonical).utf8)).map { String(format: "%02x", $0) }.joined()
     }
     public static func encode<T: Encodable>(_ value: T) throws -> Data {
@@ -67,6 +78,7 @@ public struct WorkspaceHostReply: Codable, Sendable {
     public var desiredRunning = false
     public var someChangesWereNotSaved = false
     public var previousWriteOutcomeUnknown = false
+    public var retainedEvidence: [Data] = []
     public var volumes: [WorkspaceHostVolume] = []
     public init() {}
 }
@@ -120,6 +132,7 @@ public struct WorkspaceConnectionDocument: Codable, Equatable, Sendable {
         _ = try WorkspaceHostControl.object(document["connection"], keys: ["authority", "volumeId", "endpoint", "serverName", "caCertificate", "routesRevision", "hosted"])
     }
     public func validate() throws {
+        guard try WorkspaceHostControl.encode(self).count <= WorkspaceHostControl.maxDocument else { throw WorkspaceControlError.grammar }
         guard version == 1 else { throw WorkspaceControlError.grammar }
         try connection.validate()
         if kind == "connection" {
@@ -164,4 +177,27 @@ public struct WorkspaceConnectionDocument: Codable, Equatable, Sendable {
         a.kind = "request"; a.authorization = nil; b.kind = "request"; b.authorization = nil
         return a == b
     }
+}
+
+public struct WorkspaceHostLifecycleRequest: Codable, Sendable {
+    public var lifecycleVersion: Int
+    public var operation: String
+    public func validate() throws {
+        guard lifecycleVersion == 1, ["identity", "inventory", "quiesce"].contains(operation) else { throw WorkspaceControlError.grammar }
+    }
+    public static func decode(_ data: Data) throws -> Self {
+        guard data.count <= 4096 else { throw WorkspaceControlError.grammar }
+        try PortableFSDStrictJSON.validate(data)
+        _ = try WorkspaceHostControl.object(JSONSerialization.jsonObject(with:data),keys:["lifecycleVersion","operation"])
+        let request=try JSONDecoder().decode(Self.self,from:data);try request.validate();return request
+    }
+}
+public struct WorkspaceHostLifecycleReply: Codable, Sendable {
+    public var lifecycleVersion=1
+    public var identitySchema=1
+    public var operationalVersion=WorkspaceHostControl.version
+    public var state="identity"
+    public var executionPresent=false
+    public var desiredRunning=false
+    public init() {}
 }

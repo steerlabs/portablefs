@@ -37,20 +37,34 @@ import PortableFSWorkspaceVM
             let queue = DispatchQueue(label: "dev.portablefs.workspace.host-api")
             // One bounded reader owns socket I/O away from the VZ queue. API
             // handlers only commit desired work; VM/guest operations are async.
+            let slots = DispatchSemaphore(value: 8)
+            let workers = DispatchQueue(label: "dev.portablefs.workspace.host-api.io", attributes: .concurrent)
             queue.async {
                 while true {
                     do {
                         let connection = try listener.accept()
-                        defer { connection.close() }
-                        do {
-                            let request = try WorkspaceHostControl.decodeRequest(connection.readFrame())
-                            let semaphore = DispatchSemaphore(value: 0)
-                            let response = ResponseBox()
-                            Task { @MainActor in response.value = try? WorkspaceHostControl.encode(owner.handle(request)); semaphore.signal() }
-                            guard semaphore.wait(timeout: .now() + 20) == .success, let value = response.value else { continue }
-                            try connection.writeFrame(value)
-                        } catch { /* Malformed/authentication failures get no operational authority. */ }
-                    } catch { /* A refused peer cannot stop the singleton service. */ }
+                        guard slots.wait(timeout:.now()) == .success else { connection.close(); continue }
+                        workers.async {
+                            defer { connection.close(); slots.signal() }
+                            do {
+                                let data=try connection.readFrame()
+                                try PortableFSDStrictJSON.validate(data)
+                                let object=try JSONSerialization.jsonObject(with:data) as? [String:Any]
+                                let semaphore = DispatchSemaphore(value: 0)
+                                let response = ResponseBox()
+                                if object?["lifecycleVersion"] != nil {
+                                    let request=try WorkspaceHostLifecycleRequest.decode(data)
+                                    Task { @MainActor in response.value=try? WorkspaceHostControl.encode(owner.lifecycle(request));semaphore.signal() }
+                                } else {
+                                    let request=try WorkspaceHostControl.decodeRequest(data)
+                                    Task { @MainActor in response.value = try? WorkspaceHostControl.encode(owner.handle(request)); semaphore.signal() }
+                                }
+                                guard semaphore.wait(timeout: .now() + 20) == .success, let value = response.value else { return }
+                                try connection.writeFrame(value)
+                            } catch { /* A disconnected waiter does not cancel accepted work. */ }
+                        }
+                    } catch PortableFSSignedServiceError.invalidIdentity { continue }
+                    catch { fputs("portablefs-workspace-service: host listener failed\n", stderr); exit(1) }
                 }
             }
             var signals: [DispatchSourceSignal] = []

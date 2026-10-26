@@ -58,9 +58,14 @@ Unix socket is under the canonical account state at
 UID and the exact signed running image at its canonical path in one verified
 release. The shared audit-token validation checks pidversion, CS_VALID,
 CS_RUNTIME and the kernel CodeDirectory hash. Private socket modes alone grant
-no authority. Each request/reply is bounded to 2 MiB; duplicate/unknown fields,
+no authority. Running callers must also match their enclosing release's static
+code, and the app, CLI and service must share the authenticated signing team.
+Ad-hoc identities are accepted only by separately compiled throwaway test builds. Each request/reply is bounded to 4 MiB; duplicate/unknown fields,
 unequal versions and extra operations refuse. Command acceptance is distinct
-from guest job completion and pinned SSH readiness.
+from guest job completion and pinned SSH readiness. Lifecycle v1 uses a separate
+`lifecycleVersion` discriminator with `identity`, `inventory` and idle-only
+`quiesce`. It closes admission for that execution; it does not certify service
+termination, singleton release or completion of the deferred installer protocol.
 
 Desired running state, descriptors, mount intents and retained outcomes commit
 through file sync, rename and directory sync. Stop preserves descriptors and
@@ -104,7 +109,8 @@ Grant/enrollment bytes never appear in diagnostics.
 Both signed services reserve canonical authority/volume under the same stable
 `mount-transition.lock` inode before attach. `volume-reservations.json` retains
 pending/crashed ownership; only exact cleanup or confirmed VM absence releases
-it. A workspace same-path volume-ID collision also refuses. Other volumes can
+it. A workspace volume-ID/path collision also refuses across authority names,
+including in the opposite frontend; an alias cannot create a second placement. Other volumes can
 use both frontends. FSKit reads this inventory without starting a workspace or
 requiring it enabled. This is per-account arbitration; authority enforcement
 continues to govern other users and machines.

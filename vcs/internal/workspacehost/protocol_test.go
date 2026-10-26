@@ -157,3 +157,20 @@ func TestDocumentRejectsHostLoopbackAndInvalidCSR(t *testing.T) {
 		t.Fatal("invalid CSR signature accepted")
 	}
 }
+
+func TestLifecycleVersionHasAnIndependentExactNamespace(t *testing.T) {
+	for _, operation := range []string{"identity", "inventory", "quiesce"} {
+		raw := []byte(`{"lifecycleVersion":1,"operation":"` + operation + `"}`)
+		if _, err := DecodeLifecycle(raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := DecodeRequest(raw); err == nil {
+			t.Fatal("lifecycle frame admitted as an operational verb")
+		}
+	}
+	for _, raw := range []string{`{"lifecycleVersion":8,"operation":"identity"}`, `{"lifecycleVersion":1,"operation":"start"}`, `{"lifecycleVersion":1,"operation":"quiesce","force":true}`, `{"version":1,"operation":"status"}`} {
+		if _, err := DecodeLifecycle([]byte(raw)); err == nil {
+			t.Fatal("invalid lifecycle frame accepted")
+		}
+	}
+}

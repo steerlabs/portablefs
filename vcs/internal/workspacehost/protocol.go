@@ -24,7 +24,7 @@ import (
 )
 
 const Version = 1
-const MaxFrame = 2 << 20
+const MaxFrame = 4 << 20
 const MaxDocument = 512 << 10
 const SocketName = "control.sock"
 const Starting = "Starting Linux Workspace…"
@@ -50,6 +50,7 @@ type Volume struct {
 	AuthorizationRequest string `json:"authorizationRequest,omitempty"`
 }
 type Reply struct {
+	RetainedEvidence            [][]byte `json:"retainedEvidence"`
 	SomeChangesWereNotSaved     bool     `json:"someChangesWereNotSaved"`
 	PreviousWriteOutcomeUnknown bool     `json:"previousWriteOutcomeUnknown"`
 	Version                     int      `json:"version"`
@@ -105,6 +106,15 @@ func DecodeReply(raw []byte) (Reply, error) {
 	case "stopped", "starting", "running", "reconnecting", "pending", "authorization-required", "ready", "busy", "terminal", "cleanup-required", "refused":
 	default:
 		return r, errors.New("invalid workspace state")
+	}
+	if len(r.RetainedEvidence) > 128 {
+		return r, errors.New("invalid retained workspace inventory")
+	}
+	for _, raw := range r.RetainedEvidence {
+		frame, err := workspacecontrol.Decode(raw)
+		if err != nil || frame.GetStatusReply() == nil {
+			return r, errors.New("invalid retained workspace evidence")
+		}
 	}
 	for _, v := range r.Volumes {
 		if !mountlifecycle.ValidVolume(v.VolumeID) || v.Path != "/workspaces/"+v.VolumeID || len(v.Evidence) > workspacecontrol.MaxFrame {
@@ -164,6 +174,10 @@ func (c Connection) Validate() error {
 	return nil
 }
 func (d Document) Validate() error {
+	raw, err := json.Marshal(d)
+	if err != nil || len(raw) > MaxDocument {
+		return errors.New("workspace document exceeds bound")
+	}
 	if d.Version != Version {
 		return errors.New("workspace document version mismatch")
 	}

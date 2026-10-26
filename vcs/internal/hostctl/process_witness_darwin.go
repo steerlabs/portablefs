@@ -22,6 +22,7 @@ int portablefs_process_witness_matches(
 	const char *expected_path,
 	char **observed_path_out
 );
+int portablefs_current_running_image(unsigned char cdhash_out[20]);
 int portablefs_running_image(
     const uint32_t token_values[8], int pid, int pid_version,
     unsigned char cdhash_out[20]
@@ -164,4 +165,14 @@ func (witness ProcessWitness) runningImageHash() (string, error) {
 	}
 	observed := C.GoBytes(unsafe.Pointer(&hash[0]), 20)
 	return hex.EncodeToString(observed), nil
+}
+
+// CurrentRunningCDHash authenticates this execution before it trusts an owning
+// bundle's service pin. Re-signing the file cannot replace the kernel witness.
+func CurrentRunningCDHash() (string, error) {
+	var hash [20]C.uchar
+	if status := C.portablefs_current_running_image(&hash[0]); status != 0 {
+		return "", fmt.Errorf("authenticate current running image: errno %d", int(status))
+	}
+	return hex.EncodeToString(C.GoBytes(unsafe.Pointer(&hash[0]), 20)), nil
 }

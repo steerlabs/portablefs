@@ -101,7 +101,7 @@ import PortableFSWorkspaceCore
     public func umount(_ mount: WorkspaceMountID, force: Bool, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { channel.umount(mount, force: force, deadline: clock.now + 20_000_000_000, completion: completion) }
     public func stop(force: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
         bridge.close(); ready = false
-        if force { coordinator.channelLost("explicit Force Stop"); completion(.success(())) }
+        if force { if phase == .unknown { coordinator.discardUnknown() } else { coordinator.channelLost("explicit Force Stop") }; completion(.success(())) }
         else { coordinator.stopOrderly { [weak self] result in self?.scheduleUpdate(); completion(result) } }
     }
 }

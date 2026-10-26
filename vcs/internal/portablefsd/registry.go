@@ -610,6 +610,20 @@ func (r *registry) runUnmountTransaction(
 			return true, detachErr
 		}
 	}
+	var transition *mountlifecycle.Transition
+	var reservation mountlifecycle.Reservation
+	if r.reservationStateDir != "" {
+		var err error
+		reservation, err = reservationForAttach(a)
+		if err != nil {
+			return true, errors.Join(detachErr, err)
+		}
+		transition, err = mountlifecycle.BeginTransition(r.reservationStateDir)
+		if err != nil {
+			return true, errors.Join(detachErr, err)
+		}
+		defer transition.Close()
+	}
 	r.mu.Lock()
 	delete(r.byRef, ref)
 	delete(r.byKey, a.key)
@@ -622,19 +636,8 @@ func (r *registry) runUnmountTransaction(
 		r.mu.Unlock()
 		return true, errors.Join(detachErr, err)
 	}
-	if r.reservationStateDir != "" {
-		reservation, err := reservationForAttach(a)
-		if err != nil {
-			return true, errors.Join(detachErr, err)
-		}
-		transition, err := mountlifecycle.BeginTransition(r.reservationStateDir)
-		if err != nil {
-			return true, errors.Join(detachErr, err)
-		}
-		err = transition.Release(reservation)
-		_ = transition.Close()
-		if err != nil {
-			// Keep the detached ref retryable until its reservation is durable.
+	if transition != nil {
+		if err := transition.Release(reservation); err != nil {
 			r.mu.Lock()
 			r.byRef[ref] = a
 			r.byKey[a.key] = a
@@ -647,7 +650,7 @@ func (r *registry) runUnmountTransaction(
 
 func reservationForAttach(a *attach) (mountlifecycle.Reservation, error) {
 	identity, err := mountlifecycle.AuthorityIdentity(a.dataPlaneServerName)
-	return mountlifecycle.Reservation{Authority: identity, Volume: a.volumeID, Frontend: "fskit", Owner: a.ref}, err
+	return mountlifecycle.Reservation{Authority: identity, Volume: a.volumeID, Frontend: "fskit", Owner: a.ref, Target: a.mountPath}, err
 }
 
 // closeAll is the cooperative daemon-termination path. Every attach must pass

@@ -37,6 +37,7 @@ func AuthorityIdentity(serverName string) (string, error) {
 }
 
 type Reservation struct {
+	Target    string `json:"target,omitempty"`
 	Authority string `json:"authority"`
 	Volume    string `json:"volume"`
 	Frontend  string `json:"frontend"`
@@ -49,7 +50,7 @@ type reservationState struct {
 
 func validReservation(r Reservation) bool {
 	raw, err := hex.DecodeString(r.Authority)
-	return err == nil && len(raw) == 32 && hex.EncodeToString(raw) == r.Authority && strings.Trim(r.Authority, "0") != "" && ValidVolume(r.Volume) && (r.Frontend == "fskit" || r.Frontend == "workspace") && len(r.Owner) > 0 && len(r.Owner) <= 128 && !strings.ContainsAny(r.Owner, "\x00\r\n")
+	return (r.Target == "" || filepath.IsAbs(r.Target) && filepath.Clean(r.Target) == r.Target) && err == nil && len(raw) == 32 && hex.EncodeToString(raw) == r.Authority && strings.Trim(r.Authority, "0") != "" && ValidVolume(r.Volume) && (r.Frontend == "fskit" || r.Frontend == "workspace") && len(r.Owner) > 0 && len(r.Owner) <= 128 && !strings.ContainsAny(r.Owner, "\x00\r\n")
 }
 func ValidVolume(v string) bool {
 	return len(v) > 0 && len(v) <= 128 && v != "." && v != ".." && strings.IndexFunc(v, func(r rune) bool {
@@ -106,7 +107,7 @@ func (t *Transition) Reserve(r Reservation) error {
 		return errors.New("invalid volume reservation")
 	}
 	for _, old := range t.state.Reservations {
-		if old.Authority == r.Authority && old.Volume == r.Volume || old.Frontend == "workspace" && r.Frontend == "workspace" && old.Volume == r.Volume {
+		if old.Authority == r.Authority && old.Volume == r.Volume || (old.Frontend == "workspace" || r.Frontend == "workspace") && old.Volume == r.Volume {
 			if old == r {
 				return nil
 			}

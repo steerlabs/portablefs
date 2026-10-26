@@ -149,3 +149,27 @@ func TestAuthorityIdentityCanonicalNameNotEndpoint(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkspacePathReservationCannotSplitAcrossAuthorityAliases(t *testing.T) {
+	for _, first := range []string{"fskit", "workspace"} {
+		t.Run(first, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "state")
+			transition, err := BeginTransition(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer transition.Close()
+			if err = transition.Reserve(reservation(first, "first")); err != nil {
+				t.Fatal(err)
+			}
+			second := reservation("workspace", "second")
+			if first == "workspace" {
+				second.Frontend = "fskit"
+			}
+			second.Authority = strings.Repeat("cd", 32)
+			if transition.Reserve(second) == nil {
+				t.Fatal("same workspace path escaped through another authority name")
+			}
+		})
+	}
+}

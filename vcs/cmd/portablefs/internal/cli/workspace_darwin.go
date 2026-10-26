@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/hostctl"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacehost"
 )
 
@@ -33,14 +34,45 @@ func (e *cmdEnv) requestWorkspace(ctx context.Context, request workspacehost.Req
 	}
 	service := filepath.Join(app, "Contents", "Library", "LaunchAgents", "PortableFSWorkspaceService.app")
 	peer := filepath.Join(service, "Contents", "MacOS", "portablefs-workspace-service")
-	out, err := exec.CommandContext(ctx, "/usr/bin/codesign", "-dv", "--verbose=4", service).CombinedOutput()
-	if err != nil {
-		return workspacehost.Reply{}, fmt.Errorf("inspect workspace service identity: %w", err)
-	}
-	hash, err := exactCodesignField(string(out), "CDHash")
+	architecture, err := nativeCodeArchitecture()
 	if err != nil {
 		return workspacehost.Reply{}, err
 	}
+	metadata := func(path string) (string, string, error) {
+		out, err := exec.CommandContext(ctx, "/usr/bin/codesign", "-dv", "--verbose=4", "--arch", architecture, path).CombinedOutput()
+		if err != nil {
+			return "", "", fmt.Errorf("inspect workspace signed identity: %w", err)
+		}
+		hash, err := exactCodesignField(string(out), "CDHash")
+		if err != nil {
+			return "", "", err
+		}
+		team, err := exactCodesignField(string(out), "TeamIdentifier")
+		return hash, team, err
+	}
+	hash, serviceTeam, err := metadata(service)
+	if err != nil {
+		return workspacehost.Reply{}, err
+	}
+	_, appTeam, err := metadata(app)
+	if err != nil {
+		return workspacehost.Reply{}, err
+	}
+	cliHash, cliTeam, err := metadata(executable)
+	if err != nil {
+		return workspacehost.Reply{}, err
+	}
+	if cliTeam != appTeam || cliTeam != serviceTeam || cliTeam == "not set" && !workspaceTestSigning {
+		return workspacehost.Reply{}, errors.New("workspace service is not signed by this CLI's release team")
+	}
+	running, err := hostctl.CurrentRunningCDHash()
+	if err != nil {
+		return workspacehost.Reply{}, err
+	}
+	if running != cliHash {
+		return workspacehost.Reply{}, errors.New("workspace CLI running image differs from its enclosing release")
+	}
+
 	state, err := e.mountLifecycleStateDir()
 	if err != nil {
 		return workspacehost.Reply{}, err

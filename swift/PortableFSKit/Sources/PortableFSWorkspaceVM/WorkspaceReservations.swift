@@ -7,10 +7,12 @@ public struct WorkspaceReservation: Codable, Equatable {
     public var volume: String
     public var frontend: String
     public var owner: String
+    public var target: String?
     public init(authority: String, volume: String, frontend: String = "workspace", owner: String) {
         self.authority = authority; self.volume = volume; self.frontend = frontend; self.owner = owner
     }
     func validate() throws {
+        if let target { guard target.hasPrefix("/"), !target.contains("\0"), URL(fileURLWithPath:target).standardizedFileURL.path == target else { throw WorkspaceControlError.grammar } }
         guard authority.count == 64, authority.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }), authority.contains(where: { $0 != "0" }),
               WorkspaceHostControl.validVolume(volume), ["fskit", "workspace"].contains(frontend), !owner.isEmpty, owner.utf8.count <= 128,
               !owner.contains(where: { $0 == "\0" || $0 == "\r" || $0 == "\n" }) else { throw WorkspaceControlError.grammar }
@@ -28,7 +30,7 @@ public final class WorkspaceReservations {
             try PortableFSDStrictJSON.validate(raw)
             let root = try WorkspaceHostControl.object(JSONSerialization.jsonObject(with: raw), keys: ["version", "reservations"])
             guard let entries = root["reservations"] as? [[String: Any]] else { throw WorkspaceControlError.grammar }
-            for entry in entries { _ = try WorkspaceHostControl.object(entry, keys: ["authority", "volume", "frontend", "owner"]) }
+            for entry in entries { _ = try WorkspaceHostControl.object(entry, keys: ["authority", "volume", "frontend", "owner", "target"]) }
             state = try JSONDecoder().decode(State.self, from: raw)
         }
         guard state.version == 1, state.reservations.count <= 128 else { throw WorkspaceControlError.grammar }
@@ -41,7 +43,7 @@ public final class WorkspaceReservations {
     public var inventory: [WorkspaceReservation] { state.reservations }
     public func reserve(_ reservation: WorkspaceReservation) throws {
         try reservation.validate()
-        for old in state.reservations where old.authority == reservation.authority && old.volume == reservation.volume || old.frontend == "workspace" && reservation.frontend == "workspace" && old.volume == reservation.volume {
+        for old in state.reservations where old.authority == reservation.authority && old.volume == reservation.volume || (old.frontend == "workspace" || reservation.frontend == "workspace") && old.volume == reservation.volume {
             if old == reservation { return }
             if old.frontend != reservation.frontend { throw WorkspaceVMError(reservation.frontend == "workspace" ? WorkspaceHostControl.macConflict : WorkspaceHostControl.linuxConflict) }
             throw WorkspaceVMError("Cleanup required")

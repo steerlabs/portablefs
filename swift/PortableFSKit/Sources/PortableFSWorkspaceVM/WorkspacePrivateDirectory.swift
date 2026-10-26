@@ -44,7 +44,11 @@ public final class WorkspacePrivateDirectory {
         try validateFile(file, name: name)
         var st = stat(); guard fstat(file, &st) == 0, st.st_size >= 0, st.st_size <= limit else { throw WorkspaceVMError("workspace state exceeds bound") }
         let handle = FileHandle(fileDescriptor: file, closeOnDealloc: false)
-        let data = try handle.readToEnd() ?? Data()
+        var data = Data()
+        while data.count <= limit {
+            guard let chunk = try handle.read(upToCount:limit+1-data.count), !chunk.isEmpty else { break }
+            data.append(chunk)
+        }
         guard data.count <= limit else { throw WorkspaceVMError("workspace state exceeds bound") }
         try validateFile(file, name: name); try validate(); return data
     }
@@ -88,5 +92,5 @@ public final class WorkspacePrivateDirectory {
 public final class WorkspaceFileLock {
     private let fd: Int32
     init(_ fd: Int32) { self.fd = fd }
-    deinit { workspaceFlock(fd, LOCK_UN); Darwin.close(fd) }
+    deinit { _ = workspaceFlock(fd, LOCK_UN); Darwin.close(fd) }
 }

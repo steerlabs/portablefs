@@ -177,3 +177,81 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
         for verb in ["shell","exec","pause","resume","identity","vm-list","ssh-config"] { #expect(throws:(any Error).self) { try productRequest(verb) } }
     }
 }
+
+@Suite(.serialized) struct WorkspaceProductRecoveryTests {
+    @Test @MainActor func issuerOutageRetainsPublicRequestAndPendingAuthorizationCanBeRemoved() async throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
+        let before = try #require(store.value.volumes.first?.request)
+        for _ in 0..<10 { _ = owner.handle(try productRequest("status")) }
+        _ = owner.handle(try productMount(productConnection())); try await productTurn()
+        #expect(runtime.identityCalls == 1); #expect(runtime.provisions.isEmpty)
+        #expect(store.value.volumes.first?.request == before)
+        _ = owner.handle(try productRequest("umount",volume:"vol-1"))
+        #expect(store.value.volumes.isEmpty); #expect(runtime.umounts.isEmpty)
+        let transition = try WorkspaceReservations(directory:directory)
+        #expect(transition.inventory.isEmpty)
+    }
+    @Test @MainActor func terminalCleanupAllowsFreshRequestAndKeepsKnownAndUnknownLoss() async throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
+        let old = try #require(store.value.volumes.first?.request)
+        try store.commit { $0.volumes[0].authorizationConsumed=true; $0.volumes[0].operation="ready" }
+        var terminal = WorkspaceMountStatus(); terminal.mount = try old.guestIdentity().mount
+        terminal.state="terminal";terminal.reason="authorization ended";terminal.cleanup="retained";terminal.outcome=unknownTestOutcome()
+        var loss=WorkspaceLoss();loss.sequence=1;loss.acceptedBytes=4096;loss.acceptedEntries=1;loss.reason="accepted tail lost";terminal.loss=[loss]
+        var status=WorkspaceStatusReply();status.bootID=runtime.bootID;status.hostServiceID=Data(repeating:6,count:16);status.guestServiceID=Data(repeating:7,count:16);status.state="running";status.mounts=[terminal]
+        try runtime.onStatus?(status)
+        #expect(owner.handle(try productMount(productConnection())).state=="refused")
+        terminal.cleanup="complete"
+        var retired=WorkspaceRetiredOutcome();retired.retirementSequence=1;retired.mountStatus=terminal
+        status.mounts=[];status.retired=[retired];try runtime.onStatus?(status)
+        runtime.identityReply.mount.incarnation=Data(repeating:9,count:16)
+        #expect(owner.handle(try productMount(productConnection())).state != "refused")
+        try await productTurn()
+        let fresh=try #require(store.value.volumes.first?.request)
+        #expect(fresh.identity != old.identity)
+        #expect(owner.snapshot().someChangesWereNotSaved)
+        #expect(owner.snapshot().previousWriteOutcomeUnknown)
+        #expect(store.value.volumes[0].reopenRequired)
+    }
+    @Test @MainActor func forceStopRetainsUnobservedPriorWriteOutcome() async throws {
+        let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
+        let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
+        let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+        _=owner.handle(try productMount(productConnection()));runtime.running();try await productTurn()
+        let request=try #require(store.value.volumes.first?.request)
+        var job=WorkspaceMountJob();job.mount=try request.guestIdentity().mount;job.requestID=2;job.operation="mount";job.phase="complete"
+        try runtime.report(job,mounted:true)
+        _=owner.handle(try productRequest("stop",force:true));try await productTurn()
+        #expect(!store.value.running);#expect(store.value.execution==nil)
+        #expect(owner.snapshot().previousWriteOutcomeUnknown)
+    }
+    @Test func authorityIPCanonicalizationMatchesGoNamespace() throws {
+        #expect(try WorkspaceHostControl.authorityIdentity("2001:0db8:0:0::1") == WorkspaceHostControl.authorityIdentity("2001:db8::1"))
+        #expect(try WorkspaceHostControl.authorityIdentity("::ffff:192.0.2.1") == WorkspaceHostControl.authorityIdentity("192.0.2.1"))
+    }
+}
+
+@Test @MainActor func productLifecycleQuiescenceIsIdleOnlyAndIndependentOfOperationalVersion() throws {
+    let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
+    let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    let quiesce=try WorkspaceHostLifecycleRequest.decode(Data("{\"lifecycleVersion\":1,\"operation\":\"quiesce\"}".utf8))
+    _=owner.handle(try productRequest("start"))
+    #expect(try owner.lifecycle(quiesce).state=="busy")
+    #expect(store.value.running)
+    runtime.phase = .stopped
+    // A separate idle owner with no execution can close its admission.
+    let idleDirectory=try productDirectory();defer{try? FileManager.default.removeItem(at:idleDirectory)}
+    let idleStore=try WorkspaceHostState(directory:idleDirectory.appendingPathComponent("workspace"))
+    let idle=WorkspaceProductOwner(store:idleStore,reservationDirectory:idleDirectory,hostBoot:"host-boot"){runtime}
+    #expect(try idle.lifecycle(quiesce).state=="quiesced")
+    #expect(idle.handle(try productRequest("start")).state=="refused")
+    #expect(!idleStore.value.running)
+    #expect(throws:(any Error).self) { try WorkspaceHostLifecycleRequest.decode(Data("{\"lifecycleVersion\":2,\"operation\":\"identity\"}".utf8)) }
+}
