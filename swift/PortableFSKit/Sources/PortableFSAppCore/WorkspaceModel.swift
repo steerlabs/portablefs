@@ -10,17 +10,20 @@ import ServiceManagement
     public private(set) var detail: String?
     private var wantsStart = false
     private var pendingDocument: Data?
+    private let interactive: Bool
     private var refreshing = false
     private var home: URL { get throws { URL(fileURLWithPath: try PortableFSAccountHome.resolve(), isDirectory: true) } }
     private var client: PortableFSWorkspaceClient { get throws { PortableFSWorkspaceClient(home: try home) } }
-    public init() {}
-    public init(status: PortableFSWorkspaceStatus, consentMissing: Bool = false) {
-        self.status = status; self.consentMissing = consentMissing
+    public init() { interactive = true }
+    /// A presentation-only fixture cannot register a service, open a real
+    /// editor profile or execute SSH while a test captures menu states.
+    public init(snapshot: PortableFSWorkspaceStatus, consentMissing: Bool = false) {
+        status = snapshot; self.consentMissing = consentMissing; interactive = false
     }
     public var statusText: String { consentMissing ? "Allow PortableFS in Background Items" : detail ?? status.message }
 
     public func refresh() async {
-        guard !refreshing, !working else { return }
+        guard interactive, !refreshing, !working else { return }
         refreshing = true; defer { refreshing = false }
         do {
             if wantsStart {
@@ -35,20 +38,23 @@ import ServiceManagement
         } catch { detail = error.localizedDescription }
     }
     public func start() {
-        guard !working else { return }
+        guard interactive, !working else { return }
         wantsStart = true
         status.message = "Starting Linux Workspace…"
         Task { await refresh() }
     }
     public func stop(force: Bool = false) {
+        guard interactive else { return }
         if force && !confirm(title: "Force Stop…", detail: "Open operations will fail and unflushed changes can be lost. Linux data will be kept.", action: "Force Stop") { return }
         perform(.stop, force: force)
     }
     public func remove(_ volume: PortableFSWorkspaceVolume, force: Bool = false) {
+        guard interactive else { return }
         if force && !confirm(title: "Force Remove…", detail: "Open operations will fail and unflushed changes can be lost. Remote files will be kept.", action: "Force Remove") { return }
         perform(.umount, volume: volume.volumeId, force: force)
     }
     public func openDocument(authorization: Bool = false) {
+        guard interactive else { return }
         let panel = NSOpenPanel()
         panel.title = authorization ? "Open Authorization…" : "Add Volume…"
         panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
@@ -67,6 +73,7 @@ import ServiceManagement
         } catch { detail = error.localizedDescription }
     }
     public func saveRequest(_ volume: PortableFSWorkspaceVolume) {
+        guard interactive else { return }
         do {
             guard let path = volume.authorizationRequest,
                   path == (try home).appendingPathComponent(".local/state/portablefs/workspace/authorization-" + volume.volumeId + ".pfsworkspace").path else { throw PortableFSWorkspaceError("Authorization request is not ready") }
@@ -85,7 +92,7 @@ import ServiceManagement
             catch { detail = error.localizedDescription }
         }
     }
-    public func openSettings() { SMAppService.openSystemSettingsLoginItems() }
+    public func openSettings() { if interactive { SMAppService.openSystemSettingsLoginItems() } }
     public func copy(_ text: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }
     public func copyDetails(volume: PortableFSWorkspaceVolume? = nil) {
         // Only public presentation/evidence fields; never export a saved grant.
@@ -97,7 +104,7 @@ import ServiceManagement
         copy(text)
     }
     public func terminal() {
-        guard status.canConnect else { return }
+        guard interactive, status.canConnect else { return }
         do {
             guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { throw PortableFSWorkspaceError("Terminal is not available.") }
             let document = try PortableFSWorkspaceTerminal.commandFile(in: FileManager.default.temporaryDirectory)
@@ -110,13 +117,14 @@ import ServiceManagement
         } catch { detail = error.localizedDescription }
     }
     public func editor(_ editor: PortableFSWorkspaceEditor, volume: PortableFSWorkspaceVolume) {
-        guard status.canConnect, volume.canOpen else { return }
+        guard interactive, status.canConnect, volume.canOpen else { return }
         Task {
             do { try await editor.open(volume: volume.volumeId) }
             catch { showError(error.localizedDescription) }
         }
     }
     public func removeWorkspace() {
+        guard interactive else { return }
         let alert = NSAlert(); alert.messageText = "Remove Linux Workspace…"
         alert.informativeText = "Stop Linux Workspace and remove its background service and SSH setup. Remote volumes will be kept."
         alert.addButton(withTitle: "Keep Linux data")

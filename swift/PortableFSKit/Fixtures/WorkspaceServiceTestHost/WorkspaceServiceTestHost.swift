@@ -69,7 +69,7 @@ import SwiftUI
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
         app.finishLaunching()
-        let model = PortableFSWorkspaceModel(status: status, consentMissing: consent)
+        let model = PortableFSWorkspaceModel(snapshot: status, consentMissing: consent)
         let window = NSWindow(contentRect: NSRect(x: 200, y: 400, width: 330, height: 110), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "PortableFS Workspace Menu Test"
         window.contentView = NSHostingView(rootView: VStack(alignment: .leading, spacing: 16) {
