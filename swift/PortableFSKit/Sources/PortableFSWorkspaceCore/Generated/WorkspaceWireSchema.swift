@@ -83,6 +83,7 @@ enum WorkspaceWireSchema {
             5: .init(kind: "$", repeated: false, oneof: false),
             6: .init(kind: "$", repeated: false, oneof: false),
             7: .init(kind: "$", repeated: false, oneof: false),
+            9: .init(kind: "", repeated: false, oneof: false),
         ],
         "RetiredOutcome": [
             1: .init(kind: "", repeated: false, oneof: false),
@@ -139,6 +140,7 @@ enum WorkspaceWireSchema {
         ],
         "UmountRequest": [
             1: .init(kind: "MountID", repeated: false, oneof: false),
+            2: .init(kind: "", repeated: false, oneof: false),
         ],
         "Result": [
             1: .init(kind: "$", repeated: false, oneof: false),

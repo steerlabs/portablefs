@@ -50,3 +50,13 @@ managed-terminal-removal-wakes-inflight-io
 managed-terminal-removal-unresponsive-child
 managed-caught-signal-terminal-cause
 managed-busy-unmount-application-sigkill
+service-authenticated-status
+service-unsigned-peer-refusal
+service-cross-release-refusal
+service-api-cli-five-verbs
+service-start-idempotent
+service-app-exit-vm-alive
+service-document-standalone
+service-stop-persists
+service-ssh-identity-persistence
+service-crash-no-ram-adoption

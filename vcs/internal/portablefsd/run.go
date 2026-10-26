@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 	"golang.org/x/sys/unix"
 )
@@ -67,6 +68,27 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("validate per-mount log directory: %w", err)
 	}
 	s.registry = newRegistryWithMountLogDir(s.cfg.StateDir, s.cfg.MountLogDir)
+	s.registry.reservationStateDir = filepath.Dir(s.cfg.StateDir)
+	// Restarts reconstruct reservations from this owner's durable inventory
+	// before publishing either socket. They never garbage-collect another
+	// service's pending or crashed reservations.
+	transition, err := mountlifecycle.BeginTransition(s.registry.reservationStateDir)
+	if err != nil {
+		return err
+	}
+	for _, a := range s.registry.list() {
+		reservation, reserveErr := reservationForAttach(a)
+		if reserveErr == nil {
+			reserveErr = transition.Reserve(reservation)
+		}
+		if reserveErr != nil {
+			transition.Close()
+			return reserveErr
+		}
+	}
+	if err := transition.Close(); err != nil {
+		return err
+	}
 	if s.registry.loadErr != nil {
 		return fmt.Errorf("strict persisted attach inventory: %w", s.registry.loadErr)
 	}

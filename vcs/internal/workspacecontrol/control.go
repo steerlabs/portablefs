@@ -434,7 +434,8 @@ func Jobs(jobs []*pb.MountJob, mounts []*pb.MountStatus, generation uint64) erro
 			return invalid("job incarnation conflicts with registered mount")
 		}
 		volumes[volume] = MountKey(j.Mount)
-		if j.Operation != "provision" && j.Operation != "mount" && j.Operation != "umount" {
+		if j.Force && j.Operation != "umount" { return invalid("force requires umount") }
+  if j.Operation != "provision" && j.Operation != "mount" && j.Operation != "umount" {
 			return invalid("job operation")
 		}
 		switch j.Phase {

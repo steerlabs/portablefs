@@ -214,3 +214,9 @@ if [ "${CODE_SIGNING_ALLOWED:-NO}" != "NO" ] &&
     --entitlements "$helper_entitlements" \
     "$service_app"
 fi
+
+# Only the production target owns a workspace service. The manual FSKit host
+# remains independent and no development registration is changed.
+if [ "${TARGET_NAME:-}" = PortableFSApp ]; then
+  sh "$script_dir/embed-workspace-service.sh"
+fi

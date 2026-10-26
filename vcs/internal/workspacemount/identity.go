@@ -409,6 +409,9 @@ func (s *Store) acceptProvision(ctx context.Context, p *pb.Provision) error {
 		return err
 	}
 	if h := p.HostedEnrollment; h != nil {
+		if err := validateHostedScope(p, s.guest, v.Incarnation, spki, v.Epoch); err != nil {
+			return err
+		}
 		u, e := url.Parse(h.ManagerOrigin)
 		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || u.Path != "" && u.Path != "/" {
 			return errors.New("Manager must be an HTTPS origin")

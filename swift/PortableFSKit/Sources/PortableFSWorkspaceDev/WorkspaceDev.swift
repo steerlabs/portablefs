@@ -30,7 +30,7 @@ import PortableFSWorkspaceCore
 }
 
 @MainActor final class Driver {
-    let state: WorkspaceDevState
+    let state: WorkspaceState
     let vm: WorkspaceMachine
     let power = WorkspaceSystemPower()
     let clock = WorkspaceSystemClock()
@@ -55,7 +55,7 @@ import PortableFSWorkspaceCore
     init(image: URL, stateDirectory: URL, pairingMismatch: String? = nil) throws {
         let artifact = try WorkspaceArtifact(directory: image)
         guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit else { throw WorkspaceVMError("host executable and guest release differ; rebuild the paired dev executable") }
-        state = try WorkspaceDevState(directory: stateDirectory)
+        state = try WorkspaceState(directory: stateDirectory)
         vm = try WorkspaceMachine(artifact: artifact, dataDisk: stateDirectory.appendingPathComponent("data.ext4"), serialLog: stateDirectory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress)
         channel = WorkspaceVsockChannel(vm: vm); observed = ObservedChannel(channel); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)
         var hello = WorkspaceHello(); hello.release = artifact.release; hello.bootID = random.next(); hello.hostServiceID = random.next()

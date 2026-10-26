@@ -107,6 +107,9 @@ another, and none is bumped to match another.
 | Authority host kernel | Linux 5.17 final or newer | Refused at storage startup below 5.17 and for 5.17 release candidates; later release candidates are accepted. |
 | `pfslocal` (daemon to FSKit extension) | 2.0 | Exact major and minor; paired within one signed release. |
 | Linux workspace control | `8` | Exact paired, unreleased host/guest and local mount controls; typed renewal/outcome evidence, bounded desired-job progress, one shared acknowledged mount/job retirement stream with reserved per-key capacity and exact terminal-result observation before successor admission (MountJob field 8 and StatusReply field 9 reserved), admission-only predecessor-unobserved refusals, a paired 1 MiB frame bound, and one remaining Suspend drain allowance outside token identity; paired AwakeRecover tag 25 with explicit Suspension.awake_recovery field 7 and asynchronous fixed-roster admission, guest IdentityRequest/IdentityReply tags 23/24, Provision server_name 8 and hosted_enrollment 9. Finite job/action ownership reconciles through observation; no response receipts or older decoder. |
+| Workspace host operational API | `1` | Exact paired signed-release Unix-socket API; one bounded JSON request/reply, separate from guest control 8. |
+| Workspace connection document | `1` | Exact public `.pfsworkspace` connection/request/authorization variants; guest keys never cross this boundary. |
+| Workspace desired state and volume reservations | `1`, `1` | Exact private formats; one per-user transition lock and retained execution/cleanup intent. |
 | Daemon operational control | `2` | Exact; `X-PortableFS-Control-Protocol` header and `/v2/` paths; paired within one signed release. |
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |
@@ -450,13 +453,23 @@ session on a different revision fails closed.
 
 `portablefs mount`, `reauthorize`, `umount` (alias `unmount`), `mounts`,
 `mount-loss`, `route`, `prune-local`, `daemon`, `doctor`, `mount-check`, and
-`version` are the user-facing commands, with `--json` on each and the
+`version`, and `workspace` are the user-facing commands, with `--json` on each and the
 `PORTABLEFS_MOUNT_TOKEN` environment variable. Documented flags and JSON
 fields keep their meaning; consumers must ignore unknown JSON fields.
 `mount-check --probe-mount` is the one mutating option: it installs and removes
 one throwaway FUSE mount and is opt-in for that reason. `lifecycle`,
 `install-macos-app`, and `install-linux-release` are installer and app
 coordination surfaces, not a user contract.
+
+The workspace namespace has exactly five verbs: `start`, `status [--json]`,
+`mount <connection-file> [--json]`, `umount <volume-id> [--force] [--json]`, and
+`stop [--force] [--json]`. Start and Mount may register/start the per-user service;
+Status never defeats explicit Stop. API/CLI acceptance reports pending work,
+never completed mount readiness. JSON separates desired running state, per-volume
+pending/authorization/ready/busy/terminal states and retained known/unknown loss.
+Only explicit force authorizes discarded RAM or terminal forced removal. The
+workspace is unqualified; signed image packaging and installer/update integration
+remain required before it is a supported product.
 
 `portablefs version --json` advertises exactly these capability strings, each
 a separate consumer contract unrelated to the authority major:
@@ -493,7 +506,9 @@ transaction/phase payloads are not echoed. Managed manual renewal is refused by
 design: its single automatic owner retains sequence and grant ownership.
 Resume may republish a still-valid recorded installation; exact pending install
 reconciliation survives the old serving deadline behind closed admission.
-The paired format-8 desired-job vocabulary includes `busy` for a real unforced
+The paired unreleased format-8 Umount request carries explicit `force` (field 2),
+and its observed MountJob retains it in field 9; false preserves ordinary EBUSY.
+No authority-wire field or semantics change. The paired format-8 desired-job vocabulary includes `busy` for a real unforced
 kernel `EBUSY`. That completed refusal retains the serving mount; a later
 Umount retries its original kernel owner. Both paired decoders use this exact
 vocabulary, with no older decoder.

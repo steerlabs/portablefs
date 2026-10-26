@@ -874,8 +874,10 @@ type MountJob struct {
 	// offered, running, complete, failed.
 	Phase string `protobuf:"bytes,5,opt,name=phase,proto3" json:"phase,omitempty"`
 	// unavailable, refused, authorization-required, stopped, deadline, handler-failed, busy.
-	Failure       string `protobuf:"bytes,6,opt,name=failure,proto3" json:"failure,omitempty"`
-	Reason        string `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
+	Failure string `protobuf:"bytes,6,opt,name=failure,proto3" json:"failure,omitempty"`
+	Reason  string `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Explicit user force; valid only for Umount. Never inferred from failure.
+	Force         bool `protobuf:"varint,9,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -957,6 +959,13 @@ func (x *MountJob) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *MountJob) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 // One acknowledged retirement stream for exact mount and joined job evidence.
@@ -1553,6 +1562,7 @@ func (x *MountRequest) GetMount() *MountID {
 type UmountRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Mount         *MountID               `protobuf:"bytes,1,opt,name=mount,proto3" json:"mount,omitempty"`
+	Force         bool                   `protobuf:"varint,2,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1592,6 +1602,13 @@ func (x *UmountRequest) GetMount() *MountID {
 		return x.Mount
 	}
 	return nil
+}
+
+func (x *UmountRequest) GetForce() bool {
+	if x != nil {
+		return x.Force
+	}
+	return false
 }
 
 type Result struct {
@@ -2056,7 +2073,7 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\tResumeAck\x12:\n" +
 	"\x05token\x18\x01 \x01(\v2$.portablefs.workspace.v8.ResumeTokenR\x05token\x12<\n" +
 	"\x06mounts\x18\x02 \x03(\v2$.portablefs.workspace.v8.MountStatusR\x06mounts\"\x0f\n" +
-	"\rStatusRequest\"\xed\x01\n" +
+	"\rStatusRequest\"\x83\x02\n" +
 	"\bMountJob\x126\n" +
 	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x12\x1d\n" +
 	"\n" +
@@ -2067,7 +2084,8 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"\toperation\x18\x04 \x01(\tR\toperation\x12\x14\n" +
 	"\x05phase\x18\x05 \x01(\tR\x05phase\x12\x18\n" +
 	"\afailure\x18\x06 \x01(\tR\afailure\x12\x16\n" +
-	"\x06reason\x18\a \x01(\tR\x06reasonJ\x04\b\b\x10\t\"\xbf\x01\n" +
+	"\x06reason\x18\a \x01(\tR\x06reason\x12\x14\n" +
+	"\x05force\x18\t \x01(\bR\x05forceJ\x04\b\b\x10\t\"\xbf\x01\n" +
 	"\x0eRetiredOutcome\x12/\n" +
 	"\x13retirement_sequence\x18\x01 \x01(\x04R\x12retirementSequence\x12G\n" +
 	"\fmount_status\x18\x02 \x01(\v2$.portablefs.workspace.v8.MountStatusR\vmountStatus\x123\n" +
@@ -2122,9 +2140,10 @@ const file_proto_workspace_v8_control_proto_rawDesc = "" +
 	"serverName\x12V\n" +
 	"\x11hosted_enrollment\x18\t \x01(\v2).portablefs.workspace.v8.HostedEnrollmentR\x10hostedEnrollment\"F\n" +
 	"\fMountRequest\x126\n" +
-	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\"G\n" +
+	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\"]\n" +
 	"\rUmountRequest\x126\n" +
-	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\"4\n" +
+	"\x05mount\x18\x01 \x01(\v2 .portablefs.workspace.v8.MountIDR\x05mount\x12\x14\n" +
+	"\x05force\x18\x02 \x01(\bR\x05force\"4\n" +
 	"\x06Result\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"\xc5\t\n" +

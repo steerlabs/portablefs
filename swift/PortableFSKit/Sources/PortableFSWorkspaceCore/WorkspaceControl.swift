@@ -143,7 +143,7 @@ public enum WorkspaceControl {
     }
     private static func validJob(_ job: WorkspaceMountJob, generation: UInt64) -> Bool {
         guard validMount(job.mount), job.requestID > 0, job.generation <= generation,
-              ["provision", "mount", "umount"].contains(job.operation) else { return false }
+              ["provision", "mount", "umount"].contains(job.operation), !job.force || job.operation == "umount" else { return false }
         switch job.phase {
         case "offered", "running", "complete": guard job.failure.isEmpty && job.reason.isEmpty else { return false }
         case "failed": guard ["unavailable", "refused", "authorization-required", "stopped", "deadline", "handler-failed", "busy"].contains(job.failure) && !job.reason.isEmpty && job.reason.utf8.count <= maxReason else { return false }
@@ -156,7 +156,7 @@ public enum WorkspaceControl {
     public static func retainsJob(_ current: WorkspaceMountJob, prior old: WorkspaceMountJob) -> Bool {
         guard current.mount == old.mount, current.requestID >= old.requestID, current.generation >= old.generation else { return false }
         if current.requestID == old.requestID {
-            return current.generation == old.generation && current.operation == old.operation &&
+            return current.generation == old.generation && current.operation == old.operation && current.force == old.force &&
                 (!["complete", "failed"].contains(old.phase) || current == old)
         }
         return ["complete", "failed"].contains(old.phase)

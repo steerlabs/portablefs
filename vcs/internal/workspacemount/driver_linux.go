@@ -178,10 +178,10 @@ func (m *Manager) Run(ctx context.Context, j *pb.MountJob, _ *pb.Provision) erro
 		d := m.mounts[key]
 		m.mu.Unlock()
 		if d == nil {
-			return errors.New("workspace mount not owned")
+			return m.cleanupProvisionOnly(ctx, j.Mount)
 		}
 		mode := "terminal"
-		if d.serving.Load() {
+		if d.serving.Load() && !j.Force {
 			// An unforced unmount must run while holders can still use and
 			// release the filesystem. EBUSY changes no serving or lifecycle
 			// state. Success is retained in the same original removal slot
@@ -396,6 +396,36 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (owner *D
 	d.socket = r.Socket
 	go d.watch()
 	return d, nil
+}
+
+// A provision-only job owns no child, but may own a committed initial grant.
+// Remove it through the existing two-inventory absence boundary so a failed or
+// expired issuance can be replaced without discarding an otherwise healthy VM.
+func (m *Manager) cleanupProvisionOnly(ctx context.Context, id *pb.MountID) error {
+	if m.Identity == nil || m.Inventory == nil {
+		return errors.New("workspace identity cleanup unavailable")
+	}
+	m.allocationMu.Lock()
+	defer m.allocationMu.Unlock()
+	target := filepath.Join(m.Targets, id.VolumeId)
+	for _, run := range m.Inventory.Snapshot() {
+		if !run.Removed && (proto.Equal(run.Mount, id) || run.Witness.Target == target) {
+			return errors.New("workspace child intent requires its exact cleanup owner")
+		}
+	}
+	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return err
+	}
+	instance := "mnt_" + base64.RawURLEncoding.EncodeToString(id.Incarnation)
+	run := &Desired{Mount: id, KernelBoot: strings.TrimSpace(string(boot)), Witness: Witness{Intent: instance, Source: "portablefs:" + instance, Target: target}, Outcome: control.UnknownOutcome()}
+	return m.Identity.Reissue(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId}, false, func() error {
+		if _, err := fusev3.ObservePlannedKernelMountAbsent(run.Witness.Source, run.Witness.Target); err != nil {
+			return err
+		}
+		_, err := m.reconcileCLI(ctx, run, "", true)
+		return err
+	})
 }
 
 // Reconcile runs only on a new kernel boot. It commits partial CLI evidence

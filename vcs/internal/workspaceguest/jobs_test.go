@@ -316,3 +316,29 @@ func TestVoluntaryBusyJobPreservesRealErrno(t *testing.T) {
 		t.Fatal(job)
 	}
 }
+
+func TestExplicitForceUmountIsBoundToItsExactJob(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprint(force), func(t *testing.T) {
+			received := make(chan *pb.MountJob, 1)
+			driver := jobDriverFunc(func(_ context.Context, j *pb.MountJob, _ *pb.Provision) error {
+				received <- clone(j)
+				return syscall.EBUSY
+			})
+			s, err := New(id(1), id(2), id(3), true, driver)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.ChannelLost)
+			request := jobRequest(2, mountID(4), "umount")
+			request.GetUmount().Force = force
+			if err = s.AcceptJob(request); err != nil {
+				t.Fatal(err)
+			}
+			job := await(t, received)
+			if job.Force != force {
+				t.Fatal("explicit force lost or inferred")
+			}
+		})
+	}
+}

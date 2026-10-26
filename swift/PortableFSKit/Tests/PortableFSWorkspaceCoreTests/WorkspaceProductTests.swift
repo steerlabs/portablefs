@@ -1,0 +1,179 @@
+import Foundation
+import Testing
+import PortableFSWorkspaceCore
+@testable import PortableFSWorkspaceVM
+
+private enum ProductFailure: Error { case refused }
+@MainActor private final class ProductRuntime: WorkspaceProductRuntime {
+    var phase: WorkspacePhase = .starting
+    var ready = false
+    var bootID = Data(repeating: 8, count: 16)
+    var onChange: (() -> Void)?
+    var onStatus: ((WorkspaceStatusReply) throws -> Void)?
+    var starts = 0
+    var identityCalls = 0
+    var mounts = 0
+    var umounts: [Bool] = []
+    var stops: [Bool] = []
+    var shutdownFails = false
+    var identityReply: WorkspaceIdentityReply
+    var provisions: [WorkspaceProvision] = []
+    init() throws { identityReply = try WorkspaceControl.decode(workspaceGolden("identity_reply")).identityReply }
+    func start() throws { starts += 1 }
+    func running() { ready = true; phase = .running; onChange?() }
+    func identity(_ request: WorkspaceIdentityRequest, completion: @escaping (Result<WorkspaceIdentityReply, Error>) -> Void) {
+        identityCalls += 1; identityReply.mount.authorityID = request.authorityID; identityReply.mount.volumeID = request.volumeID
+        completion(.success(identityReply))
+    }
+    func provision(_ provision: WorkspaceProvision, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { provisions.append(provision); var result = WorkspaceResult(); result.code = "accepted"; completion(.success(result)) }
+    func mount(_ mount: WorkspaceMountID, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { mounts += 1; var result = WorkspaceResult(); result.code = "accepted"; completion(.success(result)) }
+    func umount(_ mount: WorkspaceMountID, force: Bool, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { umounts.append(force); var result = WorkspaceResult(); result.code = "accepted"; completion(.success(result)) }
+    func stop(force: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
+        stops.append(force)
+        if shutdownFails { completion(.failure(ProductFailure.refused)) }
+        else { ready = false; phase = .stopped; completion(.success(())); onChange?() }
+    }
+    func report(_ job: WorkspaceMountJob, mounted: Bool = false) throws {
+        var status = WorkspaceStatusReply(); status.bootID = bootID; status.hostServiceID = Data(repeating: 6, count: 16); status.guestServiceID = Data(repeating: 7, count: 16); status.state = "running"
+        if mounted { var mount = WorkspaceMountStatus(); mount.mount = job.mount; mount.state = "ready"; mount.cleanup = "retained"; mount.renewal.state = "not-required"; mount.outcome = unknownTestOutcome(); status.mounts = [mount] }
+        status.jobs = [job]; try onStatus?(status)
+    }
+}
+private func productDirectory() throws -> URL {
+    let path = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("pfs-product-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]); return path
+}
+private func productRequest(_ operation: String, volume: String? = nil, force: Bool? = nil) throws -> WorkspaceHostRequest {
+    var value: [String: Any] = ["version": 1, "operation": operation]
+    if let volume { value["volumeId"] = volume }; if let force { value["force"] = force }
+    return try WorkspaceHostControl.decodeRequest(JSONSerialization.data(withJSONObject: value))
+}
+private func productConnection() throws -> WorkspaceConnectionDocument {
+    let value: [String: Any] = ["version":1, "kind":"connection", "connection":["authority":try WorkspaceHostControl.authorityIdentity("authority.example"), "volumeId":"vol-1", "endpoint":"authority.example:7443", "serverName":"authority.example", "caCertificate":Data("test public CA".utf8).base64EncodedString(), "routesRevision":Data(repeating:4,count:32).base64EncodedString(), "hosted":false]]
+    let raw = try JSONSerialization.data(withJSONObject:value)
+    return try JSONDecoder().decode(WorkspaceConnectionDocument.self,from:raw)
+}
+private func productMount(_ document: WorkspaceConnectionDocument) throws -> WorkspaceHostRequest {
+    let encoded = try WorkspaceHostControl.encode(document)
+    let value: [String: Any] = ["version":1, "operation":"mount", "document":try JSONSerialization.jsonObject(with:encoded)]
+    return try WorkspaceHostControl.decodeRequest(JSONSerialization.data(withJSONObject:value))
+}
+@MainActor private func productTurn() async throws { try await Task.sleep(for:.milliseconds(30)) }
+
+@Suite(.serialized) struct WorkspaceProductTests {
+    @Test @MainActor func startupIsIdempotentAndStopPersistsWithoutAppOwnership() async throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        #expect(owner.handle(try productRequest("status")).desiredRunning == false)
+        #expect(runtime.starts == 0)
+        _ = owner.handle(try productRequest("start")); _ = owner.handle(try productRequest("start"))
+        #expect(runtime.starts == 1); #expect(store.value.running)
+        runtime.running(); try await productTurn()
+        // Dropping every API request leaves the independent owner running.
+        #expect(owner.snapshot().state == "running"); #expect(runtime.stops.isEmpty)
+        _ = owner.handle(try productRequest("stop")); try await productTurn(); try await productTurn()
+        #expect(runtime.stops == [false]); #expect(!store.value.running); #expect(store.value.execution == nil)
+        #expect(owner.snapshot().state == "stopped")
+        let onDisk = try #require(try store.directory.read("desired.json"))
+        #expect(try JSONDecoder().decode(WorkspaceDesiredState.self,from:onDisk).running == false)
+        owner.launch(); #expect(runtime.starts == 1)
+    }
+    @Test @MainActor func crashWitnessNeverAdoptsRAMOrTreatsPIDExitAsTermination() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory)
+        try store.commit { $0.running = true; $0.execution = WorkspaceExecution(hostBoot:"same-boot",boot:Data(repeating:1,count:16)) }
+        let runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"same-boot") { runtime }
+        owner.launch(); #expect(runtime.starts == 0); #expect(owner.snapshot().state == "cleanup-required")
+        #expect(owner.handle(try productRequest("start")).state == "refused"); #expect(runtime.starts == 0)
+        #expect(throws:(any Error).self) { try store.requirePriorExecutionAbsent(hostBoot:"same-boot") }
+        try store.requirePriorExecutionAbsent(hostBoot:"new-host-boot")
+        #expect(store.value.execution == nil)
+    }
+    @Test @MainActor func pendingMountKeepsIntentAcrossTransitionAndRequiresExactResponse() async throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        _ = owner.handle(try productMount(productConnection()))
+        #expect(store.value.volumes.count == 1); #expect(runtime.identityCalls == 0)
+        runtime.running(); try await productTurn()
+        let request = try #require(store.value.volumes.first?.request)
+        #expect(owner.snapshot().volumes.first?.state == "authorization-required")
+        #expect(try store.directory.read("authorization-vol-1.pfsworkspace") != nil)
+        var provision = try WorkspaceControl.decode(workspaceGolden("provision")).provision
+        provision.mount = try request.guestIdentity().mount; provision.publicKey = try request.guestIdentity().publicKey
+        provision.authorityEndpoint = request.connection.endpoint; provision.serverName = request.connection.serverName; provision.caCertificate = request.connection.caCertificate; provision.routesRevision = request.connection.routesRevision
+        var frame = WorkspaceEnvelope(); frame.version = 8; frame.requestID = 1; frame.provision = provision
+        var response = request; response.kind = "authorization"; response.authorization = try WorkspaceControl.encode(frame)
+        var foreign = response; foreign.intent = String(repeating:"2",count:32)
+        #expect(owner.handle(try productMount(foreign)).state == "refused"); #expect(runtime.provisions.isEmpty)
+        runtime.phase = .pausedCold
+        _ = owner.handle(try productMount(response)); try await productTurn()
+        #expect(runtime.provisions.isEmpty); #expect(store.value.volumes[0].authorizationConsumed)
+        runtime.phase = .running; runtime.onChange?(); try await productTurn()
+        #expect(runtime.provisions.count == 1)
+        var job = WorkspaceMountJob(); job.mount = provision.mount; job.requestID = 4; job.operation = "provision"; job.phase = "complete"
+        runtime.phase = .pausedCold; try runtime.report(job); try await productTurn()
+        // The existing coordinator queue receives the mount even while paused.
+        #expect(runtime.mounts == 1)
+        _ = owner.handle(try productMount(response)); try await productTurn(); #expect(runtime.provisions.count == 1); #expect(runtime.mounts == 1)
+    }
+    @Test @MainActor func busyUnmountRetainsServingReservationAndStopNeverForces() async throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
+        let request = try #require(store.value.volumes.first?.request), mount = try request.guestIdentity().mount
+        var job = WorkspaceMountJob(); job.mount = mount; job.requestID = 2; job.operation = "mount"; job.phase = "complete"
+        try runtime.report(job,mounted:true)
+        try store.commit { $0.volumes[0].authorizationConsumed = true }
+        _ = owner.handle(try productRequest("umount",volume:"vol-1")); #expect(runtime.umounts == [false])
+        job.requestID = 3; job.operation = "umount"; job.phase = "failed"; job.failure = "busy"; job.reason = "kernel EBUSY"
+        try runtime.report(job,mounted:true); try await productTurn()
+        #expect(owner.snapshot().volumes[0].message == WorkspaceHostControl.busy)
+        do { let transition = try WorkspaceReservations(directory:directory); #expect(transition.inventory.count == 1) }
+        _ = owner.handle(try productRequest("stop")); try await productTurn()
+        #expect(runtime.stops.isEmpty); #expect(store.value.running)
+        _ = owner.handle(try productRequest("umount",volume:"vol-1",force:true)); #expect(runtime.umounts == [false,true])
+        // Re-observing an old busy result cannot consume the new force intent.
+        try runtime.report(job,mounted:true)
+        #expect(store.value.volumes[0].operation == "force-umount")
+    }
+    @Test @MainActor func failedOrderlyShutdownLeavesRunningIntentAndVM() async throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime(); runtime.shutdownFails = true
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
+        _ = owner.handle(try productRequest("stop")); try await productTurn()
+        #expect(runtime.stops == [false]); #expect(store.value.running); #expect(store.value.execution != nil); #expect(runtime.phase == .running)
+    }
+    @Test func reservationCodecBothOrdersAndCanonicalTransitionLock() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let authority = try WorkspaceHostControl.authorityIdentity("AUTHORITY.example.")
+        #expect(authority == (try WorkspaceHostControl.authorityIdentity("authority.example")))
+        let mac = WorkspaceReservation(authority:authority,volume:"vol-1",frontend:"fskit",owner:"mac-ref")
+        let linux = WorkspaceReservation(authority:authority,volume:"vol-1",owner:"linux-intent")
+        do { let transition = try WorkspaceReservations(directory:directory); try transition.reserve(mac)
+            #expect(throws:(any Error).self) { try transition.reserve(linux) }
+            #expect(throws:(any Error).self) { try WorkspaceReservations(directory:directory) }
+        }
+        do { let transition = try WorkspaceReservations(directory:directory); #expect(transition.inventory == [mac]); try transition.release(mac); try transition.reserve(linux)
+            #expect(throws:(any Error).self) { try transition.reserve(mac) }
+        }
+        #expect(!FileManager.default.fileExists(atPath:directory.appendingPathComponent("workspace").path))
+    }
+    @Test func privateStateRefusesSingletonAndReplacedOrCorruptInventory() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let state = try WorkspaceHostState(directory:directory)
+        #expect(throws:(any Error).self) { try WorkspaceHostState(directory:directory) }
+        try state.directory.write("volume-reservations.json",data:Data("{\"version\":2,\"reservations\":[]}".utf8))
+        #expect(throws:(any Error).self) { try WorkspaceReservations(directory:directory) }
+    }
+    @Test func hostAPIRejectsUnknownDuplicateCrossVersionAndExtraVerbs() throws {
+        for raw in ["{\"version\":1,\"version\":1,\"operation\":\"status\"}","{\"version\":8,\"operation\":\"status\"}","{\"version\":1,\"operation\":\"status\",\"secret\":\"x\"}"] {
+            #expect(throws:(any Error).self) { try WorkspaceHostControl.decodeRequest(Data(raw.utf8)) }
+        }
+        for verb in ["shell","exec","pause","resume","identity","vm-list","ssh-config"] { #expect(throws:(any Error).self) { try productRequest(verb) } }
+    }
+}

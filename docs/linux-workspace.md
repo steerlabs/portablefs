@@ -41,6 +41,74 @@ The pending defaults are 4 vCPUs/4 GiB for hosts with at least 16 GiB, otherwise
 free-space checks. Change resources only while stopped. Editor requirements
 and measured footprint must qualify these defaults before publication.
 
+## Product service and public handoff
+
+The product owner is `PortableFSWorkspaceService.app`, a per-user SMAppService
+LaunchAgent nested in the shipping app. It reuses the VZ machine, power adapter,
+coordinator, paired guest channel and persistent SSH identity owner. The menu app
+has a registration-only entrypoint; its exit does not own VM termination. The
+workspace service requires no FSKit registration. Image bundling, managed SSH
+include, menu/editor actions and installer/update integration remain separate,
+unqualified packaging work.
+
+`portablefs workspace` exposes only Start, Status, Mount, Umount and Stop, with
+the exact flags in `portablefs help workspace`. The service's operational-v1
+Unix socket is under the canonical account state at
+`~/.local/state/portablefs/workspace/control.sock`. Both peers require the same
+UID and the exact signed running image at its canonical path in one verified
+release. The shared audit-token validation checks pidversion, CS_VALID,
+CS_RUNTIME and the kernel CodeDirectory hash. Private socket modes alone grant
+no authority. Each request/reply is bounded to 2 MiB; duplicate/unknown fields,
+unequal versions and extra operations refuse. Command acceptance is distinct
+from guest job completion and pinned SSH readiness.
+
+Desired running state, descriptors, mount intents and retained outcomes commit
+through file sync, rename and directory sync. Stop preserves descriptors and
+Linux data; failed ordinary unmount or shutdown does not force. Initial grants
+are marked consumed before dispatch and never replayed after ambiguous delivery.
+Pending Mount remains owned by the existing coordinator across power transitions.
+A guest restart requests fresh initial authorization; persistent key/scope/epoch
+remain owned by the guest data disk.
+
+A durable execution witness is cleared only after confirmed VZ termination.
+Neither process exit nor a released service singleton proves VM absence. After
+an unconfirmed service crash, same-host-boot startup reports **Cleanup required**
+and refuses a successor. A different kernel boot-session identity proves the old
+execution absent. Automatic recovery earlier than that remains unproven by the
+public VZ lifetime contract; no old RAM is adopted or restored.
+
+A `.pfsworkspace` file is at most 512 KiB of exact-version JSON. `kind` is
+`connection`, `request`, or `authorization`. A connection contains canonical TLS
+authority identity, canonical volume ID, guest-reachable endpoint, TLS server
+name, public CA, route digest and hosted/standalone mode. Authority identity is
+SHA-256 of `portablefs-authority-identity/8` plus NUL and the canonical TLS server
+name (lowercase DNS without a terminal dot, or canonical IP). A dial-address
+alias or trust-root ordering cannot split the reservation namespace.
+
+The public request echoes the connection and a new mount intent and carries the
+canonical control-8 IdentityReply envelope (base64, including its length header,
+request ID 1). Hosted requests additionally expose `renewalScope` and canonical
+decimal-string `renewalEpoch`. The service saves it as
+`authorization-<volume-id>.pfsworkspace` in its private state directory. Operators
+sign the enclosed CSR with their existing standalone issuer. Hosted integrations
+use `workspacemount.IssueRequest` at the existing product-authenticated Manager
+boundary, then `workspacehost.HostedAuthorization` to wrap its response. The
+response echoes the complete saved request and adds the canonical control-8
+Provision envelope. `workspacehost.Document.Authorize` also wraps a standalone
+Provision. Import it with the same Mount verb. Wrong intent, key, authority,
+volume, route, scope or epoch refuses; neither file contains a private key or
+imports a signing key. The guest adds scope/epoch refusal checks before durable
+provisioning; the authority still verifies both signatures and single-use grants.
+Grant/enrollment bytes never appear in diagnostics.
+
+Both signed services reserve canonical authority/volume under the same stable
+`mount-transition.lock` inode before attach. `volume-reservations.json` retains
+pending/crashed ownership; only exact cleanup or confirmed VM absence releases
+it. A workspace same-path volume-ID collision also refuses. Other volumes can
+use both frontends. FSKit reads this inventory without starting a workspace or
+requiring it enabled. This is per-account arbitration; authority enforcement
+continues to govern other users and machines.
+
 ## Mount lifecycle
 
 The guest supervisor owns membership and recovery above each mount daemon.
@@ -509,7 +577,8 @@ guest accepts only host CID 2 on reserved port 1023, requires its independently 
 boot/service identity and exact release, and consumes one paired stream per
 boot. Disconnect discards its model; supervisor restart within that boot is
 refused. Mount and Umount dispatch real root-owned lifecycle work; Provision owns
-validation and durable storage. The dev process is the sole host caller; the signed-process local service API is Stage 2 work.
+validation and durable storage. The dev process remains a test-only host caller. The product service exposes
+the paired signed-process operational-v1 API described above.
 
 Host-side callers must pass the existing same-user signed-process/audit-token
 check. The guest channel must bind to the app-owned VM and fresh boot nonce.
@@ -537,9 +606,8 @@ reservations across both signed services and all CLI entry points. Consult
 authenticated live inventories; key by authority identity and volume, never an
 endpoint alias or display name. Authority exclusion remains the final global
 arbiter. A remote Mac writer can make Linux mutations return EBUSY; expose it.
-Other volumes may use FSKit concurrently. The cross-service reservation layer
-is pending and remains a supported-release requirement. Development mounts do
-not establish signed cross-service exclusion.
+Other volumes may use FSKit concurrently. The product cross-service reservation layer enforces this rule before attach.
+Development mounts do not establish signed cross-service exclusion.
 
 Use VZ NAT only, with direct guest DATA and CONTROL TLS to the advertised
 authority. Guest localhost means the guest; reject copied host-loopback
@@ -688,7 +756,7 @@ and recovery use the empty guest-owned roster. The FUSE probe is invoked only
 by the native gate as the ordinary workspace user, never by a boot service.
 Stage 1c implements real daemon suspension, protected root bootstrap, independent
 durable inventories and provisioning. Their native and fault qualification is
-required separately from Stage 1b evidence. Production service registration, app UI, workspace CLI,
+required separately from Stage 1b evidence. The product service, host API, CLI and public handoff are implemented. App UI,
 release packaging, update coordination and editor qualification remain pending.
 
 All new workspace surfaces are pending and unreleased: the control grammar,

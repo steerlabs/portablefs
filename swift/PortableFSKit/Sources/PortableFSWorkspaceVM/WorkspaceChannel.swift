@@ -153,8 +153,8 @@ import PortableFSWorkspaceCore
         var request = WorkspaceMountRequest(); request.mount = mount
         exchange(.mount(request), desired: true, deadline: deadline) { completion($0.map { $0.result }) }
     }
-    public func umount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
-        var request = WorkspaceUmountRequest(); request.mount = mount
+    public func umount(_ mount: WorkspaceMountID, force: Bool = false, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) {
+        var request = WorkspaceUmountRequest(); request.mount = mount; request.force = force
         exchange(.umount(request), desired: true, deadline: deadline) { completion($0.map { $0.result }) }
     }
     public func suspend(_ request: WorkspaceSuspension, deadline: UInt64, completion: @escaping (Result<WorkspaceSuspendAck, Error>) -> Void) {

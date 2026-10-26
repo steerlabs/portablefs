@@ -143,11 +143,13 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 	var id *pb.MountID
 	var provision *pb.Provision
 	var operation string
+ var force bool
 	switch b := request.Body.(type) {
 	case *pb.Envelope_Mount:
 		id, operation = b.Mount.Mount, "mount"
 	case *pb.Envelope_Umount:
 		id, operation = b.Umount.Mount, "umount"
+ force = b.Umount.Force
 	case *pb.Envelope_Provision:
 		id, operation, provision = b.Provision.Mount, "provision", clone(b.Provision)
 	default:
@@ -180,7 +182,7 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 			return ErrPredecessorUnobserved
 		}
 	}
-	j := &mountJob{status: &pb.MountJob{Mount: clone(id), RequestId: request.RequestId, Generation: s.generation, Operation: operation, Phase: "offered"}, done: make(chan struct{})}
+	j := &mountJob{status: &pb.MountJob{Mount: clone(id), RequestId: request.RequestId, Generation: s.generation, Operation: operation, Force: force, Phase: "offered"}, done: make(chan struct{})}
 	s.jobs[key] = j
 	go s.runJob(s.generationContext, j, provision)
 	return nil

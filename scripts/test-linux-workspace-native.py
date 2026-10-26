@@ -15,6 +15,7 @@ import shutil
 import signal
 from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_lifecycle import lifecycle_checks
+from linux_workspace_native_product import product_checks
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
@@ -322,6 +323,7 @@ try:
     assert stopped['operations'][-1] == 'shutdown-completed'
     assert guest.p.wait(timeout=10) == 0
     record('clean-stop')
+    product_checks(image, root / "product", record, authority=authority)
     assert sorted(passed) == sorted(required), (passed, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state)}, indent=2) + '\n')
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)

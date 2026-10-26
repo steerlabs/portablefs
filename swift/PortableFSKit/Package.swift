@@ -18,7 +18,9 @@ let package = Package(
         .library(name: "PortableFSAppCore", targets: ["PortableFSAppCore"]),
         .library(name: "PortableFSWorkspaceCore", targets: ["PortableFSWorkspaceCore"]),
         .library(name: "PortableFSWorkspaceVM", targets: ["PortableFSWorkspaceVM"]),
-        .executable(name: "portablefs-workspace-dev", targets: ["PortableFSWorkspaceDev"])
+        .executable(name: "portablefs-workspace-dev", targets: ["PortableFSWorkspaceDev"]),
+        .executable(name: "portablefs-workspace-service", targets: ["PortableFSWorkspaceService"]),
+        .executable(name: "portablefs-workspace-service-test-host", targets: ["WorkspaceServiceTestHost"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.39.0")
@@ -27,9 +29,12 @@ let package = Package(
         .target(name: "CWorkspacePower", cSettings: [.define("PFS_WORKSPACE_BUILD_COMMIT", to: "\"" + workspaceCommit + "\"")]),
         .target(name: "PortableFSWorkspaceVM", dependencies: ["PortableFSWorkspaceCore", "CWorkspacePower"]),
         .executableTarget(name: "PortableFSWorkspaceDev", dependencies: ["PortableFSWorkspaceVM"]),
+        .executableTarget(name: "PortableFSWorkspaceService", dependencies: ["PortableFSWorkspaceVM", "PortableFSAppCore"]),
+        .executableTarget(name: "WorkspaceServiceTestHost", dependencies: ["PortableFSAppCore"], path: "Fixtures/WorkspaceServiceTestHost"),
         .target(
             name: "PortableFSWorkspaceCore",
             dependencies: [
+                "PortableFSAppCore",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf")
             ]
         ),

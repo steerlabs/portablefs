@@ -561,6 +561,29 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
         }
     }
     public func vmStopped(reason: String) { self.reason = reason; finishStop() }
+    // Product Stop has already joined ordinary unmount jobs. A refused guest
+    // shutdown remains running; only explicit Force Stop or the independent
+    // power-safety owner may discard RAM.
+    public func stopOrderly(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard case .running = state, pendingSleep == nil, requestedMounts.isEmpty else { completion(.failure(WorkspaceControlError.transition)); return }
+        let transaction = StopTransaction()
+        state = .stopping(transaction)
+        vm.shutdown { [weak self] result in
+            guard let self else { completion(.failure(WorkspaceControlError.transition)); return }
+            switch self.state {
+            case .stopping(let current), .unknown(.some(let current)):
+                guard current === transaction else { completion(.failure(WorkspaceControlError.transition)); return }
+                switch result {
+                case .success: self.finishStop(); completion(.success(()))
+                case .failure(let error):
+                    self.state = .running; self.reason = "orderly shutdown refused"
+                    completion(.failure(error))
+                    if !self.notifications.isEmpty { self.powerEvent(.unknown) }
+                }
+            default: completion(.failure(WorkspaceControlError.transition))
+            }
+        }
+    }
     public func stop() {
         if case .unknown = state { reconcileUnknown(); return }
         let clean = phase == .running

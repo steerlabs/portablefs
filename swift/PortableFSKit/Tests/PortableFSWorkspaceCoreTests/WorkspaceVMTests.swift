@@ -148,9 +148,9 @@ private func temporaryDirectory() throws -> URL {
     @Test func missingClientPublicKeyIsReconstructedFromDurableIdentity() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let before: String
-        do { let state = try WorkspaceDevState(directory: directory); before = try state.authorizedKey }
+        do { let state = try WorkspaceState(directory: directory); before = try state.authorizedKey }
         try FileManager.default.removeItem(at: directory.appendingPathComponent("client_ed25519.pub"))
-        let reopened = try WorkspaceDevState(directory: directory)
+        let reopened = try WorkspaceState(directory: directory)
         #expect(try reopened.authorizedKey == before)
         #expect(reopened.formatAuthorized == "8")
         try reopened.formatCompleted()
@@ -159,12 +159,12 @@ private func temporaryDirectory() throws -> URL {
     @Test func unsafeStateDirectoryRefused() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
-        #expect(throws: (any Error).self) { try WorkspaceDevState(directory: directory) }
+        #expect(throws: (any Error).self) { try WorkspaceState(directory: directory) }
     }
     @Test func sshConfigEscapesPercentInEveryPath() throws {
         let parent = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: parent) }
         let directory = parent.appendingPathComponent("literal %h %d")
-        let state = try WorkspaceDevState(directory: directory)
+        let state = try WorkspaceState(directory: directory)
         let path = try state.pin(hostKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample")
         let config = try String(contentsOf: path, encoding: .utf8)
         for directive in ["ProxyCommand", "IdentityFile", "UserKnownHostsFile"] {
@@ -175,8 +175,8 @@ private func temporaryDirectory() throws -> URL {
     }
     @Test func persistentHostPinAndExclusiveOwner() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
-        let state = try WorkspaceDevState(directory:directory)
-        #expect(throws: (any Error).self) { try WorkspaceDevState(directory:directory) }
+        let state = try WorkspaceState(directory:directory)
+        #expect(throws: (any Error).self) { try WorkspaceState(directory:directory) }
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexample"
         _ = try state.pin(hostKey:key)
         _ = try state.pin(hostKey:key)
