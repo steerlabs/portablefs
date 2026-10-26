@@ -326,26 +326,11 @@ func runInstallMacOSAppWithLayout(
 	defer guard.Close()
 	// Hold the exact canonical workspace singleton across publication and
 	// rollback. No service execution may enter behind the final absence proof.
-	if layout.codeIdentity == macOSInstallDeveloperIDRelease {
-		workspaceExclusion, err := mountlifecycle.AcquireNamedExclusive(filepath.Join(stateDir, "workspace"), "service.lock")
-		if err != nil {
-			return macOSInstallResult{}, fmt.Errorf("workspace singleton release unconfirmed: %w", err)
-		}
-		defer workspaceExclusion.Close()
-		ownerExclusion, err := mountlifecycle.AcquireNamedExclusive(filepath.Join(stateDir, "workspace"), "owner.lock")
-		if err != nil {
-			return macOSInstallResult{}, fmt.Errorf("workspace VM owner singleton release unconfirmed: %w", err)
-		}
-		defer ownerExclusion.Close()
-		if err := requireWorkspaceResourcesAbsent(stateDir); err != nil {
-			return macOSInstallResult{}, err
-		}
-		for _, name := range []string{"control.sock", "ssh.sock"} {
-			if _, err := os.Lstat(filepath.Join(stateDir, "workspace", name)); !os.IsNotExist(err) {
-				return macOSInstallResult{}, fmt.Errorf("workspace endpoint absence unconfirmed: %s: %v", name, err)
-			}
-		}
+	releaseWorkspace, err := excludeAbsentWorkspace(stateDir, layout)
+	if err != nil {
+		return macOSInstallResult{}, err
 	}
+	defer releaseWorkspace()
 
 	if updateSession != nil {
 		if err := rejectPreparedMacOSRuntime(

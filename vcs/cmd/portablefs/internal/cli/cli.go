@@ -141,6 +141,7 @@ func commands() []command {
 		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},
 		{"lifecycle", "hold the internal mount/update lifecycle guard", cmdLifecycle},
 		{"install-macos-app", "install the signed macOS app bundle", cmdInstallMacOSApp},
+		{"uninstall-macos-app", "remove the signed macOS app and retain workspace data", cmdUninstallMacOSApp},
 		{"mount-check", "inspect this host's mount transport without changing it", cmdMountCheck},
 		{"doctor", "check this machine's PortableFS setup and report problems", cmdDoctor},
 		{"install-linux-release", "atomically activate a verified Linux release", cmdInstallLinuxRelease},

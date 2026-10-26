@@ -583,7 +583,9 @@ public enum PortableFSDServiceCoordinator {
                 "the installer fence target is not this sealed release"
             )
         }
-        try quiesceWorkspaceForInstaller(bundle: bundle)
+        // The installer retains both workspace singletons through activation
+        // and fencing. Reacquiring them here would contend with that owner;
+        // the pending product lease already forbids workspace admission.
         let service = SMAppService.agent(plistName: configuration.plistName)
         if service.status == .notRegistered {
             let paths = try runtimePaths(bundle: bundle)

@@ -460,6 +460,17 @@ installation (`install-linux-release` / `install-macos-app`), so path resolution
 the lifecycle guard, and the atomic activation swap are done by code that has
 already been proven authentic.
 
+Whole-app removal runs `portablefs uninstall-macos-app` from the installed
+helper. A custom installation link directory uses the same `--link-dir` value
+as installation. Removal authenticates its enclosing installed release, uses
+the outgoing host's tokenized clean-drain transaction, then retains account,
+mount-lifecycle and workspace singleton exclusion through deletion. It removes
+only the authenticated app and its snapshotted CLI symlink. Workspace data and
+unrelated files remain. Replaced app, directory or link names refuse deletion.
+Only after durable program-name absence may that live removal token retire its
+exact same-release `old-absent` lease. An interrupted or ambiguous handoff keeps
+the nonterminal fence; expiration never authorizes tokenless cleanup.
+
 ## The policy that keeps it from drifting
 
 Two dependency-free Node scripts are the enforcement. They run in `release.yml`
