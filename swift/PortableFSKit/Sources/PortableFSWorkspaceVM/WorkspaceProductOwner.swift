@@ -54,7 +54,7 @@ import PortableFSWorkspaceCore
                 scheduleUpdate()
             default: throw WorkspaceControlError.grammar
             }
-            failure = ""
+            if request.operation != "status" { failure = "" }
             return snapshot()
         } catch {
             var reply = snapshot(); reply.state = "refused"; reply.message = String(describing: error); return reply

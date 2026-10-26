@@ -92,6 +92,18 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
         try store.requirePriorExecutionAbsent(hostBoot:"new-host-boot")
         #expect(store.value.execution == nil)
     }
+    @Test @MainActor func statusPollingRetainsSetupRefusalUntilAnExplicitRetry() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
+        let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") {
+            throw WorkspaceVMError("SSH name already in use")
+        }
+        #expect(owner.handle(try productRequest("start")).message == "SSH name already in use")
+        for _ in 0..<3 {
+            let status = owner.handle(try productRequest("status"))
+            #expect(status.state == "cleanup-required"); #expect(status.message == "SSH name already in use")
+        }
+    }
     @Test @MainActor func pendingMountKeepsIntentAcrossTransitionAndRequiresExactResponse() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()

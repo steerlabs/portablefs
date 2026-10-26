@@ -97,7 +97,7 @@ public extension WorkspaceProductRuntime { var failureMessage: String { "" } }
                     }
                 }
                 sshProbe = probe; try probe.run()
-            } catch { failureMessage = error.localizedDescription; coordinator.channelLost(String(describing: error)) }
+            } catch { failureMessage = String(describing: error); coordinator.channelLost(String(describing: error)) }
         }
         if phase == .stopped || phase == .unknown || phase == .stopping { ready = false; bridge.close() }
         onChange?()
