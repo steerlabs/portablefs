@@ -206,8 +206,13 @@ import PortableFSWorkspaceCore
             case "probe-unavailable-jobs":
                 guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
                 pendingCommand = command
-                var mount = WorkspaceMountID(); mount.authorityID = Data(repeating: 1, count: 32); mount.volumeID = "unavailable-probe"; mount.incarnation = random.next()
-                probeUnavailableJobs(mount, index: 0, requests: [], deadline: clock.now + 5_000_000_000)
+                var request = WorkspaceIdentityRequest(); request.authorityID = Data(repeating: 1, count: 32); request.volumeID = "unavailable-probe"
+                let deadline = clock.now + 5_000_000_000
+                channel.identity(request, deadline: deadline) { [weak self] result in
+                    guard let self else { return }
+                    do { self.probeUnavailableJobs(try result.get().mount, index: 0, requests: [], deadline: deadline) }
+                    catch { self.fail(error) }
+                }
             case "stop": stop(exitCode: 0)
             default: event("refused", ["command": command])
             }

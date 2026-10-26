@@ -419,7 +419,7 @@ func (m *Manager) cleanupProvisionOnly(ctx context.Context, id *pb.MountID) erro
 	}
 	instance := "mnt_" + base64.RawURLEncoding.EncodeToString(id.Incarnation)
 	run := &Desired{Mount: id, KernelBoot: strings.TrimSpace(string(boot)), Witness: Witness{Intent: instance, Source: "portablefs:" + instance, Target: target}, Outcome: control.UnknownOutcome()}
-	return m.Identity.Reissue(&pb.IdentityRequest{AuthorityId: id.AuthorityId, VolumeId: id.VolumeId}, false, func() error {
+	return m.Identity.RetireProvision(id, func() error {
 		if _, err := fusev3.ObservePlannedKernelMountAbsent(run.Witness.Source, run.Witness.Target); err != nil {
 			return err
 		}

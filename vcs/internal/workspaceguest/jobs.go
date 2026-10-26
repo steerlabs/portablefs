@@ -143,13 +143,13 @@ func (s *Supervisor) AcceptJob(request *pb.Envelope) error {
 	var id *pb.MountID
 	var provision *pb.Provision
 	var operation string
- var force bool
+	var force bool
 	switch b := request.Body.(type) {
 	case *pb.Envelope_Mount:
 		id, operation = b.Mount.Mount, "mount"
 	case *pb.Envelope_Umount:
 		id, operation = b.Umount.Mount, "umount"
- force = b.Umount.Force
+		force = b.Umount.Force
 	case *pb.Envelope_Provision:
 		id, operation, provision = b.Provision.Mount, "provision", clone(b.Provision)
 	default:
