@@ -151,6 +151,12 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
 }
 
 @Suite struct WorkspacePresentationTests {
+    @Test func terminalDocumentExecutesOnlyTheManagedAliasAndRemovesItself() throws {
+        let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let document = try PortableFSWorkspaceTerminal.commandFile(in: home)
+        #expect(try String(contentsOf: document, encoding: .utf8) == "#!/bin/sh\n/bin/rm -- \"$0\"\nexec /usr/bin/ssh portablefs-workspace\n")
+        #expect((try FileManager.default.attributesOfItem(atPath: document.path)[.posixPermissions] as? NSNumber)?.intValue == 0o700)
+    }
     @Test func statusDoesNotStartServiceOrHideRetainedStateWhenSocketIsMissing() async throws {
         let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }
         let client = PortableFSWorkspaceClient(home: home)

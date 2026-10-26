@@ -98,10 +98,16 @@ import ServiceManagement
     }
     public func terminal() {
         guard status.canConnect else { return }
-        let source = "tell application \"Terminal\"\nactivate\ndo script \"ssh portablefs-workspace\"\nend tell"
-        var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
-        if let error { detail = "Terminal could not open SSH: \(error)" }
+        do {
+            guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { throw PortableFSWorkspaceError("Terminal is not available.") }
+            let document = try PortableFSWorkspaceTerminal.commandFile(in: FileManager.default.temporaryDirectory)
+            NSWorkspace.shared.open([document], withApplicationAt: terminal, configuration: .init()) { _, error in
+                if let error {
+                    try? FileManager.default.removeItem(at: document)
+                    Task { @MainActor in self.detail = "Terminal could not open SSH: \(error.localizedDescription)" }
+                }
+            }
+        } catch { detail = error.localizedDescription }
     }
     public func editor(_ editor: PortableFSWorkspaceEditor, volume: PortableFSWorkspaceVolume) {
         guard status.canConnect, volume.canOpen else { return }

@@ -1,5 +1,18 @@
 import AppKit
+import Darwin
 import Foundation
+
+enum PortableFSWorkspaceTerminal {
+    /// Terminal's ordinary command-document path requires no Automation grant.
+    /// The generated document removes only itself before starting plain SSH.
+    static func commandFile(in directory: URL) throws -> URL {
+        let file = directory.appendingPathComponent("PortableFS-Connect-" + UUID().uuidString + ".command")
+        let contents = Data("#!/bin/sh\n/bin/rm -- \"$0\"\nexec /usr/bin/ssh portablefs-workspace\n".utf8)
+        try contents.write(to: file, options: .withoutOverwriting)
+        guard chmod(file.path, 0o700) == 0 else { try? FileManager.default.removeItem(at: file); throw PortableFSWorkspaceError("Could not prepare Terminal") }
+        return file
+    }
+}
 
 public enum PortableFSWorkspaceEditor: String, CaseIterable, Sendable {
     case vscode, cursor
