@@ -1,6 +1,7 @@
 """Throwaway SMAppService tests; no installed app identities or SSH config."""
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
@@ -19,6 +20,10 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
     evidence.mkdir(parents=True, exist_ok=True)
     root = pathlib.Path(tempfile.mkdtemp(prefix='pfs-wsp-', dir='/private/tmp'))
     home = root/'home'; home.mkdir(mode=0o700)
+    # Faults operate only on this invocation's image, including after a crash.
+    test_image = root/'image'
+    subprocess.run(['/bin/cp', '-cR', str(pathlib.Path(image).resolve()), str(test_image)], check=True)
+
     app = root/'PortableFS Workspace Test.app'
     contents = app/'Contents'
     service = contents/'Library/LaunchAgents/PortableFSWorkspaceService.app'
@@ -43,12 +48,13 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
     version = json.loads((pathlib.Path(image)/'release.json').read_text())['app_version'] if pathlib.Path(image,'release.json').exists() else 'dev'
     info = {'CFBundleIdentifier':identifier,'CFBundleExecutable':'PortableFS','CFBundleName':'PortableFS Workspace Test '+identifier.rsplit('.',1)[-1][:8],
             'CFBundlePackageType':'APPL','CFBundleVersion':'1','CFBundleShortVersionString':version,'LSBackgroundOnly':True,
-            'PFSWorkspaceTestHome':str(home),'PFSWorkspaceTestImage':str(pathlib.Path(image).resolve())}
+            'PFSWorkspaceTestHome':str(home),'PFSWorkspaceTestImage':str(test_image)}
     with (contents/'Info.plist').open('wb') as f: plistlib.dump(info,f)
     with (service/'Contents/Info.plist').open('wb') as f:
         plistlib.dump({'CFBundleIdentifier':identifier+'.WorkspaceService','CFBundleExecutable':'portablefs-workspace-service',
                       'CFBundleName':'PortableFS Workspace Test Service','CFBundlePackageType':'APPL','CFBundleVersion':'1',
-                      'CFBundleShortVersionString':version,'LSBackgroundOnly':True,'LSMinimumSystemVersion':'26.0'},f)
+                      'CFBundleShortVersionString':version,'LSBackgroundOnly':True,'LSMinimumSystemVersion':'26.0',
+                      'PFSWorkspaceImageManifestSHA256':hashlib.sha256((test_image/'manifest.json').read_bytes()).hexdigest()},f)
     with (contents/'Library/LaunchAgents'/ (label+'.plist')).open('wb') as f:
         plistlib.dump({'Label':label,'BundleProgram':'Contents/Library/LaunchAgents/PortableFSWorkspaceService.app/Contents/MacOS/portablefs-workspace-service',
                       'RunAtLoad':True,'KeepAlive':True,'StandardErrorPath':str(evidence/'service.stderr'),'StandardOutPath':str(evidence/'service.stdout')},f)
@@ -119,6 +125,20 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
         for args in [('shell',),('pause',),('identity',),('exec','true'),('vm-list',),('start','--json')]: assert command(*args,success=False).returncode==2
         record('service-api-cli-five-verbs')
         if api_only: return
+        kernel = test_image/'kernel'
+        with kernel.open('r+b') as image_file:
+            original = image_file.read(1)
+            image_file.seek(0); image_file.write(bytes([original[0] ^ 1]))
+        refused = command('start', success=False)
+        assert refused.returncode == 1 and 'Workspace image failed verification' in refused.stdout
+        with kernel.open('r+b') as image_file: image_file.write(original)
+        record('service-corrupted-image-refusal')
+        manifest = test_image/'manifest.json'; original_manifest = manifest.read_bytes()
+        manifest.write_bytes(original_manifest + b' ')
+        refused = command('start', success=False)
+        assert refused.returncode == 1 and 'Workspace image failed verification' in refused.stdout
+        manifest.write_bytes(original_manifest)
+        record('service-image-manifest-pin')
         command('start');command('start')
         until(lambda s:s['state']=='running')
         record('service-start-idempotent')

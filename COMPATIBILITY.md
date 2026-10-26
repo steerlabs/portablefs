@@ -544,11 +544,12 @@ extension from one immutable commit, with exact executable and bundle matching.
 See [docs/release-identity.md](./docs/release-identity.md).
 
 A Mac release is identified by exactly its daemon's CodeDirectory hash,
-executable SHA-256, and release version. Protocol numbers are not part of the
-release identity and are not sealed into the bundle: after a release and its
-running daemon are authenticated, the daemon reports its own live identity
-(schema 1, control protocol, `pfslocal` major and minor). Before any socket
-request, the CLI and the app authenticate the daemon peer identically: from
+executable SHA-256, and release version. Daemon control and `pfslocal` numbers
+are not part of that tuple and have no sealed daemon protocol manifest: after a release and its running daemon are
+authenticated, the daemon reports its own live identity
+(schema 1, control protocol, `pfslocal` major and minor). The separate sealed
+guest manifest binds the workspace image's exact authority major, source commit
+and image inputs. Before any socket request, the CLI and the app authenticate the daemon peer identically: from
 the connection's kernel audit token they require the same user, the exact
 canonical daemon path inside the authenticated owning bundle, the running
 image's kernel CodeDirectory hash equal to the release's, and valid,

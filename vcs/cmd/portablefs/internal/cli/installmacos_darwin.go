@@ -4432,14 +4432,16 @@ func preflightMacOSInstallSpace(sourceApp, destinationDirectory string) error {
 	if err != nil {
 		return err
 	}
-	if expanded > (^uint64(0)-(2<<30))/2 {
+	if expanded > ^uint64(0)-(2<<30) {
 		return fmt.Errorf("installer size overflow")
 	}
 	var space unix.Statfs_t
 	if err := unix.Statfs(destinationDirectory, &space); err != nil {
 		return fmt.Errorf("check install free space: %w", err)
 	}
-	required := 2*expanded + (2 << 30)
+	// Source extraction and the download already consume space on their
+	// filesystem. Only the staged copy is additional at this boundary.
+	required := expanded + (2 << 30)
 	available := uint64(space.Bavail) * uint64(space.Bsize)
 	if available < required {
 		return fmt.Errorf("Not enough disk space: need %d bytes; available %d", required, available)

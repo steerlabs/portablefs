@@ -125,7 +125,10 @@ termination. The installer acquires the exclusive guard, proves exact FSKit abse
 `resources.present` name absent. It never decodes an outgoing desired-state
 registry. The service publishes this marker durably before VM execution and
 retires it only after confirmed termination, reservation release and loss-free,
-observed outcome evidence. Busy, unknown and lost work defer unattended update.
+observed outcome evidence. Unexpected termination or explicit Force Stop keeps
+an unobserved-execution fact in that witness, even if no guest status arrived.
+A subsequent clean boot does not erase that earlier uncertainty. Busy, unknown
+and lost work defer unattended update.
 
 The existing token-bound activation lease also closes workspace admission in
 every nonterminal phase, including an expired interrupted transaction. It closes

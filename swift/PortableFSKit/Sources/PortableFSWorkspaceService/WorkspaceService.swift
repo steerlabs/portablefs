@@ -31,12 +31,8 @@ import PortableFSWorkspaceVM
             let owner = WorkspaceProductOwner(store: store, reservationDirectory: account, hostBoot: try WorkspaceHostState.hostBootIdentity()) {
                 let artifact: WorkspaceArtifact
                 do {
-                    #if WORKSPACE_SERVICE_TESTING
-                    artifact = try WorkspaceArtifact(directory: image)
-                    #else
                     guard let pin = Bundle.main.object(forInfoDictionaryKey: "PFSWorkspaceImageManifestSHA256") as? String else { throw WorkspaceVMError("missing image pin") }
                     artifact = try WorkspaceArtifact(directory: image, manifestSHA256: pin)
-                    #endif
                 } catch { throw WorkspaceVMError("Workspace image failed verification") }
                 guard artifact.release.appVersion == bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String else { throw WorkspaceVMError("Workspace image failed verification") }
                 return try WorkspaceVMRuntime(artifact: artifact, directory: directory)

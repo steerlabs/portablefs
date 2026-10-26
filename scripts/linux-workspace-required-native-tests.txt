@@ -54,6 +54,8 @@ service-authenticated-status
 service-unsigned-peer-refusal
 service-cross-release-refusal
 service-api-cli-five-verbs
+service-corrupted-image-refusal
+service-image-manifest-pin
 service-start-idempotent
 service-app-exit-vm-alive
 service-document-standalone

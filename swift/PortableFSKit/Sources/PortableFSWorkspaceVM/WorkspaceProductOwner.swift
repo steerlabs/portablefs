@@ -10,6 +10,8 @@ import PortableFSAppCore
     private let reservationDirectory: URL
     private let hostBoot: String
     private let factory: Factory
+    private var runtimeStarted = false
+    private var cleanStopConfirmed = false
     private var runtimeAdmission: WorkspaceFileLock?
     private var runtime: (any WorkspaceProductRuntime)?
     private var latest: WorkspaceStatusReply?
@@ -127,9 +129,10 @@ import PortableFSAppCore
             // Desired availability, key/scope (in guest) and old evidence survive.
             for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity" }
         }
+        runtimeStarted = false; cleanStopConfirmed = false
         runtimeAdmission = admission
         runtime = instance
-        do { try instance.start() }
+        do { try instance.start(); runtimeStarted = true }
         catch { failure=String(describing:error);scheduleUpdate();throw error }
         withExtendedLifetime(transition) {}
     }
@@ -163,6 +166,10 @@ import PortableFSAppCore
     private func update() {
         do {
             if let runtime, runtime.phase == .stopped {
+                // Termination proves resource absence, never the outcome of
+                // work whose final drain was not observed. Keep that fact
+                // across future boots, even if no status frame arrived.
+                if runtimeStarted && !cleanStopConfirmed { try store.retainUnobservedExecution() }
                 try store.commit { state in
                     if let raw=state.current, let frame=try? WorkspaceControl.decode(raw), !frame.statusReply.mounts.isEmpty, !state.retained.contains(raw) {
                         guard state.retained.count < 128 else { throw WorkspaceVMError("workspace evidence capacity reached") }
@@ -195,10 +202,18 @@ import PortableFSAppCore
                     return
                 }
                 guard !(latest?.jobs.contains { $0.phase == "offered" || $0.phase == "running" } ?? false) else { return }
+                // A Provision that finished but never dispatched Mount has
+                // no mounted work to drain. Every accepted Mount/Umount must
+                // instead publish its exact final status before shutdown.
+                for volume in store.value.volumes where volume.operation == "mount" {
+                    try changeVolume(volume) { $0.operation = "identity"; $0.request = nil; $0.authorizationConsumed = false }
+                }
+                guard !store.value.volumes.contains(where: { $0.authorizationConsumed }) else { return }
                 guard !shutdownIssued else { return }; shutdownIssued = true
                 runtime.stop(force: false) { [weak self] result in
                     guard let self else { return }; self.shutdownIssued = false
                     if case .failure = result { self.stopRequested = false; self.failure = "Workspace is still running: orderly shutdown failed" }
+                    else { self.cleanStopConfirmed = true }
                     self.scheduleUpdate()
                 }; return
             }
@@ -313,7 +328,9 @@ import PortableFSAppCore
         guard store.value.execution == nil else { throw WorkspaceVMError("VM termination unconfirmed") }
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         for entry in transition.inventory where entry.frontend == "workspace" { try transition.release(entry) }
-        try store.publishEmptyResources()
+        if !store.previousWriteOutcomeUnknown && !WorkspaceHostState.hasUnresolvedOutcome(store.value) {
+            try store.publishEmptyResources()
+        }
     }
     // Lifecycle v1 is independent of the paired operational version. Quiesce
     // closes this serving execution's admission only after exact VM absence;
@@ -324,13 +341,14 @@ import PortableFSAppCore
         reply.executionPresent=runtime != nil || store.value.execution != nil
         reply.desiredRunning=store.value.running
         if request.operation == "quiesce" {
-            guard !reply.executionPresent, !store.value.running, inFlight.isEmpty, !WorkspaceHostState.hasUnresolvedOutcome(store.value) else { reply.state="busy";return reply }
+            guard !reply.executionPresent, !store.value.running, inFlight.isEmpty, !store.previousWriteOutcomeUnknown, !WorkspaceHostState.hasUnresolvedOutcome(store.value) else { reply.state="busy";return reply }
             try releaseAbsentReservations();quiescing=true;reply.state="quiesced"
         } else { reply.state=request.operation }
         return reply
     }
     public func snapshot() -> WorkspaceHostReply {
         var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.value.retained
+        result.previousWriteOutcomeUnknown = store.previousWriteOutcomeUnknown || runtime == nil && store.value.execution != nil
         if !failure.isEmpty { result.state = "cleanup-required"; result.message = failure }
         else if runtime == nil, store.value.execution != nil { result.state="cleanup-required";result.message="Cleanup required" }
         else if let runtime {
@@ -344,7 +362,7 @@ import PortableFSAppCore
             guard let frame = try? WorkspaceControl.decode(evidence) else { continue }
             let statuses = frame.statusReply.mounts + frame.statusReply.retired.filter(\.hasMountStatus).map(\.mountStatus)
             result.someChangesWereNotSaved = result.someChangesWereNotSaved || statuses.contains { !$0.loss.isEmpty || $0.outcome.durability == "lost" }
-            result.previousWriteOutcomeUnknown = result.previousWriteOutcomeUnknown || statuses.contains { $0.outcome.observation == "unobserved" }
+            result.previousWriteOutcomeUnknown = result.previousWriteOutcomeUnknown || statuses.contains { $0.outcome.observation == "unobserved" || $0.outcome.durability == "unresolved" }
         }
         for desired in store.value.volumes {
             let state: String

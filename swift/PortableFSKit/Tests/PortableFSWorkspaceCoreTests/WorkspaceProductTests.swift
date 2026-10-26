@@ -358,3 +358,36 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     #expect(try store.directory.read("resources.present") != nil)
     #expect(store.value.retained == [raw])
 }
+
+@Test @MainActor func productForceStopWithoutStatusKeepsUnknownOutcomeAcrossSuccessor() async throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
+    let runtime = try ProductRuntime()
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { runtime }
+    _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
+    _ = owner.handle(try productRequest("stop", force: true)); try await productTurn(); try await productTurn()
+    #expect(store.value.execution == nil)
+    #expect(owner.snapshot().previousWriteOutcomeUnknown)
+    #expect(try store.directory.read("resources.present") == Data("8\nunobserved\n".utf8))
+    _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
+    _ = owner.handle(try productRequest("stop")); try await productTurn(); try await productTurn()
+    #expect(store.value.execution == nil)
+    #expect(store.previousWriteOutcomeUnknown)
+    #expect(throws: (any Error).self) { try store.publishEmptyResources() }
+    let quiesce = try WorkspaceHostLifecycleRequest.decode(Data("{\"lifecycleVersion\":1,\"operation\":\"quiesce\"}".utf8))
+    #expect(try owner.lifecycle(quiesce).state == "busy")
+}
+
+@Test func productUnknownExecutionWitnessSurvivesServiceRecreation() throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    do {
+        let store = try WorkspaceHostState(directory: directory)
+        try store.retainUnobservedExecution()
+        try store.commit { $0.running = false }
+    }
+    let reopened = try WorkspaceHostState(directory: directory)
+    #expect(reopened.previousWriteOutcomeUnknown)
+    try reopened.commit { $0.running = false }
+    #expect(throws: (any Error).self) { try reopened.publishEmptyResources() }
+    #expect(try reopened.directory.read("resources.present") == Data("8\nunobserved\n".utf8))
+}

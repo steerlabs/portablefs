@@ -141,7 +141,8 @@ unrelated writes can still exhaust space later.
 
 Each final ZIP has a `.space.json` with measured compressed and expanded bytes,
 peak extraction, same-size update and additional required free bytes. The update
-bound retains both app copies and the archive without assuming sparse copying
-or APFS clones. Existing user data is excluded from incremental space and is
+bound retains the old app, extracted source app, staged replacement and archive
+without assuming sparse copying or APFS clones. The initial-install bound omits
+the old app; additional free bytes count the two new copies, archive and reserve. Existing user data is excluded from incremental space and is
 retained. A signed release's final sizes come from the actual notarized and
 stapled ZIP, not the guest archive's estimated contribution.

@@ -302,8 +302,8 @@ privilege or accidental CLI privilege.
 **An exact paired-release identity.** The CLI, app, daemon, and extension are
 one paired release. A release is identified by exactly three values: the
 daemon's CodeDirectory hash, its executable SHA-256, and the release version.
-Protocol numbers are not part of that identity and the bundle carries no
-protocol manifest; the authenticated daemon reports its own live identity
+Daemon control and `pfslocal` numbers are not part of that identity and have no
+sealed daemon protocol manifest; the authenticated daemon reports its own live identity
 (identity schema 1, operational control, `pfslocal` major and minor). Static
 release authentication still covers signatures, hardened runtime,
 entitlements, sealed resources, the fixed layout, exact executable matching,

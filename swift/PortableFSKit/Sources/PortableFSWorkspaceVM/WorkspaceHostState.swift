@@ -34,6 +34,7 @@ public struct WorkspaceDesiredState: Codable, Sendable {
 public final class WorkspaceHostState {
     public let directory: WorkspacePrivateDirectory
     private let singleton: WorkspaceFileLock
+    public private(set) var previousWriteOutcomeUnknown = false
     public private(set) var value: WorkspaceDesiredState
     public init(directory: URL) throws {
         self.directory = try WorkspacePrivateDirectory(directory)
@@ -50,6 +51,11 @@ public final class WorkspaceHostState {
             if let request = volume.request { try request.validate(); guard request.connection == volume.connection, request.intent == volume.intent else { throw WorkspaceControlError.grammar } }
         }
         for raw in value.retained { _ = try WorkspaceControl.decode(raw) }
+        switch try self.directory.read("resources.present", limit: 64) {
+        case nil, Data("8\n".utf8): break
+        case Data("8\nunobserved\n".utf8): previousWriteOutcomeUnknown = true
+        default: throw WorkspaceVMError("invalid workspace resource witness")
+        }
     }
     public func commit(_ update: (inout WorkspaceDesiredState) throws -> Void) throws {
         var next = value; try update(&next)
@@ -58,20 +64,23 @@ public final class WorkspaceHostState {
         // The absence of this name is the cross-release empty-resource proof.
         // Publish it before an execution can exist; retire it only after both
         // durable desired state and clean termination/loss evidence settle.
-        let hasResources = next.execution != nil || Self.hasUnresolvedOutcome(next)
-        if hasResources { try directory.write("resources.present", data: Data("8\n".utf8)) }
+        let hasResources = next.execution != nil || Self.hasUnresolvedOutcome(next) || previousWriteOutcomeUnknown
+        if hasResources { try directory.write("resources.present", data: Data((previousWriteOutcomeUnknown ? "8\nunobserved\n" : "8\n").utf8)) }
         try directory.write("desired.json", data: raw); value = next
-
+    }
+    public func retainUnobservedExecution() throws {
+        try directory.write("resources.present", data: Data("8\nunobserved\n".utf8))
+        previousWriteOutcomeUnknown = true
     }
     public func publishEmptyResources() throws {
-        guard value.execution == nil, !Self.hasUnresolvedOutcome(value) else { throw WorkspaceVMError("workspace outcome is unresolved") }
+        guard value.execution == nil, !previousWriteOutcomeUnknown, !Self.hasUnresolvedOutcome(value) else { throw WorkspaceVMError("workspace outcome is unresolved") }
         try directory.remove("resources.present")
     }
     public static func hasUnresolvedOutcome(_ state: WorkspaceDesiredState) -> Bool {
         for raw in state.retained + (state.current.map { [$0] } ?? []) {
             guard let frame = try? WorkspaceControl.decode(raw) else { return true }
             let statuses = frame.statusReply.mounts + frame.statusReply.retired.filter(\.hasMountStatus).map(\.mountStatus)
-            if statuses.contains(where: { !$0.loss.isEmpty || $0.outcome.durability == "lost" || $0.outcome.observation == "unobserved" }) { return true }
+            if statuses.contains(where: { !$0.loss.isEmpty || $0.outcome.durability != "durable" || $0.outcome.observation != "observed" || !["released", "expired"].contains($0.outcome.release) || $0.outcome.cleanupDebt != 0 }) { return true }
         }
         return false
     }
@@ -88,6 +97,7 @@ public final class WorkspaceHostState {
         guard !hostBoot.isEmpty else { throw WorkspaceVMError("host boot identity unavailable") }
         if let old = value.execution {
             guard old.hostBoot != hostBoot else { throw WorkspaceVMError("Cleanup required: previous VM termination is unconfirmed") }
+            try retainUnobservedExecution()
             try commit { $0.execution = nil }
         }
     }
