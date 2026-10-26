@@ -108,6 +108,13 @@ public enum WorkspaceRemoval {
         guard checkpoint.version == 1 else { throw PortableFSWorkspaceError("Invalid workspace removal checkpoint") }
         return checkpoint.phase != "complete"
     }
+    static func completed(home: URL) throws -> Bool {
+        let journal = home.appendingPathComponent(".local/state/portablefs/workspace-removal.json")
+        guard FileManager.default.fileExists(atPath: journal.path) else { return false }
+        let checkpoint = try JSONDecoder().decode(Checkpoint.self, from: readOwned(journal))
+        guard checkpoint.version == 1 else { throw PortableFSWorkspaceError("Invalid workspace removal checkpoint") }
+        return checkpoint.phase == "complete"
+    }
     public static func prepareToStart(home: URL) throws {
         let account = home.appendingPathComponent(".local/state/portablefs")
         guard FileManager.default.fileExists(atPath: account.path) else { return }

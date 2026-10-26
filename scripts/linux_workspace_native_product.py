@@ -244,6 +244,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         record('service-ssh-identity-persistence')
         command('stop','--json');until(lambda s:s['state']=='stopped')
         app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
+        assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
         assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
         assert not managed.exists() and not (home/'.ssh/config').exists()
         record('service-removal-keep-data')

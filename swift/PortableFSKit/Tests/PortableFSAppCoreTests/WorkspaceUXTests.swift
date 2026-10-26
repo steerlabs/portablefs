@@ -204,6 +204,7 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             let directory = home.appendingPathComponent(".local/state/portablefs/workspace")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try Data("owned".utf8).write(to: directory.appendingPathComponent("data.ext4"))
+            try Data("retained desired state".utf8).write(to: directory.appendingPathComponent("desired.json"))
             try Data().write(to: directory.appendingPathComponent("service.lock"))
             let remote = home.appendingPathComponent("remote-volume"); try Data("remote".utf8).write(to: remote)
             try PortableFSWorkspaceSSH.install(home: home, stanza: uxStanza)
@@ -218,6 +219,7 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             #expect(FileManager.default.fileExists(atPath: directory.path) == (data == .keep))
             #expect(try String(contentsOf: remote, encoding: .utf8) == "remote")
             #expect(try !WorkspaceRemoval.removalPending(home: home))
+            #expect(try await PortableFSWorkspaceClient(home: home).perform(.status).state == "stopped")
             try WorkspaceRemoval.prepareToStart(home: home)
         }
     }

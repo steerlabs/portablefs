@@ -78,7 +78,8 @@ public struct PortableFSWorkspaceClient: Sendable {
             var info = stat()
             if operation == .status, lstat(path, &info) != 0, errno == ENOENT {
                 let desired = home.appendingPathComponent(".local/state/portablefs/workspace/desired.json").path
-                guard lstat(desired, &info) != 0, errno == ENOENT else { throw PortableFSWorkspaceError("Cleanup required: Linux Workspace service is unavailable") }
+                let noState = lstat(desired, &info) != 0 && errno == ENOENT
+                guard try noState || WorkspaceRemoval.completed(home: home) else { throw PortableFSWorkspaceError("Cleanup required: Linux Workspace service is unavailable") }
                 return PortableFSWorkspaceStatus()
             }
             let data = try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys, .withoutEscapingSlashes])
