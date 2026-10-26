@@ -171,7 +171,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         assert managed.read_bytes()==config.read_bytes()
         assert (home/'.ssh/config').read_text().startswith('# PortableFS Linux Workspace\nInclude ~/.ssh/portablefs-workspace.conf\n')
         effective=subprocess.check_output(['ssh','-G','-F',str(managed),'portablefs-workspace'],env=env,text=True)
-        for option in ['user workspace\n','identitiesonly yes\n','forwardagent no\n','identityagent none\n','stricthostkeychecking true\n','clearallforwardings yes\n']:
+        for option in ['user workspace\n','identitiesonly yes\n','forwardagent no\n','identityagent none\n','stricthostkeychecking true\n']:
             assert option in effective,(option,effective)
         assert subprocess.check_output(['ssh','-F',str(managed),'portablefs-workspace','id -u'],env=env,text=True).strip()=='1000'
         (evidence/'ssh-effective.txt').write_text(effective)

@@ -106,7 +106,6 @@ public final class WorkspaceState {
           IdentityAgent none
           ForwardAgent no
           ForwardX11 no
-          ClearAllForwardings yes
           PreferredAuthentications publickey
           PubkeyAuthentication yes
           HostKeyAlias portablefs-workspace

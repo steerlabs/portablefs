@@ -65,7 +65,8 @@ edited atomically at its owned target. Read-only or unsafe files refuse setup.
 Existing alias definitions, including matching specific patterns and Includes,
 refuse with **SSH name already in use**. The dedicated key, pinned guest host
 key and Unix socket are retained under workspace state. SSH disables agent
-forwarding, agent identities and configured forwarding. There is no TCP listener.
+forwarding and agent identities. The managed SSH entry has no TCP listener;
+editors can request their ordinary SSH channel forwarding.
 An owned checkpoint makes include setup/removal retryable without adopting or
 deleting another config. Test homes never redirect OpenSSH's passwd-based `~`
 expansion; native tests use `ssh -F` with the generated managed stanza.

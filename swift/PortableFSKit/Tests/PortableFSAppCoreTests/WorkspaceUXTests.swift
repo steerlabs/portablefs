@@ -16,7 +16,6 @@ Host portablefs-workspace
   IdentitiesOnly yes
   IdentityAgent none
   ForwardAgent no
-  ClearAllForwardings yes
 Host *
 
 """.utf8)
@@ -62,7 +61,7 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             #expect(try uxSSH(probe, host: "peer") == before)
             let workspace = try uxSSH(probe, host: "portablefs-workspace")
             #expect(workspace.contains("user workspace\n")); #expect(workspace.contains("forwardagent no\n"))
-            #expect(workspace.contains("identityagent none\n")); #expect(workspace.contains("clearallforwardings yes\n"))
+            #expect(workspace.contains("identityagent none\n"))
             try PortableFSWorkspaceSSH.remove(home: home)
             #expect(try Data(contentsOf: config) == Data(original.utf8))
             #expect(try Data(contentsOf: extra) == Data("Host peer\n  HostName peer.example\n  User included\nHost *\n".utf8))
