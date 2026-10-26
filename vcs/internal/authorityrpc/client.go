@@ -35,6 +35,11 @@ var (
 	// mount: continuing would hide a subtree from every peer, so the mount must
 	// reconcile its declaration and remount rather than retry.
 	ErrRoutesMismatch = errors.New("authorityrpc: mount routing revision is not the volume's active one")
+	// Abandoning an unresolved replay ends this client's usable session even
+	// without an authority expiry verdict. Keep both the terminal scope and the
+	// unknown operation outcome; transport uncertainty alone also names retryable
+	// connection failures and must not imply session termination.
+	errUnresolvedMutation = fmt.Errorf("%w: unresolved mutation: %w", ErrSessionEnded, ErrTransportUncertain)
 )
 
 // PreKernelMountAbsenceObserver produces the supervisor's exact local evidence
@@ -2221,7 +2226,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 				return nil, nil, reconnectErr
 			}
 			if !errors.Is(reconnectErr, ErrAuthorityChanged) && !errors.Is(reconnectErr, ErrSessionEnded) && !errors.Is(reconnectErr, ErrTransportBinding) {
-				reconnectErr = ErrTransportUncertain
+				reconnectErr = errUnresolvedMutation
 			}
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
@@ -2232,8 +2237,8 @@ func (c *Client) CallMutationWithIdentityRetained(
 	// may have reached the authority, cancellation cannot settle that identity,
 	// even when the exact replay was refused before its own socket write.
 	if submitted && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		c.signalSessionEnd(ErrTransportUncertain)
-		return nil, nil, ErrTransportUncertain
+		c.signalSessionEnd(errUnresolvedMutation)
+		return nil, nil, errUnresolvedMutation
 	}
 	if err != nil {
 		return nil, nil, err
@@ -2252,7 +2257,7 @@ func (c *Client) CallMutationWithIdentityRetained(
 		return response, consumption, err
 	}
 	if response.GetUncertain() && !RecoverableUncertainty(response) {
-		c.signalSessionEnd(ErrTransportUncertain)
+		c.signalSessionEnd(errUnresolvedMutation)
 	}
 	return response, consumption, nil
 }
@@ -2313,7 +2318,7 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 			}
 		}
 		if response.GetUncertain() && !RecoverableUncertainty(response) {
-			c.signalSessionEnd(ErrTransportUncertain)
+			c.signalSessionEnd(errUnresolvedMutation)
 		}
 		if token := response.GetTerminalDeliveryToken(); len(token) != 0 {
 			if validTerminalDeliveryToken(token) {

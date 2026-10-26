@@ -59,6 +59,14 @@ func TestOrdinaryAssignedMutationHasFiniteOutage(t *testing.T) {
 				if !errors.Is(err, ErrTransportUncertain) || !errors.Is(client.SessionEndCause(), ErrTransportUncertain) {
 					t.Fatalf("unsettled submitted mutation: result=%v session=%v", err, client.SessionEndCause())
 				}
+				if !errors.Is(err, ErrSessionEnded) || !errors.Is(client.SessionEndCause(), ErrSessionEnded) || client.LocalAdmissionOpen() {
+					t.Fatalf("abandoned replay kept a usable session: result=%v session=%v", err, client.SessionEndCause())
+				}
+				canceled, cancel := context.WithCancel(t.Context())
+				cancel()
+				if _, nextErr := client.CallMutation(canceled, settlementTestMkdir()); nextErr != err {
+					t.Fatalf("subsequent call = %v, want first terminal cause %v", nextErr, err)
+				}
 				if len(client.ordinary.permits) != 0 {
 					t.Fatal("ended replay retained its lane permit")
 				}

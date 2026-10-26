@@ -1292,6 +1292,27 @@ func TestRequestTimeoutIsNeverReportedAsEINTR(t *testing.T) {
 	}
 }
 
+func TestUncertainRPCOutcomeKeepsItsErrorScope(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response *authoritypb.Response
+		err      error
+		want     syscall.Errno
+	}{
+		{"transport outcome", nil, authorityrpc.ErrTransportUncertain, syscall.EREMOTEIO},
+		{"ended session with unknown outcome", nil, errors.Join(authorityrpc.ErrSessionEnded, authorityrpc.ErrTransportUncertain), syscall.EREMOTEIO},
+		{"recorded uncertainty", &authoritypb.Response{Uncertain: true}, nil, syscall.EREMOTEIO},
+		{"ended session alone", nil, authorityrpc.ErrSessionEnded, syscall.EIO},
+		{"revoked connection", nil, context.Canceled, syscall.ENOTCONN},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rpcErrno(tc.response, tc.err); got != tc.want {
+				t.Fatalf("RPC errno = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRouteCauseSurvivesEarlierGenericSessionTeardown(t *testing.T) {
 	mount, _ := testMount(t, 8)
 	// Pre-claim only teardown ownership. This makes the production interleaving
