@@ -326,13 +326,17 @@ on its success. PR results do not substitute for that tag's run.
 `CONFIG_DM_LOG_WRITES` and `/lib/modules` is bind-mounted so `modprobe` can
 load it. The entrypoint does both.
 
-### Status for protocol 8
+### Protocol-8 qualification
 
-None of the privileged tests above has run against the protocol-8 tree. The
-FSKit instrument has never run anywhere: its driver and the authority it drives
-must first build on Linux from the integrated tree. Until a run of
-`scripts/run-powerloss.sh` passes every required test, the FSKit durability
-contract is a stated design property, not power-loss evidence.
+The complete five-test instrument exercises the integrated protocol-8 authority
+and both workload drivers. A successful run qualifies the Linux fsync and
+FSKit authority-handler durability claims at the replayed cuts, together with
+the separate process-kill recovery contract. The exact required-test gate makes
+a skipped instrument a failure.
+
+This does not qualify the daemon, extension, or macOS kernel's buffered-I/O
+boundaries. Native fsync, F_FULLFSYNC, dirty-page drain and unmount acceptance
+remain separate gates even after this instrument passes.
 
 ## Notes from bringing this up
 
