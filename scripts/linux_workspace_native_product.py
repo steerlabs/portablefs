@@ -264,6 +264,22 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
 
 if __name__=='__main__':
     import sys
-    observed=[]
-    product_checks(sys.argv[1],sys.argv[2],lambda name:(observed.append(name),print('PASS:',name,flush=True)),api_only='--api-only' in sys.argv[3:])
-    pathlib.Path(sys.argv[2],'product-results.json').write_text(json.dumps({'passed':observed},indent=2))
+    from linux_workspace_native_managed import NativeAuthority
+    image,evidence,*options=sys.argv[1:]
+    assert options in ([],['--api-only'],['--defer-ui']),options
+    api_only=options==['--api-only'];defer_ui=options==['--defer-ui']
+    evidence=pathlib.Path(evidence);evidence.mkdir(parents=True,exist_ok=True)
+    observed=[];not_run=[];authority=None
+    required=[name for name in pathlib.Path(__file__).with_name('linux-workspace-required-native-tests.txt').read_text().splitlines() if name.startswith('service-')]
+    if api_only:required=['service-app-api-client','service-authenticated-status','service-unsigned-peer-refusal','service-cross-release-refusal','service-api-cli-five-verbs']
+    try:
+        if not api_only:authority=NativeAuthority(evidence)
+        product_checks(image,evidence,lambda name:(observed.append(name),print('PASS:',name,flush=True)),
+                       authority=authority,api_only=api_only,defer_ui=defer_ui,
+                       defer_case=lambda name:(not_run.append(name),print('NOT RUN (UI deferred):',name,flush=True)))
+        assert sorted(observed+not_run)==sorted(required),(observed,not_run,required)
+        (evidence/'product-results.json').write_text(json.dumps({'required':required,'passed':observed,'notRun':not_run,
+            'scope':'api-only' if api_only else 'product','qualified':not not_run and not api_only},indent=2))
+        if not_run:sys.exit(3)
+    finally:
+        if authority is not None:authority.close()

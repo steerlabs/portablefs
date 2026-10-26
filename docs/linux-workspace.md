@@ -780,6 +780,10 @@ including real missing-extension checks, and records the exact unrun consent and
 editor-save names. It exits 3 with an INCOMPLETE verdict, never an all-passing
 native qualification. Rerun without that flag after an authorized operator
 unlocks the session.
+To rerun just the exact service/product subset with the same image after that
+unlock, use `python3 scripts/linux_workspace_native_product.py IMAGE EVIDENCE`.
+It creates its own authority/peer and throwaway service and checks every
+`service-` inventory name. It does not replace the full native inventory.
 
 It builds or verifies/reuses the pinned image, builds and signs the owner, then
 requires exact equality with `scripts/linux-workspace-required-native-tests.txt`.
