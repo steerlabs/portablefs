@@ -119,9 +119,9 @@ continues to govern other users and machines.
 ## Update exclusion
 
 The existing per-account `mount-lifecycle.lock` is the one update exclusion for
-both frontends. Workspace Start/Mount/Stop mutations acquire a shared guard;
-a live VM retains it through confirmed termination. The installer acquires the
-exclusive guard, proves exact FSKit absence and requires the workspace's
+both frontends. Workspace Start/Mount acquire a shared guard; cleanup remains
+available behind closed admission. A live VM retains the guard through confirmed
+termination. The installer acquires the exclusive guard, proves exact FSKit absence and requires the workspace's
 `resources.present` name absent. It never decodes an outgoing desired-state
 registry. The service publishes this marker durably before VM execution and
 retires it only after confirmed termination, reservation release and loss-free,

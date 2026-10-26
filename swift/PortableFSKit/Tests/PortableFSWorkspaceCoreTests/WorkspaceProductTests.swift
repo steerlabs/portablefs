@@ -334,6 +334,9 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     #expect(try store.directory.read("resources.present") == nil)
     let update = try account.lock("mount-lifecycle.lock")
     #expect(owner.handle(try productRequest("start")).state == "refused")
+    #expect(owner.handle(try productRequest("stop")).state != "refused")
+    try await productTurn()
+    #expect(!store.value.running)
     withExtendedLifetime(update) {}
 }
 

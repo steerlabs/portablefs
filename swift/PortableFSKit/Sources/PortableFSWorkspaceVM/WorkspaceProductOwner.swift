@@ -38,7 +38,10 @@ import PortableFSAppCore
         do {
             defer { scheduleUpdate() }
             try request.validate()
-            let admission = request.operation == "status" ? nil : try acquireAdmission()
+            // Cleanup never admits a VM or mount. It remains usable while the
+            // update lease closes Start/Mount, so the shared removal owner can
+            // finish an already accepted Stop before final exclusion.
+            let admission = ["start", "mount"].contains(request.operation) ? try acquireAdmission() : nil
             defer { withExtendedLifetime(admission) {} }
             guard !quiescing || request.operation == "status" else { throw WorkspaceVMError("workspace service is quiescing") }
             switch request.operation {

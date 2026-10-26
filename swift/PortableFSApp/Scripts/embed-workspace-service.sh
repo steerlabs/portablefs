@@ -33,7 +33,7 @@ if [ -n "${PORTABLEFS_WORKSPACE_ARTIFACT_DIR:-}" ]; then
   mkdir -p "$contents_dir/Resources"
   image_digest=$(python3 "$repo_root/scripts/prepare-workspace-bundle.py" \
     "$PORTABLEFS_WORKSPACE_ARTIFACT_DIR" "$image" \
-    --commit "$PFS_WORKSPACE_BUILD_COMMIT" --version "$MARKETING_VERSION" | tail -n 1)
+    --commit "$PFS_WORKSPACE_BUILD_COMMIT" --version "$MARKETING_VERSION")
 fi
 info="$service_contents/Info.plist"
 /usr/bin/plutil -create xml1 "$info"

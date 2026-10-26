@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Consume only the paired guest-arm64 workflow artifact, before code signing."""
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -16,6 +17,8 @@ if os.environ.get('PORTABLEFS_GO'):
 
 
 def prepare(artifact, destination, commit, version):
+    assets = {'guest-image.tar.gz', 'corresponding-source.tar.gz', 'manifest.json', 'source-manifest.json'}
+    assert all((artifact / name).is_file() and not (artifact / name).is_symlink() for name in assets), 'artifact assets must be regular files'
     manifest = json.loads((artifact / 'manifest.json').read_text())
     distribution = json.loads((artifact / 'distribution.json').read_text())
     assert distribution['format'] == 8 and distribution['commit'] == commit, 'distribution commit mismatch'
@@ -27,6 +30,10 @@ def prepare(artifact, destination, commit, version):
     assert manifest['release']['app_version'] == version, 'guest image is from another version'
     assert manifest['release']['authority_major'] == manifest['format'] == 8
     assert not destination.exists(), 'bundle image destination must be absent'
+    required = {'kernel', 'initramfs', 'system.ext4', 'kernel.config', 'packages.json', 'packages.tsv',
+                'source-manifest.json', 'licenses.tar.gz', 'initramfs.inventory', 'image-inputs.json',
+                'release.json', 'bin/portablefs', 'bin/portablefsd', 'bin/portablefs-workspaced'}
+    assert set(manifest['files']) == required, 'invalid exact image manifest'
     records = dict(manifest['files'])
     records['manifest.json'] = digest(artifact / 'manifest.json')
     # Validate every member before writing any path. The archive has only exact
@@ -50,7 +57,8 @@ def prepare(artifact, destination, commit, version):
             source = destination / 'corresponding-source.tar.gz'
             source.symlink_to((artifact / 'corresponding-source.tar.gz').resolve())
             try:
-                check(destination)
+                with contextlib.redirect_stdout(sys.stderr):
+                    check(destination)
             finally:
                 source.unlink()
             assert json.loads((destination / 'source-manifest.json').read_text())['archive'] == digest(artifact / 'corresponding-source.tar.gz')
