@@ -816,8 +816,9 @@ and recovery use the empty guest-owned roster. The FUSE probe is invoked only
 by the native gate as the ordinary workspace user, never by a boot service.
 Stage 1c implements real daemon suspension, protected root bootstrap, independent
 durable inventories and provisioning. Their native and fault qualification is
-required separately from Stage 1b evidence. The product service, host API, CLI and public handoff are implemented. App UI,
-release packaging, update coordination and editor qualification remain pending.
+required separately from Stage 1b evidence. The product service, host API, CLI,
+public handoff, menu and managed SSH/editor actions are implemented. Release
+packaging, update coordination and actual editor qualification remain pending.
 
 All new workspace surfaces are pending and unreleased: the control grammar,
 service identity/entitlements, guest paths, inventory format, image manifest,
