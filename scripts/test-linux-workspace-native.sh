@@ -11,8 +11,7 @@ if (( $(sw_vers -productVersion | cut -d. -f1) < 26 )); then
 fi
 [[ $# == 2 || ( $# == 3 && "$3" == --defer-ui ) ]] || { echo "usage: $0 IMAGE_DIRECTORY EVIDENCE_DIRECTORY [--defer-ui]" >&2; exit 2; }
 image="$1" evidence="$2"
-extra=()
-if [[ $# == 3 ]]; then extra=(--defer-ui); fi
+shift 2
 mkdir -p "$evidence"
 evidence="$(cd "$evidence" && pwd -P)"
 bash "$repo/scripts/test-linux-workspace-image.sh"
@@ -26,4 +25,4 @@ bash "$repo/scripts/build-linux-workspace-image.sh" "$comparison"
 cmp "$image/manifest.json" "$comparison/manifest.json"
 echo 'PASS: reproducible-image-build-twice'
 bash "$repo/scripts/test-linux-workspace-rtc.sh" "$image" "$evidence"
-python3 "$repo/scripts/test-linux-workspace-native.py" "$bin" "$image" "$evidence" "$repo/scripts/linux-workspace-required-native-tests.txt" "${extra[@]}"
+python3 "$repo/scripts/test-linux-workspace-native.py" "$bin" "$image" "$evidence" "$repo/scripts/linux-workspace-required-native-tests.txt" "$@"
