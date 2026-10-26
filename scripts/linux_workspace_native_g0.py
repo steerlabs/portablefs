@@ -15,8 +15,8 @@ import uuid
 
 def pause_checks(authority, guest, managed, record):
     traces = []
-    for fencing in ('normal', 'delayed', 'suppressed'):
-        for duration in (5, 15, 45, 150, 600):
+    for duration in (5, 15, 45, 150, 600):
+        for fencing in ('normal', 'delayed', 'suppressed'):
             case = f'g0-vz-{fencing}-{duration}s'
             token = 'g0-' + uuid.uuid4().hex
             worker = None
@@ -24,6 +24,9 @@ def pause_checks(authority, guest, managed, record):
             blocked = False
             trace = dict(case=case, requested_pause_seconds=duration, fencing=fencing,
                          first_operation_prestarted=True, host_sleep=False, request_token=token, request_path=authority.target+'/'+token)
+            def checkpoint(stage):
+                trace['stage'] = stage
+                (authority.evidence/'g0-vz-active.json').write_text(json.dumps(trace,indent=2)+'\n')
             try:
                 code = '''import errno,json,os,sys,time
 print('armed',flush=True)
@@ -73,6 +76,7 @@ print(json.dumps(result),flush=True)
                 # fresh admission; unfenced cases must deny without recovery.
                 worker.stdin.write('probe\n'); worker.stdin.flush()
                 trace['pause_confirmed_host_ns'] = time.monotonic_ns()
+                checkpoint('paused')
                 # The ordinary peer is outside the guest and remains live.
                 # It waits for the actual authority obligation, then persists.
                 trace['peer_started_host_ns'] = time.monotonic_ns()
@@ -106,6 +110,7 @@ print(json.dumps(result),flush=True)
                     assert first['operation_ns']<1_000_000_000, first
                     trace['first_operation'] = first
                     trace['denial_observed_before_host_recovery_ns'] = time.monotonic_ns()
+                    checkpoint('denied-before-recovery')
                     if fencing == 'delayed': time.sleep(.5)
                     authority.network(False); blocked = False
                     guest.command('test-recover-awake')
@@ -139,6 +144,7 @@ print(json.dumps(result),flush=True)
                 assert worker.wait(timeout=5) == 0, worker.stderr.read()
                 assert guest.ssh('cat '+shlex.quote(authority.target+'/'+token)) == 'peer-after-old-permission'
                 trace['fresh_permission_observed_host_ns'] = time.monotonic_ns()
+                checkpoint('fresh-permission')
                 traces.append(trace)
                 (authority.evidence/'g0-vz-pauses.json').write_text(json.dumps(traces,indent=2)+'\n')
                 record(case)

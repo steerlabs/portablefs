@@ -13,10 +13,12 @@ import PortableFSWorkspaceCore
     // runs. These controls never exist in the product service.
     var testHoldStatus = false
     var testStatus: ((Result<WorkspaceStatusReply, Error>) -> Void)?
-    func releaseTestStatus() {
+    func releaseTestStatus(deadline: UInt64) {
         testHoldStatus = false
         let pending = testStatus; testStatus = nil
-        pending?(.failure(WorkspaceVMError("qualification status suppression ended")))
+        // No exchange was sent while suppressed. Complete the held observer
+        // from a fresh exchange instead of inventing a control-channel loss.
+        if let pending { base.status(deadline: deadline, completion: pending) }
     }
     init(_ base: WorkspaceVsockChannel) { self.base = base }
     var isIdle: Bool { base.isIdle }
@@ -135,7 +137,7 @@ import PortableFSWorkspaceCore
     func update() {
         if reportedPhase != coordinator.phase || reportedGeneration != coordinator.generation {
             reportedPhase = coordinator.phase; reportedGeneration = coordinator.generation
-            event("phase", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "operations": vm.operations])
+            event("phase", ["phase": coordinator.phase.rawValue, "generation": coordinator.generation, "reason": coordinator.reason, "operations": vm.operations])
         }
         if stopping, coordinator.phase == .stopped {
             channel.close(); event("stopped", ["operations": vm.operations]); exit(exitCode)
@@ -177,7 +179,7 @@ import PortableFSWorkspaceCore
                     self.testPausing = false
                     switch result {
                     case .success: self.testPaused = true; self.event("test-paused-unfenced")
-                    case .failure(let error): self.observed.releaseTestStatus(); self.fail(error)
+                    case .failure(let error): self.observed.releaseTestStatus(deadline: self.clock.now + 20_000_000_000); self.fail(error)
                     }
                 }
             case "test-resume-unfenced":
@@ -193,7 +195,8 @@ import PortableFSWorkspaceCore
                 }
             case "test-recover-awake":
                 guard !testPaused, !testPausing, observed.testHoldStatus else { event("refused", ["command": command]); continue }
-                observed.releaseTestStatus(); coordinator.powerEvent(.wake)
+                coordinator.powerEvent(.wake)
+                observed.releaseTestStatus(deadline: clock.now + 20_000_000_000)
                 event("test-awake-recovery", ["generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
             case "pause":
                 guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
