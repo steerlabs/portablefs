@@ -54,7 +54,7 @@ import PortableFSWorkspaceCore
     var reportedGeneration: UInt64?
     init(image: URL, stateDirectory: URL, pairingMismatch: String? = nil) throws {
         let artifact = try WorkspaceArtifact(directory: image)
-        guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit, artifact.release.appVersion == "dev" else { throw WorkspaceVMError("host executable and guest release differ; rebuild the paired dev executable") }
+        guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit else { throw WorkspaceVMError("host executable and guest release differ; rebuild the paired dev executable") }
         state = try WorkspaceDevState(directory: stateDirectory)
         vm = try WorkspaceMachine(artifact: artifact, dataDisk: stateDirectory.appendingPathComponent("data.ext4"), serialLog: stateDirectory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress)
         channel = WorkspaceVsockChannel(vm: vm); observed = ObservedChannel(channel); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)

@@ -3,6 +3,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 snapshot=20261001T000000Z
 export SOURCE_DATE_EPOCH=1790812800
+export LC_ALL=C.UTF-8 TZ=UTC
 export E2FSPROGS_FAKE_TIME="$SOURCE_DATE_EPOCH"
 printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ trixie main\n' "$snapshot" >/etc/apt/sources.list
 printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/%s/ trixie-updates main\n' "$snapshot" >>/etc/apt/sources.list
@@ -19,6 +20,10 @@ mmdebstrap --mode=root --architectures=arm64 --variant=minbase --include="$inclu
   "deb https://snapshot.debian.org/archive/debian/$snapshot/ trixie-updates main" \
   "deb https://snapshot.debian.org/archive/debian-security/$snapshot/ trixie-security main"
 root=/build/rootfs
+# Debian's machine-id, Python bytecode headers, initramfs and ext4 metadata must
+# describe the inputs, never the build container's hostname or wall time.
+export SOURCE_DATE_EPOCH E2FSPROGS_FAKE_TIME
+
 cp -a /source/rootfs/. "$root/"
 install -m755 /output/bin/* "$root/usr/local/bin/"
 install -Dm644 /output/release.json "$root/usr/lib/portablefs-workspace/release.json"
@@ -51,7 +56,7 @@ chroot "$root" systemctl disable ssh.service ssh.socket apt-daily.timer apt-dail
 chroot "$root" systemctl mask ssh.service ssh.socket systemd-remount-fs.service serial-getty@hvc0.service getty@tty1.service
 chroot "$root" systemctl enable portablefs-workspace-bootstrap.service portablefs-workspaced.service portablefs-workspace-ssh.socket systemd-networkd.service systemd-resolved.service
 kernel="$(basename "$(find "$root/lib/modules" -mindepth 1 -maxdepth 1 -type d)")"
-[[ "$kernel" == 6.12.* ]]
+[[ "$kernel" == "$(python3 -c 'import json;print(json.load(open("/source/image.lock.json"))["kernel_release"])')" ]]
 chroot "$root" update-initramfs -u -k "$kernel"
 cp "$root/boot/vmlinuz-$kernel" /output/kernel
 python3 - <<'PYKERNEL'
@@ -62,19 +67,15 @@ PYKERNEL
 cp "$root/boot/initrd.img-$kernel" /output/initramfs
 cp "$root/boot/config-$kernel" /output/kernel.config
 chroot "$root" dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\t${Built-Using}\t${Static-Built-Using}\n' > /output/packages.tsv
-python3 - <<'PY'
-import json,re,urllib.parse
-rows = [line.rstrip('\n').split('\t') for line in open('/output/packages.tsv')]
-open('/output/packages.json','w').write(json.dumps([dict(zip(('package','version','source','source_version','built_using','static_built_using'),r)) for r in rows],indent=2)+'\n')
-sources = set((row[2], row[3]) for row in rows)
-for row in rows:
-    for field in row[4:]:
-        for name,version in re.findall(r'([a-z0-9+.-]+) \(= ([^)]+)\)', field): sources.add((name,version))
-sources = sorted(sources)
-open('/output/source-manifest.json','w').write(json.dumps({'format':8, 'snapshot':'20261001T000000Z', 'sources':[{'package':name,'version':version,'archive':'https://snapshot.debian.org/package/'+urllib.parse.quote(name,safe='')+'/'+urllib.parse.quote(version,safe='')+'/'} for name,version in sources]},indent=2)+'\n')
-PY
-find "$root/usr/share/doc" \( -name copyright -o -path "$root/usr/share/doc/portablefs-go/*" -type f \) -printf '%P\0' | sort -z | \
-  tar -C "$root/usr/share/doc" --null -T - --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 -czf /output/licenses.tar.gz
+python3 - <<'PYINVENTORY'
+import json,os,pathlib
+lock=json.load(open('/source/image.lock.json'))
+rows=[line.rstrip('\n').split('\t') for line in open('/output/packages.tsv')]
+packages=[dict(zip(('package','version','source','source_version','built_using','static_built_using'),r)) for r in rows]
+if os.environ.get('PFS_UPDATE_LOCK') != '--update-lock':
+    assert packages == lock['packages'], 'exact binary package inventory differs from lock'
+PYINVENTORY
+python3 /source/redistribute.py collect "$root" /output /source/image.lock.json
 chroot "$root" lsinitramfs "/boot/initrd.img-$kernel" >/output/initramfs.inventory
 python3 - <<'PYMODULES'
 import re
@@ -86,6 +87,7 @@ for module, symbol in {'virtio_blk':'VIRTIO_BLK', 'virtio_net':'VIRTIO_NET', 'vi
     assert 'CONFIG_' + symbol + '=m\n' in config, symbol
     assert re.search('/' + module.replace('_', '[-_]') + r'\.ko(?:\.xz)?$', inventory, re.M), module
 PYMODULES
+rm -f "$root/var/lib/systemd/random-seed" "$root/etc/.pwd.lock"
 rm -rf "$root/var/lib/apt/lists/"* "$root/var/cache/apt/archives/"* "$root/var/log/"*
 find "$root" -xdev -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 rm -f /output/system.ext4

@@ -1,101 +1,61 @@
 #!/usr/bin/env bash
-# Developer guest only. Release insertion of attested client bytes is Stage 2.
+# One clean commit produces the guest, notices and retained corresponding source.
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 repo="$(cd "$(dirname "$0")/.." && pwd -P)"
 [[ $# -ge 1 && $# -le 2 ]] || { echo "usage: $0 OUTPUT_DIRECTORY [--update-lock|--reuse]" >&2; exit 2; }
 if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=normal)" ]]; then
   echo 'refuse to label a dirty workspace image as HEAD' >&2; exit 1
 fi
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || { echo 'UNAVAILABLE: native-workspace-docker' >&2; exit 3; }
-out="$1"
-update="${2:-}"
-[[ -z "$update" || "$update" == --update-lock || "$update" == --reuse ]] || exit 2
-mkdir -p "$out"
-out="$(cd "$out" && pwd -P)"
+mode="${2:-}"
+[[ -z "$mode" || "$mode" == --update-lock || "$mode" == --reuse ]] || exit 2
+mkdir -p "$1"
+out="$(cd "$1" && pwd -P)"
 lock="$repo/deploy/linux-workspace/image.lock.json"
 builder="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["builder"])' "$lock")"
-# Build into private staging so --reuse never rewrites verified output.
-staging="$(mktemp -d "$out/.identity.XXXXXX")"
-trap 'rm -rf "$staging"' EXIT
-mkdir -p "$staging/bin" "$staging/go-notices"
 commit="$(git -C "$repo" rev-parse HEAD)"
+if [[ "$mode" == --reuse && -f "$out/manifest.json" ]]; then
+  python3 "$repo/deploy/linux-workspace/redistribute.py" check "$out"
+  python3 - "$out/release.json" "$commit" <<'PY'
+import json,sys
+assert json.load(open(sys.argv[1]))['commit'] == sys.argv[2], 'image is from another commit'
+PY
+  echo 'Reusing exact verified workspace image'
+  exit 0
+fi
+[[ -z "$(find "$out" -mindepth 1 -maxdepth 1 -print -quit)" ]] || { echo 'output directory must be empty' >&2; exit 1; }
+staging="$(mktemp -d "$out/.build.XXXXXX")"
+name="portablefs-workspace-build-$(python3 -c 'import uuid;print(uuid.uuid4().hex)')"
+cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$staging"; }
+trap cleanup EXIT
+mkdir -p "$staging/bin"
+version="$(cat "$repo/VERSION")"
 for binary in portablefs portablefsd portablefs-workspaced; do
-  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "$repo/vcs" build -trimpath -buildvcs=false -ldflags="-buildid= -s -w" -o "$staging/bin/$binary" "./cmd/$binary"
+  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "$repo/vcs" build -trimpath -buildvcs=false \
+    -ldflags="-buildid= -s -w -X main.version=$version" -o "$staging/bin/$binary" "./cmd/$binary"
 done
 python3 "$repo/deploy/linux-workspace/identity.py" "$repo" "$staging" "$commit"
-if [[ "$update" == --reuse && -f "$out/manifest.json" ]]; then
-  if python3 - "$lock" "$out" "$staging" <<'PYREUSE'
-import hashlib,json,pathlib,sys
-p,q=map(pathlib.Path,sys.argv[2:])
-assert (p/'image-inputs.json').read_bytes() == (q/'image-inputs.json').read_bytes()
-assert json.load(open(sys.argv[1]))['packages'] == json.loads((p/'packages.json').read_text())
-for name,record in json.loads((p/'manifest.json').read_text())['files'].items():
-    path=p/name
-    assert path.stat().st_size==record['size']
-    h=hashlib.sha256()
-    with path.open('rb') as f:
-        for block in iter(lambda:f.read(4*1024*1024),b''): h.update(block)
-    assert h.hexdigest()==record['sha256']
-PYREUSE
-  then
-    echo 'Reusing exact verified workspace image'
-    exit 0
-  fi
-fi
-cp -R "$staging/bin" "$out/"
-cp "$staging/image-inputs.json" "$staging/release.json" "$out/"
-# Notices for the exact linked Go module graph accompany Debian's copyrights.
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "$repo/vcs" list -m -json all >"$staging/modules.json"
-python3 - "$staging" "$repo" <<'PYNOTICES'
-import json,pathlib,shutil,subprocess,sys
-p=pathlib.Path(sys.argv[1]); raw=(p/'modules.json').read_text(); decoder=json.JSONDecoder(); modules=[]
-while raw.strip():
-    value,end=decoder.raw_decode(raw.lstrip()); raw=raw.lstrip()[end:]; modules.append(value)
-linked=set()
-for binary in (p/'bin').iterdir():
-    for line in subprocess.check_output(['go','version','-m',str(binary)],text=True).splitlines():
-        fields=line.split()
-        if fields and fields[0] in ('mod','dep'): linked.add(fields[1])
-modules=[module for module in modules if module['Path'] in linked]
-assert {module['Path'] for module in modules} == linked
-for module in modules:
-    source=pathlib.Path(module.get('Replace',module).get('Dir',sys.argv[2]+'/vcs'))
-    dest=p/'go-notices'/module['Path']; dest.mkdir(parents=True,exist_ok=True)
-    if module.get('Main'): source=pathlib.Path(sys.argv[2])
-    copied=[]
-    for name in ('LICENSE','LICENSE.txt','LICENSE.md','COPYING','NOTICE','PATENTS'):
-        if (source/name).is_file(): shutil.copyfile(source/name,dest/name); copied.append(name)
-    assert copied, 'missing license notices for linked module '+module['Path']
-runtime=p/'go-notices'/'go-runtime'; runtime.mkdir()
-goro=pathlib.Path(subprocess.check_output(['go','-C',sys.argv[2]+'/vcs','env','GOROOT'],text=True).strip())
-for name in ('LICENSE','PATENTS'): shutil.copyfile(goro/name,runtime/name)
-records=[]
-for module in modules:
-    record={key:module[key] for key in ('Path','Version','Sum') if key in module}
-    if 'Replace' in module: record['Replace']={key:module['Replace'][key] for key in ('Path','Version','Sum') if key in module['Replace']}
-    records.append(record)
-(p/'go-notices'/'modules.json').write_text(json.dumps(records,indent=2)+'\n')
-PYNOTICES
-rm -rf "$out/go-notices"
-cp -R "$staging/go-notices" "$out/"
-inputs="$(mktemp -d "$out/.build-inputs.XXXXXX")"
-cp -R "$repo/deploy/linux-workspace/." "$inputs/"
-python3 "$inputs/identity.py" "$repo" "$out" "$commit" "$inputs"
-name="portablefs-workspace-build-$(python3 -c 'import uuid;print(uuid.uuid4().hex)')"
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$inputs" "$staging"; }
-trap cleanup EXIT
-docker run --name "$name" --platform linux/arm64 --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -v "$inputs:/source:ro" -v "$out:/output" \
+python3 "$repo/deploy/linux-workspace/redistribute.py" prepare "$repo" "$staging"
+docker run --name "$name" --platform linux/arm64 --memory 4g --cpus 4 \
+  --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+  -e "PFS_UPDATE_LOCK=$mode" -v "$repo/deploy/linux-workspace:/source:ro" -v "$staging:/output" \
   "$builder" bash /source/build-guest.sh
-python3 - "$lock" "$out" "$update" <<'PY'
-import json, pathlib, sys
-lock, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-value = json.loads(lock.read_text())
-packages = json.loads((out / 'packages.json').read_text())
+python3 - "$lock" "$staging" "$mode" <<'PY'
+import json,pathlib,sys
+lock,out=map(pathlib.Path,sys.argv[1:3])
+value=json.loads(lock.read_text())
+packages=json.loads((out/'packages.json').read_text())
+sources=json.loads((out/'source-manifest.json').read_text())['debian']
 if sys.argv[3] == '--update-lock':
-    value['packages'] = packages
-    lock.write_text(json.dumps(value, indent=2) + '\n')
+    value['packages'],value['sources']=packages,sources
+    lock.write_text(json.dumps(value,indent=2)+'\n')
 else:
-    if not value['packages'] or value['packages'] != packages:
-        raise SystemExit('exact package inventory differs from image.lock.json')
+    assert value['packages'] == packages, 'exact package inventory differs from image.lock.json'
+    assert value['sources'] == sources, 'exact source inventory differs from image.lock.json'
 PY
+python3 "$repo/deploy/linux-workspace/redistribute.py" check "$staging"
+rm -rf "$staging/sources" "$staging/notices" "$staging/go-sources.json" "$staging/go-notices"
+python3 "$repo/deploy/linux-workspace/distribute.py" "$staging"
+for path in "$staging"/*; do mv "$path" "$out/"; done
+echo "PASS: release guest and retained source: $out"
