@@ -99,6 +99,9 @@ func (m *Mount) awaitWorkspaceEntry(ctx context.Context, safeForWithdrawal bool,
 		if m.workspaceServing() {
 			return nil
 		}
+		if m.workspaceRTC != nil && m.subscription.rtcIntervalClosed() {
+			return workspaceadmission.ErrClosed
+		}
 		if !safeForWithdrawal && !m.workspaceLifecycle.kernelColdReady.Load() {
 			// Namespace callbacks can hold the parent inode lock needed by
 			// EntryNotify; buffered READ can hold a folio needed by InodeNotify.
@@ -221,15 +224,15 @@ func (m *Mount) workspaceServing() bool {
 	if m == nil || m.workspace == nil {
 		return true
 	}
-	_, err := m.workspace.Check()
+	permit, err := m.workspace.Check()
 	if err != nil || !m.workspaceClockReady() || !m.workspacePermissionLive() {
 		return false
 	}
 	if m.workspaceLifecycle != nil {
 		_, _, _, live := m.subscription.currentIncarnation()
-		return live
+		return live && permit.Check() == nil
 	}
-	return true
+	return permit.Check() == nil
 }
 
 func (m *Mount) workspacePermissionLive() bool {

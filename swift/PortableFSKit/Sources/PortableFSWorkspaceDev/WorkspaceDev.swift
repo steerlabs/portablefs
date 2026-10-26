@@ -9,6 +9,15 @@ import PortableFSWorkspaceCore
     let base: WorkspaceVsockChannel
     var lastResume: WorkspaceResumeToken?
     var onHelloFailure: ((String) -> Void)?
+    // Native qualification can suppress host status handling while the guest
+    // runs. These controls never exist in the product service.
+    var testHoldStatus = false
+    var testStatus: ((Result<WorkspaceStatusReply, Error>) -> Void)?
+    func releaseTestStatus() {
+        testHoldStatus = false
+        let pending = testStatus; testStatus = nil
+        pending?(.failure(WorkspaceVMError("qualification status suppression ended")))
+    }
     init(_ base: WorkspaceVsockChannel) { self.base = base }
     var isIdle: Bool { base.isIdle }
     var statusObserver: ((WorkspaceStatusReply) throws -> Void)? {
@@ -25,7 +34,10 @@ import PortableFSWorkspaceCore
     func recoverAwake(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { base.recoverAwake(token, deadline: deadline, completion: completion) }
     func resume(_ token: WorkspaceResumeToken, deadline: UInt64, completion: @escaping (Result<WorkspaceResumeAck, Error>) -> Void) { lastResume = token; base.resume(token, deadline: deadline, completion: completion) }
     func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) { base.acknowledgeRetired(through: sequence, deadline: deadline, completion: completion) }
-    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) { base.status(deadline: deadline, completion: completion) }
+    func status(deadline: UInt64, completion: @escaping (Result<WorkspaceStatusReply, Error>) -> Void) {
+        if testHoldStatus { testStatus = completion; return }
+        base.status(deadline: deadline, completion: completion)
+    }
     func mount(_ mount: WorkspaceMountID, deadline: UInt64, completion: @escaping (Result<WorkspaceResult, Error>) -> Void) { base.mount(mount, deadline: deadline, completion: completion) }
 }
 
@@ -47,6 +59,8 @@ import PortableFSWorkspaceCore
     var exitCode: Int32 = 0
     var started: UInt64 = 0
     var inputBuffer = Data()
+    var testPaused = false
+    var testPausing = false
     var pendingCommand: String?
     var signals: [DispatchSourceSignal] = []
     var updateQueued = false
@@ -152,6 +166,35 @@ import PortableFSWorkspaceCore
             let line = inputBuffer.prefix(upTo: newline); inputBuffer.removeSubrange(...newline)
             guard let value = try? JSONSerialization.jsonObject(with: line) as? [String: String], let command = value["command"] else { fail(WorkspaceVMError("invalid dev command")); return }
             switch command {
+            case "test-hold-host":
+                guard ready, coordinator.phase == .running, channel.isIdle, !testPaused, !testPausing else { event("refused", ["command": command]); continue }
+                observed.testHoldStatus = true; event("test-host-held")
+            case "test-pause-unfenced":
+                guard ready, coordinator.phase == .running, channel.isIdle, !testPaused, !testPausing else { event("refused", ["command": command]); continue }
+                testPausing = true; observed.testHoldStatus = true
+                vm.pause { [weak self] result in
+                    guard let self else { return }
+                    self.testPausing = false
+                    switch result {
+                    case .success: self.testPaused = true; self.event("test-paused-unfenced")
+                    case .failure(let error): self.observed.releaseTestStatus(); self.fail(error)
+                    }
+                }
+            case "test-resume-unfenced":
+                guard testPaused, !testPausing else { event("refused", ["command": command]); continue }
+                testPausing = true
+                vm.resume { [weak self] result in
+                    guard let self else { return }
+                    self.testPausing = false
+                    switch result {
+                    case .success: self.testPaused = false; self.event("test-resumed-unfenced")
+                    case .failure(let error): self.fail(error)
+                    }
+                }
+            case "test-recover-awake":
+                guard !testPaused, !testPausing, observed.testHoldStatus else { event("refused", ["command": command]); continue }
+                observed.releaseTestStatus(); coordinator.powerEvent(.wake)
+                event("test-awake-recovery", ["generation": coordinator.generation, "attach_allowed": coordinator.attachAllowed])
             case "pause":
                 guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
                 pendingCommand = command; power.controlledSleep()

@@ -1934,7 +1934,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		return
 	}
 	publication.settlementClaimed = true
-	if status.Ok() && publication.workspaceBound && publication.workspace.Check() != nil && publication.opcode == 15 {
+	if status.Ok() && publication.workspaceBound && publication.opcode == 15 && (publication.workspace.Check() != nil || !r.mount.workspacePermissionLive()) {
 		for _, candidate := range publication.data {
 			r.settleDataPublicationLocked(candidate, false)
 			publication.unlicensed = append(publication.unlicensed, candidate)

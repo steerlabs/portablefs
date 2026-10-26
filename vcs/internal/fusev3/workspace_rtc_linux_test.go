@@ -250,3 +250,113 @@ func TestWorkspaceRTCOnlyColdWithdrawalAndFreshPermissionClearLatch(t *testing.T
 		t.Fatal("fresh permission did not clear completed cold latch", fresh, err)
 	}
 }
+
+type cutRTC struct {
+	reader         *injectedRTC
+	calls          int
+	before, inside func(int)
+}
+
+func (r *cutRTC) ReadUTC() (time.Time, error) {
+	r.calls++
+	if r.before != nil {
+		r.before(r.calls)
+	}
+	sampled, err := r.reader.ReadUTC()
+	if r.inside != nil {
+		r.inside(r.calls)
+	}
+	return sampled, err
+}
+func TestWorkspaceRTCFreezePublicationCutsDenyDifferentRequest(t *testing.T) {
+	for _, cut := range []string{"before-final-sample", "inside-read-before-return", "after-return", "after-prepare", "before-physical-write", "inside-physical-write"} {
+		t.Run(cut, func(t *testing.T) {
+			f, _, rtc := workspaceRTCFixture(t)
+			unique := f.unique.Add(2)
+			if status := testEntryFileSystem(f.raw).Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
+				t.Fatal(status)
+			}
+			sampled := &cutRTC{reader: rtc}
+			f.mount.workspaceRTC = sampled
+			// Four entry/TTL samples precede the retained-answer stamp's final sample.
+			const final = 5
+			freeze := func(n int) {
+				if n == final {
+					rtc.second.Store(31)
+				}
+			}
+			switch cut {
+			case "before-final-sample":
+				sampled.before = freeze
+			case "inside-read-before-return":
+				sampled.inside = freeze
+			case "after-return":
+				f.mount.subscription.config.afterWorkspaceSample = func() { freeze(sampled.calls) }
+			}
+			_, reply, prepare := f.raw.PrepareReplyPayload(unique, 1, 1, make([]byte, 128), nil, 0)
+			if prepare != fuse.OK || sampled.calls != final {
+				t.Fatal("final sample cut moved", prepare, sampled.calls)
+			}
+			if cut == "before-final-sample" && reply != fuse.EIO {
+				t.Fatal("fresh expired sample admitted", reply)
+			}
+			if cut != "before-final-sample" && reply != fuse.OK {
+				t.Fatal("in-flight residual control failed", reply)
+			}
+			rtc.second.Store(31)
+			f.raw.ReplyWritten(unique, fuse.OK)
+			next := f.unique.Add(2)
+			p, status := f.mount.workspaceFS().tryWorkspaceEntry(next)
+			if p != nil || status == fuse.OK {
+				t.Fatal("another post-resume request borrowed in-flight sample", status)
+			}
+			t.Logf("request=%d anchor=0 cut=%s expiry=10 peer=10.25 physical-completion=31 reply=%v; request=%d denied", unique, cut, reply, next)
+		})
+	}
+}
+
+func TestWorkspaceRTCReadFrozenAfterPreparationStillPurges(t *testing.T) {
+	f, _, rtc := workspaceRTCFixture(t)
+	entry := f.lookup(t, 1, "cached")
+	opened := f.openForData(t, entry.NodeId)
+	f.rpc.mu.Lock()
+	f.rpc.fileData = []byte("data")
+	f.rpc.mu.Unlock()
+	unique := f.unique.Add(2)
+	result, status := f.raw.Read(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 4}, make([]byte, 4))
+	if status != fuse.OK {
+		t.Fatal(status)
+	}
+	defer result.Done()
+	_, reply, prepare := f.raw.PrepareReplyPayload(unique, entry.NodeId, 15, nil, nil, 0)
+	if reply != fuse.OK || prepare != fuse.OK {
+		t.Fatal(reply, prepare)
+	}
+	before := len(f.notify.snapshot())
+	rtc.second.Store(31)
+	f.raw.ReplyWritten(unique, fuse.OK)
+	if len(f.notify.snapshot()) <= before || f.raw.ReplyWriteTracked(unique) {
+		t.Fatal("late successful READ lost its physical purge/settlement")
+	}
+	if !f.mount.subscription.rtcClosed {
+		t.Fatal("physical settlement did not latch expired evidence")
+	}
+}
+
+func TestWorkspaceRTCRepeatedPausesAndBackwardCorrectionAboveAnchor(t *testing.T) {
+	f, _, rtc := workspaceRTCFixture(t)
+	for _, second := range []int64{1, 2, 3, 4, 5, 4, 5} {
+		rtc.second.Store(second)
+		if !f.mount.workspaceServing() {
+			t.Fatal("bounded live interval denied", second)
+		}
+	}
+	rtc.second.Store(6)
+	if f.mount.workspaceServing() {
+		t.Fatal("small pauses reset elapsed deadline")
+	}
+	rtc.second.Store(4)
+	if f.mount.workspaceServing() {
+		t.Fatal("backward correction resurrected closure")
+	}
+}

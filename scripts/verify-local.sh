@@ -132,6 +132,7 @@ go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(MountReadyBootstrapDo
 step "native cache observer evidence"
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_macos27_kernel_cache_observer.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_writeback_probes.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_qualify_linux_workspace_clock.py
 
 # The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to

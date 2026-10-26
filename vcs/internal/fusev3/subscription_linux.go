@@ -99,6 +99,7 @@ type subscriptionConfig struct {
 	beforeRecoveryProof func(install bool)
 	// Deterministic test schedule at the last proof check/local-store boundary.
 	beforeWorkspaceInstall func()
+	afterWorkspaceSample   func() // deterministic register-return/use cut; nil in production
 	clock                  subscriptionClock
 	retryDelay             time.Duration
 	withdrawalLead         time.Duration
@@ -548,6 +549,12 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	for page := 0; page < s.config.maxPages; page++ {
 		reply, pageHorizon, err := s.rpc.Subscribe(ctx, snapshotID, after)
 		if err != nil {
+			if errors.Is(err, permissionclock.ErrUnavailable) {
+				s.mu.Lock()
+				s.closeRTCIntervalLocked()
+				s.mu.Unlock()
+				return fmt.Errorf("%w: subscribe RTC evidence", errSubscriptionExpired)
+			}
 			return fmt.Errorf("fusev3: subscribe page %d: %w", page, err)
 		}
 		if reply == nil || reply.GetIncarnation() == 0 || reply.GetHorizonNanos() == 0 ||
@@ -1557,8 +1564,8 @@ func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
 	if incarnation == 0 || incarnation != s.incarnation {
 		return false
 	}
-	if s.workspaceDrain != nil && s.workspaceDrain.incarnation == incarnation && s.drainLiveLocked() {
-		return true
+	if s.workspaceDrain != nil {
+		return s.workspaceDrain.incarnation == incarnation && s.drainLiveLocked()
 	}
 	if s.permissionRemainingLocked(s.config.withdrawalLead) <= 0 {
 		s.closeRTCIntervalLocked()
@@ -1618,6 +1625,9 @@ func (s *subscriptionRegistry) permissionRemainingLocked(lead time.Duration) tim
 		return 0
 	}
 	remaining := s.permission.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, lead)
+	if s.config.afterWorkspaceSample != nil {
+		s.config.afterWorkspaceSample()
+	}
 	if remaining <= 0 {
 		s.closeRTCIntervalLocked()
 	}
@@ -1651,4 +1661,10 @@ func (s *subscriptionRegistry) workspaceRemaining() time.Duration {
 		return 0
 	}
 	return s.permissionRemainingLocked(s.config.withdrawalLead)
+}
+
+func (s *subscriptionRegistry) rtcIntervalClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rtcClosed
 }

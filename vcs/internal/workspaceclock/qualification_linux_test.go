@@ -3,6 +3,7 @@
 package workspaceclock
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,7 +53,7 @@ func TestNativeRTCContention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q, err := qualifyRTC(r, identity)
+	q, err := qualifyRTC(New(r, nil), identity)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +62,27 @@ func TestNativeRTCContention(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Println("RTC_QUALIFICATION=" + string(raw))
+	before, err := r.ReadUTC()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b0 := r.Elapsed()
+	fmt.Println("RTC_PAUSE_ARMED")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil || line != "probe\n" {
+		t.Fatal("queued resume probe", line, err)
+	}
+	start := r.Elapsed()
+	first, err := r.ReadUTC()
+	end := r.Elapsed()
+	if err != nil || first.Sub(before) < time.Second || end-start > MaxSampleAge {
+		t.Fatal("first post-resume RTC sample", first, before, err)
+	}
+	resume, err := json.Marshal(map[string]any{"before": before, "first_after_resume": first, "boottime_before_ns": b0, "boottime_after_ns": end, "read_age_ns": end - start, "operation_prestarted": true, "host_round_trip_after_resume": false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("RTC_RESUME_QUALIFICATION=" + string(resume))
 	fmt.Println("PASS: rtc-contention-qualification")
 	// The host stops this VM after the complete result. PID 1 must not exit.
 	for {
@@ -68,7 +90,7 @@ func TestNativeRTCContention(t *testing.T) {
 	}
 }
 
-func qualifyRTC(r *RTC, identity RTCIdentity) (Qualification, error) {
+func qualifyRTC(owner *Owner, identity RTCIdentity) (Qualification, error) {
 	q := Qualification{RTCIdentity: identity}
 	q.Readers = 8
 	const each = 1000
@@ -76,11 +98,15 @@ func qualifyRTC(r *RTC, identity RTCIdentity) (Qualification, error) {
 	failures := make(chan error, q.Readers)
 	var wg sync.WaitGroup
 	for i := 0; i < q.Readers; i++ {
-		fd, e := unix.FcntlInt(r.file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+		file, e := owner.DuplicateRTC()
 		if e != nil {
 			return q, e
 		}
-		reader := &RTC{file: os.NewFile(uintptr(fd), "duplicate RTC qualification")}
+		reader, e := AdoptRTC(file)
+		if e != nil {
+			file.Close()
+			return q, e
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

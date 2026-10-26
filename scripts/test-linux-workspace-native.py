@@ -16,6 +16,7 @@ import signal
 from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_lifecycle import lifecycle_checks
 from linux_workspace_native_product import product_checks
+from linux_workspace_native_g0 import pause_checks
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
@@ -64,7 +65,7 @@ class Guest:
         while True:
             value = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
             self.history.append(value)
-            if value['event'] == expected:
+            if value['event'] in (expected if isinstance(expected, tuple) else (expected,)):
                 return value
             if value['event'] in ('failure', 'eof'):
                 raise RuntimeError(value)
@@ -209,6 +210,10 @@ try:
     measurements[-1]['rtc_contention'] = contention
     measurements[-1]['clock_owner'] = owner
     record('rtc-single-owner-duplicate-contention')
+    first_resume=json.loads((root/'rtc-first-resume.json').read_text())
+    assert first_resume['operation_prestarted'] and not first_resume['host_round_trip_after_resume']
+    assert first_resume['read_age_ns']<=250_000_000
+    record('g0-rtc-first-read-after-vz-resume')
     before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
     assert before['generation'] == 0 and before['sample_age_ns'] <= 250_000_000
     record('rtc-boot-correction')
@@ -220,6 +225,7 @@ try:
     authority.initial_io(guest)
     record('managed-write-read-fsync')
     record('managed-peer-coherence')
+    managed = pause_checks(authority, guest, managed, record)
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
