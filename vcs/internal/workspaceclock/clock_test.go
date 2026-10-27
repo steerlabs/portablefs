@@ -114,8 +114,12 @@ func TestClockFailuresClearReadinessAndRecover(t *testing.T) {
 					t.Fatal("unbounded wall drift retained readiness")
 				}
 			} else {
-				if _, err := o.Measure(); !errors.Is(err, ErrUnavailable) {
+				_, err := o.Measure()
+				if !errors.Is(err, ErrUnavailable) {
 					t.Fatal(err)
+				}
+				if name == "read" && !errors.Is(err, b.readErr) {
+					t.Fatal("shared clock read cause lost", err)
 				}
 			}
 			o.mu.Lock()

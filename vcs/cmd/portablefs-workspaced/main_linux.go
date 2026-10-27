@@ -200,6 +200,8 @@ func serve() error {
 				if e == nil {
 					_ = publishClockEvidence("clock.json", raw)
 				}
+			} else if !errors.Is(err, workspaceclock.ErrObsolete) {
+				fmt.Fprintln(os.Stderr, "workspace clock measurement unavailable:", err)
 			}
 		})
 	}()
