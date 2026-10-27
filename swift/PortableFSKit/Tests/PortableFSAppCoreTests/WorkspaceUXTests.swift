@@ -229,6 +229,7 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             let directory = home.appendingPathComponent(".local/state/portablefs/workspace")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try Data().write(to: directory.appendingPathComponent("owner.lock"))
+            chmod(directory.appendingPathComponent("owner.lock").path, 0o600)
             let actions = WorkspaceRemoval.Actions(stop: { throw PortableFSWorkspaceError("pristine workspace must not start") }, status: { .init() }, quiesce: {
                 let absent = try PortableFSDServiceCoordinator.workspaceRuntimeAbsent(directory)
                 #expect(absent)
