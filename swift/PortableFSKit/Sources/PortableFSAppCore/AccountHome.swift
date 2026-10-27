@@ -16,6 +16,10 @@ public enum PortableFSAccountHomeError: Error, CustomStringConvertible {
 /// and XDG environment overrides, then proves it is one real owned directory.
 public enum PortableFSAccountHome {
     public static func resolve() throws -> String {
+        #if WORKSPACE_SERVICE_TESTING
+        if let id = Bundle.main.bundleIdentifier, id.hasPrefix("dev.portablefs.workspace-tests."),
+           let path = Bundle.main.object(forInfoDictionaryKey: "PFSWorkspaceTestHome") as? String { return path }
+        #endif
         var entry = passwd()
         var result: UnsafeMutablePointer<passwd>?
         let recommended = sysconf(_SC_GETPW_R_SIZE_MAX)

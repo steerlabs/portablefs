@@ -238,6 +238,9 @@ func runInstallMacOSAppWithLayout(
 	if err := validateExistingManagedMacOSAppWithLayout(destinationApp, expectedAppID, layout); err != nil {
 		return macOSInstallResult{}, err
 	}
+	if err := preflightMacOSInstallSpace(sourceApp, appDir); err != nil {
+		return macOSInstallResult{}, err
+	}
 	prepared, err := prepareMacOSInstallWithLayout(sourceApp, destinationApp, cliLink, layout)
 	if err != nil {
 		return macOSInstallResult{}, err
@@ -321,6 +324,13 @@ func runInstallMacOSAppWithLayout(
 		)
 	}
 	defer guard.Close()
+	// Hold the exact canonical workspace singleton across publication and
+	// rollback. No service execution may enter behind the final absence proof.
+	releaseWorkspace, err := excludeAbsentWorkspace(stateDir, layout)
+	if err != nil {
+		return macOSInstallResult{}, err
+	}
+	defer releaseWorkspace()
 
 	if updateSession != nil {
 		if err := rejectPreparedMacOSRuntime(
@@ -3374,6 +3384,7 @@ func isPortableFSMacOSProcessName(name string) bool {
 		"PortableFSDev",
 		macOSCLIName,
 		"portablefsd",
+		"portablefs-workspace-service",
 	} {
 		if name == truncatedProcessName(executable) {
 			return true
@@ -3519,8 +3530,12 @@ func validateMacOSBundleForPublicationWithLayout(
 		return fmt.Errorf("staged app must contain exactly %s.appex", layout.extensionExecutable)
 	}
 	serviceApps, err := filepath.Glob(filepath.Join(app, "Contents", "Library", "LaunchAgents", "*.app"))
-	if err != nil || len(serviceApps) != 1 || serviceApps[0] != serviceApp {
-		return fmt.Errorf("staged app must contain exactly PortableFSDService.app")
+	expectedServices := []string{serviceApp}
+	if layout.codeIdentity == macOSInstallDeveloperIDRelease {
+		expectedServices = append(expectedServices, filepath.Join(app, "Contents/Library/LaunchAgents/PortableFSWorkspaceService.app"))
+	}
+	if err != nil || !reflect.DeepEqual(serviceApps, expectedServices) {
+		return fmt.Errorf("staged app must contain its exact service applications")
 	}
 	launchAgent := filepath.Join(
 		app,
@@ -3530,7 +3545,11 @@ func validateMacOSBundleForPublicationWithLayout(
 		expectedAppID+".portablefsd.plist",
 	)
 	launchAgents, err := filepath.Glob(filepath.Join(app, "Contents", "Library", "LaunchAgents", "*.plist"))
-	if err != nil || len(launchAgents) != 1 || launchAgents[0] != launchAgent {
+	expectedAgents := []string{launchAgent}
+	if layout.codeIdentity == macOSInstallDeveloperIDRelease {
+		expectedAgents = append(expectedAgents, filepath.Join(app, "Contents/Library/LaunchAgents", expectedAppID+".workspace.plist"))
+	}
+	if err != nil || !reflect.DeepEqual(launchAgents, expectedAgents) {
 		return fmt.Errorf("staged app must contain exactly its sealed PortableFS LaunchAgent plist")
 	}
 	if err := validatePortableFSDLaunchAgentPlist(launchAgent, expectedAppID); err != nil {
@@ -3554,6 +3573,11 @@ func validateMacOSBundleForPublicationWithLayout(
 		}
 	}
 
+	if layout.codeIdentity == macOSInstallDeveloperIDRelease {
+		if err := validateWorkspaceBundleForPublication(app, version, expectedAppID, layout); err != nil {
+			return err
+		}
+	}
 	appVersion, err := plistValue(filepath.Join(app, "Contents", "Info.plist"), "CFBundleShortVersionString")
 	if err != nil {
 		return err
@@ -3820,6 +3844,10 @@ func validateMacOSCodeSignature(output string, policy macOSInstallCodeIdentityPo
 }
 
 func validateMacOSComponentEntitlements(entitlements map[string]any, component, group string) error {
+	if _, ok := entitlements["com.apple.security.virtualization"]; ok {
+		return fmt.Errorf("only the workspace service may hold virtualization")
+	}
+
 	if component == "CLI" {
 		return validateAbsentMacOSAppGroupEntitlementDictionary(entitlements, component)
 	}
@@ -4361,4 +4389,47 @@ func connectInstalledPortablefsd(cfg fskitConfig) (*fsdControl, error) {
 		return nil, err
 	}
 	return connectCompatiblePortablefsd(cfg, version)
+}
+
+func preflightMacOSInstallSpace(sourceApp, destinationDirectory string) error {
+	var expanded uint64
+	err := filepath.WalkDir(sourceApp, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 {
+			return fmt.Errorf("unsafe installer member %s", path)
+		}
+		size := uint64(info.Size())
+		if size > (^uint64(0) - expanded) {
+			return fmt.Errorf("installer size overflow")
+		}
+		expanded += size
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if expanded > ^uint64(0)-(2<<30) {
+		return fmt.Errorf("installer size overflow")
+	}
+	var space unix.Statfs_t
+	if err := unix.Statfs(destinationDirectory, &space); err != nil {
+		return fmt.Errorf("check install free space: %w", err)
+	}
+	// Source extraction and the download already consume space on their
+	// filesystem. Only the staged copy is additional at this boundary.
+	required := expanded + (2 << 30)
+	available := uint64(space.Bavail) * uint64(space.Bsize)
+	if available < required {
+		return fmt.Errorf("Not enough disk space: need %d bytes; available %d", required, available)
+	}
+	return nil
 }

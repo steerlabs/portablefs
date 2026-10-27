@@ -19,13 +19,16 @@ from linux_workspace_native_lifecycle import lifecycle_checks
 from linux_workspace_native_product import product_checks
 from linux_workspace_native_g0 import pause_checks
 
-binary, image, evidence, inventory = sys.argv[1:]
+binary, image, evidence, inventory, *options = sys.argv[1:]
+assert options in ([], ['--defer-ui']), options
+defer_ui = bool(options)
 root = pathlib.Path(evidence)
 state = pathlib.Path(tempfile.mkdtemp(prefix=os.environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-workspace-native-'), dir='/tmp'))
 (root / 'state-directory.json').write_text(json.dumps({'state': str(state)}))
 required = pathlib.Path(inventory).read_text().splitlines()
 assert required and len(required) == len(set(required))
 passed = []
+not_run = []
 measurements = []
 events = (root / 'events.jsonl').open('w')
 (root / 'results.json').unlink(missing_ok=True)
@@ -35,6 +38,12 @@ def record(name):
     assert name in required and name not in passed, name
     passed.append(name)
     print('PASS:', name, flush=True)
+
+
+def defer_case(name):
+    assert defer_ui and name in required and name not in passed and name not in not_run, name
+    not_run.append(name)
+    print('NOT RUN (UI deferred):', name, flush=True)
 
 
 class Guest:
@@ -189,6 +198,7 @@ try:
         guest.command('probe-unavailable-jobs')
         jobs = guest.wait('jobs-refused', 10)
         assert jobs['mounts'] == 0 and jobs['failure'] == 'handler-failed' and jobs['cleanup'] == 'complete', jobs
+        assert jobs['retirement_acknowledged'] is True, jobs
         assert len(jobs['request_ids']) == 3 and all(a < b for a, b in zip(jobs['request_ids'], jobs['request_ids'][1:])), jobs
     record('unprovisioned-jobs-retain-failure')
     guest.command('probe-identity')
@@ -343,10 +353,15 @@ try:
     assert stopped['operations'][-1] == 'shutdown-completed'
     assert guest.p.wait(timeout=10) == 0
     record('clean-stop')
-    product_checks(image, root / "product", record, authority=authority)
-    product_checks(image, root / "product-loss", record, authority=authority, outcome_case='loss')
-    assert sorted(passed) == sorted(required), (passed, required)
-    (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
+    product_checks(image, root / "product", record, authority=authority, defer_ui=defer_ui, defer_case=defer_case)
+    product_checks(image, root / "product-removal", record, authority=authority, outcome_case='removal', defer_ui=defer_ui, defer_case=defer_case)
+    product_checks(image, root / "product-loss", record, authority=authority, outcome_case='loss', defer_ui=True, defer_case=lambda name: None)
+    assert sorted(passed + not_run) == sorted(required), (passed, not_run, required)
+    (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'notRun': not_run, 'qualified': not not_run, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
+    if not_run:
+        print('native-workspace: INCOMPLETE (%d passed, %d UI cases not run)' % (len(passed), len(not_run)), flush=True)
+        sys.exit(3)
+
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)
 finally:
     if guest:

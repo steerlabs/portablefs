@@ -1,16 +1,6 @@
 name: workspace-image
 on:
-  pull_request:
-    paths:
-      - 'deploy/linux-workspace/**'
-      - 'scripts/*linux-workspace*'
-      - 'vcs/**'
-      - 'VERSION'
-      - 'LICENSE*'
-      - 'COPYING*'
-      - 'NOTICE*'
-      - 'swift/PortableFSKit/Sources/PortableFSWorkspaceVM/**'
-      - '.github/workflows/workspace-image.yml'
+  workflow_call:
   workflow_dispatch:
 permissions:
   contents: read

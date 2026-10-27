@@ -14,9 +14,7 @@ public enum WorkspaceHostControl {
     public static let macConflict = "This volume is mounted on your Mac. Unmount it there before using it in Linux."
     public static let linuxConflict = "This volume is in Linux. Remove it from Linux before mounting it on your Mac."
     public static func validVolume(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 128 && value != "." && value != ".." && value.utf8.allSatisfy {
-            (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || [45, 46, 95].contains($0)
-        }
+        PortableFSWorkspaceStatus.validVolume(value)
     }
     public static func authorityIdentity(_ name: String) throws -> String {
         var canonical = name.lowercased()
@@ -71,28 +69,8 @@ public struct WorkspaceHostRequest: Codable, Sendable {
         }
     }
 }
-public struct WorkspaceHostReply: Codable, Sendable {
-    public var version = 1
-    public var state = "stopped"
-    public var message = "Linux Workspace: Stopped"
-    public var desiredRunning = false
-    public var someChangesWereNotSaved = false
-    public var previousWriteOutcomeUnknown = false
-    public var retainedEvidence: [Data] = []
-    public var volumes: [WorkspaceHostVolume] = []
-    public init() {}
-}
-public struct WorkspaceHostVolume: Codable, Sendable {
-    public var volumeId: String
-    public var path: String
-    public var state: String
-    public var message: String
-    public var evidence: Data?
-    public var authorizationRequest: String?
-    public init(volume: String, state: String, message: String) {
-        volumeId = volume; path = "/workspaces/" + volume; self.state = state; self.message = message
-    }
-}
+public typealias WorkspaceHostReply = PortableFSWorkspaceStatus
+public typealias WorkspaceHostVolume = PortableFSWorkspaceVolume
 public struct WorkspaceConnection: Codable, Equatable, Sendable {
     public var authority: String
     public var volumeId: String

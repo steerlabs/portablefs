@@ -211,10 +211,11 @@ daemon on the app's runner, so `go-darwin` verifies the same image and toolchain
 The [runner inventory](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md)
 documents the installation; the assertions reject image drift.
 
-There is **no attestation on the macOS path.** The macOS app is not built by
+The macOS app has supplementary Sigstore provenance and retains its independent
+Apple trust chain. It is not built by
 GoReleaser; it comes from `scripts/package-macos-app.sh` as
 `portablefs_<version>_darwin_universal_app.zip` and is not listed in
-`checksums.txt`. Its identity rests on four independent things.
+`checksums.txt`. Its installer identity rests on four independent things.
 
 **A sha256 sidecar.** The packager writes `<archive>.sha256` beside the zip and
 the release uploads both; the installer fetches the sidecar and refuses to
@@ -301,8 +302,8 @@ privilege or accidental CLI privilege.
 **An exact paired-release identity.** The CLI, app, daemon, and extension are
 one paired release. A release is identified by exactly three values: the
 daemon's CodeDirectory hash, its executable SHA-256, and the release version.
-Protocol numbers are not part of that identity and the bundle carries no
-protocol manifest; the authenticated daemon reports its own live identity
+Daemon control and `pfslocal` numbers are not part of that identity and have no
+sealed daemon protocol manifest; the authenticated daemon reports its own live identity
 (identity schema 1, operational control, `pfslocal` major and minor). Static
 release authentication still covers signatures, hardened runtime,
 entitlements, sealed resources, the fixed layout, exact executable matching,
@@ -459,6 +460,17 @@ installation (`install-linux-release` / `install-macos-app`), so path resolution
 the lifecycle guard, and the atomic activation swap are done by code that has
 already been proven authentic.
 
+Whole-app removal runs `portablefs uninstall-macos-app` from the installed
+helper. A custom installation link directory uses the same `--link-dir` value
+as installation. Removal authenticates its enclosing installed release, uses
+the outgoing host's tokenized clean-drain transaction, then retains account,
+mount-lifecycle and workspace singleton exclusion through deletion. It removes
+only the authenticated app and its snapshotted CLI symlink. Workspace data and
+unrelated files remain. Replaced app, directory or link names refuse deletion.
+Only after durable program-name absence may that live removal token retire its
+exact same-release `old-absent` lease. An interrupted or ambiguous handoff keeps
+the nonterminal fence; expiration never authorizes tokenless cleanup.
+
 ## The policy that keeps it from drifting
 
 Two dependency-free Node scripts are the enforcement. They run in `release.yml`
@@ -536,10 +548,40 @@ plus the frozen FSKit direct-distribution profile; it must never fall back to
 cloud-managed certificate or profile creation. That manual step is outside the
 workflow's automated proof.
 
-The macOS path has no artifact attestation; its trust rests on the sidecar
-checksum, Developer ID signing, notarization, and the exact bundle identity.
+The macOS installer retains the sidecar checksum, Developer ID signing,
+notarization and exact bundle identity. Supplemental provenance binds its ZIP,
+sidecar and measured space manifest to the exact tag.
 
 The authenticated cross-release service update has no signed predecessor
 release to update from yet. Its lifecycle v1 quiescence, spoofed-identity
 refusal, and arbitrary-distinct-release behavior are exercised by tests, not by
 replacing a published signed app in place on macOS 26 or 27.
+
+## Bundled Linux workspace
+
+The signed app additionally contains `PortableFSWorkspaceService.app` with its
+existing `<bundle-id>.WorkspaceService` identity, its sealed `.workspace.plist`
+LaunchAgent, and `Contents/Resources/LinuxWorkspace`. Only this service has
+`com.apple.security.virtualization`; its entitlement dictionary contains exactly
+that true value. The daemon identities and restricted entitlements are preserved.
+The workspace service's signed plist pins the image manifest and source commit.
+The installer and running service reject a different manifest or guest file;
+the enclosing signature additionally seals the manifest, service and metadata.
+
+`guest-arm64` builds and compares two complete images at the tag's exact commit.
+The packaging job consumes its artifact, checks matching corresponding-source
+coverage, and seals that same image. Release assets retain the guest archive,
+matching source archive, image/source/distribution manifests and reproduction
+proof, with provenance. Source retention lasts for the distribution period;
+CI artifact expiration does not meet that obligation.
+
+`verify-signed-release` downloads the actual uploaded assets while the release
+is still a draft. It proves exact release asset membership, tag/commit-bound
+provenance, the real installer's ZIP and signed-image boundary, the complete
+CLI publication validator, and byte equality between the sealed image/source
+manifests and the published ones. Its receipt binds installer/source/manifest
+hashes and measured final space. `publish` depends on this job, guest/source
+publication, the existing power-loss prerequisite and the original release
+jobs. Existing assets are never replaced and tags are never moved. This
+read-only artifact gate does not claim installed service consent, a two-release
+native replacement, editor/network qualification or the unresolved sleep gate.

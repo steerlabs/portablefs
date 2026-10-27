@@ -704,6 +704,65 @@ func TestActivationReadinessLossRetainsExactAuthenticatedPeer(t *testing.T) {
 	}
 }
 
+func TestRemovalLeaseRetirementRequiresExactSameReleaseHandoff(t *testing.T) {
+	for _, fault := range []string{"none", "token", "phase", "target", "expired", "symlink"} {
+		t.Run(fault, func(t *testing.T) {
+			root, err := os.MkdirTemp("/private/tmp", "pfs-remove-lease-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			token := strings.Repeat("a", 64)
+			hash, err := TokenSHA256(token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := testReleaseIdentity("b", "1.0.0")
+			now := time.Now()
+			lease := ActivationLease{SchemaVersion: SchemaVersion, Phase: PhaseOldAbsent, TokenSHA256: hash,
+				OldRelease: release, TargetRelease: release, CreatedAtUnixMS: now.UnixMilli(), DeadlineUnixMS: now.Add(LeaseLifetime).UnixMilli()}
+			switch fault {
+			case "token":
+				token = strings.Repeat("c", 64)
+			case "phase":
+				lease.Phase = PhaseTargetComplete
+			case "target":
+				lease.TargetRelease = testReleaseIdentity("c", "2.0.0")
+			case "expired":
+				lease.CreatedAtUnixMS = now.Add(-2 * LeaseLifetime).UnixMilli()
+				lease.DeadlineUnixMS = now.Add(-LeaseLifetime).UnixMilli()
+			}
+			body, err := json.Marshal(lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, LeaseName)
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if fault == "symlink" {
+				if err := os.Rename(path, path+".original"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(path+".original", path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = RetireRemovalLease(path, token, release)
+			if (err == nil) != (fault == "none") {
+				t.Fatalf("retire %s: %v", fault, err)
+			}
+			_, exists := os.Lstat(path)
+			if fault == "none" && !os.IsNotExist(exists) {
+				t.Fatalf("exact lease remains: %v", exists)
+			}
+			if fault != "none" && exists != nil {
+				t.Fatalf("unproven lease was removed: %v", exists)
+			}
+		})
+	}
+}
+
 func TestRequireLeasePinsExactOwnedTokenBoundState(t *testing.T) {
 	root, err := os.MkdirTemp("/private/tmp", "pfs-hostctl-lease-")
 	if err != nil {

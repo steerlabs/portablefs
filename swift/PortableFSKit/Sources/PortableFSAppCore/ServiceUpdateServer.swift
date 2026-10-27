@@ -970,6 +970,6 @@ private extension PortableFSDUpdateLease {
 
 private extension PortableFSDUpdatePhase {
     var isComplete: Bool {
-        self == .targetComplete || self == .rollbackComplete
+        permitsNormalAdmission
     }
 }

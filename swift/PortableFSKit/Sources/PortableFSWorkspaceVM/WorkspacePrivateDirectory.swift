@@ -77,13 +77,13 @@ public final class WorkspacePrivateDirectory {
         if try read(name) != nil { guard unlinkat(fd, name, 0) == 0 else { throw WorkspaceVMError("remove workspace state: \(errno)") } }
         guard fsync(fd) == 0 else { throw WorkspaceVMError("sync workspace state: \(errno)") }; try validate()
     }
-    public func lock(_ name: String) throws -> WorkspaceFileLock {
+    public func lock(_ name: String, shared: Bool = false) throws -> WorkspaceFileLock {
         try validName(name); try validate()
         let file = openat(fd, name, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard file >= 0 else { throw WorkspaceVMError("open workspace lock: \(errno)") }
         do {
             try validateFile(file, name: name)
-            guard workspaceFlock(file, LOCK_EX | LOCK_NB) == 0 else { throw WorkspaceVMError("PortableFS mount lifecycle is busy") }
+            guard workspaceFlock(file, (shared ? LOCK_SH : LOCK_EX) | LOCK_NB) == 0 else { throw WorkspaceVMError("PortableFS mount lifecycle is busy") }
             try validateFile(file, name: name); try validate()
             return try WorkspaceFileLock(file)
         } catch { Darwin.close(file); throw error }

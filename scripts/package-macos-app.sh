@@ -93,6 +93,10 @@ case "$build_number" in
   } ;;
 esac
 
+[ -n "${PORTABLEFS_WORKSPACE_ARTIFACT_DIR:-}" ] ||
+  { echo "packaging requires the guest-arm64 artifact at PORTABLEFS_WORKSPACE_ARTIFACT_DIR" >&2; exit 1; }
+[ -z "$(git -C "$repo_root" status --porcelain --untracked-files=normal)" ] ||
+  { echo "refuse to package a dirty app against a committed guest image" >&2; exit 1; }
 mkdir -p "$out_root"
 verify_tmp=$(mktemp -d "$out_root/package-verify-$version.XXXXXX")
 installed_profile=
@@ -136,7 +140,8 @@ set -- xcodebuild \
   MARKETING_VERSION="$version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   PORTABLEFS_APP_GROUP="$app_group" \
-  PORTABLEFS_GO="$go_binary"
+  PORTABLEFS_GO="$go_binary" \
+  PORTABLEFS_WORKSPACE_ARTIFACT_DIR="$PORTABLEFS_WORKSPACE_ARTIFACT_DIR"
 
 if [ -n "${PORTABLEFS_APPLE_API_KEY_PATH:-}" ]; then
   [ -n "${PORTABLEFS_APPLE_API_KEY_ID:-}" ] ||
@@ -147,6 +152,11 @@ if [ -n "${PORTABLEFS_APPLE_API_KEY_PATH:-}" ]; then
     -authenticationKeyPath "$PORTABLEFS_APPLE_API_KEY_PATH" \
     -authenticationKeyID "$PORTABLEFS_APPLE_API_KEY_ID" \
     -authenticationKeyIssuerID "$PORTABLEFS_APPLE_API_ISSUER_ID"
+fi
+
+if [ "$unsigned" != "1" ]; then
+  : "${PORTABLEFS_SERVICE_SIGN_IDENTITY:?signed packaging requires the explicit Developer ID service identity}"
+  set -- "$@" PORTABLEFS_SERVICE_SIGN_IDENTITY="$PORTABLEFS_SERVICE_SIGN_IDENTITY"
 fi
 
 if [ "$unsigned" = "1" ]; then
@@ -223,6 +233,10 @@ app_executable="$app/Contents/MacOS/PortableFS"
 cli="$app/Contents/Helpers/portablefs"
 service="$app/Contents/Library/LaunchAgents/PortableFSDService.app"
 daemon="$service/Contents/MacOS/portablefsd"
+workspace_service="$app/Contents/Library/LaunchAgents/PortableFSWorkspaceService.app"
+workspace_executable="$workspace_service/Contents/MacOS/portablefs-workspace-service"
+[ -x "$workspace_executable" ] || { echo "packaged app has no workspace service" >&2; exit 1; }
+"$cli" lifecycle verify-workspace-bundle --app "$app"
 launch_agent="$app/Contents/Library/LaunchAgents/dev.portablefs.PortableFSApp.portablefsd.plist"
 extension="$app/Contents/Extensions/PortableFSExt.appex"
 extension_executable="$extension/Contents/MacOS/PortableFSExt"
@@ -235,7 +249,7 @@ extension_executable="$extension/Contents/MacOS/PortableFSExt"
 [ -x "$extension_executable" ] ||
   { echo "packaged app has no PortableFSExt executable" >&2; exit 1; }
 
-for executable in "$app_executable" "$cli" "$daemon" "$extension_executable"; do
+for executable in "$app_executable" "$cli" "$daemon" "$extension_executable" "$workspace_executable"; do
   for required_arch in arm64 x86_64; do
     /usr/bin/lipo "$executable" -verify_arch "$required_arch"
   done
@@ -321,7 +335,7 @@ daemon_scheme=$(plutil -extract resourceScheme raw -o - "$daemon_identity")
 
 if [ "$unsigned" != "1" ]; then
   codesign --verify --deep --strict --verbose=2 "$app"
-  for code in "$app" "$extension" "$service" "$cli" "$daemon"; do
+  for code in "$app" "$extension" "$service" "$cli" "$daemon" "$workspace_service"; do
     code_identity=$(codesign -dv --verbose=4 "$code" 2>&1)
     printf '%s\n' "$code_identity" |
       grep -Fx "TeamIdentifier=$team_id" >/dev/null ||
@@ -386,6 +400,16 @@ if [ "$unsigned" != "1" ]; then
   verify_app_group_entitlement "$daemon" daemon
   verify_exact_service_entitlements
   verify_no_app_group_entitlement "$cli" cli
+  workspace_entitlements="$verify_tmp/workspace-entitlements.plist"
+  codesign -d --xml --entitlements - "$workspace_service" >"$workspace_entitlements"
+  [ "$(plutil -convert json -o - "$workspace_entitlements")" = '{"com.apple.security.virtualization":true}' ] ||
+    { echo "workspace service must hold exactly the virtualization entitlement" >&2; exit 1; }
+  for code in "$app" "$extension" "$service" "$cli"; do
+    codesign -d --xml --entitlements - "$code" >"$verify_tmp/no-virtualization.plist"
+    if /usr/libexec/PlistBuddy -c 'Print :com.apple.security.virtualization' "$verify_tmp/no-virtualization.plist" >/dev/null 2>&1; then
+      echo "only the workspace service may hold virtualization" >&2; exit 1
+    fi
+  done
 fi
 
 if [ "$release" = "1" ]; then
@@ -416,4 +440,5 @@ fi
   cd "$out_root"
   shasum -a 256 "$(basename "$zip")" >"$(basename "$zip").sha256"
 )
+python3 "$repo_root/scripts/measure-macos-package.py" "$zip" "$app" >"$zip.space.json"
 printf '%s\n' "$zip"

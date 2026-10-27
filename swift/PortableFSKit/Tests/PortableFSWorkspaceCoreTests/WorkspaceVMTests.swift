@@ -51,6 +51,16 @@ private func temporaryDirectory() throws -> URL {
         do { _ = try WorkspaceArtifact(directory: directory); Issue.record("corrupt artifact accepted") }
         catch let error as WorkspaceVMError { #expect(error.description == "artifact hash mismatch: kernel") }
     }
+    @Test func sealedManifestPinRefusesResealedImage() throws {
+        let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        try artifact(directory)
+        let manifest = directory.appendingPathComponent("manifest.json")
+        let pin = hex(Data(SHA256.hash(data: try Data(contentsOf: manifest))))
+        _ = try WorkspaceArtifact(directory: directory, manifestSHA256: pin)
+        var raw = try Data(contentsOf: manifest); raw.append(32)
+        try raw.write(to: manifest)
+        #expect(throws: (any Error).self) { try WorkspaceArtifact(directory: directory, manifestSHA256: pin) }
+    }
     @Test func imageSpaceCountsLogicalBytesAndRefusesInsufficientCapacity() throws {
         let directory = try temporaryDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         try artifact(directory)

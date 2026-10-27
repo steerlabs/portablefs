@@ -15,7 +15,14 @@ struct MenuContent: View {
                     model.quitApp()
                 }
             } else {
+                if model.backgroundConsentMissing {
+                    Text("Allow PortableFS in Background Items")
+                    Button("Open System Settings") { model.workspace.openSettings() }
+                    Divider()
+                }
                 mountsSection
+                Divider()
+                PortableFSWorkspaceMenu(model: model.workspace)
                 Divider()
 
                 alertsSection

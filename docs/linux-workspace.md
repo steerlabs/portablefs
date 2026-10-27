@@ -26,8 +26,8 @@ The selected guest is Debian 13 arm64 with a pinned 6.12 kernel, glibc, systemd,
 OpenSSH, Git, a C/C++ compiler, Node.js/npm and Python with pip/venv. The image is pinned by
 `deploy/linux-workspace/image.lock.json`; the builder records its actual kernel
 configuration, package/source inventory and output hashes, and retains the matching
-corresponding source. Release attestation and sealed-app insertion remain separate
-packaging work. Use an immutable system
+corresponding source. Release packaging seals the same-commit CI artifact and retains attested
+matching source; see [image distribution](linux-workspace-image.md). Use an immutable system
 disk and sparse persistent ext4 data disk; keep home, editor installations,
 guest identity and machine-local route backing on the data disk. Never share
 the Mac home through virtiofs. Each volume mounts at `/workspaces/<volume-id>`;
@@ -48,9 +48,41 @@ The product owner is `PortableFSWorkspaceService.app`, a per-user SMAppService
 LaunchAgent nested in the shipping app. It reuses the VZ machine, power adapter,
 coordinator, paired guest channel and persistent SSH identity owner. The menu app
 has a registration-only entrypoint; its exit does not own VM termination. The
-workspace service requires no FSKit registration. Image bundling, managed SSH
-include, menu/editor actions and installer/update integration remain separate,
-unqualified packaging work.
+workspace service requires no FSKit registration. The shipping menu's Linux
+Workspace submenu presents the same operational API as the CLI. Add Volume
+opens a connection document; pending authorization offers Save Authorization
+Request and Open Authorization. Connect opens Terminal, VS Code or Cursor,
+or copies `ssh portablefs-workspace`. Missing editors or Remote-SSH extensions
+produce an error; the app installs neither. Image bundling and both-service update exclusion are implemented. Installed
+signed-product qualification remains pending.
+
+Start installs `Include ~/.ssh/portablefs-workspace.conf` at the beginning of
+the account's SSH config. OpenSSH takes the first obtained value: placing this
+before user `Host *` defaults prevents those defaults from changing the workspace
+identity or transport. The managed file contains only the workspace Host stanza
+and a final `Host *` scope reset. Other hosts retain their effective options.
+Original bytes, CRLF and a missing final newline survive; a symlinked config is
+edited atomically at its owned target. Read-only or unsafe files refuse setup.
+Existing alias definitions, including matching specific patterns and Includes,
+refuse with **SSH name already in use**. The dedicated key, pinned guest host
+key and Unix socket are retained under workspace state. SSH disables agent
+forwarding and agent identities. The managed SSH entry has no TCP listener;
+editors can request their ordinary SSH channel forwarding.
+An owned checkpoint makes include setup/removal retryable without adopting or
+deleting another config. Test homes never redirect OpenSSH's passwd-based `~`
+expansion; native tests use `ssh -F` with the generated managed stanza.
+
+Settings offers Remove Linux Workspace with Keep Linux data selected by default.
+Delete Linux data requires a second destructive confirmation. The public AppCore
+`WorkspaceRemoval.remove(data:bundle:home:)` uses ordinary Stop and lifecycle-v1
+quiescence, refuses busy/unknown/lost outcomes, unregisters only the workspace
+service, removes the owned SSH include, and optionally deletes local workspace
+state/data. It never removes remote files. A synced checkpoint outside that data
+directory retains progress through interruption; new registration refuses an
+unfinished removal. Retrying completes it. A completed keep-data removal can
+later delete retained data without starting a VM. Explicit Start clears completed
+removal intent and begins ordinary setup again.
+
 
 `portablefs workspace` exposes only Start, Status, Mount, Umount and Stop, with
 the exact flags in `portablefs help workspace`. The service's operational-v1
@@ -66,7 +98,7 @@ unequal versions and extra operations refuse. Command acceptance is distinct
 from guest job completion and pinned SSH readiness. Lifecycle v1 uses a separate
 `lifecycleVersion` discriminator with `identity`, `inventory` and idle-only
 `quiesce`. It closes admission for that execution; it does not certify service
-termination, singleton release or completion of the deferred installer protocol.
+termination or singleton release. The installer separately requires both proofs.
 
 Desired running state, descriptors, mount intents and retained outcomes commit
 through file sync, rename and directory sync. Stop preserves descriptors and
@@ -85,6 +117,7 @@ busy after service death. Successful acquisition permits a cold successor while
 preserving prior outcomes; it never adopts old RAM. Replaced names and uncertain
 lock operations refuse. A different kernel boot-session identity also proves old
 execution absence. See [VM absence](linux-workspace-vm-absence.md).
+
 
 A `.pfsworkspace` file is at most 512 KiB of exact-version JSON. `kind` is
 `connection`, `request`, or `authorization`. A connection contains canonical TLS
@@ -118,6 +151,30 @@ including in the opposite frontend; an alias cannot create a second placement. O
 use both frontends. FSKit reads this inventory without starting a workspace or
 requiring it enabled. This is per-account arbitration; authority enforcement
 continues to govern other users and machines.
+
+## Update exclusion
+
+The existing per-account `mount-lifecycle.lock` is the one update exclusion for
+both frontends. Workspace Start/Mount acquire a shared guard; cleanup remains
+available behind closed admission. Starts retain the shared guard through durable
+execution publication. The VM's durable presence marker remains through confirmed
+termination. The installer acquires the exclusive guard, proves exact FSKit absence and requires the workspace's
+`resources.present` name absent. It never decodes an outgoing desired-state
+registry. The service publishes this marker durably before VM execution and
+retires it only after confirmed termination, reservation release and loss-free,
+observed outcome evidence. Unexpected termination or explicit Force Stop keeps
+an unobserved-execution fact in that witness, even if no guest status arrived.
+A subsequent clean boot does not erase that earlier uncertainty. Busy, unknown
+and lost work defer unattended update.
+
+The existing token-bound activation lease also closes workspace admission in
+every nonterminal phase, including an expired interrupted transaction. It closes
+the handoff gap between the outgoing host and the installer. Under exclusion,
+Service Management unregistration must complete, the canonical service singleton
+must be released and the exact control socket absent before replacement. No PID
+scan, timeout or apparently empty private JSON substitutes for these witnesses.
+Workspace removal is owned by the product's separate removal API; uninstall
+must use that API and preserve data unless the user explicitly requests deletion.
 
 ## Mount lifecycle
 
@@ -734,6 +791,29 @@ Run the native gate with explicit artifact and evidence directories:
 bash scripts/test-linux-workspace-native.sh /absolute/image /absolute/evidence
 ```
 
+The product/editor portion also requires `PFS_WORKSPACE_TEST_VSCODE_APP` to name
+a disposable downloaded VS Code app. It uses the installed `/Applications/Cursor.app`
+with separate temporary `--user-data-dir` and `--extensions-dir` directories for
+both editors. The fixture installs Remote-SSH only into those test directories;
+the shipping action never installs an extension. Real editor document saves and
+reads handshake with an independent ordinary Linux peer. The exact inventory
+also requires the AppCore client, managed SSH, two SSH agents, busy refusal,
+unmounted-path denial and data-preserving/destructive removal.
+Its denied-consent case publishes `product/consent-fixture.json`, then waits for
+computer-use toggles of only that throwaway Background Item. The controlling
+test agent writes `product/consent-denied` and `product/consent-restored` after
+the corresponding observations. A password or Touch ID request stops the case;
+an absent UI observation fails rather than skipping it.
+When the desktop is locked, `--defer-ui` runs the complete non-UI inventory,
+including real missing-extension checks, and records the exact unrun consent and
+editor-save names. It exits 3 with an INCOMPLETE verdict, never an all-passing
+native qualification. Rerun without that flag after an authorized operator
+unlocks the session.
+To rerun just the exact service/product subset with the same image after that
+unlock, use `python3 scripts/linux_workspace_native_product.py IMAGE EVIDENCE`.
+It creates its own authority/peer and throwaway service and checks every
+`service-` inventory name. It does not replace the full native inventory.
+
 It builds or verifies/reuses the pinned image, builds and signs the owner, then
 requires exact equality with `scripts/linux-workspace-required-native-tests.txt`.
 It boots fresh guests, proves real FUSE INIT >= 7.31 on a throwaway filesystem, and checks
@@ -764,14 +844,17 @@ and recovery use the empty guest-owned roster. The FUSE probe is invoked only
 by the native gate as the ordinary workspace user, never by a boot service.
 Stage 1c implements real daemon suspension, protected root bootstrap, independent
 durable inventories and provisioning. Their native and fault qualification is
-required separately from Stage 1b evidence. The product service, host API, CLI and public handoff are implemented. App UI,
-release packaging, update coordination and editor qualification remain pending.
+required separately from Stage 1b evidence. The product service, host API, CLI,
+public handoff, menu and managed SSH/editor actions are implemented. Release
+packaging and update coordination are implemented. Installed signing and actual
+editor qualification remain pending.
+
 
 All new workspace surfaces are pending and unreleased: the control grammar,
 service identity/entitlements, guest paths, inventory format, image manifest,
 SSH entry and proposed workspace command namespace. Define exact CLI flags and
 status schemas when their implementation is ready. Do not repurpose any
-existing frozen surface. Preserve the two-binary Linux client archive; a future
+existing frozen surface. Preserve the two-binary Linux client archive; the
 separate attested workspace asset must bind the exact image, kernel, package
 sources/licenses, PortableFS commit and sealed app resources.
 

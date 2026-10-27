@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Observation
 import PortableFSAppCore
+import ServiceManagement
 
 struct AppAlert: Identifiable, Equatable {
     let id = UUID()
@@ -26,6 +27,7 @@ struct AppAlert: Identifiable, Equatable {
 @MainActor
 @Observable
 final class AppModel {
+    let workspace = PortableFSWorkspaceModel()
     // MARK: Account identity
 
     private var startupPathError: String?
@@ -56,6 +58,7 @@ final class AppModel {
     private var interactiveSessionRequested = false
 
     private(set) var isLifecycleReady = false
+    private(set) var backgroundConsentMissing = false
 
     var menuBarSymbolName: String {
         mounts.contains { $0.health == "live" }
@@ -109,10 +112,11 @@ final class AppModel {
                 switch server.startupDisposition {
                 case .normal:
                     if try PortableFSDServiceCoordinator.prepareAndRegister() == .requiresApproval {
-                        startupFailure = "Allow PortableFS in System Settings > General > Login Items, then reopen the app."
-                    } else {
-                        shouldAcquireLifecycle = true
+                        backgroundConsentMissing = true
                     }
+                    // The shared app lease is independent of daemon consent.
+                    // Keep the menu available to open Settings and use Linux.
+                    shouldAcquireLifecycle = true
                 case .installerControlled:
                     // The tokenized update session owns activation. Normal
                     // registration before it completes would violate fencing.
@@ -147,11 +151,13 @@ final class AppModel {
         Task {
             await refreshMounts()
             await refreshVersion()
+            await workspace.refresh()
         }
         mountPollTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(5))
                 await refreshMounts()
+                await workspace.refresh()
             }
         }
     }
@@ -246,6 +252,7 @@ final class AppModel {
         }
         await refreshMounts()
         await refreshVersion()
+        await workspace.refresh()
     }
 
     func refreshMounts() async {
@@ -254,6 +261,9 @@ final class AppModel {
         }
         guard !isRefreshingMounts else {
             return
+        }
+        if backgroundConsentMissing, let id = Bundle.main.bundleIdentifier {
+            backgroundConsentMissing = SMAppService.agent(plistName: id + ".portablefsd.plist").status != .enabled
         }
         isRefreshingMounts = true
         defer {

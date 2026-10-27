@@ -821,11 +821,13 @@ def check_control_lifecycle() -> None:
     # The app delegates inventory to its paired CLI while retaining the
     # install guard; identity and stop remain direct authenticated requests.
     require(problems, '["lifecycle", "hold-install-exclusive", "--json"]' in swift
-            and "process.arguments = inventoryGuardArguments(outgoing: outgoing)" in swift,
+            and "process.arguments = inventoryGuardArguments(outgoing: outgoing, workspaceDrain: workspaceDrain)" in swift
+            and 'payload.purpose == (workspaceDrain ? "workspace-drain" : "service-update")' in swift,
             "the app does not invoke its lifecycle inventory guard")
     cli = read("vcs/cmd/portablefs/internal/cli/lifecyclecmd.go")
     control = read("vcs/cmd/portablefs/internal/cli/fskitmount.go")
     require(problems, "e.daemonLifecycleInventory(expectedIdentity)" in cli
+            and 'fs.BoolVar(&workspaceDrain, "workspace-drain"' in cli
             and "daemonctl.LifecycleInventoryPath" in control,
             "the CLI inventory guard does not request the shared lifecycle inventory route")
     finish(problems)
