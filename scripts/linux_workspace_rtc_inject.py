@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Root-only arm64 ptrace fixture for one owned managed daemon's RTC ioctl.
+"""Arm64 ptrace fixture for one owned managed daemon's RTC ioctl.
 
 This runs inside a disposable native guest. It never signals SSH or changes a
 clock. A skipped RTC_RD_TIME has no device sample and no output-buffer write.
@@ -60,6 +60,8 @@ class Trace:
 
     def record(self, kind, **values):
         self.events.append(dict(event=kind, boot_ns=boot_ns(), **values))
+        if getattr(self.o, 'stream_events', False):
+            print(json.dumps(self.events[-1]), flush=True)
         self.save(False)
 
     def save(self, passed, error=None):
@@ -265,8 +267,9 @@ def main():
     parser.add_argument('--timeout', type=float, default=40)
     parser.add_argument('--arm', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--stream-events', action='store_true')
     options = parser.parse_args()
-    assert platform.system() == 'Linux' and platform.machine() == 'aarch64' and os.geteuid() == 0
+    assert platform.system() == 'Linux' and platform.machine() == 'aarch64' and os.geteuid() in (0, 1000)
     assert options.count > 0 and options.delay_return >= 0
     trace = Trace(options)
     try:
