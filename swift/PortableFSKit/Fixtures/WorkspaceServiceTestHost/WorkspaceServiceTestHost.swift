@@ -41,7 +41,10 @@ import SwiftUI
                 try await Task.sleep(for:.milliseconds(200))
                 exit(0)
             case ["--unregister-workspace-test"]:
-                try await SMAppService.agent(plistName:id + ".workspace.plist").unregister(); exit(0)
+                let service = SMAppService.agent(plistName: id + ".workspace.plist")
+                if service.status != .notRegistered && service.status != .notFound { try await service.unregister() }
+                guard service.status == .notRegistered || service.status == .notFound else { exit(1) }
+                exit(0)
             case let args where args.count == 2 && args[0] == "--workspace-api":
                 let client = try client()
                 guard let action = PortableFSWorkspaceClient.Operation(rawValue: args[1]) else { exit(64) }
