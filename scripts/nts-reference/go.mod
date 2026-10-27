@@ -1,6 +1,6 @@
 module portablefs.test/nts-reference
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/beevik/ntp v1.6.0

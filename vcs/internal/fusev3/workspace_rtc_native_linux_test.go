@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -19,13 +20,27 @@ import (
 // Only the disposable native qualification initramfs runs this entry point.
 // The product image and daemons have no injected clock or pause controls.
 func TestMain(m *testing.M) {
-	native := os.Getpid() == 1
-	if native {
+	if os.Getpid() == 1 {
 		for _, v := range []struct{ path, kind string }{{"/dev", "devtmpfs"}, {"/proc", "proc"}, {"/sys", "sysfs"}} {
 			if err := unix.Mount(v.kind, v.path, v.kind, 0, ""); err != nil {
 				panic(err)
 			}
 		}
+		// A fast VZ boot can start PID 1 in kernel tick zero. Admission
+		// intentionally refuses a zero process-start witness. Run the fixture
+		// in a real child after the first tick rather than fabricating identity.
+		time.Sleep(20 * time.Millisecond)
+		child := exec.Command("/init")
+		child.Env = append(os.Environ(), "PFS_NATIVE_G0_CHILD=1")
+		child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+		_ = child.Run()
+		fmt.Println("G0_NATIVE_DONE=1")
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	native := os.Getenv("PFS_NATIVE_G0_CHILD") == "1"
+	if native {
 		os.Args = []string{os.Args[0], "-test.run=^TestNativeWorkspaceRTCPauseMatrix$", "-test.v", "-test.timeout=180s"}
 	}
 	result := m.Run()
@@ -64,7 +79,7 @@ func nativeCase(t *testing.T, name string, fields map[string]any) {
 }
 
 func TestNativeWorkspaceRTCPauseMatrix(t *testing.T) {
-	if os.Getpid() != 1 {
+	if os.Getenv("PFS_NATIVE_G0_CHILD") != "1" {
 		t.Skip("native VZ qualification initramfs only")
 	}
 	owner, err := workspaceclock.Open(nil)

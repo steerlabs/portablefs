@@ -26,7 +26,7 @@ swiftc -swift-version 5 "$repo/scripts/test-linux-workspace-rtc.swift" -o "$work
 codesign --force --sign - --entitlements "$repo/deploy/linux-workspace/dev.entitlements" "$work/rtc-vm"
 "$work/rtc-vm" "$image/kernel" "$work/initramfs" >"$evidence/rtc-contention-console.log" 2>&1
 python3 - "$evidence" "$image" <<'PY'
-import hashlib,json,pathlib,sys
+import hashlib,json,os,pathlib,sys
 root,image=map(pathlib.Path,sys.argv[1:])
 lines=(root/'rtc-contention-console.log').read_text().splitlines()
 results=[json.loads(line.split('RTC_QUALIFICATION=',1)[1]) for line in lines if line.startswith('RTC_QUALIFICATION=')]
@@ -42,6 +42,8 @@ assert len(resume)==1 and resume[0]['operation_prestarted'] and not resume[0]['h
 assert resume[0]['read_age_ns']<=250_000_000
 (root/'rtc-first-resume.json').write_text(json.dumps(resume[0],indent=2)+'\n')
 nts=[json.loads(line.split('RTC_NTS_REFERENCE=',1)[1]) for line in lines if line.startswith('RTC_NTS_REFERENCE=')]
+if os.environ.get('PFS_RTC_NTS_REFERENCE'):
+    assert len(nts)==1, 'missing authenticated first-resume reference evidence'
 if nts:
     assert len(nts)==1
     (root/'rtc-nts-reference.json').write_text(json.dumps(nts[0],indent=2)+'\n')

@@ -86,7 +86,7 @@ final class RTCQualificationVM: NSObject, VZVirtualMachineDelegate {
             }
         }
         if var reference, !referenceEmitted,
-           let line = String(decoding: transcript, as: UTF8.self).split(separator: "\n").first(where: { $0.hasPrefix("RTC_RESUME_QUALIFICATION=") }),
+           let line = String(decoding: transcript, as: UTF8.self).components(separatedBy: .newlines).first(where: { $0.hasPrefix("RTC_RESUME_QUALIFICATION=") }),
            let value = try? JSONSerialization.jsonObject(with: Data(line.dropFirst("RTC_RESUME_QUALIFICATION=".count).utf8)) as? [String: Any] {
             referenceEmitted = true
             reference["sample_began_ns"] = resumeBegan

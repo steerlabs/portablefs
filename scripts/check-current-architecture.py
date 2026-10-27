@@ -139,6 +139,8 @@ PRODUCT_COMMANDS = {
     "portablefs-workspaced",
 }
 GO_MODULES = {"vcs/go.mod", "vcs/third_party/go-fuse/go.mod"}
+# Read-only NTS qualification is deliberately outside the product graph.
+TEST_GO_MODULES = {"scripts/nts-reference/go.mod"}
 SWIFT_PACKAGES = {"swift/PortableFSKit/Package.swift"}
 SWIFT_ROOTS = {"PortableFSApp", "PortableFSKit", "PortableFSKitDev", "README.md"}
 XCODE_PROJECTS = {
@@ -951,7 +953,8 @@ def check_product_layout() -> None:
     commands = {pathlib.Path(name).parts[2] for name in files() if name.startswith("vcs/cmd/") and len(pathlib.Path(name).parts) > 3}
     require(problems, commands == PRODUCT_COMMANDS, _set_delta("vcs/cmd executables", commands, PRODUCT_COMMANDS))
     modules = {name for name in files() if pathlib.Path(name).name == "go.mod"}
-    require(problems, modules == GO_MODULES, _set_delta("Go modules", modules, GO_MODULES))
+    expected_modules = GO_MODULES | TEST_GO_MODULES
+    require(problems, modules == expected_modules, _set_delta("Go modules", modules, expected_modules))
     packages = {name for name in files() if pathlib.Path(name).name == "Package.swift"}
     require(problems, packages == SWIFT_PACKAGES, _set_delta("Swift packages", packages, SWIFT_PACKAGES))
     roots = {pathlib.Path(name).parts[1] for name in files() if name.startswith("swift/") and len(pathlib.Path(name).parts) > 1}
