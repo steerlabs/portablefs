@@ -4,6 +4,7 @@ import pathlib
 import shlex
 import subprocess
 import time
+from linux_workspace_native_hold import hold_between_cases
 
 
 def read_checks(authority, guest, evidence, record, rounds=20):
@@ -30,6 +31,7 @@ print(json.dumps({'files':31500,'matches':3150,'directories':6363}))
     rows = []
     for iteration in range(rounds):
         for name, command in commands:
+            hold_between_cases(restart_on_release=True)
             started = time.monotonic()
             result = subprocess.run([*ssh, 'cd ' + shlex.quote(target) + ' && ' + command],
                 stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=600)

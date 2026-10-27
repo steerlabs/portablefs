@@ -5,11 +5,13 @@ import signal
 import subprocess
 import threading
 import time
+from linux_workspace_native_hold import hold_between_cases
 
 
 def native_guest_class(binary, image, root, state, events, measurements):
     class Guest:
         def __init__(self):
+            hold_between_cases(restart_on_release=True)
             self.lines = queue.Queue()
             self.history = []
             self.stderr = (root / ('owner-' + str(len(measurements)) + '.stderr')).open('w')
@@ -46,6 +48,7 @@ def native_guest_class(binary, image, root, state, events, measurements):
             self.p.stdin.write(json.dumps({'command': name, **fields}) + '\n'); self.p.stdin.flush()
 
         def discard(self):
+            hold_between_cases()
             self.command('discard')
             value = self.wait('stopped', 30)
             assert value['operations'][-1] == 'stop-completed', value
@@ -59,6 +62,7 @@ def native_guest_class(binary, image, root, state, events, measurements):
             return result.stdout.strip()
 
         def stop(self, interrupt=False):
+            hold_between_cases()
             self.ssh('sync')
             if interrupt: self.p.send_signal(signal.SIGINT)
             else: self.command('stop')
@@ -68,6 +72,7 @@ def native_guest_class(binary, image, root, state, events, measurements):
             self.stderr.close()
 
         def cleanup(self):
+            hold_between_cases()
             if self.p.poll() is None:
                 self.command('stop')
                 try:

@@ -18,6 +18,7 @@ from linux_workspace_native_g0 import pause_checks
 from linux_workspace_native_ssh import SSHJobs
 from linux_workspace_native_reads import read_checks
 from linux_workspace_native_guest import native_guest_class
+from linux_workspace_native_hold import hold_between_cases
 
 binary, image, evidence, inventory, *options = sys.argv[1:]
 assert options in ([], ['--defer-ui']), options
@@ -38,6 +39,7 @@ def record(name):
     assert name in required and name not in passed, name
     passed.append(name)
     print('PASS:', name, flush=True)
+    hold_between_cases(restart_on_release=True)
 
 
 def defer_case(name):

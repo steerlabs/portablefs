@@ -15,19 +15,20 @@ import subprocess
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output', type=pathlib.Path)
 parser.add_argument('--repo', type=pathlib.Path, default=pathlib.Path(__file__).resolve().parents[1])
+parser.add_argument('--source-commit', default='HEAD')
 options = parser.parse_args()
 repo = options.repo.resolve()
 output = options.output.resolve()
 assert not output.exists() or not any(output.iterdir()), 'output must be empty'
 assert not subprocess.check_output(['git', '-C', str(repo), 'status', '--porcelain']), 'commit fixture inputs first'
-commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--verify', options.source_commit + '^{commit}'], text=True).strip()
 output.mkdir(parents=True, exist_ok=True)
 package = output / 'package'
 package.mkdir()
 targets = {'CWorkspacePower', 'PortableFSKit', 'PortableFSAppCore', 'PortableFSWorkspaceCore',
            'PortableFSWorkspaceVM', 'PortableFSWorkspaceDev'}
 prefix = 'swift/PortableFSKit/'
-paths = subprocess.check_output(['git', '-C', str(repo), 'ls-files', '-z', prefix + 'Sources']).decode().split('\0')
+paths = subprocess.check_output(['git', '-C', str(repo), 'ls-tree', '-rz', '--name-only', commit, '--', prefix + 'Sources']).decode().split('\0')
 for name in paths:
     if not name:
         continue

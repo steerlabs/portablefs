@@ -44,9 +44,11 @@ class Trace:
         self.libc.ptrace.restype = ctypes.c_long
         self.libc.ptrace.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
         self.tasks, self.stopped, self.inflight = set(), set(), {}
+        self.pending_signals = {}
         self.events = []
         self.injected = 0
         self.real_samples = 0
+        self.after_injected_boot_ns = 0
 
     def call(self, request, tid, addr=0, data=0):
         ctypes.set_errno(0)
@@ -98,9 +100,10 @@ class Trace:
             try:
                 self.call(INTERRUPT, tid)
             except OSError as error:
-                if error.errno != errno.ESRCH:
+                if error.errno not in (errno.ESRCH, errno.EIO):
                     raise
-                self.tasks.discard(tid)
+                if error.errno == errno.ESRCH:
+                    self.tasks.discard(tid)
         self.record('attached', tasks=sorted(self.tasks))
 
     def resume(self, tid, forwarded=0):
@@ -122,10 +125,12 @@ class Trace:
 
     def sample(self, tid, address):
         data = bytearray()
-        for offset in range(0, 36, 8):
+        for offset in range(0, 32, 8):
             word = self.call(PEEK_DATA, tid, address + offset)
             data.extend((word & ((1 << 64) - 1)).to_bytes(8, 'little'))
-        fields = struct.unpack('<9i', data[:36])
+        word = self.call(PEEK_DATA, tid, address + 28)
+        data.extend((word & ((1 << 64) - 1)).to_bytes(8, 'little')[4:])
+        fields = struct.unpack('<9i', data)
         return dict(zip(('second', 'minute', 'hour', 'day', 'month_zero_based',
                          'year_since_1900', 'weekday', 'yearday', 'isdst'), fields))
 
@@ -157,14 +162,15 @@ class Trace:
         if operation == 1:  # syscall entry
             number, *args = struct.unpack_from('<7Q', raw.raw, 24)
             if number == SYS_IOCTL and args[0] == self.o.fd and args[1] == RTC_RD_TIME:
-                inject = self.injected < self.o.count and pathlib.Path(self.o.arm).exists()
-                self.inflight[tid] = (args[2], inject)
+                reserved = sum(value[1] for value in self.inflight.values())
+                inject = self.injected + reserved < self.o.count and pathlib.Path(self.o.arm).exists()
+                self.inflight[tid] = (args[2], inject, boot_ns())
                 if inject:
                     self.validate()
                     self.skip(tid)
                     self.record('skip-ioctl', tid=tid, descriptor=args[0], request=args[1])
         elif operation == 2 and tid in self.inflight:  # syscall exit
-            address, injected = self.inflight.pop(tid)
+            address, injected, entry_boot = self.inflight.pop(tid)
             result = struct.unpack_from('<q', raw.raw, 24)[0]
             if injected:
                 assert result == -errno.ENOSYS, ('ioctl was not skipped', result)
@@ -180,12 +186,13 @@ class Trace:
                     self.record('return-held', seconds=self.o.delay_return)
                     time.sleep(self.o.delay_return)
                     self.record('return-released')
+                self.after_injected_boot_ns = boot_ns()
             elif result == 0:
                 self.real_samples += 1
                 if self.real_samples == 1 or self.injected:
                     self.record('real-sample', tid=tid, result=result, sequence=self.real_samples,
-                                calendar=self.sample(tid, address))
-                if self.injected == self.o.count:
+                                entry_boot_ns=entry_boot, calendar=self.sample(tid, address))
+                if self.injected == self.o.count and entry_boot > self.after_injected_boot_ns:
                     return True
             else:
                 self.record('real-error', tid=tid, result=result)
@@ -210,9 +217,10 @@ class Trace:
             try:
                 self.call(INTERRUPT, tid)
             except OSError as error:
-                if error.errno != errno.ESRCH:
+                if error.errno not in (errno.ESRCH, errno.EIO):
                     raise
-                self.tasks.discard(tid)
+                if error.errno == errno.ESRCH:
+                    self.tasks.discard(tid)
         while self.tasks - self.stopped and time.monotonic() < deadline:
             tid, status = os.waitpid(-1, os.WNOHANG | WALL)
             if not tid:
@@ -220,13 +228,20 @@ class Trace:
             elif os.WIFSTOPPED(status):
                 self.tasks.add(tid)
                 self.stopped.add(tid)
+                event, stopped_signal = status >> 16, os.WSTOPSIG(status)
+                if event == 3:
+                    child = ctypes.c_ulong()
+                    self.call(GET_EVENT, tid, 0, ctypes.byref(child))
+                    self.tasks.add(child.value)
+                if not event and stopped_signal != (signal.SIGTRAP | 0x80):
+                    self.pending_signals[tid] = stopped_signal
             else:
                 self.tasks.discard(tid)
                 self.stopped.discard(tid)
         assert not self.tasks - self.stopped, 'traced threads did not stop for detach'
         for tid in list(self.tasks):
             try:
-                self.call(DETACH, tid)
+                self.call(DETACH, tid, 0, self.pending_signals.pop(tid, 0))
             except OSError as error:
                 if error.errno != errno.ESRCH:
                     raise
