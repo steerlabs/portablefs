@@ -230,7 +230,8 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try Data().write(to: directory.appendingPathComponent("owner.lock"))
             let actions = WorkspaceRemoval.Actions(stop: { throw PortableFSWorkspaceError("pristine workspace must not start") }, status: { .init() }, quiesce: {
-                #expect(try PortableFSDServiceCoordinator.workspaceRuntimeAbsent(directory))
+                let absent = try PortableFSDServiceCoordinator.workspaceRuntimeAbsent(directory)
+                #expect(absent)
             }, unregister: {}, removeSSH: {})
             _ = try await WorkspaceRemoval.run(data: data, home: home, actions: actions)
             _ = try await WorkspaceRemoval.run(data: data, home: home, actions: actions)
