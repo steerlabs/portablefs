@@ -354,6 +354,7 @@ try:
     assert guest.p.wait(timeout=10) == 0
     record('clean-stop')
     product_checks(image, root / "product", record, authority=authority, defer_ui=defer_ui, defer_case=defer_case)
+    product_checks(image, root / "product-removal", record, authority=authority, outcome_case='removal', defer_ui=defer_ui, defer_case=defer_case)
     product_checks(image, root / "product-loss", record, authority=authority, outcome_case='loss', defer_ui=True, defer_case=lambda name: None)
     assert sorted(passed + not_run) == sorted(required), (passed, not_run, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'notRun': not_run, 'qualified': not not_run, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')

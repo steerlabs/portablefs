@@ -43,10 +43,20 @@ def execution_reference_worker(path):
 
 
 def product_checks(image, evidence, record, authority=None, api_only=False, defer_ui=False, defer_case=None, outcome_case='crash'):
-    assert outcome_case in ('crash','loss') and (outcome_case!='loss' or authority is not None)
-    if outcome_case=='loss':
+    assert outcome_case in ('crash','loss','removal') and (outcome_case!='loss' or authority is not None)
+    # Removal changes registration history. Fresh identities keep its teardown
+    # separate from the crash and loss controls inherited from the service gate.
+    ux = {'service-app-api-client','service-managed-ssh-config','service-two-ssh-agents',
+          'service-cursor-missing-extension','service-cursor-remote-save-peer',
+          'service-vscode-missing-extension','service-vscode-remote-save-peer',
+          'service-busy-removal-refusal','service-stop-busy-preserves-running',
+          'service-unmounted-path-denial','service-removal-keep-data','service-removal-delete-data',
+          'service-background-consent-denied'}
+    if not api_only:
         observe=record
-        record=lambda name:observe(name) if name.startswith('service-loss-') else None
+        if outcome_case=='loss': record=lambda name:observe(name) if name.startswith('service-loss-') else None
+        elif outcome_case=='removal': record=lambda name:observe(name) if name in ux else None
+        else: record=lambda name:observe(name) if name not in ux and not name.startswith('service-loss-') else None
     repo = pathlib.Path(__file__).resolve().parent.parent
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -126,14 +136,15 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             try: guard.wait(timeout=15)
             except subprocess.TimeoutExpired: guard.terminate();guard.wait(timeout=15)
             guard.stdout.close();guard.stderr.close()
-    # The incoming installer can leave a lock-only directory without registering
-    # any service. The actual shared API must handle that pristine boundary.
-    account = home/'.local/state/portablefs'
-    account.mkdir(parents=True, mode=0o700)
-    pristine = account/'workspace'
-    pristine.mkdir(mode=0o700)
-    (pristine/'owner.lock').touch(mode=0o600)
-    prepare_update()
+    if outcome_case=='removal':
+        # The incoming installer can leave a lock-only directory without registering
+        # any service. The actual shared API must handle that pristine boundary.
+        account = home/'.local/state/portablefs'
+        account.mkdir(parents=True, mode=0o700)
+        pristine = account/'workspace'
+        pristine.mkdir(mode=0o700)
+        (pristine/'owner.lock').touch(mode=0o600)
+        prepare_update()
     registered = subprocess.run([str(host),'--workspace-service-register'],env=env,capture_output=True,text=True)
     if registered.returncode:
         (evidence/'product-registration.txt').write_text(registered.stdout+registered.stderr)
@@ -210,29 +221,30 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         if api_only:
             finished=True
             return
-        # The controlling agent uses computer use to toggle only this generated
-        # Background Item. No global background-item reset or installed service
-        # identifier participates. Files coordinate the two UI observations.
-        if defer_ui or outcome_case=='loss':
-            if outcome_case!='loss': defer_case('service-background-consent-denied')
-        else:
-            (evidence/'consent-fixture.json').write_text(json.dumps({**fixture, 'displayName': info['CFBundleName']},indent=2))
-            print('AWAITING: disable throwaway Background Item; write '+str(evidence/'consent-denied'),flush=True)
-            deadline=time.monotonic()+300
-            while not (evidence/'consent-denied').exists():
-                assert time.monotonic()<deadline,'denied-consent UI observation unavailable'
-                time.sleep(.2)
-            denied=app_command('--workspace-service-register',success=False)
-            assert denied.returncode==3 and 'Allow PortableFS in Background Items' in denied.stderr,denied
-            (evidence/'denied-consent.txt').write_text(denied.stdout+denied.stderr)
-            print('AWAITING: re-enable same throwaway Background Item; write '+str(evidence/'consent-restored'),flush=True)
-            deadline=time.monotonic()+300
-            while not (evidence/'consent-restored').exists():
-                assert time.monotonic()<deadline,'restored-consent UI observation unavailable'
-                time.sleep(.2)
-            app_command('--workspace-service-register')
-            until(lambda s:s['state']=='stopped',30)
-            record('service-background-consent-denied')
+        if outcome_case=='removal':
+            # The controlling agent uses computer use to toggle only this generated
+            # Background Item. No global background-item reset or installed service
+            # identifier participates. Files coordinate the two UI observations.
+            if defer_ui:
+                defer_case('service-background-consent-denied')
+            else:
+                (evidence/'consent-fixture.json').write_text(json.dumps({**fixture, 'displayName': info['CFBundleName']},indent=2))
+                print('AWAITING: disable throwaway Background Item; write '+str(evidence/'consent-denied'),flush=True)
+                deadline=time.monotonic()+300
+                while not (evidence/'consent-denied').exists():
+                    assert time.monotonic()<deadline,'denied-consent UI observation unavailable'
+                    time.sleep(.2)
+                denied=app_command('--workspace-service-register',success=False)
+                assert denied.returncode==3 and 'Allow PortableFS in Background Items' in denied.stderr,denied
+                (evidence/'denied-consent.txt').write_text(denied.stdout+denied.stderr)
+                print('AWAITING: re-enable same throwaway Background Item; write '+str(evidence/'consent-restored'),flush=True)
+                deadline=time.monotonic()+300
+                while not (evidence/'consent-restored').exists():
+                    assert time.monotonic()<deadline,'restored-consent UI observation unavailable'
+                    time.sleep(.2)
+                app_command('--workspace-service-register')
+                until(lambda s:s['state']=='stopped',30)
+                record('service-background-consent-denied')
         kernel = test_image/'kernel'
         with kernel.open('r+b') as image_file:
             original = image_file.read(1)
@@ -309,21 +321,22 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         assert ssh('cat /home/workspace/service-product-proof')=='service-persistence'
         assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
         record('service-ssh-identity-persistence')
-        command('stop','--json');until(lambda s:s['state']=='stopped')
-        snapshot('before-removal')
-        prepare_update();prepare_update()
-        assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
-        assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
-        assert not managed.exists() and not (home/'.ssh/config').exists()
-        record('service-removal-keep-data')
-        app_command('--workspace-remove','delete');app_command('--workspace-remove','delete')
-        assert not (home/'.local/state/portablefs/workspace').exists()
-        if authority is not None:
-            assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'removal-peer-sentinel').read_text())")=='remote-data'
-        record('service-removal-delete-data')
-        app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
-        ssh('printf service-persistence > /home/workspace/service-product-proof')
-        before=(home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()
+        if outcome_case=='removal':
+            command('stop','--json');until(lambda s:s['state']=='stopped')
+            snapshot('before-removal')
+            prepare_update();prepare_update()
+            assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
+            assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
+            assert not managed.exists() and not (home/'.ssh/config').exists()
+            record('service-removal-keep-data')
+            app_command('--workspace-remove','delete');app_command('--workspace-remove','delete')
+            assert not (home/'.local/state/portablefs/workspace').exists()
+            if authority is not None:
+                assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'removal-peer-sentinel').read_text())")=='remote-data'
+            record('service-removal-delete-data')
+            app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
+            ssh('printf service-persistence > /home/workspace/service-product-proof')
+            before=(home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()
         if authority is not None:
             mount_volume()
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
@@ -334,7 +347,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
                 assert first.result()=='volume-agent-two' and second.result()=='volume-agent-one'
             assert authority.peer("import pathlib; p=pathlib.Path('/var/tmp/pfs-native/home/peer'); print((p/'agent-one').read_text()+','+(p/'agent-two').read_text())")=='volume-agent-one,volume-agent-two'
             record('service-two-ssh-agents')
-            if outcome_case!='loss': editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record,defer_ui,defer_case)
+            if outcome_case=='removal': editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record,defer_ui,defer_case)
             holder=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace',
                 'cd /workspaces/native-managed && echo holding && read -r release'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:
@@ -367,9 +380,16 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         settled=snapshot('stopped-after-volume')
         assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
         record('service-used-clean-stop-outcome')
-        prepare_update();prepare_update()
-        assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
-        app_command('--workspace-service-register')
+        if outcome_case=='removal':
+            prepare_update();prepare_update()
+            assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
+            app_command('--workspace-service-register')
+            command('start');until(lambda s:s['state']=='running')
+            assert ssh('cat /home/workspace/service-product-proof')=='service-persistence'
+            assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
+            command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+            finished=True
+            return
         command('start');until(lambda s:s['state']=='running')
         if authority is not None: mount_volume()
         if outcome_case=='loss':
@@ -439,6 +459,14 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
         suspended=False
         try:
             os.kill(worker,signal.SIGSTOP);suspended=True
+            # Signal delivery must settle before the owner-death control.
+            deadline=time.monotonic()+5
+            while True:
+                stopped=subprocess.check_output(['ps','-p',str(worker),'-o','state='],text=True).strip()
+                if stopped.startswith('T'): break
+                assert time.monotonic()<deadline, 'VM worker did not acknowledge SIGSTOP'
+                time.sleep(.01)
+            (evidence/'worker-paused.json').write_text(json.dumps({'worker':worker,'state':stopped,'lsof':observed},indent=2))
             subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
             crashed=True
             refused=until(lambda s:s['state']=='cleanup-required')
@@ -447,7 +475,10 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             (evidence/'crash-worker-held.json').write_text(json.dumps({'worker':worker,'lsof':observed,'status':refused},indent=2))
             record('service-crash-live-worker-refusal')
         finally:
-            if suspended: os.kill(worker,signal.SIGCONT)
+            if suspended:
+                try: os.kill(worker,signal.SIGCONT)
+                except ProcessLookupError: pass
+
         deadline=time.monotonic()+30
         while execution_reference_busy(reference):
             assert time.monotonic()<deadline, 'VM worker retained execution reference after owner death'
@@ -492,7 +523,7 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
         subprocess.run([lsregister,'-u',str(app)],check=True)
         if confirmed_absent and finished: shutil.rmtree(root)
         elif confirmed_absent: (evidence/'failed-test-state.txt').write_text(str(root)+'\nVM confirmed stopped; retained for failure diagnosis\n')
-        else: (evidence/'unconfirmed-test-vm-state.txt').write_text(str(root)+'\nretained until host reboot proves absence\n')
+        else: (evidence/'unconfirmed-test-vm-state.txt').write_text(str(root)+'\nretained until exact execution-reference or host-boot absence proof\n')
 
 if __name__=='__main__':
     import sys
@@ -510,6 +541,7 @@ if __name__=='__main__':
                        authority=authority,api_only=api_only,defer_ui=defer_ui,
                        defer_case=lambda name:(not_run.append(name),print('NOT RUN (UI deferred):',name,flush=True)))
         if not api_only:
+            product_checks(image,evidence/'product-removal',lambda name:(observed.append(name),print('PASS:',name,flush=True)),authority=authority,outcome_case='removal',defer_ui=defer_ui,defer_case=lambda name:(not_run.append(name),print('NOT RUN (UI deferred):',name,flush=True)))
             product_checks(image,evidence/'product-loss',lambda name:(observed.append(name),print('PASS:',name,flush=True)),authority=authority,outcome_case='loss',defer_ui=True,defer_case=lambda name:None)
         assert sorted(observed+not_run)==sorted(required),(observed,not_run,required)
         (evidence/'product-results.json').write_text(json.dumps({'required':required,'passed':observed,'notRun':not_run,
