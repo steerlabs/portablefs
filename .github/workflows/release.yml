@@ -19,6 +19,10 @@ jobs:
   powerloss:
     uses: ./.github/workflows/powerloss.yml
 
+  guest-arm64:
+    needs: [validate]
+    uses: ./.github/workflows/workspace-image.yml
+
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -213,7 +217,7 @@ jobs:
             "$server_arm64_asset"
 
   macos-app:
-    needs: [validate, goreleaser]
+    needs: [validate, goreleaser, guest-arm64]
     runs-on: xcode-27
     # Must exceed the 2h `notarytool --wait --timeout 2h` in
     # scripts/package-macos-app.sh so the notary wait reports its own timeout
@@ -222,6 +226,8 @@ jobs:
     environment: release
     permissions:
       contents: write # upload the notarized app to the draft release
+      id-token: write
+      attestations: write
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
     steps:
@@ -260,6 +266,11 @@ jobs:
 
       - name: Test the Swift app and installer core
         run: bash scripts/test-swift-xcode.sh
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-workspace-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/guest-artifact
 
       - name: Import exact archive and distribution identities
         env:
@@ -412,6 +423,8 @@ jobs:
           PORTABLEFS_APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey_portablefs_release.p8
           PORTABLEFS_APPLE_API_KEY_ID: ${{ secrets.PORTABLEFS_APPLE_API_KEY_ID }}
           PORTABLEFS_APPLE_API_ISSUER_ID: ${{ secrets.PORTABLEFS_APPLE_API_ISSUER_ID }}
+          PORTABLEFS_SERVICE_SIGN_IDENTITY: "Developer ID Application: TrendUp AI, Inc. (B47U2LLKHW)"
+          PORTABLEFS_WORKSPACE_ARTIFACT_DIR: ${{ runner.temp }}/guest-artifact/first
           PORTABLEFS_RELEASE: "1"
           PORTABLEFS_UNSIGNED: "0"
           PORTABLEFS_DEVELOPER_ID_EXPORT: "1"
@@ -430,14 +443,22 @@ jobs:
           sh scripts/test-macos-installer-zip-namespace.sh \
             "dist/macos/portablefs_${version}_darwin_universal_app.zip"
 
+      - name: Attest notarized installer and space manifest
+        id: macos-attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/macos/portablefs_*_darwin_universal_app.zip*
+
       - name: Upload notarized app
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUNDLE: ${{ steps.macos-attestation.outputs.bundle-path }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           artifact="dist/macos/portablefs_${version}_darwin_universal_app.zip"
-          gh release upload "$GITHUB_REF_NAME" "$artifact" "$artifact.sha256"
+          cp "$BUNDLE" dist/macos/macos.attestation.jsonl
+          gh release upload "$GITHUB_REF_NAME" "$artifact" "$artifact.sha256" "$artifact.space.json" dist/macos/macos.attestation.jsonl
 
       - name: Remove ephemeral signing keychain
         if: always()
@@ -464,8 +485,95 @@ jobs:
             "$PORTABLEFS_APPLE_API_KEY_PATH"
           exit "$cleanup_status"
 
+  workspace-assets:
+    needs: [validate, goreleaser, guest-arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-workspace-arm64-${{ github.sha }}
+          path: ${{ runner.temp }}/guest-artifact
+      - name: Bind retained guest and source assets to the tag
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/guest-artifact" "$GITHUB_SHA" <<'PYCODE'
+          import json,pathlib,sys
+          root=pathlib.Path(sys.argv[1])
+          assert json.loads((root/'reproducibility.json').read_text())['commit'] == sys.argv[2]
+          assert json.loads((root/'first/distribution.json').read_text())['commit'] == sys.argv[2]
+          PYCODE
+          mkdir workspace-release
+          version="${GITHUB_REF_NAME#v}"
+          cp "$RUNNER_TEMP/guest-artifact/first/guest-image.tar.gz" "workspace-release/portablefs-workspace_${version}_linux_arm64.tar.gz"
+          cp "$RUNNER_TEMP/guest-artifact/first/corresponding-source.tar.gz" "workspace-release/portablefs-workspace_${version}_source.tar.gz"
+          cp "$RUNNER_TEMP/guest-artifact/first/manifest.json" workspace-release/workspace-manifest.json
+          cp "$RUNNER_TEMP/guest-artifact/first/source-manifest.json" workspace-release/workspace-source-manifest.json
+          cp "$RUNNER_TEMP/guest-artifact/first/distribution.json" workspace-release/workspace-distribution.json
+          cp "$RUNNER_TEMP/guest-artifact/reproducibility.json" workspace-release/workspace-reproducibility.json
+      - name: Attest exact guest and corresponding source assets
+        id: workspace-attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: workspace-release/*
+      - name: Retain corresponding source for the entire distribution period
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUNDLE: ${{ steps.workspace-attestation.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+          cp "$BUNDLE" workspace-release/workspace.attestation.jsonl
+          gh release upload "$GITHUB_REF_NAME" workspace-release/*
+
+  verify-signed-release:
+    needs: [validate, macos-app, workspace-assets]
+    runs-on: xcode-27
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify pinned Xcode and macOS SDK
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
+          test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
+      - name: Qualify the actual signed tagged assets while still draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true
+          mkdir "$RUNNER_TEMP/tagged-assets"
+          gh release download "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/tagged-assets"
+          bash scripts/verify-tagged-workspace-release.sh "$RUNNER_TEMP/tagged-assets"
+      - name: Attest signed artifact qualification receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/tagged-assets/signed-qualification.json
+      - name: Retain signed qualification evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-workspace-qualification-${{ github.sha }}
+          path: ${{ runner.temp }}/tagged-assets/signed-qualification.json
+          if-no-files-found: error
+
   publish:
-    needs: [validate, goreleaser, macos-app]
+    needs: [validate, powerloss, goreleaser, guest-arm64, workspace-assets, macos-app, verify-signed-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: release

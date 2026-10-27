@@ -21,9 +21,16 @@ public enum WorkspaceRemoval {
             try PortableFSWorkspaceSSH.remove(home: home)
             return Outcome(data: data)
         }
+        let directory = home.appendingPathComponent(".local/state/portablefs/workspace", isDirectory: true)
+        let pristine = (service.status == .notRegistered || service.status == .notFound) &&
+            !FileManager.default.fileExists(atPath: directory.appendingPathComponent("desired.json").path)
         return try await run(data: data, home: home, actions: Actions(
             stop: { try await client.perform(.stop) }, status: { try await client.perform(.status) },
-            quiesce: { try await client.quiesce() },
+            quiesce: {
+                if pristine {
+                    guard try PortableFSDServiceCoordinator.workspaceRuntimeAbsent(directory) else { throw PortableFSWorkspaceError("Linux Workspace is still running") }
+                } else { try await client.quiesce() }
+            },
             unregister: {
                 if service.status != .notRegistered && service.status != .notFound { try await service.unregister() }
                 guard service.status == .notRegistered || service.status == .notFound else { throw PortableFSWorkspaceError("Linux Workspace is still registered") }
@@ -82,7 +89,7 @@ public enum WorkspaceRemoval {
         if FileManager.default.fileExists(atPath: directory.path) {
             let deadline = ContinuousClock.now.advanced(by: .seconds(20))
             while singleton == nil {
-                do { singleton = try RemovalLock(directory.appendingPathComponent("service.lock"), create: checkpoint.phase == "ssh-removed") }
+                do { singleton = try RemovalLock(directory.appendingPathComponent("service.lock"), create: pristineLockOnly(directory) || checkpoint.phase == "ssh-removed") }
                 catch {
                     guard ContinuousClock.now < deadline else { throw PortableFSWorkspaceError("Linux Workspace service has not exited") }
                     try await Task.sleep(for: .milliseconds(100))
@@ -100,6 +107,10 @@ public enum WorkspaceRemoval {
         }
         checkpoint.phase = "complete"; try save(checkpoint, to: journal)
         return Outcome(data: data)
+    }
+    private static func pristineLockOnly(_ directory: URL) -> Bool {
+        !FileManager.default.fileExists(atPath: directory.appendingPathComponent("desired.json").path) &&
+        !FileManager.default.fileExists(atPath: directory.appendingPathComponent("resources.present").path)
     }
     public static func removalPending(home: URL) throws -> Bool {
         let journal = home.appendingPathComponent(".local/state/portablefs/workspace-removal.json")

@@ -757,8 +757,8 @@ for (const releaseGate of [
   "args: check",
   "needs: [validate, powerloss]",
   "uses: ./.github/workflows/powerloss.yml",
-  "needs: [validate, goreleaser]",
-  "needs: [validate, goreleaser, macos-app]",
+  "needs: [validate, goreleaser, guest-arm64]",
+  "needs: [validate, powerloss, goreleaser, guest-arm64, workspace-assets, macos-app, verify-signed-release]",
   "run: bash scripts/test-swift-xcode.sh",
 ]) {
   requireText(workflow, releaseGate, `release validation gate ${releaseGate}`);
@@ -879,7 +879,7 @@ for (const ciGate of [
 // same image and SDK as the Swift tests, packaging and signing lanes.
 for (const [filename, source, jobs] of [
   ["ci.yml", ciWorkflow, ["swift-xcode-native", "go-darwin", "macos-app-unsigned"]],
-  ["release.yml", workflow, ["macos-app"]],
+  ["release.yml", workflow, ["macos-app", "verify-signed-release"]],
 ]) {
   for (const job of jobs) {
     const body = new RegExp(`\n  ${job}:\n([\\s\\S]*?)(?=\n  [\\w-]+:\n|$)`).exec(source)?.[1] ?? "";
@@ -964,6 +964,25 @@ for (const retiredControlPlane of ["ghcr.io", "docker/build-push-action", "Docke
     failures.push(`release workflow still publishes retired control-plane images (${retiredControlPlane})`);
   }
 }
+
+const gatekeeperIndex = installer.indexOf('spctl --assess --type execute');
+const workspaceExecutionIndex = installer.indexOf('"$source_cli" lifecycle verify-workspace-bundle');
+if (gatekeeperIndex < 0 || workspaceExecutionIndex <= gatekeeperIndex) {
+  failures.push("workspace verification executes staged code before Gatekeeper authentication");
+}
+for (const contract of [
+  'PortableFSWorkspaceService.app', 'WorkspaceService', 'com.apple.security.virtualization',
+  'lifecycle verify-workspace-bundle --app', 'Workspace image failed verification',
+]) requireText(installer, contract, `workspace installer trust ${contract}`);
+for (const contract of [
+  'PORTABLEFS_WORKSPACE_ARTIFACT_DIR', 'workspace_executable', 'lifecycle verify-workspace-bundle --app',
+  'workspace service must hold exactly the virtualization entitlement', 'measure-macos-package.py',
+]) requireText(packager, contract, `workspace package trust ${contract}`);
+for (const contract of [
+  'uses: ./.github/workflows/workspace-image.yml', 'name: linux-workspace-arm64-${{ github.sha }}',
+  'corresponding-source.tar.gz', 'workspace-release/*', 'workspace.attestation.jsonl',
+  'verify-tagged-workspace-release.sh', 'signed-qualification.json',
+]) requireText(workflow, contract, `workspace release trust ${contract}`);
 
 if (failures.length > 0) {
   process.stderr.write(`install release trust policy failed:\n- ${failures.join("\n- ")}\n`);

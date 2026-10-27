@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
 
 type Session struct {
@@ -377,6 +379,44 @@ func RequireLease(
 		return fmt.Errorf("activation lease %s does not match the authenticated update session", path)
 	}
 	return nil
+}
+
+// RetireRemovalLease is used only under retained product/singleton exclusion
+// after the host has departed and both installed program names are durably
+// absent. It cannot consume another transaction or an interrupted update.
+func RetireRemovalLease(path, token string, release ReleaseIdentity) error {
+	directory, err := privatepath.OpenExistingDir(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	parent, err := directory.Stat()
+	if err != nil {
+		return err
+	}
+	var before unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), LeaseName, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if err := RequireLease(path, token, PhaseOldAbsent, release, release); err != nil {
+		return err
+	}
+	namedParent, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !os.SameFile(parent, namedParent) {
+		return fmt.Errorf("removal lease directory changed")
+	}
+	var after unix.Stat_t
+	if err := unix.Fstatat(int(directory.Fd()), LeaseName, &after, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || before.Mtim != after.Mtim ||
+		before.Ctim != after.Ctim || before.Mode != after.Mode || before.Uid != after.Uid || before.Nlink != after.Nlink {
+		return fmt.Errorf("removal lease changed before retirement")
+	}
+	if err := unix.Unlinkat(int(directory.Fd()), LeaseName, 0); err != nil {
+		return err
+	}
+	return directory.Sync()
 }
 
 func (s *Session) HostPID() int { return s.hostWitness.PID }

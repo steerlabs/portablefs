@@ -27,8 +27,7 @@ public final class WorkspaceState {
         machineID = String(lines[0]); macAddress = String(lines[1])
         let disk = directory.appendingPathComponent("data.ext4")
         if !FileManager.default.fileExists(atPath: disk.path) {
-            let attributes = try FileManager.default.attributesOfFileSystem(forPath: directory.path)
-            guard let free = attributes[.systemFreeSize] as? NSNumber, free.uint64Value >= 8 * 1024 * 1024 * 1024 else { throw WorkspaceVMError("Not enough disk space") }
+            try WorkspaceDiskSpace.preflight(at: directory, requiredBytes: WorkspaceDiskSpace.initialDataReserveBytes)
             try Self.atomic(Data("8\n".utf8), to: directory.appendingPathComponent("format-authorized"))
             let temporary = directory.appendingPathComponent("data.initializing")
             let fd = open(temporary.path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)

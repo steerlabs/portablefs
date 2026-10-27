@@ -26,8 +26,8 @@ The selected guest is Debian 13 arm64 with a pinned 6.12 kernel, glibc, systemd,
 OpenSSH, Git, a C/C++ compiler, Node.js/npm and Python with pip/venv. The image is pinned by
 `deploy/linux-workspace/image.lock.json`; the builder records its actual kernel
 configuration, package/source inventory and output hashes, and retains the matching
-corresponding source. Release attestation and sealed-app insertion remain separate
-packaging work. Use an immutable system
+corresponding source. Release packaging seals the same-commit CI artifact and retains attested
+matching source; see [image distribution](linux-workspace-image.md). Use an immutable system
 disk and sparse persistent ext4 data disk; keep home, editor installations,
 guest identity and machine-local route backing on the data disk. Never share
 the Mac home through virtiofs. Each volume mounts at `/workspaces/<volume-id>`;
@@ -53,8 +53,8 @@ Workspace submenu presents the same operational API as the CLI. Add Volume
 opens a connection document; pending authorization offers Save Authorization
 Request and Open Authorization. Connect opens Terminal, VS Code or Cursor,
 or copies `ssh portablefs-workspace`. Missing editors or Remote-SSH extensions
-produce an error; the app installs neither. Image bundling and installer/update
-integration remain separate, unqualified packaging work.
+produce an error; the app installs neither. Image bundling and both-service update exclusion are implemented. Installed
+signed-product qualification remains pending.
 
 Start installs `Include ~/.ssh/portablefs-workspace.conf` at the beginning of
 the account's SSH config. OpenSSH takes the first obtained value: placing this
@@ -83,6 +83,7 @@ unfinished removal. Retrying completes it. A completed keep-data removal can
 later delete retained data without starting a VM. Explicit Start clears completed
 removal intent and begins ordinary setup again.
 
+
 `portablefs workspace` exposes only Start, Status, Mount, Umount and Stop, with
 the exact flags in `portablefs help workspace`. The service's operational-v1
 Unix socket is under the canonical account state at
@@ -97,7 +98,7 @@ unequal versions and extra operations refuse. Command acceptance is distinct
 from guest job completion and pinned SSH readiness. Lifecycle v1 uses a separate
 `lifecycleVersion` discriminator with `identity`, `inventory` and idle-only
 `quiesce`. It closes admission for that execution; it does not certify service
-termination, singleton release or completion of the deferred installer protocol.
+termination or singleton release. The installer separately requires both proofs.
 
 Desired running state, descriptors, mount intents and retained outcomes commit
 through file sync, rename and directory sync. Stop preserves descriptors and
@@ -116,6 +117,7 @@ busy after service death. Successful acquisition permits a cold successor while
 preserving prior outcomes; it never adopts old RAM. Replaced names and uncertain
 lock operations refuse. A different kernel boot-session identity also proves old
 execution absence. See [VM absence](linux-workspace-vm-absence.md).
+
 
 A `.pfsworkspace` file is at most 512 KiB of exact-version JSON. `kind` is
 `connection`, `request`, or `authorization`. A connection contains canonical TLS
@@ -149,6 +151,30 @@ including in the opposite frontend; an alias cannot create a second placement. O
 use both frontends. FSKit reads this inventory without starting a workspace or
 requiring it enabled. This is per-account arbitration; authority enforcement
 continues to govern other users and machines.
+
+## Update exclusion
+
+The existing per-account `mount-lifecycle.lock` is the one update exclusion for
+both frontends. Workspace Start/Mount acquire a shared guard; cleanup remains
+available behind closed admission. Starts retain the shared guard through durable
+execution publication. The VM's durable presence marker remains through confirmed
+termination. The installer acquires the exclusive guard, proves exact FSKit absence and requires the workspace's
+`resources.present` name absent. It never decodes an outgoing desired-state
+registry. The service publishes this marker durably before VM execution and
+retires it only after confirmed termination, reservation release and loss-free,
+observed outcome evidence. Unexpected termination or explicit Force Stop keeps
+an unobserved-execution fact in that witness, even if no guest status arrived.
+A subsequent clean boot does not erase that earlier uncertainty. Busy, unknown
+and lost work defer unattended update.
+
+The existing token-bound activation lease also closes workspace admission in
+every nonterminal phase, including an expired interrupted transaction. It closes
+the handoff gap between the outgoing host and the installer. Under exclusion,
+Service Management unregistration must complete, the canonical service singleton
+must be released and the exact control socket absent before replacement. No PID
+scan, timeout or apparently empty private JSON substitutes for these witnesses.
+Workspace removal is owned by the product's separate removal API; uninstall
+must use that API and preserve data unless the user explicitly requests deletion.
 
 ## Mount lifecycle
 
@@ -820,13 +846,15 @@ Stage 1c implements real daemon suspension, protected root bootstrap, independen
 durable inventories and provisioning. Their native and fault qualification is
 required separately from Stage 1b evidence. The product service, host API, CLI,
 public handoff, menu and managed SSH/editor actions are implemented. Release
-packaging, update coordination and actual editor qualification remain pending.
+packaging and update coordination are implemented. Installed signing and actual
+editor qualification remain pending.
+
 
 All new workspace surfaces are pending and unreleased: the control grammar,
 service identity/entitlements, guest paths, inventory format, image manifest,
 SSH entry and proposed workspace command namespace. Define exact CLI flags and
 status schemas when their implementation is ready. Do not repurpose any
-existing frozen surface. Preserve the two-binary Linux client archive; a future
+existing frozen surface. Preserve the two-binary Linux client archive; the
 separate attested workspace asset must bind the exact image, kernel, package
 sources/licenses, PortableFS commit and sealed app resources.
 

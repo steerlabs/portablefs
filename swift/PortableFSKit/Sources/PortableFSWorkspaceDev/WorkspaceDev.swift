@@ -64,6 +64,8 @@ import PortableFSWorkspaceCore
     var testPaused = false
     var testPausing = false
     var pendingCommand: String?
+    var probeRetirements: [UInt64: WorkspaceStatusReply] = [:]
+    var lastProbeRequestID: UInt64 = 0
     var signals: [DispatchSourceSignal] = []
     var updateQueued = false
     var reportedPhase: WorkspacePhase?
@@ -93,6 +95,15 @@ import PortableFSWorkspaceCore
         let consume = channel.statusObserver
         channel.statusObserver = { [weak self] status in
             try consume?(status)
+            if let self, self.pendingCommand == "probe-unavailable-jobs" {
+                // Coordinator observation queues the real retirement ACK. A
+                // later poll may therefore be empty; retain the exact frame
+                // that supplied the probe's proof before that ACK runs.
+                for retired in status.retired where retired.hasJob && retired.job.requestID > self.lastProbeRequestID {
+                    self.probeRetirements[retired.job.requestID] = status
+                }
+                guard self.probeRetirements.count <= 3 else { throw WorkspaceVMError("unexpected probe retirement inventory") }
+            }
             if !status.retired.isEmpty { self?.event("retained-evidence", ["body": try status.serializedData().base64EncodedString()]) }
         }
     }
@@ -252,6 +263,7 @@ import PortableFSWorkspaceCore
             case "probe-unavailable-jobs":
                 guard ready, coordinator.phase == .running, pendingCommand == nil else { event("refused", ["command": command]); continue }
                 pendingCommand = command
+                probeRetirements.removeAll(keepingCapacity: true)
                 var request = WorkspaceIdentityRequest(); request.authorityID = Data(repeating: 1, count: 32); request.volumeID = "unavailable-probe"
                 let deadline = clock.now + 5_000_000_000
                 channel.identity(request, deadline: deadline) { [weak self] result in
@@ -289,10 +301,18 @@ import PortableFSWorkspaceCore
         channel.status(deadline: deadline) { [weak self] result in
             guard let self else { return }
             do {
-                let status = try result.get()
-                guard status.mounts.isEmpty,
+                let current = try result.get()
+                let operation = ["provision", "mount", "umount"][index]
+                let floor = requests.last ?? self.lastProbeRequestID
+                let remembered = self.probeRetirements.filter { entry in
+                    entry.key > floor && entry.value.retired.contains {
+                        $0.hasJob && $0.job.requestID == entry.key && $0.job.mount == mount && $0.job.operation == operation
+                    }
+                }.max(by: { $0.key < $1.key })?.value
+                let status = current.jobs.isEmpty && current.retired.isEmpty ? (remembered ?? current) : current
+                guard current.mounts.isEmpty, status.mounts.isEmpty,
                       let job = status.jobs.first ?? status.retired.last(where: { $0.hasJob })?.job, job.mount == mount,
-                      job.operation == ["provision", "mount", "umount"][index], job.requestID > (requests.last ?? 0),
+                      job.operation == operation, job.requestID > floor,
                       job.generation == self.coordinator.generation, self.clock.now < deadline else { throw WorkspaceVMError("desired job observation mismatch") }
                 if job.phase == "offered" || job.phase == "running" {
                     Task { @MainActor in
@@ -310,8 +330,18 @@ import PortableFSWorkspaceCore
                 }
                 let accepted = requests + [job.requestID]
                 guard status.jobs.isEmpty, status.retired.count == 1, status.retired[0].job == job else { throw WorkspaceVMError("desired job retirement missing") }
+                if !current.retired.isEmpty {
+                    // Require a fresh empty inventory after the coordinator's
+                    // queued ACK, exercising the observed-frame path on every
+                    // probe rather than depending on timer scheduling.
+                    self.observeUnavailableJob(mount, index: index, requests: requests, deadline: deadline)
+                    return
+                }
+                guard current.jobs.isEmpty else { throw WorkspaceVMError("probe retirement was not acknowledged") }
+                self.lastProbeRequestID = job.requestID
+                self.probeRetirements.removeValue(forKey: job.requestID)
                 if index < 2 { self.probeUnavailableJobs(mount, index: index + 1, requests: accepted, deadline: deadline) }
-                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": "handler-failed", "cleanup": job.phase]) }
+                else { self.pendingCommand = nil; self.event("jobs-refused", ["request_ids": accepted, "mounts": status.mounts.count, "failure": "handler-failed", "cleanup": job.phase, "retirement_acknowledged": true]) }
             } catch { self.fail(error) }
         }
     }

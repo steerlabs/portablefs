@@ -194,6 +194,14 @@ the download is corrupt or has been tampered with; nothing was installed"
   awk '$1 ~ /^[bcdlps-]/ && $1 !~ /^[-d]/ { exit 1 }' "$tmp/macos-member-types.txt" ||
     die "$archive contains a symlink or special filesystem entry"
 
+  expanded_bytes=$(awk '
+    $1 ~ /^[-d]/ { if ($4 !~ /^[0-9]+$/) exit 1; total += $4 }
+    END { printf "%.0f\n", total }
+  ' "$tmp/macos-member-types.txt") || die "could not determine expanded installer size"
+  available_bytes=$(df -Pk "$tmp" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }')
+  awk -v free="$available_bytes" -v expanded="$expanded_bytes" 'BEGIN { exit !(free >= 2 * expanded + 2147483648) }' ||
+    die "Not enough disk space: extraction and staging require two app copies plus 2 GiB headroom"
+
   mkdir "$tmp/unpacked" || die "could not create unpack directory"
   ditto -x -k "$tmp/$archive" "$tmp/unpacked" ||
     die "could not extract $archive"
@@ -310,6 +318,14 @@ the download is corrupt or has been tampered with; nothing was installed"
     printf '%s\n' "$item_signing" | grep '^CodeDirectory .*flags=.*runtime' >/dev/null ||
       die "$signed_item was not signed with the hardened runtime"
   done
+  source_workspace="$source_app/Contents/Library/LaunchAgents/PortableFSWorkspaceService.app"
+  workspace_signing=$(codesign -dv --verbose=4 "$source_workspace" 2>&1) || die "workspace service signature missing"
+  printf '%s\n' "$workspace_signing" | grep -Fx "Identifier=$EXPECTED_BUNDLE_ID.WorkspaceService" >/dev/null || die "substituted workspace service"
+  printf '%s\n' "$workspace_signing" | grep -Fx "TeamIdentifier=$EXPECTED_TEAM_ID" >/dev/null || die "workspace service team mismatch"
+  printf '%s\n' "$workspace_signing" | grep '^Authority=Developer ID Application: ' >/dev/null || die "workspace service requires Developer ID"
+  printf '%s\n' "$workspace_signing" | grep '^CodeDirectory .*flags=.*runtime' >/dev/null || die "workspace service requires hardened runtime"
+  codesign -d --entitlements :- "$source_workspace" >"$tmp/workspace-entitlements.plist" || die "workspace entitlements missing"
+  [ "$(plutil -convert json -o - "$tmp/workspace-entitlements.plist")" = '{"com.apple.security.virtualization":true}' ] || die "workspace service must hold exactly virtualization"
   spctl --assess --type execute --verbose=2 "$source_app" ||
     die "Gatekeeper rejected PortableFS.app; refusing installation"
 
@@ -321,6 +337,7 @@ the download is corrupt or has been tampered with; nothing was installed"
     die "PortableFS.app identifies as version $app_version, expected $version"
   [ "$service_version" = "$version" ] ||
     die "PortableFSDService.app identifies as version $service_version, expected $version"
+  "$source_cli" lifecycle verify-workspace-bundle --app "$source_app" || die "Workspace image failed verification"
   cli_version=$("$source_cli" version 2>/dev/null) ||
     die "PortableFS.app CLI failed its version smoke test"
   daemon_version=$("$source_daemon" -version 2>/dev/null) ||

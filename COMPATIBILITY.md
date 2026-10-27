@@ -114,6 +114,7 @@ another, and none is bumped to match another.
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |
 | Mac release identity | daemon CodeDirectory hash, executable SHA-256, release version | Static release authentication; protocol numbers are not part of it. |
+| Workspace resource witness | `workspace/resources.present` under account state | Present through execution or unresolved outcome; absent only after confirmed VM termination, reservation release and clean observed outcomes. Cross-release readers check existence only, under product lifecycle exclusion. |
 | Lifecycle registry witness | `attaches.json` in the daemon state directory | Present only while the daemon has registered attachments; absent means none. |
 | Mount membership file | `mount.membership`, header `PFS-MEMBERSHIP-1` | Exact; one shared codec for authority and cell host. |
 | Signed cell plan | version `3` | Exact version, token prefix, and signing domain. |
@@ -468,7 +469,7 @@ Status never defeats explicit Stop. API/CLI acceptance reports pending work,
 never completed mount readiness. JSON separates desired running state, per-volume
 pending/authorization/ready/busy/terminal states and retained known/unknown loss.
 Only explicit force authorizes discarded RAM or terminal forced removal. The
-workspace is unqualified; signed image packaging and installer/update integration
+workspace is unqualified; installed signed-product and editor qualification
 remain required before it is a supported product.
 
 `portablefs version --json` advertises exactly these capability strings, each
@@ -543,11 +544,12 @@ extension from one immutable commit, with exact executable and bundle matching.
 See [docs/release-identity.md](./docs/release-identity.md).
 
 A Mac release is identified by exactly its daemon's CodeDirectory hash,
-executable SHA-256, and release version. Protocol numbers are not part of the
-release identity and are not sealed into the bundle: after a release and its
-running daemon are authenticated, the daemon reports its own live identity
-(schema 1, control protocol, `pfslocal` major and minor). Before any socket
-request, the CLI and the app authenticate the daemon peer identically: from
+executable SHA-256, and release version. Daemon control and `pfslocal` numbers
+are not part of that tuple and have no sealed daemon protocol manifest: after a release and its running daemon are
+authenticated, the daemon reports its own live identity
+(schema 1, control protocol, `pfslocal` major and minor). The separate sealed
+guest manifest binds the workspace image's exact authority major, source commit
+and image inputs. Before any socket request, the CLI and the app authenticate the daemon peer identically: from
 the connection's kernel audit token they require the same user, the exact
 canonical daemon path inside the authenticated owning bundle, the running
 image's kernel CodeDirectory hash equal to the release's, and valid,

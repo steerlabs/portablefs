@@ -26,10 +26,14 @@ import PortableFSWorkspaceVM
             guard let testImage = bundle.object(forInfoDictionaryKey: "PFSWorkspaceTestImage") as? String else { throw WorkspaceVMError("test image missing") }
             image = URL(fileURLWithPath: testImage, isDirectory: true)
             #endif
+            try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: account)
             let store = try WorkspaceHostState(directory: directory)
             let owner = WorkspaceProductOwner(store: store, reservationDirectory: account, hostBoot: try WorkspaceHostState.hostBootIdentity()) { reference in
                 let artifact: WorkspaceArtifact
-                do { artifact = try WorkspaceArtifact(directory: image) } catch { throw WorkspaceVMError("Workspace image failed verification") }
+                do {
+                    guard let pin = Bundle.main.object(forInfoDictionaryKey: "PFSWorkspaceImageManifestSHA256") as? String else { throw WorkspaceVMError("missing image pin") }
+                    artifact = try WorkspaceArtifact(directory: image, manifestSHA256: pin)
+                } catch { throw WorkspaceVMError("Workspace image failed verification") }
                 guard artifact.release.appVersion == bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String else { throw WorkspaceVMError("Workspace image failed verification") }
                 return try WorkspaceVMRuntime(artifact: artifact, directory: directory, executionReference: reference, sshHome: home)
             }

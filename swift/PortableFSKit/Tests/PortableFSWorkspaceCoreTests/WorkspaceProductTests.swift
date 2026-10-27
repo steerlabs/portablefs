@@ -408,3 +408,103 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     let transition=try WorkspaceReservations(directory:directory)
     #expect(transition.inventory == [mac]);#expect(runtime.starts==1)
 }
+
+@Test @MainActor func productUpdateExcludesStartsAndRetainsCrashWitness() async throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let account = try WorkspacePrivateDirectory(directory)
+    let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
+    let runtime = try ProductRuntime()
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { runtime }
+    do {
+        let update = try account.lock("mount-lifecycle.lock")
+        #expect(owner.handle(try productRequest("start")).state == "refused")
+        #expect(!store.value.running); #expect(runtime.starts == 0)
+        withExtendedLifetime(update) {}
+    }
+    #expect(owner.handle(try productRequest("start")).state == "starting")
+    #expect(try store.directory.read("resources.present") != nil)
+    do {
+        // Closing new admission must still permit Stop to drain the live VM.
+        // Its durable presence marker blocks ordinary replacement meanwhile.
+        let update = try account.lock("mount-lifecycle.lock")
+        #expect(try store.directory.read("resources.present") != nil)
+        #expect(owner.handle(try productRequest("start")).state == "refused")
+        withExtendedLifetime(update) {}
+    }
+    runtime.running(); try await productTurn()
+    _ = owner.handle(try productRequest("stop")); try await productTurn(); try await productTurn()
+    #expect(store.value.execution == nil)
+    #expect(try store.directory.read("resources.present") == nil)
+    let update = try account.lock("mount-lifecycle.lock")
+    #expect(owner.handle(try productRequest("start")).state == "refused")
+    #expect(owner.handle(try productRequest("stop")).state != "refused")
+    try await productTurn()
+    #expect(!store.value.running)
+    withExtendedLifetime(update) {}
+}
+
+@Test func pendingUpdateRefusesReservationButAllowsCleanup() throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let transition = try WorkspaceReservations(directory: directory)
+    let old = WorkspaceReservation(authority: String(repeating: "a", count: 64), volume: "old", owner: "old")
+    try transition.reserve(old)
+    let host = try WorkspacePrivateDirectory(directory.appendingPathComponent("host"))
+    let release: [String: Any] = ["codeDirectoryHash": String(repeating: "b", count: 40), "executableSHA256": String(repeating: "b", count: 64), "daemonVersion": "1"]
+    let lease: [String: Any] = ["schemaVersion": 1, "phase": "preparing-old", "tokenSHA256": String(repeating: "c", count: 64), "oldRelease": release, "targetRelease": release, "createdAtUnixMs": 1_800_000_000_000, "deadlineUnixMs": 1_800_000_300_000]
+    try host.write("activation.json", data: JSONSerialization.data(withJSONObject: lease))
+    #expect(throws: (any Error).self) { try transition.reserve(WorkspaceReservation(authority: old.authority, volume: "new", owner: "new")) }
+    try transition.release(old)
+    #expect(transition.inventory.isEmpty)
+}
+
+@Test @MainActor func productEmptyWitnessRequiresTerminationAndPreservesLostOutcome() throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try WorkspaceHostState(directory: directory)
+    try store.commit { $0.execution = WorkspaceExecution(hostBoot: "same-boot", boot: Data(repeating: 1, count: 16)) }
+    #expect(throws: (any Error).self) { try store.publishEmptyResources() }
+    #expect(throws: (any Error).self) { try store.requirePriorExecutionAbsent(hostBoot: "same-boot") }
+    #expect(try store.directory.read("resources.present") != nil)
+    // A reboot proves execution absence, but never silently acknowledges loss.
+    var frame = try WorkspaceControl.decode(workspaceGolden("status_reply"))
+    frame.statusReply.mounts[0].outcome = unknownTestOutcome()
+    let raw = try WorkspaceControl.encode(frame)
+    try store.commit { $0.retained.append(raw) }
+    try store.requirePriorExecutionAbsent(hostBoot: "new-host-boot")
+    #expect(store.value.execution == nil)
+    #expect(throws: (any Error).self) { try store.publishEmptyResources() }
+    #expect(try store.directory.read("resources.present") != nil)
+    #expect(store.value.retained == [raw])
+}
+
+@Test @MainActor func productForceStopWithoutStatusKeepsUnknownOutcomeAcrossSuccessor() async throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
+    let runtime = try ProductRuntime()
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { runtime }
+    _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
+    _ = owner.handle(try productRequest("stop", force: true)); try await productTurn(); try await productTurn()
+    #expect(store.value.execution == nil)
+    #expect(owner.snapshot().previousWriteOutcomeUnknown)
+    #expect(try store.directory.read("resources.present") == Data("8\nunobserved\n".utf8))
+    _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
+    _ = owner.handle(try productRequest("stop")); try await productTurn(); try await productTurn()
+    #expect(store.value.execution == nil)
+    #expect(store.previousWriteOutcomeUnknown)
+    #expect(throws: (any Error).self) { try store.publishEmptyResources() }
+    let quiesce = try WorkspaceHostLifecycleRequest.decode(Data("{\"lifecycleVersion\":1,\"operation\":\"quiesce\"}".utf8))
+    #expect(try owner.lifecycle(quiesce).state == "busy")
+}
+
+@Test func productUnknownExecutionWitnessSurvivesServiceRecreation() throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    do {
+        let store = try WorkspaceHostState(directory: directory)
+        try store.retainUnobservedExecution()
+        try store.commit { $0.running = false }
+    }
+    let reopened = try WorkspaceHostState(directory: directory)
+    #expect(reopened.previousWriteOutcomeUnknown)
+    try reopened.commit { $0.running = false }
+    #expect(throws: (any Error).self) { try reopened.publishEmptyResources() }
+    #expect(try reopened.directory.read("resources.present") == Data("8\nunobserved\n".utf8))
+}

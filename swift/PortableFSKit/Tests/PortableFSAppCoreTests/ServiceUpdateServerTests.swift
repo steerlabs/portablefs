@@ -60,6 +60,7 @@ private final class UpdateActionRecorder: @unchecked Sendable {
     var exitEvents: [String] = []
     var lifecycleEvents: [String] = []
     var activationError: Error?
+    var preparationError: Error?
     var exitPreparationError: Error?
 
     func actions(sealed: PortableFSDReleaseIdentity) -> PortableFSDServiceUpdateActions {
@@ -68,6 +69,7 @@ private final class UpdateActionRecorder: @unchecked Sendable {
             proveActive: { self.proven.append($0) },
             prepareOld: {
                 self.prepared += 1
+                if let preparationError = self.preparationError { throw preparationError }
                 return sealed
             },
             activate: { release in
@@ -105,6 +107,23 @@ private final class UpdateActionRecorder: @unchecked Sendable {
 }
 
 private enum FakeActivationFailure: Error { case failed }
+
+@Test func updateServerBusyPreparationRestoresOldAdmissionWithoutExit() throws {
+    let fixture = try UpdateServerFixture()
+    let recorder = UpdateActionRecorder()
+    recorder.preparationError = FakeActivationFailure.failed
+    let connection = FakeUpdateConnection()
+    connection.reads = [{ _ in try updateFrame([
+        "schemaVersion": 1, "operation": "prepare-update", "targetRelease": releaseObject(updateTargetRelease)
+    ]) }]
+    fixture.handler(recorder: recorder, sealed: updateOldRelease).handle(connection)
+    #expect(recorder.prepared == 1)
+    #expect(recorder.restored == [updateOldRelease])
+    #expect(recorder.resumed == 1)
+    #expect(recorder.exited == 0)
+    #expect(connection.writes.isEmpty)
+    #expect(try fixture.store.load()?.phase == .rollbackComplete)
+}
 
 private final class DirectorySyncInjector: @unchecked Sendable {
     private(set) var calls = 0

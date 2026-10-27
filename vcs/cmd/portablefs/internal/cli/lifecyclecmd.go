@@ -29,6 +29,22 @@ func cmdLifecycle(e *cmdEnv, args []string) int {
 	if len(args) == 0 {
 		return e.usageError("lifecycle", fmt.Errorf("expected `hold-shared`, `hold-account-exclusive`, `hold-install-exclusive`, or `identity`"))
 	}
+	if args[0] == "verify-workspace-bundle" || args[0] == "verify-macos-bundle" {
+		fs := newFlagSet("lifecycle verify-workspace-bundle")
+		var app string
+		fs.StringVar(&app, "app", "", "staged app path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return e.usageError("lifecycle", err)
+		}
+		if app == "" || fs.NArg() != 0 {
+			return e.usageError("lifecycle", fmt.Errorf("expected --app"))
+		}
+		if args[0] == "verify-macos-bundle" {
+			return e.verifyMacOSReleaseBundle(app)
+		}
+		return e.verifyWorkspaceBundle(app)
+	}
+
 	if args[0] == "identity" {
 		fs := newFlagSet("lifecycle identity")
 		var jsonOut bool
@@ -158,10 +174,12 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	fs := newFlagSet("lifecycle hold-install-exclusive")
 	var jsonOut bool
 	var expectedDaemonVersion string
+	var workspaceDrain bool
 	var expectedDaemonSHA256 string
 	var expectedDaemonPath string
 	var expectedDaemonCDHash string
 	fs.BoolVar(&jsonOut, "json", false, "write the versioned service-update readiness handshake")
+	fs.BoolVar(&workspaceDrain, "workspace-drain", false, "exclude starts while the outgoing host drains its workspace")
 	fs.StringVar(&expectedDaemonVersion, "expected-daemon-version", "", "authenticated live daemon version")
 	fs.StringVar(&expectedDaemonSHA256, "expected-daemon-sha256", "", "authenticated live daemon executable SHA-256")
 	fs.StringVar(&expectedDaemonPath, "expected-daemon-path", "", "canonical daemon path in the authenticated owning bundle")
@@ -190,6 +208,9 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.usageError("lifecycle", err)
 	}
+	if workspaceDrain && expectedIdentity == nil {
+		return e.usageError("lifecycle", fmt.Errorf("workspace drain requires the authenticated outgoing daemon identity"))
+	}
 	stateDir, err := e.mountLifecycleStateDir()
 	if err != nil {
 		return e.fail("lifecycle", err)
@@ -205,10 +226,14 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 	}
 	defer mountGuard.Close()
 
-	inventory, err := e.strictAccountInventory(
-		"updating the PortableFS service",
-		expectedIdentity,
-	)
+	purpose := "service-update"
+	var inventory lifecycleInventory
+	if workspaceDrain {
+		purpose = "workspace-drain"
+		inventory, err = e.strictFSKitInventory("draining Linux Workspace for an update", expectedIdentity)
+	} else {
+		inventory, err = e.strictAccountInventory("updating the PortableFS service", expectedIdentity)
+	}
 	if err != nil {
 		return e.fail("lifecycle", err)
 	}
@@ -216,7 +241,7 @@ func cmdHoldInstallExclusive(e *cmdEnv, args []string) int {
 		payload, err := json.Marshal(installExclusiveReadiness{
 			SchemaVersion:      1,
 			Held:               true,
-			Purpose:            "service-update",
+			Purpose:            purpose,
 			lifecycleInventory: inventory,
 		})
 		if err != nil {
@@ -261,6 +286,17 @@ func (e *cmdEnv) strictAccountInventory(
 	action string,
 	expectedIdentity *daemonRelease,
 ) (lifecycleInventory, error) {
+	stateDir, err := e.mountLifecycleStateDir()
+	if err != nil {
+		return lifecycleInventory{}, err
+	}
+	if err := requireWorkspaceResourcesAbsent(stateDir); err != nil {
+		return lifecycleInventory{}, err
+	}
+	return e.strictFSKitInventory(action, expectedIdentity)
+}
+
+func (e *cmdEnv) strictFSKitInventory(action string, expectedIdentity *daemonRelease) (lifecycleInventory, error) {
 	var inventory lifecycleInventory
 	kernelMounts, err := e.kernelMountInventory()
 	if err != nil {
@@ -320,6 +356,9 @@ func (e *cmdEnv) strictAccountInventory(
 // replacement preflight refuses all CLI anchors and any daemon registry entry.
 // The app still owns the final absence check under singleton exclusion.
 func rejectDurableMountAnchors(stateDir string) error {
+	if err := requireWorkspaceResourcesAbsent(stateDir); err != nil {
+		return err
+	}
 	mountStateDir := filepath.Join(stateDir, "mounts")
 	states, err := listMountStates(mountStateDir)
 	if err != nil {

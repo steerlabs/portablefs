@@ -80,6 +80,17 @@ func makeCompleteBundleFixture(t *testing.T, root string, layout macOSInstallLay
 			t.Fatal(err)
 		}
 	}
+	if layout.codeIdentity == macOSInstallDeveloperIDRelease {
+		workspace := filepath.Join(app, "Contents/Library/LaunchAgents/PortableFSWorkspaceService.app/Contents")
+		if err := os.MkdirAll(filepath.Join(workspace, "MacOS"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(workspace, "MacOS/portablefs-workspace-service"), []byte("#!/bin/sh\nexit 99\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		writeBundleFixturePlist(t, filepath.Join(workspace, "Info.plist"), map[string]any{"CFBundleIdentifier": appID + ".WorkspaceService", "CFBundleExecutable": "portablefs-workspace-service"})
+		writeBundleFixturePlist(t, filepath.Join(filepath.Dir(filepath.Dir(workspace)), appID+".workspace.plist"), map[string]any{"Label": appID + ".workspace", "BundleProgram": "Contents/Library/LaunchAgents/PortableFSWorkspaceService.app/Contents/MacOS/portablefs-workspace-service", "RunAtLoad": true, "KeepAlive": true})
+	}
 	return app
 }
 
@@ -126,7 +137,7 @@ func TestCompiledBundleEntryPointsEnforceOneLayout(t *testing.T) {
 			if err := os.Mkdir(filepath.Join(app, "Contents", "Library", "LaunchAgents", "Extra.app"), 0755); err != nil {
 				t.Fatal(err)
 			}
-		}, "must contain exactly PortableFSDService.app"},
+		}, "must contain its exact service applications"},
 		{"extra agent", func(t *testing.T, app string) {
 			if err := os.WriteFile(filepath.Join(app, "Contents", "Library", "LaunchAgents", "Extra.plist"), []byte("{}"), 0644); err != nil {
 				t.Fatal(err)

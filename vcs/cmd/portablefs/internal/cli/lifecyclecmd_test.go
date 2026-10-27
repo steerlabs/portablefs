@@ -80,6 +80,52 @@ func TestLifecycleHoldInstallExclusiveHandshakeAndEOF(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDrainRequiresExactFSKitAbsenceAndPreservesWorkspaceWitness(t *testing.T) {
+	for _, condition := range []string{"empty-fskit", "kernel-present", "daemon-busy", "identity-missing"} {
+		t.Run(condition, func(t *testing.T) {
+			e, stdout, stderr := testEnv(t)
+			e.stdin = strings.NewReader("")
+			directory := filepath.Join(e.lifecycleStateDir, "workspace")
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(directory, "resources.present")
+			if err := os.WriteFile(marker, []byte("8\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			e.daemonLifecycleInventoryFn = func(expected *daemonRelease) (int, error) {
+				if expected == nil {
+					t.Fatal("outgoing daemon identity missing")
+				}
+				if condition == "daemon-busy" {
+					return 1, nil
+				}
+				return 0, nil
+			}
+			if condition == "kernel-present" {
+				e.kernelInventoryFn = func() ([]string, error) { return []string{"/live-fskit"}, nil }
+			}
+			args := []string{"lifecycle", "hold-install-exclusive", "--json", "--workspace-drain"}
+			if condition != "identity-missing" {
+				args = append(args,
+					"--expected-daemon-version", "1", "--expected-daemon-sha256", strings.Repeat("a", 64),
+					"--expected-daemon-path", "/authenticated/portablefsd", "--expected-daemon-cdhash", strings.Repeat("b", 40))
+			}
+			code := e.run(args)
+			if condition == "empty-fskit" {
+				if code != 0 || !strings.Contains(stdout.String(), `"purpose":"workspace-drain"`) {
+					t.Fatalf("drain code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+				}
+			} else if code == 0 || stdout.Len() != 0 {
+				t.Fatalf("unsafe drain accepted: %d %s", code, stdout.String())
+			}
+			if _, err := os.Lstat(marker); err != nil {
+				t.Fatalf("helper changed workspace evidence: %v", err)
+			}
+		})
+	}
+}
+
 func TestLifecycleHoldInstallExclusiveHoldsBothGuardsUntilEOF(t *testing.T) {
 	e, _, stderr := testEnv(t)
 	stdinReader, stdinWriter := io.Pipe()

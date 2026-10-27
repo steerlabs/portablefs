@@ -153,6 +153,7 @@ fi
 # programs (the repository carries no JavaScript packages); they read the
 # installer, the workflows and .goreleaser.yaml as text.
 step "release trust policy"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_prepare_workspace_bundle.py
 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.10 .github/workflows/*.yml
 if [ -f scripts/install.sh ]; then
   sh -n scripts/install.sh
