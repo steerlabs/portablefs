@@ -169,7 +169,7 @@ try:
     before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
     assert before['generation'] == 0 and before['sample_age_ns'] <= 250_000_000
     record('rtc-boot-correction')
-    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '65']
+    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '60']
     subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), *clock_arguments], check=True)
     record('rtc-awake-measurement')
     authority = NativeAuthority(root)
