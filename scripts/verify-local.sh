@@ -133,6 +133,7 @@ step "native cache observer evidence"
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_macos27_kernel_cache_observer.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_writeback_probes.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_qualify_linux_workspace_clock.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_g3_support.py
 go -C scripts/nts-reference test -race ./...
 go -C scripts/nts-reference vet ./...
 

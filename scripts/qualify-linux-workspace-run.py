@@ -20,6 +20,10 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
+from g3_product_probe import ProductProbe
+from g3_continuity import Continuity
+from g3_pins import verify as verify_pins
 
 from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_g0 import pause_checks
@@ -105,10 +109,16 @@ def main():
     parser.add_argument('reference', type=pathlib.Path)
     parser.add_argument('evidence', type=pathlib.Path)
     parser.add_argument('--soak', action='store_true')
+    parser.add_argument('--pins',type=pathlib.Path,required=True)
     args = parser.parse_args()
+    hold=pathlib.Path('/Users/timjang/.local/state/portablefs-tests/linux-workspace/HOLD')
+    if hold.exists(): parser.error('HOLD exists: no VM, container or soak may start')
+    pins=verify_pins(json.loads(args.pins.read_text()),ROOT,args.image,args.binary,args.reference)
+    run_id=str(uuid.uuid4())
     evidence = args.evidence.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
     assert not (evidence/'status.json').exists(), 'use a new evidence directory'
+    atomic(evidence/'run-inputs.json',pins)
     os.environ['PFS_NATIVE_CLOCK_SOAK'] = '1'
     os.environ['PFS_NATIVE_FIXTURE_PREFIX'] = 'pfs-g3-'
     os.environ['PFS_RTC_NTS_REFERENCE'] = str(args.reference.resolve())
@@ -121,7 +131,7 @@ def main():
     now = lambda: datetime.datetime.now(datetime.timezone.utc)
     status = dict(pid=os.getpid(), launched=now().isoformat(), state_directory=str(state),
                   image_manifest_sha256=hashlib.sha256((args.image/'manifest.json').read_bytes()).hexdigest(),
-                  phase='preparing', caffeinate_pid=caffeinate.pid, errors=[])
+                  phase='preparing', caffeinate_pid=caffeinate.pid, errors=[],run_id=run_id)
     (evidence/'pid').write_text(str(os.getpid())+'\n')
     atomic(evidence/'status.json',status)
     guest = authority = process = None
@@ -134,13 +144,17 @@ def main():
     peer = None
     try:
         # Validate real authenticated connectivity before spending time booting.
-        subprocess.run([str(args.reference)], check=True, timeout=10)
+        preflight=json.loads(subprocess.check_output([str(args.reference)],text=True,timeout=10))
+        sys.path.insert(0,str(ROOT))
+        from g3_coverage import OPERATORS
+        assert len({OPERATORS[r['server']] for r in preflight['references']})>=2, 'preflight lacks two operators'
+        atomic(evidence/'adapter-preflight.json',preflight)
         subprocess.run(['bash',str(ROOT/'test-linux-workspace-g0.sh'),str(args.image),str(evidence)],
                        check=True,timeout=240)
         subprocess.run(['bash',str(ROOT/'test-linux-workspace-rtc.sh'),str(args.image),str(evidence)],
                        check=True,timeout=150)
         atomic(evidence/'admission.json',dict(image_manifest_sha256=status['image_manifest_sha256'],
-                   rtc_admission='pass',first_read_after_resume=True,concurrent_duplicate_readers=True,
+                   rtc_admission='pass',first_read_after_resume=False,concurrent_duplicate_readers=False,
                    basis='55 exact injected admission cases and separate exact-kernel RTC initramfs; product pause traces follow'))
         guest = Guest(str(args.binary), args.image, state, evidence)
         status['guest_pid'] = guest.p.pid
@@ -148,6 +162,8 @@ def main():
         status['authority_container'] = authority.name
         managed = authority.mount(guest)
         authority.initial_io(guest)
+        initial_probe=ProductProbe(guest,args.reference.resolve())
+        initial_probe.close()
 
         def campaigns():
             nonlocal managed
@@ -159,32 +175,40 @@ def main():
                         case = json.loads(stream.readline(65536))
                         assert case['image_manifest_sha256'] == status['image_manifest_sha256']
                         assert case['host_sleep'] is False
+                        assert case['run_id']==run_id
+                        if hold.exists(): raise RuntimeError('HOLD appeared: coordinator required before load campaign')
                         directory = evidence/'campaigns'/f"{case['block']:02d}-{case['fencing']}-{case['pause_seconds']}"
                         directory.mkdir(parents=True)
+                        phase=json.loads((evidence/'clock/load-state.json').read_text())
+                        assert phase['run_id']==run_id and phase['load']==case['load'], 'actual load phase differs from campaign'
+                        if phase['load']=='load': os.getpgid(phase['pid'])
                         prior_evidence = authority.evidence
                         authority.evidence = directory
                         try:
+                            probe=ProductProbe(guest,args.reference.resolve())
                             managed = pause_checks(authority,guest,managed,lambda _: None,
-                                                   durations=(case['pause_seconds'],),modes=(case['fencing'],))
+                                                   durations=(case['pause_seconds'],),modes=(case['fencing'],),
+                                                   rtc_probe=probe,load=case['load'])
                         finally:
                             authority.evidence = prior_evidence
-                        # Separate read-only initramfs, exact product kernel: this
-                        # preserves sole-opening ownership in the product guest.
-                        subprocess.run(['bash',str(ROOT/'test-linux-workspace-rtc.sh'),str(args.image),str(directory)],
-                                       check=True, timeout=150, stdout=subprocess.DEVNULL)
-                        first = json.loads((directory/'rtc-nts-reference.json').read_text())
-                        duplicate = json.loads((directory/'rtc-contention.json').read_text())
                         trace = json.loads((directory/'g0-vz-pauses.json').read_text())[0]
+                        trace['load_evidence']=phase
+                        first=trace['product_first_read']
+                        duplicate=trace['product_duplicate_readers']
                         result = dict(case=case,image_manifest_sha256=status['image_manifest_sha256'],
                                       first_operation_prestarted=trace['first_operation_prestarted'],
                                       denied_before_host_round_trip='denial_observed_before_host_recovery_ns' in trace,
                                       closed_cold_fresh=trace['recovery_disposition']=='closed-cold-fresh',
                                       terminal_cleanup_complete=trace['recovery_disposition']=='terminal-cleanup-fresh-authorization',
                                       first_read=first,duplicate_readers=duplicate,
-                                      first_read_fixture='separate test-only initramfs on exact product kernel',
+                                      first_read_fixture='prestarted reader of product service retained RTC description',
                                       trace=trace)
                     except Exception as error:
-                        result = dict(error=repr(error))
+                        active=directory/'g0-vz-active.json' if 'directory' in locals() else None
+                        trace=json.loads(active.read_text()) if active and active.exists() else {}
+                        operation=trace.get('first_operation',{})
+                        violation=case.get('fencing')!='normal' and (operation.get('success') is True or operation.get('operation_ns',0)>=1_000_000_000)
+                        result = dict(error=repr(error),case=case,trace=trace,bound_violation=violation,admission_violation=violation)
                     client.sendall((json.dumps(result)+'\n').encode())
 
         threading.Thread(target=campaigns,daemon=True).start()
@@ -203,6 +227,11 @@ while True:
         while not authority.peer("import pathlib; print(pathlib.Path('/var/tmp/pfs-native/home/peer/soak-heartbeat').exists())") == 'True':
             assert time.monotonic()<deadline, 'peer heartbeat did not start'
             time.sleep(.1)
+        continuity=Continuity(authority,guest,evidence/'peer-heartbeats.jsonl')
+        # Docker events preserve even a pause/unpause wholly between polls.
+        event_log=(evidence/'authority-events.jsonl').open('w')
+        event_process=subprocess.Popen(['docker','events','--since',str(int(time.time())),
+                        '--filter','container='+authority.name,'--format','{{json .}}'],stdout=event_log,stderr=subprocess.STDOUT)
         stamp = now()
         status.update(phase='running',start_time=stamp.isoformat(),
                       expected_end=(stamp+datetime.timedelta(hours=72) if args.soak else stamp+datetime.timedelta(minutes=30)).isoformat(),
@@ -213,7 +242,7 @@ while True:
                    str(evidence/'clock'),'--utc-reference-command',str(args.reference),
                    '--pause-command',shlex.join([sys.executable,str(pathlib.Path(__file__).resolve()),'--driver',address]),
                    '--admission-evidence',str(evidence/'admission.json'),
-                   '--stop-file',str(stop)]
+                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id]
         command += ['--soak'] if args.soak else ['--seconds','1800','--dry-run']
         with (evidence/'harness.log').open('w') as log:
             process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
@@ -222,7 +251,23 @@ while True:
                 assert caffeinate.poll() is None, 'awake assertion exited'
                 assert guest.p.poll() is None, 'guest owner exited'
                 assert peer.poll() is None, 'independent peer exited'
-                if campaign_lock.acquire(blocking=False):
+                campaign_active=not campaign_lock.acquire(blocking=False)
+                try:
+                    status['continuity']=continuity.check(campaign_active)
+                    serial=state/'serial.log'
+                    if serial.exists() and serial.stat().st_size>8*1024*1024:
+                        with serial.open('r+b') as serial_log: serial_log.truncate(0)
+                    if (evidence/'owner.stderr').stat().st_size>8*1024*1024:
+                        with (evidence/'owner.stderr').open('r+b') as error_log: error_log.truncate(0)
+                    if event_process.poll() is not None: raise RuntimeError('authority event stream lost')
+                    for line in (evidence/'authority-events.jsonl').read_text().splitlines():
+                        event=json.loads(line)
+                        if event.get('Action') in ('pause','unpause','die','kill','restart','stop','destroy'):
+                            raise RuntimeError('unplanned authority disruption: '+event['Action'])
+                except BaseException:
+                    if not campaign_active: campaign_lock.release()
+                    raise
+                if not campaign_active:
                     try:
                         # A real guest admission/coherence operation, separate
                         # from the maintenance-page measurement and live peer.
@@ -232,15 +277,23 @@ while True:
                 progress = evidence/'clock/progress.json'
                 if progress.exists():
                     status['progress']=json.loads(progress.read_text())
+                    clock_run=json.loads((evidence/'clock/run.json').read_text())
+                    status['start_time']=clock_run['start_time']
+                    status['expected_end']=(datetime.datetime.fromisoformat(status['start_time'])+datetime.timedelta(seconds=clock_run['seconds'])).isoformat()
                 status['updated']=now().isoformat()
                 if stop.exists(): status['phase']='stopping'
                 atomic(evidence/'status.json',status)
-                closing.wait(10)
+                status_path=evidence/'STATUS.md'
+                status_path.write_text('# G3 clock run\n\n'+f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\n")
+                closing.wait(5)
             assert process.returncode == 0, f'harness exited {process.returncode}'
         status['result']=json.loads((evidence/'clock/result.json').read_text())
         status['phase']='stopped' if stop.exists() else 'completed'
     except BaseException as error:
-        status['errors'].append(repr(error));status['phase']='failed'
+        status['errors'].append(repr(error));status['phase']='invalid'
+        atomic(evidence/'INVALID.json',dict(run_id=run_id,error=repr(error),observed_ns=time.monotonic_ns(),at=now().isoformat()))
+        atomic(evidence/'status.json',status)
+        (evidence/'STATUS.md').write_text('# G3 clock run\n\nInvalid: '+repr(error)+'\nEvidence preserved; stopping owned resources.\n')
         raise
     finally:
         stop.touch()
@@ -264,10 +317,13 @@ while True:
             if authority is not None:
                 try: authority.close()
                 except Exception as error: status['errors'].append('authority cleanup: '+repr(error))
+        if 'event_process' in locals() and event_process.poll() is None:
+            event_process.terminate();event_process.wait(timeout=5)
         server.close()
         caffeinate.terminate();caffeinate.wait(timeout=5)
         status['finished']=now().isoformat()
         atomic(evidence/'status.json',status)
+        (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+f"Phase: {status['phase']}.\nRun: {run_id}; owner PID: {os.getpid()}.\nErrors: {status['errors']!r}.\nEvidence retained; runs are never spliced.\n")
     if status['errors']:
         raise RuntimeError(status['errors'])
 

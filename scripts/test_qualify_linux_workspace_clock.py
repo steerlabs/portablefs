@@ -1,181 +1,211 @@
 #!/usr/bin/env python3
-"""Falsify UTC/reference arithmetic without clocks, networking or a guest."""
+"""Synthetic acceptance and falsification: no network, VM or clock changes."""
+import copy
+import datetime
 import importlib.util
 import pathlib
-import unittest
-import json
 import tempfile
-import threading
-import datetime
+import json
+import unittest
 from unittest import mock
 
-spec = importlib.util.spec_from_file_location('clock', pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py'))
-clock = importlib.util.module_from_spec(spec)
+spec=importlib.util.spec_from_file_location('clock',pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py'))
+clock=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(clock)
+from g3_coverage import campaign_coverage, coverage_verdict, inventory, propagate
+
+S=clock.SECOND
+START=10*S
+UTC=clock.utc_ns('2026-10-27T00:00:00Z')
+RUN='one-continuous-run'
+
+
+def observation(slot,closing=False):
+    began=START+slot*30*S
+    rtc=datetime.datetime.fromtimestamp((UTC+slot*30*S)//S,datetime.timezone.utc).isoformat()
+    wall=datetime.datetime.fromtimestamp((UTC+slot*30*S+205_000_000)/S,datetime.timezone.utc).isoformat()
+    refs=[dict(server=host,protocol='NTS',authenticated=True,unix_ns=UTC+slot*30*S+105_000_000,
+               uncertainty_ns=1000,query_began_ns=began+100_000_000,query_ended_ns=began+110_000_000)
+          for host in ('time.cloudflare.com','nts.netnod.se')]
+    return dict(run_id=RUN,run_start_ns=START,observation='closing' if closing else 'opening' if slot==0 else 'ordinary',
+                interval_slot=None if closing else slot,reference_began_ns=began,reference_ended_ns=began+120_000_000,
+                sample_began_ns=began+200_000_000,sample_ended_ns=began+210_000_000,
+                host_wall_pair=dict(began_ns=began+180_000_000,ended_ns=began+180_001_000,wall_ns=UTC+slot*30*S+180_000_500),
+                independent_reference=dict(references=refs,clock=clock.REFERENCE_CLOCK),
+                sample=dict(measurement=dict(rtc=rtc,wall_after=wall,sample_age_ns=1000,elapsed_end_ns=slot*30*S,generation=1),
+                            elapsed_ns=slot*30*S,wall_ns=UTC+slot*30*S+205_000_000))
+
+
+def verdict(rows,seconds=72*3600,envelope=None,disruptions=()):
+    return coverage_verdict(copy.deepcopy(rows),START,seconds,RUN,clock.reference_interval,clock.evaluate,envelope,disruptions)
 
 
 class QualificationTests(unittest.TestCase):
-    def test_query_timing_keeps_complete_ntp_transit(self):
-        refs=[dict(server=n,protocol='NTS',authenticated=True,unix_ns=1000,uncertainty_ns=5,
-                   query_began_ns=102,query_ended_ns=118) for n in ('a','b')]
-        self.assertEqual(clock.reference_interval(refs,100,120,130,150,clock.REFERENCE_CLOCK),(1007,1053))
-        # A mismatched domain or fabricated interval cannot tighten evidence.
-        # The legacy full-invocation contract remains conservative.
-        self.assertEqual(clock.reference_interval(refs,100,120,130,150),(1005,1055))
-        for domain in ('other',True):
-            with self.assertRaises(ValueError): clock.reference_interval(refs,100,120,130,150,domain)
-        for begin,end in ((99,118),(119,118),(102,121),(True,118)):
-            refs[0].update(query_began_ns=begin,query_ended_ns=end)
-            with self.assertRaises(ValueError): clock.reference_interval(refs,100,120,130,150,clock.REFERENCE_CLOCK)
+    @classmethod
+    def setUpClass(cls):
+        cls.full=[observation(n) for n in range(8640)]+[observation(8640,True)]
 
-    def test_charges_complete_reference_and_sampling_transit(self):
-        refs = [dict(server=n, protocol='NTS', authenticated=True, unix_ns=1000, uncertainty_ns=5) for n in ('a','b')]
-        self.assertEqual(clock.reference_interval(refs, 100, 120, 130, 150), (1005,1055))
-        self.assertEqual(clock.reference_interval(refs, 100, 120, 105, 110), (980,1015))
-        with self.assertRaises(ValueError):
-            clock.reference_interval(refs,120,100,130,150)
-        refs[1]['authenticated'] = False
-        with self.assertRaises(ValueError):
-            clock.reference_interval(refs,100,120,130,150)
+    def test_exact_continuous_72_hours_and_closing(self):
+        result=verdict(self.full)
+        self.assertEqual(result['utc'],'pass',result['missing'][:3])
+        self.assertEqual(result['unique_slots'],8640)
+        self.assertEqual(result['direct_reference_slots'],8640)
+        self.assertEqual(result['minimum_reference_slots'],8554)
+        self.assertTrue(result['directly_referenced_endpoints'])
 
-    def test_missing_or_same_reference_is_not_coverage(self):
-        ref = dict(server='a', protocol='NTS', authenticated=True, unix_ns=1000, uncertainty_ns=5)
-        for refs in ([],[ref],[ref,ref]):
-            with self.assertRaises(ValueError):
-                clock.reference_interval(refs,100,120,130,150)
+    def test_required_falsifications_never_pass(self):
+        for name,edit in (
+            ('single unbounded gap',lambda r:r[1].update(independent_reference=None)),
+            ('missing closing anchor',lambda r:r.pop()),
+            ('disagreeing reference',lambda r:r[4]['independent_reference']['references'][1].update(unix_ns=UTC+999*S)),
+            ('spliced run',lambda r:r[10].update(run_id='second-run')),
+            ('spliced start',lambda r:r[10].update(run_start_ns=START+1)),
+            ('duplicated slot',lambda r:r.insert(2,copy.deepcopy(r[1]))),
+            ('missing ordinary sample',lambda r:r[3].pop('sample')),
+            ('missing host bracket',lambda r:r[3].pop('host_wall_pair')),
+            ('unplanned authority pause',lambda r:r[5].update(failures=['authority paused'])),
+            ('prior failure on retry',lambda r:r[6].update(bound_violation=True,error='previous violation')),
+        ):
+            with self.subTest(name=name):
+                rows=copy.deepcopy(self.full);edit(rows)
+                result=verdict(rows)
+                self.assertNotEqual(result['utc'],'pass')
+                if name in ('disagreeing reference','prior failure on retry','unplanned authority pause'):
+                    self.assertEqual(result['utc'],'fail')
 
-    def test_pause_campaign_binds_image_and_independent_first_read(self):
-        class NoWait:
-            def wait(self, seconds): return False
-            def is_set(self): return False
-        with tempfile.TemporaryDirectory(prefix='pfs-g0-campaign-test-') as directory:
-            campaign=clock.PauseCampaign.__new__(clock.PauseCampaign)
-            campaign.command='test-driver'; campaign.image_hash='candidate'
-            campaign.evidence=pathlib.Path(directory); campaign.duration=1800
-            campaign.dry_run=True; campaign.started=0; campaign.stop=NoWait()
-            campaign.active=threading.Event(); campaign.records=[];campaign.errors=[]
-            utc=clock.utc_ns('2026-10-26T00:00:00Z')
-            def result(args, **kwargs):
-                case=json.loads(args[-1])
-                return json.dumps(dict(case=case,image_manifest_sha256='candidate',
-                    first_operation_prestarted=True,denied_before_host_round_trip=True,closed_cold_fresh=True,
-                    first_read=dict(rtc='2026-10-26T00:00:00Z',sample_age_ns=1000,
-                        reference_began_ns=100,reference_ended_ns=120,sample_began_ns=130,sample_ended_ns=140,
-                        references=[dict(server=n,protocol='NTS',authenticated=True,unix_ns=utc+500_000_000,uncertainty_ns=1000) for n in ('a','b')]),
-                    duplicate_readers=dict(readers=8,samples=8000,maximum_ns=1000)))
-            with mock.patch.object(clock.subprocess,'check_output',side_effect=result): campaign.run()
-            self.assertEqual(len(campaign.records),3)
-            self.assertFalse(campaign.errors)
-            self.assertTrue(all(v['first_read_source']=='pass' for v in campaign.records))
-            def failed_bound(args, **kwargs):
-                value=json.loads(result(args,**kwargs))
-                value['first_read']['rtc']='2026-10-26T00:00:05Z'
-                return json.dumps(value)
-            campaign.records=[];campaign.errors=[]
-            with mock.patch.object(clock.subprocess,'check_output',side_effect=failed_bound): campaign.run()
-            self.assertFalse(campaign.records)
-            self.assertEqual(len(campaign.errors),3)
-            self.assertTrue(all(v['bound_violation'] for v in campaign.errors))
-            campaign.records=[];campaign.errors=[]
-            campaign.dry_run=False;campaign.duration=6*3600
-            with mock.patch.object(clock.subprocess,'check_output',side_effect=result): campaign.run()
-            self.assertEqual(len(campaign.records),24)
-            self.assertEqual([v['case']['load'] for v in campaign.records],['idle']*12+['load']*12)
-            self.assertFalse(campaign.errors)
+    def test_bracketed_gap_requires_independent_pinned_envelope(self):
+        rows=copy.deepcopy(self.full);rows[3]['independent_reference']=None
+        envelope=dict(independent=True,support_sha256='external-pointwise-rate-evidence',pinned_before_start=True,rho_ppm=500)
+        result=verdict(rows,envelope=envelope)
+        self.assertEqual(result['utc'],'pass',result['missing'])
+        self.assertEqual(result['bounded_gap_slots'],1)
+        self.assertEqual(result['direct_reference_slots'],8639)
+        for edits in ({'independent':False},{'support_sha256':None},{'pinned_before_start':False},{'rho_ppm':501}):
+            unsupported=dict(envelope,**edits)
+            self.assertEqual(verdict(rows,envelope=unsupported)['utc'],'inconclusive')
+        for n in range(1,5): rows[n]['independent_reference']=None
+        self.assertEqual(verdict(rows,envelope=envelope)['utc'],'inconclusive')
+        # The whole timing bracket and both directions are retained.
+        self.assertEqual(propagate(dict(begin_ns=0,end_ns=2*S,utc_interval_ns=(100*S,102*S)),60*S,61*S,500),
+                         (158*S-30_500_000,163*S+30_500_000))
 
-    def test_fractional_nanoseconds_are_not_rounded(self):
-        self.assertEqual(clock.utc_ns('2026-10-26T00:00:00.123456789Z')-
-                         clock.utc_ns('2026-10-26T00:00:00Z'),123456789)
+    def test_disruption_invalidates_even_complete_evidence(self):
+        for event in ('authority pause','host sleep','host reboot','guest owner restart','peer lost'):
+            result=verdict(self.full,disruptions=[event])
+            self.assertEqual(result['utc'],'inconclusive')
+            self.assertEqual(result['invalid'],[event])
 
-    def test_pause_overlap_includes_completed_case_and_error(self):
-        campaign=clock.PauseCampaign.__new__(clock.PauseCampaign)
-        campaign.active=threading.Event(); campaign.records=[];campaign.errors=[]
-        token=campaign.sample_token()
-        self.assertFalse(campaign.overlaps_sample(token))
-        campaign.active.set()
-        self.assertTrue(campaign.overlaps_sample(token))
+    def test_missing_opening_never_extrapolates(self):
+        rows=copy.deepcopy(self.full);rows[0]['independent_reference']=None
+        envelope=dict(independent=True,support_sha256='external',pinned_before_start=True,rho_ppm=500)
+        self.assertEqual(verdict(rows,envelope=envelope)['utc'],'inconclusive')
 
-        active=campaign.sample_token()
-        campaign.active.clear()
-        self.assertTrue(campaign.overlaps_sample(active))
-        campaign.records.append({})
-        self.assertTrue(campaign.overlaps_sample(token))
-        token=campaign.sample_token()
-        campaign.errors.append({})
-        self.assertTrue(campaign.overlaps_sample(token))
+    def test_aliases_count_one_and_disagreement_is_retained(self):
+        row=observation(0);refs=row['independent_reference']['references']
+        refs[0]['server']='sth1.nts.netnod.se'
+        with self.assertRaises(ValueError): clock.reference_interval(refs,START,START+S,START,START+S)
+        refs[0]['server']='time.cloudflare.com'
+        disagree=copy.deepcopy(refs[0]);disagree['server']='ptbtime1.ptb.de';disagree['unix_ns']+=5*S
+        with self.assertRaises(clock.ReferenceDisagreement):
+            clock.reference_interval(refs+[disagree],START,START+S,START,START+S)
+        refs[1]['server']='pilot.time.nl'
+        with self.assertRaises(ValueError): clock.reference_interval(refs,START,START+S,START,START+S)
 
-    def test_catchup_burst_cannot_fill_missing_measurement_slot(self):
-        rows=[dict(interval_slot=v) for v in (0,2,2)]
-        self.assertFalse(clock.measurement_coverage(rows,60))
-        rows.append(dict(interval_slot=1))
-        self.assertTrue(clock.measurement_coverage(rows,60))
+    def test_reference_timestamp_brackets_and_authentication(self):
+        row=observation(0);refs=row['independent_reference']['references']
+        interval=clock.reference_interval(refs,START,START+120_000_000,START+200_000_000,START+210_000_000,clock.REFERENCE_CLOCK)
+        self.assertEqual(interval,(UTC+195_000_000-1000,UTC+215_000_000+1000))
+        for field,value in (('authenticated',False),('query_began_ns',START-1),('query_ended_ns',START+121_000_000),('uncertainty_ns',True)):
+            invalid=copy.deepcopy(refs);invalid[0][field]=value
+            with self.assertRaises(ValueError): clock.reference_interval(invalid,START,START+120_000_000,START+200_000_000,START+210_000_000,clock.REFERENCE_CLOCK)
+        with self.assertRaises(ValueError): clock.reference_interval(refs,START,START+S,START,START+S,'other.clock')
 
-    def test_completed_pause_does_not_validate_old_projection(self):
-        campaign=clock.PauseCampaign.__new__(clock.PauseCampaign)
-        campaign.active=threading.Event(); campaign.records=[];campaign.errors=[]
-        campaign.finish=lambda: None
-        elapsed=[0.]; calls=[0]
-        epoch=datetime.datetime(2026,10,26,tzinfo=datetime.timezone.utc)
-        def probe(*args, **kwargs):
-            calls[0]+=1
-            current=epoch+datetime.timedelta(seconds=elapsed[0])
-            stamp=current.isoformat()
-            sample=dict(measurement=dict(rtc=stamp,wall_after=stamp,sample_age_ns=0,
-                        elapsed_end_ns=int(elapsed[0]*clock.SECOND)),
-                        elapsed_ns=int(elapsed[0]*clock.SECOND),wall_ns=clock.utc_ns(stamp))
-            if calls[0]==2:
-                campaign.records.append({})
-                sample['measurement']['elapsed_end_ns']=-600*clock.SECOND
-            return json.dumps(sample)
-        def advance(seconds): elapsed[0]+=seconds
-        with tempfile.TemporaryDirectory(prefix='pfs-g0-overlap-test-') as directory:
-            root=pathlib.Path(directory);image=root/'image';image.mkdir()
-            (image/'manifest.json').write_text('{}')
-            with mock.patch('sys.argv',['qualify',str(image),'unused-ssh',str(root/'evidence'),'--seconds','60']), \
-                 mock.patch.object(clock,'PauseCampaign',return_value=campaign), \
+    def test_allocations_remain_binding(self):
+        row=observation(0);sample=row['sample']
+        for field,value in (('sample_age_ns',250_000_001),):
+            invalid=copy.deepcopy(sample);invalid['measurement'][field]=value
+            with self.assertRaises(clock.BoundViolation):clock.evaluate(invalid)
+        sample['wall_ns']+=250_000_001
+        with self.assertRaises(clock.BoundViolation):clock.evaluate(sample)
+        row=observation(0)
+        self.assertEqual(clock.evaluate(row['sample'],(UTC+3*S,UTC+3*S+1000))['source'],'fail')
+        self.assertEqual(clock.evaluate(row['sample'])['source'],'inconclusive')
+
+    def test_generation_projection_never_crosses_pause(self):
+        rows=[observation(0),observation(1),observation(2,True)]
+        rows[1]['sample']['measurement']['elapsed_end_ns']=-600*S
+        self.assertEqual(verdict(rows,seconds=60)['utc'],'inconclusive')
+        window=dict(verified=True,run_id=RUN,begin_ns=rows[1]['sample_began_ns'],end_ns=rows[1]['sample_ended_ns'])
+        rows[1]['planned_window']=window
+        result=verdict(rows,seconds=60)
+        self.assertEqual(result['utc'],'pass')
+        self.assertEqual(result['planned_unavailability_slots'],1)
+        rows[1]['planned_window']['verified']=False
+        self.assertEqual(verdict(rows,seconds=60)['utc'],'inconclusive')
+
+    def test_exact_inventory_identity_and_load(self):
+        rows=[]
+        for (block,mode,duration),load in inventory().items():
+            begin=START+(block*6*3600+(3*3600 if load=='load' else 0)+900)*S
+            case=dict(block=block,fencing=mode,pause_seconds=duration,load=load,run_start_ns=START)
+            rows.append(dict(case=case,trace=dict(load=load,pause_confirmed_host_ns=begin,boot_id='product-boot',resume_requested_host_ns=begin+int(duration*S),
+                         requested_pause_seconds=duration,fencing=mode,
+                         load_evidence=dict(load=load,run_start_ns=START,block=block*2+(load=='load'),pid=123 if load=='load' else None)),
+                first_read=dict(vm='product',operation_prestarted=True,host_round_trip_after_resume=False,generation=block,generation_after=block,
+                                boot_id='product-boot',sample_began_ns=begin+int(duration*S)),first_read_source='pass',
+                duplicate_readers=dict(vm='product',read_only=True,second_open_busy=True,readers=8,samples=8000,maximum_ns=250_000_000)))
+        result=campaign_coverage(rows,[])
+        self.assertEqual(result['completed'],288)
+        self.assertTrue(result['first_read_after_resume'])
+        self.assertTrue(result['concurrent_duplicate_readers'])
+        for name,edit in (
+            ('duplicate identity',lambda r:r.__setitem__(1,copy.deepcopy(r[0]))),
+            ('wrong load',lambda r:r[0]['trace'].update(load='load')),
+            ('fixture first read',lambda r:r[0]['first_read'].update(vm='fixture')),
+            ('generation change',lambda r:r[0]['first_read'].update(generation_after=999)),
+            ('fixture contention',lambda r:r[0]['duplicate_readers'].update(vm='fixture')),
+            ('too few readers',lambda r:r[0]['duplicate_readers'].update(readers=7)),
+            ('too few reads',lambda r:r[0]['duplicate_readers'].update(samples=7999)),
+            ('old read',lambda r:r[0]['duplicate_readers'].update(maximum_ns=250_000_001)),
+        ):
+            with self.subTest(name=name):
+                invalid=copy.deepcopy(rows);edit(invalid);result=campaign_coverage(invalid,[])
+                self.assertFalse(result['complete'] and result['first_read_after_resume'] and result['concurrent_duplicate_readers'])
+
+    def test_live_loop_uses_half_open_slots_and_separate_closing(self):
+        elapsed=[10.0]
+        def probe(command,**kwargs):
+            ns=int(elapsed[0]*S)
+            if command[0]=='adapter':
+                return json.dumps(dict(clock=clock.REFERENCE_CLOCK,references=[dict(server=host,protocol='NTS',authenticated=True,
+                    unix_ns=UTC+int((elapsed[0]-10)*S)+S//2,uncertainty_ns=1000,query_began_ns=ns,query_ended_ns=ns)
+                    for host in ('time.cloudflare.com','nts.netnod.se')]))
+            value=observation(round((elapsed[0]-10)/30))['sample']
+            value['wall_ns']=UTC+int((elapsed[0]-10)*S)+S//2
+            value['measurement']['wall_after']=datetime.datetime.fromtimestamp(value['wall_ns']/S,datetime.timezone.utc).isoformat()
+            return json.dumps(value)
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);image=root/'image';image.mkdir();(image/'manifest.json').write_text('{}')
+            with mock.patch('sys.argv',['qualify',str(image),'unused',str(root/'evidence'),'--seconds','60','--utc-reference-command','adapter']), \
                  mock.patch.object(clock.time,'monotonic',side_effect=lambda:elapsed[0]), \
-                 mock.patch.object(clock.time,'monotonic_ns',side_effect=lambda:int(elapsed[0]*clock.SECOND)), \
-                 mock.patch.object(clock.time,'sleep',side_effect=advance), \
-                 mock.patch.object(clock.subprocess,'check_output',side_effect=probe), \
-                 mock.patch('builtins.print'):
+                 mock.patch.object(clock.time,'monotonic_ns',side_effect=lambda:int(elapsed[0]*S)), \
+                 mock.patch.object(clock.time,'time_ns',side_effect=lambda:UTC+int((elapsed[0]-10)*S)+S//2), \
+                 mock.patch.object(clock.time,'sleep',side_effect=lambda n:elapsed.__setitem__(0,elapsed[0]+n)), \
+                 mock.patch.object(clock.subprocess,'check_output',side_effect=probe),mock.patch('builtins.print'):
                 self.assertEqual(clock.main(),0)
             result=json.loads((root/'evidence/result.json').read_text())
-            rows=json.loads((root/'evidence/samples.json').read_text())
-            self.assertFalse(result['failures'])
-            self.assertTrue(result['measurement_coverage_complete'])
-            self.assertTrue(rows[1]['intentional_pause_unavailability'])
-            self.assertNotIn('checks',rows[1])
+            self.assertEqual(result['samples'],3)
+            self.assertEqual(result['coverage']['unique_slots'],2)
+            self.assertEqual(result['reference_coverage'],2)
+            self.assertTrue(result['proof_source_coverage_qualified'],result['coverage'])
+            self.assertEqual(result['utc'],'inconclusive')
 
     def test_load_ends_by_own_stdin_eof(self):
         load=mock.Mock();load.wait.return_value=0
-        self.assertTrue(clock.stop_load(load))
-        load.stdin.close.assert_called_once()
-        load.terminate.assert_not_called()
-        load.wait.side_effect=[clock.subprocess.TimeoutExpired('owned-ssh',20),0]
-        self.assertFalse(clock.stop_load(load))
-        load.terminate.assert_called_once()
+        self.assertTrue(clock.stop_load(load));load.stdin.close.assert_called_once();load.terminate.assert_not_called()
 
-    def test_integer_nanoseconds_and_separate_source_bound(self):
-        rtc = clock.utc_ns('2026-10-26T00:00:00Z')
-        sample = dict(measurement=dict(rtc='2026-10-26T00:00:00Z', wall_after='2026-10-26T00:00:00.500000Z',
-                                      sample_age_ns=1000, elapsed_end_ns=0), elapsed_ns=0, wall_ns=rtc+500_000_000)
-        no_reference = clock.evaluate(sample)
-        self.assertEqual(no_reference['source'],'inconclusive')
-        self.assertEqual(clock.evaluate(sample,(rtc+499_999_000,rtc+500_001_000))['source'],'pass')
-        self.assertEqual(clock.evaluate(sample,(rtc+3_000_000_000,rtc+3_000_001_000))['source'],'fail')
-        sample['elapsed_ns'] = 60*clock.SECOND
-        with self.assertRaises(ValueError):
-            clock.evaluate(sample)
-
-    def test_age_and_drift_allocations_fail_closed(self):
-        rtc = clock.utc_ns('2026-10-26T00:00:00Z')
-        sample = dict(measurement=dict(rtc='2026-10-26T00:00:00Z',wall_after='2026-10-26T00:00:00Z',
-                                      sample_age_ns=250_000_001,elapsed_end_ns=0),elapsed_ns=0,wall_ns=rtc)
-        with self.assertRaises(ValueError): clock.evaluate(sample)
-        sample['measurement']['sample_age_ns']=0
-        sample['wall_ns']+=250_000_001
-        with self.assertRaises(ValueError): clock.evaluate(sample)
+    def test_nanoseconds_are_exact(self):
+        self.assertEqual(clock.utc_ns('2026-10-27T00:00:00.123456789Z')-UTC,123456789)
 
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__=='__main__':unittest.main()

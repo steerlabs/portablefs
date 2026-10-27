@@ -12,7 +12,7 @@ import time
 import uuid
 
 
-def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600), modes=('normal','delayed','suppressed')):
+def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600), modes=('normal','delayed','suppressed'), rtc_probe=None, load=None):
     traces = []
     for duration in durations:
         for fencing in modes:
@@ -27,6 +27,9 @@ def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600),
                 trace['stage'] = stage
                 (authority.evidence/'g0-vz-active.json').write_text(json.dumps(trace,indent=2)+'\n')
             try:
+                if rtc_probe: rtc_probe.prepare(duration)
+                trace['load'] = load
+                if rtc_probe: trace['boot_id'] = rtc_probe.armed['boot_id']
                 code = '''import errno,json,os,sys,time
 print('armed',flush=True)
 assert sys.stdin.readline().strip()=='probe'
@@ -59,6 +62,7 @@ print(json.dumps(result),flush=True)
                     assert ready.select(10), 'independent peer not armed'
                     assert peer.stdout.readline().strip() == 'peer-armed'
                 trace['peer_armed_host_ns'] = time.monotonic_ns()
+                trace['fence_requested_host_ns'] = time.monotonic_ns()
                 if fencing != 'normal':
                     limit = time.monotonic()+10
                     while True:
@@ -90,6 +94,7 @@ print(json.dumps(result),flush=True)
                 worker.stdin.write('probe\n'); worker.stdin.flush()
                 trace['pause_confirmed_host_ns'] = time.monotonic_ns()
                 checkpoint('paused')
+                if rtc_probe: rtc_probe.paused(duration)
                 # The ordinary peer is outside the guest and remains live.
                 # It waits for the actual authority obligation, then persists.
                 trace['peer_started_host_ns'] = time.monotonic_ns()
@@ -104,6 +109,7 @@ print(json.dumps(result),flush=True)
                 if fencing != 'normal':
                     assert peer_before_resume, 'expired-permission peer did not complete while frozen'
                 trace['resume_requested_host_ns'] = time.monotonic_ns()
+                if rtc_probe: rtc_probe.resuming(trace['resume_requested_host_ns'])
                 trace['actual_paused_seconds'] = (trace['resume_requested_host_ns']-trace['pause_confirmed_host_ns'])/1e9
                 assert duration <= trace['actual_paused_seconds'] < duration+1, trace
                 trace['peer_completed_before_resume'] = peer_before_resume
@@ -116,6 +122,8 @@ print(json.dumps(result),flush=True)
                         ready.register(worker.stdout, selectors.EVENT_READ)
                         assert ready.select(5), 'first expired operation waited for host recovery'
                         first = json.loads(worker.stdout.readline())
+                    trace['first_operation'] = first
+                    checkpoint('first-operation-observed')
                     assert not first['success'] and first['errno_name'] in ('EIO','ENOTCONN','ESTALE','EACCES'), first
                     assert first['operation_ns']<1_000_000_000, first
                     trace['first_operation'] = first
@@ -130,6 +138,9 @@ print(json.dumps(result),flush=True)
                 stdout, stderr = peer.communicate(timeout=20)
                 assert peer.returncode==0 and stdout.strip()=='peer-complete', (stdout,stderr)
                 trace['peer_receipt_observed_host_ns'] = time.monotonic_ns()
+                if rtc_probe:
+                    trace['product_first_read'], trace['product_duplicate_readers'] = rtc_probe.finish()
+                    checkpoint('product-rtc-read')
                 deadline=time.monotonic()+90
                 while True:
                     snapshot=authority.status(guest)
@@ -161,6 +172,7 @@ print(json.dumps(result),flush=True)
                 authority.unmount(guest,managed)
                 managed = authority.mount(guest)
             finally:
+                if rtc_probe: rtc_probe.close()
                 if blocked: authority.network(False)
                 if peer is not None and peer.poll() is None:
                     peer.terminate()

@@ -1,0 +1,12 @@
+{
+  "id": "astra-g3-2026-10-27",
+  "aggregate_deadline_seconds": 9,
+  "maximum_operator_attempts": 2,
+  "operators": {
+    "Cloudflare": ["time.cloudflare.com"],
+    "Netnod": ["nts.netnod.se", "sth1.nts.netnod.se", "sth2.nts.netnod.se"],
+    "PTB": ["ptbtime1.ptb.de", "ptbtime2.ptb.de", "ptbtime3.ptb.de", "ptbtime4.ptb.de"],
+    "SIDN/TimeNL": ["ntppool1.time.nl", "ntppool2.time.nl"],
+    "NIC.br/NTP.br": ["a.st1.ntp.br", "c.st1.ntp.br", "d.st1.ntp.br", "e.st1.ntp.br"]
+  }
+}

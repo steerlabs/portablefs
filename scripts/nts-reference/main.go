@@ -3,23 +3,24 @@
 package main
 
 import (
-	"crypto/tls"
+	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/beevik/ntp"
-	"github.com/beevik/nts"
 )
 
 type reference struct {
+	Operator      string `json:"operator,omitempty"`
 	Server        string `json:"server"`
 	Protocol      string `json:"protocol"`
 	Authenticated bool   `json:"authenticated"`
@@ -32,41 +33,8 @@ type reference struct {
 type observation struct {
 	References []reference `json:"references"`
 	Clock      string      `json:"clock,omitempty"`
-}
-
-type queriedResponse struct {
-	Response         *ntp.Response
-	BeganNS, EndedNS int64
-}
-
-// Authentication is established by NewSession's verified TLS 1.3 NTS-KE and
-// QueryWithOptions' NTS extension (unique-ID and AEAD verification). Validate
-// must still be called: ntp deliberately returns invalid/auth-failed responses
-// for diagnostic consumers. Never mark such a response authenticated.
-func query(server string, timeout time.Duration) (queriedResponse, error) {
-	session, err := nts.NewSessionWithOptions(server, &nts.SessionOptions{Timeout: timeout,
-		Dialer: func(network, address string, config *tls.Config) (*tls.Conn, error) {
-			deadline := time.Now().Add(timeout)
-			conn, err := tls.DialWithDialer(&net.Dialer{Deadline: deadline}, network, address, config)
-			if err != nil {
-				return nil, err
-			}
-			if err := conn.SetDeadline(deadline); err != nil {
-				conn.Close()
-				return nil, err
-			}
-			return conn, nil
-		}})
-	if err != nil {
-		return queriedResponse{}, fmt.Errorf("NTS-KE: %w", err)
-	}
-	began, err := monotonicNow()
-	if err != nil {
-		return queriedResponse{}, err
-	}
-	response, err := session.QueryWithOptions(&ntp.QueryOptions{Version: 4, Timeout: timeout})
-	ended, clockErr := monotonicNow()
-	return queriedResponse{response, began, ended}, errors.Join(err, clockErr)
+	Policy     string      `json:"policy,omitempty"`
+	Exchanges  []exchange  `json:"exchanges,omitempty"`
 }
 
 func authenticatedReference(server string, response *ntp.Response) (reference, error) {
@@ -96,61 +64,124 @@ func authenticatedReference(server string, response *ntp.Response) (reference, e
 	return reference{Server: server, Protocol: "NTS", Authenticated: true, UnixNS: stamp.UnixNano(), UncertaintyNS: int64(uncertainty)}, nil
 }
 
-type queryFunc func(string, time.Duration) (queriedResponse, error)
+// Each operator gets two attempts, with both address families in each attempt.
+// All attempts share one deadline; no failed path extends the slot's budget.
+type queryFunc func(context.Context, string, string) ([]reference, []exchange)
+
+type exchange struct {
+	Server  string `json:"server"`
+	Family  string `json:"family"`
+	Stage   string `json:"stage"`
+	BeganNS int64  `json:"began_ns"`
+	EndedNS int64  `json:"ended_ns"`
+	Error   string `json:"error,omitempty"`
+}
+
+//go:embed policy.json
+var policyBytes []byte
+
+var policy struct {
+	ID        string              `json:"id"`
+	Operators map[string][]string `json:"operators"`
+}
+
+func init() {
+	if err := json.Unmarshal(policyBytes, &policy); err != nil {
+		panic(err)
+	}
+}
 
 func collect(servers []string, timeout time.Duration, probe queryFunc, diagnostic io.Writer) (observation, error) {
-	// A fixed operator-diverse allowlist prevents aliases from manufacturing
-	// independence. Each entry is a different operator: Cloudflare, Netnod, PTB.
-	allowed := map[string]bool{"time.cloudflare.com": true, "nts.netnod.se": true, "ptbtime1.ptb.de": true}
-	seen := make(map[string]bool)
-	for _, server := range servers {
-		if !allowed[server] || seen[server] {
-			return observation{}, fmt.Errorf("duplicate or unsupported independent server %q", server)
+	allowed := map[string]string{}
+	for operator, hosts := range policy.Operators {
+		for _, host := range hosts {
+			allowed[host] = operator
 		}
-		seen[server] = true
 	}
-	if len(servers) < 2 {
-		return observation{}, errors.New("at least two independent NTS servers required")
+	groups := map[string][]string{}
+	seen := map[string]bool{}
+	for _, host := range servers {
+		operator, ok := allowed[host]
+		if !ok || seen[host] {
+			return observation{}, fmt.Errorf("duplicate or unsupported server %q", host)
+		}
+		seen[host] = true
+		groups[operator] = append(groups[operator], host)
 	}
-	refs := make([]reference, len(servers))
-	errs := make([]error, len(servers))
+	if len(groups) < 2 {
+		return observation{}, errors.New("at least two approved operators required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), min(timeout, 9*time.Second))
+	defer cancel()
+	type outcome struct {
+		refs      []reference
+		exchanges []exchange
+	}
+	outcomes := make(chan outcome, len(groups))
 	var group sync.WaitGroup
-	for i, server := range servers {
+	for operator, hosts := range groups {
 		group.Go(func() {
-			response, err := probe(server, timeout)
-			if err == nil {
-				refs[i], err = authenticatedReference(server, response.Response)
-				refs[i].QueryBeganNS, refs[i].QueryEndedNS = response.BeganNS, response.EndedNS
+			var result outcome
+			for attempt := 0; attempt < 2 && ctx.Err() == nil; attempt++ {
+				// The first attempt cannot consume the retry's aggregate budget.
+				attemptCtx, done := context.WithTimeout(ctx, 4400*time.Millisecond)
+				paths := make(chan outcome, 2)
+				var families sync.WaitGroup
+				for _, family := range []string{"4", "6"} {
+					families.Go(func() {
+						refs, exchanges := probe(attemptCtx, hosts[attempt%len(hosts)], family)
+						paths <- outcome{refs, exchanges}
+					})
+				}
+				families.Wait()
+				close(paths)
+				done()
+				for path := range paths {
+					for i := range path.refs {
+						path.refs[i].Operator = operator
+					}
+					result.refs = append(result.refs, path.refs...)
+					result.exchanges = append(result.exchanges, path.exchanges...)
+				}
+				// Retain every authenticated response, including disagreements.
+				// A successful operator is never retried to find a nicer answer.
+				if len(result.refs) != 0 {
+					break
+				}
 			}
-			errs[i] = err
+			outcomes <- result
 		})
 	}
 	group.Wait()
-	result := observation{References: make([]reference, 0, len(servers))}
-	for i, err := range errs {
-		if err != nil {
-			fmt.Fprintf(diagnostic, "%s: %v\n", servers[i], err)
-		} else {
-			result.References = append(result.References, refs[i])
-		}
+	close(outcomes)
+	result := observation{References: []reference{}, Clock: referenceClock, Policy: policy.ID}
+	for outcome := range outcomes {
+		result.References = append(result.References, outcome.refs...)
+		result.Exchanges = append(result.Exchanges, outcome.exchanges...)
 	}
-	if len(result.References) < 2 {
-		return observation{}, errors.New("fewer than two authenticated independent NTS responses")
+	sort.Slice(result.References, func(i, j int) bool { return result.References[i].QueryBeganNS < result.References[j].QueryBeganNS })
+	for _, item := range result.Exchanges {
+		if item.Error != "" {
+			fmt.Fprintf(diagnostic, "%s %s %s: %s\n", item.Server, item.Family, item.Stage, item.Error)
+		}
 	}
 	return result, nil
 }
 
 func main() {
-	servers := flag.String("servers", "time.cloudflare.com,nts.netnod.se,ptbtime1.ptb.de", "independent NTS operators (comma separated)")
-	timeout := flag.Duration("timeout", 3*time.Second, "timeout for each NTS-KE and NTP exchange")
+	defaults := []string{}
+	for _, name := range []string{"Cloudflare", "Netnod", "PTB", "SIDN/TimeNL", "NIC.br/NTP.br"} {
+		defaults = append(defaults, policy.Operators[name]...)
+	}
+	servers := flag.String("servers", strings.Join(defaults, ","), "approved NTS hosts, grouped by operator")
+	timeout := flag.Duration("timeout", 9*time.Second, "aggregate collection deadline (maximum 9s)")
 	flag.Parse()
-	if flag.NArg() != 0 || *timeout <= 0 || *timeout > 4*time.Second {
-		fmt.Fprintln(os.Stderr, "expected no positional arguments and timeout in (0,4s]")
+	if flag.NArg() != 0 || *timeout <= 0 || *timeout > 9*time.Second {
+		fmt.Fprintln(os.Stderr, "expected no positional arguments and aggregate timeout in (0,9s]")
 		os.Exit(2)
 	}
 	result, err := collect(strings.Split(*servers, ","), *timeout, query, os.Stderr)
 	if err == nil {
-		result.Clock = referenceClock
 		err = json.NewEncoder(os.Stdout).Encode(result)
 	}
 	if err != nil {
