@@ -25,17 +25,25 @@ type reference struct {
 	Authenticated bool   `json:"authenticated"`
 	UnixNS        int64  `json:"unix_ns"`
 	UncertaintyNS int64  `json:"uncertainty_ns"`
+	QueryBeganNS  int64  `json:"query_began_ns,omitempty"`
+	QueryEndedNS  int64  `json:"query_ended_ns,omitempty"`
 }
 
 type observation struct {
 	References []reference `json:"references"`
+	Clock      string      `json:"clock,omitempty"`
+}
+
+type queriedResponse struct {
+	Response         *ntp.Response
+	BeganNS, EndedNS int64
 }
 
 // Authentication is established by NewSession's verified TLS 1.3 NTS-KE and
 // QueryWithOptions' NTS extension (unique-ID and AEAD verification). Validate
 // must still be called: ntp deliberately returns invalid/auth-failed responses
 // for diagnostic consumers. Never mark such a response authenticated.
-func query(server string, timeout time.Duration) (*ntp.Response, error) {
+func query(server string, timeout time.Duration) (queriedResponse, error) {
 	session, err := nts.NewSessionWithOptions(server, &nts.SessionOptions{Timeout: timeout,
 		Dialer: func(network, address string, config *tls.Config) (*tls.Conn, error) {
 			deadline := time.Now().Add(timeout)
@@ -50,9 +58,15 @@ func query(server string, timeout time.Duration) (*ntp.Response, error) {
 			return conn, nil
 		}})
 	if err != nil {
-		return nil, fmt.Errorf("NTS-KE: %w", err)
+		return queriedResponse{}, fmt.Errorf("NTS-KE: %w", err)
 	}
-	return session.QueryWithOptions(&ntp.QueryOptions{Version: 4, Timeout: timeout})
+	began, err := monotonicNow()
+	if err != nil {
+		return queriedResponse{}, err
+	}
+	response, err := session.QueryWithOptions(&ntp.QueryOptions{Version: 4, Timeout: timeout})
+	ended, clockErr := monotonicNow()
+	return queriedResponse{response, began, ended}, errors.Join(err, clockErr)
 }
 
 func authenticatedReference(server string, response *ntp.Response) (reference, error) {
@@ -66,8 +80,8 @@ func authenticatedReference(server string, response *ntp.Response) (reference, e
 		return reference{}, errors.New("invalid NTPv4 uncertainty")
 	}
 	// Use authenticated server transmit time, never host wall + estimated offset.
-	// Its sample is inside this command's invocation. The Python harness charges
-	// the complete invocation and SSH transit interval, including path asymmetry;
+	// Its sample is inside the bracketed NTP exchange. The Python harness charges
+	// the complete NTP and SSH transit interval, including path asymmetry;
 	// adding RTT again here would double charge it. Round half root delay upward.
 	delay := max(response.RootDelay, 0)
 	if delay > 2*time.Second || response.RootDispersion > time.Second || response.Precision > time.Second {
@@ -79,10 +93,10 @@ func authenticatedReference(server string, response *ntp.Response) (reference, e
 		!stamp.Before(time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC)) {
 		return reference{}, errors.New("timestamp or uncertainty outside source allocation")
 	}
-	return reference{server, "NTS", true, stamp.UnixNano(), int64(uncertainty)}, nil
+	return reference{Server: server, Protocol: "NTS", Authenticated: true, UnixNS: stamp.UnixNano(), UncertaintyNS: int64(uncertainty)}, nil
 }
 
-type queryFunc func(string, time.Duration) (*ntp.Response, error)
+type queryFunc func(string, time.Duration) (queriedResponse, error)
 
 func collect(servers []string, timeout time.Duration, probe queryFunc, diagnostic io.Writer) (observation, error) {
 	// A fixed operator-diverse allowlist prevents aliases from manufacturing
@@ -105,7 +119,8 @@ func collect(servers []string, timeout time.Duration, probe queryFunc, diagnosti
 		group.Go(func() {
 			response, err := probe(server, timeout)
 			if err == nil {
-				refs[i], err = authenticatedReference(server, response)
+				refs[i], err = authenticatedReference(server, response.Response)
+				refs[i].QueryBeganNS, refs[i].QueryEndedNS = response.BeganNS, response.EndedNS
 			}
 			errs[i] = err
 		})
@@ -135,6 +150,7 @@ func main() {
 	}
 	result, err := collect(strings.Split(*servers, ","), *timeout, query, os.Stderr)
 	if err == nil {
+		result.Clock = referenceClock
 		err = json.NewEncoder(os.Stdout).Encode(result)
 	}
 	if err != nil {

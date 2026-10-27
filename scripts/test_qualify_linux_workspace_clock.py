@@ -15,6 +15,19 @@ spec.loader.exec_module(clock)
 
 
 class QualificationTests(unittest.TestCase):
+    def test_query_timing_keeps_complete_ntp_transit(self):
+        refs=[dict(server=n,protocol='NTS',authenticated=True,unix_ns=1000,uncertainty_ns=5,
+                   query_began_ns=102,query_ended_ns=118) for n in ('a','b')]
+        self.assertEqual(clock.reference_interval(refs,100,120,130,150,clock.REFERENCE_CLOCK),(1007,1053))
+        # A mismatched domain or fabricated interval cannot tighten evidence.
+        # The legacy full-invocation contract remains conservative.
+        self.assertEqual(clock.reference_interval(refs,100,120,130,150),(1005,1055))
+        for domain in ('other',True):
+            with self.assertRaises(ValueError): clock.reference_interval(refs,100,120,130,150,domain)
+        for begin,end in ((99,118),(119,118),(102,121),(True,118)):
+            refs[0].update(query_began_ns=begin,query_ended_ns=end)
+            with self.assertRaises(ValueError): clock.reference_interval(refs,100,120,130,150,clock.REFERENCE_CLOCK)
+
     def test_charges_complete_reference_and_sampling_transit(self):
         refs = [dict(server=n, protocol='NTS', authenticated=True, unix_ns=1000, uncertainty_ns=5) for n in ('a','b')]
         self.assertEqual(clock.reference_interval(refs, 100, 120, 130, 150), (1005,1055))

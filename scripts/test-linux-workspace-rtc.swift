@@ -40,6 +40,7 @@ final class RTCQualificationVM: NSObject, VZVirtualMachineDelegate {
                       let value = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
                       let references = value["references"] else { self.finish(1); return }
                 self.reference = ["references": references, "reference_began_ns": began, "reference_ended_ns": ended]
+                self.reference?["clock"] = value["clock"]
                 self.resumeAfterReference()
             }
         }

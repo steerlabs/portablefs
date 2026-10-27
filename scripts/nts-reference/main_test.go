@@ -25,7 +25,7 @@ func TestJSONContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := json.Marshal(observation{[]reference{r}})
+	encoded, err := json.Marshal(observation{References: []reference{r}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,22 +76,27 @@ func TestCollectionFailsClosed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var diagnostics bytes.Buffer
-			result, err := collect(tc.servers, time.Second, func(server string, _ time.Duration) (*ntp.Response, error) {
+			result, err := collect(tc.servers, time.Second, func(server string, _ time.Duration) (queriedResponse, error) {
 				if tc.fail[server] {
-					return nil, nts.ErrAuthFailedOnClient
+					return queriedResponse{}, nts.ErrAuthFailedOnClient
 				}
-				return validResponse(), nil
+				return queriedResponse{validResponse(), 100, 200}, nil
 			}, &diagnostics)
 			if (err == nil) != (tc.want >= 2) || len(result.References) != tc.want {
 				t.Fatalf("references=%d, error=%v", len(result.References), err)
+			}
+			for _, ref := range result.References {
+				if ref.QueryBeganNS != 100 || ref.QueryEndedNS != 200 {
+					t.Fatal("NTP sample interval was not retained", ref)
+				}
 			}
 			if tc.fail != nil && !strings.Contains(diagnostics.String(), nts.ErrAuthFailedOnClient.Error()) {
 				t.Fatal("authentication failure was not diagnosed")
 			}
 		})
 	}
-	if _, err := collect(servers, time.Second, func(string, time.Duration) (*ntp.Response, error) {
-		return nil, errors.New("TLS certificate verification failed")
+	if _, err := collect(servers, time.Second, func(string, time.Duration) (queriedResponse, error) {
+		return queriedResponse{}, errors.New("TLS certificate verification failed")
 	}, io.Discard); err == nil {
 		t.Fatal("failed key exchange produced evidence")
 	}

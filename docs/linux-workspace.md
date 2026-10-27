@@ -1034,8 +1034,11 @@ and sampling every 30 seconds. An explicit read-only NTS adapter supplies at
 least two independent authenticated UTC references, including server uncertainty.
 `scripts/nts-reference/` supplies the read-only adapter in a separate test-only
 Go module. Build its binary before passing it as `--utc-reference-command`.
-The harness charges the full reference collection and guest sampling/transit
-interval. Missing reference coverage is inconclusive. Source error must stay
+The harness charges the full NTP exchange and guest sampling/transit interval.
+The adapter can bracket that exchange in the host's exact monotonic clock;
+the harness validates the named domain and both endpoints inside its invocation.
+NTS-KE completes before the fresh NTP timestamp. Without query brackets the
+whole command interval is charged. Missing reference coverage is inconclusive. Source error must stay
 within one second, quantization below one second, sample/set age and awake drift
 within 250 ms each, and conditional total error within three seconds. Separate
 UTC, RTC admission and G0 verdicts require matching first-read-after-resume and
