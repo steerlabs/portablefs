@@ -1,5 +1,6 @@
 // Package workspaceclock disciplines TLS wall time. It does not supply elapsed
-// lease time or implement RTC admission. The source error budget needs separate
+// lease time; managed daemons read duplicated RTC descriptors independently at
+// permission boundaries. The source error budget needs separate
 // exact-image qualification before supported workspace mounts can be enabled.
 package workspaceclock
 

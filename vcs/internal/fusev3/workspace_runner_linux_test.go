@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"sync"
 	"testing"
 	"time"
@@ -40,10 +41,10 @@ func (r *workspaceRunnerRPC) AcknowledgeChanges(ctx context.Context, i, p uint64
 	}
 	return r.subscriptionTestRPC.AcknowledgeChanges(ctx, i, p)
 }
-func (r *workspaceRunnerRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
+func (r *workspaceRunnerRPC) RenewSubscription(context.Context, uint64) (permissionclock.Permission, error) {
 	close(r.renewEntered)
 	<-r.renewRelease
-	return r.horizon.Add(time.Hour), nil
+	return permissionclock.Permission{Time: r.horizon.Add(time.Hour)}, nil
 }
 func workspaceRunner(t *testing.T, rpc *workspaceRunnerRPC, clock subscriptionClock) (*subscriptionRegistry, *subscriptionTestInvalidator, context.CancelFunc, <-chan error) {
 	t.Helper()

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -461,7 +462,7 @@ func TestRenewalPreservesDaemonPayloadForSameEpoch(t *testing.T) {
 	if before <= 0 {
 		t.Fatal("initial subscription did not admit payload")
 	}
-	if !registry.acceptRenewal(20, clock.Now().Add(2*time.Minute)) {
+	if !registry.acceptRenewal(20, permissionclock.Permission{Time: clock.Now().Add(2 * time.Minute)}) {
 		t.Fatal("valid same-incarnation renewal was rejected")
 	}
 	after := registry.remaining(coordinate, stamp, stamp.version)

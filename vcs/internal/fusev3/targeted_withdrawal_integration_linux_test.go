@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"net"
 	"os"
 	"sync"
@@ -91,16 +92,16 @@ func (t *integrationTransport) NextControlEvent(ctx context.Context, incarnation
 	return event, err
 }
 
-func (t *integrationTransport) RenewSubscription(ctx context.Context, incarnation uint64) (time.Time, error) {
+func (t *integrationTransport) RenewSubscription(ctx context.Context, incarnation uint64) (permissionclock.Permission, error) {
 	horizon, err := t.Client.RenewSubscription(ctx, incarnation)
 	if t.clockOffset != nil {
-		horizon = horizon.Add(time.Duration(t.clockOffset.Load()))
+		horizon.Time = horizon.Add(time.Duration(t.clockOffset.Load()))
 	}
 	t.hookMu.Lock()
 	hook := t.afterSubscriptionRenewal
 	t.hookMu.Unlock()
 	if hook != nil {
-		hook(horizon, err)
+		hook(horizon.Time, err)
 	}
 	return horizon, err
 }

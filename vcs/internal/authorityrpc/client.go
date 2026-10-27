@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
@@ -48,6 +49,7 @@ var (
 type PreKernelMountAbsenceObserver func(context.Context) (*authoritypb.MountAbsenceProof, error)
 
 type ClientConfig struct {
+	WorkspaceRTC permissionclock.UTCReader
 	// AwaitTLS is mandatory for a workspace transport, including retained
 	// cleanup and activation reconciliation. Ordinary clients leave it nil.
 	AwaitTLS func(context.Context) error
@@ -239,7 +241,7 @@ type Client struct {
 	subscriptionWatermark     uint64
 	subscriptionIncarnation   uint64
 	subscriptionHorizonNanos  uint64
-	subscriptionDeadline      time.Time
+	subscriptionDeadline      permissionclock.Permission
 	subscriptionNow           func() time.Time
 	poisoned                  atomic.Bool
 	closed                    atomic.Bool

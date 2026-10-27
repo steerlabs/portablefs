@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"strings"
 	"testing"
 	"time"
@@ -45,9 +46,9 @@ type suspendSubscriptionRPC struct {
 	clock *subscriptionTestClock
 }
 
-func (r suspendSubscriptionRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r suspendSubscriptionRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	reply, _, err := r.subscriptionRPC.Subscribe(ctx, snapshot, after)
-	return reply, r.clock.Now().Add(volumeserver.SubscriptionTTL), err
+	return reply, permissionclock.Permission{Time: r.clock.Now().Add(volumeserver.SubscriptionTTL)}, err
 }
 
 // CONTROL and Go timers remain parked while elapsed time passes the remote
@@ -482,7 +483,7 @@ func TestSubscriptionSuspendRejectsRenewalBeforeTimerRuns(t *testing.T) {
 	sub, clock, _, _ := activeSubscriptionFixture(t, 7)
 	deadline := clock.Now().Add(10 * time.Second)
 	clock.advance(time.Minute)
-	if sub.acceptRenewal(7, deadline) {
+	if sub.acceptRenewal(7, permissionclock.Permission{Time: deadline}) {
 		t.Fatal("pre-suspend renewal revived an expired continuous horizon")
 	}
 	if sub.stamp().incarnation != 0 {

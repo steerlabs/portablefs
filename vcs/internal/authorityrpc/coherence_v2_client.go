@@ -10,6 +10,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,21 +28,29 @@ var ErrSubscriptionReset = errors.New("authorityrpc: uncertain control result re
 // identity set when both are present. The returned deadline is anchored at the
 // local request start. Callers must therefore treat it as a conservative cache
 // horizon even when the response spent time in transit.
-func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte) (result *authoritypb.SubscribeReply, deadlineResult time.Time, resultErr error) {
+func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte) (result *authoritypb.SubscribeReply, deadlineResult permissionclock.Permission, resultErr error) {
 	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
-		return nil, time.Time{}, err
+		return nil, permissionclock.Permission{}, err
 	}
 	if !c.linuxSubscriptionProfile() {
-		return nil, time.Time{}, syscall.EOPNOTSUPP
+		return nil, permissionclock.Permission{}, syscall.EOPNOTSUPP
 	}
 	if (len(snapshotID) == 0) != (len(afterIdentity) == 0) {
-		return nil, time.Time{}, syscall.EINVAL
+		return nil, permissionclock.Permission{}, syscall.EINVAL
 	}
 	if len(snapshotID) != 0 && (!validCoherenceIdentity(snapshotID) || !validCoherenceIdentity(afterIdentity)) {
-		return nil, time.Time{}, syscall.EINVAL
+		return nil, permissionclock.Permission{}, syscall.EINVAL
 	}
 	started := c.subscriptionTime()
+	var rtc time.Time
+	if c.cfg.WorkspaceRTC != nil {
+		var err error
+		rtc, err = permissionclock.SampleUTC(c.cfg.WorkspaceRTC)
+		if err != nil {
+			return nil, permissionclock.Permission{}, err
+		}
+	}
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_Subscribe{
 		Subscribe: &authoritypb.SubscribeRequest{
 			SnapshotId:    append([]byte(nil), snapshotID...),
@@ -49,16 +58,16 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 		},
 	}})
 	if err != nil {
-		return nil, time.Time{}, err
+		return nil, permissionclock.Permission{}, err
 	}
 	if err := successfulControlResponse(response); err != nil {
-		return nil, time.Time{}, err
+		return nil, permissionclock.Permission{}, err
 	}
 	reply := response.GetSubscribe()
 	if err := validateSubscribeReply(reply); err != nil {
-		return nil, time.Time{}, err
+		return nil, permissionclock.Permission{}, err
 	}
-	deadline := started.Add(time.Duration(reply.GetHorizonNanos()))
+	deadline := permissionclock.Permission{Time: started.Add(time.Duration(reply.GetHorizonNanos())), Started: started, RTC: rtc, Horizon: time.Duration(reply.GetHorizonNanos())}
 	c.subscriptionMu.Lock()
 	if len(snapshotID) == 0 {
 		c.subscriptionSnapshot = append(c.subscriptionSnapshot[:0], reply.GetSnapshotId()...)
@@ -73,13 +82,13 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 		reply.GetHorizonNanos() != c.subscriptionHorizonNanos ||
 		c.subscriptionDeadline.IsZero() {
 		c.subscriptionMu.Unlock()
-		return nil, time.Time{}, errors.New("authorityrpc: subscribe pagination changed frozen snapshot metadata")
+		return nil, permissionclock.Permission{}, errors.New("authorityrpc: subscribe pagination changed frozen snapshot metadata")
 	} else {
 		deadline = c.subscriptionDeadline
 	}
 	c.subscriptionMu.Unlock()
-	if !c.subscriptionTime().Before(deadline) {
-		return nil, time.Time{}, ErrSubscriptionReset
+	if !c.subscriptionTime().Before(deadline.Time) {
+		return nil, permissionclock.Permission{}, ErrSubscriptionReset
 	}
 	return proto.Clone(reply).(*authoritypb.SubscribeReply), deadline, nil
 }
@@ -87,37 +96,45 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 // RenewSubscription refreshes one exact incarnation. A late reply cannot
 // revive an expired subscription because the deadline is measured from the
 // request start rather than response receipt.
-func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (result time.Time, resultErr error) {
+func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (result permissionclock.Permission, resultErr error) {
 	defer c.reportSessionError(&resultErr)
 	if err := c.checkCallEntry(); err != nil {
-		return time.Time{}, err
+		return permissionclock.Permission{}, err
 	}
 	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
-		return time.Time{}, ErrSubscriptionReset
+		return permissionclock.Permission{}, ErrSubscriptionReset
 	}
 	if !c.linuxSubscriptionProfile() {
-		return time.Time{}, syscall.EOPNOTSUPP
+		return permissionclock.Permission{}, syscall.EOPNOTSUPP
 	}
 	if incarnation == 0 {
-		return time.Time{}, syscall.EINVAL
+		return permissionclock.Permission{}, syscall.EINVAL
 	}
 	started := c.subscriptionTime()
+	var rtc time.Time
+	if c.cfg.WorkspaceRTC != nil {
+		var err error
+		rtc, err = permissionclock.SampleUTC(c.cfg.WorkspaceRTC)
+		if err != nil {
+			return permissionclock.Permission{}, err
+		}
+	}
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{
 		RenewSubscription: &authoritypb.RenewSubscriptionRequest{Incarnation: incarnation},
 	}})
 	if err != nil {
-		return time.Time{}, err
+		return permissionclock.Permission{}, err
 	}
 	if err := successfulControlResponse(response); err != nil {
-		return time.Time{}, err
+		return permissionclock.Permission{}, err
 	}
 	reply := response.GetRenewSubscription()
 	if reply == nil || reply.GetIncarnation() != incarnation || !validHorizon(reply.GetHorizonNanos()) {
-		return time.Time{}, errors.New("authorityrpc: subscription renewal returned a malformed result")
+		return permissionclock.Permission{}, errors.New("authorityrpc: subscription renewal returned a malformed result")
 	}
-	deadline := started.Add(time.Duration(reply.GetHorizonNanos()))
-	if !c.subscriptionTime().Before(deadline) {
-		return time.Time{}, ErrSubscriptionReset
+	deadline := permissionclock.Permission{Time: started.Add(time.Duration(reply.GetHorizonNanos())), Started: started, RTC: rtc, Horizon: time.Duration(reply.GetHorizonNanos())}
+	if !c.subscriptionTime().Before(deadline.Time) {
+		return permissionclock.Permission{}, ErrSubscriptionReset
 	}
 	return deadline, nil
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 )
 
 type coherenceV2ClientHandler struct {
@@ -124,7 +125,7 @@ func TestSubscribePaginationKeepsInitialHorizonAnchor(t *testing.T) {
 	if second.GetNextAfterIdentity() != nil {
 		t.Fatal("second page did not complete the frozen snapshot")
 	}
-	if !secondDeadline.Equal(firstDeadline) {
+	if !secondDeadline.Equal(firstDeadline.Time) {
 		t.Fatalf("pagination extended initial horizon: first=%v second=%v", firstDeadline, secondDeadline)
 	}
 }
@@ -367,5 +368,62 @@ func TestSubscriptionProofUsesContinuousRequestAnchor(t *testing.T) {
 	deadline, err = client.RenewSubscription(t.Context(), 7)
 	if err != nil || !deadline.Equal(anchor.Add(10*time.Second)) {
 		t.Fatalf("renewal deadline=%v err=%v", deadline, err)
+	}
+}
+
+type permissionRTCRead func() (time.Time, error)
+
+func (f permissionRTCRead) ReadUTC() (time.Time, error) { return f() }
+
+func TestWorkspaceSubscriptionAnchorsSurviveQueuePaginationAndRenewal(t *testing.T) {
+	handler := &coherenceV2ClientHandler{clientTestHandler: clientTestHandler{epoch: bytes.Repeat([]byte{0x19}, 16), maxInFlight: 9}, pollStarted: make(chan struct{}), pollRelease: make(chan struct{}), paginate: true}
+	c := dialCoherenceV2TestClient(t, handler)
+	base := time.Unix(100, 0)
+	r0 := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	var elapsed atomic.Int64
+	c.subscriptionNow = func() time.Time { return base.Add(time.Duration(elapsed.Load())) }
+	captured := make(chan struct{})
+	var once sync.Once
+	c.cfg.WorkspaceRTC = permissionRTCRead(func() (time.Time, error) {
+		sampled := r0.Add(time.Duration(elapsed.Load())).Truncate(time.Second)
+		once.Do(func() { close(captured) })
+		return sampled, nil
+	})
+	// Occupy the exact CONTROL liveness lane before CallIdempotent queues.
+	c.liveness.permits <- struct{}{}
+	done := make(chan permissionclock.Permission, 1)
+	var first *authoritypb.SubscribeReply
+	var callErr error
+	go func() {
+		var p permissionclock.Permission
+		first, p, callErr = c.Subscribe(t.Context(), nil, nil)
+		done <- p
+	}()
+	// The read itself witnesses capture, before releasing queue capacity.
+	// A handler hook advances time only after the queued request dispatches.
+	hook := func() { elapsed.Store(int64(2 * time.Second)) }
+	handler.beforeSubscriptionReply.Store(&hook)
+	<-captured
+	elapsed.Store(int64(2 * time.Second))
+	<-c.liveness.permits
+	p := <-done
+	if callErr != nil || !p.Started.Equal(base) || !p.RTC.Equal(r0) || !p.Time.Equal(p.Started.Add(10*time.Second)) {
+		t.Fatal(p, callErr)
+	}
+	initial := p
+	handler.beforeSubscriptionReply.Store(nil)
+	elapsed.Store(int64(3 * time.Second))
+	_, p, err := c.Subscribe(t.Context(), first.GetSnapshotId(), first.GetNextAfterIdentity())
+	if err != nil || p != initial {
+		t.Fatal("pagination replaced request anchors", initial, p, err)
+	}
+	elapsed.Store(int64(4 * time.Second))
+	handler.beforeSubscriptionReply.Store(nil)
+	candidate, err := c.RenewSubscription(t.Context(), first.Incarnation)
+	if err != nil || !candidate.Started.Equal(base.Add(4*time.Second)) || !candidate.RTC.Equal(r0.Add(4*time.Second)) {
+		t.Fatal(candidate, err)
+	}
+	if c.subscriptionDeadline != initial {
+		t.Fatal("renewal installed candidate into snapshot owner")
 	}
 }

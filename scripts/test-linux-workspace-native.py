@@ -1,5 +1,6 @@
 """Real VZ execution, independent causal assertions, exact required inventory."""
 import json
+import hashlib
 import os
 import datetime
 import pathlib
@@ -16,6 +17,7 @@ import signal
 from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_lifecycle import lifecycle_checks
 from linux_workspace_native_product import product_checks
+from linux_workspace_native_g0 import pause_checks
 
 binary, image, evidence, inventory = sys.argv[1:]
 root = pathlib.Path(evidence)
@@ -64,7 +66,7 @@ class Guest:
         while True:
             value = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
             self.history.append(value)
-            if value['event'] == expected:
+            if value['event'] in (expected if isinstance(expected, tuple) else (expected,)):
                 return value
             if value['event'] in ('failure', 'eof'):
                 raise RuntimeError(value)
@@ -106,7 +108,6 @@ class Guest:
 guest = None
 authority = None
 try:
-    authority = NativeAuthority(root)
     guest = Guest()
     corrupt = pathlib.Path(tempfile.mkdtemp(prefix='pfs-corrupt-', dir='/tmp')) / 'image'
     try:
@@ -119,6 +120,11 @@ try:
     finally:
         shutil.rmtree(corrupt.parent)
     record('artifact-verification')
+    g0_native=json.loads((root/'g0-native.json').read_text())
+    assert g0_native['image_manifest_sha256']==hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest()
+    for case in g0_native['cases']:
+        assert case['pass'] and case['no_host_round_trip_after_resume'] and case['rpc_delta']==0
+        record(case['case'])
     operations = guest.starting['operations']
     assert operations.index('power-registered') < operations.index('start-request')
     record('power-before-start')
@@ -209,25 +215,39 @@ try:
     measurements[-1]['rtc_contention'] = contention
     measurements[-1]['clock_owner'] = owner
     record('rtc-single-owner-duplicate-contention')
+    first_resume=json.loads((root/'rtc-first-resume.json').read_text())
+    assert first_resume['operation_prestarted'] and not first_resume['host_round_trip_after_resume']
+    assert first_resume['read_age_ns']<=250_000_000
+    record('g0-rtc-first-read-after-vz-resume')
     before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
     assert before['generation'] == 0 and before['sample_age_ns'] <= 250_000_000
     record('rtc-boot-correction')
-    subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), '--seconds', '65'], check=True)
+    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '65']
+    subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), *clock_arguments], check=True)
     record('rtc-awake-measurement')
+    authority = NativeAuthority(root)
     managed = authority.mount(guest, outage=True)
     record('managed-standalone-provision')
     record('managed-prepare-outage-over-45s')
     authority.initial_io(guest)
     record('managed-write-read-fsync')
     record('managed-peer-coherence')
+    managed = pause_checks(authority, guest, managed, record)
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
     old_key = (state / 'guest_host_key.pub').read_text()
+    guest.command('status')
+    prior_generation = guest.wait('status')['generation']
+    before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
+    assert before['generation'] == prior_generation and before['sample_age_ns'] <= 250_000_000, before
+    expected_generation = prior_generation + 1
+    measurements[-1]['pre_pause_clock'] = before
     # One input batch makes Status in flight when Suspend is enqueued.
     guest.p.stdin.write(json.dumps({'command':'status'})+'\n'+json.dumps({'command':'pause'})+'\n'); guest.p.stdin.flush()
     paused = guest.wait('paused', 25)
-    assert paused['fenced'] and not paused['attach_allowed'] and paused['generation'] == 1
-    assert paused['operations'].index('pause-completed') < paused['operations'].index('sleep-fenced')
+    assert paused['fenced'] and not paused['attach_allowed'] and paused['generation'] == expected_generation
+    operations = paused['operations']
+    assert max(i for i, op in enumerate(operations) if op == 'pause-completed') < max(i for i, op in enumerate(operations) if op == 'sleep-fenced')
     guest.command('status')
     assert guest.wait('status')['phase'] == 'pausedCold'
     authority.write_while_paused()
@@ -247,11 +267,11 @@ try:
     deadline = time.monotonic() + 10
     while True:
         after = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
-        if after['generation'] == 1:
+        if after['generation'] == expected_generation:
             break
         assert time.monotonic() < deadline, after
         time.sleep(.1)
-    assert after['generation'] == 1 and after['sample_age_ns'] <= 250_000_000
+    assert after['generation'] == expected_generation and after['sample_age_ns'] <= 250_000_000
     wall_delta = (datetime.datetime.fromisoformat(after['wall_after'].replace('Z', '+00:00')) - datetime.datetime.fromisoformat(before['wall_after'].replace('Z', '+00:00'))).total_seconds()
     elapsed_delta = (after['elapsed_end_ns'] - before['elapsed_end_ns']) / 1e9
     assert wall_delta - elapsed_delta >= 3, 'resume did not exercise real guest wall correction'
@@ -325,7 +345,7 @@ try:
     record('clean-stop')
     product_checks(image, root / "product", record, authority=authority)
     assert sorted(passed) == sorted(required), (passed, required)
-    (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state)}, indent=2) + '\n')
+    (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)
 finally:
     if guest:

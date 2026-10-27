@@ -333,6 +333,11 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (owner *D
 		return nil, err
 	}
 	defer clock.Close()
+	rtc, err := m.Clock.DuplicateRTC()
+	if err != nil {
+		return nil, err
+	}
+	defer rtc.Close()
 	input, writer, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -356,10 +361,10 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (owner *D
 	if err != nil {
 		return nil, err
 	}
-	d.child = exec.Command(m.Binary, "mount", "--foreground", "--workspace-gate-fd=3", "--workspace-owner-fd=4", "--workspace-bootstrap-fd=5", "--workspace-clock-fd=6", "--workspace-ready-fd=7", id.VolumeId, path)
+	d.child = exec.Command(m.Binary, "mount", "--foreground", "--workspace-gate-fd=3", "--workspace-owner-fd=4", "--workspace-bootstrap-fd=5", "--workspace-clock-fd=6", "--workspace-ready-fd=7", "--workspace-rtc-fd=8", id.VolumeId, path)
 	d.child.Env = []string{"HOME=/home/workspace", "PATH=/usr/local/bin:/usr/bin:/bin"}
 	d.child.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 1000, Gid: 1000}}
-	d.child.ExtraFiles = []*os.File{files[0], files[1], input, clock, readyWriter}
+	d.child.ExtraFiles = []*os.File{files[0], files[1], input, clock, readyWriter, rtc}
 	d.child.Stderr = os.Stderr
 	if err = d.child.Start(); err != nil {
 		return nil, err
@@ -368,6 +373,7 @@ func (m *Manager) start(ctx context.Context, id *pb.MountID, g uint64) (owner *D
 	files[1].Close()
 	input.Close()
 	clock.Close()
+	rtc.Close()
 	readyWriter.Close()
 	go func() { d.exitErr = d.child.Wait(); close(d.exited) }()
 	processStart, err := mountcontrol.ProcessStart(int32(d.child.Process.Pid))

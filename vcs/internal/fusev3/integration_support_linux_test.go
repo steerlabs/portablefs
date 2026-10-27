@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"math/big"
 	"net"
 	"os"
@@ -258,10 +259,10 @@ type integrationTransport struct {
 	clockOffset              *atomic.Int64
 }
 
-func (t *integrationTransport) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (t *integrationTransport) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	r, horizon, err := t.Client.Subscribe(ctx, snapshot, after)
 	if t.clockOffset != nil {
-		horizon = horizon.Add(time.Duration(t.clockOffset.Load()))
+		horizon.Time = horizon.Add(time.Duration(t.clockOffset.Load()))
 	}
 	return r, horizon, err
 }

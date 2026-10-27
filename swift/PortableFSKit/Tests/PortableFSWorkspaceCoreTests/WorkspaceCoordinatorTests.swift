@@ -724,3 +724,20 @@ private enum InjectedFailure: Error { case failed }
     #expect(rig.power.registered)
     #expect(!rig.vm.calls.contains("stop"))
 }
+
+@Test @MainActor func workspaceUnfencedWakeImmediatelyStartsColdRecovery() throws {
+    for event: WorkspacePowerEvent in [.wake, .cancelledSleep] {
+        let r = try Rig()
+        #expect(r.coordinator.attachAllowed)
+        let generation = r.coordinator.generation
+        r.coordinator.powerEvent(event)
+        #expect(!r.coordinator.attachAllowed)
+        #expect(r.coordinator.phase == .recovering)
+        #expect(r.coordinator.generation == generation + 1)
+        #expect(r.channel.awakeRecoveries.count == 1)
+        r.coordinator.powerEvent(event)
+        #expect(r.channel.awakeRecoveries.count == 1)
+        #expect(r.channel.suspensions.isEmpty)
+        #expect(r.vm.pauses.isEmpty)
+    }
+}

@@ -1740,7 +1740,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	// This precedes both the arena shortcut and empty candidate sets. An
 	// assigned effect is still its original operation; denial cannot fabricate a
 	// definite no-change CREATE/WRITE result. READ still owes physical purge.
-	workspaceClosed := publication.workspaceBound && publication.workspace.Check() != nil
+	workspaceClosed := r.workspaceReplyPermissionLocked(publication, opcode, outData)
 	if workspaceClosed && publication.retainedAnswer && publication.source == nil && opcode != 15 {
 		publication.cacheRejected = true
 	}
@@ -1757,6 +1757,11 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		return 0, fuse.EIO, fuse.OK
 	}
 	if publication.cachedArena && publication.originalFinalized {
+		if r.workspaceReplyPermissionLocked(publication, opcode, outData) && publication.retainedAnswer && publication.source == nil && opcode != 15 {
+			publication.cacheRejected = true
+			r.mu.Unlock()
+			return 0, fuse.EIO, fuse.OK
+		}
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
@@ -1834,6 +1839,14 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		publication.data = retained
 	}
 	zeroAttributes := len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity]
+	// Reservation validation can itself straddle a pause. The last permission
+	// sample must also bound the encoded lifetime, including a still-live but
+	// shortened interval. Assigned outcomes and READ's purge remain owned.
+	if r.workspaceReplyPermissionLocked(publication, opcode, outData) && publication.retainedAnswer && publication.source == nil && opcode != 15 {
+		publication.cacheRejected = true
+		r.mu.Unlock()
+		return 0, fuse.EIO, fuse.OK
+	}
 	r.mu.Unlock()
 
 	if nameDropped {
@@ -1849,6 +1862,32 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	// not carry PortableFS trailers; returning the original payload length is
 	// what preserves the upstream wire shape.
 	return payloadSize, fuse.OK, fuse.OK
+}
+
+func (r *rawFileSystem) workspaceReplyPermissionLocked(publication *replyPublication, opcode uint32, out []byte) bool {
+	if !publication.workspaceBound {
+		return false
+	}
+	closed := publication.workspace.Check() != nil
+	if r.mount.workspaceRTC == nil {
+		return closed
+	}
+	var remaining time.Duration
+	if !closed {
+		remaining = r.mount.subscription.workspaceRemaining()
+		closed = remaining <= 0 || publication.workspace.Check() != nil
+	}
+	if closed {
+		remaining = 0
+	}
+	capReplyLifetime(opcode, out, remaining)
+	for _, candidate := range publication.dirPlus {
+		if candidate.entry != nil {
+			candidate.entry.SetEntryTimeout(min(candidate.entry.EntryTimeout(), remaining))
+			candidate.entry.SetAttrTimeout(min(candidate.entry.AttrTimeout(), remaining))
+		}
+	}
+	return closed
 }
 
 func disableKeepCache(opcode uint32, out []byte) {
@@ -1920,7 +1959,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		return
 	}
 	publication.settlementClaimed = true
-	if status.Ok() && publication.workspaceBound && publication.workspace.Check() != nil && publication.opcode == 15 {
+	if status.Ok() && publication.workspaceBound && publication.opcode == 15 && (publication.workspace.Check() != nil || !r.mount.workspacePermissionLive()) {
 		for _, candidate := range publication.data {
 			r.settleDataPublicationLocked(candidate, false)
 			publication.unlicensed = append(publication.unlicensed, candidate)
@@ -4502,4 +4541,27 @@ func (m *Mount) recordFatalCause(err error) {
 	m.fatalMu.Lock()
 	m.fatalErr = errors.Join(m.fatalErr, err)
 	m.fatalMu.Unlock()
+}
+
+// Cap the encoded lifetime again at physical preparation, including cached
+// arena replies whose payload was encoded before a capacity wait or pause.
+func capReplyLifetime(opcode uint32, out []byte, remaining time.Duration) {
+	capAt := func(sec, nano int) {
+		if sec+8 > len(out) || nano+4 > len(out) {
+			return
+		}
+		seconds, nanos := binary.LittleEndian.Uint64(out[sec:sec+8]), binary.LittleEndian.Uint32(out[nano:nano+4])
+		remaining = max(time.Duration(0), remaining)
+		if seconds > uint64(remaining/time.Second) || seconds == uint64(remaining/time.Second) && uint64(nanos) > uint64(remaining%time.Second) {
+			binary.LittleEndian.PutUint64(out[sec:sec+8], uint64(remaining/time.Second))
+			binary.LittleEndian.PutUint32(out[nano:nano+4], uint32(remaining%time.Second))
+		}
+	}
+	switch opcode {
+	case 1, 6, 8, 9, 13, 35, 51:
+		capAt(16, 32)
+		capAt(24, 36)
+	case 3, 4:
+		capAt(0, 8)
+	}
 }
