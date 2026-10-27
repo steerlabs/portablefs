@@ -56,6 +56,12 @@ not establish scheduler ordering against every other RTC reader in that VM.
 The run pins candidate, image, host owner, harness files, reference binary and
 policy before boot. The image commit can differ from the harness commit only
 with a recorded path/diff assessment. The run owns its caffeinate assertion,
+and uses a private, prestarted SSH master for ordinary probes. Reusing the
+connection removes handshake latency from the charged sampling bracket; it
+does not narrow a bracket after collection or change any acceptance bound.
+The master disables keepalives during scheduled guest pauses, never adopts an
+existing socket, and stops through its exact owned process identity. No SSH
+control command or shared transport socket is used. The run owns its
 guest, authority container and independent peer. Docker events, process/boot
 identities, host awake/continuous clock pairs and durable peer progress detect
 unplanned disruption. The sampler independently checks its exact parent PID,

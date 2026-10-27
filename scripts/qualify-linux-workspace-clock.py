@@ -299,6 +299,40 @@ def attach_planned_windows(records, campaign):
                     row['rejected_projection']=row.pop('sample')
 
 
+class ProbeTransport:
+    """Reuse only this run's SSH connection; keep every probe's full bracket."""
+    def __init__(self, ssh, control, evidence):
+        if control.exists():
+            raise RuntimeError('refuse to adopt an existing probe control socket')
+        self.log=(evidence/'probe-ssh-master.stderr').open('w')
+        self.process=None
+        common=['-S',str(control),'-o','ServerAliveInterval=0','-o','TCPKeepAlive=no']
+        self.command=ssh[:-1]+common+['-o','ControlMaster=no',ssh[-1]]
+        try:
+            self.process=subprocess.Popen(ssh[:-1]+common+['-o','ControlPersist=no','-M','-N',ssh[-1]],
+                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=self.log)
+            deadline=time.monotonic()+10
+            while not control.exists():
+                if self.process.poll() is not None:
+                    raise RuntimeError('owned probe SSH connection exited before readiness')
+                if time.monotonic()>=deadline:
+                    raise TimeoutError('owned probe SSH connection did not become ready')
+                time.sleep(.01)
+            subprocess.check_output(self.command+['true'],text=True,timeout=10)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.process is not None and self.process.poll() is None:
+            # Exact Popen identity owned by this run; never ssh -O or a PID scan.
+            self.process.terminate()
+            try:self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill();self.process.wait(timeout=5)
+        self.log.close()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('image', type=pathlib.Path)
@@ -316,6 +350,7 @@ def main():
     p.add_argument('--hold-file',type=pathlib.Path)
     p.add_argument('--owner-pid',type=int)
     p.add_argument('--owner-status',type=pathlib.Path)
+    p.add_argument('--probe-control-path',type=pathlib.Path)
     a = p.parse_args()
     seconds = FULL_SECONDS if a.soak else a.seconds
     if a.soak and (not a.owner_pid or not a.owner_status):
@@ -326,6 +361,8 @@ def main():
     a.evidence.mkdir(parents=True, exist_ok=False)
     image_hash = hashlib.sha256((a.image/'manifest.json').read_bytes()).hexdigest()
     ssh = ['ssh','-F',a.ssh_config,'portablefs-workspace']
+    transport=ProbeTransport(ssh,a.probe_control_path,a.evidence) if a.probe_control_path else None
+    if transport: ssh=transport.command
     run_id = a.run_id or str(uuid.uuid4())
     host_awake_origin=host_pair()
     start_ns = time.monotonic_ns()
@@ -415,6 +452,10 @@ def main():
                 disruption=dict(run_id=run_id,error=str(error),observed_ns=time.monotonic_ns())
                 run_disruptions.append(disruption);row['disruption']=disruption
                 if a.invalid_file: record_invalid(a.invalid_file,disruption)
+            if transport and transport.process.poll() is not None:
+                disruption=dict(run_id=run_id,error='owned probe SSH connection exited',observed_ns=time.monotonic_ns())
+                run_disruptions.append(disruption)
+                if a.invalid_file: record_invalid(a.invalid_file,disruption)
             if a.owner_pid:
                 try:
                     row['owner_heartbeat_ns']=verify_owner(a.owner_status,a.owner_pid,run_id,time.monotonic_ns,os.getppid)
@@ -439,6 +480,7 @@ def main():
         sample_file.close()
         campaign.finish()
         if load is not None and not stop_load(load): failures.append('owned guest load failed')
+        if transport: transport.close()
     try:
         verify_awake(host_awake_origin,host_pair())
         if a.owner_pid: verify_owner(a.owner_status,a.owner_pid,run_id,time.monotonic_ns,os.getppid)

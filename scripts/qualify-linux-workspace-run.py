@@ -42,6 +42,8 @@ def write_status(evidence, status, body):
             "Other sessions must not pause pfs-g3* containers. Any unplanned authority pause invalidates the run.\n"
             "Coordinate quiet windows before container pauses; the run must restart at zero after disruption.\n\n"
             f"Pinned UTC-source candidate and image commit: {status.get('candidate_commit','unknown')}.\n"
+            f"Image manifest SHA-256: {status.get('image_manifest_sha256','unknown')}.\n"
+            f"Guest system.ext4 SHA-256: {status.get('image_system_ext4_sha256','unknown')}.\n"
             "This run qualifies the UTC source on that image. Later directory-cache and workspace RTC-sampling "
             "consolidation changes affect the admission path; the final candidate's admission behavior requires "
             "the native G0 inventory. This source run does not substitute for that inventory.\n\n")
@@ -153,7 +155,7 @@ def main():
     assert not (evidence/'status.json').exists(), 'use a new evidence directory'
     atomic(evidence/'run-inputs.json',pins)
     os.environ['PFS_NATIVE_CLOCK_SOAK'] = '1'
-    os.environ['PFS_NATIVE_FIXTURE_PREFIX'] = 'pfs-g3-'
+    os.environ['PFS_NATIVE_FIXTURE_PREFIX'] = 'pfs-g3-soak-' if args.soak else 'pfs-g3-proof-'
     os.environ['PFS_RTC_NTS_REFERENCE'] = str(args.reference.resolve())
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
     state = pathlib.Path(tempfile.mkdtemp(prefix='pfs-g3-', dir='/tmp'))
@@ -164,6 +166,7 @@ def main():
     now = lambda: datetime.datetime.now(datetime.timezone.utc)
     status = dict(pid=os.getpid(), launched=now().isoformat(), state_directory=str(state),
                   candidate_commit=pins['candidate_commit'], image_commit=pins['image_commit'],
+                  image_system_ext4_sha256=pins['system_ext4_sha256'],
                   image_manifest_sha256=hashlib.sha256((args.image/'manifest.json').read_bytes()).hexdigest(),
                   phase='preparing', caffeinate_pid=caffeinate.pid, errors=[],run_id=run_id)
     (evidence/'pid').write_text(str(os.getpid())+'\n')
@@ -284,7 +287,7 @@ while True:
                    str(evidence/'clock'),'--utc-reference-command',str(args.reference),
                    '--pause-command',shlex.join([sys.executable,str(pathlib.Path(__file__).resolve()),'--driver',address]),
                    '--admission-evidence',str(evidence/'admission.json'),
-                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--hold-file',str(hold),'--owner-pid',str(os.getpid()),'--owner-status',str(evidence/'status.json')]
+                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--hold-file',str(hold),'--owner-pid',str(os.getpid()),'--owner-status',str(evidence/'status.json'),'--probe-control-path',str(state/'clock-probe.sock')]
         command += ['--soak'] if args.soak else ['--seconds','1800','--dry-run']
         with (evidence/'harness.log').open('w') as log:
             process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)

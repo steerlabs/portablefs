@@ -85,6 +85,30 @@ class SupportTests(unittest.TestCase):
             owner.cleanup_owned_resources(authority,guest,{'owned':'mount'},peer,hold,status)
             authority.unmount.assert_called_once_with(guest,{'owned':'mount'});authority.close.assert_called_once();guest.stop.assert_called_once()
 
+    def test_probe_transport_owns_its_socket_and_exact_process(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('probe_clock',pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py'))
+        clock=importlib.util.module_from_spec(spec);spec.loader.exec_module(clock)
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);control=root/'probe.sock'
+            process=mock.Mock();process.poll.return_value=None
+            def start(*args,**kwargs):control.touch();return process
+            with mock.patch.object(clock.subprocess,'Popen',side_effect=start) as popen,mock.patch.object(clock.subprocess,'check_output',return_value='') as check:
+                transport=clock.ProbeTransport(['ssh','-F','owned-config','guest'],control,root)
+                self.assertIn('ServerAliveInterval=0',transport.command)
+                self.assertIn('TCPKeepAlive=no',transport.command)
+                self.assertNotIn('-O',popen.call_args.args[0])
+                self.assertEqual(popen.call_args.args[0][popen.call_args.args[0].index('-S')+1],str(control))
+                check.assert_called_once_with(transport.command+['true'],text=True,timeout=10)
+                transport.close();process.terminate.assert_called_once();process.wait.assert_called_once_with(timeout=5)
+                with self.assertRaisesRegex(RuntimeError,'existing probe control socket'):
+                    clock.ProbeTransport(['ssh','guest'],control,root)
+            control.unlink();process.reset_mock();process.poll.return_value=1
+            with mock.patch.object(clock.subprocess,'Popen',return_value=process):
+                with self.assertRaisesRegex(RuntimeError,'before readiness'):
+                    clock.ProbeTransport(['ssh','guest'],control,root)
+            process.terminate.assert_not_called()
+
     def test_product_generation_requires_even_stable_seqlock(self):
         import struct
         page=bytearray(4096);struct.pack_into('<QQ',page,128,2,42)
