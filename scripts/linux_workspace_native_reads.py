@@ -11,8 +11,9 @@ def read_checks(authority, guest, evidence, record, rounds=20):
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
     setup = r'''
-import json,pathlib,subprocess
-root=pathlib.Path('/var/tmp/pfs-native/home/peer/read-stress')
+import json,pathlib,shutil,subprocess
+from concurrent.futures import ThreadPoolExecutor
+root=pathlib.Path('/var/tmp/pfs-native/home/read-stress-source')
 root.mkdir()
 for directory in range(6300):
     parent=root/('g%02d'%(directory//100))/('d%03d'%(directory%100));parent.mkdir(parents=True,exist_ok=True)
@@ -20,6 +21,20 @@ for directory in range(6300):
         (parent/('f%03d.go'%number)).write_text('package fixture\n'+('// TODO: retained search marker\n' if directory%2==0 and number==0 else '// ordinary source\n')+'var payload = "'+('x'*1024)+'"\n')
 def git(*args):subprocess.run(['git','-C',str(root),*args],check=True,stdout=subprocess.DEVNULL)
 git('init','-q');git('add','.');git('-c','user.name=Workspace Test','-c','user.email=workspace@example.invalid','commit','-qm','Read stress fixture')
+# Populate through the independent peer after preparing Git's local objects.
+# Parallel file imports keep fixture preparation out of the read-load result.
+def copy(source,target):
+    with open(source,'rb') as incoming,open(target,'wb') as outgoing:shutil.copyfileobj(incoming,outgoing,1024*1024)
+    shutil.copystat(source,target,follow_symlinks=False)
+    return target
+with ThreadPoolExecutor(max_workers=8) as pool:
+    pending=[]
+    def submit(source,target):
+        pending.append(pool.submit(copy,source,target))
+        return target
+    shutil.copytree(root,'/var/tmp/pfs-native/home/peer/read-stress',symlinks=True,copy_function=submit)
+    for future in pending:future.result()
+subprocess.run(['sync','-f','/var/tmp/pfs-native/home/peer/read-stress'],check=True)
 print(json.dumps({'files':31500,'matches':3150,'directories':6363}))
 '''
     expected = json.loads(authority.peer(setup))
@@ -43,4 +58,4 @@ print(json.dumps({'files':31500,'matches':3150,'directories':6363}))
             assert row['lines'] == (expected['matches'] if name == 'rg' else 0), row
     record('managed-large-repository-read-stress')
     # Namespace cleanup also crosses the real mount rather than backing storage.
-    authority.peer("import shutil;shutil.rmtree('/var/tmp/pfs-native/home/peer/read-stress')")
+    authority.peer("import shutil;shutil.rmtree('/var/tmp/pfs-native/home/peer/read-stress');shutil.rmtree('/var/tmp/pfs-native/home/read-stress-source')")
