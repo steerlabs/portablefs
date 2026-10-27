@@ -177,7 +177,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func statusPollingRetainsSetupRefusalUntilAnExplicitRetry() throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
         let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
-        let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") {
+        let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { _ in
             throw WorkspaceVMError("SSH name already in use")
         }
         #expect(owner.handle(try productRequest("start")).message == "SSH name already in use")
@@ -414,7 +414,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     let account = try WorkspacePrivateDirectory(directory)
     let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
     let runtime = try ProductRuntime()
-    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { runtime }
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { _ in runtime }
     do {
         let update = try account.lock("mount-lifecycle.lock")
         #expect(owner.handle(try productRequest("start")).state == "refused")
@@ -460,9 +460,13 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
 @Test @MainActor func productEmptyWitnessRequiresTerminationAndPreservesLostOutcome() throws {
     let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
     let store = try WorkspaceHostState(directory: directory)
-    try store.commit { $0.execution = WorkspaceExecution(hostBoot: "same-boot", boot: Data(repeating: 1, count: 16)) }
-    #expect(throws: (any Error).self) { try store.publishEmptyResources() }
-    #expect(throws: (any Error).self) { try store.requirePriorExecutionAbsent(hostBoot: "same-boot") }
+    do {
+        let reference = try store.directory.lock("owner.lock")
+        try store.commit { $0.execution = WorkspaceExecution(hostBoot: "same-boot", boot: Data(repeating: 1, count: 16), reference: reference.identity) }
+        #expect(throws: (any Error).self) { try store.publishEmptyResources() }
+        #expect(throws: (any Error).self) { try store.requirePriorExecutionAbsent(hostBoot: "same-boot") }
+        withExtendedLifetime(reference) {}
+    }
     #expect(try store.directory.read("resources.present") != nil)
     // A reboot proves execution absence, but never silently acknowledges loss.
     var frame = try WorkspaceControl.decode(workspaceGolden("status_reply"))
@@ -480,7 +484,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
     let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace"))
     let runtime = try ProductRuntime()
-    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { runtime }
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { _ in runtime }
     _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
     _ = owner.handle(try productRequest("stop", force: true)); try await productTurn(); try await productTurn()
     #expect(store.value.execution == nil)
