@@ -98,6 +98,9 @@ func run(args []string) error {
 			return errors.New("provision DIRECTORY ENDPOINT IDENTITY_BASE64")
 		}
 		lifetime := time.Hour
+		if os.Getenv("PFS_NATIVE_CLOCK_SOAK") == "1" {
+			lifetime = 96 * time.Hour
+		}
 		if args[0] == "provision-short" {
 			lifetime = 25 * time.Second
 		}
@@ -197,7 +200,11 @@ func issue(name string, pub ed25519.PublicKey, parent *x509.Certificate, signer 
 	if err != nil {
 		return nil, err
 	}
-	t := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour), BasicConstraintsValid: true, IsCA: ca, KeyUsage: x509.KeyUsageDigitalSignature}
+	lifetime := 24 * time.Hour
+	if os.Getenv("PFS_NATIVE_CLOCK_SOAK") == "1" {
+		lifetime = 96 * time.Hour
+	}
+	t := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(lifetime), BasicConstraintsValid: true, IsCA: ca, KeyUsage: x509.KeyUsageDigitalSignature}
 	if ca {
 		t.KeyUsage |= x509.KeyUsageCertSign
 	} else if client {
@@ -285,7 +292,11 @@ func setup(dir, volume string) error {
 	// Fixed VZ pauses plus lifecycle checks can outlast an hour. Keep the
 	// independent peer authorized throughout the full inventory; guest expiry
 	// cases retain their separate short grants.
-	token, err := grant(k, volume, peer.RawSubjectPublicKeyInfo, 3*time.Hour)
+	peerLifetime := 3 * time.Hour
+	if os.Getenv("PFS_NATIVE_CLOCK_SOAK") == "1" {
+		peerLifetime = 96 * time.Hour
+	}
+	token, err := grant(k, volume, peer.RawSubjectPublicKeyInfo, peerLifetime)
 	if err != nil {
 		return err
 	}

@@ -7,7 +7,7 @@ work="$(mktemp -d "$evidence/g0-initramfs.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "$repo/vcs" test -c -o "$work/init" ./internal/fusev3
 python3 - "$work" <<'PY'
-import gzip,pathlib,stat,sys
+import gzip,os,pathlib,stat,sys
 root=pathlib.Path(sys.argv[1]); archive=bytearray()
 def entry(name,mode,data=b'',major=0,minor=0):
  name=name.encode()+b'\0'; fields=[1,mode,0,0,1,0,len(data),0,0,major,minor,len(name),0]
@@ -15,6 +15,7 @@ def entry(name,mode,data=b'',major=0,minor=0):
  archive.extend(b'\0'*(-len(archive)%4));archive.extend(data);archive.extend(b'\0'*(-len(archive)%4))
 for name in ('dev','proc','sys','tmp','run'):entry(name,stat.S_IFDIR|0o755)
 entry('dev/console',stat.S_IFCHR|0o600,major=5,minor=1)
+entry('entropy',stat.S_IFREG|0o400,os.urandom(64))
 entry('init',stat.S_IFREG|0o755,(root/'init').read_bytes());entry('TRAILER!!!',0)
 (root/'initramfs').write_bytes(gzip.compress(archive,mtime=0))
 PY

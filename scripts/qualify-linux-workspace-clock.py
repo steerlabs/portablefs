@@ -7,6 +7,8 @@ The NTS adapter command must return independently authenticated observations:
 "unix_ns":...,"uncertainty_ns":...}, ...]}. Each observation's sample lies
 inside that command invocation. No host clock is changed. Missing evidence is
 inconclusive, including missing NTS, resume or duplicate-reader coverage.
+Optional query_began_ns/query_ended_ns in the named host monotonic clock constrain
+the NTP sample inside the full invocation without charging earlier NTS-KE time.
 """
 import argparse
 import datetime
@@ -19,11 +21,13 @@ import subprocess
 import time
 import threading
 import re
+import sys
 
 SECOND = 1_000_000_000
 FULL_SECONDS = 72 * 3600
 BLOCK_SECONDS = 3 * 3600
 INTERVAL = 30
+REFERENCE_CLOCK = {'darwin':'darwin.CLOCK_UPTIME_RAW','linux':'linux.CLOCK_MONOTONIC'}.get(sys.platform)
 
 
 def utc_ns(value):
@@ -35,12 +39,14 @@ def utc_ns(value):
     return (delta.days * 86400 + delta.seconds) * SECOND + delta.microseconds * 1000 + extra
 
 
-def reference_interval(references, began, ended, guest_began, guest_ended):
-    """Charge server uncertainty and the complete command/SSH transit window."""
+def reference_interval(references, began, ended, guest_began, guest_ended, reference_clock=None):
+    """Charge server uncertainty and the complete bounded NTP/SSH transit window."""
     if began > ended or guest_began > guest_ended:
         raise ValueError('reversed reference or sample interval')
     if not isinstance(references, list) or len(references) < 2:
         raise ValueError('two independent NTS servers required')
+    if reference_clock is not None and (REFERENCE_CLOCK is None or reference_clock != REFERENCE_CLOCK):
+        raise ValueError('reference uses a different monotonic clock')
     servers, intervals = set(), []
     for ref in references:
         if ref['protocol'] != 'NTS' or ref['authenticated'] is not True:
@@ -54,8 +60,17 @@ def reference_interval(references, began, ended, guest_began, guest_ended):
         instant = ref['unix_ns']
         if type(instant) is not int:
             raise ValueError('reference timestamp must be integer nanoseconds')
-        intervals.append((instant - uncertainty + guest_began - ended,
-                          instant + uncertainty + guest_ended - began))
+        first, last = began, ended
+        if reference_clock is not None:
+            qb, qe = ref['query_began_ns'], ref['query_ended_ns']
+            if type(qb) is not int or type(qe) is not int or not began<=qb<=qe<=ended:
+                raise ValueError('NTP query outside reference command interval')
+            # Both clocks use the same kernel monotonic domain. Charge the
+            # complete NTP/guest transit. KE precedes this fresh time sample;
+            # process launch and exit cannot change its observed endpoints.
+            first, last = qb, qe
+        intervals.append((instant - uncertainty + guest_began - last,
+                          instant + uncertainty + guest_ended - first))
     low, high = max(v[0] for v in intervals), min(v[1] for v in intervals)
     if low > high:
         raise ValueError('independent UTC intervals disagree')
@@ -189,7 +204,7 @@ class PauseCampaign:
                         raise ValueError('pause did not prove cold recovery or exact terminal cleanup')
                     first = result['first_read']
                     interval = reference_interval(first['references'], first['reference_began_ns'],
-                        first['reference_ended_ns'], first['sample_began_ns'], first['sample_ended_ns'])
+                        first['reference_ended_ns'], first['sample_began_ns'], first['sample_ended_ns'],first.get('clock'))
                     rtc = utc_ns(first['rtc'])
                     offset = (rtc-interval[1],rtc+SECOND+first['sample_age_ns']-interval[0])
                     if not 0 <= first['sample_age_ns'] <= SECOND//4:
@@ -235,6 +250,7 @@ def main():
     p.add_argument('--utc-reference-command')
     p.add_argument('--admission-evidence', type=pathlib.Path)
     p.add_argument('--pause-command', help='read-only-clock native VZ qualification driver; receives one JSON case argument')
+    p.add_argument('--stop-file', type=pathlib.Path, help='finish cleanly after the current sample when this file exists')
     a = p.parse_args()
     seconds = FULL_SECONDS if a.soak else a.seconds
     if seconds < 60 or (a.soak and a.dry_run):
@@ -274,17 +290,19 @@ def main():
             began = time.monotonic_ns()
             record = dict(index=len(records), block=block, load='load' if block % 2 else 'idle',
                           interval_slot=int((ref_began-int(start*SECOND))//(INTERVAL*SECOND)),
+                          reference_began_ns=ref_began, reference_ended_ns=ref_ended,
+                          sample_began_ns=began, host_wall_ns=time.time_ns(),
                           host_elapsed_ns=began-int(start*SECOND), independent_reference=reference, reference_error=reference_error, reference_valid=False)
             if reference:
                 try:
-                    reference_interval(reference['references'],ref_began,ref_ended,ref_ended,ref_ended)
+                    reference_interval(reference['references'],ref_began,ref_ended,ref_ended,ref_ended,reference.get('clock'))
                     record['reference_valid']=True
                 except (KeyError,TypeError,ValueError) as error:
                     record['reference_error']=str(error)
             try:
                 sample = json.loads(subprocess.check_output(ssh + [PROBE], text=True, timeout=10))
                 ended = time.monotonic_ns()
-                record.update(sample=sample, host_measurement_ns=ended-began,
+                record.update(sample=sample, sample_ended_ns=ended, host_measurement_ns=ended-began,
                               full_reference_sampling_transit_ns=ended-ref_began)
                 if campaign.overlaps_sample(pause_token):
                     # Old maintenance projection is deliberately invalid across
@@ -295,7 +313,7 @@ def main():
                     interval = None
                     if reference:
                         try:
-                            interval = reference_interval(reference['references'], ref_began, ref_ended, began, ended)
+                            interval = reference_interval(reference['references'], ref_began, ref_ended, began, ended,reference.get('clock'))
                         except (KeyError, TypeError, ValueError) as error:
                             reference_error = str(error)
                     checks = evaluate(sample, interval)
@@ -311,7 +329,15 @@ def main():
                     failures.append(str(error))
             records.append(record)
             sample_file.write(json.dumps(record, sort_keys=True)+'\n'); sample_file.flush()
-            if time.monotonic() >= deadline:
+            progress = dict(pid=os.getpid(), seconds=time.monotonic()-start,
+                            samples=len(records), reference_coverage=sum(v['reference_valid'] for v in records),
+                            source_coverage=sum(v.get('checks',{}).get('source')=='pass' for v in records),
+                            failures=failures, pause_campaign_cases=len(campaign.records),
+                            pause_campaign_errors=campaign.errors, last_sample=record)
+            temporary = a.evidence/'progress.json.tmp'
+            temporary.write_text(json.dumps(progress,indent=2)+'\n')
+            temporary.replace(a.evidence/'progress.json')
+            if time.monotonic() >= deadline or (a.stop_file and a.stop_file.exists()):
                 break
             next_sample += INTERVAL
             time.sleep(max(0, min(start+next_sample, deadline)-time.monotonic()))
