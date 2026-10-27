@@ -23,7 +23,7 @@ public enum WorkspaceRemoval {
         }
         let directory = home.appendingPathComponent(".local/state/portablefs/workspace", isDirectory: true)
         let pristine = try (service.status == .notRegistered || service.status == .notFound) &&
-            pristineLockOnly(directory)
+            (!FileManager.default.fileExists(atPath: directory.path) || pristineLockOnly(directory))
         return try await run(data: data, home: home, actions: Actions(
             stop: { try await client.perform(.stop) }, status: { try await client.perform(.status) },
             quiesce: {

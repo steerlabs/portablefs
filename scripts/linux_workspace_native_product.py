@@ -295,6 +295,8 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'removal-peer-sentinel').read_text())")=='remote-data'
         record('service-removal-delete-data')
         app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
+        ssh('printf service-persistence > /home/workspace/service-product-proof')
+        before=(home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()
         if authority is not None:
             mount_volume()
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
