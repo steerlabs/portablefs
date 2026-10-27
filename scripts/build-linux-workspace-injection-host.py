@@ -53,7 +53,7 @@ let package = Package(name: "WorkspaceRTCInjectionHost", platforms: [.macOS(.v26
         .target(name: "PortableFSWorkspaceVM", dependencies: ["PortableFSWorkspaceCore", "CWorkspacePower"]),
         .executableTarget(name: "PortableFSWorkspaceDev", dependencies: ["PortableFSWorkspaceVM"])
     ])
-'''.replace('COMMIT', commit))
+'''.replace('"COMMIT"', json.dumps(commit)))
 
 proof = dict(source_commit=commit, guest_image_modified=False, host_only_changes=[], files={})
 
@@ -89,7 +89,7 @@ patch('Sources/PortableFSWorkspaceDev/WorkspaceDev.swift', [
 ])
 proof['host_only_changes'] = ['systemd.debug_shell=hvc0 on the disposable VM kernel command line',
                               'bounded private dev stdin command to the existing console input']
-subprocess.run(['swift', 'build', '--package-path', str(package), '--product', 'portablefs-workspace-dev'], check=True)
+subprocess.run(['swift', 'build', '--jobs', '4', '--package-path', str(package), '--product', 'portablefs-workspace-dev'], check=True)
 binary_dir = pathlib.Path(subprocess.check_output(['swift', 'build', '--package-path', str(package), '--show-bin-path'], text=True).strip())
 binary = output / 'portablefs-workspace-dev'
 shutil.copy2(binary_dir / binary.name, binary)
