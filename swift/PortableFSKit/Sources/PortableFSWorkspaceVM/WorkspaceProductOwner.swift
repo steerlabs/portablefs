@@ -4,7 +4,7 @@ import PortableFSWorkspaceCore
 /// One durable desired-state owner above the existing VM and guest jobs. API
 /// connections are waiters only; closing an app/CLI never cancels accepted work.
 @MainActor public final class WorkspaceProductOwner {
-    public typealias Factory = () throws -> any WorkspaceProductRuntime
+    public typealias Factory = (WorkspaceFileLock) throws -> any WorkspaceProductRuntime
     public let store: WorkspaceHostState
     private let reservationDirectory: URL
     private let hostBoot: String
@@ -98,17 +98,17 @@ import PortableFSWorkspaceCore
             guard runtime.phase != .stopped else { throw WorkspaceVMError(failure.isEmpty ? "Cleanup required" : failure) }
             return
         }
-        try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
+        let reference = try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         for volume in store.value.volumes { try transition.reserve(volume.reservation) }
         let instance: any WorkspaceProductRuntime
-        do { instance = try factory() } catch { failure = String(describing: error); throw error }
+        do { instance = try factory(reference) } catch { failure = String(describing: error); throw error }
         instance.onStatus = { [weak self] in guard let self else { throw WorkspaceControlError.transition }; try self.observe($0) }
         instance.onChange = { [weak self] in self?.scheduleUpdate() }
         try store.commit { state in
             if let current = state.current, !state.retained.contains(current) { state.retained.append(current) }
             state.current = nil
-            state.execution = WorkspaceExecution(hostBoot: hostBoot, boot: instance.bootID)
+            state.execution = WorkspaceExecution(hostBoot: hostBoot, boot: instance.bootID, reference: reference.identity)
             // Fresh boot requests fresh initial authorization for a new MountID.
             // Desired availability, key/scope (in guest) and old evidence survive.
             for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity" }
@@ -117,6 +117,7 @@ import PortableFSWorkspaceCore
         do { try instance.start() }
         catch { failure=String(describing:error);scheduleUpdate();throw error }
         withExtendedLifetime(transition) {}
+        withExtendedLifetime(reference) {}
     }
     private func remove(_ volume: String, force: Bool) throws {
         guard let index = store.value.volumes.firstIndex(where: { $0.connection.volumeId == volume }) else { throw WorkspaceVMError("unknown workspace volume") }

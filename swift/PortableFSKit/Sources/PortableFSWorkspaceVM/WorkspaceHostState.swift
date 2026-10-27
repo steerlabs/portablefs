@@ -20,10 +20,11 @@ public struct WorkspaceDesiredVolume: Codable, Sendable {
 public struct WorkspaceExecution: Codable, Sendable {
     public var hostBoot: String
     public var boot: Data
-    public init(hostBoot: String, boot: Data) { self.hostBoot = hostBoot; self.boot = boot }
+    public var reference: WorkspaceFileIdentity
+    public init(hostBoot: String, boot: Data, reference: WorkspaceFileIdentity) { self.hostBoot = hostBoot; self.boot = boot; self.reference = reference }
 }
 public struct WorkspaceDesiredState: Codable, Sendable {
-    public var version = 1
+    public var version = 2
     public var running = false
     public var execution: WorkspaceExecution?
     public var volumes: [WorkspaceDesiredVolume] = []
@@ -43,7 +44,7 @@ public final class WorkspaceHostState {
             _ = try WorkspaceHostControl.object(JSONSerialization.jsonObject(with: raw), keys: ["version", "running", "execution", "volumes", "retained", "current"])
             value = try JSONDecoder().decode(WorkspaceDesiredState.self, from: raw)
         } else { value = WorkspaceDesiredState() }
-        guard value.version == 1, value.volumes.count <= 64, value.retained.count <= 128,
+        guard value.version == 2, value.volumes.count <= 64, value.retained.count <= 128,
               Set(value.volumes.map { $0.connection.volumeId }).count == value.volumes.count else { throw WorkspaceVMError("invalid workspace desired state") }
         for volume in value.volumes {
             try volume.connection.validate(); try volume.reservation.validate()
@@ -63,15 +64,17 @@ public final class WorkspaceHostState {
         try directory.write(name, data: WorkspaceHostControl.encode(document))
         return directory.url.appendingPathComponent(name)
     }
-    /// A process exit, released service flock or old PID is never VM absence
-    /// proof. Confirmed VZ termination clears execution. After a service crash,
-    /// only an actual host boot change establishes absence without its VZ owner.
-    public func requirePriorExecutionAbsent(hostBoot: String) throws {
+    /// A fresh description must acquire the VM's exact retained lock inode.
+    /// Keep this reference through execution publication and give its handle to
+    /// VZ; a service singleton, old PID or socket absence proves no VM absence.
+    @discardableResult public func requirePriorExecutionAbsent(hostBoot: String) throws -> WorkspaceFileLock {
         guard !hostBoot.isEmpty else { throw WorkspaceVMError("host boot identity unavailable") }
+        let reference = try directory.lock("vm-execution.lock")
         if let old = value.execution {
-            guard old.hostBoot != hostBoot else { throw WorkspaceVMError("Cleanup required: previous VM termination is unconfirmed") }
+            guard old.hostBoot != hostBoot || old.reference == reference.identity else { throw WorkspaceVMError("Cleanup required: previous VM execution reference was replaced") }
             try commit { $0.execution = nil }
         }
+        return reference
     }
     public static func hostBootIdentity() throws -> String {
         var size = 0

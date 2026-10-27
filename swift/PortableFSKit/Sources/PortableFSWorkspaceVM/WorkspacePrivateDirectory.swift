@@ -85,12 +85,23 @@ public final class WorkspacePrivateDirectory {
             try validateFile(file, name: name)
             guard workspaceFlock(file, LOCK_EX | LOCK_NB) == 0 else { throw WorkspaceVMError("PortableFS mount lifecycle is busy") }
             try validateFile(file, name: name); try validate()
-            return WorkspaceFileLock(file)
+            return try WorkspaceFileLock(file)
         } catch { Darwin.close(file); throw error }
     }
 }
+public struct WorkspaceFileIdentity: Codable, Equatable, Sendable {
+    public let device: UInt32
+    public let inode: UInt64
+}
 public final class WorkspaceFileLock {
-    private let fd: Int32
-    init(_ fd: Int32) { self.fd = fd }
-    deinit { _ = workspaceFlock(fd, LOCK_UN); Darwin.close(fd) }
+    public let fileHandle: FileHandle
+    public let identity: WorkspaceFileIdentity
+    init(_ fd: Int32) throws {
+        var st = stat()
+        guard fstat(fd, &st) == 0 else { throw WorkspaceVMError("inspect workspace lock: \(errno)") }
+        identity = WorkspaceFileIdentity(device: UInt32(bitPattern: st.st_dev), inode: st.st_ino)
+        fileHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+    // Closing our reference must not unlock a description still held by VZ.
+    // The kernel releases flock only after the last descriptor reference closes.
 }

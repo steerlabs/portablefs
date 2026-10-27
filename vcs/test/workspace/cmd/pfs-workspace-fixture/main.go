@@ -24,6 +24,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
 	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacehost"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -123,12 +124,25 @@ func run(args []string) error {
 			return err
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{"mount": base64.StdEncoding.EncodeToString(mount), "public_key": base64.StdEncoding.EncodeToString(v.PublicKey), "guest_uuid": base64.StdEncoding.EncodeToString(v.GuestUuid), "identity_incarnation": base64.StdEncoding.EncodeToString(v.IdentityIncarnation)})
-	case "decode-status":
+	case "decode-status", "decode-status-evidence":
 		if len(args) != 2 {
-			return errors.New("decode-status BASE64")
+			return errors.New("decode-status or decode-status-evidence BASE64")
 		}
 		v := new(pb.StatusReply)
-		if err := decode(args[1], v); err != nil {
+		if args[0] == "decode-status-evidence" {
+			raw, err := base64.StdEncoding.DecodeString(args[1])
+			if err != nil {
+				return err
+			}
+			frame, err := workspacecontrol.Decode(raw)
+			if err != nil {
+				return err
+			}
+			v = frame.GetStatusReply()
+			if v == nil {
+				return errors.New("evidence has no status reply")
+			}
+		} else if err := decode(args[1], v); err != nil {
 			return err
 		}
 		raw, err := protojson.Marshal(v)
