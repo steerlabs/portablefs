@@ -46,7 +46,7 @@ public enum WorkspaceHostControl {
     public static func decodeRequest(_ data: Data) throws -> WorkspaceHostRequest {
         guard data.count <= maxFrame else { throw WorkspaceControlError.grammar }
         try PortableFSDStrictJSON.validate(data)
-        let value = try object(JSONSerialization.jsonObject(with: data), keys: ["version", "operation", "document", "volumeId", "force"])
+        let value = try object(JSONSerialization.jsonObject(with: data), keys: ["version", "operation", "document", "volumeId", "force", "outcomeId"])
         if let document = value["document"] { try WorkspaceConnectionDocument.validateShape(document) }
         let request = try JSONDecoder().decode(WorkspaceHostRequest.self, from: data)
         try request.validate(); return request
@@ -58,10 +58,13 @@ public struct WorkspaceHostRequest: Codable, Sendable {
     public var document: WorkspaceConnectionDocument?
     public var volumeId: String?
     public var force: Bool?
+    public var outcomeId: String?
     public func validate() throws {
         guard version == 1 else { throw WorkspaceControlError.grammar }
+        guard operation == "dismiss" || outcomeId == nil else { throw WorkspaceControlError.grammar }
         switch operation {
         case "start", "status": guard document == nil, volumeId == nil, force != true else { throw WorkspaceControlError.grammar }
+        case "dismiss": guard document == nil, volumeId == nil, force != true, let outcomeId, PortableFSWorkspaceOutcome.validID(outcomeId) else { throw WorkspaceControlError.grammar }
         case "stop": guard document == nil, volumeId == nil else { throw WorkspaceControlError.grammar }
         case "mount": guard let document, volumeId == nil, force != true else { throw WorkspaceControlError.grammar }; try document.validate()
         case "umount": guard document == nil, let volumeId, WorkspaceHostControl.validVolume(volumeId) else { throw WorkspaceControlError.grammar }

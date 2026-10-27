@@ -6,7 +6,14 @@ public struct PortableFSWorkspaceMenu: View {
     public var body: some View {
         Menu("Linux Workspace") {
             Text(model.statusText)
-            ForEach(model.status.notices, id: \.self) { Text($0) }
+            ForEach(model.status.outcomes) { outcome in
+                Menu(outcome.message) {
+                    if let volume = outcome.volumeId { Text(volume) }
+                    Button("Copy Details") { model.copyDetails(outcome: outcome) }
+                    Button("Dismiss") { model.dismiss(outcome) }.disabled(model.working)
+                }
+            }
+            if model.status.outcomes.isEmpty { ForEach(model.status.notices, id: \.self) { Text($0) } }
             if model.consentMissing { Button("Open System Settings") { model.openSettings() } }
             Divider()
             if model.status.showsStop {

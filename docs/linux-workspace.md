@@ -108,6 +108,43 @@ Pending Mount remains owned by the existing coordinator across power transitions
 A guest restart requests fresh initial authorization; persistent key/scope/epoch
 remain owned by the guest data disk.
 
+The host discards clean retirement evidence after durably recording its exact
+guest observation cursor, then acknowledges the guest's retirement stream.
+Only exceptional write outcomes remain in desired state format 3. The menu
+shows each notice with **Copy Details** and **Dismiss**. Merely reading status,
+starting, stopping, recovering or replacing a mount never acknowledges a notice.
+The CLI keeps five verbs:
+
+```sh
+portablefs workspace status
+portablefs workspace status --dismiss <outcome-id> [--json]
+```
+
+Status prints each retained notice's ID and this command. The ID is
+`<sequence>/<guest-incarnation>/<volume>`: a positive host outcome sequence,
+32 lowercase hex digits naming the mount incarnation, and the exact canonical
+volume. A workspace execution whose guest status was never observed uses its
+boot incarnation and `-` for workspace scope. The paired host API operation is
+`dismiss` with one `outcomeId`. There is no bulk or implicit acknowledgement.
+An absent valid ID is an idempotent no-op, including a retry after a lost reply;
+a malformed ID refuses. An ID never selects another sequence, incarnation or
+volume. No acknowledgement tombstone history grows with use.
+
+Dismiss atomically commits removal of that exact retained notice through file
+sync, rename and directory sync. Only afterward may confirmed VM absence and
+reservation release remove the resource witness. A crash before the commit
+retains the notice; a crash after it may leave a conservative witness, but cannot
+recreate the notice. Dismiss acknowledges the displayed outcome; it does not
+assert that lost writes became durable or release live resources.
+
+The host reserves the same 128 slots across retained notices, admitted volume
+keys and one execution slot for a crash without guest status. Each active key
+can transfer its reserved slot into a final notice without observer overflow.
+Full capacity refuses new volume/replacement or cold-start admission with a
+Dismiss hint. Cleanup, status and exact Dismiss remain available. Guest retirement
+ACK releases guest evidence independently of the user's later Dismiss; loss or
+unknown evidence is already durable at the host before that ACK.
+
 A durable execution witness is cleared only after confirmed VZ termination or
 exact absence proof. Neither process exit nor a released service singleton proves
 VM absence. The service gives its locked `owner.lock` description to an immutable
@@ -161,11 +198,11 @@ execution publication. The VM's durable presence marker remains through confirme
 termination. The installer acquires the exclusive guard, proves exact FSKit absence and requires the workspace's
 `resources.present` name absent. It never decodes an outgoing desired-state
 registry. The service publishes this marker durably before VM execution and
-retires it only after confirmed termination, reservation release and loss-free,
-observed outcome evidence. Unexpected termination or explicit Force Stop keeps
-an unobserved-execution fact in that witness, even if no guest status arrived.
-A subsequent clean boot does not erase that earlier uncertainty. Busy, unknown
-and lost work defer unattended update.
+retires it only after confirmed termination, reservation release and clean or
+explicitly acknowledged outcomes. Unexpected termination or explicit Force Stop
+commits an unknown outcome in desired state, even if no guest status arrived.
+A subsequent clean boot does not erase that earlier uncertainty. Busy work and
+unacknowledged unknown or lost outcomes defer unattended update.
 
 The existing token-bound activation lease also closes workspace admission in
 every nonterminal phase, including an expired interrupted transaction. It closes
@@ -196,7 +233,7 @@ A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
 The supervisor binds these identities progressively and persists desired ownership
 under `/data/workspace`; existing CLI records own session/mount inventory. Active slots and
-unacknowledged retired outcomes share a bound of 64. Retirements have monotonic,
+unacknowledged retired outcomes share a bound of 128 (at most 64 active keys). Retirements have monotonic,
 guest-incarnation-scoped sequence numbers.
 The observer retains exact outcomes, then acknowledges through a sequence;
 duplicate or older acknowledgements succeed without erasing newer outcomes. Full

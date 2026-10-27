@@ -67,10 +67,12 @@ in flight through XPC also retain the lock; loss of the client alone cannot rele
 them. State and reservation locks continue to serialize all user transitions.
 
 Acquisition proves old execution absence, not prior write durability. The host
-retains the prior status before installing the new boot identity. The fresh Linux
+atomically retains the prior execution's unknown outcome before clearing its
+execution identity and installing a new boot identity. The fresh Linux
 kernel then uses the existing cold reconciliation and loss-retention rules; no old
 RAM, child process, descriptor or session is adopted. Removal and unattended update
-still refuse unresolved or lost work. A different host kernel boot proves the old
+still refuse unacknowledged unknown or lost outcomes. Only exact Dismiss
+acknowledges a retained notice; it never proves write durability. A different host kernel boot proves the old
 execution absent independently, without upgrading its write outcome.
 
 ## Why process and disk scans remain insufficient

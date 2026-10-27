@@ -21,6 +21,13 @@ from concurrent.futures import ThreadPoolExecutor
 from linux_workspace_native_editors import editor_checks
 
 
+def wait_for_hold():
+    path = os.environ.get('PFS_TEST_HOLD_FILE')
+    while path and pathlib.Path(path).exists():
+        print('HOLD: waiting between native cases', flush=True)
+        time.sleep(30)
+
+
 def execution_reference_busy(path):
     fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC)
     try:
@@ -51,12 +58,13 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
           'service-vscode-missing-extension','service-vscode-remote-save-peer',
           'service-busy-removal-refusal','service-stop-busy-preserves-running',
           'service-unmounted-path-denial','service-removal-keep-data','service-removal-delete-data',
-          'service-background-consent-denied'}
+          'service-background-consent-denied','service-outcome-clean-1000-cycles'}
     if not api_only:
         observe=record
         if outcome_case=='loss': record=lambda name:observe(name) if name.startswith('service-loss-') else None
         elif outcome_case=='removal': record=lambda name:observe(name) if name in ux else None
         else: record=lambda name:observe(name) if name not in ux and not name.startswith('service-loss-') else None
+    wait_for_hold()
     repo = pathlib.Path(__file__).resolve().parent.parent
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -285,6 +293,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         record('service-app-exit-vm-alive')
         before=(home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()
         def mount_volume():
+            wait_for_hold()
             descriptor=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
                 '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-connection','/var/tmp/pfs-native/home/test-pki',authority.endpoint,authority.volume],text=True)
             connection=root/'connection.pfsworkspace';connection.write_text(descriptor)
@@ -381,6 +390,21 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
         record('service-used-clean-stop-outcome')
         if outcome_case=='removal':
+            command('start');until(lambda s:s['state']=='running')
+            peak=0
+            for cycle in range(1000):
+                mount_volume()
+                assert ssh("python3 -c \"import os; f=os.open('/workspaces/native-managed/cycle-proof',os.O_CREAT|os.O_WRONLY|os.O_TRUNC,0o600); os.write(f,b'cycle'); os.fsync(f); os.close(f)\"") == ''
+                command('umount',authority.volume,'--json');settled=until(lambda s:not s['volumes'])
+                saved=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())
+                assert not saved['retained'] and not settled['outcomes'] and not settled['retainedEvidence'], (cycle,saved)
+                assert not settled['someChangesWereNotSaved'] and not settled['previousWriteOutcomeUnknown'], (cycle,settled)
+                peak=max(peak,(home/'.local/state/portablefs/workspace/desired.json').stat().st_size)
+                assert peak<16384,(cycle,peak)
+                if (cycle+1)%100==0:
+                    (evidence/'clean-cycles.json').write_text(json.dumps({'cycles':cycle+1,'peak_state_bytes':peak,'retirement_through':saved['retirementThrough']},indent=2))
+            command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+            record('service-outcome-clean-1000-cycles')
             prepare_update();prepare_update()
             assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
             app_command('--workspace-service-register')
@@ -393,6 +417,38 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         command('start');until(lambda s:s['state']=='running')
         if authority is not None: mount_volume()
         if outcome_case=='loss':
+            for cycle in range(127):
+                if cycle: mount_volume()
+                command('umount',authority.volume,'--force','--json')
+                settled=until(lambda s:not s['volumes'] and len(s['outcomes'])==cycle+1)
+                assert settled['previousWriteOutcomeUnknown'],(cycle,settled)
+                assert len(json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())['retained'])==cycle+1
+            refused=command('mount',str(root/'connection.pfsworkspace'),'--json',success=False)
+            assert refused.returncode==1 and 'Dismiss a previous write outcome' in refused.stdout,refused
+            assert status()['state']=='running' and len(status()['outcomes'])==127
+            record('service-loss-capacity-backpressure')
+            # Every operation names one exact notice; no API acknowledges all.
+            chosen=settled['outcomes'][63]['id']
+            command('status','--dismiss',chosen,'--json')
+            command('status','--dismiss',chosen,'--json')
+            command('status','--dismiss','999999/09090909090909090909090909090909/unknown','--json')
+            assert len(status()['outcomes'])==126
+            mount_volume();command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
+            for outcome in status()['outcomes']: command('status','--dismiss',outcome['id'],'--json')
+            assert not status()['outcomes'] and not status()['previousWriteOutcomeUnknown']
+            record('service-loss-double-and-unknown-dismiss')
+            # Force a final independent notice and prove removal's unchanged
+            # guard before Dismiss, then the actual public removal boundary.
+            mount_volume();command('umount',authority.volume,'--force','--json');until(lambda s:not s['volumes'])
+            command('stop','--json');settled=until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+            refused=app_command('--workspace-remove','keep',success=False)
+            assert refused.returncode!=0 and 'Previous write outcome unknown' in refused.stderr
+            for outcome in settled['outcomes']: app_command('--workspace-api','dismiss',outcome['id'])
+            assert not status()['previousWriteOutcomeUnknown']
+            app_command('--workspace-remove','keep')
+            record('service-loss-force-umount-dismiss-removal')
+            app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
+            mount_volume()
             payload=b'accepted-before-expiry'
             script="""import errno,json,os
 f=os.open('/workspaces/native-managed/loss-proof',os.O_CREAT|os.O_TRUNC|os.O_WRONLY,0o600)
@@ -448,6 +504,11 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             assert refused.returncode!=0 and 'Some changes were not saved' in refused.stderr
             prepare_update('Some changes were not saved')
             record('service-loss-retained-after-clean-stop')
+            for outcome in settled['outcomes']: command('status','--dismiss',outcome['id'],'--json')
+            settled=snapshot('known-loss-dismissed')
+            assert not settled['outcomes'] and not settled['someChangesWereNotSaved'] and not settled['previousWriteOutcomeUnknown']
+            prepare_update()
+            record('service-loss-dismiss-update')
             finished=True
             return
         old_boot=ssh('cat /proc/sys/kernel/random/boot_id')
@@ -506,6 +567,16 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
         assert refused.returncode!=0 and 'Previous write outcome unknown' in refused.stderr
         snapshot('cleanup')
         record('service-removal-unknown-refusal')
+        for outcome in settled['outcomes']: command('status','--dismiss',outcome['id'],'--json')
+        settled=snapshot('unknown-dismissed')
+        assert not settled['outcomes'] and not settled['previousWriteOutcomeUnknown']
+        # Recreate the real owner before update; a conservative stale presence
+        # marker must not recreate an acknowledged outcome.
+        subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
+        until(lambda s:s['state']=='stopped' and not s['outcomes'])
+        prepare_update()
+        record('service-crash-dismiss-update')
+        record('service-outcome-dismiss-durable')
         crashed=False
         finished=True
     finally:

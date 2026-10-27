@@ -61,7 +61,13 @@ if ! command -v node >/dev/null 2>&1; then
   fi
 fi
 
-step() { printf '\n== %s ==\n' "$1"; }
+step() {
+  while [[ -n "${PFS_TEST_HOLD_FILE:-}" && -e "$PFS_TEST_HOLD_FILE" ]]; do
+    echo 'HOLD: waiting between verification phases'
+    sleep 30
+  done
+  printf '\n== %s ==\n' "$1"
+}
 
 # 1. Cross-platform compile. Linux releases are static CGO-disabled binaries.
 # Darwin helpers call Foundation's app-group API through cgo; only a native

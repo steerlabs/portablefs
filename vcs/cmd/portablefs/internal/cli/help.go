@@ -63,7 +63,7 @@ func commandHelp(name string) (string, bool) {
 	texts := map[string]string{
 		"workspace": `USAGE
   portablefs workspace start
-  portablefs workspace status [--json]
+  portablefs workspace status [--dismiss <outcome-id>] [--json]
   portablefs workspace mount <connection-file> [--json]
   portablefs workspace umount <volume-id> [--force] [--json]
   portablefs workspace stop [--force] [--json]

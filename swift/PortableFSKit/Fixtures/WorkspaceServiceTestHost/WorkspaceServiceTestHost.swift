@@ -50,6 +50,9 @@ import SwiftUI
             case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "mount":
                 let status = try await client().perform(.mount, document: Data(contentsOf: URL(fileURLWithPath: args[2])))
                 print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
+            case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "dismiss":
+                let status = try await client().perform(.dismiss, outcomeID: args[2])
+                print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
             case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "umount":
                 let status = try await client().perform(.umount, volume: args[2])
                 print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)

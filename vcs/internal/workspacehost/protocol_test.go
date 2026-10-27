@@ -48,8 +48,8 @@ func publicRequest(t *testing.T) Document {
 	}
 	return d
 }
-func TestHostOperationalVersionAndOnlyFiveOperations(t *testing.T) {
-	for _, operation := range []string{"start", "status", "stop", "mount", "umount", "shell", "exec", "pause", "resume", "identity", "vm-list", "ssh-config"} {
+func TestHostOperationalVersionAndExactOperations(t *testing.T) {
+	for _, operation := range []string{"start", "status", "stop", "mount", "umount", "dismiss", "shell", "exec", "pause", "resume", "identity", "vm-list", "ssh-config"} {
 		t.Run(operation, func(t *testing.T) {
 			r := Request{Version: 1, Operation: operation}
 			if operation == "mount" {
@@ -62,8 +62,11 @@ func TestHostOperationalVersionAndOnlyFiveOperations(t *testing.T) {
 			if operation == "umount" {
 				r.VolumeID = "vol-1"
 			}
+			if operation == "dismiss" {
+				r.OutcomeID = "1/01010101010101010101010101010101/vol-1"
+			}
 			err := r.Validate()
-			valid := operation == "start" || operation == "status" || operation == "stop" || operation == "mount" || operation == "umount"
+			valid := operation == "start" || operation == "status" || operation == "stop" || operation == "mount" || operation == "umount" || operation == "dismiss"
 			if (err == nil) != valid {
 				t.Fatalf("validation %v", err)
 			}
@@ -172,5 +175,48 @@ func TestLifecycleVersionHasAnIndependentExactNamespace(t *testing.T) {
 		if _, err := DecodeLifecycle([]byte(raw)); err == nil {
 			t.Fatal("invalid lifecycle frame accepted")
 		}
+	}
+}
+
+func TestExactOutcomeIdentityAndDismissGrammar(t *testing.T) {
+	const id = "17/01010101010101010101010101010101/vol-1"
+	for _, tc := range []struct {
+		id    string
+		valid bool
+	}{
+		{id, true}, {"1/01010101010101010101010101010101/-", true},
+		{"", false}, {"all", false}, {"17", false}, {"0/01010101010101010101010101010101/vol-1", false},
+		{"017/01010101010101010101010101010101/vol-1", false}, {"17/00000000000000000000000000000000/vol-1", false},
+		{"17/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/vol-1", false}, {id + "/extra", false}, {"17/01010101010101010101010101010101/..", false},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			if ValidOutcomeID(tc.id) != tc.valid {
+				t.Fatal("identity validation differs")
+			}
+			raw, _ := json.Marshal(Request{Version: 1, Operation: "dismiss", OutcomeID: tc.id})
+			if _, err := DecodeRequest(raw); (err == nil) != tc.valid {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, request := range []Request{
+		{Version: 1, Operation: "status", OutcomeID: id},
+		{Version: 1, Operation: "stop", OutcomeID: id},
+		{Version: 1, Operation: "dismiss", OutcomeID: id, Force: true},
+		{Version: 1, Operation: "dismiss", OutcomeID: id, VolumeID: "vol-1"},
+	} {
+		if request.Validate() == nil {
+			t.Fatal("implicit or non-exact acknowledgement accepted", request)
+		}
+	}
+	reply := Reply{Version: 1, State: "stopped", Volumes: []Volume{}, Outcomes: []Outcome{{ID: id, PreviousWriteOutcomeUnknown: true}}}
+	raw, _ := json.Marshal(reply)
+	if _, err := DecodeReply(raw); err != nil {
+		t.Fatal(err)
+	}
+	reply.Outcomes = append(reply.Outcomes, reply.Outcomes[0])
+	raw, _ = json.Marshal(reply)
+	if _, err := DecodeReply(raw); err == nil {
+		t.Fatal("duplicate outcome identity accepted")
 	}
 }

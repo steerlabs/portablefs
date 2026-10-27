@@ -54,7 +54,7 @@ public final class WorkspacePrivateDirectory {
     }
     public func write(_ name: String, data: Data) throws {
         try validName(name); try validate()
-        _ = try read(name)
+        _ = try read(name, limit: 4 << 20)
         let temporary = "." + name + "." + UUID().uuidString
         let file = openat(fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
         guard file >= 0 else { throw WorkspaceVMError("create workspace state: \(errno)") }
