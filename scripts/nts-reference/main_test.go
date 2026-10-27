@@ -1,11 +1,10 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
-	"errors"
 	"io"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,46 +57,64 @@ func TestInvalidResponses(t *testing.T) {
 	}
 }
 
-func TestCollectionFailsClosed(t *testing.T) {
-	servers := []string{"time.cloudflare.com", "nts.netnod.se", "ptbtime1.ptb.de"}
-	for _, tc := range []struct {
-		name    string
-		servers []string
-		fail    map[string]bool
-		want    int
-	}{
-		{"three operators", servers, nil, 3},
-		{"one unavailable", servers, map[string]bool{servers[2]: true}, 2},
-		{"single response", servers, map[string]bool{servers[1]: true, servers[2]: true}, 0},
-		{"unauthenticated", servers, map[string]bool{servers[0]: true, servers[1]: true, servers[2]: true}, 0},
-		{"single operator", servers[:1], nil, 0},
-		{"duplicate operator", []string{servers[0], servers[0]}, nil, 0},
-		{"alias", []string{servers[0], "TIME.CLOUDFLARE.COM"}, nil, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var diagnostics bytes.Buffer
-			result, err := collect(tc.servers, time.Second, func(server string, _ time.Duration) (queriedResponse, error) {
-				if tc.fail[server] {
-					return queriedResponse{}, nts.ErrAuthFailedOnClient
-				}
-				return queriedResponse{validResponse(), 100, 200}, nil
-			}, &diagnostics)
-			if (err == nil) != (tc.want >= 2) || len(result.References) != tc.want {
-				t.Fatalf("references=%d, error=%v", len(result.References), err)
-			}
-			for _, ref := range result.References {
-				if ref.QueryBeganNS != 100 || ref.QueryEndedNS != 200 {
-					t.Fatal("NTP sample interval was not retained", ref)
-				}
-			}
-			if tc.fail != nil && !strings.Contains(diagnostics.String(), nts.ErrAuthFailedOnClient.Error()) {
-				t.Fatal("authentication failure was not diagnosed")
-			}
-		})
+func TestCollectionGroupsRetriesAndRetainsDisagreement(t *testing.T) {
+	servers := []string{"time.cloudflare.com", "nts.netnod.se", "sth1.nts.netnod.se", "ptbtime1.ptb.de", "ntppool1.time.nl", "a.st1.ntp.br"}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	result, err := collect(servers, time.Second, func(ctx context.Context, server, family string) ([]reference, []exchange) {
+		mu.Lock()
+		calls[server]++
+		mu.Unlock()
+		if server == "ptbtime1.ptb.de" || server == "nts.netnod.se" {
+			return nil, []exchange{{Server: server, Error: nts.ErrAuthFailedOnClient.Error()}}
+		}
+		response := validResponse()
+		if server == "ntppool1.time.nl" {
+			response.Timestamps.ServerXmit = response.Timestamps.ServerXmit.Add(5 * time.Second)
+		}
+		ref, e := authenticatedReference(server, response)
+		if e != nil {
+			t.Error(e)
+		}
+		ref.QueryBeganNS = 100
+		ref.QueryEndedNS = 200
+		return []reference{ref}, nil
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := collect(servers, time.Second, func(string, time.Duration) (queriedResponse, error) {
-		return queriedResponse{}, errors.New("TLS certificate verification failed")
-	}, io.Discard); err == nil {
-		t.Fatal("failed key exchange produced evidence")
+	if calls["nts.netnod.se"] != 2 || calls["sth1.nts.netnod.se"] != 2 || calls["ptbtime1.ptb.de"] != 4 {
+		t.Fatal(calls)
+	}
+	counts := map[string]int{}
+	for _, ref := range result.References {
+		counts[ref.Operator]++
+		if ref.QueryBeganNS != 100 {
+			t.Fatal(ref)
+		}
+	}
+	if len(counts) != 4 || counts["Netnod"] != 2 || counts["SIDN/TimeNL"] != 2 {
+		t.Fatal(counts)
+	}
+	if result.References == nil {
+		t.Fatal("authenticated disagreement was discarded")
+	}
+}
+
+func TestPolicyAndAggregateDeadline(t *testing.T) {
+	for _, servers := range [][]string{{"time.cloudflare.com"}, {"nts.netnod.se", "sth2.nts.netnod.se"}, {"time.cloudflare.com", "time.cloudflare.com"}, {"time.cloudflare.com", "pilot.time.nl"}, {"time.cloudflare.com", "TIME.CLOUDFLARE.COM"}} {
+		_, err := collect(servers, time.Second, nil, io.Discard)
+		if err == nil {
+			t.Fatal("accepted", servers)
+		}
+	}
+	began := time.Now()
+	result, err := collect([]string{"time.cloudflare.com", "nts.netnod.se"}, 20*time.Millisecond,
+		func(ctx context.Context, _, _ string) ([]reference, []exchange) { <-ctx.Done(); return nil, nil }, io.Discard)
+	if err != nil || len(result.References) != 0 || time.Since(began) > time.Second {
+		t.Fatal(result, err, time.Since(began))
+	}
+	if len(policy.Operators) != 5 {
+		t.Fatal("policy groups", len(policy.Operators))
 	}
 }
