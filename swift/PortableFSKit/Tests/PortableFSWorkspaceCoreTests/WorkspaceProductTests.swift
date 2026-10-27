@@ -810,3 +810,47 @@ private func quiesceRequest() throws -> WorkspaceHostLifecycleRequest {
     #expect(runtime.identityCalls == 64)
     #expect(owner.snapshot().outcomes.isEmpty)
 }
+
+@Test @MainActor func readyReopenNoticeClearsOnlyForItsExactIncarnationAndStaysCleared() async throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { _ in runtime }
+    _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
+    try store.commit { $0.volumes[0].operation = "ready"; $0.volumes[0].reopenRequired = true; $0.volumes[0].message = "" }
+    let json = try #require(JSONSerialization.jsonObject(with: WorkspaceHostControl.encode(owner.snapshot())) as? [String: Any])
+    let rows = try #require(json["volumes"] as? [[String: Any]])
+    let token = try #require(rows.first?["reopenId"] as? String)
+    #expect(owner.snapshot().volumes[0].requiresReopen)
+    func acknowledge(_ id: String) throws -> WorkspaceHostReply {
+        let raw = try JSONSerialization.data(withJSONObject: ["version": 1, "operation": "dismiss-reopen", "volumeId": "vol-1", "reopenId": id])
+        return owner.handle(try WorkspaceHostControl.decodeRequest(raw))
+    }
+    _ = try acknowledge(String(repeating: "09", count: 16))
+    #expect(store.value.volumes[0].reopenRequired)
+    try store.commit { $0.volumes[0].operation = "mount-pending" }
+    _ = try acknowledge(token)
+    #expect(store.value.volumes[0].reopenRequired)
+    try store.commit { $0.volumes[0].operation = "ready" }
+    #expect(try !acknowledge(token).volumes[0].requiresReopen)
+    _ = try acknowledge(token)
+    #expect(!store.value.volumes[0].reopenRequired)
+    let persisted = try JSONDecoder().decode(WorkspaceDesiredState.self, from: Data(contentsOf: store.directory.url.appendingPathComponent("desired.json")))
+    #expect(!persisted.volumes[0].reopenRequired)
+    let desired = store.value.volumes[0]
+    var nextIdentity = try #require(desired.request).guestIdentity()
+    nextIdentity.mount.incarnation = Data(repeating: 11, count: 16)
+    let nextRequest = try WorkspaceConnectionDocument(connection: desired.connection, intent: desired.intent, identity: nextIdentity)
+    try store.commit {
+        $0.volumes[0].request = nextRequest; $0.volumes[0].reopenRequired = true
+        $0.outcomeSequence = 1
+        var retained = WorkspaceRetainedOutcome(notice: .init(id: "1/01010101010101010101010101010101/-", lost: false, unknown: true), evidence: nil)
+        retained.awaitingGuest = false; $0.retained = [retained]
+    }
+    #expect(owner.snapshot().volumes[0].requiresReopen)
+    _ = try acknowledge(token)
+    #expect(owner.snapshot().volumes[0].requiresReopen)
+    _ = try acknowledge(String(repeating: "0b", count: 16))
+    #expect(!owner.snapshot().volumes[0].requiresReopen)
+    #expect(owner.snapshot().outcomes.count == 1)
+    #expect(owner.snapshot().previousWriteOutcomeUnknown)
+}

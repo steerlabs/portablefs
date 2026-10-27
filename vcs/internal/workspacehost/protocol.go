@@ -40,6 +40,7 @@ type Request struct {
 	VolumeID  string    `json:"volumeId,omitempty"`
 	Force     bool      `json:"force,omitempty"`
 	OutcomeID string    `json:"outcomeId,omitempty"`
+	ReopenID  string    `json:"reopenId,omitempty"`
 }
 type Volume struct {
 	VolumeID string `json:"volumeId"`
@@ -49,12 +50,18 @@ type Volume struct {
 	// Typed protocol-8 evidence; retained outcomes survive replacement and Stop.
 	Evidence             []byte `json:"evidence,omitempty"`
 	AuthorizationRequest string `json:"authorizationRequest,omitempty"`
+	ReopenID             string `json:"reopenId,omitempty"`
 }
 type Outcome struct {
 	ID                          string `json:"id"`
 	SomeChangesWereNotSaved     bool   `json:"someChangesWereNotSaved"`
 	PreviousWriteOutcomeUnknown bool   `json:"previousWriteOutcomeUnknown"`
 	Details                     string `json:"details"`
+}
+
+func validIncarnation(id string) bool {
+	raw, err := hex.DecodeString(id)
+	return err == nil && workspacecontrol.ID(raw) && hex.EncodeToString(raw) == id
 }
 
 func ValidOutcomeID(id string) bool {
@@ -96,10 +103,17 @@ func (r Request) Validate() error {
 	if r.Operation != "dismiss" && r.OutcomeID != "" {
 		return errors.New("unexpected workspace outcome ID")
 	}
+	if r.Operation != "dismiss-reopen" && r.ReopenID != "" {
+		return errors.New("unexpected workspace reopen ID")
+	}
 	switch r.Operation {
 	case "start", "status":
 		if r.Document != nil || r.VolumeID != "" || r.Force {
 			return errors.New("unexpected workspace request field")
+		}
+	case "dismiss-reopen":
+		if r.Document != nil || !mountlifecycle.ValidVolume(r.VolumeID) || r.Force || !validIncarnation(r.ReopenID) {
+			return errors.New("dismiss-reopen requires one exact ready mount incarnation")
 		}
 	case "dismiss":
 		if r.Document != nil || r.VolumeID != "" || r.Force || !ValidOutcomeID(r.OutcomeID) {
@@ -156,7 +170,7 @@ func DecodeReply(raw []byte) (Reply, error) {
 		}
 	}
 	for _, v := range r.Volumes {
-		if !mountlifecycle.ValidVolume(v.VolumeID) || v.Path != "/workspaces/"+v.VolumeID || len(v.Evidence) > workspacecontrol.MaxFrame {
+		if !mountlifecycle.ValidVolume(v.VolumeID) || v.Path != "/workspaces/"+v.VolumeID || len(v.Evidence) > workspacecontrol.MaxFrame || v.ReopenID != "" && (!validIncarnation(v.ReopenID) || v.State != "ready" || v.Message != "Reconnect your editor and reopen this folder.") {
 			return r, errors.New("invalid workspace volume")
 		}
 	}

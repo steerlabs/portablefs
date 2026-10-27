@@ -191,6 +191,12 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
         let decoded = try PortableFSWorkspaceStatus.decode(JSONEncoder().encode(value))
         #expect(decoded.canConnect); #expect(decoded.notices == ["Some changes were not saved", "Previous write outcome unknown"])
         #expect(decoded.volumes[0].requiresReopen); #expect(decoded.volumes[0].canOpen)
+        value.volumes[0].reopenId = String(repeating: "01", count: 16)
+        #expect(try PortableFSWorkspaceStatus.decode(JSONEncoder().encode(value)).volumes[0].reopenId == value.volumes[0].reopenId)
+        value.volumes[0].state = "pending"
+        #expect(throws: (any Error).self) { try PortableFSWorkspaceStatus.decode(JSONEncoder().encode(value)) }
+        value.volumes[0].state = "ready"
+
         value.state = "stopped"; #expect(!value.canConnect); #expect(value.notices == decoded.notices)
         value.volumes[0].path = "/tmp/unmounted"
         #expect(throws: (any Error).self) { try PortableFSWorkspaceStatus.decode(JSONEncoder().encode(value)) }

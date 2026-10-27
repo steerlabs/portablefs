@@ -20,8 +20,7 @@ public struct PortableFSWorkspaceOutcome: Codable, Equatable, Sendable, Identifi
     public static func validID(_ id: String) -> Bool {
         let fields = id.split(separator: "/", omittingEmptySubsequences: false)
         guard fields.count == 3, let sequence = UInt64(fields[0]), sequence > 0, String(sequence) == fields[0],
-              fields[1].count == 32, fields[1].contains(where: { $0 != "0" }),
-              fields[1].utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return false }
+              PortableFSWorkspaceStatus.validIncarnation(String(fields[1])) else { return false }
         return fields[2] == "-" || PortableFSWorkspaceStatus.validVolume(String(fields[2]))
     }
 }
@@ -51,15 +50,19 @@ public struct PortableFSWorkspaceStatus: Codable, Sendable {
               let outcomes = object["outcomes"] as? [[String: Any]],
               outcomes.allSatisfy({ Set($0.keys) == ["id", "someChangesWereNotSaved", "previousWriteOutcomeUnknown", "details"] && !$0.values.contains(where: { $0 is NSNull }) }),
               let rows = object["volumes"] as? [[String: Any]],
-              rows.allSatisfy({ Set($0.keys).isSubset(of: ["volumeId", "path", "state", "message", "evidence", "authorizationRequest"]) && !$0.values.contains(where: { $0 is NSNull }) }),
+              rows.allSatisfy({ Set($0.keys).isSubset(of: ["volumeId", "path", "state", "message", "evidence", "authorizationRequest", "reopenId"]) && !$0.values.contains(where: { $0 is NSNull }) }),
               !object.values.contains(where: { $0 is NSNull }) else { throw PortableFSWorkspaceError("Invalid workspace response") }
         let value = try JSONDecoder().decode(Self.self, from: data)
         guard value.version == 1, ["stopped", "starting", "running", "pending", "reconnecting", "cleanup-required", "refused", "busy"].contains(value.state),
               value.outcomes.count <= 128, Set(value.outcomes.map(\.id)).count == value.outcomes.count,
               value.outcomes.allSatisfy({ PortableFSWorkspaceOutcome.validID($0.id) && ($0.someChangesWereNotSaved || $0.previousWriteOutcomeUnknown) && $0.details.utf8.count <= 32768 }),
               value.volumes.count <= 64, Set(value.volumes.map(\.volumeId)).count == value.volumes.count,
-              value.volumes.allSatisfy({ $0.path == "/workspaces/" + $0.volumeId && validVolume($0.volumeId) && ["stopped", "authorization-required", "ready", "busy", "terminal", "pending"].contains($0.state) }) else { throw PortableFSWorkspaceError("Invalid workspace response") }
+              value.volumes.allSatisfy({ ($0.reopenId == nil || validIncarnation($0.reopenId ?? "") && $0.state == "ready" && $0.requiresReopen) && $0.path == "/workspaces/" + $0.volumeId && validVolume($0.volumeId) && ["stopped", "authorization-required", "ready", "busy", "terminal", "pending"].contains($0.state) }) else { throw PortableFSWorkspaceError("Invalid workspace response") }
         return value
+    }
+    public static func validIncarnation(_ value: String) -> Bool {
+        value.utf8.count == 32 && value.contains(where: { $0 != "0" }) &&
+        value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
     public static func validVolume(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 128 && value != "." && value != ".." && value.utf8.allSatisfy {
@@ -75,6 +78,7 @@ public struct PortableFSWorkspaceVolume: Codable, Sendable, Identifiable {
     public var message: String
     public var evidence: Data?
     public var authorizationRequest: String?
+    public var reopenId: String?
     public var id: String { volumeId }
     public var requiresAuthorization: Bool { state == "authorization-required" || state == "terminal" }
     public var requiresReopen: Bool { message == "Reconnect your editor and reopen this folder." }
@@ -87,11 +91,14 @@ public struct PortableFSWorkspaceVolume: Codable, Sendable, Identifiable {
 /// The menu uses the same authenticated operational-v1 endpoint as the CLI.
 /// Blocking connect/framing and signature checks stay off the presentation actor.
 public struct PortableFSWorkspaceClient: Sendable {
-    public enum Operation: String, Sendable { case start, status, mount, umount, stop, dismiss }
+    public enum Operation: String, Sendable {
+        case start, status, mount, umount, stop, dismiss
+        case dismissReopen = "dismiss-reopen"
+    }
     private let bundleURL: URL
     public let home: URL
     public init(bundle: Bundle = .main, home: URL) { bundleURL = bundle.bundleURL; self.home = home }
-    public func perform(_ operation: Operation, document: Data? = nil, volume: String? = nil, force: Bool = false, outcomeID: String? = nil) async throws -> PortableFSWorkspaceStatus {
+    public func perform(_ operation: Operation, document: Data? = nil, volume: String? = nil, force: Bool = false, outcomeID: String? = nil, reopenID: String? = nil) async throws -> PortableFSWorkspaceStatus {
         try await Task.detached {
             var request: [String: Any] = ["version": 1, "operation": operation.rawValue]
             if let document {
@@ -100,12 +107,16 @@ public struct PortableFSWorkspaceClient: Sendable {
                 request["document"] = try JSONSerialization.jsonObject(with: document)
             }
             if let volume {
-                guard operation == .umount, PortableFSWorkspaceStatus.validVolume(volume) else { throw PortableFSWorkspaceError("Invalid workspace volume") }
+                guard operation == .umount || operation == .dismissReopen, PortableFSWorkspaceStatus.validVolume(volume) else { throw PortableFSWorkspaceError("Invalid workspace volume") }
                 request["volumeId"] = volume
             }
             if let outcomeID {
                 guard operation == .dismiss, PortableFSWorkspaceOutcome.validID(outcomeID) else { throw PortableFSWorkspaceError("Invalid workspace outcome") }
                 request["outcomeId"] = outcomeID
+            }
+            if let reopenID {
+                guard operation == .dismissReopen, volume != nil, PortableFSWorkspaceStatus.validIncarnation(reopenID) else { throw PortableFSWorkspaceError("Invalid workspace reopen notice") }
+                request["reopenId"] = reopenID
             }
             if force { guard operation == .stop || operation == .umount else { throw PortableFSWorkspaceError("Invalid workspace action") }; request["force"] = true }
             let path = home.appendingPathComponent(".local/state/portablefs/workspace/control.sock").path

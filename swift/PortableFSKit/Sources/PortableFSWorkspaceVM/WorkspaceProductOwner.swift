@@ -44,13 +44,22 @@ import PortableFSAppCore
             // finish an already accepted Stop before final exclusion.
             let admission = ["start", "mount"].contains(request.operation) ? try acquireAdmission() : nil
             defer { withExtendedLifetime(admission) {} }
-            guard !quiescing || ["status", "dismiss"].contains(request.operation) else { throw WorkspaceVMError("workspace service is quiescing") }
+            guard !quiescing || ["status", "dismiss", "dismiss-reopen"].contains(request.operation) else { throw WorkspaceVMError("workspace service is quiescing") }
             switch request.operation {
             case "status": break
             case "dismiss":
                 guard let id = request.outcomeId else { throw WorkspaceControlError.grammar }
                 try store.dismiss(id)
                 if runtime == nil, store.value.execution == nil { try releaseAbsentReservations() }
+            case "dismiss-reopen":
+                // Editor launch can outlive recovery; only its ready incarnation owns this reminder.
+                if let index = store.value.volumes.firstIndex(where: { $0.connection.volumeId == request.volumeId }),
+                   snapshot().volumes.first(where: { $0.volumeId == request.volumeId })?.state == "ready",
+                   let mount = try store.value.volumes[index].request?.guestIdentity().mount,
+                   mount.incarnation.map({ String(format: "%02x", $0) }).joined() == request.reopenId,
+                   store.value.volumes[index].reopenRequired {
+                    try store.commit { $0.volumes[index].reopenRequired = false }
+                }
             case "start":
                 guard !stopRequested else { throw WorkspaceVMError("workspace stop is pending") }
                 try store.commit { $0.running = true }; try startIfNeeded()
@@ -394,7 +403,10 @@ import PortableFSAppCore
                 if current.state == "authorization-required" { volume.state = "authorization-required"; volume.message = WorkspaceHostControl.authorizationRequired }
             }
             if volume.state == "ready", desired.reopenRequired { volume.message = "Reconnect your editor and reopen this folder." }
-            if runtime == nil, store.value.execution == nil { volume.state="stopped";volume.message="Linux Workspace: Stopped" }
+            if volume.state == "ready", volume.requiresReopen, let mount = try? desired.request?.guestIdentity().mount {
+                volume.reopenId = mount.incarnation.map { String(format: "%02x", $0) }.joined()
+            }
+            if runtime == nil, store.value.execution == nil { volume.state="stopped";volume.message="Linux Workspace: Stopped";volume.reopenId=nil }
             if desired.request != nil { volume.authorizationRequest = store.directory.url.appendingPathComponent("authorization-" + desired.connection.volumeId + ".pfsworkspace").path }
             if let latest {
                 var page = latest; page.mounts = page.mounts.filter { $0.mount.volumeID == volume.volumeId }; page.jobs = page.jobs.filter { $0.mount.volumeID == volume.volumeId }

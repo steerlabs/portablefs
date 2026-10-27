@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func publicRequest(t *testing.T) Document {
 	return d
 }
 func TestHostOperationalVersionAndExactOperations(t *testing.T) {
-	for _, operation := range []string{"start", "status", "stop", "mount", "umount", "dismiss", "shell", "exec", "pause", "resume", "identity", "vm-list", "ssh-config"} {
+	for _, operation := range []string{"start", "status", "stop", "mount", "umount", "dismiss", "dismiss-reopen", "shell", "exec", "pause", "resume", "identity", "vm-list", "ssh-config"} {
 		t.Run(operation, func(t *testing.T) {
 			r := Request{Version: 1, Operation: operation}
 			if operation == "mount" {
@@ -59,14 +60,17 @@ func TestHostOperationalVersionAndExactOperations(t *testing.T) {
 				d.Identity = nil
 				r.Document = &d
 			}
-			if operation == "umount" {
+			if operation == "umount" || operation == "dismiss-reopen" {
 				r.VolumeID = "vol-1"
+			}
+			if operation == "dismiss-reopen" {
+				r.ReopenID = strings.Repeat("01", 16)
 			}
 			if operation == "dismiss" {
 				r.OutcomeID = "1/01010101010101010101010101010101/vol-1"
 			}
 			err := r.Validate()
-			valid := operation == "start" || operation == "status" || operation == "stop" || operation == "mount" || operation == "umount" || operation == "dismiss"
+			valid := operation == "start" || operation == "status" || operation == "stop" || operation == "mount" || operation == "umount" || operation == "dismiss" || operation == "dismiss-reopen"
 			if (err == nil) != valid {
 				t.Fatalf("validation %v", err)
 			}
@@ -218,5 +222,43 @@ func TestExactOutcomeIdentityAndDismissGrammar(t *testing.T) {
 	raw, _ = json.Marshal(reply)
 	if _, err := DecodeReply(raw); err == nil {
 		t.Fatal("duplicate outcome identity accepted")
+	}
+}
+
+func TestReopenDismissalNamesOneIncarnationWithoutChangingPublicVerbs(t *testing.T) {
+	id := strings.Repeat("01", 16)
+	cases := []struct {
+		name    string
+		request Request
+		valid   bool
+	}{
+		{"exact", Request{Version: 1, Operation: "dismiss-reopen", VolumeID: "vol-1", ReopenID: id}, true},
+		{"missing-id", Request{Version: 1, Operation: "dismiss-reopen", VolumeID: "vol-1"}, false},
+		{"missing-volume", Request{Version: 1, Operation: "dismiss-reopen", ReopenID: id}, false},
+		{"zero-id", Request{Version: 1, Operation: "dismiss-reopen", VolumeID: "vol-1", ReopenID: strings.Repeat("0", 32)}, false},
+		{"status-is-read-only", Request{Version: 1, Operation: "status", ReopenID: id}, false},
+		{"outcome-is-separate", Request{Version: 1, Operation: "dismiss", OutcomeID: "1/" + id + "/vol-1", ReopenID: id}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = DecodeRequest(raw)
+			if (err == nil) != tc.valid {
+				t.Fatalf("validation: %v", err)
+			}
+		})
+	}
+	reply := Reply{Version: 1, State: "running", Volumes: []Volume{{VolumeID: "vol-1", Path: "/workspaces/vol-1", State: "ready", Message: "Reconnect your editor and reopen this folder.", ReopenID: id}}}
+	raw, _ := json.Marshal(reply)
+	if _, err := DecodeReply(raw); err != nil {
+		t.Fatal(err)
+	}
+	reply.Volumes[0].State = "pending"
+	raw, _ = json.Marshal(reply)
+	if _, err := DecodeReply(raw); err == nil {
+		t.Fatal("pending mount exposed a ready-only dismissal")
 	}
 }

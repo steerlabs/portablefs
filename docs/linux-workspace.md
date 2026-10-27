@@ -136,6 +136,12 @@ decision. A complete empty guest retirement stream with no matching active key
 confirms cleanup and removes this intent, including after a lost ACK reply.
 Unacknowledged notices remain visible regardless of guest ACK.
 
+The separate reconnect-editor reminder clears after a successful menu editor-open
+action or its Dismiss button, once the volume is ready. The paired host operation
+`dismiss-reopen` carries `volumeId` and the ready row's `reopenId` mount incarnation;
+a stale or pending-volume action cannot clear a later reminder. This commits only
+`reopenRequired`, never a retained loss/unknown notice, and adds no CLI verb.
+
 Dismiss atomically commits removal of that exact retained notice through file
 sync, rename and directory sync. Only afterward may confirmed VM absence and
 reservation release remove the resource witness. A crash before the commit

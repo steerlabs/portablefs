@@ -53,6 +53,9 @@ public struct PortableFSWorkspaceMenu: View {
                             Button("Open in \(editor.name)") { model.editor(editor, volume: volume) }
                         }
                     }
+                    if volume.reopenId != nil {
+                        Button("Dismiss") { model.dismissReopen(volume) }.disabled(model.working)
+                    }
                     Button("Remove from Linux") { model.remove(volume) }.disabled(model.working)
                     if volume.state == "busy" || volume.state == "terminal" {
                         Button("Force Remove…") { model.remove(volume, force: true) }.disabled(model.working)
