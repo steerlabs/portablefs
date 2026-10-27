@@ -101,12 +101,37 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
     lsregister='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
     subprocess.run([lsregister,'-f',str(app)],check=True)
     host = contents/'MacOS/PortableFS' 
+    update_receipts=[]
+    def prepare_update(refusal=None):
+        guard=subprocess.Popen([str(cli),'lifecycle','hold-install-exclusive','--json'],env=env,
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        try:
+            assert select.select([guard.stdout],[],[],15)[0], 'installer admission readiness deadline'
+            frame=guard.stdout.readline()
+            if refusal is None:
+                ready=json.loads(frame)
+                assert ready['held'] and ready['purpose']=='service-update',ready
+                assert all(ready[key]==0 for key in ['kernelMounts','mountRecords','mountIntents','durableAttaches','liveAttaches']),ready
+            else:
+                assert not frame and guard.wait(timeout=15)==1,frame
+                assert 'workspace resources remain' in guard.stderr.read()
+                ready=None
+            result=subprocess.run([str(host),'--workspace-update-quiesce'],env=env,capture_output=True,text=True,timeout=210)
+            if refusal is None: assert result.returncode==0,(result.stdout,result.stderr)
+            else: assert result.returncode!=0 and refusal in result.stderr,result.stderr
+            update_receipts.append({'guard':ready,'refusal':refusal,'exit':result.returncode,'stderr':result.stderr})
+            (evidence/'update-boundaries.json').write_text(json.dumps(update_receipts,indent=2))
+        finally:
+            guard.stdin.close()
+            try: guard.wait(timeout=15)
+            except subprocess.TimeoutExpired: guard.terminate();guard.wait(timeout=15)
+            guard.stdout.close();guard.stderr.close()
     # The incoming installer can leave a lock-only directory without registering
     # any service. The actual shared API must handle that pristine boundary.
     pristine = home/'.local/state/portablefs/workspace'
     pristine.mkdir(parents=True, mode=0o700)
     (pristine/'owner.lock').touch(mode=0o600)
-    subprocess.run([str(host),'--workspace-update-quiesce'],env=env,check=True,capture_output=True,text=True)
+    prepare_update()
     registered = subprocess.run([str(host),'--workspace-service-register'],env=env,capture_output=True,text=True)
     if registered.returncode:
         (evidence/'product-registration.txt').write_text(registered.stdout+registered.stderr)
@@ -284,7 +309,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         record('service-ssh-identity-persistence')
         command('stop','--json');until(lambda s:s['state']=='stopped')
         snapshot('before-removal')
-        app_command('--workspace-update-quiesce');app_command('--workspace-update-quiesce')
+        prepare_update();prepare_update()
         assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
         assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
         assert not managed.exists() and not (home/'.ssh/config').exists()
@@ -340,7 +365,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         settled=snapshot('stopped-after-volume')
         assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
         record('service-used-clean-stop-outcome')
-        app_command('--workspace-update-quiesce');app_command('--workspace-update-quiesce')
+        prepare_update();prepare_update()
         assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
         app_command('--workspace-service-register')
         command('start');until(lambda s:s['state']=='running')
@@ -399,7 +424,9 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             (evidence/'known-loss-retained.json').write_text(json.dumps({'status':settled,'losses':losses,'old_descriptor':result},indent=2))
             refused=app_command('--workspace-remove','delete',success=False)
             assert refused.returncode!=0 and 'Some changes were not saved' in refused.stderr
+            prepare_update('Some changes were not saved')
             record('service-loss-retained-after-clean-stop')
+            finished=True
             return
         old_boot=ssh('cat /proc/sys/kernel/random/boot_id')
         if authority is not None:
@@ -441,6 +468,7 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             assert settled['previousWriteOutcomeUnknown'],settled
             (evidence/'crash-reconciled-unknown.json').write_text(json.dumps(settled,indent=2))
             record('service-crash-reconcile-unknown-retained')
+        prepare_update('Previous write outcome unknown')
         refused=app_command('--workspace-remove','delete',success=False)
         assert refused.returncode!=0 and 'Previous write outcome unknown' in refused.stderr
         snapshot('cleanup')
