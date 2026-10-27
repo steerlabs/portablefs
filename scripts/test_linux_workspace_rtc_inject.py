@@ -60,6 +60,23 @@ class ProofSelection(unittest.TestCase):
     def exit(self, result):
         self.info = struct.pack('<B3xIQQqB', 2, 0xc00000b7, 0, 0, result, int(result < 0))
 
+    def test_arm64_skip_initializes_its_preserved_return_register(self):
+        calls=[]
+        def call(request,tid,addr=0,data=0):
+            self.assertEqual(request,module.SET_REGSET)
+            vector=ctypes.cast(data,ctypes.POINTER(module.IOVec))[0]
+            if addr==module.NT_ARM_SYSTEM_CALL:
+                value=ctypes.cast(vector.base,ctypes.POINTER(ctypes.c_int))[0]
+                self.assertEqual(value,-1)
+            else:
+                self.assertEqual(addr,module.NT_PRSTATUS)
+                self.assertEqual(ctypes.c_int64(self.registers[0]).value,-errno.ENOSYS)
+            calls.append(addr)
+            return 0
+        self.trace.call=call
+        module.Trace.skip(self.trace,17)
+        self.assertEqual(calls,[module.NT_ARM_SYSTEM_CALL,module.NT_PRSTATUS])
+
     def test_only_selected_ioctl_can_be_skipped(self):
         for number, fd, request in [(0,8,module.RTC_RD_TIME),(module.SYS_IOCTL,9,module.RTC_RD_TIME),
                                     (module.SYS_IOCTL,8,0)]:

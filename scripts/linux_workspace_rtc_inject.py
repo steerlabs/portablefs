@@ -122,6 +122,11 @@ class Trace:
         number = ctypes.c_int(-1)
         vector = IOVec(ctypes.addressof(number), ctypes.sizeof(number))
         self.call(SET_REGSET, tid, NT_ARM_SYSTEM_CALL, ctypes.byref(vector))
+        # arm64 preserves x0 when a tracer selects NO_SYSCALL. Initialize the
+        # skipped-return sentinel explicitly; the exit stop must retain it.
+        registers, vector = self.registers(tid)
+        registers[0] = (-errno.ENOSYS) & ((1 << 64) - 1)
+        self.call(SET_REGSET, tid, NT_PRSTATUS, ctypes.byref(vector))
 
     def sample(self, tid, address):
         data = bytearray()
