@@ -85,6 +85,7 @@ type workspaceLifecycle struct {
 	kernelColdReady atomic.Bool
 	coldOutcome     *pb.MountOutcome
 	closeCleanupErr error // protected by Mount.mu; terminal/barrier verdicts stay separate
+	closeHealthy    bool  // joined close began live and completed before local transport shutdown
 }
 
 // FinalizeWorkspace preserves the run's terminal/loss evidence independently
@@ -96,14 +97,14 @@ func (m *Mount) FinalizeWorkspace() (WorkspaceObservation, error) {
 		return WorkspaceObservation{}, errors.New("fusev3: managed finalization has no outcome owner")
 	}
 	m.mu.Lock()
-	closeErr := m.closeLocked()
+	_ = m.closeLocked()
 	cleanupErr := w.closeCleanupErr
 	o := m.WorkspaceObservation()
 	// Serving deliberately persists an unknown interval before accepting work.
 	// Only the joined final barrier and authenticated detach can resolve it;
 	// kernel/process absence, or cleanup of a failed session, cannot do so.
 	evidence := w.evidence.Load()
-	if closeErr == nil && len(o.Loss) == 0 && (evidence == nil || evidence.failure == nil && !evidence.abandoned) {
+	if w.closeHealthy && len(o.Loss) == 0 && (evidence == nil || evidence.failure == nil && !evidence.abandoned) {
 		o.Outcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released"}
 		w.observation.Store(&o)
 	}

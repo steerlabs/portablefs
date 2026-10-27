@@ -42,6 +42,26 @@ func (r finalizationRPC) Close() error {
 }
 
 func TestWorkspaceFinalizationRetainsTerminalOutcomeAndRefusesCleanupDebt(t *testing.T) {
+	for _, ended := range []bool{false, true} {
+		name := "cancelled-before-close"
+		if ended {
+			name = "session-ended-before-close"
+		}
+		t.Run(name, func(t *testing.T) {
+			m, _ := testMount(t, 8)
+			bindWorkspaceTestGate(t, m)
+			m.workspaceLifecycle = &workspaceLifecycle{persist: func(WorkspaceObservation) error { return nil }}
+			if ended {
+				m.rpc.(*epochRPC).rpc = finalizationRPC{RPC: m.rpc.(*epochRPC).rpc, cause: errors.New("old session ended")}
+			} else {
+				m.cancel()
+			}
+			o, err := m.FinalizeWorkspace()
+			if err != nil || o.Outcome.Observation != "unobserved" || o.Outcome.Durability != "unresolved" || o.Outcome.Release != "unresolved" {
+				t.Fatal("local cleanup certified an already-ended interval", o.Outcome, err)
+			}
+		})
+	}
 	for _, tc := range []struct {
 		name                                                        string
 		refusal, ended, badProof, closeFailed, wantError, abandoned bool
