@@ -185,6 +185,32 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         ssh('printf service-persistence > /home/workspace/service-product-proof')
         record('service-app-exit-vm-alive')
         before=(home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()
+        # Successful removal requires no unknown/lost outcome. Exercise it
+        # before the volume workload, whose final guest evidence may be unknown.
+        if authority is not None:
+            authority.peer("import pathlib; (pathlib.Path('/var/tmp/pfs-native/home/peer')/'removal-peer-sentinel').write_text('remote-data')")
+        command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+        record('service-stop-persists')
+        # Registration and status cannot defeat the explicit stopped intent.
+        subprocess.run([str(host),'--workspace-service-register'],env=env,check=True)
+        assert status()['state']=='stopped'
+        command('start');until(lambda s:s['state']=='running')
+        assert ssh('cat /home/workspace/service-product-proof')=='service-persistence'
+        assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
+        record('service-ssh-identity-persistence')
+        command('stop','--json');until(lambda s:s['state']=='stopped')
+        snapshot('before-removal')
+        app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
+        assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
+        assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
+        assert not managed.exists() and not (home/'.ssh/config').exists()
+        record('service-removal-keep-data')
+        app_command('--workspace-remove','delete');app_command('--workspace-remove','delete')
+        assert not (home/'.local/state/portablefs/workspace').exists()
+        if authority is not None:
+            assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'removal-peer-sentinel').read_text())")=='remote-data'
+        record('service-removal-delete-data')
+        app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
         if authority is not None:
             descriptor=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
                 '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-connection','/var/tmp/pfs-native/home/test-pki',authority.endpoint,authority.volume],text=True)
@@ -228,32 +254,20 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
                 holder.stdin.write('release\n');holder.stdin.flush();holder.wait(timeout=15)
                 holder.stdin.close();holder.stdout.close();holder.stderr.close()
             app_command('--workspace-api','umount',authority.volume);until(lambda s:not s['volumes'])
+            snapshot('volume-removed')
             denied=subprocess.run(['ssh','-F',str(config),'portablefs-workspace',
                 'printf forbidden > /workspaces/native-managed/unmounted-proof'],env=env,capture_output=True,text=True,timeout=30)
             assert denied.returncode!=0 and ('Permission denied' in denied.stderr or 'does not exist' in denied.stderr),denied
             assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'unmounted-proof').exists())")=='False'
             record('service-unmounted-path-denial')
         command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
-        record('service-stop-persists')
-        # Registration and status cannot defeat the explicit stopped intent.
-        subprocess.run([str(host),'--workspace-service-register'],env=env,check=True)
-        assert status()['state']=='stopped'
+        settled=snapshot('stopped-after-volume')
+        if settled['previousWriteOutcomeUnknown'] or settled['someChangesWereNotSaved']:
+            refused=app_command('--workspace-remove','delete',success=False)
+            assert refused.returncode!=0 and (home/'.local/state/portablefs/workspace/data.ext4').exists()
+            assert 'Previous write outcome unknown' in refused.stderr or 'Some changes were not saved' in refused.stderr
+            (evidence/'unmount-removal-refusal.txt').write_text(refused.stderr)
         command('start');until(lambda s:s['state']=='running')
-        assert ssh('cat /home/workspace/service-product-proof')=='service-persistence'
-        assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
-        record('service-ssh-identity-persistence')
-        command('stop','--json');until(lambda s:s['state']=='stopped')
-        app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
-        assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
-        assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
-        assert not managed.exists() and not (home/'.ssh/config').exists()
-        record('service-removal-keep-data')
-        app_command('--workspace-remove','delete');app_command('--workspace-remove','delete')
-        assert not (home/'.local/state/portablefs/workspace').exists()
-        if authority is not None:
-            assert authority.peer("import pathlib; print((pathlib.Path('/var/tmp/pfs-native/home/peer')/'product-proof').read_text())")=='product-volume'
-        record('service-removal-delete-data')
-        app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
         subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
         crashed=True
         until(lambda s:s['state']=='cleanup-required')
