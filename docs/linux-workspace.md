@@ -128,7 +128,13 @@ boot incarnation and `-` for workspace scope. The paired host API operation is
 `dismiss` with one `outcomeId`. There is no bulk or implicit acknowledgement.
 An absent valid ID is an idempotent no-op, including a retry after a lost reply;
 a malformed ID refuses. An ID never selects another sequence, incarnation or
-volume. No acknowledgement tombstone history grows with use.
+volume. No acknowledgement history grows with use. If the guest has not yet confirmed
+its retirement ACK, a dismissed record remains as bounded cleanup intent. It is
+hidden from notices and does not block removal/update after execution absence.
+Cold replay of that exact mount incarnation preserves its notice ID and Dismiss
+decision. A complete empty guest retirement stream with no matching active key
+confirms cleanup and removes this intent, including after a lost ACK reply.
+Unacknowledged notices remain visible regardless of guest ACK.
 
 Dismiss atomically commits removal of that exact retained notice through file
 sync, rename and directory sync. Only afterward may confirmed VM absence and
@@ -140,8 +146,10 @@ assert that lost writes became durable or release live resources.
 The host reserves the same 128 slots across retained notices, admitted volume
 keys and one execution slot for a crash without guest status. Each active key
 can transfer its reserved slot into a final notice without observer overflow.
-Full capacity refuses new volume/replacement or cold-start admission with a
-Dismiss hint. Cleanup, status and exact Dismiss remain available. Guest retirement
+Full capacity refuses new volume/replacement admission with a Dismiss hint.
+A cold boot reserves only its execution slot, then reconciles pending guest ACKs
+before admitting fresh desired volume identities; pending cleanup cannot deadlock
+that reconciliation. Cleanup, status and exact Dismiss remain available. Guest retirement
 ACK releases guest evidence independently of the user's later Dismiss; loss or
 unknown evidence is already durable at the host before that ACK.
 

@@ -162,3 +162,4 @@ service-loss-force-umount-dismiss-removal
 service-loss-dismiss-update
 service-crash-dismiss-update
 service-outcome-dismiss-durable
+service-loss-dismiss-before-guest-ack-crash

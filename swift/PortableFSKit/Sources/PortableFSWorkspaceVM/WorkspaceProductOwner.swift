@@ -173,7 +173,7 @@ import PortableFSAppCore
                 // Termination proves resource absence, never the outcome of
                 // work whose final drain was not observed. Keep that fact
                 // across future boots, even if no status frame arrived.
-                if runtimeStarted && !cleanStopConfirmed { try store.retainUnobservedExecution() }
+                if runtimeStarted && !cleanStopConfirmed && store.value.execution != nil { try store.retainUnobservedExecution() }
                 try store.commit { state in
                     if let raw = state.current {
                         let frame = try WorkspaceControl.decode(raw)
@@ -230,6 +230,12 @@ import PortableFSAppCore
                 switch volume.operation {
                 case "identity":
                     guard runtime.phase == .running else { continue }
+                    do { try store.requireOutcomeCapacity(replacing: name) }
+                    catch {
+                        let message = String(describing: error)
+                        if volume.message != message { try changeVolume(volume) { $0.message = message } }
+                        continue
+                    }
                     var request = WorkspaceIdentityRequest(); request.volumeID = name
                     request.authorityID = Data(stride(from: 0, to: volume.connection.authority.count, by: 2).compactMap { offset in UInt8(volume.connection.authority.dropFirst(offset).prefix(2), radix: 16) })
                     inFlight.insert(name)
@@ -288,6 +294,7 @@ import PortableFSAppCore
                 }
                 state.retirementThrough = retired.retirementSequence
             }
+            WorkspaceHostState.confirmGuestRetirements(status, state: &state)
         }
         latest = status
         let jobs = status.jobs + status.retired.filter(\.hasJob).map(\.job)
@@ -357,8 +364,8 @@ import PortableFSAppCore
         return reply
     }
     public func snapshot() -> WorkspaceHostReply {
-        var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.value.retained.compactMap(\.evidence)
-        result.outcomes=store.value.retained.map(\.notice)
+        var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.retainedOutcomes.compactMap(\.evidence)
+        result.outcomes=store.retainedOutcomes.map(\.notice)
         result.previousWriteOutcomeUnknown = store.previousWriteOutcomeUnknown || runtime == nil && store.value.execution != nil
         if !failure.isEmpty { result.state = "cleanup-required"; result.message = failure }
         else if runtime == nil, store.value.execution != nil { result.state="cleanup-required";result.message="Cleanup required" }
@@ -373,7 +380,8 @@ import PortableFSAppCore
         result.previousWriteOutcomeUnknown = result.previousWriteOutcomeUnknown || result.outcomes.contains { $0.previousWriteOutcomeUnknown }
         for desired in store.value.volumes {
             let state: String
-            if desired.message == WorkspaceHostControl.busy { state = "busy" }
+            if desired.message == WorkspaceHostControl.outcomeCapacity { state = "pending" }
+            else if desired.message == WorkspaceHostControl.busy { state = "busy" }
             else if desired.operation == "authorization-required" || desired.operation == "identity" { state = "authorization-required" }
             else if desired.operation == "ready" { state = "ready" }
             else if desired.operation == "terminal" { state = "terminal" }

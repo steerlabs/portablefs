@@ -417,6 +417,36 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         command('start');until(lambda s:s['state']=='running')
         if authority is not None: mount_volume()
         if outcome_case=='loss':
+            hold=home/'.local/state/portablefs/workspace/test-retire-ack.hold'
+            hold.touch(mode=0o600)
+            old_kernel=ssh('cat /proc/sys/kernel/random/boot_id')
+            old_execution=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())['execution']['boot']
+            command('umount',authority.volume,'--force','--json')
+            pending=until(lambda s:not s['volumes'] and len(s['outcomes'])==1)
+            dismissed=pending['outcomes'][0]['id']
+            command('status','--dismiss',dismissed,'--json')
+            committed=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())
+            exact=[r for r in committed['retained'] if r['notice']['id']==dismissed]
+            assert len(exact)==1 and exact[0]['dismissed'] and exact[0]['awaitingGuest'],committed
+            # The test-only gate prevented every retirement ACK dispatch.
+            # Kill only this fixture's owner while its guest still owns evidence.
+            subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
+            hold.unlink()
+            def recovered(s):
+                if s['state']=='cleanup-required': command('start',success=False)
+                execution=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text()).get('execution')
+                return s['state']=='running' and execution and execution['boot']!=old_execution
+            until(recovered)
+            assert ssh('cat /proc/sys/kernel/random/boot_id')!=old_kernel
+            def replay_settled(s):
+                saved=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())
+                return saved['retirementThrough']>0 and not any(r['notice']['id']==dismissed for r in saved['retained'])
+            after=until(replay_settled)
+            assert all(o['id']!=dismissed for o in after['outcomes']),after
+            (evidence/'dismiss-before-guest-ack-crash.json').write_text(json.dumps({'before_crash':committed,'after_replay':after,'dismissed':dismissed},indent=2))
+            for outcome in after['outcomes']: command('status','--dismiss',outcome['id'],'--json')
+            record('service-loss-dismiss-before-guest-ack-crash')
+            mount_volume()
             for cycle in range(127):
                 if cycle: mount_volume()
                 command('umount',authority.volume,'--force','--json')
@@ -593,10 +623,14 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             except Exception as error:
                 (evidence/'cleanup-unconfirmed.txt').write_text(str(error)+'\n')
         subprocess.run([str(host),'--unregister-workspace-test'],env=env,check=True,capture_output=True,text=True)
-        probe=subprocess.run(['launchctl','print',f'gui/{os.getuid()}/{label}'],capture_output=True,text=True)
-        assert probe.returncode==113,('throwaway registration still present',probe.stdout,probe.stderr)
+        deadline=time.monotonic()+15
         reference=home/'.local/state/portablefs/workspace/owner.lock'
-        if confirmed_absent and reference.exists(): assert not execution_reference_busy(reference)
+        while True:
+            probe=subprocess.run(['launchctl','print',f'gui/{os.getuid()}/{label}'],capture_output=True,text=True)
+            held=confirmed_absent and reference.exists() and execution_reference_busy(reference)
+            if probe.returncode==113 and not held: break
+            assert time.monotonic()<deadline,('throwaway cleanup still pending',probe.stdout,probe.stderr,held)
+            time.sleep(.1)
         (evidence/'cleanup-confirmation.json').write_text(json.dumps({'identifier':identifier,'launchctl_exit':probe.returncode,'execution_absent':confirmed_absent,'finished':finished},indent=2))
         subprocess.run([lsregister,'-u',str(app)],check=True)
         if confirmed_absent and finished: shutil.rmtree(root)

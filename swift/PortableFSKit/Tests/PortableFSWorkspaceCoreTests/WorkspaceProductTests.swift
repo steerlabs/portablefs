@@ -487,7 +487,10 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     let runtime = try ProductRuntime()
     let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host-boot") { _ in runtime }
     _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
-    _ = owner.handle(try productRequest("stop", force: true)); try await productTurn(); try await productTurn()
+    _ = owner.handle(try productRequest("stop", force: true))
+    // Retry the stopped-owner continuation after its durable outcome cut.
+    try store.retainUnobservedExecution()
+    try await productTurn(); try await productTurn()
     #expect(store.value.execution == nil)
     #expect(owner.snapshot().previousWriteOutcomeUnknown)
     #expect(try store.directory.read("resources.present") == Data("8\n".utf8))
@@ -612,9 +615,11 @@ private func quiesceRequest() throws -> WorkspaceHostLifecycleRequest {
     let id = try #require(owner.snapshot().outcomes.first?.id)
     #expect(owner.snapshot().previousWriteOutcomeUnknown)
     #expect(try owner.lifecycle(quiesceRequest()).state == "busy")
-    let foreign = "999/09090909090909090909090909090909/other"
-    #expect(owner.handle(try dismissRequest(foreign)).state != "refused")
-    #expect(owner.snapshot().outcomes.map(\.id) == [id])
+    let fields = id.split(separator: "/").map(String.init)
+    for foreign in ["999/" + fields[1] + "/" + fields[2], fields[0] + "/09090909090909090909090909090909/" + fields[2], fields[0] + "/" + fields[1] + "/other"] {
+        #expect(owner.handle(try dismissRequest(foreign)).state != "refused")
+        #expect(owner.snapshot().outcomes.map(\.id) == [id])
+    }
     _ = owner.handle(try dismissRequest(id)); _ = owner.handle(try dismissRequest(id))
     #expect(!owner.snapshot().previousWriteOutcomeUnknown)
     #expect(try owner.lifecycle(quiesceRequest()).state == "quiesced")
@@ -641,12 +646,16 @@ private func quiesceRequest() throws -> WorkspaceHostLifecycleRequest {
             // single atomic decision rather than interpreting that witness.
         }
         let reopened = try WorkspaceHostState(directory: directory)
-        #expect(reopened.value.retained.contains { $0.notice.id == dismissed } == (cut == "before"))
-        #expect(reopened.value.retained.contains { $0.notice.id == other })
+        #expect(reopened.retainedOutcomes.contains { $0.notice.id == dismissed } == (cut == "before"))
+        #expect(reopened.retainedOutcomes.contains { $0.notice.id == other })
         try reopened.dismiss(dismissed); try reopened.dismiss(dismissed)
-        #expect(reopened.value.retained.map { $0.notice.id } == [other])
+        #expect(reopened.retainedOutcomes.map { $0.notice.id } == [other])
         #expect(throws: (any Error).self) { try reopened.publishEmptyResources() }
         try reopened.dismiss(other); try reopened.publishEmptyResources()
+        #expect(reopened.retainedOutcomes.isEmpty)
+        var completed = try WorkspaceControl.decode(workspaceGolden("status_reply")).statusReply
+        completed.mounts = []; completed.jobs = []; completed.retired = []
+        try reopened.commit { state in WorkspaceHostState.confirmGuestRetirements(completed, state: &state) }
         #expect(reopened.value.retained.isEmpty)
         #expect(try reopened.directory.read("resources.present") == nil)
     }
@@ -699,6 +708,7 @@ private func quiesceRequest() throws -> WorkspaceHostLifecycleRequest {
     frame.statusReply.bootID = runtime.bootID; frame.statusReply.mounts = []; frame.statusReply.jobs = []; frame.statusReply.retired = [retired]
     try runtime.onStatus?(frame.statusReply)
     #expect(store.value.retained.count == 127)
+    frame.statusReply.retired = []; try runtime.onStatus?(frame.statusReply)
     let id = try #require(owner.snapshot().outcomes.first?.id)
     _ = owner.handle(try dismissRequest(id))
     #expect(owner.handle(try productMount(another)).state != "refused")
@@ -721,4 +731,82 @@ private func quiesceRequest() throws -> WorkspaceHostLifecycleRequest {
     #expect(raw.count <= WorkspaceHostControl.maxFrame)
     #expect(try PortableFSWorkspaceStatus.decode(raw).outcomes.count == 128)
     #expect(try #require(try store.directory.read("desired.json", limit: 4 << 20)).count <= 4 << 20)
+}
+
+@Test @MainActor func productRetirementReplayedAfterCrashKeepsExactDismissDecision() async throws {
+    for dismissed in [false, true] {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+        let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host") { _ in runtime }
+        _ = owner.handle(try productRequest("start"))
+        var status = try WorkspaceControl.decode(workspaceGolden("retired_mount_with_job")).statusReply
+        status.bootID = runtime.bootID; status.mounts = []; status.jobs = []; status.retired = [try #require(status.retired.first)]
+        try runtime.onStatus?(status)
+        let old = try #require(owner.snapshot().outcomes.first?.id)
+        if dismissed { _ = owner.handle(try dismissRequest(old)) }
+        // The guest never confirmed its retirement ACK before this crash.
+        _ = owner.handle(try productRequest("stop", force: true)); try await productTurn()
+        for outcome in owner.snapshot().outcomes where outcome.id != old { _ = owner.handle(try dismissRequest(outcome.id)) }
+        runtime.bootID = Data(repeating: 9, count: 16); runtime.phase = .starting
+        _ = owner.handle(try productRequest("start"))
+        status.bootID = runtime.bootID; status.retired[0].retirementSequence = 1
+        try runtime.onStatus?(status)
+        #expect(owner.snapshot().outcomes.map(\.id) == (dismissed ? [] : [old]))
+    }
+}
+
+
+@Test @MainActor func productPendingGuestAcksCannotDeadlockColdBootOrGrowAcrossReconciliation() async throws {
+    let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at: directory) }
+    let store = try WorkspaceHostState(directory: directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
+    var frame = try WorkspaceControl.decode(workspaceGolden("status_reply"))
+    do {
+        let reference = try store.directory.lock("owner.lock")
+        try store.commit { state in
+            for sequence in 1...63 {
+                frame.statusReply.mounts[0].mount.incarnation = Data(repeating: 1, count: 8) + withUnsafeBytes(of: UInt64(sequence).bigEndian) { Data($0) }
+                try WorkspaceHostState.retain(frame.statusReply.mounts[0], evidence: WorkspaceControl.encode(frame), state: &state)
+            }
+            state.running = true
+            state.execution = WorkspaceExecution(hostBoot: "host", boot: Data(repeating: 1, count: 16), reference: reference.identity)
+            // All 64 Mounts were admitted after the last snapshot. Each exact
+            // consumed request must transfer its reserved slot on owner death.
+            for volume in 0..<64 {
+                var connection = try productConnection().connection; connection.volumeId = "volume-" + String(volume)
+                let intent = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                var desired = WorkspaceDesiredVolume(connection: connection, intent: intent)
+                var identity = runtime.identityReply
+                identity.mount.volumeID = connection.volumeId
+                identity.mount.authorityID = Data(stride(from: 0, to: connection.authority.count, by: 2).compactMap { UInt8(connection.authority.dropFirst($0).prefix(2), radix: 16) })
+                desired.request = try WorkspaceConnectionDocument(connection: connection, intent: intent, identity: identity)
+                desired.authorizationConsumed = true; desired.operation = "mount-pending"
+                state.volumes.append(desired)
+            }
+        }
+    }
+    try store.requirePriorExecutionAbsent(hostBoot: "host")
+    #expect(store.value.retained.count == 127)
+    let oldMounts = try store.value.volumes.map { volume in try #require(try volume.request?.guestIdentity().mount) }
+    for mount in oldMounts { #expect(store.value.retained.contains { $0.guestMountKey == WorkspaceControl.mountKey(mount) }) }
+    for outcome in store.retainedOutcomes { try store.dismiss(outcome.notice.id) }
+    #expect(store.value.retained.count == 127); #expect(store.retainedOutcomes.isEmpty)
+    let owner = WorkspaceProductOwner(store: store, reservationDirectory: directory, hostBoot: "host") { _ in runtime }
+    owner.launch(); #expect(runtime.starts == 1)
+    runtime.running(); try await productTurn()
+    #expect(runtime.identityCalls == 0)
+    #expect(owner.snapshot().volumes.allSatisfy { $0.state == "pending" && $0.message == WorkspaceHostControl.outcomeCapacity })
+    frame.statusReply.bootID = runtime.bootID; frame.statusReply.mounts = []; frame.statusReply.jobs = []; frame.statusReply.retired = []
+    for page in 0..<4 {
+        frame.statusReply.retired = oldMounts[(page*16)..<(page*16+16)].enumerated().map { offset, mount in
+            var status = WorkspaceMountStatus(); status.mount = mount; status.state = "terminal"; status.cleanup = "complete"; status.reason = "old owner ended"; status.renewal.state = "pending"; status.outcome = unknownTestOutcome()
+            var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(page*16+offset+1); retired.mountStatus = status
+            return retired
+        }
+        try runtime.onStatus?(frame.statusReply)
+        #expect(store.value.retained.count == 127); #expect(owner.snapshot().outcomes.isEmpty)
+    }
+    frame.statusReply.retired = []; try runtime.onStatus?(frame.statusReply); try await productTurn()
+    #expect(store.value.retained.isEmpty)
+    #expect(runtime.identityCalls == 64)
+    #expect(owner.snapshot().outcomes.isEmpty)
 }

@@ -21,6 +21,9 @@ import PortableFSWorkspaceCore
     private var ready = false
     private var pendingHello: (() -> Void)?
     public var isIdle: Bool { active == nil && queue.isEmpty && pendingHello == nil }
+    #if WORKSPACE_SERVICE_TESTING
+    var testRetirementAckHeld: (() -> Bool)?
+    #endif
     public var statusObserver: ((WorkspaceStatusReply) throws -> Void)?
     public var onFailure: ((String) -> Void)?
     public init(vm: WorkspaceMachine) { self.vm = vm }
@@ -167,6 +170,11 @@ import PortableFSWorkspaceCore
         exchange(.resume(token), deadline: deadline) { completion($0.map { $0.resumeAck }) }
     }
     public func acknowledgeRetired(through sequence: UInt64, deadline: UInt64, completion: @escaping (Result<Void, Error>) -> Void) {
+        #if WORKSPACE_SERVICE_TESTING
+        if testRetirementAckHeld?() == true {
+            completion(.failure(WorkspaceVMError("test retirement acknowledgement held"))); return
+        }
+        #endif
         var ack = WorkspaceRetireAck(); ack.throughSequence = sequence
         exchange(.retireAck(ack), deadline: deadline) { result in completion(result.flatMap { $0.result.code == "accepted" ? .success(()) : .failure(WorkspaceVMError("retirement refused")) }) }
     }

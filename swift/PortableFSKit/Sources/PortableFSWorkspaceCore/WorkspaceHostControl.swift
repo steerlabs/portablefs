@@ -10,6 +10,7 @@ public enum WorkspaceHostControl {
     public static let starting = "Starting Linux Workspace…"
     public static let running = "Linux Workspace: Running"
     public static let authorizationRequired = "Authorization required"
+    public static let outcomeCapacity = "Dismiss a previous write outcome before adding or replacing a volume"
     public static let busy = "Volume is in use. Close its terminals and editor windows, then try again."
     public static let macConflict = "This volume is mounted on your Mac. Unmount it there before using it in Linux."
     public static let linuxConflict = "This volume is in Linux. Remove it from Linux before mounting it on your Mac."
