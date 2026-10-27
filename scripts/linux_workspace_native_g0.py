@@ -5,6 +5,7 @@ are separately owned by the injected Go inventory; actual pause durations and
 publication observations are recorded here without rounding them to that model.
 """
 import json
+import contextlib
 import selectors
 import shlex
 import subprocess
@@ -167,9 +168,10 @@ print(json.dumps(result),flush=True)
                     try: peer.wait(timeout=5)
                     except subprocess.TimeoutExpired: peer.kill();peer.wait(timeout=5)
                 if worker is not None:
+                    worker.stdin.close()
                     if worker.poll() is None:
-                        worker.terminate()
-                        try: worker.wait(timeout=5)
-                        except subprocess.TimeoutExpired: worker.kill();worker.wait(timeout=5)
-                    worker.stdin.close();worker.stdout.close();worker.stderr.close()
+                        # EOF releases an armed worker; outer guest teardown
+                        # retires a blocked operation without signaling SSH.
+                        with contextlib.suppress(subprocess.TimeoutExpired): worker.wait(timeout=5)
+                    worker.stdout.close();worker.stderr.close()
     return managed

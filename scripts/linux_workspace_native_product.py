@@ -488,8 +488,10 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
                 assert ssh('cat /workspaces/native-managed/loss-proof')=='peer-after-loss'
                 record('service-loss-accepted-tail-peer')
             finally:
-                if writer.poll() is None: writer.terminate();writer.wait(timeout=20)
-                writer.stdin.close();writer.stdout.close();writer.stderr.close()
+                writer.stdin.close()
+                if writer.poll() is None:
+                    with contextlib.suppress(subprocess.TimeoutExpired): writer.wait(timeout=20)
+                writer.stdout.close();writer.stderr.close()
             command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
             command('stop','--json');settled=until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
             assert settled['someChangesWereNotSaved'],settled

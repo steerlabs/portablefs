@@ -129,9 +129,8 @@ result.write_text(json.dumps(value))
             if p.poll() is None:
                 with contextlib.suppress(Exception):
                     self.g.ssh('touch '+stop)
-                try: p.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    p.terminate(); p.wait(timeout=5)
+                with contextlib.suppress(subprocess.TimeoutExpired): p.wait(timeout=10)
+                # Outer guest teardown closes any unresponsive SSH session.
             p.stdout.close(); stderr.close()
 
     def finish_holder(self, holder, allow_errors=False):
