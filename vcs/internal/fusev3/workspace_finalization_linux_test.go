@@ -157,6 +157,9 @@ func TestWorkspaceFinalizationDrainsAcceptedCutAfterServingClosure(t *testing.T)
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, g, base := coldFixture(t)
+			prior := control.UnknownOutcome()
+			prior.CleanupDebt = 4
+			f.mount.workspaceLifecycle.observation.Store(&WorkspaceObservation{Outcome: prior})
 			r := &closeCutRPC{coldTestRPC: base, permission: func() error { _, err := f.mount.workspace.Check(); return err }}
 			f.mount.rpc.(*epochRPC).rpc = r
 			e := f.lookup(t, 1, "close-cut")
@@ -189,6 +192,9 @@ func TestWorkspaceFinalizationDrainsAcceptedCutAfterServingClosure(t *testing.T)
 			o, err := f.mount.FinalizeWorkspace()
 			if err != nil {
 				t.Fatal("local finalization refused", err)
+			}
+			if o.Outcome.CleanupDebt != prior.CleanupDebt {
+				t.Fatal("finalization erased cumulative cleanup evidence", o.Outcome)
 			}
 			f.rpc.mu.Lock()
 			applied := f.rpc.applied

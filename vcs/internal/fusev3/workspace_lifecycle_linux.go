@@ -105,7 +105,7 @@ func (m *Mount) FinalizeWorkspace() (WorkspaceObservation, error) {
 	// kernel/process absence, or cleanup of a failed session, cannot do so.
 	evidence := w.evidence.Load()
 	if w.closeHealthy && len(o.Loss) == 0 && (evidence == nil || evidence.failure == nil && !evidence.abandoned) {
-		o.Outcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released"}
+		o.Outcome = &pb.MountOutcome{Durability: "durable", Observation: "observed", Release: "released", CleanupDebt: o.Outcome.CleanupDebt}
 		w.observation.Store(&o)
 	}
 	m.mu.Unlock()
