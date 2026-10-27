@@ -128,8 +128,10 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             guard.stdout.close();guard.stderr.close()
     # The incoming installer can leave a lock-only directory without registering
     # any service. The actual shared API must handle that pristine boundary.
-    pristine = home/'.local/state/portablefs/workspace'
-    pristine.mkdir(parents=True, mode=0o700)
+    account = home/'.local/state/portablefs'
+    account.mkdir(parents=True, mode=0o700)
+    pristine = account/'workspace'
+    pristine.mkdir(mode=0o700)
     (pristine/'owner.lock').touch(mode=0o600)
     prepare_update()
     registered = subprocess.run([str(host),'--workspace-service-register'],env=env,capture_output=True,text=True)
