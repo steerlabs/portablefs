@@ -30,28 +30,30 @@ class LifecycleChecks:
         stop, result = '~/'+tag+'.stop', '~/'+tag+'.json'
         worker = r'''import json,os,pathlib,threading,time
 home=pathlib.Path.home(); stop=home/STOP; result=home/RESULT
-root=pathlib.Path(ROOT); errors=[]; counts={}; ready=set(); lock=threading.Lock()
+root=pathlib.Path(ROOT); errors=[]; error_details=[]; counts={}; ready=set(); lock=threading.Lock()
 allocated=[]
 if KIND=='killable': (home/(TAG+'.pid')).write_text(str(os.getpid()))
 def run(i):
-    n=0; fd=None
+    n=0; fd=None; stage='open'
     try:
         flags=os.O_CREAT|os.O_WRONLY
         if KIND!='positioned': flags|=os.O_APPEND
         fd=os.open(root/(TAG+'-'+str(i)),flags,0o600)
         while not stop.exists():
             try:
-                data=('%08d\n'%n).encode()
+                stage='write'; data=('%08d\n'%n).encode()
                 written=os.pwrite(fd,data,n*len(data)) if KIND=='positioned' else os.write(fd,data)
                 assert written==len(data)
-                os.fsync(fd); n+=1
+                stage='fsync'; os.fsync(fd); n+=1
                 if KIND=='killable':
                     marker=home/(TAG+'.ack-'+str(i)); temp=marker.with_name(marker.name+'.tmp')
                     temp.write_text(str(n));temp.replace(marker)
                 if n==1:
                     with lock: ready.add(i)
             except OSError as e:
-                with lock: errors.append(e.errno)
+                with lock:
+                    errors.append(e.errno)
+                    error_details.append(dict(errno=e.errno,stage=stage,iteration=n,thread=i,boottime_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME)))
                 break
             time.sleep(.01)
     except BaseException as e:
@@ -60,7 +62,9 @@ def run(i):
         try:
             if fd is not None: os.close(fd)
         except OSError as e:
-            with lock: errors.append(e.errno)
+            with lock:
+                errors.append(e.errno)
+                error_details.append(dict(errno=e.errno,stage='close',iteration=n,thread=i,boottime_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME)))
         counts[str(i)]=n
 if KIND=='probe':
     fd=os.open(root/TAG,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
@@ -107,7 +111,7 @@ else:
         time.sleep(.005)
     print('held-ready',flush=True)
     for w in workers: w.join()
-value={'counts':counts,'errors':errors,'tag':TAG}
+value={'counts':counts,'errors':errors,'error_details':error_details,'tag':TAG}
 if KIND=='allocate': value['allocated']=allocated
 result.write_text(json.dumps(value))
 '''

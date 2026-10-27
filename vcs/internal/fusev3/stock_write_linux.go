@@ -158,7 +158,7 @@ func (r *rawFileSystem) writeStockAttempt(input *fuse.WriteIn, data []byte, unac
 		}}}
 	}
 	response, err := handle.node.withWriteDelegation(ctx, handle, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
-		candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
+		candidate, callErrno := handle.node.mutateWithSourceAdmission(ctx, request(ref), gate, unaccepted)
 		if callErrno != 0 {
 			return candidate, callErrno
 		}
@@ -166,6 +166,7 @@ func (r *rawFileSystem) writeStockAttempt(input *fuse.WriteIn, data []byte, unac
 	})
 	var visibility *appliedVisibilityError
 	if err != nil && !errors.As(err, &visibility) {
+		*unaccepted = *unaccepted || r.mount.workspace != nil && err == workspaceadmission.ErrClosed
 		return 0, fuse.Status(delegationErrno(err))
 	}
 	if response == nil || response.GetUncertain() || response.GetWrite() == nil {
