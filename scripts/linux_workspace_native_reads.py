@@ -10,6 +10,7 @@ from linux_workspace_native_hold import hold_between_cases
 def read_checks(authority, guest, evidence, record, rounds=20):
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
+    hold_between_cases(restart_on_release=True)
     setup = r'''
 import json,pathlib,shutil,subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,18 @@ print(json.dumps({'files':31500,'matches':3150,'directories':6363}))
     assert expected == {'files':31500, 'matches':3150, 'directories':6363}, expected
     target = authority.target + '/read-stress'
     ssh = ['/usr/bin/ssh', '-F', guest.ready['ssh_config'], 'portablefs-workspace']
+    # The imported index names the source filesystem's stat identities. Refresh
+    # it once through the managed mount, as an ordinary first status would, so
+    # the read-only rounds exercise normal metadata walks without rehashing every
+    # unchanged blob solely because the fixture crossed filesystems.
+    hold_between_cases(restart_on_release=True)
+    began = time.monotonic()
+    prepared = subprocess.run([*ssh, 'cd ' + shlex.quote(target) + ' && git -c safe.directory=' +
+        shlex.quote(target) + ' status --porcelain'], stdin=subprocess.DEVNULL, text=True,
+        capture_output=True, timeout=1800)
+    (evidence / 'index-refresh.json').write_text(json.dumps({'seconds':time.monotonic()-began,
+        'returncode':prepared.returncode, 'stdout':prepared.stdout, 'stderr':prepared.stderr}, indent=2) + '\n')
+    assert prepared.returncode == 0 and not prepared.stdout and not prepared.stderr, prepared
     commands = [('rg', 'rg -l TODO .'), ('git-status', 'GIT_OPTIONAL_LOCKS=0 git -c safe.directory=' +
         shlex.quote(target) + ' status --porcelain')]
     rows = []
