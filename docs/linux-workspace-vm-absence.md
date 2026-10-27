@@ -28,16 +28,23 @@ workload cannot establish that invariant. A guest can execute from RAM while
 not performing disk I/O. Absence of a disk reference is not itself absence of
 vCPU execution.
 
+[Apple DTS](https://developer.apple.com/forums/thread/850709) confirms that the
+system is expected to clean up a crashed client's VM, but supplies no guaranteed
+completion timeline or successor-process handle for confirming teardown.
+The related [ownership discussion](https://developer.apple.com/forums/thread/848542)
+identifies worker-process identities and relationships as implementation details.
+Expected eventual cleanup does not establish the exact completion boundary.
+
 No global exact-VM termination query, successor-owned termination handle, or
-platform-enforced lifetime binding has been established for this construction.
+externally observable teardown boundary has been established for this construction.
 The product therefore does not turn a process/file scan into permission to
 clear execution state, release reservations or start a successor. Native
 SIGKILL qualification retains the execution witness and refuses the successor;
 it does not claim the old VM survived, or infer its termination from silence.
 
 An earlier recovery mechanism requires both a documented lifetime invariant
-and an executable test which holds the old VM alive after owner death, proves
-presence throughout that interval, independently confirms termination, then
+and an executable test which kills the owner while the old VM executes, proves
+presence for any remaining execution interval, independently confirms termination, then
 proves absence and successful successor admission. Until both exist, the
 refusal remains. This audit does not prove that no future platform mechanism
 can provide that boundary.

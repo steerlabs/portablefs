@@ -140,3 +140,55 @@ func TestMacOSAppRemovalPreservesDataAndRefusesReplacement(t *testing.T) {
 		})
 	}
 }
+
+func TestRemovalAbsenceProofPreservesRecreatedProgramNames(t *testing.T) {
+	for _, change := range []string{"app", "link", "parent"} {
+		t.Run(change, func(t *testing.T) {
+			root, err := os.MkdirTemp("/private/tmp", "pfs-remove-final-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(root) })
+			app := filepath.Join(root, "Applications", "PortableFS.app")
+			link := filepath.Join(root, "bin", "portablefs")
+			for _, path := range []string{app, filepath.Dir(link)} {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(filepath.Join(app, "Contents", "Helpers", "portablefs"), link); err != nil {
+				t.Fatal(err)
+			}
+			removal, err := prepareMacOSAppRemoval(app, link)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := removal.commit(); err != nil {
+				t.Fatal(err)
+			}
+			replacement := link
+			switch change {
+			case "app":
+				replacement = app
+			case "parent":
+				replacement = filepath.Dir(app)
+				if err := os.Rename(replacement, replacement+".original"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change == "link" {
+				if err := os.WriteFile(replacement, []byte("foreign"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Mkdir(replacement, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := removal.requireAbsent(); err == nil {
+				t.Fatal("changed program namespace authorized completion")
+			}
+			if _, err := os.Lstat(replacement); err != nil {
+				t.Fatalf("replacement was removed: %v", err)
+			}
+		})
+	}
+}

@@ -37,6 +37,8 @@ cat >"$work/shims/df" <<'SH'
 #!/bin/sh
 if [ "${PFS_TEST_NO_SPACE:-0}" = 1 ]; then
   printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'test 100 100 0 100% /'
+elif [ -n "${PFS_TEST_FREE_KIB:-}" ]; then
+  printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' "test 10000000 0 $PFS_TEST_FREE_KIB 0% /"
 else
   exec /bin/df "$@"
 fi
@@ -63,16 +65,19 @@ run_case() {
   output="$work/$name.log"
   python3 - "$archive" "$members" <<'PY'
 import stat
+import os
 import sys
 import zipfile
 
 with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    size = int(os.environ.get('PFS_TEST_ZIP_PAYLOAD_BYTES', '7'))
+    assert 0 <= size <= 1 << 20
     for member in sys.argv[2].split("|"):
         entry = zipfile.ZipInfo(member)
         entry.create_system = 3
         mode = stat.S_IFDIR | 0o755 if member.endswith("/") else stat.S_IFREG | 0o644
         entry.external_attr = mode << 16
-        archive.writestr(entry, b"" if member.endswith("/") else b"fixture")
+        archive.writestr(entry, b"" if member.endswith("/") else b"x" * size)
 PY
   digest=$(shasum -a 256 "$archive" | awk '{ print $1 }')
   printf '%s  %s\n' "$digest" "$release_archive" >"$archive.sha256"
@@ -91,7 +96,9 @@ PY
 }
 
 run_case normal_directories 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' reach
-PFS_TEST_NO_SPACE=1 run_case peak_space_failure 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' 'Not enough disk space'
+( PFS_TEST_NO_SPACE=1 run_case peak_space_failure 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' 'Not enough disk space' )
+( PFS_TEST_FREE_KIB=2098688 PFS_TEST_ZIP_PAYLOAD_BYTES=1048576 run_case peak_staging_space_failure 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' 'Not enough disk space' )
+( PFS_TEST_FREE_KIB=2099200 PFS_TEST_ZIP_PAYLOAD_BYTES=1048576 run_case exact_peak_space_boundary 'PortableFS.app/|PortableFS.app/Contents/|PortableFS.app/Contents/file' reach )
 run_case repeated_root_slash 'PortableFS.app//' 'unsafe member name'
 run_case repeated_nested_slash 'PortableFS.app/Contents//' 'unsafe member name'
 run_case dot_component 'PortableFS.app/./Contents' 'unsafe member name'

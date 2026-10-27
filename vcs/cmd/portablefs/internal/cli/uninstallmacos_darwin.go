@@ -126,6 +126,12 @@ func runUninstallMacOSApp(e *cmdEnv, requestedLinkDir string) (macOSInstallResul
 	if err := removal.commit(); err != nil {
 		return macOSInstallResult{}, fmt.Errorf("owned app removal incomplete; workspace data retained: %w", err)
 	}
+	if err := rejectLiveMacOSRuntimeWithLayout(e, stateDir, layout); err != nil {
+		return macOSInstallResult{}, err
+	}
+	if err := removal.requireAbsent(); err != nil {
+		return macOSInstallResult{}, err
+	}
 	// Only the exact live token can retire this lease, after all owned program
 	// names are durably absent and while both services remain excluded.
 	if err := hostctl.RetireRemovalLease(hostctl.LeasePath(home), session.Token(), release); err != nil {
@@ -204,7 +210,29 @@ func (p *macOSAppRemoval) commit() error {
 			return err
 		}
 	}
-	return removeSnapshottedTreeAt(parent, filepath.Base(p.app), p.appID, nil)
+	if err := removeSnapshottedTreeAt(parent, filepath.Base(p.app), p.appID, nil); err != nil {
+		return err
+	}
+	return p.requireAbsent()
+}
+
+func (p *macOSAppRemoval) requireAbsent() error {
+	for _, item := range []struct {
+		path string
+		id   pathSnapshot
+	}{
+		{filepath.Dir(p.app), p.appParentID}, {filepath.Dir(p.link), p.linkParentID},
+	} {
+		if err := requireUnchangedPath(item.path, item.id); err != nil {
+			return err
+		}
+	}
+	for _, path := range []string{p.app, p.link} {
+		if err := requireRuntimePathAbsent(path, "removed program name"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func excludeAbsentWorkspace(stateDir string, layout macOSInstallLayout) (func(), error) {

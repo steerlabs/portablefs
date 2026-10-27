@@ -199,8 +199,8 @@ the download is corrupt or has been tampered with; nothing was installed"
     END { printf "%.0f\n", total }
   ' "$tmp/macos-member-types.txt") || die "could not determine expanded installer size"
   available_bytes=$(df -Pk "$tmp" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }')
-  awk -v free="$available_bytes" -v expanded="$expanded_bytes" 'BEGIN { exit !(free >= expanded + 2147483648) }' ||
-    die "Not enough disk space: installer extraction requires image bytes plus 2 GiB headroom"
+  awk -v free="$available_bytes" -v expanded="$expanded_bytes" 'BEGIN { exit !(free >= 2 * expanded + 2147483648) }' ||
+    die "Not enough disk space: extraction and staging require two app copies plus 2 GiB headroom"
 
   mkdir "$tmp/unpacked" || die "could not create unpack directory"
   ditto -x -k "$tmp/$archive" "$tmp/unpacked" ||
