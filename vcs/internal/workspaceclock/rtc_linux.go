@@ -34,9 +34,23 @@ func Open(unavailable func()) (*Owner, error) {
 	return owner, nil
 }
 func (r *RTC) ReadUTC() (time.Time, error) {
-	raw, err := unix.IoctlGetRTCTime(int(r.file.Fd()))
-	if err != nil {
-		return time.Time{}, err
+	return readRTCUTC(int(r.file.Fd()), unix.IoctlGetRTCTime)
+}
+
+func readRTCUTC(fd int, ioctl func(int) (*unix.RTCTime, error)) (time.Time, error) {
+	var raw *unix.RTCTime
+	for {
+		var err error
+		raw, err = ioctl(fd)
+		// EINTR produced no sample. Complete this acquisition on the retained
+		// description; only its eventual fresh result reaches permission checks.
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return time.Time{}, err
+		}
+		break
 	}
 	y, m, d := int(raw.Year)+1900, time.Month(raw.Mon+1), int(raw.Mday)
 	h, min, sec := int(raw.Hour), int(raw.Min), int(raw.Sec)

@@ -567,8 +567,13 @@ by one second each plus integer quantization of less than one second.
 Entry, delegated acceptance after capacity waits, CONTROL/drain and physical
 reply preparation use that original interval. Encoded cache lifetimes cannot
 exceed its remaining permission, including finalized cached-arena replies.
-Invalid evidence, ioctl failure, backward RTC below the anchor and expiry close
-it synchronously. Successful reads and delayed renewal cannot reopen it; complete
+An `RTC_RD_TIME` interrupted with EINTR produced no sample and restarts on the
+same retained descriptor, without an attempt cap, deadline, backoff or signal
+masking. Only a fresh successful sample reaches the unchanged predicate and
+original anchors; time spent restarting receives no discount. Continued
+interruption can stall acquisition and makes no bounded-progress promise.
+Invalid evidence, any other ioctl errno, backward RTC below the anchor and
+expiry close permission synchronously. Successful reads and delayed renewal cannot reopen it; complete
 cold withdrawal and fresh permission in the accepted recovery generation must
 precede serving. Renewal checks the installed old interval before replacing it.
 Managed workspaces renew every second. Ordinary native mounts retain their

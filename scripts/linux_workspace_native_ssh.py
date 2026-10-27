@@ -17,7 +17,8 @@ def stop(sig,frame):
     put('.stopped',{'pid':os.getpid(),'signal':sig})
     sys.exit(0)
 signal.signal(signal.SIGTERM,stop)
-signal.signal(signal.SIGHUP,stop)
+if signal.getsignal(signal.SIGHUP)!=signal.SIG_IGN:
+    signal.signal(signal.SIGHUP,stop)
 put('.started',{'pid':os.getpid(),'start':pathlib.Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19],
     'cgroup':pathlib.Path('/proc/self/cgroup').read_text()})
 n=0
