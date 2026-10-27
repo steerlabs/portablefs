@@ -1,14 +1,16 @@
 # Workspace VM absence
 
 Same-boot recovery uses a kernel-held execution reference, independent of the
-service process. Process exit, released service/owner singletons and vanished
+service process. Process exit, a released service singleton and vanished
 control or SSH endpoints still prove no VM absence.
 
 ## Execution reference
 
 The owner acquires `flock(LOCK_EX | LOCK_NB)` on a fresh open description of
-`vm-execution.lock` in the validated workspace state directory before constructing
-the VM. Private desired-state format 2 records its device/inode with the execution
+the existing `owner.lock` in the validated workspace state directory before
+constructing the VM. WorkspaceState validates and adopts that same reference;
+it does not take a second lock. Private desired-state format 2 records its
+device/inode with the execution
 identity before VZ Start. A successor never substitutes a recreated inode for a
 same-boot execution. Unequal desired-state formats refuse; no historical decoder
 or conversion exists. Authority and paired workspace control remain protocol 8.
@@ -17,6 +19,8 @@ The same file handle becomes the writing handle of a dedicated, output-only
 `VZFileHandleSerialPortAttachment`. The immutable VM configuration retains this
 third serial device; the ordinary bounded diagnostic console and bootstrap console
 retain their existing paths. The guest workspace user does not use this device.
+The removal/update boundary already fences the canonical owner lock; extending
+its reference into VZ also fences the old VM after service death.
 
 Darwin's [flock contract](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/flock.2.html)
 associates duplicated descriptors with one lock. Descriptor transfer retains the

@@ -265,7 +265,7 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
         old_boot=ssh('cat /proc/sys/kernel/random/boot_id')
         if authority is not None:
             assert ssh('cat /workspaces/native-managed/product-proof')=='peer-product'
-        reference=home/'.local/state/portablefs/workspace/vm-execution.lock'
+        reference=home/'.local/state/portablefs/workspace/owner.lock'
         worker,observed=execution_reference_worker(reference)
         assert execution_reference_busy(reference)
         suspended=False

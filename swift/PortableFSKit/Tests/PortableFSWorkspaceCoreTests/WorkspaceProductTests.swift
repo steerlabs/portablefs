@@ -84,7 +84,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
         for lost in [false, true] {
             let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
             let store = try WorkspaceHostState(directory:directory)
-            var reference: WorkspaceFileLock? = try store.directory.lock("vm-execution.lock")
+            var reference: WorkspaceFileLock? = try store.directory.lock("owner.lock")
             guard let identity = reference?.identity else { throw ProductFailure.refused }
             var old = try WorkspaceControl.decode(workspaceGolden("status_reply"))
             try #require(!old.statusReply.mounts.isEmpty)
@@ -118,7 +118,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test func descriptorPassedLockSurvivesOriginalOwnerRetirement() throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let state = try WorkspacePrivateDirectory(directory)
-        var reference: WorkspaceFileLock? = try state.lock("vm-execution.lock")
+        var reference: WorkspaceFileLock? = try state.lock("owner.lock")
         guard let identity = reference?.identity, let descriptor = reference?.fileHandle.fileDescriptor else { throw ProductFailure.refused }
         // Process duplicates this descriptor onto the child's stdin. This
         // borrowed wrapper must not keep the original description alive.
@@ -132,17 +132,17 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
         #expect(try output.fileHandleForReading.read(upToCount:8) == Data("holding\n".utf8))
         withExtendedLifetime(reference) {}
         reference = nil
-        #expect(throws:(any Error).self) { try state.lock("vm-execution.lock") }
+        #expect(throws:(any Error).self) { try state.lock("owner.lock") }
         child.terminate(); child.waitUntilExit()
-        let successor = try state.lock("vm-execution.lock")
+        let successor = try state.lock("owner.lock")
         #expect(successor.identity == identity)
     }
     @Test func replacedExecutionLockCannotProveSameBootAbsence() throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory)
-        let reference = try store.directory.lock("vm-execution.lock")
+        let reference = try store.directory.lock("owner.lock")
         try store.commit { $0.execution = WorkspaceExecution(hostBoot:"same-boot",boot:Data(repeating:1,count:16),reference:reference.identity) }
-        try store.directory.remove("vm-execution.lock")
+        try store.directory.remove("owner.lock")
         #expect(throws:(any Error).self) { try store.requirePriorExecutionAbsent(hostBoot:"same-boot") }
         #expect(store.value.execution != nil)
         withExtendedLifetime(reference) {}
@@ -153,6 +153,26 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
         var unequal = WorkspaceDesiredState(); unequal.version = 1
         try state.write("desired.json",data:WorkspaceHostControl.encode(unequal))
         #expect(throws:(any Error).self) { try WorkspaceHostState(directory:directory) }
+    }
+    @Test func workspaceStateRetainsTransferredOwnerLock() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let privateDirectory = try WorkspacePrivateDirectory(directory)
+        var reference: WorkspaceFileLock? = try privateDirectory.lock("owner.lock")
+        var state: WorkspaceState? = try WorkspaceState(directory:directory,ownership:reference)
+        reference = nil
+        #expect(throws:(any Error).self) { try privateDirectory.lock("owner.lock") }
+        withExtendedLifetime(state) {}
+        state = nil
+        let successor = try privateDirectory.lock("owner.lock")
+        withExtendedLifetime(successor) {}
+    }
+    @Test func workspaceStateRejectsForeignOwnershipBeforeDiskCreation() throws {
+        let first = try productDirectory(), second = try productDirectory()
+        defer { try? FileManager.default.removeItem(at:first); try? FileManager.default.removeItem(at:second) }
+        let owner = try WorkspacePrivateDirectory(first).lock("owner.lock")
+        #expect(throws:(any Error).self) { try WorkspaceState(directory:second,ownership:owner) }
+        #expect(!FileManager.default.fileExists(atPath:second.appendingPathComponent("data.ext4").path))
+        withExtendedLifetime(owner) {}
     }
     @Test @MainActor func pendingMountKeepsIntentAcrossTransitionAndRequiresExactResponse() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
@@ -353,7 +373,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
 @Test @MainActor func productStoppedIntentCannotHideUnconfirmedOldExecution() throws {
     let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
     let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
-    let reference = try store.directory.lock("vm-execution.lock")
+    let reference = try store.directory.lock("owner.lock")
     try store.commit{$0.running=false;$0.execution=WorkspaceExecution(hostBoot:"host-boot",boot:Data(repeating:1,count:16),reference:reference.identity)}
     let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in runtime }
     owner.launch()

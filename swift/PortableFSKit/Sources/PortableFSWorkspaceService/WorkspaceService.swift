@@ -31,7 +31,7 @@ import PortableFSWorkspaceVM
                 let artifact: WorkspaceArtifact
                 do { artifact = try WorkspaceArtifact(directory: image) } catch { throw WorkspaceVMError("Workspace image failed verification") }
                 guard artifact.release.appVersion == bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String else { throw WorkspaceVMError("Workspace image failed verification") }
-                return try WorkspaceVMRuntime(artifact: artifact, directory: directory, executionReference: reference.fileHandle)
+                return try WorkspaceVMRuntime(artifact: artifact, directory: directory, executionReference: reference)
             }
             let listener = try PortableFSSignedLocalListener(directory: directory, socketName: "control.sock", release: release, frameLimit: WorkspaceHostControl.maxFrame)
             let queue = DispatchQueue(label: "dev.portablefs.workspace.host-api")

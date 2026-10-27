@@ -88,6 +88,11 @@ public final class WorkspacePrivateDirectory {
             return try WorkspaceFileLock(file)
         } catch { Darwin.close(file); throw error }
     }
+    func validateLock(_ lock: WorkspaceFileLock, name: String) throws {
+        try validName(name); try validate()
+        try validateFile(lock.fileHandle.fileDescriptor, name: name)
+        try validate()
+    }
 }
 public struct WorkspaceFileIdentity: Codable, Equatable, Sendable {
     public let device: UInt32

@@ -69,7 +69,7 @@ public final class WorkspaceHostState {
     /// VZ; a service singleton, old PID or socket absence proves no VM absence.
     @discardableResult public func requirePriorExecutionAbsent(hostBoot: String) throws -> WorkspaceFileLock {
         guard !hostBoot.isEmpty else { throw WorkspaceVMError("host boot identity unavailable") }
-        let reference = try directory.lock("vm-execution.lock")
+        let reference = try directory.lock("owner.lock")
         if let old = value.execution {
             guard old.hostBoot != hostBoot || old.reference == reference.identity else { throw WorkspaceVMError("Cleanup required: previous VM execution reference was replaced") }
             try commit { $0.execution = nil }

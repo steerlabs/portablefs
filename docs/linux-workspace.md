@@ -78,8 +78,8 @@ remain owned by the guest data disk.
 
 A durable execution witness is cleared only after confirmed VZ termination or
 exact absence proof. Neither process exit nor a released service singleton proves
-VM absence. The service gives a locked open file description to an immutable VZ
-serial attachment. A successor must acquire that exact pinned inode through a
+VM absence. The service gives its locked `owner.lock` description to an immutable
+VZ serial attachment. A successor must acquire that exact pinned inode through a
 fresh description before constructing its VM. A retained VM descriptor keeps it
 busy after service death. Successful acquisition permits a cold successor while
 preserving prior outcomes; it never adopts old RAM. Replaced names and uncertain
