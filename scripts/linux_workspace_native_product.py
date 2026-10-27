@@ -1,6 +1,7 @@
 """Throwaway SMAppService tests; no installed app identities or SSH config."""
 import base64
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -164,7 +165,15 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
             record('service-document-standalone')
             command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
-        command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+        update_lock = os.open(home/'.local/state/portablefs/mount-lifecycle.lock', os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(update_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert command('start', success=False).returncode == 1
+            assert status()['desiredRunning']
+            command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+        finally:
+            os.close(update_lock)
+        record('service-stop-under-update-exclusion')
         record('service-stop-persists')
         # Registration and status cannot defeat the explicit stopped intent.
         subprocess.run([str(host),'--workspace-service-register'],env=env,check=True)

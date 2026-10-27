@@ -60,5 +60,6 @@ service-start-idempotent
 service-app-exit-vm-alive
 service-document-standalone
 service-stop-persists
+service-stop-under-update-exclusion
 service-ssh-identity-persistence
 service-crash-no-ram-adoption
