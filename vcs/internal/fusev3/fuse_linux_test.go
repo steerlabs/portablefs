@@ -400,6 +400,10 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		}
 		if f.replyOverride == nil && request.GetOpen() != nil && result.GetOpen() != nil {
 			result.GetOpen().CacheCapable = request.GetOpen().GetCacheCapable()
+			if request.GetOpen().GetReusableDirectoryReadIncarnation() != 0 {
+				item := f.itemForTokenLocked(request.GetOpen().GetItem())
+				result.GetOpen().DirectoryReadProof = &authoritypb.DirectoryReadProof{Reusable: true, StableIdentity: cloneBytes(item.GetStableIdentity()), Incarnation: request.GetOpen().GetReusableDirectoryReadIncarnation(), ObjectVersion: 1, SnapshotSequence: result.VolumeVersion}
+			}
 			if request.GetOpen().GetWriteIntent() {
 				result.GetOpen().Delegation = testDelegation()
 			}
@@ -1463,7 +1467,7 @@ func TestOpendirWithoutEnumerationCoverageOpensUncached(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
 		if request.GetOpen() != nil {
-			return &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: testToken(901)}}}, nil
+			return &authoritypb.Response{VolumeVersion: 2, Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: testToken(901), DirectoryReadProof: &authoritypb.DirectoryReadProof{Reusable: true, StableIdentity: testIdentity(8), Incarnation: 1, ObjectVersion: 1, SnapshotSequence: 2}}}}, nil
 		}
 		return &authoritypb.Response{}, nil
 	}

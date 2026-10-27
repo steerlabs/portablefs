@@ -117,6 +117,49 @@ ROUTES, and RESTORE where one errno has two meanings.
 
 ### Directory-page capability reuse and reclaim
 
+Linux `OpenRequest.reusable_directory_read_incarnation` (tag 5) explicitly
+requests a reusable directory-read proof for that exact nonzero subscription
+incarnation.
+Zero requests ordinary OPEN. A different current incarnation is a coherence
+refusal before description allocation; replay retains the original result.
+It requires exactly read-only flags, without
+append, truncate, sync, data-sync, write intent or cache-capable intent. Other
+profiles refuse it. The authority checks current directory read and search
+access using effective credentials and ACLs, opens and retains the backing
+description, and registers both directory and directory-attribute cache
+footprints under the same storage/permission cut.
+
+`OpenReply.directory_read_proof` (tag 4) contains `DirectoryReadProof`:
+`stable_identity` (1, nonzero 16 bytes), `incarnation` (2, nonzero),
+`object_version` (3), `snapshot_sequence` (4), and `reusable` (5). The version
+satisfies
+`0 < object_version <= snapshot_sequence`, and the snapshot equals the
+envelope volume version. The enclosing handle owns the backing description.
+The evaluated `reusable` bit grants future local opens only when both read
+and search access succeeded. If search was denied but ordinary read OPEN
+succeeded, it is false: this one handle remains readable, and every later
+OPEN must return to authority access admission. Read denial still fails OPEN.
+No delegation or kernel cache-capable grant accompanies this proof. A
+successful requested OPEN must carry this evaluated result; an unrequested
+result is invalid. Only `reusable = true` permits future local opens.
+Ordinary OPEN without this request retains its existing one-handle meaning.
+
+One exact mutation replay outcome owns access evaluation, the description,
+and the proof. Replay neither reopens nor resamples permission, even after
+permission withdrawal. An old result cannot restore withdrawn admission. The
+daemon binds the proof to its requested Item and exact live subscription,
+and can create independent local directory handles only while that
+directory's attribute/permission generation remains unchanged. Attribute
+withdrawal closes new-open admission; existing application handles retain
+their granted rights and independent XFS cookies and root-barrier loss
+baselines. Ordinary local release drops a reference. Eviction and cold
+retirement release idle cache-owned descriptions through counted,
+session-exact CLOSE/CLOSE_BATCH cleanup; they cannot close a live handle's
+description. Epoch replacement never sends old tokens to the new session.
+
+This addition changes only the unreleased protocol-8 grammar; there is no
+older-major execution path or negotiated fallback.
+
 `ReadDirRequest.want_items` is tag 5. The
 `held_identities` field (tag 6) is a sorted, unique list of nonzero 16-byte
 stable identities that the session already retains for the page beginning at

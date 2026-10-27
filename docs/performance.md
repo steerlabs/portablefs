@@ -5,6 +5,41 @@ and no qualified performance result for the LAN targets below. Measurements take
 earlier protocols are not evidence for protocol 8 and are not reproduced here;
 git history holds them.
 
+## Linux metadata acceptance
+
+Both ordinary and workspace mounts use the subscription-owned daemon directory
+cache and the explicit protocol-8 reusable directory-read proof. Payloads are
+bounded by 128 MiB and 65,536 unique names (including listings); cached directory
+descriptions have an additional 8,192-entry bound. Capacity retires idle
+descriptions, never application handle rights. Authority defaults allow 16,384
+open descriptions per session and 65,536 per worker; smaller explicit limits
+remain supported and can cause cache capacity misses.
+
+Positive kernel entry/attribute validity and FOPEN_CACHE_DIR remain disabled.
+The raw publication owner settles page fills, cached hits and permission
+proofs; withdrawal closes coordinates, revokes pending fills, joins finalized
+physical replies, drops daemon facts, performs inode notifications and then
+acknowledges the contiguous CONTROL prefix. A source mutation uses the same
+local gate. Live subscription renewal preserves unchanged facts; cold loss
+retires cache permission before a new incarnation can serve.
+
+`scripts/benchmark-linux-metadata.py` and its fixed manifest define the
+replacement measurement lane. A successful timing requires exact command
+status and output identity, complete before/after counters, fixed corpus and
+tool revisions, a READY authority, qualified RTT, and a quiet-machine load
+record. Missing data or a failed search invalidates the sample. The harness
+alternates ordinary/workspace order and reports median and nearest-rank p95;
+raw JSON belongs in the external evidence directory.
+
+The targets are p95 warm status <=2 s with zero unchanged-directory OPEN or
+READDIR RPCs, warm/cold content search <=10/25 s, clone with root barrier
+<=60 s, fresh/no-op pinned npm install with root barrier <=15/2 s, primed
+1,000-entry expansion <=100 ms, and workspace/ordinary ratios <=1.10 median
+and <=1.20 p95. None is established by source changes or unit tests. Generic
+remote editor watch delivery remains a separate qualification boundary.
+
+## macOS write callbacks
+
 macOS 27 grants writeThrough, never writeBack: each `write(2)` waits for its
 durable authority callback, so small-write throughput pays one round trip and
 one storage durability cost per callback. writeBack was disabled after a

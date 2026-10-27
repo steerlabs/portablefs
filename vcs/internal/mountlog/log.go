@@ -77,18 +77,19 @@ type renewalRecord struct {
 // WritebackStats is sampled only at existing renewal events. It is diagnostic
 // backlog, not a durability receipt, and carries no per-file identifiers.
 type WritebackStats struct {
-	DirtyBytes          int64  `json:"dirtyBytes"`
-	DirtyEntries        int    `json:"dirtyEntries"`
-	RetainedBytes       int64  `json:"retainedBytes"`
-	RetainedEntries     int    `json:"retainedEntries"`
-	PendingAdmissions   int    `json:"pendingAdmissions"`
-	FlushingIdentities  int    `json:"flushingIdentities"`
-	ScheduledIdentities int    `json:"scheduledIdentities"`
-	TrackedIdentities   int    `json:"trackedIdentities"`
-	BufferIdentities    int    `json:"bufferIdentities"`
-	PendingCloses       int    `json:"pendingCloses"`
-	DurabilityLag       uint64 `json:"durabilityLag"`
-	LossSequence        uint64 `json:"lossSequence"`
+	Metadata            *MetadataStats `json:"metadata,omitempty"`
+	DirtyBytes          int64          `json:"dirtyBytes"`
+	DirtyEntries        int            `json:"dirtyEntries"`
+	RetainedBytes       int64          `json:"retainedBytes"`
+	RetainedEntries     int            `json:"retainedEntries"`
+	PendingAdmissions   int            `json:"pendingAdmissions"`
+	FlushingIdentities  int            `json:"flushingIdentities"`
+	ScheduledIdentities int            `json:"scheduledIdentities"`
+	TrackedIdentities   int            `json:"trackedIdentities"`
+	BufferIdentities    int            `json:"bufferIdentities"`
+	PendingCloses       int            `json:"pendingCloses"`
+	DurabilityLag       uint64         `json:"durabilityLag"`
+	LossSequence        uint64         `json:"lossSequence"`
 }
 
 func (writer *Writer) WriteRenewal(event mountenrollment.RenewalEvent, writeback *WritebackStats) error {

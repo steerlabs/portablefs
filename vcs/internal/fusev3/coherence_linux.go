@@ -494,7 +494,7 @@ func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 		// primitive is whole-inode withdrawal: it drops retained pages and
 		// This record has no retained-data obligation, so the stock attribute-only
 		// shape is sufficient and avoids evicting unrelated clean pages.
-		if status := server.InodeNotify(inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
+		if status := r.mount.inodeNotify(server, inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
 			failures = append(failures, fmt.Sprintf("withdraw cached attributes for inode %d: %v", inode, status))
 		}
 	}
@@ -541,7 +541,7 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 		// pages. Every other failure is recorded, because a page this mount
 		// could not take back is stale data a fenced participant can still
 		// serve, and the operator has to be told that in the revocation report.
-		if status := server.InodeNotify(inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+		if status := r.mount.inodeNotify(server, inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
 			failures = append(failures, fmt.Sprintf("withdraw cached data for inode %d: %v", inode, status))
 		}
 	}

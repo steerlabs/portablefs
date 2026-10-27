@@ -186,7 +186,7 @@ create_service_identity() {
     -M -d /home/portablefs -s /bin/bash portablefs
   install -d -m 0700 -o "$PORTABLEFS_SERVICE_UID" -g "$PORTABLEFS_SERVICE_GID" \
     /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache \
-    /home/portablefs/tmp /home/portablefs/bin /home/portablefs/creds \
+    /home/portablefs/tmp /home/portablefs/bin /home/portablefs/test-pki \
     /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs
 }
 
@@ -219,7 +219,7 @@ start_authority() {
   local control=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME
   local membership=$control/mount.membership
   as_service /home/portablefs/bin/pfs-coherence-credentials \
-    --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 --lifetime 1h ||
+    --dir /home/portablefs/test-pki --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 --lifetime 1h ||
     fail "minting the credential set failed" 70
   cat > /home/portablefs/launch-authority.sh <<LAUNCH
 #!/usr/bin/env bash
@@ -230,10 +230,10 @@ exec /home/portablefs/bin/portablefs-authority \
     --volume-id "$PORTABLEFS_VOLUME_NAME" \
     --root "$volume" \
     --project-id "$PORTABLEFS_PROJECT_ID" \
-    --tls-cert /home/portablefs/creds/server.crt \
-    --tls-key /home/portablefs/creds/server.key \
-    --client-ca /home/portablefs/creds/ca.pem \
-    --capability-public-key /home/portablefs/creds/capability-public.pem \
+    --tls-cert /home/portablefs/test-pki/server.crt \
+    --tls-key /home/portablefs/test-pki/server.key \
+    --client-ca /home/portablefs/test-pki/ca.pem \
+    --capability-public-key /home/portablefs/test-pki/capability-public.pem \
     --mount-membership-file "$membership" \
     --capability-max-lifetime 1h
 LAUNCH
@@ -288,10 +288,10 @@ install_route_declaration() {
   if ! as_service /home/portablefs/bin/pfs-coherence-routes \
     --authority "127.0.0.1:${PORTABLEFS_AUTHORITY_PORT}" \
     --volume-id "$PORTABLEFS_VOLUME_NAME" \
-    --access-token-file /home/portablefs/creds/admin-0.token \
-    --tls-cert /home/portablefs/creds/client.crt \
-    --tls-key /home/portablefs/creds/client.key \
-    --tls-server-ca /home/portablefs/creds/ca.pem \
+    --access-token-file /home/portablefs/test-pki/admin-0.token \
+    --tls-cert /home/portablefs/test-pki/client.crt \
+    --tls-key /home/portablefs/test-pki/client.key \
+    --tls-server-ca /home/portablefs/test-pki/ca.pem \
     --tls-server-name authority.portablefs.test \
     --apply-file /home/portablefs/routes.txt >"$log" 2>&1; then
     echo "coherence-matrix-linux: installing the volume's machine-local route declaration failed:" >&2
@@ -305,10 +305,10 @@ install_route_declaration() {
   ROUTES_CONTRACT_COMMAND="/home/portablefs/bin/pfs-coherence-routes \
     --authority 127.0.0.1:${PORTABLEFS_AUTHORITY_PORT} \
     --volume-id ${PORTABLEFS_VOLUME_NAME} \
-    --access-token-file /home/portablefs/creds/access-2.token \
-    --tls-cert /home/portablefs/creds/client.crt \
-    --tls-key /home/portablefs/creds/client.key \
-    --tls-server-ca /home/portablefs/creds/ca.pem \
+    --access-token-file /home/portablefs/test-pki/access-2.token \
+    --tls-cert /home/portablefs/test-pki/client.crt \
+    --tls-key /home/portablefs/test-pki/client.key \
+    --tls-server-ca /home/portablefs/test-pki/ca.pem \
     --tls-server-name authority.portablefs.test \
     --check-revision-contract"
 }
@@ -326,10 +326,10 @@ start_mount() {
     --authority "127.0.0.1:${PORTABLEFS_AUTHORITY_PORT}" \
     --volume-id "$PORTABLEFS_VOLUME_NAME" \
     --mountpoint "$point" \
-    --access-token-file "/home/portablefs/creds/access-${index}.token" \
-    --tls-cert /home/portablefs/creds/client.crt \
-    --tls-key /home/portablefs/creds/client.key \
-    --tls-server-ca /home/portablefs/creds/ca.pem \
+    --access-token-file "/home/portablefs/test-pki/access-${index}.token" \
+    --tls-cert /home/portablefs/test-pki/client.crt \
+    --tls-key /home/portablefs/test-pki/client.key \
+    --tls-server-ca /home/portablefs/test-pki/ca.pem \
     --tls-server-name authority.portablefs.test \
     --max-frame-bytes 16777216 \
     --name-cache-capacity "$PORTABLEFS_NAME_CACHE_CAPACITY" \
@@ -602,7 +602,7 @@ run_container() {
   FENCE_COMMAND="kill -9 ${MOUNT_B_PID}"
   RESUME_COMMAND="kill -CONT ${MOUNT_B_PID}"
   PAUSE_COMMAND="(sleep 5.5; kill -CONT ${MOUNT_B_PID}) </dev/null >/dev/null 2>&1 & kill -STOP ${MOUNT_B_PID}"
-  GATEWAY_COMMAND="/home/portablefs/bin/pfs-coherence-routes --authority 127.0.0.1:${PORTABLEFS_AUTHORITY_PORT} --volume-id ${PORTABLEFS_VOLUME_NAME} --access-token-file /home/portablefs/creds/gateway.token --tls-cert /home/portablefs/creds/client.crt --tls-key /home/portablefs/creds/client.key --tls-server-ca /home/portablefs/creds/ca.pem --tls-server-name authority.portablefs.test --gateway-mount-root /home/portablefs/mount-a"
+  GATEWAY_COMMAND="/home/portablefs/bin/pfs-coherence-routes --authority 127.0.0.1:${PORTABLEFS_AUTHORITY_PORT} --volume-id ${PORTABLEFS_VOLUME_NAME} --access-token-file /home/portablefs/test-pki/gateway.token --tls-cert /home/portablefs/test-pki/client.crt --tls-key /home/portablefs/test-pki/client.key --tls-server-ca /home/portablefs/test-pki/ca.pem --tls-server-name authority.portablefs.test --gateway-mount-root /home/portablefs/mount-a"
   install_epoch_restart_helper
   echo "coherence-matrix-linux: stock kernel $KERNEL_RELEASE, two independent mounts of volume $PORTABLEFS_VOLUME_NAME (black-box behavior only)"
   local both=(/home/portablefs/mount-a /home/portablefs/mount-b)

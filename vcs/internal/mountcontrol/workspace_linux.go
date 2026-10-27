@@ -287,6 +287,9 @@ func action(p *Phase) bool {
 	return err == nil && boundWitness(p.Witness)
 }
 func (r Response) ValidateWorkspace() error {
+	if r.Metadata != nil {
+		return ErrGrammar
+	}
 	w := r.Workspace
 	if w == nil || w.Binding.validate() != nil || !mountid.ValidMountInstance(r.MountInstanceID) || r.Sequence != 0 || r.LossSequence != "" || r.AuthorizationDeadlineUnixMs != 0 || r.Error != "" {
 		return ErrGrammar

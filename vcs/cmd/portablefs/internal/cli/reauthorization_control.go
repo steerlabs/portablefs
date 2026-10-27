@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 	"time"
 )
 
@@ -11,8 +12,9 @@ type fuseReauthorizationHandler func(context.Context, string, uint64, []byte) (t
 type fuseLossSnapshotHandler func() (mountLossSnapshot, error)
 
 type mountLossSnapshot struct {
-	MountInstanceID string `json:"mountInstanceId"`
-	LossSequence    string `json:"lossSequence"`
+	Metadata        *mountlog.MetadataStats `json:"metadata,omitempty"`
+	MountInstanceID string                  `json:"mountInstanceId"`
+	LossSequence    string                  `json:"lossSequence"`
 }
 
 type fuseReauthorizationControl interface {

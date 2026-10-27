@@ -11,13 +11,18 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-// A complete directory has no members outside cachedNames. MKDIR establishes
-// the empty set; only physically committed local additions preserve it. Losing
-// any member or observing a peer namespace change invalidates the whole proof.
-// Each proof consumes one unit of the declared name-cache capacity.
+// MKDIR establishes an empty set whose local additions live in cachedNames.
+// A complete immutable page walk instead retains an explicit names-only set;
+// its members need not have Item capabilities. Membership withdrawal or loss
+// of a contributing page invalidates that proof. Every proof consumes one unit
+// of the declared name-cache capacity.
 type directoryCompleteness struct {
-	stamp subscriptionStamp
-	valid bool
+	stamp      subscriptionStamp
+	permission subscriptionStamp
+	valid      bool
+	// An enumerated proof can contain names without retained Item capabilities.
+	// Their presence requires LOOKUP; only a name outside this set is absent.
+	members map[string]struct{}
 }
 
 type completeDirectoryPublication struct {
@@ -36,6 +41,7 @@ func (r *rawFileSystem) dropCompleteDirectoryLocked(identity publicationIdentity
 }
 
 func (r *rawFileSystem) dropDirectoryPageHintsLocked(identity publicationIdentity) {
+	r.dropDirectoryPagesLocked(identity)
 	for key := range r.directoryPageHints {
 		if key.directory == identity {
 			delete(r.directoryPageHints, key)
@@ -145,7 +151,7 @@ func (r *rawFileSystem) settleCompleteDirectoriesLocked(p *replyPublication, suc
 			member := r.cachedNames[candidate.member]
 			valid = valid && candidate.prior.valid && r.completeDirectories[candidate.identity] == candidate.prior && member != nil && member.identity == candidate.child && r.mount.subscription.remaining(coordinate, candidate.prior.stamp, p.servedVersion) > 0
 		} else {
-			valid = valid && r.cachedNameTotalLocked() < r.nameCapacity
+			valid = valid && r.cachedNameTotalLocked() < r.nameCapacity && r.trimDirectoryPagesLocked(768, 0)
 		}
 		r.settleSourcePublicationLocked(coordinate)
 		if !valid {

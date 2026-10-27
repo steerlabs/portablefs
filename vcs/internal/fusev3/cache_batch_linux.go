@@ -48,6 +48,7 @@ func (r *rawFileSystem) invalidateCacheCoordinatesContext(ctx context.Context, w
 		coordinate := w.coordinate
 		switch coordinate.kind {
 		case publicationNamespaceName:
+			enumerations[coordinate.parent] = struct{}{}
 			r.dropDirectoryPageHintsLocked(coordinate.parent)
 			r.dropCompleteDirectoryLocked(coordinate.parent)
 			parent := r.byIdentityLocked(coordinate.parent)
@@ -66,6 +67,8 @@ func (r *rawFileSystem) invalidateCacheCoordinatesContext(ctx context.Context, w
 			r.dropCompleteDirectoryLocked(coordinate.item)
 			enumerations[coordinate.item] = struct{}{}
 		case publicationItemAttributes, publicationItemData:
+			r.dropCompleteDirectoryLocked(coordinate.item)
+			r.retireDirectoryBackingLocked(r.directories.proofs[coordinate.item])
 			delete(r.cachedAttrs, coordinate.item)
 			delete(r.cachedAttrPayloads, coordinate.item)
 			record := r.byIdentityLocked(coordinate.item)
@@ -98,6 +101,7 @@ func (r *rawFileSystem) invalidateCacheCoordinatesContext(ctx context.Context, w
 		}
 	}
 	r.mu.Unlock()
+	r.flushDirectoryRetirements(ctx)
 	for _, token := range reclaim {
 		r.mount.deferReclaim(token)
 	}
@@ -119,7 +123,7 @@ func (r *rawFileSystem) invalidateCacheCoordinatesContext(ctx context.Context, w
 				offset, length = int64(b.GetOffset()), int64(b.GetLength())
 			}
 		}
-		if status := notifier.InodeNotify(n.inode, offset, length); !status.Ok() && status != fuse.ENOENT {
+		if status := r.mount.inodeNotify(notifier, n.inode, offset, length); !status.Ok() && status != fuse.ENOENT {
 			return fmt.Errorf("fusev3: invalidate inode %d: %v", n.inode, status)
 		}
 	}

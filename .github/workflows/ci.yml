@@ -48,6 +48,7 @@ jobs:
           sh -n scripts/install.sh
           node scripts/check-install-release-trust.mjs
           python3 scripts/test_prepare_workspace_bundle.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_benchmark_linux_metadata.py
       - name: Verify current architecture and checker tests
         run: |
           set -euo pipefail

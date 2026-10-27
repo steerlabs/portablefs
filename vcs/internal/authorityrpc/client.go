@@ -1778,6 +1778,9 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 		if err == nil {
 			err = validateMkdirResult(request, completed.response)
 		}
+		if err == nil {
+			err = validateDirectoryReadResult(request, completed.response)
+		}
 		if err != nil {
 			if completed.releaseFrame != nil {
 				completed.releaseFrame()
@@ -1805,6 +1808,9 @@ func (c *Client) validateSessionProofPlacement(request *authoritypb.Request, res
 }
 
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX && response.GetOpen().GetDirectoryReadProof() != nil {
+		return fmt.Errorf("%w: directory read proof outside Linux profile", ErrTransportBinding)
+	}
 	if response.GetSessionTerminal() && response.GetErrno() != int32(syscall.ESTALE) {
 		return fmt.Errorf("%w: terminal session response omitted ESTALE", ErrTransportBinding)
 	}

@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"io"
 	"reflect"
 	"unicode/utf8"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 )
 
 const MaxIdentityBytes = mountenrollment.MaxClientIdentityBytes
@@ -39,13 +41,14 @@ type Request struct {
 	Workspace            *Workspace `json:"workspace,omitempty"`
 }
 type Response struct {
-	MountInstanceID             string             `json:"mountInstanceId,omitempty"`
-	LossSequence                string             `json:"lossSequence,omitempty"`
-	AuthorizationDeadlineUnixMs int64              `json:"authorizationDeadlineUnixMs,omitempty"`
-	Error                       string             `json:"error,omitempty"`
-	OK                          bool               `json:"ok"`
-	Sequence                    uint64             `json:"sequence,omitempty"`
-	Workspace                   *WorkspaceResponse `json:"workspace,omitempty"`
+	Metadata                    *mountlog.MetadataStats `json:"metadata,omitempty"`
+	MountInstanceID             string                  `json:"mountInstanceId,omitempty"`
+	LossSequence                string                  `json:"lossSequence,omitempty"`
+	AuthorizationDeadlineUnixMs int64                   `json:"authorizationDeadlineUnixMs,omitempty"`
+	Error                       string                  `json:"error,omitempty"`
+	OK                          bool                    `json:"ok"`
+	Sequence                    uint64                  `json:"sequence,omitempty"`
+	Workspace                   *WorkspaceResponse      `json:"workspace,omitempty"`
 }
 
 // strictValue checks exact key spelling as well as duplicates before Go's JSON
@@ -153,6 +156,9 @@ func DecodeResponse(raw []byte, workspace bool) (Response, error) {
 	if err := StrictJSON(raw, &r, limit); err != nil {
 		return r, err
 	}
+	if !r.validMetadataPlacement() {
+		return r, ErrGrammar
+	}
 	if workspace {
 		if err := r.ValidateWorkspace(); err != nil {
 			return r, err
@@ -163,6 +169,9 @@ func DecodeResponse(raw []byte, workspace bool) (Response, error) {
 	return r, nil
 }
 func EncodeResponse(r Response) ([]byte, error) {
+	if !r.validMetadataPlacement() {
+		return nil, ErrGrammar
+	}
 	limit := MaxOrdinaryResponse
 	if r.Workspace != nil {
 		limit = MaxWorkspaceResponse
@@ -179,4 +188,9 @@ func EncodeResponse(r Response) ([]byte, error) {
 		return nil, ErrGrammar
 	}
 	return raw, nil
+}
+
+func (r Response) validMetadataPlacement() bool {
+	return r.Metadata == nil || r.OK && r.Error == "" && r.Workspace == nil && r.LossSequence != "" && r.Sequence == 0 && r.AuthorizationDeadlineUnixMs == 0 &&
+		r.Metadata.PID > 0 && r.Metadata.ProcessStart != "" && len(r.Metadata.FUSEOperations) == mountlog.FUSEOperationSlots
 }

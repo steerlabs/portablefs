@@ -321,8 +321,8 @@ the worker class and workload measurements.
 | `--max-lock-records` | `65536` |
 | `--max-items` | `524288` |
 | `--max-items-per-session` | `262144` |
-| `--max-opens` | `32768` |
-| `--max-opens-per-session` | `4096` |
+| `--max-opens` | `65536` |
+| `--max-opens-per-session` | `16384` |
 | `--max-retained-reply-bytes` | `512 MiB` |
 | `--max-frame-bytes-in-flight` | `512 MiB` |
 | `--max-in-flight` | `256` |

@@ -87,6 +87,7 @@ type volumeStore interface {
 	StatFS() (xfsstore.FSStat, error)
 	Create(xfsstore.Capability, string, fs.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error)
 	SearchPermitted(xfsstore.Capability) (bool, error)
+	DirectoryReadPermitted(xfsstore.Capability) (bool, error)
 	Mkdir(xfsstore.Capability, string, fs.FileMode) (xfsstore.Capability, xfsstore.Attr, error)
 	Symlink(xfsstore.Capability, string, string) (xfsstore.Capability, xfsstore.Attr, error)
 	Readlink(xfsstore.Capability) (string, error)
@@ -1948,6 +1949,12 @@ func (h *VolumeHandler) constructDirectoryPage(
 			case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
 				// The namespace fact remains exact, but this authority never
 				// exposes the object's metadata or a retained capability.
+			case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+				// An already-open readable directory retains getdents rights
+				// after search permission is revoked. Its names and d_type/ino
+				// still come from that description; no child attribute sample
+				// or capability was acquired for READDIRPLUS publication.
+				attr = xfsstore.Attr{Kind: entry.Kind, Ino: entry.Ino}
 			case err != nil:
 				h.forgetDirectoryCandidates(candidates)
 				return nil, false, false, err

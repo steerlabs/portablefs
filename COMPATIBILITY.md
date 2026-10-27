@@ -227,6 +227,12 @@ succeeds. Replay returns the original bit without resampling.
 
 ### Linux profile
 
+- Unreleased protocol 8 includes the explicit reusable directory-read proof in
+  OPEN. The identity, incarnation and versioned snapshot bind retained backing
+  access to unchanged directory permission admission. New opens stop on
+  withdrawal; retained application handles keep their granted rights. See the
+  exact [wire contract](docs/coherence-v2/wire.md#directory-page-capability-reuse-and-reclaim).
+
 - One volume subscription per mount: a 10-second authority horizon renewed
   every 3 seconds, anchored conservatively at request start on Linux
   `CLOCK_BOOTTIME`. Receipt, renewal, cache and delegation admission compare
@@ -461,6 +467,12 @@ fields keep their meaning; consumers must ignore unknown JSON fields.
 one throwaway FUSE mount and is opt-in for that reason. `lifecycle`,
 `install-macos-app`, and `install-linux-release` are installer and app
 coordination surfaces, not a user contract.
+
+`mount-loss --json` adds an observational `metadata` object with bounded cache,
+stock-FUSE-operation, RTC and recovery counters. It is neither a permission nor a
+durability receipt. The paired unreleased local loss-snapshot response carries
+the same typed object; it is refused on workspace lifecycle and authorization
+responses. Existing mount-loss identity and loss-sequence meanings are unchanged.
 
 The workspace namespace has exactly five verbs: `start`, `status [--json]`,
 `mount <connection-file> [--json]`, `umount <volume-id> [--force] [--json]`, and

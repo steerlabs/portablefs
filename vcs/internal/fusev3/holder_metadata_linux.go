@@ -195,7 +195,7 @@ func (r *rawFileSystem) pinMetadataLocked(p *replyPublication, s *delegationStat
 		p.retainedAnswer = true
 	}
 	if p.holderAdmission == nil {
-		p.cachedCoordinates, p.cachedCount, p.holderAdmission = [2]publicationCoordinate{first, second}, count, s
+		p.cachedCoordinates, p.cachedCount, p.holderAdmission = [3]publicationCoordinate{first, second}, count, s
 		return
 	}
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}

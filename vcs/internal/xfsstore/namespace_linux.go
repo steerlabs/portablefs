@@ -438,6 +438,17 @@ func (v *Volume) Link(source Capability, newParent Capability, newName string) (
 // accepts mode-000 directories as successful creations with a false witness.
 // The caller keeps the newly created child unexposed under its storage turn.
 func (v *Volume) SearchPermitted(item Capability) (bool, error) {
+	return v.directoryAccessPermitted(item, unix.X_OK)
+}
+
+// DirectoryReadPermitted checks both rights before a reusable future-open
+// proof is issued. A retained description or creation grant cannot substitute
+// for the current effective-credential/ACL check.
+func (v *Volume) DirectoryReadPermitted(item Capability) (bool, error) {
+	return v.directoryAccessPermitted(item, unix.R_OK|unix.X_OK)
+}
+
+func (v *Volume) directoryAccessPermitted(item Capability, mode uint32) (bool, error) {
 	object, err := v.holdObject(item)
 	if err != nil {
 		return false, err
@@ -446,12 +457,12 @@ func (v *Volume) SearchPermitted(item Capability) (bool, error) {
 	if object.kind != KindDirectory {
 		return false, syscall.ENOTDIR
 	}
-	err = unix.Faccessat2(object.fd(), "", unix.X_OK, unix.AT_EMPTY_PATH|unix.AT_EACCESS)
+	err = unix.Faccessat2(object.fd(), "", mode, unix.AT_EMPTY_PATH|unix.AT_EACCESS)
 	if errors.Is(err, syscall.EACCES) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check child search permission: %w", err)
+		return false, fmt.Errorf("check directory access: %w", err)
 	}
 	return true, nil
 }

@@ -333,7 +333,15 @@ func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negat
 }
 
 func (r *rawFileSystem) sourceCoordinateBusyLocked(coordinate publicationCoordinate, owner *sourcePublicationLease) bool {
+	if coordinate.kind == publicationItemAttributes && r.directories.opening[coordinate.item] != nil {
+		return true
+	}
 	for _, publication := range r.replyPublications {
+		for _, fill := range publication.directoryFills {
+			if fill.reservation != nil && fill.reservation.coordinate == coordinate || fill.owner != nil && coordinate == (publicationCoordinate{kind: publicationItemEnumeration, item: fill.key.directory}) {
+				return true
+			}
+		}
 		for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
 			if cached == coordinate {
 				return true
@@ -604,6 +612,7 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 	var directories []*dirHandle
 	for coordinate := range l.coordinates {
 		if coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData {
+			l.r.retireDirectoryBackingLocked(l.r.directories.proofs[coordinate.item])
 			delete(l.r.cachedAttrs, coordinate.item)
 			delete(l.r.cachedAttrPayloads, coordinate.item)
 		}
@@ -622,6 +631,7 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 	// Directory cursor locks must never nest inside the inode-table lock. The
 	// source gate stays closed while buffered pages and in-flight fetches retire.
 	l.r.mu.Unlock()
+	l.r.flushDirectoryRetirements(context.Background())
 	for _, directory := range directories {
 		directory.invalidateEnumeration()
 	}

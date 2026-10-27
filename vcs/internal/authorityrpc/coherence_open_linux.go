@@ -112,6 +112,9 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 	}
 	return h.mutate(ctx, req, cred, func() *authoritypb.Response {
 		body := req.GetOpen()
+		if body.GetReusableDirectoryReadIncarnation() != 0 && (profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX || !validDirectoryReadRequest(body)) {
+			return h.coherenceError(0, syscall.EINVAL)
+		}
 		if body.GetWriteIntent() && !body.GetFlags().GetWrite() {
 			return h.coherenceError(0, syscall.EINVAL)
 		}
@@ -131,6 +134,9 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 			}
 		}
 		var delegationReservation *volumeserver.DelegationReservation
+		if requested := body.GetReusableDirectoryReadIncarnation(); requested != 0 && requested != token.Incarnation {
+			return h.coherenceError(0, volumeserver.ErrSubscription)
+		}
 		if body.GetWriteIntent() && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX {
 			reservation, e := h.Coherence.Reserve(ctx, token, identity)
 			if e != nil {
@@ -164,6 +170,18 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 			return h.coherenceError(0, err)
 		}
 		defer reservation.release()
+		var directoryProof *authoritypb.DirectoryReadProof
+		if body.GetReusableDirectoryReadIncarnation() != 0 {
+			permitted, accessErr := h.Store.DirectoryReadPermitted(item)
+			if accessErr != nil {
+				return h.coherenceError(0, accessErr)
+			}
+			if err := h.admitCoherenceCache(token, volumeserver.CacheAdmission{Directories: [][16]byte{identity}, Attributes: [][16]byte{identity}}); err != nil {
+				return h.coherenceError(0, err)
+			}
+			version, stamps := h.sampleVersions(identity)
+			directoryProof = &authoritypb.DirectoryReadProof{StableIdentity: identity[:], Incarnation: token.Incarnation, ObjectVersion: stamps[0], SnapshotSequence: version, Reusable: permitted}
+		}
 		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_EXCLUSIVE && (body.GetFlags().GetWrite() || body.GetWriteIntent()) {
 			if err := h.Writers.CheckOwner(cred.ID); err != nil {
 				return h.coherenceError(0, err)
@@ -207,7 +225,10 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 		}
 		resp := h.success(0)
 		resp.VolumeVersion = h.coherenceVersionNow()
-		resp.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: handle[:], Delegation: coherenceDelegationProto(grant), CacheCapable: cache}}
+		if directoryProof != nil {
+			resp.VolumeVersion = directoryProof.GetSnapshotSequence()
+		}
+		resp.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: handle[:], Delegation: coherenceDelegationProto(grant), CacheCapable: cache, DirectoryReadProof: directoryProof}}
 		return resp
 	})
 }

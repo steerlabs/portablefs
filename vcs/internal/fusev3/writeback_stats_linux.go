@@ -2,10 +2,13 @@
 
 package fusev3
 
+import "github.com/steerlabs/portablefs/vcs/internal/mountlog"
+
 // WritebackStats is a bounded aggregate diagnostic snapshot. Dirty entries
 // await Authority application; retained entries also include applied data still
 // awaiting visibility or durability. Individual identities are never exposed.
 type WritebackStats struct {
+	Metadata            *mountlog.MetadataStats
 	DirtyBytes          int64
 	DirtyEntries        int
 	RetainedBytes       int64
@@ -29,6 +32,7 @@ func (m *Mount) WritebackStats() WritebackStats {
 		return WritebackStats{}
 	}
 	d := m.delegations
+	metadata := m.MetadataStats()
 	d.epoch.RLock()
 	defer d.epoch.RUnlock()
 	d.mu.RLock()
@@ -42,6 +46,7 @@ func (m *Mount) WritebackStats() WritebackStats {
 	closes := d.closePending
 	d.closeMu.Unlock()
 	return WritebackStats{
+		Metadata:   metadata,
 		DirtyBytes: stats.AcceptedBytes, DirtyEntries: stats.Accepted,
 		RetainedBytes: stats.Bytes, RetainedEntries: stats.Entries,
 		PendingAdmissions: stats.WaitingAdmissions, FlushingIdentities: stats.Flushing,

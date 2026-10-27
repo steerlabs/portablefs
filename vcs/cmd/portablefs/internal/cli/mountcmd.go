@@ -1430,7 +1430,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			if stats == nil {
 				return mountLossSnapshot{}, errors.New("live writeback state unavailable")
 			}
-			return mountLossSnapshot{MountInstanceID: mountInstanceID, LossSequence: strconv.FormatUint(stats.LossSequence, 10)}, nil
+			return mountLossSnapshot{MountInstanceID: mountInstanceID, LossSequence: strconv.FormatUint(stats.LossSequence, 10), Metadata: stats.Metadata}, nil
 		})
 		if err != nil {
 			return cleanupMountedFUSE(err)

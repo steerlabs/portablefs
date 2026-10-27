@@ -204,12 +204,17 @@ type replyDataPublication struct {
 // RawFileSystem method returns. They settle after their physical /dev/fuse
 // write, which is the stock-kernel publication edge available to userspace.
 type replyPublication struct {
-	workspace      workspaceadmission.ServingPermit
-	workspaceBound bool
-	callbackOwned  bool
-	workspaceDone  chan struct{}
-	cachedNext     *replyPublication
-	cachedArena    bool
+	directoryHits                    uint64
+	directoryOpenHit, metadataHit    bool
+	directoryFills                   []*directoryPageFill
+	directoryProof                   *directoryProofPublication
+	directoryHandle, directoryOrphan uint64
+	workspace                        workspaceadmission.ServingPermit
+	workspaceBound                   bool
+	callbackOwned                    bool
+	workspaceDone                    chan struct{}
+	cachedNext                       *replyPublication
+	cachedArena                      bool
 	// A read using retained cache or holder permission must stay tracked and
 	// revalidate that permission at physical publication, regardless of arena.
 	retainedAnswer bool
@@ -220,7 +225,7 @@ type replyPublication struct {
 	holderAdmissions       []*delegationState
 	metadataSample         uint64
 	metadataResampled      bool
-	cachedCoordinates      [2]publicationCoordinate
+	cachedCoordinates      [3]publicationCoordinate
 	cachedCount            int
 	completeDirectories    [2]completeDirectoryPublication
 	completeDirectoryCount int
@@ -273,7 +278,7 @@ type replyPublication struct {
 }
 
 func (p *replyPublication) empty() bool {
-	return p == nil || p.workspaceDone == nil && len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
+	return p == nil || p.directoryHandle == 0 && p.directoryOrphan == 0 && len(p.directoryFills) == 0 && p.directoryProof == nil && p.workspaceDone == nil && len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 && p.cachedCount == 0 && p.holderAdmission == nil &&
 		!p.retainedAnswer && p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
@@ -454,6 +459,7 @@ type rawFileSystem struct {
 	cachedNames         map[nameKey]*inodeRecord
 	completeDirectories map[publicationIdentity]*directoryCompleteness
 	directoryPageHints  map[directoryPageKey]directoryPageHint
+	directories         directoryCache
 	cachedStableNames   map[publicationNamespace]*inodeRecord
 	cachedNameStable    map[nameKey]publicationNamespace
 	cachedNameStamps    map[nameKey]subscriptionStamp
@@ -552,6 +558,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		handles:          make(map[uint64]*handleRecord),
 
 		cachedNames:             make(map[nameKey]*inodeRecord),
+		directories:             newDirectoryCache(),
 		completeDirectories:     make(map[publicationIdentity]*directoryCompleteness),
 		directoryPageHints:      make(map[directoryPageKey]directoryPageHint),
 		cachedStableNames:       make(map[publicationNamespace]*inodeRecord),
@@ -656,6 +663,9 @@ func (r *rawFileSystem) removeCachedNameLocked(key nameKey, preserveComplete boo
 			r.dropCompleteDirectoryLocked(stable.parent)
 		}
 		if r.cachedStableNames[stable] == record {
+			if r.directories.nameRefs[stable] != 0 {
+				r.directories.overlap--
+			}
 			delete(r.cachedStableNames, stable)
 		}
 		delete(r.cachedNameStable, key)
@@ -711,6 +721,9 @@ func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationName
 		record.names = make(map[nameKey]struct{})
 	}
 	r.cachedNames[key] = record
+	if r.directories.nameRefs[stable] != 0 {
+		r.directories.overlap++
+	}
 	r.cachedStableNames[stable] = record
 	r.cachedNameStable[key] = stable
 	r.cachedNameStamps[key] = lease
@@ -744,7 +757,13 @@ func cacheCandidateVersion(publication *replyPublication) (uint64, uint64) {
 }
 
 func (r *rawFileSystem) reserveCacheCandidateLocked(publication *replyPublication, coordinate publicationCoordinate) (*cacheInstallReservation, bool) {
-	snapshot := cacheCandidateSnapshot(publication)
+	return r.reserveCacheSnapshotLocked(publication, coordinate, cacheCandidateSnapshot(publication))
+}
+
+// Directory pages and reusable OPEN proofs have their own response snapshot;
+// they do not populate the attribute publisher's single-sample cacheStamp.
+// Keep their reservation on the same raw owner without inventing that stamp.
+func (r *rawFileSystem) reserveCacheSnapshotLocked(publication *replyPublication, coordinate publicationCoordinate, snapshot uint64) (*cacheInstallReservation, bool) {
 	if publication == nil || publication.settlementClaimed || snapshot == 0 || r.withdrawingCoordinates[coordinate] || r.publicationRemaining(publication, coordinate) <= 0 {
 		return nil, false
 	}
@@ -782,6 +801,9 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
 		return 0, publication, false
 	}
+	if !r.trimDirectoryPagesLocked(768, 0) {
+		return 0, publication, false
+	}
 	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
 	if !admitted {
 		return 0, publication, false
@@ -811,7 +833,7 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 // in-flight reply already holds. Bindings and absences are summed because the
 // declared capacity is one promise about kernel state, not two.
 func (r *rawFileSystem) cachedNameTotalLocked() int {
-	return len(r.cachedNames) + len(r.cachedNegatives) + len(r.completeDirectories) + r.pendingNames + r.pendingNegatives
+	return len(r.cachedNames) + len(r.cachedNegatives) + len(r.completeDirectories) + r.pendingNames + r.pendingNegatives + r.directories.names - r.directories.overlap + r.directories.pendingNames
 }
 
 // admitNegativeNameLocked decides the lifetime one proven absence is published
@@ -831,6 +853,9 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 		return 0, publication, false
 	}
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+		return 0, publication, false
+	}
+	if !r.trimDirectoryPagesLocked(768, 0) {
 		return 0, publication, false
 	}
 	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
@@ -878,6 +903,9 @@ func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, ident
 		return 0, coordinate, nil, false
 	}
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+		return 0, coordinate, nil, false
+	}
+	if !r.trimDirectoryPagesLocked(512, 0) {
 		return 0, coordinate, nil, false
 	}
 	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
@@ -1080,6 +1108,7 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 			lookupReference:     lookupReference,
 		})
 	}
+	r.coldDirectoryCacheLocked()
 	r.replyTerminal = true
 	r.replyTerminalizing = false
 	close(r.replyTerminalDone)
@@ -1090,6 +1119,7 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 		if completion.publication.workspaceDone != nil && r.beforeReplySettlement != nil {
 			r.beforeReplySettlement(completion.publication)
 		}
+		r.finishDirectoryOpen(completion.publication)
 		r.finishDirPlusLookupCompletion(completion.dirPlus)
 		if completion.lookupReference != nil {
 			r.Forget(completion.lookupReference.id, 1)
@@ -1246,6 +1276,9 @@ func (r *rawFileSystem) commitDirPlusLookupTransaction(ctx context.Context) erro
 func (r *rawFileSystem) abortDirPlusLookupTransaction(ctx context.Context) {
 	publication := replyPublicationFromContext(ctx)
 	r.mu.Lock()
+	if publication != nil {
+		publication.cacheRejected = true
+	}
 	completion := r.settleDirPlusLookupTransactionLocked(publication, false)
 	r.mu.Unlock()
 	r.finishDirPlusLookupCompletion(completion)
@@ -1268,7 +1301,7 @@ func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyP
 			r.bindPathLocked(lookup.record, lookup.parent, lookup.name)
 		}
 		for key, hint := range tx.pageHints {
-			if _, exists := r.directoryPageHints[key]; exists || len(r.directoryPageHints) < r.nameCapacity {
+			if _, exists := r.directoryPageHints[key]; exists || len(r.directoryPageHints) < r.nameCapacity && r.trimDirectoryPagesLocked(8192, 0) {
 				r.directoryPageHints[key] = hint
 			}
 		}
@@ -1292,6 +1325,7 @@ func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyP
 }
 
 func (r *rawFileSystem) finishDirPlusLookupCompletion(completion dirPlusLookupCompletion) {
+	r.flushDirectoryRetirements(context.Background())
 	if completion.tx == nil {
 		return
 	}
@@ -1359,6 +1393,9 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		}
 	}
 	if r.cachedNameTotalLocked()+len(newNames) > r.nameCapacity || len(r.cachedAttrs)+r.pendingAttrs+len(newAttrs) > r.attrCapacity {
+		admissible = false
+	}
+	if !r.trimDirectoryPagesLocked(768*len(newNames)+512*len(newAttrs), 0) {
 		admissible = false
 	}
 	if !admissible {
@@ -1618,6 +1655,8 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 	for _, attr := range publication.attrs {
 		r.settleAttrPublicationLocked(attr, reusable)
 	}
+	r.settleDirectoryCacheLocked(publication, reusable)
+	r.trimDirectoryPagesLocked(0, 0)
 	for _, data := range publication.data {
 		r.settleDataPublicationLocked(data, successful)
 	}
@@ -1756,7 +1795,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		// usable so the ordinary cold-withdrawal path can complete.
 		return 0, fuse.EIO, fuse.OK
 	}
-	if publication.cachedArena && publication.originalFinalized {
+	if (publication.cachedArena || publication.directoryOpenHit) && publication.originalFinalized {
 		if r.workspaceReplyPermissionLocked(publication, opcode, outData) && publication.retainedAnswer && publication.source == nil && opcode != 15 {
 			publication.cacheRejected = true
 			r.mu.Unlock()
@@ -1979,7 +2018,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 				if notify == nil {
 					return errors.New("fusev3: unlicensed read has no notifier")
 				}
-				result := notify.InodeNotify(candidate.record.id, 0, 0)
+				result := r.mount.inodeNotify(notify, candidate.record.id, 0, 0)
 				if result.Ok() || result == fuse.ENOENT {
 					return nil
 				}
@@ -2040,6 +2079,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	if publication.workspaceDone != nil && r.beforeReplySettlement != nil {
 		r.beforeReplySettlement(publication)
 	}
+	r.finishDirectoryOpen(publication)
 	r.finishDirPlusLookupCompletion(dirPlusCompletion)
 	if lookupReference != nil {
 		r.Forget(lookupReference.id, 1)
@@ -3948,7 +3988,7 @@ func (r *rawFileSystem) RemoveXAttr(interrupted <-chan struct{}, header *fuse.In
 	return fuse.OK
 }
 
-func (r *rawFileSystem) OpenDir(interrupted <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
+func (r *rawFileSystem) OpenDir(interrupted <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
 	record := r.acquire(input.NodeId)
 	if record == nil {
 		return fuse.Status(syscall.ESTALE)
@@ -3982,6 +4022,11 @@ func (r *rawFileSystem) OpenDir(interrupted <-chan struct{}, input *fuse.OpenIn,
 		return lifecycle
 	}
 	defer finish()
+	defer func() {
+		if !status.Ok() {
+			r.rejectDirectoryReply(ctx)
+		}
+	}()
 	handle, flags, errno := record.node.OpendirHandle(ctx, input.Flags)
 	if errno != 0 {
 		return fuse.Status(errno)
@@ -4014,11 +4059,22 @@ func (r *rawFileSystem) OpenDir(interrupted <-chan struct{}, input *fuse.OpenIn,
 		}
 		return fuse.EIO
 	}
+	p := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	admitted := p != nil && r.replyPublications[p.requestUnique] == p && !p.settlementClaimed && !r.replyTerminal && !r.replyTerminalizing
+	if admitted {
+		p.directoryHandle = id
+	}
+	r.mu.Unlock()
+	if !admitted {
+		r.discardDirectoryOpen(id)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	out.Fh, out.OpenFlags = id, flags
 	return fuse.OK
 }
 
-func (r *rawFileSystem) ReadDir(interrupted <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+func (r *rawFileSystem) ReadDir(interrupted <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) (status fuse.Status) {
 
 	if r.mount.workspace != nil {
 		entry, entryStatus := r.mount.workspaceFS().beginWorkspaceEntry(input.Unique, interrupted)
@@ -4052,6 +4108,11 @@ func (r *rawFileSystem) ReadDir(interrupted <-chan struct{}, input *fuse.ReadIn,
 		return lifecycle
 	}
 	defer finish()
+	defer func() {
+		if !status.Ok() {
+			r.rejectDirectoryReply(ctx)
+		}
+	}()
 	if errno := handle.Seekdir(ctx, input.Offset); errno != 0 {
 		return fuse.Status(errno)
 	}
