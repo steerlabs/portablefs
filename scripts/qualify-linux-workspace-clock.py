@@ -24,7 +24,7 @@ import re
 import sys
 import selectors
 import uuid
-from g3_coverage import (OPERATORS, BoundViolation, ReferenceDisagreement, coverage_verdict, campaign_coverage)
+from g3_coverage import (OPERATORS, BoundViolation, ReferenceDisagreement, coverage_verdict, campaign_coverage, causal_generation)
 
 SECOND = 1_000_000_000
 FULL_SECONDS = 72 * 3600
@@ -222,8 +222,7 @@ class PauseCampaign:
                     first = result['first_read']
                     if (first.get('vm') != 'product' or first.get('operation_prestarted') is not True
                             or first.get('host_round_trip_after_resume') is not False
-                            or type(first.get('generation')) is not int
-                            or first.get('generation') != first.get('generation_after')):
+                            or not causal_generation(first,result.get('trace') or {})):
                         raise ValueError('missing causal product RTC first read/generation')
                     interval = reference_interval(first['references'], first['reference_began_ns'],
                         first['reference_ended_ns'], first['sample_began_ns'], first['sample_ended_ns'],first.get('clock'))
@@ -292,10 +291,11 @@ def attach_planned_windows(records, campaign):
             elif row['sample_began_ns'] > window['end_ns'] and row.get('sample') and trace.get('product_first_read'):
                 first=trace['product_first_read']
                 sample=row['sample']
-                if (sample['measurement']['elapsed_end_ns'] < first['boottime_began_ns']
-                        or sample['measurement']['generation'] < first['generation']):
+                recovery_generation=trace.get('recovery',{}).get('generation')
+                if (type(recovery_generation) is not int
+                        or sample['measurement']['generation'] < recovery_generation):
                     row['error']='guest BOOTTIME projection crosses a pause/recovery generation'
-                    row.pop('sample')
+                    row['rejected_projection']=row.pop('sample')
 
 
 def main():

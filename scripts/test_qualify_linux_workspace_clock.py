@@ -33,7 +33,7 @@ def observation(slot,closing=False):
                 host_wall_pair=dict(began_ns=began+180_000_000,ended_ns=began+180_001_000,wall_ns=UTC+slot*30*S+180_000_500),
                 independent_reference=dict(references=refs,clock=clock.REFERENCE_CLOCK),
                 sample=dict(measurement=dict(rtc=rtc,wall_after=wall,sample_age_ns=1000,elapsed_end_ns=slot*30*S,generation=1),
-                            elapsed_ns=slot*30*S,wall_ns=UTC+slot*30*S+205_000_000))
+                            elapsed_ns=slot*30*S,wall_ns=UTC+slot*30*S+205_000_000,boot_id='one-product-boot',service_pid='444'))
 
 
 def verdict(rows,seconds=72*3600,envelope=None,disruptions=()):
@@ -60,6 +60,8 @@ class QualificationTests(unittest.TestCase):
             ('disagreeing reference',lambda r:r[4]['independent_reference']['references'][1].update(unix_ns=UTC+999*S)),
             ('spliced run',lambda r:r[10].update(run_id='second-run')),
             ('spliced start',lambda r:r[10].update(run_start_ns=START+1)),
+            ('spliced guest',lambda r:r[10]['sample'].update(boot_id='different-boot')),
+            ('restarted guest owner',lambda r:r[10]['sample'].update(service_pid='445')),
             ('duplicated slot',lambda r:r.insert(2,copy.deepcopy(r[1]))),
             ('missing ordinary sample',lambda r:r[3].pop('sample')),
             ('missing host bracket',lambda r:r[3].pop('host_wall_pair')),
@@ -150,15 +152,18 @@ class QualificationTests(unittest.TestCase):
             begin=START+(block*6*3600+(3*3600 if load=='load' else 0)+900)*S
             case=dict(block=block,fencing=mode,pause_seconds=duration,load=load,run_start_ns=START)
             rows.append(dict(case=case,trace=dict(load=load,pause_confirmed_host_ns=begin,boot_id='product-boot',resume_requested_host_ns=begin+int(duration*S),
-                         requested_pause_seconds=duration,fencing=mode,
+                         requested_pause_seconds=duration,fencing=mode,recovery=dict(generation=block+1),
                          load_evidence=dict(load=load,run_start_ns=START,block=block*2+(load=='load'),pid=123 if load=='load' else None)),
-                first_read=dict(vm='product',operation_prestarted=True,host_round_trip_after_resume=False,generation=block,generation_after=block,
+                first_read=dict(vm='product',operation_prestarted=True,host_round_trip_after_resume=False,generation=block,generation_after=block,armed_generation=block,
                                 boot_id='product-boot',sample_began_ns=begin+int(duration*S)),first_read_source='pass',
                 duplicate_readers=dict(vm='product',read_only=True,second_open_busy=True,readers=8,samples=8000,maximum_ns=250_000_000)))
         result=campaign_coverage(rows,[])
         self.assertEqual(result['completed'],288)
         self.assertTrue(result['first_read_after_resume'])
         self.assertTrue(result['concurrent_duplicate_readers'])
+        straddled=copy.deepcopy(rows)
+        straddled[0]['first_read']['generation_after']=straddled[0]['first_read']['generation']+1
+        self.assertTrue(campaign_coverage(straddled,[])['first_read_after_resume'])
         for name,edit in (
             ('duplicate identity',lambda r:r.__setitem__(1,copy.deepcopy(r[0]))),
             ('wrong load',lambda r:r[0]['trace'].update(load='load')),
@@ -211,12 +216,16 @@ class QualificationTests(unittest.TestCase):
             clock.attach_planned_windows([invalid],campaign)
             self.assertEqual('planned_window' in invalid,planned)
         # No old generation may escape a completed recovery window.
-        trace['product_first_read']=dict(boottime_began_ns=10*S,generation=2)
+        trace['product_first_read']=dict(boottime_began_ns=31*S,generation=2)
+        trace['recovery']=dict(generation=2)
         later=observation(1)
         later['sample']['measurement']['generation']=1
         clock.attach_planned_windows([later],campaign)
         self.assertNotIn('sample',later)
         self.assertIn('projection crosses',later['error'])
+        fresh=observation(1);fresh['sample']['measurement']['generation']=2
+        clock.attach_planned_windows([fresh],campaign)
+        self.assertIn('sample',fresh)  # The service may read before the diagnostic reader.
 
     def test_load_ends_by_own_stdin_eof(self):
         load=mock.Mock();load.wait.return_value=0

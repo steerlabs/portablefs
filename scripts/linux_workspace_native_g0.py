@@ -115,7 +115,7 @@ print(json.dumps(result),flush=True)
                 trace['peer_completed_before_resume'] = peer_before_resume
                 if peer_before_resume: trace['peer_completion_upper_host_ns'] = trace['resume_requested_host_ns']
                 if fencing == 'normal':
-                    guest.command('resume'); guest.wait('resumed',25)
+                    guest.command('resume'); trace['recovery']=guest.wait('resumed',25)
                 else:
                     guest.command('test-resume-unfenced'); guest.wait('test-resumed-unfenced',10)
                     with selectors.DefaultSelector() as ready:

@@ -34,6 +34,17 @@ def inventory(blocks=12):
     return result
 
 
+def causal_generation(read, trace):
+    # A raw RTC ioctl does not project BOOTTIME or make an admission decision.
+    # Preserve both exact generation reads when Resume publishes concurrently;
+    # only this case's single known recovery transition may straddle the ioctl.
+    values=(read.get('armed_generation'),read.get('generation'),read.get('generation_after'),
+            trace.get('recovery',{}).get('generation'))
+    if any(type(value) is not int for value in values):return False
+    armed,before,after,recovered=values
+    return recovered==armed+1 and armed<=before<=after<=recovered
+
+
 def campaign_coverage(records, errors):
     expected = inventory()
     seen, first, duplicate = set(), set(), set()
@@ -67,8 +78,7 @@ def campaign_coverage(records, errors):
         read = record.get('first_read', {})
         if (read.get('vm') == 'product' and read.get('operation_prestarted') is True
                 and read.get('host_round_trip_after_resume') is False
-                and type(read.get('generation')) is int
-                and read.get('generation') == read.get('generation_after')
+                and causal_generation(read,trace)
                 and read.get('boot_id') == trace.get('boot_id')
                 and read.get('sample_began_ns') == trace.get('resume_requested_host_ns')
                 and record.get('first_read_source') == 'pass'):
@@ -104,6 +114,7 @@ def coverage_verdict(records, start_ns, seconds, run_id, reference_interval, eva
     direct, bounded, ordinary, planned = set(), set(), set(), set()
     checks = []
     previous = start_ns-1
+    guest_identity=None
     for row in records:
         if not isinstance(row,dict) or type(row.get('reference_began_ns')) is not int:
             missing.append('missing/malformed observation timestamp');continue
@@ -114,6 +125,12 @@ def coverage_verdict(records, start_ns, seconds, run_id, reference_interval, eva
             failures.append(row.get('error', 'observed bound violation'))
         if row.get('run_id') != run_id or row.get('run_start_ns') != start_ns:
             invalid.append('spliced run identity or start epoch')
+        sample=row.get('sample') or row.get('rejected_projection')
+        if sample:
+            identity=(sample.get('boot_id'),sample.get('service_pid'))
+            if not all(identity): missing.append('missing guest boot/service identity')
+            elif guest_identity is None: guest_identity=identity
+            elif guest_identity!=identity: invalid.append('guest reboot/service owner restart or spliced guest')
         began = row['reference_began_ns']
         if began <= previous:
             invalid.append('non-increasing observation timestamps')

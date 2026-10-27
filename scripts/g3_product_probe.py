@@ -88,7 +88,8 @@ class ProductProbe:
                      reference_began_ns=min(v['reference_began_ns'] for v in self.reference_results),
                      reference_ended_ns=max(v['reference_ended_ns'] for v in self.reference_results),
                      adapter_collections=self.reference_results,reference_errors=self.reference_errors,
-                     sample_began_ns=self.resume_ns,sample_ended_ns=ended)
+                     sample_began_ns=self.resume_ns,sample_ended_ns=ended,armed_generation=self.armed['generation'],
+                     generation_straddled=first['generation']!=first['generation_after'])
         assert first['boot_id']==self.armed['boot_id'] and first['service_pid']==self.armed['service_pid']
         return first, duplicate
 

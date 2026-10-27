@@ -37,6 +37,13 @@ def atomic(path, value):
     temporary.replace(path)
 
 
+def write_status(evidence, status, body):
+    notice=(f"Owned authority container: {status.get('authority_container','preparing')}.\n"
+            "Other sessions must not pause pfs-g3* containers. Any unplanned authority pause invalidates the run.\n"
+            "Coordinate quiet windows before container pauses; the run must restart at zero after disruption.\n\n")
+    (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+notice+body)
+
+
 def driver(address, case):
     with socket.socket(socket.AF_UNIX) as client:
         client.connect(address)
@@ -136,6 +143,7 @@ def main():
                   phase='preparing', caffeinate_pid=caffeinate.pid, errors=[],run_id=run_id)
     (evidence/'pid').write_text(str(os.getpid())+'\n')
     atomic(evidence/'status.json',status)
+    write_status(evidence,status,'Preparing pinned run inputs.\n')
     guest = authority = process = None
     server = socket.socket(socket.AF_UNIX)
     address = str(state/'campaign.sock')
@@ -295,8 +303,7 @@ while True:
                 if (evidence/'coordinator-request.json').exists():
                     status['coordinator_request']=json.loads((evidence/'coordinator-request.json').read_text())
                 atomic(evidence/'status.json',status)
-                status_path=evidence/'STATUS.md'
-                status_path.write_text('# G3 clock run\n\n'+f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\nCoordinator request: {status.get('coordinator_request','none')}.\n")
+                write_status(evidence,status,f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\nCoordinator request: {status.get('coordinator_request','none')}.\n")
                 closing.wait(5)
             assert process.returncode == 0, f'harness exited {process.returncode}'
         status['result']=json.loads((evidence/'clock/result.json').read_text())
@@ -310,7 +317,7 @@ while True:
         if disrupted:
             atomic(evidence/'INVALID.json',dict(run_id=run_id,error=repr(error),observed_ns=time.monotonic_ns(),at=now().isoformat()))
         atomic(evidence/'status.json',status)
-        (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+status['phase']+': '+repr(error)+'\nEvidence preserved; stopping owned resources.\n')
+        write_status(evidence,status,status['phase']+': '+repr(error)+'\nEvidence preserved; stopping owned resources.\n')
         raise
     finally:
         stop.touch()
@@ -340,7 +347,7 @@ while True:
         caffeinate.terminate();caffeinate.wait(timeout=5)
         status['finished']=now().isoformat()
         atomic(evidence/'status.json',status)
-        (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+f"Phase: {status['phase']}.\nRun: {run_id}; owner PID: {os.getpid()}.\nErrors: {status['errors']!r}.\nEvidence retained; runs are never spliced.\n")
+        write_status(evidence,status,f"Phase: {status['phase']}.\nRun: {run_id}; owner PID: {os.getpid()}.\nErrors: {status['errors']!r}.\nEvidence retained; runs are never spliced.\n")
     if status['errors']:
         raise RuntimeError(status['errors'])
 
