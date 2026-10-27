@@ -62,6 +62,11 @@ service-used-clean-stop-outcome
 service-stop-persists
 service-ssh-identity-persistence
 service-crash-no-ram-adoption
+service-crash-live-worker-refusal
+service-crash-same-boot-recovery
+service-crash-reconcile-unknown-retained
+service-loss-accepted-tail-peer
+service-loss-retained-after-clean-stop
 g0-vz-normal-5s
 g0-vz-normal-15s
 g0-vz-normal-45s

@@ -9,10 +9,13 @@ public final class WorkspaceState {
     public var formatAuthorized: String { FileManager.default.fileExists(atPath: directory.appendingPathComponent("format-authorized").path) ? "8" : "" }
     public let machineID: String
     public let macAddress: String
-    public init(directory: URL) throws {
+    public init(directory: URL, ownership: WorkspaceFileLock? = nil) throws {
         self.directory = directory
         privateDirectory = try WorkspacePrivateDirectory(directory)
-        lock = try privateDirectory.lock("owner.lock")
+        if let ownership {
+            try privateDirectory.validateLock(ownership, name: "owner.lock")
+            lock = ownership
+        } else { lock = try privateDirectory.lock("owner.lock") }
         let identity = directory.appendingPathComponent("network-identity")
         if !FileManager.default.fileExists(atPath: identity.path) {
             let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()

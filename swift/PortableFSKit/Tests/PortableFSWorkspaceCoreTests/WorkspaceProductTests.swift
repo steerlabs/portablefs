@@ -65,7 +65,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func startupIsIdempotentAndStopPersistsWithoutAppOwnership() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { _ in runtime }
         #expect(owner.handle(try productRequest("status")).desiredRunning == false)
         #expect(runtime.starts == 0)
         _ = owner.handle(try productRequest("start")); _ = owner.handle(try productRequest("start"))
@@ -81,21 +81,103 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
         owner.launch(); #expect(runtime.starts == 1)
     }
     @Test @MainActor func crashWitnessNeverAdoptsRAMOrTreatsPIDExitAsTermination() throws {
+        for lost in [false, true] {
+            let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+            let store = try WorkspaceHostState(directory:directory)
+            var reference: WorkspaceFileLock? = try store.directory.lock("owner.lock")
+            guard let identity = reference?.identity else { throw ProductFailure.refused }
+            var old = try WorkspaceControl.decode(workspaceGolden("status_reply"))
+            try #require(!old.statusReply.mounts.isEmpty)
+            old.statusReply.mounts = [old.statusReply.mounts[0]]
+            old.statusReply.retired = []; old.statusReply.jobs = []
+            old.statusReply.mounts[0].outcome = unknownTestOutcome()
+            old.statusReply.mounts[0].loss = []
+            if lost {
+                var loss = WorkspaceLoss(); loss.sequence = 1; loss.acceptedEntries = 1; loss.acceptedBytes = 4096; loss.reason = "accepted old tail lost"
+                old.statusReply.mounts[0].loss = [loss]
+                old.statusReply.mounts[0].state = "terminal"; old.statusReply.mounts[0].reason = loss.reason
+                old.statusReply.mounts[0].outcome.durability = "lost"; old.statusReply.mounts[0].outcome.observation = "observed"; old.statusReply.mounts[0].outcome.release = "abandoned"
+            }
+            let evidence = try WorkspaceControl.encode(old)
+            try store.commit { $0.running = true; $0.execution = WorkspaceExecution(hostBoot:"same-boot",boot:Data(repeating:1,count:16),reference:identity); $0.current = evidence }
+            let runtime = try ProductRuntime()
+            let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"same-boot") { _ in runtime }
+            let start = try productRequest("start")
+            withExtendedLifetime(reference) {
+                owner.launch(); #expect(runtime.starts == 0); #expect(owner.snapshot().state == "cleanup-required")
+                #expect(owner.handle(start).state == "refused"); #expect(runtime.starts == 0)
+                #expect(throws:(any Error).self) { try store.requirePriorExecutionAbsent(hostBoot:"same-boot") }
+            }
+            reference = nil
+            #expect(owner.handle(try productRequest("start")).state == "starting")
+            #expect(runtime.starts == 1); #expect(store.value.execution?.boot == runtime.bootID)
+            #expect(store.value.execution?.boot != Data(repeating:1,count:16))
+            #expect(store.value.retained.contains(evidence)); #expect(owner.snapshot().previousWriteOutcomeUnknown == !lost); #expect(owner.snapshot().someChangesWereNotSaved == lost)
+        }
+    }
+    @Test func descriptorPassedLockSurvivesOriginalOwnerRetirement() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let state = try WorkspacePrivateDirectory(directory)
+        var reference: WorkspaceFileLock? = try state.lock("owner.lock")
+        guard let identity = reference?.identity, let descriptor = reference?.fileHandle.fileDescriptor else { throw ProductFailure.refused }
+        // Process duplicates this descriptor onto the child's stdin. This
+        // borrowed wrapper must not keep the original description alive.
+        let borrowed = FileHandle(fileDescriptor: descriptor, closeOnDealloc:false)
+        let child = Process(), output = Pipe()
+        child.executableURL = URL(fileURLWithPath:"/usr/bin/python3")
+        child.arguments = ["-c", "import os,signal; os.fstat(0); print('holding',flush=True); signal.pause()"]
+        child.standardInput = borrowed; child.standardOutput = output; child.standardError = FileHandle.nullDevice
+        try child.run()
+        defer { if child.isRunning { child.terminate(); child.waitUntilExit() } }
+        #expect(try output.fileHandleForReading.read(upToCount:8) == Data("holding\n".utf8))
+        withExtendedLifetime(reference) {}
+        reference = nil
+        #expect(throws:(any Error).self) { try state.lock("owner.lock") }
+        child.terminate(); child.waitUntilExit()
+        let successor = try state.lock("owner.lock")
+        #expect(successor.identity == identity)
+    }
+    @Test func replacedExecutionLockCannotProveSameBootAbsence() throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory)
-        try store.commit { $0.running = true; $0.execution = WorkspaceExecution(hostBoot:"same-boot",boot:Data(repeating:1,count:16)) }
-        let runtime = try ProductRuntime()
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"same-boot") { runtime }
-        owner.launch(); #expect(runtime.starts == 0); #expect(owner.snapshot().state == "cleanup-required")
-        #expect(owner.handle(try productRequest("start")).state == "refused"); #expect(runtime.starts == 0)
+        let reference = try store.directory.lock("owner.lock")
+        try store.commit { $0.execution = WorkspaceExecution(hostBoot:"same-boot",boot:Data(repeating:1,count:16),reference:reference.identity) }
+        try store.directory.remove("owner.lock")
         #expect(throws:(any Error).self) { try store.requirePriorExecutionAbsent(hostBoot:"same-boot") }
-        try store.requirePriorExecutionAbsent(hostBoot:"new-host-boot")
-        #expect(store.value.execution == nil)
+        #expect(store.value.execution != nil)
+        withExtendedLifetime(reference) {}
+    }
+    @Test func desiredStateRequiresDescriptorWitnessFormat() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let state = try WorkspacePrivateDirectory(directory)
+        var unequal = WorkspaceDesiredState(); unequal.version = 1
+        try state.write("desired.json",data:WorkspaceHostControl.encode(unequal))
+        #expect(throws:(any Error).self) { try WorkspaceHostState(directory:directory) }
+    }
+    @Test func workspaceStateRetainsTransferredOwnerLock() throws {
+        let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
+        let privateDirectory = try WorkspacePrivateDirectory(directory)
+        var reference: WorkspaceFileLock? = try privateDirectory.lock("owner.lock")
+        var state: WorkspaceState? = try WorkspaceState(directory:directory,ownership:reference)
+        reference = nil
+        #expect(throws:(any Error).self) { try privateDirectory.lock("owner.lock") }
+        withExtendedLifetime(state) {}
+        state = nil
+        let successor = try privateDirectory.lock("owner.lock")
+        withExtendedLifetime(successor) {}
+    }
+    @Test func workspaceStateRejectsForeignOwnershipBeforeDiskCreation() throws {
+        let first = try productDirectory(), second = try productDirectory()
+        defer { try? FileManager.default.removeItem(at:first); try? FileManager.default.removeItem(at:second) }
+        let owner = try WorkspacePrivateDirectory(first).lock("owner.lock")
+        #expect(throws:(any Error).self) { try WorkspaceState(directory:second,ownership:owner) }
+        #expect(!FileManager.default.fileExists(atPath:second.appendingPathComponent("data.ext4").path))
+        withExtendedLifetime(owner) {}
     }
     @Test @MainActor func pendingMountKeepsIntentAcrossTransitionAndRequiresExactResponse() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { _ in runtime }
         _ = owner.handle(try productMount(productConnection()))
         #expect(store.value.volumes.count == 1); #expect(runtime.identityCalls == 0)
         runtime.running(); try await productTurn()
@@ -123,7 +205,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func busyUnmountRetainsServingReservationAndStopNeverForces() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { _ in runtime }
         _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
         let request = try #require(store.value.volumes.first?.request), mount = try request.guestIdentity().mount
         var job = WorkspaceMountJob(); job.mount = mount; job.requestID = 2; job.operation = "mount"; job.phase = "complete"
@@ -144,7 +226,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func failedOrderlyShutdownLeavesRunningIntentAndVM() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime(); runtime.shutdownFails = true
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { _ in runtime }
         _ = owner.handle(try productRequest("start")); runtime.running(); try await productTurn()
         _ = owner.handle(try productRequest("stop")); try await productTurn()
         #expect(runtime.stops == [false]); #expect(store.value.running); #expect(store.value.execution != nil); #expect(runtime.phase == .running)
@@ -183,7 +265,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func issuerOutageRetainsPublicRequestAndPendingAuthorizationCanBeRemoved() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { _ in runtime }
         _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
         let before = try #require(store.value.volumes.first?.request)
         for _ in 0..<10 { _ = owner.handle(try productRequest("status")) }
@@ -198,7 +280,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func terminalCleanupAllowsFreshRequestAndKeepsKnownAndUnknownLoss() async throws {
         let directory = try productDirectory(); defer { try? FileManager.default.removeItem(at:directory) }
         let store = try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")), runtime = try ProductRuntime()
-        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { runtime }
+        let owner = WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot") { _ in runtime }
         _ = owner.handle(try productMount(productConnection())); runtime.running(); try await productTurn()
         let old = try #require(store.value.volumes.first?.request)
         try store.commit { $0.volumes[0].authorizationConsumed=true; $0.volumes[0].operation="ready" }
@@ -223,7 +305,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     @Test @MainActor func forceStopRetainsUnobservedPriorWriteOutcome() async throws {
         let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
         let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
-        let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+        let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in runtime }
         _=owner.handle(try productMount(productConnection()));runtime.running();try await productTurn()
         let request=try #require(store.value.volumes.first?.request)
         var job=WorkspaceMountJob();job.mount=try request.guestIdentity().mount;job.requestID=2;job.operation="mount";job.phase="complete"
@@ -241,7 +323,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
 @Test @MainActor func productLifecycleQuiescenceIsIdleOnlyAndIndependentOfOperationalVersion() throws {
     let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
     let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
-    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in runtime }
     let quiesce=try WorkspaceHostLifecycleRequest.decode(Data("{\"lifecycleVersion\":1,\"operation\":\"quiesce\"}".utf8))
     _=owner.handle(try productRequest("start"))
     #expect(try owner.lifecycle(quiesce).state=="busy")
@@ -250,7 +332,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     // A separate idle owner with no execution can close its admission.
     let idleDirectory=try productDirectory();defer{try? FileManager.default.removeItem(at:idleDirectory)}
     let idleStore=try WorkspaceHostState(directory:idleDirectory.appendingPathComponent("workspace"))
-    let idle=WorkspaceProductOwner(store:idleStore,reservationDirectory:idleDirectory,hostBoot:"host-boot"){runtime}
+    let idle=WorkspaceProductOwner(store:idleStore,reservationDirectory:idleDirectory,hostBoot:"host-boot"){ _ in runtime }
     #expect(try idle.lifecycle(quiesce).state=="quiesced")
     #expect(idle.handle(try productRequest("start")).state=="refused")
     #expect(!idleStore.value.running)
@@ -262,7 +344,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
     let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace"))
     let first=try ProductRuntime(),second=try ProductRuntime();first.startFails=true;second.bootID=Data(repeating:9,count:16)
     var creations=0
-    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){creations+=1;return creations==1 ? first:second}
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in creations+=1;return creations==1 ? first:second}
     #expect(owner.handle(try productRequest("start")).state=="refused")
     #expect(owner.handle(try productRequest("start")).state=="refused")
     try await productTurn()
@@ -275,7 +357,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
 @Test @MainActor func productStopIntentPersistsBeforeContendedReservationCleanup() async throws {
     let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
     let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
-    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in runtime }
     _=owner.handle(try productMount(productConnection()));runtime.running();try await productTurn()
     do {
         let transition=try WorkspaceReservations(directory:directory)
@@ -291,17 +373,19 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
 @Test @MainActor func productStoppedIntentCannotHideUnconfirmedOldExecution() throws {
     let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
     let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
-    try store.commit{$0.running=false;$0.execution=WorkspaceExecution(hostBoot:"host-boot",boot:Data(repeating:1,count:16))}
-    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    let reference = try store.directory.lock("owner.lock")
+    try store.commit{$0.running=false;$0.execution=WorkspaceExecution(hostBoot:"host-boot",boot:Data(repeating:1,count:16),reference:reference.identity)}
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in runtime }
     owner.launch()
     #expect(owner.snapshot().state=="cleanup-required");#expect(runtime.starts==0)
     #expect(store.value.execution != nil)
+    withExtendedLifetime(reference) {}
 }
 
 @Test @MainActor func productStoppedDescriptorRemovalDoesNotReleaseAFollowingMacReservation() async throws {
     let directory=try productDirectory();defer{try? FileManager.default.removeItem(at:directory)}
     let store=try WorkspaceHostState(directory:directory.appendingPathComponent("workspace")),runtime=try ProductRuntime()
-    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){runtime}
+    let owner=WorkspaceProductOwner(store:store,reservationDirectory:directory,hostBoot:"host-boot"){ _ in runtime }
     let connection=try productConnection()
     _=owner.handle(try productMount(connection));runtime.running();try await productTurn()
     _=owner.handle(try productRequest("stop",force:true));try await productTurn()

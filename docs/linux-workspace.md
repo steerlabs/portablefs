@@ -76,12 +76,15 @@ Pending Mount remains owned by the existing coordinator across power transitions
 A guest restart requests fresh initial authorization; persistent key/scope/epoch
 remain owned by the guest data disk.
 
-A durable execution witness is cleared only after confirmed VZ termination.
-Neither process exit nor a released service singleton proves VM absence. After
-an unconfirmed service crash, same-host-boot startup reports **Cleanup required**
-and refuses a successor. A different kernel boot-session identity proves the old
-execution absent. Automatic recovery earlier than that remains unproven by the
-public VZ lifetime contract; no old RAM is adopted or restored.
+A durable execution witness is cleared only after confirmed VZ termination or
+exact absence proof. Neither process exit nor a released service singleton proves
+VM absence. The service gives its locked `owner.lock` description to an immutable
+VZ serial attachment. A successor must acquire that exact pinned inode through a
+fresh description before constructing its VM. A retained VM descriptor keeps it
+busy after service death. Successful acquisition permits a cold successor while
+preserving prior outcomes; it never adopts old RAM. Replaced names and uncertain
+lock operations refuse. A different kernel boot-session identity also proves old
+execution absence. See [VM absence](linux-workspace-vm-absence.md).
 
 A `.pfsworkspace` file is at most 512 KiB of exact-version JSON. `kind` is
 `connection`, `request`, or `authorization`. A connection contains canonical TLS

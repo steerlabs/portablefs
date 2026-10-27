@@ -344,6 +344,7 @@ try:
     assert guest.p.wait(timeout=10) == 0
     record('clean-stop')
     product_checks(image, root / "product", record, authority=authority)
+    product_checks(image, root / "product-loss", record, authority=authority, outcome_case='loss')
     assert sorted(passed) == sorted(required), (passed, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
     print('native-workspace: PASS (exact inventory: %d)' % len(passed), flush=True)

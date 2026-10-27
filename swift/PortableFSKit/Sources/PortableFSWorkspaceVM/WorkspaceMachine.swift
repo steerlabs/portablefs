@@ -36,7 +36,7 @@ import PortableFSWorkspaceCore
     private var shutdownID: UUID?
     private var shutdownCompletion: ((Result<Void, Error>) -> Void)?
 
-    public init(artifact: WorkspaceArtifact, dataDisk: URL, serialLog: URL, machineID: String, macAddress: String) throws {
+    public init(artifact: WorkspaceArtifact, dataDisk: URL, serialLog: URL, machineID: String, macAddress: String, executionReference: FileHandle? = nil) throws {
         guard VZVirtualMachine.isSupported else { throw WorkspaceVMError("UNAVAILABLE: native-workspace-virtualization") }
         #if !arch(arm64)
         throw WorkspaceVMError("UNAVAILABLE: native-workspace-apple-silicon")
@@ -66,6 +66,14 @@ import PortableFSWorkspaceCore
         let seed = VZVirtioConsoleDeviceSerialPortConfiguration()
         seed.attachment = VZFileHandleSerialPortAttachment(fileHandleForReading: seedInput.fileHandleForReading, fileHandleForWriting: seedOutput.fileHandleForWriting)
         config.serialPorts = [serial, seed]
+        if let executionReference {
+            // An immutable, output-only device retains the lock-carrying open
+            // description in the VM worker, independently of service lifetime.
+            // Keep the diagnostic console's bounded pipe unchanged.
+            let witness = VZVirtioConsoleDeviceSerialPortConfiguration()
+            witness.attachment = VZFileHandleSerialPortAttachment(fileHandleForReading: nil, fileHandleForWriting: executionReference)
+            config.serialPorts.append(witness)
+        }
         try config.validate()
         machine = VZVirtualMachine(configuration: config, queue: .main)
         super.init()
