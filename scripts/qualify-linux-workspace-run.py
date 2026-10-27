@@ -40,7 +40,11 @@ def atomic(path, value):
 def write_status(evidence, status, body):
     notice=(f"Owned authority container: {status.get('authority_container','preparing')}.\n"
             "Other sessions must not pause pfs-g3* containers. Any unplanned authority pause invalidates the run.\n"
-            "Coordinate quiet windows before container pauses; the run must restart at zero after disruption.\n\n")
+            "Coordinate quiet windows before container pauses; the run must restart at zero after disruption.\n\n"
+            f"Pinned UTC-source candidate and image commit: {status.get('candidate_commit','unknown')}.\n"
+            "This run qualifies the UTC source on that image. Later directory-cache and workspace RTC-sampling "
+            "consolidation changes affect the admission path; the final candidate's admission behavior requires "
+            "the native G0 inventory. This source run does not substitute for that inventory.\n\n")
     (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+notice+body)
 
 
@@ -159,6 +163,7 @@ def main():
     caffeinate = subprocess.Popen(['caffeinate','-i','-w',str(os.getpid())])
     now = lambda: datetime.datetime.now(datetime.timezone.utc)
     status = dict(pid=os.getpid(), launched=now().isoformat(), state_directory=str(state),
+                  candidate_commit=pins['candidate_commit'], image_commit=pins['image_commit'],
                   image_manifest_sha256=hashlib.sha256((args.image/'manifest.json').read_bytes()).hexdigest(),
                   phase='preparing', caffeinate_pid=caffeinate.pid, errors=[],run_id=run_id)
     (evidence/'pid').write_text(str(os.getpid())+'\n')

@@ -66,7 +66,11 @@ preserved, the owned resources stop, and the next run starts at zero in a new
 directory. No interruption is subtracted and no run is spliced.
 
 UTC, RTC admission and aggregate G0 remain separate verdicts. Qualification is
-conditional on the trusted host and authenticated reference servers; NTS does
+scoped to the pinned candidate and image. A UTC-source campaign can remain
+applicable when later directory-cache or RTC-sampling consolidation changes
+alter admission without changing the RTC source. Record that split explicitly;
+the final candidate's admission behavior still requires its native G0 inventory.
+Qualification is conditional on the trusted host and authenticated reference servers; NTS does
 not prove server UTC correctness or future clock behavior. The native
 sampling/use-straddle and resident-kernel-state residual remain unproven.
 
