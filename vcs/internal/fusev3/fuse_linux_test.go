@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"sort"
 	"strings"
 	"sync"
@@ -180,7 +181,7 @@ func (f *fakeRPC) SessionEndCause() error {
 	return f.sessionEnd
 }
 func (f *fakeRPC) FinishLocalSessionEnforcement() {}
-func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	f.mu.Lock()
 	f.subscribeCalls++
 	gate := f.subscribeGate
@@ -189,13 +190,13 @@ func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*autho
 		select {
 		case <-gate:
 		case <-ctx.Done():
-			return nil, time.Time{}, ctx.Err()
+			return nil, permissionclock.Permission{}, ctx.Err()
 		}
 	}
-	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, continuous.Time().Add(10 * time.Second), nil
+	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, permissionclock.Permission{Time: continuous.Time().Add(10 * time.Second)}, nil
 }
-func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
-	return continuous.Time().Add(10 * time.Second), nil
+func (f *fakeRPC) RenewSubscription(context.Context, uint64) (permissionclock.Permission, error) {
+	return permissionclock.Permission{Time: continuous.Time().Add(10 * time.Second)}, nil
 }
 func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after, completed uint64) (*authoritypb.ControlEvent, error) {
 	<-ctx.Done()

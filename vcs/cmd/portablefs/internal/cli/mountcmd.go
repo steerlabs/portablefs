@@ -54,29 +54,29 @@ type mountReady struct {
 }
 
 type mountOpts struct {
-	common                                                   commonOpts
-	strategy                                                 string
-	addr                                                     string
-	mountToken                                               string
-	dataPlaneTransport                                       string
-	dataPlaneServerName                                      string
-	dataPlaneCAPath                                          string
-	clientCertPath                                           string
-	clientKeyPath                                            string
-	authExpiresAtMs                                          int64
-	managerURL                                               string
-	managerServerName                                        string
-	managerCAPath                                            string
-	enrollmentID                                             string
-	enrollmentCertPath                                       string
-	authorityGeneration                                      uint64
-	foreground                                               bool
-	readyFD                                                  int
-	opLockFD                                                 int
-	workspaceGateFD                                          int
-	workspaceOwnerFD                                         int
-	workspaceBootstrapFD, workspaceClockFD, workspaceReadyFD int
-	workspaceReconcileFD                                     int
+	common                                                                   commonOpts
+	strategy                                                                 string
+	addr                                                                     string
+	mountToken                                                               string
+	dataPlaneTransport                                                       string
+	dataPlaneServerName                                                      string
+	dataPlaneCAPath                                                          string
+	clientCertPath                                                           string
+	clientKeyPath                                                            string
+	authExpiresAtMs                                                          int64
+	managerURL                                                               string
+	managerServerName                                                        string
+	managerCAPath                                                            string
+	enrollmentID                                                             string
+	enrollmentCertPath                                                       string
+	authorityGeneration                                                      uint64
+	foreground                                                               bool
+	readyFD                                                                  int
+	opLockFD                                                                 int
+	workspaceGateFD                                                          int
+	workspaceOwnerFD                                                         int
+	workspaceBootstrapFD, workspaceClockFD, workspaceReadyFD, workspaceRTCFD int
+	workspaceReconcileFD                                                     int
 }
 
 // A mount that is already absent cannot fail closed a second time. Keep a
@@ -121,6 +121,7 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.IntVar(&o.workspaceGateFD, "workspace-gate-fd", 0, "internal: sealed read-only workspace admission descriptor")
 	fs.IntVar(&o.workspaceOwnerFD, "workspace-owner-fd", 0, "internal: workspace supervisor lifetime reader")
 	fs.IntVar(&o.workspaceBootstrapFD, "workspace-bootstrap-fd", 0, "internal: workspace private launch pipe")
+	fs.IntVar(&o.workspaceRTCFD, "workspace-rtc-fd", 0, "internal: read-only RTC descriptor")
 	fs.IntVar(&o.workspaceClockFD, "workspace-clock-fd", 0, "internal: shared TLS clock reader")
 	fs.IntVar(&o.workspaceReadyFD, "workspace-ready-fd", 0, "internal: workspace control readiness pipe")
 	fs.IntVar(&o.workspaceReconcileFD, "workspace-reconcile-fd", 0, "internal: workspace inventory reconciliation pipe")
@@ -206,7 +207,7 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if o.workspaceReconcileFD != 0 {
 		return e.runWorkspaceReconcile(o.workspaceReconcileFD, positionals[0], positionals[1])
 	}
-	if o.workspaceGateFD != 0 || o.workspaceOwnerFD != 0 || o.workspaceBootstrapFD != 0 || o.workspaceClockFD != 0 || o.workspaceReadyFD != 0 {
+	if o.workspaceRTCFD != 0 || o.workspaceGateFD != 0 || o.workspaceOwnerFD != 0 || o.workspaceBootstrapFD != 0 || o.workspaceClockFD != 0 || o.workspaceReadyFD != 0 {
 		return e.runWorkspaceMount(&o, positionals[0], positionals[1])
 	}
 	if err := refuseManagedWorkspaceMount(&o); err != nil {

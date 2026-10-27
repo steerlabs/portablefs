@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -34,9 +35,9 @@ func (r *progressSubscriptionRPC) AcknowledgeChanges(context.Context, uint64, ui
 	return nil
 }
 
-func (r *progressSubscriptionRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r *progressSubscriptionRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	if r.subscribeCalls.Add(1) == 1 {
-		return nil, time.Time{}, syscall.EAGAIN
+		return nil, permissionclock.Permission{}, syscall.EAGAIN
 	}
 	return r.subscriptionTestRPC.Subscribe(ctx, snapshot, after)
 }

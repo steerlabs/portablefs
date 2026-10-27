@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"sync"
 	"testing"
 	"time"
@@ -17,10 +18,10 @@ type startupBlockedRPC struct {
 	once    sync.Once
 }
 
-func (r *startupBlockedRPC) Subscribe(ctx context.Context, _, _ []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r *startupBlockedRPC) Subscribe(ctx context.Context, _, _ []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	r.once.Do(func() { close(r.entered) })
 	<-ctx.Done()
-	return nil, time.Time{}, ctx.Err()
+	return nil, permissionclock.Permission{}, ctx.Err()
 }
 func TestPreKernelSubscriptionUsesStartupCancellation(t *testing.T) {
 	rpc := &startupBlockedRPC{fakeRPC: newFakeRPC(), entered: make(chan struct{})}

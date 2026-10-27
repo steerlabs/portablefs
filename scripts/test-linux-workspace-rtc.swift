@@ -9,6 +9,7 @@ final class RTCQualificationVM: NSObject, VZVirtualMachineDelegate {
     let input = Pipe()
     var transcript = Data()
     var stopping = false
+    var pauseRequested = false
 
     init(kernel: URL, initramfs: URL) throws {
         let configuration = VZVirtualMachineConfiguration()
@@ -37,6 +38,19 @@ final class RTCQualificationVM: NSObject, VZVirtualMachineDelegate {
         transcript.append(data)
         FileHandle.standardOutput.write(data)
         if transcript.count > 1024 * 1024 { finish(1); return }
+        if !pauseRequested, String(decoding: transcript, as: UTF8.self).contains("RTC_PAUSE_ARMED") {
+            pauseRequested = true
+            machine.pause { [weak self] result in
+                guard let self else { return }
+                if case .failure = result { self.finish(1); return }
+                self.input.fileHandleForWriting.write(Data("probe\n".utf8))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self.machine.resume { result in
+                        if case .failure = result { self.finish(1) }
+                    }
+                }
+            }
+        }
         if String(decoding: transcript, as: UTF8.self).contains("PASS: rtc-contention-qualification\r\n") || String(decoding: transcript, as: UTF8.self).contains("PASS: rtc-contention-qualification\n") {
             finish(0)
         }

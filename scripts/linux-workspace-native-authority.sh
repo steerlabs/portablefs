@@ -37,11 +37,12 @@ cleanup() {
   [[ -z $(losetup -j "$root/xfs.img") ]]
 }
 trap cleanup EXIT TERM INT
+# Match the generated peer grant, including its one-minute NotBefore lead.
 setpriv --reuid 200001 --regid 200001 --clear-groups "$root/bin/portablefs-authority" --listen 0.0.0.0:17443 --volume-id "$volume" \
   --root "$root/xfs/$volume" --project-id 42016 \
   --tls-cert "$root/home/test-pki/server.pem" --tls-key "$root/home/test-pki/server.key" \
   --client-ca "$root/home/test-pki/client-ca.pem" --capability-public-key "$root/home/test-pki/capability-public.pem" \
-  --capability-max-lifetime 61m --mount-membership-file "$root/xfs/.portablefs-control/$volume/mount.membership" \
+  --capability-max-lifetime 181m --mount-membership-file "$root/xfs/.portablefs-control/$volume/mount.membership" \
   >"$root/authority.log" 2>&1 &
 authority_pid=$!
 for attempt in $(seq 1 150); do

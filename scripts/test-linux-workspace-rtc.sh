@@ -37,6 +37,10 @@ assert result['readers']==8 and result['samples']==8000
 assert result['maximum_ns']<=250_000_000
 result['kernel_sha256']=hashlib.sha256((image/'kernel').read_bytes()).hexdigest()
 result['image_manifest_sha256']=hashlib.sha256((image/'manifest.json').read_bytes()).hexdigest()
+resume=[json.loads(line.split('RTC_RESUME_QUALIFICATION=',1)[1]) for line in lines if line.startswith('RTC_RESUME_QUALIFICATION=')]
+assert len(resume)==1 and resume[0]['operation_prestarted'] and not resume[0]['host_round_trip_after_resume']
+assert resume[0]['read_age_ns']<=250_000_000
+(root/'rtc-first-resume.json').write_text(json.dumps(resume[0],indent=2)+'\n')
 (root/'rtc-contention.json').write_text(json.dumps(result,indent=2)+'\n')
 print('PASS: native-rtc-contention-qualification')
 PY

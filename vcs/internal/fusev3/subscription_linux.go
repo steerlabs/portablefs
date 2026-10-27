@@ -16,6 +16,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/continuous"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/workspaceadmission"
 )
@@ -49,8 +50,8 @@ func (s subscriptionStamp) withVersion(version uint64) subscriptionStamp {
 }
 
 type subscriptionRPC interface {
-	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error)
-	RenewSubscription(context.Context, uint64) (time.Time, error)
+	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error)
+	RenewSubscription(context.Context, uint64) (permissionclock.Permission, error)
 	NextControlEvent(context.Context, uint64, uint64, uint64) (*authoritypb.ControlEvent, error)
 	AcknowledgeChanges(context.Context, uint64, uint64) error
 }
@@ -98,6 +99,7 @@ type subscriptionConfig struct {
 	beforeRecoveryProof func(install bool)
 	// Deterministic test schedule at the last proof check/local-store boundary.
 	beforeWorkspaceInstall func()
+	afterWorkspaceSample   func() // deterministic register-return/use cut; nil in production
 	clock                  subscriptionClock
 	retryDelay             time.Duration
 	withdrawalLead         time.Duration
@@ -141,6 +143,8 @@ type subscriptionRegistry struct {
 	watermark              uint64
 	horizon                time.Time
 	cacheUntil             time.Time
+	permission             permissionclock.Permission
+	rtcClosed              bool
 	delegated              map[publicationIdentity]uint64
 	stale                  map[publicationIdentity]struct{}
 	coordinates            map[publicationCoordinate]subscriptionCoordinateState
@@ -325,7 +329,10 @@ func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicati
 		servedVersion < s.watermark || servedVersion < s.versionFloor || servedVersion < state.minVersion {
 		return 0
 	}
-	return max(time.Duration(0), s.cacheUntil.Sub(s.config.clock.Now()))
+	if s.mount == nil || s.mount.workspaceRTC == nil {
+		return max(time.Duration(0), s.cacheUntil.Sub(s.config.clock.Now()))
+	}
+	return s.permissionRemainingLocked(s.config.withdrawalLead)
 }
 
 func (s *subscriptionRegistry) signalHorizonChangedLocked() {
@@ -537,6 +544,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 		incarnation  uint64
 		horizonNanos uint64
 		horizon      time.Time
+		permission   permissionclock.Permission
 		delegated    []publicationIdentity
 		previous     publicationIdentity
 		havePrevious bool
@@ -544,6 +552,12 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	for page := 0; page < s.config.maxPages; page++ {
 		reply, pageHorizon, err := s.rpc.Subscribe(ctx, snapshotID, after)
 		if err != nil {
+			if errors.Is(err, permissionclock.ErrUnavailable) {
+				s.mu.Lock()
+				s.closeRTCIntervalLocked()
+				s.mu.Unlock()
+				return fmt.Errorf("%w: subscribe RTC evidence", errSubscriptionExpired)
+			}
 			return fmt.Errorf("fusev3: subscribe page %d: %w", page, err)
 		}
 		if reply == nil || reply.GetIncarnation() == 0 || reply.GetHorizonNanos() == 0 ||
@@ -555,7 +569,8 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 		}
 		if page == 0 {
 			watermark, incarnation, horizonNanos = reply.GetWatermark(), reply.GetIncarnation(), reply.GetHorizonNanos()
-			horizon = pageHorizon
+			horizon = pageHorizon.Time
+			permission = pageHorizon
 			snapshotID = bytes.Clone(reply.GetSnapshotId())
 		} else if reply.GetWatermark() != watermark || reply.GetIncarnation() != incarnation ||
 			reply.GetHorizonNanos() != horizonNanos || !bytes.Equal(reply.GetSnapshotId(), snapshotID) {
@@ -600,6 +615,21 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			if s.config.beforeWorkspaceInstall != nil {
 				s.config.beforeWorkspaceInstall()
 			}
+			if s.mount != nil && s.mount.workspaceRTC != nil {
+				if permission.Horizon != time.Duration(horizonNanos) || permission.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, s.config.withdrawalLead) <= 0 {
+					s.closeRTCIntervalLocked()
+					s.mu.Unlock()
+					return errSubscriptionExpired
+				}
+				// The sample may have straddled a new host generation. It cannot install
+				// into that generation or clear its closure.
+				if proof == nil || s.mount.workspace.Recover(*proof) != nil {
+					s.mu.Unlock()
+					return workspaceadmission.ErrClosed
+				}
+			}
+			s.permission = permission
+			s.rtcClosed = false
 			s.workspaceDrain = nil
 			s.workspaceReset = false
 			s.workspaceProof = proof
@@ -1177,7 +1207,7 @@ func (s *subscriptionRegistry) ackChanges(ctx context.Context, incarnation, posi
 
 func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64) error {
 	for {
-		timer := s.config.clock.NewTimer(volumeserver.SubscriptionRenewInterval)
+		timer := s.config.clock.NewTimer(s.renewInterval())
 		select {
 		case <-timer.C():
 		case <-ctx.Done():
@@ -1192,6 +1222,14 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 		}
 		deadline, err := s.rpc.RenewSubscription(ctx, incarnation)
 		if err != nil {
+			if s.mount != nil && s.mount.workspaceRTC != nil && errors.Is(err, permissionclock.ErrUnavailable) {
+				s.mu.Lock()
+				if s.incarnation == incarnation {
+					s.closeRTCIntervalLocked()
+				}
+				s.mu.Unlock()
+				return errSubscriptionExpired
+			}
 			if errors.Is(err, authorityrpc.ErrSubscriptionReset) || !authorityrpc.TransientTransport(err) {
 				return err
 			}
@@ -1210,11 +1248,12 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 	}
 }
 
-func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.Time) bool {
+func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, candidate permissionclock.Permission) bool {
+	deadline := candidate.Time
 	cacheUntil := deadline.Add(-s.config.withdrawalLead)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.renewalLiveLocked() || s.paused || s.incarnation != incarnation {
+	if s.incarnation != incarnation || s.paused || !s.renewalLiveLocked() {
 		return false
 	}
 	now := s.config.clock.Now()
@@ -1223,7 +1262,16 @@ func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, deadline time.T
 	if !now.Before(s.cacheUntil) || !cacheUntil.After(now) {
 		return false
 	}
+	if s.mount != nil && s.mount.workspaceRTC != nil && candidate.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, s.config.withdrawalLead) <= 0 {
+		s.closeRTCIntervalLocked()
+		return false
+	}
+	if s.mount != nil && s.mount.workspaceRTC != nil && (s.workspaceProof == nil ||
+		s.mount.workspace.Recover(*s.workspaceProof) != nil && !s.mount.workspace.Installed(*s.workspaceProof)) {
+		return false
+	}
 	if deadline.After(s.horizon) {
+		s.permission = candidate
 		s.horizon = deadline
 		s.cacheUntil = cacheUntil
 		s.signalHorizonChangedLocked()
@@ -1508,6 +1556,12 @@ func (r *rawFileSystem) markIdentityStale(identity publicationIdentity) {
 // Denial is not withdrawal completion: serveDone joins the workers and their
 // subsequent kernel invalidation attempt.
 func (s *subscriptionRegistry) liveLocked() bool {
+	if s.mount != nil && s.mount.workspaceRTC != nil {
+		if s.active && s.permissionRemainingLocked(s.config.withdrawalLead) <= 0 {
+			s.closeRTCIntervalLocked()
+		}
+		return s.active
+	}
 	if s.active && !s.config.clock.Now().Before(s.cacheUntil) {
 		s.active = false
 		s.generation++
@@ -1525,11 +1579,18 @@ func (s *subscriptionRegistry) delegationHorizonLive(incarnation uint64) bool {
 	if incarnation == 0 || incarnation != s.incarnation {
 		return false
 	}
-	if s.workspaceDrain != nil && s.workspaceDrain.incarnation == incarnation && s.config.clock.Now().Before(s.workspaceDrain.deadline) {
+	if s.workspaceDrain != nil {
+		return s.workspaceDrain.incarnation == incarnation && s.drainLiveLocked()
+	}
+	if s.mount == nil || s.mount.workspaceRTC == nil {
+		if !s.config.clock.Now().Before(s.cacheUntil) {
+			s.liveLocked()
+			return false
+		}
 		return true
 	}
-	if !s.config.clock.Now().Before(s.cacheUntil) {
-		s.liveLocked()
+	if s.permissionRemainingLocked(s.config.withdrawalLead) <= 0 {
+		s.closeRTCIntervalLocked()
 		return false
 	}
 	return true
@@ -1544,7 +1605,7 @@ func (s *subscriptionRegistry) workspaceServingLocked() bool {
 }
 func (s *subscriptionRegistry) controlLiveLocked() bool {
 	if s.workspaceDrain != nil {
-		return s.workspaceDrain.incarnation == s.incarnation && s.config.clock.Now().Before(s.workspaceDrain.deadline)
+		return s.workspaceDrain.incarnation == s.incarnation && s.drainLiveLocked()
 	}
 	if !s.liveLocked() {
 		return false
@@ -1567,4 +1628,65 @@ func (s *subscriptionRegistry) renewalLiveLocked() bool {
 		return true
 	}
 	return s.workspaceProof != nil && (s.mount.workspace.Recover(*s.workspaceProof) == nil || s.mount.workspace.Installed(*s.workspaceProof))
+}
+
+// Ordinary clients retain the protocol's three-second cadence. The workspace
+// has an earlier RTC cutoff under the full endpoint uncertainty envelope.
+func (s *subscriptionRegistry) renewInterval() time.Duration {
+	if s.mount != nil && s.mount.workspaceRTC != nil {
+		return time.Second
+	}
+	return volumeserver.SubscriptionRenewInterval
+}
+
+func (s *subscriptionRegistry) permissionRemainingLocked(lead time.Duration) time.Duration {
+	if s.mount == nil || s.mount.workspaceRTC == nil {
+		return max(time.Duration(0), s.cacheUntil.Sub(s.config.clock.Now()))
+	}
+	if s.rtcClosed {
+		return 0
+	}
+	remaining := s.permission.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, lead)
+	if s.config.afterWorkspaceSample != nil {
+		s.config.afterWorkspaceSample()
+	}
+	if remaining <= 0 {
+		s.closeRTCIntervalLocked()
+	}
+	return remaining
+}
+
+// The caller owns only the local use lock. Closure never joins workers or
+// reenters lifecycle/manager locks. A late successful sample cannot clear it.
+func (s *subscriptionRegistry) closeRTCIntervalLocked() {
+	if s.mount != nil && s.mount.workspaceRTC != nil {
+		s.rtcClosed = true
+	}
+	if s.active {
+		s.active = false
+		s.generation++
+		s.signalHorizonChangedLocked()
+	}
+}
+
+func (s *subscriptionRegistry) drainLiveLocked() bool {
+	return s.workspaceDrain != nil && s.config.clock.Now().Before(s.workspaceDrain.deadline) && s.permissionRemainingLocked(s.config.withdrawalLead) > 0
+}
+
+func (s *subscriptionRegistry) workspaceRemaining() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.liveLocked() {
+		return 0
+	}
+	return s.permissionRemainingLocked(s.config.withdrawalLead)
+}
+
+func (s *subscriptionRegistry) rtcIntervalClosed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rtcClosed
 }

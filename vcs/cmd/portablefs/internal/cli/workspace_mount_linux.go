@@ -43,6 +43,7 @@ type workspaceChild struct {
 	launch                          workspacemount.Launch
 	reader                          *workspaceadmission.Reader
 	clock                           *workspaceclock.Reader
+	rtc                             *workspaceclock.RTC
 	clockBinding                    workspaceclock.Binding
 	control                         *workspaceControlConfig
 	fence                           *authorityrpc.DispatchFence
@@ -63,9 +64,9 @@ type workspaceChild struct {
 
 func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 	seen := map[int]bool{}
-	for _, fd := range []int{o.workspaceGateFD, o.workspaceOwnerFD, o.workspaceBootstrapFD, o.workspaceClockFD, o.workspaceReadyFD} {
+	for _, fd := range []int{o.workspaceGateFD, o.workspaceOwnerFD, o.workspaceBootstrapFD, o.workspaceClockFD, o.workspaceReadyFD, o.workspaceRTCFD} {
 		if fd < 3 || seen[fd] {
-			return e.fail("mount", errors.New("workspace requires five distinct inherited descriptors"))
+			return e.fail("mount", errors.New("workspace requires six distinct inherited descriptors"))
 		}
 		seen[fd] = true
 		syscall.CloseOnExec(fd)
@@ -102,6 +103,13 @@ func (e *cmdEnv) runWorkspaceMount(o *mountOpts, volume, path string) int {
 		return e.fail("mount", err)
 	}
 	defer c.clock.Close()
+	rtcFile := os.NewFile(uintptr(o.workspaceRTCFD), "workspace RTC")
+	c.rtc, err = workspaceclock.AdoptRTC(rtcFile)
+	if err != nil {
+		rtcFile.Close()
+		return e.fail("mount", err)
+	}
+	defer c.rtc.Close()
 	c.clockBinding = workspaceclock.Binding{Owner: c.clock, Generation: c.generation.Load, Current: c.current}
 	if launch.Provision.HostedEnrollment != nil {
 		h := launch.Provision.HostedEnrollment
@@ -370,7 +378,7 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 	identity := &clientTLSIdentity{certificate: cert, keyPEM: c.launch.PrivateKey}
 	transport := dataPlaneTransport{Mode: dataPlaneTransportTLSPrivateCA, ServerName: p.ServerName, CAPEM: string(p.CaCertificate), CASHA256: c.state.DataPlaneCASHA256}
 	accepted := false
-	m, attached, clean, err := mountFUSEv3(ctx, fuseV3Config{addr: p.AuthorityEndpoint, token: string(p.Capability), transport: transport, identity: identity, volumeID: p.Mount.VolumeId, mountPath: c.state.MountPath, mountInstanceID: c.state.MountInstanceID, backingRoot: c.launch.BackingRoot, requireMountEnrollment: c.renewer != nil, awaitTLS: c.clockBinding.AwaitTLS, dispatchFence: c.fence, beforeKernel: func(client *authorityrpc.Client, routes mountRoutes) (*fusev3.ManagedConfig, error) {
+	m, attached, clean, err := mountFUSEv3(ctx, fuseV3Config{addr: p.AuthorityEndpoint, token: string(p.Capability), transport: transport, identity: identity, volumeID: p.Mount.VolumeId, mountPath: c.state.MountPath, mountInstanceID: c.state.MountInstanceID, backingRoot: c.launch.BackingRoot, requireMountEnrollment: c.renewer != nil, awaitTLS: c.clockBinding.AwaitTLS, rtc: c.rtc, dispatchFence: c.fence, beforeKernel: func(client *authorityrpc.Client, routes mountRoutes) (*fusev3.ManagedConfig, error) {
 		c.client = client
 		revision := routes.rules.Revision()
 		if !bytes.Equal(revision[:], p.RoutesRevision) {
@@ -418,7 +426,7 @@ func (c *workspaceChild) prepare(ctx context.Context, j *mountcontrol.Job, g, se
 		if err = c.control.Owner.Record(mountcontrol.Facts{Witness: w}); err != nil {
 			return nil, err
 		}
-		return &fusev3.ManagedConfig{Admission: c.reader, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string, cause error) error {
+		return &fusev3.ManagedConfig{Admission: c.reader, RTC: c.rtc, Permit: mountenrollment.Permit{Generation: g, GateSerial: serial}, Clock: c, Renewer: c.renewer, Standalone: c.renewer == nil, Persist: c.persist, FUSE: rights.FDs[0], Abort: rights.FDs[1], Remove: func(mode string, cause error) error {
 			reason := "workspace unmount requested"
 			if cause != nil {
 				reason = control.BoundedReason(cause.Error())

@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"fmt"
+	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
 	"syscall"
 	"testing"
 	"time"
@@ -19,12 +20,12 @@ type successorSubscriptionRPC struct {
 	clock *subscriptionTestClock
 }
 
-func (r successorSubscriptionRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+func (r successorSubscriptionRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, permissionclock.Permission, error) {
 	reply, _, err := r.subscriptionRPC.Subscribe(ctx, snapshot, after)
 	if reply != nil {
 		reply.Incarnation = 2
 	}
-	return reply, r.clock.Now().Add(10 * time.Second), err
+	return reply, permissionclock.Permission{Time: r.clock.Now().Add(10 * time.Second)}, err
 }
 
 func TestStaleReadCacheOpenAndCreatePublication(t *testing.T) {
