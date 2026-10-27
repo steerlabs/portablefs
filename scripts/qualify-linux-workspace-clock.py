@@ -208,6 +208,7 @@ class PauseCampaign:
                     raw = subprocess.check_output(shlex.split(self.command)+[json.dumps(case)], text=True,
                                                   timeout=pause+120)
                     result = json.loads(raw)
+                    if not isinstance(result,dict): raise ValueError('pause driver returned a malformed result')
                     if result.get('bound_violation'):
                         raise BoundViolation(result.get('error','observed campaign admission violation'))
                     if result.get('image_manifest_sha256') != self.image_hash:
@@ -247,7 +248,9 @@ class PauseCampaign:
                     if result is not None: self.records.append(result)
                 finally:
                     self.active.clear()
-                    (self.evidence/'pause-campaign.json').write_text(json.dumps(dict(cases=self.records,errors=self.errors),indent=2)+'\n')
+                    temporary=self.evidence/'pause-campaign.json.tmp'
+                    temporary.write_text(json.dumps(dict(cases=self.records,errors=self.errors),indent=2)+'\n')
+                    temporary.replace(self.evidence/'pause-campaign.json')
 
     def finish(self):
         self.stop.set()
@@ -309,6 +312,7 @@ def main():
     p.add_argument('--stop-file', type=pathlib.Path)
     p.add_argument('--invalid-file', type=pathlib.Path)
     p.add_argument('--run-id', default=None)
+    p.add_argument('--hold-file',type=pathlib.Path)
     a = p.parse_args()
     seconds = FULL_SECONDS if a.soak else a.seconds
     if seconds < 60 or seconds % INTERVAL or (a.soak and a.dry_run):
@@ -336,6 +340,10 @@ def main():
             began = time.monotonic_ns()
             closing = began >= deadline_ns
             current = min(int((began-start_ns)//(block_seconds*SECOND)), int((seconds-1)//block_seconds))
+            if a.hold_file and a.hold_file.exists() and current%2:
+                atomic(a.evidence.parent/'coordinator-request.json',dict(reason='HOLD conflicts with scheduled load; coordinator decision required'))
+                if a.stop_file: a.stop_file.touch()
+                break
             if current != block:
                 if load is not None:
                     if not stop_load(load): failures.append('owned guest load failed')
@@ -434,8 +442,18 @@ def main():
                maximum_awake_drift_ns=max((v['awake_drift_bound_ns'] for v in checks),default=None),
                maximum_conditional_utc_error_ns=max((v['worst_conditional_utc_error_ns'] for v in checks),default=None),
                maximum_source_offset_abs_ns=max((abs(n) for v in checks for n in v.get('source_offset_interval_ns',[])),default=None))
+    proof_campaigns=sum(v.get('first_read_source')=='pass'
+                        and v.get('first_read',{}).get('vm')=='product'
+                        and v.get('duplicate_readers',{}).get('vm')=='product'
+                        and v.get('duplicate_readers',{}).get('readers',0)>=8
+                        and v.get('duplicate_readers',{}).get('samples',0)>=8000
+                        and 0<=v.get('duplicate_readers',{}).get('maximum_ns',-1)<=SECOND//4
+                        for v in campaign.records)
+    proof_qualified=(not a.soak and a.dry_run and seconds==1800 and source_qualified
+                     and admission=='pass' and proof_campaigns==3 and not campaign.errors)
     result=dict(format=9,run_id=run_id,image_manifest_sha256=image_hash,seconds=(time.monotonic_ns()-start_ns)/SECOND,
-                coverage=verdict,proof_source_coverage_qualified=source_qualified,worst_cases=worst,full_soak=full,
+                coverage=verdict,proof_source_coverage_qualified=source_qualified,
+                proof_qualified=proof_qualified,proof_campaigns_completed=proof_campaigns,proof_campaigns_required=3 if a.dry_run else None,worst_cases=worst,full_soak=full,
                 samples=len(records),reference_coverage=verdict['direct_reference_slots'],source_coverage=verdict['source_passes'],
                 source_measurements=verdict['ordinary_measurements'],failures=verdict['failures'],invalid=bool(disruptions or verdict['invalid']),
                 utc=utc,rtc_admission=admission,g0='fail' if 'fail' in (utc,admission) else 'pass' if utc==admission=='pass' else 'inconclusive',

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Test-only reader in the product VM; no device reopen or clock setter.
 
-pidfd_getfd duplicates the running service's sole read-only RTC description.
+pidfd_getfd duplicates the managed daemon's inherited read-only RTC description.
+That description comes from the product root service's sole device opening.
 The accompanying sealed clock page supplies the exact generation at the read.
 This helper is copied into the disposable guest, never into the product image.
 """
@@ -53,10 +54,16 @@ def main():
     assert fcntl.fcntl(rtc, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
     page = mmap.mmap(clock, mmap.PAGESIZE, access=mmap.ACCESS_READ)
     assert page[:13] == b'PFS-TLS-CLOCK'
+    ownership=json.loads(pathlib.Path('/run/portablefs-workspace/clock-owner.json').read_text())
+    assert ownership['read_only'] and ownership['second_open_busy']
+    inherited=os.fstat(rtc);device=os.stat('/dev/rtc0')
+    assert inherited.st_rdev==device.st_rdev, 'descriptor is not the product RTC'
+    second_errno=None
     try:
         other = os.open('/dev/rtc0', os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as error:
-        assert error.errno == errno.EBUSY
+        second_errno=error.errno
+        assert error.errno in (errno.EBUSY,errno.EACCES)
     else:
         os.close(other)
         raise RuntimeError('product RTC unexpectedly admits a second opening')
@@ -70,7 +77,9 @@ def main():
         utc = datetime.datetime(year+1900, month+1, day, hour, minute, sec, tzinfo=datetime.timezone.utc)
         return utc.isoformat(), ended-began, began, ended
     print(json.dumps(dict(event='armed',vm='product',boot_id=boot,service_pid=pid,generation=generation(page))),flush=True)
-    assert sys.stdin.readline().strip() == 'probe'
+    command=sys.stdin.readline().strip()
+    if command=='stop' or not command:return
+    assert command == 'probe'
     g0 = generation(page)
     utc, age, began, ended = read(rtc)
     g1 = generation(page)
@@ -95,7 +104,8 @@ def main():
     for thread in readers: thread.join()
     assert not errors and len(samples) == 8000, errors
     print(json.dumps(dict(event='contention',vm='product',boot_id=boot,service_pid=pid,
-         readers=8,samples=len(samples),maximum_ns=max(samples),read_only=True,second_open_busy=True)),flush=True)
+         readers=8,samples=len(samples),maximum_ns=max(samples),read_only=True,second_open_busy=ownership['second_open_busy'],
+         second_open_probe_errno=second_errno,ownership_basis='product root owner startup inspection',owner_inspection=ownership)),flush=True)
 
 
 if __name__ == '__main__':

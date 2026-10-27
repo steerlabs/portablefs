@@ -114,6 +114,8 @@ def main():
     hold=pathlib.Path('/Users/timjang/.local/state/portablefs-tests/linux-workspace/HOLD')
     if hold.exists(): parser.error('HOLD exists: no VM, container or soak may start')
     pins=verify_pins(json.loads(args.pins.read_text()),ROOT,args.image,args.binary,args.reference)
+    def require_unheld():
+        if hold.exists(): raise RuntimeError('HOLD exists: native work must wait for coordinator')
     run_id=str(uuid.uuid4())
     evidence = args.evidence.resolve()
     evidence.mkdir(parents=True, exist_ok=True)
@@ -149,15 +151,19 @@ def main():
         from g3_coverage import OPERATORS
         assert len({OPERATORS[r['server']] for r in preflight['references']})>=2, 'preflight lacks two operators'
         atomic(evidence/'adapter-preflight.json',preflight)
+        require_unheld()
         subprocess.run(['bash',str(ROOT/'test-linux-workspace-g0.sh'),str(args.image),str(evidence)],
                        check=True,timeout=240)
+        require_unheld()
         subprocess.run(['bash',str(ROOT/'test-linux-workspace-rtc.sh'),str(args.image),str(evidence)],
                        check=True,timeout=150)
         atomic(evidence/'admission.json',dict(image_manifest_sha256=status['image_manifest_sha256'],
                    rtc_admission='pass',first_read_after_resume=False,concurrent_duplicate_readers=False,
                    basis='55 exact injected admission cases and separate exact-kernel RTC initramfs; product pause traces follow'))
+        require_unheld()
         guest = Guest(str(args.binary), args.image, state, evidence)
         status['guest_pid'] = guest.p.pid
+        require_unheld()
         authority = NativeAuthority(evidence)
         status['authority_container'] = authority.name
         managed = authority.mount(guest)
@@ -176,7 +182,10 @@ def main():
                         assert case['image_manifest_sha256'] == status['image_manifest_sha256']
                         assert case['host_sleep'] is False
                         assert case['run_id']==run_id
-                        if hold.exists(): raise RuntimeError('HOLD appeared: coordinator required before load campaign')
+                        if hold.exists():
+                            atomic(evidence/'coordinator-request.json',dict(reason='HOLD blocks VZ pause/load campaign; coordinator decision required',case=case))
+                            stop.touch()
+                            raise RuntimeError('HOLD appeared: coordinator required before pause/load campaign')
                         directory = evidence/'campaigns'/f"{case['block']:02d}-{case['fencing']}-{case['pause_seconds']}"
                         directory.mkdir(parents=True)
                         phase=json.loads((evidence/'clock/load-state.json').read_text())
@@ -242,7 +251,7 @@ while True:
                    str(evidence/'clock'),'--utc-reference-command',str(args.reference),
                    '--pause-command',shlex.join([sys.executable,str(pathlib.Path(__file__).resolve()),'--driver',address]),
                    '--admission-evidence',str(evidence/'admission.json'),
-                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id]
+                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--hold-file',str(hold)]
         command += ['--soak'] if args.soak else ['--seconds','1800','--dry-run']
         with (evidence/'harness.log').open('w') as log:
             process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
@@ -260,7 +269,8 @@ while True:
                     if (evidence/'owner.stderr').stat().st_size>8*1024*1024:
                         with (evidence/'owner.stderr').open('r+b') as error_log: error_log.truncate(0)
                     if event_process.poll() is not None: raise RuntimeError('authority event stream lost')
-                    for line in (evidence/'authority-events.jsonl').read_text().splitlines():
+                    for line in (evidence/'authority-events.jsonl').read_text().splitlines(keepends=True):
+                        if not line.endswith('\n'): continue
                         event=json.loads(line)
                         if event.get('Action') in ('pause','unpause','die','kill','restart','stop','destroy'):
                             raise RuntimeError('unplanned authority disruption: '+event['Action'])
@@ -282,18 +292,25 @@ while True:
                     status['expected_end']=(datetime.datetime.fromisoformat(status['start_time'])+datetime.timedelta(seconds=clock_run['seconds'])).isoformat()
                 status['updated']=now().isoformat()
                 if stop.exists(): status['phase']='stopping'
+                if (evidence/'coordinator-request.json').exists():
+                    status['coordinator_request']=json.loads((evidence/'coordinator-request.json').read_text())
                 atomic(evidence/'status.json',status)
                 status_path=evidence/'STATUS.md'
-                status_path.write_text('# G3 clock run\n\n'+f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\n")
+                status_path.write_text('# G3 clock run\n\n'+f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\nCoordinator request: {status.get('coordinator_request','none')}.\n")
                 closing.wait(5)
             assert process.returncode == 0, f'harness exited {process.returncode}'
         status['result']=json.loads((evidence/'clock/result.json').read_text())
         status['phase']='stopped' if stop.exists() else 'completed'
+        if not args.soak and not stop.exists() and not status['result']['proof_qualified']:
+            raise RuntimeError('30-minute proof did not qualify; preserve result and do not launch soak')
     except BaseException as error:
-        status['errors'].append(repr(error));status['phase']='invalid'
-        atomic(evidence/'INVALID.json',dict(run_id=run_id,error=repr(error),observed_ns=time.monotonic_ns(),at=now().isoformat()))
+        status['errors'].append(repr(error))
+        disrupted=process is not None and process.poll() is None
+        status['phase']='invalid' if disrupted else 'failed' if status.get('result',{}).get('failures') else 'inconclusive'
+        if disrupted:
+            atomic(evidence/'INVALID.json',dict(run_id=run_id,error=repr(error),observed_ns=time.monotonic_ns(),at=now().isoformat()))
         atomic(evidence/'status.json',status)
-        (evidence/'STATUS.md').write_text('# G3 clock run\n\nInvalid: '+repr(error)+'\nEvidence preserved; stopping owned resources.\n')
+        (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+status['phase']+': '+repr(error)+'\nEvidence preserved; stopping owned resources.\n')
         raise
     finally:
         stop.touch()

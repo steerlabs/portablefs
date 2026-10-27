@@ -14,7 +14,9 @@ class ProductProbe:
         # Stream source on stdin; never enumerate or copy a guest credential.
         subprocess.run(['ssh','-F',guest.ready['ssh_config'],'portablefs-workspace',
                         'cat > /tmp/g3-product-rtc-reader.py'],input=source,text=True,check=True,timeout=10)
-        pid = int(guest.ssh('systemctl show --property=MainPID --value portablefs-workspaced'))
+        find="import os,pathlib; found=[]\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit():\n  try:\n   if (p/'comm').read_text().strip()=='portablefs' and os.readlink(p/'fd/8')=='/dev/rtc0': found.append(int(p.name))\n  except (FileNotFoundError,PermissionError): pass\nassert len(found)==1,found\nprint(found[0])"
+        import shlex
+        pid=int(guest.ssh('python3 -c '+shlex.quote(find)))
         self.process = subprocess.Popen(['ssh','-F',guest.ready['ssh_config'],
                         '-o','ServerAliveInterval=0','-o','TCPKeepAlive=no','portablefs-workspace',
                         f'python3 -u /tmp/g3-product-rtc-reader.py {pid}'],
@@ -92,6 +94,10 @@ class ProductProbe:
 
     def close(self):
         if self.process.poll() is None:
-            self.process.terminate()
-            try: self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired: self.process.kill();self.process.wait(timeout=5)
+            try:
+                self.process.stdin.write('stop\n');self.process.stdin.flush();self.process.stdin.close()
+                self.process.wait(timeout=15)
+            except (BrokenPipeError,subprocess.TimeoutExpired):
+                # A paused guest cannot consume stdin. Its owned VM shutdown
+                # closes the bridge; never kill a host SSH process by name.
+                pass

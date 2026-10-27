@@ -37,12 +37,15 @@ unauthenticated fallback or favorable-pair selection exists.
 The exact pause inventory contains 12 six-hour blocks, three fencing modes and
 eight durations (0.1, 0.5, 2, 5, 15, 45, 150 and 600 seconds). Acceptance checks
 identities and actual three-hour idle/load placement. A prestarted reader in
-the product VM duplicates the running service's retained read-only RTC opening
-using pidfd_getfd. It records its first read after the requested pause, the
+the product VM duplicates a managed daemon's inherited read-only RTC description,
+which comes from the root service's retained opening
+using pidfd_getfd under the image’s existing same-user ptrace policy. It records its first read after the requested pause, the
 sealed clock page's exact generation before and after that read, boot/service
 identity, host resume-to-receipt bracket and NTS exchanges. Eight duplicated
 readers then perform at least 8,000 reads per case, with maximum age at most
-250 ms. Separate two-second initramfs evidence remains fixture evidence.
+250 ms. Ownership also retains the root service’s published read-only/second-open-busy
+inspection; an unprivileged second-open permission denial is recorded separately.
+Separate two-second initramfs evidence remains fixture evidence.
 These observations qualify the prestarted reader in the product VM; they do
 not establish scheduler ordering against every other RTC reader in that VM.
 

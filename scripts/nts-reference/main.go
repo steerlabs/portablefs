@@ -35,6 +35,8 @@ type observation struct {
 	Clock      string      `json:"clock,omitempty"`
 	Policy     string      `json:"policy,omitempty"`
 	Exchanges  []exchange  `json:"exchanges,omitempty"`
+	BeganNS    int64       `json:"began_ns,omitempty"`
+	EndedNS    int64       `json:"ended_ns,omitempty"`
 }
 
 func authenticatedReference(server string, response *ntp.Response) (reference, error) {
@@ -111,6 +113,10 @@ func collect(servers []string, timeout time.Duration, probe queryFunc, diagnosti
 	if len(groups) < 2 {
 		return observation{}, errors.New("at least two approved operators required")
 	}
+	began, clockErr := monotonicNow()
+	if clockErr != nil {
+		return observation{}, clockErr
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), min(timeout, 9*time.Second))
 	defer cancel()
 	type outcome struct {
@@ -154,7 +160,7 @@ func collect(servers []string, timeout time.Duration, probe queryFunc, diagnosti
 	}
 	group.Wait()
 	close(outcomes)
-	result := observation{References: []reference{}, Clock: referenceClock, Policy: policy.ID}
+	result := observation{References: []reference{}, Clock: referenceClock, Policy: policy.ID, BeganNS: began}
 	for outcome := range outcomes {
 		result.References = append(result.References, outcome.refs...)
 		result.Exchanges = append(result.Exchanges, outcome.exchanges...)
@@ -165,7 +171,8 @@ func collect(servers []string, timeout time.Duration, probe queryFunc, diagnosti
 			fmt.Fprintf(diagnostic, "%s %s %s: %s\n", item.Server, item.Family, item.Stage, item.Error)
 		}
 	}
-	return result, nil
+	result.EndedNS, clockErr = monotonicNow()
+	return result, clockErr
 }
 
 func main() {

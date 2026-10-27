@@ -63,6 +63,7 @@ class QualificationTests(unittest.TestCase):
             ('duplicated slot',lambda r:r.insert(2,copy.deepcopy(r[1]))),
             ('missing ordinary sample',lambda r:r[3].pop('sample')),
             ('missing host bracket',lambda r:r[3].pop('host_wall_pair')),
+            ('reversed host bracket',lambda r:r[3]['host_wall_pair'].update(began_ns=999999999999999)),
             ('unplanned authority pause',lambda r:r[5].update(failures=['authority paused'])),
             ('prior failure on retry',lambda r:r[6].update(bound_violation=True,error='previous violation')),
         ):
@@ -199,6 +200,23 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(result['reference_coverage'],2)
             self.assertTrue(result['proof_source_coverage_qualified'],result['coverage'])
             self.assertEqual(result['utc'],'inconclusive')
+
+    def test_only_causal_pause_timeouts_are_planned(self):
+        row=observation(0)
+        trace=dict(fence_requested_host_ns=row['sample_began_ns'],fresh_permission_observed_host_ns=row['sample_ended_ns'],
+                   peer_receipt_observed_host_ns=row['sample_ended_ns'])
+        campaign=mock.Mock(records=[dict(case=dict(run_id=RUN,block=0,fencing='normal',pause_seconds=.1),trace=trace)])
+        for kind,planned in (('CalledProcessError',False),('TimeoutExpired',True)):
+            invalid=copy.deepcopy(row);invalid.pop('sample');invalid['error_type']=kind
+            clock.attach_planned_windows([invalid],campaign)
+            self.assertEqual('planned_window' in invalid,planned)
+        # No old generation may escape a completed recovery window.
+        trace['product_first_read']=dict(boottime_began_ns=10*S,generation=2)
+        later=observation(1)
+        later['sample']['measurement']['generation']=1
+        clock.attach_planned_windows([later],campaign)
+        self.assertNotIn('sample',later)
+        self.assertIn('projection crosses',later['error'])
 
     def test_load_ends_by_own_stdin_eof(self):
         load=mock.Mock();load.wait.return_value=0
