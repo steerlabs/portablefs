@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/permissionclock"
@@ -25,6 +26,28 @@ func TestMain(m *testing.M) {
 			if err := unix.Mount(v.kind, v.path, v.kind, 0, ""); err != nil {
 				panic(err)
 			}
+		}
+		// This minimal initramfs has no modular virtio-rng driver or userspace
+		// entropy service. Fresh host-generated test entropy prevents crypto/rand
+		// fixture identities from waiting indefinitely for incidental interrupts.
+		entropy, err := os.ReadFile("/entropy")
+		if err != nil || len(entropy) != 64 {
+			panic("missing generated test entropy")
+		}
+		var pool struct {
+			Bits, Size int32
+			Bytes      [64]byte
+		}
+		pool.Bits, pool.Size = 512, 64
+		copy(pool.Bytes[:], entropy)
+		fd, err := unix.Open("/dev/random", unix.O_WRONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			panic(err)
+		}
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), unix.RNDADDENTROPY, uintptr(unsafe.Pointer(&pool)))
+		unix.Close(fd)
+		if errno != 0 {
+			panic(errno)
 		}
 		// A fast VZ boot can start PID 1 in kernel tick zero. Admission
 		// intentionally refuses a zero process-start witness. Run the fixture

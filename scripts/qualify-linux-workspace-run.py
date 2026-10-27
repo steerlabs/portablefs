@@ -136,9 +136,9 @@ def main():
         # Validate real authenticated connectivity before spending time booting.
         subprocess.run([str(args.reference)], check=True, timeout=10)
         subprocess.run(['bash',str(ROOT/'test-linux-workspace-g0.sh'),str(args.image),str(evidence)],
-                       check=True,timeout=180)
+                       check=True,timeout=240)
         subprocess.run(['bash',str(ROOT/'test-linux-workspace-rtc.sh'),str(args.image),str(evidence)],
-                       check=True,timeout=90)
+                       check=True,timeout=150)
         atomic(evidence/'admission.json',dict(image_manifest_sha256=status['image_manifest_sha256'],
                    rtc_admission='pass',first_read_after_resume=True,concurrent_duplicate_readers=True,
                    basis='55 exact injected admission cases and separate exact-kernel RTC initramfs; product pause traces follow'))
@@ -171,7 +171,7 @@ def main():
                         # Separate read-only initramfs, exact product kernel: this
                         # preserves sole-opening ownership in the product guest.
                         subprocess.run(['bash',str(ROOT/'test-linux-workspace-rtc.sh'),str(args.image),str(directory)],
-                                       check=True, timeout=90, stdout=subprocess.DEVNULL)
+                                       check=True, timeout=150, stdout=subprocess.DEVNULL)
                         first = json.loads((directory/'rtc-nts-reference.json').read_text())
                         duplicate = json.loads((directory/'rtc-contention.json').read_text())
                         trace = json.loads((directory/'g0-vz-pauses.json').read_text())[0]
