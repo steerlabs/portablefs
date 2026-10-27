@@ -141,10 +141,31 @@ def product_checks(image, evidence, record, authority=None, api_only=False):
             authorized=root/'authorized.pfsworkspace';authorized.write_text(response)
             command('mount',str(authorized),'--json')
             until(lambda s:s['volumes'] and s['volumes'][0]['state']=='ready')
-            assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
+            assert ssh("python3 -c \"import os; p='/workspaces/native-managed/product-proof'; f=open(p,'wb'); f.write(b'product-volume'); f.flush(); os.fsync(f.fileno()); f.close(); print(open(p).read())\"")=='product-volume'
+            assert authority.peer("import os; p='/var/tmp/pfs-native/home/peer/product-proof'; assert open(p).read()=='product-volume'; f=open(p,'w'); f.write('peer-product'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-durable')")=='peer-durable'
+            assert ssh('cat /workspaces/native-managed/product-proof')=='peer-product'
             record('service-document-standalone')
-            command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
+            holder=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace',
+                'cd /workspaces/native-managed && echo holding && read -r release'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            try:
+                assert holder.stdout.readline().strip()=='holding'
+                command('umount',authority.volume,'--json')
+                until(lambda s:s['volumes'] and s['volumes'][0]['state']=='busy')
+                assert ssh('cat /workspaces/native-managed/product-proof')=='peer-product'
+            finally:
+                holder.stdin.write('release\n');holder.stdin.flush();holder.wait(timeout=15)
+                holder.stdin.close();holder.stdout.close();holder.stderr.close()
+            command('umount',authority.volume,'--json')
+            settled=until(lambda s:not s['volumes'])
+            (evidence/'used-clean-unmount.json').write_text(json.dumps(settled,indent=2))
+            assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
+            record('service-used-clean-unmount-outcome')
         command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+        if authority is not None:
+            settled=status()
+            (evidence/'used-clean-stop.json').write_text(json.dumps(settled,indent=2))
+            assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
+            record('service-used-clean-stop-outcome')
         record('service-stop-persists')
         # Registration and status cannot defeat the explicit stopped intent.
         subprocess.run([str(host),'--workspace-service-register'],env=env,check=True)
