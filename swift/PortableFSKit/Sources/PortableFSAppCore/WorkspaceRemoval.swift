@@ -22,8 +22,8 @@ public enum WorkspaceRemoval {
             return Outcome(data: data)
         }
         let directory = home.appendingPathComponent(".local/state/portablefs/workspace", isDirectory: true)
-        let pristine = (service.status == .notRegistered || service.status == .notFound) &&
-            !FileManager.default.fileExists(atPath: directory.appendingPathComponent("desired.json").path)
+        let pristine = try (service.status == .notRegistered || service.status == .notFound) &&
+            pristineLockOnly(directory)
         return try await run(data: data, home: home, actions: Actions(
             stop: { try await client.perform(.stop) }, status: { try await client.perform(.status) },
             quiesce: {
@@ -108,9 +108,9 @@ public enum WorkspaceRemoval {
         checkpoint.phase = "complete"; try save(checkpoint, to: journal)
         return Outcome(data: data)
     }
-    private static func pristineLockOnly(_ directory: URL) -> Bool {
-        !FileManager.default.fileExists(atPath: directory.appendingPathComponent("desired.json").path) &&
-        !FileManager.default.fileExists(atPath: directory.appendingPathComponent("resources.present").path)
+    private static func pristineLockOnly(_ directory: URL) throws -> Bool {
+        let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        return Set(entries).isSubset(of: ["service.lock", "owner.lock"])
     }
     public static func removalPending(home: URL) throws -> Bool {
         let journal = home.appendingPathComponent(".local/state/portablefs/workspace-removal.json")

@@ -223,6 +223,20 @@ private func uxConfig(_ original: Data?, home: URL) throws -> URL {
             try WorkspaceRemoval.prepareToStart(home: home)
         }
     }
+    @Test func pristineInstallerLocksAllowKeepDeleteAndRetry() async throws {
+        for data in [WorkspaceRemoval.DataDisposition.keep, .delete] {
+            let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }
+            let directory = home.appendingPathComponent(".local/state/portablefs/workspace")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try Data().write(to: directory.appendingPathComponent("owner.lock"))
+            let actions = WorkspaceRemoval.Actions(stop: { throw PortableFSWorkspaceError("pristine workspace must not start") }, status: { .init() }, quiesce: {
+                #expect(try PortableFSDServiceCoordinator.workspaceRuntimeAbsent(directory))
+            }, unregister: {}, removeSSH: {})
+            _ = try await WorkspaceRemoval.run(data: data, home: home, actions: actions)
+            _ = try await WorkspaceRemoval.run(data: data, home: home, actions: actions)
+            #expect(FileManager.default.fileExists(atPath: directory.path) == (data == .keep))
+        }
+    }
     @Test func removalRefusesUnsafeOutcomesBeforeUnregister() async throws {
         for reason in ["busy", "cleanup-required", "lost", "unknown"] {
             let home = try uxHome(); defer { try? FileManager.default.removeItem(at: home) }

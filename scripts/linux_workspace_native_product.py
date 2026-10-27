@@ -101,6 +101,12 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
     lsregister='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
     subprocess.run([lsregister,'-f',str(app)],check=True)
     host = contents/'MacOS/PortableFS' 
+    # The incoming installer can leave a lock-only directory without registering
+    # any service. The actual shared API must handle that pristine boundary.
+    pristine = home/'.local/state/portablefs/workspace'
+    pristine.mkdir(parents=True, mode=0o700)
+    (pristine/'owner.lock').touch(mode=0o600)
+    subprocess.run([str(host),'--workspace-update-quiesce'],env=env,check=True,capture_output=True,text=True)
     registered = subprocess.run([str(host),'--workspace-service-register'],env=env,capture_output=True,text=True)
     if registered.returncode:
         (evidence/'product-registration.txt').write_text(registered.stdout+registered.stderr)
@@ -278,7 +284,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         record('service-ssh-identity-persistence')
         command('stop','--json');until(lambda s:s['state']=='stopped')
         snapshot('before-removal')
-        app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
+        app_command('--workspace-update-quiesce');app_command('--workspace-update-quiesce')
         assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
         assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
         assert not managed.exists() and not (home/'.ssh/config').exists()
@@ -332,7 +338,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         settled=snapshot('stopped-after-volume')
         assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
         record('service-used-clean-stop-outcome')
-        app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
+        app_command('--workspace-update-quiesce');app_command('--workspace-update-quiesce')
         assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
         app_command('--workspace-service-register')
         command('start');until(lambda s:s['state']=='running')
@@ -471,6 +477,8 @@ if __name__=='__main__':
         product_checks(image,evidence,lambda name:(observed.append(name),print('PASS:',name,flush=True)),
                        authority=authority,api_only=api_only,defer_ui=defer_ui,
                        defer_case=lambda name:(not_run.append(name),print('NOT RUN (UI deferred):',name,flush=True)))
+        if not api_only:
+            product_checks(image,evidence/'product-loss',lambda name:(observed.append(name),print('PASS:',name,flush=True)),authority=authority,outcome_case='loss',defer_ui=True,defer_case=lambda name:None)
         assert sorted(observed+not_run)==sorted(required),(observed,not_run,required)
         (evidence/'product-results.json').write_text(json.dumps({'required':required,'passed':observed,'notRun':not_run,
             'scope':'api-only' if api_only else 'product','qualified':not not_run and not api_only},indent=2))

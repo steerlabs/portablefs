@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-import PortableFSAppCore
+@testable import PortableFSAppCore
 import PortableFSKit
 import ServiceManagement
 import AppKit
@@ -25,6 +25,9 @@ import SwiftUI
         guard let id = Bundle.main.bundleIdentifier, id.hasPrefix("dev.portablefs.workspace-tests.") else { exit(64) }
         do {
             switch Array(CommandLine.arguments.dropFirst()) {
+            case ["--workspace-update-quiesce"]:
+                try await Task.detached { try PortableFSDServiceCoordinator.quiesceWorkspaceForInstaller(bundle: .main) }.value
+                exit(0)
             case ["--workspace-service-register"]:
                 let enabled = try PortableFSWorkspaceServiceRegistration.register()
                 if !enabled { fputs("Allow PortableFS in Background Items\n", stderr) }; exit(enabled ? 0 : 3)
