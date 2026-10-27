@@ -9,7 +9,7 @@ control or SSH endpoints still prove no VM absence.
 The owner acquires `flock(LOCK_EX | LOCK_NB)` on a fresh open description of
 the existing `owner.lock` in the validated workspace state directory before
 constructing the VM. WorkspaceState validates and adopts that same reference;
-it does not take a second lock. Private desired-state format 2 records its
+it does not take a second lock. Private desired-state format 3 records its
 device/inode with the execution
 identity before VZ Start. A successor never substitutes a recreated inode for a
 same-boot execution. Unequal desired-state formats refuse; no historical decoder
