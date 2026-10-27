@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from g3_product_probe import ProductProbe
-from g3_continuity import Continuity
+from g3_continuity import Continuity, record_invalid
 from g3_pins import verify as verify_pins
 
 from linux_workspace_native_managed import NativeAuthority
@@ -42,6 +42,26 @@ def write_status(evidence, status, body):
             "Other sessions must not pause pfs-g3* containers. Any unplanned authority pause invalidates the run.\n"
             "Coordinate quiet windows before container pauses; the run must restart at zero after disruption.\n\n")
     (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+notice+body)
+
+
+def cleanup_owned_resources(authority, guest, managed, peer, hold, status):
+    held=hold.exists()
+    if held and authority is not None:
+        status['deferred_container_cleanup']=dict(container=authority.name,reason='HOLD: do not unpause, stop, kill, remove or replace')
+    if not held and peer is not None and peer.poll() is None:
+        peer.terminate()
+        try:peer.wait(timeout=5)
+        except subprocess.TimeoutExpired:peer.kill();peer.wait(timeout=5)
+    if not hold.exists() and authority is not None and guest is not None:
+        try:
+            if managed:authority.unmount(guest,managed)
+        except Exception as error:status['errors'].append('unmount: '+repr(error))
+    if guest is not None:
+        try:guest.stop()
+        except Exception as error:status['errors'].append('guest stop: '+repr(error))
+    if not hold.exists() and authority is not None:
+        try:authority.close()
+        except Exception as error:status['errors'].append('authority cleanup: '+repr(error))
 
 
 def driver(address, case):
@@ -205,7 +225,7 @@ def main():
                             probe=ProductProbe(guest,args.reference.resolve())
                             managed = pause_checks(authority,guest,managed,lambda _: None,
                                                    durations=(case['pause_seconds'],),modes=(case['fencing'],),
-                                                   rtc_probe=probe,load=case['load'])
+                                                   rtc_probe=probe,load=case['load'],hold_file=hold)
                         finally:
                             authority.evidence = prior_evidence
                         trace = json.loads((directory/'g0-vz-pauses.json').read_text())[0]
@@ -252,19 +272,24 @@ while True:
         stamp = now()
         status.update(phase='running',start_time=stamp.isoformat(),
                       expected_end=(stamp+datetime.timedelta(hours=72) if args.soak else stamp+datetime.timedelta(minutes=30)).isoformat(),
-                      peer_pid=peer.pid)
+                      peer_pid=peer.pid,continuity=continuity.check(False))
         (evidence/'start-time').write_text(status['start_time']+'\n')
         atomic(evidence/'status.json',status)
         command = [sys.executable,str(ROOT/'qualify-linux-workspace-clock.py'),str(args.image),guest.ready['ssh_config'],
                    str(evidence/'clock'),'--utc-reference-command',str(args.reference),
                    '--pause-command',shlex.join([sys.executable,str(pathlib.Path(__file__).resolve()),'--driver',address]),
                    '--admission-evidence',str(evidence/'admission.json'),
-                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--hold-file',str(hold)]
+                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--hold-file',str(hold),'--owner-pid',str(os.getpid()),'--owner-status',str(evidence/'status.json')]
         command += ['--soak'] if args.soak else ['--seconds','1800','--dry-run']
         with (evidence/'harness.log').open('w') as log:
             process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
             status['harness_pid']=process.pid
             while process.poll() is None:
+                if hold.exists():
+                    stop.touch();closing.set()
+                    record_invalid(evidence/'INVALID.json',dict(run_id=run_id,error='Coordinator HOLD stops native qualification',observed_ns=time.monotonic_ns()))
+                    process.terminate()  # This exact sampler owns the load stdin.
+                    raise RuntimeError('HOLD requires immediate stop; container cleanup deferred')
                 assert caffeinate.poll() is None, 'awake assertion exited'
                 assert guest.p.poll() is None, 'guest owner exited'
                 assert peer.poll() is None, 'independent peer exited'
@@ -305,6 +330,8 @@ while True:
                 atomic(evidence/'status.json',status)
                 write_status(evidence,status,f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\nCoordinator request: {status.get('coordinator_request','none')}.\n")
                 closing.wait(5)
+            if hold.exists(): raise RuntimeError('HOLD active at completion; container cleanup deferred')
+            status['continuity']=continuity.check(False)
             assert process.returncode == 0, f'harness exited {process.returncode}'
         status['result']=json.loads((evidence/'clock/result.json').read_text())
         status['phase']='stopped' if stop.exists() else 'completed'
@@ -312,10 +339,10 @@ while True:
             raise RuntimeError('30-minute proof did not qualify; preserve result and do not launch soak')
     except BaseException as error:
         status['errors'].append(repr(error))
-        disrupted=process is not None and process.poll() is None
+        disrupted=(evidence/'INVALID.json').exists() or (process is not None and process.poll() is None)
         status['phase']='invalid' if disrupted else 'failed' if status.get('result',{}).get('failures') else 'inconclusive'
-        if disrupted:
-            atomic(evidence/'INVALID.json',dict(run_id=run_id,error=repr(error),observed_ns=time.monotonic_ns(),at=now().isoformat()))
+        if disrupted and not (evidence/'INVALID.json').exists():
+            record_invalid(evidence/'INVALID.json',dict(run_id=run_id,error=repr(error),observed_ns=time.monotonic_ns(),at=now().isoformat()))
         atomic(evidence/'status.json',status)
         write_status(evidence,status,status['phase']+': '+repr(error)+'\nEvidence preserved; stopping owned resources.\n')
         raise
@@ -327,27 +354,15 @@ while True:
                 process.terminate();process.wait(timeout=30)
         closing.set()
         with campaign_lock:
-            if peer is not None and peer.poll() is None:
-                peer.terminate()
-                try: peer.wait(timeout=5)
-                except subprocess.TimeoutExpired: peer.kill();peer.wait(timeout=5)
-            if authority is not None and guest is not None:
-                try:
-                    if managed: authority.unmount(guest,managed)
-                except Exception as error: status['errors'].append('unmount: '+repr(error))
-            if guest is not None:
-                try: guest.stop()
-                except Exception as error: status['errors'].append('guest stop: '+repr(error))
-            if authority is not None:
-                try: authority.close()
-                except Exception as error: status['errors'].append('authority cleanup: '+repr(error))
+            cleanup_owned_resources(authority,guest,managed,peer,hold,status)
         if 'event_process' in locals() and event_process.poll() is None:
             event_process.terminate();event_process.wait(timeout=5)
         server.close()
         caffeinate.terminate();caffeinate.wait(timeout=5)
         status['finished']=now().isoformat()
+        if (evidence/'clock/result.json').exists(): status['result']=json.loads((evidence/'clock/result.json').read_text())
         atomic(evidence/'status.json',status)
-        write_status(evidence,status,f"Phase: {status['phase']}.\nRun: {run_id}; owner PID: {os.getpid()}.\nErrors: {status['errors']!r}.\nEvidence retained; runs are never spliced.\n")
+        write_status(evidence,status,f"Phase: {status['phase']}.\nRun: {run_id}; owner PID: {os.getpid()}.\nErrors: {status['errors']!r}.\nDeferred container cleanup: {status.get('deferred_container_cleanup','none')}.\nEvidence retained; runs are never spliced.\n")
     if status['errors']:
         raise RuntimeError(status['errors'])
 

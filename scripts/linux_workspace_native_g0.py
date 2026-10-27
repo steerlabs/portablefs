@@ -12,7 +12,7 @@ import time
 import uuid
 
 
-def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600), modes=('normal','delayed','suppressed'), rtc_probe=None, load=None):
+def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600), modes=('normal','delayed','suppressed'), rtc_probe=None, load=None, hold_file=None):
     traces = []
     for duration in durations:
         for fencing in modes:
@@ -100,7 +100,10 @@ print(json.dumps(result),flush=True)
                 trace['peer_started_host_ns'] = time.monotonic_ns()
                 peer.stdin.write('publish\n'); peer.stdin.flush()
                 target = time.monotonic()+duration
-                while time.monotonic()<target: time.sleep(min(.25,target-time.monotonic()))
+                while time.monotonic()<target:
+                    if hold_file and hold_file.exists(): raise RuntimeError('HOLD cancels campaign; container cleanup deferred')
+                    time.sleep(min(.25,target-time.monotonic()))
+                if hold_file and hold_file.exists(): raise RuntimeError('HOLD cancels resume; container cleanup deferred')
                 # A normal cold fence may leave the old authority obligation
                 # to expire after a short pause. Resume on schedule and join
                 # that peer independently; do not turn a five-second case into
@@ -173,13 +176,16 @@ print(json.dumps(result),flush=True)
                 managed = authority.mount(guest)
             finally:
                 if rtc_probe: rtc_probe.close()
-                if blocked: authority.network(False)
-                if peer is not None and peer.poll() is None:
+                held=hold_file is not None and hold_file.exists()
+                if blocked and not held: authority.network(False)
+                if peer is not None and peer.poll() is None and not held:
                     peer.terminate()
                     try: peer.wait(timeout=5)
                     except subprocess.TimeoutExpired: peer.kill();peer.wait(timeout=5)
                 if worker is not None:
-                    if worker.poll() is None:
+                    if worker.poll() is None and held:
+                        worker.stdin.close()
+                    elif worker.poll() is None:
                         worker.terminate()
                         try: worker.wait(timeout=5)
                         except subprocess.TimeoutExpired: worker.kill();worker.wait(timeout=5)

@@ -58,7 +58,9 @@ policy before boot. The image commit can differ from the harness commit only
 with a recorded path/diff assessment. The run owns its caffeinate assertion,
 guest, authority container and independent peer. Docker events, process/boot
 identities, host awake/continuous clock pairs and durable peer progress detect
-unplanned disruption. Any authority pause, host sleep/reboot, guest/owner
+unplanned disruption. The sampler independently checks its exact parent PID,
+fresh owner/authority/peer heartbeat, and host awake/continuous clock pairs;
+owner loss cannot leave a qualifying orphan sampler. Any authority pause, host sleep/reboot, guest/owner
 restart or lost authority/peer continuity invalidates the run. Evidence is
 preserved, the owned resources stop, and the next run starts at zero in a new
 directory. No interruption is subtracted and no run is spliced.
@@ -67,3 +69,9 @@ UTC, RTC admission and aggregate G0 remain separate verdicts. Qualification is
 conditional on the trusted host and authenticated reference servers; NTS does
 not prove server UTC correctness or future clock behavior. The native
 sampling/use-straddle and resident-kernel-state residual remain unproven.
+
+During a coordinator HOLD, no new native work begins. An active qualification
+stops, its evidence remains invalid/incomplete, and container cleanup is deferred.
+The owner must not unpause, stop, kill, remove or replace a coordinator-paused
+container. A later explicit release authorizes cleanup and a new run, never
+continuation of the interrupted timer.

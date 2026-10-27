@@ -24,6 +24,7 @@ import re
 import sys
 import selectors
 import uuid
+from g3_continuity import verify_owner, verify_awake, host_pair, record_invalid
 from g3_coverage import (OPERATORS, BoundViolation, ReferenceDisagreement, coverage_verdict, campaign_coverage, causal_generation)
 
 SECOND = 1_000_000_000
@@ -313,8 +314,12 @@ def main():
     p.add_argument('--invalid-file', type=pathlib.Path)
     p.add_argument('--run-id', default=None)
     p.add_argument('--hold-file',type=pathlib.Path)
+    p.add_argument('--owner-pid',type=int)
+    p.add_argument('--owner-status',type=pathlib.Path)
     a = p.parse_args()
     seconds = FULL_SECONDS if a.soak else a.seconds
+    if a.soak and (not a.owner_pid or not a.owner_status):
+        p.error('soak requires the continuous native owner and its status evidence')
     if seconds < 60 or seconds % INTERVAL or (a.soak and a.dry_run):
         p.error('duration must contain whole 30-second slots, at least 60s; soak excludes dry-run')
     block_seconds = 900 if a.dry_run else BLOCK_SECONDS
@@ -322,6 +327,7 @@ def main():
     image_hash = hashlib.sha256((a.image/'manifest.json').read_bytes()).hexdigest()
     ssh = ['ssh','-F',a.ssh_config,'portablefs-workspace']
     run_id = a.run_id or str(uuid.uuid4())
+    host_awake_origin=host_pair()
     start_ns = time.monotonic_ns()
     start_pair=wall_pair()
     start_wall_ns=start_pair['wall_ns']+start_ns-(start_pair['began_ns']+start_pair['ended_ns'])//2
@@ -329,7 +335,7 @@ def main():
     start = start_ns/SECOND
     deadline_ns = start_ns+int(seconds*SECOND)
     campaign = PauseCampaign(a.pause_command,image_hash,a.evidence,seconds,a.dry_run,start_ns,run_id)
-    records, failures = [], []
+    records, failures, run_disruptions = [], [], []
     load, block = None, -1
     next_ns = start_ns
     sample_file = (a.evidence/'samples.jsonl').open('x')
@@ -340,8 +346,8 @@ def main():
             began = time.monotonic_ns()
             closing = began >= deadline_ns
             current = min(int((began-start_ns)//(block_seconds*SECOND)), int((seconds-1)//block_seconds))
-            if a.hold_file and a.hold_file.exists() and current%2:
-                atomic(a.evidence.parent/'coordinator-request.json',dict(reason='HOLD conflicts with scheduled load; coordinator decision required'))
+            if a.hold_file and a.hold_file.exists():
+                atomic(a.evidence.parent/'coordinator-request.json',dict(reason='HOLD stops native qualification; explicit coordinator release required'))
                 if a.stop_file: a.stop_file.touch()
                 break
             if current != block:
@@ -403,6 +409,19 @@ def main():
                 except (KeyError,TypeError,ValueError) as error:
                     row['tentative_check_error']=str(error)
             row['host_wall_pair_after']=wall_pair()
+            try:
+                row['host_awake_pair_ns']=verify_awake(host_awake_origin,host_pair())
+            except RuntimeError as error:
+                disruption=dict(run_id=run_id,error=str(error),observed_ns=time.monotonic_ns())
+                run_disruptions.append(disruption);row['disruption']=disruption
+                if a.invalid_file: record_invalid(a.invalid_file,disruption)
+            if a.owner_pid:
+                try:
+                    row['owner_heartbeat_ns']=verify_owner(a.owner_status,a.owner_pid,run_id,time.monotonic_ns,os.getppid)
+                except (OSError,ValueError,RuntimeError) as error:
+                    disruption=dict(run_id=run_id,error=str(error),observed_ns=time.monotonic_ns())
+                    run_disruptions.append(disruption);row['disruption']=disruption
+                    if a.invalid_file: record_invalid(a.invalid_file,disruption)
             records.append(row)
             sample_file.write(json.dumps(row,sort_keys=True)+'\n');sample_file.flush()
             temporary=a.evidence/'progress.json.tmp'
@@ -412,7 +431,7 @@ def main():
                    source_coverage=sum(v.get('tentative_checks',{}).get('source')=='pass' for v in records),
                    failures=failures,pause_campaign_cases=len(campaign.records),pause_campaign_errors=campaign.errors,last_sample=row))
             temporary.replace(a.evidence/'progress.json')
-            if failures or closing or (a.stop_file and a.stop_file.exists()) or (a.invalid_file and a.invalid_file.exists()): break
+            if failures or run_disruptions or closing or (a.stop_file and a.stop_file.exists()) or (a.invalid_file and a.invalid_file.exists()): break
             # Never synthesize catch-up observations for elapsed slots.
             next_ns=max(next_ns+INTERVAL*SECOND,start_ns+((time.monotonic_ns()-start_ns)//(INTERVAL*SECOND)+1)*INTERVAL*SECOND)
             time.sleep(max(0,(min(next_ns,deadline_ns)-time.monotonic_ns())/SECOND))
@@ -420,8 +439,15 @@ def main():
         sample_file.close()
         campaign.finish()
         if load is not None and not stop_load(load): failures.append('owned guest load failed')
+    try:
+        verify_awake(host_awake_origin,host_pair())
+        if a.owner_pid: verify_owner(a.owner_status,a.owner_pid,run_id,time.monotonic_ns,os.getppid)
+    except (OSError,ValueError,RuntimeError) as error:
+        disruption=dict(run_id=run_id,error=str(error),observed_ns=time.monotonic_ns())
+        run_disruptions.append(disruption)
+        if a.invalid_file: record_invalid(a.invalid_file,disruption)
     attach_planned_windows(records,campaign)
-    disruptions=[]
+    disruptions=list(run_disruptions)
     if a.invalid_file and a.invalid_file.exists(): disruptions.append(json.loads(a.invalid_file.read_text()))
     verdict=coverage_verdict(records,start_ns,seconds,run_id,reference_interval,evaluate,disruptions=disruptions)
     verdict['failures'].extend(failures)

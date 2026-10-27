@@ -193,6 +193,7 @@ class QualificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=pathlib.Path(directory);image=root/'image';image.mkdir();(image/'manifest.json').write_text('{}')
             with mock.patch('sys.argv',['qualify',str(image),'unused',str(root/'evidence'),'--seconds','60','--utc-reference-command','adapter']), \
+                 mock.patch.object(clock,'host_pair',return_value=(1000,2000)), \
                  mock.patch.object(clock.time,'monotonic',side_effect=lambda:elapsed[0]), \
                  mock.patch.object(clock.time,'monotonic_ns',side_effect=lambda:int(elapsed[0]*S)), \
                  mock.patch.object(clock.time,'time_ns',side_effect=lambda:UTC+int((elapsed[0]-10)*S)+S//2), \

@@ -1,5 +1,6 @@
 """Run identity and continuity checks, independent of planned guest fences."""
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -15,6 +16,14 @@ def host_pair():
     continuous = time.clock_gettime_ns(clock)
     after = time.monotonic_ns()
     return continuous-after, continuous-before
+
+
+def verify_awake(initial, current):
+    lower,upper=current
+    # This detects suspend, not an independently supported UTC rate envelope.
+    if lower>initial[1]+1_000_000 or upper<initial[0]-1_000_000:
+        raise RuntimeError('host sleep/monotonic discontinuity')
+    return current
 
 
 class Continuity:
@@ -52,11 +61,7 @@ print(json.dumps(rows,sort_keys=True))
         return dict(pid=state['Pid'],started=state['StartedAt'],processes=json.loads(processes))
 
     def check(self, campaign_active=False):
-        lower,upper=host_pair()
-        # Allow one millisecond for independently read clock quantization. This
-        # is sleep detection, not an oscillator-rate envelope for source gaps.
-        if lower > self.host[1]+1_000_000 or upper < self.host[0]-1_000_000:
-            raise RuntimeError('host sleep/monotonic discontinuity')
+        lower,upper=verify_awake(self.host,host_pair())
         if self.snapshot()!=self.initial:
             raise RuntimeError('authority/ordinary peer process identity changed')
         if self.guest.p.poll() is not None:
@@ -78,3 +83,29 @@ print(json.dumps(rows,sort_keys=True))
                 raise RuntimeError('guest reboot/service owner restart')
         return dict(host_clock_offset_bracket_ns=[lower,upper],authority=self.initial,
                     peer_completed_ns=self.last_peer,observed_ns=time.monotonic_ns())
+
+
+def verify_owner(status_path, owner_pid, run_id, now_ns, parent_pid):
+    status=json.loads(pathlib.Path(status_path).read_text())
+    parent_pid=parent_pid() if callable(parent_pid) else parent_pid
+    if parent_pid!=owner_pid:
+        raise RuntimeError('clock sampler lost its exact owner process')
+    if status.get('pid')!=owner_pid or status.get('run_id')!=run_id:
+        raise RuntimeError('clock sampler owner identity changed')
+    heartbeat=status.get('continuity',{}).get('observed_ns')
+    now_ns=now_ns() if callable(now_ns) else now_ns
+    if type(heartbeat) is not int or not 0<=now_ns-heartbeat<=45_000_000_000:
+        raise RuntimeError('clock sampler lost fresh authority/peer continuity evidence')
+    return heartbeat
+
+
+def record_invalid(path, value):
+    """Atomically retain the first disruption across the owner and sampler."""
+    path=pathlib.Path(path)
+    temporary=path.with_name(path.name+f'.{os.getpid()}.tmp')
+    temporary.write_text(json.dumps(value,indent=2)+'\n')
+    try:
+        try:os.link(temporary,path)
+        except FileExistsError:pass
+    finally:
+        temporary.unlink()
