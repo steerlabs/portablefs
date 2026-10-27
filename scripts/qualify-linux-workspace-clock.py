@@ -345,8 +345,15 @@ def main():
         duplicates_covered = False
     if not resume_covered or not duplicates_covered:
         utc = 'inconclusive' if utc != 'fail' else utc
+    checks = [v['checks'] for v in records if 'checks' in v]
+    worst = dict(observations=len(checks), complete=len(checks)==available,
+                 maximum_sample_set_age_ns=max((v['sample_set_age_ns'] for v in checks), default=None),
+                 maximum_awake_drift_ns=max((v['awake_drift_bound_ns'] for v in checks), default=None),
+                 maximum_conditional_utc_error_ns=max((v['worst_conditional_utc_error_ns'] for v in checks), default=None),
+                 maximum_source_offset_abs_ns=max((abs(n) for v in checks for n in v.get('source_offset_interval_ns', [])), default=None))
+    (a.evidence / 'worst-cases.json').write_text(json.dumps(worst, indent=2)+'\n')
     result = dict(format=8, image_manifest_sha256=image_hash, seconds=time.monotonic()-start,
-                  dry_run=a.dry_run, full_soak=full, samples=len(records), source_coverage=coverage, source_measurements=available, reference_coverage=reference_coverage,
+                  worst_cases=worst, dry_run=a.dry_run, full_soak=full, samples=len(records), source_coverage=coverage, source_measurements=available, reference_coverage=reference_coverage,
                   blocks=sorted({(v['block'], v['load']) for v in records}), failures=failures,
                   measurement_coverage_complete=cadence_complete,
                   awake_discipline_passed=not failures, utc=utc, rtc_admission=admission,

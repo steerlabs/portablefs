@@ -4,7 +4,6 @@ These runs never sleep the host or edit a clock. Exact virtual-clock schedules
 are separately owned by the injected Go inventory; actual pause durations and
 publication observations are recorded here without rounding them to that model.
 """
-import errno
 import json
 import selectors
 import shlex
@@ -35,7 +34,7 @@ b=time.clock_gettime_ns(time.CLOCK_BOOTTIME);start=time.monotonic_ns()
 try:
  os.stat(PATH); result={'success':True}
 except OSError as e:
- result={'success':False,'errno':e.errno}
+ result={'success':False,'errno':e.errno,'errno_name':errno.errorcode[e.errno]}
 result.update(boottime_ns=b,operation_ns=time.monotonic_ns()-start)
 print(json.dumps(result),flush=True)
 '''.replace('PATH', repr(authority.target+'/'+token))
@@ -106,7 +105,7 @@ print(json.dumps(result),flush=True)
                         ready.register(worker.stdout, selectors.EVENT_READ)
                         assert ready.select(5), 'first expired operation waited for host recovery'
                         first = json.loads(worker.stdout.readline())
-                    assert not first['success'] and first['errno'] in (errno.EIO,errno.ENOTCONN,errno.ESTALE,errno.EACCES), first
+                    assert not first['success'] and first['errno_name'] in ('EIO','ENOTCONN','ESTALE','EACCES'), first
                     assert first['operation_ns']<1_000_000_000, first
                     trace['first_operation'] = first
                     trace['denial_observed_before_host_recovery_ns'] = time.monotonic_ns()
