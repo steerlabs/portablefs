@@ -12,10 +12,10 @@ import time
 import uuid
 
 
-def pause_checks(authority, guest, managed, record):
+def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600), modes=('normal','delayed','suppressed')):
     traces = []
-    for duration in (5, 15, 45, 150, 600):
-        for fencing in ('normal', 'delayed', 'suppressed'):
+    for duration in durations:
+        for fencing in modes:
             case = f'g0-vz-{fencing}-{duration}s'
             token = 'g0-' + uuid.uuid4().hex
             worker = None
@@ -58,8 +58,9 @@ print(json.dumps(result),flush=True)
                     # Let the old authority horizon age before the five-second
                     # case so the peer completes within the requested pause.
                     # No host observer can initiate cold recovery in this gap.
-                    time.sleep(6.5)
-                    trace['pre_pause_network_gap_seconds'] = 6.5
+                    gap = max(6.5, 10.1-duration)
+                    time.sleep(gap)
+                    trace['pre_pause_network_gap_seconds'] = gap
                     limit = time.monotonic()+10
                     while True:
                         guest.command('test-pause-unfenced')

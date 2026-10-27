@@ -41,6 +41,10 @@ resume=[json.loads(line.split('RTC_RESUME_QUALIFICATION=',1)[1]) for line in lin
 assert len(resume)==1 and resume[0]['operation_prestarted'] and not resume[0]['host_round_trip_after_resume']
 assert resume[0]['read_age_ns']<=250_000_000
 (root/'rtc-first-resume.json').write_text(json.dumps(resume[0],indent=2)+'\n')
+nts=[json.loads(line.split('RTC_NTS_REFERENCE=',1)[1]) for line in lines if line.startswith('RTC_NTS_REFERENCE=')]
+if nts:
+    assert len(nts)==1
+    (root/'rtc-nts-reference.json').write_text(json.dumps(nts[0],indent=2)+'\n')
 (root/'rtc-contention.json').write_text(json.dumps(result,indent=2)+'\n')
 print('PASS: native-rtc-contention-qualification')
 PY

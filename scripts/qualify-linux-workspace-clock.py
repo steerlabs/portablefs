@@ -235,6 +235,7 @@ def main():
     p.add_argument('--utc-reference-command')
     p.add_argument('--admission-evidence', type=pathlib.Path)
     p.add_argument('--pause-command', help='read-only-clock native VZ qualification driver; receives one JSON case argument')
+    p.add_argument('--stop-file', type=pathlib.Path, help='finish cleanly after the current sample when this file exists')
     a = p.parse_args()
     seconds = FULL_SECONDS if a.soak else a.seconds
     if seconds < 60 or (a.soak and a.dry_run):
@@ -274,6 +275,8 @@ def main():
             began = time.monotonic_ns()
             record = dict(index=len(records), block=block, load='load' if block % 2 else 'idle',
                           interval_slot=int((ref_began-int(start*SECOND))//(INTERVAL*SECOND)),
+                          reference_began_ns=ref_began, reference_ended_ns=ref_ended,
+                          sample_began_ns=began, host_wall_ns=time.time_ns(),
                           host_elapsed_ns=began-int(start*SECOND), independent_reference=reference, reference_error=reference_error, reference_valid=False)
             if reference:
                 try:
@@ -284,7 +287,7 @@ def main():
             try:
                 sample = json.loads(subprocess.check_output(ssh + [PROBE], text=True, timeout=10))
                 ended = time.monotonic_ns()
-                record.update(sample=sample, host_measurement_ns=ended-began,
+                record.update(sample=sample, sample_ended_ns=ended, host_measurement_ns=ended-began,
                               full_reference_sampling_transit_ns=ended-ref_began)
                 if campaign.overlaps_sample(pause_token):
                     # Old maintenance projection is deliberately invalid across
@@ -311,7 +314,15 @@ def main():
                     failures.append(str(error))
             records.append(record)
             sample_file.write(json.dumps(record, sort_keys=True)+'\n'); sample_file.flush()
-            if time.monotonic() >= deadline:
+            progress = dict(pid=os.getpid(), seconds=time.monotonic()-start,
+                            samples=len(records), reference_coverage=sum(v['reference_valid'] for v in records),
+                            source_coverage=sum(v.get('checks',{}).get('source')=='pass' for v in records),
+                            failures=failures, pause_campaign_cases=len(campaign.records),
+                            pause_campaign_errors=campaign.errors, last_sample=record)
+            temporary = a.evidence/'progress.json.tmp'
+            temporary.write_text(json.dumps(progress,indent=2)+'\n')
+            temporary.replace(a.evidence/'progress.json')
+            if time.monotonic() >= deadline or (a.stop_file and a.stop_file.exists()):
                 break
             next_sample += INTERVAL
             time.sleep(max(0, min(start+next_sample, deadline)-time.monotonic()))
