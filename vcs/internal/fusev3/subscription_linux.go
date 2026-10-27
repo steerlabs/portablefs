@@ -653,6 +653,9 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			s.lastChangeSeen = 0
 			s.lastChangeAck = 0
 			s.signalHorizonChangedLocked()
+			if s.mount != nil && s.mount.workspaceRTC != nil {
+				log.Printf("portablefs: workspace cache permission installed incarnation=%d boot_anchor_ns=%d rtc_anchor=%s horizon_ns=%d lead_ns=%d", incarnation, permission.Started.UnixNano(), permission.RTC.Format(time.RFC3339), permission.Horizon, s.config.withdrawalLead)
+			}
 			s.mu.Unlock()
 			if s.control != nil {
 				s.control.SetIncarnation(incarnation)
@@ -1677,7 +1680,7 @@ func (s *subscriptionRegistry) closeRTCIntervalLocked(causes ...error) {
 		s.signalHorizonChangedLocked()
 	}
 	if first && len(causes) != 0 && causes[0] != nil {
-		log.Printf("portablefs: workspace cache permission closed incarnation=%d: %v", s.incarnation, causes[0])
+		log.Printf("portablefs: workspace cache permission closed incarnation=%d boot_anchor_ns=%d rtc_anchor=%s horizon_ns=%d lead_ns=%d closed_boot_ns=%d: %v", s.incarnation, s.permission.Started.UnixNano(), s.permission.RTC.Format(time.RFC3339), s.permission.Horizon, s.config.withdrawalLead, s.config.clock.Now().UnixNano(), causes[0])
 	}
 }
 
