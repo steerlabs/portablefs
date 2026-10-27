@@ -32,6 +32,8 @@ lines=(root/'rtc-contention-console.log').read_text().splitlines()
 results=[json.loads(line.split('RTC_QUALIFICATION=',1)[1]) for line in lines if line.startswith('RTC_QUALIFICATION=')]
 assert len(results)==1 and 'PASS: rtc-contention-qualification' in lines
 result=results[0]
+result['vm']='fixture'
+result['pause_seconds_before_reference_collection']=2
 assert result['read_only'] and result['second_open_busy']
 assert result['readers']==8 and result['samples']==8000
 assert result['maximum_ns']<=250_000_000
@@ -40,12 +42,16 @@ result['image_manifest_sha256']=hashlib.sha256((image/'manifest.json').read_byte
 resume=[json.loads(line.split('RTC_RESUME_QUALIFICATION=',1)[1]) for line in lines if line.startswith('RTC_RESUME_QUALIFICATION=')]
 assert len(resume)==1 and resume[0]['operation_prestarted'] and not resume[0]['host_round_trip_after_resume']
 assert resume[0]['read_age_ns']<=250_000_000
+resume[0]['vm']='fixture'
+resume[0]['pause_seconds_before_reference_collection']=2
 (root/'rtc-first-resume.json').write_text(json.dumps(resume[0],indent=2)+'\n')
 nts=[json.loads(line.split('RTC_NTS_REFERENCE=',1)[1]) for line in lines if line.startswith('RTC_NTS_REFERENCE=')]
 if os.environ.get('PFS_RTC_NTS_REFERENCE'):
     assert len(nts)==1, 'missing authenticated first-resume reference evidence'
 if nts:
     assert len(nts)==1
+    nts[0]['vm']='fixture'
+    nts[0]['pause_seconds_before_reference_collection']=2
     (root/'rtc-nts-reference.json').write_text(json.dumps(nts[0],indent=2)+'\n')
 (root/'rtc-contention.json').write_text(json.dumps(result,indent=2)+'\n')
 print('PASS: native-rtc-contention-qualification')
