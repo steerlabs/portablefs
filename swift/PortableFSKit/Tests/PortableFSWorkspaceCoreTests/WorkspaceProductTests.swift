@@ -112,7 +112,7 @@ private func productMount(_ document: WorkspaceConnectionDocument) throws -> Wor
             #expect(owner.handle(try productRequest("start")).state == "starting")
             #expect(runtime.starts == 1); #expect(store.value.execution?.boot == runtime.bootID)
             #expect(store.value.execution?.boot != Data(repeating:1,count:16))
-            #expect(store.value.retained.contains(evidence)); #expect(owner.snapshot().previousWriteOutcomeUnknown == !lost); #expect(owner.snapshot().someChangesWereNotSaved == lost)
+            #expect(store.value.retained.contains(evidence)); #expect(owner.snapshot().previousWriteOutcomeUnknown); #expect(owner.snapshot().someChangesWereNotSaved == lost)
         }
     }
     @Test func descriptorPassedLockSurvivesOriginalOwnerRetirement() throws {

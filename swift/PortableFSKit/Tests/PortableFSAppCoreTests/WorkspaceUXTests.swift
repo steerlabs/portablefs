@@ -4,7 +4,7 @@ import Testing
 @testable import PortableFSAppCore
 
 private func uxHome() throws -> URL {
-    let home = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent("pfs-ux-" + UUID().uuidString)
+    let home = URL(fileURLWithPath: "/private/tmp", isDirectory: true).appendingPathComponent("pfs-ux-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     return home
 }
